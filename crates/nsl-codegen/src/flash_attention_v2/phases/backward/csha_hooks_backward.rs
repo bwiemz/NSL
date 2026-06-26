@@ -942,13 +942,13 @@ pub fn emit_prologue_recompute_from_raw(
         "V2_PROLOGUE_RECOMPUTE_FROM_RAW_ENTRY{namespace_suffix}:\n"
     ));
 
-    // Risk-3: null-guard on x_raw_ptr. Silent garbage is the primary
-    // failure mode if forward save logic ever drops the x_raw write.
+    // Risk-3: null-guard on x_raw_ptr.
+    // Cycle 12: trap on null x_raw_ptr -- silent garbage was the
+    // cycle-11 bug; loud abort is the fix. With R3 fused_projections
+    // augmentation x_raw should never be null when this emitter runs.
     ptx.push_str("    ld.param.u64 %rd_x_raw_ptr, [x_raw_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p_xraw_null, %rd_x_raw_ptr, 0;\n");
-    ptx.push_str(&format!(
-        "    @%p_xraw_null bra V2_PROLOGUE_RECOMPUTE_FROM_RAW_DONE{namespace_suffix};\n"
-    ));
+    ptx.push_str("    @%p_xraw_null trap;\n");
 
     // One thread per row of the Q tile (block_q rows, tid_x identifies
     // the row in this scope). Other lanes idle through both passes;
@@ -1225,13 +1225,18 @@ pub fn emit_kv_recompute(
     ));
     ptx.push_str(&format!("V2_KV_RECOMPUTE_{kv_iter_suffix}:\n"));
 
-    // Step 1: Risk-3 null-guard on x_raw_ptr (early-exit if forward did
-    // not stage x_raw — silent garbage is the failure mode).
+    // Step 1: Risk-3 null-guard on x_raw_ptr.
+    // Cycle 12: trap on null x_raw_ptr -- silent garbage was the
+    // cycle-11 bug; loud abort is the fix. With R3 fused_projections
+    // augmentation x_raw should never be null when this emitter runs,
+    // because the augmented R3 refuses configs that don't stage x_raw
+    // on the forward path. The trap is defense-in-depth -- if any
+    // future refactor weakens the R3 augmentation or the forward save
+    // path drops the x_raw write, we get CUDA_ERROR_LAUNCH_FAILED at
+    // runtime instead of silently wrong gradients.
     ptx.push_str("    ld.param.u64 %rd_kvr_xraw, [x_raw_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p_kvr_xraw_null, %rd_kvr_xraw, 0;\n");
-    ptx.push_str(&format!(
-        "    @%p_kvr_xraw_null bra V2_KV_RECOMPUTE_DONE_{kv_iter_suffix};\n"
-    ));
+    ptx.push_str("    @%p_kvr_xraw_null trap;\n");
 
     // Step 2: produce x_norm in SMEM scratch via the cycle-11 Task-2 emitter.
     let suffix = format!("_bwd_recompute_{kv_iter_suffix}");
