@@ -23,7 +23,10 @@
 use nsl_codegen::flash_attention::{
     CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
 };
-use nsl_codegen::flash_attention_v2::synthesize_backward_with_tier;
+use nsl_codegen::flash_attention_v2::{
+    synthesize_backward_combined, synthesize_backward_with_tier,
+    synthesize_backward_with_tier_b,
+};
 
 // ----- shared config helpers ---------------------------------------------
 
@@ -204,6 +207,96 @@ fn g2_r12_segment_masked_refuses() {
     assert!(
         err.contains("paged-segment-masked composition deferred"),
         "R12 missing expected substring 'paged-segment-masked composition deferred': {err}"
+    );
+}
+
+// ----- G2-prod: cycle-12 Phase F — refusals must fire from the production
+// entry too (`synthesize_backward_with_tier_b`), not just the direct fork
+// (`synthesize_backward_with_recompute`). Reviewer 1 on cycle-12 Phase D
+// caught that production routes `synthesize_backward_combined` →
+// `synthesize_backward` → `synthesize_backward_with_tier_b(config, None)`,
+// which NEVER calls `synthesize_backward_with_recompute`. These tests
+// exercise the production path directly to lock in reachability.
+// --------------------------------------------------------------------
+
+#[test]
+fn g2_prod_r3_unreachable_from_production_regression() {
+    // Reviewer 1 regression: build a config with checkpoint=Some +
+    // csha.fused_projections=false and call the production entry
+    // `synthesize_backward_with_tier_b` directly. Without Phase F the
+    // R3 cascade was unreachable from here — only the direct fork
+    // `synthesize_backward_with_recompute` had the gate.
+    let mut cfg = base_fusible();
+    let mut csha = CshaExtras::level1(1e-6);
+    csha.fused_projections = false; // intentionally bad → triggers R3
+    cfg.csha = Some(csha);
+    let err = synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err("R3 must refuse from the production entry too");
+    assert!(
+        err.contains("fused_projections gate failed"),
+        "R3 unreachable from production: {err}"
+    );
+}
+
+#[test]
+fn g2_prod_r3_unreachable_via_combined_entry_regression() {
+    // Cycle-12 Phase F: `synthesize_backward_combined` calls
+    // `synthesize_backward` → `synthesize_backward_with_tier_b`. The
+    // R3 cascade must surface at this entry too.
+    let mut cfg = base_fusible();
+    let mut csha = CshaExtras::level1(1e-6);
+    csha.fused_projections = false;
+    cfg.csha = Some(csha);
+    let err = synthesize_backward_combined(&cfg)
+        .expect_err("R3 must refuse via combined-entry production path");
+    assert!(
+        err.contains("fused_projections gate failed"),
+        "R3 unreachable from synthesize_backward_combined: {err}"
+    );
+}
+
+#[test]
+fn g2_prod_r11_unreachable_from_production_regression() {
+    // Reviewer 1 regression for R11: build a config that satisfies
+    // `tier_b2_hybrid_backward_compile_time_eligible` AND has
+    // checkpoint=Some, then call `synthesize_backward_with_tier_b`
+    // directly. Without Phase F, R11 was unreachable from the
+    // production entry. Predicate requires: gpu_sm>=80, csha.level>=2,
+    // active_heads==1, d_model==head_dim, rope_q permitted, no sinks.
+    let mut csha = CshaExtras::level1(1e-6);
+    csha.level = 2;
+    csha.fused_projections = true; // satisfy R3
+    csha.active_heads = 1;
+    csha.d_model = 64;
+    let cfg = FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        num_sink_tokens: 0,
+        gpu_sm: 80, // Ampere → tier_b2_can_dispatch ok
+        segment_masked: false,
+        csha: Some(csha),
+        checkpoint: Some(CheckpointExtras::full()),
+    };
+
+    // Sanity: predicate must accept this config so R11 is reachable.
+    use nsl_codegen::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
+    assert!(
+        tier_b2_hybrid_backward_compile_time_eligible(&cfg),
+        "test scaffolding bug: cfg is not hybrid-eligible, R11 won't fire"
+    );
+
+    let err = synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err("R11 must refuse from the production entry");
+    assert!(
+        err.contains("Tier B.2 hybrid backward composition"),
+        "R11 unreachable from production: {err}"
     );
 }
 

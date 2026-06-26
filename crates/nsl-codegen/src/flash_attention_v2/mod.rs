@@ -1034,24 +1034,29 @@ pub fn synthesize_backward_with_tier(
 /// the dispatch fork in `synthesize_backward_with_tier` never reaches this
 /// function, so no checkpoint-related PTX is emitted on the no-decorator
 /// path — `fa_v2_snapshots` remains byte-identical.
-pub fn synthesize_backward_with_recompute(
-    config: &FlashAttentionConfig,
-) -> Result<String, String> {
+/// Cycle-12 Phase F: cycle-5 invariant `feedback_deferral_must_refuse`
+/// requires refusals to fire at EVERY entry point. Reviewer 1 (on
+/// cycle-12 Phase D) found the R3/R11/R12 cascade lived ONLY inside
+/// `synthesize_backward_with_recompute`, but production routes through
+/// `synthesize_backward_combined` → `synthesize_backward` →
+/// `synthesize_backward_with_tier_b(config, None)`, which NEVER calls
+/// `synthesize_backward_with_recompute`. So R3/R11/R12 were functionally
+/// dead under the production call chain.
+///
+/// This helper centralises the R3/R7/R8.1/R9/R10/R11/R12 sequence so
+/// it can be called from BOTH the direct dispatch fork
+/// (`synthesize_backward_with_recompute`) AND the production entry
+/// (`synthesize_backward_with_tier_b`). When `config.checkpoint.is_none()`
+/// the helper is a no-op — preserving the byte-identity invariant of
+/// the no-decorator path (`fa_v2_snapshots` 25/25 byte-identical).
+fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> Result<(), String> {
     use crate::flash_attention::CheckpointPolicy;
     use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
 
-    // Carrier presence is guaranteed by the dispatch fork at
-    // `synthesize_backward_with_tier`. If a caller hits this entry
-    // point directly with `checkpoint: None`, refuse loudly rather
-    // than silently routing to the no-decorator backward.
-    let extras = config
-        .checkpoint
-        .as_ref()
-        .ok_or_else(|| {
-            "synthesize_backward_with_recompute called without \
-             config.checkpoint set; v1 only services policy=\"full\""
-                .to_string()
-        })?;
+    // No carrier ⇒ no checkpoint policy in play ⇒ nothing to gate.
+    let Some(extras) = config.checkpoint.as_ref() else {
+        return Ok(());
+    };
     let CheckpointPolicy::Full = extras.policy;
 
     // ── R3 (cycle-12 augmented): Non-Level-1-fusible prologue ────────
@@ -1151,6 +1156,30 @@ pub fn synthesize_backward_with_recompute(
                 .to_string(),
         );
     }
+
+    Ok(())
+}
+
+pub fn synthesize_backward_with_recompute(
+    config: &FlashAttentionConfig,
+) -> Result<String, String> {
+    // Carrier presence is guaranteed by the dispatch fork at
+    // `synthesize_backward_with_tier`. If a caller hits this entry
+    // point directly with `checkpoint: None`, refuse loudly rather
+    // than silently routing to the no-decorator backward.
+    if config.checkpoint.is_none() {
+        return Err(
+            "synthesize_backward_with_recompute called without \
+             config.checkpoint set; v1 only services policy=\"full\""
+                .to_string(),
+        );
+    }
+
+    // Cycle-12 Phase F: centralised R3/R7/R8.1/R9/R10/R11/R12 cascade.
+    // This is also called from `synthesize_backward_with_tier_b` so the
+    // refusals fire from the production call chain too — closing the
+    // cycle-5 invariant gap Reviewer 1 caught.
+    validate_checkpoint_eligibility(config)?;
 
     // SMEM budget extension (Cut 7 / R5): re-run the scalar v2 validator
     // with the checkpoint carrier in place so `recompute_extra_bytes` is
@@ -1285,6 +1314,18 @@ pub fn synthesize_backward_with_tier_b(
     config: &FlashAttentionConfig,
     tier_b: Option<(u32, SegmentResidency)>,
 ) -> Result<String, String> {
+    // Cycle-12 Phase F (Reviewer 1 NEEDS_FIXES): refuse R3/R7/R8.1/R9/
+    // R10/R11/R12 from the production entry too. Production routes
+    // `synthesize_backward_combined` → `synthesize_backward` → here
+    // WITHOUT going through `synthesize_backward_with_recompute`, so
+    // without this call the cycle-12 refusal cascade would be
+    // unreachable from the production call chain — violating the
+    // cycle-5 invariant `feedback_deferral_must_refuse`. When
+    // `config.checkpoint.is_none()` this is a no-op, preserving the
+    // `fa_v2_snapshots` 25/25 byte-identity invariant for the
+    // no-decorator path.
+    validate_checkpoint_eligibility(config)?;
+
     // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
     // The forward eligibility predicate already refuses
     // `csha.save_activations_for_backward = true` + `num_sink_tokens > 0`
