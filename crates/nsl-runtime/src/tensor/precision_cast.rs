@@ -192,6 +192,16 @@ fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
     use crate::cuda::precision_cast_kernels;
 
     let len = t.len as usize;
+    // CFTP v7 follow-on (finding-4): zero-length casts must not produce a
+    // published tensor pointing at stale HBM. They're a programming error
+    // in this path (the wengert lowering never emits a zero-length cast),
+    // so refuse loudly rather than silently exposing caching-allocator
+    // garbage in the dst buffer.
+    assert!(
+        len > 0,
+        "gpu_cast_and_publish: zero-length cast (t.len == 0) is not supported; \
+         caller must not request a cast of an empty tensor"
+    );
     let target_elem_size: usize = match target_dtype {
         DTYPE_F32 => 4,
         DTYPE_FP16 => 2,
@@ -206,6 +216,12 @@ fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
     // caching allocator + OOM recovery).
     let dst_bytes = len * target_elem_size;
     let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
+    // CFTP v7 follow-on (finding-4): defensive zero-fill closes the
+    // partial-write window if a future change to the cast kernel ever
+    // leaves bytes unwritten (e.g. if the u64 bounds check above were
+    // accidentally re-narrowed to u32 by a refactor). Cheap — memset is
+    // parallel-async on every Blackwell/Hopper SKU we target.
+    crate::cuda::inner::memset_d8(dst_data, dst_bytes);
 
     // Same-dtype path: device-to-device memcpy (no conversion).
     if t.dtype == target_dtype {
