@@ -14,8 +14,10 @@
 //! The codegen tests in `crates/nsl-codegen/src/precision_cast_ptx.rs` keep
 //! pinning the emitted structure; the strings here are a CONSTANT
 //! materialisation of that emitter at a single point in time — if the codegen
-//! ever moves, the runtime strings here must move in lockstep (a
-//! `cast_ptx_runtime_matches_codegen` test enforces this byte-for-byte).
+//! ever moves, the runtime strings here must move in lockstep, and the
+//! `runtime_embedded_ptx_matches_codegen_byte_for_byte` test in
+//! `crates/nsl-codegen/tests/precision_cast_ptx_runtime_parity.rs` enforces
+//! that byte-for-byte via the `__test_runtime_ptx_strings()` hook below.
 //!
 //! ## Module cache
 //!
