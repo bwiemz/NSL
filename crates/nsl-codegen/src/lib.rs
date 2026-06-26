@@ -158,6 +158,7 @@ pub mod flash_attention;
 pub mod flash_attention_selector;
 pub mod flash_attention_v2;
 pub mod fused_linear_ce;
+pub mod precision_cast_ptx;
 pub mod fusion;
 pub mod fusion_graph;
 pub mod fusion_report;
