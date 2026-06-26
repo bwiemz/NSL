@@ -255,34 +255,26 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
 
 /// Convert f32 to IEEE 754 half-precision (f16) bits.
 ///
-/// IMPORTANT: This **truncates** the lower 13 mantissa bits (one-sided bias
-/// toward zero). It is NOT round-to-nearest-even. Worst-case relative error
-/// approaches the f16 unit roundoff (~9.77e-4) rather than half-ULP (~4.88e-4).
-/// For IEEE-compliant RTE rounding (e.g. matching PTX `cvt.rn.f16.f32` or
-/// `half::f16::from_f32`), use the `half` crate; CFTP v6's fast cast path
-/// reuses this primitive as-is and the rounding gap is deferred to v7 (see
-/// `tensor/precision_cast.rs` module note). Saturates to ±Inf on overflow,
-/// flushes to zero on underflow.
+/// # CFTP v7 follow-on — RTE + NaN preservation
+///
+/// Delegates to `half::f16::from_f32`, which is IEEE-754 default
+/// round-to-nearest-even and bit-identical to PTX `cvt.rn.f16.f32`.
+/// This closes adversarial-review findings 2 (CPU vs GPU divergence),
+/// 7 (one-sided bias up to one full unit roundoff), 8 (NaN silently
+/// flushed to ±Inf — previous implementation tested `exp >= 143` first
+/// which covered both finite overflow AND `exp == 255` non-finite),
+/// and 10 (denormal range divergence).
+///
+/// Concrete previously-buggy cases now correct:
+/// * `f32::NAN` → quiet f16 NaN (was f16 +Inf 0x7C00)
+/// * f32 0x3F80FFFF → 0x3C01 (RTE, was 0x3C00 truncating)
+/// * f32 0x387FFFFF → 0x0400 (smallest normal RTE up-round, was 0x03FF)
+///
+/// Saturates to ±Inf on overflow, flushes to zero on underflow (same
+/// IEEE-754 boundary semantics as PTX cvt.rn).
 #[inline]
 pub(crate) fn f32_to_f16_bits(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let mant = bits & 0x7F_FFFF;
-    if exp >= 143 {
-        return sign | 0x7C00;
-    }
-    if exp <= 102 {
-        return sign;
-    }
-    if exp <= 112 {
-        let shift = 113 - exp;
-        let m = (0x80_0000 | mant) >> (shift + 13);
-        return sign | m as u16;
-    }
-    let f16_exp = ((exp - 112) as u16) << 10;
-    let f16_mant = (mant >> 13) as u16;
-    sign | f16_exp | f16_mant
+    half::f16::from_f32(val).to_bits()
 }
 
 /// Convert bfloat16 bits to f32 — bf16 is just the top 16 bits of f32.
@@ -293,16 +285,22 @@ pub(crate) fn bf16_bits_to_f32(bits: u16) -> f32 {
 
 /// Convert f32 to bf16 bits.
 ///
-/// IMPORTANT: This **truncates** the lower 16 bits of the f32 (one-sided bias
-/// toward zero). It is NOT round-to-nearest-even — worst-case relative error
-/// approaches the bf16 unit roundoff (~7.81e-3) rather than half-ULP. For
-/// IEEE-compliant RTE rounding (e.g. matching PTX `cvt.rn.bf16.f32` or
-/// `half::bf16::from_f32`), use the `half` crate; CFTP v6's fast cast path
-/// reuses this primitive as-is and the rounding gap is deferred to v7 (see
-/// `tensor/precision_cast.rs` module note).
+/// # CFTP v7 follow-on — RTE + NaN preservation
+///
+/// Delegates to `half::bf16::from_f32`, which is IEEE-754 default
+/// round-to-nearest-even and bit-identical to PTX `cvt.rn.bf16.f32`.
+/// This closes adversarial-review findings 2 (CPU vs GPU divergence),
+/// 7 (truncation bias), 8 (signaling NaNs whose payload sat in the low
+/// 16 mantissa bits collapsed to bf16 +Inf), and 10 (f32 denormals
+/// flushed to zero asymmetrically vs GPU).
+///
+/// Concrete previously-buggy cases now correct:
+/// * `f32::from_bits(0x7F800001)` (sNaN with low-16 payload) → quiet
+///   bf16 NaN (was bf16 +Inf 0x7F80)
+/// * f32 = 0x3F80FFFF → 0x3F81 (RTE, was 0x3F80 truncating)
 #[inline]
 pub(crate) fn f32_to_bf16_bits(val: f32) -> u16 {
-    (val.to_bits() >> 16) as u16
+    half::bf16::from_f32(val).to_bits()
 }
 
 /// Metadata for a user-defined custom datatype

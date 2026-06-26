@@ -1,0 +1,10 @@
+# CFTP v7 — negative fixture: `@fused_lm_ce` attached to a non-`train`
+# block MUST refuse at the semantic-checker layer.  The companion
+# `nsl-cli` test pins the exact diagnostic message ("@fused_lm_ce may
+# only be applied to a `train` block") so a regression that silently
+# accepts the decorator on other constructs flips immediately.
+
+from nsl.nn.losses import cross_entropy
+
+@fused_lm_ce(enabled = true, dtype = "fp16", vocab_size = 4096, hidden_size = 128, batch_size = 2, seq_len = 32, vocab_tile = 1024)
+let x = randn([2, 32, 128])

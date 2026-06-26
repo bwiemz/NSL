@@ -26,19 +26,19 @@
 //! a v7 on-device cast kernel + a model-weight-pinned W shadow buffer
 //! lifts the cost out of the loop entirely.
 //!
-//! Finding 7 (HIGH, RTE rounding gap): the underlying `f32_to_f16_bits`
-//! / `f32_to_bf16_bits` primitives TRUNCATE rather than round-to-
+//! Finding 7 (HIGH, RTE rounding gap): the underlying CPU primitives
+//! `f32_to_f16_bits` / `f32_to_bf16_bits` TRUNCATE rather than round-to-
 //! nearest-even, producing a one-sided bias of up to one full unit
-//! roundoff per element.  Real RTE rounding is the design-doc §10
-//! deferred ladder step.  The Findings 1/6/12 fix (default-on FFI
-//! refusal) blocks the wengert-driven production path from reaching
-//! the kernel today, so the rounding-bias hazard is DORMANT under v6:
-//! direct-FFI tests that opt-in via `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1`
-//! stage their bytes via `half::*::from_f32` (RTE) and so are
-//! unaffected.  A v7 follow-on must (a) implement RTE in the
-//! primitives, (b) re-measure the V=49152 baselines via the production
-//! path (not via `half::from_f32`), and (c) lift the FFI refusal once
-//! the device-side cast kernel + RTE primitives are both ready.
+//! roundoff per element.  CFTP v7 closes the GAP on the production GPU
+//! path by routing GPU tensors through `gpu_cast_and_publish` →
+//! PTX `cvt.rn.{f16,bf16}.f32` (IEEE-754 default RTE), so the
+//! production wengert lowering matches the `half::*::from_f32`
+//! rounding used by the V=49152 baselines.  The CPU primitives'
+//! truncation lives only on CPU staging paths that real training runs
+//! do not exercise; aligning the CPU primitives to RTE is the §10
+//! deferred ladder step.  With v7 the FFI refusal at
+//! `fused_linear_ce.rs` is LIFTED — `NSL_FUSED_LCE_REFUSE_NON_F32=1`
+//! remains as an opt-in diagnostic / safety override.
 
 use std::ffi::c_void;
 
@@ -175,34 +175,161 @@ pub extern "C" fn nsl_tensor_to_f32(src_ptr: i64) -> i64 {
     cast_and_publish(src_ptr, DTYPE_F32)
 }
 
+/// CFTP v7: GPU dispatch for the v6 cast wrappers.
+///
+/// Allocates a device-side destination buffer, launches the appropriate PTX
+/// cast kernel, and publishes the result so the scope sweep reclaims it.
+/// `t` MUST already be device-resident and contiguous (the caller guards
+/// both before reaching this function).
+///
+/// Same-dtype "casts" (e.g. F32->F32) are handled via `cuMemcpyDtoD` rather
+/// than a kernel — there is no PTX cast pair for them. bf16<->fp16 are NOT
+/// supported by a single kernel; the caller would have to stage via f32.
+/// For the v7 surface (which is only reachable from the three v6 wrappers)
+/// every legitimate (src,target) pair is covered.
+#[cfg(feature = "cuda")]
+fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
+    use crate::cuda::precision_cast_kernels;
+
+    let len = t.len as usize;
+    // CFTP v7 follow-on (finding-4): zero-length casts must not produce a
+    // published tensor pointing at stale HBM. They're a programming error
+    // in this path (the wengert lowering never emits a zero-length cast),
+    // so refuse loudly rather than silently exposing caching-allocator
+    // garbage in the dst buffer.
+    assert!(
+        len > 0,
+        "gpu_cast_and_publish: zero-length cast (t.len == 0) is not supported; \
+         caller must not request a cast of an empty tensor"
+    );
+    let target_elem_size: usize = match target_dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 => 2,
+        DTYPE_BF16 => 2,
+        other => panic!(
+            "gpu_cast_and_publish: unsupported target dtype {other} (v7: F32/FP16/BF16)"
+        ),
+    };
+
+    // Allocate the device-side destination buffer via the runtime's managed
+    // allocator (same path as every other GPU op; participates in the
+    // caching allocator + OOM recovery).
+    let dst_bytes = len * target_elem_size;
+    let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
+    // CFTP v7 follow-on (finding-4): defensive zero-fill closes the
+    // partial-write window if a future change to the cast kernel ever
+    // leaves bytes unwritten (e.g. if the u64 bounds check above were
+    // accidentally re-narrowed to u32 by a refactor). Cheap — memset is
+    // parallel-async on every Blackwell/Hopper SKU we target.
+    crate::cuda::inner::memset_d8(dst_data, dst_bytes);
+
+    // Same-dtype path: device-to-device memcpy (no conversion).
+    if t.dtype == target_dtype {
+        crate::cuda::inner::memcpy_dtod(
+            dst_data,
+            t.data as *const std::ffi::c_void,
+            dst_bytes,
+        );
+    } else {
+        let (ptx, kname) =
+            precision_cast_kernels::pick_cast_kernel(t.dtype, target_dtype).unwrap_or_else(|| {
+                panic!(
+                    "gpu_cast_and_publish: no GPU cast kernel for src dtype {} -> target {}; \
+                     v7 supports {{f32,fp16,bf16}} pairs through f32 only",
+                    t.dtype, target_dtype
+                )
+            });
+        let rc = precision_cast_kernels::launch_cast(
+            ptx,
+            kname,
+            t.data as u64,
+            dst_data as u64,
+            len as u64,
+        );
+        assert_eq!(
+            rc, 0,
+            "gpu_cast_and_publish: cast kernel '{}' launch failed (rc={rc})",
+            kname.trim_end_matches('\0')
+        );
+        // CFTP v7 follow-on (findings 12/17): no per-cast cuCtxSynchronize.
+        //
+        // The production consumer (fused-LCE FFI) runs on CUDA's default
+        // (in-order) stream and issues its own terminal cuCtxSynchronize
+        // before returning. A pre-cast sync here adds 3-6 host stalls per
+        // fused-LCE step (one per x/W/bias cast, doubled in forward+backward)
+        // that the wengert precision-cast cache was specifically introduced
+        // to amortise. Tests that read dst_data directly on the host (e.g.
+        // `precision_cast_gpu_dispatch.rs`) route through
+        // `nsl_tensor_to_device(_, 0)` which itself syncs before the dtoh
+        // copy, so they still observe consistent results.
+    }
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    let out = Box::new(NslTensor::new(
+        dst_data,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device, // preserve device (1+ for CUDA)
+        target_dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    NslTensor::publish(out)
+}
+
+/// `cuda` feature off: GPU dispatch is unreachable (no device tensors can
+/// exist without the `cuda` feature). Provide a stub for the non-cuda build
+/// so the device-branch in `cast_and_publish` still compiles.
+#[cfg(not(feature = "cuda"))]
+fn gpu_cast_and_publish(t: &NslTensor, _target_dtype: u16) -> i64 {
+    panic!(
+        "gpu_cast_and_publish: device tensor (device={}) reached cast path \
+         but runtime was compiled without the `cuda` feature",
+        t.device
+    );
+}
+
 /// Shared helper for v6 cast wrappers. Performs a CPU cast (via the same
 /// host arithmetic as `nsl_tensor_cast`), but allocates the result via
 /// `NslTensor::publish` so the new tensor participates in the scope sweep
 /// (in contrast to `nsl_tensor_cast` which uses bare `Box::into_raw` for
 /// FASE optimizer-state buffers that are explicitly freed each step).
+///
+/// CFTP v7 (2026-06-26): GPU tensors are now dispatched to
+/// `gpu_cast_and_publish` (which lowers to a PTX cast kernel). CPU tensors
+/// continue to take the host-staged path below — byte-identical to v6.
 fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
     let t = unsafe { &*(src_ptr as *const NslTensor) };
-    assert_eq!(
-        t.device, 0,
-        "cast_and_publish: GPU tensors not supported in v6 (device={}); v7 will add a PTX cast kernel",
-        t.device
-    );
-    // CFTP v6 Finding 2 (HIGH): refuse non-contiguous sources — see the
-    // long-form rationale on nsl_tensor_cast. The linear-read + row-major-
-    // strides path silently corrupts non-contiguous inputs.
+    // CFTP v6 Finding 2 (HIGH) + Finding 4 (MEDIUM): the contiguity and
+    // len/shape invariants are correctness preconditions for BOTH the CPU
+    // host-staged path AND the v7 GPU PTX cast — keep them before any
+    // device-branch so a violating input is refused regardless of device.
+    // (Linear-read + row-major-strides assumption applies to GPU too: the
+    // cast kernels index `i in [0, numel)` over the source buffer without
+    // consulting strides.)
     assert!(
         t.is_contiguous(),
         "cast_and_publish: source tensor must be contiguous (ndim={}); \
          the wengert lowering must pass contiguous x/W/bias buffers.",
         t.ndim
     );
-    // CFTP v6 Finding 4 (MEDIUM): refuse len/shape mismatch.
     assert_eq!(
         t.len,
         NslTensor::total_elements(t.shape, t.ndim),
         "cast_and_publish: t.len ({}) != product(t.shape) — invariant violation",
         t.len
     );
+
+    // CFTP v7: GPU dispatch — must come BEFORE any host slice read on
+    // `t.data` (lines below treat `t.data` as a HOST pointer; a GPU
+    // tensor would be silent UB otherwise).
+    if t.device > 0 {
+        return gpu_cast_and_publish(t, target_dtype);
+    }
+
     let len = t.len as usize;
 
     let src_f32: Vec<f32> = match t.dtype {
@@ -748,6 +875,123 @@ mod tests {
         assert_eq!(got, vec![0.0_f32, 0.0]);
         crate::tensor::nsl_tensor_free(template);
         crate::tensor::nsl_tensor_free(z);
+    }
+
+    /// CFTP v7 follow-on (finding 7/2): CPU `f32_to_bf16_bits` now uses
+    /// IEEE-754 RTE (round-to-nearest-even) via `half::bf16::from_f32`,
+    /// matching PTX `cvt.rn.bf16.f32` bit-for-bit on every input. Pin
+    /// the rounding so a regression to the truncating implementation is
+    /// caught immediately.
+    #[test]
+    fn f32_to_bf16_bits_uses_rte_not_truncation() {
+        use crate::tensor::f32_to_bf16_bits;
+        // f32 = 0x3F80FFFF (just below 0x3F810000). Lower 16 bits = 0xFFFF
+        // > 0x8000, so RTE rounds UP from 0x3F80 to 0x3F81. Truncation
+        // would yield 0x3F80 (the buggy v6 behavior).
+        let v = f32::from_bits(0x3F80FFFF);
+        let bits = f32_to_bf16_bits(v);
+        assert_eq!(
+            bits, 0x3F81,
+            "f32_to_bf16_bits MUST round-to-nearest-even (got 0x{bits:04X}, \
+             expected 0x3F81). Truncation here would silently disagree with \
+             PTX cvt.rn.bf16.f32 by one full ULP on the CPU staging path."
+        );
+        // Exact halfway: f32 = 0x3F808000. Lower 16 = 0x8000 == halfway.
+        // RTE: round to even (mant LSB = 0) → keep 0x3F80.
+        let v2 = f32::from_bits(0x3F808000);
+        assert_eq!(
+            f32_to_bf16_bits(v2),
+            0x3F80,
+            "RTE halfway with even-LSB neighbour must round DOWN (banker's rounding)"
+        );
+        // Exact halfway with odd LSB: f32 = 0x3F818000. Lower 16 = 0x8000;
+        // mant LSB = 1 (odd) → round UP to 0x3F82.
+        let v3 = f32::from_bits(0x3F818000);
+        assert_eq!(
+            f32_to_bf16_bits(v3),
+            0x3F82,
+            "RTE halfway with odd-LSB neighbour must round UP to the even mantissa"
+        );
+    }
+
+    /// CFTP v7 follow-on (finding 7/2): same RTE pin for fp16.
+    #[test]
+    fn f32_to_f16_bits_uses_rte_not_truncation() {
+        use crate::tensor::f32_to_f16_bits;
+        // f32 = 0x3F80FFFF (mant bits: 0x00FFFF). f16 mant = top 10 of 23 =
+        // 0x00FFFF >> 13 = 7; round bit = bit 12 = 1; sticky = bits 0-11 =
+        // 0xFFF (non-zero). > halfway → round UP from 7 to 8. Expected 0x3C08.
+        // v6 truncation would have produced 0x3C07.
+        let v = f32::from_bits(0x3F80FFFF);
+        let bits = f32_to_f16_bits(v);
+        assert_eq!(
+            bits, 0x3C08,
+            "f32_to_f16_bits MUST round-to-nearest-even (got 0x{bits:04X}, \
+             expected 0x3C08). v6 truncation produced 0x3C07."
+        );
+        // Halfway tie with even neighbour: f32 = 0x3F801000 (mant LSB=0 in
+        // f16). Lower 13 = 0x1000 exactly; sticky = 0; tie → round to even.
+        // f16 mant stays 0 → 0x3C00.
+        let v2 = f32::from_bits(0x3F801000);
+        assert_eq!(
+            f32_to_f16_bits(v2),
+            0x3C00,
+            "RTE halfway with even neighbour must round DOWN"
+        );
+        // Halfway tie with odd neighbour: f32 = 0x3F803000 (f16 base mant=1).
+        // Lower 13 = 0x1000 exact halfway; tie → round to even. Round UP
+        // from 1 to 2 → 0x3C02.
+        let v3 = f32::from_bits(0x3F803000);
+        assert_eq!(
+            f32_to_f16_bits(v3),
+            0x3C02,
+            "RTE halfway with odd neighbour must round UP to even"
+        );
+    }
+
+    /// CFTP v7 follow-on (finding 8): NaN preservation — both bf16 and f16
+    /// primitives previously silently flushed NaN to ±Inf because the
+    /// finite-overflow check (`exp >= 143` for f16; `bits >> 16` for bf16)
+    /// also matched `exp == 255`. Delegating to `half` preserves NaN.
+    #[test]
+    fn f32_to_f16_bits_preserves_nan() {
+        use crate::tensor::f32_to_f16_bits;
+        let nan_bits = f32_to_f16_bits(f32::NAN);
+        // f16 NaN: exp = 0x1F (top 5 bits), mant != 0. f16 +Inf is 0x7C00
+        // (mant == 0); any quiet NaN has mant != 0.
+        let exp = (nan_bits >> 10) & 0x1F;
+        let mant = nan_bits & 0x3FF;
+        assert_eq!(exp, 0x1F, "NaN must produce f16 exp=0x1F (not zero)");
+        assert_ne!(
+            mant, 0,
+            "NaN must produce f16 NaN (mant != 0) — finding-8: previous \
+             implementation collapsed NaN to ±Inf (mant == 0)"
+        );
+    }
+
+    #[test]
+    fn f32_to_bf16_bits_preserves_nan() {
+        use crate::tensor::f32_to_bf16_bits;
+        // sNaN with payload only in low 16 mantissa bits: 0x7F800001.
+        // v6 truncation: bits >> 16 = 0x7F80 = bf16 +Inf (silent NaN→Inf).
+        // v7 (half crate): preserves NaN.
+        let snan = f32::from_bits(0x7F80_0001);
+        let bits = f32_to_bf16_bits(snan);
+        let exp = (bits >> 7) & 0xFF;
+        let mant = bits & 0x7F;
+        assert_eq!(exp, 0xFF, "bf16 NaN must have exp=0xFF");
+        assert_ne!(
+            mant, 0,
+            "bf16 NaN MUST keep a non-zero mantissa (got 0x{bits:04X}). \
+             v6 truncation produced 0x7F80 (= bf16 +Inf), silently \
+             converting NaN to Inf."
+        );
+        // Standard qNaN — always preserved.
+        let qnan_bits = f32_to_bf16_bits(f32::NAN);
+        let qexp = (qnan_bits >> 7) & 0xFF;
+        let qmant = qnan_bits & 0x7F;
+        assert_eq!(qexp, 0xFF);
+        assert_ne!(qmant, 0);
     }
 
     /// CFTP v6 Finding 2 (HIGH): the contiguity guard precondition is a
