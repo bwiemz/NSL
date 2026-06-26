@@ -56,12 +56,23 @@ fn emit_header(ptx: &mut String, version: &str) {
 /// stride registers.
 ///
 /// On exit, the following are live:
-///   * `%rd_src`  — source base pointer
-///   * `%rd_dst`  — destination base pointer
-///   * `%r_numel` — element count (u32; cast from u64 param)
-///   * `%r_idx`   — current element index (grid-stride init)
-///   * `%r_stride` — grid stride (`gridDim.x * blockDim.x`)
-///   * `%p_done`  — predicate register reserved for the bounds check
+///   * `%rd_src`     — source base pointer
+///   * `%rd_dst`     — destination base pointer
+///   * `%rd_numel`   — element count (u64; preserved full width from u64 param)
+///   * `%rd_idx`     — current element index (u64; grid-stride init)
+///   * `%rd_stride`  — grid stride (u64; `gridDim.x * blockDim.x`)
+///   * `%p_done`     — predicate register reserved for the bounds check
+///
+/// # Why u64 indices (CFTP v7 finding-1 / finding-9 fix)
+///
+/// The FFI passes `numel` as `u64`; for very large tensors (>= 2^32
+/// elements, e.g. 4.3B bf16 = 8.6 GB — well within H100 80GB and B200
+/// 192GB reach for full V*H weight tensors), narrowing to u32 silently
+/// drops the upper 32 bits.  The kernel would then iterate
+/// `numel mod 2^32` elements and leave the rest of `dst` whatever the
+/// caching allocator returned.  Keeping the bounds check, index, and
+/// stride in u64 closes that hazard; the byte-offset arithmetic was
+/// already 64-bit so the change is small.
 fn emit_entry_preamble(ptx: &mut String, kernel_name: &str) {
     ptx.push_str(&format!(".visible .entry {kernel_name} (\n"));
     ptx.push_str("    .param .u64 src_ptr,\n");
@@ -73,17 +84,17 @@ fn emit_entry_preamble(ptx: &mut String, kernel_name: &str) {
     // Register declarations.
     ptx.push_str("    .reg .pred %p_done;\n");
     ptx.push_str("    .reg .u32 %tid_x, %ctaid_x, %ntid_x, %nctaid_x;\n");
-    ptx.push_str("    .reg .u32 %r_numel, %r_idx, %r_stride, %r_tmp;\n");
-    ptx.push_str("    .reg .u64 %rd_src, %rd_dst, %rd_numel64;\n");
-    ptx.push_str("    .reg .u64 %rd_off, %rd_off_bytes, %rd_addr;\n");
+    ptx.push_str("    .reg .u32 %r_tmp_x, %r_tmp_y;\n");
+    ptx.push_str("    .reg .u64 %rd_src, %rd_dst, %rd_numel;\n");
+    ptx.push_str("    .reg .u64 %rd_idx, %rd_stride, %rd_tile;\n");
+    ptx.push_str("    .reg .u64 %rd_off_bytes, %rd_addr;\n");
     ptx.push_str("    .reg .f32 %f_val;\n");
     ptx.push_str("    .reg .b16 %h_val;\n\n");
 
-    // Load src / dst base pointers.
+    // Load src / dst base pointers + numel (full u64 width).
     ptx.push_str("    ld.param.u64 %rd_src, [src_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_dst, [dst_ptr];\n");
-    ptx.push_str("    ld.param.u64 %rd_numel64, [numel];\n");
-    ptx.push_str("    cvt.u32.u64 %r_numel, %rd_numel64;\n\n");
+    ptx.push_str("    ld.param.u64 %rd_numel, [numel];\n\n");
 
     // tid / cta / ntid / nctaid.
     ptx.push_str("    mov.u32 %tid_x, %tid.x;\n");
@@ -91,18 +102,22 @@ fn emit_entry_preamble(ptx: &mut String, kernel_name: &str) {
     ptx.push_str("    mov.u32 %ntid_x, %ntid.x;\n");
     ptx.push_str("    mov.u32 %nctaid_x, %nctaid.x;\n\n");
 
-    // idx = ctaid.x * ntid.x + tid.x. mad.lo.u32 is banned at PTX ISA 7.0;
-    // emit mul.lo + add (see MEMORY.md global GPU invariants).
-    ptx.push_str("    mul.lo.u32 %r_tmp, %ctaid_x, %ntid_x;\n");
-    ptx.push_str("    add.u32 %r_idx, %r_tmp, %tid_x;\n");
+    // idx = ctaid.x * ntid.x + tid.x (u32 product, widened to u64 since the
+    // initial grid-stride seed always fits in 32 bits — gridDim.x is u32 by
+    // the CUDA hardware limit). mad.lo.u32 is banned at PTX ISA 7.0; emit
+    // mul.lo + add (see MEMORY.md global GPU invariants).
+    ptx.push_str("    mul.lo.u32 %r_tmp_x, %ctaid_x, %ntid_x;\n");
+    ptx.push_str("    add.u32 %r_tmp_x, %r_tmp_x, %tid_x;\n");
+    ptx.push_str("    cvt.u64.u32 %rd_idx, %r_tmp_x;\n");
 
-    // stride = nctaid.x * ntid.x.
-    ptx.push_str("    mul.lo.u32 %r_stride, %nctaid_x, %ntid_x;\n\n");
+    // stride = nctaid.x * ntid.x (u32 product, widened to u64 — also <= 2^32).
+    ptx.push_str("    mul.lo.u32 %r_tmp_y, %nctaid_x, %ntid_x;\n");
+    ptx.push_str("    cvt.u64.u32 %rd_stride, %r_tmp_y;\n\n");
 }
 
 /// Common kernel body suffix: closes the grid-stride loop and `ret`s.
 fn emit_loop_tail(ptx: &mut String) {
-    ptx.push_str("    add.u32 %r_idx, %r_idx, %r_stride;\n");
+    ptx.push_str("    add.u64 %rd_idx, %rd_idx, %rd_stride;\n");
     ptx.push_str("    bra CAST_LOOP;\n");
     ptx.push_str("CAST_DONE:\n");
     ptx.push_str("    ret;\n");
@@ -116,12 +131,12 @@ fn emit_loop_tail(ptx: &mut String) {
 /// even modifier is the established pattern (see `fused_linear_ce.rs:1028`).
 fn emit_narrow_body(ptx: &mut String, cvt_mnemonic: &str) {
     ptx.push_str("CAST_LOOP:\n");
-    ptx.push_str("    setp.ge.u32 %p_done, %r_idx, %r_numel;\n");
+    // u64 bounds check — supports numel > 2^32.
+    ptx.push_str("    setp.ge.u64 %p_done, %rd_idx, %rd_numel;\n");
     ptx.push_str("    @%p_done bra CAST_DONE;\n");
 
-    // Source offset (f32 = 4 bytes).
-    ptx.push_str("    cvt.u64.u32 %rd_off, %r_idx;\n");
-    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_off, 2;\n");
+    // Source offset (f32 = 4 bytes). %rd_idx is already u64.
+    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_idx, 2;\n");
     ptx.push_str("    add.u64 %rd_addr, %rd_src, %rd_off_bytes;\n");
     ptx.push_str("    ld.global.f32 %f_val, [%rd_addr];\n");
 
@@ -129,7 +144,7 @@ fn emit_narrow_body(ptx: &mut String, cvt_mnemonic: &str) {
     ptx.push_str(&format!("    {cvt_mnemonic} %h_val, %f_val;\n"));
 
     // Destination offset (b16 = 2 bytes).
-    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_off, 1;\n");
+    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_idx, 1;\n");
     ptx.push_str("    add.u64 %rd_addr, %rd_dst, %rd_off_bytes;\n");
     ptx.push_str("    st.global.b16 [%rd_addr], %h_val;\n");
 
@@ -143,12 +158,12 @@ fn emit_narrow_body(ptx: &mut String, cvt_mnemonic: &str) {
 /// Example values: `"cvt.f32.bf16"` or `"cvt.f32.f16"`.
 fn emit_widen_body(ptx: &mut String, cvt_mnemonic: &str) {
     ptx.push_str("CAST_LOOP:\n");
-    ptx.push_str("    setp.ge.u32 %p_done, %r_idx, %r_numel;\n");
+    // u64 bounds check — supports numel > 2^32.
+    ptx.push_str("    setp.ge.u64 %p_done, %rd_idx, %rd_numel;\n");
     ptx.push_str("    @%p_done bra CAST_DONE;\n");
 
-    // Source offset (b16 = 2 bytes).
-    ptx.push_str("    cvt.u64.u32 %rd_off, %r_idx;\n");
-    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_off, 1;\n");
+    // Source offset (b16 = 2 bytes). %rd_idx is already u64.
+    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_idx, 1;\n");
     ptx.push_str("    add.u64 %rd_addr, %rd_src, %rd_off_bytes;\n");
     ptx.push_str("    ld.global.b16 %h_val, [%rd_addr];\n");
 
@@ -156,7 +171,7 @@ fn emit_widen_body(ptx: &mut String, cvt_mnemonic: &str) {
     ptx.push_str(&format!("    {cvt_mnemonic} %f_val, %h_val;\n"));
 
     // Destination offset (f32 = 4 bytes).
-    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_off, 2;\n");
+    ptx.push_str("    shl.b64 %rd_off_bytes, %rd_idx, 2;\n");
     ptx.push_str("    add.u64 %rd_addr, %rd_dst, %rd_off_bytes;\n");
     ptx.push_str("    st.global.f32 [%rd_addr], %f_val;\n");
 
@@ -357,14 +372,31 @@ mod tests {
             let txt = as_text(&ptx_bytes);
             assert!(txt.contains("CAST_LOOP:"), "grid-stride loop label missing");
             assert!(txt.contains("CAST_DONE:"), "loop-done label missing");
+            // CFTP v7 finding-1 fix: index/stride/numel widened to u64 so
+            // the kernel correctly covers tensors with numel > 2^32.
             assert!(
-                txt.contains("add.u32 %r_idx, %r_idx, %r_stride;"),
-                "grid-stride advance line missing"
+                txt.contains("add.u64 %rd_idx, %rd_idx, %rd_stride;"),
+                "grid-stride advance line missing (u64 index)"
             );
-            // Stride is gridDim.x * blockDim.x (= nctaid.x * ntid.x).
+            // Stride is gridDim.x * blockDim.x — computed in u32 then widened
+            // to u64 (initial seed always fits in 32 bits per CUDA HW limits).
             assert!(
-                txt.contains("mul.lo.u32 %r_stride, %nctaid_x, %ntid_x;"),
-                "stride must be nctaid.x * ntid.x"
+                txt.contains("mul.lo.u32 %r_tmp_y, %nctaid_x, %ntid_x;"),
+                "stride init must be nctaid.x * ntid.x"
+            );
+            assert!(
+                txt.contains("cvt.u64.u32 %rd_stride, %r_tmp_y;"),
+                "stride must be widened to u64"
+            );
+            // u64 bounds check — pinned to catch silent re-narrowing.
+            assert!(
+                txt.contains("setp.ge.u64 %p_done, %rd_idx, %rd_numel;"),
+                "bounds check must be u64 (finding-1: numel > 2^32 support)"
+            );
+            // Must NOT silently re-narrow numel into a u32 register.
+            assert!(
+                !txt.contains("cvt.u32.u64 %r_numel"),
+                "kernel must NOT truncate numel to u32 (finding-1)"
             );
         }
     }

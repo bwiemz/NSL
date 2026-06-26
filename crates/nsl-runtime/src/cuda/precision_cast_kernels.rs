@@ -22,6 +22,18 @@
 //! Reuses `crate::cuda::inner::kernel_launch`'s internal FNV-1a-keyed cache;
 //! no per-launch `cuModuleLoadData`. (The first call seeds the cache; every
 //! subsequent call hits it.)
+//!
+//! ## CFTP v7 follow-on — byte-for-byte parity enforcement
+//!
+//! Finding 3/11/13 of the v7 adversarial review noted that the original
+//! v7 docstring claimed a `cast_ptx_runtime_matches_codegen` test
+//! enforced byte-for-byte parity between this file's embedded constants
+//! and `nsl-codegen::precision_cast_ptx::synthesize_*_ptx()` — but only
+//! substring checks existed.  The byte-for-byte assertion now lives in
+//! `crates/nsl-codegen/tests/precision_cast_ptx_runtime_parity.rs` and
+//! consumes the `__test_runtime_ptx_strings()` / `__test_runtime_kernel_names()`
+//! hooks at the bottom of this file.  Any future drift (mnemonic swap,
+//! `.version` bump, reg-decl reorder, blank-line shift) trips that test.
 
 #![allow(dead_code)]
 
@@ -48,6 +60,13 @@ pub(crate) const CAST_BLOCK_DIM_X: u32 = 256;
 // pins the equality. PTX is ASCII-only and NUL-terminated per the
 // `cuModuleLoadData` C-string contract.
 
+// CFTP v7 follow-on (findings 3/11/13): the byte-for-byte parity test
+// lives at `crates/nsl-codegen/tests/precision_cast_ptx_runtime_parity.rs`
+// and uses `__test_runtime_ptx_strings()` below to compare the embedded
+// constants against `nsl_codegen::precision_cast_ptx::synthesize_*_ptx()`
+// at test time.  Any future divergence (mnemonic swap, header bump, reg
+// reorder) fails CI loudly instead of going silently stale.
+
 /// f32 -> bf16 (RTE). `.version 8.0` because bf16 cvt mnemonics need
 /// PTX ISA 7.8+.
 pub(crate) const PTX_F32_TO_BF16: &str = concat!(
@@ -62,34 +81,35 @@ pub(crate) const PTX_F32_TO_BF16: &str = concat!(
     "{\n",
     "    .reg .pred %p_done;\n",
     "    .reg .u32 %tid_x, %ctaid_x, %ntid_x, %nctaid_x;\n",
-    "    .reg .u32 %r_numel, %r_idx, %r_stride, %r_tmp;\n",
-    "    .reg .u64 %rd_src, %rd_dst, %rd_numel64;\n",
-    "    .reg .u64 %rd_off, %rd_off_bytes, %rd_addr;\n",
+    "    .reg .u32 %r_tmp_x, %r_tmp_y;\n",
+    "    .reg .u64 %rd_src, %rd_dst, %rd_numel;\n",
+    "    .reg .u64 %rd_idx, %rd_stride, %rd_tile;\n",
+    "    .reg .u64 %rd_off_bytes, %rd_addr;\n",
     "    .reg .f32 %f_val;\n",
     "    .reg .b16 %h_val;\n\n",
     "    ld.param.u64 %rd_src, [src_ptr];\n",
     "    ld.param.u64 %rd_dst, [dst_ptr];\n",
-    "    ld.param.u64 %rd_numel64, [numel];\n",
-    "    cvt.u32.u64 %r_numel, %rd_numel64;\n\n",
+    "    ld.param.u64 %rd_numel, [numel];\n\n",
     "    mov.u32 %tid_x, %tid.x;\n",
     "    mov.u32 %ctaid_x, %ctaid.x;\n",
     "    mov.u32 %ntid_x, %ntid.x;\n",
     "    mov.u32 %nctaid_x, %nctaid.x;\n\n",
-    "    mul.lo.u32 %r_tmp, %ctaid_x, %ntid_x;\n",
-    "    add.u32 %r_idx, %r_tmp, %tid_x;\n",
-    "    mul.lo.u32 %r_stride, %nctaid_x, %ntid_x;\n\n",
+    "    mul.lo.u32 %r_tmp_x, %ctaid_x, %ntid_x;\n",
+    "    add.u32 %r_tmp_x, %r_tmp_x, %tid_x;\n",
+    "    cvt.u64.u32 %rd_idx, %r_tmp_x;\n",
+    "    mul.lo.u32 %r_tmp_y, %nctaid_x, %ntid_x;\n",
+    "    cvt.u64.u32 %rd_stride, %r_tmp_y;\n\n",
     "CAST_LOOP:\n",
-    "    setp.ge.u32 %p_done, %r_idx, %r_numel;\n",
+    "    setp.ge.u64 %p_done, %rd_idx, %rd_numel;\n",
     "    @%p_done bra CAST_DONE;\n",
-    "    cvt.u64.u32 %rd_off, %r_idx;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 2;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 2;\n",
     "    add.u64 %rd_addr, %rd_src, %rd_off_bytes;\n",
     "    ld.global.f32 %f_val, [%rd_addr];\n",
     "    cvt.rn.bf16.f32 %h_val, %f_val;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 1;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 1;\n",
     "    add.u64 %rd_addr, %rd_dst, %rd_off_bytes;\n",
     "    st.global.b16 [%rd_addr], %h_val;\n",
-    "    add.u32 %r_idx, %r_idx, %r_stride;\n",
+    "    add.u64 %rd_idx, %rd_idx, %rd_stride;\n",
     "    bra CAST_LOOP;\n",
     "CAST_DONE:\n",
     "    ret;\n",
@@ -110,34 +130,35 @@ pub(crate) const PTX_BF16_TO_F32: &str = concat!(
     "{\n",
     "    .reg .pred %p_done;\n",
     "    .reg .u32 %tid_x, %ctaid_x, %ntid_x, %nctaid_x;\n",
-    "    .reg .u32 %r_numel, %r_idx, %r_stride, %r_tmp;\n",
-    "    .reg .u64 %rd_src, %rd_dst, %rd_numel64;\n",
-    "    .reg .u64 %rd_off, %rd_off_bytes, %rd_addr;\n",
+    "    .reg .u32 %r_tmp_x, %r_tmp_y;\n",
+    "    .reg .u64 %rd_src, %rd_dst, %rd_numel;\n",
+    "    .reg .u64 %rd_idx, %rd_stride, %rd_tile;\n",
+    "    .reg .u64 %rd_off_bytes, %rd_addr;\n",
     "    .reg .f32 %f_val;\n",
     "    .reg .b16 %h_val;\n\n",
     "    ld.param.u64 %rd_src, [src_ptr];\n",
     "    ld.param.u64 %rd_dst, [dst_ptr];\n",
-    "    ld.param.u64 %rd_numel64, [numel];\n",
-    "    cvt.u32.u64 %r_numel, %rd_numel64;\n\n",
+    "    ld.param.u64 %rd_numel, [numel];\n\n",
     "    mov.u32 %tid_x, %tid.x;\n",
     "    mov.u32 %ctaid_x, %ctaid.x;\n",
     "    mov.u32 %ntid_x, %ntid.x;\n",
     "    mov.u32 %nctaid_x, %nctaid.x;\n\n",
-    "    mul.lo.u32 %r_tmp, %ctaid_x, %ntid_x;\n",
-    "    add.u32 %r_idx, %r_tmp, %tid_x;\n",
-    "    mul.lo.u32 %r_stride, %nctaid_x, %ntid_x;\n\n",
+    "    mul.lo.u32 %r_tmp_x, %ctaid_x, %ntid_x;\n",
+    "    add.u32 %r_tmp_x, %r_tmp_x, %tid_x;\n",
+    "    cvt.u64.u32 %rd_idx, %r_tmp_x;\n",
+    "    mul.lo.u32 %r_tmp_y, %nctaid_x, %ntid_x;\n",
+    "    cvt.u64.u32 %rd_stride, %r_tmp_y;\n\n",
     "CAST_LOOP:\n",
-    "    setp.ge.u32 %p_done, %r_idx, %r_numel;\n",
+    "    setp.ge.u64 %p_done, %rd_idx, %rd_numel;\n",
     "    @%p_done bra CAST_DONE;\n",
-    "    cvt.u64.u32 %rd_off, %r_idx;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 1;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 1;\n",
     "    add.u64 %rd_addr, %rd_src, %rd_off_bytes;\n",
     "    ld.global.b16 %h_val, [%rd_addr];\n",
     "    cvt.f32.bf16 %f_val, %h_val;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 2;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 2;\n",
     "    add.u64 %rd_addr, %rd_dst, %rd_off_bytes;\n",
     "    st.global.f32 [%rd_addr], %f_val;\n",
-    "    add.u32 %r_idx, %r_idx, %r_stride;\n",
+    "    add.u64 %rd_idx, %rd_idx, %rd_stride;\n",
     "    bra CAST_LOOP;\n",
     "CAST_DONE:\n",
     "    ret;\n",
@@ -158,34 +179,35 @@ pub(crate) const PTX_F32_TO_FP16: &str = concat!(
     "{\n",
     "    .reg .pred %p_done;\n",
     "    .reg .u32 %tid_x, %ctaid_x, %ntid_x, %nctaid_x;\n",
-    "    .reg .u32 %r_numel, %r_idx, %r_stride, %r_tmp;\n",
-    "    .reg .u64 %rd_src, %rd_dst, %rd_numel64;\n",
-    "    .reg .u64 %rd_off, %rd_off_bytes, %rd_addr;\n",
+    "    .reg .u32 %r_tmp_x, %r_tmp_y;\n",
+    "    .reg .u64 %rd_src, %rd_dst, %rd_numel;\n",
+    "    .reg .u64 %rd_idx, %rd_stride, %rd_tile;\n",
+    "    .reg .u64 %rd_off_bytes, %rd_addr;\n",
     "    .reg .f32 %f_val;\n",
     "    .reg .b16 %h_val;\n\n",
     "    ld.param.u64 %rd_src, [src_ptr];\n",
     "    ld.param.u64 %rd_dst, [dst_ptr];\n",
-    "    ld.param.u64 %rd_numel64, [numel];\n",
-    "    cvt.u32.u64 %r_numel, %rd_numel64;\n\n",
+    "    ld.param.u64 %rd_numel, [numel];\n\n",
     "    mov.u32 %tid_x, %tid.x;\n",
     "    mov.u32 %ctaid_x, %ctaid.x;\n",
     "    mov.u32 %ntid_x, %ntid.x;\n",
     "    mov.u32 %nctaid_x, %nctaid.x;\n\n",
-    "    mul.lo.u32 %r_tmp, %ctaid_x, %ntid_x;\n",
-    "    add.u32 %r_idx, %r_tmp, %tid_x;\n",
-    "    mul.lo.u32 %r_stride, %nctaid_x, %ntid_x;\n\n",
+    "    mul.lo.u32 %r_tmp_x, %ctaid_x, %ntid_x;\n",
+    "    add.u32 %r_tmp_x, %r_tmp_x, %tid_x;\n",
+    "    cvt.u64.u32 %rd_idx, %r_tmp_x;\n",
+    "    mul.lo.u32 %r_tmp_y, %nctaid_x, %ntid_x;\n",
+    "    cvt.u64.u32 %rd_stride, %r_tmp_y;\n\n",
     "CAST_LOOP:\n",
-    "    setp.ge.u32 %p_done, %r_idx, %r_numel;\n",
+    "    setp.ge.u64 %p_done, %rd_idx, %rd_numel;\n",
     "    @%p_done bra CAST_DONE;\n",
-    "    cvt.u64.u32 %rd_off, %r_idx;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 2;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 2;\n",
     "    add.u64 %rd_addr, %rd_src, %rd_off_bytes;\n",
     "    ld.global.f32 %f_val, [%rd_addr];\n",
     "    cvt.rn.f16.f32 %h_val, %f_val;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 1;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 1;\n",
     "    add.u64 %rd_addr, %rd_dst, %rd_off_bytes;\n",
     "    st.global.b16 [%rd_addr], %h_val;\n",
-    "    add.u32 %r_idx, %r_idx, %r_stride;\n",
+    "    add.u64 %rd_idx, %rd_idx, %rd_stride;\n",
     "    bra CAST_LOOP;\n",
     "CAST_DONE:\n",
     "    ret;\n",
@@ -206,40 +228,71 @@ pub(crate) const PTX_FP16_TO_F32: &str = concat!(
     "{\n",
     "    .reg .pred %p_done;\n",
     "    .reg .u32 %tid_x, %ctaid_x, %ntid_x, %nctaid_x;\n",
-    "    .reg .u32 %r_numel, %r_idx, %r_stride, %r_tmp;\n",
-    "    .reg .u64 %rd_src, %rd_dst, %rd_numel64;\n",
-    "    .reg .u64 %rd_off, %rd_off_bytes, %rd_addr;\n",
+    "    .reg .u32 %r_tmp_x, %r_tmp_y;\n",
+    "    .reg .u64 %rd_src, %rd_dst, %rd_numel;\n",
+    "    .reg .u64 %rd_idx, %rd_stride, %rd_tile;\n",
+    "    .reg .u64 %rd_off_bytes, %rd_addr;\n",
     "    .reg .f32 %f_val;\n",
     "    .reg .b16 %h_val;\n\n",
     "    ld.param.u64 %rd_src, [src_ptr];\n",
     "    ld.param.u64 %rd_dst, [dst_ptr];\n",
-    "    ld.param.u64 %rd_numel64, [numel];\n",
-    "    cvt.u32.u64 %r_numel, %rd_numel64;\n\n",
+    "    ld.param.u64 %rd_numel, [numel];\n\n",
     "    mov.u32 %tid_x, %tid.x;\n",
     "    mov.u32 %ctaid_x, %ctaid.x;\n",
     "    mov.u32 %ntid_x, %ntid.x;\n",
     "    mov.u32 %nctaid_x, %nctaid.x;\n\n",
-    "    mul.lo.u32 %r_tmp, %ctaid_x, %ntid_x;\n",
-    "    add.u32 %r_idx, %r_tmp, %tid_x;\n",
-    "    mul.lo.u32 %r_stride, %nctaid_x, %ntid_x;\n\n",
+    "    mul.lo.u32 %r_tmp_x, %ctaid_x, %ntid_x;\n",
+    "    add.u32 %r_tmp_x, %r_tmp_x, %tid_x;\n",
+    "    cvt.u64.u32 %rd_idx, %r_tmp_x;\n",
+    "    mul.lo.u32 %r_tmp_y, %nctaid_x, %ntid_x;\n",
+    "    cvt.u64.u32 %rd_stride, %r_tmp_y;\n\n",
     "CAST_LOOP:\n",
-    "    setp.ge.u32 %p_done, %r_idx, %r_numel;\n",
+    "    setp.ge.u64 %p_done, %rd_idx, %rd_numel;\n",
     "    @%p_done bra CAST_DONE;\n",
-    "    cvt.u64.u32 %rd_off, %r_idx;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 1;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 1;\n",
     "    add.u64 %rd_addr, %rd_src, %rd_off_bytes;\n",
     "    ld.global.b16 %h_val, [%rd_addr];\n",
     "    cvt.f32.f16 %f_val, %h_val;\n",
-    "    shl.b64 %rd_off_bytes, %rd_off, 2;\n",
+    "    shl.b64 %rd_off_bytes, %rd_idx, 2;\n",
     "    add.u64 %rd_addr, %rd_dst, %rd_off_bytes;\n",
     "    st.global.f32 [%rd_addr], %f_val;\n",
-    "    add.u32 %r_idx, %r_idx, %r_stride;\n",
+    "    add.u64 %rd_idx, %rd_idx, %rd_stride;\n",
     "    bra CAST_LOOP;\n",
     "CAST_DONE:\n",
     "    ret;\n",
     "}\n",
     "\0",
 );
+
+/// CFTP v7 finding-3/11/13 fix: expose embedded PTX strings to the parity
+/// test (`crates/nsl-codegen/tests/precision_cast_ptx_runtime_parity.rs`)
+/// so the runtime-embedded bytes can be compared byte-for-byte against the
+/// codegen synthesizers.  Without this hook the substring-based parity
+/// check could not catch silent emitter drift (e.g. mnemonic swap or
+/// `.version` bump on one side only).
+///
+/// Order pinned: `(F32->BF16, BF16->F32, F32->FP16, FP16->F32)`.
+#[doc(hidden)]
+pub fn __test_runtime_ptx_strings() -> [&'static str; 4] {
+    [
+        PTX_F32_TO_BF16,
+        PTX_BF16_TO_F32,
+        PTX_F32_TO_FP16,
+        PTX_FP16_TO_F32,
+    ]
+}
+
+/// Companion to `__test_runtime_ptx_strings`: same order, kernel name C
+/// strings (NUL-terminated as the runtime embeds them).
+#[doc(hidden)]
+pub fn __test_runtime_kernel_names() -> [&'static str; 4] {
+    [
+        KNAME_F32_TO_BF16,
+        KNAME_BF16_TO_F32,
+        KNAME_F32_TO_FP16,
+        KNAME_FP16_TO_F32,
+    ]
+}
 
 /// Pick the (PTX, kernel-name) pair for a (`src_dtype`, `target_dtype`) cast.
 /// Returns `None` if the cast pair has no GPU kernel (caller must refuse / take
@@ -267,7 +320,9 @@ pub(crate) fn pick_cast_kernel(src_dtype: u16, target_dtype: u16) -> Option<(&'s
 ///   for allocating `dst_dev` with `numel * sizeof(target_dtype)` bytes.
 /// * Block size is fixed at `CAST_BLOCK_DIM_X = 256`.
 /// * Grid is `ceil(numel / block)` (clamped to u32::MAX); the kernel uses a
-///   grid-stride loop so any clamp still covers `numel` correctly.
+///   grid-stride loop so any clamp still covers `numel` correctly — and as
+///   of CFTP v7 follow-on (finding-1/9 fix) the kernel uses u64 indices
+///   and bounds, so >2^32-element casts complete correctly.
 /// * Shared mem = 0 (pure element-wise).
 ///
 /// Returns 0 on success, non-zero CUresult on failure.
@@ -289,12 +344,15 @@ pub(crate) fn launch_cast(
         &mut n_val as *mut _ as *mut c_void,
     ];
 
-    let block = CAST_BLOCK_DIM_X as i64;
-    // Cap gridDim.x at u32::MAX (CUDA hardware limit); the kernel's grid-stride
-    // loop covers anything above that. In practice tensors with > 2^31 elements
-    // are not realistic but the grid-stride loop guarantees correctness.
-    let raw_grid = (numel as i64 + block - 1) / block;
-    let grid = raw_grid.min(u32::MAX as i64).max(1);
+    // CFTP v7 follow-on (finding-5/9): div_ceil in u64 so pathological
+    // numel values can't flip sign in signed i64 arithmetic and silently
+    // collapse the grid to 1.  Cap gridDim.x at u32::MAX (CUDA hardware
+    // limit); the u64 grid-stride loop in the kernel covers anything
+    // above that correctly.
+    let block_u64: u64 = CAST_BLOCK_DIM_X as u64;
+    let raw_grid_u64: u64 = numel.div_ceil(block_u64);
+    let grid: i64 = raw_grid_u64.min(u32::MAX as u64).max(1) as i64;
+    let block: i64 = block_u64 as i64;
 
     let result = crate::cuda::inner::kernel_launch(
         ptx.as_ptr(),
