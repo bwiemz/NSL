@@ -251,11 +251,17 @@ fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
             "gpu_cast_and_publish: cast kernel '{}' launch failed (rc={rc})",
             kname.trim_end_matches('\0')
         );
-        // Synchronise so callers reading the destination see consistent
-        // results (mirrors `nsl_fused_linear_ce_forward`'s post-launch sync).
-        unsafe {
-            cudarc::driver::sys::cuCtxSynchronize();
-        }
+        // CFTP v7 follow-on (findings 12/17): no per-cast cuCtxSynchronize.
+        //
+        // The production consumer (fused-LCE FFI) runs on CUDA's default
+        // (in-order) stream and issues its own terminal cuCtxSynchronize
+        // before returning. A pre-cast sync here adds 3-6 host stalls per
+        // fused-LCE step (one per x/W/bias cast, doubled in forward+backward)
+        // that the wengert precision-cast cache was specifically introduced
+        // to amortise. Tests that read dst_data directly on the host (e.g.
+        // `precision_cast_gpu_dispatch.rs`) route through
+        // `nsl_tensor_to_device(_, 0)` which itself syncs before the dtoh
+        // copy, so they still observe consistent results.
     }
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
