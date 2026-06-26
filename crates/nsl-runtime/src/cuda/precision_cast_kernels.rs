@@ -354,6 +354,34 @@ mod tests {
         }
     }
 
+    /// The PTX strings are `static`, so every call to `pick_cast_kernel` for
+    /// the same pair returns pointers into the SAME memory. This is what
+    /// makes the FNV-1a-keyed module cache in `kernel_launch` work
+    /// efficiently — the bytes hashed are stable across calls.
+    ///
+    /// Pin the static-address invariant so a future refactor that returns
+    /// freshly-allocated `Vec<u8>` from `pick_cast_kernel` would surface
+    /// here (and not via a silent perf regression where the module cache
+    /// re-loads every call).
+    #[test]
+    fn embedded_ptx_strings_have_stable_addresses_across_calls() {
+        use crate::tensor::{DTYPE_BF16, DTYPE_F32};
+        let (ptx_a, kname_a) = pick_cast_kernel(DTYPE_F32, DTYPE_BF16).unwrap();
+        let (ptx_b, kname_b) = pick_cast_kernel(DTYPE_F32, DTYPE_BF16).unwrap();
+        assert_eq!(
+            ptx_a.as_ptr() as usize,
+            ptx_b.as_ptr() as usize,
+            "PTX must be `static` (cache-friendly): repeated lookup must \
+             return identical address; otherwise the FNV-1a module cache \
+             will re-load the module on every launch"
+        );
+        assert_eq!(
+            kname_a.as_ptr() as usize,
+            kname_b.as_ptr() as usize,
+            "kernel-name lookup must also be `static`"
+        );
+    }
+
     #[test]
     fn pick_cast_kernel_covers_supported_pairs() {
         use crate::tensor::{DTYPE_BF16, DTYPE_F32, DTYPE_FP16};
