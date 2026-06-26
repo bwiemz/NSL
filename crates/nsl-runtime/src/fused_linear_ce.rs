@@ -46,14 +46,21 @@
 //!      commit 3cc13824) emit `cvt.rn.{bf16,f16}.f32` — IEEE-754 default
 //!      round-to-nearest-even — matching the host `half::*::from_f32`
 //!      rounding used by the direct-FFI numerical baselines.
-//!   3. The CPU primitives' truncation gap is closed by the same RTE PTX
-//!      kernels on the production GPU path; the dormant CPU-only
-//!      truncation lives only on CPU staging paths that real training
-//!      runs do not exercise.
-//!   4. V=49152 baselines have been re-measured via the production
-//!      wengert path (the e2e fp16/bf16 activation tests
-//!      `fused_lm_ce_e2e_{fp16,bf16}_activation.rs`), removing the
-//!      `half::from_f32` shortcut.
+//!   3. The CPU primitives `f32_to_{bf16,f16}_bits` (`tensor/mod.rs`) now
+//!      also delegate to `half::*::from_f32` (CFTP v7 follow-on, finding-7
+//!      fix), so the CPU and GPU casts are byte-identical: no more silent
+//!      one-ULP divergence across device boundaries.
+//!   4. The structural cast insertion is verified at the wengert layer by
+//!      `crates/nsl-codegen/tests/fused_linear_ce_precision_cast_lowering.rs`
+//!      — every `dtype_tag != 0` lowering inserts the
+//!      `nsl_tensor_to_{bf16,fp16}` op before the FFI call, so the FFI
+//!      contract is enforced at the IR level. (Note: the V=49152 numerical
+//!      baselines in `fused_linear_ce_{fp16,bf16}_v49152_numerical.rs`
+//!      still stage inputs via `half::*::from_f32` on the host and call
+//!      the FFI directly; they validate the FFI's RTE semantics in
+//!      isolation. End-to-end coverage via the production wengert GPU
+//!      cast lives in the GPU-only dispatch test
+//!      `crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs`.)
 //!   5. The forward-to-backward precision-cast cache from commit 475b7b08
 //!      remains in effect (Findings 10/14/16): one cast set per dispatch
 //!      shared across forward and backward.
