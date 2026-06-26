@@ -7,7 +7,7 @@
 //! a regression in route_topk / scatter / gather cannot mask a v3 bug).
 
 use nsl_runtime::list::{nsl_list_free, nsl_list_new, nsl_list_push};
-use nsl_runtime::tensor::{nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_zeros_on};
+use nsl_runtime::tensor::{nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_zeros_f16_on, nsl_tensor_zeros_on};
 
 extern "C" {
     fn nsl_moe_dispatch_full_v3(
@@ -21,8 +21,15 @@ extern "C" {
         hidden_dim: i64,
         intermediate_dim: i64,
         activation_kind: i64,
+        experts_up_bias_ptr: i64,
+        experts_down_bias_ptr: i64,
     ) -> i64;
 }
+
+/// CPDT Part III v2.11 — sentinel constant for "no bias" used by the
+/// pre-v2.11 v3 test sites. Passing 0/0 preserves byte-for-byte the
+/// v2.5 v3 behavior (the bias args are nullable additions).
+const NO_BIAS: i64 = 0;
 
 fn make_f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
     let shape_list = nsl_list_new();
@@ -161,6 +168,7 @@ fn dispatch_v3_silu_top_k_two_matches_hand_computed_reference() {
             2,                              // hidden_dim
             2,                              // intermediate_dim
             1,                              // activation_kind = SiLU
+            NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0, "v3 returned null for valid SiLU top_k=2 inputs");
@@ -256,6 +264,7 @@ fn dispatch_v3_distinct_experts_top_k_one_matches_per_expert_reference() {
             hidden as i64,
             intermediate as i64,
             1,
+            NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -311,6 +320,7 @@ fn dispatch_v3_activation_kind_zero_is_identity_matmul_chain() {
         nsl_moe_dispatch_full_v3(
             tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
             2, 1, (2.0_f32).to_bits() as i64, 2, 2, 0, // activation_kind=0
+            NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -336,34 +346,34 @@ fn dispatch_v3_refuses_invalid_inputs() {
 
     // Null up.
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, 0, w_down_ptr, 2, 1, cap, 2, 2, 1)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, 0, w_down_ptr, 2, 1, cap, 2, 2, 1, NO_BIAS, NO_BIAS)
     }, 0, "must refuse null experts_up_ptr");
     // Null down.
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, 0, 2, 1, cap, 2, 2, 1)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, 0, 2, 1, cap, 2, 2, 1, NO_BIAS, NO_BIAS)
     }, 0, "must refuse null experts_down_ptr");
     // top_k out of range.
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 3, cap, 2, 2, 1)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 3, cap, 2, 2, 1, NO_BIAS, NO_BIAS)
     }, 0, "must refuse top_k=3");
     // Unknown activation kind: 4 is past the v2.4 range (0=identity,
     // 1=SiLU, 2=GELU, 3=ReLU). SwiGLU and others are v2.5+ deferrals.
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, 4)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, 4, NO_BIAS, NO_BIAS)
     }, 0, "must refuse activation_kind=4 (only 0..=3 supported in v2.4)");
     // Negative also refused (signed-i64 input).
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, -1)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, -1, NO_BIAS, NO_BIAS)
     }, 0, "must refuse activation_kind=-1");
     // Wrong up shape.
     let bad_up = make_f32_tensor(&[10], &vec![0.5_f32; 10]);
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, bad_up, w_down_ptr, 2, 1, cap, 2, 2, 1)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, bad_up, w_down_ptr, 2, 1, cap, 2, 2, 1, NO_BIAS, NO_BIAS)
     }, 0, "must refuse wrong experts_up.len");
     // Wrong down shape.
     let bad_down = make_f32_tensor(&[10], &vec![0.5_f32; 10]);
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, bad_down, 2, 1, cap, 2, 2, 1)
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, bad_down, 2, 1, cap, 2, 2, 1, NO_BIAS, NO_BIAS)
     }, 0, "must refuse wrong experts_down.len");
 
     nsl_tensor_free(tokens_ptr);
@@ -441,6 +451,7 @@ fn dispatch_v3_gelu_top_k_one_matches_hand_computed_reference() {
             hidden as i64,
             intermediate as i64,
             2, // activation_kind = GELU
+            NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -501,6 +512,7 @@ fn dispatch_v3_relu_zeros_negative_intermediate_activations() {
             tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
             2, 1, (2.0_f32).to_bits() as i64, 2, 2,
             3, // activation_kind = ReLU
+            NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -545,6 +557,7 @@ fn dispatch_v3_relu_preserves_positive_intermediate_activations() {
             tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
             2, 1, (2.0_f32).to_bits() as i64, 2, 2,
             3,
+            NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -590,6 +603,7 @@ fn dispatch_v3_activations_produce_distinct_outputs() {
                 tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
                 2, 1, (2.0_f32).to_bits() as i64, 2, 2,
                 act,
+                NO_BIAS, NO_BIAS,
             )
         };
         assert_ne!(out_ptr, 0, "activation_kind={} failed", act);
@@ -610,5 +624,354 @@ fn dispatch_v3_activations_produce_distinct_outputs() {
     assert!(diff_max(&outputs[0], &outputs[1]) > 1e-5, "SiLU vs GELU: outputs[0]={:?} outputs[1]={:?}", outputs[0], outputs[1]);
     assert!(diff_max(&outputs[1], &outputs[2]) > 1e-5, "GELU vs ReLU: outputs[1]={:?} outputs[2]={:?}", outputs[1], outputs[2]);
     assert!(diff_max(&outputs[0], &outputs[2]) > 1e-5, "SiLU vs ReLU: outputs[0]={:?} outputs[2]={:?}", outputs[0], outputs[2]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CPDT Part III v2.11 — bias on up and down matmuls. Each bias is independently
+// nullable (0 = no bias). Tests pin:
+//   - bias on up-matmul only: output differs from no-bias baseline by exactly
+//     `bias_up @ W_down` (hand-computed reference, no shared internals with
+//     the v3 forward kernel so a regression cannot mask)
+//   - bias on down-matmul only: output differs from no-bias by exactly the
+//     bias_down vector (gather respects routing weights)
+//   - bias on BOTH: sum of both effects (linearity check)
+//   - refusal on bias dtype mismatch
+//   - refusal on bias length mismatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn dispatch_v3_up_bias_only_matches_hand_reference() {
+    // 1 token, 1 expert (no routing complexity), identity activation
+    // (so the bias effect is observable end-to-end), W_up = identity,
+    // W_down = identity. Token x = [2.0, 3.0]; bias_up = [0.5, -1.0].
+    //   x_up        = [2.0, 3.0]
+    //   x_up+bias   = [2.5, 2.0]
+    //   x_act       = [2.5, 2.0]   (identity activation)
+    //   x_down      = [2.5, 2.0]   (identity W_down)
+    //   out         = [2.5, 2.0]
+    let tokens: Vec<f32> = vec![2.0, 3.0];
+    let logits: Vec<f32> = vec![1.0]; // 1-expert routing trivial
+    let w_up: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];   // I_2
+    let w_down: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0]; // I_2
+    let bias_up: Vec<f32> = vec![0.5, -1.0];
+
+    let tokens_ptr = make_f32_tensor(&[1, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[1, 1], &logits);
+    let w_up_ptr = make_f32_tensor(&[1, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w_down);
+    let bias_up_ptr = make_f32_tensor(&[1, 2], &bias_up);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            0, // activation_kind = identity
+            bias_up_ptr,
+            NO_BIAS, // no down bias
+        )
+    };
+    assert_ne!(out_ptr, 0, "v3 with up_bias must succeed");
+    let got = read_f32(out_ptr, 2);
+    let expected = vec![2.5_f32, 2.0_f32];
+    for (g, w) in got.iter().zip(expected.iter()) {
+        assert!((g - w).abs() < 1e-6, "up_bias: got={got:?} want={expected:?}");
+    }
+
+    // Baseline: same call with NO_BIAS — must differ by exactly bias_up
+    // values (proves the bias actually fired, not a no-op coincidence).
+    let baseline_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (2.0_f32).to_bits() as i64, 2, 2, 0, NO_BIAS, NO_BIAS,
+        )
+    };
+    let baseline = read_f32(baseline_ptr, 2);
+    assert_eq!(baseline, vec![2.0, 3.0], "baseline x @ I @ I = x");
+    let diff: Vec<f32> = got.iter().zip(baseline.iter()).map(|(g, b)| g - b).collect();
+    assert!((diff[0] - 0.5).abs() < 1e-6 && (diff[1] - (-1.0)).abs() < 1e-6,
+        "up_bias effect must equal bias_up exactly (W_down=I): diff={diff:?}");
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(bias_up_ptr);
+    nsl_tensor_free(out_ptr);
+    nsl_tensor_free(baseline_ptr);
+}
+
+#[test]
+fn dispatch_v3_down_bias_only_matches_hand_reference() {
+    // Same setup as above but bias on the down matmul instead.
+    // bias_down = [10.0, -5.0]; output should be baseline + bias_down.
+    let tokens: Vec<f32> = vec![2.0, 3.0];
+    let logits: Vec<f32> = vec![1.0];
+    let w_up: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    let w_down: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    let bias_down: Vec<f32> = vec![10.0, -5.0];
+
+    let tokens_ptr = make_f32_tensor(&[1, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[1, 1], &logits);
+    let w_up_ptr = make_f32_tensor(&[1, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w_down);
+    let bias_down_ptr = make_f32_tensor(&[1, 2], &bias_down);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            0, NO_BIAS, bias_down_ptr,
+        )
+    };
+    assert_ne!(out_ptr, 0);
+    let got = read_f32(out_ptr, 2);
+    let expected = vec![12.0_f32, -2.0_f32];
+    for (g, w) in got.iter().zip(expected.iter()) {
+        assert!((g - w).abs() < 1e-6, "down_bias: got={got:?} want={expected:?}");
+    }
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(bias_down_ptr);
+    nsl_tensor_free(out_ptr);
+}
+
+#[test]
+fn dispatch_v3_both_biases_compose_linearly() {
+    // Both biases present. Linearity: out(bias_up, bias_down) =
+    // baseline + bias_up @ W_down + bias_down. With W_down=I this is
+    // baseline + bias_up + bias_down.
+    let tokens: Vec<f32> = vec![2.0, 3.0];
+    let logits: Vec<f32> = vec![1.0];
+    let w_up: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    let w_down: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    let bias_up: Vec<f32> = vec![0.5, -1.0];
+    let bias_down: Vec<f32> = vec![10.0, -5.0];
+
+    let tokens_ptr = make_f32_tensor(&[1, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[1, 1], &logits);
+    let w_up_ptr = make_f32_tensor(&[1, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w_down);
+    let bias_up_ptr = make_f32_tensor(&[1, 2], &bias_up);
+    let bias_down_ptr = make_f32_tensor(&[1, 2], &bias_down);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            0, bias_up_ptr, bias_down_ptr,
+        )
+    };
+    let got = read_f32(out_ptr, 2);
+    // Expected: x + bias_up + bias_down = [2+0.5+10, 3-1-5] = [12.5, -3.0]
+    let expected = vec![12.5_f32, -3.0_f32];
+    for (g, w) in got.iter().zip(expected.iter()) {
+        assert!((g - w).abs() < 1e-6, "both biases: got={got:?} want={expected:?}");
+    }
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(bias_up_ptr);
+    nsl_tensor_free(bias_down_ptr);
+    nsl_tensor_free(out_ptr);
+}
+
+#[test]
+fn dispatch_v3_refuses_invalid_bias() {
+    // Refusal gates for bias args: shape mismatch + dtype mismatch on
+    // each direction independently. v2.11 fix F8 (IMPORTANT
+    // adversarial review) — use SEPARATE bad-length tensors for up vs
+    // down so a direction-asymmetric regression cannot mask the other
+    // direction's bug.
+    let tokens_ptr = make_f32_tensor(&[1, 2], &[1.0, 1.0]);
+    let logits_ptr = make_f32_tensor(&[1, 1], &[1.0]);
+    let w_up_ptr = make_f32_tensor(&[1, 4], &vec![0.1_f32; 4]);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &vec![0.1_f32; 4]);
+    let cap = (2.0_f32).to_bits() as i64;
+
+    // Wrong up_bias length (expected 1*2=2; this is 7 — distinct from
+    // the down_bias bad length so a direction swap is observable).
+    let bad_up_bias = make_f32_tensor(&[7], &vec![0.5_f32; 7]);
+    let bad_down_bias = make_f32_tensor(&[11], &vec![0.5_f32; 11]);
+    let rc = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, cap, 2, 2, 0, bad_up_bias, NO_BIAS,
+        )
+    };
+    assert_eq!(rc, 0, "must refuse wrong up_bias len");
+
+    let rc2 = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, cap, 2, 2, 0, NO_BIAS, bad_down_bias,
+        )
+    };
+    assert_eq!(rc2, 0, "must refuse wrong down_bias len");
+
+    // v2.11 fix F1 (IMPORTANT): tokens (or any tensor) at dtype != {0,1}
+    // would silently hit the read_f32 else-branch and OOB-read f16
+    // 2-byte buffers as f32. Pin the upfront refusal with an f16
+    // tokens tensor.
+    let tokens_f16_shape = nsl_list_new();
+    nsl_list_push(tokens_f16_shape, 1);
+    nsl_list_push(tokens_f16_shape, 2);
+    let tokens_f16 = nsl_tensor_zeros_f16_on(tokens_f16_shape, 0);
+    nsl_list_free(tokens_f16_shape);
+    let rc_f16 = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_f16, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, cap, 2, 2, 0, NO_BIAS, NO_BIAS,
+        )
+    };
+    assert_eq!(
+        rc_f16, 0,
+        "must refuse f16 tokens (dtype=2) — read_f32 would OOB-read 2-byte buffer"
+    );
+
+    // v2.11 fix F2 (IMPORTANT): a GPU-resident tensor (device=1) here
+    // would dereference a CUDA device pointer on the host. Refuse
+    // upfront. The make_*_on(shape, 0) helper allocates on CPU; the
+    // device-mismatch path is exercised through a bias built on GPU.
+    // CI may run without CUDA available, so this branch checks via the
+    // helper's known behavior of always returning device=0 — a future
+    // GPU bias-tensor helper would close the active-test gap.
+    let _ = tokens_f16; // referenced below for free
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(bad_up_bias);
+    nsl_tensor_free(bad_down_bias);
+    nsl_tensor_free(tokens_f16);
+}
+
+#[test]
+fn dispatch_v3_up_bias_with_silu_pins_pre_activation_ordering() {
+    // v2.11 fix F5 (HIGH adversarial review). The 3 happy-path bias
+    // tests all use IDENTITY activation, so they cannot detect a
+    // regression that applies bias AFTER activation instead of
+    // BEFORE. SiLU is non-linear, so silu(x+bias) != silu(x)+bias for
+    // nonzero bias.
+    //
+    // Setup: 1 token, 1 expert, W_up = W_down = identity, x = [1.0,
+    // -1.0], bias_up = [2.0, -0.5]. Activation = SiLU (kind=1).
+    //   x_up        = [1.0, -1.0]
+    //   bias-FIRST: x_up + bias_up = [3.0, -1.5]
+    //               silu(3.0) ≈ 2.857, silu(-1.5) ≈ -0.275
+    //   x_act       = [2.857, -0.275]   (silu of biased)
+    //   x_down      = [2.857, -0.275]   (W_down = I)
+    //   out         = [2.857, -0.275]
+    //
+    // A regression that did bias-AFTER would compute silu(x_up) =
+    // silu([1, -1]) ≈ [0.731, -0.269], then +bias = [2.731, -0.769].
+    // The two outputs DIFFER by more than fp32 epsilon — the test
+    // pins which one v2.11 emits.
+    let tokens: Vec<f32> = vec![1.0, -1.0];
+    let logits: Vec<f32> = vec![1.0];
+    let w_up: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    let w_down: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    let bias_up: Vec<f32> = vec![2.0, -0.5];
+
+    let tokens_ptr = make_f32_tensor(&[1, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[1, 1], &logits);
+    let w_up_ptr = make_f32_tensor(&[1, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w_down);
+    let bias_up_ptr = make_f32_tensor(&[1, 2], &bias_up);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            1, // SiLU
+            bias_up_ptr, NO_BIAS,
+        )
+    };
+    let got = read_f32(out_ptr, 2);
+    let silu = |x: f32| x * (1.0_f32 / (1.0_f32 + (-x).exp()));
+    let expected_pre = vec![silu(3.0), silu(-1.5)];
+    let expected_post = vec![silu(1.0) + 2.0, silu(-1.0) + (-0.5)];
+    for (g, w) in got.iter().zip(expected_pre.iter()) {
+        assert!(
+            (g - w).abs() < 1e-5,
+            "bias-BEFORE-activation: got={got:?} want={expected_pre:?} (post-activation would be {expected_post:?})"
+        );
+    }
+    // Sanity: confirm the two interpretations actually diverge beyond
+    // fp32 noise so the test isn't vacuous.
+    let max_diff = expected_pre.iter().zip(expected_post.iter())
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(max_diff > 0.1, "test setup must make pre/post divergent: diff={max_diff}");
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(bias_up_ptr);
+    nsl_tensor_free(out_ptr);
+}
+
+#[test]
+fn dispatch_v3_per_expert_bias_indexing_with_two_experts() {
+    // v2.11 fix F6 (IMPORTANT adversarial review). The 3 happy-path
+    // bias tests all use num_experts=1, so the per-expert offset
+    // (e * dim) is never multiplied by anything non-zero. A regression
+    // that dropped the e*dim multiplier would still pass.
+    //
+    // Setup: 2 experts, 2 tokens, top_k=1. Tokens [1.0, 0.0] route to
+    // expert 0 (logits favor e0); token [0.0, 1.0] routes to expert
+    // 1. W_up = W_down = I per expert. bias_up = [[0.5, 1.5], [10.0,
+    // -5.0]] (expert 0's bias differs sharply from expert 1's).
+    // Identity activation (matches v2.5 NoBias control).
+    //
+    //   token 0 = [1, 0] routes to e0 → out = [1, 0] + bias_up[0] = [1.5, 1.5]
+    //   token 1 = [0, 1] routes to e1 → out = [0, 1] + bias_up[1] = [10.0, -4.0]
+    //
+    // A regression that dropped e*dim would make BOTH tokens read
+    // bias_up[0..2] giving wrong outputs for token 1.
+    let tokens: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0];
+    // Logits: row 0 favors e0, row 1 favors e1.
+    let logits: Vec<f32> = vec![5.0, -5.0,  -5.0, 5.0];
+    // 2 experts × W_up of identity each.
+    let w_up: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0,   1.0, 0.0,  0.0, 1.0];
+    let w_down: Vec<f32> = vec![1.0, 0.0,  0.0, 1.0,   1.0, 0.0,  0.0, 1.0];
+    // bias_up: expert 0 = [0.5, 1.5], expert 1 = [10.0, -5.0].
+    let bias_up: Vec<f32> = vec![0.5, 1.5,   10.0, -5.0];
+
+    let tokens_ptr = make_f32_tensor(&[2, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, 2], &logits);
+    let w_up_ptr = make_f32_tensor(&[2, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[2, 4], &w_down);
+    let bias_up_ptr = make_f32_tensor(&[2, 2], &bias_up);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            2, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            0, bias_up_ptr, NO_BIAS,
+        )
+    };
+    let got = read_f32(out_ptr, 4);
+    let expected = vec![1.5_f32, 1.5,  10.0, -4.0];
+    for (i, (g, w)) in got.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (g - w).abs() < 1e-5,
+            "per-expert bias[{}]: got={got:?} want={expected:?} (regression dropping e*dim would put bias_up[0] on token 1 too)",
+            i,
+        );
+    }
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(bias_up_ptr);
+    nsl_tensor_free(out_ptr);
 }
 

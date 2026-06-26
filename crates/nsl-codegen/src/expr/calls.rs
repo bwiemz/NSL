@@ -1881,6 +1881,18 @@ impl Compiler<'_> {
                 let activation_kind_val = builder
                     .ins()
                     .iconst(cranelift_codegen::ir::types::I64, activation as i64);
+                // CPDT Part III v2.11 — bias args. The runtime FFI gains
+                // experts_up_bias_ptr + experts_down_bias_ptr (null=0
+                // means no bias). v2.11 ships ONLY the FFI extension +
+                // direct-call tests; source-level bias activation
+                // (auto-detection from WeightMap or a new
+                // moe_dispatch_ffn signature with bias kwargs) is a
+                // v2.12 deferral. For now, codegen always passes 0/0
+                // here so v2.5/v2.7 v3 emission stays byte-identical
+                // from the source-facing side.
+                let zero_bias = builder
+                    .ins()
+                    .iconst(cranelift_codegen::ir::types::I64, 0_i64);
                 let result = self.compile_call_by_name(
                     builder,
                     "nsl_moe_dispatch_full_v3",
@@ -1895,6 +1907,8 @@ impl Compiler<'_> {
                         hidden_val,
                         intermediate_val,
                         activation_kind_val,
+                        zero_bias,
+                        zero_bias,
                     ],
                 )?;
                 return Ok(result);
