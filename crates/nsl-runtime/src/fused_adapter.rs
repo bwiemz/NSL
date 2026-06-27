@@ -801,3 +801,212 @@ pub extern "C" fn nsl_adapter_fused_gatedlora_matmul(
     }
     cpu_fallback_fused_gatedlora(x, w, lora_a, lora_b, scale, gate)
 }
+
+#[cfg(test)]
+mod forward_only_adapter_regression_tests {
+    //! Regression tests pinning the forward-only `@adapter` null-guard fallback.
+    //!
+    //! The codegen-side null-base guard in `expr/access.rs` yields `0` for
+    //! `lora_A_*` / `lora_B_*` / `ia3_scale_*` / `gate_*` field accesses when
+    //! the adapter side-table is unmaterialized (no train block ran). Each
+    //! fused FFI below detects null adapter operands and falls back to the
+    //! base `x @ W` forward instead of dereferencing null pointers (which
+    //! used to segfault as 0xC0000005). These tests pin that contract so a
+    //! refactor that strips the "defensive" null checks fails loudly.
+    //!
+    //! Note on `WARNED_UNMATERIALIZED_ADAPTER`: the module-level latch is
+    //! one-shot per process, so only the FIRST null-adapter test that runs
+    //! in a given binary will emit the warning. The tests here intentionally
+    //! do not assert on stderr; any future test that adds a stderr assertion
+    //! must reset the latch (`WARNED_UNMATERIALIZED_ADAPTER.store(false, ..)`)
+    //! at test start to avoid order-dependent flakes.
+    //!
+    //! See docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+    use super::*;
+    use crate::tensor::NslTensor;
+    use crate::tensor::arithmetic::nsl_tensor_matmul;
+    use crate::tensor::creation::tensor_from_shape_list_f64;
+    use crate::tensor::nsl_tensor_free;
+
+    /// Build a 2-D CPU f64 tensor of shape `[rows, cols]` populated with `data`
+    /// in row-major order. `data.len()` must equal `rows * cols`.
+    ///
+    /// The shape list is freed before return — `tensor_from_shape_list_f64`
+    /// only reads from it (`NslList::from_ptr` is a borrow), so the caller
+    /// retains ownership.
+    fn mk_2d_f64(data: &[f64], rows: i64, cols: i64) -> i64 {
+        assert_eq!(data.len() as i64, rows * cols, "data length mismatch");
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, rows);
+        crate::list::nsl_list_push(shape, cols);
+        let ptr = tensor_from_shape_list_f64(shape, 0.0);
+        crate::list::nsl_list_free(shape);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = *v };
+        }
+        ptr
+    }
+
+    fn read_f64(ptr: i64, idx: usize) -> f64 {
+        let t = unsafe { &*(ptr as *const NslTensor) };
+        unsafe { *(t.data as *const f64).add(idx) }
+    }
+
+    fn tensor_len(ptr: i64) -> usize {
+        let t = unsafe { &*(ptr as *const NslTensor) };
+        t.len as usize
+    }
+
+    /// Assert that two f64 CPU tensors of the same length are bitwise equal.
+    fn assert_tensor_eq(a: i64, b: i64) {
+        let na = tensor_len(a);
+        let nb = tensor_len(b);
+        assert_eq!(na, nb, "tensor length mismatch ({na} vs {nb})");
+        for i in 0..na {
+            let va = read_f64(a, i);
+            let vb = read_f64(b, i);
+            assert_eq!(va, vb, "elem {i}: {va} vs {vb}");
+        }
+    }
+
+    /// Gap #1 regression: forward-only `@adapter` LoRA — both null adapter
+    /// tensors must not segfault and must return the base `x @ W` result.
+    #[test]
+    fn fused_lora_null_adapter_falls_back_to_base_matmul() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w = mk_2d_f64(&[5.0, 6.0, 7.0, 8.0], 2, 2);
+        let expected = nsl_tensor_matmul(x, w, 0);
+
+        let out = nsl_adapter_fused_lora_matmul(x, w, 0, 0, 1.0, 0);
+        assert_ne!(out, 0, "fused LoRA must return a valid tensor when adapter is null");
+        assert_tensor_eq(out, expected);
+
+        nsl_tensor_free(x);
+        nsl_tensor_free(w);
+        nsl_tensor_free(out);
+        nsl_tensor_free(expected);
+    }
+
+    /// Gap #1 regression: forward-only `@adapter` LoRA — null `lora_a` alone
+    /// (with non-null `lora_b`) must still trigger fallback, not the fused path.
+    #[test]
+    fn fused_lora_null_lora_a_only_falls_back() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w = mk_2d_f64(&[5.0, 6.0, 7.0, 8.0], 2, 2);
+        let lora_b = mk_2d_f64(&[0.1, 0.2, 0.3, 0.4], 2, 2);
+        let expected = nsl_tensor_matmul(x, w, 0);
+
+        let out = nsl_adapter_fused_lora_matmul(x, w, 0, lora_b, 1.0, 0);
+        assert_ne!(out, 0);
+        assert_tensor_eq(out, expected);
+
+        nsl_tensor_free(x);
+        nsl_tensor_free(w);
+        nsl_tensor_free(lora_b);
+        nsl_tensor_free(out);
+        nsl_tensor_free(expected);
+    }
+
+    /// Gap #1 regression: forward-only `@adapter` LoRA — symmetric to the
+    /// above, but with null `lora_b` only.
+    #[test]
+    fn fused_lora_null_lora_b_only_falls_back() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w = mk_2d_f64(&[5.0, 6.0, 7.0, 8.0], 2, 2);
+        let lora_a = mk_2d_f64(&[0.1, 0.2, 0.3, 0.4], 2, 2);
+        let expected = nsl_tensor_matmul(x, w, 0);
+
+        let out = nsl_adapter_fused_lora_matmul(x, w, lora_a, 0, 1.0, 0);
+        assert_ne!(out, 0);
+        assert_tensor_eq(out, expected);
+
+        nsl_tensor_free(x);
+        nsl_tensor_free(w);
+        nsl_tensor_free(lora_a);
+        nsl_tensor_free(out);
+        nsl_tensor_free(expected);
+    }
+
+    /// Gap #1 regression: forward-only `@adapter` IA³ — null `ia3_scale` must
+    /// fall back to base `x @ W` (since `y = (x @ W) * 1 == x @ W`).
+    #[test]
+    fn fused_ia3_null_scale_falls_back_to_base_matmul() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w = mk_2d_f64(&[5.0, 6.0, 7.0, 8.0], 2, 2);
+        let expected = nsl_tensor_matmul(x, w, 0);
+
+        let out = nsl_adapter_fused_ia3_matmul(x, w, 0, 0);
+        assert_ne!(out, 0);
+        assert_tensor_eq(out, expected);
+
+        nsl_tensor_free(x);
+        nsl_tensor_free(w);
+        nsl_tensor_free(out);
+        nsl_tensor_free(expected);
+    }
+
+    /// Gap #1 regression: forward-only `@adapter` GatedLoRA — every adapter
+    /// operand null. With `lora_b == 0` the gated delta is zero anyway, so
+    /// fallback to base `x @ W` is the documented Step-0 invariant.
+    #[test]
+    fn fused_gatedlora_null_adapter_falls_back_to_base_matmul() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w = mk_2d_f64(&[5.0, 6.0, 7.0, 8.0], 2, 2);
+        let expected = nsl_tensor_matmul(x, w, 0);
+
+        let out = nsl_adapter_fused_gatedlora_matmul(x, w, 0, 0, 1.0, 0, 0);
+        assert_ne!(out, 0);
+        assert_tensor_eq(out, expected);
+
+        nsl_tensor_free(x);
+        nsl_tensor_free(w);
+        nsl_tensor_free(out);
+        nsl_tensor_free(expected);
+    }
+
+    /// Gap #1 regression: forward-only `@adapter` GatedLoRA — null `gate`
+    /// alone (with valid lora_a + lora_b) must still fall back. The cpu
+    /// fallback would dereference `gate` to compute `sigmoid(gate)`.
+    #[test]
+    fn fused_gatedlora_null_gate_only_falls_back() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w = mk_2d_f64(&[5.0, 6.0, 7.0, 8.0], 2, 2);
+        let lora_a = mk_2d_f64(&[0.1, 0.2, 0.3, 0.4], 2, 2);
+        let lora_b = mk_2d_f64(&[0.5, 0.6, 0.7, 0.8], 2, 2);
+        let expected = nsl_tensor_matmul(x, w, 0);
+
+        let out = nsl_adapter_fused_gatedlora_matmul(x, w, lora_a, lora_b, 1.0, 0, 0);
+        assert_ne!(out, 0);
+        assert_tensor_eq(out, expected);
+
+        nsl_tensor_free(x);
+        nsl_tensor_free(w);
+        nsl_tensor_free(lora_a);
+        nsl_tensor_free(lora_b);
+        nsl_tensor_free(out);
+        nsl_tensor_free(expected);
+    }
+
+    /// Precondition guard intact: x==0 returns 0 for all three FFIs (sanity
+    /// check that the null-adapter fallback doesn't accidentally bypass the
+    /// x/w null guard above it).
+    #[test]
+    fn null_x_returns_zero_across_all_three_ffis() {
+        let w = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        assert_eq!(nsl_adapter_fused_lora_matmul(0, w, 0, 0, 1.0, 0), 0);
+        assert_eq!(nsl_adapter_fused_ia3_matmul(0, w, 0, 0), 0);
+        assert_eq!(nsl_adapter_fused_gatedlora_matmul(0, w, 0, 0, 1.0, 0, 0), 0);
+        nsl_tensor_free(w);
+    }
+
+    /// Precondition guard intact: w==0 returns 0 for all three FFIs.
+    #[test]
+    fn null_w_returns_zero_across_all_three_ffis() {
+        let x = mk_2d_f64(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        assert_eq!(nsl_adapter_fused_lora_matmul(x, 0, 0, 0, 1.0, 0), 0);
+        assert_eq!(nsl_adapter_fused_ia3_matmul(x, 0, 0, 0), 0);
+        assert_eq!(nsl_adapter_fused_gatedlora_matmul(x, 0, 0, 0, 1.0, 0, 0), 0);
+        nsl_tensor_free(x);
+    }
+}
