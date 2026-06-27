@@ -153,13 +153,14 @@ impl WggoPlan {
         for layer in &self.applied.layers {
             writeln!(
                 s,
-                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}, PCA={}",
+                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={} [{}], m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
                 layer.active_heads, // number of actually-kept heads (no "of total" info here)
                 layer.ffn_width,
                 layer.csha_level,
                 layer.adapter_rank,
+                layer.adapter_placement.as_str(),
                 layer.optim_m_bits,
                 layer.optim_v_bits,
                 if layer.fase_fused { "fused" } else { "deferred" },
@@ -650,22 +651,30 @@ pub fn run_on_wengert_with_weights(
 
     // Load the weights file up front so its lifetime covers the call.
     // Skip the load when the cache hit already carries the scores.
+    // On failure, capture the message so it lands in the plan's report
+    // (Phase 9 field 6) — not only on stderr (G11).
+    let mut load_warning: Option<String> = None;
     let checkpoint = if cached_report.is_some() {
         None
     } else {
-        weights_path.and_then(|p| {
-            match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
-                Ok(ck) => Some(ck),
-                Err(e) => {
-                    eprintln!(
-                        "[wggo] warning: could not load weights from {}: {} — falling back to uniform scores",
-                        p.display(),
-                        e
-                    );
-                    None
+        match weights_path {
+            Some(p) => {
+                match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
+                    Ok(ck) => Some(ck),
+                    Err(e) => {
+                        let msg = format!(
+                            "could not load weights from {}: {} — falling back to uniform importance scores",
+                            p.display(),
+                            e
+                        );
+                        eprintln!("[wggo] warning: {msg}");
+                        load_warning = Some(msg);
+                        None
+                    }
                 }
             }
-        })
+            None => None,
+        }
     };
     let weights_ref: Option<&dyn WeightProvider> = checkpoint
         .as_ref()
@@ -713,6 +722,13 @@ pub fn run_on_wengert_with_weights(
         scorer,
     };
     let mut plan = run(input);
+
+    // Surface the weights-load failure (if any) in the report itself, not
+    // only on stderr.  Prepended-style: it precedes any degradation warnings
+    // run() may have added.
+    if let Some(msg) = load_warning {
+        plan.warnings.insert(0, msg);
+    }
 
     // Overwrite with cached report when it was a hit — saves both the
     // checkpoint load and the analyzer's per-layer L2 reductions.
@@ -1161,6 +1177,33 @@ mod tests {
         let plan = run(toy_input(&w));
         assert!(plan.warnings.is_empty());
         assert!(plan.render_report().contains("Warnings / limitations: 0"));
+    }
+
+    /// G11: a weights-load failure must surface in the plan's report
+    /// (`warnings` -> "Warnings / limitations" section), not only on stderr.
+    #[test]
+    fn weights_load_failure_surfaces_in_report() {
+        let w = two_block_wengert();
+        let missing = std::path::Path::new("definitely/does/not/exist.nslweights");
+        let plan = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            Some(missing),
+            AnalysisConfig::default(),
+            None,
+        )
+        .expect("plan is still produced via uniform-importance fallback");
+        assert!(
+            plan.warnings.iter().any(|m| m.contains("could not load weights")),
+            "load failure missing from plan.warnings: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.render_report().contains("could not load weights"),
+            "load failure missing from rendered report"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -224,7 +224,7 @@ mod tests {
     use super::*;
     use crate::wggo_apply::{apply, AppliedLayer};
     use crate::wggo_cost::{build_lut, LayerShape, LutAxes};
-    use crate::wggo_dp::{LayerDecision as CoarseDecision, LayerPlan};
+    use crate::wggo_dp::{CoarseDecision, LayerPlan};
     use crate::wggo_ilp::{solve_layer, LayerIlpConstraints};
 
     fn h100() -> &'static crate::gpu_specs::GpuSpec {

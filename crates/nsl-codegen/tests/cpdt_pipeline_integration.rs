@@ -31,7 +31,7 @@ use nsl_codegen::cpdt_optim::AdamWHyperparams;
 use nsl_codegen::cpdt_tier_apply::PrecisionConfig;
 use nsl_codegen::cpdt_zero::{ClusterSpec, ModelSize};
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
-use nsl_codegen::wggo_dp::LayerDecision as CoarseDecision;
+use nsl_codegen::wggo_dp::CoarseDecision;
 use nsl_codegen::wggo_overrides::{OverrideRejectReason, WggoOverrides};
 
 /// Build an `AppliedPlan` with `n_layers` layers, each carrying
@@ -51,6 +51,7 @@ fn applied_plan_with_shard(n_layers: usize, shard: u32) -> AppliedPlan {
             ffn_width: 4096,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 8,
             optim_v_bits: 8,
             fase_fused: false,

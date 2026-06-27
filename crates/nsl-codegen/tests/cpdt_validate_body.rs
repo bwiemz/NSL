@@ -8,7 +8,7 @@ use std::io::Write;
 use nsl_codegen::cpdt_sensitivity::{validate, ValidationError};
 use nsl_codegen::weight_aware::WeightMap;
 use nsl_codegen::wggo_apply::AppliedPlan;
-use nsl_codegen::wggo_dp::LayerDecision as CoarseDecision;
+use nsl_codegen::wggo_dp::CoarseDecision;
 
 /// Write a minimal safetensors file containing `tensor_names` (each a 1×1
 /// f32 tensor) to a temp path, load it as a WeightMap, and return the pair
@@ -54,6 +54,7 @@ fn plan_with_layers(layer_names: &[&str]) -> AppliedPlan {
             ffn_width: 0,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 32,
             optim_v_bits: 32,
             fase_fused: false,

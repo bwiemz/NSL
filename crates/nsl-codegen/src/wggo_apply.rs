@@ -13,8 +13,8 @@
 
 use serde::Serialize;
 
-use crate::wggo_dp::{InterLayerPlan, LayerDecision as CoarseDecision};
-use crate::wggo_ilp::LayerIlpSolution;
+use crate::wggo_dp::{CoarseDecision, InterLayerPlan};
+use crate::wggo_ilp::{AdapterPlacement, LayerIlpSolution};
 
 /// Normalised per-layer decision ready for downstream consumption.
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +35,11 @@ pub struct AppliedLayer {
     pub ffn_width: u64,
     pub csha_level: u8,
     pub adapter_rank: u64,
+    /// Which projections the WRGA adapter attaches to (G5/G7 decision).
+    /// `None` when `adapter_rank == 0` or the layer is pruned.  Carried to
+    /// the consumer boundary alongside `adapter_rank` for the WRGA codegen
+    /// wiring; see [`crate::wggo_overrides::PerLayerOverride`].
+    pub adapter_placement: AdapterPlacement,
     pub optim_m_bits: u8,
     pub optim_v_bits: u8,
     /// Whether FASE fuses the optimizer step into the backward pass.
@@ -89,15 +94,17 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
         let active_heads = ilp_sol.decision.active_heads() as u32;
         // Prune-decision propagation: if the inter-layer DP decided to
         // prune, force adapter rank and csha level to safe defaults.
-        let (csha_level, adapter_rank, fase_fused, packing_mode) = match coarse.decision {
-            CoarseDecision::Prune => (0, 0, false, 0u8),
-            _ => (
-                ilp_sol.decision.csha_level,
-                ilp_sol.decision.adapter_rank,
-                ilp_sol.decision.fase_fused,
-                ilp_sol.decision.packing_mode,
-            ),
-        };
+        let (csha_level, adapter_rank, adapter_placement, fase_fused, packing_mode) =
+            match coarse.decision {
+                CoarseDecision::Prune => (0, 0, AdapterPlacement::None, false, 0u8),
+                _ => (
+                    ilp_sol.decision.csha_level,
+                    ilp_sol.decision.adapter_rank,
+                    ilp_sol.decision.adapter_placement,
+                    ilp_sol.decision.fase_fused,
+                    ilp_sol.decision.packing_mode,
+                ),
+            };
         let cost = if coarse.decision == CoarseDecision::Prune {
             0.0
         } else {
@@ -117,6 +124,7 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
             ffn_width: ilp_sol.decision.ffn_width,
             csha_level,
             adapter_rank,
+            adapter_placement,
             optim_m_bits: ilp_sol.decision.optim_m_bits,
             optim_v_bits: ilp_sol.decision.optim_v_bits,
             fase_fused,
@@ -141,7 +149,7 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
 mod tests {
     use super::*;
     use crate::wggo_cost::{build_lut, LayerShape, LutAxes};
-    use crate::wggo_dp::{LayerPlan, LayerDecision as CoarseDecision};
+    use crate::wggo_dp::{CoarseDecision, LayerPlan};
     use crate::wggo_ilp::{solve_layer, LayerIlpConstraints};
 
     fn toy_shape() -> LayerShape {
@@ -234,6 +242,45 @@ mod tests {
         // Layer 0 has rank=4; layer 2 is pruned → forced to 0.
         assert!(adapters.contains(&0));
         assert!(!adapters.contains(&2));
+    }
+
+    #[test]
+    fn apply_carries_adapter_placement_and_overrides_propagate() {
+        // G13: the placement decision flows ILP -> AppliedLayer ->
+        // PerLayerOverride, and is forced to None on pruned layers (mirroring
+        // adapter_rank).
+        let inter = inter_plan(3); // layer 2 is Prune
+        let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
+        let ilp = vec![
+            {
+                let mut s = solve_layer(&lut, &LayerIlpConstraints::default());
+                s.decision.adapter_rank = 8;
+                s.decision.adapter_placement = AdapterPlacement::AttnQKVO;
+                s
+            },
+            solve_layer(&lut, &LayerIlpConstraints::default()),
+            {
+                let mut s = solve_layer(&lut, &LayerIlpConstraints::default());
+                s.decision.adapter_rank = 8;
+                s.decision.adapter_placement = AdapterPlacement::AttnAndFfn;
+                s
+            },
+        ];
+        let applied = apply(&inter, &ilp);
+        assert_eq!(applied.layers[0].adapter_placement, AdapterPlacement::AttnQKVO);
+        assert_eq!(
+            applied.layers[2].adapter_placement,
+            AdapterPlacement::None,
+            "pruned layer must force placement to None"
+        );
+
+        let overrides = crate::wggo_overrides::WggoOverrides::from_applied(&applied);
+        assert_eq!(
+            overrides.per_layer[0].adapter_placement,
+            AdapterPlacement::AttnQKVO,
+            "override must carry the placement to the consumer boundary"
+        );
+        assert_eq!(overrides.per_layer[2].adapter_placement, AdapterPlacement::None);
     }
 
     #[test]

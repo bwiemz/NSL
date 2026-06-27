@@ -36,6 +36,11 @@ pub enum DecisionKind {
     CshaLevel,
     WrgaAdapter,
     CpdtPrecision,
+    /// FASE: whether the optimizer step is fused into the backward pass
+    /// (deferred gradient materialization) for this layer.
+    FaseStep,
+    /// PCA: sequence-packing mode chosen for this layer's attention kernels.
+    PcaPacking,
 }
 
 /// A human-readable record of one ILP decision, suitable for reporting.
@@ -911,7 +916,52 @@ fn build_decision_trace(
         cross_decision_note: None,
     };
 
-    vec![cep_trace, csha_trace, wrga_trace, cpdt_trace]
+    // ---------- FASE (fused optimizer step) ----------
+    let fase_trace = DecisionTrace {
+        kind: DecisionKind::FaseStep,
+        chosen: if decision.fase_fused {
+            "Fused step (deferred grads)".to_string()
+        } else {
+            "Deferred to standalone optimizer".to_string()
+        },
+        runner_up: None,
+        binding_constraint: Some(if c.allow_fase {
+            "allow_fase = true".to_string()
+        } else {
+            "allow_fase = false — fusion forbidden for this layer".to_string()
+        }),
+        metric_summary: if decision.fase_fused {
+            "Gradient buffers not materialized in HBM; backward writes updates in place.".to_string()
+        } else {
+            "Gradients materialized; optimizer runs as a separate pass.".to_string()
+        },
+        cross_decision_note: None,
+    };
+
+    // ---------- PCA (sequence packing) ----------
+    let pca_mode = match decision.packing_mode {
+        0 => "none",
+        1 => "segment_id",
+        2 => "tile_skip",
+        3 => "multi_seq",
+        _ => "unknown",
+    };
+    let pca_trace = DecisionTrace {
+        kind: DecisionKind::PcaPacking,
+        chosen: format!("Packing mode {} ({})", decision.packing_mode, pca_mode),
+        runner_up: None,
+        binding_constraint: None,
+        metric_summary: if decision.packing_mode == 0 {
+            "No sequence packing — padded positions computed.".to_string()
+        } else {
+            format!("Skips padded work via {pca_mode} packing (paper §4.3.6).")
+        },
+        cross_decision_note: None,
+    };
+
+    vec![
+        cep_trace, csha_trace, wrga_trace, cpdt_trace, fase_trace, pca_trace,
+    ]
 }
 
 fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
@@ -1020,6 +1070,29 @@ mod tests {
         assert!(sol.feasible);
         assert!(sol.decision.active_heads() >= 1);
         assert!(sol.cost_us > 0.0);
+    }
+
+    #[test]
+    fn decision_trace_covers_all_six_dimensions() {
+        // G13: the explainer trace must cover all six WGGO decision
+        // dimensions, not only the original four (FASE + PCA were missing).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let sol = solve_layer(&lut, &LayerIlpConstraints::default());
+        assert!(sol.feasible);
+        let has = |pred: fn(&DecisionKind) -> bool| sol.decision_trace.iter().any(|t| pred(&t.kind));
+        assert!(has(|k| matches!(k, DecisionKind::CepHeadPrune)));
+        assert!(has(|k| matches!(k, DecisionKind::CshaLevel)));
+        assert!(has(|k| matches!(k, DecisionKind::WrgaAdapter)));
+        assert!(has(|k| matches!(k, DecisionKind::CpdtPrecision)));
+        assert!(
+            has(|k| matches!(k, DecisionKind::FaseStep)),
+            "FASE decision dimension missing from trace"
+        );
+        assert!(
+            has(|k| matches!(k, DecisionKind::PcaPacking)),
+            "PCA decision dimension missing from trace"
+        );
+        assert_eq!(sol.decision_trace.len(), 6);
     }
 
     #[test]

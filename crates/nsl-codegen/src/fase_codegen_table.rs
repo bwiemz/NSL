@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use crate::fase::FaseOptimizer;
     use crate::wggo_apply::{AppliedLayer, AppliedPlan};
-    use crate::wggo_dp::LayerDecision as CoarseDecision;
+    use crate::wggo_dp::CoarseDecision;
 
     fn applied_layer(idx: u32, name: &str) -> AppliedLayer {
         AppliedLayer {
@@ -96,6 +96,7 @@ mod tests {
             ffn_width: 4096,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 32,
             optim_v_bits: 32,
             fase_fused: false,
