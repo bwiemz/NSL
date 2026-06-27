@@ -755,7 +755,13 @@ impl<'a> Compiler<'a> {
             .map_err(|e| CodegenError::new(format!("failed to set probestack strategy: {e}")))?;
 
         // M62a: Enable position-independent code for shared library emission.
-        if options.shared_lib {
+        // Also unconditionally on macOS: the system ld defaults to PIE for
+        // executables and rejects absolute relocations in .text with
+        // "Found illegal text-relocations". Mirrors the calibration codegen
+        // policy in `calibration/binary_codegen.rs::new_calibration_object_module`.
+        // COFF/PE (Windows) does NOT use ELF-style GOT, so do not set is_pic
+        // there — it can produce link failures on the MSVC linker.
+        if options.shared_lib || cfg!(target_os = "macos") {
             flag_builder
                 .set("is_pic", "true")
                 .map_err(|e| CodegenError::new(format!("failed to enable PIC: {e}")))?;
