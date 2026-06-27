@@ -53,6 +53,25 @@ use object::{Object, ObjectSymbol};
 
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::hooks::{CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
+
+/// Strip the host-ABI symbol-name prefix so logical NSL symbol names compare
+/// uniformly across platforms.
+///
+/// Mach-O (macOS) decorates every exported and undefined symbol with a
+/// leading underscore: a symbol declared in Cranelift as `nsl_calib_model_
+/// forward` appears in the object file as `_nsl_calib_model_forward`. ELF
+/// (Linux) and COFF (Windows MSVC) do not. Both production verification
+/// (e.g. `link_calibration_binary` post-checks) and the test assertions
+/// below compare against the un-prefixed logical name, so we strip a single
+/// leading underscore on macOS only.
+#[inline]
+fn strip_host_symbol_prefix(name: &str) -> &str {
+    if cfg!(target_os = "macos") {
+        name.strip_prefix('_').unwrap_or(name)
+    } else {
+        name
+    }
+}
 use crate::calibration::registry::HookRegistry;
 use crate::calibration::retention_pass::build_arena_layout;
 use crate::calibration::sidecar::{Sidecar, WggoHeadGradients, SIDECAR_VERSION};
@@ -3375,10 +3394,10 @@ pub fn link_calibration_binary(
             calib_model_obj.display()
         ),
     })?;
-    if !obj
-        .symbols()
-        .any(|symbol| symbol.name() == Ok("nsl_calib_model_forward") && !symbol.is_undefined())
-    {
+    if !obj.symbols().any(|symbol| {
+        symbol.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_forward")
+            && !symbol.is_undefined()
+    }) {
         return Err(HarnessError::Infrastructure {
             reason: format!(
                 "calibration: model-forward wrapper missing from calib_model.o.\n\
@@ -3390,9 +3409,10 @@ pub fn link_calibration_binary(
         });
     }
     if needs_backward
-        && !obj
-            .symbols()
-            .any(|symbol| symbol.name() == Ok("nsl_calib_model_backward") && !symbol.is_undefined())
+        && !obj.symbols().any(|symbol| {
+            symbol.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_backward")
+                && !symbol.is_undefined()
+        })
     {
         return Err(HarnessError::Infrastructure {
             reason: format!(
@@ -4132,8 +4152,8 @@ mod tests {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         assert!(
-            obj.symbols()
-                .any(|symbol| symbol.name() == Ok("nsl_calib_model_forward")),
+            obj.symbols().any(|symbol| symbol.name().map(strip_host_symbol_prefix)
+                == Ok("nsl_calib_model_forward")),
             "calib_model.o must export nsl_calib_model_forward"
         );
     }
@@ -4154,7 +4174,8 @@ mod tests {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         assert!(
-            obj.symbols().any(|symbol| symbol.name() == Ok("model_forward")),
+            obj.symbols().any(|symbol| symbol.name().map(strip_host_symbol_prefix)
+                == Ok("model_forward")),
             "calib_model.o must export model_forward"
         );
     }
@@ -4205,7 +4226,7 @@ mod tests {
         let imports: Vec<String> = obj
             .symbols()
             .filter(|symbol| symbol.is_undefined())
-            .filter_map(|symbol| symbol.name().ok().map(str::to_string))
+            .filter_map(|symbol| symbol.name().ok().map(|n| strip_host_symbol_prefix(n).to_string()))
             .collect();
         assert!(
             imports.iter().any(|symbol| symbol == "nsl_calib_model_forward"),
@@ -4225,7 +4246,8 @@ mod tests {
         );
 
         assert!(
-            obj.symbols().any(|symbol| symbol.name() == Ok("main") && !symbol.is_undefined()),
+            obj.symbols().any(|symbol| symbol.name().map(strip_host_symbol_prefix)
+                == Ok("main") && !symbol.is_undefined()),
             "scaffolding.o must export main"
         );
     }
@@ -4337,7 +4359,7 @@ mod tests {
         let imports: Vec<String> = obj
             .symbols()
             .filter(|s| s.is_undefined())
-            .filter_map(|s| s.name().ok().map(str::to_string))
+            .filter_map(|s| s.name().ok().map(|n| strip_host_symbol_prefix(n).to_string()))
             .collect();
         assert!(
             imports.iter().any(|s| s == "nsl_calib_model_backward"),
@@ -4421,6 +4443,7 @@ mod grad_arena_emission {
     use object::{Object, ObjectSection, ObjectSymbol};
     use nsl_lexer::Interner;
 
+    use super::strip_host_symbol_prefix;
     use crate::calibration::discovery::WggoGradTarget;
     use crate::calibration::observation::ProjectionRef;
     use crate::calibration::retention::build_grad_arena_layout;
@@ -4822,6 +4845,7 @@ mod backward_wrapper {
 mod loop_body_dispatch {
     use object::{Object, ObjectSymbol};
 
+    use super::strip_host_symbol_prefix;
     use crate::calibration::hooks::{FinalizePlanEntry, ObservePlanEntry};
     use crate::calibration::observation::ProjectionRef;
     use crate::calibration::retention_pass::build_arena_layout;
@@ -4884,7 +4908,7 @@ mod loop_body_dispatch {
         let imports: Vec<String> = obj
             .symbols()
             .filter(|s| s.is_undefined())
-            .filter_map(|s| s.name().ok().map(str::to_string))
+            .filter_map(|s| s.name().ok().map(|n| strip_host_symbol_prefix(n).to_string()))
             .collect();
 
         assert!(
@@ -4925,7 +4949,7 @@ mod loop_body_dispatch {
         let imports: Vec<String> = obj
             .symbols()
             .filter(|s| s.is_undefined())
-            .filter_map(|s| s.name().ok().map(str::to_string))
+            .filter_map(|s| s.name().ok().map(|n| strip_host_symbol_prefix(n).to_string()))
             .collect();
 
         assert!(
