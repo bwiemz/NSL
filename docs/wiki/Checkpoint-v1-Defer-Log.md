@@ -378,8 +378,45 @@ save sites suppressed) holds; the cycle-14 NUMERICAL gate stays RED.
 | G14-D SMEM budget accounting | GREEN | `g14_d_recompute_extra_bytes_accounted` |
 | G14-E cuda_available NSL_SKIP_CUDA_TESTS honor | GREEN | `g14_e_cuda_available_honors_skip_env` |
 | G14-F Path A baseline correctness | RED | causal+rope_q+L1-fused-proj diverges on RTX 5070 Ti |
-| G14-G Path B compilability | RED | ptxas rejects emit_rope_k_epilogue undeclared regs |
-| G14-H Path B numerical correctness (§5.3) | BLOCKED | depends on G14-F + G14-G |
+| G14-G Path B compilability | GREEN (cycle-15) | Resolved by Bug 2 fix at commit `525a2fb5`; verified empirically by cycle-15 Task 3 GPU re-run on RTX 5070 Ti (no ptxas rc=218) |
+| G14-H Path B numerical correctness (§5.3) | BLOCKED | depends on G14-F + new G15-K (Path B runtime CUDA_ERROR_ILLEGAL_ADDRESS) |
+
+## CYCLE 15 - BUG 2 (RoPE register gap, cycle-14 Bug 5 equivalent): RESOLVED
+
+**Status:** RESOLVED in commit `525a2fb5` (cycle-15 Task 1).
+
+**Identity:** Cycle-15 Bug 2 == cycle-14 Bug 5 (`emit_rope_k_epilogue` missing
+RoPE register block from backward prelude). Same defect, finally closed.
+
+**Root cause:** Forward prelude declared the RoPE pair-sweep register block
+under gate `cfg.rope_q && cfg.csha.is_some()`, but backward prelude did NOT.
+`emit_kv_recompute` (cycle-12 functional substitution path) invokes
+`emit_rope_k_epilogue` which emits PTX referencing `%rd_rope_cos`,
+`%rd_rope_sin`, `%f_rope_cos`, etc. - undeclared in backward prelude scope.
+ptxas rejected at PTX line ~18541 with rc=218 "Arguments mismatch for
+instruction 'ld'".
+
+**Fix:** Lifted the verbatim register block (11 .reg lines) into
+`crates/nsl-codegen/src/flash_attention_v2/phases/backward/prelude.rs`
+under the same gate as forward. Placement: after base register pools,
+before the PCA §4.3 RoPE-reset block (which declares disjoint registers
+under the narrower `segment_masked && rope_q` gate).
+
+**Structural witnesses:** G15-2a (positive: `rope_q=true && csha.is_some()`
+emits `%rd_rope_cos` in prelude window) and G15-2b (negative: `rope_q=false`
+skips block) in `crates/nsl-codegen/tests/cycle15_backward_prelude_rope.rs`.
+Both GREEN.
+
+**Empirical verification:** Cycle-15 Task 3 GPU re-run on RTX 5070 Ti
+(Blackwell sm_120, CUDA 13.2, cudarc 0.19.4): Path B PTX compiles cleanly
+(no ptxas rc=218). Independently reproduced by Reviewer 2 byte-for-byte.
+
+**Gate update:** G14-G transitions RED -> GREEN. G15-Bug2 closed.
+
+**Cycle-5 invariant:** Bug 2 closure unblocks Path B PTXAS COMPILE only.
+It does NOT unlock §5.3 numerical validation. Path B still RED at runtime
+with CUDA_ERROR_ILLEGAL_ADDRESS (new defect, see Cycle 16 work items).
+R0 retirement HOLDS unconditionally.
 
 ## CYCLE 15 - BUG 1 (Tier B scalar backward): DEFERRED TO CYCLE 16
 
@@ -483,12 +520,14 @@ Paper §6.3 49% headline remains STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED on Bla
 - A4 (hd=128): SKIPPED -- backward validator refused: 217472 bytes > 101376 byte
   SMEM cap at (block_q=32, head_dim=128). Config not executable on this device.
 
-**Classification:** CASE C (partially) -- Bug 2 fix (Task 1) prevented ptxas
-rc=218 compile failure; Path B now compiles PTX. However Path B still crashes at
-runtime with CUDA_ERROR_ILLEGAL_ADDRESS in the backward kernel, indicating a
-remaining runtime defect beyond the register-declaration gap. A3 also crashes with
-CUDA_ERROR_MISALIGNED_ADDRESS. The primary CASE C criterion (ptxas rc=218) is
-resolved, but Path B is not numerically testable due to the new runtime crash.
+**Classification:** Spec §5 matrix cell = **Path A RED + Path B RED**.
+Path B's failure mode CHANGED (ptxas rc=218 in cycle 14 -> CUDA_ERROR_ILLEGAL_ADDRESS
+at runtime in cycle 15). Bug 2 fix (Task 1) confirmed compilable at PTX-emit but
+revealed a downstream runtime defect (G15-K, see Cycle 16 work items). Path A
+remains numerically RED (Bug 1 deferred). Cycle-5 disposition: §5.3 NUMERICAL
+EVIDENCE NOT CLAIMABLE. Cycle-14 spec's "CASE C (partially)" working label is
+NOT in spec §5 - the honest matrix mapping is "both bugs persist, scope reduced
+to Bug 2 closure + Bug 1 triage report + new runtime defect surfacing."
 
 **Task-2 static analysis empirical status:** PARTIAL -- Path A numbers are
 byte-for-byte consistent with cycle-14 results (same magnitudes: dq 4.420e0,
@@ -505,4 +544,45 @@ Path B compiles PTX (Bug 2 fix confirmed) but crashes at runtime; no
 checkpoint-recompute backward numerics were produced.
 
 **Paper §6.3 49% headline:** STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED on Blackwell.
+
+### Cycle 16 work items (explicitly labeled)
+
+The following four surfaces are cycle-15 OUTPUTS - all carried forward to cycle 16:
+
+1. **G16-1 (carries from Bug 1):** Tier B scalar backward fix (3 structural
+   defects). Highest priority. See "CYCLE 15 - BUG 1" section above for full
+   triage. Estimated >60 LOC across `finalize.rs`, `mod.rs`,
+   `csha_hooks_backward.rs`. Must fix all three together (dK SMEM staleness,
+   k_start offset, pre-RoPE HBM output). Required to GREEN Path A baseline.
+
+2. **G16-2 (NEW from cycle-15 Task 3):** Path B runtime
+   `CUDA_ERROR_ILLEGAL_ADDRESS` inside `nsl_flash_attention_csha_backward`
+   after Bug 2 (PTX compile) closure. Suspected memory/pointer defect in
+   `emit_kv_recompute` path or its load addressing. Must be triaged with
+   `cuda-memcheck` or printf instrumentation. Required to GREEN Path B
+   compilability-to-launch.
+
+3. **G16-3 (NEW from cycle-15 Task 3):** Ablation A3 (`fused_proj=FALSE`)
+   `CUDA_ERROR_MISALIGNED_ADDRESS` on cuMemFree_v2/cuMemsetD8_v2 inside or
+   after backward kernel. SMEM=45696 bytes dyn=0. Separate from G16-2 because
+   it surfaces on a different config flavor (no fused projections), but
+   likely related to memory layout/alignment in the non-fused backward path.
+   Cycle 16 should triage these two together if they share a root cause.
+
+4. **G16-4 (NEW from cycle-15 Task 3, INFRASTRUCTURE):** Test infrastructure
+   bug in `csha_reference.rs:85:31` - panics with "index out of bounds:
+   the len is 0 but the index is 0" when `rope_q=false`. The CPU reference
+   does not handle empty cos/sin slices. Must be fixed BEFORE A1 ablation
+   can produce useful narrowing data. NOT a GPU backward bug.
+
+The following surface is **NOT a cycle-16 work item** - it is a configuration
+constraint, not a defect:
+
+- **A4 SMEM cap refusal** (217472 > 101376 byte cap at `block_q=32, head_dim=128`
+  on sm_120, Blackwell consumer). The backward validator correctly refuses
+  this config because the SMEM requirement exceeds the device cap. To
+  exercise `head_dim=128` on cycle-16 ablations, EITHER (a) reduce
+  `block_q` to 16, OR (b) restructure the backward to consume less SMEM
+  per tile. Neither requires defect-level work; this is a config-not-bug
+  classification per cycle-5 honesty discipline.
 
