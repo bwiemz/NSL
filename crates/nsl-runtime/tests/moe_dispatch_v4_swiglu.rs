@@ -30,12 +30,23 @@ extern "C" {
         hidden_dim: i64,
         intermediate_dim: i64,
         gate_activation_kind: i64,
+        // v2.14: 3 nullable bias pointers (NO_BIAS = 0 → no bias for
+        // that direction). Existing pre-v2.14 call sites pass
+        // NO_BIAS, NO_BIAS, NO_BIAS to preserve byte-identical
+        // behavior.
+        experts_gate_bias_ptr: i64,
+        experts_up_bias_ptr: i64,
+        experts_down_bias_ptr: i64,
     ) -> i64;
 }
 
 /// v2.8 SwiGLU constant — preserves byte-for-byte the v2.5/v2.7
 /// behavior in this test file (which all predate gate_activation_kind).
 const SWIGLU: i64 = 1;
+
+/// v2.14 no-bias sentinel — preserves byte-for-byte the v2.5/v2.7/v2.8
+/// behavior for pre-v2.14 v4 call sites.
+const NO_BIAS: i64 = 0;
 
 fn make_f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
     let shape_list = nsl_list_new();
@@ -186,6 +197,7 @@ fn dispatch_v4_top_k_one_distinct_experts_matches_reference() {
             hidden as i64,
             intermediate as i64,
             SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0, "v4 returned null for valid SwiGLU inputs");
@@ -276,6 +288,7 @@ fn dispatch_v4_top_k_two_symmetric_closed_form() {
             2,
             2,
             SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -336,6 +349,7 @@ fn dispatch_v4_zero_gate_kills_expert_contribution_exactly() {
             tokens_ptr, logits_ptr,
             w_gate_ptr, w_up_ptr, w_down_ptr,
             2, 1, (2.0_f32).to_bits() as i64, 3, 2, SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -386,6 +400,7 @@ fn dispatch_v4_swiglu_differs_from_silu_when_gate_equals_up() {
             tokens_ptr, logits_ptr,
             w_gate_ptr, w_up_ptr, w_down_ptr,
             2, 1, (2.0_f32).to_bits() as i64, 2, 2, SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -441,6 +456,7 @@ fn dispatch_v4_refuses_invalid_inputs() {
     let v = |gate, up, down, ne, tk, h, i| unsafe {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr, gate, up, down, ne, tk, cap, h, i, SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
 
@@ -467,6 +483,7 @@ fn dispatch_v4_refuses_invalid_inputs() {
     let v_null = |t, l| unsafe {
         nsl_moe_dispatch_full_v4(
             t, l, w_gate_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_eq!(v_null(0, logits_ptr), 0, "null tokens");
@@ -632,6 +649,7 @@ fn dispatch_v4_geglu_matches_hand_reference() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
             1, 1, (4.0_f32).to_bits() as i64, 2, 2, 2, /* GeGLU */
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0, "v4 returned null for valid GeGLU inputs");
@@ -661,6 +679,7 @@ fn dispatch_v4_geglu_matches_hand_reference() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
             1, 1, (4.0_f32).to_bits() as i64, 2, 2, SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     let swiglu_out = read_f32(swiglu_out_ptr, 4);
@@ -709,6 +728,7 @@ fn dispatch_v4_reglu_matches_hand_reference() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
             1, 1, (4.0_f32).to_bits() as i64, 2, 2, 3, /* ReGLU */
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     assert_ne!(out_ptr, 0, "v4 returned null for valid ReGLU inputs");
@@ -736,6 +756,7 @@ fn dispatch_v4_reglu_matches_hand_reference() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
             1, 1, (4.0_f32).to_bits() as i64, 2, 2, SWIGLU,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
     let swiglu_out = read_f32(swiglu_out_ptr, 4);
@@ -776,6 +797,7 @@ fn dispatch_v4_refuses_invalid_gate_activation_kind() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
             2, 1, cap, 2, 2, kind,
+            NO_BIAS, NO_BIAS, NO_BIAS,
         )
     };
 
@@ -803,4 +825,404 @@ fn dispatch_v4_refuses_invalid_gate_activation_kind() {
     nsl_tensor_free(ok1);
     nsl_tensor_free(ok2);
     nsl_tensor_free(ok3);
+}
+
+// ── CPDT Part III v2.14 — v4 FFN bias tests ──────────────────────────────
+
+/// SwiGLU expert with biases:
+///   x_gate = (token @ W_gate) + gate_bias
+///   x_up   = (token @ W_up)   + up_bias
+///   x_act  = silu(x_gate) * x_up
+///   out    = (x_act @ W_down) + down_bias
+///
+/// Independent of route_topk / scatter / gather so a routing-pipeline
+/// regression cannot silently corrupt this reference.
+#[allow(clippy::too_many_arguments)]
+fn swiglu_expert_with_biases(
+    token: &[f32],
+    w_gate: &[f32],
+    w_up: &[f32],
+    w_down: &[f32],
+    gate_bias: &[f32],
+    up_bias: &[f32],
+    down_bias: &[f32],
+    hidden: usize,
+    intermediate: usize,
+) -> Vec<f32> {
+    let mut x_gate = vec![0.0_f32; intermediate];
+    let mut x_up = vec![0.0_f32; intermediate];
+    for j in 0..intermediate {
+        let mut sg = 0.0_f32;
+        let mut su = 0.0_f32;
+        for k in 0..hidden {
+            sg += token[k] * w_gate[k * intermediate + j];
+            su += token[k] * w_up[k * intermediate + j];
+        }
+        x_gate[j] = sg + gate_bias[j];
+        x_up[j] = su + up_bias[j];
+    }
+    let mut x_act = vec![0.0_f32; intermediate];
+    for j in 0..intermediate {
+        x_act[j] = silu(x_gate[j]) * x_up[j];
+    }
+    let mut out = vec![0.0_f32; hidden];
+    for h in 0..hidden {
+        let mut s = 0.0_f32;
+        for j in 0..intermediate {
+            s += x_act[j] * w_down[j * hidden + h];
+        }
+        out[h] = s + down_bias[h];
+    }
+    out
+}
+
+/// All 3 biases (gate + up + down) supplied. Numerical match against
+/// `swiglu_expert_with_biases` reference. Uses num_experts=2 so the
+/// per-expert bias offset (e * dim) is exercised — a regression that
+/// dropped the `e *` factor would still pass num_experts=1.
+#[test]
+fn dispatch_v4_all_three_biases_matches_hand_reference() {
+    let hidden = 2_usize;
+    let intermediate = 2_usize;
+    let n_experts = 2_usize;
+    // Tokens [2, 2]: both route deterministically — token 0 to expert 0, token 1 to expert 1.
+    let tokens: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+    // Logits [2, 2]: row 0 picks col 0, row 1 picks col 1.
+    let logits: Vec<f32> = vec![10.0, -10.0, -10.0, 10.0];
+
+    // Distinct per-expert weights so any mis-routing surfaces.
+    let w_gate: Vec<f32> = vec![
+        // expert 0: [hidden=2, intermediate=2]
+        0.5, 1.0,
+        -0.5, 0.25,
+        // expert 1
+        2.0, -1.0,
+        0.5, 1.5,
+    ];
+    let w_up: Vec<f32> = vec![
+        0.1, 0.2,
+        0.3, 0.4,
+        1.0, 0.5,
+        -0.5, 0.25,
+    ];
+    let w_down: Vec<f32> = vec![
+        // expert 0: [intermediate=2, hidden=2]
+        1.0, 0.0,
+        0.0, 1.0,
+        // expert 1
+        0.5, 0.25,
+        -0.25, 0.5,
+    ];
+    // Per-expert biases.
+    let gate_bias: Vec<f32> = vec![
+        // expert 0: [intermediate=2]
+        1.0, -0.5,
+        // expert 1
+        -1.0, 0.5,
+    ];
+    let up_bias: Vec<f32> = vec![
+        0.25, -0.25,
+        -0.5, 1.0,
+    ];
+    let down_bias: Vec<f32> = vec![
+        // expert 0: [hidden=2]
+        0.1, 0.2,
+        // expert 1
+        -0.1, -0.2,
+    ];
+
+    let tokens_ptr = make_f32_tensor(&[2, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, 2], &logits);
+    let w_gate_ptr = make_f32_tensor(&[2, 4], &w_gate);
+    let w_up_ptr = make_f32_tensor(&[2, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[2, 4], &w_down);
+    let gate_bias_ptr = make_f32_tensor(&[2, 2], &gate_bias);
+    let up_bias_ptr = make_f32_tensor(&[2, 2], &up_bias);
+    let down_bias_ptr = make_f32_tensor(&[2, 2], &down_bias);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (2.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            gate_bias_ptr, up_bias_ptr, down_bias_ptr,
+        )
+    };
+    assert_ne!(out_ptr, 0, "v4 returned null for valid biased SwiGLU inputs");
+    let got = read_f32(out_ptr, 2 * hidden);
+
+    // Reference: token 0 → expert 0; token 1 → expert 1.
+    let token0 = &tokens[0..2];
+    let token1 = &tokens[2..4];
+    let exp0_out = swiglu_expert_with_biases(
+        token0,
+        &w_gate[0..4], &w_up[0..4], &w_down[0..4],
+        &gate_bias[0..2], &up_bias[0..2], &down_bias[0..2],
+        hidden, intermediate,
+    );
+    let exp1_out = swiglu_expert_with_biases(
+        token1,
+        &w_gate[4..8], &w_up[4..8], &w_down[4..8],
+        &gate_bias[2..4], &up_bias[2..4], &down_bias[2..4],
+        hidden, intermediate,
+    );
+    let mut expected = vec![0.0_f32; 2 * hidden];
+    expected[0..hidden].copy_from_slice(&exp0_out);
+    expected[hidden..2 * hidden].copy_from_slice(&exp1_out);
+
+    for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (g - e).abs() < 1e-5,
+            "v4 biased output mismatch at i={i}: got {g}, expected {e}",
+        );
+    }
+}
+
+/// Gate-bias-only path — verifies the bias-BEFORE-activation ordering
+/// for gate. silu(x + bias) ≠ silu(x) + bias (the activation is
+/// nonlinear), so a regression applying gate_bias AFTER silu would
+/// produce numerically distinct output (>0.1 here) from the
+/// hand-computed pre-activation path.
+#[test]
+fn dispatch_v4_gate_bias_only_pins_bias_before_activation_ordering() {
+    let hidden = 1_usize;
+    let intermediate = 1_usize;
+    let n_experts = 1_usize;
+    let tokens: Vec<f32> = vec![1.0, -1.0];
+    let logits: Vec<f32> = vec![1.0, 1.0];
+    // W_gate = [[1.0]], W_up = [[1.0]], W_down = [[1.0]].
+    let w_gate: Vec<f32> = vec![1.0];
+    let w_up: Vec<f32> = vec![1.0];
+    let w_down: Vec<f32> = vec![1.0];
+    // Strong gate_bias → silu(x+2) vs silu(x)+2 diverges by >0.1.
+    let gate_bias: Vec<f32> = vec![2.0];
+
+    let tokens_ptr = make_f32_tensor(&[2, 1], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, 1], &logits);
+    let w_gate_ptr = make_f32_tensor(&[1, 1], &w_gate);
+    let w_up_ptr = make_f32_tensor(&[1, 1], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 1], &w_down);
+    let gate_bias_ptr = make_f32_tensor(&[1, 1], &gate_bias);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (4.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            gate_bias_ptr, NO_BIAS, NO_BIAS,
+        )
+    };
+    assert_ne!(out_ptr, 0);
+    let got = read_f32(out_ptr, 2 * hidden);
+
+    // Expected per-token pre-bias-activation: silu(token + 2) * token.
+    // Token 0 = 1.0: silu(3.0) * 1.0 ≈ 2.857
+    // Token 1 = -1.0: silu(1.0) * -1.0 ≈ -0.731
+    let want_t0 = silu(1.0 + 2.0) * 1.0;
+    let want_t1 = silu(-1.0 + 2.0) * -1.0;
+    assert!((got[0] - want_t0).abs() < 1e-5, "got[0]={} expected {}", got[0], want_t0);
+    assert!((got[1] - want_t1).abs() < 1e-5, "got[1]={} expected {}", got[1], want_t1);
+
+    // Confirm divergence vs post-activation application.
+    let post_act_t0 = silu(1.0) * 1.0 + 2.0; // wrong: bias added AFTER silu
+    assert!(
+        (got[0] - post_act_t0).abs() > 0.1,
+        "gate bias must produce distinct output vs post-silu addition (sanity check)",
+    );
+}
+
+/// v2.14 fix F3 (IMPORTANT adversarial review) — non-square dims
+/// (hidden=2, intermediate=4) so the 3 bias offsets diverge:
+///   gate_bias_off = e * intermediate = e * 4
+///   up_bias_off   = e * intermediate = e * 4   (same as gate)
+///   down_bias_off = e * hidden       = e * 2
+/// A regression that swapped gate_bias and down_bias offsets would
+/// have undetectable consequences with hidden=intermediate (both
+/// offsets equal e * D); non-square dims surface the bug.
+#[test]
+fn dispatch_v4_all_three_biases_hidden_neq_intermediate_matches_reference() {
+    let hidden = 2_usize;
+    let intermediate = 4_usize;
+    let n_experts = 2_usize;
+    let tokens: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+    let logits: Vec<f32> = vec![10.0, -10.0, -10.0, 10.0];
+
+    let w_gate: Vec<f32> = (0..n_experts * hidden * intermediate)
+        .map(|i| 0.1_f32 * (i as f32 + 1.0))
+        .collect();
+    let w_up: Vec<f32> = (0..n_experts * hidden * intermediate)
+        .map(|i| 0.2_f32 * (i as f32 + 1.0))
+        .collect();
+    let w_down: Vec<f32> = (0..n_experts * intermediate * hidden)
+        .map(|i| 0.05_f32 * (i as f32 + 1.0))
+        .collect();
+    // Per-expert biases — distinct values + asymmetric direction
+    // sizes ensure offsets cannot be swapped silently.
+    let gate_bias: Vec<f32> = (0..n_experts * intermediate)
+        .map(|i| (i as f32) + 1.0)
+        .collect();
+    let up_bias: Vec<f32> = (0..n_experts * intermediate)
+        .map(|i| -(i as f32) - 0.5)
+        .collect();
+    let down_bias: Vec<f32> = (0..n_experts * hidden)
+        .map(|i| 0.25_f32 * (i as f32 + 1.0))
+        .collect();
+
+    let tokens_ptr = make_f32_tensor(&[2, hidden as i64], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, n_experts as i64], &logits);
+    let w_gate_ptr = make_f32_tensor(&[n_experts as i64, (hidden * intermediate) as i64], &w_gate);
+    let w_up_ptr = make_f32_tensor(&[n_experts as i64, (hidden * intermediate) as i64], &w_up);
+    let w_down_ptr = make_f32_tensor(&[n_experts as i64, (intermediate * hidden) as i64], &w_down);
+    let gate_bias_ptr = make_f32_tensor(&[n_experts as i64, intermediate as i64], &gate_bias);
+    let up_bias_ptr = make_f32_tensor(&[n_experts as i64, intermediate as i64], &up_bias);
+    let down_bias_ptr = make_f32_tensor(&[n_experts as i64, hidden as i64], &down_bias);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (2.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            gate_bias_ptr, up_bias_ptr, down_bias_ptr,
+        )
+    };
+    assert_ne!(out_ptr, 0);
+    let got = read_f32(out_ptr, 2 * hidden);
+
+    let exp0 = swiglu_expert_with_biases(
+        &tokens[0..hidden],
+        &w_gate[0..hidden * intermediate],
+        &w_up[0..hidden * intermediate],
+        &w_down[0..intermediate * hidden],
+        &gate_bias[0..intermediate],
+        &up_bias[0..intermediate],
+        &down_bias[0..hidden],
+        hidden, intermediate,
+    );
+    let exp1 = swiglu_expert_with_biases(
+        &tokens[hidden..2 * hidden],
+        &w_gate[hidden * intermediate..2 * hidden * intermediate],
+        &w_up[hidden * intermediate..2 * hidden * intermediate],
+        &w_down[intermediate * hidden..2 * intermediate * hidden],
+        &gate_bias[intermediate..2 * intermediate],
+        &up_bias[intermediate..2 * intermediate],
+        &down_bias[hidden..2 * hidden],
+        hidden, intermediate,
+    );
+
+    for h in 0..hidden {
+        assert!(
+            (got[h] - exp0[h]).abs() < 1e-4,
+            "token 0 expert 0 h={h}: got {} expected {}",
+            got[h], exp0[h],
+        );
+        assert!(
+            (got[hidden + h] - exp1[h]).abs() < 1e-4,
+            "token 1 expert 1 h={h}: got {} expected {}",
+            got[hidden + h], exp1[h],
+        );
+    }
+}
+
+/// Refuse cases for bias args: f16 bias dtype mismatch, wrong-length,
+/// device != 0. v2.11/v2.14 require all biases match tokens.dtype and
+/// be on CPU.
+///
+/// v2.14 fix F4 (IMPORTANT adversarial review): coverage now includes
+/// the middle direction (wrong-length up_bias) — the original test
+/// covered gate + down but skipped up. A regression that mis-indexed
+/// the up_bias check would otherwise pass silently.
+#[test]
+fn dispatch_v4_refuses_invalid_bias() {
+    let hidden = 2_usize;
+    let intermediate = 2_usize;
+    let n_experts = 1_usize;
+    let tokens: Vec<f32> = vec![1.0, 0.0];
+    let logits: Vec<f32> = vec![1.0];
+    let w: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5];
+    let gate_bias_ok: Vec<f32> = vec![0.0, 0.0];
+
+    let tokens_ptr = make_f32_tensor(&[1, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[1, 1], &logits);
+    let w_gate_ptr = make_f32_tensor(&[1, 4], &w);
+    let w_up_ptr = make_f32_tensor(&[1, 4], &w);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w);
+
+    // F16 bias → dtype mismatch → refuse.
+    let f16_shape_list = nsl_list_new();
+    nsl_list_push(f16_shape_list, 1);
+    nsl_list_push(f16_shape_list, 2);
+    let f16_bias_ptr = nsl_tensor_zeros_f16_on(f16_shape_list, 0);
+    nsl_list_free(f16_shape_list);
+
+    let r1 = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (4.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            f16_bias_ptr, NO_BIAS, NO_BIAS,
+        )
+    };
+    assert_eq!(r1, 0, "f16 gate_bias against f32 tokens must refuse");
+
+    // Wrong-length gate bias (expected = 1*2 = 2, got 3).
+    let bad_gate_bias: Vec<f32> = vec![0.0, 0.0, 0.0];
+    let bad_gate_bias_ptr = make_f32_tensor(&[3], &bad_gate_bias);
+
+    let r2 = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (4.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            bad_gate_bias_ptr, NO_BIAS, NO_BIAS,
+        )
+    };
+    assert_eq!(r2, 0, "wrong-length gate_bias must refuse");
+
+    // v2.14 fix F4 — wrong-length UP_bias (middle direction; the
+    // original test had asymmetric coverage on gate + down only).
+    // expected = 1 * 2 = 2, got 7.
+    let bad_up_bias: Vec<f32> = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let gate_bias_ptr_a = make_f32_tensor(&[1, 2], &gate_bias_ok);
+    let bad_up_bias_ptr = make_f32_tensor(&[7], &bad_up_bias);
+    let down_bias_ptr_ok = make_f32_tensor(&[1, 2], &gate_bias_ok);
+
+    let r_up = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (4.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            gate_bias_ptr_a, bad_up_bias_ptr, down_bias_ptr_ok,
+        )
+    };
+    assert_eq!(r_up, 0, "wrong-length up_bias must refuse");
+
+    // Wrong-length down bias (expected = 1*2 = 2, got 5).
+    let bad_down_bias: Vec<f32> = vec![0.0, 0.0, 0.0, 0.0, 0.0];
+    let gate_bias_ptr = make_f32_tensor(&[1, 2], &gate_bias_ok);
+    let up_bias_ptr = make_f32_tensor(&[1, 2], &gate_bias_ok);
+    let bad_down_bias_ptr = make_f32_tensor(&[5], &bad_down_bias);
+
+    let r3 = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            n_experts as i64, 1, (4.0_f32).to_bits() as i64,
+            hidden as i64, intermediate as i64, SWIGLU,
+            gate_bias_ptr, up_bias_ptr, bad_down_bias_ptr,
+        )
+    };
+    assert_eq!(r3, 0, "wrong-length down_bias must refuse");
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_gate_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(f16_bias_ptr);
+    nsl_tensor_free(bad_gate_bias_ptr);
+    nsl_tensor_free(gate_bias_ptr);
+    nsl_tensor_free(up_bias_ptr);
+    nsl_tensor_free(bad_down_bias_ptr);
+    nsl_tensor_free(gate_bias_ptr_a);
+    nsl_tensor_free(bad_up_bias_ptr);
+    nsl_tensor_free(down_bias_ptr_ok);
 }

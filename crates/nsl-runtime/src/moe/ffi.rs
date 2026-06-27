@@ -1007,10 +1007,31 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
 ///   - experts_gate.len != n_experts * hidden * intermediate
 ///   - experts_up.len   != n_experts * hidden * intermediate
 ///   - experts_down.len != n_experts * intermediate * hidden
+///   - v2.14: tokens.dtype ∉ {0=f64, 1=f32} (read_f32 OOB-reads other dtypes)
+///   - v2.14: any of tokens / experts_* / bias_* not on CPU (device != 0)
+///   - v2.14: any non-null bias_ptr with mismatched dtype/device or wrong len
 ///
-/// Deferrals (v2.next): bias on any matmul, capacity-overflow renorm,
-/// GPU expert_parallel_matmul, FP16/mixed-precision experts.
+/// v2.14 (CPDT Part III v2.14) — bias args. The FFI gains 3 nullable
+/// bias pointers at positions 12+13+14. Application ordering matches
+/// the v3 paper-faithful convention for the bias-before-activation
+/// invariant:
+///   - gate_bias added to gate matmul output BEFORE the SwiGLU/GeGLU/
+///     ReGLU activation (so `act(gate @ x + gate_bias) * (up @ x + up_bias)`)
+///   - up_bias added to up matmul output BEFORE the GLU multiply
+///   - down_bias added to down matmul output BEFORE gather/sum
+/// Expected bias shape (FFI checks total elem count only):
+///   - gate_bias: n_experts * intermediate_dim
+///   - up_bias:   n_experts * intermediate_dim
+///   - down_bias: n_experts * hidden_dim
+/// Any combination of {gate, up, down} biases is independently
+/// optional — null pointer means no bias for that direction (matches
+/// v2.11's v3 convention).
+///
+/// Deferrals (v2.next): capacity-overflow renorm, GPU
+/// expert_parallel_matmul, FP16/mixed-precision experts (relax F1
+/// upfront dtype refusal).
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_moe_dispatch_full_v4(
     tokens_ptr: i64,
     logits_ptr: i64,
@@ -1023,6 +1044,9 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
     hidden_dim: i64,
     intermediate_dim: i64,
     gate_activation_kind: i64,
+    experts_gate_bias_ptr: i64,
+    experts_up_bias_ptr: i64,
+    experts_down_bias_ptr: i64,
 ) -> i64 {
     use crate::tensor::NslTensor;
     use crate::memory::checked_alloc;
@@ -1064,6 +1088,20 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
     let experts_up = NslTensor::from_ptr(experts_up_ptr);
     let experts_down = NslTensor::from_ptr(experts_down_ptr);
 
+    // v2.14 (carry-over from v2.11 F1+F2): upfront dtype + device gates.
+    // `read_f32` only handles dtype {0, 1}; other dtypes would silently
+    // OOB-read. All tensors must live on CPU (device 0) — GPU pointers
+    // dereferenced as host pointers segfault.
+    if tokens.dtype != 0 && tokens.dtype != 1 {
+        return 0;
+    }
+    if tokens.device != 0 {
+        return 0;
+    }
+    if experts_gate.device != 0 || experts_up.device != 0 || experts_down.device != 0 {
+        return 0;
+    }
+
     if experts_gate.dtype != tokens.dtype
         || experts_up.dtype != tokens.dtype
         || experts_down.dtype != tokens.dtype
@@ -1090,6 +1128,50 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
         return 0;
     }
 
+    // v2.14 bias validation: each non-null bias must (a) be CPU, (b)
+    // match tokens.dtype, (c) have the expected total elem count for
+    // its direction. Validated BEFORE any allocation so a failure
+    // can't leave the caller with half-materialized state.
+    let expected_gate_bias = num_experts_us.saturating_mul(intermediate_dim_us);
+    let expected_up_bias = num_experts_us.saturating_mul(intermediate_dim_us);
+    let expected_down_bias = num_experts_us.saturating_mul(hidden_dim_us);
+    let gate_bias_opt = if experts_gate_bias_ptr == 0 {
+        None
+    } else {
+        let b = NslTensor::from_ptr(experts_gate_bias_ptr);
+        if b.dtype != tokens.dtype
+            || b.device != 0
+            || (b.len as usize) != expected_gate_bias
+        {
+            return 0;
+        }
+        Some(b)
+    };
+    let up_bias_opt = if experts_up_bias_ptr == 0 {
+        None
+    } else {
+        let b = NslTensor::from_ptr(experts_up_bias_ptr);
+        if b.dtype != tokens.dtype
+            || b.device != 0
+            || (b.len as usize) != expected_up_bias
+        {
+            return 0;
+        }
+        Some(b)
+    };
+    let down_bias_opt = if experts_down_bias_ptr == 0 {
+        None
+    } else {
+        let b = NslTensor::from_ptr(experts_down_bias_ptr);
+        if b.dtype != tokens.dtype
+            || b.device != 0
+            || (b.len as usize) != expected_down_bias
+        {
+            return 0;
+        }
+        Some(b)
+    };
+
     let total_tokens = if logits.ndim >= 2 {
         (unsafe { *logits.shape.offset(0) }) as usize
     } else {
@@ -1111,6 +1193,19 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
     let experts_gate_f32 = read_f32(&experts_gate);
     let experts_up_f32 = read_f32(&experts_up);
     let experts_down_f32 = read_f32(&experts_down);
+    // v2.14 bias materialization. Hoisted outside the kernel loops so
+    // the bias buffer is materialized once per FFI call, not per
+    // (expert, token) pair. Type annotation pins the closure-reborrow
+    // pattern (NslTensor::from_ptr returns &'static mut so
+    // .as_ref().map(read_f32) hits a &&mut NslTensor vs &NslTensor
+    // mismatch; explicit `|t| read_f32(&**t)` works around the
+    // double-mut-ref).
+    let gate_bias_f32_opt: Option<Vec<f32>> =
+        gate_bias_opt.as_ref().map(|t| read_f32(&**t));
+    let up_bias_f32_opt: Option<Vec<f32>> =
+        up_bias_opt.as_ref().map(|t| read_f32(&**t));
+    let down_bias_f32_opt: Option<Vec<f32>> =
+        down_bias_opt.as_ref().map(|t| read_f32(&**t));
 
     let routing = router::route_topk(
         &logits_f32, total_tokens, num_experts_us, top_k, capacity_factor,
@@ -1134,12 +1229,21 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
         let gate_off = e * hidden_dim_us * intermediate_dim_us;
         let up_off = e * hidden_dim_us * intermediate_dim_us;
         let down_off = e * intermediate_dim_us * hidden_dim_us;
+        // v2.14 per-expert bias offsets hoisted once per expert
+        // (matches the v2.11 v3 pattern at ffi.rs around line ~770).
+        let gate_bias_off = e * intermediate_dim_us;
+        let up_bias_off = e * intermediate_dim_us;
+        let down_bias_off = e * hidden_dim_us;
         for t in start..end {
             let tok_off = t * hidden_dim_us;
             let out_off = t * hidden_dim_us;
 
             // Combined gate+up matmul — token bytes loaded once per
             // k-iteration and applied to both gate and up weights.
+            // v2.14: biases applied inside this j-loop BEFORE the GLU
+            // activation step that follows. This matches the v2.11 v3
+            // bias-before-activation invariant (and the SwiGLU paper
+            // formulation for the rare biased variant).
             for j in 0..intermediate_dim_us {
                 let mut sum_g = 0.0_f32;
                 let mut sum_u = 0.0_f32;
@@ -1147,6 +1251,12 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
                     let tk = sorted_tokens[tok_off + k];
                     sum_g += tk * experts_gate_f32[gate_off + k * intermediate_dim_us + j];
                     sum_u += tk * experts_up_f32[up_off + k * intermediate_dim_us + j];
+                }
+                if let Some(b) = &gate_bias_f32_opt {
+                    sum_g += b[gate_bias_off + j];
+                }
+                if let Some(b) = &up_bias_f32_opt {
+                    sum_u += b[up_bias_off + j];
                 }
                 gate_scratch[j] = sum_g;
                 up_scratch[j] = sum_u;
@@ -1196,11 +1306,18 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
             }
 
             // x_down[h] = sum over j of x_act[j] * W_down[e][j, h]
+            // v2.14: down_bias added BEFORE the gather (which writes
+            // into sorted_outputs and is consumed by dispatch::gather).
+            // Bias-before-gather matches the v3 convention at v2.11's
+            // FFI — the gather is an output-projection step in MoE.
             for h in 0..hidden_dim_us {
                 let mut sum = 0.0_f32;
                 for j in 0..intermediate_dim_us {
                     sum += up_scratch[j]
                         * experts_down_f32[down_off + j * hidden_dim_us + h];
+                }
+                if let Some(b) = &down_bias_f32_opt {
+                    sum += b[down_bias_off + h];
                 }
                 sorted_outputs[out_off + h] = sum;
             }

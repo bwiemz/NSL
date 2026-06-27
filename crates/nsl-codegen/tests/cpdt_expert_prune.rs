@@ -1705,6 +1705,83 @@ fn pass_v3_bias_non_divisible_num_elements_refuses() {
     }
 }
 
+/// CPDT Part III v2.14 fix F5 (IMPORTANT adversarial review) — v4
+/// composition: post-v2.13-prune of a v4 (GateUpDown) bundle with all
+/// 3 biases must pass v2.14's `detect_v4_biases` gate at the new
+/// `n_live`. This pins the prune → detect composition that v2.14
+/// introduced (v2.13 already sliced v4 biases as defensive forward-
+/// compat; v2.14 is the cycle where detect_v4_biases consumes them).
+#[test]
+fn pass_v4_with_biases_post_prune_passes_v2_14_detect_v4_biases() {
+    use nsl_codegen::moe::detect_v4_biases;
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.gate.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 1)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // All 3 v4 biases. Up bias = [N, D] per v2.14's expected_up_elems
+    // = num_experts * intermediate_dim. Here hidden=intermediate=D=4.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.gate.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Pruned { n_live, layout, .. }] => {
+            assert_eq!(*n_live, 3);
+            assert_eq!(*layout, MoeExpertsLayout::GateUpDown);
+        }
+        other => panic!("expected v4 Pruned outcome, got {other:?}"),
+    }
+
+    // Post-prune: detect_v4_biases must validate the sliced biases at
+    // the new n_live=3. A regression in v2.13's GateUpDown bias_specs
+    // or in v2.14's detect_v4_biases would surface here.
+    let result = detect_v4_biases(&wm, key, 3, D, D);
+    assert!(
+        matches!(result, Ok(Some(()))),
+        "post-prune v4 bundle must pass detect_v4_biases at n_live=3; got {result:?}",
+    );
+}
+
 /// Post-prune v2.12 detect_v3_biases composition test: after the v2.13
 /// pass slices weights + biases, the sliced bundle must pass v2.12's
 /// detect_v3_biases gate at the new `n_live`. Composition matters

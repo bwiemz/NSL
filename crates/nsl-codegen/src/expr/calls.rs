@@ -1591,9 +1591,30 @@ impl Compiler<'_> {
         // explicitly want SwiGLU. Failure is loud, message lists the
         // expected WeightMap keys.
         if func_name == "moe_dispatch_swiglu" {
-            if args.len() != 5 {
+            // CPDT Part III v2.14 — `moe_dispatch_swiglu` accepts the
+            // 5-arg form (no bias) for the Mixtral-without-bias case
+            // (the SwiGLU paper convention) OR the 8-arg form (...,
+            // experts_gate_bias, experts_up_bias, experts_down_bias)
+            // for the rare biased variant (e.g., NSL-converted GPT-2
+            // ported to SwiGLU). The v2.14 FFI (14 i64 args) accepts
+            // both forms via the nullable bias pointers. Mirrors v3's
+            // 4/6 arity pattern from v2.12.
+            if args.len() != 5 && args.len() != 8 {
+                // v2.14 fix F7 (IMPORTANT adversarial review): cite a
+                // concrete biased-v4 family. v3's F7 names GPT-2/OPT
+                // for the bias case (well-known); v4 biased variants
+                // are rarer but T5-style models with SwiGLU + bias do
+                // exist (and any NSL-converted GeGLU/ReGLU MoE could
+                // ship biases). Naming the convention makes the
+                // 8-arg form recognizable.
                 return Err(crate::error::CodegenError::new(
-                    "moe_dispatch_swiglu() takes 5 arguments (tokens, router_logits, experts_gate, experts_up, experts_down)",
+                    "moe_dispatch_swiglu() takes 5 arguments (tokens, router_logits, experts_gate, \
+                     experts_up, experts_down) OR 8 arguments (..., experts_gate_bias, \
+                     experts_up_bias, experts_down_bias). The 8-arg form is required when the \
+                     loaded weight bundle has v4 FFN biases — all 3 (gate, up, down) are \
+                     required if any are present (v4 paper convention; mirrors v3's GPT-2 / OPT \
+                     pattern but with 3 directions instead of 2). The 5-arg form is the default \
+                     for the Mixtral / DeepSeek convention which omits FFN bias.",
                 ));
             }
             let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
@@ -1601,6 +1622,18 @@ impl Compiler<'_> {
             let experts_gate_val = self.compile_expr(builder, state, &args[2].value)?;
             let experts_up_val = self.compile_expr(builder, state, &args[3].value)?;
             let experts_down_val = self.compile_expr(builder, state, &args[4].value)?;
+            // v2.14: 8-arg form compiles 3 bias expressions; 5-arg
+            // leaves bias_vals = None and emits iconst(0)/iconst(0)/
+            // iconst(0) at the call site (preserves v2.5/v2.7 v4
+            // emission byte-identical for bias-free MoE).
+            let bias_vals: Option<(_, _, _)> = if args.len() == 8 {
+                let g = self.compile_expr(builder, state, &args[5].value)?;
+                let u = self.compile_expr(builder, state, &args[6].value)?;
+                let d = self.compile_expr(builder, state, &args[7].value)?;
+                Some((g, u, d))
+            } else {
+                None
+            };
 
             // Same multi-MoE candidate resolution as v3 — refuse on >=2
             // matches (multi-MoE disambiguation is v2.next).
@@ -1702,7 +1735,77 @@ impl Compiler<'_> {
                 None
             };
 
+            // CPDT Part III v2.14 fix F1 (IMPORTANT adversarial review):
+            // orphan-bias pre-pass for v4, symmetric to v2.12 F2 for v3.
+            // If bias entries are present but the weight dims fail to
+            // resolve (e.g., malformed bundle: biases present but
+            // missing or mis-shaped weight tensors), surface a bias-
+            // aware error BEFORE falling through to the generic v4-
+            // dims-not-resolvable diagnostic. Without this gate the
+            // user only sees "missing experts.gate/up/down.weight"
+            // with no hint that orphan v4 biases also exist in the
+            // bundle and would have activated with the right weight
+            // pack.
+            if v4_dims.is_none() {
+                if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    if crate::moe::any_v4_bias_entry_present(weight_map, key) {
+                        return Err(crate::error::CodegenError::new(format!(
+                            "moe_dispatch_swiglu: WeightMap under '{key}' contains v4 bias \
+                             entries (`experts.gate.bias` and/or `experts.up.bias` and/or \
+                             `experts.down.bias`) BUT the v4 weight dimensions could not \
+                             be resolved (missing or mis-shaped `experts.gate.weight` / \
+                             `experts.up.weight` / `experts.down.weight`). This is an \
+                             orphaned-bias bundle: the biases would never activate \
+                             because their parent projections are absent. Fix the bundle \
+                             by adding the missing weight tensors (and re-running any \
+                             auto-pack step), or remove the orphaned biases."
+                        )));
+                    }
+                }
+            }
+
             if let Some((hidden_dim, intermediate_dim)) = v4_dims {
+                // CPDT Part III v2.14 source-activation gate. Mirrors
+                // v3's v2.12 detection: when the WeightMap has v4
+                // biases, the source MUST use the 8-arg form so the
+                // bias pointers reach the FFI; the 5-arg form would
+                // silently drop them. Partial / mis-shaped biases
+                // also refuse here with actionable element counts.
+                let weight_map_has_biases = if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    match crate::moe::detect_v4_biases(
+                        weight_map,
+                        key,
+                        num_experts,
+                        hidden_dim,
+                        intermediate_dim,
+                    ) {
+                        Ok(opt) => opt.is_some(),
+                        Err(msg) => {
+                            return Err(crate::error::CodegenError::new(format!(
+                                "moe_dispatch_swiglu: {msg}"
+                            )));
+                        }
+                    }
+                } else {
+                    false
+                };
+                if weight_map_has_biases && bias_vals.is_none() {
+                    return Err(crate::error::CodegenError::new(format!(
+                        "moe_dispatch_swiglu: WeightMap under '{}' has v4 FFN biases \
+                         (`experts.gate.bias` + `experts.up.bias` + `experts.down.bias`), but \
+                         the call site uses the 5-arg form (no bias). To activate the loaded \
+                         biases, add the bias model fields and call the 8-arg form: \
+                         `moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up, \
+                         experts_down, experts_gate_bias, experts_up_bias, experts_down_bias)`. \
+                         Or, to drop the loaded biases, remove them from the weight bundle.",
+                        lookup_key.as_deref().unwrap_or("?")
+                    )));
+                }
+
                 let hidden_val = builder.ins().iconst(
                     cranelift_codegen::ir::types::I64,
                     hidden_dim as i64,
@@ -1711,6 +1814,25 @@ impl Compiler<'_> {
                     cranelift_codegen::ir::types::I64,
                     intermediate_dim as i64,
                 );
+                // v2.14: bias args. The 5-arg form emits 3 separate
+                // iconst(0) values (matches v2.12 F1 Cranelift IR
+                // hygiene — no Value reuse across arg slots). The
+                // 8-arg form threads the compiled bias expressions.
+                let (bias_gate_arg, bias_up_arg, bias_down_arg) = match bias_vals {
+                    Some((g, u, d)) => (g, u, d),
+                    None => {
+                        let zg = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        let zu = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        let zd = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        (zg, zu, zd)
+                    }
+                };
                 let result = self.compile_call_by_name(
                     builder,
                     "nsl_moe_dispatch_full_v4",
@@ -1726,6 +1848,9 @@ impl Compiler<'_> {
                         hidden_val,
                         intermediate_val,
                         gate_activation_val,
+                        bias_gate_arg,
+                        bias_up_arg,
+                        bias_down_arg,
                     ],
                 )?;
                 return Ok(result);
@@ -1746,7 +1871,9 @@ impl Compiler<'_> {
                  Mixtral safetensors use per-expert experts.{{e}}.w1/w2/w3 — v2.6's \
                  packing primitive (auto-run at WeightMap::load since v2.7) rewrites \
                  them in place under the HF prefix; declare `@moe(weight_prefix=\"...\")` \
-                 in source to point this lookup at that prefix.",
+                 in source to point this lookup at that prefix. For biased v4 \
+                 checkpoints, also include <prefix>.experts.{{gate,up,down}}.bias and \
+                 call the 8-arg form of moe_dispatch_swiglu (v2.14).",
                 lookup_key
                     .as_deref()
                     .map(|k| format!(" '{}'", k))

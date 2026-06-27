@@ -1488,7 +1488,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // `[total_tokens, hidden_dim]`. See nsl-runtime/src/moe/ffi.rs.
     (
         "nsl_moe_dispatch_full_v4",
+        // v2.14: 14 i64 args. Positions 12+13+14 are
+        // experts_{gate,up,down}_bias_ptr (nullable, 0 = no bias).
+        // Codegen always emits iconst(0) for these in the 5-arg
+        // source form; the 8-arg form threads source-supplied bias
+        // expressions through (mirrors v3's 4/6 pattern in v2.12).
         &[
+            types::I64,
+            types::I64,
+            types::I64,
             types::I64,
             types::I64,
             types::I64,
