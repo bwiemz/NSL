@@ -164,6 +164,20 @@ enum Cli {
         /// CEP: write the delta JSON here (default: <model>.cep.json).
         #[arg(long)]
         cep_out: Option<PathBuf>,
+
+        /// WRGA paper §8.3: emit the WRGA compilation report without running
+        /// codegen output. Pass without value (or `-`) for stdout; provide a
+        /// path to write to a file. Sister of `nsl build --wrga-report` but
+        /// avoids producing a `.o`. Requires `@wrga` decorators in the source.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
+        wrga_analyze: Option<PathBuf>,
+
+        /// WRGA paper §8.3: target GPU for the WRGA roofline analysis (e.g.
+        /// "H100-SXM", "A100-PCIe", "RTX-4090"). Overrides any `target=` set
+        /// on `@wrga(...)` decorators. Looked up in the codegen GPU spec
+        /// database; empty / unknown falls back to the database default.
+        #[arg(long)]
+        wrga_target: Option<String>,
     },
 
     /// Compile and execute an NSL program
@@ -881,10 +895,23 @@ fn main_inner() {
             cep_profile,
             cep_target,
             cep_out,
+            wrga_analyze,
+            wrga_target,
         } => {
             if cep_search && cep_profile {
                 eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
                 std::process::exit(1);
+            }
+            // WRGA paper §8.3: `--wrga-analyze` short-circuits the check path
+            // to emit just the WRGA compilation report (no .o, no shape trace,
+            // no NaN analysis side effects). Mutually exclusive with CEP modes
+            // since CEP early-exits above.
+            if let Some(ref report_path) = wrga_analyze {
+                std::process::exit(run_check_wrga_analyze(
+                    &file,
+                    report_path,
+                    wrga_target.as_deref(),
+                ));
             }
             if cep_search {
                 let ov = nsl_codegen::cep::CliOverrides {
@@ -2630,7 +2657,7 @@ fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::Wrg
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
         WrgaInputs,
     };
-    WrgaInputs {
+    let mut inputs = WrgaInputs {
         wrga: m
             .wrga_configs
             .iter()
@@ -2663,7 +2690,9 @@ fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::Wrg
                 alpha: c.alpha,
             })
             .collect(),
-    }
+    };
+    apply_wrga_target_override(&mut inputs);
+    inputs
 }
 
 /// CFTP §4.4 G3 (Sprint 2): bridge `@fused_lm_ce(...)` configs from
@@ -2720,7 +2749,7 @@ fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::Wrg
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
         WrgaInputs,
     };
-    WrgaInputs {
+    let mut inputs = WrgaInputs {
         wrga: a
             .wrga_configs
             .iter()
@@ -2753,7 +2782,9 @@ fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::Wrg
                 alpha: c.alpha,
             })
             .collect(),
-    }
+    };
+    apply_wrga_target_override(&mut inputs);
+    inputs
 }
 
 fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool, linear_types: bool) {
@@ -3385,6 +3416,152 @@ fn check_wrga_report_preconditions(
         );
         process::exit(2);
     }
+}
+
+/// WRGA paper §8.3: `nsl check --wrga-analyze` — run the WRGA pass on the
+/// source and emit `WrgaPlan::render_report()` without leaving a `.o` behind.
+///
+/// Reuses the existing `run_build_inner` to do all the heavy lifting (multi-
+/// file resolution, source-AD lowering, codegen, WRGA bridge) because that
+/// path is the only one that produces a `WrgaPlan` today, and reimplementing
+/// it would duplicate ~200 lines of multi-file orchestration. The build is
+/// redirected at a per-process temp directory; the directory is deleted after
+/// the report has been written, so `nsl check` remains side-effect-free from
+/// the user's perspective.
+///
+/// `wrga_target` (optional) overrides the `target=` field on every
+/// `@wrga(...)` decorator before codegen — so `--wrga-target h100` from the
+/// CLI wins over any source-level `@wrga(target="a100")`. The override is
+/// installed by mutating the entry module's `wrga_configs` in
+/// `frontend_with_flags`'s output via a CLI-side passthrough; we do this by
+/// post-processing `WrgaInputs` inside `run_build_inner` — see
+/// `apply_wrga_target_override` below.
+///
+/// Returns the process exit code: `0` on success, `2` on "no WRGA decorators
+/// in source" (so CI can distinguish absence from compile failure), `1` on
+/// any other error.
+fn run_check_wrga_analyze(
+    file: &PathBuf,
+    report_path: &std::path::Path,
+    wrga_target: Option<&str>,
+) -> i32 {
+    // Pre-check: surface "no decorators" as exit 2 BEFORE running codegen.
+    // The build path would silently report "no plan" with exit 0, which the
+    // paper's `--wrga-analyze` contract treats as a distinct error class.
+    let (_interner, _parse_result, analysis) = frontend_with_flags(file, false);
+    let has_wrga_decorators = !analysis.wrga_configs.is_empty()
+        || !analysis.freeze_configs.is_empty()
+        || !analysis.adapter_configs.is_empty();
+    if !has_wrga_decorators {
+        eprintln!(
+            "nsl: --wrga-analyze: no @wrga / @freeze / @adapter decorators found in '{}'",
+            file.display()
+        );
+        return 2;
+    }
+
+    // Redirect the build at a temp dir we own. Pre-create it so the linker has
+    // a real path to drop the .o into, and so cleanup at the end is bounded.
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("nsl_check");
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nsl_check_wrga_analyze_{}_{}",
+        std::process::id(),
+        stem
+    ));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        eprintln!("nsl: --wrga-analyze: could not create temp dir: {e}");
+        return 1;
+    }
+    let temp_obj = temp_dir.join(format!("{stem}.o"));
+
+    // The WRGA target override travels via a thread-local that the build path
+    // checks just before constructing `WrgaInputs`. This avoids threading a
+    // new param through `run_build_inner`'s six callers. The RAII guard
+    // guarantees the cell is cleared even if `run_build_inner` panics, so the
+    // override cannot leak into any in-process follow-on CLI invocation.
+    let _override_guard = wrga_target.map(|t| WrgaTargetOverrideGuard::set(t.to_string()));
+
+    let opts = nsl_codegen::CompileOptions {
+        source_ad: true,
+        ..nsl_codegen::CompileOptions::default()
+    };
+
+    // We pass our temp_obj as `output`. emit_obj=true so the linker is
+    // skipped. The single-file build path ignores `output` and drops the .o
+    // next to the source file (see `run_build_single` line ~4479); the
+    // multi-file build path uses its own internal temp dir. To make `nsl
+    // check` side-effect-free across BOTH dispatches, we explicitly clean
+    // the source-adjacent .o path too, after the build returns.
+    let source_adjacent_obj = file.with_file_name(format!("{stem}.o"));
+    let source_adjacent_pre_existed = source_adjacent_obj.exists();
+
+    run_build_inner(
+        file,
+        Some(temp_obj.clone()),
+        true,   // emit_obj
+        false,  // dump_ir
+        true,   // quiet
+        &opts,
+        Some(report_path),
+    );
+
+    // Cleanup: our owned temp dir, plus any source-adjacent .o that the build
+    // path dropped. Never delete a source-adjacent .o that ALREADY existed
+    // before the call — that would be a user-data loss bug.
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if !source_adjacent_pre_existed && source_adjacent_obj.exists() {
+        let _ = std::fs::remove_file(&source_adjacent_obj);
+    }
+    0
+}
+
+/// RAII guard that clears `WRGA_TARGET_OVERRIDE` on drop. Holding this guard
+/// keeps the thread-local set for the lifetime of the build; dropping it
+/// (including on panic) restores `None`.
+struct WrgaTargetOverrideGuard;
+
+impl WrgaTargetOverrideGuard {
+    fn set(value: String) -> Self {
+        WRGA_TARGET_OVERRIDE.with(|c| *c.borrow_mut() = Some(value));
+        Self
+    }
+}
+
+impl Drop for WrgaTargetOverrideGuard {
+    fn drop(&mut self) {
+        WRGA_TARGET_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+thread_local! {
+    /// CLI-side override for `WrgaInputs::wrga[*].target`. Set by
+    /// `run_check_wrga_analyze` before invoking the build pipeline; read by
+    /// `analysis_to_wrga_inputs` / `module_data_to_wrga_inputs` to patch each
+    /// decorator's target field before the bridge ships to codegen.
+    static WRGA_TARGET_OVERRIDE: std::cell::RefCell<Option<String>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+/// Apply the thread-local `WRGA_TARGET_OVERRIDE` (set by
+/// `run_check_wrga_analyze`) to a freshly-built `WrgaInputs`. No-op when no
+/// override is active. When the source has no `@wrga(...)` decorator at all
+/// (only `@freeze` / `@adapter`), a minimal Auto-mode config is inserted so
+/// the bridge surfaces the user's target choice.
+fn apply_wrga_target_override(inputs: &mut nsl_codegen::WrgaInputs) {
+    WRGA_TARGET_OVERRIDE.with(|c| {
+        let Some(target) = c.borrow().clone() else { return };
+        for cfg in &mut inputs.wrga {
+            cfg.target = Some(target.clone());
+        }
+        if inputs.wrga.is_empty() {
+            inputs.wrga.push(nsl_codegen::WrgaDecoratorConfig {
+                mode: nsl_ast::block::WrgaMode::Auto,
+                budget: None,
+                target: Some(target),
+                layers: Vec::new(),
+            });
+        }
+    });
 }
 
 /// Task 3 (B.1): emit the WRGA report to stdout or a file. Mirrors the logic in
