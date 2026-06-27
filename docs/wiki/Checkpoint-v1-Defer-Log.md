@@ -782,3 +782,76 @@ Cell text: "Both still RED. Cycle scope shrinks to: ship whatever closed cleanly
 
 **Build blocker for Cycle 17:** C drive must be freed before next GPU re-run. Pre-existing nsl-codegen compile errors (CheckpointPolicy import path + AnalysisResult field mismatch) prevent fresh E-drive build and must be resolved or the incremental C-drive cache preserved. Recommend: (1) free C drive space, (2) verify `cargo build --release --features cuda --tests` succeeds cleanly on C drive, (3) re-run t_recompute_hd64_s512_bq32 as first Cycle 17 action.
 
+---
+
+### Cycle-16 Task 4 SUPPLEMENTARY VERIFICATION (post-implementer, fresh E-drive build)
+
+**Critical correction to Task-2 (G16-1) empirical disposition.** Task 4 implementer
+assumed PTX Defects 1+2 were NOT in the tested binary because Path A was byte-identical
+to cycle 15. The orchestrator re-ran with a fresh E-drive build (TEMP also redirected
+to E:\\tmp to bypass linker disk-full) at branch tip post-Tasks 1+2+3:
+
+1. `cargo build --release --features cuda --tests` from cycle-16 worktree with E:
+   TEMP + target succeeds in 1m 33s, exit 0. The claimed "pre-existing nsl-codegen
+   compile errors" do NOT exist on cycle-16 source -- they were a stale E-drive
+   incremental-cache artifact from a partial earlier build.
+
+2. `cargo test --features cuda --test csha_checkpoint_recompute_gpu -- --ignored
+   t_recompute_hd64_s512_bq32 --nocapture` produces a kernel that DOES contain all
+   cycle-16 PTX fixes. Direct PTX dump verification at
+   `E:\\tmp\\cycle14_path_A_hd64_S512.ptx` (2352198 bytes):
+   - `add.u64 %rd35, %rd33, %k_start` -- PRESENT (defect-2 K-tile RoPE fix landed)
+   - `Phase 4 dK store` / `emit_store_dk_only` marker -- PRESENT (Phase-4 dK store added)
+   - Old buggy `mov.u64 %rd35, %rd33;` line (K-tile branch) -- ABSENT (replaced)
+
+3. Path A magnitudes on this fresh binary: BYTE-IDENTICAL to cycle 15 baseline
+   (dq 4.420e0, dk 4.356e0, dv 8.571e0 / max_rel 3.979e3, dwq 3.403e1, dwk 3.664e1,
+   dwv 1.733e1, dx 4.691e1).
+
+**Empirical conclusion:** G16-1 Option A IS in the kernel PTX but is INSUFFICIENT
+to GREEN Path A baseline. The cycle-15 static analysis identifying 3 defects was
+directionally correct (Option A landed cleanly per structural witnesses 3/3 GREEN)
+but does NOT close the actual numerical bug. The true root cause of Bug 1 is
+upstream of or orthogonal to the 3 defects fixed in Option A.
+
+**Cycle 17 implications:**
+
+- DO NOT revert Task 2 commit `d232b615`. The K-tile k_start RoPE fix is provably
+  correct (Q-tile symmetric pattern was always intended); the Phase-4 dK cooperative
+  store mirrors the dQ pattern which is architecturally sound. Both changes are
+  sound directions; they just don't fully close the bug.
+- Re-investigate Bug 1 root cause. Working hypotheses for cycle 17:
+  1. dK SMEM may be re-zeroed elsewhere (not just inside emit_store_kv_only loop),
+     so removing the per-KV-tile dK store didn't actually accumulate dK across KV
+     tiles.
+  2. The Phase-4 dK store reads from SMEM that was correctly accumulated, but the
+     SMEM accumulation itself never happened (dqdk_accum may not be RMW for dK).
+  3. Cycle-15 static analysis missed a 4th defect that is the actual numerical-
+     divergence root cause.
+  4. Bug 1 is in dq/dv/dx path (not just dK/dwk) and the dK/dwk magnitudes match
+     because they share an upstream divergence. dq max_rel 1.000e0 (i.e. dq is
+     essentially zero where it shouldn't be) and dv max_rel 3.979e3 strongly
+     suggest an upstream-of-dK divergence.
+
+**Task-2 corrected disposition:** STRUCTURAL FIX LANDED. EMPIRICAL VERIFICATION
+SHOWS OPTION A IS INSUFFICIENT. Bug 1 root cause requires Cycle 17 re-investigation.
+
+**Cycle-16 net disposition:**
+
+| Work item | Cycle 16 outcome | Cycle 17 carryover |
+|---|---|---|
+| G16-1 | Option A LANDED (correct direction, insufficient empirically) | Re-investigate Bug 1 root cause |
+| G16-2 | RESOLVED (SMEM grant fix; Path B compiles + runs; verified) | None (closed) |
+| G16-3 | DEFERRED with refined hypothesis (Phase-4 SMEM overshoot into rms_strip at d_model=0) | Triage with cuda-memcheck |
+| G16-4 | RESOLVED (A1 no longer panics; empirically confirmed) | None (closed) |
+
+**Cycle-5 invariant disposition (final):** Section 5.3 numerical evidence NOT
+CLAIMABLE. Paper section 6.3 49% headline: STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED
+on Blackwell. R0 retirement HOLDS unconditionally.
+
+**Build blocker addendum:** Both blockers (disk-full and "pre-existing compile
+errors") were addressable in-session by (1) freeing C: drive (cycle-16 worktree
+target dir cleanup ~14 GB), and (2) redirecting both `TEMP` and `CARGO_TARGET_DIR`
+to E:. No actual lib compile errors exist on cycle-16 source. Cycle 17 can
+proceed with the same workaround.
+
