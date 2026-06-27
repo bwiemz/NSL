@@ -56,6 +56,7 @@ fn applied_plan_blocks(n_layers: usize) -> AppliedPlan {
             ffn_width: 4096,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 8,
             optim_v_bits: 8,
             fase_fused: false,

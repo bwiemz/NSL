@@ -51,6 +51,7 @@ fn applied_plan_with_shard(n_layers: usize, shard: u32) -> AppliedPlan {
             ffn_width: 4096,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 8,
             optim_v_bits: 8,
             fase_fused: false,

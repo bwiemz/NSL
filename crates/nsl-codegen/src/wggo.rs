@@ -153,13 +153,14 @@ impl WggoPlan {
         for layer in &self.applied.layers {
             writeln!(
                 s,
-                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}, PCA={}",
+                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={} [{}], m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
                 layer.active_heads, // number of actually-kept heads (no "of total" info here)
                 layer.ffn_width,
                 layer.csha_level,
                 layer.adapter_rank,
+                layer.adapter_placement.as_str(),
                 layer.optim_m_bits,
                 layer.optim_v_bits,
                 if layer.fase_fused { "fused" } else { "deferred" },

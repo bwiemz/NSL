@@ -583,6 +583,7 @@ mod tests {
                 active_heads: 8,
                 requested_csha_level: None,
                 adapter_rank: 32, // would clamp to r_max if weights were present
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: 0,
@@ -662,6 +663,7 @@ mod tests {
                 active_heads: 8,
                 requested_csha_level: None,
                 adapter_rank: 32, // > r_max=16 → RankClampedToBounds
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: 0,

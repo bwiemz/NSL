@@ -102,6 +102,10 @@ pub struct PerLayerOverride {
     // Future-consumer fields (populated now so the struct shape is stable;
     // their wiring plans land later without signature churn):
     pub adapter_rank: u64,   // WRGA
+    /// WRGA: which projections the adapter attaches to (companion to
+    /// `adapter_rank`).  Carried for the WRGA-codegen wiring; consumed
+    /// together with `adapter_rank` once WRGA reads per-layer overrides.
+    pub adapter_placement: crate::wggo_ilp::AdapterPlacement,
     pub fase_fused: bool,    // FASE
     pub packing_mode: u8,    // PCA / fusion
     /// CPDT: per-layer ZeRO shard factor recommendation. Aggregated to a
@@ -123,6 +127,7 @@ impl WggoOverrides {
                     active_heads: l.active_heads,
                     requested_csha_level: map_csha_level(l.csha_level),
                     adapter_rank: l.adapter_rank,
+                    adapter_placement: l.adapter_placement,
                     fase_fused: l.fase_fused,
                     packing_mode: l.packing_mode,
                     shard_factor: l.shard_factor,
@@ -245,6 +250,7 @@ mod tests {
                 ffn_width: 2048,
                 csha_level: 2,
                 adapter_rank: 16,
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 optim_m_bits: 8,
                 optim_v_bits: 16,
                 fase_fused: true,
@@ -347,6 +353,7 @@ mod tests {
             ffn_width: 2048,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 8,
             optim_v_bits: 16,
             fase_fused: true,
@@ -457,6 +464,7 @@ mod tests {
                     active_heads: 8,
                     requested_csha_level: None,
                     adapter_rank: *rank as u64,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                     fase_fused: false,
                     packing_mode: 0,
                     shard_factor: 0,
@@ -501,6 +509,7 @@ mod tests {
                 active_heads: 8,
                 requested_csha_level: None,
                 adapter_rank: 0,
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: s,

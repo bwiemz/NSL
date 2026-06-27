@@ -54,6 +54,7 @@ fn plan_with_layers(layer_names: &[&str]) -> AppliedPlan {
             ffn_width: 0,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 32,
             optim_v_bits: 32,
             fase_fused: false,

@@ -96,6 +96,7 @@ mod tests {
             ffn_width: 4096,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 32,
             optim_v_bits: 32,
             fase_fused: false,
