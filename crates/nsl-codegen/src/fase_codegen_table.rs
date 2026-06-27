@@ -90,6 +90,8 @@ mod tests {
             coarse: CoarseDecision::KeepFull,
             pipeline_stage: 0,
             shard_factor: 1,
+            shard_grads: 1,
+            shard_optim: 1,
             active_heads: 8,
             ffn_width: 4096,
             csha_level: 0,

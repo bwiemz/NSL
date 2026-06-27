@@ -759,6 +759,8 @@ mod tests {
             coarse: LayerDecision::Prune,
             pipeline_stage: 0,
             shard_factor: 1,
+            shard_grads: 1,
+            shard_optim: 1,
             active_heads: 0,
             ffn_width: 0,
             csha_level: 0,
