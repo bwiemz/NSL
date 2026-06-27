@@ -17,32 +17,76 @@ use nsl_codegen::CompileOptions;
 use nsl_errors::FileId;
 use nsl_lexer::{tokenize, Interner};
 
-fn parse(src: &str) -> (nsl_ast::Module, Interner) {
-    let mut interner = Interner::new();
-    let (tokens, _diags) = tokenize(src, FileId(0), &mut interner);
-    let parsed = nsl_parser::parse(&tokens, &mut interner);
-    (parsed.module, interner)
+// ─── Fixture helpers ────────────────────────────────────────────────────────
+
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
-const COMPOSED_SRC: &str = concat!(
-    "dataset PretrainCorpus(\"/data/pile\"):\n",
-    "    source = \"/data/pile.bin\"\n",
-    "    packing = true\n",
-    "    max_sequence_length = 2048\n",
-    "    mean_doc_length = 400\n",
+fn read_fixture(name: &str) -> String {
+    std::fs::read_to_string(fixture_path(name))
+        .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
+}
+
+/// Canonical §5 composition source — single source of truth for the
+/// positive-path tests (report-level pin, codegen pin, subprocess CLI).
+/// Lives at `tests/fixtures/training_report_fase_pca_composition.nsl`.
+const COMPOSED_FIXTURE: &str = "training_report_fase_pca_composition.nsl";
+
+/// Minimal model declaration so inline sources semantic-check. Train block
+/// configs reference `model = m`; semantic analysis demands `m` be in scope.
+/// (The canonical fixture has its own model decl.)
+const MODEL_PREAMBLE: &str = concat!(
+    "model Linear:\n",
+    "    w: Tensor = ones([2, 1])\n",
+    "    fn forward(self, x: Tensor) -> Tensor:\n",
+    "        return x @ self.w\n",
     "\n",
-    "train(model = m, grad_accumulation = 4):\n",
-    "    data:\n",
-    "        source = PretrainCorpus\n",
-    "    optimizer: AdamW\n",
+    "let m = Linear()\n",
+    "\n",
 );
 
+// ─── Parse + semantic ───────────────────────────────────────────────────────
+
+/// Parse then run the semantic checker; returns (ast, interner, diagnostics).
+/// This anchors the v8 semantic-checker fix in every bare-AST test — if the
+/// `data:` section bypass or dataset-field whitelist regresses, the relevant
+/// test's `assert_no_semantic_errors` panic will surface it.
+fn parse_and_check(src: &str) -> (nsl_ast::Module, Interner, Vec<nsl_errors::Diagnostic>) {
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    (parsed.module, interner, analysis.diagnostics)
+}
+
+fn assert_no_semantic_errors(diags: &[nsl_errors::Diagnostic]) {
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "expected zero semantic errors; got {}: {:?}",
+        errors.len(),
+        errors
+    );
+}
+
+// ─── Positive composition (§5 paper-canonical) ──────────────────────────────
+
 /// §5 paper-canonical composition: dataset packing + grad_accumulation
-/// co-activate on the same train block.
+/// co-activate on the same train block. Pins via the canonical fixture +
+/// semantic-checker pass, so the test exercises every layer the
+/// composition has to flow through.
 #[test]
 fn fase_deferred_and_pca_co_activate_on_same_train_block() {
-    let (ast, interner) = parse(COMPOSED_SRC);
-    let report = build_report(&ast, &interner, Path::new("composition.nsl"));
+    let src = read_fixture(COMPOSED_FIXTURE);
+    let (ast, interner, diags) = parse_and_check(&src);
+    assert_no_semantic_errors(&diags);
+    let report = build_report(&ast, &interner, &fixture_path(COMPOSED_FIXTURE));
 
     assert_eq!(
         report.train_blocks.len(),
@@ -79,33 +123,42 @@ fn fase_deferred_and_pca_co_activate_on_same_train_block() {
     );
 }
 
+// ─── Negative compositions ─────────────────────────────────────────────────
+
 /// Negative: packing=true but grad_accumulation=1 -> only PCA active.
 /// Confirms PCA fires INDEPENDENTLY of FASE's accumulation trigger.
+/// Pins the planner's exact contract: `accumulation==1` short-circuits to
+/// `FaseMode::Passthrough` BEFORE the optimizer is inspected (fase.rs:189-200).
 #[test]
 fn pca_active_without_fase_when_grad_accumulation_one() {
-    let src = concat!(
-        "dataset PretrainCorpus(\"/data/pile\"):\n",
-        "    source = \"/data/pile.bin\"\n",
-        "    packing = true\n",
-        "    max_sequence_length = 2048\n",
-        "    mean_doc_length = 400\n",
-        "\n",
-        "train(model = m, grad_accumulation = 1):\n",
-        "    data:\n",
-        "        source = PretrainCorpus\n",
-        "    optimizer: AdamW\n",
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "    packing = true\n",
+            "    max_sequence_length = 2048\n",
+            "    mean_doc_length = 400\n",
+            "\n",
+            "train(model = m, grad_accumulation = 1):\n",
+            "    data:\n",
+            "        source = PretrainCorpus\n",
+            "    optimizer: AdamW\n",
+        )
     );
-    let (ast, interner) = parse(src);
+    let (ast, interner, diags) = parse_and_check(&src);
+    assert_no_semantic_errors(&diags);
     let report = build_report(&ast, &interner, Path::new("pca_only.nsl"));
     let block = &report.train_blocks[0];
 
-    // FASE Deferred requires accumulation > 1.
-    assert_ne!(
+    // accumulation==1 -> Passthrough (planner's documented short-circuit).
+    assert_eq!(
         block.fase.plan.mode,
-        FaseMode::Deferred,
-        "Deferred mode requires accumulation > 1; got {:?}",
+        FaseMode::Passthrough,
+        "accumulation=1 must map to Passthrough; got {:?}",
         block.fase.plan.mode
     );
+    assert_eq!(block.fase.plan.accumulation, 1);
     // PCA still active.
     assert!(
         block.pca.is_some(),
@@ -118,16 +171,21 @@ fn pca_active_without_fase_when_grad_accumulation_one() {
 /// Confirms FASE fires INDEPENDENTLY of PCA's packing trigger.
 #[test]
 fn fase_active_without_pca_when_dataset_has_no_packing() {
-    let src = concat!(
-        "dataset PretrainCorpus(\"/data/pile\"):\n",
-        "    max_sequence_length = 2048\n",
-        "\n",
-        "train(model = m, grad_accumulation = 4):\n",
-        "    data:\n",
-        "        source = PretrainCorpus\n",
-        "    optimizer: AdamW\n",
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "    max_sequence_length = 2048\n",
+            "\n",
+            "train(model = m, grad_accumulation = 4):\n",
+            "    data:\n",
+            "        source = PretrainCorpus\n",
+            "    optimizer: AdamW\n",
+        )
     );
-    let (ast, interner) = parse(src);
+    let (ast, interner, diags) = parse_and_check(&src);
+    assert_no_semantic_errors(&diags);
     let report = build_report(&ast, &interner, Path::new("fase_only.nsl"));
     let block = &report.train_blocks[0];
 
@@ -146,19 +204,23 @@ fn fase_active_without_pca_when_dataset_has_no_packing() {
 /// either Deferred mode or PCA detection.
 #[test]
 fn fase_grad_clip_composes_with_pca_packing() {
-    let src = concat!(
-        "dataset PretrainCorpus(\"/data/pile\"):\n",
-        "    source = \"/data/pile.bin\"\n",
-        "    packing = true\n",
-        "    max_sequence_length = 2048\n",
-        "    mean_doc_length = 400\n",
-        "\n",
-        "train(model = m, grad_accumulation = 4, grad_clip = 1.0):\n",
-        "    data:\n",
-        "        source = PretrainCorpus\n",
-        "    optimizer: AdamW\n",
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "    packing = true\n",
+            "    max_sequence_length = 2048\n",
+            "    mean_doc_length = 400\n",
+            "\n",
+            "train(model = m, grad_accumulation = 4, grad_clip = 1.0):\n",
+            "    data:\n",
+            "        source = PretrainCorpus\n",
+            "    optimizer: AdamW\n",
+        )
     );
-    let (ast, interner) = parse(src);
+    let (ast, interner, diags) = parse_and_check(&src);
+    assert_no_semantic_errors(&diags);
     let report = build_report(&ast, &interner, Path::new("composition_clip.nsl"));
     let block = &report.train_blocks[0];
 
@@ -170,48 +232,114 @@ fn fase_grad_clip_composes_with_pca_packing() {
     );
 }
 
-/// Composition regression: real Cranelift codegen run on the composed
-/// source must not crash. Mirrors the smoke-style assertion of
-/// `fase_deferred_smoke::fase_deferred_compiles_adamw_grad_accum_4`,
-/// but with the PCA trigger also active.
+// ─── End-to-end codegen (production path) ──────────────────────────────────
+
+/// Composition regression: real Cranelift codegen runs on the §5 canonical
+/// fixture AND the resulting compile preserves both activations. Uses the
+/// SAME fixture as the report-level test so a single canonical source
+/// drives all paths.
+///
+/// Pins both:
+///   - The compile completes without error (H1 production-path closure —
+///     the `data: source = <ident>` config pair is skipped at codegen),
+///   - The same parsed AST surfaces FASE Deferred + PCA Some via the
+///     report builder (catches a regression that compiles cleanly but
+///     silently strips dataset metadata before lowering).
 #[test]
-fn composed_source_compiles_without_error() {
-    // Standalone code path needs `from nsl.nn.losses import mse_loss` plus
-    // a model + step body so the parser produces a complete program for the
-    // compiler. (The report-level tests above use the bare-AST shortcut.)
-    let src = concat!(
-        "from nsl.nn.losses import mse_loss\n",
-        "\n",
-        "dataset PretrainCorpus(\"/data/pile\"):\n",
-        "    source = \"/data/pile.bin\"\n",
-        "    packing = true\n",
-        "    max_sequence_length = 2048\n",
-        "    mean_doc_length = 400\n",
-        "\n",
-        "model Tiny:\n",
-        "    w: Tensor = ones([4, 4])\n",
-        "\n",
-        "    fn forward(self, x: Tensor) -> Tensor:\n",
-        "        return x @ self.w\n",
-        "\n",
-        "let m = Tiny()\n",
-        "let x = ones([2, 4])\n",
-        "let y = zeros([2, 4])\n",
-        "\n",
-        "train(model = m, epochs = 1, grad_accumulation = 4):\n",
-        "    data:\n",
-        "        source = PretrainCorpus\n",
-        "    optimizer: AdamW(lr = 0.001, weight_decay = 0.01)\n",
-        "    step(batch):\n",
-        "        let pred = m.forward(x)\n",
-        "        let loss = mse_loss(pred, y)\n",
-    );
+fn composed_source_compiles_and_preserves_both_activations() {
+    let src = read_fixture(COMPOSED_FIXTURE);
+
+    // 1) End-to-end Cranelift compile (mirrors fase_deferred_smoke).
     let opts = CompileOptions {
         source_ad: true,
         ..Default::default()
     };
-    nsl_codegen::debug_compile_and_return_plan(src, &opts).expect(
+    nsl_codegen::debug_compile_and_return_plan(&src, &opts).expect(
         "FASE Deferred + PCA-packing composition must compile without error",
+    );
+
+    // 2) Same source -> semantic-check + report-builder pin so a
+    //    regression that compiles cleanly but strips dataset metadata
+    //    before lowering still fails this test.
+    let (ast, interner, diags) = parse_and_check(&src);
+    assert_no_semantic_errors(&diags);
+    let report = build_report(&ast, &interner, &fixture_path(COMPOSED_FIXTURE));
+    let block = report
+        .train_blocks
+        .first()
+        .expect("expected one train block in canonical fixture");
+    assert_eq!(
+        block.fase.plan.mode,
+        FaseMode::Deferred,
+        "composition must keep FASE Deferred; got {:?}",
+        block.fase.plan.mode
+    );
+    assert!(
+        block.pca.is_some(),
+        "composition must keep PCA section populated"
+    );
+}
+
+// ─── Semantic-checker negative regressions (M1) ────────────────────────────
+
+/// M1 regression: unknown `data:` section keys must be refused. Before v8
+/// the bypass accepted ANY ident-target Assign; v8 narrows it to an
+/// allowlist (currently `{source}`) and surfaces a typo'd key.
+#[test]
+fn data_section_unknown_key_is_refused() {
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "\n",
+            "train(model = m, grad_accumulation = 4):\n",
+            "    data:\n",
+            "        surce = PretrainCorpus\n", // typo for `source`
+            "    optimizer: AdamW\n",
+        )
+    );
+    let (_ast, _interner, diags) = parse_and_check(&src);
+    let msgs: Vec<String> = diags.iter().map(|d| d.message.to_string()).collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("unknown data-section key") && m.contains("surce")),
+        "expected 'unknown data-section key surce'; got: {msgs:?}",
+    );
+}
+
+/// H2 regression: paper-canonical `separator_token_id` must pass semantic
+/// check AND populate the PCA packing config (the v8 first-pass omitted
+/// it — adversarial review caught it).
+#[test]
+fn separator_token_id_accepted_and_threaded_through() {
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "    packing = true\n",
+            "    max_sequence_length = 2048\n",
+            "    mean_doc_length = 400\n",
+            "    separator_token_id = 2\n",
+            "\n",
+            "train(model = m, grad_accumulation = 4):\n",
+            "    data:\n",
+            "        source = PretrainCorpus\n",
+            "    optimizer: AdamW\n",
+        )
+    );
+    let (ast, interner, diags) = parse_and_check(&src);
+    assert_no_semantic_errors(&diags);
+    let report = build_report(&ast, &interner, Path::new("sep.nsl"));
+    let pca = report.train_blocks[0]
+        .pca
+        .as_ref()
+        .expect("expected PCA section");
+    assert_eq!(
+        pca.packing_config.separator_token_id,
+        Some(2),
+        "separator_token_id must flow into PCA packing config"
     );
 }
 
@@ -224,12 +352,6 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("workspace root")
         .to_path_buf()
-}
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
 }
 
 fn run_check(format: Option<&str>) -> (i32, String, String) {
@@ -249,7 +371,7 @@ fn run_check(format: Option<&str>) -> (i32, String, String) {
             cmd.arg("--training-report");
         }
     }
-    cmd.arg(fixture("training_report_fase_pca_composition.nsl"));
+    cmd.arg(fixture_path(COMPOSED_FIXTURE));
     cmd.env("NSL_STDLIB_PATH", &stdlib_path);
 
     let out = cmd.output().expect("spawn nsl check");

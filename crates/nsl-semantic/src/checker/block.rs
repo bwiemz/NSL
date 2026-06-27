@@ -2,6 +2,13 @@ use std::collections::HashSet;
 
 use super::*;
 
+/// Allowlist of legal `data:` section config keys. Mirrors the codegen-side
+/// table at `nsl-codegen/src/stmt.rs` (search for `DATA_SECTION_KEYS`); both
+/// must stay in sync or a key accepted here will hit a "variable" error at
+/// codegen time. v8 ships with a single key; future keys (loader, prefetch,
+/// format, …) should land in both places at once.
+const DATA_SECTION_KEYS: &[&str] = &["source"];
+
 impl<'a> TypeChecker<'a> {
     pub(crate) fn check_train_block(&mut self, train: &TrainBlock) {
         // Check config expressions (model=, epochs=, etc.)
@@ -16,14 +23,32 @@ impl<'a> TypeChecker<'a> {
                 TrainSection::Data(stmts) => {
                     // Data section entries are configuration pairs of the form
                     // `key = expr` (e.g. `source = PretrainCorpus`) — `key` is
-                    // a config identifier, NOT a variable lookup. Type-check
-                    // only the RHS expression so `key` does not raise
-                    // "undefined variable". Non-Assign statements fall through
-                    // to the standard checker.
+                    // a config identifier, NOT a variable lookup. Each allowed
+                    // key is checked against `DATA_SECTION_KEYS`; the RHS is
+                    // type-checked but the LHS lookup is skipped. Unknown keys
+                    // are refused (mirrors the dataset-field whitelist below).
+                    // Compound-assignment ops (`+=`, etc.) and non-Ident
+                    // targets (e.g. `obj.field = X`) fall through to the
+                    // standard checker.
                     for stmt in stmts {
-                        if let StmtKind::Assign { target, value, .. } = &stmt.kind {
-                            if matches!(target.kind, nsl_ast::expr::ExprKind::Ident(_)) {
-                                self.check_expr(value);
+                        if let StmtKind::Assign {
+                            target,
+                            value,
+                            op: nsl_ast::operator::AssignOp::Assign,
+                        } = &stmt.kind
+                        {
+                            if let nsl_ast::expr::ExprKind::Ident(name_sym) = target.kind {
+                                let name = self.resolve_name(name_sym);
+                                if DATA_SECTION_KEYS.contains(&name.as_str()) {
+                                    self.check_expr(value);
+                                } else {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "unknown data-section key '{name}'"
+                                        ))
+                                        .with_label(target.span, "unknown data-section key"),
+                                    );
+                                }
                                 continue;
                             }
                         }
@@ -416,10 +441,19 @@ impl<'a> TypeChecker<'a> {
                 "shuffle" | "packing" => {
                     self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
                 }
-                // PCA-related length fields (paper §4.1 / pca_activation.rs):
-                // `max_sequence_length` and its alias `max_seq_len` drive
-                // packing-config detection; `mean_doc_length` and
-                // `doc_length_stddev` feed the PCA strategy planner.
+                // PCA-related length fields (paper §4.2 / pca_activation.rs
+                // ::extract_dataset_packing). Keep this arm in sync with the
+                // five fields that `extract_dataset_packing` reads:
+                //   - `max_sequence_length` and its alias `max_seq_len` drive
+                //     packing-config detection;
+                //   - `mean_doc_length` + `doc_length_stddev` feed the PCA
+                //     strategy planner;
+                //   - `separator_token_id` is the document separator id used
+                //     by §4.4 (fused linear-CE separator skipping).
+                // v9 follow-on: widen `mean_doc_length`/`doc_length_stddev`
+                // to also accept Float literals (calibration tools may emit
+                // 384.7) and add a non-negative literal check at semantic
+                // time to refuse nonsense stats up-front.
                 "sequence_length"
                 | "max_samples"
                 | "shuffle_buffer"
@@ -427,7 +461,8 @@ impl<'a> TypeChecker<'a> {
                 | "max_sequence_length"
                 | "max_seq_len"
                 | "mean_doc_length"
-                | "doc_length_stddev" => {
+                | "doc_length_stddev"
+                | "separator_token_id" => {
                     self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
                 }
                 "resume_from" => {
