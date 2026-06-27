@@ -178,6 +178,14 @@ enum Cli {
         /// database; empty / unknown falls back to the database default.
         #[arg(long)]
         wrga_target: Option<String>,
+
+        /// WRGA paper §8.3: emit a structural PEFT comparison report (WRGA vs.
+        /// LoRA / AdaLoRA / GaLore / ReFT) without running codegen output.
+        /// Pass without value (or `-`) for stdout; provide a path to write to
+        /// a file. Mutually exclusive with `--wrga-analyze`. Requires `@wrga`
+        /// decorators in the source.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
+        wrga_compare: Option<PathBuf>,
     },
 
     /// Compile and execute an NSL program
@@ -897,9 +905,14 @@ fn main_inner() {
             cep_out,
             wrga_analyze,
             wrga_target,
+            wrga_compare,
         } => {
             if cep_search && cep_profile {
                 eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
+                std::process::exit(1);
+            }
+            if wrga_analyze.is_some() && wrga_compare.is_some() {
+                eprintln!("error: --wrga-analyze and --wrga-compare are mutually exclusive");
                 std::process::exit(1);
             }
             // WRGA paper §8.3: `--wrga-analyze` short-circuits the check path
@@ -908,6 +921,15 @@ fn main_inner() {
             // since CEP early-exits above.
             if let Some(ref report_path) = wrga_analyze {
                 std::process::exit(run_check_wrga_analyze(
+                    &file,
+                    report_path,
+                    wrga_target.as_deref(),
+                ));
+            }
+            // WRGA paper §8.3: `--wrga-compare` — same dispatch shape as
+            // `--wrga-analyze`, but renders the PEFT comparison report.
+            if let Some(ref report_path) = wrga_compare {
+                std::process::exit(run_check_wrga_compare(
                     &file,
                     report_path,
                     wrga_target.as_deref(),
@@ -3515,6 +3537,92 @@ fn run_check_wrga_analyze(
     0
 }
 
+/// WRGA paper §8.3: `nsl check --wrga-compare` — run the WRGA pass on the
+/// source and emit `WrgaPlan::render_compare_report()` (PEFT comparison
+/// against LoRA / AdaLoRA / GaLore / ReFT) without leaving a `.o` behind.
+///
+/// Plumbing mirrors `run_check_wrga_analyze` exactly, except:
+/// 1. The CLI-side capture slot is armed before invoking the build so the
+///    plan can be pulled back out after `run_build_inner` returns.
+/// 2. `wrga_report` is passed as `None`, suppressing the normal analyze
+///    report from appearing on stdout (we only want the compare report).
+///
+/// Returns the same exit-code shape as `run_check_wrga_analyze`: `0` on
+/// success, `2` on "no WRGA decorators in source", `1` on any other error.
+fn run_check_wrga_compare(
+    file: &PathBuf,
+    report_path: &std::path::Path,
+    wrga_target: Option<&str>,
+) -> i32 {
+    let (_interner, _parse_result, analysis) = frontend_with_flags(file, false);
+    let has_wrga_decorators = !analysis.wrga_configs.is_empty()
+        || !analysis.freeze_configs.is_empty()
+        || !analysis.adapter_configs.is_empty();
+    if !has_wrga_decorators {
+        eprintln!(
+            "nsl: --wrga-compare: no @wrga / @freeze / @adapter decorators found in '{}'",
+            file.display()
+        );
+        return 2;
+    }
+
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("nsl_check");
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nsl_check_wrga_compare_{}_{}",
+        std::process::id(),
+        stem
+    ));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        eprintln!("nsl: --wrga-compare: could not create temp dir: {e}");
+        return 1;
+    }
+    let temp_obj = temp_dir.join(format!("{stem}.o"));
+
+    let _override_guard = wrga_target.map(|t| WrgaTargetOverrideGuard::set(t.to_string()));
+    let _capture_guard = WrgaPlanCaptureGuard::arm();
+
+    let opts = nsl_codegen::CompileOptions {
+        source_ad: true,
+        ..nsl_codegen::CompileOptions::default()
+    };
+
+    let source_adjacent_obj = file.with_file_name(format!("{stem}.o"));
+    let source_adjacent_pre_existed = source_adjacent_obj.exists();
+
+    run_build_inner(
+        file,
+        Some(temp_obj.clone()),
+        true,   // emit_obj
+        false,  // dump_ir
+        true,   // quiet
+        &opts,
+        None,   // wrga_report — suppress the analyze report; we render compare below
+    );
+
+    // Belt-and-suspenders cleanup of artifacts. Same logic as the analyze path.
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if !source_adjacent_pre_existed && source_adjacent_obj.exists() {
+        let _ = std::fs::remove_file(&source_adjacent_obj);
+    }
+
+    // Pull the captured plan out and render comparison.
+    let Some(plan) = WrgaPlanCaptureGuard::take() else {
+        eprintln!(
+            "nsl: --wrga-compare: codegen completed but no @train block with WRGA decorators \
+             was compiled; nothing to compare"
+        );
+        return 2;
+    };
+    let report = plan.render_compare_report();
+    if report_path == std::path::Path::new("-") {
+        print!("{}", report);
+    } else if let Err(e) = std::fs::write(report_path, &report) {
+        eprintln!("nsl: --wrga-compare: could not write report: {e}");
+        return 1;
+    }
+    0
+}
+
 /// RAII guard that clears `WRGA_TARGET_OVERRIDE` on drop. Holding this guard
 /// keeps the thread-local set for the lifetime of the build; dropping it
 /// (including on panic) restores `None`.
@@ -3540,6 +3648,57 @@ thread_local! {
     /// decorator's target field before the bridge ships to codegen.
     static WRGA_TARGET_OVERRIDE: std::cell::RefCell<Option<String>>
         = const { std::cell::RefCell::new(None) };
+
+    /// CLI-side capture slot for the `WrgaPlan` produced during a check-mode
+    /// build. Set by `run_check_wrga_compare` before invoking the build; read
+    /// at every site that has a fresh plan in scope, so the comparison report
+    /// can be rendered from the plan after the build returns. `None` outside
+    /// a capture window — no overhead on normal `nsl build` paths.
+    static WRGA_PLAN_CAPTURE: std::cell::RefCell<Option<nsl_codegen::wrga::WrgaPlan>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard that arms `WRGA_PLAN_CAPTURE` for the lifetime of the guard,
+/// then disarms on drop. Use the returned guard to keep capture live for the
+/// duration of a single `run_build_inner` invocation, then call `take()` to
+/// extract the captured plan before the guard drops.
+struct WrgaPlanCaptureGuard;
+
+impl WrgaPlanCaptureGuard {
+    fn arm() -> Self {
+        WRGA_PLAN_CAPTURE.with(|c| *c.borrow_mut() = None);
+        Self
+    }
+
+    /// Extract the captured plan, leaving `None` behind. Returns `None` if no
+    /// plan was captured (e.g. compile failed, or no @train block had WRGA
+    /// decorators).
+    fn take() -> Option<nsl_codegen::wrga::WrgaPlan> {
+        WRGA_PLAN_CAPTURE.with(|c| c.borrow_mut().take())
+    }
+}
+
+impl Drop for WrgaPlanCaptureGuard {
+    fn drop(&mut self) {
+        WRGA_PLAN_CAPTURE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Capture the just-produced `WrgaPlan` into `WRGA_PLAN_CAPTURE` if and only
+/// if the capture slot is currently armed (i.e. someone called
+/// `WrgaPlanCaptureGuard::arm`). No-op otherwise. Called at every site in
+/// `run_build_single` / `run_build_multi` / `run_build_zk` / `run_build_standalone`
+/// just after `compile_returning_plan` returns. Captures the FIRST non-`None`
+/// plan we see, so multi-file paths that compile multiple modules don't
+/// overwrite the entry-module plan with a dependency's empty one.
+fn capture_wrga_plan_if_armed(plan: &Option<nsl_codegen::wrga::WrgaPlan>) {
+    let Some(p) = plan else { return };
+    WRGA_PLAN_CAPTURE.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(p.clone());
+        }
+    });
 }
 
 /// Apply the thread-local `WRGA_TARGET_OVERRIDE` (set by
@@ -3570,6 +3729,11 @@ fn emit_wrga_report(
     wrga_plan: &Option<nsl_codegen::wrga::WrgaPlan>,
     wrga_report: Option<&std::path::Path>,
 ) {
+    // Always offer the plan to the capture slot; the helper is a no-op when
+    // `--wrga-compare` hasn't armed it. Doing the capture up-here covers every
+    // build path that funnels through `emit_wrga_report`.
+    capture_wrga_plan_if_armed(wrga_plan);
+
     let Some(report_path) = wrga_report else { return; };
     match wrga_plan {
         Some(p) => {
@@ -4475,6 +4639,8 @@ fn run_build_single(
     };
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
+    // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
+    capture_wrga_plan_if_armed(&wrga_plan);
     if let Some(report_path) = wrga_report {
         match &wrga_plan {
             Some(p) => {
@@ -4815,6 +4981,8 @@ fn run_build_multi(
     }
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
+    // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
+    capture_wrga_plan_if_armed(&entry_wrga_plan);
     if let Some(report_path) = wrga_report {
         match &entry_wrga_plan {
             Some(p) => {

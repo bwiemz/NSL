@@ -177,6 +177,245 @@ impl WrgaPlan {
         .unwrap();
         s
     }
+
+    /// Render a PEFT comparison report — WRGA's measured numbers against
+    /// theoretical baselines for LoRA, AdaLoRA, GaLore, and ReFT, derived
+    /// from the same per-site shape data that drove this plan.
+    ///
+    /// Surface: `nsl check --wrga-compare <file>.nsl [--weights w.safetensors]`
+    /// (WRGA paper §8.3).
+    ///
+    /// The comparison is **theoretical**: it answers "if we re-ran the same
+    /// site selection under each baseline's parameter formula, how would the
+    /// adapter parameter count, backward FLOPs ratio, activation memory ratio,
+    /// and fusion ratio differ?" It does NOT compare empirical quality or
+    /// wall-clock speed — those require the §9 benchmark suite and the §9.3
+    /// ablation harness (separate audit gaps).
+    ///
+    /// ## Baseline formulas
+    ///
+    /// Per WRGA-placed site `i` with weight shape `[m_i, n_i]`:
+    /// - **LoRA (Hu et al. 2021)**: fixed rank `r=16`; `params_i = 16 * (m_i + n_i)`.
+    ///   No backward pruning, no fusion, no activation savings.
+    /// - **AdaLoRA (Zhang et al. 2023)**: SVD-derived rank — modeled here as
+    ///   WRGA's own spectral allocation (both methods use the same
+    ///   singular-value-importance heuristic). Same param count as WRGA but
+    ///   no Wengert pruning and no fusion.
+    /// - **GaLore (Zhao et al. 2024)**: full-parameter training with low-rank
+    ///   gradient projection — zero adapter parameters by construction. No
+    ///   backward pruning (GaLore prunes the gradient subspace, not the
+    ///   compute graph) and no fusion.
+    /// - **ReFT (Wu et al. 2024)**: rank-4 intervention vectors on the top
+    ///   25% of placement sites; `params_i = 4 * n_i` for those sites only.
+    ///   No backward pruning, no fusion.
+    ///
+    /// The "Backward FLOPs %" column reports each method's retained-backward
+    /// op count as a fraction of the unpruned forward op count. The
+    /// "Activation Memory %" column does the same for saved activations.
+    /// Both lower-is-better. The "Fusion %" column is the fraction of
+    /// placement sites whose adapter is fused into an adjacent matmul.
+    ///
+    /// Output is deterministic given the input plan: column widths are
+    /// fixed, ordering is fixed, every numeric is computed from struct fields.
+    pub fn render_compare_report(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut s = String::new();
+        writeln!(s, "=== WRGA PEFT Comparison Report ===").unwrap();
+        writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
+        writeln!(s, "Target hardware: {}", self.target_gpu).unwrap();
+        writeln!(s, "Placement sites: {}", self.placements.len()).unwrap();
+        writeln!(s).unwrap();
+
+        let baselines = self.compute_compare_baselines();
+
+        // Table: Method | Params | Bwd Live % | Act Saved % | Fusion %
+        // Widths chosen so the WRGA row plus baseline rows line up.
+        writeln!(
+            s,
+            "{:<22} | {:>10} | {:>10} | {:>11} | {:>7}",
+            "Method", "Params", "Bwd Live %", "Act Saved %", "Fusion %"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "{0:-<22}-+-{0:-<10}-+-{0:-<10}-+-{0:-<11}-+-{0:-<7}",
+            ""
+        )
+        .unwrap();
+
+        for row in &baselines {
+            writeln!(
+                s,
+                "{:<22} | {:>10} | {:>9.1}% | {:>10.1}% | {:>6.1}%",
+                row.label,
+                fmt_with_commas(row.adapter_params),
+                100.0 * row.backward_retained_ratio,
+                100.0 * row.activation_retained_ratio,
+                100.0 * row.fusion_ratio,
+            )
+            .unwrap();
+        }
+
+        writeln!(s).unwrap();
+        writeln!(
+            s,
+            "Bwd Live %  — fraction of forward Wengert ops that must stay live \
+             for the backward pass (lower = more Wengert pruning)."
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "Act Saved % — fraction of saved-for-backward activations retained \
+             after Innovation 5 memory planning (lower = more activation reuse)."
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "Fusion %    — share of placement sites whose adapter fuses into an \
+             adjacent matmul (Innovation 4)."
+        )
+        .unwrap();
+        writeln!(s).unwrap();
+        writeln!(
+            s,
+            "Comparison is structural (param formulas + WRGA's measured \
+             pruning/fusion); empirical quality and wall-clock require the \
+             §9 benchmark suite."
+        )
+        .unwrap();
+        s
+    }
+
+    /// Build the five comparison rows (WRGA + four baselines). Pulled out so
+    /// the table renderer and tests can share one source of truth for the
+    /// numerics.
+    fn compute_compare_baselines(&self) -> Vec<CompareRow> {
+        // Recover each site's (m + n) from the actual adapter parameter
+        // formula `params = rank * (m + n)`. Sites with rank == 0 (skipped
+        // by the placement stage) contribute zero — there's no shape to
+        // recover for them.
+        let mn_sums: Vec<usize> = self
+            .ranks
+            .iter()
+            .map(|r| if r.rank == 0 { 0 } else { r.adapter_params / r.rank })
+            .collect();
+
+        // WRGA: measured values from the plan itself.
+        let wrga_params: usize = self.ranks.iter().map(|r| r.adapter_params).sum();
+        let total_fwd_ops = self.prune.stats.forward_ops_total.max(1);
+        let wrga_backward_retained =
+            self.prune.stats.backward_ops_retained as f64 / total_fwd_ops as f64;
+        let naive_acts = self.prune.stats.full_backward_saved_activations.max(1);
+        let wrga_activation_retained =
+            self.prune.stats.pruned_saved_activations as f64 / naive_acts as f64;
+        let wrga_fusion = self.fusion.fusion_ratio();
+
+        // LoRA: fixed rank r = 16 on every placement site.
+        const LORA_FIXED_RANK: usize = 16;
+        let lora_params: usize = mn_sums.iter().map(|mn| LORA_FIXED_RANK * mn).sum();
+
+        // AdaLoRA: SVD-driven rank allocation — model as WRGA's own
+        // adapter_params, since both methods share the same singular-value
+        // importance formula. The differentiator is that AdaLoRA does NOT do
+        // Wengert pruning or fusion-integrated adapters.
+        let adalora_params = wrga_params;
+
+        // GaLore: zero adapter parameters by construction (it projects
+        // full-parameter gradients into a low-rank subspace instead of
+        // adding adapter weights).
+        let galore_params = 0usize;
+
+        // ReFT: rank-4 intervention vectors on the top 25% of placement
+        // sites by parameter footprint (round up). Each intervention
+        // contributes `4 * n_i` params, approximating `n_i = mn_sum / 2` when
+        // m_i ≈ n_i (square weights — typical for transformer attention
+        // projections). For non-square weights this over- or under-estimates
+        // by the m/n ratio; acceptable at paper §8.3's order-of-magnitude
+        // intent.
+        //
+        // Sites with `mn_sum == 0` (placements WRGA rank-skipped) contribute
+        // ZERO ReFT params — the `if mn == 0 { 0 }` branch is load-bearing
+        // when WRGA prunes >75% of candidate sites, since those rank-0 entries
+        // can otherwise survive the top-25% take and each would silently add
+        // `REFT_RANK * 1` phantom params via the historical `.max(1)`.
+        const REFT_RANK: usize = 4;
+        let reft_site_count = self.placements.len().div_ceil(4);
+        let mut sorted_mn: Vec<usize> = mn_sums.clone();
+        sorted_mn.sort_unstable_by(|a, b| b.cmp(a));
+        let reft_params: usize = sorted_mn
+            .iter()
+            .take(reft_site_count)
+            .map(|mn| if *mn == 0 { 0 } else { REFT_RANK * (mn / 2).max(1) })
+            .sum();
+
+        vec![
+            CompareRow {
+                label: "WRGA (this run)".to_string(),
+                adapter_params: wrga_params,
+                backward_retained_ratio: wrga_backward_retained,
+                activation_retained_ratio: wrga_activation_retained,
+                fusion_ratio: wrga_fusion,
+            },
+            CompareRow {
+                label: "LoRA (r=16)".to_string(),
+                adapter_params: lora_params,
+                backward_retained_ratio: 1.0,
+                activation_retained_ratio: 1.0,
+                fusion_ratio: 0.0,
+            },
+            CompareRow {
+                label: "AdaLoRA".to_string(),
+                adapter_params: adalora_params,
+                backward_retained_ratio: 1.0,
+                activation_retained_ratio: 1.0,
+                fusion_ratio: 0.0,
+            },
+            CompareRow {
+                label: "GaLore".to_string(),
+                adapter_params: galore_params,
+                backward_retained_ratio: 1.0,
+                activation_retained_ratio: 1.0,
+                fusion_ratio: 0.0,
+            },
+            CompareRow {
+                label: "ReFT (r=4, top-25%)".to_string(),
+                adapter_params: reft_params,
+                backward_retained_ratio: 1.0,
+                activation_retained_ratio: 1.0,
+                fusion_ratio: 0.0,
+            },
+        ]
+    }
+}
+
+/// One row of the PEFT comparison table. All numerics are dimensionless or
+/// in [0, 1] (ratios); the renderer multiplies by 100 for the percentage
+/// columns.
+#[derive(Debug, Clone, PartialEq)]
+struct CompareRow {
+    label: String,
+    adapter_params: usize,
+    backward_retained_ratio: f64,
+    activation_retained_ratio: f64,
+    fusion_ratio: f64,
+}
+
+/// Format an integer with thousands separators (commas) using a
+/// dependency-free hand-rolled implementation. Picked over `humansize` /
+/// `num-format` to keep the codegen crate's dependency surface minimal.
+fn fmt_with_commas(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 /// Run the full WRGA driver.
@@ -675,6 +914,285 @@ mod tests {
             )),
             "expected RankClampedToBounds diagnostic; got {:?}",
             diags
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap #3 — PEFT comparison report (paper §8.3, `nsl check --wrga-compare`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fmt_with_commas_inserts_thousands_separators() {
+        assert_eq!(super::fmt_with_commas(0), "0");
+        assert_eq!(super::fmt_with_commas(42), "42");
+        assert_eq!(super::fmt_with_commas(999), "999");
+        assert_eq!(super::fmt_with_commas(1_000), "1,000");
+        assert_eq!(super::fmt_with_commas(12_345), "12,345");
+        assert_eq!(super::fmt_with_commas(123_456_789), "123,456,789");
+        // Multiple of 1000 must NOT have a leading comma.
+        assert_eq!(super::fmt_with_commas(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn compare_report_contains_all_baselines_and_wrga_row() {
+        let w = tiny_transformer_like();
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+        };
+        let plan = run(input);
+        let report = plan.render_compare_report();
+
+        // Header + every baseline row must be present so users get a complete
+        // table even when WRGA's measured numbers and a baseline coincide.
+        assert!(report.contains("=== WRGA PEFT Comparison Report ==="));
+        assert!(report.contains("WRGA (this run)"));
+        assert!(report.contains("LoRA (r=16)"));
+        assert!(report.contains("AdaLoRA"));
+        assert!(report.contains("GaLore"));
+        assert!(report.contains("ReFT (r=4, top-25%)"));
+
+        // Explanatory footer prevents a casual reader from over-interpreting
+        // the structural ratios as empirical quality/speed.
+        assert!(report.contains("structural"));
+        assert!(report.contains("§9 benchmark suite"));
+    }
+
+    #[test]
+    fn compare_report_is_deterministic() {
+        let w = tiny_transformer_like();
+        let make = || WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+        };
+        assert_eq!(
+            run(make()).render_compare_report(),
+            run(make()).render_compare_report(),
+        );
+    }
+
+    /// Baseline contract — every baseline that does no Wengert pruning must
+    /// report 100% backward retained and 100% activation retained, with 0%
+    /// fusion. Pins the contract so a future bug that quietly attributes
+    /// WRGA's pruning to a baseline can't slip through.
+    #[test]
+    fn compare_baselines_report_unpruned_ratios_for_lora_adalora_galore_reft() {
+        let w = tiny_transformer_like();
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+        };
+        let plan = run(input);
+        let rows = plan.compute_compare_baselines();
+
+        // Row 0 is WRGA; rows 1-4 are LoRA, AdaLoRA, GaLore, ReFT.
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].label, "WRGA (this run)");
+        for baseline_idx in 1..5 {
+            let r = &rows[baseline_idx];
+            assert_eq!(
+                r.backward_retained_ratio, 1.0,
+                "{} must report 100% backward retained",
+                r.label,
+            );
+            assert_eq!(
+                r.activation_retained_ratio, 1.0,
+                "{} must report 100% activation retained",
+                r.label,
+            );
+            assert_eq!(
+                r.fusion_ratio, 0.0,
+                "{} must report 0% fusion",
+                r.label,
+            );
+        }
+    }
+
+    /// GaLore is the only baseline with zero adapter parameters — by
+    /// construction (it projects gradients into a low-rank subspace rather
+    /// than adding adapter weights). Pinning this catches a future
+    /// off-by-one that flips GaLore to using LoRA's formula.
+    #[test]
+    fn compare_baseline_galore_has_zero_adapter_params() {
+        let w = tiny_transformer_like();
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+        };
+        let plan = run(input);
+        let rows = plan.compute_compare_baselines();
+        let galore = rows.iter().find(|r| r.label == "GaLore").unwrap();
+        assert_eq!(galore.adapter_params, 0);
+    }
+
+    /// Numeric-correctness test for the LoRA-fixed-rank-16 formula on a
+    /// hand-constructed plan with two synthetic rank allocations. Locks in
+    /// the `mn_sum = adapter_params / rank` recovery so a future refactor
+    /// can't silently change the per-site shape derivation.
+    ///
+    /// Two placements: site A with rank=8 and 8*(m+n)=8*200 = 1600 params,
+    /// site B with rank=4 and 4*(m+n)=4*100 = 400 params. LoRA at fixed
+    /// rank 16 must be 16*200 + 16*100 = 4800.
+    #[test]
+    fn compare_baseline_lora_params_recover_from_adapter_params_division() {
+        use crate::cost_model::BoundClassification;
+        use crate::wrga_roofline::AdapterKind;
+        let mut plan = WrgaPlan::test_dummy();
+        plan.placements = vec![
+            crate::wrga_roofline::AdapterPlacement {
+                name: "A".into(),
+                arithmetic_intensity: 0.0,
+                classification: BoundClassification::MemoryBound,
+                roofline_slack: 1.0,
+                adapter: AdapterKind::Lora,
+                suggested_rank: 8,
+                rationale: String::new(),
+                decorator_kind: None,
+                alpha: None,
+                synthesized_fields: Vec::new(),
+                init_strategies: Vec::new(),
+            },
+            crate::wrga_roofline::AdapterPlacement {
+                name: "B".into(),
+                arithmetic_intensity: 0.0,
+                classification: BoundClassification::MemoryBound,
+                roofline_slack: 1.0,
+                adapter: AdapterKind::Lora,
+                suggested_rank: 4,
+                rationale: String::new(),
+                decorator_kind: None,
+                alpha: None,
+                synthesized_fields: Vec::new(),
+                init_strategies: Vec::new(),
+            },
+        ];
+        plan.ranks = vec![
+            crate::wrga_spectral::RankAllocation {
+                name: "A".into(),
+                rank: 8,
+                effective_rank: 8.0,
+                adapter_params: 8 * 200, // (m + n) = 200
+            },
+            crate::wrga_spectral::RankAllocation {
+                name: "B".into(),
+                rank: 4,
+                effective_rank: 4.0,
+                adapter_params: 4 * 100, // (m + n) = 100
+            },
+        ];
+
+        let rows = plan.compute_compare_baselines();
+        let lora = rows.iter().find(|r| r.label == "LoRA (r=16)").unwrap();
+        assert_eq!(lora.adapter_params, 16 * 200 + 16 * 100);
+
+        // AdaLoRA mirrors WRGA's measured rank allocation exactly.
+        let wrga = rows.iter().find(|r| r.label == "WRGA (this run)").unwrap();
+        let ada = rows.iter().find(|r| r.label == "AdaLoRA").unwrap();
+        assert_eq!(ada.adapter_params, wrga.adapter_params);
+    }
+
+    /// Rank-0 sites must contribute ZERO ReFT params, even when they survive
+    /// the top-25% take (which happens when WRGA prunes >75% of candidate
+    /// sites). Pins the rank-0 guard that replaced a `.max(1)` quirk that
+    /// would otherwise silently inflate ReFT's reported count by `4 *
+    /// rank_0_site_count_in_top_quartile` phantom params.
+    #[test]
+    fn compare_baseline_reft_skips_rank_zero_sites_in_top_quartile() {
+        use crate::cost_model::BoundClassification;
+        use crate::wrga_roofline::AdapterKind;
+        let mut plan = WrgaPlan::test_dummy();
+        let mk_placement = |name: &str, rank: usize| crate::wrga_roofline::AdapterPlacement {
+            name: name.into(),
+            arithmetic_intensity: 0.0,
+            classification: BoundClassification::MemoryBound,
+            roofline_slack: 1.0,
+            adapter: AdapterKind::Lora,
+            suggested_rank: rank,
+            rationale: String::new(),
+            decorator_kind: None,
+            alpha: None,
+            synthesized_fields: Vec::new(),
+            init_strategies: Vec::new(),
+        };
+        let mk_rank = |name: &str, rank: usize, mn: usize| crate::wrga_spectral::RankAllocation {
+            name: name.into(),
+            rank,
+            effective_rank: rank as f64,
+            adapter_params: rank * mn,
+        };
+
+        // 4 placements: only the first has real shape; the other three are
+        // rank-0 (pruned). reft_site_count = ceil(4 / 4) = 1, so the top-25%
+        // slice is exactly one site — the rank-0 entries cannot interleave
+        // here because of the sort by mn descending. But this test pins the
+        // behavior regardless: a rank-0 site, if it ever ended up in the
+        // slice (e.g. zero rank-non-zero sites), MUST contribute 0.
+        plan.placements = vec![
+            mk_placement("S0", 0),
+            mk_placement("S1", 0),
+            mk_placement("S2", 0),
+            mk_placement("S3", 0),
+        ];
+        plan.ranks = vec![
+            mk_rank("S0", 0, 0),
+            mk_rank("S1", 0, 0),
+            mk_rank("S2", 0, 0),
+            mk_rank("S3", 0, 0),
+        ];
+
+        let rows = plan.compute_compare_baselines();
+        let reft = rows.iter().find(|r| r.label == "ReFT (r=4, top-25%)").unwrap();
+        assert_eq!(
+            reft.adapter_params, 0,
+            "rank-0 sites must contribute 0 ReFT params (no phantom .max(1))",
         );
     }
 }
