@@ -274,6 +274,30 @@ pub fn emit(
     ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     ptx.push_str("    .reg .u64 %warp_row;\n");
 
+    // CSHA RoPE pair-sweep register block (matches forward prelude).
+    // Required by emit_kv_recompute -> emit_rope_k_epilogue under
+    // checkpoint=Some(Full) backward path. Cycle-15 cross-prelude fix.
+    // Gated on rope_q && csha.is_some() -- mirrors forward prelude gate
+    // at phases/forward/prelude.rs "CSHA A.2.4 RoPE epilogue registers".
+    if config.rope_q && config.csha.is_some() {
+        // HBM pointer registers for cos/sin tables.
+        ptx.push_str("    .reg .u64 %rd_rope_cos, %rd_rope_sin, %rd_rope_addr;\n");
+        ptx.push_str("    .reg .u64 %rd_rope_cs_idx, %rd_rope_x0_off, %rd_rope_x1_off;\n");
+        // f32 accumulators for rotation math.
+        ptx.push_str("    .reg .f32 %f_rope_cos, %f_rope_sin;\n");
+        ptx.push_str("    .reg .f32 %f_rope_x0, %f_rope_x1, %f_rope_y0, %f_rope_y1;\n");
+        ptx.push_str("    .reg .f32 %f_rope_neg_x1;\n");
+        // f16 scratch for pair loads/stores.
+        ptx.push_str("    .reg .b16 %h_rope_pair, %h_rope_y0, %h_rope_y1;\n");
+        // u32 loop/index registers.
+        ptx.push_str("    .reg .u32 %r_rope_tid, %r_rope_pair_idx;\n");
+        ptx.push_str("    .reg .u32 %r_rope_row, %r_rope_dim_pair;\n");
+        ptx.push_str("    .reg .u32 %r_rope_cs_off, %r_rope_smem_row_off;\n");
+        ptx.push_str("    .reg .u32 %r_rope_x0_col, %r_rope_x0_off, %r_rope_x1_off;\n");
+        // Predicate registers for null-guard and loop exit.
+        ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
+    }
+
     // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue) — backward
     // mirror of the forward prelude.rs PCA §4.3 register block. Gated on
     // segment_masked && rope_q so sentinel-disabled (segment_masked=false)

@@ -72,6 +72,14 @@ name = "checkpoint_cycle11_structural"
 path = "tests/checkpoint_cycle11_structural.rs"
 required-features = ["test-helpers"]
 
+# Cycle-15 Task 1: backward prelude RoPE register block structural witnesses.
+# Uses bypass_r0_for_testing() so test-helpers feature is required (same
+# rationale as checkpoint_cycle11_structural above).
+[[test]]
+name = "cycle15_backward_prelude_rope"
+path = "tests/cycle15_backward_prelude_rope.rs"
+required-features = ["test-helpers"]
+
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
