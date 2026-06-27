@@ -368,7 +368,7 @@ pub fn solve(
     // candidate index and the predecessor bucket for backtracking.
     let inf = f64::INFINITY;
     let mut dp = vec![vec![inf; NB + 1]; n + 1];
-    let mut choice = vec![vec![(usize::MAX, 0usize); NB + 1]; n + 1];
+    let mut choice: Vec<Vec<Option<(usize, usize)>>> = vec![vec![None; NB + 1]; n + 1];
     for b in 0..=NB {
         dp[0][b] = 0.0;
     }
@@ -385,7 +385,7 @@ pub fn solve(
                     let total = prev + c.cost_us;
                     if total < dp[j][b] {
                         dp[j][b] = total;
-                        choice[j][b] = (ci, b - bc);
+                        choice[j][b] = Some((ci, b - bc));
                     }
                 }
             }
@@ -417,7 +417,8 @@ pub fn solve(
     let mut chosen: Vec<Option<Cand>> = vec![None; n];
     let mut b = best_b;
     for j in (1..=n).rev() {
-        let (ci, prev_b) = choice[j][b];
+        let (ci, prev_b) = choice[j][b]
+            .expect("DP backtrack: every layer on a finite-cost path has a recorded choice");
         chosen[j - 1] = Some(cands[j - 1][ci]);
         b = prev_b;
     }

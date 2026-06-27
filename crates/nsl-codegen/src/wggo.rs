@@ -456,7 +456,13 @@ pub fn run(input: WggoInput) -> WggoPlan {
                     resolutions.iter().filter_map(|r| r.layer()).collect();
                 for (i, inter_layer) in inter.layers.iter().enumerate() {
                     if conflicting.contains(&inter_layer.layer_index) {
-                        per_layer[i] = ilp_solve_layer(&luts[i], &ilp_constraints[i]);
+                        // Defensive indexing (mirrors recost_total) — a caller
+                        // may pass fewer ilp_constraints than layers.
+                        if let (Some(lut), Some(cons)) =
+                            (luts.get(i).or_else(|| luts.first()), ilp_constraints.get(i).or_else(|| ilp_constraints.first()))
+                        {
+                            per_layer[i] = ilp_solve_layer(lut, cons);
+                        }
                     }
                 }
                 // Re-detect + re-resolve on the escalated decisions.
