@@ -594,7 +594,7 @@ constraint, not a defect:
 **Branch:** `feat/csha-cycle16-multi-bug-closure`
 **Tests added:** `crates/nsl-codegen/tests/csha_cycle16_g16_2_g16_3_triage.rs` (6 structural tests)
 
-### G16-2: Path B CUDA_ERROR_ILLEGAL_ADDRESS -- RESOLVED
+### G16-2: Path B CUDA_ERROR_ILLEGAL_ADDRESS -- RESOLVED (commit `2f62090e`)
 
 **Root cause identified and fixed in cycle-16 Task 3.**
 
@@ -838,12 +838,13 @@ SHOWS OPTION A IS INSUFFICIENT. Bug 1 root cause requires Cycle 17 re-investigat
 
 **Cycle-16 net disposition:**
 
-| Work item | Cycle 16 outcome | Cycle 17 carryover |
+| Work item | Cycle 16 outcome (commit SHA) | Cycle 17 carryover |
 |---|---|---|
-| G16-1 | Option A LANDED (correct direction, insufficient empirically) | Re-investigate Bug 1 root cause |
-| G16-2 | RESOLVED (SMEM grant fix; Path B compiles + runs; verified) | None (closed) |
+| G16-1 | Option A LANDED `d232b615` (correct direction, insufficient empirically; refuted by `c2c6879b`) | Re-investigate Bug 1 root cause |
+| G16-2 | RESOLVED `2f62090e` (SMEM grant fix; Path B compiles + runs; verified) | None (closed) |
 | G16-3 | DEFERRED with refined hypothesis (Phase-4 SMEM overshoot into rms_strip at d_model=0) | Triage with cuda-memcheck |
-| G16-4 | RESOLVED (A1 no longer panics; empirically confirmed) | None (closed) |
+| G16-4 | RESOLVED `a8309e72` (A1 no longer panics; empirically confirmed) | None (closed) |
+| C17-cleanup | (R1 MEDIUM finding) `%rd_dk_*` register names in `emit_store_kv_only` (V-only path) should be renamed to `%rd_dv_*` for clarity. Non-blocking; cosmetic only. | Rename in cycle 17 |
 
 **Cycle-5 invariant disposition (final):** Section 5.3 numerical evidence NOT
 CLAIMABLE. Paper section 6.3 49% headline: STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED
