@@ -14,7 +14,19 @@ impl<'a> TypeChecker<'a> {
         for section in &train.sections {
             match section {
                 TrainSection::Data(stmts) => {
+                    // Data section entries are configuration pairs of the form
+                    // `key = expr` (e.g. `source = PretrainCorpus`) — `key` is
+                    // a config identifier, NOT a variable lookup. Type-check
+                    // only the RHS expression so `key` does not raise
+                    // "undefined variable". Non-Assign statements fall through
+                    // to the standard checker.
                     for stmt in stmts {
+                        if let StmtKind::Assign { target, value, .. } = &stmt.kind {
+                            if matches!(target.kind, nsl_ast::expr::ExprKind::Ident(_)) {
+                                self.check_expr(value);
+                                continue;
+                            }
+                        }
                         self.check_stmt(stmt);
                     }
                 }
@@ -404,7 +416,18 @@ impl<'a> TypeChecker<'a> {
                 "shuffle" | "packing" => {
                     self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
                 }
-                "sequence_length" | "max_samples" | "shuffle_buffer" | "pack_separator" => {
+                // PCA-related length fields (paper §4.1 / pca_activation.rs):
+                // `max_sequence_length` and its alias `max_seq_len` drive
+                // packing-config detection; `mean_doc_length` and
+                // `doc_length_stddev` feed the PCA strategy planner.
+                "sequence_length"
+                | "max_samples"
+                | "shuffle_buffer"
+                | "pack_separator"
+                | "max_sequence_length"
+                | "max_seq_len"
+                | "mean_doc_length"
+                | "doc_length_stddev" => {
                     self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
                 }
                 "resume_from" => {
