@@ -554,6 +554,14 @@ enum Cli {
         #[arg(long, value_name = "F")]
         wggo_prune_fraction: Option<f64>,
 
+        /// Number of devices in the target cluster (compile-time
+        /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
+        /// tensor-parallel `world_size` baked into the artifact.  Unlike the
+        /// `run` command's `--devices`, this does not spawn processes — it
+        /// only informs the compiler's global-optimization plan.
+        #[arg(long, default_value_t = 1)]
+        devices: u32,
+
         /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
         /// "block", or "off").  Passing `--csha` without a value enables
         /// auto mode.
@@ -1122,6 +1130,7 @@ fn main_inner() {
             wggo_weights,
             wggo_importance,
             wggo_prune_fraction,
+            devices,
             csha,
             csha_report,
             cpdt,
@@ -1368,7 +1377,7 @@ fn main_inner() {
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
-                world_size: 1, // Build cmd doesn't use --devices; TP world_size is always 1
+                world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
                 fusion_report,
                 vram_budget: vram_budget.as_deref()
                     .and_then(nsl_codegen::memory_planner::parse_vram_budget),
