@@ -237,6 +237,7 @@ fn run_fused_backward_config(
     let shape = CshaShape {
         seq, heads: h, head_dim: hd, d_model: dm,
         causal, norm_eps,
+        rope_q: true,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_host);
 

@@ -285,6 +285,7 @@ fn tier_b1_canonical_matches_cpu_reference() {
             d_model,
             causal,
             norm_eps,
+            rope_q: true,
         },
     );
 

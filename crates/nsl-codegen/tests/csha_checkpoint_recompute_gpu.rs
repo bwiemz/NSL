@@ -816,6 +816,7 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
         seq, heads, head_dim: hd, d_model: dm,
         causal: config.causal,
         norm_eps: 1e-6,
+        rope_q: true,
     };
     let cpu_grads: CshaGradients = csha_reference_backward(&inputs, &shape, &artifacts.do_f32);
 

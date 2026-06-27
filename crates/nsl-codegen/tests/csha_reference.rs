@@ -32,6 +32,9 @@ pub struct CshaShape {
     pub d_model: usize,
     pub causal: bool,
     pub norm_eps: f32,
+    /// When false, cos/sin slices are empty and RoPE is skipped entirely.
+    /// Set to false for ablation A1 (rope_q=false kernel configs).
+    pub rope_q: bool,
 }
 
 /// Apply RMSNorm to a single row of length `d_model`.
@@ -113,7 +116,7 @@ fn softmax_rows(s: &mut [f32], rows: usize, cols: usize) {
 ///
 /// Returns O of shape `[seq, heads * head_dim]` — the pre-Wo attention output.
 pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps } = *shape;
+    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q } = *shape;
     let kv_dim = heads * head_dim;
 
     // Step 1: RMSNorm(x) -> x_norm   shape [seq, d_model]
@@ -131,9 +134,11 @@ pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
     // Reshape Q, K from [seq, kv_dim] to [seq, heads, head_dim] is logical;
     // the flat layout [seq * heads * head_dim] is the same either way.
 
-    // Step 3: RoPE(Q, cos, sin); RoPE(K, cos, sin)
-    apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
-    apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+    // Step 3: RoPE(Q, cos, sin); RoPE(K, cos, sin) -- skipped when rope_q=false.
+    if rope_q {
+        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
+        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+    }
 
     // Step 4a: S = Q @ K^T / sqrt(head_dim)  per head, shape [seq, seq]
     // Step 4b: mask upper triangle if causal
@@ -233,7 +238,7 @@ struct Intermediates {
 /// Compute the full set of forward intermediates. Keeps the chain-rule
 /// backward arithmetically closed-form (no numerical re-derivation).
 fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermediates {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps } = *shape;
+    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q } = *shape;
     let kv_dim = heads * head_dim;
 
     let mut x_norm = Vec::with_capacity(seq * d_model);
@@ -250,8 +255,10 @@ fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermed
     let mut k = matmul(&x_norm, inputs.wk, seq, d_model, kv_dim);
     let v = matmul(&x_norm, inputs.wv, seq, d_model, kv_dim);
 
-    apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
-    apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+    if rope_q {
+        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
+        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+    }
 
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut p_per_head = Vec::with_capacity(heads);
@@ -292,7 +299,7 @@ pub fn csha_reference_backward(
     shape: &CshaShape,
     do_out: &[f32],
 ) -> CshaGradients {
-    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _ } = *shape;
+    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _, rope_q } = *shape;
     let kv_dim = heads * head_dim;
     let inter = forward_intermediates(inputs, shape);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -366,23 +373,26 @@ pub fn csha_reference_backward(
     // forward: y0 = x0*cos - x1*sin; y1 = x0*sin + x1*cos
     // inverse (since rotation is orthogonal): dx0 = dy0*cos + dy1*sin
     //                                         dx1 = -dy0*sin + dy1*cos
-    let half = head_dim / 2;
-    for tensor in [&mut d_q, &mut d_k] {
-        for s in 0..seq {
-            for h in 0..heads {
-                let base = s * kv_dim + h * head_dim;
-                for pair in 0..half {
-                    let cos_v = inputs.cos[s * half + pair];
-                    let sin_v = inputs.sin[s * half + pair];
-                    let y0 = tensor[base + 2 * pair];
-                    let y1 = tensor[base + 2 * pair + 1];
-                    tensor[base + 2 * pair]     =  y0 * cos_v + y1 * sin_v;
-                    tensor[base + 2 * pair + 1] = -y0 * sin_v + y1 * cos_v;
+    // Skipped when rope_q=false (cos/sin slices are empty; RoPE was not applied).
+    if rope_q {
+        let half = head_dim / 2;
+        for tensor in [&mut d_q, &mut d_k] {
+            for s in 0..seq {
+                for h in 0..heads {
+                    let base = s * kv_dim + h * head_dim;
+                    for pair in 0..half {
+                        let cos_v = inputs.cos[s * half + pair];
+                        let sin_v = inputs.sin[s * half + pair];
+                        let y0 = tensor[base + 2 * pair];
+                        let y1 = tensor[base + 2 * pair + 1];
+                        tensor[base + 2 * pair]     =  y0 * cos_v + y1 * sin_v;
+                        tensor[base + 2 * pair + 1] = -y0 * sin_v + y1 * cos_v;
+                    }
                 }
             }
         }
     }
-    // d_q, d_k now hold dQ_pre_rope, dK_pre_rope.
+    // d_q, d_k now hold dQ_pre_rope, dK_pre_rope (or post-attention if rope_q=false).
 
     // dWq = x_norm^T @ dQ_pre_rope   (shape [d_model, kv_dim])
     // dWk, dWv similarly.
@@ -482,6 +492,7 @@ mod tests {
             d_model: 4,
             causal: false,
             norm_eps: 1e-5,
+            rope_q: true,
         };
         #[rustfmt::skip]
         let x = [
@@ -569,6 +580,7 @@ mod tests {
             d_model: 32,
             causal: true,
             norm_eps: 1e-5,
+            rope_q: true,
         };
         let kv_dim = shape.heads * shape.head_dim;
         let x = det_seq(42, shape.seq * shape.d_model);
@@ -624,6 +636,7 @@ mod tests {
             d_model: 4,
             causal: false,
             norm_eps: 1e-5,
+            rope_q: true,
         };
         let kv_dim = shape.heads * shape.head_dim;
         let mut x = det_seq(7, shape.seq * shape.d_model);
@@ -717,6 +730,7 @@ mod tests {
             d_model: 128,
             causal: true,
             norm_eps: 1e-5,
+            rope_q: true,
         };
         let x = det_seq(42, shape.seq * shape.d_model);
         let w_size = shape.d_model * shape.heads * shape.head_dim;

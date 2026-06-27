@@ -480,6 +480,7 @@ fn run_ablation(
         seq, heads, head_dim: hd, d_model: dm,
         causal,
         norm_eps: 1e-6,
+        rope_q: config.rope_q,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_f32);
 

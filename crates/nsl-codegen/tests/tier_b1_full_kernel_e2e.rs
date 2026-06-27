@@ -300,6 +300,7 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
         },
         &CshaShape {
             seq, heads, head_dim, d_model, causal, norm_eps,
+            rope_q: true,
         },
     );
 

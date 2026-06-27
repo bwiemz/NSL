@@ -169,6 +169,7 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
         },
         &CshaShape {
             seq, heads, head_dim, d_model, causal, norm_eps,
+            rope_q: true,
         },
     );
 

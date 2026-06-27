@@ -334,6 +334,7 @@ fn run_fused_config_dmodel(
             // Standard path: d_model == head_dim, CPU reference handles both.
             let shape = CshaShape {
                 seq, heads: 1, head_dim, d_model: head_dim, causal, norm_eps,
+                rope_q: true,
             };
             let inputs = CshaInputs {
                 x: &x_h, wq: &wq_f32, wk: &wk_f32, wv: &wv_f32,
@@ -361,6 +362,7 @@ fn run_fused_config_dmodel(
             // CPU ref with d_model=d_model, head_dim=head_dim, norm already done.
             let shape = CshaShape {
                 seq, heads: 1, head_dim, d_model, causal, norm_eps,
+                rope_q: true,
             };
             // Use all-ones norm_weight and pass pre-normalised x_norm_dmodel
             // as the x input, with identity norm (norm_eps=0, weight=1 ensures
