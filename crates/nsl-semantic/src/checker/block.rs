@@ -441,29 +441,23 @@ impl<'a> TypeChecker<'a> {
                 "shuffle" | "packing" => {
                     self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
                 }
-                // PCA-related length fields (paper §4.2 / pca_activation.rs
-                // ::extract_dataset_packing). Keep this arm in sync with the
-                // five fields that `extract_dataset_packing` reads:
-                //   - `max_sequence_length` and its alias `max_seq_len` drive
-                //     packing-config detection;
-                //   - `mean_doc_length` + `doc_length_stddev` feed the PCA
-                //     strategy planner;
-                //   - `separator_token_id` is the document separator id used
-                //     by §4.4 (fused linear-CE separator skipping).
-                // v9 follow-on: widen `mean_doc_length`/`doc_length_stddev`
-                // to also accept Float literals (calibration tools may emit
-                // 384.7) and add a non-negative literal check at semantic
-                // time to refuse nonsense stats up-front.
+                // PCA-related Int fields (§4.2 / pca_activation.rs).
+                // `mean_doc_length` and `doc_length_stddev` are in the arm
+                // below — they accept Float as well (calibration tool output).
                 "sequence_length"
                 | "max_samples"
                 | "shuffle_buffer"
                 | "pack_separator"
                 | "max_sequence_length"
                 | "max_seq_len"
-                | "mean_doc_length"
-                | "doc_length_stddev"
                 | "separator_token_id" => {
                     self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
+                }
+                // §4.2 / pca_activation.rs: calibration tools emit these as
+                // floats (e.g. 384.7). Accept Int OR Float; reject negative
+                // literals up-front since they are physically impossible stats.
+                "mean_doc_length" | "doc_length_stddev" => {
+                    self.check_numeric_nonneg_dataset_field(&entry.value, &key);
                 }
                 "resume_from" => {
                     self.check_assignable_expr(&entry.value, &Type::Str, "dataset resume_from");
@@ -523,6 +517,46 @@ impl<'a> TypeChecker<'a> {
                     display_type(&ty)
                 ))
                 .with_label(expr.span, "wrong type"),
+            );
+        }
+    }
+
+    /// Accept Int or Float for `mean_doc_length` / `doc_length_stddev`; reject
+    /// negative literals (physically impossible document-length statistics).
+    ///
+    /// Negative literals: the parser produces `UnaryOp(Neg, IntLiteral(n))` for
+    /// `-n`, NOT `IntLiteral(-n)`. Both forms are checked.
+    fn check_numeric_nonneg_dataset_field(&mut self, expr: &Expr, field: &str) {
+        let ty = self.check_expr(expr);
+        let is_numeric = matches!(ty, Type::Int | Type::Float) || ty.is_indeterminate();
+        if !is_numeric {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "dataset {field} must be a number (Int or Float), got {}",
+                    display_type(&ty)
+                ))
+                .with_label(expr.span, "wrong type"),
+            );
+            return;
+        }
+        // Reject negative literals. `-1` parses as `UnaryOp(Neg, IntLiteral(1))`;
+        // `IntLiteral(-1)` is only produced by the pattern sub-parser, not here.
+        let is_negative_literal = match &expr.kind {
+            ExprKind::IntLiteral(v) => *v < 0,
+            ExprKind::FloatLiteral(v) => *v < 0.0,
+            ExprKind::UnaryOp {
+                op: UnaryOp::Neg,
+                operand,
+            } => matches!(
+                operand.kind,
+                ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_)
+            ),
+            _ => false,
+        };
+        if is_negative_literal {
+            self.diagnostics.push(
+                Diagnostic::error(format!("dataset {field} must be non-negative"))
+                    .with_label(expr.span, "negative value"),
             );
         }
     }

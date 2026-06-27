@@ -436,3 +436,69 @@ fn training_report_json_pins_both_fase_and_pca() {
         stdout
     );
 }
+
+// ─── M4/L4 semantic-checker regressions (v9 follow-on) ────────────────────
+
+/// M4 regression: calibration tools emit `mean_doc_length` / `doc_length_stddev`
+/// as floats (e.g. 384.7). Before the v9 fix the checker hardcoded `Type::Int`
+/// for those fields and would reject float literals with "must be Int, got Float".
+#[test]
+fn mean_doc_length_as_float_literal_accepted() {
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "    packing = true\n",
+            "    max_sequence_length = 2048\n",
+            "    mean_doc_length = 384.7\n",
+            "    doc_length_stddev = 128.3\n",
+            "\n",
+            "train(model = m, grad_accumulation = 4):\n",
+            "    data:\n",
+            "        source = PretrainCorpus\n",
+            "    optimizer: AdamW\n",
+        )
+    );
+    let (_ast, _interner, diags) = parse_and_check(&src);
+    let type_errors: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            matches!(d.level, nsl_errors::Level::Error)
+                && (d.message.contains("mean_doc_length") || d.message.contains("doc_length_stddev"))
+        })
+        .collect();
+    assert!(
+        type_errors.is_empty(),
+        "mean_doc_length and doc_length_stddev must accept Float literals; got errors: {:?}",
+        type_errors
+    );
+}
+
+/// L4 regression: negative literal for mean_doc_length / doc_length_stddev must
+/// be rejected at semantic-check time — a negative average document length is
+/// physically impossible and indicates a miscalibrated stats file.
+#[test]
+fn mean_doc_length_negative_literal_rejected() {
+    let src = format!(
+        "{MODEL_PREAMBLE}{}",
+        concat!(
+            "dataset PretrainCorpus(\"/data/pile\"):\n",
+            "    source = \"/data/pile.bin\"\n",
+            "    packing = true\n",
+            "    max_sequence_length = 2048\n",
+            "    mean_doc_length = -1\n",
+            "\n",
+            "train(model = m, grad_accumulation = 4):\n",
+            "    data:\n",
+            "        source = PretrainCorpus\n",
+            "    optimizer: AdamW\n",
+        )
+    );
+    let (_ast, _interner, diags) = parse_and_check(&src);
+    let msgs: Vec<String> = diags.iter().map(|d| d.message.to_string()).collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("mean_doc_length") && m.contains("non-negative")),
+        "expected 'mean_doc_length must be non-negative'; got: {msgs:?}",
+    );
+}
