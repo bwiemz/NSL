@@ -42,7 +42,14 @@ fn decision_trace_is_constructible_and_serializable() {
 #[test]
 fn decision_kind_round_trips_all_variants() {
     use DecisionKind::*;
-    for k in [CepHeadPrune, CshaLevel, WrgaAdapter, CpdtPrecision] {
+    for k in [
+        CepHeadPrune,
+        CshaLevel,
+        WrgaAdapter,
+        CpdtPrecision,
+        FaseStep,
+        PcaPacking,
+    ] {
         let s = serde_json::to_string(&k).unwrap();
         let back: DecisionKind = serde_json::from_str(&s).unwrap();
         assert_eq!(format!("{back:?}"), format!("{k:?}"));
@@ -78,7 +85,7 @@ fn layer_ilp_solution_default_decision_trace_is_empty() {
 // --------------------------- Task 2 --------------------------------
 
 #[test]
-fn solve_layer_populates_four_decision_traces_per_layer() {
+fn solve_layer_populates_six_decision_traces_per_layer() {
     let lut = build_lut(&layer_shape(), h100(), &LutAxes::default());
     let sol = solve_layer(&lut, &LayerIlpConstraints::default());
     assert!(sol.feasible, "expected feasible solution");
@@ -86,8 +93,8 @@ fn solve_layer_populates_four_decision_traces_per_layer() {
     let trace = &sol.decision_trace;
     assert_eq!(
         trace.len(),
-        4,
-        "expected 4 decision traces, got {}: {:?}",
+        6,
+        "expected 6 decision traces, got {}: {:?}",
         trace.len(),
         trace
             .iter()
@@ -96,7 +103,14 @@ fn solve_layer_populates_four_decision_traces_per_layer() {
     );
 
     let kinds: Vec<_> = trace.iter().map(|t| format!("{:?}", t.kind)).collect();
-    for expected in &["CepHeadPrune", "CshaLevel", "WrgaAdapter", "CpdtPrecision"] {
+    for expected in &[
+        "CepHeadPrune",
+        "CshaLevel",
+        "WrgaAdapter",
+        "CpdtPrecision",
+        "FaseStep",
+        "PcaPacking",
+    ] {
         assert!(
             kinds.iter().any(|k| k == expected),
             "missing trace for kind {}, got {:?}",
