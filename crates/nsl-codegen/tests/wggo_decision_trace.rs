@@ -63,6 +63,7 @@ fn layer_ilp_solution_default_decision_trace_is_empty() {
             optim_v_bits: 8,
             fase_fused: false,
             packing_mode: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
         },
         cost_us: 0.0,
         memory_bytes: 0,

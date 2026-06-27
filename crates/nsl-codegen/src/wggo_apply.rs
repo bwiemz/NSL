@@ -23,7 +23,14 @@ pub struct AppliedLayer {
     pub layer_name: String,
     pub coarse: CoarseDecision,
     pub pipeline_stage: u32,
+    /// ZeRO parameter-shard factor.  Named `shard_factor` for back-compat;
+    /// see `shard_grads`/`shard_optim` for the other two ZeRO dimensions.
     pub shard_factor: u32,
+    /// ZeRO gradient-shard factor (preserved from the inter-layer plan, no
+    /// longer collapsed into `shard_factor`).
+    pub shard_grads: u32,
+    /// ZeRO optimizer-state-shard factor (preserved from the inter-layer plan).
+    pub shard_optim: u32,
     pub active_heads: u32,
     pub ffn_width: u64,
     pub csha_level: u8,
@@ -104,6 +111,8 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
             coarse: coarse.decision,
             pipeline_stage: coarse.pipeline_stage,
             shard_factor: coarse.shard_params,
+            shard_grads: coarse.shard_grads,
+            shard_optim: coarse.shard_optim,
             active_heads,
             ffn_width: ilp_sol.decision.ffn_width,
             csha_level,
@@ -277,6 +286,36 @@ mod tests {
         assert_eq!(applied.layers[0].activation_bytes, 2_000_000);
         assert_eq!(applied.layers[1].param_bytes, 500_000);
         assert_eq!(applied.layers[1].activation_bytes, 300_000);
+    }
+
+    #[test]
+    fn apply_preserves_three_shard_factors() {
+        // The three ZeRO shard factors must survive the projection into
+        // AppliedLayer rather than being collapsed into one (G6).
+        let inter = InterLayerPlan {
+            layers: vec![LayerPlan {
+                layer_index: 0,
+                name: "blocks.0".to_string(),
+                decision: CoarseDecision::KeepFull,
+                pipeline_stage: 0,
+                shard_params: 8,
+                shard_grads: 4,
+                shard_optim: 2,
+                estimated_us: 10.0,
+                estimated_bytes: 1_000_000,
+                param_bytes: 500_000,
+                activation_bytes: 300_000,
+            }],
+            total_us: 10.0,
+            peak_memory_bytes: 1_000_000,
+            pipeline_stages: 1,
+        };
+        let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
+        let ilp = vec![solve_layer(&lut, &LayerIlpConstraints::default())];
+        let applied = apply(&inter, &ilp);
+        assert_eq!(applied.layers[0].shard_factor, 8);
+        assert_eq!(applied.layers[0].shard_grads, 4);
+        assert_eq!(applied.layers[0].shard_optim, 2);
     }
 
     #[test]

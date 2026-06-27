@@ -67,6 +67,72 @@ pub enum Resolution {
     NoChange,
 }
 
+impl Resolution {
+    /// The layer this resolution applies to, if any (`NoChange` has none).
+    pub fn layer(&self) -> Option<u32> {
+        match *self {
+            Resolution::DowngradeCsha { layer, .. }
+            | Resolution::RemoveWrgaAdapter { layer }
+            | Resolution::DeferFaseStep { layer }
+            | Resolution::AcceptNonUniformShard { layer } => Some(layer),
+            Resolution::NoChange => None,
+        }
+    }
+}
+
+/// The optimization techniques WGGO coordinates, ordered by resolution
+/// priority.  `priority()` returns a rank where **lower wins** — so when two
+/// techniques conflict, the one with the larger rank yields.  This encodes the
+/// paper's order `CEP > CPDT > CSHA > WRGA > FASE > PCA` as an explicit
+/// comparator instead of per-conflict hardcoded winners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Technique {
+    Cep,
+    Cpdt,
+    Csha,
+    Wrga,
+    Fase,
+    Pca,
+}
+
+impl Technique {
+    /// Resolution rank — lower wins.  `CEP` is highest priority (0), `PCA`
+    /// lowest (5).
+    pub fn priority(self) -> u8 {
+        match self {
+            Technique::Cep => 0,
+            Technique::Cpdt => 1,
+            Technique::Csha => 2,
+            Technique::Wrga => 3,
+            Technique::Fase => 4,
+            Technique::Pca => 5,
+        }
+    }
+}
+
+impl ConflictKind {
+    /// The two techniques in tension for this conflict.
+    fn techniques(&self) -> (Technique, Technique) {
+        match self {
+            ConflictKind::CshaVsCep { .. } => (Technique::Csha, Technique::Cep),
+            ConflictKind::WrgaVsCpdt { .. } => (Technique::Wrga, Technique::Cpdt),
+            ConflictKind::FaseVsCpdt { .. } => (Technique::Fase, Technique::Cpdt),
+            ConflictKind::CepVsCpdt { .. } => (Technique::Cep, Technique::Cpdt),
+        }
+    }
+
+    /// The technique that must yield, decided purely by priority comparison
+    /// (the higher-rank technique loses).
+    pub fn loser(&self) -> Technique {
+        let (a, b) = self.techniques();
+        if a.priority() < b.priority() {
+            b
+        } else {
+            a
+        }
+    }
+}
+
 /// Compact per-layer decisions used by the detector.  Callers populate
 /// this from the individual WRGA/CSHA/FASE/PCA plans.
 #[derive(Debug, Clone, Default)]
@@ -135,23 +201,34 @@ pub fn detect(decisions: &[LayerDecisions]) -> Vec<ConflictKind> {
 pub fn resolve(conflicts: &[ConflictKind]) -> Vec<Resolution> {
     conflicts
         .iter()
-        .map(|c| match *c {
-            ConflictKind::CshaVsCep { layer, csha_level, .. } => {
-                // CEP wins over CSHA → downgrade.  Level 2/3 → Level 1.
-                let to = csha_level.saturating_sub(1).min(1);
-                Resolution::DowngradeCsha { layer, to_level: to }
-            }
-            ConflictKind::WrgaVsCpdt { layer, .. } => {
-                // CPDT wins over WRGA → drop the adapter.
-                Resolution::RemoveWrgaAdapter { layer }
-            }
-            ConflictKind::FaseVsCpdt { layer, .. } => {
-                // CPDT wins over FASE → defer the step.
-                Resolution::DeferFaseStep { layer }
-            }
-            ConflictKind::CepVsCpdt { layer, .. } => {
-                // CEP wins over CPDT → accept a heterogeneous shard.
-                Resolution::AcceptNonUniformShard { layer }
+        .map(|c| {
+            // The loser is decided by the explicit priority comparator; the
+            // resolution then drops/downgrades that technique.
+            let loser = c.loser();
+            match (c, loser) {
+                (ConflictKind::CshaVsCep { layer, csha_level, .. }, Technique::Csha) => {
+                    // CEP wins over CSHA → downgrade.  Level 2/3 → Level 1.
+                    let to = csha_level.saturating_sub(1).min(1);
+                    Resolution::DowngradeCsha {
+                        layer: *layer,
+                        to_level: to,
+                    }
+                }
+                (ConflictKind::WrgaVsCpdt { layer, .. }, Technique::Wrga) => {
+                    // CPDT wins over WRGA → drop the adapter.
+                    Resolution::RemoveWrgaAdapter { layer: *layer }
+                }
+                (ConflictKind::FaseVsCpdt { layer, .. }, Technique::Fase) => {
+                    // CPDT wins over FASE → defer the step.
+                    Resolution::DeferFaseStep { layer: *layer }
+                }
+                (ConflictKind::CepVsCpdt { layer, .. }, Technique::Cpdt) => {
+                    // CEP wins over CPDT → accept a heterogeneous shard.
+                    Resolution::AcceptNonUniformShard { layer: *layer }
+                }
+                // Defensive: any (conflict, loser) pairing the priority order
+                // doesn't recognise is a no-op rather than a silent mis-edit.
+                _ => Resolution::NoChange,
             }
         })
         .collect()
@@ -329,5 +406,67 @@ mod tests {
         let (kept, res) = greedy_resolve(d.clone());
         assert!(res.is_empty());
         assert_eq!(kept.len(), d.len());
+    }
+
+    #[test]
+    fn priority_orders_techniques_cep_highest_pca_lowest() {
+        // Strictly increasing rank: CEP > CPDT > CSHA > WRGA > FASE > PCA.
+        let order = [
+            Technique::Cep,
+            Technique::Cpdt,
+            Technique::Csha,
+            Technique::Wrga,
+            Technique::Fase,
+            Technique::Pca,
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].priority() < pair[1].priority(),
+                "{:?} should outrank {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(Technique::Cep.priority(), 0);
+        assert_eq!(Technique::Pca.priority(), 5);
+    }
+
+    #[test]
+    fn loser_is_the_lower_priority_technique() {
+        // The yielding technique in each conflict is decided by the comparator.
+        assert_eq!(
+            ConflictKind::CshaVsCep {
+                layer: 0,
+                csha_level: 3,
+                pruned_heads: 2
+            }
+            .loser(),
+            Technique::Csha
+        );
+        assert_eq!(
+            ConflictKind::WrgaVsCpdt {
+                layer: 0,
+                adapter_rank: 8,
+                shard_factor: 4
+            }
+            .loser(),
+            Technique::Wrga
+        );
+        assert_eq!(
+            ConflictKind::FaseVsCpdt {
+                layer: 0,
+                shard_factor: 4
+            }
+            .loser(),
+            Technique::Fase
+        );
+        assert_eq!(
+            ConflictKind::CepVsCpdt {
+                layer: 0,
+                head_count: 6
+            }
+            .loser(),
+            Technique::Cpdt
+        );
     }
 }

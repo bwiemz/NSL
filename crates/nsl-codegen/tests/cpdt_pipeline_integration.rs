@@ -45,6 +45,8 @@ fn applied_plan_with_shard(n_layers: usize, shard: u32) -> AppliedPlan {
             coarse: CoarseDecision::KeepFull,
             pipeline_stage: 0,
             shard_factor: shard,
+            shard_grads: shard,
+            shard_optim: shard,
             active_heads: 8,
             ffn_width: 4096,
             csha_level: 0,
