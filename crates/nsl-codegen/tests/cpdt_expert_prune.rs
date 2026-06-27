@@ -886,3 +886,880 @@ fn pass_v4_dtype_mismatch_names_offending_projection() {
     assert_eq!(wm.get(&format!("{key}.experts.down.weight")).unwrap().shape, vec![N, D * D]);
     assert_eq!(cfgs[key].num_experts, N);
 }
+
+// ── CPDT Part III v2.13 — bias-aware prune (pass-level) ───────────────────
+
+/// v3 UpDown layout with both biases present, well-shaped. Expert 1 is
+/// dead (router column zeroed by `router_flat`). After prune the bias
+/// tensors must be sliced consistently with the weights — `n_live=3`
+/// rows kept in the order `[0, 2, 3]`.
+#[test]
+fn pass_v3_with_biases_slices_biases_consistently_with_weights() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    // up.weight + down.weight: [N, D*D] each.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // up.bias: shape [N, D] with expert e block = [e+10, e+20, e+30, e+40].
+    // 2D layout. After prune the kept rows must be 0, 2, 3.
+    let up_bias_per_expert: Vec<f32> = (0..N)
+        .flat_map(|e| (0..D).map(move |j| (e * 10 + j * 10 + 10) as f32))
+        .collect();
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        f32s(&up_bias_per_expert),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    // down.bias: shape [N * D] (1D layout). v2.12 accepts both.
+    let down_bias_flat: Vec<f32> =
+        (0..N).flat_map(|e| (0..D).map(move |j| (e * 100 + j + 1) as f32)).collect();
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        f32s(&down_bias_flat),
+        vec![N * D],
+        WeightDType::F32,
+    ));
+
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+
+    // Outcome must be Pruned with n_live=3, dead=[1].
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Pruned { dead, n_live, layout, .. }] => {
+            assert_eq!(dead, &vec![1u32]);
+            assert_eq!(*n_live, 3);
+            assert_eq!(*layout, MoeExpertsLayout::UpDown);
+        }
+        other => panic!("expected Pruned outcome, got {other:?}"),
+    }
+
+    // Weight sliced shape: [3, D*D]; bias up sliced shape: [3, D] (2D
+    // preserved); bias down sliced shape: [3 * D] (1D preserved).
+    let up_bias_entry = wm.get(&format!("{key}.experts.up.bias")).unwrap();
+    assert_eq!(up_bias_entry.shape, vec![3, D], "2D bias shape preserved post-prune");
+    let down_bias_entry = wm.get(&format!("{key}.experts.down.bias")).unwrap();
+    assert_eq!(down_bias_entry.shape, vec![3 * D], "1D bias shape preserved post-prune");
+
+    // Verify the SLICING contents for up.bias: kept rows 0, 2, 3 — so
+    // each row's values must match the expert's pre-prune values.
+    let up_bias_after = to_f32(&up_bias_entry.data);
+    for (new_row, &orig) in [0u32, 2, 3].iter().enumerate() {
+        for j in 0..D {
+            let expected = (orig as usize * 10 + j * 10 + 10) as f32;
+            let actual = up_bias_after[new_row * D + j];
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "up.bias row {} (orig {}) col {} = {} expected {}",
+                new_row, orig, j, actual, expected,
+            );
+        }
+    }
+    // Same for down.bias 1D — index by orig_row * D + j.
+    let down_bias_after = to_f32(&down_bias_entry.data);
+    for (new_row, &orig) in [0u32, 2, 3].iter().enumerate() {
+        for j in 0..D {
+            let expected = (orig as usize * 100 + j + 1) as f32;
+            let actual = down_bias_after[new_row * D + j];
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "down.bias row {} (orig {}) col {} = {} expected {}",
+                new_row, orig, j, actual, expected,
+            );
+        }
+    }
+
+    // cfgs.num_experts updated to n_live.
+    assert_eq!(cfgs[key].num_experts, 3);
+}
+
+/// Partial-bias bundle: up.bias present but down.bias missing. v2.13
+/// must refuse with `PartialBiasBundle` naming the missing direction.
+#[test]
+fn pass_v3_partial_bias_only_up_refuses_loudly() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // Only up.bias — down.bias missing.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::PartialBiasBundle { present, missing, .. },
+            ..
+        }] => {
+            assert_eq!(present.len(), 1);
+            assert!(present[0].ends_with("up.bias"), "present must name up.bias, got {present:?}");
+            assert_eq!(missing.len(), 1);
+            assert!(missing[0].ends_with("down.bias"), "missing must name down.bias, got {missing:?}");
+        }
+        other => panic!("expected PartialBiasBundle refusal, got {other:?}"),
+    }
+
+    // Bundle untouched (refusal is upfront).
+    assert_eq!(wm.get(&format!("{key}.router.weight")).unwrap().shape, vec![D, N]);
+    assert_eq!(wm.get(&format!("{key}.experts.up.weight")).unwrap().shape, vec![N, D * D]);
+    assert_eq!(wm.get(&format!("{key}.experts.up.bias")).unwrap().shape, vec![N, D]);
+    assert_eq!(cfgs[key].num_experts, N);
+}
+
+/// Symmetric partial-bias: down.bias present but up.bias missing. Must
+/// refuse with the OPPOSITE present/missing pair so a regression that
+/// swapped the direction labels would be caught.
+#[test]
+fn pass_v3_partial_bias_only_down_refuses_loudly() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::PartialBiasBundle { present, missing, .. },
+            ..
+        }] => {
+            assert!(present[0].ends_with("down.bias"), "present must name down.bias, got {present:?}");
+            assert!(missing[0].ends_with("up.bias"), "missing must name up.bias, got {missing:?}");
+        }
+        other => panic!("expected PartialBiasBundle refusal, got {other:?}"),
+    }
+}
+
+/// v3 with both biases present and well-shaped, BUT no dead experts.
+/// Outcome must be NoDeadExperts (not Pruned) — bundle stays byte-
+/// identical including bias entries. This pins that v2.13 doesn't
+/// accidentally rewrite untouched biases (which would be a wasteful
+/// allocation and could mask shape drift).
+#[test]
+fn pass_v3_with_biases_and_no_dead_experts_is_identity() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    // Router with NO dead columns — make all columns non-zero.
+    let router_no_dead: Vec<f32> = vec![
+        1.0, 2.0, 1.0, 1.0,
+        1.0, 1.0, 2.0, 1.0,
+        1.0, 1.0, 1.0, 2.0,
+        2.0, 1.0, 1.0, 1.0,
+    ];
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_no_dead),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    let up_bias_orig: Vec<f32> = (0..N * D).map(|i| (i + 1) as f32).collect();
+    let down_bias_orig: Vec<f32> = (0..N * D).map(|i| (i + 100) as f32).collect();
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        f32s(&up_bias_orig),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        f32s(&down_bias_orig),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::NoDeadExperts { .. }] => {}
+        other => panic!("expected NoDeadExperts, got {other:?}"),
+    }
+    // Bias entries are byte-identical (not re-encoded).
+    let up_after = to_f32(&wm.get(&format!("{key}.experts.up.bias")).unwrap().data);
+    assert_eq!(up_after, up_bias_orig);
+    let down_after = to_f32(&wm.get(&format!("{key}.experts.down.bias")).unwrap().data);
+    assert_eq!(down_after, down_bias_orig);
+}
+
+/// Bias dtype mismatch (router F32, bias F16). v2.13 must refuse with
+/// `ProjectionDtypeMismatch` naming the bias — same refusal variant as
+/// for weight projections (single byte-width slice convention).
+#[test]
+fn pass_v3_bias_dtype_mismatch_refuses() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 2], // F16: 2 bytes/elem
+        vec![N, D],
+        WeightDType::F16,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::ProjectionDtypeMismatch { name, .. },
+            ..
+        }] => {
+            assert!(name.ends_with("experts.up.bias"), "refusal must name up.bias, got '{name}'");
+        }
+        other => panic!("expected ProjectionDtypeMismatch on up.bias, got {other:?}"),
+    }
+}
+
+/// Underscore-suffixed bias names (`experts.up_bias` instead of
+/// `experts.up.bias`) must resolve and slice identically. The v2.12
+/// `detect_v3_biases` already accepts both conventions; v2.13 prune
+/// must match so a HF safetensors bundle using the underscore form
+/// gets sliced consistently with v2.12 detection.
+#[test]
+fn pass_v3_underscore_bias_names_slice_correctly() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    let up_bias: Vec<f32> = (0..N * D).map(|i| i as f32).collect();
+    let down_bias: Vec<f32> = (0..N * D).map(|i| (i + 100) as f32).collect();
+    // Underscore-suffix form.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up_bias"),
+        f32s(&up_bias),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down_bias"),
+        f32s(&down_bias),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Pruned { n_live, .. }] => {
+            assert_eq!(*n_live, 3);
+        }
+        other => panic!("expected Pruned outcome, got {other:?}"),
+    }
+    // Bias entries preserved under their original (underscore) names.
+    let up_b = wm.get(&format!("{key}.experts.up_bias")).unwrap();
+    assert_eq!(up_b.shape, vec![3, D]);
+    let down_b = wm.get(&format!("{key}.experts.down_bias")).unwrap();
+    assert_eq!(down_b.shape, vec![3, D]);
+
+    // v2.13 fix F4 (HIGH adversarial review): assert CONTENT, not just
+    // shape. The original test only verified shape — a regression that
+    // mutated the shape field but kept the original `[N*D]` bytes
+    // (silent shape/data mismatch) would have passed. Cross-check the
+    // sliced byte count AND the per-row content for both biases.
+    assert_eq!(up_b.data.len(), 3 * D * 4, "up_bias byte len must match new shape");
+    assert_eq!(down_b.data.len(), 3 * D * 4, "down_bias byte len must match new shape");
+    let up_after = to_f32(&up_b.data);
+    let down_after = to_f32(&down_b.data);
+    for (new_row, &orig) in [0u32, 2, 3].iter().enumerate() {
+        for j in 0..D {
+            let expected_up = (orig as usize * D + j) as f32;
+            assert!(
+                (up_after[new_row * D + j] - expected_up).abs() < 1e-6,
+                "up_bias slicing wrong at row {new_row} (orig {orig}) col {j}",
+            );
+            let expected_down = (orig as usize * D + j + 100) as f32;
+            assert!(
+                (down_after[new_row * D + j] - expected_down).abs() < 1e-6,
+                "down_bias slicing wrong at row {new_row} (orig {orig}) col {j}",
+            );
+        }
+    }
+}
+
+// ── v2.13 fix bundle: F1 + F2 + F7 + F9 + F10 + F15 regression tests ─────
+
+/// F1 HIGH — bias rank-3+ refused with `BiasShapeRankUnsupported`.
+/// Pre-v2.13-F1, the writeback's else-branch silently flattened to 1D.
+#[test]
+fn pass_v3_bias_rank_3_refuses_loudly_f1() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // Rank-3 bias: [N, 2, D/2] — N*2*(D/2) = N*D = 16 elems total.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, 2, D / 2],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::BiasShapeRankUnsupported { name, actual_ndim, .. },
+            ..
+        }] => {
+            assert!(name.ends_with("experts.up.bias"));
+            assert_eq!(*actual_ndim, 3);
+        }
+        other => panic!("expected BiasShapeRankUnsupported, got {other:?}"),
+    }
+    // Bundle untouched.
+    assert_eq!(cfgs[key].num_experts, N);
+    assert_eq!(wm.get(&format!("{key}.experts.up.weight")).unwrap().shape, vec![N, D * D]);
+}
+
+/// F2 HIGH — Single layout with bias entries refused with
+/// `SingleLayoutWithBiasEntries`. Pre-v2.13-F2 the prune sliced the
+/// single weight but left orphan biases at original n_experts.
+#[test]
+fn pass_single_layout_with_bias_entries_refuses_loudly_f2() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    // Single layout: just experts.weight, no up/down/gate.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 5)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // But there's an up.bias loitering — this is the orphan case.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::SingleLayoutWithBiasEntries { orphan_biases_present, .. },
+            ..
+        }] => {
+            assert!(*orphan_biases_present);
+        }
+        other => panic!("expected SingleLayoutWithBiasEntries, got {other:?}"),
+    }
+    // Bundle untouched.
+    assert_eq!(cfgs[key].num_experts, N);
+    assert_eq!(wm.get(&format!("{key}.experts.weight")).unwrap().shape, vec![N, D * D]);
+}
+
+/// F15 IMPORTANT — orphan bias without any weight projections. The
+/// layout match falls into the (false, false, false, false) arm; pre-
+/// v2.13-F15 this silently produced `SkippedMissingExperts` while the
+/// orphan biases polluted the WeightMap.
+#[test]
+fn pass_orphan_bias_without_weight_refuses_loudly_f15() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    // ONLY biases present — no experts.up.weight, no experts.down.weight.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::OrphanBiasWithoutWeight { orphan_biases, .. },
+            ..
+        }] => {
+            assert!(orphan_biases.iter().any(|n| n.ends_with("up.bias")));
+            assert!(orphan_biases.iter().any(|n| n.ends_with("down.bias")));
+        }
+        other => panic!("expected OrphanBiasWithoutWeight, got {other:?}"),
+    }
+}
+
+/// F7 IMPORTANT — multi-gap dead set (dead=[1,3], index_remap=[0,2]).
+/// Pre-v2.13-F7 every test used router_flat which only zeroes column 1
+/// (single contiguous gap). A regression that conflated dead/index_remap
+/// would survive dead=[1] but corrupt at dead=[1,3].
+#[test]
+fn pass_v3_with_biases_multi_gap_dead_set_f7() {
+    let key = "m";
+    // Custom router: columns 1 AND 3 are zero (dead). Columns 0 and 2 alive.
+    let router_multi_dead: Vec<f32> = vec![
+        9.0, 0.0, 1.0, 0.0,
+        1.0, 0.0, 9.0, 0.0,
+        1.0, 0.0, 1.0, 0.0,
+        1.0, 0.0, 1.0, 0.0,
+    ];
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_multi_dead),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // Bias values encode expert index: row e = [e*10, e*10+1, e*10+2, e*10+3].
+    let up_bias: Vec<f32> = (0..N)
+        .flat_map(|e| (0..D).map(move |j| (e * 10 + j) as f32))
+        .collect();
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        f32s(&up_bias),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        f32s(&up_bias),
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Pruned { dead, n_live, .. }] => {
+            assert_eq!(dead, &vec![1u32, 3u32]);
+            assert_eq!(*n_live, 2);
+        }
+        other => panic!("expected Pruned with dead=[1,3] n_live=2, got {other:?}"),
+    }
+    // Kept rows must be exactly [0, 2] in that order.
+    let up_b = wm.get(&format!("{key}.experts.up.bias")).unwrap();
+    let up_after = to_f32(&up_b.data);
+    for (new_row, &orig) in [0u32, 2].iter().enumerate() {
+        for j in 0..D {
+            let expected = (orig as usize * 10 + j) as f32;
+            assert!(
+                (up_after[new_row * D + j] - expected).abs() < 1e-6,
+                "multi-gap up_bias row {new_row} (orig {orig}) col {j} = {} expected {}",
+                up_after[new_row * D + j], expected,
+            );
+        }
+    }
+}
+
+/// F9 IMPORTANT — non-divisible bias must refuse upfront, leaving the
+/// WeightMap and moe_configs UNCHANGED. Pre-v2.13-F9 the test only
+/// asserted the refusal variant; a regression that ran the refusal
+/// AFTER weight slicing would have left half-pruned state.
+#[test]
+fn pass_v3_non_divisible_bias_refuses_upfront_no_mutation_f9() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // up.bias has 15 elements, 15 % 4 != 0 — refuses.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; 15 * 4],
+        vec![15],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+
+    // F9: pin the refusal-then-no-mutation contract.
+    assert_eq!(outcomes.len(), 1, "expected exactly one outcome");
+    match &outcomes[0] {
+        MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::BundleInconsistent { reason },
+            ..
+        } => {
+            assert!(reason.contains("up.bias") && reason.contains("15"));
+        }
+        other => panic!("expected BundleInconsistent refusal, got {other:?}"),
+    }
+    // WeightMap and cfgs UNCHANGED (no partial mutation).
+    assert_eq!(cfgs[key].num_experts, N, "cfg.num_experts must not be mutated");
+    assert_eq!(wm.get(&format!("{key}.router.weight")).unwrap().shape, vec![D, N]);
+    assert_eq!(wm.get(&format!("{key}.experts.up.weight")).unwrap().shape, vec![N, D * D]);
+    assert_eq!(wm.get(&format!("{key}.experts.down.weight")).unwrap().shape, vec![N, D * D]);
+}
+
+/// F10 IMPORTANT — multi-MoE bundle (two layers). Each layer has its
+/// own router + weights + biases. The pass must produce two
+/// independent Pruned outcomes with per-layer slicing. Pre-v2.13-F10
+/// any cross-layer state leak would silently affect bias slicing in
+/// real two-block models (Mixtral has 8 layers).
+#[test]
+fn pass_v3_two_moe_layers_with_biases_independent_slicing_f10() {
+    let mut wm = WeightMap::default();
+    let mut cfgs = HashMap::new();
+    for layer_idx in 0..2 {
+        let key = format!("blocks.{layer_idx}");
+        wm.insert(WeightEntry::new(
+            format!("{key}.router.weight"),
+            f32s(&router_flat()),
+            vec![D, N],
+            WeightDType::F32,
+        ));
+        wm.insert(WeightEntry::new(
+            format!("{key}.experts.up.weight"),
+            f32s(&v4_projection_flat(&[0, 1, 2, 3], 2 + layer_idx)),
+            vec![N, D * D],
+            WeightDType::F32,
+        ));
+        wm.insert(WeightEntry::new(
+            format!("{key}.experts.down.weight"),
+            f32s(&v4_projection_flat(&[0, 1, 2, 3], 3 + layer_idx)),
+            vec![N, D * D],
+            WeightDType::F32,
+        ));
+        // Per-layer bias values include layer_idx so cross-leak would be visible.
+        let up_bias: Vec<f32> = (0..N)
+            .flat_map(|e| (0..D).map(move |j| (layer_idx * 1000 + e * 10 + j) as f32))
+            .collect();
+        wm.insert(WeightEntry::new(
+            format!("{key}.experts.up.bias"),
+            f32s(&up_bias),
+            vec![N, D],
+            WeightDType::F32,
+        ));
+        wm.insert(WeightEntry::new(
+            format!("{key}.experts.down.bias"),
+            f32s(&up_bias),
+            vec![N, D],
+            WeightDType::F32,
+        ));
+        cfgs.insert(key, moe_info(N, 1));
+    }
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+
+    assert_eq!(outcomes.len(), 2, "expected two Pruned outcomes");
+    for o in &outcomes {
+        match o {
+            MoePruneOutcome::Pruned { n_live, .. } => assert_eq!(*n_live, 3),
+            other => panic!("expected Pruned, got {other:?}"),
+        }
+    }
+    // Each layer's bias values reflect its own layer_idx encoding (no
+    // cross-layer leak). Kept rows = [0, 2, 3] for both layers.
+    for layer_idx in 0..2 {
+        let key = format!("blocks.{layer_idx}");
+        let up_b = wm.get(&format!("{key}.experts.up.bias")).unwrap();
+        let up_after = to_f32(&up_b.data);
+        for (new_row, &orig) in [0u32, 2, 3].iter().enumerate() {
+            for j in 0..D {
+                let expected = (layer_idx * 1000 + orig as usize * 10 + j) as f32;
+                assert!(
+                    (up_after[new_row * D + j] - expected).abs() < 1e-6,
+                    "layer {layer_idx} row {new_row} (orig {orig}) col {j} = {} expected {} — cross-layer leak?",
+                    up_after[new_row * D + j], expected,
+                );
+            }
+        }
+        assert_eq!(cfgs[&key].num_experts, 3, "each layer's cfg must be independently updated");
+    }
+}
+
+/// Bias num_elements not divisible by n_experts — refuse with the
+/// `BundleInconsistent` variant. Off-by-one in intermediate_dim would
+/// otherwise land as silent corruption on writeback (the slicer
+/// computes block_elems = num_elements / n_experts; truncation would
+/// drop bytes from the last expert's bias block).
+#[test]
+fn pass_v3_bias_non_divisible_num_elements_refuses() {
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // up.bias has 15 elements; 15 % N (=4) == 3, refuses.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; 15 * 4],
+        vec![15],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    match outcomes.as_slice() {
+        [MoePruneOutcome::Refused {
+            refusal: ExpertPruneRefusal::BundleInconsistent { reason },
+            ..
+        }] => {
+            assert!(reason.contains("up.bias") && reason.contains("15"),
+                "diagnostic must name the offending bias and elem count: {reason}");
+        }
+        other => panic!("expected BundleInconsistent refusal, got {other:?}"),
+    }
+}
+
+/// Post-prune v2.12 detect_v3_biases composition test: after the v2.13
+/// pass slices weights + biases, the sliced bundle must pass v2.12's
+/// detect_v3_biases gate at the new `n_live`. Composition matters
+/// because v2.12's detection runs at codegen AFTER the v2.13 pass;
+/// any post-prune shape inconsistency would surface as a v2.12
+/// shape-mismatch refusal — which would be confusing because the
+/// user would see a v2.12 error for a v2.13 pass bug.
+#[test]
+fn pass_v3_post_prune_passes_v2_12_detect_v3_biases() {
+    use nsl_codegen::moe::detect_v3_biases;
+    let key = "m";
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 2)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.weight"),
+        f32s(&v4_projection_flat(&[0, 1, 2, 3], 3)),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    // Up bias: [N, D] = [4, 4] = 16 elems. Down bias: [N, D] = 16 elems.
+    // Post-prune at n_live=3, expected_up_elems = 3 * D = 12, expected_down_elems = 3 * D = 12.
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.up.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.down.bias"),
+        vec![0u8; N * D * 4],
+        vec![N, D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert(key.to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    assert!(matches!(outcomes.as_slice(), [MoePruneOutcome::Pruned { .. }]));
+
+    // Post-prune dims: hidden=D=4, intermediate=D=4 (square), n_live=3.
+    // detect_v3_biases at the new dims must pass.
+    let result = detect_v3_biases(&wm, key, 3, D, D);
+    assert!(
+        matches!(result, Ok(Some(()))),
+        "post-prune bundle must pass v2.12 detect_v3_biases; got {result:?}"
+    );
+}

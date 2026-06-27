@@ -119,6 +119,49 @@ pub enum ExpertPruneRefusal {
     /// when at least one expert is dead). Refusal mirrors the router
     /// 2D check and names the offending projection.
     ProjectionShapeNot2D { name: String, actual_ndim: usize, num_elements: usize },
+    /// CPDT Part III v2.13 — partial-bias bundle. The detected layout
+    /// (UpDown for v3, GateUpDown for v4) has at least one bias entry
+    /// present but at least one missing. Mirrors v2.12's `detect_v3_
+    /// biases` partial-bias refusal: biases are all-or-nothing per
+    /// layout family. If only some are present, the bundle is almost
+    /// certainly the result of a stale or mis-packed save and silently
+    /// pruning the present biases (while leaving the absent ones at
+    /// the old `n_experts` row count) would produce silent corruption
+    /// at the v2.12 codegen detection step (mismatched element count
+    /// after the writeback). Refuse loudly with the present / missing
+    /// names so the user can fix the bundle.
+    ///
+    /// v2.13 fix F11: dropped the redundant `layer` field — it
+    /// duplicated `MoePruneOutcome::Refused.layer` with no consumer.
+    PartialBiasBundle { present: Vec<String>, missing: Vec<String> },
+    /// CPDT Part III v2.13 fix F1 (HIGH adversarial review) — bias
+    /// entry has rank > 2. The slicing logic admits 1D `[n*dim]` and
+    /// 2D `[n, dim]` layouts only; rank-3+ writeback can't pick a
+    /// canonical shape without per-axis semantics that v2.13 doesn't
+    /// model. Refuse loudly rather than silently flatten to 1D
+    /// (which would re-introduce the non-monotonic shape-rewrite
+    /// hazard that v2.9 fix F2 closed on the weight side).
+    BiasShapeRankUnsupported { name: String, actual_ndim: usize, num_elements: usize },
+    /// CPDT Part III v2.13 fix F2 (HIGH adversarial review) — the
+    /// detected layout is Single (v1/v2 legacy packed format) but
+    /// bias entries are present. Single does not support FFN biases
+    /// (the legacy single-projection convention has no bias hook).
+    /// Without this gate the prune would slice the single weight to
+    /// `n_live` rows while leaving the orphan biases at the original
+    /// `n_experts` count — silently inflating WeightMap.total_bytes()
+    /// and confusing downstream passes that scan by total weight
+    /// (mirrors the v2.9 F3 over-complete-layout invariant for the
+    /// bias case).
+    SingleLayoutWithBiasEntries { layer: String, orphan_biases_present: bool },
+    /// CPDT Part III v2.13 fix F15 (IMPORTANT adversarial review) —
+    /// a v3/v4 bias entry is present but the corresponding weight
+    /// projection is absent (e.g., `experts.up.bias` shipped without
+    /// `experts.up.weight`). Layout detection only inspects weight
+    /// keys, so an orphan bias bundle silently falls into
+    /// `SkippedMissingExperts` while leaving the orphan bias tensors
+    /// in the WeightMap. v2.13 surfaces this loudly so downstream
+    /// passes don't see polluted state.
+    OrphanBiasWithoutWeight { layer: String, orphan_biases: Vec<String> },
 }
 
 /// Prune dead experts from a MoE weight bundle: slice router columns + drop
@@ -433,11 +476,76 @@ pub fn prune_moe_weights_in_map(
             .iter()
             .any(|s| weight_map.get(&format!("{lookup_key}.{s}")).is_some());
 
+        // v2.13 fix F2 + F15 (adversarial review): pre-check whether
+        // ANY bias entries are present before falling into the layout
+        // match. Two distinct hazards:
+        //
+        //   F2 — Single + bias entries: Single (v1/v2) has no bias
+        //   support. Silently pruning the single weight while leaving
+        //   the bias tensors at original n_experts inflates
+        //   total_bytes and pollutes downstream passes (the same
+        //   class as v2.9 fix F3's over-complete weight refusal,
+        //   mirrored for the bias case).
+        //
+        //   F15 — orphan biases without weights: e.g. up.bias present
+        //   but up.weight absent. The layout match only inspects
+        //   weight keys, so this falls into SkippedMissingExperts
+        //   (or the ambiguous wildcard) while orphan biases stay in
+        //   the WeightMap. Surface it loudly.
+        //
+        // Uses `any_v3_bias_entry_present` from moe.rs — the same
+        // cheap presence-only detector v2.12 added (F2 there).
+        let any_bias = crate::moe::any_v3_bias_entry_present(weight_map, lookup_key);
+        let bias_entries_present_names = {
+            let mut found: Vec<String> = Vec::new();
+            for s in [
+                "experts.up.bias",
+                "experts.up_bias",
+                "experts.down.bias",
+                "experts.down_bias",
+                "experts.gate.bias",
+                "experts.gate_bias",
+            ] {
+                let full = format!("{lookup_key}.{s}");
+                if weight_map.get(&full).is_some() {
+                    found.push(full);
+                }
+            }
+            found
+        };
+
         let layout = match (gate_present, up_present, down_present, single_present) {
             (true,  true,  true,  false) => MoeExpertsLayout::GateUpDown,
             (false, true,  true,  false) => MoeExpertsLayout::UpDown,
-            (false, false, false, true) => MoeExpertsLayout::Single,
+            (false, false, false, true) => {
+                // v2.13 fix F2: Single layout + bias entries → refuse.
+                if any_bias {
+                    outcomes.push(MoePruneOutcome::Refused {
+                        layer: key.clone(),
+                        refusal: ExpertPruneRefusal::SingleLayoutWithBiasEntries {
+                            layer: key.clone(),
+                            orphan_biases_present: true,
+                        },
+                    });
+                    continue;
+                }
+                MoeExpertsLayout::Single
+            }
             (false, false, false, false) => {
+                // v2.13 fix F15: orphan biases without ANY weights
+                // (the genuinely "biases shipped without their
+                // projections" case). Surface specifically rather
+                // than silently SkippedMissingExperts.
+                if any_bias {
+                    outcomes.push(MoePruneOutcome::Refused {
+                        layer: key.clone(),
+                        refusal: ExpertPruneRefusal::OrphanBiasWithoutWeight {
+                            layer: key.clone(),
+                            orphan_biases: bias_entries_present_names,
+                        },
+                    });
+                    continue;
+                }
                 outcomes.push(MoePruneOutcome::SkippedMissingExperts { layer: key });
                 continue;
             }
@@ -569,13 +677,157 @@ pub fn prune_moe_weights_in_map(
             })
             .collect();
 
+        // CPDT Part III v2.13 — bias detection + all-or-nothing refusal.
+        //
+        // The slicing operation in `prune_dead_experts_split` is byte-
+        // generic: any `[n_experts, block_elems]` packed buffer gets
+        // sliced by the same index_remap. Bias tensors (shape
+        // `[n_experts, dim]` packed, or 1D `[n_experts * dim]` flat
+        // per v2.12's accept-both convention) fit that contract
+        // exactly. So instead of duplicating the slicing logic, we
+        // append biases as ADDITIONAL ExpertProjections in the same
+        // Vec passed to `prune_dead_experts_split`. The kept_projections
+        // result is then split back into weight + bias halves for
+        // separate writeback (biases preserve their original shape;
+        // weights are always 2D).
+        //
+        // All-or-nothing rule: if ANY bias is found for the layout's
+        // expected set, ALL must be present. Partial bundles are
+        // refused with `PartialBiasBundle` (mirrors v2.12's
+        // `detect_v3_biases` partial refusal). Rationale: silently
+        // pruning the present biases while leaving the absent ones at
+        // their pre-prune `n_experts` count would cause v2.12 codegen
+        // detection to fail downstream with a mismatched-element
+        // diagnostic — better to refuse loudly at the prune site so
+        // the user can fix the bundle in one place.
+        //
+        // Layout scope:
+        //   Single (v1/v2): no bias support (legacy single-projection)
+        //   UpDown (v3): {experts.up.bias, experts.down.bias}
+        //   GateUpDown (v4): {experts.gate.bias, experts.up.bias,
+        //                     experts.down.bias} — defensive forward-
+        //                     compat (v2.12 doesn't activate v4 bias
+        //                     from source yet; v2.next bias-FFI cycle
+        //                     would). Slicing keeps the bundle
+        //                     self-consistent either way.
+        let bias_specs: Vec<(Vec<&str>, &str)> = match layout {
+            MoeExpertsLayout::Single => Vec::new(),
+            MoeExpertsLayout::UpDown => vec![
+                (vec!["experts.up.bias", "experts.up_bias"], "experts.up.bias"),
+                (vec!["experts.down.bias", "experts.down_bias"], "experts.down.bias"),
+            ],
+            MoeExpertsLayout::GateUpDown => vec![
+                (vec!["experts.gate.bias", "experts.gate_bias"], "experts.gate.bias"),
+                (vec!["experts.up.bias", "experts.up_bias"], "experts.up.bias"),
+                (vec!["experts.down.bias", "experts.down_bias"], "experts.down.bias"),
+            ],
+        };
+        let bias_resolved: Vec<Option<WeightEntry>> = bias_specs
+            .iter()
+            .map(|(suffixes, _)| resolve(weight_map, lookup_key, suffixes).cloned())
+            .collect();
+        let bias_present_count = bias_resolved.iter().filter(|o| o.is_some()).count();
+        let bias_expected_count = bias_specs.len();
+
+        if bias_present_count > 0 && bias_present_count < bias_expected_count {
+            let present_names: Vec<String> = bias_specs
+                .iter()
+                .zip(bias_resolved.iter())
+                .filter_map(|((_, canonical), r)| r.as_ref().map(|_| canonical.to_string()))
+                .collect();
+            let missing_names: Vec<String> = bias_specs
+                .iter()
+                .zip(bias_resolved.iter())
+                .filter_map(|((_, canonical), r)| {
+                    if r.is_none() { Some(canonical.to_string()) } else { None }
+                })
+                .collect();
+            outcomes.push(MoePruneOutcome::Refused {
+                layer: key.clone(),
+                refusal: ExpertPruneRefusal::PartialBiasBundle {
+                    present: present_names,
+                    missing: missing_names,
+                },
+            });
+            continue;
+        }
+
+        // Validate bias dtype + element count, then build bias
+        // ExpertProjections. Track original shapes for shape-preserving
+        // writeback after slicing.
+        let mut bias_projections: Vec<ExpertProjection> = Vec::new();
+        let mut bias_original_shapes: Vec<Vec<usize>> = Vec::new();
+        let mut bias_refusal: Option<ExpertPruneRefusal> = None;
+        for entry_opt in bias_resolved.iter() {
+            let Some(entry) = entry_opt else { continue };
+            if entry.dtype != router_entry.dtype {
+                bias_refusal = Some(ExpertPruneRefusal::ProjectionDtypeMismatch {
+                    name: entry.name.clone(),
+                    projection_dtype: entry.dtype,
+                    router_dtype: router_entry.dtype,
+                });
+                break;
+            }
+            // v2.13 fix F1 (HIGH adversarial review) — rank gate.
+            // The writeback reconstructs shape from entry.shape rank
+            // (1D → 1D, 2D → 2D); rank-3+ has no canonical writeback
+            // semantics so refuse loudly rather than silently flatten
+            // to 1D (which would re-introduce the non-monotonic shape-
+            // rewrite hazard v2.9 fix F2 closed for weights).
+            if entry.shape.len() != 1 && entry.shape.len() != 2 {
+                bias_refusal = Some(ExpertPruneRefusal::BiasShapeRankUnsupported {
+                    name: entry.name.clone(),
+                    actual_ndim: entry.shape.len(),
+                    num_elements: entry.num_elements,
+                });
+                break;
+            }
+            // v2.12 accept-both convention: 1D `[n*dim]` OR 2D `[n, dim]`.
+            // The slicing only cares about total elem count divisibility
+            // by n_experts. Shape on writeback is reconstructed from
+            // the original entry.shape rank to preserve the user's
+            // chosen layout (avoids non-monotonic 1D→2D rewrites).
+            if !entry.num_elements.is_multiple_of(n.max(1)) {
+                bias_refusal = Some(ExpertPruneRefusal::BundleInconsistent {
+                    reason: format!(
+                        "bias '{}' num_elements {} not divisible by n_experts {n}",
+                        entry.name, entry.num_elements,
+                    ),
+                });
+                break;
+            }
+            let block_elems = entry.num_elements / n.max(1);
+            bias_projections.push(ExpertProjection {
+                name: entry.name.clone(),
+                data: entry.data.clone(),
+                block_elems,
+                dtype: entry.dtype,
+            });
+            bias_original_shapes.push(entry.shape.clone());
+        }
+        if let Some(r) = bias_refusal {
+            outcomes.push(MoePruneOutcome::Refused { layer: key, refusal: r });
+            continue;
+        }
+
+        // Concatenate biases to the weight projections list. The split
+        // index (weight_proj_count) lets us separate the kept slices
+        // back into weight + bias halves for differentiated writeback.
+        let weight_proj_count = projections.len();
+        let mut all_projections = projections;
+        all_projections.extend(bias_projections);
+        let bias_entry_names: Vec<String> = bias_resolved
+            .iter()
+            .filter_map(|o| o.as_ref().map(|e| e.name.clone()))
+            .collect();
+
         match prune_dead_experts_split(
             &router_entry.data,
             router_entry.dtype,
             d_model,
             n,
             info.top_k,
-            &projections,
+            &all_projections,
             &dead,
         ) {
             Err(refusal) => outcomes.push(MoePruneOutcome::Refused { layer: key, refusal }),
@@ -583,13 +835,28 @@ pub fn prune_moe_weights_in_map(
                 outcomes.push(MoePruneOutcome::NoDeadExperts { layer: key });
             }
             Ok(res) => {
+                // v2.13: split kept_projections back into weight + bias
+                // halves. The first `weight_proj_count` are the
+                // original `resolved` weight entries; any remainder
+                // are biases (in the same order as bias_resolved /
+                // bias_original_shapes / bias_entry_names).
+                let (weight_kept, bias_kept) = res.kept_projections.split_at(weight_proj_count);
+
                 let dropped_router_bytes = router_entry.data.len().saturating_sub(res.sliced_router.len()) as u64;
-                let dropped_proj_bytes: u64 = resolved
+                let dropped_weight_bytes: u64 = resolved
                     .iter()
-                    .zip(res.kept_projections.iter())
+                    .zip(weight_kept.iter())
                     .map(|(in_e, kp)| in_e.data.len().saturating_sub(kp.data.len()) as u64)
                     .sum();
-                let dropped_bytes = dropped_router_bytes + dropped_proj_bytes;
+                // v2.13: bias slicing also drops bytes. Iterate the
+                // option vector to match the bias_kept order.
+                let dropped_bias_bytes: u64 = bias_resolved
+                    .iter()
+                    .filter_map(|o| o.as_ref())
+                    .zip(bias_kept.iter())
+                    .map(|(in_e, kp)| in_e.data.len().saturating_sub(kp.data.len()) as u64)
+                    .sum();
+                let dropped_bytes = dropped_router_bytes + dropped_weight_bytes + dropped_bias_bytes;
 
                 // Writeback: mutate WeightMap in place. Use the
                 // RESOLVED entry's name (preserving the suffix the
@@ -603,11 +870,43 @@ pub fn prune_moe_weights_in_map(
                     router_entry.dtype,
                 );
                 weight_map.insert(new_router);
-                for (in_e, kp) in resolved.iter().zip(res.kept_projections.into_iter()) {
+                for (in_e, kp) in resolved.iter().zip(weight_kept.iter().cloned()) {
                     let new_entry = WeightEntry::new(
                         in_e.name.clone(),
                         kp.data,
                         vec![res.n_live, kp.block_elems],
+                        kp.dtype,
+                    );
+                    weight_map.insert(new_entry);
+                }
+                // v2.13: bias writeback preserves the original shape
+                // rank. A 1D `[n_experts * dim]` entry becomes 1D
+                // `[n_live * dim]`; a 2D `[n_experts, dim]` entry
+                // becomes 2D `[n_live, dim]`. This avoids the non-
+                // monotonic shape-rewrite hazard that v2.9 fix F2
+                // codified (changing rank only when at least one
+                // expert is dead would be silent corruption).
+                for ((name, orig_shape), kp) in bias_entry_names
+                    .iter()
+                    .zip(bias_original_shapes.iter())
+                    .zip(bias_kept.iter().cloned())
+                {
+                    // v2.13 fix F1 (HIGH adversarial review): exhaustive
+                    // match — the upstream rank gate refuses anything
+                    // other than 1D or 2D, so a rank-3+ value reaching
+                    // here is a structural invariant violation.
+                    let new_shape: Vec<usize> = match orig_shape.len() {
+                        1 => vec![res.n_live * kp.block_elems],
+                        2 => vec![res.n_live, kp.block_elems],
+                        _ => unreachable!(
+                            "bias rank {} not in {{1,2}} — upstream `BiasShapeRankUnsupported` gate should have refused",
+                            orig_shape.len(),
+                        ),
+                    };
+                    let new_entry = WeightEntry::new(
+                        name.clone(),
+                        kp.data,
+                        new_shape,
                         kp.dtype,
                     );
                     weight_map.insert(new_entry);
@@ -646,6 +945,41 @@ pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
             MoePruneOutcome::SkippedMissingExperts { layer } => {
                 eprintln!("[cpdt] moe '{layer}': skipped — no expert weights found")
             }
+            // v2.13 fix F12 (IMPORTANT adversarial review): dedicated
+            // pretty-print arms for the v2.13 bias-related refusals.
+            // Falls back to {refusal:?} Debug for the v2.9 variants
+            // (which already have meaningful Debug output).
+            MoePruneOutcome::Refused {
+                layer,
+                refusal: ExpertPruneRefusal::PartialBiasBundle { present, missing },
+            } => eprintln!(
+                "[cpdt] moe '{layer}': prune refused — partial bias bundle. present={present:?}, missing={missing:?}. \
+                 v3/v4 biases are all-or-nothing per layout family (UpDown / GateUpDown). \
+                 Fix by adding the missing bias tensors to the checkpoint, OR by removing the present biases entirely."
+            ),
+            MoePruneOutcome::Refused {
+                layer,
+                refusal: ExpertPruneRefusal::BiasShapeRankUnsupported { name, actual_ndim, num_elements },
+            } => eprintln!(
+                "[cpdt] moe '{layer}': prune refused — bias '{name}' has rank {actual_ndim} (num_elements={num_elements}). \
+                 v2.13 supports 1D `[n_experts * dim]` or 2D `[n_experts, dim]` bias layouts only. \
+                 Reshape the bias tensor to one of those layouts."
+            ),
+            MoePruneOutcome::Refused {
+                layer,
+                refusal: ExpertPruneRefusal::SingleLayoutWithBiasEntries { .. },
+            } => eprintln!(
+                "[cpdt] moe '{layer}': prune refused — Single layout (v1/v2 packed format) does not support FFN biases. \
+                 Remove the bias tensors from the checkpoint, OR upgrade the bundle to a multi-projection layout (v3 UpDown / v4 GateUpDown)."
+            ),
+            MoePruneOutcome::Refused {
+                layer,
+                refusal: ExpertPruneRefusal::OrphanBiasWithoutWeight { orphan_biases, .. },
+            } => eprintln!(
+                "[cpdt] moe '{layer}': prune refused — orphan bias bundle. \
+                 No expert weight projections were found under this layer, but bias entries exist: {orphan_biases:?}. \
+                 Either add the matching weight tensors, or remove these orphan biases from the checkpoint."
+            ),
             MoePruneOutcome::Refused { layer, refusal } => {
                 eprintln!("[cpdt] moe '{layer}': prune refused — {refusal:?}")
             }
