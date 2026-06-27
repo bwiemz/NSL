@@ -29,6 +29,38 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
 }
 
+/// Allowlist of legal `data:` section config keys. Mirrors
+/// `nsl-semantic/src/checker/block.rs::DATA_SECTION_KEYS` — both must stay
+/// in sync. A key present here but missing in the semantic table will reach
+/// `compile_assign` and fail with an undefined-variable error; a key
+/// present in the semantic table but missing here will reach
+/// `compile_assign` with the same failure mode. v8 ships with a single
+/// canonical key (`source`); future keys should land in both places.
+const DATA_SECTION_KEYS: &[&str] = &["source"];
+
+/// Returns true iff `stmt` is a `data:` section config pair of the form
+/// `<allowlisted-key> = <expr>` (plain `Assign`, plain ident target). These
+/// are PCA-detection metadata consumed via the AST walker in
+/// `pca_activation.rs`; they must not be lowered as variable assignments.
+fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> bool {
+    let StmtKind::Assign {
+        target,
+        op: AssignOp::Assign,
+        ..
+    } = &stmt.kind
+    else {
+        return false;
+    };
+    let ExprKind::Ident(name_sym) = target.kind else {
+        return false;
+    };
+    let name = match interner.resolve(name_sym.0) {
+        Some(n) => n,
+        None => return false,
+    };
+    DATA_SECTION_KEYS.contains(&name)
+}
+
 /// Task 4: WRGA bridge — build a `WrgaInput` from decorator configs stashed on
 /// the Compiler and run `wrga::run` against the primal Wengert list.
 ///
@@ -3371,8 +3403,20 @@ impl Compiler<'_> {
                     }
                 }
                 TrainSection::Data(stmts) => {
-                    // Compile data section stmts — typically creates a DataLoader
+                    // Compile data section stmts — typically creates a DataLoader.
+                    // `key = expr` config pairs (e.g. `source = PretrainCorpus`)
+                    // are PCA-detection metadata consumed via the AST walker in
+                    // `pca_activation.rs`; they MUST NOT flow through
+                    // `compile_assign`, which would try to look up `key` as a
+                    // variable. Skip the allowlisted keys here and let
+                    // anything else (statements, future loader builders) go
+                    // through the standard compile path. Keep this list in
+                    // sync with `nsl-semantic/src/checker/block.rs`
+                    // (`DATA_SECTION_KEYS`).
                     for stmt in stmts {
+                        if is_data_section_config_pair(stmt, self.interner) {
+                            continue;
+                        }
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
@@ -6902,7 +6946,12 @@ impl Compiler<'_> {
                     step_body = Some((body, *param));
                 }
                 TrainSection::Data(stmts) => {
+                    // See `compile_train_block::TrainSection::Data` for why
+                    // the allowlisted config pairs are skipped.
                     for stmt in stmts {
+                        if is_data_section_config_pair(stmt, self.interner) {
+                            continue;
+                        }
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
