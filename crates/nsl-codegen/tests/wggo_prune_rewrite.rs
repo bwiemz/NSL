@@ -35,7 +35,7 @@
 
 use nsl_codegen::wengert::{PrimalOp, VarId, WengertList, WengertOp};
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
-use nsl_codegen::wggo_dp::LayerDecision;
+use nsl_codegen::wggo_dp::CoarseDecision;
 use nsl_codegen::weight_aware::WeightMap;
 use nsl_codegen::wggo_prune::{PruneRefusal, run};
 use std::collections::HashMap;
@@ -217,7 +217,7 @@ fn mk_prune_layer(idx: u32, name: &str) -> AppliedLayer {
     AppliedLayer {
         layer_index: idx,
         layer_name: name.to_string(),
-        coarse: LayerDecision::Prune,
+        coarse: CoarseDecision::Prune,
         pipeline_stage: 0,
         shard_factor: 1,
         shard_grads: 1,
@@ -241,7 +241,7 @@ fn mk_keep_layer(idx: u32, name: &str) -> AppliedLayer {
     AppliedLayer {
         layer_index: idx,
         layer_name: name.to_string(),
-        coarse: LayerDecision::KeepFull,
+        coarse: CoarseDecision::KeepFull,
         pipeline_stage: 0,
         shard_factor: 1,
         shard_grads: 1,

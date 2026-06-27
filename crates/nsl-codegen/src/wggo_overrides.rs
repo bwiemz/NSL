@@ -191,7 +191,7 @@ fn map_csha_level(raw: u8) -> Option<FusionLevel> {
 pub fn collect_prune_diagnostics(
     applied: &crate::wggo_apply::AppliedPlan,
 ) -> Vec<OverrideDiagnostic> {
-    use crate::wggo_dp::LayerDecision;
+    use crate::wggo_dp::CoarseDecision;
     applied
         .layers
         .iter()
@@ -200,7 +200,7 @@ pub fn collect_prune_diagnostics(
         // `wggo_prune::run()`. Role classification is delegated to
         // `wggo_graph::infer_role` so all consumers use the same authority.
         .filter(|l| {
-            matches!(l.coarse, LayerDecision::Prune)
+            matches!(l.coarse, CoarseDecision::Prune)
                 && matches!(
                     crate::wggo_graph::infer_role(&l.layer_name),
                     crate::wggo_graph::LayerRole::Block
@@ -229,7 +229,7 @@ pub fn whole_block_prune_not_implemented_reason() -> &'static str {
 mod tests {
     use super::*;
     use crate::wggo_apply::{AppliedLayer, AppliedPlan};
-    use crate::wggo_dp::LayerDecision as CoarseDecision;
+    use crate::wggo_dp::CoarseDecision;
 
     fn sample_applied() -> AppliedPlan {
         AppliedPlan {

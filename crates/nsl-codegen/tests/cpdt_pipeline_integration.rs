@@ -31,7 +31,7 @@ use nsl_codegen::cpdt_optim::AdamWHyperparams;
 use nsl_codegen::cpdt_tier_apply::PrecisionConfig;
 use nsl_codegen::cpdt_zero::{ClusterSpec, ModelSize};
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
-use nsl_codegen::wggo_dp::LayerDecision as CoarseDecision;
+use nsl_codegen::wggo_dp::CoarseDecision;
 use nsl_codegen::wggo_overrides::{OverrideRejectReason, WggoOverrides};
 
 /// Build an `AppliedPlan` with `n_layers` layers, each carrying

@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn model_size_from_applied_plan_sums_per_layer_bytes() {
         use crate::wggo_apply::{AppliedLayer, AppliedPlan};
-        use crate::wggo_dp::LayerDecision as CoarseDecision;
+        use crate::wggo_dp::CoarseDecision;
 
         let plan = AppliedPlan {
             layers: vec![

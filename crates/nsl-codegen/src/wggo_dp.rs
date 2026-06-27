@@ -49,9 +49,15 @@ impl std::fmt::Display for DpError {
 
 impl std::error::Error for DpError {}
 
-/// Coarse decision for one layer.
+/// Level-1 (inter-layer DP) coarse disposition for one layer.
+///
+/// Distinct from [`crate::wggo_ilp::LayerDecision`], which is the rich
+/// Level-2 (per-layer ILP) decision (head keep-mask, FFN width, CSHA level,
+/// adapter rank/placement, optimizer precision, …).  This enum only records
+/// the DP's keep/thin/prune disposition; renamed from `LayerDecision` to end
+/// the name collision (G13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum LayerDecision {
+pub enum CoarseDecision {
     /// Keep the layer at full width.
     KeepFull,
     /// Thin the layer: shrink FFN and keep fewer heads.
@@ -61,12 +67,12 @@ pub enum LayerDecision {
     Prune,
 }
 
-impl LayerDecision {
+impl CoarseDecision {
     pub fn as_str(self) -> &'static str {
         match self {
-            LayerDecision::KeepFull => "keep_full",
-            LayerDecision::Thin => "thin",
-            LayerDecision::Prune => "prune",
+            CoarseDecision::KeepFull => "keep_full",
+            CoarseDecision::Thin => "thin",
+            CoarseDecision::Prune => "prune",
         }
     }
 }
@@ -76,7 +82,7 @@ impl LayerDecision {
 pub struct LayerPlan {
     pub layer_index: u32,
     pub name: String,
-    pub decision: LayerDecision,
+    pub decision: CoarseDecision,
     pub pipeline_stage: u32,
     /// ZeRO parameter-shard factor.
     pub shard_params: u32,
@@ -107,7 +113,7 @@ impl InterLayerPlan {
     pub fn kept_layers(&self) -> usize {
         self.layers
             .iter()
-            .filter(|l| !matches!(l.decision, LayerDecision::Prune))
+            .filter(|l| !matches!(l.decision, CoarseDecision::Prune))
             .count()
     }
     pub fn pruned_layers(&self) -> usize {
@@ -173,8 +179,8 @@ impl Default for DpConfig {
 }
 
 /// Candidate transitions the DP considers for one layer.
-fn candidate_decisions(layer: &Layer, cfg: &DpConfig) -> Vec<LayerDecision> {
-    let mut out = vec![LayerDecision::KeepFull];
+fn candidate_decisions(layer: &Layer, cfg: &DpConfig) -> Vec<CoarseDecision> {
+    let mut out = vec![CoarseDecision::KeepFull];
     if layer.role == LayerRole::Block || layer.role == LayerRole::Attention || layer.role == LayerRole::Ffn {
         let score = cfg
             .importance
@@ -183,17 +189,17 @@ fn candidate_decisions(layer: &Layer, cfg: &DpConfig) -> Vec<LayerDecision> {
             .copied()
             .unwrap_or(1.0);
         if score < cfg.thin_floor {
-            out.push(LayerDecision::Thin);
+            out.push(CoarseDecision::Thin);
         }
         if score < cfg.prune_floor {
-            out.push(LayerDecision::Prune);
+            out.push(CoarseDecision::Prune);
         }
     }
     out
 }
 
 /// Approximate cost contribution of one layer under a decision.
-fn layer_cost(decision: LayerDecision, lut_best: Option<LayerCostEntry>) -> (f64, u64, u64, u64) {
+fn layer_cost(decision: CoarseDecision, lut_best: Option<LayerCostEntry>) -> (f64, u64, u64, u64) {
     let best = lut_best.unwrap_or(LayerCostEntry {
         forward_us: 0.0,
         backward_us: 0.0,
@@ -204,19 +210,19 @@ fn layer_cost(decision: LayerDecision, lut_best: Option<LayerCostEntry>) -> (f64
         classification: crate::cost_model::BoundClassification::Unknown,
     });
     match decision {
-        LayerDecision::KeepFull => (
+        CoarseDecision::KeepFull => (
             best.total_us(),
             best.param_bytes + best.activation_bytes,
             best.param_bytes,
             best.activation_bytes,
         ),
-        LayerDecision::Thin => (
+        CoarseDecision::Thin => (
             best.total_us() * 0.6,
             best.param_bytes * 60 / 100 + best.activation_bytes,
             best.param_bytes * 60 / 100,
             best.activation_bytes,
         ),
-        LayerDecision::Prune => (0.1, 0, 0, 0), // tiny residual identity
+        CoarseDecision::Prune => (0.1, 0, 0, 0), // tiny residual identity
     }
 }
 
@@ -227,7 +233,7 @@ const NB: usize = 256;
 /// resolved cost and resident-memory footprint.
 #[derive(Debug, Clone, Copy)]
 struct Cand {
-    decision: LayerDecision,
+    decision: CoarseDecision,
     shard: u32,
     /// forward + backward + comm + optimizer latency (μs).
     cost_us: f64,
@@ -484,7 +490,7 @@ pub fn passthrough_plan(
         let lut = luts.get(i).or_else(|| luts.first());
         let lut_best = lut.and_then(|l| l.argmin_feasible().map(|(_, _, _, _, e)| e));
         let (compute_us, _bytes, param_bytes, activation_bytes) =
-            layer_cost(LayerDecision::KeepFull, lut_best);
+            layer_cost(CoarseDecision::KeepFull, lut_best);
         let (comm_us, optim_us) =
             comm_optim_us(param_bytes, shard, shard, cfg.cluster.interconnect_gbs, gpu);
         let resident = resident_bytes(param_bytes, activation_bytes, shard);
@@ -494,7 +500,7 @@ pub fn passthrough_plan(
         plans.push(LayerPlan {
             layer_index: layer.index,
             name: layer.name.clone(),
-            decision: LayerDecision::KeepFull,
+            decision: CoarseDecision::KeepFull,
             pipeline_stage: 0,
             shard_params: shard,
             shard_grads: shard,
@@ -583,8 +589,8 @@ mod tests {
         // Layer 1 → thin (below thin_floor); Layer 2 → prune (below prune_floor).
         // With an ample budget the DP picks these because they are cheaper, not
         // because memory forces it.
-        assert_eq!(plan.layers[1].decision, LayerDecision::Thin);
-        assert_eq!(plan.layers[2].decision, LayerDecision::Prune);
+        assert_eq!(plan.layers[1].decision, CoarseDecision::Thin);
+        assert_eq!(plan.layers[2].decision, CoarseDecision::Prune);
         assert_eq!(plan.pruned_layers(), 1);
     }
 
@@ -707,7 +713,7 @@ mod tests {
             ..Default::default()
         };
         let plan = solve(&g, &[lut], &cfg, gpu()).expect("feasible by thinning");
-        assert!(plan.layers.iter().all(|l| l.decision == LayerDecision::Thin));
+        assert!(plan.layers.iter().all(|l| l.decision == CoarseDecision::Thin));
         let total: u64 = plan.layers.iter().map(|l| l.estimated_bytes).sum();
         assert!(total <= budget, "total {total} > budget {budget}");
     }

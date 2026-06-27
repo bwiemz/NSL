@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 
-use crate::wggo_dp::{InterLayerPlan, LayerDecision as CoarseDecision};
+use crate::wggo_dp::{CoarseDecision, InterLayerPlan};
 use crate::wggo_ilp::LayerIlpSolution;
 
 /// Normalised per-layer decision ready for downstream consumption.
@@ -141,7 +141,7 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
 mod tests {
     use super::*;
     use crate::wggo_cost::{build_lut, LayerShape, LutAxes};
-    use crate::wggo_dp::{LayerPlan, LayerDecision as CoarseDecision};
+    use crate::wggo_dp::{CoarseDecision, LayerPlan};
     use crate::wggo_ilp::{solve_layer, LayerIlpConstraints};
 
     fn toy_shape() -> LayerShape {

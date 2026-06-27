@@ -30,7 +30,7 @@ use nsl_codegen::cpdt_tier_apply::PrecisionConfig;
 use nsl_codegen::cpdt_zero::{ClusterSpec, ModelSize};
 use nsl_codegen::weight_aware::WeightMap;
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
-use nsl_codegen::wggo_dp::LayerDecision as CoarseDecision;
+use nsl_codegen::wggo_dp::CoarseDecision;
 use nsl_codegen::wggo_overrides::WggoOverrides;
 use nsl_codegen::CompileOptions;
 use nsl_lexer::Interner;
