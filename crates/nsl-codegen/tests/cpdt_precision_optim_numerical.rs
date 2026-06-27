@@ -21,9 +21,9 @@
 //! | Mode | Description | Gate |
 //! |------|-------------|------|
 //! | Compiled-mechanism run (1) | real cast ops, N steps | (reference) |
-//! | Mode B — cast correctness (2) | pure-Rust truncating FP16 | rel_err < 1e-5 |
+//! | Mode B — cast correctness (2) | pure-Rust RTE FP16 | rel_err < 1e-5 |
 //! | Mode A — precision-adaptive claim (3) | pure FP32 (no quant) | rel_err < 5e-2 |
-//! | Negative control (4) | RTN rounding != truncation | must differ > 1e-5 |
+//! | Negative control (4) | truncation != RTE | must differ > 1e-5 |
 //! | High-tier bit-exact (5) | F32->F32 cast round-trip | bit-exact |
 //!
 //! ## AdamW recipe (from `fase_numerical_validation.rs` / `fase_optimizer.rs`)
@@ -40,20 +40,24 @@
 //! NSL's FASE AdamW DOES apply bias-correction divisors (1 - beta^t) per the
 //! `adamw_fase_deferred_reference` fn in `fase_numerical_validation.rs`.
 //!
-//! ## FP16 truncation note
+//! ## FP16 rounding note
 //!
-//! `nsl_runtime`'s `f32_to_f16_bits` TRUNCATES the mantissa (`mant >> 13`,
-//! no guard/sticky logic), despite the docstring claiming RTN.  The conversion
-//! is biased toward zero.  All references that simulate FP16 storage replicate
-//! this truncation exactly.
+//! Post-v7 (PR #255, commit `8f378f61`), `nsl_runtime`'s `f32_to_f16_bits`
+//! uses `half::f16::from_f32`, which is IEEE-754 round-to-nearest-even (RTE).
+//! Prior to v7 the primitive truncated the mantissa; v7's adversarial review
+//! flagged truncation as a HIGH-severity bug (~0.5 ULP bias + dropped NaN
+//! payloads) and switched to RTE so CPU↔GPU produce bit-identical results.
+//! All references that simulate FP16 storage now replicate RTE exactly via
+//! the local `f32_to_f16_bits_rtn` helper.
 //!
 //! ## Tolerance derivation (Mode A, FP16 vs FP32)
 //!
-//! Per-step FP16 truncation max relative error <= 2^-10 ~= 9.77e-4 (one
-//! mantissa bucket in the f16 encoding).  The EMA low-pass filter with decay
-//! beta means the accumulated state drift is bounded by ~eps_per_step/(1-beta)
-//! in steady state (geometric series bound).  For beta1=0.9: ~9.77e-3; for
-//! beta2=0.999: ~0.977.  v enters via sqrt+bias-correction which compresses
+//! Per-step FP16 RTE max relative error <= 2^-11 ~= 4.88e-4 (half a mantissa
+//! bucket in the f16 encoding — the symmetric tie-to-even rule halves the
+//! worst-case truncation error).  The EMA low-pass filter with decay beta
+//! means the accumulated state drift is bounded by ~eps_per_step/(1-beta) in
+//! steady state (geometric series bound).  For beta1=0.9: ~4.88e-3; for
+//! beta2=0.999: ~0.488.  v enters via sqrt+bias-correction which compresses
 //! sensitivity.  We use a conservative empirical bound of rel_err < 5e-2.
 
 use nsl_runtime::list::{nsl_list_free, nsl_list_new, nsl_list_push};
@@ -90,10 +94,9 @@ fn read_f32_tensor(ptr: i64, len: usize) -> Vec<f32> {
 // FP16 conversion helpers -- replicated from nsl_runtime's pub(crate) fns
 // ---------------------------------------------------------------------------
 
-/// Truncating f32->f16 bits.  Mirrors `nsl_runtime::tensor::f32_to_f16_bits`
-/// exactly (truncation in the normal-number path: `mant >> 13`, no round bit).
-/// Used in Mode B reference and negative-control without linking to the
-/// `pub(crate)` symbol.
+/// Truncating f32->f16 bits.  Mirrors the pre-v7 `nsl_runtime`
+/// behavior (truncation in the normal-number path: `mant >> 13`, no round bit).
+/// Used by the negative-control reference to keep the Mode B gate non-vacuous.
 #[inline]
 fn f32_to_f16_bits_truncate(val: f32) -> u16 {
     let bits = val.to_bits();
@@ -118,41 +121,20 @@ fn f32_to_f16_bits_truncate(val: f32) -> u16 {
     sign | f16_exp | f16_mant
 }
 
-/// Round-to-nearest-even f32->f16 bits.  Used ONLY for the negative control
-/// (Mode 4).  The runtime uses truncation, not RTN, so results differ for
-/// values whose f32 mantissa has non-zero bits in positions 11-13.
+/// IEEE-754 round-to-nearest-even (RTE) f32->f16 bits — delegates to
+/// `half::f16::from_f32`, the same primitive the runtime uses for
+/// `nsl_tensor_cast` (see `nsl-runtime/src/tensor/mod.rs::f32_to_f16_bits`).
+/// The previous hand-rolled implementation had a mantissa-overflow bug at
+/// the f16 power-of-two boundary (e.g. for `-0.001953` it produced `-2^-10`
+/// instead of `-2^-9`); delegating to the `half` crate eliminates that class
+/// of bug and guarantees bit-identity with the runtime on every input.
+///
+/// Used by the Mode B reference (post-v7) and the
+/// `cast_ops_match_pure_rust_rte` spot-check.  The name `rtn` is retained
+/// for git-history continuity; the implementation IS true ties-to-even.
 #[inline]
 fn f32_to_f16_bits_rtn(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let mant = bits & 0x7F_FFFF;
-    if exp >= 143 {
-        return sign | 0x7C00;
-    }
-    if exp <= 102 {
-        return sign;
-    }
-    if exp <= 112 {
-        let shift = 113 - exp;
-        let m_full = (0x80_0000 | mant) >> shift;
-        let round = m_full & (1 << 12);
-        let m_trunc = m_full >> 13;
-        let m_rtn = if round != 0 { m_trunc + 1 } else { m_trunc };
-        return sign | m_rtn as u16;
-    }
-    // Normal: RTN -- add guard bit before shifting
-    let guard = (mant >> 12) & 1;
-    let sticky = mant & 0xFFF;
-    let f16_mant_trunc = (mant >> 13) as u16;
-    // Round up if guard=1 and (sticky!=0 OR lsb=1)
-    let f16_mant_rtn = if guard != 0 && (sticky != 0 || (f16_mant_trunc & 1) != 0) {
-        f16_mant_trunc + 1
-    } else {
-        f16_mant_trunc
-    };
-    let f16_exp = ((exp - 112) as u16) << 10;
-    sign | f16_exp | f16_mant_rtn
+    half::f16::from_f32(val).to_bits()
 }
 
 /// Widen f16 bits back to f32.  Exact mirror of `nsl_runtime::tensor::f16_bits_to_f32`.
@@ -352,17 +334,25 @@ fn run_compiled_mechanism(theta_init: &[f32], use_fp16_state: bool) -> Vec<f32> 
 }
 
 /// Run 2 (Mode B reference): pure-Rust AdamW that truncates m/v each step via
-/// `f32_to_f16_bits_truncate` -- the same truncation as the runtime's cast ops.
+/// `f32_to_f16_bits_rtn` -- the same IEEE-754 round-to-nearest-even (RTE) used
+/// by the runtime's cast ops via `half::f16::from_f32` (see
+/// `nsl-runtime/src/tensor/mod.rs::f32_to_f16_bits`).
+///
+/// History: prior to CFTP v7 (PR #255, commit `8f378f61`) the CPU primitive
+/// truncated the mantissa; v7's adversarial review flagged that as a
+/// HIGH-severity bug (~0.5 ULP bias + dropped NaN payloads) and switched the
+/// CPU path to the `half` crate's RTE so CPU↔GPU stay bit-identical. The
+/// test's reference must use the same rounding mode the runtime now uses.
 ///
 /// m and v are initialized to 0.0 (exact in both F32 and F16).  Each step:
-///   - m/v enter with the truncated values from the previous step (exact match
-///     to the compiled mechanism's dequanted state)
+///   - m/v enter with the RTE-rounded values from the previous step (exact
+///     match to the compiled mechanism's dequanted state)
 ///   - AdamW update produces new m/v
-///   - trunc_fp16() simulates the quant-store round-trip
+///   - rtn_fp16() simulates the quant-store round-trip
 ///
 /// Should be bit-for-bit identical to run_compiled_mechanism(..., true) up to
 /// f32 arithmetic ordering; gate: rel_err < 1e-5.
-fn run_mode_b_truncate_reference(theta_init: &[f32]) -> Vec<f32> {
+fn run_mode_b_rte_reference(theta_init: &[f32]) -> Vec<f32> {
     let len = theta_init.len();
     let mut theta = theta_init.to_vec();
     let mut m = vec![0.0_f32; len];
@@ -372,8 +362,8 @@ fn run_mode_b_truncate_reference(theta_init: &[f32]) -> Vec<f32> {
         let grad = gradients_for_step(step);
         adamw_step_f32(&mut theta, &mut m, &mut v, &grad, LR, BETA1, BETA2, EPS, WD, step as u32);
         for i in 0..len {
-            m[i] = trunc_fp16(m[i]);
-            v[i] = trunc_fp16(v[i]);
+            m[i] = rtn_fp16(m[i]);
+            v[i] = rtn_fp16(v[i]);
         }
     }
     theta
@@ -393,10 +383,11 @@ fn run_mode_a_fp32_reference(theta_init: &[f32]) -> Vec<f32> {
     theta
 }
 
-/// Run 4 (negative control): pure-Rust AdamW that quantizes m/v via RTN each
-/// step.  Because the runtime uses truncation (not RTN), theta must differ from
-/// the compiled mechanism wherever m/v have non-zero guard bits.
-fn run_negative_control_rtn(theta_init: &[f32]) -> Vec<f32> {
+/// Run 4 (negative control): pure-Rust AdamW that quantizes m/v via
+/// TRUNCATION each step.  Because the runtime uses RTE (not truncation) post-v7,
+/// theta must differ from the compiled mechanism wherever m/v have non-zero
+/// guard bits — proving the Mode B gate is non-vacuous.
+fn run_negative_control_truncate(theta_init: &[f32]) -> Vec<f32> {
     let len = theta_init.len();
     let mut theta = theta_init.to_vec();
     let mut m = vec![0.0_f32; len];
@@ -406,8 +397,8 @@ fn run_negative_control_rtn(theta_init: &[f32]) -> Vec<f32> {
         let grad = gradients_for_step(step);
         adamw_step_f32(&mut theta, &mut m, &mut v, &grad, LR, BETA1, BETA2, EPS, WD, step as u32);
         for i in 0..len {
-            m[i] = rtn_fp16(m[i]);
-            v[i] = rtn_fp16(v[i]);
+            m[i] = trunc_fp16(m[i]);
+            v[i] = trunc_fp16(v[i]);
         }
     }
     theta
@@ -449,10 +440,15 @@ fn verify_truncation_rtn_differ(theta_init: &[f32]) -> bool {
 
 /// Primary validation: five-way comparison of the FP16-storage AdamW mechanism.
 ///
+/// Post-v7 the runtime CPU cast uses IEEE-754 round-to-nearest-even (RTE) via
+/// `half::f16::from_f32` — see commit `8f378f61` for context. The Mode B
+/// reference must use RTE; the negative control uses truncation to keep the
+/// gate non-vacuous.
+///
 /// Covers:
-///   - Mode B (cast correctness): compiled == truncating-Rust ref (rel < 1e-5)
+///   - Mode B (cast correctness): compiled == RTE-Rust ref (rel < 1e-5)
 ///   - Mode A (FP16 precision claim): compiled ~= FP32 ref (rel < 5e-2)
-///   - Negative control: compiled != RTN ref (rel > 1e-5, proves gate non-vacuous)
+///   - Negative control: compiled != truncation ref (rel > 1e-5, proves gate non-vacuous)
 ///   - High-tier: F32-state compiled == FP32 ref bit-exactly
 #[test]
 fn cpdt_fp16_adamw_numerical_validation() {
@@ -461,35 +457,36 @@ fn cpdt_fp16_adamw_numerical_validation() {
     // Pre-check: ensure the negative-control inputs are non-vacuous.
     assert!(
         verify_truncation_rtn_differ(&theta_init),
-        "PRECONDITION FAILED: truncation and RTN produce identical results for all \
+        "PRECONDITION FAILED: truncation and RTE produce identical results for all \
          m/v values over {N_STEPS} steps.  The negative-control gate would be vacuous."
     );
 
     // Run all five regimes.
     let result_compiled  = run_compiled_mechanism(&theta_init, true  /* FP16 state */);
-    let result_mode_b    = run_mode_b_truncate_reference(&theta_init);
+    let result_mode_b    = run_mode_b_rte_reference(&theta_init);
     let result_mode_a    = run_mode_a_fp32_reference(&theta_init);
-    let result_neg_ctrl  = run_negative_control_rtn(&theta_init);
+    let result_neg_ctrl  = run_negative_control_truncate(&theta_init);
     let result_high_tier = run_compiled_mechanism(&theta_init, false /* F32 state */);
 
     // --- Mode B: cast correctness ---
-    // Both apply the same truncation each step -> must agree to f32-arithmetic
+    // Both apply the same RTE rounding each step -> must agree to f32-arithmetic
     // precision (essentially floating-point order effects only).
     let rel_err_b = max_rel_err(&result_compiled, &result_mode_b);
     println!(
-        "[Mode B] compiled-mechanism vs truncating-Rust ref: max rel_err = {rel_err_b:.2e}"
+        "[Mode B] compiled-mechanism vs RTE-Rust ref: max rel_err = {rel_err_b:.2e}"
     );
     assert!(
         rel_err_b < 1e-5,
-        "Mode B FAILED: compiled-mechanism and truncating-Rust reference diverge by \
+        "Mode B FAILED: compiled-mechanism and RTE-Rust reference diverge by \
          {rel_err_b:.2e} (gate: < 1e-5).  This indicates nsl_tensor_cast / \
-         nsl_tensor_cast_into does NOT faithfully implement f32->f16 truncation."
+         nsl_tensor_cast_into does NOT faithfully implement IEEE-754 \
+         round-to-nearest-even for f32->f16 (`half::f16::from_f32`)."
     );
 
     // --- Mode A: precision-adaptive claim ---
     // FP16 storage accumulates drift but the EMA low-pass bounds it.
-    // Derivation: per-step trunc_err <= 2^-10 ~= 9.8e-4; EMA bound for m:
-    // ~9.8e-3 (beta1=0.9); for v: ~0.98 (beta2=0.999) but sqrt compression
+    // Derivation: per-step round_err <= 2^-11 (RTE) ~= 4.9e-4; EMA bound for m:
+    // ~4.9e-3 (beta1=0.9); for v: ~0.49 (beta2=0.999) but sqrt compression
     // reduces it; empirical conservative bound 5e-2.
     let rel_err_a = max_rel_err(&result_compiled, &result_mode_a);
     println!(
@@ -501,18 +498,18 @@ fn cpdt_fp16_adamw_numerical_validation() {
          (gate: < 5e-2).  FP16 optimizer state precision loss is unacceptably large."
     );
 
-    // --- Negative control: must NOT match RTN ---
-    // Proves the Mode B gate is non-vacuous: if truncation == RTN for all
+    // --- Negative control: must NOT match truncation ---
+    // Proves the Mode B gate is non-vacuous: if RTE == truncation for all
     // inputs, the gate would pass trivially even for a broken cast.
     let rel_err_neg = max_rel_err(&result_compiled, &result_neg_ctrl);
     println!(
-        "[Neg ctrl] compiled-mechanism vs RTN reference: max rel_err = {rel_err_neg:.2e}"
+        "[Neg ctrl] compiled-mechanism vs truncation reference: max rel_err = {rel_err_neg:.2e}"
     );
     assert!(
         rel_err_neg > 1e-5,
-        "Negative control FAILED: compiled-mechanism matches RTN reference within \
-         {rel_err_neg:.2e} (must be > 1e-5).  The Mode B gate is VACUOUS: truncation \
-         and RTN are indistinguishable on these inputs."
+        "Negative control FAILED: compiled-mechanism matches truncation reference within \
+         {rel_err_neg:.2e} (must be > 1e-5).  The Mode B gate is VACUOUS: RTE \
+         and truncation are indistinguishable on these inputs."
     );
 
     // --- High-tier: F32 state is bit-identical to pure-FP32 ---
@@ -569,9 +566,11 @@ fn f16_conversion_helpers_sanity() {
 }
 
 /// Spot-check: compiled-mechanism cast ops faithfully implement pure-Rust
-/// truncation (bit-exact round-trip for a set of representative values).
+/// IEEE-754 round-to-nearest-even (bit-exact round-trip for a set of
+/// representative values). Post-v7 the runtime uses `half::f16::from_f32`
+/// for the f32->f16 step; `rtn_fp16` mirrors that exactly.
 #[test]
-fn cast_ops_match_pure_rust_truncation() {
+fn cast_ops_match_pure_rust_rte() {
     // Values include normals, a small near-subnormal, and a negative.
     // Use std::f32::consts::PI instead of the literal to satisfy clippy::approx_constant.
     let vals = [0.1_f32, -0.5, std::f32::consts::PI, 1.0001, 100.0, -0.001953, 0.0625];
@@ -581,11 +580,11 @@ fn cast_ops_match_pure_rust_truncation() {
     let got = read_f32_tensor(back_ptr, vals.len());
 
     for (i, &v) in vals.iter().enumerate() {
-        let expected = trunc_fp16(v);
+        let expected = rtn_fp16(v);
         assert_eq!(
             got[i].to_bits(),
             expected.to_bits(),
-            "elem[{i}] v={v}: cast round-trip got {} expected {} (pure-Rust truncation)",
+            "elem[{i}] v={v}: cast round-trip got {} expected {} (pure-Rust IEEE-754 RTE)",
             got[i],
             expected
         );
