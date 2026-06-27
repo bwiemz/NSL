@@ -118,6 +118,9 @@ pub struct WggoPlan {
     pub weight_analysis: WeightAnalysisReport,
     /// Total solver wall-clock time (μs, self-reported — not measured).
     pub estimated_solve_us: u64,
+    /// Graceful-degradation / limitation warnings accumulated during the run
+    /// (e.g. "full mode infeasible, degraded to off").  Empty on a clean run.
+    pub warnings: Vec<String>,
 }
 
 impl WggoPlan {
@@ -198,6 +201,11 @@ impl WggoPlan {
             self.weight_analysis.layers_without_weights
         )
         .unwrap();
+        writeln!(s).unwrap();
+        writeln!(s, "Warnings / limitations: {}", self.warnings.len()).unwrap();
+        for w in &self.warnings {
+            writeln!(s, "  WARNING: {w}").unwrap();
+        }
         writeln!(s).unwrap();
         write!(s, "{}", self.schedule.render()).unwrap();
         s
@@ -339,6 +347,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             template_stats,
             weight_analysis,
             estimated_solve_us: t0.elapsed().as_micros() as u64,
+            warnings: Vec::new(),
         };
     }
 
@@ -354,15 +363,20 @@ pub fn run(input: WggoInput) -> WggoPlan {
         importance: input.importance.clone(),
         ..Default::default()
     };
+    // G4 degradation ladder, rung 0: the inter-layer DP is shared by Full and
+    // Greedy, so if it refuses the budget neither optimized mode can proceed —
+    // degrade to Off and run the downstream passes independently, with a
+    // warning, rather than emitting a silently over-budget optimization.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut effective_mode = input.mode;
     let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
         Ok(p) => p,
         Err(e) => {
-            // G4/T8 replaces this with the Full→Greedy→Off degradation ladder;
-            // for now refuse loudly and fall back to a passthrough plan rather
-            // than emitting a silently over-budget optimization.
-            eprintln!(
-                "[wggo] WARNING: inter-layer DP infeasible ({e}); falling back to passthrough plan"
-            );
+            warnings.push(format!(
+                "inter-layer DP infeasible ({e}); degraded {} -> off (downstream passes run independently)",
+                effective_mode.as_str()
+            ));
+            effective_mode = WggoMode::Off;
             passthrough_plan(&graph, &luts, &dp_cfg, gpu)
         }
     };
@@ -392,7 +406,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // correct path: it keeps the conflict detector live in production (G8) and
     // surfaces a visible resolution in the report, instead of silently
     // disabling the option before it can ever conflict.
-    let (per_layer, template_stats) = match input.mode {
+    let (mut per_layer, mut template_stats) = match effective_mode {
         WggoMode::Greedy => (
             ilp_solve_all_greedy(&luts, &ilp_constraints),
             TemplateStats::default(),
@@ -400,56 +414,67 @@ pub fn run(input: WggoInput) -> WggoPlan {
         _ => ilp_solve_all_templated(&luts, &ilp_constraints),
     };
 
-    // 6. Build initial LayerDecisions vector for conflict detection.
-    let mut per_layer = per_layer;
-    let layer_decisions = build_layer_decisions(&inter, &per_layer);
-
-    // 7. Conflict detection + resolution (greedy mode resolves here;
-    //    Full mode still runs the same resolver because the ILP itself
-    //    already honours the hard constraints — remaining conflicts are
-    //    the ones crossing technique boundaries).
-    //
-    //    Capture the pre-resolution cost so greedy mode can detect a
-    //    resolution-induced regression below.
-    let cost_before: f64 = per_layer
-        .iter()
-        .filter(|s| s.cost_us.is_finite())
-        .map(|s| s.cost_us)
-        .sum();
-    let (resolved, resolutions) = greedy_resolve(layer_decisions);
-    splice_resolved(&mut per_layer, &resolved);
-
-    // G3 (greedy mode only): re-cost the resolved configuration and, if the
-    // conflict resolution worsened it beyond the threshold, escalate the
-    // conflicting layers to the full ILP and re-resolve.  Greedy's fast local
-    // heuristics can leave a lot on the table once a conflict forces a change,
-    // so spending the full branch-and-bound on just those layers recovers
-    // quality without the cost of a full-model ILP.
-    let mut resolutions = resolutions;
-    if input.mode == WggoMode::Greedy && !resolutions.is_empty() {
-        let cost_after = recost_total(&luts, &per_layer, &ilp_constraints);
-        if cost_after > cost_before * (1.0 + GREEDY_RECOST_THRESHOLD) {
-            let conflicting: std::collections::HashSet<u32> =
-                resolutions.iter().filter_map(|r| r.layer()).collect();
-            for (i, inter_layer) in inter.layers.iter().enumerate() {
-                if conflicting.contains(&inter_layer.layer_index) {
-                    per_layer[i] = ilp_solve_layer(&luts[i], &ilp_constraints[i]);
-                }
-            }
-            // Re-detect + re-resolve on the escalated decisions.
-            let ld2 = build_layer_decisions(&inter, &per_layer);
-            let (resolved2, resolutions2) = greedy_resolve(ld2);
-            splice_resolved(&mut per_layer, &resolved2);
-            resolutions = resolutions2;
-        }
+    // G4 degradation ladder, rung 1: if the full branch-and-bound ILP could not
+    // make a single layer feasible, fall back to the greedy solver before
+    // giving up entirely.
+    if effective_mode == WggoMode::Full
+        && !per_layer.is_empty()
+        && per_layer.iter().all(|s| !s.feasible)
+    {
+        warnings.push("full ILP found no feasible layer; degraded full -> greedy".to_string());
+        effective_mode = WggoMode::Greedy;
+        per_layer = ilp_solve_all_greedy(&luts, &ilp_constraints);
+        template_stats = TemplateStats::default();
     }
+
+    // 6-7. Conflict detection + resolution — skipped in Off (or degraded-Off)
+    //      mode, which runs the downstream passes independently.
+    let resolutions = if effective_mode == WggoMode::Off {
+        Vec::new()
+    } else {
+        let layer_decisions = build_layer_decisions(&inter, &per_layer);
+        // Capture the pre-resolution cost so greedy mode can detect a
+        // resolution-induced regression below.
+        let cost_before: f64 = per_layer
+            .iter()
+            .filter(|s| s.cost_us.is_finite())
+            .map(|s| s.cost_us)
+            .sum();
+        let (resolved, mut resolutions) = greedy_resolve(layer_decisions);
+        splice_resolved(&mut per_layer, &resolved);
+
+        // G3 (greedy mode only): re-cost the resolved configuration and, if the
+        // conflict resolution worsened it beyond the threshold, escalate the
+        // conflicting layers to the full ILP and re-resolve.  Greedy's fast
+        // local heuristics can leave a lot on the table once a conflict forces
+        // a change, so spending the full branch-and-bound on just those layers
+        // recovers quality without the cost of a full-model ILP.
+        if effective_mode == WggoMode::Greedy && !resolutions.is_empty() {
+            let cost_after = recost_total(&luts, &per_layer, &ilp_constraints);
+            if cost_after > cost_before * (1.0 + GREEDY_RECOST_THRESHOLD) {
+                let conflicting: std::collections::HashSet<u32> =
+                    resolutions.iter().filter_map(|r| r.layer()).collect();
+                for (i, inter_layer) in inter.layers.iter().enumerate() {
+                    if conflicting.contains(&inter_layer.layer_index) {
+                        per_layer[i] = ilp_solve_layer(&luts[i], &ilp_constraints[i]);
+                    }
+                }
+                // Re-detect + re-resolve on the escalated decisions.
+                let ld2 = build_layer_decisions(&inter, &per_layer);
+                let (resolved2, resolutions2) = greedy_resolve(ld2);
+                splice_resolved(&mut per_layer, &resolved2);
+                resolutions = resolutions2;
+            }
+        }
+        resolutions
+    };
 
     // 8. Apply + communication schedule.
     let applied = apply(&inter, &per_layer);
     let schedule = build_schedule(&inter, &applied);
 
     WggoPlan {
-        mode: input.mode,
+        mode: effective_mode,
         target_gpu: gpu.name.to_string(),
         graph,
         inter_layer: inter,
@@ -460,6 +485,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         template_stats,
         weight_analysis,
         estimated_solve_us: t0.elapsed().as_micros() as u64,
+        warnings,
     }
 }
 
@@ -981,15 +1007,18 @@ mod tests {
         assert_eq!(plan.schedule.total_collectives, 0);
     }
 
-    /// Helper: a memory-pressured cluster that forces the DP to shard.
+    /// Helper: a memory-pressured cluster that forces the DP to shard every
+    /// layer (the sharded footprint of all layers fits, the unsharded one does
+    /// not) — so the DP stays feasible and conflicts fire via the real path.
     fn sharded_cluster(inp: &WggoInput) -> ClusterSpec {
         let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
         let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
         let one = lut.argmin_feasible().expect("feasible entry").4;
         let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
+        let n = build_graph(inp.wengert).layers.len() as u64;
         ClusterSpec {
             num_gpus: 8,
-            memory_budget: 2 * sharded + sharded / 2,
+            memory_budget: (n + 1) * sharded,
             max_stages: 1,
             interconnect_gbs: 300.0,
         }
@@ -1073,6 +1102,59 @@ mod tests {
             plan.per_layer.iter().all(|s| s.nodes_explored < 100),
             "no conflicts → greedy solutions kept, no escalation"
         );
+    }
+
+    #[test]
+    fn full_mode_degrades_to_off_on_infeasible_budget() {
+        // 1-byte budget, no shard/prune relief → the DP refuses; Full must
+        // degrade gracefully to Off with a warning rather than crash or emit an
+        // over-budget plan (G4).
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.cluster = ClusterSpec {
+            num_gpus: 1,
+            memory_budget: 1,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        };
+        let plan = run(inp);
+        assert_eq!(
+            plan.mode,
+            WggoMode::Off,
+            "Full should degrade to Off when the DP refuses"
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("infeasible")),
+            "degradation must record a warning, got {:?}",
+            plan.warnings
+        );
+        assert!(
+            !plan.applied.layers.is_empty(),
+            "degraded run still produces a usable plan"
+        );
+    }
+
+    #[test]
+    fn report_contains_warnings_section() {
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.cluster = ClusterSpec {
+            num_gpus: 1,
+            memory_budget: 1,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        };
+        let rep = run(inp).render_report();
+        assert!(rep.contains("Warnings / limitations:"));
+        assert!(rep.contains("WARNING:"));
+    }
+
+    #[test]
+    fn clean_run_has_no_warnings() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(plan.warnings.is_empty());
+        assert!(plan.render_report().contains("Warnings / limitations: 0"));
     }
 
     // -----------------------------------------------------------------------
