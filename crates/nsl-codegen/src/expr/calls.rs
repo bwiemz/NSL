@@ -1774,15 +1774,39 @@ impl Compiler<'_> {
         // v2.4 deferral — when added it threads through the existing
         // `extract_moe_decorator` path in moe.rs.
         if func_name == "moe_dispatch_ffn" {
-            if args.len() != 4 {
+            // CPDT Part III v2.12 — `moe_dispatch_ffn` accepts the 4-arg
+            // form (tokens, logits, experts_up, experts_down) for the
+            // bias-free case (Llama-1+, Mixtral SwiGLU pre-bias variant)
+            // OR the 6-arg form (..., experts_up_bias, experts_down_bias)
+            // for GPT-2 / OPT FFN-bias families. Source-level activation
+            // gate: when the WeightMap has bias entries but the 4-arg
+            // form is used, refuse loudly (see the detect_v3_biases call
+            // below). The v2.11 FFI signature (12 i64 args) accepts both
+            // forms via the nullable bias pointers.
+            if args.len() != 4 && args.len() != 6 {
                 return Err(crate::error::CodegenError::new(
-                    "moe_dispatch_ffn() takes 4 arguments (tokens, router_logits, experts_up, experts_down)",
+                    "moe_dispatch_ffn() takes 4 arguments (tokens, router_logits, \
+                     experts_up, experts_down) OR 6 arguments (..., experts_up_bias, \
+                     experts_down_bias). The 6-arg form is required when the loaded \
+                     weight bundle has FFN biases (GPT-2 / OPT convention); the 4-arg \
+                     form is required when it does not (Llama-1+ / Mixtral).",
                 ));
             }
             let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
             let logits_val = self.compile_expr(builder, state, &args[1].value)?;
             let experts_up_val = self.compile_expr(builder, state, &args[2].value)?;
             let experts_down_val = self.compile_expr(builder, state, &args[3].value)?;
+            // v2.12: 6-arg form compiles the bias expressions. The
+            // 4-arg form leaves these as None and emits `iconst(0)` at
+            // the call site below (preserves v2.5/v2.7 byte-identical
+            // emission for bias-free MoE).
+            let bias_vals: Option<(_, _)> = if args.len() == 6 {
+                let bias_up_val = self.compile_expr(builder, state, &args[4].value)?;
+                let bias_down_val = self.compile_expr(builder, state, &args[5].value)?;
+                Some((bias_up_val, bias_down_val))
+            } else {
+                None
+            };
 
             // Same multi-MoE candidate resolution as the v2 site —
             // ensures multi-MoE-per-class fails LOUDLY (refuse on >=2
@@ -1863,7 +1887,74 @@ impl Compiler<'_> {
                 None
             };
 
+            // CPDT Part III v2.12 fix F2 (HIGH adversarial review): if
+            // bias entries are present but the weight dims fail to
+            // resolve (e.g., the user shipped a malformed bundle with
+            // biases but missing weights), surface a bias-aware error
+            // BEFORE falling through to the generic v3-dims-not-
+            // resolvable diagnostic. Otherwise the user sees only
+            // "missing experts.up.weight" and never realizes their
+            // bundle also has orphaned bias entries that would have
+            // activated with the right weight pack.
+            if v3_dims.is_none() {
+                if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    if crate::moe::any_v3_bias_entry_present(weight_map, key) {
+                        return Err(crate::error::CodegenError::new(format!(
+                            "moe_dispatch_ffn: WeightMap under '{key}' contains v3 bias \
+                             entries (`experts.up.bias` and/or `experts.down.bias`) BUT \
+                             the v3 weight dimensions could not be resolved (missing or \
+                             mis-shaped `experts.up.weight` / `experts.down.weight`). \
+                             This is an orphaned-bias bundle: the biases would never \
+                             activate because their parent projections are absent. Fix \
+                             the bundle by adding the missing weight tensors (and \
+                             re-running any auto-pack step), or remove the orphaned \
+                             biases."
+                        )));
+                    }
+                }
+            }
+
             if let Some((hidden_dim, intermediate_dim)) = v3_dims {
+                // CPDT Part III v2.12 source-activation gate. When the
+                // WeightMap has v3 biases, the source MUST use the 6-arg
+                // form so the bias pointers reach the FFI; the 4-arg
+                // form would silently drop them. Partial / mis-shaped
+                // biases also refuse here so the diagnostic lands at
+                // codegen with the actionable element counts.
+                let weight_map_has_biases = if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    match crate::moe::detect_v3_biases(
+                        weight_map,
+                        key,
+                        num_experts,
+                        hidden_dim,
+                        intermediate_dim,
+                    ) {
+                        Ok(opt) => opt.is_some(),
+                        Err(msg) => {
+                            return Err(crate::error::CodegenError::new(format!(
+                                "moe_dispatch_ffn: {msg}"
+                            )));
+                        }
+                    }
+                } else {
+                    false
+                };
+                if weight_map_has_biases && bias_vals.is_none() {
+                    return Err(crate::error::CodegenError::new(format!(
+                        "moe_dispatch_ffn: WeightMap under '{}' has v3 FFN biases \
+                         (`experts.up.bias` + `experts.down.bias`), but the call site \
+                         uses the 4-arg form (no bias). To activate the loaded biases, \
+                         add the bias model fields and call the 6-arg form: \
+                         `moe_dispatch_ffn(tokens, logits, experts_up, experts_down, \
+                         experts_up_bias, experts_down_bias)`. Or, to drop the loaded \
+                         biases, remove them from the weight bundle.",
+                        lookup_key.as_deref().unwrap_or("?")
+                    )));
+                }
                 let hidden_val = builder.ins().iconst(
                     cranelift_codegen::ir::types::I64,
                     hidden_dim as i64,
@@ -1881,18 +1972,35 @@ impl Compiler<'_> {
                 let activation_kind_val = builder
                     .ins()
                     .iconst(cranelift_codegen::ir::types::I64, activation as i64);
-                // CPDT Part III v2.11 — bias args. The runtime FFI gains
+                // CPDT Part III v2.12 — bias args. The runtime FFI's
                 // experts_up_bias_ptr + experts_down_bias_ptr (null=0
-                // means no bias). v2.11 ships ONLY the FFI extension +
-                // direct-call tests; source-level bias activation
-                // (auto-detection from WeightMap or a new
-                // moe_dispatch_ffn signature with bias kwargs) is a
-                // v2.12 deferral. For now, codegen always passes 0/0
-                // here so v2.5/v2.7 v3 emission stays byte-identical
-                // from the source-facing side.
-                let zero_bias = builder
-                    .ins()
-                    .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                // means no bias). The 4-arg `moe_dispatch_ffn` form
+                // emits `iconst(0)` here so v2.5/v2.7 v3 emission stays
+                // byte-identical for bias-free MoE. The 6-arg form
+                // threads the compiled bias expressions through the
+                // FFI; v2.11's upfront-dtype + device-CPU + len gates
+                // validate them at runtime entry.
+                let (bias_up_arg, bias_down_arg) = match bias_vals {
+                    Some((u, d)) => (u, d),
+                    None => {
+                        // v2.12 fix F1 (HIGH adversarial review): emit
+                        // two separate `iconst(0)` Values rather than
+                        // aliasing one Value into two call-arg slots.
+                        // Cranelift's IR technically permits a Value to
+                        // be reused across arg positions, but the
+                        // verifier in debug builds has flagged this
+                        // pattern in past Cranelift versions. Two
+                        // iconsts cost zero (constant-folded by the
+                        // backend) and eliminate the brittleness.
+                        let zero_up = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        let zero_down = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        (zero_up, zero_down)
+                    }
+                };
                 let result = self.compile_call_by_name(
                     builder,
                     "nsl_moe_dispatch_full_v3",
@@ -1907,8 +2015,8 @@ impl Compiler<'_> {
                         hidden_val,
                         intermediate_val,
                         activation_kind_val,
-                        zero_bias,
-                        zero_bias,
+                        bias_up_arg,
+                        bias_down_arg,
                     ],
                 )?;
                 return Ok(result);
@@ -1931,7 +2039,9 @@ impl Compiler<'_> {
                  <prefix>.experts.up.weight AND <prefix>.experts.down.weight (with `.weight` \
                  suffix optional). Declare `@moe(weight_prefix=\"...\")` in source to point \
                  this lookup at a non-NSL-identifier prefix (e.g., an HF Mixtral path \
-                 segment with dots).",
+                 segment with dots). For GPT-2 / OPT FFN-bias checkpoints, also include \
+                 <prefix>.experts.up.bias + <prefix>.experts.down.bias and call the 6-arg \
+                 form of moe_dispatch_ffn (v2.12).",
                 lookup_key
                     .as_deref()
                     .map(|k| format!(" '{}'", k))

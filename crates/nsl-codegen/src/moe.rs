@@ -137,6 +137,153 @@ pub fn derive_v3_dims(
     Some((hidden, intermediate_from_up))
 }
 
+/// CPDT Part III v2.12 — detect whether the WeightMap has v3 FFN biases
+/// (`<key>.experts.up.bias` + `<key>.experts.down.bias`) and validate
+/// their shapes against `(num_experts, hidden_dim, intermediate_dim)`.
+///
+/// The v2.11 runtime FFI takes nullable bias pointers — the loaded bias
+/// must be a contiguous tensor of length `num_experts * intermediate_dim`
+/// (up bias) or `num_experts * hidden_dim` (down bias). To be ergonomic
+/// the user typically ships them packed as `[num_experts, dim]`, but the
+/// FFI only checks total length so other 1D / 2D layouts with the same
+/// element count are accepted.
+///
+/// **v2.12 fix F11 (IMPORTANT adversarial review): HF safetensors caveat.**
+/// The v2.7 auto-pack at `WeightMap::load` rewrites per-expert HF Mixtral
+/// weight keys (`<prefix>.experts.{e}.w{1,2,3}.weight`) into NSL packed
+/// convention (`<prefix>.experts.{gate,up,down}.weight`). It does NOT
+/// transform per-expert HF bias keys — by design, because the HF bias
+/// suffix convention is itself unstandardized (GPT-2 uses `<prefix>.c_fc.bias`
+/// for FFN, OPT uses `<prefix>.fc1.bias`, the dot-prefixed Mixtral form
+/// uses `<prefix>.experts.{e}.b1`, etc.). Callers loading a checkpoint
+/// with HF-convention bias keys must pre-pack the biases into the NSL
+/// `<key>.experts.{up,down}.bias` form (e.g., via a one-shot script)
+/// before this detection will resolve them. A v2.next deferral covers
+/// extending `moe_hf_pack.rs` to auto-pack the GPT-2 / OPT bias forms.
+///
+/// Name resolution mirrors `derive_v3_dims`:
+///   - `<key>.experts.up.bias` (or `.bias` suffix optional via `experts.up_bias`)
+///   - `<key>.experts.down.bias` (or `.down_bias`)
+///
+/// The four outcomes:
+///   1. NEITHER present → `Ok(None)`. Caller emits the v2.5/v2.7 byte-
+///      identical 0/0 bias path. No source-level change required.
+///   2. BOTH present + well-shaped → `Ok(Some(()))`. Caller is REQUIRED
+///      to pass the 6-arg `moe_dispatch_ffn` form so the bias pointers
+///      reach the FFI; otherwise the 4-arg call would silently drop the
+///      bias entries. This is the v2.12 source-activation gate.
+///   3. ONE present, the other missing → `Err(msg)`. Partial bias is
+///      almost certainly a packing bug (e.g., a stale prune pass dropped
+///      one direction). Refuse loudly so the user notices.
+///   4. BOTH present but shape disagrees → `Err(msg)`. Same loud refusal
+///      — a passed-through 6-arg call would refuse at the FFI gate, but
+///      the diagnostic at codegen is far more actionable.
+///
+/// The function returns `Ok(Some(()))` rather than a dim tuple because
+/// the dims are already known from `derive_v3_dims` — duplicating them
+/// here invites drift. Callers chain this AFTER `derive_v3_dims` and
+/// use that function's `(hidden, intermediate)` for the FFI args.
+/// CPDT Part III v2.12 fix F2 (HIGH adversarial review): cheap presence-
+/// only detector for v3 bias entries. Used in the v3 lowering arm BEFORE
+/// `derive_v3_dims` is called, so that a malformed weight bundle (e.g.,
+/// missing `experts.up.weight` but containing `experts.up.bias`) gets a
+/// bias-aware diagnostic instead of the generic "v3 dims not resolvable"
+/// error.
+///
+/// Returns `true` when EITHER `<key>.experts.up.bias` OR
+/// `<key>.experts.down.bias` (or their underscore variants) is present.
+/// The full-shape validation (and the partial-bias refusal) is the
+/// caller's responsibility once dims are known — `detect_v3_biases`
+/// remains the single source of truth for shape semantics.
+pub fn any_v3_bias_entry_present(weight_map: &WeightMap, key: &str) -> bool {
+    ["experts.up.bias", "experts.up_bias", "experts.down.bias", "experts.down_bias"]
+        .iter()
+        .any(|s| weight_map.get(&format!("{key}.{s}")).is_some())
+}
+
+pub fn detect_v3_biases(
+    weight_map: &WeightMap,
+    key: &str,
+    num_experts: usize,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+) -> Result<Option<()>, String> {
+    let up_bias = ["experts.up.bias", "experts.up_bias"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")));
+    let down_bias = ["experts.down.bias", "experts.down_bias"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")));
+
+    match (up_bias, down_bias) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!(
+            "@moe v3: WeightMap has `{key}.experts.up.bias` but no \
+             `{key}.experts.down.bias` (partial-bias bundle). v3 FFN \
+             biases must be present on BOTH projections or NEITHER. \
+             Either add the missing down bias, or remove the up bias \
+             from the weight bundle."
+        )),
+        (None, Some(_)) => Err(format!(
+            "@moe v3: WeightMap has `{key}.experts.down.bias` but no \
+             `{key}.experts.up.bias` (partial-bias bundle). v3 FFN \
+             biases must be present on BOTH projections or NEITHER. \
+             Either add the missing up bias, or remove the down bias \
+             from the weight bundle."
+        )),
+        (Some(up), Some(down)) => {
+            // v2.12 fix F3 (IMPORTANT adversarial review): use
+            // `checked_mul` to refuse on overflow (32-bit hosts or
+            // adversarial safetensors with synthetic huge shapes).
+            // Matches the v2.11 FFI's `saturating_mul` convention at
+            // `ffi.rs:734` — same direction (refuse, don't wrap), but
+            // we report the overflow as the diagnostic instead of
+            // silently shrinking expected_elems and accepting a small
+            // buffer that the FFI would then refuse with a length
+            // mismatch (the codegen diagnostic is far more actionable).
+            let expected_up_elems = num_experts.checked_mul(intermediate_dim).ok_or_else(|| {
+                format!(
+                    "@moe v3: num_experts={} * intermediate_dim={} overflows usize. \
+                     The codegen-derived dims are nonsensical; check `derive_v3_dims` \
+                     output against the safetensors shapes for `{key}`.",
+                    num_experts, intermediate_dim
+                )
+            })?;
+            let expected_down_elems = num_experts.checked_mul(hidden_dim).ok_or_else(|| {
+                format!(
+                    "@moe v3: num_experts={} * hidden_dim={} overflows usize. \
+                     The codegen-derived dims are nonsensical; check `derive_v3_dims` \
+                     output against the safetensors shapes for `{key}`.",
+                    num_experts, hidden_dim
+                )
+            })?;
+            // Use num_elements (precomputed from shape product) instead
+            // of `shape.iter().product()` so that 1D `[N*D]` and 2D
+            // `[N, D]` layouts are accepted as long as total elements
+            // match the FFI's contiguous-buffer expectation.
+            if up.num_elements != expected_up_elems {
+                return Err(format!(
+                    "@moe v3: `{key}.experts.up.bias` has {} elements; \
+                     expected {} (num_experts={} * intermediate_dim={}). \
+                     The v2.11 FFI requires a contiguous `[num_experts, \
+                     intermediate_dim]` bias buffer.",
+                    up.num_elements, expected_up_elems, num_experts, intermediate_dim
+                ));
+            }
+            if down.num_elements != expected_down_elems {
+                return Err(format!(
+                    "@moe v3: `{key}.experts.down.bias` has {} elements; \
+                     expected {} (num_experts={} * hidden_dim={}). \
+                     The v2.11 FFI requires a contiguous `[num_experts, \
+                     hidden_dim]` bias buffer.",
+                    down.num_elements, expected_down_elems, num_experts, hidden_dim
+                ));
+            }
+            Ok(Some(()))
+        }
+    }
+}
+
 /// CPDT Part III v2.5 codegen lowering for `nsl_moe_dispatch_full_v4`:
 /// derive `(hidden_dim, intermediate_dim)` from the WeightMap by
 /// resolving router + gate + up + down expert blocks.
@@ -760,6 +907,123 @@ mod tests {
             derive_v3_dims(&wm, "blocks.0", 4),
             None,
             "router.shape[1] != num_experts → refuse v3"
+        );
+    }
+
+    // ── detect_v3_biases (CPDT Part III v2.12 source-activation gate) ─────
+
+    #[test]
+    fn detect_v3_biases_neither_present_returns_ok_none() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            detect_v3_biases(&wm, "blocks.0", 4, 16, 32),
+            Ok(None),
+            "no bias entries → no-bias path (byte-identical to v2.5/v2.7 v3 emission)"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_both_present_well_shaped_returns_ok_some() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        wm.insert(make_weight("blocks.0.experts.up.bias", vec![4, 32]));
+        wm.insert(make_weight("blocks.0.experts.down.bias", vec![4, 16]));
+        assert_eq!(
+            detect_v3_biases(&wm, "blocks.0", 4, 16, 32),
+            Ok(Some(())),
+            "both biases with matching elem counts → caller must use 6-arg form"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_both_present_as_1d_returns_ok_some() {
+        // The FFI's contract is total-elements, not rank. 1D `[N*D]`
+        // layouts must be accepted so safetensors bundles that pack
+        // biases flat are usable without a pre-shape step.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.experts.up.bias", vec![4 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.bias", vec![4 * 16]));
+        assert_eq!(
+            detect_v3_biases(&wm, "blocks.0", 4, 16, 32),
+            Ok(Some(())),
+            "1D bias layouts with matching elem count → accepted"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_only_up_present_refuses_loudly() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.experts.up.bias", vec![4, 32]));
+        let r = detect_v3_biases(&wm, "blocks.0", 4, 16, 32);
+        assert!(matches!(r, Err(_)), "partial bias (up only) must refuse");
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("partial-bias bundle") && msg.contains("up.bias"),
+            "diagnostic must name the present direction (up.bias): {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_only_down_present_refuses_loudly() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.experts.down.bias", vec![4, 16]));
+        let r = detect_v3_biases(&wm, "blocks.0", 4, 16, 32);
+        assert!(matches!(r, Err(_)), "partial bias (down only) must refuse");
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("partial-bias bundle") && msg.contains("down.bias"),
+            "diagnostic must name the present direction (down.bias): {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_up_shape_mismatch_refuses_loudly() {
+        // up.bias has 4 * 31 = 124 elements; expected 4 * 32 = 128.
+        // Off-by-one in intermediate_dim would otherwise produce
+        // silent-corruption-grade OOB reads at runtime.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.experts.up.bias", vec![4, 31]));
+        wm.insert(make_weight("blocks.0.experts.down.bias", vec![4, 16]));
+        let r = detect_v3_biases(&wm, "blocks.0", 4, 16, 32);
+        assert!(matches!(r, Err(_)), "up-bias shape mismatch must refuse");
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("up.bias") && msg.contains("124") && msg.contains("128"),
+            "diagnostic must name actual + expected element counts: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_down_shape_mismatch_refuses_loudly() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.experts.up.bias", vec![4, 32]));
+        wm.insert(make_weight("blocks.0.experts.down.bias", vec![4, 17]));
+        let r = detect_v3_biases(&wm, "blocks.0", 4, 16, 32);
+        assert!(matches!(r, Err(_)), "down-bias shape mismatch must refuse");
+        let msg = r.unwrap_err();
+        assert!(
+            msg.contains("down.bias") && msg.contains("68") && msg.contains("64"),
+            "diagnostic must name actual (4*17=68) + expected (4*16=64): {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_v3_biases_alternate_underscore_names_resolve() {
+        // `experts.up_bias` / `experts.down_bias` (underscore instead of
+        // dotted) is a common HF safetensors convention; must resolve
+        // the same as the dotted form.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.experts.up_bias", vec![4, 32]));
+        wm.insert(make_weight("blocks.0.experts.down_bias", vec![4, 16]));
+        assert_eq!(
+            detect_v3_biases(&wm, "blocks.0", 4, 16, 32),
+            Ok(Some(())),
+            "underscore-suffixed names must resolve same as dotted form"
         );
     }
 
