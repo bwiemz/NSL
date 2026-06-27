@@ -523,6 +523,237 @@ fn forward_launch_and_saves(
     }
 }
 
+/// Launches the CSHA backward kernel for `bwd_cfg` against `forward`'s saves
+/// and returns the 7 readback gradients (as f32). `bwd_cfg.checkpoint`
+/// determines which dispatch branch is taken inside
+/// `synthesize_backward_with_tier_b` (mod.rs:1459):
+///   - `None` ⇒ HBM-resident kv_load (Path A baseline)
+///   - `Some(Full)` ⇒ kv_recompute from x_raw + Wk/Wv (Path B — §5.3 evidence)
+fn launch_backward_path(
+    bwd_cfg: &FlashAttentionConfig,
+    forward: &ForwardArtifacts,
+    head_dim: u32,
+    seq_len: u32,
+    path_label: &str,
+) -> CshaGradients {
+    let batch = 1usize;
+    let heads = 1usize;
+    let seq = seq_len as usize;
+    let hd = head_dim as usize;
+    let dm = hd;
+    let kv_dim = heads * hd;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let norm_eps = 1e-6f32;
+    let causal = bwd_cfg.causal;
+
+    // ── Allocate gradient output buffers + dxn scratch ─────────────────────
+    let dq_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes) };
+    let dk_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes) };
+    let dv_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes) };
+    let dx_dev = unsafe { nsl_test_cuda_alloc(forward.dx_bytes) };
+    // R-C14-2 mitigation: allocate the dx_norm scratch buffer per sister
+    // line 281. No readback — kernel internal staging only; undersizing
+    // causes the dRMSNorm tile to scribble past `dx_dev`'s end.
+    let dxn_dev = unsafe { nsl_test_cuda_alloc(forward.dxn_bytes) };
+
+    // ── Backward PTX synth + name ──────────────────────────────────────────
+    let mut bwd_ptx_str = synthesize_backward_with_tier_b(bwd_cfg, None)
+        .unwrap_or_else(|e| {
+            free_all(&[dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev,
+                dx_dev, dxn_dev]);
+            panic!("[{path_label}] backward PTX synth failed hd={head_dim} S={seq_len}: {e}");
+        });
+    if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
+    let bwd_ptx = bwd_ptx_str.into_bytes();
+    let bwd_name = CString::new(backward_kernel_name(bwd_cfg)).unwrap();
+
+    // ── R-C14-4: SMEM accounting ───────────────────────────────────────────
+    // Per `phases/backward/prelude.rs:backward_total_bytes` the dynamic
+    // request is `total_bytes + backward_extra_bytes` (+segment_overhead
+    // when segment_masked, which we don't set). If the kernel was emitted
+    // with `.extern .shared shmem[]`, the runtime MUST pass that byte
+    // count as the cuLaunchKernel `sharedMemBytes` arg — otherwise the
+    // grant is silently truncated and stores past the static cap hit
+    // ILLEGAL_ADDRESS. Mirrors `tests/csha_cuda_launch_classic.rs:284`
+    // sister idiom for forward smem.
+    let bwd_smem_total = smem_layout::total_bytes(bwd_cfg)
+        + smem_layout::backward_extra_bytes(bwd_cfg);
+    let bwd_needs_dyn = bwd_smem_total > 48 * 1024;
+    let bwd_smem_dyn = if bwd_needs_dyn { bwd_smem_total as i64 } else { 0 };
+    eprintln!(
+        "  [{path_label}] bwd SMEM total={} bytes; dyn_request={} (needs_dynamic={})",
+        bwd_smem_total, bwd_smem_dyn, bwd_needs_dyn
+    );
+
+    // ── Launch ─────────────────────────────────────────────────────────────
+    let rc_bwd = unsafe {
+        nsl_flash_attention_csha_backward(
+            forward.q_dev, forward.k_dev, forward.v_dev,
+            forward.out_dev, forward.lse_dev,
+            scale.to_bits() as i64,
+            batch as i64, heads as i64, seq as i64, hd as i64,
+            0, 0, 0, 0,
+            forward.cos_dev, forward.sin_dev,
+            0, 0,
+            bwd_smem_dyn,
+            bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
+            bwd_cfg.block_q, bwd_cfg.block_kv,
+            if causal { 1 } else { 0 },
+            forward.x_dev, forward.nw_dev,
+            forward.wq_dev, forward.wk_dev, forward.wv_dev,
+            0, norm_eps.to_bits() as i64,
+            heads as i64, dm as i64,
+            forward.saves.q_proj, forward.saves.k_proj, forward.saves.v_proj,
+            forward.saves.row_max, forward.saves.row_sum,
+            forward.saves.x_raw,
+            forward.do_dev,
+            dq_dev, dk_dev, dv_dev,
+            dwq_dev, dwk_dev, dwv_dev,
+            dx_dev,
+            dxn_dev,
+            // segment_ids, tier_b_ptx, tier_b_name, doc_starts, tier_b2_active.
+            0, 0, 0, 0, 0,
+        )
+    };
+    if rc_bwd != 0 {
+        let log = unsafe {
+            let p = nsl_test_cuda_jit_log(bwd_ptx.as_ptr() as i64);
+            if p != 0 {
+                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
+            } else { "<no log>".into() }
+        };
+        free_all(&[dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev,
+            dx_dev, dxn_dev]);
+        panic!(
+            "[{path_label}] backward launch FAILED rc={rc_bwd} hd={head_dim} S={seq_len}\n\
+             JIT log:\n{log}"
+        );
+    }
+
+    // ── Readback ───────────────────────────────────────────────────────────
+    let read_f16 = |dev: i64, elems: usize| -> Vec<f32> {
+        let mut raw = vec![0u16; elems];
+        unsafe { nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, dev, (elems * 2) as i64); }
+        raw.iter().map(|&b| f16_to_f32(b)).collect()
+    };
+    let read_f32 = |dev: i64, elems: usize| -> Vec<f32> {
+        let mut out = vec![0f32; elems];
+        unsafe { nsl_test_cuda_d2h(out.as_mut_ptr() as i64, dev, (elems * 4) as i64); }
+        out
+    };
+    let qkv_elems = heads * seq * hd;
+    let dw_elems = dm * kv_dim;
+    let dx_elems = heads * seq * hd;
+    let grads = CshaGradients {
+        dq: read_f16(dq_dev, qkv_elems),
+        dk: read_f16(dk_dev, qkv_elems),
+        dv: read_f16(dv_dev, qkv_elems),
+        dwq: read_f16(dwq_dev, dw_elems),
+        dwk: read_f16(dwk_dev, dw_elems),
+        dwv: read_f16(dwv_dev, dw_elems),
+        dx: read_f32(dx_dev, dx_elems),
+    };
+
+    free_all(&[dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev,
+        dx_dev, dxn_dev]);
+    grads
+}
+
+/// Per-tensor diff envelope at the cycle-14 tolerance ladder. Panics with a
+/// verbatim summary if any tensor exceeds tolerance (NOT just eprintln).
+/// Tolerances per spec §6:
+///   dQ/dK/dV at hd<128: atol=5e-4 rtol=5e-3
+///   dQ/dK/dV at hd≥128: atol=2e-3 rtol=1e-2
+///   dW:                 atol=1e-3 rtol=1e-2
+///   dx:                 atol=1e-2 rtol=2e-2
+/// Per-tensor diff summary. Returns (max_abs, max_rel, ok-mask) for the 7
+/// tensors so the caller can decide whether to assert or just log.
+fn diff_summary(
+    label: &str,
+    a: &CshaGradients,
+    b: &CshaGradients,
+    head_dim: usize,
+) -> Vec<&'static str> {
+    let (atol_qkv, rtol_qkv) = tol_dqkv(head_dim);
+    let atol_dw  = 1e-3f32; let rtol_dw  = 1e-2f32;
+    let atol_dx  = 1e-2f32; let rtol_dx  = 2e-2f32;
+
+    let check = |name: &str, x: &[f32], y: &[f32], atol: f32, rtol: f32| -> bool {
+        let abs = max_abs_diff(x, y);
+        let rel = max_rel_diff(x, y);
+        let ok = abs <= atol || rel <= rtol;
+        eprintln!(
+            "  [{label}] {name}: max_abs={abs:.3e} max_rel={rel:.3e} \
+             (atol={atol:.0e} rtol={rtol:.0e}) {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        ok
+    };
+
+    let names_and_oks: Vec<(&'static str, bool)> = vec![
+        ("dq",  check("dq",  &a.dq,  &b.dq,  atol_qkv, rtol_qkv)),
+        ("dk",  check("dk",  &a.dk,  &b.dk,  atol_qkv, rtol_qkv)),
+        ("dv",  check("dv",  &a.dv,  &b.dv,  atol_qkv, rtol_qkv)),
+        ("dwq", check("dwq", &a.dwq, &b.dwq, atol_dw,  rtol_dw)),
+        ("dwk", check("dwk", &a.dwk, &b.dwk, atol_dw,  rtol_dw)),
+        ("dwv", check("dwv", &a.dwv, &b.dwv, atol_dw,  rtol_dw)),
+        ("dx",  check("dx",  &a.dx,  &b.dx,  atol_dx,  rtol_dx)),
+    ];
+    names_and_oks.into_iter().filter_map(|(n, ok)| if !ok { Some(n) } else { None }).collect()
+}
+
+#[allow(dead_code)]
+fn assert_grads_within_tolerance(
+    label: &str,
+    a: &CshaGradients,
+    b: &CshaGradients,
+    head_dim: usize,
+) {
+    let (atol_qkv, rtol_qkv) = tol_dqkv(head_dim);
+    let atol_dw  = 1e-3f32;
+    let rtol_dw  = 1e-2f32;
+    let atol_dx  = 1e-2f32;
+    let rtol_dx  = 2e-2f32;
+
+    let check = |name: &str, x: &[f32], y: &[f32], atol: f32, rtol: f32| -> (f32, f32, bool) {
+        let abs = max_abs_diff(x, y);
+        let rel = max_rel_diff(x, y);
+        // Pass if EITHER atol OR rtol envelope holds (standard PyTorch
+        // semantics — atol catches small-magnitude tensors where rel
+        // explodes; rtol catches large-magnitude tensors where abs is
+        // unreasonable).
+        let ok = abs <= atol || rel <= rtol;
+        eprintln!(
+            "  [{label}] {name}: max_abs={abs:.3e} max_rel={rel:.3e} \
+             (atol={atol:.0e} rtol={rtol:.0e}) {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        (abs, rel, ok)
+    };
+
+    let r_dq  = check("dq",  &a.dq,  &b.dq,  atol_qkv, rtol_qkv);
+    let r_dk  = check("dk",  &a.dk,  &b.dk,  atol_qkv, rtol_qkv);
+    let r_dv  = check("dv",  &a.dv,  &b.dv,  atol_qkv, rtol_qkv);
+    let r_dwq = check("dwq", &a.dwq, &b.dwq, atol_dw,  rtol_dw);
+    let r_dwk = check("dwk", &a.dwk, &b.dwk, atol_dw,  rtol_dw);
+    let r_dwv = check("dwv", &a.dwv, &b.dwv, atol_dw,  rtol_dw);
+    let r_dx  = check("dx",  &a.dx,  &b.dx,  atol_dx,  rtol_dx);
+
+    let fails: Vec<&str> = [
+        ("dq",  r_dq.2),  ("dk",  r_dk.2),  ("dv",  r_dv.2),
+        ("dwq", r_dwq.2), ("dwk", r_dwk.2), ("dwv", r_dwv.2),
+        ("dx",  r_dx.2),
+    ].iter().filter_map(|(n, ok)| if !ok { Some(*n) } else { None }).collect();
+    assert!(
+        fails.is_empty(),
+        "[{label}] tolerance FAIL: {} tensor(s) out of envelope: {:?}",
+        fails.len(), fails
+    );
+}
+
 /// Three-way comparator driver. Tasks 3-5 progressively expand:
 ///   T3: forward launch (with saves) — verify out is finite
 ///   T4: backward Path A (checkpoint=None baseline) vs cpu_reference
@@ -548,12 +779,11 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
     let seq = seq_len as usize;
     let heads = 1usize;
     let dm = hd;
-    let kv_dim = heads * hd;
 
     // ── Task 3: forward launch with saves ──────────────────────────────────
     let artifacts = forward_launch_and_saves(&config, head_dim, seq_len);
 
-    // ── CPU full-stack reference (used in Tasks 4-5) ───────────────────────
+    // ── CPU full-stack reference ───────────────────────────────────────────
     let inputs = CshaInputs {
         x: &artifacts.x_host,
         wq: &artifacts.wq_f32, wk: &artifacts.wk_f32, wv: &artifacts.wv_f32,
@@ -567,8 +797,7 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
     };
     let cpu_grads: CshaGradients = csha_reference_backward(&inputs, &shape, &artifacts.do_f32);
 
-    // CPU prologue oracle (unused in Task 3 but kept live for future SMEM
-    // readback; pacify lint).
+    // CPU prologue oracle (kept live for cycle-15 SMEM readback).
     let prologue_cfg = PrologueConfig {
         seq_len: seq, head_dim: hd, d_model: dm, eps: 1e-6,
         num_heads_q: heads, num_heads_kv: heads, num_heads_v: heads,
@@ -581,10 +810,54 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
     );
     let _ = (&q_proj_cpu, &k_proj_cpu, &v_proj_cpu);
 
-    // Pacify until Task 4 wires backward.
-    let _ = (&cpu_grads, &kv_dim);
+    // ── Task 4: backward Path A (checkpoint=None baseline) ─────────────────
+    // Clone of config with checkpoint stripped so the dispatch fork at
+    // mod.rs:1496 takes the kv_load branch (HBM-resident K_proj/V_proj
+    // read from forward saves) instead of kv_recompute.
+    let mut cfg_a = config.clone();
+    cfg_a.checkpoint = None;
 
-    // ── Cleanup forward+saves (Tasks 4-5 take ownership next commit) ───────
+    eprintln!(
+        "[cycle14 path A] hd={head_dim} S={seq_len} launching backward with \
+         checkpoint=None (kv_load baseline)"
+    );
+    let gpu_a = launch_backward_path(&cfg_a, &artifacts, head_dim, seq_len, "path A");
+    eprintln!("[cycle14 path A] vs cpu_reference:");
+    let fails_a = diff_summary("path A vs cpu_ref", &gpu_a, &cpu_grads, hd);
+
+    if !fails_a.is_empty() {
+        // R5 deferral surfaced: Path A baseline is RED on cycle-14 config
+        // (causal=true rope_q=true level=1 fused_proj). The sister
+        // `t6_3_smoke_single_config` runs at causal=false rope_q=false and
+        // is GREEN on this branch — see `csha_cuda_backward.rs:425`. So
+        // the harness wiring is sound; the cycle-14-specific config
+        // exposes a numerical bug in the level-1 fused-projections
+        // backward when both causal AND rope_q are enabled.
+        //
+        // Per cycle-14 spec §4 Commit 4: "If red: STOP — the harness
+        // wiring has a bug, not the recompute path". The next cycle's
+        // analysis will localise which backward phase (likely
+        // `csha_hooks_backward::emit_drmsnorm` or `emit_drope`)
+        // produces the divergence. R0 stays in production until cycle
+        // 15 lands the fix.
+        unsafe { nsl_csha_free_backward_activations(artifacts.saves); }
+        free_all(&[
+            artifacts.q_dev, artifacts.k_dev, artifacts.v_dev,
+            artifacts.out_dev, artifacts.lse_dev,
+            artifacts.x_dev, artifacts.nw_dev,
+            artifacts.wq_dev, artifacts.wk_dev, artifacts.wv_dev,
+            artifacts.cos_dev, artifacts.sin_dev, artifacts.do_dev,
+        ]);
+        panic!(
+            "[cycle14 task4] Path A RED at hd={head_dim} S={seq_len}: \
+             {} tensor(s) out of tolerance: {:?}. Per spec Commit 4 STOP \
+             condition triggered — Task 5 Path B run deferred until \
+             baseline is restored.",
+            fails_a.len(), fails_a
+        );
+    }
+
+    // ── Cleanup forward+saves ──────────────────────────────────────────────
     unsafe { nsl_csha_free_backward_activations(artifacts.saves); }
     free_all(&[
         artifacts.q_dev, artifacts.k_dev, artifacts.v_dev,
@@ -594,18 +867,5 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
         artifacts.cos_dev, artifacts.sin_dev, artifacts.do_dev,
     ]);
 
-    let _ = (
-        artifacts.qkv_bytes, artifacts.w_bytes, artifacts.rope_bytes,
-        artifacts.dw_bytes, artifacts.dx_bytes, artifacts.dxn_bytes,
-    );
-
-    let (atol_dqkv, rtol_dqkv) = tol_dqkv(hd);
-    eprintln!(
-        "[cycle14 task3] hd={head_dim} S={seq_len} forward launched cleanly; \
-         tols pending Task 4: dqkv=(atol={atol_dqkv:.1e}, rtol={rtol_dqkv:.1e})"
-    );
-    let _zero = max_abs_diff(&cpu_grads.dq, &cpu_grads.dq);
-    let _zero_rel = max_rel_diff(&cpu_grads.dq, &cpu_grads.dq);
-    debug_assert_eq!(_zero, 0.0, "self-diff must be 0");
-    let _ = _zero_rel;
+    eprintln!("[cycle14 task4] hd={head_dim} S={seq_len} Path A GREEN");
 }
