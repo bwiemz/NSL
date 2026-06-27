@@ -46,8 +46,8 @@ use nsl_codegen::flash_attention::{
     CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
 };
 use nsl_codegen::flash_attention_v2::{
-    flash_attention_kernel_name_v2, smem_layout, synthesize_backward_with_tier_b,
-    synthesize_flash_attention_ptx_v2,
+    flash_attention_kernel_name_v2, shared_mem_bytes_v2_backward, smem_layout,
+    synthesize_backward_with_tier_b, synthesize_flash_attention_ptx_v2,
 };
 use nsl_test::cpu_naive_prologue::{cpu_naive_norm_proj_rope, PrologueConfig};
 
@@ -593,16 +593,12 @@ fn launch_backward_path(
     let bwd_name = CString::new(backward_kernel_name(bwd_cfg)).unwrap();
 
     // ── R-C14-4: SMEM accounting ───────────────────────────────────────────
-    // Per `phases/backward/prelude.rs:backward_total_bytes` the dynamic
-    // request is `total_bytes + backward_extra_bytes` (+segment_overhead
-    // when segment_masked, which we don't set). If the kernel was emitted
-    // with `.extern .shared shmem[]`, the runtime MUST pass that byte
-    // count as the cuLaunchKernel `sharedMemBytes` arg — otherwise the
-    // grant is silently truncated and stores past the static cap hit
-    // ILLEGAL_ADDRESS. Mirrors `tests/csha_cuda_launch_classic.rs:284`
-    // sister idiom for forward smem.
-    let bwd_smem_total = smem_layout::total_bytes(bwd_cfg)
-        + smem_layout::backward_extra_bytes(bwd_cfg);
+    // G16-2 fix: use shared_mem_bytes_v2_backward which adds recompute_extra_bytes
+    // when checkpoint=Some(Full). The checkpoint path writes a recomputed x_norm
+    // scratch tile starting at recompute_xnorm_offset (immediately after the
+    // backward_total_bytes region). Omitting this grant caused
+    // CUDA_ERROR_ILLEGAL_ADDRESS in emit_kv_recompute -> emit_one_recompute_matmul.
+    let bwd_smem_total = shared_mem_bytes_v2_backward(bwd_cfg);
     let bwd_needs_dyn = bwd_smem_total > 48 * 1024;
     let bwd_smem_dyn = if bwd_needs_dyn { bwd_smem_total as i64 } else { 0 };
     eprintln!(

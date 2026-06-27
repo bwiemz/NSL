@@ -887,13 +887,24 @@ pub fn shared_mem_bytes_v2(config: &FlashAttentionConfig) -> u32 {
 /// layout, and the seg_smem region lives in the same extern shmem
 /// allocation per the Blackwell static+extern fix
 /// (see `phases/backward/prelude.rs::backward_needs_dynamic_smem`).
+///
+/// G16-2 fix: when `config.checkpoint = Some(Full)`, the kv_recompute path
+/// writes to a recomputed x_norm scratch tile starting at
+/// `smem_layout::recompute_xnorm_offset`, which sits immediately AFTER the
+/// `backward_total_bytes` region. The launch must grant those extra bytes or
+/// the store fires CUDA_ERROR_ILLEGAL_ADDRESS.
 pub fn shared_mem_bytes_v2_backward(config: &FlashAttentionConfig) -> u32 {
     let seg_overhead = if config.segment_masked {
         crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    phases::backward::prelude::backward_total_bytes(config) + seg_overhead
+    let recompute_extra = if config.checkpoint.is_some() {
+        smem_layout::recompute_extra_bytes(config) as u32
+    } else {
+        0
+    };
+    phases::backward::prelude::backward_total_bytes(config) + seg_overhead + recompute_extra
 }
 
 /// SMEM byte count for a v2 forward kernel including Tier B contribution.

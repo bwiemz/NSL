@@ -88,6 +88,13 @@ name = "cycle16_g16_1_witnesses"
 path = "tests/cycle16_g16_1_witnesses.rs"
 required-features = ["test-helpers"]
 
+# Cycle-16 Task 3: G16-2 + G16-3 triage witnesses. Structural tests only;
+# GPU smoke tests are gated on feature = "cuda" + #[ignore] so they never
+# run in default CI. No bypass_r0 needed -- no bypass_r0_for_testing() calls.
+[[test]]
+name = "csha_cycle16_g16_2_g16_3_triage"
+path = "tests/csha_cycle16_g16_2_g16_3_triage.rs"
+
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"

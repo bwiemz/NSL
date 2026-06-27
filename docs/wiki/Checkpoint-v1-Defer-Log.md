@@ -586,3 +586,101 @@ constraint, not a defect:
   per tile. Neither requires defect-level work; this is a config-not-bug
   classification per cycle-5 honesty discipline.
 
+---
+
+## CYCLE 16 - TASK 3: G16-2 + G16-3 Joint Triage
+
+**Date:** 2026-06-27
+**Branch:** `feat/csha-cycle16-multi-bug-closure`
+**Tests added:** `crates/nsl-codegen/tests/csha_cycle16_g16_2_g16_3_triage.rs` (6 structural tests)
+
+### G16-2: Path B CUDA_ERROR_ILLEGAL_ADDRESS -- RESOLVED
+
+**Root cause identified and fixed in cycle-16 Task 3.**
+
+The `emit_kv_recompute` path (activated only when `checkpoint=Some(Full)`) writes a
+recomputed x_norm scratch tile to SMEM starting at `recompute_xnorm_offset`. The
+`smem_layout::recompute_xnorm_offset(config)` returns:
+
+    total_bytes(config) + backward_extra_bytes(config)
+
+This is exactly the boundary of what `shared_mem_bytes_v2_backward` was granting
+before the fix. The kernel wrote to SMEM addresses beyond the allocation boundary
+immediately after launch, corrupting adjacent memory. The crash manifested at the
+subsequent `cuMemFree_v2(dk_scratch_raw)` call inside
+`nsl_flash_attention_csha_backward` because the kernel had overwritten allocator
+metadata for the scratch buffer.
+
+**Fix (< 10 LOC):**
+`shared_mem_bytes_v2_backward` in `crates/nsl-codegen/src/flash_attention_v2/mod.rs`
+now adds `recompute_extra_bytes(config) as u32` when `config.checkpoint.is_some()`.
+The test harness `launch_backward_path()` in `csha_checkpoint_recompute_gpu.rs` was
+also updated to derive SMEM from `shared_mem_bytes_v2_backward` rather than computing
+it manually.
+
+**Verification:**
+
+- Path B (checkpoint=Full, hd=64, S=512) now runs to completion: SMEM 90496 -> 94592 bytes.
+- Path B is numerically RED (inherits Bug 1 / G16-1 divergence), but no CUDA error.
+- lib tests: 2049/2049 GREEN.
+- fa_v2_snapshots: 25/25 GREEN (byte-identical; no non-checkpoint path affected).
+
+**Structural witnesses (pass by default, no GPU needed):**
+
+- `g16_2_t1_smem_includes_recompute_extra_after_fix`: delta == `recompute_extra_bytes`.
+- `g16_2_t2_smem_no_change_without_checkpoint`: Path A SMEM unchanged.
+- `g16_2_t3_recompute_xnorm_offset_equals_old_boundary`: confirms write started at old boundary.
+
+---
+
+### G16-3: A3 CUDA_ERROR_MISALIGNED_ADDRESS -- DEFERRED to cycle 17
+
+**Root cause: structurally inconclusive in cycle 16.**
+
+Config: `causal=true, rope_q=true, fused_projections=false, d_model=0, hd=64, S=512, bq=32, checkpoint=None` (Path A).
+
+**Static analysis findings:**
+
+- Kernel synthesizes OK (PTX emission step is not the failure).
+- Kernel launches successfully (launch rc=0, kernel runs to completion).
+- Crash fires during `cuMemFree_v2(dk_scratch_raw)` inside
+  `nsl_flash_attention_csha_backward` -- GPU memory corruption during or after kernel.
+- SMEM=45696 bytes, dyn=0 (static) -- this is NOT a SMEM-grant issue (unlike G16-2).
+- `emit_xnorm_recompute`, `emit_dproj`, `emit_drmsnorm`: all return early when `d_model=0`; no SMEM writes from these paths.
+- The "Phase 1b drains garbage" hypothesis from cycle-15 task description is
+  structurally REFUTED: `emit_drmsnorm` exits at lines 551-553 BEFORE emitting
+  any phase 1, 1b, or 2 code when `d_model == 0`.
+- Basic dQ/dK/dV backward (emit_store_kv_only, emit_store_dk_only) still runs and
+  is the candidate corruption site.
+
+**SMEM aliasing finding (documented in g16_3_t1_zero_d_model_smem_aliasing):**
+When `d_model=0`, `backward_x_norm_offset == backward_dx_norm_offset == backward_rms_strip_offset`.
+The three conceptual tiles collapse to the same SMEM address. The rms_strip tile
+(bq*4 = 128 bytes) lives at this offset and could alias with Phase-4 SMEM read/write
+ranges from the dQ/dK/dV cooperative store.
+
+**Working hypothesis for cycle 17:**
+A Phase-4 SMEM cooperative store (dQ or dK tile) overshoots into the rms_strip
+region (which is zero-sized due to d_model=0 aliasing). With rms_strip co-located
+at the same offset as the V_in tile or another adjacent tile, the write corrupts
+the allocator metadata for the dk_scratch buffer that was placed immediately after
+the kernel's SMEM shadow region on the heap. Needs `cuda-memcheck` to confirm
+the exact address of the stray write.
+
+**Cycle 16 disposition:** DEFERRED-TO-CYCLE-17 per cycle-5 deferral-must-refuse
+invariant. This is a judgment call -- the crash is real, observed, and reproducible,
+but the fix scope is inconclusive (could be SMEM layout re-ordering, a missing
+guard, or allocator interaction). Forcing a fix without cuda-memcheck evidence
+risks silent mis-correction.
+
+**Repro:**
+
+    cargo test --release --features cuda --test csha_cycle15_bug1_ablations -- \
+      --ignored a3_fused_proj_off_causal_true_rope_q_true_hd64 --nocapture
+
+**Structural witnesses (pass by default, no GPU needed):**
+
+- `g16_3_t1_zero_d_model_smem_aliasing`: confirms 3-way aliasing when d_model=0.
+- `g16_3_t2_a3_backward_ptx_synthesizes_ok`: PTX synthesis succeeds; crash is runtime-only.
+- `g16_3_t3_a3_smem_is_static`: SMEM < 48*1024; dyn=0 (unlike G16-2 which needed dynamic SMEM).
+
