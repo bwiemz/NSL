@@ -114,16 +114,18 @@ fn tol_dqkv(head_dim: usize) -> (f32, f32) {
     }
 }
 
-/// Build a cycle-12 narrowed-R0-PASSES config (Level-1 fused-projections +
-/// `@checkpoint(policy="full")`, causal, rope_q, no sinks, no segments,
-/// no paged_kv collision, block_q == block_kv).
-fn build_cycle12_config(head_dim: u32, _seq_len: u32, block: u32) -> FlashAttentionConfig {
+/// Build a cycle-14 Level-1 fused-projections + `@checkpoint(policy="full")`
+/// config: causal, rope_q, no sinks, no segments, no paged_kv collision,
+/// block_q == block_kv == 32 (downsized from cycle-12's 64 to bring hd=128
+/// configs back inside the sm_120 99 KB dynamic-SMEM cap per spec §1.7),
+/// `gpu_sm=80` to unlock the Tier B.1 dispatch fork on Blackwell.
+fn build_cycle14_config(head_dim: u32, _seq_len: u32) -> FlashAttentionConfig {
     // seq_len enters via the harness `inputs`/launch shape; FlashAttentionConfig
     // doesn't carry a sequence dimension (the kernel takes it at launch).
     let d_model = head_dim; // 1 head, dm == hd for shape alignment with CPU ref
     FlashAttentionConfig {
-        block_q: block as i64,
-        block_kv: block as i64,
+        block_q: 32,
+        block_kv: 32,
         head_dim: head_dim as i64,
         causal: true,
         paged: false,
@@ -132,7 +134,7 @@ fn build_cycle12_config(head_dim: u32, _seq_len: u32, block: u32) -> FlashAttent
         gqa_group_size: 1,
         tree_mask: false,
         num_sink_tokens: 0,
-        gpu_sm: 75,
+        gpu_sm: 80,
         segment_masked: false,
         csha: Some(CshaExtras::level1_with_fused_proj(1e-6)),
         checkpoint: Some(CheckpointExtras::full()),
@@ -170,50 +172,95 @@ impl WithDModel for FlashAttentionConfig {
 
 #[test]
 #[ignore]
-fn t_checkpoint_recompute_hd64_s512() {
-    run_three_way_oracle(64, 512, 64);
+fn t_recompute_hd64_s512_bq32() {
+    run_three_way_oracle(64, 512);
 }
 
 #[test]
 #[ignore]
-fn t_checkpoint_recompute_hd64_s2048() {
-    run_three_way_oracle(64, 2048, 64);
+fn t_recompute_hd64_s2048_bq32() {
+    run_three_way_oracle(64, 2048);
 }
 
 #[test]
 #[ignore]
-fn t_checkpoint_recompute_hd128_s512() {
-    run_three_way_oracle(128, 512, 64);
+fn t_recompute_hd128_s512_bq32() {
+    run_three_way_oracle(128, 512);
 }
 
 #[test]
 #[ignore]
-fn t_checkpoint_recompute_hd128_s2048() {
-    run_three_way_oracle(128, 2048, 64);
+fn t_recompute_hd128_s2048_bq32() {
+    run_three_way_oracle(128, 2048);
 }
 
+// ── G14-B/C/D default-run gates (no #[ignore]) ─────────────────────────────
+
+/// G14-B: cycle-14 pre-impl R5 refusal pin. With block=64 + hd=128 +
+/// fused_projections=true, the backward SMEM total still exceeds the
+/// sm_120 dynamic-SMEM cap. The cycle-12 cascade routes this through
+/// `validate_scalar_v2_config` which returns a refusal whose message
+/// contains the substring `"exceeds device"` (smem_layout.rs:245+).
+/// Pinning it here keeps the budget math honest under future refactors.
 #[test]
-#[ignore]
-fn t_checkpoint_recompute_hd128_s4096() {
-    run_three_way_oracle(128, 4096, 64);
+fn g14_b_recompute_hd128_s4096_bq64_refuses_r5() {
+    let mut cfg = build_cycle14_config(128, 4096);
+    cfg.block_q = 64;
+    cfg.block_kv = 64;
+    // Re-pin checkpoint after the mutation (no-op for the carrier).
+    cfg.checkpoint = Some(CheckpointExtras::full());
+    let err = synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err("over-cap config must refuse with R5");
+    assert!(
+        err.contains("exceeds device"),
+        "R5 'exceeds device' substring missing: {err}"
+    );
 }
 
-/// Three-way comparator driver. Cycle 12 ships compile-only — `cuda_available`
-/// returns false so this exits early; the body documents the cycle-13
-/// activation path.
-fn run_three_way_oracle(head_dim: u32, seq_len: u32, block: u32) {
+/// G14-C: with `gpu_sm=80`, the synthesized PTX MUST target sm_80
+/// (cycle-9 spec §1.8 dispatch invariant — Blackwell sm_120 JITs sm_80
+/// PTX forward-compat per Phase A smoke proof).
+#[test]
+fn g14_c_sm80_target_emitted_under_gpu_sm_80() {
+    let cfg = build_cycle14_config(64, 512);
+    let ptx = synthesize_backward_with_tier_b(&cfg, None)
+        .expect("hd=64 bq=32 must synthesize");
+    assert!(
+        ptx.contains(".target sm_80"),
+        ".target sm_80 missing from synthesized backward PTX"
+    );
+}
+
+/// G14-D: the SMEM total (forward layout + backward extras) for the
+/// cycle-14 hd=64 baseline config MUST fit under the sm_120 99 KB cap
+/// when `gpu_sm=80` AND `block=32`. Catches accidental budget regressions
+/// in `smem_layout::backward_extra_bytes` or `smem_layout::total_bytes`.
+#[test]
+fn g14_d_recompute_extra_bytes_accounted() {
+    let cfg = build_cycle14_config(64, 512);
+    let total = smem_layout::total_bytes(&cfg) + smem_layout::backward_extra_bytes(&cfg);
+    assert!(
+        total <= 99 * 1024,
+        "cycle-14 hd=64 bq=32 SMEM total {total} > sm_120 99 KB cap"
+    );
+}
+
+/// Three-way comparator driver. Task-2 commit ships with signature change
+/// (block param removed — locked at bq=bkv=32 via `build_cycle14_config`).
+/// Task-3+ expands the body to launch forward+backward on real GPU.
+fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
     if !cuda_available() {
         eprintln!(
-            "[cycle12 csha checkpoint recompute] skipping hd={head_dim} S={seq_len} \
-             — cycle-12 ships compile-only; cycle 13 wires real CUDA"
+            "[cycle14 csha checkpoint recompute] skipping hd={head_dim} S={seq_len} \
+             — no CUDA device (or NSL_SKIP_CUDA_TESTS set)"
         );
         return;
     }
 
-    // ── Config + PTX synthesis (cycle 12 compile-only) ─────────────────────
-    let config = build_cycle12_config(head_dim, seq_len, block);
+    // ── Config + PTX synthesis ─────────────────────────────────────────────
+    let config = build_cycle14_config(head_dim, seq_len);
     let bwd_ptx = synthesize_backward_with_tier_b(&config, None)
-        .expect("cycle-12 narrowed-R0-PASSES config must synthesize backward PTX");
+        .expect("cycle-14 baseline config must synthesize backward PTX");
     assert!(
         bwd_ptx.contains("V2_KV_RECOMPUTE_MAIN"),
         "expected backward PTX to contain the kv-recompute label V2_KV_RECOMPUTE_MAIN"

@@ -79,8 +79,21 @@ pub fn emit(
     // a misrouted caller can't produce an invalid kernel.
     let _ = Direction::Backward;
 
+    // Cycle 14: mirror forward prelude's gpu_sm-aware target selection.
+    // Tier B.2 hybrid backward and forward both target sm_80 when
+    // `gpu_sm >= 80`; scalar Tier C backward stayed on sm_75 because it
+    // pre-dated the dispatch. With `gpu_sm=80` configs now reaching this
+    // emitter (Blackwell + RTX 5070 Ti harness), keeping sm_75 here
+    // would mismatch the forward target inside the same module — and
+    // would block the G14-C `.target sm_80` assertion. sm_75 PTX
+    // continues to JIT cleanly when `gpu_sm < 80`.
     use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
-    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
+    let target_sm = if config.gpu_sm >= 80 {
+        TargetSm::Sm80
+    } else {
+        TargetSm::Sm75
+    };
+    emit_ptx_header(ptx, PtxVersion::V8_7, target_sm);
 
     let dyn_smem = backward_needs_dynamic_smem(config);
     if dyn_smem {
