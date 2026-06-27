@@ -448,3 +448,61 @@ and requires careful regression testing against the full fa_v2_snapshots suite.
 **Cycle-5 invariant:** §5.3 numerical validation NOT claimed for Path A baseline.
 Paper §6.3 49% headline remains STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED on Blackwell.
 
+### Cycle-15 GPU re-run on RTX 5070 Ti (CUDA 13.2, cudarc 0.19.4)
+
+**t_recompute_hd64_s512_bq32:**
+
+- Path A (baseline, checkpoint=None): RED -- all 7 gradients FAIL.
+  dq: max_abs=4.420e0 max_rel=1.000e0 | dk: max_abs=4.356e0 max_rel=2.040e1 |
+  dv: max_abs=8.571e0 max_rel=3.979e3 | dwq: max_abs=3.403e1 max_rel=1.000e0 |
+  dwk: max_abs=3.664e1 max_rel=1.020e0 | dwv: max_abs=1.733e1 max_rel=1.032e0 |
+  dx: max_abs=4.691e1 max_rel=1.118e0
+- Path B (checkpoint=Some(Full)): CUDA_ERROR_ILLEGAL_ADDRESS crash in
+  nsl_flash_attention_csha_backward after backward launch. PTX compiled (no
+  ptxas rc=218). No numerical values produced -- process aborted with
+  STATUS_STACK_BUFFER_OVERRUN (exit code 0xc0000409). Bug 2 fix prevented the
+  ptxas compile failure but Path B still crashes at runtime with an illegal
+  address access in the backward kernel.
+
+**Cycle-15 ablations (all run sequentially --test-threads=1):**
+- A1 (rope_q=FALSE): INFRA-FAIL -- panicked at csha_reference.rs:85:31 "index
+  out of bounds: the len is 0 but the index is 0". The CPU reference
+  implementation does not handle rope_q=false; this is a test infrastructure
+  bug, not a GPU backward bug. No GPU numerical output produced.
+- A2 (causal=FALSE): RED -- all 7 gradients FAIL. PTX compiled, backward
+  launched (rc=0). dq: max_abs=inf max_rel=inf | dk: max_abs=inf max_rel=inf |
+  dv: max_abs=inf max_rel=inf | dwq: max_abs=inf max_rel=inf |
+  dwk: max_abs=3.463e1 max_rel=5.188e1 | dwv: max_abs=1.533e1 max_rel=4.015e1 |
+  dx: max_abs=9.269e6 max_rel=1.916e9. inf values on dq/dk/dv/dwq indicate
+  catastrophic divergence (NaN/inf in output); dx magnitude 9.269e6 vs Path A
+  4.691e1 indicates causal=false exposes additional kernel defects beyond Bug 1.
+- A3 (fused_proj=FALSE): CUDA_ERROR_MISALIGNED_ADDRESS crash on cuMemFree_v2
+  after backward launch. PTX compiled (SMEM=45696 bytes dyn=0). No numerical
+  output produced. The misaligned-address error on free indicates GPU memory
+  corruption during or after the backward kernel execution with fused_proj=false.
+- A4 (hd=128): SKIPPED -- backward validator refused: 217472 bytes > 101376 byte
+  SMEM cap at (block_q=32, head_dim=128). Config not executable on this device.
+
+**Classification:** CASE C (partially) -- Bug 2 fix (Task 1) prevented ptxas
+rc=218 compile failure; Path B now compiles PTX. However Path B still crashes at
+runtime with CUDA_ERROR_ILLEGAL_ADDRESS in the backward kernel, indicating a
+remaining runtime defect beyond the register-declaration gap. A3 also crashes with
+CUDA_ERROR_MISALIGNED_ADDRESS. The primary CASE C criterion (ptxas rc=218) is
+resolved, but Path B is not numerically testable due to the new runtime crash.
+
+**Task-2 static analysis empirical status:** PARTIAL -- Path A numbers are
+byte-for-byte consistent with cycle-14 results (same magnitudes: dq 4.420e0,
+dv 3.979e3 max_rel, dx 4.691e1), confirming Tasks 1-2 did not perturb the
+forward/backward emission for the baseline path. The three static-analysis defects
+(dK SMEM staleness, k_start offset, pre-RoPE HBM output) remain the leading
+hypothesis for Bug 1. However, A1 infra-failure and A3/Path-B runtime crashes
+prevent empirical confirmation of which specific defect drives which gradient error.
+A2 (causal=false) shows inf values not present in Path A, suggesting causal masking
+suppresses a secondary divergence path that is distinct from Bug 1.
+
+**Cycle-5 invariant disposition:** §5.3 numerical evidence NOT CLAIMED.
+Path B compiles PTX (Bug 2 fix confirmed) but crashes at runtime; no
+checkpoint-recompute backward numerics were produced.
+
+**Paper §6.3 49% headline:** STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED on Blackwell.
+
