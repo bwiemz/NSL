@@ -275,7 +275,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                     (4, "%r_effective_pos_k", "%k_start")
                 };
                 ptx.push_str(&format!(
-                    "    // PCA §4.3 site {site}: backward {label} effective_pos\n"
+                    "    // PCA sec.4.3 site {site}: backward {label} effective_pos\n"
                 ));
                 // abs_row = (row narrowed to u32) + (base narrowed to u32).
                 ptx.push_str("    cvt.u32.u64 %r_abs_pos, %rd33;\n");
@@ -934,13 +934,28 @@ pub fn emit_prologue_recompute_from_raw(
     let xn_off = recompute_xnorm_offset(config);
 
     ptx.push_str(&format!(
-        "    // Cycle-11 §5: RMSNorm(x_raw) -> SMEM xnorm scratch \
+        "    // Cycle-11 sec.5: RMSNorm(x_raw) -> SMEM xnorm scratch \
          (q_tile_iter={q_tile_iter}, suffix='{namespace_suffix}', \
          xn_off={xn_off})\n"
     ));
     ptx.push_str(&format!(
         "V2_PROLOGUE_RECOMPUTE_FROM_RAW_ENTRY{namespace_suffix}:\n"
     ));
+
+    // Cycle 14: register declarations for emit_prologue_recompute_from_raw.
+    // The backward prelude does not pre-declare these — open a function-
+    // scoped sub-block so ptxas can parse the references below.
+    ptx.push_str(&format!(
+        "    {{ // Cycle-14 prologue-recompute reg scope ({namespace_suffix})\n"
+    ));
+    ptx.push_str("    .reg .u64 %rd_x_raw_ptr;\n");
+    ptx.push_str(&format!("    .reg .pred %p_xraw_null;\n"));
+    ptx.push_str(&format!(
+        "    .reg .pred %p_row_active{namespace_suffix};\n"
+    ));
+    ptx.push_str("    .reg .u64 %rd_xr0, %rd_xr1, %rd_xr_row, %rd_xr_sm, %rd_xr_nw;\n");
+    ptx.push_str("    .reg .f32 %f_xr_ms, %f_xr_v, %f_xr_tmp, %f_xr_rms, %f_xr_rinv, %f_xr_w;\n");
+    ptx.push_str("    .reg .b16 %h_xr_v;\n");
 
     // Risk-3: null-guard on x_raw_ptr.
     // Cycle 12: trap on null x_raw_ptr -- silent garbage was the
@@ -1029,6 +1044,9 @@ pub fn emit_prologue_recompute_from_raw(
     ptx.push_str(&format!(
         "    bar.sync 0;  // xnorm scratch tile visible to all lanes ({namespace_suffix})\n"
     ));
+    ptx.push_str(&format!(
+        "    }} // end Cycle-14 prologue-recompute reg scope ({namespace_suffix})\n"
+    ));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1089,10 +1107,23 @@ fn emit_one_recompute_matmul(
     let rows_per_warp = block_kv.div_ceil(4);
 
     ptx.push_str(&format!(
-        "    // Cycle-11 §3: {tag} recompute matmul (block_kv={block_kv}, \
+        "    // Cycle-11 sec.3: {tag} recompute matmul (block_kv={block_kv}, \
          slices/lane={slices_per_lane}, rows/warp={rows_per_warp})\n"
     ));
     ptx.push_str(&format!("V2_RECOMPUTE_{tag}_MATMUL_{label_suffix}:\n"));
+
+    // Cycle 14: register declarations for the recompute matmul. Wrap in
+    // a function-scoped sub-block so ptxas can parse the references below.
+    ptx.push_str(&format!(
+        "    {{ // Cycle-14 {tag}-recompute-matmul reg scope ({label_suffix})\n"
+    ));
+    ptx.push_str("    .reg .u64 %rd_rcw, %rd_rc_row, %rd_rc_row_abs, %rd_rc_xnrow;\n");
+    ptx.push_str("    .reg .u64 %rd_rc_col, %rd_rc_jg, %rd_rc_wo, %rd_rc_wa;\n");
+    ptx.push_str("    .reg .u64 %rd_rc_sm, %rd_rc_sm_c;\n");
+    ptx.push_str("    .reg .u32 %r_rc0;\n");
+    ptx.push_str("    .reg .pred %p_rc_null, %p_rc_oob;\n");
+    ptx.push_str("    .reg .f32 %f_rc_acc, %f_rc_x, %f_rc_w;\n");
+    ptx.push_str("    .reg .b16 %h_rc_x, %h_rc_w, %h_rc_out;\n");
 
     // Per-projection null-guard on the weight pointer.
     ptx.push_str(&format!(
@@ -1195,6 +1226,9 @@ fn emit_one_recompute_matmul(
     ptx.push_str(&format!(
         "    bar.sync 0;  // recomputed {tag} tile visible ({label_suffix})\n"
     ));
+    ptx.push_str(&format!(
+        "    }} // end Cycle-14 {tag}-recompute-matmul reg scope ({label_suffix})\n"
+    ));
 }
 
 /// Cycle-11 §3 / Task 3: emit the full K/V projection-recompute sequence
@@ -1220,10 +1254,31 @@ pub fn emit_kv_recompute(
     }
     let xn_off = recompute_xnorm_offset(config);
 
+    // Cycle 14: PTX comment MUST be ASCII-only — em-dash/section-sign
+    // were causing `ptxas fatal: Unexpected non-ASCII character` on
+    // line 1084 when checkpoint=Some(Full) routed here. See
+    // `feedback_ptx_comment_ascii_only`.
     ptx.push_str(&format!(
-        "    // ─── Cycle-11 §3 emit_kv_recompute ({kv_iter_suffix}) ───\n"
+        "    // --- Cycle-11 sec.3 emit_kv_recompute ({kv_iter_suffix}) ---\n"
     ));
     ptx.push_str(&format!("V2_KV_RECOMPUTE_{kv_iter_suffix}:\n"));
+
+    // Cycle 14: register declarations for the kv_recompute null-guard. The
+    // backward prelude's register pool doesn't include these; emit them
+    // in a function-scoped sub-block so ptxas can parse the references
+    // below. Sub-blocks (`{ ... }`) give us scope without conflict with
+    // the outer kernel's register pool.
+    //
+    // KNOWN-INCOMPLETE per cycle 14: emit_rope_k_epilogue (step 5) reuses
+    // registers declared by the forward prelude (%rd_rope_cos, %rd_rope_sin,
+    // %p_rope_skip, %r_rope_*, %rd_rope_*, %h_rope_pair, ...). The forward
+    // prelude pre-declares them; the backward prelude does not. Cycle 15
+    // adds either a full backward-side rope register block in
+    // phases/backward/prelude.rs or factors the rope decls into a shared
+    // helper. This sub-block declares only what step 1 needs.
+    ptx.push_str("    { // Cycle-14 kv_recompute null-guard reg scope\n");
+    ptx.push_str("    .reg .u64 %rd_kvr_xraw;\n");
+    ptx.push_str("    .reg .pred %p_kvr_xraw_null;\n");
 
     // Step 1: Risk-3 null-guard on x_raw_ptr.
     // Cycle 12: trap on null x_raw_ptr -- silent garbage was the
@@ -1237,6 +1292,7 @@ pub fn emit_kv_recompute(
     ptx.push_str("    ld.param.u64 %rd_kvr_xraw, [x_raw_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p_kvr_xraw_null, %rd_kvr_xraw, 0;\n");
     ptx.push_str("    @%p_kvr_xraw_null trap;\n");
+    ptx.push_str("    } // end Cycle-14 kv_recompute null-guard reg scope\n");
 
     // Step 2: produce x_norm in SMEM scratch via the cycle-11 Task-2 emitter.
     let suffix = format!("_bwd_recompute_{kv_iter_suffix}");
@@ -1244,7 +1300,7 @@ pub fn emit_kv_recompute(
 
     // Step 3: K_proj recompute -> %k_smem_base
     ptx.push_str(&format!(
-        "    // Cycle-11 §3 step 3: K_proj recompute -> %k_smem_base ({kv_iter_suffix})\n"
+        "    // Cycle-11 sec.3 step 3: K_proj recompute -> %k_smem_base ({kv_iter_suffix})\n"
     ));
     emit_one_recompute_matmul(
         ptx,
@@ -1258,7 +1314,7 @@ pub fn emit_kv_recompute(
 
     // Step 4: V_proj recompute -> %v_smem_base
     ptx.push_str(&format!(
-        "    // Cycle-11 §3 step 4: V_proj recompute -> %v_smem_base ({kv_iter_suffix})\n"
+        "    // Cycle-11 sec.3 step 4: V_proj recompute -> %v_smem_base ({kv_iter_suffix})\n"
     ));
     emit_one_recompute_matmul(
         ptx,
@@ -1275,7 +1331,7 @@ pub fn emit_kv_recompute(
     // fused_projections=true; otherwise it's a no-op. R7 (rope_q=true +
     // segment_masked) remains refused upstream by mod.rs cascade.
     ptx.push_str(&format!(
-        "    // Cycle-11 §3 step 5: K RoPE epilogue ({kv_iter_suffix})\n"
+        "    // Cycle-11 sec.3 step 5: K RoPE epilogue ({kv_iter_suffix})\n"
     ));
     crate::flash_attention_v2::phases::forward::csha_hooks::emit_rope_k_epilogue(ptx, config);
 

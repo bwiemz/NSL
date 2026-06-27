@@ -566,6 +566,28 @@ fn launch_backward_path(
                 dx_dev, dxn_dev]);
             panic!("[{path_label}] backward PTX synth failed hd={head_dim} S={seq_len}: {e}");
         });
+    // Cycle 14 diagnostic: PTX ASCII audit. ptxas rc=218 with
+    // "Unexpected non-ASCII character" is loud but doesn't say WHICH
+    // character. List every non-ASCII byte with its line and byte offset
+    // so the source code can be located surgically.
+    for (line_idx, line) in bwd_ptx_str.lines().enumerate() {
+        if line.chars().any(|c| !c.is_ascii()) {
+            let bad: Vec<(usize, char)> = line.char_indices()
+                .filter(|(_, c)| !c.is_ascii())
+                .collect();
+            eprintln!(
+                "  [{path_label}] PTX line {} contains non-ASCII chars: {:?} \\\n    LINE: {}",
+                line_idx + 1, bad, line.trim_end()
+            );
+        }
+    }
+    // Dump raw PTX to scratch dir for diagnostic when launch fails.
+    let dump_path = std::env::temp_dir().join(format!(
+        "cycle14_{path_label}_hd{head_dim}_S{seq_len}.ptx"
+    ).replace(' ', "_"));
+    std::fs::write(&dump_path, &bwd_ptx_str).ok();
+    eprintln!("  [{path_label}] PTX dump: {}", dump_path.display());
+
     if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
     let bwd_ptx = bwd_ptx_str.into_bytes();
     let bwd_name = CString::new(backward_kernel_name(bwd_cfg)).unwrap();
@@ -825,35 +847,68 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
     eprintln!("[cycle14 path A] vs cpu_reference:");
     let fails_a = diff_summary("path A vs cpu_ref", &gpu_a, &cpu_grads, hd);
 
-    if !fails_a.is_empty() {
-        // R5 deferral surfaced: Path A baseline is RED on cycle-14 config
-        // (causal=true rope_q=true level=1 fused_proj). The sister
-        // `t6_3_smoke_single_config` runs at causal=false rope_q=false and
-        // is GREEN on this branch — see `csha_cuda_backward.rs:425`. So
-        // the harness wiring is sound; the cycle-14-specific config
-        // exposes a numerical bug in the level-1 fused-projections
-        // backward when both causal AND rope_q are enabled.
-        //
-        // Per cycle-14 spec §4 Commit 4: "If red: STOP — the harness
-        // wiring has a bug, not the recompute path". The next cycle's
-        // analysis will localise which backward phase (likely
-        // `csha_hooks_backward::emit_drmsnorm` or `emit_drope`)
-        // produces the divergence. R0 stays in production until cycle
-        // 15 lands the fix.
-        unsafe { nsl_csha_free_backward_activations(artifacts.saves); }
-        free_all(&[
-            artifacts.q_dev, artifacts.k_dev, artifacts.v_dev,
-            artifacts.out_dev, artifacts.lse_dev,
-            artifacts.x_dev, artifacts.nw_dev,
-            artifacts.wq_dev, artifacts.wk_dev, artifacts.wv_dev,
-            artifacts.cos_dev, artifacts.sin_dev, artifacts.do_dev,
-        ]);
+    // ── Task 5 diagnostic: Path B (checkpoint=Some(Full)) — §5.3 EVIDENCE ──
+    // Even when Path A baseline is RED vs cpu_reference, the Path A vs
+    // Path B comparison is still load-bearing: it isolates whether the
+    // kv_recompute path emits the same gradients as the kv_load path.
+    // If A and B agree (within recompute-arithmetic tolerance) but BOTH
+    // disagree with cpu_reference, the bug is somewhere upstream of the
+    // dispatch fork (in the shared backward emission); the §5.3
+    // mechanism's substitution itself is structurally sound. If A and B
+    // disagree, the substitution introduces additional error and the
+    // cycle-11/12 recompute path needs investigation.
+    eprintln!(
+        "[cycle14 path B] hd={head_dim} S={seq_len} launching backward with \
+         checkpoint=Some(Full) (kv_recompute — §5.3 EVIDENCE path)"
+    );
+    let mut cfg_b = config.clone();
+    cfg_b.checkpoint = Some(CheckpointExtras::full());
+    let gpu_b = launch_backward_path(&cfg_b, &artifacts, head_dim, seq_len, "path B");
+
+    eprintln!("[cycle14 path B] vs cpu_reference:");
+    let fails_b_vs_cpu = diff_summary("path B vs cpu_ref", &gpu_b, &cpu_grads, hd);
+    eprintln!("[cycle14 path B] vs Path A (recompute correctness):");
+    let fails_b_vs_a = diff_summary("path B vs path A", &gpu_b, &gpu_a, hd);
+
+    // ── Cleanup before any panic ───────────────────────────────────────────
+    unsafe { nsl_csha_free_backward_activations(artifacts.saves); }
+    free_all(&[
+        artifacts.q_dev, artifacts.k_dev, artifacts.v_dev,
+        artifacts.out_dev, artifacts.lse_dev,
+        artifacts.x_dev, artifacts.nw_dev,
+        artifacts.wq_dev, artifacts.wk_dev, artifacts.wv_dev,
+        artifacts.cos_dev, artifacts.sin_dev, artifacts.do_dev,
+    ]);
+
+    // ── Disposition (per spec §2) ──────────────────────────────────────────
+    // - Path B vs cpu_ref GREEN  ⇒ §5.3 mechanism end-to-end validated; R0 retires.
+    // - Path B vs cpu_ref RED + Path A vs cpu_ref GREEN ⇒ cycle-11/12 recompute bug; R0 stays.
+    // - Both RED but Path B vs Path A GREEN ⇒ shared-emission bug upstream; §5.3 substitution OK.
+    // - Both RED + Path B vs Path A RED ⇒ harness wiring OR independent bugs; full diagnosis cycle 15.
+    let cpu_a_ok = fails_a.is_empty();
+    let cpu_b_ok = fails_b_vs_cpu.is_empty();
+    let ab_ok    = fails_b_vs_a.is_empty();
+    eprintln!(
+        "[cycle14 disposition] hd={head_dim} S={seq_len}: A_vs_cpu={} B_vs_cpu={} B_vs_A={}",
+        if cpu_a_ok { "GREEN" } else { "RED" },
+        if cpu_b_ok { "GREEN" } else { "RED" },
+        if ab_ok    { "GREEN" } else { "RED" },
+    );
+
+    if !cpu_a_ok {
         panic!(
-            "[cycle14 task4] Path A RED at hd={head_dim} S={seq_len}: \
-             {} tensor(s) out of tolerance: {:?}. Per spec Commit 4 STOP \
-             condition triggered — Task 5 Path B run deferred until \
-             baseline is restored.",
-            fails_a.len(), fails_a
+            "[cycle14 task5] Path A RED at hd={head_dim} S={seq_len}: \
+             A_vs_cpu fails={:?}; B_vs_cpu fails={:?}; B_vs_A fails={:?}. \
+             Spec §2 disposition: depends on B_vs_A outcome (see eprintln above).",
+            fails_a, fails_b_vs_cpu, fails_b_vs_a
+        );
+    }
+    if !cpu_b_ok {
+        panic!(
+            "[cycle14 task5] Path B RED vs cpu_reference at hd={head_dim} S={seq_len}: \
+             B_vs_cpu fails={:?}; B_vs_A fails={:?}. Per spec §2: real cycle-11/12 \
+             recompute bug surfaced; R0 stays with refined wording.",
+            fails_b_vs_cpu, fails_b_vs_a
         );
     }
 
