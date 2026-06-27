@@ -40,11 +40,26 @@
 mod csha_reference;
 use csha_reference::{csha_reference_backward, CshaGradients, CshaInputs, CshaShape};
 
+use std::ffi::CString;
+
 use nsl_codegen::flash_attention::{
     CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
 };
-use nsl_codegen::flash_attention_v2::synthesize_backward_with_tier_b;
+use nsl_codegen::flash_attention_v2::{
+    flash_attention_kernel_name_v2, smem_layout, synthesize_backward_with_tier_b,
+    synthesize_flash_attention_ptx_v2,
+};
 use nsl_test::cpu_naive_prologue::{cpu_naive_norm_proj_rope, PrologueConfig};
+
+// Cycle-14 FFI block — mirrors csha_cuda_backward.rs:57-65 sister template.
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h,
+    nsl_test_cuda_free, nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+};
+use nsl_runtime::flash_attention::{
+    nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
+    nsl_flash_attention_csha_backward, nsl_flash_attention_csha_with_saves,
+};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -59,13 +74,26 @@ fn det_seq(seed: u32, n: usize) -> Vec<f32> {
 }
 
 /// Honors `NSL_SKIP_CUDA_TESTS` (idiom from csha_cuda_backward.rs:137).
+/// Cycle 14: activated — wires the real `nsl_cuda_init` check.
 fn cuda_available() -> bool {
     if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
         return false;
     }
-    // Cycle 13 wires the real cudarc/nsl_cuda_init check; cycle 12 ships
-    // compile-only so we conservatively return false here (test will skip).
-    false
+    unsafe { nsl_cuda_init() == 0 }
+}
+
+/// G14-E default-run gate: `cuda_available()` MUST return false when
+/// `NSL_SKIP_CUDA_TESTS` is set, regardless of whether a CUDA device is
+/// present on the host. Closes the cycle-14 "env-var honored" invariant.
+#[test]
+fn g14_e_cuda_available_honors_skip_env() {
+    // SAFETY: env var manipulation; serial test by convention.
+    std::env::set_var("NSL_SKIP_CUDA_TESTS", "1");
+    assert!(
+        !cuda_available(),
+        "cuda_available must respect NSL_SKIP_CUDA_TESTS"
+    );
+    std::env::remove_var("NSL_SKIP_CUDA_TESTS");
 }
 
 /// max(|a[i] - b[i]|).
