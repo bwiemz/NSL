@@ -1665,25 +1665,20 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             dump_first_nonfinite_scratch("dv_scratch", dv_scratch_raw);
         }
 
-        // Convert f32 scratch → f16 output for dK and dV.
-        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            if !dk_scratch_raw.is_null() && d_k != 0 {
-                let c_rc = csha_bwd_convert_f32_to_f16(
-                    dk_scratch_raw, d_k as *mut c_void, qkv_elems,
-                );
-                if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    rc = c_rc;
-                }
-            }
-            if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
-                && !dv_scratch_raw.is_null() && d_v != 0
-            {
-                let c_rc = csha_bwd_convert_f32_to_f16(
-                    dv_scratch_raw, d_v as *mut c_void, qkv_elems,
-                );
-                if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    rc = c_rc;
-                }
+        // Convert f32 scratch -> f16 output for dV only.
+        // Cycle-16 G16-1 fix: dK is now written as f16 directly by the kernel
+        // (emit_store_dk_only Phase 4). The dk_scratch buffer is allocated and
+        // passed to the kernel (param slot stays; register loaded but unused),
+        // but we must NOT run the f32->f16 conversion for dK -- it would
+        // overwrite the correct f16 dK the kernel already wrote to dk_ptr.
+        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            && !dv_scratch_raw.is_null() && d_v != 0
+        {
+            let c_rc = csha_bwd_convert_f32_to_f16(
+                dv_scratch_raw, d_v as *mut c_void, qkv_elems,
+            );
+            if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                rc = c_rc;
             }
         }
 

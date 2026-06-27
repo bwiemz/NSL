@@ -1,4 +1,4 @@
-//! Tier C backward CSHA hooks: x_norm re-materialisation, inverse RoPE,
+﻿//! Tier C backward CSHA hooks: x_norm re-materialisation, inverse RoPE,
 //! projection gradients, and RMSNorm gradient. Each mirrors its forward
 //! counterpart in `phases/forward/csha_hooks.rs` with the chain-rule math.
 //!
@@ -309,10 +309,12 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             } else if label == "Q" {
                 ptx.push_str("    add.u64 %rd35, %rd33, %q_start;\n");
             } else {
-                // K tile: kv rows start at 0 for the configs this first cut
-                // supports (single-KV-block). Honor q_start anyway so the
-                // config where K streams over q_start is correct.
-                ptx.push_str("    mov.u64 %rd35, %rd33;\n");
+                // K tile: cs_row = k_start + tile-local row. Mirrors the Q-tile
+                // pattern at line 310 (add.u64 %rd35, %rd33, %q_start). Cycle-16
+                // G16-1 defect-2 fix: the prior mov.u64 applied cos/sin row
+                // 0..block_kv-1 regardless of k_start, so tiles after the first
+                // KV block de-rotated with the wrong slice (wrong by k_start rows).
+                ptx.push_str("    add.u64 %rd35, %rd33, %k_start;\n");
             }
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd35, %rd35, {};\n", half

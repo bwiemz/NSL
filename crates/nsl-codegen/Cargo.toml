@@ -80,6 +80,14 @@ name = "cycle15_backward_prelude_rope"
 path = "tests/cycle15_backward_prelude_rope.rs"
 required-features = ["test-helpers"]
 
+# Cycle-16 Task 2: G16-1 structural witnesses for the 3-defect coordinated
+# dK backward fix (Option A). Uses bypass_r0_for_testing() + emit_store_kv_only
+# direct call, so test-helpers feature is required.
+[[test]]
+name = "cycle16_g16_1_witnesses"
+path = "tests/cycle16_g16_1_witnesses.rs"
+required-features = ["test-helpers"]
+
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"

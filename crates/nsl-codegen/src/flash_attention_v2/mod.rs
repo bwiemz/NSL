@@ -1684,6 +1684,12 @@ pub fn synthesize_backward_with_tier_b(
     phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
 
     // Phase 4: cooperative global stores of the 7 gradients + final fence.
+    // Cycle-16 G16-1 defect-1+3 fix: emit_store_dk_only writes the fully-
+    // accumulated, post-inverse-RoPE dK SMEM tile to f16 HBM directly. Must
+    // be called AFTER emit_drope (which rotates dK SMEM in-place) and AFTER
+    // the KV outer loop completes (Phase 3 runs post-loop). emit_store_dq_only
+    // follows immediately after (dQ path unchanged).
+    phases::backward::finalize::emit_store_dk_only(&mut ptx, config, 0);
     phases::backward::finalize::emit_store_dq_only(&mut ptx, config, 0);
 
     ptx.push_str("    ret;\n");
