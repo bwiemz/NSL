@@ -684,3 +684,101 @@ risks silent mis-correction.
 - `g16_3_t2_a3_backward_ptx_synthesizes_ok`: PTX synthesis succeeds; crash is runtime-only.
 - `g16_3_t3_a3_smem_is_static`: SMEM < 48*1024; dyn=0 (unlike G16-2 which needed dynamic SMEM).
 
+---
+
+### Cycle-16 Task 4 - GPU re-run on RTX 5070 Ti (CUDA 13.1, cudarc 0.19.4)
+
+**Hardware:** NVIDIA GeForce RTX 5070 Ti (WDDM), Driver 591.86, CUDA header 13.1.
+
+**Build status:** BLOCKED on C drive (0 bytes free). Linker temp files write to
+C:\Users\bwiem\AppData\Local\Temp which is exhausted. Fresh E-drive build
+(CARGO_TARGET_DIR=E:\cargo-target) failed at nsl-codegen lib due to pre-existing
+compile errors (CheckpointPolicy import path divergence in source_ad.rs +
+entry_points.rs; AnalysisResult struct mismatch). Best available binary:
+`csha_checkpoint_recompute_gpu-ee148af4d4ea1f41.exe` (16:34 local time, 2700288
+bytes). This binary includes Task 1 (G16-4) + Task 2 runtime Defect-3 (dK f32->f16
+conversion removed from nsl-runtime, compiled at 16:28). It does NOT include Task 2
+PTX Defects 1+2 (csha_hooks_backward.rs k_start fix + finalize.rs Phase-4 dK store)
+because the nsl-codegen rlib linked at 16:34 predates the 16:49 rlib that contains
+those changes. Evidence: Path A magnitudes are byte-identical to cycle-15 baseline,
+which is impossible if the PTX K-tile RoPE fix (Defect 2) landed.
+
+**t_recompute_hd64_s512_bq32:**
+
+- Path A (baseline, checkpoint=None):
+  - dq: max_abs=4.420e0 max_rel=1.000e0 (atol=5e-4 rtol=5e-3) FAIL
+  - dk: max_abs=4.356e0 max_rel=1.000e0 (atol=5e-4 rtol=5e-3) FAIL
+  - dv: max_abs=8.571e0 max_rel=3.979e3 (atol=5e-4 rtol=5e-3) FAIL
+  - dwq: max_abs=3.403e1 max_rel=1.000e0 (atol=1e-3 rtol=1e-2) FAIL
+  - dwk: max_abs=3.664e1 max_rel=1.181e0 (atol=1e-3 rtol=1e-2) FAIL
+  - dwv: max_abs=1.733e1 max_rel=1.032e0 (atol=1e-3 rtol=1e-2) FAIL
+  - dx: max_abs=4.691e1 max_rel=1.029e0 (atol=1e-2 rtol=2e-2) FAIL
+  - bwd SMEM=90496 bytes, dyn_request=90496
+  - Status: RED (byte-identical to cycle-15; PTX Defects 1+2 not in binary)
+
+- Path B (checkpoint=Some(Full)):
+  - dq: max_abs=1.341e1 max_rel=3.566e6 (atol=5e-4 rtol=5e-3) FAIL
+  - dk: max_abs=4.356e0 max_rel=1.000e0 (atol=5e-4 rtol=5e-3) FAIL
+  - dv: max_abs=2.022e0 max_rel=3.702e4 (atol=5e-4 rtol=5e-3) FAIL
+  - dwq: max_abs=4.534e1 max_rel=3.315e3 (atol=1e-3 rtol=1e-2) FAIL
+  - dwk: max_abs=3.658e1 max_rel=5.124e2 (atol=1e-3 rtol=1e-2) FAIL
+  - dwv: max_abs=1.728e1 max_rel=2.570e1 (atol=1e-3 rtol=1e-2) FAIL
+  - dx: max_abs=9.497e1 max_rel=3.116e4 (atol=1e-2 rtol=2e-2) FAIL
+  - bwd SMEM=94592 bytes, dyn_request=94592
+  - Path B vs Path A: dq FAIL, dk PASS, dv FAIL, dwq FAIL, dwk FAIL, dwv FAIL, dx FAIL
+  - Status: RED (numerically wrong but no crash; changed from cycle-15's CUDA_ERROR_ILLEGAL_ADDRESS)
+
+**Cycle-15 ablations (re-run after G16-4, using binary at 16:37 which has G16-4 + runtime Defect-3):**
+
+- A1 (rope_q=FALSE, causal=true, fused_proj=true, hd=64, S=512):
+  - RUNS TO COMPLETION -- no panic (G16-4 fix confirmed)
+  - dq: max_abs=6.198e4 max_rel=3.406e8 FAIL
+  - dk: max_abs=5.415e0 max_rel=1.000e0 FAIL
+  - dv: max_abs=7.779e3 max_rel=1.588e6 FAIL
+  - dwq: max_abs=3.049e4 max_rel=6.807e6 FAIL
+  - dwk: max_abs=4.010e1 max_rel=1.852e1 FAIL
+  - dwv: max_abs=1.851e1 max_rel=4.804e1 FAIL
+  - dx: max_abs=5.478e5 max_rel=3.703e7 FAIL
+  - Status: RED numerically (expected -- same PTX bugs; G16-4 only fixed CPU reference panic)
+
+- A2 (causal=FALSE, rope_q=true, fused_proj=true, hd=64, S=512):
+  - dq: max_abs=inf max_rel=inf FAIL
+  - dk: max_abs=3.740e0 max_rel=1.000e0 FAIL
+  - dv: max_abs=inf max_rel=inf FAIL
+  - dwq: max_abs=inf max_rel=inf FAIL
+  - dwk: max_abs=3.460e1 max_rel=1.532e1 FAIL
+  - dwv: max_abs=1.533e1 max_rel=4.015e1 FAIL
+  - dx: max_abs=9.269e6 max_rel=1.916e9 FAIL
+  - Status: RED (unchanged from cycle-15 in character; dk/dwk/dwv finite matches cycle-15)
+
+- A3 (fused_proj=FALSE, causal=true, rope_q=true, hd=64, S=512):
+  - CUDA_ERROR_MISALIGNED_ADDRESS in nsl_flash_attention_csha_backward (unchanged)
+  - Process aborted (non-unwinding panic); A4 not reached.
+
+- A4 (hd=128, causal=true, rope_q=true, fused_proj=true): SKIPPED (config-not-bug; A3 abort prevents A4)
+
+**Comparison to cycle-15:**
+
+- Path A: BYTE-IDENTICAL (dq 4.420e0, dk 4.356e0, dv 8.571e0/3.979e3, dwq 3.403e1, dwk 3.664e1, dwv 1.733e1, dx 4.691e1) -- confirms PTX Defects 1+2 NOT compiled into tested binary
+- Path B: CHANGED from CUDA_ERROR_ILLEGAL_ADDRESS to numerical RED -- confirms Defect-3 (runtime dK f32->f16 conversion removal) partially effective; PTX bugs remain
+- A1: CHANGED from csha_reference.rs:85 OOB panic to numerical RED -- G16-4 fix confirmed empirically
+- A2: UNCHANGED in character (inf dq/dv/dwq, finite dk/dwk/dwv/dx)
+- A3: UNCHANGED (CUDA_ERROR_MISALIGNED_ADDRESS abort)
+- A4: UNCHANGED (skipped)
+
+**Classification:** Spec section 7 cell = Path A RED + Path B RED
+
+Cell text: "Both still RED. Cycle scope shrinks to: ship whatever closed cleanly (likely G16-4), defer the rest. R0 stays retired. Cycle 17 carries G16-1/G16-2/G16-3. Paper section 6.3 stays STRUCTURAL PARTIAL."
+
+**Task-1 (G16-4) empirical disposition:** EMPIRICALLY CONFIRMED. A1 no longer panics; runs to numerical comparison. CPU reference rope_q=false gate verified working on RTX 5070 Ti.
+
+**Task-2 (G16-1) empirical disposition:** PARTIALLY EMPIRICALLY CONFIRMED, FULL VERIFICATION BLOCKED. Defect-3 (runtime dK f32->f16 conversion removal) confirmed via Path B no longer crashing. PTX Defects 1+2 (K-tile k_start + Phase-4 dK cooperative store) NOT testable in this session -- nsl-codegen PTX changes could not be compiled due to disk-full blocker on build host. Deferred to Cycle 17 as first action: fresh build + GPU re-run on clean disk.
+
+**Task-3 (G16-2 SMEM grant) empirical disposition:** SMEM grant structural witnesses all pass (g16_2_t1 through g16_2_t3, 3/3 ok). GPU execution of Path B runs to completion (94592 bytes SMEM, no CUDA_ERROR_ILLEGAL_ADDRESS) -- this is the primary empirical evidence that G16-2 landed. However the binary tested (16:34) predates the G16-2 SMEM grant change (16:52 commit), so the SMEM=94592 result is from the pre-G16-2 binary running at hd=64 where SMEM naturally fits. Full G16-2 validation requires fresh build at hd=128 or a config that previously hit the SMEM cap.
+
+**Cycle-5 invariant disposition:** section 5.3 numerical evidence NOT CLAIMABLE. Both Path A and Path B RED. Independent reviewer re-run on clean build host required before any claim.
+
+**Paper section 6.3 49% headline:** STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED on Blackwell.
+
+**Build blocker for Cycle 17:** C drive must be freed before next GPU re-run. Pre-existing nsl-codegen compile errors (CheckpointPolicy import path + AnalysisResult field mismatch) prevent fresh E-drive build and must be resolved or the incremental C-drive cache preserved. Recommend: (1) free C drive space, (2) verify `cargo build --release --features cuda --tests` succeeds cleanly on C drive, (3) re-run t_recompute_hd64_s512_bq32 as first Cycle 17 action.
+
