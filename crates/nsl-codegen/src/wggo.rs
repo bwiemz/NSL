@@ -21,7 +21,9 @@ use crate::wengert::WengertList;
 use crate::wggo_apply::{apply, AppliedPlan};
 use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
 use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
-use crate::wggo_dp::{solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan};
+use crate::wggo_dp::{
+    passthrough_plan, solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan,
+};
 use crate::wggo_graph::{build as build_graph, OptGraph};
 use crate::wggo_ilp::{
     solve_all_greedy as ilp_solve_all_greedy, solve_all_templated as ilp_solve_all_templated,
@@ -230,7 +232,10 @@ pub fn run(input: WggoInput) -> WggoPlan {
             importance: input.importance.clone(),
             ..Default::default()
         };
-        let inter = dp_solve(&graph, &luts, &dp_cfg);
+        // Off mode bypasses optimization, so an over-budget passthrough is the
+        // intended behavior rather than a refusal.
+        let inter =
+            dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
             vec![LayerIlpConstraints::default(); n]
         } else {
@@ -275,7 +280,18 @@ pub fn run(input: WggoInput) -> WggoPlan {
         importance: input.importance.clone(),
         ..Default::default()
     };
-    let inter = dp_solve(&graph, &luts, &dp_cfg);
+    let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
+        Ok(p) => p,
+        Err(e) => {
+            // G4/T8 replaces this with the Full→Greedy→Off degradation ladder;
+            // for now refuse loudly and fall back to a passthrough plan rather
+            // than emitting a silently over-budget optimization.
+            eprintln!(
+                "[wggo] WARNING: inter-layer DP infeasible ({e}); falling back to passthrough plan"
+            );
+            passthrough_plan(&graph, &luts, &dp_cfg, gpu)
+        }
+    };
 
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
@@ -855,10 +871,24 @@ mod tests {
 
     #[test]
     fn schedule_present_for_multi_gpu_run() {
-        // Multi-GPU triggers ZeRO sharding via the inter-layer DP, which
-        // in turn forces the schedule to issue collectives.
+        // Multi-GPU *under memory pressure* triggers ZeRO sharding via the
+        // inter-layer DP, which in turn forces the schedule to issue
+        // collectives.  (Without pressure the DP correctly keeps shard=1 and
+        // the schedule stays empty — sharding is a memory/comm trade-off, not
+        // an unconditional consequence of having multiple GPUs.)
         let w = two_block_wengert();
-        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        let mut inp = toy_input(&w);
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
+        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
+        inp.cluster = ClusterSpec {
+            num_gpus: 8,
+            memory_budget: 2 * sharded + sharded / 2,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        };
+        let plan = run(inp);
         assert!(plan.schedule.total_collectives >= 1);
         let rep = plan.render_report();
         assert!(rep.contains("Communication schedule"));
