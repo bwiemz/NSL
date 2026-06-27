@@ -32,6 +32,7 @@ fn empty_layer_solution() -> LayerIlpSolution {
             optim_v_bits: 16,
             fase_fused: false,
             packing_mode: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
         },
         cost_us: 0.0,
         memory_bytes: 0,
