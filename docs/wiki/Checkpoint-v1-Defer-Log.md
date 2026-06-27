@@ -381,3 +381,70 @@ save sites suppressed) holds; the cycle-14 NUMERICAL gate stays RED.
 | G14-G Path B compilability | RED | ptxas rejects emit_rope_k_epilogue undeclared regs |
 | G14-H Path B numerical correctness (§5.3) | BLOCKED | depends on G14-F + G14-G |
 
+## CYCLE 15 - BUG 1 (Tier B scalar backward): DEFERRED TO CYCLE 16
+
+**Triage protocol completed.** Ablation test infrastructure committed at
+`crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs`. All four ablations
+(A1-A4) compile cleanly under `cargo test --no-run` but GPU execution requires
+Blackwell hardware not available in this task session. Results below are
+STATIC-ANALYSIS-ONLY, not empirical GPU runs.
+
+Ablation results (STATIC-ANALYSIS):
+- A1 (rope_q off): NOT-RUN-NO-GPU
+- A2 (causal off): NOT-RUN-NO-GPU
+- A3 (fused_proj off): NOT-RUN-NO-GPU
+- A4 (hd=128): NOT-RUN-NO-GPU
+
+**Pattern:** STATIC-ANALYSIS-DEFERRED (no GPU in task scope)
+
+**Root cause (static analysis, HIGH confidence):** Two compounding structural defects
+in the Tier C backward KV-loop / Phase 3 hook split:
+
+1. **dK SMEM staleness in Phase 3 (Candidate C, HIGH confidence):**
+   `emit_store_kv_only` (in `finalize.rs:68`) is called inside the KV outer loop
+   and writes the current-tile dK to f32 HBM scratch via RMW, then the SMEM tile
+   is re-zeroed for the next KV tile. After the KV loop completes, the dK SMEM
+   tile holds ONLY the last-KV-tile contribution (k_start = seq-block_kv). Phase 3
+   then calls `emit_drope` and `emit_dproj` on this stale SMEM tile, so dWk
+   receives only a fraction of the correct dWk accumulation (1/num_kv_tiles ≈ 1/16
+   for seq=512, block_kv=32). This corrupts dwk and cascades into dx.
+
+2. **dK inverse-RoPE k_start offset missing (Candidate B, HIGH confidence):**
+   In `csha_hooks_backward.rs:315`, the K tile's cos/sin index uses
+   `mov.u64 %rd35, %rd33` (tile_local_row only, 0..block_kv-1), ignoring k_start.
+   After the KV loop, the dK SMEM holds positions from the last KV tile
+   (k_start = 480 for seq=512, block_kv=32). `emit_drope` applies cos[0..31]
+   to those positions instead of cos[480..511], corrupting the dK SMEM tile that
+   `emit_dproj` reads for dWk.
+
+3. **dK HBM output is pre-inverse-RoPE:** The f32 scratch populated by
+   `emit_store_kv_only` inside the KV loop is converted to f16 dK output by the
+   runtime after the kernel exits. This dK is the attention-backward dK BEFORE
+   inverse RoPE, while the CPU reference returns dK AFTER inverse RoPE. This
+   explains the dK tensor failure independently of defects 1 and 2.
+
+These three defects interact: the dV failure and large dQ errors likely stem from
+cascading numerical errors across the softmax Jacobian path once the D-correction
+strip or S-recompute uses stale state. The 4.4e0 dQ error and 3.979e3 dV relative
+error magnitude match what is expected from a missing-RoPE + partial-accumulation
+double fault.
+
+**Why deferred:** Fixing these three defects requires:
+(a) Restructuring the backward to accumulate dK across KV tiles using SMEM RMW
+    (or carrying k_start into Phase 3 hooks so the inverse RoPE uses the correct
+    cos/sin slice), AND
+(b) Emitting a Phase 4 cooperative store for dK (post-inverse-RoPE) to HBM f16
+    in the same manner as dQ.
+The combined fix surface is >60 LOC across finalize.rs, mod.rs, and
+csha_hooks_backward.rs. This exceeds the Task 2 bounded-scope limit (30 LOC)
+and requires careful regression testing against the full fa_v2_snapshots suite.
+
+**Cycle 16 prerequisite:** Ship a revised backward orchestration that:
+- Carries k_start into `emit_drope` K-tile cs_row computation OR restructures
+  Phase 3 to process each KV tile's dK contribution in-loop before re-zeroing.
+- Stores post-inverse-RoPE dK to the f16 HBM output in Phase 4 (symmetric to dQ).
+- All three structural defects must be fixed together because they interact.
+
+**Cycle-5 invariant:** §5.3 numerical validation NOT claimed for Path A baseline.
+Paper §6.3 49% headline remains STRUCTURAL PARTIAL, NUMERICAL UNVERIFIED on Blackwell.
+
