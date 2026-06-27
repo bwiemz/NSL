@@ -216,6 +216,13 @@ impl WggoPlan {
     }
 }
 
+/// Heuristic per-layer ceiling on adapter-allreduce "cost units"
+/// (`rank · placement_sites · shard_factor`) under ZeRO sharding.  An adapter
+/// whose cost exceeds this on a sharded layer trips the `WrgaVsCpdt` conflict,
+/// and the resolver drops the adapter (CPDT > WRGA).  Deterministic fallback
+/// heuristic — the repo has no measured collective-latency oracle.
+const ADAPTER_COMM_SHARD_BUDGET: f64 = 64.0;
+
 /// Run the WGGO driver.
 pub fn run(input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
@@ -312,14 +319,12 @@ pub fn run(input: WggoInput) -> WggoPlan {
         input.scorer.as_deref(),
     );
     weight_analysis.apply_to(&mut ilp_constraints);
-    // Pre-prune the FASE option on layers CPDT will shard — fusing the
-    // optimizer step into backward conflicts with reduce-scatter ordering,
-    // and the conflict resolver would defer it anyway.
-    for (cons, lp) in ilp_constraints.iter_mut().zip(inter.layers.iter()) {
-        if lp.shard_params > 1 || lp.shard_grads > 1 || lp.shard_optim > 1 {
-            cons.allow_fase = false;
-        }
-    }
+    // NOTE: FASE is intentionally *not* pre-pruned on sharded layers here.
+    // Letting the ILP pick a fused optimizer step and then resolving the
+    // resulting FaseVsCpdt conflict (DeferFaseStep) is the architecturally
+    // correct path: it keeps the conflict detector live in production (G8) and
+    // surfaces a visible resolution in the report, instead of silently
+    // disabling the option before it can ever conflict.
     let (per_layer, template_stats) = match input.mode {
         WggoMode::Greedy => (
             ilp_solve_all_greedy(&luts, &ilp_constraints),
@@ -342,8 +347,13 @@ pub fn run(input: WggoInput) -> WggoPlan {
             adapter_rank: sol.decision.adapter_rank,
             shard_factor: inter_layer.shard_params,
             fase_fused: sol.decision.fase_fused,
-            adapter_comm_cost: 0.0,
-            adapter_comm_budget: f64::MAX,
+            // Real (non-neutralized) adapter-allreduce cost under sharding so
+            // the WrgaVsCpdt detector is live in production (G8): cost grows
+            // with adapter rank, placement sites, and shard degree.
+            adapter_comm_cost: (sol.decision.adapter_rank
+                * sol.decision.adapter_placement.proj_sites() as u64
+                * inter_layer.shard_params as u64) as f64,
+            adapter_comm_budget: ADAPTER_COMM_SHARD_BUDGET,
         })
         .collect();
 
@@ -899,6 +909,59 @@ mod tests {
         let w = two_block_wengert();
         let plan = run_on_wengert(&w, "H100", "full", 1).expect("plan");
         assert_eq!(plan.schedule.total_collectives, 0);
+    }
+
+    /// Helper: a memory-pressured cluster that forces the DP to shard.
+    fn sharded_cluster(inp: &WggoInput) -> ClusterSpec {
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
+        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
+        ClusterSpec {
+            num_gpus: 8,
+            memory_budget: 2 * sharded + sharded / 2,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        }
+    }
+
+    #[test]
+    fn fase_vs_cpdt_conflict_fires_and_defers() {
+        // FASE is no longer pre-pruned on sharded layers (G8): the ILP picks a
+        // fused optimizer step and the now-live FaseVsCpdt conflict defers it.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.cluster = sharded_cluster(&inp);
+        let plan = run(inp);
+        assert!(
+            plan.resolutions
+                .iter()
+                .any(|r| matches!(r, Resolution::DeferFaseStep { .. })),
+            "expected a DeferFaseStep resolution, got {:?}",
+            plan.resolutions
+        );
+    }
+
+    #[test]
+    fn wrga_vs_cpdt_conflict_fires_when_sharded() {
+        // Force a large adapter on every layer (no rank-0 option) on a sharded
+        // cluster.  The driver now feeds a real adapter-allreduce cost (G8), so
+        // the WrgaVsCpdt detector fires and the resolver drops the adapter.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.lut_axes = LutAxes {
+            adapter_ranks: vec![16],
+            ..LutAxes::default()
+        };
+        inp.cluster = sharded_cluster(&inp);
+        let plan = run(inp);
+        assert!(
+            plan.resolutions
+                .iter()
+                .any(|r| matches!(r, Resolution::RemoveWrgaAdapter { .. })),
+            "expected a RemoveWrgaAdapter resolution, got {:?}",
+            plan.resolutions
+        );
     }
 
     // -----------------------------------------------------------------------
