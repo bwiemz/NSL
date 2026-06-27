@@ -276,3 +276,108 @@ decorator is active.
 | G9 K/V structural save-suppression | GREEN | 4/4 in csha_checkpoint_full_save_suppression |
 | G1 byte-identity (no-decorator) | GREEN | 25/25 fa_v2_snapshots preserved post-cycle-13 |
 
+## Cycle 14 GPU harness activation — R0 STAYS
+
+Cycle 14 wired the cycle-13 skeleton harness end-to-end on RTX 5070 Ti
+sm_120 with the goal of letting numerics decide R0 disposition. Both
+paths landed RED on hardware; R0 remains in production refusal cascade.
+
+### What landed (6 commits, all GREEN at structural level)
+
+- **Task 1** — `cuda_available()` activation via `nsl_cuda_init() == 0`
+  honoring `NSL_SKIP_CUDA_TESTS`; full FFI declaration block mirroring
+  the sister `csha_cuda_backward.rs:57-65` template. G14-E default-run
+  gate pins the env-var honor invariant.
+- **Task 2** — Config downsized to `block=32`, `gpu_sm=80`. Backward
+  prelude target selector now mirrors forward (`Sm80` when
+  `gpu_sm >= 80`, else `Sm75`) — required for G14-C `.target sm_80`
+  pin. fa_v2_snapshots 25/25 still byte-identical. G14-B/C/D default-run
+  gates all GREEN.
+- **Task 3** — Forward `nsl_flash_attention_csha_with_saves` launches
+  cleanly (rc=0) at hd=64 S=512 on RTX 5070 Ti; first 4 output values
+  reach back to host as finite f16; 1940/32768 elements non-zero (sparse
+  is plausible under causal+rope_q+f16-flush).
+- **Task 4** — Path A (`checkpoint=None` baseline) launches successfully
+  after R-C14-4 dynamic-SMEM grant fix (90496 bytes for hd=64 bq=32
+  L1-fused-proj), but produces gradients that diverge from
+  `csha_reference_backward` by orders of magnitude on all 7 tensors.
+  See "R0 disposition" below.
+- **Task 5** — Path B (`checkpoint=Some(Full)`) diagnostic surfaced
+  FOUR pre-existing cycle-11/12 bugs:
+    1. `feedback_ptx_comment_ascii_only` violation (`§` in six PTX
+       comments) — FIXED in `csha_hooks_backward.rs`.
+    2. `emit_kv_recompute` undeclared predicate/u64 regs — FIXED via
+       function-scoped sub-block.
+    3. `emit_prologue_recompute_from_raw` ~13 undeclared regs — FIXED.
+    4. `emit_one_recompute_matmul` ~18 undeclared regs — FIXED.
+  After these 4 fixes Path B reaches `emit_rope_k_epilogue` (step 5 of
+  emit_kv_recompute) which calls into the forward's RoPE emitter
+  expecting RoPE registers in scope — but the backward prelude doesn't
+  declare them. Path B still RED with ptxas rc=218. Closing this is
+  cycle-15 work.
+
+### R0 disposition: STAYS
+
+R0 must reaffirm because:
+
+- **Path A (kv_load baseline) RED vs cpu_reference** on RTX 5070 Ti
+  at hd=64 S=512 bq=32 causal+rope_q+L1-fused-proj (the cycle-14
+  config flavor). Verbatim per-tensor results:
+
+      dq:  max_abs=4.420e0  max_rel=1.000e0
+      dk:  max_abs=4.356e0  max_rel=2.040e1
+      dv:  max_abs=8.571e0  max_rel=3.979e3
+      dwq: max_abs=3.403e1  max_rel=1.000e0
+      dwk: max_abs=3.664e1  max_rel=1.020e0
+      dwv: max_abs=1.733e1  max_rel=1.032e0
+      dx:  max_abs=4.691e1  max_rel=1.118e0
+
+  This is independent of @checkpoint — the dispatch fork at
+  `mod.rs:1496` takes the standard `kv_load` branch when
+  `checkpoint=None`. So the bug is upstream of cycle-11/12, in the
+  shared Level-1 fused-projections scalar backward emission. The
+  closest GREEN sister (`t6_3_smoke_single_config` at causal=false
+  rope_q=false hd=32 level=2) does not exercise this config flavor.
+
+- **Path B doesn't even reach the launch state.** The cycle-11/12
+  `emit_kv_recompute` and its callees emit PTX that ptxas rejects
+  (Bugs 2+3+4 fixed in cycle 14; Bug 5 remains for cycle 15). With
+  Path B uncompilable, the §5.3 mechanism's numerical correctness
+  remains untested on Blackwell. The structural fixes that DID land
+  (ASCII + 3 register-decl gaps) tighten the cycle-15 surface area
+  without unlocking the validation.
+
+### Paper §6.3 49%-headline status (post-cycle-14)
+
+Cycle 14 was scoped to deliver "partially validated K/V suppression
+mechanism end-to-end on Blackwell." The mechanism remains **UNVERIFIED
+numerically** on hardware. The cycle-13 STRUCTURAL gate (G9: K and V
+save sites suppressed) holds; the cycle-14 NUMERICAL gate stays RED.
+
+### Cycle 15 prerequisites (what unblocks the §5.3 evidence)
+
+1. Add the RoPE register block to `phases/backward/prelude.rs` (or
+   factor into a shared helper called from both preludes). This is
+   what makes Path B compilable — without it, no Path B comparison is
+   possible at all.
+2. Root-cause the Path A numerical divergence. The config flavor
+   (causal=true + rope_q=true + L1 fused_projections) has never had a
+   full backward GPU oracle test; `t6_3_matrix_sweep_numerical` covers
+   level=2 not level=1.
+3. Once both are closed, re-run the cycle-14 harness. With a clean
+   Path A baseline + a launchable Path B, the cycle-14 spec §2 R0
+   retirement criterion ("Path B vs cpu_reference GREEN") becomes
+   testable on Blackwell.
+
+### Gate inventory updates (cycle 14)
+
+| Gate | Status | Notes |
+|---|---|---|
+| G14-B R5 refusal pin (hd=128 bq=64 over-cap) | GREEN | `g14_b_recompute_hd128_s4096_bq64_refuses_r5` |
+| G14-C `.target sm_80` PTX pin | GREEN | After backward prelude target-sm fix |
+| G14-D SMEM budget accounting | GREEN | `g14_d_recompute_extra_bytes_accounted` |
+| G14-E cuda_available NSL_SKIP_CUDA_TESTS honor | GREEN | `g14_e_cuda_available_honors_skip_env` |
+| G14-F Path A baseline correctness | RED | causal+rope_q+L1-fused-proj diverges on RTX 5070 Ti |
+| G14-G Path B compilability | RED | ptxas rejects emit_rope_k_epilogue undeclared regs |
+| G14-H Path B numerical correctness (§5.3) | BLOCKED | depends on G14-F + G14-G |
+
