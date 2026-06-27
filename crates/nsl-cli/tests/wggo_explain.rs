@@ -61,6 +61,7 @@ fn empty_plan() -> WggoPlan {
         template_stats: Default::default(),
         weight_analysis: Default::default(),
         estimated_solve_us: 0,
+        warnings: Vec::new(),
     }
 }
 
