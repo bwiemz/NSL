@@ -380,6 +380,23 @@ pub fn solve_layer(
     }
 }
 
+/// Re-evaluate a decision's cost (μs) against the LUT, e.g. after the conflict
+/// resolver has mutated `csha_level` / `adapter_rank` / `fase_fused`.  Returns
+/// `f64::INFINITY` when the (possibly post-resolution) decision is no longer
+/// representable in the LUT.  Used by greedy mode's cost re-evaluation (G3).
+pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstraints) -> f64 {
+    let h_count = (d.active_heads() as u64).max(1);
+    let Some(base) = lut.get(h_count, d.ffn_width, d.csha_level, d.adapter_rank) else {
+        return f64::INFINITY;
+    };
+    if !base.feasible {
+        return f64::INFINITY;
+    }
+    let adj = apply_fase(base, d.fase_fused, c.fase_backward_speedup);
+    let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
+    entry.total_us() + placement_cost_us(d.adapter_rank, d.adapter_placement)
+}
+
 /// Diagnostic counters for [`solve_all_templated`].
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct TemplateStats {

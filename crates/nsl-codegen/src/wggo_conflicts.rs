@@ -67,6 +67,19 @@ pub enum Resolution {
     NoChange,
 }
 
+impl Resolution {
+    /// The layer this resolution applies to, if any (`NoChange` has none).
+    pub fn layer(&self) -> Option<u32> {
+        match *self {
+            Resolution::DowngradeCsha { layer, .. }
+            | Resolution::RemoveWrgaAdapter { layer }
+            | Resolution::DeferFaseStep { layer }
+            | Resolution::AcceptNonUniformShard { layer } => Some(layer),
+            Resolution::NoChange => None,
+        }
+    }
+}
+
 /// The optimization techniques WGGO coordinates, ordered by resolution
 /// priority.  `priority()` returns a rank where **lower wins** — so when two
 /// techniques conflict, the one with the larger rank yields.  This encodes the

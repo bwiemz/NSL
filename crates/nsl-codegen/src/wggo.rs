@@ -26,7 +26,8 @@ use crate::wggo_dp::{
 };
 use crate::wggo_graph::{build as build_graph, OptGraph};
 use crate::wggo_ilp::{
-    solve_all_greedy as ilp_solve_all_greedy, solve_all_templated as ilp_solve_all_templated,
+    recost_decision, solve_all_greedy as ilp_solve_all_greedy,
+    solve_all_templated as ilp_solve_all_templated, solve_layer as ilp_solve_layer,
     LayerIlpConstraints, LayerIlpSolution, TemplateStats,
 };
 use crate::wggo_schedule::{build_schedule, CommSchedule};
@@ -223,6 +224,72 @@ impl WggoPlan {
 /// heuristic — the repo has no measured collective-latency oracle.
 const ADAPTER_COMM_SHARD_BUDGET: f64 = 64.0;
 
+/// Greedy mode escalates conflicting layers to the full ILP when conflict
+/// resolution worsens the estimated step time by more than this fraction (G3).
+const GREEDY_RECOST_THRESHOLD: f64 = 0.05;
+
+/// Build the conflict-detector input table from the inter-layer plan and the
+/// per-layer ILP solutions.  Factored out so it can be rebuilt after greedy
+/// escalation re-solves some layers.
+fn build_layer_decisions(
+    inter: &InterLayerPlan,
+    per_layer: &[LayerIlpSolution],
+) -> Vec<LayerDecisions> {
+    inter
+        .layers
+        .iter()
+        .zip(per_layer.iter())
+        .map(|(inter_layer, sol)| LayerDecisions {
+            layer: inter_layer.layer_index,
+            csha_level: sol.decision.csha_level,
+            head_count: sol.decision.active_heads() as u32,
+            pruned_heads: (sol.decision.keep_head.len() as u32)
+                .saturating_sub(sol.decision.active_heads() as u32),
+            adapter_rank: sol.decision.adapter_rank,
+            shard_factor: inter_layer.shard_params,
+            fase_fused: sol.decision.fase_fused,
+            // Real (non-neutralized) adapter-allreduce cost under sharding so
+            // the WrgaVsCpdt detector is live in production (G8): cost grows
+            // with adapter rank, placement sites, and shard degree.
+            adapter_comm_cost: (sol.decision.adapter_rank
+                * sol.decision.adapter_placement.proj_sites() as u64
+                * inter_layer.shard_params as u64) as f64,
+            adapter_comm_budget: ADAPTER_COMM_SHARD_BUDGET,
+        })
+        .collect()
+}
+
+/// Feed the resolver's verdicts back into the per-layer ILP solutions so
+/// `apply` sees post-resolution decisions (downgraded CSHA, removed adapter,
+/// deferred FASE step).
+fn splice_resolved(per_layer: &mut [LayerIlpSolution], resolved: &[LayerDecisions]) {
+    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
+        sol.decision.csha_level = r.csha_level;
+        sol.decision.adapter_rank = r.adapter_rank;
+        sol.decision.fase_fused = r.fase_fused;
+    }
+}
+
+/// Total re-costed step time across all layers (G3 cost re-evaluation).
+fn recost_total(
+    luts: &[LayerCostLut],
+    per_layer: &[LayerIlpSolution],
+    constraints: &[LayerIlpConstraints],
+) -> f64 {
+    per_layer
+        .iter()
+        .enumerate()
+        .map(|(i, sol)| {
+            let lut = luts.get(i).or_else(|| luts.first());
+            let cons = constraints.get(i).or_else(|| constraints.first());
+            match (lut, cons) {
+                (Some(lut), Some(cons)) => recost_decision(lut, &sol.decision, cons),
+                _ => 0.0,
+            }
+        })
+        .sum()
+}
+
 /// Run the WGGO driver.
 pub fn run(input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
@@ -334,44 +401,47 @@ pub fn run(input: WggoInput) -> WggoPlan {
     };
 
     // 6. Build initial LayerDecisions vector for conflict detection.
-    let layer_decisions: Vec<LayerDecisions> = inter
-        .layers
-        .iter()
-        .zip(per_layer.iter())
-        .map(|(inter_layer, sol)| LayerDecisions {
-            layer: inter_layer.layer_index,
-            csha_level: sol.decision.csha_level,
-            head_count: sol.decision.active_heads() as u32,
-            pruned_heads: (sol.decision.keep_head.len() as u32)
-                .saturating_sub(sol.decision.active_heads() as u32),
-            adapter_rank: sol.decision.adapter_rank,
-            shard_factor: inter_layer.shard_params,
-            fase_fused: sol.decision.fase_fused,
-            // Real (non-neutralized) adapter-allreduce cost under sharding so
-            // the WrgaVsCpdt detector is live in production (G8): cost grows
-            // with adapter rank, placement sites, and shard degree.
-            adapter_comm_cost: (sol.decision.adapter_rank
-                * sol.decision.adapter_placement.proj_sites() as u64
-                * inter_layer.shard_params as u64) as f64,
-            adapter_comm_budget: ADAPTER_COMM_SHARD_BUDGET,
-        })
-        .collect();
+    let mut per_layer = per_layer;
+    let layer_decisions = build_layer_decisions(&inter, &per_layer);
 
     // 7. Conflict detection + resolution (greedy mode resolves here;
     //    Full mode still runs the same resolver because the ILP itself
     //    already honours the hard constraints — remaining conflicts are
     //    the ones crossing technique boundaries).
+    //
+    //    Capture the pre-resolution cost so greedy mode can detect a
+    //    resolution-induced regression below.
+    let cost_before: f64 = per_layer
+        .iter()
+        .filter(|s| s.cost_us.is_finite())
+        .map(|s| s.cost_us)
+        .sum();
     let (resolved, resolutions) = greedy_resolve(layer_decisions);
+    splice_resolved(&mut per_layer, &resolved);
 
-    // Feed the resolver's verdicts back into the per-layer ILP solutions so
-    // `apply` sees the post-resolution decisions, not the pre-resolution
-    // ones.  The resolver may have downgraded CSHA, removed an adapter, or
-    // deferred a FASE fused step.
-    let mut per_layer = per_layer;
-    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
-        sol.decision.csha_level = r.csha_level;
-        sol.decision.adapter_rank = r.adapter_rank;
-        sol.decision.fase_fused = r.fase_fused;
+    // G3 (greedy mode only): re-cost the resolved configuration and, if the
+    // conflict resolution worsened it beyond the threshold, escalate the
+    // conflicting layers to the full ILP and re-resolve.  Greedy's fast local
+    // heuristics can leave a lot on the table once a conflict forces a change,
+    // so spending the full branch-and-bound on just those layers recovers
+    // quality without the cost of a full-model ILP.
+    let mut resolutions = resolutions;
+    if input.mode == WggoMode::Greedy && !resolutions.is_empty() {
+        let cost_after = recost_total(&luts, &per_layer, &ilp_constraints);
+        if cost_after > cost_before * (1.0 + GREEDY_RECOST_THRESHOLD) {
+            let conflicting: std::collections::HashSet<u32> =
+                resolutions.iter().filter_map(|r| r.layer()).collect();
+            for (i, inter_layer) in inter.layers.iter().enumerate() {
+                if conflicting.contains(&inter_layer.layer_index) {
+                    per_layer[i] = ilp_solve_layer(&luts[i], &ilp_constraints[i]);
+                }
+            }
+            // Re-detect + re-resolve on the escalated decisions.
+            let ld2 = build_layer_decisions(&inter, &per_layer);
+            let (resolved2, resolutions2) = greedy_resolve(ld2);
+            splice_resolved(&mut per_layer, &resolved2);
+            resolutions = resolutions2;
+        }
     }
 
     // 8. Apply + communication schedule.
@@ -961,6 +1031,47 @@ mod tests {
                 .any(|r| matches!(r, Resolution::RemoveWrgaAdapter { .. })),
             "expected a RemoveWrgaAdapter resolution, got {:?}",
             plan.resolutions
+        );
+    }
+
+    #[test]
+    fn greedy_recost_escalates_conflicting_layers_to_full_ilp() {
+        // Sharded greedy run: the ILP picks a fused FASE step, the FaseVsCpdt
+        // conflict defers it, and (with a large FASE speedup) that deferral is
+        // a big cost regression — so the conflicting layers are re-solved by
+        // the full branch-and-bound ILP (G3).  The greedy solver explores only
+        // a handful of nodes; the full solver explores far more.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.mode = WggoMode::Greedy;
+        inp.cluster = sharded_cluster(&inp);
+        let n = build_graph(&w).layers.len();
+        let mut cons = LayerIlpConstraints::default();
+        cons.fase_backward_speedup = 0.5;
+        inp.ilp_constraints = vec![cons; n];
+        let plan = run(inp);
+        let nodes: Vec<u64> = plan.per_layer.iter().map(|s| s.nodes_explored).collect();
+        assert!(
+            nodes.iter().any(|&n| n > 100),
+            "expected a conflicting layer escalated to the full ILP, got nodes {nodes:?}"
+        );
+    }
+
+    #[test]
+    fn greedy_without_conflicts_does_not_escalate() {
+        // Single-GPU greedy run: no sharding → no conflicts → no escalation, so
+        // the cheap greedy solutions are kept (few nodes explored).
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.mode = WggoMode::Greedy;
+        let plan = run(inp);
+        assert!(
+            plan.resolutions.is_empty(),
+            "single-GPU run should produce no conflicts"
+        );
+        assert!(
+            plan.per_layer.iter().all(|s| s.nodes_explored < 100),
+            "no conflicts → greedy solutions kept, no escalation"
         );
     }
 
