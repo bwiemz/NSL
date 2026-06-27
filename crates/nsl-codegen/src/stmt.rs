@@ -296,6 +296,21 @@ pub(crate) fn invoke_wrga_if_enabled(
         manual_adapter_owned.iter().map(|s| s.as_str()).collect();
     let hybrid_layers: Vec<&str> = hybrid_owned.iter().map(|s| s.as_str()).collect();
 
+    // WRGA paper §8.3: surface the first non-empty `target=` set on
+    // `WrgaInputs::wrga[*]`. The CLI's `--wrga-target` override pipes through
+    // this field via `apply_wrga_target_override` in the CLI's bridge
+    // functions. Source-level `@wrga(target="...")` decorators do NOT yet
+    // populate this field — both bridge functions still emit `target: None`
+    // pending symbol-resolution wiring — so this `find_map` falls back to the
+    // historical "rtx5070ti" default for the `nsl build` path. Existing build
+    // behaviour is therefore unchanged; only the `nsl check --wrga-analyze`
+    // path produces a non-None target today.
+    let target_override = inputs
+        .wrga
+        .iter()
+        .find_map(|c| c.target.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("rtx5070ti");
+
     let wrga_input = crate::wrga::WrgaInput {
         mode,
         trainable_patterns,
@@ -304,7 +319,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         wengert: list,
         loss_output: list.output,
         weights: None,
-        target: "rtx5070ti",
+        target: target_override,
         budget_params,
         r_min: 2,
         r_max: 16,
