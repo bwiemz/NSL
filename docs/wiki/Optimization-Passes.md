@@ -106,6 +106,31 @@ The WGGO driver orchestrates eight stages (§5 of the research paper): (1) Wenge
 
 Fires: **train-block, when `--wggo <mode>` is set.** Pure advisory on forward-only builds.
 
+**CLI flags** (on `nsl build`, unless noted):
+
+| Flag | Values / default | Effect |
+| --- | --- | --- |
+| `--wggo <mode>` | `full` \| `greedy` \| `off`; bare `--wggo` ⇒ `full`; absent ⇒ off | Selects the global-optimization mode. `full` runs the inter-layer DP + per-layer ILP + conflict resolution; `greedy` skips the ILP and re-costs the resolved config, escalating layers that regress > 5%; `off` runs each pass independently. |
+| `--wggo-report` | off | Prints the global-optimization report to stderr, including the **Warnings / limitations** section (degradation notices, weights-load failures). |
+| `--wggo-weights <path>` | none | A `.nslweights` sidecar for real weight-based head-importance scoring. On load failure WGGO falls back to uniform scores and records a warning in the report. |
+| `--wggo-importance <mode>` | `auto` (default) \| `magnitude` \| `grad` | Head-importance scoring source. `auto` uses gradient scoring when a calibration sidecar is present, else magnitude; `grad` errors if no sidecar is present. |
+| `--wggo-prune-fraction <F>` | `0.25`, clamped `[0.0, 0.9]` | Fraction of heads the default `min_retained_importance` threshold may prune. |
+| `--devices <N>` | `1` | Cluster size (compile-time `world_size`). Drives WGGO's ZeRO-sharding budget — the DP only shards (`shard > 1`) when `N > 1` and memory pressure requires it. Unlike `nsl run --devices`, this spawns no processes; it only informs the plan. |
+| `--explain-wggo` *(on `nsl profile`)* | off | Runs WGGO Full and emits a per-layer decision explanation covering all six dimensions: CEP (head prune), CSHA (fusion level), WRGA (adapter rank/placement), CPDT (optimizer precision), FASE (fused step), PCA (sequence packing). |
+
+Full multi-GPU invocation with a report:
+
+```sh
+nsl build model.nsl --source-ad --emit-obj -o model_out \
+  --devices 8 \
+  --wggo full --wggo-report \
+  --wggo-weights model.nslweights \
+  --wggo-importance auto \
+  --wggo-prune-fraction 0.3
+```
+
+If `--wggo full` is infeasible for the given `--devices` / memory budget, WGGO degrades **Full → Greedy → Off**, recording a warning at each step rather than silently producing an over-budget plan.
+
 ---
 
 ### CSHA — Compiler-Synthesized Holistic Attention
