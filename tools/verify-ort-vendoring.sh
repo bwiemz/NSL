@@ -54,6 +54,7 @@ bindgen \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
+    --no-rustfmt-bindings \
     "${HEADER}" \
     > "${GENERATED}"
 
