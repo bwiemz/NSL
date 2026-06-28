@@ -50,11 +50,16 @@ fi
 # Generate Rust definitions from the upstream header. Allowlist Ort* and
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
+#
+# Use --formatter=prettyplease (built into bindgen ≥0.65, no external
+# rustfmt binary required) so the script works on CI runners that have
+# bindgen but not rustfmt. The old --no-rustfmt-bindings flag was removed
+# in bindgen 0.66 and causes bindgen to exit 1 on ≥0.66 / 0.72.x.
 bindgen \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
-    --no-rustfmt-bindings \
+    --formatter=prettyplease \
     "${HEADER}" \
     > "${GENERATED}"
 
@@ -68,13 +73,22 @@ bindgen \
 #
 # Field-by-field structural equality is NOT checked here; the binary-layout
 # assertions inside `vendored.rs` (`const _:` blocks) guard that property.
+#
+# Use -o (only-matching) without a ^ anchor so the pattern works regardless
+# of whether the formatter places attributes on their own line. The || true
+# prevents grep's exit-1-on-no-match from tripping set -euo pipefail.
 extract_types() {
-    # shellcheck disable=SC2016
-    grep -hE '^(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" \
+    grep -oE '(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" \
         | sed -E 's/^(pub struct |pub enum |pub type )//; s/[^A-Za-z0-9_].*$//' \
-        | sort -u
+        | sort -u \
+        || true
 }
 extract_types "${GENERATED}" > "${UPSTREAM_SYMS}"
+if [[ ! -s "${UPSTREAM_SYMS}" ]]; then
+    echo "ERROR: bindgen produced no Ort*/ONNX* type declarations from ${HEADER}."
+    echo "Check that bindgen can parse the header (try: bindgen --formatter=prettyplease ${HEADER})."
+    exit 1
+fi
 extract_types "${VENDORED}" > "${VENDORED_SYMS}"
 
 # Spec C only vendors a subset of upstream types (Ort{Session,Status,...},

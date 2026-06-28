@@ -5,8 +5,9 @@
 //!
 //! M57.1 wire-array realization (Task W5):
 //! - drops 2D/1D LocalParamArray lines like
-//!   `localparam signed [7:0] W1 [0:783][0:127] = '{...};` — the
+//!   `localparam signed [0:783][0:127][7:0] W1 = '{...};` — the
 //!   `'{...}` literal is too wide to be human-auditable.
+//!   (Dims are emitted PACKED before the name so Yosys `-sv` can parse them.)
 //! - collapses runs of per-element `assign acc_l<i>[<n>][0] = …` bias-seed
 //!   assigns + `assign x_l<i>_a[<n>] = x_l<i>[<bit> +: <w>]` fan-out
 //!   assigns into a single `… elided` marker line so the structural
@@ -22,7 +23,7 @@ pub fn elide_localparams(verilog: &str) -> String {
     // SystemVerilog array form. The `'{}` literal can span the rest of the
     // line; we anchor only on the leading shape and terminating `};`.
     let array = Regex::new(
-        r"^\s*localparam\s+signed\s+\[\d+:0\]\s+\w+(?:\s*\[0:\d+\])+\s*=\s*'\{.*\};\s*$",
+        r"^\s*localparam\s+signed\s+(?:\[0:\d+\])*\[\d+:0\]\s+\w+\s*=\s*'\{.*\};\s*$",
     ).unwrap();
     // M57.1 wire-array mini §3.2: per-element fan-out / bias-seed assigns
     // (e.g. `assign x_l1_a[7] = x_l1[56 +: 8];` or
@@ -97,14 +98,14 @@ mod tests {
 
     #[test]
     fn elides_2d_localparam_array() {
-        let input = "    localparam signed [7:0] W1 [0:783][0:127] = '{'{8'sd0, 8'sd1}, '{8'sd2, 8'sd3}};";
+        let input = "    localparam signed [0:783][0:127][7:0] W1 = '{'{8'sd0, 8'sd1}, '{8'sd2, 8'sd3}};";
         let out = elide_localparams(input);
         assert!(!out.contains("W1"), "2D array localparam should be elided");
     }
 
     #[test]
     fn elides_1d_localparam_array() {
-        let input = "    localparam signed [31:0] b1 [0:127] = '{32'sd0, 32'sd1};";
+        let input = "    localparam signed [0:127][31:0] b1 = '{32'sd0, 32'sd1};";
         let out = elide_localparams(input);
         assert!(!out.contains("b1"), "1D array localparam should be elided");
     }

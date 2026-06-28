@@ -78,7 +78,7 @@ pub struct AssignWireArrayElement {
 /// §4 (Task W5).
 ///
 /// Emits
-/// `localparam signed [width-1:0] {name} [0:dims[0]-1][0:dims[1]-1] = '{...values...};`
+/// `localparam signed [0:dims[0]-1][0:dims[1]-1][width-1:0] {name} = '{...values...};`
 /// at the module level (in the LocalParam preamble block). For `dims.len() == 2`
 /// the literal renders as `'{ '{row0}, '{row1}, ... }`; for `dims.len() == 1`
 /// as `'{ cell, cell, ... }`. Higher ranks are not yet supported by the v1

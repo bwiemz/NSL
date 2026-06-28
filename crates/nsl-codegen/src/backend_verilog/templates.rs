@@ -104,17 +104,25 @@ pub fn emit_local_param(lp: &LocalParam) -> String {
 }
 
 /// M57.1 wire-array realization (Task W5): emit a module-scope multi-dim
-/// const array as `localparam signed [W-1:0] name [0:dim0-1]... = '{...};`.
+/// const array as `localparam signed [0:dim0-1]...[W-1:0] name = '{...};`.
 /// For 2D arrays the literal renders as a nested SystemVerilog `'{ }`. For
 /// 1D as a flat `'{ }`. Higher ranks panic (not exercised by v1 MLP).
+///
+/// All array dimensions are declared as PACKED (before the identifier) so
+/// Yosys can parse the declaration with `-sv`. Yosys rejects the
+/// `localparam [W-1:0] name [dim...]` form (unpacked dims after name) with
+/// "unexpected '[', expecting ',' or '=' or ';'". Element access `name[k][n]`
+/// is identical for packed multi-dim arrays, so no access-site changes are
+/// needed.
 ///
 /// Mechanical lowering — values flow verbatim through `{width}'sd{value}`,
 /// matching `emit_local_param`'s signed-decimal encoding. Snapshot tests
 /// elide localparam lines (`elide_localparams`) so the bulk of the W matrix
 /// content doesn't dominate the structural-skeleton snapshot.
 pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
+    // Packed dims placed BEFORE the identifier: [0:dim0-1][0:dim1-1]...[W-1:0]
     let dims_str: String = lpa.dims.iter()
-        .map(|d| format!(" [0:{}]", d - 1))
+        .map(|d| format!("[0:{}]", d - 1))
         .collect();
     let values_str = match lpa.dims.len() {
         2 => {
@@ -142,8 +150,8 @@ pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
         n => panic!("emit_local_param_array: rank {} not supported in v1", n),
     };
     format!(
-        "localparam signed [{}:0] {}{} = {};",
-        lpa.width - 1, lpa.name, dims_str, values_str
+        "localparam signed {}[{}:0] {} = {};",
+        dims_str, lpa.width - 1, lpa.name, values_str
     )
 }
 
