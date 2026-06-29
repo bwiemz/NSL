@@ -28,14 +28,35 @@ cargo clippy
 
 ## Code Quality Requirements
 
-All contributions must pass before merge:
+NSL separates tests into tiers so the stable contract stays meaningful. See
+[`STATUS.md`](STATUS.md) for what is Stable vs Beta vs Experimental.
 
-- **`cargo build`** — zero errors, zero warnings
-- **`cargo test`** — all tests pass, no regressions
-- **`cargo clippy`** — zero warnings
-- **New features** must include unit tests
-- **Codegen changes** should include snapshot tests (`insta`)
-- **Kernel/fusion changes** should include differential tests
+**Required on every PR (the stable green-build contract):**
+
+```bash
+cargo build --workspace                      # zero errors, zero warnings
+cargo clippy --workspace -- -D warnings      # zero warnings
+cargo test --workspace -- --skip e2e_        # workspace unit/integration tests
+```
+
+**Required for the area you touch:**
+
+- **New features** must include unit tests.
+- **Codegen changes** should include snapshot tests (`insta`).
+- **Kernel/fusion changes** should include differential tests.
+
+**Nightly / environment-gated (not a per-PR merge blocker):**
+
+```bash
+cargo test -p nsl-cli --test e2e -- --test-threads=1   # needs full toolchain (C linker, optional OpenSSL/CUDA)
+# CUDA, ONNX, and FPGA (Verilator/Yosys) suites run in dedicated CI jobs
+```
+
+**Informational / research (Experimental tier — not a merge blocker):**
+
+- `experimental::*` subsystem tests (CEP, CFIE, CSHA, WGGO, WRGA, CPDT, ZK,
+  FPGA, …) and performance-baseline comparisons. These may fail depending on the
+  checkout/environment; treat results against the tier they belong to.
 
 ## Pull Request Process
 
