@@ -158,7 +158,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-          components: clippy
+          # rustfmt is required by `bindgen` in tools/verify-ort-vendoring.sh:
+          # bindgen shells out to rustfmt to format generated bindings, and the
+          # pinned 1.95.0 toolchain does not ship it by default.
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: actions/cache@v4

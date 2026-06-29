@@ -80,9 +80,34 @@ Co-Authored-By: Your Name <your@email.com>
 
 Prefix: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`
 
+## Review gates (what reviewers will push back on)
+
+To keep the core stable while research subsystems evolve, reviewers hold the
+line on a few structural rules. Save a round-trip by checking these before you
+open a PR:
+
+- **Stable vs experimental:** new research passes/subsystems land in the
+  `experimental::*` namespace and must be **opt-in** (not enabled by default).
+  Update [`STATUS.md`](STATUS.md) in the same PR.
+- **Runtime FFI:** new exported C-ABI symbols must document ownership,
+  nullability, alignment, length, error behavior, threading, and the no-unwind
+  rule (see [`docs/abi/`](docs/abi/)). Host-facing symbols go in the generated
+  header; layout changes to `NslTensorDesc` are a **major** ABI bump.
+- **Hardware claims:** a new "supported on hardware X" claim needs a golden
+  correctness test (vs CPU reference) and a row in [`docs/hardware/`](docs/hardware/).
+  Don't claim in docs what CI doesn't validate.
+- **Config sprawl:** prefer grouping over adding yet another top-level field to
+  `CompileOptions`; prefer a subcommand/module over piling logic into
+  `nsl-cli/src/main.rs`.
+- **Clippy suppressions:** fix or locally `#[allow(...)]` at the site; don't
+  broaden crate-wide suppressions to get a build green.
+
 ## Architecture
 
 For architectural documentation (crate graph, compiler pipeline, runtime internals, optimization passes, how to add a language feature), see [`docs/wiki/Architecture-Overview.md`](docs/wiki/Architecture-Overview.md).
+
+For the runtime C-ABI contract and FFI safety rules, see [`docs/abi/`](docs/abi/).
+For the stable/beta/experimental tiering of every subsystem, see [`STATUS.md`](STATUS.md).
 
 ## Questions?
 

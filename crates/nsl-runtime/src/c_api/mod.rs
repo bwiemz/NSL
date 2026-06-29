@@ -1172,6 +1172,34 @@ pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// Golden ABI guard: the `NslTensorDesc` layout is part of the C-ABI
+    /// contract documented on the struct and emitted into generated headers.
+    /// Any change here is a breaking ABI change and must bump
+    /// `NSL_ABI_VERSION_MAJOR`. This test fails loudly if the layout drifts.
+    #[test]
+    fn nsl_tensor_desc_abi_layout_is_pinned() {
+        assert_eq!(size_of::<NslTensorDesc>(), 48, "NslTensorDesc must be 48 bytes");
+        assert_eq!(align_of::<NslTensorDesc>(), 8, "NslTensorDesc must be 8-byte aligned");
+        assert_eq!(offset_of!(NslTensorDesc, data), 0);
+        assert_eq!(offset_of!(NslTensorDesc, shape), 8);
+        assert_eq!(offset_of!(NslTensorDesc, strides), 16);
+        assert_eq!(offset_of!(NslTensorDesc, ndim), 24);
+        assert_eq!(offset_of!(NslTensorDesc, dtype), 28);
+        assert_eq!(offset_of!(NslTensorDesc, device_type), 32);
+        assert_eq!(offset_of!(NslTensorDesc, device_id), 36);
+        assert_eq!(offset_of!(NslTensorDesc, tape_id), 40);
+    }
+
+    /// The packed `nsl_abi_version()` value must decode to the documented
+    /// major/minor constants — the same numbers the generated header pins.
+    #[test]
+    fn nsl_abi_version_packs_major_minor() {
+        let packed = nsl_abi_version();
+        assert_eq!((packed >> 16) as u32, NSL_ABI_VERSION_MAJOR);
+        assert_eq!((packed & 0xffff) as u32, NSL_ABI_VERSION_MINOR);
+    }
 
     #[test]
     fn test_model_lifecycle() {
