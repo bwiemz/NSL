@@ -41,131 +41,7 @@ impl From<CliWggoImportance> for nsl_codegen::WggoImportance {
 #[command(name = "nsl", about = "NeuralScript Language Toolchain", version)]
 pub(crate) enum Cli {
     /// Parse and type-check an NSL file
-    Check {
-        /// Path to the .nsl file
-        file: PathBuf,
-
-        /// Print the token stream
-        #[arg(long)]
-        dump_tokens: bool,
-
-        /// Print the AST as JSON
-        #[arg(long)]
-        dump_ast: bool,
-
-        /// Print the inferred type map
-        #[arg(long)]
-        dump_types: bool,
-
-        /// Print a compile-time shape-propagation trace
-        #[arg(long)]
-        shapes: bool,
-
-        /// M37: Run roofline performance analysis
-        #[arg(long)]
-        perf: bool,
-
-        /// M37: Target GPU for performance analysis (e.g., "H100", "A100-PCIe")
-        #[arg(long)]
-        gpu: Option<String>,
-
-        /// M37: Write Chrome tracing JSON to file
-        #[arg(long)]
-        trace: Option<String>,
-
-        /// M38a: Enable linear types ownership checking
-        #[arg(long)]
-        linear_types: bool,
-
-        /// M45: Run compile-time NaN/Inf risk analysis
-        #[arg(long)]
-        nan_analysis: bool,
-
-        /// M46: Enable deterministic mode (compile-time non-determinism detection)
-        #[arg(long)]
-        deterministic: bool,
-
-        /// M52: Run weight analysis report
-        #[arg(long)]
-        weight_analysis: bool,
-
-        /// M52: Path to safetensors weight file for weight analysis
-        #[arg(long)]
-        weights: Option<PathBuf>,
-
-        /// M52: Dead weight threshold for analysis (default: 1e-6)
-        #[arg(long, default_value_t = 1e-6)]
-        dead_weight_threshold: f64,
-
-        /// M52: Sparsity threshold for analysis (default: 0.5)
-        #[arg(long, default_value_t = 0.5)]
-        sparse_threshold: f64,
-
-        /// M53: Enable WCET analysis for @real_time functions
-        #[arg(long)]
-        wcet: bool,
-
-        /// M53: Write WCET certificate JSON to file
-        #[arg(long)]
-        wcet_cert: Option<PathBuf>,
-
-        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
-        #[arg(long)]
-        cpu: Option<String>,
-
-        /// M53: Write DO-178C compliance report to file (FPGA only)
-        #[arg(long)]
-        do178c_report: Option<PathBuf>,
-
-        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
-        #[arg(long, default_value = "gpu")]
-        wcet_target: String,
-
-        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
-        #[arg(long)]
-        fpga_device: Option<String>,
-
-        /// Emit a training-pipeline decision audit for every train block in the file.
-        /// Pass without value for text output, or `--training-report=json` for JSON.
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
-        training_report: Option<TrainingReportFormat>,
-
-        /// CEP: run hardware-aware architecture search.
-        #[arg(long)]
-        cep_search: bool,
-        /// CEP: print a bare CompilationProfile for the model (paper §7.1
-        /// differentiator — equivalent of PyTorch's missing 'nsl check --perf').
-        #[arg(long)]
-        cep_profile: bool,
-        /// CEP: target GPU for analysis (e.g. H100-SXM).
-        #[arg(long)]
-        cep_target: Option<String>,
-        /// CEP: write the delta JSON here (default: <model>.cep.json).
-        #[arg(long)]
-        cep_out: Option<PathBuf>,
-
-        /// WRGA paper §8.3: emit the WRGA compilation report without running
-        /// codegen output. Pass without value (or `-`) for stdout; provide a
-        /// path to write to a file. Sister of `nsl build --wrga-report` but
-        /// avoids producing a `.o`. Requires `@wrga` decorators in the source.
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
-        wrga_analyze: Option<PathBuf>,
-
-        /// WRGA paper §8.3: target GPU for the WRGA roofline analysis (e.g.
-        /// "H100-SXM", "A100-PCIe", "RTX-4090"). Overrides any `target=` set
-        /// on `@wrga(...)` decorators. Looked up in the codegen GPU spec
-        /// database; empty / unknown falls back to the database default.
-        #[arg(long)]
-        wrga_target: Option<String>,
-
-        /// WRGA paper §8.3: emit a structural PEFT comparison report (WRGA vs.
-        /// LoRA / AdaLoRA / GaLore / ReFT) without running codegen output.
-        /// Pass without value (or `-`) for stdout; provide a path to write to
-        /// a file. Mutually exclusive with `--wrga-analyze`. Requires `@wrga`
-        /// decorators in the source.
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
-        wrga_compare: Option<PathBuf>,
-    },
+    Check(CheckArgs),
 
     /// Compile and execute an NSL program
     Run {
@@ -840,4 +716,131 @@ pub(crate) enum ZkCmd {
         #[arg(long)]
         public: PathBuf,
     },
+}
+
+#[derive(clap::Args)]
+pub(crate) struct CheckArgs {
+        /// Path to the .nsl file
+        pub(crate) file: PathBuf,
+
+        /// Print the token stream
+        #[arg(long)]
+        pub(crate) dump_tokens: bool,
+
+        /// Print the AST as JSON
+        #[arg(long)]
+        pub(crate) dump_ast: bool,
+
+        /// Print the inferred type map
+        #[arg(long)]
+        pub(crate) dump_types: bool,
+
+        /// Print a compile-time shape-propagation trace
+        #[arg(long)]
+        pub(crate) shapes: bool,
+
+        /// M37: Run roofline performance analysis
+        #[arg(long)]
+        pub(crate) perf: bool,
+
+        /// M37: Target GPU for performance analysis (e.g., "H100", "A100-PCIe")
+        #[arg(long)]
+        pub(crate) gpu: Option<String>,
+
+        /// M37: Write Chrome tracing JSON to file
+        #[arg(long)]
+        pub(crate) trace: Option<String>,
+
+        /// M38a: Enable linear types ownership checking
+        #[arg(long)]
+        pub(crate) linear_types: bool,
+
+        /// M45: Run compile-time NaN/Inf risk analysis
+        #[arg(long)]
+        pub(crate) nan_analysis: bool,
+
+        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        #[arg(long)]
+        pub(crate) deterministic: bool,
+
+        /// M52: Run weight analysis report
+        #[arg(long)]
+        pub(crate) weight_analysis: bool,
+
+        /// M52: Path to safetensors weight file for weight analysis
+        #[arg(long)]
+        pub(crate) weights: Option<PathBuf>,
+
+        /// M52: Dead weight threshold for analysis (default: 1e-6)
+        #[arg(long, default_value_t = 1e-6)]
+        pub(crate) dead_weight_threshold: f64,
+
+        /// M52: Sparsity threshold for analysis (default: 0.5)
+        #[arg(long, default_value_t = 0.5)]
+        pub(crate) sparse_threshold: f64,
+
+        /// M53: Enable WCET analysis for @real_time functions
+        #[arg(long)]
+        pub(crate) wcet: bool,
+
+        /// M53: Write WCET certificate JSON to file
+        #[arg(long)]
+        pub(crate) wcet_cert: Option<PathBuf>,
+
+        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
+        #[arg(long)]
+        pub(crate) cpu: Option<String>,
+
+        /// M53: Write DO-178C compliance report to file (FPGA only)
+        #[arg(long)]
+        pub(crate) do178c_report: Option<PathBuf>,
+
+        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
+        #[arg(long, default_value = "gpu")]
+        pub(crate) wcet_target: String,
+
+        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
+        #[arg(long)]
+        pub(crate) fpga_device: Option<String>,
+
+        /// Emit a training-pipeline decision audit for every train block in the file.
+        /// Pass without value for text output, or `--training-report=json` for JSON.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
+        pub(crate) training_report: Option<TrainingReportFormat>,
+
+        /// CEP: run hardware-aware architecture search.
+        #[arg(long)]
+        pub(crate) cep_search: bool,
+        /// CEP: print a bare CompilationProfile for the model (paper §7.1
+        /// differentiator — equivalent of PyTorch's missing 'nsl check --perf').
+        #[arg(long)]
+        pub(crate) cep_profile: bool,
+        /// CEP: target GPU for analysis (e.g. H100-SXM).
+        #[arg(long)]
+        pub(crate) cep_target: Option<String>,
+        /// CEP: write the delta JSON here (default: <model>.cep.json).
+        #[arg(long)]
+        pub(crate) cep_out: Option<PathBuf>,
+
+        /// WRGA paper §8.3: emit the WRGA compilation report without running
+        /// codegen output. Pass without value (or `-`) for stdout; provide a
+        /// path to write to a file. Sister of `nsl build --wrga-report` but
+        /// avoids producing a `.o`. Requires `@wrga` decorators in the source.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
+        pub(crate) wrga_analyze: Option<PathBuf>,
+
+        /// WRGA paper §8.3: target GPU for the WRGA roofline analysis (e.g.
+        /// "H100-SXM", "A100-PCIe", "RTX-4090"). Overrides any `target=` set
+        /// on `@wrga(...)` decorators. Looked up in the codegen GPU spec
+        /// database; empty / unknown falls back to the database default.
+        #[arg(long)]
+        pub(crate) wrga_target: Option<String>,
+
+        /// WRGA paper §8.3: emit a structural PEFT comparison report (WRGA vs.
+        /// LoRA / AdaLoRA / GaLore / ReFT) without running codegen output.
+        /// Pass without value (or `-`) for stdout; provide a path to write to
+        /// a file. Mutually exclusive with `--wrga-analyze`. Requires `@wrga`
+        /// decorators in the source.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
+        pub(crate) wrga_compare: Option<PathBuf>,
 }
