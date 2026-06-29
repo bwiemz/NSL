@@ -173,6 +173,36 @@ fn capi_trace(msg: impl AsRef<str>) {
 }
 
 // ---------------------------------------------------------------------------
+// FFI: ABI version
+// ---------------------------------------------------------------------------
+
+/// NSL runtime C-ABI version — **major** component.
+///
+/// Bump this on any *breaking* change to an exported symbol's signature or
+/// semantics, or to the [`NslTensorDesc`] memory layout. A host that links a
+/// runtime whose `nsl_abi_version()` major differs from the major baked into
+/// the generated header (`NSL_ABI_VERSION_MAJOR`) must refuse to run: the ABI
+/// is incompatible.
+pub const NSL_ABI_VERSION_MAJOR: u32 = 1;
+
+/// NSL runtime C-ABI version — **minor** component.
+///
+/// Bump this for backward-compatible additions (new exported symbols, new
+/// trailing optional behavior). A host built against minor `m` can safely use a
+/// runtime with minor `>= m` and the same major.
+pub const NSL_ABI_VERSION_MINOR: u32 = 0;
+
+/// Return the runtime's C-ABI version packed as `(major << 16) | minor`.
+///
+/// Hosts can call this immediately after loading `libnsl_runtime` and compare
+/// against the `NSL_ABI_VERSION_*` macros emitted into the generated C header
+/// to detect runtime/header skew before making any other call.
+#[no_mangle]
+pub extern "C" fn nsl_abi_version() -> i64 {
+    ((NSL_ABI_VERSION_MAJOR as i64) << 16) | (NSL_ABI_VERSION_MINOR as i64)
+}
+
+// ---------------------------------------------------------------------------
 // FFI: Error handling
 // ---------------------------------------------------------------------------
 
