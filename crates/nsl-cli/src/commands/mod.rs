@@ -7,6 +7,7 @@
 //! Extractions are behavior-preserving: code is moved verbatim, with only the
 //! visibility (`pub(crate)`) and `use` paths adjusted.
 
+pub(crate) mod cep;
 pub(crate) mod convert;
 pub(crate) mod fmt;
 pub(crate) mod init;
