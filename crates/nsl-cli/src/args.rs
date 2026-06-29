@@ -44,163 +44,7 @@ pub(crate) enum Cli {
     Check(CheckArgs),
 
     /// Compile and execute an NSL program
-    Run {
-        /// Path to the .nsl file
-        file: PathBuf,
-
-        /// Enable memory profiling (writes memory_profile.json on exit)
-        #[arg(long)]
-        profile_memory: bool,
-
-        /// Enable kernel profiling (writes kernel_profile.json on exit)
-        #[arg(long)]
-        profile_kernels: bool,
-
-        /// Enable all profilers and merge into profile.json
-        #[arg(long)]
-        profile: bool,
-
-        /// Number of GPUs for tensor parallelism (spawns N processes)
-        #[arg(long, default_value = "1")]
-        devices: u32,
-
-        /// M41: Number of prefill workers for disaggregated inference
-        #[arg(long, default_value = "1")]
-        prefill_workers: u32,
-
-        /// M41: Number of decode workers for disaggregated inference
-        #[arg(long, default_value = "1")]
-        decode_workers: u32,
-
-        /// M47: GPU target backend (cuda, rocm, metal, webgpu)
-        #[arg(long, default_value = "cuda")]
-        target: String,
-
-        /// Disable all fusion optimizations (for differential testing)
-        #[arg(long)]
-        disable_fusion: bool,
-
-        /// Force tape-based AD (disable source-to-source AD)
-        #[arg(long)]
-        tape_ad: bool,
-
-        /// Use compile-time source-to-source AD instead of runtime tape AD
-        #[arg(long)]
-        source_ad: bool,
-
-        /// Debug training: disable fusion + FBIP, emit gradient checksums
-        #[arg(long)]
-        debug_training: bool,
-
-        /// M45: Enable tensor operation tracing (writes .nsl.trace binary)
-        #[arg(long)]
-        trace_ops: bool,
-
-        /// M46: Enable deterministic mode (compile-time non-determinism detection)
-        #[arg(long)]
-        deterministic: bool,
-
-        /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
-        #[arg(long)]
-        distribute: Option<String>,
-
-        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
-        #[arg(long)]
-        zero_stage: Option<u32>,
-
-        /// M53: Enable WCET analysis for @real_time functions
-        #[arg(long)]
-        wcet: bool,
-
-        /// M53: Write WCET certificate JSON to file
-        #[arg(long)]
-        wcet_cert: Option<PathBuf>,
-
-        /// M53: GPU target for WCET analysis (e.g., "A100-SXM", "Orin")
-        #[arg(long)]
-        gpu: Option<String>,
-
-        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
-        #[arg(long)]
-        cpu: Option<String>,
-
-        /// M53: Write DO-178C compliance report to file (FPGA only)
-        #[arg(long)]
-        do178c_report: Option<PathBuf>,
-
-        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
-        #[arg(long, default_value = "gpu")]
-        wcet_target: String,
-
-        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
-        #[arg(long)]
-        fpga_device: Option<String>,
-
-        /// Synchronize after every CUDA kernel launch (debug: surfaces async GPU errors)
-        #[arg(long)]
-        cuda_sync: bool,
-
-        /// ELTLS instrumentation: print a GPU memory report at end of run.
-        /// Prints epilog_frees_total plus (with --features cuda) the
-        /// live caching-allocator block summary and driver/allocator stats.
-        #[arg(long)]
-        gpu_mem_report: bool,
-
-        /// Render predicted-vs-actual kernel timings instead of running the program
-        #[arg(long)]
-        monitor: bool,
-
-        /// Activate @inspect hooks: dump tensor stats/contents to .nsl-inspect/
-        #[arg(long)]
-        inspect: bool,
-
-        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
-        /// "block", or "off").  Passing `--csha` without a value enables
-        /// auto mode.  Mirrors `nsl build --csha`.
-        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
-        csha: Option<String>,
-
-        /// CSHA: print the attention-fusion report to stderr
-        #[arg(long)]
-        csha_report: bool,
-
-        /// M38a/M56: Enable linear types ownership checking. Required for
-        /// agent declarations (M56). Closes Task 20 of the M56 plan.
-        #[arg(long)]
-        linear_types: bool,
-
-        /// CPDT: planner mode ("full", "zero_only", or "off").
-        /// Passing `--cpdt` without a value enables full mode.
-        /// Mirrors `nsl build --cpdt` so precision-adaptive training
-        /// executes end-to-end via `nsl run`.
-        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
-        cpdt: Option<String>,
-
-        /// CPDT: number of GPUs in the target cluster. Required when `--cpdt` is set.
-        #[arg(long, value_name = "N")]
-        cpdt_num_gpus: Option<u32>,
-
-        /// CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s).
-        #[arg(long, value_name = "BPS", default_value_t = 9e11)]
-        cpdt_intra_bw: f64,
-
-        /// CPDT: inter-node bandwidth in bytes/sec (default 1e11 = 100 GB/s).
-        #[arg(long, value_name = "BPS", default_value_t = 1e11)]
-        cpdt_inter_bw: f64,
-
-        /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
-        #[arg(long, default_value_t = false)]
-        cpdt_report: bool,
-
-        /// Path to the model weights file (.safetensors) for the
-        /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
-        #[arg(short = 'w', long)]
-        weights: Option<PathBuf>,
-
-        /// Arguments to pass to the compiled program
-        #[arg(last = true)]
-        args: Vec<String>,
-    },
+    Run(RunArgs),
 
     /// Compile an NSL file to a native executable
     Build(BuildArgs),
@@ -846,4 +690,163 @@ pub(crate) struct BuildArgs {
         /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
         #[arg(long)]
         pub(crate) cep_emit_source: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct RunArgs {
+        /// Path to the .nsl file
+        pub(crate) file: PathBuf,
+
+        /// Enable memory profiling (writes memory_profile.json on exit)
+        #[arg(long)]
+        pub(crate) profile_memory: bool,
+
+        /// Enable kernel profiling (writes kernel_profile.json on exit)
+        #[arg(long)]
+        pub(crate) profile_kernels: bool,
+
+        /// Enable all profilers and merge into profile.json
+        #[arg(long)]
+        pub(crate) profile: bool,
+
+        /// Number of GPUs for tensor parallelism (spawns N processes)
+        #[arg(long, default_value = "1")]
+        pub(crate) devices: u32,
+
+        /// M41: Number of prefill workers for disaggregated inference
+        #[arg(long, default_value = "1")]
+        pub(crate) prefill_workers: u32,
+
+        /// M41: Number of decode workers for disaggregated inference
+        #[arg(long, default_value = "1")]
+        pub(crate) decode_workers: u32,
+
+        /// M47: GPU target backend (cuda, rocm, metal, webgpu)
+        #[arg(long, default_value = "cuda")]
+        pub(crate) target: String,
+
+        /// Disable all fusion optimizations (for differential testing)
+        #[arg(long)]
+        pub(crate) disable_fusion: bool,
+
+        /// Force tape-based AD (disable source-to-source AD)
+        #[arg(long)]
+        pub(crate) tape_ad: bool,
+
+        /// Use compile-time source-to-source AD instead of runtime tape AD
+        #[arg(long)]
+        pub(crate) source_ad: bool,
+
+        /// Debug training: disable fusion + FBIP, emit gradient checksums
+        #[arg(long)]
+        pub(crate) debug_training: bool,
+
+        /// M45: Enable tensor operation tracing (writes .nsl.trace binary)
+        #[arg(long)]
+        pub(crate) trace_ops: bool,
+
+        /// M46: Enable deterministic mode (compile-time non-determinism detection)
+        #[arg(long)]
+        pub(crate) deterministic: bool,
+
+        /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
+        #[arg(long)]
+        pub(crate) distribute: Option<String>,
+
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        #[arg(long)]
+        pub(crate) zero_stage: Option<u32>,
+
+        /// M53: Enable WCET analysis for @real_time functions
+        #[arg(long)]
+        pub(crate) wcet: bool,
+
+        /// M53: Write WCET certificate JSON to file
+        #[arg(long)]
+        pub(crate) wcet_cert: Option<PathBuf>,
+
+        /// M53: GPU target for WCET analysis (e.g., "A100-SXM", "Orin")
+        #[arg(long)]
+        pub(crate) gpu: Option<String>,
+
+        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
+        #[arg(long)]
+        pub(crate) cpu: Option<String>,
+
+        /// M53: Write DO-178C compliance report to file (FPGA only)
+        #[arg(long)]
+        pub(crate) do178c_report: Option<PathBuf>,
+
+        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
+        #[arg(long, default_value = "gpu")]
+        pub(crate) wcet_target: String,
+
+        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
+        #[arg(long)]
+        pub(crate) fpga_device: Option<String>,
+
+        /// Synchronize after every CUDA kernel launch (debug: surfaces async GPU errors)
+        #[arg(long)]
+        pub(crate) cuda_sync: bool,
+
+        /// ELTLS instrumentation: print a GPU memory report at end of run.
+        /// Prints epilog_frees_total plus (with --features cuda) the
+        /// live caching-allocator block summary and driver/allocator stats.
+        #[arg(long)]
+        pub(crate) gpu_mem_report: bool,
+
+        /// Render predicted-vs-actual kernel timings instead of running the program
+        #[arg(long)]
+        pub(crate) monitor: bool,
+
+        /// Activate @inspect hooks: dump tensor stats/contents to .nsl-inspect/
+        #[arg(long)]
+        pub(crate) inspect: bool,
+
+        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
+        /// "block", or "off").  Passing `--csha` without a value enables
+        /// auto mode.  Mirrors `nsl build --csha`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+        pub(crate) csha: Option<String>,
+
+        /// CSHA: print the attention-fusion report to stderr
+        #[arg(long)]
+        pub(crate) csha_report: bool,
+
+        /// M38a/M56: Enable linear types ownership checking. Required for
+        /// agent declarations (M56). Closes Task 20 of the M56 plan.
+        #[arg(long)]
+        pub(crate) linear_types: bool,
+
+        /// CPDT: planner mode ("full", "zero_only", or "off").
+        /// Passing `--cpdt` without a value enables full mode.
+        /// Mirrors `nsl build --cpdt` so precision-adaptive training
+        /// executes end-to-end via `nsl run`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        pub(crate) cpdt: Option<String>,
+
+        /// CPDT: number of GPUs in the target cluster. Required when `--cpdt` is set.
+        #[arg(long, value_name = "N")]
+        pub(crate) cpdt_num_gpus: Option<u32>,
+
+        /// CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s).
+        #[arg(long, value_name = "BPS", default_value_t = 9e11)]
+        pub(crate) cpdt_intra_bw: f64,
+
+        /// CPDT: inter-node bandwidth in bytes/sec (default 1e11 = 100 GB/s).
+        #[arg(long, value_name = "BPS", default_value_t = 1e11)]
+        pub(crate) cpdt_inter_bw: f64,
+
+        /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
+        #[arg(long, default_value_t = false)]
+        pub(crate) cpdt_report: bool,
+
+        /// Path to the model weights file (.safetensors) for the
+        /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
+        #[arg(short = 'w', long)]
+        pub(crate) weights: Option<PathBuf>,
+
+        /// Arguments to pass to the compiled program
+        #[arg(last = true)]
+        pub(crate) args: Vec<String>,
 }
