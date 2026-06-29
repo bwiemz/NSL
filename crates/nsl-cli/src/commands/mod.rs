@@ -8,3 +8,7 @@
 //! visibility (`pub(crate)`) and `use` paths adjusted.
 
 pub(crate) mod convert;
+pub(crate) mod fmt;
+pub(crate) mod init;
+pub(crate) mod profile_merge;
+pub(crate) mod tokenize;

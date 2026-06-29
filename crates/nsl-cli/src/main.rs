@@ -2216,10 +2216,10 @@ fn main_inner() {
             commands::convert::run_convert(&input, &output);
         }
         Cli::Init { name } => {
-            run_init(&name);
+            commands::init::run_init(&name);
         }
         Cli::Fmt { files, check } => {
-            run_fmt(&files, check);
+            commands::fmt::run_fmt(&files, check);
         }
         Cli::Debug {
             file,
@@ -2272,7 +2272,7 @@ fn main_inner() {
             }
         }
         Cli::Tokenize { dirs, output, vocab_size, min_freq, ext } => {
-            run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
+            commands::tokenize::run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
         }
 
         Cli::FpgaCompile { file, output_dir, fixture, test_taps, seq } => {
@@ -5120,7 +5120,7 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
 
     // Merge profile traces before exiting (process::exit won't return)
     if profile {
-        merge_profile_traces("memory_profile.json", "kernel_profile.json", "profile.json");
+        commands::profile_merge::merge_profile_traces("memory_profile.json", "kernel_profile.json", "profile.json");
     }
 
     // Clean up
@@ -5312,297 +5312,6 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
                 other
             );
             process::exit(1);
-        }
-    }
-}
-
-fn run_fmt(files: &[String], check: bool) {
-    use std::path::Path;
-
-    let mut total = 0u32;
-    let mut changed = 0u32;
-    let mut errors = 0u32;
-
-    for pattern in files {
-        // Treat as literal file path (glob support can come later)
-        let path = Path::new(pattern);
-        if !path.exists() {
-            eprintln!("error: file not found: {}", pattern);
-            errors += 1;
-            continue;
-        }
-        total += 1;
-        match formatter::format_file(path, check) {
-            Ok(true) => {
-                changed += 1;
-                if check {
-                    println!("Would reformat: {}", path.display());
-                } else {
-                    println!("Formatted: {}", path.display());
-                }
-            }
-            Ok(false) => {} // already formatted
-            Err(e) => {
-                eprintln!("{}", e);
-                errors += 1;
-            }
-        }
-    }
-
-    if total > 0 || errors > 0 {
-        println!("{} file(s) checked, {} changed, {} error(s)", total, changed, errors);
-    }
-
-    if check && changed > 0 {
-        process::exit(1);
-    }
-    if errors > 0 {
-        process::exit(1);
-    }
-}
-
-fn merge_profile_traces(memory_path: &str, kernel_path: &str, output_path: &str) {
-    let mem_json = std::fs::read_to_string(memory_path).unwrap_or_default();
-    let kern_json = std::fs::read_to_string(kernel_path).unwrap_or_default();
-
-    let mem_events = extract_trace_events(&mem_json).unwrap_or_default();
-    let kern_events = extract_trace_events(&kern_json).unwrap_or_default();
-
-    let merged = format!(
-        r#"{{"traceEvents":[{}{}{}],"metadata":{{"merged":true}}}}"#,
-        mem_events,
-        if !mem_events.is_empty() && !kern_events.is_empty() { "," } else { "" },
-        kern_events,
-    );
-
-    std::fs::write(output_path, &merged).ok();
-    std::fs::remove_file(memory_path).ok();
-    std::fs::remove_file(kernel_path).ok();
-    eprintln!("[nsl] merged profile written to {}", output_path);
-}
-
-fn extract_trace_events(json: &str) -> Option<String> {
-    let start = json.find("\"traceEvents\":")? + "\"traceEvents\":".len();
-    let bracket_start = json[start..].find('[')? + start;
-    let mut depth = 0;
-    let mut bracket_end = bracket_start;
-    for (i, ch) in json[bracket_start..].char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    bracket_end = bracket_start + i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    Some(json[bracket_start + 1..bracket_end].to_string())
-}
-
-fn run_init(name: &str) {
-    let root = std::path::Path::new(name);
-
-    // Refuse to overwrite an existing directory
-    if root.exists() {
-        eprintln!("error: directory '{}' already exists", name);
-        process::exit(1);
-    }
-
-    // Create project root and sub-directories
-    for dir in &[root.to_path_buf(), root.join("data"), root.join("weights")] {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("error: could not create directory '{}': {e}", dir.display());
-            process::exit(1);
-        }
-    }
-
-    // main.nsl — tensor example
-    let main_nsl = "\
-# My first NeuralScript program
-
-let x = zeros([2, 3])
-let y = ones([2, 3])
-let z = x + y
-
-print(z)
-print(f\"Sum: {z.sum()}\")
-";
-
-    // nsl.toml
-    let nsl_toml = format!(
-        "\
-# NeuralScript Project Configuration
-# Reserved for future use by the NSL package manager (v0.2)
-
-[project]
-name = \"{name}\"
-version = \"0.1.0\"
-entry = \"main.nsl\"
-"
-    );
-
-    // .gitignore
-    let gitignore = "\
-# Build
-*.exe
-*.o
-.nsl-cache/
-
-# ML artifacts
-*.safetensors
-*.bin
-*.nslm
-/weights/
-/data/
-";
-
-    let files: &[(&str, &str)] = &[
-        ("main.nsl", main_nsl),
-        ("nsl.toml", &nsl_toml),
-        (".gitignore", gitignore),
-    ];
-
-    for (filename, contents) in files {
-        let path = root.join(filename);
-        if let Err(e) = std::fs::write(&path, contents) {
-            eprintln!("error: could not write '{}': {e}", path.display());
-            process::exit(1);
-        }
-    }
-
-    println!("Created project '{name}'. Run: cd {name} && nsl run main.nsl");
-}
-
-fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, min_freq: u64, ext: &str) {
-    use std::io::Write;
-
-    // Default directories if none specified
-    let search_dirs: Vec<String> = if dirs.is_empty() {
-        vec!["stdlib".into(), "examples".into(), "tests".into(), "models".into()]
-    } else {
-        dirs.to_vec()
-    };
-
-    // Collect all source files
-    let mut source_files: Vec<PathBuf> = Vec::new();
-    for dir in &search_dirs {
-        let dir_path = PathBuf::from(dir);
-        if !dir_path.exists() {
-            eprintln!("warning: directory '{}' not found, skipping", dir);
-            continue;
-        }
-        collect_files_recursive(&dir_path, ext, &mut source_files);
-    }
-    source_files.sort();
-
-    if source_files.is_empty() {
-        eprintln!("error: no .{ext} files found in {:?}", search_dirs);
-        process::exit(1);
-    }
-
-    eprintln!("[tokenize] Found {} .{} files across {} directories", source_files.len(), ext, search_dirs.len());
-
-    // Concatenate all source text into a temporary corpus file
-    let corpus_path = std::env::temp_dir().join("nsl_tokenizer_corpus.txt");
-    {
-        let mut corpus = std::fs::File::create(&corpus_path).unwrap_or_else(|e| {
-            eprintln!("error: could not create corpus file: {e}");
-            process::exit(1);
-        });
-        let mut total_bytes: usize = 0;
-        for file in &source_files {
-            match std::fs::read_to_string(file) {
-                Ok(content) => {
-                    total_bytes += content.len();
-                    let _ = corpus.write_all(content.as_bytes());
-                    let _ = corpus.write_all(b"\n");
-                }
-                Err(e) => {
-                    eprintln!("warning: could not read '{}': {e}", file.display());
-                }
-            }
-        }
-        eprintln!("[tokenize] Corpus: {} bytes from {} files", total_bytes, source_files.len());
-    }
-
-    // Train BPE tokenizer using the runtime's nsl_bpe_train
-    eprintln!("[tokenize] Training BPE tokenizer (vocab_size={}, min_freq={})...", vocab_size, min_freq);
-
-    // We call the runtime's BPE trainer directly via Rust (not through FFI)
-    use tokenizers::models::bpe::{BPE, BpeTrainer};
-    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-    use tokenizers::Tokenizer;
-
-    let trainer = BpeTrainer::builder()
-        .vocab_size(vocab_size)
-        .min_frequency(min_freq)
-        .special_tokens(vec![
-            tokenizers::AddedToken::from("<|endoftext|>".to_string(), true),
-            tokenizers::AddedToken::from("<|padding|>".to_string(), true),
-            tokenizers::AddedToken::from("<|fim_prefix|>".to_string(), true),
-            tokenizers::AddedToken::from("<|fim_middle|>".to_string(), true),
-            tokenizers::AddedToken::from("<|fim_suffix|>".to_string(), true),
-        ])
-        .build();
-
-    let mut tokenizer = Tokenizer::new(BPE::default());
-    tokenizer.with_pre_tokenizer(Some(
-        tokenizers::PreTokenizerWrapper::ByteLevel(ByteLevel::default()),
-    ));
-
-    let mut trainer_wrapper = tokenizers::models::TrainerWrapper::BpeTrainer(trainer);
-    match tokenizer.train_from_files(&mut trainer_wrapper, vec![corpus_path.to_string_lossy().to_string()]) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("error: BPE training failed: {e}");
-            process::exit(1);
-        }
-    }
-
-    // Ensure output directory exists
-    if let Some(parent) = output.parent() {
-        if !parent.exists() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-    }
-
-    // Save tokenizer
-    match tokenizer.save(output.to_string_lossy().as_ref(), true) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("error: could not save tokenizer to '{}': {e}", output.display());
-            process::exit(1);
-        }
-    }
-
-    let final_vocab = tokenizer.get_vocab_size(true);
-    eprintln!("[tokenize] Saved tokenizer to '{}' (vocab_size={})", output.display(), final_vocab);
-
-    // Clean up corpus
-    let _ = std::fs::remove_file(&corpus_path);
-
-    // Test: encode a sample string
-    let sample = "fn forward(self, x: Tensor) -> Tensor:";
-    if let Ok(encoding) = tokenizer.encode(sample, false) {
-        let tokens = encoding.get_tokens();
-        eprintln!("[tokenize] Sample: \"{}\" -> {} tokens: {:?}", sample, tokens.len(), &tokens[..tokens.len().min(10)]);
-    }
-}
-
-fn collect_files_recursive(dir: &PathBuf, ext: &str, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, ext, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            out.push(path);
         }
     }
 }
