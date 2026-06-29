@@ -9,6 +9,7 @@
 
 pub(crate) mod build;
 pub(crate) mod cep;
+pub(crate) mod check;
 pub(crate) mod convert;
 pub(crate) mod fmt;
 pub(crate) mod fpga;
