@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process;
 
 pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
-    let (interner, parse_result, analysis) = crate::frontend(file);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend(file);
 
     // Compile in test mode — produces a binary with test-dispatch main()
     let (obj_bytes, test_fns) = match nsl_codegen::compile_test(

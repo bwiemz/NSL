@@ -85,7 +85,7 @@ pub(crate) fn run_cep_prune(
         return 1;
     };
 
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, false);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     // Analysis-error gate — same accessor as run_check: filter
     // `analysis.diagnostics` on `Level::Error`. `frontend_with_flags` already
     // exits on errors, but we keep a defensive gate that prints with source
@@ -233,7 +233,7 @@ pub(crate) fn run_cep_joint(
         return 1;
     };
 
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, false);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let analysis_errors: Vec<_> = analysis
         .diagnostics
         .iter()
@@ -334,7 +334,7 @@ pub(crate) fn run_cep_joint(
 pub(crate) fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides) -> i32 {
     use nsl_codegen::cep_extract::extract_search_axes;
 
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, false);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let analysis_errors: Vec<_> = analysis
         .diagnostics
         .iter()
@@ -399,7 +399,7 @@ pub(crate) fn run_cep_profile(
 ) -> i32 {
     use nsl_codegen::cep_extract::{cross_check_dims, extract_model_spec};
 
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, false);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let analysis_errors: Vec<_> = analysis
         .diagnostics
         .iter()

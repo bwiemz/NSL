@@ -98,7 +98,7 @@ pub(crate) fn run_check_wrga_analyze(
     // Pre-check: surface "no decorators" as exit 2 BEFORE running codegen.
     // The build path would silently report "no plan" with exit 0, which the
     // paper's `--wrga-analyze` contract treats as a distinct error class.
-    let (_interner, _parse_result, analysis) = crate::frontend_with_flags(file, false);
+    let (_interner, _parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let has_wrga_decorators = !analysis.wrga_configs.is_empty()
         || !analysis.freeze_configs.is_empty()
         || !analysis.adapter_configs.is_empty();
@@ -182,7 +182,7 @@ pub(crate) fn run_check_wrga_compare(
     report_path: &std::path::Path,
     wrga_target: Option<&str>,
 ) -> i32 {
-    let (_interner, _parse_result, analysis) = crate::frontend_with_flags(file, false);
+    let (_interner, _parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let has_wrga_decorators = !analysis.wrga_configs.is_empty()
         || !analysis.freeze_configs.is_empty()
         || !analysis.adapter_configs.is_empty();
@@ -404,15 +404,15 @@ fn run_build_shared_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, options.linear_types_enabled);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so they take effect on the
     // shared-library build path, and fail fast if --wrga-report is combined
     // with decorators but without --source-ad.
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::analysis_to_wrga_inputs(&analysis));
-    options.fused_ce_configs = crate::analysis_to_fused_ce_configs(&analysis);
+    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
@@ -704,8 +704,8 @@ fn run_build_shared_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::module_data_to_wrga_inputs(mod_data));
-            entry_options.fused_ce_configs = crate::module_data_to_fused_ce_configs(mod_data);
+            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(mod_data));
+            entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
             entry_options.export_functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
@@ -850,7 +850,7 @@ pub(crate) fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, options.linear_types_enabled);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the ZK build path.
@@ -858,8 +858,8 @@ pub(crate) fn run_build_zk(
     // present without `--source-ad` (mirroring the single/multi build paths).
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::analysis_to_wrga_inputs(&analysis));
-    options.fused_ce_configs = crate::analysis_to_fused_ce_configs(&analysis);
+    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -1078,7 +1078,7 @@ pub(crate) fn run_build_standalone(
 
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(&file_pb, options.linear_types_enabled);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(&file_pb, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the standalone build path.
@@ -1086,8 +1086,8 @@ pub(crate) fn run_build_standalone(
     // present without `--source-ad`.
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::analysis_to_wrga_inputs(&analysis));
-    options.fused_ce_configs = crate::analysis_to_fused_ce_configs(&analysis);
+    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -1215,7 +1215,7 @@ fn run_build_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = crate::frontend_with_flags(file, options.linear_types_enabled);
+    let (interner, parse_result, analysis) = crate::pipeline::frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): fail fast if --wrga-report is used without --source-ad
     // when decorators are present — the old silent-notice behaviour was
@@ -1224,8 +1224,8 @@ fn run_build_single(
 
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::analysis_to_wrga_inputs(&analysis));
-    options.fused_ce_configs = crate::analysis_to_fused_ce_configs(&analysis);
+    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weight_index_map = analysis.weight_index_map.clone();
@@ -1476,8 +1476,8 @@ fn run_build_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::module_data_to_wrga_inputs(mod_data));
-            entry_options.fused_ce_configs = crate::module_data_to_fused_ce_configs(mod_data);
+            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(mod_data));
+            entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(
