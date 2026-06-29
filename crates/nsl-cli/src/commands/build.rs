@@ -970,9 +970,9 @@ pub(crate) fn run_build_zk(
 }
 
 /// M55c: Handle `nsl zk <subcommand>`.
-pub(crate) fn run_zk_cmd(cmd: crate::ZkCmd) {
+pub(crate) fn run_zk_cmd(cmd: crate::args::ZkCmd) {
     match cmd {
-        crate::ZkCmd::Stats { file } => {
+        crate::args::ZkCmd::Stats { file } => {
             match std::fs::read(&file) {
                 Ok(data) => {
                     if data.len() < 12 {
@@ -995,7 +995,7 @@ pub(crate) fn run_zk_cmd(cmd: crate::ZkCmd) {
                 }
             }
         }
-        crate::ZkCmd::Prove { file, pk: _, input: _, output } => {
+        crate::args::ZkCmd::Prove { file, pk: _, input: _, output } => {
             // For the folding backend, proofs are generated during compilation.
             eprintln!("[nsl/zk] For the folding backend, proofs are generated during `nsl build --zk-circuit`.");
             eprintln!("[nsl/zk] The proof file is written alongside the binary as <file>.<fn_name>.proof");
@@ -1004,7 +1004,7 @@ pub(crate) fn run_zk_cmd(cmd: crate::ZkCmd) {
             }
             eprintln!("[nsl/zk] To generate a proof, run: nsl build --zk-circuit {}", file.display());
         }
-        crate::ZkCmd::Verify { vk: _, proof, public: _ } => {
+        crate::args::ZkCmd::Verify { vk: _, proof, public: _ } => {
             match std::fs::read(&proof) {
                 Ok(data) => {
                     if data.len() < 12 {
