@@ -31,6 +31,11 @@ pub enum OverrideRejectReason {
     RankClampedToBounds { r_min: u32, r_max: u32 },
     RankForbiddenByWggo,
     BudgetExceededDowngraded { original_rank: u32, final_rank: u32 },
+    /// WRGA's roofline wanted an adapter on a projection that falls outside
+    /// WGGO's chosen `adapter_placement` for the layer (the comm-budget-feasible
+    /// minimal set, G5/G7).  WRGA forces the site to `Skip` to respect the
+    /// placement; `placement` is the WGGO set that excluded it.
+    AdapterSiteOutsidePlacement { placement: String },
     // CPDT:
     /// WGGO's recommended shard factor doesn't divide world_size.
     ShardFactorIncompatibleWithWorldSize { recommended: u32, world_size: u32 },
