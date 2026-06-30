@@ -148,7 +148,7 @@ pub fn build_scorer(
     weight_provider: Arc<dyn WeightProvider + Send + Sync>,
 ) -> Result<Box<dyn GradientScorer>, crate::CodegenError> {
     use crate::WggoImportance;
-    match (opts.wggo_importance, opts.calibration_sidecar.as_ref()) {
+    match (opts.wggo.importance, opts.calibration_sidecar.as_ref()) {
         (WggoImportance::Magnitude, _) => Ok(Box::new(NullGradientScorer)),
         (WggoImportance::Grad, None) => Err(crate::CodegenError::new(
             "--wggo-importance=grad requires --calibration-data",
@@ -291,7 +291,7 @@ mod tests {
 
     fn opts(importance: WggoImportance, sidecar: Option<Sidecar>) -> CompileOptions {
         let mut o = CompileOptions::default();
-        o.wggo_importance = importance;
+        o.wggo.importance = importance;
         o.calibration_sidecar = sidecar;
         o
     }

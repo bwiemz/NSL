@@ -272,8 +272,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
                 wrga_fold_allocations: false,
-                wggo_mode: None,
-                wggo_report: false,
+                wggo: nsl_codegen::WggoOptions::default(),
                 // Phase 4 Task 6: when a train block is detected with --monitor,
                 // the health monitor takes over; disable the Phase 1/2 kernel
                 // timing path so they don't stomp on each other.
@@ -298,9 +297,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 health_monitor: detected_train_block,
                 health_flush_interval: None,
                 inspect_enabled: inspect,
-                wggo_weights: None,
-                wggo_importance: nsl_codegen::WggoImportance::Auto,
-                wggo_prune_fraction: None,
                 csha_mode: csha.clone(),
                 csha_report,
                 // CPDT: thread the planner mode + cluster + plan-out slot into

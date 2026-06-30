@@ -1429,7 +1429,7 @@ mod tests {
         };
 
         let mut opts = CompileOptions::default();
-        opts.wggo_importance = WggoImportance::Auto;
+        opts.wggo.importance = WggoImportance::Auto;
         opts.calibration_sidecar = Some(sidecar);
 
         let w = two_block_wengert();
