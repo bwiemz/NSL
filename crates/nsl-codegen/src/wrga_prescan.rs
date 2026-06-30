@@ -34,7 +34,7 @@ use crate::wrga_fused_ptx::{
 use crate::wrga_fusion::{build_fusion_plan, FusionPlan, FusionTarget};
 use crate::wrga_memory::MemoryPlan;
 use crate::wrga_prune::{PruneResult, PruneStats};
-use crate::wrga_roofline::{AdapterKind as RooflineAdapterKind, AdapterPlacement};
+use crate::wrga_roofline::{AdapterKind as RooflineAdapterKind, AdapterPlacement, SiteKind};
 
 /// Build a minimal, zero-analysis `WrgaPlan` with one placement per
 /// `@adapter(...)` target, then run the inject pass (with compiler dim
@@ -66,6 +66,11 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
             };
             placements.push(AdapterPlacement {
                 name: target.clone(),
+                // Decorator-targeted fields are matmul-shaped by
+                // construction (LoRA/IA³/GatedLoRA only attach to 2D
+                // weights through the prescan path), so set kind so the
+                // fusion-decision pass doesn't re-derive from name.
+                kind: SiteKind::Matmul,
                 // B.3 Task 5: the prescan path has no Wengert graph to
                 // measure arithmetic intensity, but `@adapter(type=lora,
                 // target=["Class.field"])` syntactically targets a
