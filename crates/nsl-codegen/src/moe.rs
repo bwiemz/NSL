@@ -781,9 +781,124 @@ pub fn extract_moe_decorator<'a>(
     Ok(None)
 }
 
+/// CPDT Part III v2.20 — generic per-model decorator-config resolver.
+///
+/// Picks the `(config_key, value)` entry for a call site under the current
+/// method's model. Used by the three `moe_dispatch*` sites and (v2.20) by
+/// the `@context_parallel` and `@speculative` resolution sites, all of
+/// which store their configs as `HashMap<String, T>` keyed by
+/// `"{model_name}.{field_name}"` (collected from `ModelDef` walks in
+/// `compiler/collection.rs`).
+///
+/// Filtering rules:
+///   * If `current_method_model_name` is `Some(model)`, candidates must
+///     start with the `"{model}."` prefix. The trailing dot avoids
+///     prefix shadowing between e.g. `Block` and `Block0`. Exactly one
+///     match returns Some; ≥2 matches return None (multi-decorator-per-
+///     model is a documented deferral); zero matches fall through to
+///     the singleton fallback.
+///   * Singleton fallback: if exactly one config exists in the map,
+///     use it. This preserves the pre-v2.19 single-decorator behaviour
+///     for helper-model methods that call into a sister model's
+///     decorator-bearing field.
+///   * Otherwise None.
+///
+/// This is a pure function (no `Compiler` borrow) so it is trivially
+/// unit-testable — see the `decorator_resolver_*` tests in this module.
+pub(crate) fn resolve_decorator_config_for_call_site<T: Clone>(
+    current_method_model_name: Option<&str>,
+    configs: &std::collections::HashMap<String, T>,
+) -> Option<(String, T)> {
+    if let Some(model_name) = current_method_model_name {
+        let prefix = format!("{model_name}.");
+        let mut candidates = configs.iter().filter(|(key, _)| key.starts_with(&prefix));
+        if let Some((k, v)) = candidates.next() {
+            if candidates.next().is_none() {
+                return Some((k.clone(), v.clone()));
+            }
+            return None;
+        }
+    }
+    if configs.len() == 1 {
+        configs.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn cfg_map(entries: &[(&str, u32)]) -> HashMap<String, u32> {
+        entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn decorator_resolver_picks_unique_match_under_model_prefix() {
+        let map = cfg_map(&[("Block0.f", 1), ("Block1.f", 2)]);
+        let got = resolve_decorator_config_for_call_site(Some("Block1"), &map);
+        assert_eq!(got, Some(("Block1.f".to_string(), 2)));
+    }
+
+    #[test]
+    fn decorator_resolver_avoids_prefix_shadowing_block_vs_block0() {
+        // The trailing dot in `"{model}."` must keep `Block` from
+        // matching `Block0.f` — a real regression risk if the dot
+        // were ever dropped.
+        let map = cfg_map(&[("Block0.f", 1), ("Block.f", 7)]);
+        let got = resolve_decorator_config_for_call_site(Some("Block"), &map);
+        assert_eq!(got, Some(("Block.f".to_string(), 7)));
+    }
+
+    #[test]
+    fn decorator_resolver_refuses_when_two_match_under_model() {
+        // Multi-decorator-per-model deferral: ≥2 entries under one
+        // model prefix surface as None instead of picking
+        // HashMap-iteration order.
+        let map = cfg_map(&[("Block0.f1", 1), ("Block0.f2", 2), ("Block1.g", 9)]);
+        let got = resolve_decorator_config_for_call_site(Some("Block0"), &map);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn decorator_resolver_zero_match_under_model_falls_back_to_singleton() {
+        // Helper-model pattern: PlainBlock has no decorators but the
+        // call site lives there; the only config in the map belongs
+        // to a sister model. Singleton fallback fires.
+        let map = cfg_map(&[("Host.f", 42)]);
+        let got = resolve_decorator_config_for_call_site(Some("PlainBlock"), &map);
+        assert_eq!(got, Some(("Host.f".to_string(), 42)));
+    }
+
+    #[test]
+    fn decorator_resolver_zero_match_and_multi_total_returns_none() {
+        let map = cfg_map(&[("Host.f", 1), ("Other.g", 2)]);
+        let got = resolve_decorator_config_for_call_site(Some("PlainBlock"), &map);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn decorator_resolver_no_model_context_uses_singleton_fallback() {
+        let map = cfg_map(&[("Host.f", 5)]);
+        let got = resolve_decorator_config_for_call_site(None, &map);
+        assert_eq!(got, Some(("Host.f".to_string(), 5)));
+    }
+
+    #[test]
+    fn decorator_resolver_no_model_context_and_multi_total_returns_none() {
+        let map = cfg_map(&[("Host.f", 1), ("Other.g", 2)]);
+        let got = resolve_decorator_config_for_call_site(None, &map);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn decorator_resolver_empty_map_returns_none() {
+        let map: HashMap<String, u32> = HashMap::new();
+        let got = resolve_decorator_config_for_call_site(Some("Block0"), &map);
+        assert!(got.is_none());
+    }
 
     #[test]
     fn test_extract_moe_empty_decorators() {

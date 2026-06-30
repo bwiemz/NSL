@@ -54,83 +54,14 @@ fn static_tensor_numel(ty: &Type) -> Option<i64> {
     Some(total)
 }
 
-impl Compiler<'_> {
-    /// CPDT Part III v2.19 — resolve the `(moe_configs_key, MoeInfo)`
-    /// for a `moe_dispatch{,_ffn,_swiglu}` call site under the current
-    /// method's model.
-    ///
-    /// Pre-v2.19, the three call sites parsed `state.current_function_name`
-    /// via `split("__").next()` to derive a model prefix. That was broken
-    /// in two ways:
-    /// 1. `current_function_name` is `None` for model methods —
-    ///    `compile_model_methods` never sets it (only top-level functions
-    ///    do via `func.rs:133`).
-    /// 2. Even if it were set to the mangled `__nsl_model_X_method` name,
-    ///    `split("__").next()` returns the empty string before the leading
-    ///    `__`, matching every key.
-    ///
-    /// In practice, model-method bodies always hit failure (1): the
-    /// `and_then` arm short-circuited on `None`, then the singleton
-    /// fallback below refused for `moe_configs.len() >= 2`. The
-    /// silent-cross-route risk from (2) would have surfaced only if
-    /// the data source had ever been wired to the mangled name — it
-    /// was not, so the bug presented as a hard error at the v4-dims
-    /// derivation rather than as a quiet miscompile.
-    ///
-    /// The v2.19 helper prefers `self.current_method_model_name` (already
-    /// populated in `compile_model_methods.rs:579,735` for model methods)
-    /// and filters by the `"{model_name}."` prefix — the trailing dot
-    /// avoids prefix shadowing between e.g. `Block` and `Block0`. Returns
-    /// `None` when ≥2 keys match the model prefix (multi-MoE-per-model is
-    /// the documented v2.next deferral). Falls back to the singleton path
-    /// for top-level calls / models with zero MoE entries / unknown
-    /// method-model context.
-    ///
-    /// **Footgun**: `agent.rs:424` reuses `current_method_model_name`
-    /// to stash the agent name during agent-body compilation. If a
-    /// user names an agent identically to a `@moe`-bearing model, an
-    /// agent-method call to `moe_dispatch_*` would inherit that
-    /// model's MoE config via the prefix scan. Agents cannot register
-    /// `@moe` decorators themselves (collection.rs only walks
-    /// `ModelDef`), so the collision is a latent footgun rather than
-    /// a current bug — but a v2.next pass that distinguishes agent
-    /// vs. model context would close it cleanly.
-    fn resolve_moe_config_for_call_site(&self) -> Option<(String, crate::moe::MoeInfo)> {
-        if let Some(model_name) = self.current_method_model_name.as_ref() {
-            let prefix = format!("{model_name}.");
-            let mut candidates = self
-                .features
-                .moe_configs
-                .iter()
-                .filter(|(key, _)| key.starts_with(&prefix));
-            if let Some((k, v)) = candidates.next() {
-                if candidates.next().is_none() {
-                    return Some((k.clone(), v.clone()));
-                }
-                // ≥2 MoE entries under this model — multi-MoE-per-model
-                // is the documented v2.next deferral. Returning None
-                // funnels into the v4 hard-error path; outside CPDT
-                // Full mode the v2 site's silent v1 fallback still
-                // applies (matching pre-v2.19 behaviour for that
-                // code path).
-                return None;
-            }
-            // Zero matches: this model has no @moe decorators. Fall
-            // through to the singleton fallback below (preserves the
-            // pre-v2.19 single-MoE behaviour when the call lives on
-            // a helper model that doesn't itself carry the decorator).
-        }
-        if self.features.moe_configs.len() == 1 {
-            self.features
-                .moe_configs
-                .iter()
-                .next()
-                .map(|(k, v)| (k.clone(), v.clone()))
-        } else {
-            None
-        }
-    }
+// CPDT Part III v2.19 introduced the per-model decorator-config
+// resolver to fix multi-model `@moe` composition; v2.20 generalized
+// the resolver to `crate::moe::resolve_decorator_config_for_call_site`
+// and applied it to `@context_parallel` + `@speculative` too. See
+// that function's rustdoc for the resolution rules and the agent/
+// model name-collision footgun.
 
+impl Compiler<'_> {
     pub(crate) fn compile_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1272,17 +1203,23 @@ impl Compiler<'_> {
                 return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
 
-            // M34: Check for context parallelism (ring attention)
-            // Look up config using the model name prefix from the mangled function name
-            // ("ModelName__method_name"), mirroring the MoE/speculative patterns.
-            let cp_config = state.current_function_name.as_ref().and_then(|fn_name| {
-                let model_prefix = fn_name.split("__").next().unwrap_or("");
-                self.features
-                    .context_parallel_configs
-                    .iter()
-                    .find(|(key, _)| key.starts_with(model_prefix))
-                    .map(|(_, info)| info.clone())
-            });
+            // M34: Check for context parallelism (ring attention).
+            //
+            // CPDT Part III v2.20 — multi-model `@context_parallel`
+            // composition. Pre-v2.20 used the same broken
+            // `state.current_function_name.split("__").next()` pattern
+            // as the MoE sites (fixed in v2.19): `current_function_name`
+            // is None for model methods, AND `split("__").next()` on a
+            // mangled name returns the empty string. In practice the
+            // lookup always returned None, silently skipping the
+            // ring-attention codepath whenever the call lived inside a
+            // model method body — `@context_parallel` was effectively a
+            // no-op for any non-top-level caller.
+            let cp_config = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.context_parallel_configs,
+            )
+            .map(|(_, info)| info);
 
             if let Some(cp_info) = cp_config {
                 eprintln!(
@@ -1716,7 +1653,10 @@ impl Compiler<'_> {
             // its own model's MoE config. Multi-MoE-PER-model is the
             // documented v2.next deferral (helper returns None and
             // the call site falls into the hard-error path).
-            let config_with_key = self.resolve_moe_config_for_call_site();
+            let config_with_key = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.moe_configs,
+            );
             let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
                 match &config_with_key {
                     Some((k, info)) => (
@@ -1994,7 +1934,10 @@ impl Compiler<'_> {
             // decorators on one model) remains the documented v2.next
             // deferral and surfaces as `None` here, hitting the v3
             // hard-error path below.
-            let config_with_key = self.resolve_moe_config_for_call_site();
+            let config_with_key = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.moe_configs,
+            );
             let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
                 match &config_with_key {
                     Some((k, info)) => (
@@ -2241,7 +2184,10 @@ impl Compiler<'_> {
             // the v1 fallback (`nsl_moe_dispatch_full`) emits the
             // M32 identity skeleton without diagnostic. Both
             // sub-cases match pre-v2.19 behaviour for the deferral.
-            let config_with_key = self.resolve_moe_config_for_call_site();
+            let config_with_key = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.moe_configs,
+            );
             let (cfg_key, num_experts, top_k, capacity_factor) = match &config_with_key {
                 Some((k, info)) => {
                     (Some(k.clone()), info.num_experts, info.top_k, info.capacity_factor)
@@ -2347,16 +2293,21 @@ impl Compiler<'_> {
             let verifier_logits = self.compile_expr(builder, state, &args[2].value)?;
             let vocab_size = self.compile_expr(builder, state, &args[3].value)?;
 
-            // Look up @speculative config using model name prefix from the mangled
-            // function name ("ModelName__method_name"), mirroring the MoE pattern (M32).
-            let config = state.current_function_name.as_ref().and_then(|fn_name| {
-                let model_prefix = fn_name.split("__").next().unwrap_or("");
-                self.features
-                    .speculative_configs
-                    .iter()
-                    .find(|(key, _)| key.starts_with(model_prefix))
-                    .map(|(_, info)| info.clone())
-            });
+            // CPDT Part III v2.20 — multi-model `@speculative`
+            // composition. Pre-v2.20 used the same broken
+            // `current_function_name.split("__").next()` pattern as the
+            // MoE sites (fixed in v2.19): `current_function_name` is
+            // None for model methods, so the lookup always returned
+            // None and `speculative_decode` silently fell through to
+            // hard-coded defaults (`temperature=0.0`, `num_tokens=5`,
+            // `method=Draft`, `tree_width=4`) regardless of user
+            // `@speculative(...)` values — making the decorator a no-op
+            // inside any model method body.
+            let config = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.speculative_configs,
+            )
+            .map(|(_, info)| info);
 
             let (temperature, num_tokens, method_id, tree_width) = match &config {
                 Some(info) => (
