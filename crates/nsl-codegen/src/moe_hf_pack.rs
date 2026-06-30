@@ -1692,6 +1692,66 @@ mod tests {
             .collect()
     }
 
+    /// CPDT Part III v2.17: BF16-typed test fixture (parallel to
+    /// make_f32_entry). Real HF Mixtral checkpoints ship in BF16; the
+    /// byte-agnostic pack chain MUST produce a packed entry that
+    /// preserves the BF16 dtype + correct byte content.
+    fn make_bf16_entry(name: &str, shape: Vec<usize>, vals: &[f32]) -> WeightEntry {
+        let num_elements = shape.iter().product::<usize>();
+        assert_eq!(vals.len(), num_elements, "shape vs vals mismatch");
+        let mut data = Vec::with_capacity(num_elements * 2);
+        for v in vals {
+            data.extend_from_slice(&half::bf16::from_f32(*v).to_le_bytes());
+        }
+        WeightEntry {
+            name: name.to_string(),
+            data,
+            shape,
+            dtype: WeightDType::BF16,
+            num_elements,
+            sparsity: None,
+            eliminated: false,
+        }
+    }
+
+    fn read_bf16(entry: &WeightEntry) -> Vec<f32> {
+        entry
+            .data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32())
+            .collect()
+    }
+
+    /// CPDT Part III v2.17: F16-typed test fixture (parallel to
+    /// make_f32_entry). Some HF checkpoints use F16 (older Llama,
+    /// converted GPT variants). The pack must handle it identically
+    /// to BF16 since both have byte_width=2.
+    fn make_f16_entry(name: &str, shape: Vec<usize>, vals: &[f32]) -> WeightEntry {
+        let num_elements = shape.iter().product::<usize>();
+        assert_eq!(vals.len(), num_elements, "shape vs vals mismatch");
+        let mut data = Vec::with_capacity(num_elements * 2);
+        for v in vals {
+            data.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+        }
+        WeightEntry {
+            name: name.to_string(),
+            data,
+            shape,
+            dtype: WeightDType::F16,
+            num_elements,
+            sparsity: None,
+            eliminated: false,
+        }
+    }
+
+    fn read_f16(entry: &WeightEntry) -> Vec<f32> {
+        entry
+            .data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+            .collect()
+    }
+
     // ── transpose_2d_bytes ────────────────────────────────────────────
 
     #[test]
@@ -3448,5 +3508,282 @@ mod tests {
         let gate_vals = read_f32(gate);
         assert_eq!(gate_vals, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
         assert_eq!(outcome.num_experts, 2);
+    }
+
+    // ── v2.17 — BF16/F16 dtype coverage ──────────────────────────────
+    //
+    // The byte-agnostic pack chain SHOULD handle BF16/F16 cleanly by
+    // design (transpose_2d_bytes works in raw bytes; element_bytes
+    // derives from WeightDType::byte_width). v2.17 pins this with
+    // happy-path tests covering both dtypes for weight + bias pack +
+    // orchestrator. Real HF Mixtral checkpoints ship in BF16; if the
+    // chain regressed to F32-assumption (e.g., a hard-coded 4 in a
+    // byte-offset computation), these tests catch it.
+
+    #[test]
+    fn pack_hf_mixtral_experts_bf16_two_experts_round_trips() {
+        // 2 experts, hidden=2, intermediate=3. BF16 entries throughout.
+        // The transpose semantics should be byte-identical to the F32
+        // happy-path test (modulo the 2-byte element width).
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_bf16_entry(
+            "moe0.experts.0.w1.weight",
+            vec![3, 2],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        ));
+        wm.insert(make_bf16_entry(
+            "moe0.experts.0.w3.weight",
+            vec![3, 2],
+            &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ));
+        wm.insert(make_bf16_entry(
+            "moe0.experts.0.w2.weight",
+            vec![2, 3],
+            &[13.0, 14.0, 15.0, 16.0, 17.0, 18.0],
+        ));
+        wm.insert(make_bf16_entry(
+            "moe0.experts.1.w1.weight",
+            vec![3, 2],
+            &[19.0, 20.0, 21.0, 22.0, 23.0, 24.0],
+        ));
+        wm.insert(make_bf16_entry(
+            "moe0.experts.1.w3.weight",
+            vec![3, 2],
+            &[25.0, 26.0, 27.0, 28.0, 29.0, 30.0],
+        ));
+        wm.insert(make_bf16_entry(
+            "moe0.experts.1.w2.weight",
+            vec![2, 3],
+            &[31.0, 32.0, 33.0, 34.0, 35.0, 36.0],
+        ));
+
+        let outcome = pack_hf_mixtral_experts(&mut wm, "moe0", "moe0", 2)
+            .expect("BF16 weight pack ok");
+        assert_eq!(outcome.num_experts, 2);
+
+        let gate = wm.get("moe0.experts.gate.weight").expect("gate present");
+        // Packed dtype MUST be BF16 (preserved from source).
+        assert_eq!(gate.dtype, WeightDType::BF16);
+        assert_eq!(gate.shape, vec![2, 6]);
+        assert_eq!(gate.data.len(), 2 * 6 * 2, "BF16 = 2 bytes/element");
+        // Transpose semantics: HF [3, 2] = [[1,2],[3,4],[5,6]] →
+        // [2, 3] = [[1,3,5],[2,4,6]] → flat [1,3,5,2,4,6].
+        // BF16 is lossless for small integer values 1..30.
+        let gate_vals = read_bf16(gate);
+        assert_eq!(
+            gate_vals,
+            vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0, 19.0, 21.0, 23.0, 20.0, 22.0, 24.0]
+        );
+    }
+
+    #[test]
+    fn pack_hf_mixtral_experts_f16_two_experts_round_trips() {
+        // Same as BF16 case but with F16. Both dtypes have byte_width=2
+        // so the byte-level pack should be identical modulo the actual
+        // bit pattern of each element. Small integers are lossless in
+        // F16 up to 2048, so we can use exact equality.
+        let mut wm = WeightMap::new_for_test();
+        for (e, base) in [(0_usize, 0.0_f32), (1, 100.0)] {
+            wm.insert(make_f16_entry(
+                &format!("moe0.experts.{}.w1.weight", e),
+                vec![3, 2],
+                &[base + 1.0, base + 2.0, base + 3.0, base + 4.0, base + 5.0, base + 6.0],
+            ));
+            wm.insert(make_f16_entry(
+                &format!("moe0.experts.{}.w3.weight", e),
+                vec![3, 2],
+                &[base + 7.0; 6],
+            ));
+            wm.insert(make_f16_entry(
+                &format!("moe0.experts.{}.w2.weight", e),
+                vec![2, 3],
+                &[base + 8.0; 6],
+            ));
+        }
+
+        let outcome = pack_hf_mixtral_experts(&mut wm, "moe0", "moe0", 2)
+            .expect("F16 weight pack ok");
+        assert_eq!(outcome.num_experts, 2);
+
+        let gate = wm.get("moe0.experts.gate.weight").expect("gate present");
+        assert_eq!(gate.dtype, WeightDType::F16);
+        assert_eq!(gate.shape, vec![2, 6]);
+        assert_eq!(gate.data.len(), 2 * 6 * 2);
+        let gate_vals = read_f16(gate);
+        // Expert 0: HF [3,2] [[1,2],[3,4],[5,6]] → packed [1,3,5,2,4,6]
+        // Expert 1: HF [3,2] [[101,102],[103,104],[105,106]] → packed
+        //   [101,103,105,102,104,106]
+        assert_eq!(
+            gate_vals,
+            vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0, 101.0, 103.0, 105.0, 102.0, 104.0, 106.0]
+        );
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_bf16_round_trips() {
+        // BF16 happy-path bias pack. The pack copy is pure
+        // concatenation (no transpose for 1-D biases), so the BF16
+        // bytes flow through unchanged.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_bf16_entry(
+                &format!("moe0.experts.{}.w1.bias", e),
+                vec![3],
+                &[1.0 + e as f32, 2.0 + e as f32, 3.0 + e as f32],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("moe0.experts.{}.w3.bias", e),
+                vec![3],
+                &[10.0 + e as f32; 3],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("moe0.experts.{}.w2.bias", e),
+                vec![2],
+                &[100.0 + e as f32; 2],
+            ));
+        }
+
+        let outcome = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("BF16 bias pack ok")
+            .expect("biases present");
+        assert_eq!(outcome.num_experts, 2);
+
+        let gate = wm.get("moe0.experts.gate.bias").expect("gate.bias present");
+        assert_eq!(gate.dtype, WeightDType::BF16);
+        assert_eq!(gate.shape, vec![2, 3]);
+        let gate_vals = read_bf16(gate);
+        assert_eq!(gate_vals, vec![1.0, 2.0, 3.0, 2.0, 3.0, 4.0]);
+
+        let down = wm.get("moe0.experts.down.bias").expect("down.bias present");
+        assert_eq!(down.dtype, WeightDType::BF16);
+        assert_eq!(down.shape, vec![2, 2]);
+        assert_eq!(read_bf16(down), vec![100.0, 100.0, 101.0, 101.0]);
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_f16_round_trips() {
+        // F16 happy-path bias pack. Lossless for small integers.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_f16_entry(
+                &format!("moe0.experts.{}.w1.bias", e),
+                vec![3],
+                &[1.0 + e as f32; 3],
+            ));
+            wm.insert(make_f16_entry(
+                &format!("moe0.experts.{}.w3.bias", e),
+                vec![3],
+                &[10.0 + e as f32; 3],
+            ));
+            wm.insert(make_f16_entry(
+                &format!("moe0.experts.{}.w2.bias", e),
+                vec![2],
+                &[100.0 + e as f32; 2],
+            ));
+        }
+        let outcome = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("F16 bias pack ok")
+            .expect("biases present");
+        assert_eq!(outcome.num_experts, 2);
+        let up = wm.get("moe0.experts.up.bias").expect("up.bias present");
+        assert_eq!(up.dtype, WeightDType::F16);
+        assert_eq!(read_f16(up), vec![10.0, 10.0, 10.0, 11.0, 11.0, 11.0]);
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_bf16_orchestrator_end_to_end() {
+        // End-to-end through the orchestrator with BF16 weights AND
+        // BF16 biases. Pins that the entire HF→NSL auto-pack pipeline
+        // is dtype-clean at the BF16 width — what real Mixtral
+        // checkpoints actually ship.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_bf16_entry(
+                &format!("Block.experts.{}.w1.weight", e),
+                vec![3, 2],
+                &[1.0 + (e as f32) * 10.0; 6],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("Block.experts.{}.w3.weight", e),
+                vec![3, 2],
+                &[2.0 + (e as f32) * 10.0; 6],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("Block.experts.{}.w2.weight", e),
+                vec![2, 3],
+                &[3.0 + (e as f32) * 10.0; 6],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("Block.experts.{}.w1.bias", e),
+                vec![3],
+                &[4.0 + (e as f32) * 10.0; 3],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("Block.experts.{}.w3.bias", e),
+                vec![3],
+                &[5.0 + (e as f32) * 10.0; 3],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("Block.experts.{}.w2.bias", e),
+                vec![2],
+                &[6.0 + (e as f32) * 10.0; 2],
+            ));
+        }
+
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.packed.len(), 1);
+        assert_eq!(outcome.bias_packed.len(), 1);
+        assert!(outcome.failed.is_empty());
+        assert!(outcome.bias_failed.is_empty());
+
+        // All 6 packed entries exist with BF16 dtype.
+        for nsl_name in [
+            "Block.experts.gate.weight",
+            "Block.experts.up.weight",
+            "Block.experts.down.weight",
+            "Block.experts.gate.bias",
+            "Block.experts.up.bias",
+            "Block.experts.down.bias",
+        ] {
+            let entry = wm.get(nsl_name).unwrap_or_else(|| panic!("{} missing", nsl_name));
+            assert_eq!(
+                entry.dtype,
+                WeightDType::BF16,
+                "{} must preserve BF16 dtype",
+                nsl_name,
+            );
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_short_form_bf16_round_trips() {
+        // v2.16-A composition with v2.17: short `.b{N}` form ALSO
+        // works at BF16. The pack should produce a BF16 packed entry
+        // identical to the canonical-form BF16 case.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_bf16_entry(
+                &format!("moe0.experts.{}.b1", e),
+                vec![3],
+                &[1.0 + e as f32; 3],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("moe0.experts.{}.b3", e),
+                vec![3],
+                &[10.0 + e as f32; 3],
+            ));
+            wm.insert(make_bf16_entry(
+                &format!("moe0.experts.{}.b2", e),
+                vec![2],
+                &[100.0 + e as f32; 2],
+            ));
+        }
+        let outcome = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("short-form BF16 bias pack ok")
+            .expect("biases present");
+        assert_eq!(outcome.num_experts, 2);
+        let gate = wm.get("moe0.experts.gate.bias").expect("gate.bias present");
+        assert_eq!(gate.dtype, WeightDType::BF16);
+        assert_eq!(read_bf16(gate), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     }
 }
