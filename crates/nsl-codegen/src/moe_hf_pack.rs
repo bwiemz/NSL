@@ -137,14 +137,44 @@ impl HfProjection {
     /// `nn.Linear` convention is `<module>.weight` + `<module>.bias`, so
     /// each HF MoE expert's per-projection bias key (when biases are
     /// enabled at training time) is the matching `w{1,2,3}.bias`
-    /// suffix. The dot-prefixed `b{1,2,3}` form some early Mixtral
-    /// exports used is NOT in scope for v2.15 (deferred to v2.next).
+    /// suffix.
     pub fn hf_bias_suffix(self) -> &'static str {
         match self {
             Self::Gate => "w1.bias",
             Self::Up => "w3.bias",
             Self::Down => "w2.bias",
         }
+    }
+
+    /// CPDT Part III v2.16: alternative short-form HF bias suffix
+    /// (e.g. `b1` for `Gate`). Some early Mixtral exports — notably
+    /// pre-1.0 community converters that flattened the `nn.Linear`
+    /// to a custom `Linear` struct with a `bias: Parameter` field of
+    /// rank 1 — emitted bias keys as `<prefix>.experts.{e}.b{1,2,3}`
+    /// without the `.bias` suffix. v2.16 accepts BOTH forms (the
+    /// canonical `.w{N}.bias` and the short `.b{N}`) so users
+    /// importing converted Mixtral checkpoints don't have to rename
+    /// keys before loading.
+    ///
+    /// Within a single block, the bias auto-pack pins ONE form per
+    /// projection per block. Mixing forms (e.g. expert 0 uses `.w1.bias`
+    /// while expert 1 uses `.b1`) is REFUSED as `MixedBiasSuffixForms`
+    /// because the typical cause is a partially-converted checkpoint.
+    pub fn hf_bias_suffix_short(self) -> &'static str {
+        match self {
+            Self::Gate => "b1",
+            Self::Up => "b3",
+            Self::Down => "b2",
+        }
+    }
+
+    /// CPDT Part III v2.16: returns BOTH bias-suffix variants
+    /// (canonical `.w{N}.bias` first, short `.b{N}` second) for
+    /// caller-side iteration. Order matters: the canonical form is
+    /// probed first so a checkpoint with both present resolves to
+    /// `.w{N}.bias` (the FormCanonical variant of `BiasSuffixForm`).
+    pub fn hf_bias_suffixes_all(self) -> [&'static str; 2] {
+        [self.hf_bias_suffix(), self.hf_bias_suffix_short()]
     }
 
     /// CPDT Part III v2.15: NSL packed bias suffix under the target
@@ -159,6 +189,27 @@ impl HfProjection {
     }
 
     pub const ALL: [HfProjection; 3] = [Self::Gate, Self::Up, Self::Down];
+}
+
+/// CPDT Part III v2.16: which of the two HF bias suffix conventions a
+/// per-expert bias key uses. Pinned per (projection, expert) at
+/// detection time; the per-block uniformity invariant is enforced by
+/// `validate_all_bias_projections`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BiasSuffixForm {
+    /// Canonical `.w{N}.bias` (matches `nn.Linear.bias` convention).
+    Canonical,
+    /// Short `.b{N}` (matches early Mixtral converter convention).
+    Short,
+}
+
+impl BiasSuffixForm {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical (.w{N}.bias)",
+            Self::Short => "short (.b{N})",
+        }
+    }
 }
 
 /// Outcome of a successful packing call. Useful for telemetry +
@@ -262,10 +313,16 @@ pub enum PackError {
     /// caught a matching orphan `w*.weight`, but a checkpoint shipping
     /// extra biases WITHOUT extra weights (rare but possible — a
     /// half-pruned checkpoint) needs its own loud refusal.
+    ///
+    /// v2.16-C (closes v2.15 review F15 LOW deferral): the variant
+    /// now carries `found_extra_indices: Vec<usize>` (sorted +
+    /// deduplicated) instead of a single `found_extra_index`. Users
+    /// recovering from a half-pruned checkpoint can fix every orphan
+    /// in one pass instead of rebuilding once per orphan.
     ExtraBiasesPresent {
         hf_prefix: String,
         declared_num_experts: usize,
-        found_extra_index: usize,
+        found_extra_indices: Vec<usize>,
         offending_key: String,
     },
     /// CPDT Part III v2.15 review fix F6 (IMPORTANT adversarial review):
@@ -310,6 +367,47 @@ pub enum PackError {
         bias_dim: usize,
         num_experts: usize,
         element_bytes: usize,
+    },
+    /// CPDT Part III v2.16: a single block mixes the canonical
+    /// `.w{N}.bias` suffix with the short `.b{N}` form across
+    /// (projection, expert) slots. The typical cause is a
+    /// partially-converted checkpoint where some keys were renamed
+    /// and others weren't. The pack refuses rather than silently
+    /// picking one form per slot because the inconsistency usually
+    /// indicates a stale conversion script.
+    MixedBiasSuffixForms {
+        hf_prefix: String,
+        canonical_keys: Vec<String>,
+        short_keys: Vec<String>,
+    },
+    /// CPDT Part III v2.16 (closes v2.15 review F2 HIGH deferral):
+    /// the orchestrator detected per-expert bias keys (canonical or
+    /// short form) under a prefix where NO per-expert weight keys
+    /// exist. A v4 dispatch needs both weights and biases; the user's
+    /// checkpoint is malformed for the v4 lowering. Surface the
+    /// cause at load time with an actionable diagnostic instead of
+    /// letting `derive_v4_dims` fail later with a less obvious
+    /// "router missing" diagnostic.
+    BiasesWithoutWeights {
+        hf_prefix: String,
+        bias_keys: Vec<String>,
+    },
+    /// CPDT Part III v2.16 review fix F1 (IMPORTANT adversarial review):
+    /// a single (projection, expert) slot has BOTH the canonical
+    /// `.w{N}.bias` AND the short `.b{N}` form present. The pre-v2.16
+    /// behavior was to silently prefer canonical and leave the short
+    /// form as an orphan. The adversarial review surfaced this 3 times
+    /// (same-slot duplicates with mismatched shapes/dtypes would be
+    /// silently undetected). Refuse loudly: the typical cause is a
+    /// half-completed conversion script that wrote new keys without
+    /// removing the originals, and a clean refusal points the user
+    /// at the cause.
+    SameSlotBothBiasSuffixForms {
+        hf_prefix: String,
+        projection: HfProjection,
+        expert_index: usize,
+        canonical_key: String,
+        short_key: String,
     },
 }
 
@@ -396,14 +494,14 @@ impl std::fmt::Display for PackError {
             Self::ExtraBiasesPresent {
                 hf_prefix,
                 declared_num_experts,
-                found_extra_index,
+                found_extra_indices,
                 offending_key,
             } => write!(
                 f,
-                "pack_hf_mixtral_biases: caller declared {} experts under prefix '{}' but the WeightMap contains a bias entry at expert index {} ({}) — refuse rather than silently leave orphan biases",
+                "pack_hf_mixtral_biases: caller declared {} experts under prefix '{}' but the WeightMap contains orphan bias entries at expert indices {:?}. Representative key (smallest orphan index, canonical form): {}. Remove ALL orphans before rebuilding — refuse rather than silently leave them.",
                 declared_num_experts,
                 hf_prefix,
-                found_extra_index,
+                found_extra_indices,
                 offending_key,
             ),
             Self::ZeroBiasDim { hf_prefix, projection, offending_key } => write!(
@@ -437,6 +535,31 @@ impl std::fmt::Display for PackError {
                 bias_dim,
                 num_experts,
                 element_bytes,
+            ),
+            Self::MixedBiasSuffixForms { hf_prefix, canonical_keys, short_keys } => write!(
+                f,
+                "pack_hf_mixtral_biases: prefix '{}' mixes the canonical `.w{{N}}.bias` suffix and the short `.b{{N}}` suffix across (projection, expert) slots. canonical_keys={:?}, short_keys={:?}. Pick ONE convention for the whole block — the typical cause is a partially-converted checkpoint where a rename script ran on some keys but not others.",
+                hf_prefix, canonical_keys, short_keys,
+            ),
+            Self::BiasesWithoutWeights { hf_prefix, bias_keys } => write!(
+                f,
+                "HF Mixtral auto-pack: prefix '{}' has per-expert bias keys but NO per-expert weight keys ({:?} found, no `.experts.{{e}}.w{{1,2,3}}.weight` companions). A v4 dispatch needs both weights and biases — the checkpoint is malformed for v4 lowering. Either add the missing weight keys or remove the orphan biases.",
+                hf_prefix, bias_keys,
+            ),
+            Self::SameSlotBothBiasSuffixForms {
+                hf_prefix,
+                projection,
+                expert_index,
+                canonical_key,
+                short_key,
+            } => write!(
+                f,
+                "pack_hf_mixtral_biases: prefix '{}' has BOTH the canonical `{}` and the short `{}` at the same (projection={}, expert={}) slot. The typical cause is a conversion script that wrote new keys without removing the originals. Pick ONE form for every slot — leaving duplicates would silently orphan the form that wasn't picked, hiding shape/dtype mismatches between the two.",
+                hf_prefix,
+                canonical_key,
+                short_key,
+                projection.nsl_bias_suffix(),
+                expert_index,
             ),
         }
     }
@@ -761,6 +884,56 @@ struct BiasProjectionPlan {
     source_keys: Vec<String>,
 }
 
+/// CPDT Part III v2.16: resolve a per-expert bias key by probing
+/// BOTH suffix forms (canonical `.w{N}.bias` and short `.b{N}`).
+///
+/// v2.16 review fix F1 (IMPORTANT): probes BOTH forms in one pass
+/// and REFUSES if both are present at the same slot — the original
+/// "canonical-wins, short-orphan-stays" behavior silently masked
+/// shape/dtype mismatches between the duplicates and left
+/// inconsistent state in the WeightMap. The adversarial review
+/// surfaced this same hazard from 3 distinct angles, so the fix
+/// closes it loudly.
+///
+/// Returns:
+///   - `Ok(None)` — neither form present at this slot
+///   - `Ok(Some(canonical_key, Canonical))` — only canonical present
+///   - `Ok(Some(short_key, Short))` — only short present
+///   - `Err(SameSlotBothBiasSuffixForms)` — both present (refuse)
+fn resolve_bias_key(
+    weight_map: &WeightMap,
+    hf_prefix: &str,
+    expert_index: usize,
+    projection: HfProjection,
+) -> Result<Option<(String, BiasSuffixForm)>, PackError> {
+    let canonical = format!(
+        "{}.experts.{}.{}",
+        hf_prefix,
+        expert_index,
+        projection.hf_bias_suffix(),
+    );
+    let short = format!(
+        "{}.experts.{}.{}",
+        hf_prefix,
+        expert_index,
+        projection.hf_bias_suffix_short(),
+    );
+    let canonical_present = weight_map.get(&canonical).is_some();
+    let short_present = weight_map.get(&short).is_some();
+    match (canonical_present, short_present) {
+        (false, false) => Ok(None),
+        (true, false) => Ok(Some((canonical, BiasSuffixForm::Canonical))),
+        (false, true) => Ok(Some((short, BiasSuffixForm::Short))),
+        (true, true) => Err(PackError::SameSlotBothBiasSuffixForms {
+            hf_prefix: hf_prefix.to_string(),
+            projection,
+            expert_index,
+            canonical_key: canonical,
+            short_key: short,
+        }),
+    }
+}
+
 /// Validate every per-expert bias key for the three projections.
 /// Returns `Ok(None)` when NO bias keys exist at all (the clean no-bias
 /// case). Returns `Ok(Some(plans))` when ALL `3 * num_experts` keys
@@ -772,24 +945,38 @@ fn validate_all_bias_projections(
     hf_prefix: &str,
     num_experts: usize,
 ) -> Result<Option<Vec<BiasProjectionPlan>>, PackError> {
-    // First pass: collect which (projection, expert) bias keys exist.
-    // We need to know the all-vs-none state BEFORE per-projection
-    // validation, because the "no biases at all" outcome must short-
-    // circuit (it's not an error, just a no-op).
+    // First pass: probe BOTH suffix forms per (projection, expert)
+    // slot. v2.16 accepts canonical `.w{N}.bias` and short `.b{N}`,
+    // but the per-block uniformity invariant requires that EVERY
+    // resolved slot use the SAME form — mixing is refused.
     let mut present_keys: Vec<String> = Vec::new();
     let mut missing_keys: Vec<String> = Vec::new();
+    let mut canonical_keys: Vec<String> = Vec::new();
+    let mut short_keys: Vec<String> = Vec::new();
     for proj in HfProjection::ALL {
         for e in 0..num_experts {
-            let key = format!(
-                "{}.experts.{}.{}",
-                hf_prefix,
-                e,
-                proj.hf_bias_suffix(),
-            );
-            if weight_map.get(&key).is_some() {
-                present_keys.push(key);
-            } else {
-                missing_keys.push(key);
+            // resolve_bias_key may return Err for same-slot duplicates
+            // (v2.16 review fix F1); propagate as an early refusal so
+            // the diagnostic points exactly at the offending slot.
+            match resolve_bias_key(weight_map, hf_prefix, e, proj)? {
+                Some((key, BiasSuffixForm::Canonical)) => {
+                    canonical_keys.push(key.clone());
+                    present_keys.push(key);
+                }
+                Some((key, BiasSuffixForm::Short)) => {
+                    short_keys.push(key.clone());
+                    present_keys.push(key);
+                }
+                None => {
+                    // Report the canonical form as the "missing" key
+                    // because that's the convention we recommend.
+                    missing_keys.push(format!(
+                        "{}.experts.{}.{}",
+                        hf_prefix,
+                        e,
+                        proj.hf_bias_suffix(),
+                    ));
+                }
             }
         }
     }
@@ -809,10 +996,21 @@ fn validate_all_bias_projections(
             missing: missing_keys,
         });
     }
+    // v2.16 invariant: per-block suffix uniformity. Mixed forms
+    // almost always indicate a partially-converted checkpoint.
+    if !canonical_keys.is_empty() && !short_keys.is_empty() {
+        return Err(PackError::MixedBiasSuffixForms {
+            hf_prefix: hf_prefix.to_string(),
+            canonical_keys,
+            short_keys,
+        });
+    }
 
     // All `3 * num_experts` bias keys present. Validate per-projection
     // shape + dtype + data-length consistency, mirroring the weight
-    // pack's per-projection pass.
+    // pack's per-projection pass. v2.16: per-slot key resolution
+    // goes through `resolve_bias_key` so the same canonical-vs-short
+    // probe runs here as in the all-keys-present scan above.
     let mut plans: Vec<BiasProjectionPlan> = Vec::with_capacity(3);
     for proj in HfProjection::ALL {
         let mut expected_num_elements: Option<usize> = None;
@@ -820,17 +1018,17 @@ fn validate_all_bias_projections(
         let mut source_keys: Vec<String> = Vec::with_capacity(num_experts);
 
         for e in 0..num_experts {
-            let key = format!(
-                "{}.experts.{}.{}",
-                hf_prefix,
-                e,
-                proj.hf_bias_suffix(),
-            );
+            // v2.16 review fix F1: the early-pass above has already
+            // validated that no slot trips SameSlotBothBiasSuffixForms,
+            // so `?` here is safe — re-running resolve_bias_key would
+            // only re-discover known-good state.
+            let (key, _form) = resolve_bias_key(weight_map, hf_prefix, e, proj)?
+                .expect("all-keys-present scan above validated existence");
             // Phase 1 above proved presence; double-checking here would
             // mask a future regression in the all-or-nothing scan.
             let entry = weight_map
                 .get(&key)
-                .expect("all-keys-present scan above validated existence");
+                .expect("resolve_bias_key returned a key that was just looked up");
             // v2.15 review fix F5 (IMPORTANT): defensive invariant
             // assertion that `num_elements` matches `shape.product()`.
             // The WeightEntry constructor computes num_elements from
@@ -966,8 +1164,16 @@ fn validate_all_bias_projections(
     // refused — those orphans would otherwise leak and confuse
     // downstream passes that walk the WeightMap looking for keys
     // under `<prefix>.experts.*`.
+    //
+    // v2.16-A: the scan also recognizes the short `.b{N}` form
+    // alongside the canonical `.w{N}.bias` form.
+    // v2.16-C: the scan accumulates ALL orphan indices (sorted +
+    // deduplicated) instead of reporting only the maximum. Users
+    // recovering from a half-pruned checkpoint can fix every orphan
+    // in one pass instead of rebuilding repeatedly.
     let prefix_search = format!("{}.experts.", hf_prefix);
-    let mut max_extra: Option<usize> = None;
+    let mut extra_indices: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
     for name in weight_map.names() {
         let Some(rest) = name.strip_prefix(&prefix_search) else {
             continue;
@@ -975,22 +1181,30 @@ fn validate_all_bias_projections(
         let Some((idx_str, tail)) = rest.split_once('.') else {
             continue;
         };
-        if !matches!(tail, "w1.bias" | "w2.bias" | "w3.bias") {
+        if !matches!(
+            tail,
+            "w1.bias" | "w2.bias" | "w3.bias" | "b1" | "b2" | "b3",
+        ) {
             continue;
         }
         let Ok(idx) = idx_str.parse::<usize>() else {
             continue;
         };
         if idx >= num_experts {
-            max_extra = Some(max_extra.map_or(idx, |m| m.max(idx)));
+            extra_indices.insert(idx);
         }
     }
-    if let Some(idx) = max_extra {
-        let offending_key = format!("{}{}.w1.bias", prefix_search, idx);
+    if !extra_indices.is_empty() {
+        let found_extra_indices: Vec<usize> = extra_indices.into_iter().collect();
+        let first_idx = found_extra_indices[0];
+        // Report the canonical form for the FIRST orphan as the
+        // representative `offending_key`. The full list is in
+        // `found_extra_indices` for downstream consumers.
+        let offending_key = format!("{}{}.w1.bias", prefix_search, first_idx);
         return Err(PackError::ExtraBiasesPresent {
             hf_prefix: hf_prefix.to_string(),
             declared_num_experts: num_experts,
-            found_extra_index: idx,
+            found_extra_indices,
             offending_key,
         });
     }
@@ -1300,12 +1514,106 @@ pub struct AutoPackOutcome {
 /// (v2.6); cross-block atomicity is intentionally NOT provided because
 /// a partial result is still useful (you can build a model that uses
 /// the successful layers and inspect the failures).
+/// CPDT Part III v2.16-B: scan for per-expert HF bias keys at
+/// prefixes that have NO matching per-expert weight keys. Returns a
+/// sorted list of `(hf_prefix, bias_keys)` pairs for orphan prefixes.
+/// `detected_weight_prefixes` is the set of prefixes the weight
+/// detector already found — those are EXCLUDED from the orphan scan
+/// since their bias keys will be picked up by the per-block bias
+/// pack downstream.
+///
+/// Recognizes BOTH bias suffix forms: canonical `.w{1,2,3}.bias` and
+/// short `.b{1,2,3}` (v2.16-A).
+fn find_bias_only_prefixes(
+    weight_map: &WeightMap,
+    detected_weight_prefixes: &std::collections::HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    use std::collections::BTreeMap;
+    let mut per_prefix: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for name in weight_map.names() {
+        // Bias key shape: `<prefix>.experts.<idx>.<bias-suffix>`. The
+        // `<prefix>` is everything to the left of `.experts.`. We
+        // match canonical `.w{1,2,3}.bias` AND short `.b{1,2,3}`.
+        let Some((prefix, rest)) = name.rsplit_once(".experts.") else {
+            continue;
+        };
+        let Some((idx_str, tail)) = rest.split_once('.') else {
+            continue;
+        };
+        // Skip non-numeric expert indices (e.g., already-packed
+        // `experts.gate.bias`).
+        if idx_str.parse::<usize>().is_err() {
+            continue;
+        }
+        let is_bias = matches!(
+            tail,
+            "w1.bias" | "w2.bias" | "w3.bias" | "b1" | "b2" | "b3",
+        );
+        if !is_bias {
+            continue;
+        }
+        // Skip prefixes the weight detector found — their biases will
+        // be packed by the per-block bias pass.
+        if detected_weight_prefixes.contains(prefix) {
+            continue;
+        }
+        per_prefix
+            .entry(prefix.to_string())
+            .or_default()
+            .push(name.to_string());
+    }
+
+    per_prefix
+        .into_iter()
+        .map(|(prefix, mut keys)| {
+            keys.sort();
+            (prefix, keys)
+        })
+        .collect()
+}
+
 pub fn pack_all_detected_hf_mixtral_blocks(weight_map: &mut WeightMap) -> AutoPackOutcome {
     let detected = detect_hf_mixtral_blocks(weight_map);
     let mut packed = Vec::new();
     let mut failed = Vec::new();
     let mut bias_packed = Vec::new();
     let mut bias_failed = Vec::new();
+
+    // CPDT Part III v2.16-B (closes v2.15 review F2 HIGH deferral):
+    // BEFORE running the per-block pack, scan for per-expert HF bias
+    // keys at prefixes WITHOUT matching per-expert weight keys. Those
+    // bias-only-no-weights prefixes are NOT detected as blocks by
+    // `detect_hf_mixtral_blocks` (which requires all 3 weight keys),
+    // so the bias pack never runs for them and the orphans stay in
+    // the WeightMap. The user's compilation would later fail with a
+    // less obvious "router missing" or `derive_v4_dims` error.
+    //
+    // Surface the orphans HERE as `BiasesWithoutWeights` so the user
+    // gets an actionable diagnostic at load time pointing at the
+    // actual problem (missing weights for the bias-bearing block).
+    let detected_prefixes: std::collections::HashSet<String> = detected
+        .iter()
+        .map(|b| b.hf_prefix.clone())
+        .collect();
+    for (orphan_prefix, bias_keys) in find_bias_only_prefixes(weight_map, &detected_prefixes) {
+        // Synthetic DetectedHfMixtralBlock — num_experts=0 is a
+        // sentinel meaning "the orchestrator never derived this from
+        // weights." The error message in `BiasesWithoutWeights`
+        // carries the actionable detail.
+        let synthetic_block = DetectedHfMixtralBlock {
+            hf_prefix: orphan_prefix.clone(),
+            num_experts: 0,
+        };
+        bias_failed.push((
+            synthetic_block,
+            PackError::BiasesWithoutWeights {
+                hf_prefix: orphan_prefix,
+                bias_keys,
+            },
+        ));
+    }
+
     for block in detected {
         // Rewrite in place — target prefix == HF prefix. The v2.7
         // source kwarg `@moe(weight_prefix="…")` lets users point the
@@ -2602,10 +2910,10 @@ mod tests {
         wm.insert(make_f32_entry("moe0.experts.5.w1.bias", vec![3], &[1.0; 3]));
         let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
         match err {
-            PackError::ExtraBiasesPresent { found_extra_index, .. } => {
-                assert_eq!(found_extra_index, 5);
+            PackError::ExtraBiasesPresent { found_extra_indices, .. } => {
+                assert_eq!(found_extra_indices, vec![5]);
             }
-            other => panic!("expected ExtraBiasesPresent at index 5, got {:?}", other),
+            other => panic!("expected ExtraBiasesPresent at [5], got {:?}", other),
         }
         // Atomicity: orphan preserved, no packed entries.
         assert!(wm.get("moe0.experts.5.w1.bias").is_some());
@@ -2825,6 +3133,284 @@ mod tests {
         assert!(wm.get("moe0.experts.gate.bias").is_none());
         assert!(wm.get("moe0.experts.up.bias").is_none());
         assert!(wm.get("moe0.experts.down.bias").is_none());
+    }
+
+    // ── v2.16 — short-form suffix + bias-only detection + multi-orphan ─
+
+    /// v2.16-A helper: insert biases under the SHORT `.b{N}` suffix
+    /// form for a single block (parallel to insert_hf_biases which
+    /// uses the canonical `.w{N}.bias` form).
+    fn insert_hf_biases_short_form(
+        wm: &mut WeightMap,
+        prefix: &str,
+        num_experts: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) {
+        for e in 0..num_experts {
+            wm.insert(make_f32_entry(
+                &format!("{}.experts.{}.b1", prefix, e),
+                vec![intermediate],
+                &vec![1.0_f32 + e as f32; intermediate],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("{}.experts.{}.b3", prefix, e),
+                vec![intermediate],
+                &vec![10.0_f32 + e as f32; intermediate],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("{}.experts.{}.b2", prefix, e),
+                vec![hidden],
+                &vec![100.0_f32 + e as f32; hidden],
+            ));
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_accepts_short_form_suffix() {
+        // v2.16-A: a checkpoint shipping biases under `.b{1,2,3}`
+        // resolves identically to the canonical `.w{1,2,3}.bias`
+        // form. Numerical content must be byte-identical to the
+        // canonical happy-path test.
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_biases_short_form(&mut wm, "moe0", 2, 2, 3);
+
+        let outcome = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("pack ok")
+            .expect("biases present");
+
+        assert_eq!(outcome.num_experts, 2);
+        let gate = wm.get("moe0.experts.gate.bias").expect("gate.bias present");
+        assert_eq!(gate.shape, vec![2, 3]);
+        assert_eq!(read_f32(gate), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        let up = wm.get("moe0.experts.up.bias").expect("up.bias present");
+        assert_eq!(read_f32(up), vec![10.0, 10.0, 10.0, 11.0, 11.0, 11.0]);
+        let down = wm.get("moe0.experts.down.bias").expect("down.bias present");
+        assert_eq!(read_f32(down), vec![100.0, 100.0, 101.0, 101.0]);
+
+        // Short-form HF sources removed.
+        for short in ["b1", "b2", "b3"] {
+            for e in 0..2 {
+                let key = format!("moe0.experts.{}.{}", e, short);
+                assert!(wm.get(&key).is_none(), "{} should be removed", key);
+            }
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_mixed_canonical_and_short_suffix_forms() {
+        // v2.16-A invariant: per-block uniformity. Expert 0 uses
+        // canonical `.w1.bias`, expert 1 uses short `.b1`. Refuse —
+        // a partially-converted checkpoint is the typical cause.
+        let mut wm = WeightMap::new_for_test();
+        // Expert 0: canonical
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        // Expert 1: short
+        wm.insert(make_f32_entry("moe0.experts.1.b1", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.1.b3", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.1.b2", vec![2], &[1.0; 2]));
+
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::MixedBiasSuffixForms { canonical_keys, short_keys, .. } => {
+                assert_eq!(canonical_keys.len(), 3, "expert 0 contributes 3 canonical");
+                assert_eq!(short_keys.len(), 3, "expert 1 contributes 3 short");
+            }
+            other => panic!("expected MixedBiasSuffixForms, got {:?}", other),
+        }
+        // Atomicity: every source preserved, no packed entries.
+        assert!(wm.get("moe0.experts.0.w1.bias").is_some());
+        assert!(wm.get("moe0.experts.1.b1").is_some());
+        assert!(wm.get("moe0.experts.gate.bias").is_none());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_same_slot_both_forms_present() {
+        // v2.16 review fix F1 (IMPORTANT adversarial review): if a
+        // single slot has BOTH canonical `.w{N}.bias` and short `.b{N}`
+        // forms, the pre-fix behavior was to silently prefer canonical
+        // and leave the short form as an orphan. The adversarial review
+        // surfaced this 3 times as an actionability gap (mismatched
+        // shapes/dtypes between the two duplicates would also be
+        // silently undetected). Refuse loudly with
+        // SameSlotBothBiasSuffixForms pointing at the offending slot.
+        let mut wm = WeightMap::new_for_test();
+        // Expert 0 has BOTH canonical w1.bias AND short b1 — same
+        // projection, same expert. Different values to exercise the
+        // "would have silently picked one" hazard.
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[7.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[7.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[7.0; 2]));
+        wm.insert(make_f32_entry("moe0.experts.0.b1", vec![3], &[99.0; 3]));
+
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 1).unwrap_err();
+        match err {
+            PackError::SameSlotBothBiasSuffixForms {
+                projection,
+                expert_index,
+                canonical_key,
+                short_key,
+                ..
+            } => {
+                assert_eq!(projection, HfProjection::Gate);
+                assert_eq!(expert_index, 0);
+                assert_eq!(canonical_key, "moe0.experts.0.w1.bias");
+                assert_eq!(short_key, "moe0.experts.0.b1");
+            }
+            other => panic!("expected SameSlotBothBiasSuffixForms, got {:?}", other),
+        }
+        // Atomicity — both forms still present, no packed entries.
+        assert!(wm.get("moe0.experts.0.w1.bias").is_some());
+        assert!(wm.get("moe0.experts.0.b1").is_some());
+        assert!(wm.get("moe0.experts.gate.bias").is_none());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_same_slot_both_forms_with_mismatched_dtype() {
+        // v2.16 review fix F1 explicit dtype-mismatch scenario:
+        // canonical w1.bias is F32, short b1 is F16. Pre-fix, the
+        // canonical (F32) would have been picked and the F16 b1 would
+        // have stayed as an orphan with NO dtype validation. Now both
+        // duplicates trip the refusal, exposing the inconsistency.
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[7.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[7.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[7.0; 2]));
+        // F16 b1 — 3 elements * 2 bytes = 6 bytes.
+        wm.insert(WeightEntry::new(
+            "moe0.experts.0.b1".to_string(),
+            vec![0u8; 6],
+            vec![3],
+            WeightDType::F16,
+        ));
+
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 1).unwrap_err();
+        assert!(matches!(err, PackError::SameSlotBothBiasSuffixForms { .. }));
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_canonical_and_short_produce_byte_identical_packed() {
+        // v2.16 review fix F3 (LOW): the suffix-form aliasing contract
+        // says canonical and short produce byte-identical packed
+        // entries for the same numerical values. Lock that in by
+        // packing the same numerical content twice (once per form)
+        // and comparing the resulting packed entries byte-for-byte.
+        let canonical_packed: Vec<u8> = {
+            let mut wm = WeightMap::new_for_test();
+            insert_hf_biases(&mut wm, "moe0", 2, 2, 3);
+            pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+                .expect("canonical pack ok")
+                .expect("biases present");
+            wm.get("moe0.experts.gate.bias").unwrap().data.clone()
+        };
+        let short_packed: Vec<u8> = {
+            let mut wm = WeightMap::new_for_test();
+            insert_hf_biases_short_form(&mut wm, "moe0", 2, 2, 3);
+            pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+                .expect("short pack ok")
+                .expect("biases present");
+            wm.get("moe0.experts.gate.bias").unwrap().data.clone()
+        };
+        assert_eq!(
+            canonical_packed, short_packed,
+            "canonical vs short pack must produce byte-identical packed gate.bias",
+        );
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_enumerates_all_extra_bias_orphan_indices() {
+        // v2.16-C: orphans at indices 3, 5, 7 (num_experts=2) all
+        // appear in `found_extra_indices`, sorted + deduplicated.
+        // Pre-v2.16 the scan only reported the max (idx 7); users
+        // had to rebuild after each fix.
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_biases(&mut wm, "moe0", 2, 2, 3);
+        // Multiple orphans at different indices.
+        wm.insert(make_f32_entry("moe0.experts.3.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.5.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.7.w2.bias", vec![2], &[1.0; 2]));
+        // Also include a short-form orphan to confirm both forms
+        // contribute to the scan.
+        wm.insert(make_f32_entry("moe0.experts.9.b1", vec![3], &[1.0; 3]));
+
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::ExtraBiasesPresent { found_extra_indices, .. } => {
+                assert_eq!(
+                    found_extra_indices,
+                    vec![3, 5, 7, 9],
+                    "all orphan indices must be enumerated, sorted",
+                );
+            }
+            other => panic!("expected ExtraBiasesPresent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_surfaces_bias_only_orphan_prefix() {
+        // v2.16-B: a WeightMap with bias keys at a prefix but NO
+        // matching weight keys. The detector returns empty for this
+        // prefix; the orchestrator's pre-scan must surface
+        // BiasesWithoutWeights into bias_failed.
+        let mut wm = WeightMap::new_for_test();
+        // Real HF block A — fully weights, no biases.
+        insert_hf_block(&mut wm, "good", 2);
+        // Orphan block B — biases only, no weights.
+        for e in 0..2 {
+            wm.insert(make_f32_entry(
+                &format!("bias_only.experts.{}.w1.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("bias_only.experts.{}.w3.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("bias_only.experts.{}.w2.bias", e),
+                vec![2],
+                &[1.0; 2],
+            ));
+        }
+
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        // Good block packs cleanly.
+        assert_eq!(outcome.packed.len(), 1);
+        assert_eq!(outcome.packed[0].0.hf_prefix, "good");
+        // Bias-only block surfaces in bias_failed.
+        assert_eq!(outcome.bias_failed.len(), 1);
+        assert_eq!(outcome.bias_failed[0].0.hf_prefix, "bias_only");
+        assert!(matches!(
+            outcome.bias_failed[0].1,
+            PackError::BiasesWithoutWeights { .. }
+        ));
+        // Orphan bias keys are preserved (not silently dropped).
+        assert!(wm.get("bias_only.experts.0.w1.bias").is_some());
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_orphan_prefix_short_form_also_detected() {
+        // v2.16-A + v2.16-B composition: orphan biases use the short
+        // `.b{N}` form. find_bias_only_prefixes must catch them too.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_f32_entry(
+                &format!("orphan.experts.{}.b1", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+        }
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.bias_failed.len(), 1);
+        match &outcome.bias_failed[0].1 {
+            PackError::BiasesWithoutWeights { bias_keys, .. } => {
+                assert!(bias_keys.iter().any(|k| k.ends_with(".b1")));
+            }
+            other => panic!("expected BiasesWithoutWeights, got {:?}", other),
+        }
     }
 
     #[test]

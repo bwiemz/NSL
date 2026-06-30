@@ -255,14 +255,22 @@ fn load_and_register_weights_if_needed(
     // surface treatment as weight-pack failures.
     if !auto_pack.failed.is_empty() || !auto_pack.bias_failed.is_empty() {
         let mut msg = String::from(
-            "CPDT v2.7/v2.15: HF Mixtral auto-pack failed for one or more detected blocks:\n",
+            "CPDT v2.7/v2.15/v2.16: HF Mixtral auto-pack failed for one or more detected blocks:\n",
         );
         use std::fmt::Write as _;
         for (block, err) in &auto_pack.failed {
             let _ = writeln!(msg, "  - {} (weights): {}", block.hf_prefix, err);
         }
         for (block, err) in &auto_pack.bias_failed {
-            let _ = writeln!(msg, "  - {} (biases): {}", block.hf_prefix, err);
+            // v2.16-B: BiasesWithoutWeights uses a synthetic block
+            // with num_experts=0. Surface a clearer label so users
+            // know the failure isn't tied to a fully-detected block.
+            let kind = if matches!(err, crate::moe_hf_pack::PackError::BiasesWithoutWeights { .. }) {
+                "biases-without-weights"
+            } else {
+                "biases"
+            };
+            let _ = writeln!(msg, "  - {} ({}): {}", block.hf_prefix, kind, err);
         }
         if !auto_pack.packed.is_empty() || !auto_pack.bias_packed.is_empty() {
             let _ = std::fmt::Write::write_str(
