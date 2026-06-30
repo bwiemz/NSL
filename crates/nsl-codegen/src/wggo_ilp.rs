@@ -121,6 +121,66 @@ impl AdapterPlacement {
             AdapterPlacement::AttnAndFfn => "q,k,v,o + ffn_up, ffn_down",
         }
     }
+
+    /// Whether a weight/site `name` falls inside this placement's allowed
+    /// projection set.  Used by WRGA to narrow its roofline-chosen adapter
+    /// sites to the projections WGGO budgeted for (the placement encodes a
+    /// comm-budget-feasible minimal set — see G5/G7).
+    ///
+    /// Returns:
+    /// * `Some(true)`  — `name` is a recognized projection inside the set.
+    /// * `Some(false)` — `name` is a recognized projection *outside* the set.
+    /// * `None`        — `name` is not a recognized attention/FFN projection
+    ///   (a norm, embedding, or unknown weight); the placement has no opinion
+    ///   and the caller should leave the site untouched.
+    ///
+    /// Recognition is limited to *split* per-projection weight names (see
+    /// [`proj_role`]).  **Fused or non-standard projections** — GPT-2 `c_attn`
+    /// / `c_proj` / `c_fc`, NeoX/Falcon `query_key_value` / `dense*`, Phi/MPT
+    /// `Wqkv`, fused `gate_up_proj` — return `None`, so placement cannot
+    /// constrain those weights (deliberate v1 limitation; the consumer treats
+    /// `None` as fail-safe pass-through).
+    pub fn covers_projection(self, name: &str) -> Option<bool> {
+        let role = proj_role(name)?;
+        let allowed = match self {
+            AdapterPlacement::None => false,
+            AdapterPlacement::AttnQV => matches!(role, ProjRole::Q | ProjRole::V),
+            AdapterPlacement::AttnQKVO => {
+                matches!(role, ProjRole::Q | ProjRole::K | ProjRole::V | ProjRole::O)
+            }
+            AdapterPlacement::AttnAndFfn => true, // Q/K/V/O + Ffn — every recognized role
+        };
+        Some(allowed)
+    }
+}
+
+/// Attention / FFN projection role inferred from a weight name's final
+/// dotted component (after stripping a trailing `.weight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjRole {
+    Q,
+    K,
+    V,
+    O,
+    Ffn,
+}
+
+/// Classify a weight/site name into a [`ProjRole`], tolerating the common
+/// naming variants (`wq` / `w_q` / `q_proj`, FFN `gate`/`up`/`down`/`fc*`).
+/// Returns `None` for names that are not attention/FFN projections.
+pub fn proj_role(name: &str) -> Option<ProjRole> {
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+    let last = base.rsplit('.').next().unwrap_or(base).to_ascii_lowercase();
+    match last.as_str() {
+        "wq" | "w_q" | "q_proj" | "query" => Some(ProjRole::Q),
+        "wk" | "w_k" | "k_proj" | "key" => Some(ProjRole::K),
+        "wv" | "w_v" | "v_proj" | "value" => Some(ProjRole::V),
+        "wo" | "w_o" | "o_proj" | "out_proj" => Some(ProjRole::O),
+        "w_gate" | "gate_proj" | "w_up" | "up_proj" | "w_down" | "down_proj" | "fc1" | "fc2" => {
+            Some(ProjRole::Ffn)
+        }
+        _ => None,
+    }
 }
 
 /// Integer decision variables for one layer.
@@ -1102,6 +1162,43 @@ mod tests {
         constraints.memory_budget = 1_000; // 1 KB — nothing fits.
         let sol = solve_layer(&lut, &constraints);
         assert!(!sol.feasible);
+    }
+
+    #[test]
+    fn proj_role_classifies_naming_variants() {
+        assert_eq!(proj_role("blocks.0.attn.wq"), Some(ProjRole::Q));
+        assert_eq!(proj_role("model.layers.3.self_attn.q_proj.weight"), Some(ProjRole::Q));
+        assert_eq!(proj_role("blocks.0.attn.w_k"), Some(ProjRole::K));
+        assert_eq!(proj_role("blocks.0.attn.wv"), Some(ProjRole::V));
+        assert_eq!(proj_role("blocks.0.attn.out_proj"), Some(ProjRole::O));
+        assert_eq!(proj_role("blocks.0.mlp.gate_proj"), Some(ProjRole::Ffn));
+        assert_eq!(proj_role("blocks.0.ffn.fc1"), Some(ProjRole::Ffn));
+        // Not projections:
+        assert_eq!(proj_role("blocks.0.attn_norm.weight"), None);
+        assert_eq!(proj_role("embed.weight"), None);
+        assert_eq!(proj_role("var_42"), None);
+    }
+
+    #[test]
+    fn covers_projection_respects_placement_set() {
+        use AdapterPlacement::*;
+        // AttnQV: Q and V in, K and O out.
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wq"), Some(true));
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wv"), Some(true));
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wk"), Some(false));
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wo"), Some(false));
+        // AttnQKVO: all four attn projections in, FFN out.
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.attn.wk"), Some(true));
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.attn.wo"), Some(true));
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.mlp.fc1"), Some(false));
+        // AttnAndFfn: everything recognized is in.
+        assert_eq!(AttnAndFfn.covers_projection("blocks.0.mlp.fc1"), Some(true));
+        assert_eq!(AttnAndFfn.covers_projection("blocks.0.attn.wk"), Some(true));
+        // None excludes every projection.
+        assert_eq!(None.covers_projection("blocks.0.attn.wq"), Some(false));
+        // Unrecognized names: no opinion regardless of placement.
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.attn_norm.weight"), Option::None);
+        assert_eq!(AttnAndFfn.covers_projection("embed.weight"), Option::None);
     }
 
     #[test]

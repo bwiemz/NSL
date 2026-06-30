@@ -4556,6 +4556,9 @@ impl Compiler<'_> {
                                 original_rank,
                                 final_rank,
                             } => format!("budget_exceeded_{original_rank}_to_{final_rank}"),
+                            crate::wggo_overrides::OverrideRejectReason::AdapterSiteOutsidePlacement {
+                                placement,
+                            } => format!("site_outside_placement_[{placement}]"),
                             other => format!("{:?}", other),
                         };
                         eprintln!(

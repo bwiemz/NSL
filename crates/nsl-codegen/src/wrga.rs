@@ -429,7 +429,12 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
     // ── Stage 3: Roofline analysis + placement ────────────────────────────
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
     let sites = infer_sites_from_wengert(input.wengert, &trainable, &input);
-    let placements = place_adapters(&sites, gpu, input.r_min, input.r_max);
+    let mut placements = place_adapters(&sites, gpu, input.r_min, input.r_max);
+
+    // Narrow the roofline placement to the projections WGGO budgeted for
+    // (its `adapter_placement` is the comm-budget-feasible set, G5/G7).  Sites
+    // outside it are forced to Skip; each overruled site yields a diagnostic.
+    let placement_diags = apply_wggo_placement_filter(&mut placements, input.wggo_overrides);
 
     // ── Stage 4: Spectral rank allocation (if weights supplied) ───────────
     let (spectral, ranks, override_diags) = run_spectral(input.weights, &placements, &input);
@@ -463,8 +468,83 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         ranks,
         fusion,
         memory,
-        override_diagnostics: override_diags,
+        override_diagnostics: {
+            // Placement-filter diagnostics (site exclusions) precede the
+            // rank-allocation diagnostics from spectral analysis.
+            let mut d = placement_diags;
+            d.extend(override_diags);
+            d
+        },
     }
+}
+
+/// Narrow WRGA's roofline-chosen adapter sites to the projections WGGO
+/// budgeted for.  For each layer WGGO gave a positive rank and a non-`None`
+/// `adapter_placement`, any site whose projection falls *outside* that set is
+/// forced to [`AdapterKind::Skip`] — WGGO's placement is the comm-budget-
+/// feasible minimal set (G5/G7), so adapting extra sites would exceed the
+/// adapter-comm budget WGGO enforced.  Returns one [`OverrideDiagnostic`] per
+/// roofline adapter that was overruled.
+///
+/// **v1 scope / known limitation.**  Enforcement keys off
+/// [`AdapterPlacement::covers_projection`], which only recognizes *split*
+/// per-projection weight names (`wq`/`q_proj`, FFN `gate`/`up`/`down`/`fc*`;
+/// see [`crate::wggo_ilp::proj_role`]).  Any site whose name it does *not*
+/// recognize returns `None` ("no opinion") and is left untouched.  That escape
+/// set is broader than just norms/embeddings: it includes whole model families
+/// whose projections are **fused or differently named** — GPT-2 `c_attn`
+/// (fused QKV) / `c_proj` / `c_fc`, GPT-NeoX & Falcon `query_key_value` /
+/// `dense` / `dense_h_to_4h` / `dense_4h_to_h`, Phi/MPT `Wqkv`, and fused
+/// `gate_up_proj`.  For such models a non-`None` placement does **not**
+/// constrain WRGA, so the comm-budget guarantee is not enforced there (WRGA may
+/// over-place).  This is fail-safe — the filter never produces a *wrong*
+/// adapter, only an unconstrained one — and is the deliberate conservative v1
+/// choice.  Note this diverges from CEP, which *hard-refuses* fused-QKV models
+/// (`cep_extract.rs`) under the repo's "deferral must refuse" invariant;
+/// extending placement enforcement to fused weights is a follow-up.
+fn apply_wggo_placement_filter(
+    placements: &mut [AdapterPlacement],
+    overrides: Option<&crate::wggo_overrides::WggoOverrides>,
+) -> Vec<crate::wggo_overrides::OverrideDiagnostic> {
+    use crate::wrga_roofline::AdapterKind;
+    let Some(over) = overrides else {
+        return Vec::new();
+    };
+    let mut diags = Vec::new();
+    for p in placements.iter_mut() {
+        let Some(ov) = over.find_by_layer_containing(&p.name) else {
+            continue;
+        };
+        // rank==0 means WGGO wants no adapter on this layer at all — that is
+        // the rank path's job (`RankForbiddenByWggo`); skipping here avoids a
+        // double-report.  For rank>0 the placement drives the decision via
+        // `covers_projection`, INCLUDING an (invariant-violating) `None`
+        // placement: `None` excludes every projection, so all recognized sites
+        // are forced to Skip with a diagnostic rather than silently adapted.
+        if ov.adapter_rank == 0 {
+            continue;
+        }
+        if ov.adapter_placement.covers_projection(&p.name) == Some(false)
+            && !matches!(p.adapter, AdapterKind::Skip)
+        {
+            diags.push(crate::wggo_overrides::OverrideDiagnostic {
+                layer_index: ov.layer_index,
+                // Per-LAYER name (e.g. "blocks.0"); the spectral rank path
+                // (`allocate_ranks`) instead reports per-PROJECTION names
+                // (e.g. "blocks.0.attn.wq").  Harmless today — the sole
+                // renderer keys off `layer_index` — but the granularity differs.
+                layer_name: ov.layer_name.clone(),
+                reason: crate::wggo_overrides::OverrideRejectReason::AdapterSiteOutsidePlacement {
+                    placement: ov.adapter_placement.as_str().to_string(),
+                },
+                requested: format!("{:?}", p.adapter).to_ascii_lowercase(),
+                applied: "skip".to_string(),
+            });
+            p.adapter = AdapterKind::Skip;
+            p.suggested_rank = 0;
+        }
+    }
+    diags
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,5 +1276,162 @@ mod tests {
             reft.adapter_params, 0,
             "rank-0 sites must contribute 0 ReFT params (no phantom .max(1))",
         );
+    }
+
+    /// Build an all-LoRA roofline placement for `name` (the roofline wants an
+    /// adapter on every site, so any Skip the filter produces is its doing).
+    fn mk_lora_placement(name: &str) -> crate::wrga_roofline::AdapterPlacement {
+        crate::wrga_roofline::AdapterPlacement {
+            name: name.into(),
+            arithmetic_intensity: 0.0,
+            classification: crate::cost_model::BoundClassification::MemoryBound,
+            roofline_slack: 1.0,
+            adapter: crate::wrga_roofline::AdapterKind::Lora,
+            suggested_rank: 8,
+            rationale: String::new(),
+            decorator_kind: None,
+            alpha: None,
+            synthesized_fields: Vec::new(),
+            init_strategies: Vec::new(),
+        }
+    }
+
+    fn override_for(layer: &str, rank: u64, placement: crate::wggo_ilp::AdapterPlacement) -> crate::wggo_overrides::WggoOverrides {
+        crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![crate::wggo_overrides::PerLayerOverride {
+                layer_index: 0,
+                layer_name: layer.into(),
+                active_heads: 8,
+                requested_csha_level: None,
+                adapter_rank: rank,
+                adapter_placement: placement,
+                fase_fused: false,
+                packing_mode: 0,
+                shard_factor: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn wggo_placement_filter_skips_excluded_projections() {
+        use crate::wrga_roofline::AdapterKind;
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wq"),
+            mk_lora_placement("blocks.0.attn.wk"),
+            mk_lora_placement("blocks.0.attn.wv"),
+            mk_lora_placement("blocks.0.attn.wo"),
+        ];
+        // WGGO chose AttnQV (q,v) for blocks.0 with a positive rank.
+        let over = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::AttnQV);
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wq"), AdapterKind::Lora, "q in placement → kept");
+        assert_eq!(kind("blocks.0.attn.wv"), AdapterKind::Lora, "v in placement → kept");
+        assert_eq!(kind("blocks.0.attn.wk"), AdapterKind::Skip, "k outside placement → skipped");
+        assert_eq!(kind("blocks.0.attn.wo"), AdapterKind::Skip, "o outside placement → skipped");
+
+        assert_eq!(diags.len(), 2, "one diagnostic per overruled site (wk, wo)");
+        assert!(diags.iter().all(|d| matches!(
+            d.reason,
+            crate::wggo_overrides::OverrideRejectReason::AdapterSiteOutsidePlacement { .. }
+        )));
+        assert!(diags.iter().all(|d| d.applied == "skip" && d.requested == "lora"));
+    }
+
+    #[test]
+    fn wggo_placement_filter_governs_each_site_by_its_own_layer() {
+        // Discriminating multi-layer test: a regression that applied layer 0's
+        // placement to every site (or matched the wrong layer) would slip past
+        // the single-layer tests.  Layer 0 = AttnQV, layer 1 = AttnQKVO, layer
+        // 2 has no override at all.
+        use crate::wrga_roofline::AdapterKind;
+        let over = crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![
+                crate::wggo_overrides::PerLayerOverride {
+                    layer_index: 0,
+                    layer_name: "blocks.0".into(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: 8,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::AttnQV,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    shard_factor: 0,
+                },
+                crate::wggo_overrides::PerLayerOverride {
+                    layer_index: 1,
+                    layer_name: "blocks.1".into(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: 8,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::AttnQKVO,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    shard_factor: 0,
+                },
+            ],
+        };
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wk"), // excluded by layer-0 AttnQV
+            mk_lora_placement("blocks.1.attn.wk"), // allowed by layer-1 AttnQKVO
+            mk_lora_placement("blocks.2.attn.wk"), // no override for layer 2
+        ];
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wk"), AdapterKind::Skip, "layer-0 AttnQV excludes K");
+        assert_eq!(kind("blocks.1.attn.wk"), AdapterKind::Lora, "layer-1 AttnQKVO allows K");
+        assert_eq!(kind("blocks.2.attn.wk"), AdapterKind::Lora, "no override → untouched");
+        assert_eq!(diags.len(), 1, "only the layer-0 K site is overruled");
+        assert_eq!(diags[0].layer_index, 0);
+    }
+
+    #[test]
+    fn wggo_placement_none_with_positive_rank_excludes_all_projections() {
+        // Defends against the invariant-violating (rank>0, placement=None)
+        // state: placement None means "zero projections", so every recognized
+        // attention/FFN site must be forced to Skip (with a diagnostic) — never
+        // silently left adapted.  A non-projection site stays untouched.
+        use crate::wrga_roofline::AdapterKind;
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wq"),
+            mk_lora_placement("blocks.0.attn.wv"),
+            mk_lora_placement("blocks.0.attn_norm.weight"), // not a projection
+        ];
+        let over = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::None);
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wq"), AdapterKind::Skip);
+        assert_eq!(kind("blocks.0.attn.wv"), AdapterKind::Skip);
+        assert_eq!(
+            kind("blocks.0.attn_norm.weight"),
+            AdapterKind::Lora,
+            "non-projection site is not governed by placement"
+        );
+        assert_eq!(diags.len(), 2, "wq + wv excluded; norm untouched");
+    }
+
+    #[test]
+    fn wggo_placement_filter_is_noop_without_governing_override() {
+        use crate::wrga_roofline::AdapterKind;
+        // (a) No overrides → untouched, no diagnostics.
+        let mut p1 = vec![mk_lora_placement("blocks.0.attn.wk")];
+        assert!(apply_wggo_placement_filter(&mut p1, None).is_empty());
+        assert_eq!(p1[0].adapter, AdapterKind::Lora);
+
+        // (b) Override with placement None / rank 0 → the rank path's job; the
+        // placement filter must not double-report or skip here.
+        let over = override_for("blocks.0", 0, crate::wggo_ilp::AdapterPlacement::None);
+        let mut p2 = vec![mk_lora_placement("blocks.0.attn.wk")];
+        assert!(apply_wggo_placement_filter(&mut p2, Some(&over)).is_empty());
+        assert_eq!(p2[0].adapter, AdapterKind::Lora);
+
+        // (c) A non-projection site (norm) is never governed by placement.
+        let over_qv = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::AttnQV);
+        let mut p3 = vec![mk_lora_placement("blocks.0.attn_norm.weight")];
+        assert!(apply_wggo_placement_filter(&mut p3, Some(&over_qv)).is_empty());
+        assert_eq!(p3[0].adapter, AdapterKind::Lora);
     }
 }
