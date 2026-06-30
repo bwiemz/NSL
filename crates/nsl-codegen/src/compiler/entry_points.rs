@@ -218,6 +218,23 @@ fn load_and_register_weights_if_needed(
             );
         }
     }
+    // CPDT Part III v2.15 — bias auto-pack telemetry. Blocks that
+    // shipped per-expert HF `.w{1,2,3}.bias` keys get their biases
+    // packed into NSL convention alongside the weights. Blocks
+    // without biases produce no entry here (Ok(None) no-op).
+    if !auto_pack.bias_packed.is_empty() {
+        eprintln!(
+            "[nsl] CPDT v2.15: auto-packed v4 biases for {} HF Mixtral MoE block{}",
+            auto_pack.bias_packed.len(),
+            if auto_pack.bias_packed.len() == 1 { "" } else { "s" },
+        );
+        for (block, _) in &auto_pack.bias_packed {
+            eprintln!(
+                "  - {} (num_experts={})",
+                block.hf_prefix, block.num_experts,
+            );
+        }
+    }
     // v2.7 adversarial-review F2 fix: hard-refuse on any auto-pack
     // failure. Previously the wrapper only printed failures to stderr
     // and let the build continue, which created a silent-corruption
@@ -229,15 +246,25 @@ fn load_and_register_weights_if_needed(
     // orphans. Per the "deferral must refuse" / "no silent fallback"
     // invariant carried from v2.3..v2.6, any HF block detected MUST
     // either pack successfully or surface as a build error.
-    if !auto_pack.failed.is_empty() {
+    //
+    // v2.15 extends the same refuse-loudly contract to bias-pack
+    // failures: a partial bias bundle would silently drop biases at
+    // the v4 lowering's `detect_v4_biases` (no `.experts.gate.bias`
+    // resolves because the HF `.w1.bias` keys remain unpacked), so
+    // the 5-arg no-bias path runs and produces wrong numerics. Same
+    // surface treatment as weight-pack failures.
+    if !auto_pack.failed.is_empty() || !auto_pack.bias_failed.is_empty() {
         let mut msg = String::from(
-            "CPDT v2.7: HF Mixtral auto-pack failed for one or more detected blocks:\n",
+            "CPDT v2.7/v2.15: HF Mixtral auto-pack failed for one or more detected blocks:\n",
         );
+        use std::fmt::Write as _;
         for (block, err) in &auto_pack.failed {
-            use std::fmt::Write as _;
-            let _ = writeln!(msg, "  - {}: {}", block.hf_prefix, err);
+            let _ = writeln!(msg, "  - {} (weights): {}", block.hf_prefix, err);
         }
-        if !auto_pack.packed.is_empty() {
+        for (block, err) in &auto_pack.bias_failed {
+            let _ = writeln!(msg, "  - {} (biases): {}", block.hf_prefix, err);
+        }
+        if !auto_pack.packed.is_empty() || !auto_pack.bias_packed.is_empty() {
             let _ = std::fmt::Write::write_str(
                 &mut msg,
                 "\nNote: other blocks WERE successfully packed in place (per-block \

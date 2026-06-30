@@ -132,6 +132,32 @@ impl HfProjection {
         }
     }
 
+    /// CPDT Part III v2.15: HF safetensors bias suffix (e.g. `w1.bias`
+    /// for `Gate`). Symmetric to `hf_suffix()`. The canonical
+    /// `nn.Linear` convention is `<module>.weight` + `<module>.bias`, so
+    /// each HF MoE expert's per-projection bias key (when biases are
+    /// enabled at training time) is the matching `w{1,2,3}.bias`
+    /// suffix. The dot-prefixed `b{1,2,3}` form some early Mixtral
+    /// exports used is NOT in scope for v2.15 (deferred to v2.next).
+    pub fn hf_bias_suffix(self) -> &'static str {
+        match self {
+            Self::Gate => "w1.bias",
+            Self::Up => "w3.bias",
+            Self::Down => "w2.bias",
+        }
+    }
+
+    /// CPDT Part III v2.15: NSL packed bias suffix under the target
+    /// prefix. Matches the names `detect_v4_biases` (and the v3
+    /// detector) resolve.
+    pub fn nsl_bias_suffix(self) -> &'static str {
+        match self {
+            Self::Gate => "experts.gate.bias",
+            Self::Up => "experts.up.bias",
+            Self::Down => "experts.down.bias",
+        }
+    }
+
     pub const ALL: [HfProjection; 3] = [Self::Gate, Self::Up, Self::Down];
 }
 
@@ -218,6 +244,73 @@ pub enum PackError {
         found_extra_index: usize,
         offending_key: String,
     },
+    /// CPDT Part III v2.15: HF per-expert bias keys exist for SOME
+    /// (projection, expert) slots but not all `3 * num_experts`. Bias
+    /// auto-pack is all-or-nothing per block — mixing partial bias
+    /// presence with the v4 lowering would silently drop the missing
+    /// directions at runtime. The `present` and `missing` vectors
+    /// enumerate the offending slots so the user can repair their
+    /// checkpoint.
+    PartialBiasBundle {
+        hf_prefix: String,
+        present: Vec<String>,
+        missing: Vec<String>,
+    },
+    /// CPDT Part III v2.15: per-expert bias keys exist at indices
+    /// ≥ `num_experts`. Symmetric to `ExtraExpertsPresent` but for
+    /// bias keys. The weight-pack's extra-experts scan would have
+    /// caught a matching orphan `w*.weight`, but a checkpoint shipping
+    /// extra biases WITHOUT extra weights (rare but possible — a
+    /// half-pruned checkpoint) needs its own loud refusal.
+    ExtraBiasesPresent {
+        hf_prefix: String,
+        declared_num_experts: usize,
+        found_extra_index: usize,
+        offending_key: String,
+    },
+    /// CPDT Part III v2.15 review fix F6 (IMPORTANT adversarial review):
+    /// a per-expert bias declares `num_elements == 0` (e.g., a `[0]`
+    /// shape or a `[N, 0]` packed shape). Phase 2 would silently
+    /// allocate an empty buffer and write a `[num_experts, 0]` packed
+    /// entry, which `detect_v4_biases` would later reject with a
+    /// cryptic "0 elements; expected N * D" diagnostic. Refusing at
+    /// pack time gives the user a clear actionable error pointing at
+    /// the bias source.
+    ZeroBiasDim {
+        hf_prefix: String,
+        projection: HfProjection,
+        offending_key: String,
+    },
+    /// CPDT Part III v2.15 review fix F7 (IMPORTANT adversarial review):
+    /// the three projections within a single block have INCONSISTENT
+    /// dtypes (e.g., gate F32, up F32, down F16). Within-projection
+    /// dtype consistency is already enforced by `DtypeMismatch`, but
+    /// the v4 runtime FFI (`nsl_moe_dispatch_full_v4`) requires
+    /// uniform dtype across all three projections AND tokens —
+    /// mixed dtypes would silently fail at the FFI's dtype-equality
+    /// guard, returning 0 with no actionable diagnostic. Refusing at
+    /// pack time is far more actionable.
+    MixedProjectionDtypes {
+        hf_prefix: String,
+        gate_dtype: String,
+        up_dtype: String,
+        down_dtype: String,
+    },
+    /// CPDT Part III v2.15 review fix F4 (IMPORTANT adversarial review):
+    /// `bias_dim * element_bytes` or `num_experts * bytes_per_expert`
+    /// overflows `usize`. Realistic checkpoints never trigger this
+    /// (would require num_experts in the billions), but an adversarial
+    /// safetensors with synthetic huge shapes would otherwise wrap to
+    /// a small allocation in release builds and trip a generic
+    /// copy_from_slice OOB panic. Surfacing the overflow as a typed
+    /// error matches the loud-refusal convention.
+    BiasByteOverflow {
+        hf_prefix: String,
+        projection: HfProjection,
+        bias_dim: usize,
+        num_experts: usize,
+        element_bytes: usize,
+    },
 }
 
 impl std::fmt::Display for PackError {
@@ -294,6 +387,56 @@ impl std::fmt::Display for PackError {
                 hf_prefix,
                 found_extra_index,
                 offending_key,
+            ),
+            Self::PartialBiasBundle { hf_prefix, present, missing } => write!(
+                f,
+                "pack_hf_mixtral_biases: prefix '{}' has partial HF bias bundle. present={:?}, missing={:?}. v4 bias auto-pack is all-or-nothing per block — either add the missing per-expert bias keys (one of `.w{{1,2,3}}.bias` per expert) or remove the present ones before loading.",
+                hf_prefix, present, missing,
+            ),
+            Self::ExtraBiasesPresent {
+                hf_prefix,
+                declared_num_experts,
+                found_extra_index,
+                offending_key,
+            } => write!(
+                f,
+                "pack_hf_mixtral_biases: caller declared {} experts under prefix '{}' but the WeightMap contains a bias entry at expert index {} ({}) — refuse rather than silently leave orphan biases",
+                declared_num_experts,
+                hf_prefix,
+                found_extra_index,
+                offending_key,
+            ),
+            Self::ZeroBiasDim { hf_prefix, projection, offending_key } => write!(
+                f,
+                "pack_hf_mixtral_biases: prefix '{}' projection {} bias ({}) has 0 elements. Zero-length biases are nonsensical and would later trip a confusing diagnostic at `detect_v4_biases`. Either remove the empty bias or fix the source checkpoint.",
+                hf_prefix,
+                projection.nsl_bias_suffix(),
+                offending_key,
+            ),
+            Self::MixedProjectionDtypes {
+                hf_prefix,
+                gate_dtype,
+                up_dtype,
+                down_dtype,
+            } => write!(
+                f,
+                "pack_hf_mixtral_biases: prefix '{}' has mismatched bias dtypes across projections (gate={}, up={}, down={}). The v4 FFI requires uniform dtype across all three projections (matching `tokens.dtype`); mixed dtypes would silently fail at the runtime dtype-equality gate. Re-export the checkpoint with consistent bias dtypes.",
+                hf_prefix, gate_dtype, up_dtype, down_dtype,
+            ),
+            Self::BiasByteOverflow {
+                hf_prefix,
+                projection,
+                bias_dim,
+                num_experts,
+                element_bytes,
+            } => write!(
+                f,
+                "pack_hf_mixtral_biases: prefix '{}' projection {} byte-count derivation overflows usize (bias_dim={}, num_experts={}, element_bytes={}). The checkpoint shape is pathologically large — re-export with realistic dims.",
+                hf_prefix,
+                projection.nsl_bias_suffix(),
+                bias_dim,
+                num_experts,
+                element_bytes,
             ),
         }
     }
@@ -570,6 +713,434 @@ pub fn pack_hf_mixtral_experts(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// CPDT Part III v2.15 — HF bias auto-pack
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Symmetric to the v2.6 weight pack: detect + transform per-expert HF
+// bias keys (`<prefix>.experts.{e}.w{1,2,3}.bias`) into NSL packed
+// convention (`<prefix>.experts.{gate,up,down}.bias`) so the v4 bias
+// detector (`detect_v4_biases` in `moe.rs`) resolves them.
+//
+// Layout transform is pure concatenation along a new expert axis:
+//   - Per-expert HF bias is 1-D `[D]` (matching the `nn.Linear.bias`
+//     convention: D = out_features of the parent weight).
+//   - NSL packed bias is 2-D `[num_experts, D]`, row-major.
+//   - NO transpose — biases are 1-D, so the byte ordering is just
+//     `expert0_bias || expert1_bias || …` concatenated.
+//
+// The `D` per projection follows the parent weight's `out_dim`:
+//   - Gate (w1.bias):  D = intermediate_dim
+//   - Up   (w3.bias):  D = intermediate_dim
+//   - Down (w2.bias):  D = hidden_dim
+//
+// Refusal contract (all-or-nothing per block):
+//   1. NO bias keys for any (projection, expert) slot → `Ok(None)` (no-op)
+//   2. ALL `3 * num_experts` bias keys present + consistent → pack
+//   3. Anything else → `Err(PartialBiasBundle | …)` — loud refusal.
+//      The v4 lowering's `detect_v4_biases` is itself all-or-nothing
+//      (gate + up + down all present, or none); auto-pack must honor
+//      the same contract or risk silently dropping biases at runtime.
+//
+// Scope: `.w{1,2,3}.bias` only (canonical PyTorch nn.Linear convention).
+// The dot-prefixed `.b{1,2,3}` form some early Mixtral exports used is
+// deferred to a future cycle. v3 (2-projection) bias auto-pack is not
+// reachable today because the weight detector requires all 3
+// `.w{1,2,3}.weight` keys (only the v4 path is auto-packable).
+
+/// Per-projection bias plan built by Phase 1 and consumed by Phase 2.
+/// Mirrors `ProjectionPlan` but for 1-D biases — no `in_dim`, no
+/// transpose. `bias_dim` is the parent weight's `out_dim` (intermediate
+/// for gate/up, hidden for down).
+struct BiasProjectionPlan {
+    projection: HfProjection,
+    bias_dim: usize,
+    dtype: crate::weight_aware::WeightDType,
+    element_bytes: usize,
+    /// `num_experts` long: the HF source key for each expert. Stored
+    /// from Phase 1 so Phase 2 doesn't re-derive via `format!`.
+    source_keys: Vec<String>,
+}
+
+/// Validate every per-expert bias key for the three projections.
+/// Returns `Ok(None)` when NO bias keys exist at all (the clean no-bias
+/// case). Returns `Ok(Some(plans))` when ALL `3 * num_experts` keys
+/// exist + are consistent. Returns `Err(...)` for any partial,
+/// shape-mismatched, dtype-mismatched, data-length-mismatched, or
+/// orphan-extra case.
+fn validate_all_bias_projections(
+    weight_map: &WeightMap,
+    hf_prefix: &str,
+    num_experts: usize,
+) -> Result<Option<Vec<BiasProjectionPlan>>, PackError> {
+    // First pass: collect which (projection, expert) bias keys exist.
+    // We need to know the all-vs-none state BEFORE per-projection
+    // validation, because the "no biases at all" outcome must short-
+    // circuit (it's not an error, just a no-op).
+    let mut present_keys: Vec<String> = Vec::new();
+    let mut missing_keys: Vec<String> = Vec::new();
+    for proj in HfProjection::ALL {
+        for e in 0..num_experts {
+            let key = format!(
+                "{}.experts.{}.{}",
+                hf_prefix,
+                e,
+                proj.hf_bias_suffix(),
+            );
+            if weight_map.get(&key).is_some() {
+                present_keys.push(key);
+            } else {
+                missing_keys.push(key);
+            }
+        }
+    }
+
+    if present_keys.is_empty() {
+        // Clean no-bias case — no-op for this block. The weight pack
+        // already happened (or is about to); the user's compilation
+        // proceeds with the v2.5/v2.7 no-bias 5-arg path.
+        return Ok(None);
+    }
+    if !missing_keys.is_empty() {
+        // Partial bundle. Refuse loudly with both lists so the user
+        // can pinpoint what's missing.
+        return Err(PackError::PartialBiasBundle {
+            hf_prefix: hf_prefix.to_string(),
+            present: present_keys,
+            missing: missing_keys,
+        });
+    }
+
+    // All `3 * num_experts` bias keys present. Validate per-projection
+    // shape + dtype + data-length consistency, mirroring the weight
+    // pack's per-projection pass.
+    let mut plans: Vec<BiasProjectionPlan> = Vec::with_capacity(3);
+    for proj in HfProjection::ALL {
+        let mut expected_num_elements: Option<usize> = None;
+        let mut expected_dtype: Option<crate::weight_aware::WeightDType> = None;
+        let mut source_keys: Vec<String> = Vec::with_capacity(num_experts);
+
+        for e in 0..num_experts {
+            let key = format!(
+                "{}.experts.{}.{}",
+                hf_prefix,
+                e,
+                proj.hf_bias_suffix(),
+            );
+            // Phase 1 above proved presence; double-checking here would
+            // mask a future regression in the all-or-nothing scan.
+            let entry = weight_map
+                .get(&key)
+                .expect("all-keys-present scan above validated existence");
+            // v2.15 review fix F5 (IMPORTANT): defensive invariant
+            // assertion that `num_elements` matches `shape.product()`.
+            // The WeightEntry constructor computes num_elements from
+            // shape, so this is true by construction — but a future
+            // refactor (e.g., adding a builder that lets callers
+            // override num_elements without re-deriving from shape)
+            // would silently break Phase 2's slice copy. Catching the
+            // drift here in debug builds prevents the silent
+            // truncation hazard.
+            debug_assert_eq!(
+                entry.num_elements,
+                entry.shape.iter().product::<usize>(),
+                "WeightEntry invariant: num_elements must equal shape.product() for key {}",
+                key,
+            );
+            // A bias entry is conventionally 1-D `[D]`, but a checkpoint
+            // shipped as `[1, D]` or `[D, 1]` has the same flat element
+            // count and is also accepted at the FFI layer. Match the
+            // detector's tolerance (`num_elements` only) here so a
+            // user's auto-packed bias keys resolve identically to a
+            // hand-packed bundle.
+            match (expected_num_elements, expected_dtype) {
+                (None, None) => {
+                    expected_num_elements = Some(entry.num_elements);
+                    expected_dtype = Some(entry.dtype);
+                }
+                (Some(n), Some(dt)) => {
+                    if entry.num_elements != n {
+                        return Err(PackError::ShapeMismatch {
+                            projection: proj,
+                            expected: vec![n],
+                            actual: vec![entry.num_elements],
+                            offending_expert: e,
+                        });
+                    }
+                    if entry.dtype != dt {
+                        return Err(PackError::DtypeMismatch {
+                            projection: proj,
+                            expected_dtype: format!("{:?}", dt),
+                            actual_dtype: format!("{:?}", entry.dtype),
+                            offending_expert: e,
+                        });
+                    }
+                }
+                _ => unreachable!("num_elements and dtype always set together"),
+            }
+            let expected_bytes = entry.num_elements * entry.dtype.byte_width();
+            if entry.data.len() != expected_bytes {
+                return Err(PackError::DataLengthMismatch {
+                    projection: proj,
+                    expert_index: e,
+                    key: key.clone(),
+                    expected_bytes,
+                    actual_bytes: entry.data.len(),
+                });
+            }
+            source_keys.push(key);
+        }
+
+        let dim = expected_num_elements.expect("first-expert pass sets expected_num_elements");
+        let dt = expected_dtype.expect("first-expert pass sets expected_dtype");
+        // v2.15 review fix F6 (IMPORTANT): refuse zero-element biases
+        // up-front. The pack would otherwise produce a `[num_experts,
+        // 0]` packed entry that `detect_v4_biases` later rejects with
+        // a less actionable diagnostic — surface the cause at its
+        // origin instead.
+        if dim == 0 {
+            return Err(PackError::ZeroBiasDim {
+                hf_prefix: hf_prefix.to_string(),
+                projection: proj,
+                offending_key: source_keys[0].clone(),
+            });
+        }
+        // v2.15 review fix F4 (IMPORTANT): refuse on overflow in the
+        // per-expert byte count derivation. Phase 2 multiplies
+        // `bias_dim * element_bytes` then `num_experts * ...` to
+        // allocate the packed buffer; wrapping multiplication in
+        // release builds would silently undersize the Vec and panic
+        // (or, with very large num_experts, allocate a tiny buffer
+        // and copy_from_slice would OOB on the first expert).
+        let bytes_per_expert = dim.checked_mul(dt.byte_width()).ok_or(
+            PackError::BiasByteOverflow {
+                hf_prefix: hf_prefix.to_string(),
+                projection: proj,
+                bias_dim: dim,
+                num_experts,
+                element_bytes: dt.byte_width(),
+            },
+        )?;
+        num_experts.checked_mul(bytes_per_expert).ok_or(
+            PackError::BiasByteOverflow {
+                hf_prefix: hf_prefix.to_string(),
+                projection: proj,
+                bias_dim: dim,
+                num_experts,
+                element_bytes: dt.byte_width(),
+            },
+        )?;
+        plans.push(BiasProjectionPlan {
+            projection: proj,
+            bias_dim: dim,
+            dtype: dt,
+            element_bytes: dt.byte_width(),
+            source_keys,
+        });
+    }
+
+    // v2.15 review fix F7 (IMPORTANT): cross-projection dtype
+    // consistency check. Within-projection consistency is enforced
+    // above (DtypeMismatch); cross-projection consistency must also
+    // hold because `nsl_moe_dispatch_full_v4` requires uniform dtype
+    // across all three bias arrays AND tokens. Refusing at pack time
+    // produces an actionable diagnostic instead of the FFI's silent
+    // `return 0` at the dtype-equality gate.
+    if !plans.is_empty() {
+        let gate_dt = plans[0].dtype;
+        let up_dt = plans[1].dtype;
+        let down_dt = plans[2].dtype;
+        if gate_dt != up_dt || up_dt != down_dt {
+            return Err(PackError::MixedProjectionDtypes {
+                hf_prefix: hf_prefix.to_string(),
+                gate_dtype: format!("{:?}", gate_dt),
+                up_dtype: format!("{:?}", up_dt),
+                down_dtype: format!("{:?}", down_dt),
+            });
+        }
+    }
+
+    // Extra-bias scan symmetric to the weight pack's extra-experts
+    // scan. A checkpoint with bias keys at index >= num_experts (a
+    // half-pruned bundle the weight scan didn't catch because the
+    // matching `.w*.weight` was deleted but `.w*.bias` wasn't) MUST be
+    // refused — those orphans would otherwise leak and confuse
+    // downstream passes that walk the WeightMap looking for keys
+    // under `<prefix>.experts.*`.
+    let prefix_search = format!("{}.experts.", hf_prefix);
+    let mut max_extra: Option<usize> = None;
+    for name in weight_map.names() {
+        let Some(rest) = name.strip_prefix(&prefix_search) else {
+            continue;
+        };
+        let Some((idx_str, tail)) = rest.split_once('.') else {
+            continue;
+        };
+        if !matches!(tail, "w1.bias" | "w2.bias" | "w3.bias") {
+            continue;
+        }
+        let Ok(idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
+        if idx >= num_experts {
+            max_extra = Some(max_extra.map_or(idx, |m| m.max(idx)));
+        }
+    }
+    if let Some(idx) = max_extra {
+        let offending_key = format!("{}{}.w1.bias", prefix_search, idx);
+        return Err(PackError::ExtraBiasesPresent {
+            hf_prefix: hf_prefix.to_string(),
+            declared_num_experts: num_experts,
+            found_extra_index: idx,
+            offending_key,
+        });
+    }
+
+    Ok(Some(plans))
+}
+
+/// Pack HF Mixtral per-expert MoE biases into NSL's packed convention.
+///
+/// See the section docstring above for the layout contract. On success
+/// the WeightMap is mutated: the `3 * num_experts` per-expert HF bias
+/// entries are removed, and 3 new packed bias entries are inserted
+/// under `<target_prefix>`.
+///
+/// Returns:
+///   - `Ok(None)` when the WeightMap holds no per-expert bias keys for
+///     any (projection, expert) slot under `hf_prefix`. The WeightMap
+///     is left untouched — this is the clean "no biases on this block"
+///     no-op path.
+///   - `Ok(Some(outcome))` when all `3 * num_experts` HF bias keys
+///     existed and got packed. The outcome enumerates the inserted +
+///     removed names for telemetry.
+///   - `Err(PackError::…)` for any refusal. Refusals are atomic
+///     (two-phase commit pattern, same as `pack_hf_mixtral_experts`):
+///     Phase 1 (`validate_all_bias_projections`) only reads, Phase 2
+///     stages all packed buffers locally then applies inserts + removes
+///     in one batch.
+///
+/// # Scope: what this function does and does NOT validate
+///
+/// v2.15 review fix F8 (IMPORTANT): the pack's job is to TRANSFORM HF
+/// key names into NSL key names without numerics validation. It does
+/// validate:
+///   - Per-projection shape + dtype consistency across experts
+///   - All-or-nothing per (projection, expert) slot presence
+///   - Cross-projection dtype consistency (gate/up/down all same dtype)
+///   - Non-zero bias dim
+///   - Byte-count overflow safety (`checked_mul` guards)
+///   - Per-projection target name collisions
+///   - Orphan bias keys at expert index >= num_experts
+///
+/// It does NOT validate:
+///   - Per-bias element count vs the parent WEIGHT's `out_dim` (gate
+///     bias should have `intermediate_dim` elements, down bias should
+///     have `hidden_dim` elements). That validation happens at
+///     codegen via [`crate::moe::detect_v4_biases`], which has access
+///     to the dims derived from `derive_v4_dims`. A user who packs a
+///     bundle with bias_dim mismatched against weight_out_dim will
+///     get an error at the v4 lowering, not at pack time.
+///
+/// This split mirrors the v2.6 weight pack's "pack is permissive,
+/// lowering is strict" principle — duplicating the dim derivation
+/// here would invite drift between the two validators.
+///
+/// # Scope: what the AUTO-DETECTOR does NOT find
+///
+/// v2.15 review fix F2 (HIGH): the orchestrator
+/// `pack_all_detected_hf_mixtral_blocks` discovers blocks via the
+/// weight-driven `detect_hf_mixtral_blocks` scan (which looks for
+/// `.w{1,2,3}.weight` keys). A checkpoint with HF BIASES but no HF
+/// WEIGHTS under the same prefix is NOT detected as a block, so
+/// `pack_hf_mixtral_biases` never runs and the biases stay orphaned.
+/// This is acceptable today because such a checkpoint is malformed
+/// for v4 dispatch (no weights → `derive_v4_dims` fails first), but
+/// a future cycle could extend the detector to also scan for bias
+/// keys for completeness.
+pub fn pack_hf_mixtral_biases(
+    weight_map: &mut WeightMap,
+    hf_prefix: &str,
+    target_prefix: &str,
+    num_experts: usize,
+) -> Result<Option<PackOutcome>, PackError> {
+    if num_experts == 0 {
+        return Err(PackError::ZeroNumExperts);
+    }
+
+    // Pre-check target name collisions on all 3 bias slots BEFORE the
+    // validation pass, mirroring the weight pack's pre-check. Same
+    // rationale: a regression that consolidated the collision checks
+    // would otherwise surface in surprising places.
+    for proj in HfProjection::ALL {
+        let target_name = format!("{}.{}", target_prefix, proj.nsl_bias_suffix());
+        if weight_map.get(&target_name).is_some() {
+            return Err(PackError::TargetAlreadyExists { name: target_name });
+        }
+    }
+
+    // PHASE 1 — validate. Returns Ok(None) if no biases anywhere, which
+    // we pass through directly: nothing to pack.
+    let Some(plans) = validate_all_bias_projections(weight_map, hf_prefix, num_experts)?
+    else {
+        return Ok(None);
+    };
+
+    // PHASE 2 — infallible. Build packed buffers locally, then apply
+    // inserts + removes atomically.
+    let mut staged_inserts: Vec<WeightEntry> = Vec::with_capacity(3);
+    let mut inserted_names: Vec<String> = Vec::with_capacity(3);
+    let mut removed_names: Vec<String> = Vec::with_capacity(3 * num_experts);
+
+    for plan in &plans {
+        let bytes_per_expert = plan.bias_dim * plan.element_bytes;
+        let mut packed = vec![0u8; num_experts * bytes_per_expert];
+        for (e, key) in plan.source_keys.iter().enumerate() {
+            let entry = weight_map
+                .get(key)
+                .expect("Phase 1 validated presence; WeightMap unchanged since");
+            // v2.15 review fix F14 (LOW): Phase 1's DataLengthMismatch
+            // check enforces `entry.data.len() == entry.num_elements *
+            // byte_width()` EXACTLY for every shape — 1-D `[D]`,
+            // 2-D `[1, D]`, 2-D `[D, 1]` — so by the time this code
+            // runs, `entry.data.len()` equals `bytes_per_expert`
+            // (because num_elements is invariant to layout and
+            // bias_dim was set from the same num_elements). The
+            // `[..bytes_per_expert]` slice is therefore a no-op range
+            // check that protects against future regressions in the
+            // Phase 1 contract. No padding semantics exist.
+            let dst_off = e * bytes_per_expert;
+            packed[dst_off..dst_off + bytes_per_expert]
+                .copy_from_slice(&entry.data[..bytes_per_expert]);
+        }
+        let packed_name = format!("{}.{}", target_prefix, plan.projection.nsl_bias_suffix());
+        let packed_shape = vec![num_experts, plan.bias_dim];
+        staged_inserts.push(WeightEntry::new(
+            packed_name.clone(),
+            packed,
+            packed_shape,
+            plan.dtype,
+        ));
+        inserted_names.push(packed_name);
+    }
+
+    for entry in staged_inserts {
+        weight_map.insert(entry);
+    }
+    for plan in &plans {
+        for key in &plan.source_keys {
+            weight_map.remove(key);
+            removed_names.push(key.clone());
+        }
+    }
+
+    Ok(Some(PackOutcome {
+        num_experts,
+        inserted_names,
+        removed_names,
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // CPDT Part III v2.7 — auto-detection
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -699,6 +1270,23 @@ pub struct AutoPackOutcome {
     /// MoE block (e.g., dtype mismatch on layer 5) still gets the
     /// other layers packed.
     pub failed: Vec<(DetectedHfMixtralBlock, PackError)>,
+    /// CPDT Part III v2.15: blocks whose weight pack succeeded AND
+    /// whose per-expert HF bias keys (`.w{1,2,3}.bias`) also packed
+    /// successfully into the NSL `.experts.{gate,up,down}.bias`
+    /// convention. Blocks with no bias keys do NOT appear here (the
+    /// bias pack returned `Ok(None)` — no-op). The wire-up at
+    /// `entry_points.rs` logs this list separately from `packed` so
+    /// users can see bias auto-pack firing in stderr.
+    pub bias_packed: Vec<(DetectedHfMixtralBlock, PackOutcome)>,
+    /// CPDT Part III v2.15: blocks whose weight pack succeeded but
+    /// whose bias pack refused (e.g., partial-bias bundle). Surfaced
+    /// alongside `failed` by the entry-points wrapper as a hard build
+    /// error — the v4 lowering would otherwise silently drop biases.
+    /// Note: a bias-pack failure does NOT roll back the successful
+    /// weight pack for that block; per-pass atomicity is preserved
+    /// (each pass is independently atomic), but cross-pass atomicity
+    /// is not (matching v2.7's cross-block independence).
+    pub bias_failed: Vec<(DetectedHfMixtralBlock, PackError)>,
 }
 
 /// Scan `weight_map` for HF Mixtral blocks (via
@@ -716,6 +1304,8 @@ pub fn pack_all_detected_hf_mixtral_blocks(weight_map: &mut WeightMap) -> AutoPa
     let detected = detect_hf_mixtral_blocks(weight_map);
     let mut packed = Vec::new();
     let mut failed = Vec::new();
+    let mut bias_packed = Vec::new();
+    let mut bias_failed = Vec::new();
     for block in detected {
         // Rewrite in place — target prefix == HF prefix. The v2.7
         // source kwarg `@moe(weight_prefix="…")` lets users point the
@@ -726,11 +1316,41 @@ pub fn pack_all_detected_hf_mixtral_blocks(weight_map: &mut WeightMap) -> AutoPa
             &block.hf_prefix,
             block.num_experts,
         ) {
-            Ok(outcome) => packed.push((block, outcome)),
+            Ok(outcome) => {
+                packed.push((block.clone(), outcome));
+                // CPDT Part III v2.15 — bias auto-pack. Only attempted
+                // when the weight pack succeeded (a weight-pack failure
+                // already surfaces as a hard build error at the
+                // entry-points wrapper). The bias pack is independent
+                // of the weight pack's atomicity: Ok(None) is the
+                // no-bias no-op, Ok(Some) is a successful per-block
+                // packing, Err is an all-or-nothing refusal that
+                // entry_points.rs surfaces alongside weight-pack
+                // failures.
+                match pack_hf_mixtral_biases(
+                    weight_map,
+                    &block.hf_prefix,
+                    &block.hf_prefix,
+                    block.num_experts,
+                ) {
+                    Ok(Some(bias_outcome)) => {
+                        bias_packed.push((block, bias_outcome));
+                    }
+                    Ok(None) => {
+                        // No biases on this block — clean no-op. Don't
+                        // record; the absence in `bias_packed` itself
+                        // is the signal that this block has no
+                        // biases.
+                    }
+                    Err(err) => {
+                        bias_failed.push((block, err));
+                    }
+                }
+            }
             Err(err) => failed.push((block, err)),
         }
     }
-    AutoPackOutcome { packed, failed }
+    AutoPackOutcome { packed, failed, bias_packed, bias_failed }
 }
 
 #[cfg(test)]
@@ -1739,5 +2359,508 @@ mod tests {
         // The stale packed entry is preserved (atomic refusal).
         assert!(wm.get("moe0.experts.gate.weight").is_some());
         assert!(wm.get("moe0.experts.0.w1.weight").is_some());
+    }
+
+    // ── v2.15 — HF bias auto-pack tests ───────────────────────────────
+
+    /// Helper: insert per-expert HF biases for ALL three projections.
+    /// `intermediate` is the gate/up bias dim; `hidden` is the down
+    /// bias dim. Matches `nn.Linear.bias` shape `[out_features]` per
+    /// projection.
+    fn insert_hf_biases(
+        wm: &mut WeightMap,
+        prefix: &str,
+        num_experts: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) {
+        for e in 0..num_experts {
+            // w1.bias (gate) shape [intermediate]
+            wm.insert(make_f32_entry(
+                &format!("{}.experts.{}.w1.bias", prefix, e),
+                vec![intermediate],
+                &vec![1.0_f32 + e as f32; intermediate],
+            ));
+            // w3.bias (up) shape [intermediate]
+            wm.insert(make_f32_entry(
+                &format!("{}.experts.{}.w3.bias", prefix, e),
+                vec![intermediate],
+                &vec![10.0_f32 + e as f32; intermediate],
+            ));
+            // w2.bias (down) shape [hidden]
+            wm.insert(make_f32_entry(
+                &format!("{}.experts.{}.w2.bias", prefix, e),
+                vec![hidden],
+                &vec![100.0_f32 + e as f32; hidden],
+            ));
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_two_experts_packs_correctly() {
+        // 2 experts, hidden=2, intermediate=3. Weights are present too
+        // but this test exercises the bias pack in isolation (skip the
+        // orchestrator). After packing:
+        //   - gate.bias / up.bias shape [2, 3] (intermediate dim)
+        //   - down.bias shape [2, 2] (hidden dim)
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_biases(&mut wm, "moe0", 2, 2, 3);
+
+        let outcome = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("pack ok")
+            .expect("biases present, must produce Some");
+
+        assert_eq!(outcome.num_experts, 2);
+        assert_eq!(outcome.inserted_names.len(), 3);
+        assert_eq!(outcome.removed_names.len(), 6);
+
+        let gate = wm.get("moe0.experts.gate.bias").expect("gate.bias present");
+        assert_eq!(gate.shape, vec![2, 3]);
+        // Expert 0 gate.bias = [1, 1, 1]; expert 1 = [2, 2, 2].
+        let gate_vals = read_f32(gate);
+        assert_eq!(gate_vals, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+
+        let up = wm.get("moe0.experts.up.bias").expect("up.bias present");
+        assert_eq!(up.shape, vec![2, 3]);
+        let up_vals = read_f32(up);
+        assert_eq!(up_vals, vec![10.0, 10.0, 10.0, 11.0, 11.0, 11.0]);
+
+        let down = wm.get("moe0.experts.down.bias").expect("down.bias present");
+        assert_eq!(down.shape, vec![2, 2]);
+        let down_vals = read_f32(down);
+        assert_eq!(down_vals, vec![100.0, 100.0, 101.0, 101.0]);
+
+        // Per-expert HF bias sources removed.
+        for proj in ["w1", "w2", "w3"] {
+            for e in 0..2 {
+                let key = format!("moe0.experts.{}.{}.bias", e, proj);
+                assert!(wm.get(&key).is_none(), "{} should be removed", key);
+            }
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_no_biases_present_returns_ok_none() {
+        // Clean no-bias case — no per-expert .w*.bias keys exist. The
+        // pack returns Ok(None) and leaves the WeightMap untouched.
+        let mut wm = WeightMap::new_for_test();
+        // Insert only weights (no biases) so the orchestrator's
+        // weight-pack would still succeed for this block.
+        insert_hf_block(&mut wm, "moe0", 2);
+        let names_before: Vec<String> = wm.names().map(|s| s.to_string()).collect();
+        let result = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("pack ok");
+        assert!(result.is_none(), "no biases present → Ok(None) expected");
+        let names_after: Vec<String> = wm.names().map(|s| s.to_string()).collect();
+        assert_eq!(names_before, names_after, "WeightMap must be untouched");
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_partial_bundle_missing_one_expert() {
+        // 2 experts; expert 0 has all 3 bias suffixes, expert 1 only
+        // has w1.bias + w3.bias (missing w2.bias). Partial bundle —
+        // refuse loudly.
+        let mut wm = WeightMap::new_for_test();
+        // Full expert 0.
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        // Partial expert 1 — w2.bias missing.
+        wm.insert(make_f32_entry("moe0.experts.1.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.1.w3.bias", vec![3], &[1.0; 3]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::PartialBiasBundle { present, missing, .. } => {
+                assert_eq!(present.len(), 5);
+                assert_eq!(missing.len(), 1);
+                assert!(missing.iter().any(|s| s == "moe0.experts.1.w2.bias"));
+            }
+            other => panic!("expected PartialBiasBundle, got {:?}", other),
+        }
+        // Atomicity — every bias source preserved, no packed entries.
+        assert!(wm.get("moe0.experts.0.w1.bias").is_some());
+        assert!(wm.get("moe0.experts.gate.bias").is_none());
+        assert!(wm.get("moe0.experts.up.bias").is_none());
+        assert!(wm.get("moe0.experts.down.bias").is_none());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_partial_bundle_missing_full_projection() {
+        // Partial-by-projection: ALL experts have w1.bias + w3.bias but
+        // NO expert has w2.bias. The downstream `detect_v4_biases`
+        // requires all 3 directions; auto-pack must refuse to avoid
+        // silently dropping the down bias at runtime.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w1.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w3.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+        }
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::PartialBiasBundle { present, missing, .. } => {
+                assert_eq!(present.len(), 4);
+                assert_eq!(missing.len(), 2);
+                // Both missing entries are w2.bias.
+                assert!(missing.iter().all(|s| s.ends_with("w2.bias")));
+            }
+            other => panic!("expected PartialBiasBundle, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_shape_mismatch() {
+        // Expert 0 w1.bias is [3]; expert 1 w1.bias is [4]. Mismatched
+        // bias dim on Gate — silent-corruption hazard (packed buffer
+        // would have wrong stride).
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        wm.insert(make_f32_entry("moe0.experts.1.w1.bias", vec![4], &[1.0; 4]));
+        wm.insert(make_f32_entry("moe0.experts.1.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.1.w2.bias", vec![2], &[1.0; 2]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::ShapeMismatch { projection, expected, actual, offending_expert } => {
+                assert_eq!(projection, HfProjection::Gate);
+                assert_eq!(expected, vec![3]);
+                assert_eq!(actual, vec![4]);
+                assert_eq!(offending_expert, 1);
+            }
+            other => panic!("expected ShapeMismatch on Gate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_dtype_mismatch() {
+        // Expert 0 biases F32; expert 1 w3.bias F16 (same element
+        // count, different dtype). Refuse — silent reinterpretation
+        // across the packed tensor would corrupt the runtime read.
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        wm.insert(make_f32_entry("moe0.experts.1.w1.bias", vec![3], &[1.0; 3]));
+        // F16 expert-1 w3.bias — 3 elements * 2 bytes = 6 bytes.
+        wm.insert(WeightEntry::new(
+            "moe0.experts.1.w3.bias".to_string(),
+            vec![0u8; 6],
+            vec![3],
+            WeightDType::F16,
+        ));
+        wm.insert(make_f32_entry("moe0.experts.1.w2.bias", vec![2], &[1.0; 2]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::DtypeMismatch { projection, offending_expert, .. } => {
+                assert_eq!(projection, HfProjection::Up);
+                assert_eq!(offending_expert, 1);
+            }
+            other => panic!("expected DtypeMismatch on Up, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_target_collision() {
+        // Pre-existing gate.bias under target prefix — refuse loudly
+        // rather than overwriting.
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("moe0.experts.gate.bias", vec![1, 3], &[99.0; 3]));
+        // Plus a valid HF bias bundle for 1 expert.
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 1).unwrap_err();
+        assert!(
+            matches!(err, PackError::TargetAlreadyExists { ref name } if name == "moe0.experts.gate.bias"),
+            "expected TargetAlreadyExists on gate.bias, got {:?}",
+            err,
+        );
+        // Stale packed entry preserved; HF sources preserved.
+        assert!(wm.get("moe0.experts.0.w1.bias").is_some());
+        let pre = wm.get("moe0.experts.gate.bias").unwrap();
+        assert_eq!(read_f32(pre), vec![99.0, 99.0, 99.0]);
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_extra_biases_at_higher_index() {
+        // Caller declares 2 experts; valid bias bundles for experts
+        // 0+1; expert 5 has w1.bias only (orphan). Refuse loudly via
+        // the unified extra-bias scan — partial expert 5 would also
+        // trip PartialBiasBundle, but for HIGH indices the orphan
+        // semantics are clearer than "partial bundle".
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_biases(&mut wm, "moe0", 2, 2, 3);
+        // Orphan at index 5.
+        wm.insert(make_f32_entry("moe0.experts.5.w1.bias", vec![3], &[1.0; 3]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::ExtraBiasesPresent { found_extra_index, .. } => {
+                assert_eq!(found_extra_index, 5);
+            }
+            other => panic!("expected ExtraBiasesPresent at index 5, got {:?}", other),
+        }
+        // Atomicity: orphan preserved, no packed entries.
+        assert!(wm.get("moe0.experts.5.w1.bias").is_some());
+        assert!(wm.get("moe0.experts.gate.bias").is_none());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_zero_num_experts() {
+        let mut wm = WeightMap::new_for_test();
+        assert!(matches!(
+            pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 0),
+            Err(PackError::ZeroNumExperts)
+        ));
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_packs_weights_and_biases_in_place() {
+        // End-to-end through the orchestrator: a block with both
+        // weights AND biases gets both packed in a single call, and
+        // the resulting WeightMap looks exactly like a hand-packed
+        // bundle.
+        let mut wm = WeightMap::new_for_test();
+        // hidden=2, intermediate=3, 2 experts. insert_hf_block uses
+        // these exact dims for weights (w1/w3 = [3,2] = [intermediate,
+        // hidden]; w2 = [2,3] = [hidden, intermediate]).
+        insert_hf_block(&mut wm, "moe0", 2);
+        insert_hf_biases(&mut wm, "moe0", 2, 2, 3);
+
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.packed.len(), 1, "weight pack succeeded");
+        assert_eq!(outcome.bias_packed.len(), 1, "bias pack succeeded");
+        assert!(outcome.failed.is_empty());
+        assert!(outcome.bias_failed.is_empty());
+
+        // Both weight + bias packed entries exist under the NSL
+        // convention.
+        assert!(wm.get("moe0.experts.gate.weight").is_some());
+        assert!(wm.get("moe0.experts.up.weight").is_some());
+        assert!(wm.get("moe0.experts.down.weight").is_some());
+        assert!(wm.get("moe0.experts.gate.bias").is_some());
+        assert!(wm.get("moe0.experts.up.bias").is_some());
+        assert!(wm.get("moe0.experts.down.bias").is_some());
+
+        // All HF sources (weights + biases) removed.
+        for proj in ["w1", "w2", "w3"] {
+            for e in 0..2 {
+                assert!(
+                    wm.get(&format!("moe0.experts.{}.{}.weight", e, proj)).is_none(),
+                    "{} weight should be removed", proj,
+                );
+                assert!(
+                    wm.get(&format!("moe0.experts.{}.{}.bias", e, proj)).is_none(),
+                    "{} bias should be removed", proj,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_packs_weights_skipping_biases_when_absent() {
+        // Block has weights only (no biases) — the orchestrator packs
+        // weights successfully and the bias pass returns Ok(None) so
+        // nothing is recorded in bias_packed. Verifies the no-op path
+        // doesn't pollute the outcome.
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_block(&mut wm, "moe0", 2);
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.packed.len(), 1);
+        assert!(outcome.bias_packed.is_empty(), "no biases → bias_packed empty");
+        assert!(outcome.failed.is_empty());
+        assert!(outcome.bias_failed.is_empty());
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_partial_bias_bundle_surfaces_in_bias_failed() {
+        // Block has weights + a PARTIAL bias bundle (only w1.bias for
+        // expert 0). The orchestrator packs weights successfully but
+        // the bias pass refuses with PartialBiasBundle, which lands
+        // in bias_failed (and entry_points.rs turns this into a hard
+        // build error).
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_block(&mut wm, "moe0", 2);
+        // Only one bias key out of 6 — clear partial state.
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.packed.len(), 1, "weight pack must succeed");
+        assert!(outcome.bias_packed.is_empty(), "bias pack failed, nothing packed");
+        assert_eq!(outcome.bias_failed.len(), 1, "partial-bias-bundle surfaced");
+        assert!(matches!(
+            outcome.bias_failed[0].1,
+            PackError::PartialBiasBundle { .. }
+        ));
+        // Weight pack DID apply (per-pass atomicity, not cross-pass).
+        // Source bias key for expert 0 preserved — the PartialBiasBundle
+        // refusal didn't touch it.
+        assert!(wm.get("moe0.experts.gate.weight").is_some());
+        assert!(wm.get("moe0.experts.0.w1.bias").is_some());
+    }
+
+    // ── v2.15 review fixes — additional refusal coverage ──────────────
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_target_collision_on_up_not_just_gate() {
+        // v2.15 review fix F1 (HIGH): the pre-check loop covers all 3
+        // bias slots (gate/up/down), but the original test suite only
+        // exercised the Gate slot. A regression that consolidated the
+        // pre-check to only Gate would let an Up or Down collision
+        // proceed to Phase 2's `weight_map.insert()`, which silently
+        // overwrites the stale entry. Pin Up explicitly.
+        let mut wm = WeightMap::new_for_test();
+        // Pre-existing collision on the Up bias target only.
+        wm.insert(make_f32_entry("moe0.experts.up.bias", vec![1, 3], &[99.0; 3]));
+        // Valid HF bias bundle for 1 expert.
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 1).unwrap_err();
+        assert!(
+            matches!(err, PackError::TargetAlreadyExists { ref name } if name == "moe0.experts.up.bias"),
+            "expected TargetAlreadyExists on up.bias, got {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_target_collision_on_down_not_just_gate() {
+        // v2.15 review fix F1 (HIGH): symmetric test for the Down slot.
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("moe0.experts.down.bias", vec![1, 2], &[99.0; 2]));
+        wm.insert(make_f32_entry("moe0.experts.0.w1.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w3.bias", vec![3], &[1.0; 3]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.bias", vec![2], &[1.0; 2]));
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 1).unwrap_err();
+        assert!(
+            matches!(err, PackError::TargetAlreadyExists { ref name } if name == "moe0.experts.down.bias"),
+            "expected TargetAlreadyExists on down.bias, got {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_zero_bias_dim() {
+        // v2.15 review fix F6 (IMPORTANT): a [0]-shaped bias for all
+        // experts trips the ZeroBiasDim refusal at Phase 1, surfacing
+        // the cause at the bias source rather than as a less actionable
+        // "0 elements; expected N" diagnostic from detect_v4_biases
+        // later.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w1.bias", e),
+                vec![0],
+                &[],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w3.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w2.bias", e),
+                vec![2],
+                &[1.0; 2],
+            ));
+        }
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::ZeroBiasDim { projection, offending_key, .. } => {
+                assert_eq!(projection, HfProjection::Gate);
+                assert!(offending_key.ends_with("w1.bias"));
+            }
+            other => panic!("expected ZeroBiasDim on Gate, got {:?}", other),
+        }
+        // Atomicity: no packed entries appeared.
+        assert!(wm.get("moe0.experts.gate.bias").is_none());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_refuses_mixed_projection_dtypes() {
+        // v2.15 review fix F7 (IMPORTANT): gate F32, up F32, down F16
+        // is internally consistent within each projection (every
+        // expert's bias for that projection has the same dtype), but
+        // the cross-projection mismatch would silently fail the
+        // runtime FFI's dtype-equality gate (return 0 with no clear
+        // diagnostic). Refusing here at pack time gives a clear error.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            // Gate + Up: F32 (3 elements per bias).
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w1.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w3.bias", e),
+                vec![3],
+                &[1.0; 3],
+            ));
+            // Down: F16 (2 elements per bias = 4 bytes).
+            wm.insert(WeightEntry::new(
+                format!("moe0.experts.{}.w2.bias", e),
+                vec![0u8; 4],
+                vec![2],
+                WeightDType::F16,
+            ));
+        }
+        let err = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::MixedProjectionDtypes { gate_dtype, up_dtype, down_dtype, .. } => {
+                assert_eq!(gate_dtype, "F32");
+                assert_eq!(up_dtype, "F32");
+                assert_eq!(down_dtype, "F16");
+            }
+            other => panic!("expected MixedProjectionDtypes, got {:?}", other),
+        }
+        // Atomicity: no packed entries appeared.
+        assert!(wm.get("moe0.experts.gate.bias").is_none());
+        assert!(wm.get("moe0.experts.up.bias").is_none());
+        assert!(wm.get("moe0.experts.down.bias").is_none());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_biases_accepts_2d_packed_bias_shape() {
+        // Some checkpoints ship per-expert bias as `[1, D]` instead of
+        // `[D]` (a leftover from a packing pre-script). Match the v4
+        // detector's tolerance (num_elements-only) by accepting both
+        // layouts. The packed output should be byte-identical.
+        let mut wm = WeightMap::new_for_test();
+        for e in 0..2 {
+            // 2-D `[1, 3]` w1.bias instead of 1-D `[3]`.
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w1.bias", e),
+                vec![1, 3],
+                &[1.0_f32 + e as f32; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w3.bias", e),
+                vec![1, 3],
+                &[10.0_f32 + e as f32; 3],
+            ));
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.{}.w2.bias", e),
+                vec![1, 2],
+                &[100.0_f32 + e as f32; 2],
+            ));
+        }
+        let outcome = pack_hf_mixtral_biases(&mut wm, "moe0", "moe0", 2)
+            .expect("pack ok")
+            .expect("biases present");
+        let gate = wm.get("moe0.experts.gate.bias").expect("gate.bias present");
+        // Packed shape is canonicalized to [num_experts, bias_dim],
+        // independent of source shape.
+        assert_eq!(gate.shape, vec![2, 3]);
+        let gate_vals = read_f32(gate);
+        assert_eq!(gate_vals, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        assert_eq!(outcome.num_experts, 2);
     }
 }
