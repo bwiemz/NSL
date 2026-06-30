@@ -83,6 +83,14 @@ pub(crate) fn invoke_cpdt_if_enabled(
     applied_plan: &crate::wggo_apply::AppliedPlan,
     train_block: Option<&nsl_ast::block::TrainBlock>,
 ) {
+    // Experimental subsystem (CPDT). Compiled in by default; a build that opts
+    // out (`--no-default-features` without `experimental-cpdt`) turns CPDT
+    // planning into a no-op here. See STATUS.md / docs/architecture/.
+    #[cfg(not(feature = "experimental-cpdt"))]
+    {
+        let _ = (compiler, applied_plan, train_block);
+        return;
+    }
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
     use crate::cpdt_expert::ExpertConfig;
     use crate::cpdt_joint::JointConfig;
@@ -208,7 +216,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // Publish to the CLI-owned output slot (if any) so `nsl build` can
     // render the plan after compile returns without threading it through
     // every entry-point's return tuple.
-    if let Some(slot) = compiler.compile_options.cpdt_plan_out.as_ref() {
+    if let Some(slot) = compiler.compile_options.cpdt.plan_out.as_ref() {
         if let Ok(mut guard) = slot.lock() {
             *guard = Some(plan.clone());
         }
@@ -220,6 +228,14 @@ pub(crate) fn invoke_wrga_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
 ) -> Option<crate::wrga::WrgaPlan> {
+    // Experimental subsystem (WRGA). Compiled in by default; a build that opts
+    // out (`--no-default-features` without `experimental-wrga`) turns WRGA
+    // adapter/freeze codegen into a no-op here. See STATUS.md / docs/architecture/.
+    #[cfg(not(feature = "experimental-wrga"))]
+    {
+        let _ = (compiler, list);
+        return None;
+    }
     let inputs = compiler.wrga_inputs.as_ref()?;
     if inputs.wrga.is_empty() && inputs.freeze.is_empty() && inputs.adapter.is_empty() {
         return None;
@@ -4298,7 +4314,7 @@ impl Compiler<'_> {
                 // (via self.wggo_overrides) so that per-layer fusion-level
                 // decisions from WGGO are honoured (or rejected with a
                 // diagnostic) by CSHA.
-                if let Some(ref mode_str) = self.compile_options.csha_mode {
+                if let Some(ref mode_str) = self.compile_options.csha.mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // H.1: when `@flash_attention(head_dim=N)` is on a
                         // method, `compile_flash_attention_kernels` has
@@ -4334,7 +4350,7 @@ impl Compiler<'_> {
                             8,    // default head count; weight-informed path refines this
                             self.wggo_overrides.as_ref(),
                         ) {
-                            if self.compile_options.csha_report {
+                            if self.compile_options.csha.report {
                                 eprintln!("{}", plan.render_report());
                             } else {
                                 eprintln!("[csha] {}", plan.summary());

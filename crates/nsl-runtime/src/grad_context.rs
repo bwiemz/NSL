@@ -477,3 +477,31 @@ pub extern "C" fn nsl_model_backward(
     crate::list::nsl_list_free(grads_list);
     0
 }
+
+#[cfg(test)]
+mod abi_layout_tests {
+    use super::GradContext;
+    use std::mem::{align_of, offset_of};
+
+    /// `GradContext` crosses the C ABI only as an opaque `*mut GradContext`
+    /// (passed as an `i64` handle). The one field C touches directly is
+    /// `magic`: callers do a 4-byte read at the pointer to distinguish a live
+    /// context (`NSL_GRAD_CONTEXT_MAGIC`) from a freed/garbage one before any
+    /// dereference — the same guard pattern as `TENSOR_MAGIC` in
+    /// `tensor::nsl_tensor_free_if_valid`. That read is only valid while
+    /// `magic` is the FIRST field. This golden test pins the invariant so a
+    /// field reorder can't silently turn the validation into a wild read.
+    #[test]
+    fn magic_is_first_field_for_ffi_validation() {
+        assert_eq!(
+            offset_of!(GradContext, magic),
+            0,
+            "GradContext.magic must be at offset 0 so the C-side 4-byte magic \
+             read validates the right bytes; moving it is a breaking ABI change",
+        );
+        assert!(
+            align_of::<GradContext>() >= align_of::<u32>(),
+            "GradContext must be at least u32-aligned so the magic read is not torn",
+        );
+    }
+}

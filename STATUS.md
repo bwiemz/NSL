@@ -98,6 +98,33 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 
 ---
 
+## Opting out of experimental subsystems
+
+The experimental passes are compiled in by default. A downstream build can opt
+out of a research subsystem with Cargo features (phase-1: behavioral gating at
+the pass entry point — the pass becomes a no-op; it does not yet strip the
+modules from the binary):
+
+```bash
+# Build with WRGA + CPDT planning disabled (passes become no-ops):
+cargo build -p nsl-codegen --no-default-features --features "<keep these>"
+```
+
+Currently gated at their entry point: `experimental-wrga`, `experimental-cpdt`
+(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA/ZK/FPGA
+follow the same pattern as gating is extended. See
+[`docs/architecture/compiler-state.md`](docs/architecture/compiler-state.md)
+for the compiler-state model (and the thread-local audit + migration plan that
+the same hardening pass produced).
+
+The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
+(`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`, …).
+The `calibration_*` and dev-tools (`profile_*`/`health_*`) clusters are left
+flat *deliberately*: they are already prefix-cohesive and their field names
+(`target_gpu`, `dtype`, `calibration_data`) collide with identically-named
+fields on other structs, so a mechanical rename is unsafe without per-site type
+analysis. Group them only alongside that analysis.
+
 ## How this maps to tests
 
 | Tier         | Required on every PR | Nightly / env-gated         | Informational only |

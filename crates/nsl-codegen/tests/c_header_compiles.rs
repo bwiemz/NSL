@@ -106,3 +106,39 @@ int64_t (*nsl_abi_version_ptr)(void) = &nsl_abi_version;
         header,
     );
 }
+
+/// The generated C header pins the ABI version it was built against via the
+/// `NSL_ABI_VERSION_MAJOR` / `_MINOR` macros. Those must always equal the live
+/// runtime constants — otherwise a host built against a stale header links a
+/// runtime it silently disagrees with. This catches codegen/runtime version
+/// skew with a pure text comparison (no C compiler), so it runs everywhere,
+/// including Windows runners without a toolchain.
+#[test]
+fn c_header_abi_version_matches_runtime_constants() {
+    let header = nsl_codegen::c_header::emit(&[], "version_check");
+
+    let macro_u32 = |name: &str| -> u32 {
+        let needle = format!("#define {name} ");
+        let start = header
+            .find(&needle)
+            .unwrap_or_else(|| panic!("generated header is missing `{name}`:\n{header}"));
+        let rest = &header[start + needle.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{name}` macro value is not a u32: {rest:?}"))
+    };
+
+    assert_eq!(
+        macro_u32("NSL_ABI_VERSION_MAJOR"),
+        nsl_runtime::c_api::NSL_ABI_VERSION_MAJOR,
+        "generated header NSL_ABI_VERSION_MAJOR diverges from the runtime constant; \
+         the header generator and runtime must agree on the ABI version",
+    );
+    assert_eq!(
+        macro_u32("NSL_ABI_VERSION_MINOR"),
+        nsl_runtime::c_api::NSL_ABI_VERSION_MINOR,
+        "generated header NSL_ABI_VERSION_MINOR diverges from the runtime constant; \
+         the header generator and runtime must agree on the ABI version",
+    );
+}

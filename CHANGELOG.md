@@ -26,6 +26,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   experimental, FFI, hardware-claim, config-sprawl, and clippy-suppression
   boundaries; test requirements split into required-on-PR / nightly / research.
 
+### Added — Architecture hardening (cont.: config decomposition, PTX metadata, FFI/state)
+
+- `CompileOptions` decomposition continued: extracted the `csha_*` cluster into
+  `CshaOptions` and the `cpdt_*` cluster into `CpdtOptions` (joining the existing
+  `WcetOptions`/`ZkOptions`/`WggoOptions`). `CompileOptions.{csha,cpdt}` replace
+  six flat fields; behavior-preserving. The `calibration_*` and dev-tools
+  clusters are left flat deliberately (already prefix-cohesive; their field names
+  collide with identically-named fields on other structs, so a blind rename is
+  unsafe) — rationale recorded in `STATUS.md`.
+- `nsl_codegen::ptx_metadata` — static, dependency-free, GPU-free parser that
+  extracts per-kernel declared register counts, static shared-memory bytes, and
+  target SM from synthesized PTX text, plus a report formatter that flags kernels
+  exceeding the 255-register per-thread cap. Covered by unit tests + a public-API
+  integration test.
+- `nsl ptx-metadata <file.ptx>` — CLI subcommand surfacing the per-kernel PTX
+  resource report (registers / shared memory / target SM). Pure text analysis;
+  no CUDA toolkit required.
+- FFI safety tests: `grad_context::abi_layout_tests::magic_is_first_field_for_ffi_validation`
+  pins `GradContext.magic` at offset 0 (the only field the C side reads through
+  the opaque handle); `c_header_abi_version_matches_runtime_constants` asserts the
+  generated header's `NSL_ABI_VERSION_*` macros equal the live runtime constants
+  (catches codegen/runtime version skew; no C compiler needed).
+- Experimental subsystem feature flags: `experimental-wrga` / `experimental-cpdt`
+  (both in `default`) gate the WRGA and CPDT pass entry points in `stmt.rs`, so a
+  `--no-default-features` build can turn those research passes into no-ops. The
+  default build is byte-identical (gates compile out). Phase-1 behavioral gating;
+  see `docs/architecture/compiler-state.md`.
+- `docs/architecture/compiler-state.md` — audit of compiler/runtime thread-local
+  globals (classified test-only / FFI-OK / migrate), establishing `Compiler` as
+  the session object and a staged plan to retire the WRGA build-side globals into
+  explicit context (review item: "replace hidden thread-local state").
+- `docs/hardware/cuda_status.md` — "Golden CPU-reference test coverage" section
+  making the GPU-vs-CPU-oracle validation pattern traceable to specific tests.
+
 ### Changed
 
 - `SECURITY.md` — corrected the supported-versions table (now `main` + 0.9.x)
