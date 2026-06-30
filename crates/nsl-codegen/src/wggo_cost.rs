@@ -100,6 +100,14 @@ pub struct LayerCostLut {
     pub axes_adapter_ranks: Vec<u64>,
     /// Flattened row-major `[heads][ffn][csha][rank]` entries.
     pub entries: Vec<LayerCostEntry>,
+    /// Model dtype size (bytes).  Needed to convert an entry's `param_bytes`
+    /// into a parameter *element* count for the precision-aware optimizer term
+    /// ([`optimizer_us`]).
+    pub dtype_bytes: u64,
+    /// Target HBM bandwidth (GB/s).  The optimizer term divides bytes-moved by
+    /// this (same divisor as [`comm_optim_us`]) so it is commensurate, in μs,
+    /// with the forward/backward latencies the ILP already sums.
+    pub peak_bandwidth_gbs: f64,
 }
 
 impl LayerCostLut {
@@ -176,6 +184,8 @@ pub fn build_lut(shape: &LayerShape, gpu: &GpuSpec, axes: &LutAxes) -> LayerCost
         axes_csha_levels: axes.csha_levels.clone(),
         axes_adapter_ranks: axes.adapter_ranks.clone(),
         entries,
+        dtype_bytes: shape.dtype_bytes,
+        peak_bandwidth_gbs: gpu.peak_bandwidth_gbs,
     }
 }
 
@@ -314,6 +324,54 @@ pub fn comm_optim_us(
     (comm_us, optim_us)
 }
 
+/// Optimizer-step latency (μs) for one layer — **precision- and FASE-aware**.
+///
+/// Adam's update is HBM-bandwidth-bound: each step streams the master
+/// parameter (read + write) and the gradient (read) at the model dtype, plus
+/// the two moment buffers `m`, `v` (each read + write) at their *chosen*
+/// precisions `p_m`, `p_v`.  Lower moment precision ⇒ fewer bytes moved ⇒ a
+/// cheaper step.
+///
+/// This is the cost signal the Level-2 ILP needs to trade optimizer precision
+/// against numerical safety: without it the ILP's objective is independent of
+/// `p_m`/`p_v`, so it has no reason to ever pick sub-fp32 moments (it just
+/// keeps whichever precision it enumerates first — 32-bit).  The DP's coarser
+/// [`comm_optim_us`] stays precision-blind on purpose: precision is a Level-2
+/// decision, unknown when the Level-1 DP runs.
+///
+/// When FASE fuses the optimizer step into the backward pass, the standalone
+/// gradient HBM round-trip is eliminated (the gradient is already resident from
+/// backward), so that read is dropped.
+///
+/// `param_bytes` / `dtype_bytes` describe the layer's parameters at the model
+/// dtype; `peak_bandwidth_gbs` is the same HBM-bandwidth divisor
+/// [`comm_optim_us`] uses, so the result is commensurate, in μs, with the
+/// forward/backward latencies the ILP already sums.
+///
+/// Simplification: the master parameter and gradient are modeled at the *model*
+/// dtype (`param_bytes`), not a separate fp32 master copy.  For sub-fp32 models
+/// this under-counts master-copy traffic, but it matches the existing
+/// [`comm_optim_us`] convention and preserves the term's purpose — the relative
+/// ordering across `m_bits`/`v_bits` (lower precision is cheaper).  A separate
+/// `master_dtype_bytes` is a future refinement.
+pub fn optimizer_us(
+    param_bytes: u64,
+    dtype_bytes: u64,
+    m_bits: u8,
+    v_bits: u8,
+    fase_fused: bool,
+    peak_bandwidth_gbs: f64,
+) -> f64 {
+    let elements = param_bytes as f64 / dtype_bytes.max(1) as f64;
+    let m_bytes = elements * (m_bits as f64 / 8.0);
+    let v_bytes = elements * (v_bits as f64 / 8.0);
+    let param_rw = 2.0 * param_bytes as f64; // master read + write
+    let grad_read = if fase_fused { 0.0 } else { param_bytes as f64 };
+    let moment_rw = 2.0 * m_bytes + 2.0 * v_bytes; // m, v each read + write
+    let total_bytes = param_rw + grad_read + moment_rw;
+    total_bytes / (peak_bandwidth_gbs.max(1.0) * 1e9) * 1e6
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -362,6 +420,37 @@ mod tests {
         let (_, o8) = comm_optim_us(1_000_000, 1, 8, 300.0, h100());
         assert!(o1 > 0.0);
         assert!(o8 < o1);
+    }
+
+    #[test]
+    fn optimizer_us_decreases_with_lower_moment_precision() {
+        // The core gap-#2 signal: cheaper moments ⇒ cheaper step, so the ILP
+        // gets a reason to lower precision when numerically safe.
+        let o32 = optimizer_us(1_000_000, 2, 32, 32, false, 3350.0);
+        let o16 = optimizer_us(1_000_000, 2, 16, 16, false, 3350.0);
+        let o8 = optimizer_us(1_000_000, 2, 8, 8, false, 3350.0);
+        assert!(o32 > o16, "32-bit moments must cost more than 16-bit");
+        assert!(o16 > o8, "16-bit moments must cost more than 8-bit");
+        assert!(o8 > 0.0);
+    }
+
+    #[test]
+    fn optimizer_us_fase_fusion_is_cheaper() {
+        // Fusing the step into backward drops the standalone gradient read.
+        let fused = optimizer_us(1_000_000, 2, 16, 16, true, 3350.0);
+        let separate = optimizer_us(1_000_000, 2, 16, 16, false, 3350.0);
+        assert!(fused < separate);
+    }
+
+    #[test]
+    fn optimizer_us_scales_with_param_bytes_and_is_deterministic() {
+        let small = optimizer_us(1_000_000, 2, 16, 16, false, 3350.0);
+        let big = optimizer_us(4_000_000, 2, 16, 16, false, 3350.0);
+        assert!(big > small);
+        assert_eq!(
+            optimizer_us(1_234_567, 2, 8, 16, false, 3350.0),
+            optimizer_us(1_234_567, 2, 8, 16, false, 3350.0)
+        );
     }
 
     #[test]

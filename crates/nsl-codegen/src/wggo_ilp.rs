@@ -323,14 +323,11 @@ pub fn solve_layer(
     lut: &LayerCostLut,
     constraints: &LayerIlpConstraints,
 ) -> LayerIlpSolution {
-    // Pre-compute global cheapest feasible entry as an initial bound.
-    let initial_best = lut.argmin_feasible().map(|(_, _, _, _, e)| e.total_us());
     let mut state = SolverState {
         best_cost: f64::INFINITY,
         best_decision: None,
         best_entry: None,
         nodes: 0,
-        global_lower_bound: initial_best.unwrap_or(0.0),
     };
 
     // Walk the domain.  The ordering matters: try (largest feasible CSHA,
@@ -392,7 +389,22 @@ pub fn solve_layer(
                                     if !importance_ok(&heads_config, constraints) {
                                         continue;
                                     }
-                                    let cand_cost = entry.total_us() + placement_us;
+                                    // Objective = forward + backward (LUT) +
+                                    // adapter-comm (placement) + optimizer step.
+                                    // The optimizer term is what makes `m_bits` /
+                                    // `v_bits` / `fase` affect the cost at all —
+                                    // without it the ILP's objective is blind to
+                                    // its own precision/FASE decisions (paper §2.3
+                                    // optimizer_time term).
+                                    let optim_us = crate::wggo_cost::optimizer_us(
+                                        entry.param_bytes,
+                                        lut.dtype_bytes,
+                                        m_bits,
+                                        v_bits,
+                                        fase,
+                                        lut.peak_bandwidth_gbs,
+                                    );
+                                    let cand_cost = entry.total_us() + placement_us + optim_us;
                                     if cand_cost >= state.best_cost {
                                         continue; // bound prune
                                     }
@@ -459,7 +471,18 @@ pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstr
     }
     let adj = apply_fase(base, d.fase_fused, c.fase_backward_speedup);
     let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
-    entry.total_us() + placement_cost_us(d.adapter_rank, d.adapter_placement)
+    // Mirror `solve_layer`'s objective exactly so a re-cost after conflict
+    // resolution is comparable: forward+backward + adapter-comm + optimizer.
+    entry.total_us()
+        + placement_cost_us(d.adapter_rank, d.adapter_placement)
+        + crate::wggo_cost::optimizer_us(
+            entry.param_bytes,
+            lut.dtype_bytes,
+            d.optim_m_bits,
+            d.optim_v_bits,
+            d.fase_fused,
+            lut.peak_bandwidth_gbs,
+        )
 }
 
 /// Diagnostic counters for [`solve_all_templated`].
@@ -525,6 +548,11 @@ fn lut_eq(a: &LayerCostLut, b: &LayerCostLut) -> bool {
         || a.axes_csha_levels != b.axes_csha_levels
         || a.axes_adapter_ranks != b.axes_adapter_ranks
         || a.entries.len() != b.entries.len()
+        // `dtype_bytes` / `peak_bandwidth_gbs` feed `optimizer_us`, so two LUTs
+        // that differ only in those (mixed-precision layers, or different GPU
+        // targets) must NOT share a templated solution.
+        || a.dtype_bytes != b.dtype_bytes
+        || a.peak_bandwidth_gbs.to_bits() != b.peak_bandwidth_gbs.to_bits()
     {
         return false;
     }
@@ -667,7 +695,16 @@ pub fn solve_layer_greedy(
             adapter_placement: best_placement(r, constraints)
                 .unwrap_or(AdapterPlacement::None),
         },
-        cost_us: entry.total_us(),
+        cost_us: entry.total_us()
+            + placement_cost_us(r, best_placement(r, constraints).unwrap_or(AdapterPlacement::None))
+            + crate::wggo_cost::optimizer_us(
+                entry.param_bytes,
+                lut.dtype_bytes,
+                m_bits,
+                v_bits,
+                fase_fused,
+                lut.peak_bandwidth_gbs,
+            ),
         memory_bytes,
         smem_bytes: entry.smem_bytes,
         nodes_explored: nodes,
@@ -717,8 +754,6 @@ struct SolverState {
     best_decision: Option<LayerDecision>,
     best_entry: Option<LayerCostEntry>,
     nodes: u64,
-    #[allow(dead_code)]
-    global_lower_bound: f64,
 }
 
 /// Pick the lowest precision (in bits) that the sensitivity floor allows.
@@ -1274,6 +1309,48 @@ mod tests {
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
         assert_eq!(sol.decision.csha_level, 0);
+    }
+
+    #[test]
+    fn lut_eq_distinguishes_dtype_bytes_and_bandwidth() {
+        // Both fields feed `optimizer_us`, so two LUTs that differ only in them
+        // must NOT be treated as the same template (else `solve_all_templated`
+        // would reuse a solution costed for a different optimizer dtype/target).
+        let a = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut b = a.clone();
+        b.dtype_bytes = a.dtype_bytes + 2;
+        assert!(!lut_eq(&a, &b));
+        let mut c = a.clone();
+        c.peak_bandwidth_gbs = a.peak_bandwidth_gbs * 2.0;
+        assert!(!lut_eq(&a, &c));
+        assert!(lut_eq(&a, &a.clone())); // identical ⇒ equal
+    }
+
+    #[test]
+    fn low_sensitivity_picks_low_optimizer_precision() {
+        // Gap #2: with the optimizer-cost term in the objective, a layer with
+        // no numerical-sensitivity floor now prefers the cheapest (lowest-bit)
+        // moments.  Before the fix the ILP always returned 32/32 because the
+        // objective was independent of precision.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints::default(); // sensitivity = 0
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.optim_m_bits, 8);
+        assert_eq!(sol.decision.optim_v_bits, 8);
+    }
+
+    #[test]
+    fn full_and_greedy_agree_on_optimizer_precision_at_low_sensitivity() {
+        // Both solvers now minimize the same objective, so they converge on the
+        // same (lowest-allowed) optimizer precision — previously the full ILP
+        // returned 32/32 while greedy returned 8/8 for the same layer.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let full = solve_layer(&lut, &c);
+        let greedy = solve_layer_greedy(&lut, &c);
+        assert_eq!(full.decision.optim_m_bits, greedy.decision.optim_m_bits);
+        assert_eq!(full.decision.optim_v_bits, greedy.decision.optim_v_bits);
     }
 
     #[test]

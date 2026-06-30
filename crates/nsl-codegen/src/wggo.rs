@@ -371,7 +371,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         let inter =
             dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-            vec![LayerIlpConstraints::default(); n]
+            default_constraints_for(&graph)
         } else {
             input.ilp_constraints
         };
@@ -435,7 +435,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
     let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-        vec![LayerIlpConstraints::default(); n]
+        default_constraints_for(&graph)
     } else {
         input.ilp_constraints
     };
@@ -560,6 +560,50 @@ pub fn run(input: WggoInput) -> WggoPlan {
 /// with no known residual projection, so both widths are unknown.  Unknown
 /// (`None`) widths are treated as compatible by [`crate::wggo_shape::classify`]
 /// (fail-safe — only provable mismatches are flagged).
+/// Conservative role-based numerical-sensitivity floor for the per-layer ILP.
+///
+/// The ILP now costs optimizer precision ([`crate::wggo_cost::optimizer_us`]),
+/// so with no sensitivity signal it would recommend the cheapest (8-bit) Adam
+/// moments for *every* layer — including the numerically fragile ones.
+/// Production callers pass no explicit `ilp_constraints`, and the weight-
+/// analysis stage populates importance but never sensitivity, so without this
+/// floor the embeddings / LM-head / norms would be advised down to 8-bit.
+/// Assign a coarse floor by [`LayerRole`]: fragile layers are pinned to high
+/// precision; the transformer blocks — where low-bit Adam moments are well
+/// established — may be lowered.
+///
+/// The graph builder buckets most non-`blocks.N` params (embeddings, norms, the
+/// LM head, the raw input) into the catch-all `Other` role, so `Other` is held
+/// at ≥16-bit as the conservative default.  This is intentionally coarse; a
+/// gradient/spectral per-layer sensitivity score (cf. `cpdt_sensitivity`) is the
+/// natural refinement.  Note the optimizer-precision decision is currently
+/// *advisory* — it is surfaced in the plan/report but not yet lowered to
+/// optimizer codegen (`PerLayerOverride` does not carry it), so this governs the
+/// recommendation, not yet generated code.
+fn role_sensitivity_floor(role: LayerRole) -> f64 {
+    match role {
+        // ≥ critical_prec_threshold (0.9 default) → forces 32-bit moments.
+        LayerRole::Embedding | LayerRole::LmHead => 0.95,
+        // ≥ high_prec_threshold (0.5 default) → forces ≥16-bit.
+        LayerRole::Other => 0.6,
+        // The bulk transformer compute may use low-bit Adam moments.
+        LayerRole::Attention | LayerRole::Ffn | LayerRole::Block => 0.0,
+    }
+}
+
+/// Per-layer default ILP constraints with the [`role_sensitivity_floor`]
+/// applied (used when the caller supplies no explicit `ilp_constraints`).
+fn default_constraints_for(graph: &OptGraph) -> Vec<LayerIlpConstraints> {
+    graph
+        .layers
+        .iter()
+        .map(|l| LayerIlpConstraints {
+            sensitivity: role_sensitivity_floor(l.role),
+            ..Default::default()
+        })
+        .collect()
+}
+
 fn inter_layer_dims(role: LayerRole, d_model: u64) -> (Option<u64>, Option<u64>) {
     // A zero `d_model` is a defensively-initialised / unknown shape, not a real
     // width: report unknown on every edge so the gate stays fail-safe.
@@ -965,6 +1009,42 @@ mod tests {
     }
 
     #[test]
+    fn role_sensitivity_floor_pins_fragile_roles_high_and_blocks_low() {
+        assert!(role_sensitivity_floor(LayerRole::Embedding) >= 0.9);
+        assert!(role_sensitivity_floor(LayerRole::LmHead) >= 0.9);
+        assert!(role_sensitivity_floor(LayerRole::Other) >= 0.5);
+        assert!(role_sensitivity_floor(LayerRole::Other) < 0.9);
+        assert_eq!(role_sensitivity_floor(LayerRole::Block), 0.0);
+        assert_eq!(role_sensitivity_floor(LayerRole::Attention), 0.0);
+        assert_eq!(role_sensitivity_floor(LayerRole::Ffn), 0.0);
+    }
+
+    #[test]
+    fn run_applies_role_sensitivity_floor_to_optimizer_precision() {
+        // End-to-end: the now-precision-aware ILP must NOT advise 8-bit Adam
+        // moments for the fragile catch-all `Other` bucket (embeddings/norms/
+        // head/input land here), while the transformer blocks may use 8-bit.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        for layer in &plan.applied.layers {
+            if layer.layer_name.starts_with("blocks.") {
+                assert_eq!(
+                    layer.optim_m_bits, 8,
+                    "block {} should allow low-bit moments",
+                    layer.layer_name
+                );
+            } else {
+                assert!(
+                    layer.optim_m_bits >= 16,
+                    "fragile layer {} must keep >=16-bit moments, got {}",
+                    layer.layer_name,
+                    layer.optim_m_bits
+                );
+            }
+        }
+    }
+
+    #[test]
     fn full_mode_produces_plan_with_applied_layers() {
         let w = two_block_wengert();
         let plan = run(toy_input(&w));
@@ -1136,12 +1216,13 @@ mod tests {
 
     #[test]
     fn template_stats_reuse_identical_blocks() {
-        // The two-block toy Wengert produces two layers with identical
-        // shape and constraints, so Full mode should solve once and
-        // replicate.
+        // The two-block toy Wengert produces two `blocks.N` layers (role
+        // Block) plus the catch-all `other` bucket.  The role-based sensitivity
+        // floor gives Block and Other distinct constraints, so Full mode solves
+        // two templates (Block, Other) and the second block reuses the first.
         let w = two_block_wengert();
         let plan = run(toy_input(&w));
-        assert_eq!(plan.template_stats.templates_solved, 1);
+        assert_eq!(plan.template_stats.templates_solved, 2);
         assert!(plan.template_stats.template_hits >= 1);
         let rep = plan.render_report();
         assert!(rep.contains("Templates:"));
