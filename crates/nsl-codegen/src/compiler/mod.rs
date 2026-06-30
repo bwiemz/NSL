@@ -499,6 +499,47 @@ pub struct Compiler<'a> {
     /// cache and evicts on the last component (dx_norm / component=7).
     pub csha_fused_bwd_cache: HashMap<Value, [Value; 8]>,
 
+    // ── CFTP §4.4 G3 Sprint 4: FusedLinearCe forward+backward side-channels ─
+    /// Maps the Cranelift Value of a `PrimalOp::FusedLinearCe` forward result
+    /// to the saved `lse_out` device pointer that the backward kernel
+    /// requires.  Populated by the forward lowering arm and consumed (with
+    /// eviction on the last extract) by `FusedLinearCeBackwardExtract`.
+    pub fused_ce_fwd_lse: HashMap<Value, Value>,
+    /// CFTP v6 Findings 10/14 (cache forward casts across fwd/bwd) +
+    /// Finding 16 (pair dtype with cached value).  Stores `(x_cast,
+    /// w_cast, bias_cast, dtype_tag)` keyed by the forward
+    /// `FusedLinearCe` result Value so the symmetric backward extract
+    /// can REUSE the forward's precision-cast shadow buffers instead
+    /// of emitting three more `nsl_tensor_to_{bf16,fp16}` calls per
+    /// step.  The `dtype_tag` slot lets the backward arm cross-check
+    /// the cached cast bytes match the current backward's dtype — a
+    /// mismatch (e.g. a curriculum that flips dtype mid-step) surfaces
+    /// as a CodegenError rather than silently reusing the wrong cast.
+    ///
+    /// Memory savings: ~430MB for V=49152/H=4096/B=2/S=4096 — the v6
+    /// docstring at `lower_fused_linear_ce_forward` quoted `(B*S*H +
+    /// V*H + V) * 2 bytes` as the cost PER forward+backward step, but
+    /// the v6 implementation emitted SIX casts per dispatch (forward
+    /// three + backward three), doubling the actual cost.  This cache
+    /// brings the v6 implementation in line with the docstring.
+    ///
+    /// Eviction: the same lifecycle as `fused_ce_bwd_cache` — the
+    /// backward dispatch's last-component extract (component=2)
+    /// evicts the cast cache alongside the `[dx, dW, dbias]` slots.
+    /// On a forward-only compile (no backward in the same module),
+    /// the cache entries remain in the compiler and are dropped when
+    /// the `Compiler` itself is dropped — no scope-sweep involvement
+    /// because the `Value` handles point at IR-emitted call results,
+    /// not runtime tensors.
+    pub fused_ce_fwd_casts: HashMap<Value, (Value, Value, Value, i64)>,
+    /// Three-slot side-channel for the fused linear-CE backward outputs
+    /// (`dx`, `dW`, `dbias`) keyed by the forward result Value.  Populated
+    /// by component=0's lowering arm via `nsl_fused_linear_ce_backward`;
+    /// components 1 and 2 read from the cache; the last component (2)
+    /// evicts.  Mirrors `flash_attn_bwd_cache` (list-based) but uses a
+    /// fixed-arity slot record for the v1 three-output backward.
+    pub fused_ce_bwd_cache: HashMap<Value, [Value; 3]>,
+
     // ── WRGA side-channel (Milestone A) ─────────────────────────────
     /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.
     /// Consumed inside `compile_train_step_with_source_ad` when a `@train` block
@@ -508,6 +549,16 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
+
+    // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
+    /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
+    /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
+    /// is present.  Sprint 2 stores these without consuming them; Sprint
+    /// 2.5 will read `fused_ce_configs[0].enabled` at the cross_entropy
+    /// lowering site to drive substitution toward `nsl_fused_linear_ce_*`
+    /// FFIs.  The marker comment in `wengert_lower.rs::PrimalOp::CrossEntropyLoss`
+    /// documents the deferred substitution site.
+    pub fused_ce_configs: Vec<crate::FusedCeDecoratorConfig>,
 
     // ── CPDT side-channel (pipeline integration) ─────────────────────
     /// CPDT mode requested via CLI. `Off` → planner does not run.
@@ -706,7 +757,13 @@ impl<'a> Compiler<'a> {
             .map_err(|e| CodegenError::new(format!("failed to set probestack strategy: {e}")))?;
 
         // M62a: Enable position-independent code for shared library emission.
-        if options.shared_lib {
+        // Also unconditionally on macOS: the system ld defaults to PIE for
+        // executables and rejects absolute relocations in .text with
+        // "Found illegal text-relocations". Mirrors the calibration codegen
+        // policy in `calibration/binary_codegen.rs::new_calibration_object_module`.
+        // COFF/PE (Windows) does NOT use ELF-style GOT, so do not set is_pic
+        // there — it can produce link failures on the MSVC linker.
+        if options.shared_lib || cfg!(target_os = "macos") {
             flag_builder
                 .set("is_pic", "true")
                 .map_err(|e| CodegenError::new(format!("failed to enable PIC: {e}")))?;
@@ -773,8 +830,12 @@ impl<'a> Compiler<'a> {
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             csha_fused_bwd_cache: HashMap::new(),
+            fused_ce_fwd_lse: HashMap::new(),
+            fused_ce_fwd_casts: HashMap::new(),
+            fused_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            fused_ce_configs: options.fused_ce_configs.clone(),
             cpdt_mode: options.cpdt_mode,
             cpdt_cluster: options.cpdt_cluster.clone(),
             cpdt_plan: None,
@@ -1057,15 +1118,15 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
 
-        let safety_margin = self.compile_options.wcet_safety_margin;
-        let target_kind = self.compile_options.wcet_target.as_str();
+        let safety_margin = self.compile_options.wcet.safety_margin;
+        let target_kind = self.compile_options.wcet.target.as_str();
 
         // Build the WcetTarget based on CLI flags
         let target = match target_kind {
             "fpga" => {
                 let fpga_name = self
                     .compile_options
-                    .fpga_device
+                    .wcet.fpga_device
                     .as_deref()
                     .unwrap_or("xcvu440");
                 let fpga = find_fpga(fpga_name).ok_or_else(|| {
@@ -1090,7 +1151,7 @@ impl<'a> Compiler<'a> {
                 // Default: GPU statistical
                 let gpu_name = self
                     .compile_options
-                    .wcet_gpu
+                    .wcet.gpu
                     .as_deref()
                     .unwrap_or("A100-SXM");
                 let _ = find_gpu(gpu_name).ok_or_else(|| {
@@ -1107,7 +1168,7 @@ impl<'a> Compiler<'a> {
 
         // M53: If --wcet-cpu is specified, validate the CPU model and emit an advisory note.
         // CPU WCET estimates are advisory — they use the CpuSpec database in gpu_specs.rs.
-        if let Some(ref cpu_name) = self.compile_options.wcet_cpu {
+        if let Some(ref cpu_name) = self.compile_options.wcet.cpu {
             if !cpu_name.is_empty() {
                 match crate::gpu_specs::find_cpu(cpu_name) {
                     Some(cpu) => {
@@ -1192,7 +1253,7 @@ impl<'a> Compiler<'a> {
             }
 
             // Emit certificate if requested
-            if let Some(ref cert_path) = self.compile_options.wcet_report_path {
+            if let Some(ref cert_path) = self.compile_options.wcet.report_path {
                 let cert =
                     build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
                 emit_certificate(&cert, cert_path).map_err(|e| {
@@ -1202,7 +1263,7 @@ impl<'a> Compiler<'a> {
             }
 
             // Emit DO-178C report if requested (guarded: FPGA only)
-            if let Some(ref do178c_path) = self.compile_options.do178c_report {
+            if let Some(ref do178c_path) = self.compile_options.wcet.do178c_report {
                 let cert =
                     build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
                 emit_do178c_report(&cert, do178c_path)

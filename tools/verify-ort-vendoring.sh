@@ -50,6 +50,12 @@ fi
 # Generate Rust definitions from the upstream header. Allowlist Ort* and
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
+#
+# Note: bindgen's default formatter shells out to `rustfmt`. `extract_types`
+# below relies on each declaration starting its own line, so we keep rustfmt
+# formatting (rather than `--formatter none`, whose single-line token stream
+# would defeat the line-anchored grep). CI must therefore provide the rustfmt
+# component — see `.github/workflows/ci.yml`.
 bindgen \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \

@@ -1,0 +1,25 @@
+from nsl.nn.losses import mse_loss
+
+dataset PretrainCorpus("/data/pile"):
+    source = "/data/pile.bin"
+    packing = true
+    max_sequence_length = 2048
+    mean_doc_length = 400
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 1, grad_accumulation = 4):
+    data:
+        source = PretrainCorpus
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)

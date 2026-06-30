@@ -39,6 +39,8 @@ fn csha_forward_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
+        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — CFTP v2 follow-on.
+        i64,
     ) -> i64 = nsl_flash_attention_csha;
 }
 
@@ -64,6 +66,8 @@ fn csha_with_saves_ffi_accepts_trailing_doc_starts_ptr() {
         // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
         i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
+        i64,
+        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — CFTP v2 follow-on.
         i64,
     ) -> i64 = nsl_flash_attention_csha_with_saves;
 }
@@ -97,6 +101,8 @@ fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
+        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — CFTP v2 follow-on.
+        i64,
     ) -> i64 = nsl_flash_attention_csha_backward;
 }
 
@@ -121,6 +127,8 @@ fn csha_forward_ffi_sentinel_zero_returns_minus_one_without_panic() {
         // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
         0, 0,
         // PCA §4.3: doc_starts_ptr (0 = identity positions).
+        0,
+        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero (0 = classic topology).
         0,
     );
     assert_eq!(r, -1, "non-CUDA build must return -1");

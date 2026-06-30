@@ -410,9 +410,11 @@ fn find_msvc() -> Result<MsvcPaths, CodegenError> {
 
     let mut msvc_bin = None;
     let mut msvc_lib = None;
+    let mut checked_roots: Vec<String> = Vec::new();
 
     for root in &vs_roots {
         let vc_tools = PathBuf::from(root).join(r"VC\Tools\MSVC");
+        checked_roots.push(vc_tools.display().to_string());
         if vc_tools.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&vc_tools) {
                 let mut versions: Vec<PathBuf> = entries
@@ -434,8 +436,58 @@ fn find_msvc() -> Result<MsvcPaths, CodegenError> {
         }
     }
 
+    // Fallback: ask `vswhere.exe` for the latest VS installation. This handles
+    // editions / paths that the hard-coded list misses (e.g. side-by-side
+    // installs, custom layouts, or runner images that move VS to a different
+    // directory). vswhere.exe ships with Visual Studio Installer at a fixed
+    // path on every Windows host that has any VS edition installed.
+    if msvc_bin.is_none() {
+        let vswhere =
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe");
+        checked_roots.push(format!("vswhere.exe at {}", vswhere.display()));
+        if vswhere.exists() {
+            let output = Command::new(&vswhere)
+                .args([
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ])
+                .output();
+            if let Ok(out) = output {
+                let install_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !install_path.is_empty() {
+                    let vc_tools = PathBuf::from(&install_path).join(r"VC\Tools\MSVC");
+                    if let Ok(entries) = std::fs::read_dir(&vc_tools) {
+                        let mut versions: Vec<PathBuf> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir())
+                            .collect();
+                        versions.sort();
+                        if let Some(latest) = versions.last() {
+                            let bin = latest.join(r"bin\Hostx64\x64");
+                            let lib = latest.join(r"lib\x64");
+                            if bin.join("link.exe").exists() {
+                                msvc_bin = Some(bin);
+                                msvc_lib = Some(lib);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let msvc_bin = msvc_bin.ok_or_else(|| {
-        CodegenError::new("MSVC tools not found. Install Visual Studio Build Tools or gcc")
+        CodegenError::new(format!(
+            "MSVC tools not found. Install Visual Studio Build Tools or gcc. \
+             Checked: {}",
+            checked_roots.join("; ")
+        ))
     })?;
     let msvc_lib = msvc_lib.unwrap();
 

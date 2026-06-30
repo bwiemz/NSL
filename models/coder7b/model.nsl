@@ -44,9 +44,9 @@ model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
 # ─── Pre-norm Transformer Block ───
 # x -> RMSNorm -> GQA -> residual -> RMSNorm -> SwiGLU -> residual
 
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn_norm: RMSNorm = RMSNorm(d_model)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
 
@@ -60,7 +60,7 @@ model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, d
 
 model NSLCoder:
     embed: Tensor = randn([49152, 4096]) * full([1], 0.02)
-    blocks: [TransformerBlock; 32] = TransformerBlock(4096, 32, 8, 14336, 0.0)
+    blocks: [TransformerBlock; 32] = TransformerBlock(4096, 32, 8, 128, 14336, 0.0)
     norm: RMSNorm = RMSNorm(4096)
 
     fn forward(self, input_ids: Tensor) -> Tensor:

@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — Architecture hardening (stable/experimental boundaries, ABI versioning)
+
+- `STATUS.md` — single source of truth tiering every subsystem as Stable / Beta /
+  Experimental, with the per-tier test expectations.
+- `docs/hardware/` — tested-on matrix plus `cuda_status.md` and `fpga_status.md`,
+  making GPU/FPGA claims traceable (Validated / Built / Analysis-only) to actual
+  evidence instead of aspirational support.
+- `docs/abi/README.md` — runtime C-ABI contract: versioning policy and the
+  per-symbol FFI safety checklist.
+- Runtime C-ABI versioning: `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR,
+  NSL_ABI_VERSION_MINOR}` constants and the `nsl_abi_version()` exported fn
+  (packed `(major<<16)|minor`). Generated C headers now emit matching
+  `NSL_ABI_VERSION_*` macros (pinned to the runtime constants) and the
+  `nsl_abi_version()` prototype, so hosts can detect runtime/header skew.
+- Golden ABI-layout test pinning `NslTensorDesc` to 48 bytes / 8-byte align /
+  fixed field offsets (`nsl_tensor_desc_abi_layout_is_pinned`).
+- `CONTRIBUTING.md` — "Review gates" section formalizing the stable-vs-
+  experimental, FFI, hardware-claim, config-sprawl, and clippy-suppression
+  boundaries; test requirements split into required-on-PR / nightly / research.
+
+### Changed
+
+- `SECURITY.md` — corrected the supported-versions table (now `main` + 0.9.x)
+  and enumerated the highest-risk areas (C ABI, dlopen, model/weight parsers,
+  path handling, CUDA launch, generated-code execution, compiler DoS).
+- `README.md` — replaced the inaccurate "no runtime" claim with "no Python
+  interpreter / no GIL; programs link a small native runtime", and added a
+  pre-1.0 maturity pointer to `STATUS.md`.
+
+### Fixed
+
+- `test-onnx-rt` CI job: install the `rustfmt` toolchain component, which
+  `bindgen` requires when generating bindings in `tools/verify-ort-vendoring.sh`
+  (the pinned 1.95.0 toolchain ships without it, failing the job at the
+  vendoring step independently of ONNX itself).
+
 ### Added — CSHA Tier B.2 backward Phase 2 (foundation + dQ-kernel emitter)
 
 - `flash_attention_v2::tier_b2::backward::d_prepass::synthesize_d_prepass` — D pre-pass kernel emitter (row-per-lane schedule: 32 lanes × 1 row each, sequential over `head_dim`; no inter-lane reduction; no SMEM; sm_80+; computes `D[b,h,q] = rowsum(dO * O)`). Spec §3.3's original butterfly-reduction schedule was replaced after the first GPU launch revealed a row/col conflation bug — both schedules are HBM-bandwidth-bound at canonical sizes, and the row-per-lane schedule avoids the bug class entirely.

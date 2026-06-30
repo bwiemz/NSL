@@ -44,6 +44,8 @@ fn render_trace(out: &mut String, t: &DecisionTrace) {
         DecisionKind::CshaLevel => "CSHA",
         DecisionKind::WrgaAdapter => "WRGA",
         DecisionKind::CpdtPrecision => "CPDT",
+        DecisionKind::FaseStep => "FASE",
+        DecisionKind::PcaPacking => "PCA",
     };
     out.push_str(&format!("  {}: {}\n", label, t.chosen));
     out.push_str(&format!("    Reason: {}\n", t.metric_summary));

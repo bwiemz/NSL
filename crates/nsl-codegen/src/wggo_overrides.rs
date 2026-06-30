@@ -102,6 +102,10 @@ pub struct PerLayerOverride {
     // Future-consumer fields (populated now so the struct shape is stable;
     // their wiring plans land later without signature churn):
     pub adapter_rank: u64,   // WRGA
+    /// WRGA: which projections the adapter attaches to (companion to
+    /// `adapter_rank`).  Carried for the WRGA-codegen wiring; consumed
+    /// together with `adapter_rank` once WRGA reads per-layer overrides.
+    pub adapter_placement: crate::wggo_ilp::AdapterPlacement,
     pub fase_fused: bool,    // FASE
     pub packing_mode: u8,    // PCA / fusion
     /// CPDT: per-layer ZeRO shard factor recommendation. Aggregated to a
@@ -123,6 +127,7 @@ impl WggoOverrides {
                     active_heads: l.active_heads,
                     requested_csha_level: map_csha_level(l.csha_level),
                     adapter_rank: l.adapter_rank,
+                    adapter_placement: l.adapter_placement,
                     fase_fused: l.fase_fused,
                     packing_mode: l.packing_mode,
                     shard_factor: l.shard_factor,
@@ -191,7 +196,7 @@ fn map_csha_level(raw: u8) -> Option<FusionLevel> {
 pub fn collect_prune_diagnostics(
     applied: &crate::wggo_apply::AppliedPlan,
 ) -> Vec<OverrideDiagnostic> {
-    use crate::wggo_dp::LayerDecision;
+    use crate::wggo_dp::CoarseDecision;
     applied
         .layers
         .iter()
@@ -200,7 +205,7 @@ pub fn collect_prune_diagnostics(
         // `wggo_prune::run()`. Role classification is delegated to
         // `wggo_graph::infer_role` so all consumers use the same authority.
         .filter(|l| {
-            matches!(l.coarse, LayerDecision::Prune)
+            matches!(l.coarse, CoarseDecision::Prune)
                 && matches!(
                     crate::wggo_graph::infer_role(&l.layer_name),
                     crate::wggo_graph::LayerRole::Block
@@ -229,7 +234,7 @@ pub fn whole_block_prune_not_implemented_reason() -> &'static str {
 mod tests {
     use super::*;
     use crate::wggo_apply::{AppliedLayer, AppliedPlan};
-    use crate::wggo_dp::LayerDecision as CoarseDecision;
+    use crate::wggo_dp::CoarseDecision;
 
     fn sample_applied() -> AppliedPlan {
         AppliedPlan {
@@ -239,10 +244,13 @@ mod tests {
                 coarse: CoarseDecision::KeepFull,
                 pipeline_stage: 0,
                 shard_factor: 1,
+                shard_grads: 1,
+                shard_optim: 1,
                 active_heads: 4,
                 ffn_width: 2048,
                 csha_level: 2,
                 adapter_rank: 16,
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 optim_m_bits: 8,
                 optim_v_bits: 16,
                 fase_fused: true,
@@ -339,10 +347,13 @@ mod tests {
             coarse,
             pipeline_stage: 0,
             shard_factor: 1,
+            shard_grads: 1,
+            shard_optim: 1,
             active_heads: 4,
             ffn_width: 2048,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 8,
             optim_v_bits: 16,
             fase_fused: true,
@@ -453,6 +464,7 @@ mod tests {
                     active_heads: 8,
                     requested_csha_level: None,
                     adapter_rank: *rank as u64,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                     fase_fused: false,
                     packing_mode: 0,
                     shard_factor: 0,
@@ -497,6 +509,7 @@ mod tests {
                 active_heads: 8,
                 requested_csha_level: None,
                 adapter_rank: 0,
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: s,

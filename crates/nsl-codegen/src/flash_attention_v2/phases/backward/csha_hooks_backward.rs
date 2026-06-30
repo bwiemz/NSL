@@ -275,7 +275,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                     (4, "%r_effective_pos_k", "%k_start")
                 };
                 ptx.push_str(&format!(
-                    "    // PCA §4.3 site {site}: backward {label} effective_pos\n"
+                    "    // PCA sec.4.3 site {site}: backward {label} effective_pos\n"
                 ));
                 // abs_row = (row narrowed to u32) + (base narrowed to u32).
                 ptx.push_str("    cvt.u32.u64 %r_abs_pos, %rd33;\n");

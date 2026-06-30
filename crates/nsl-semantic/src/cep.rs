@@ -56,6 +56,30 @@ pub struct CepPruneConfig {
     pub span: Span,
 }
 
+/// Pattern check only; out-of-range layer indices are caught at build time by
+/// `parse_preserve_layers` in the bridge (the semantic pass does not know `n_layers`).
+///
+/// Returns `true` if the pattern is structurally valid (bare non-negative integer,
+/// "blocks.<n>", or "blocks.<n>.<suffix>"), `false` if it should be rejected.
+fn is_valid_preserve_pattern(p: &str) -> bool {
+    // Bare non-negative integer.
+    if p.parse::<u32>().is_ok() {
+        return true;
+    }
+    // "blocks.<N>" or "blocks.<N>.<suffix>"
+    if let Some(rest) = p.strip_prefix("blocks.") {
+        let head = rest.split('.').next().unwrap_or("");
+        // "blocks.*" or "blocks.*.X" — wildcard spanning layers: reject.
+        if head == "*" || head.is_empty() {
+            return false;
+        }
+        if head.parse::<u32>().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 fn parse_cep_constraints(
     arg: &nsl_ast::expr::Arg,
     deco_label: &str,
@@ -188,7 +212,19 @@ pub fn validate_cep_prune_decorator(
                     ExprKind::ListLiteral(items) => {
                         for item in items {
                             match &item.kind {
-                                ExprKind::StringLiteral(s) => preserve.push(s.clone()),
+                                ExprKind::StringLiteral(s) => {
+                                    if !is_valid_preserve_pattern(s) {
+                                        diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "@cep_prune: preserve pattern '{s}' is not recognized; \
+                                                use a layer index (e.g. '7') or 'blocks.<n>' / 'blocks.<n>.*' \
+                                                (e.g. 'blocks.0.*')"
+                                            ))
+                                            .with_label(item.span, "unrecognized preserve pattern"),
+                                        );
+                                    }
+                                    preserve.push(s.clone());
+                                }
                                 _ => diagnostics.push(
                                     Diagnostic::error(
                                         "@cep_prune: preserve entries must be strings"
@@ -413,6 +449,110 @@ model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
             Some(3000.0f64),
             "latency_us mismatch"
         );
+    }
+
+    /// Verify that `is_valid_preserve_pattern` accepts and rejects the correct patterns.
+    #[test]
+    fn is_valid_preserve_pattern_rules() {
+        // Valid patterns.
+        assert!(is_valid_preserve_pattern("0"));
+        assert!(is_valid_preserve_pattern("7"));
+        assert!(is_valid_preserve_pattern("blocks.0"));
+        assert!(is_valid_preserve_pattern("blocks.7"));
+        assert!(is_valid_preserve_pattern("blocks.0.*"));
+        assert!(is_valid_preserve_pattern("blocks.7.*"));
+        assert!(is_valid_preserve_pattern("blocks.3.attn"));
+        assert!(is_valid_preserve_pattern("blocks.1.ffn.gate"));
+        // Invalid patterns.
+        assert!(!is_valid_preserve_pattern("foo"));
+        assert!(!is_valid_preserve_pattern("blocks"));
+        assert!(!is_valid_preserve_pattern("blocks.*"));
+        assert!(!is_valid_preserve_pattern("blocks.*.attn"));
+        assert!(!is_valid_preserve_pattern("blocks.abc"));
+        assert!(!is_valid_preserve_pattern("*"));
+        assert!(!is_valid_preserve_pattern(""));
+    }
+
+    /// Verify that a malformed preserve pattern (e.g. "foo") produces a diagnostic
+    /// at check time via the semantic validator.
+    #[test]
+    fn semantic_diagnoses_malformed_preserve_patterns() {
+        let src = "\
+@cep_prune(preserve=[\"foo\", \"blocks.*\"])\n\
+model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
+
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse_result.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            parse_result.diagnostics
+        );
+
+        let stmt = parse_result.module.stmts.first().expect("expected one stmt");
+        let nsl_ast::stmt::StmtKind::Decorated { ref decorators, .. } = stmt.kind else {
+            panic!("expected Decorated stmt, got {:?}", stmt.kind);
+        };
+        let deco = decorators.first().expect("expected one decorator");
+
+        let resolve_sym = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let mut diagnostics = Vec::new();
+        let _cfg = validate_cep_prune_decorator(deco, &resolve_sym, &mut diagnostics);
+
+        // Both "foo" and "blocks.*" should each produce a diagnostic.
+        assert!(
+            diagnostics.len() >= 2,
+            "expected at least 2 diagnostics for 2 bad patterns, got: {diagnostics:?}"
+        );
+        let any_mentions_preserve = diagnostics
+            .iter()
+            .any(|d| d.message.contains("preserve pattern"));
+        assert!(
+            any_mentions_preserve,
+            "expected a diagnostic mentioning 'preserve pattern', got: {diagnostics:?}"
+        );
+    }
+
+    /// Verify that `@cep_prune(preserve=["blocks.0.*", "blocks.7.*"])` (paper §6.1 syntax)
+    /// produces zero diagnostics and the correct preserve list.
+    #[test]
+    fn semantic_accepts_paper_glob_preserve_syntax() {
+        let src = "\
+@cep_prune(preserve=[\"blocks.0.*\", \"blocks.7.*\"])\n\
+model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
+
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse_result.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            parse_result.diagnostics
+        );
+
+        let stmt = parse_result.module.stmts.first().expect("expected one stmt");
+        let nsl_ast::stmt::StmtKind::Decorated { ref decorators, .. } = stmt.kind else {
+            panic!("expected Decorated stmt, got {:?}", stmt.kind);
+        };
+        let deco = decorators.first().expect("expected one decorator");
+
+        let resolve_sym = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let mut diagnostics = Vec::new();
+        let cfg = validate_cep_prune_decorator(deco, &resolve_sym, &mut diagnostics)
+            .expect("validate_cep_prune_decorator returned None");
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics for valid glob patterns: {diagnostics:?}"
+        );
+        assert_eq!(cfg.preserve, vec!["blocks.0.*", "blocks.7.*"]);
     }
 
     /// Verify that `@cep_prune(constraints=5)` (a non-dict value) produces a

@@ -5,7 +5,6 @@
 use std::ffi::CString;
 
 fn build_lib(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    use assert_cmd::prelude::*;
     use std::process::Command;
     let nsl = r#"
 @export
@@ -29,8 +28,7 @@ fn identity(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     let manifest_dir: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
     let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
     let stdlib = workspace_root.join("stdlib");
-    let status = Command::cargo_bin("nsl")
-        .unwrap()
+    let status = Command::new(nsl_bin())
         .env("NSL_STDLIB_PATH", &stdlib)
         .args([
             "build",
@@ -75,4 +73,18 @@ fn lookup_returns_zero_for_unknown_export() {
     let ptr = nsl_runtime::c_api::nsl_model_lookup_function(model, unk.as_ptr() as i64);
     assert_eq!(ptr, 0);
     nsl_runtime::c_api::nsl_model_destroy(model);
+}
+/// Path to the `nsl` binary built by `cargo test --workspace`.
+///
+/// `nsl` lives in the sibling `nsl-cli` crate, so Cargo does not set
+/// `CARGO_BIN_EXE_nsl` for this crate's integration tests, and assert_cmd 2.2+
+/// no longer falls back to the target directory. Resolve it next to the running
+/// test executable instead: `target/<profile>/deps/<test>` -> `target/<profile>/nsl`.
+fn nsl_bin() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("locate test executable");
+    dir.pop(); // drop the test-binary file name
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    dir.join(format!("nsl{}", std::env::consts::EXE_SUFFIX))
 }

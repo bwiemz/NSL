@@ -468,6 +468,7 @@ mod override_tests {
                 active_heads: 8,
                 requested_csha_level: None,
                 adapter_rank: 0,
+                adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: 4,

@@ -14,6 +14,7 @@ pub mod register_budget;
 pub mod phases;
 pub mod tier_b1;
 pub mod tier_b2;
+pub mod per_doc_cta;
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_segment::SegmentResidency;

@@ -1,0 +1,27 @@
+# CFTP v7 — negative fixture: an UNRECOGNISED `dtype` string MUST be
+# refused at the semantic-checker layer (no silent fall-through to F32).
+# The companion `nsl-cli` test pins the exact diagnostic message so a
+# silent dtype-accept regression flips immediately.
+
+from nsl.nn.losses import cross_entropy
+
+model LM:
+    w: Tensor = randn([4096, 128])
+    bias: Tensor = zeros([4096])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return bias_add(x @ self.w.transpose(0, 1), self.bias)
+
+let m = LM()
+let x = randn([2, 32, 128])
+let targets = zeros([2, 32])
+
+@fused_lm_ce(enabled = true, dtype = "int8", vocab_size = 4096, hidden_size = 128, batch_size = 2, seq_len = 32, vocab_tile = 1024)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let logits = m.forward(x)
+        let loss = cross_entropy(logits, targets)
+    callbacks:
+        on_step(step, loss):
+            print(loss)

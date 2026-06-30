@@ -68,7 +68,6 @@ impl VerilogEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::*;
     use crate::hir::nodes::*;
 
     #[test]

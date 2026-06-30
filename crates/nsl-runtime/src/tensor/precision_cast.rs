@@ -8,13 +8,45 @@
 //! toward zero — proper rounding for optimizer state is a deferred ladder
 //! step (see the design doc §10). Models its allocation on
 //! `crate::fp8::nsl_fp8_cast`.
+//!
+//! # Adversarial review v6 — remaining deferred items
+//!
+//! Finding 3 (MEDIUM, HBM growth in long-scope loops): each forward+
+//! backward step allocates one set of cast shadow buffers per
+//! FusedLinearCe op via `cast_and_publish`'s `NslTensor::publish`,
+//! which `scope_track`s the tensor; the scope sweep runs at function
+//! exit. A training loop body lowered into one Cranelift function
+//! that runs N iterations within ONE scope (e.g., gradient
+//! accumulation) accumulates the cast tensors over the entire loop
+//! rather than per iteration.  The Finding 10/14 forward-to-backward
+//! cache halves the per-iteration cost (one cast set per dispatch
+//! instead of two), but the per-loop accumulation hazard remains.
+//! Mitigations: (a) ensure the lowered loop body emits per-iteration
+//! `nsl_tensor_scope_begin`/`scope_end` boundaries; (b) longer term,
+//! a v7 on-device cast kernel + a model-weight-pinned W shadow buffer
+//! lifts the cost out of the loop entirely.
+//!
+//! Finding 7 (HIGH, RTE rounding gap): the underlying CPU primitives
+//! `f32_to_f16_bits` / `f32_to_bf16_bits` TRUNCATE rather than round-to-
+//! nearest-even, producing a one-sided bias of up to one full unit
+//! roundoff per element.  CFTP v7 closes the GAP on the production GPU
+//! path by routing GPU tensors through `gpu_cast_and_publish` →
+//! PTX `cvt.rn.{f16,bf16}.f32` (IEEE-754 default RTE), so the
+//! production wengert lowering matches the `half::*::from_f32`
+//! rounding used by the V=49152 baselines.  The CPU primitives'
+//! truncation lives only on CPU staging paths that real training runs
+//! do not exercise; aligning the CPU primitives to RTE is the §10
+//! deferred ladder step.  With v7 the FFI refusal at
+//! `fused_linear_ce.rs` is LIFTED — `NSL_FUSED_LCE_REFUSE_NON_F32=1`
+//! remains as an opt-in diagnostic / safety override.
 
 use std::ffi::c_void;
 
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::{
-    f16_bits_to_f32, f32_to_f16_bits, int8_blockwise, NslTensor, DTYPE_F32, DTYPE_FP16, DTYPE_INT8,
+    bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, NslTensor, DTYPE_BF16,
+    DTYPE_F32, DTYPE_FP16,
 };
 
 /// Cast a tensor to `target_dtype`, returning a NEW owned tensor.
@@ -34,6 +66,30 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
         "nsl_tensor_cast: GPU tensors not supported in v1 (device={})",
         t.device
     );
+    // CFTP v6 Finding 2 (HIGH): the cast reads `t.data` LINEARLY for `len`
+    // contiguous elements then overwrites the output strides with
+    // `compute_strides(shape)` (always row-major contiguous). A non-contiguous
+    // source (transposed view, sliced view, broadcast) would silently produce a
+    // tensor whose values are wrong — the cast reads physical layout but claims
+    // logical contiguous semantics. Refuse non-contiguous sources loudly so a
+    // future caller that legitimately passes a strided view surfaces here
+    // rather than silently corrupting training numerics.
+    assert!(
+        t.is_contiguous(),
+        "nsl_tensor_cast: source tensor must be contiguous (ndim={}); \
+         non-contiguous sources are NOT supported — call \
+         nsl_tensor_contiguous(src) before nsl_tensor_cast.",
+        t.ndim
+    );
+    // CFTP v6 Finding 4 (MEDIUM): len/shape mismatch would size the alloc
+    // by `t.len` while downstream callers (PTX kernels) trust `product(shape)`
+    // — refuse such tensors at the cast site to catch the violation early.
+    assert_eq!(
+        t.len,
+        NslTensor::total_elements(t.shape, t.ndim),
+        "nsl_tensor_cast: t.len ({}) != product(t.shape) — invariant violation",
+        t.len
+    );
     let len = t.len as usize;
     let target = target_dtype as u16;
 
@@ -46,15 +102,11 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             d.iter().map(|&b| f16_bits_to_f32(b)).collect()
         }
-        DTYPE_INT8 => {
-            // CPDT §3.2 — INT8 blockwise source: read via int8_blockwise::dequant_to_buffer.
-            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
-            let src_bytes = unsafe { std::slice::from_raw_parts(t.data as *const u8, bytes) };
-            let mut out = vec![0.0f32; len];
-            int8_blockwise::dequant_to_buffer(src_bytes, &mut out);
-            out
+        DTYPE_BF16 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
+            d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast: unsupported source dtype {other}"),
+        other => panic!("nsl_tensor_cast: unsupported source dtype {other} (v6: F32/FP16/BF16)"),
     };
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
@@ -75,17 +127,14 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             }
             p as *mut c_void
         }
-        DTYPE_INT8 => {
-            // CPDT §3.2 — INT8 blockwise target: write via int8_blockwise::quant_to_buffer.
-            // Deterministic rounding for the bare-cast path; the stochastic
-            // variant lives at `nsl_tensor_quant_int8_blockwise`.
-            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
-            let p = checked_alloc(bytes);
-            let buf = unsafe { std::slice::from_raw_parts_mut(p, bytes) };
-            int8_blockwise::quant_to_buffer(&src_f32, buf, false, len as u64);
+        DTYPE_BF16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_bf16_bits(v) };
+            }
             p as *mut c_void
         }
-        other => panic!("nsl_tensor_cast: unsupported target dtype {other}"),
+        other => panic!("nsl_tensor_cast: unsupported target dtype {other} (v6: F32/FP16/BF16)"),
     };
 
     let out = Box::new(NslTensor::new(
@@ -99,6 +148,250 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     Box::into_raw(out) as i64
 }
 
+/// CFTP v6 convenience: cast a tensor to BF16, returning a NEW owned tensor
+/// published into the scope sweep (so the shadow buffer is reclaimed at
+/// function-scope exit — the right lifecycle for forward inline-cast). The
+/// source tensor is NOT consumed. v6 is CPU-only (the underlying
+/// `nsl_tensor_cast` is CPU-only); a device-side PTX cast kernel is deferred
+/// to v7. Supports F32/FP16/BF16 source dtypes (BF16->BF16 is a faithful copy).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_bf16(src_ptr: i64) -> i64 {
+    cast_and_publish(src_ptr, DTYPE_BF16)
+}
+
+/// CFTP v6 convenience: cast a tensor to FP16, returning a NEW owned tensor
+/// published into the scope sweep. See `nsl_tensor_to_bf16`. Uses the crate's
+/// `f32_to_f16_bits` primitive (truncating, not RTE — see module note).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_fp16(src_ptr: i64) -> i64 {
+    cast_and_publish(src_ptr, DTYPE_FP16)
+}
+
+/// CFTP v6 convenience: cast a tensor to F32, returning a NEW owned tensor
+/// published into the scope sweep. Needed for backward symmetry: if dx is
+/// emitted as BF16/FP16, the wengert tape may need an F32 widened copy.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_f32(src_ptr: i64) -> i64 {
+    cast_and_publish(src_ptr, DTYPE_F32)
+}
+
+/// CFTP v7: GPU dispatch for the v6 cast wrappers.
+///
+/// Allocates a device-side destination buffer, launches the appropriate PTX
+/// cast kernel, and publishes the result so the scope sweep reclaims it.
+/// `t` MUST already be device-resident and contiguous (the caller guards
+/// both before reaching this function).
+///
+/// Same-dtype "casts" (e.g. F32->F32) are handled via `cuMemcpyDtoD` rather
+/// than a kernel — there is no PTX cast pair for them. bf16<->fp16 are NOT
+/// supported by a single kernel; the caller would have to stage via f32.
+/// For the v7 surface (which is only reachable from the three v6 wrappers)
+/// every legitimate (src,target) pair is covered.
+#[cfg(feature = "cuda")]
+fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
+    use crate::cuda::precision_cast_kernels;
+
+    let len = t.len as usize;
+    // CFTP v7 follow-on (finding-4): zero-length casts must not produce a
+    // published tensor pointing at stale HBM. They're a programming error
+    // in this path (the wengert lowering never emits a zero-length cast),
+    // so refuse loudly rather than silently exposing caching-allocator
+    // garbage in the dst buffer.
+    assert!(
+        len > 0,
+        "gpu_cast_and_publish: zero-length cast (t.len == 0) is not supported; \
+         caller must not request a cast of an empty tensor"
+    );
+    let target_elem_size: usize = match target_dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 => 2,
+        DTYPE_BF16 => 2,
+        other => panic!(
+            "gpu_cast_and_publish: unsupported target dtype {other} (v7: F32/FP16/BF16)"
+        ),
+    };
+
+    // Allocate the device-side destination buffer via the runtime's managed
+    // allocator (same path as every other GPU op; participates in the
+    // caching allocator + OOM recovery).
+    let dst_bytes = len * target_elem_size;
+    let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
+    // CFTP v7 follow-on (finding-4): defensive zero-fill closes the
+    // partial-write window if a future change to the cast kernel ever
+    // leaves bytes unwritten (e.g. if the u64 bounds check above were
+    // accidentally re-narrowed to u32 by a refactor). Cheap — memset is
+    // parallel-async on every Blackwell/Hopper SKU we target.
+    crate::cuda::inner::memset_d8(dst_data, dst_bytes);
+
+    // Same-dtype path: device-to-device memcpy (no conversion).
+    if t.dtype == target_dtype {
+        crate::cuda::inner::memcpy_dtod(
+            dst_data,
+            t.data as *const std::ffi::c_void,
+            dst_bytes,
+        );
+    } else {
+        let (ptx, kname) =
+            precision_cast_kernels::pick_cast_kernel(t.dtype, target_dtype).unwrap_or_else(|| {
+                panic!(
+                    "gpu_cast_and_publish: no GPU cast kernel for src dtype {} -> target {}; \
+                     v7 supports {{f32,fp16,bf16}} pairs through f32 only",
+                    t.dtype, target_dtype
+                )
+            });
+        let rc = precision_cast_kernels::launch_cast(
+            ptx,
+            kname,
+            t.data as u64,
+            dst_data as u64,
+            len as u64,
+        );
+        assert_eq!(
+            rc, 0,
+            "gpu_cast_and_publish: cast kernel '{}' launch failed (rc={rc})",
+            kname.trim_end_matches('\0')
+        );
+        // CFTP v7 follow-on (findings 12/17): no per-cast cuCtxSynchronize.
+        //
+        // The production consumer (fused-LCE FFI) runs on CUDA's default
+        // (in-order) stream and issues its own terminal cuCtxSynchronize
+        // before returning. A pre-cast sync here adds 3-6 host stalls per
+        // fused-LCE step (one per x/W/bias cast, doubled in forward+backward)
+        // that the wengert precision-cast cache was specifically introduced
+        // to amortise. Tests that read dst_data directly on the host (e.g.
+        // `precision_cast_gpu_dispatch.rs`) route through
+        // `nsl_tensor_to_device(_, 0)` which itself syncs before the dtoh
+        // copy, so they still observe consistent results.
+    }
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    let out = Box::new(NslTensor::new(
+        dst_data,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device, // preserve device (1+ for CUDA)
+        target_dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    NslTensor::publish(out)
+}
+
+/// `cuda` feature off: GPU dispatch is unreachable (no device tensors can
+/// exist without the `cuda` feature). Provide a stub for the non-cuda build
+/// so the device-branch in `cast_and_publish` still compiles.
+#[cfg(not(feature = "cuda"))]
+fn gpu_cast_and_publish(t: &NslTensor, _target_dtype: u16) -> i64 {
+    panic!(
+        "gpu_cast_and_publish: device tensor (device={}) reached cast path \
+         but runtime was compiled without the `cuda` feature",
+        t.device
+    );
+}
+
+/// Shared helper for v6 cast wrappers. Performs a CPU cast (via the same
+/// host arithmetic as `nsl_tensor_cast`), but allocates the result via
+/// `NslTensor::publish` so the new tensor participates in the scope sweep
+/// (in contrast to `nsl_tensor_cast` which uses bare `Box::into_raw` for
+/// FASE optimizer-state buffers that are explicitly freed each step).
+///
+/// CFTP v7 (2026-06-26): GPU tensors are now dispatched to
+/// `gpu_cast_and_publish` (which lowers to a PTX cast kernel). CPU tensors
+/// continue to take the host-staged path below — byte-identical to v6.
+fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
+    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    // CFTP v6 Finding 2 (HIGH) + Finding 4 (MEDIUM): the contiguity and
+    // len/shape invariants are correctness preconditions for BOTH the CPU
+    // host-staged path AND the v7 GPU PTX cast — keep them before any
+    // device-branch so a violating input is refused regardless of device.
+    // (Linear-read + row-major-strides assumption applies to GPU too: the
+    // cast kernels index `i in [0, numel)` over the source buffer without
+    // consulting strides.)
+    assert!(
+        t.is_contiguous(),
+        "cast_and_publish: source tensor must be contiguous (ndim={}); \
+         the wengert lowering must pass contiguous x/W/bias buffers.",
+        t.ndim
+    );
+    assert_eq!(
+        t.len,
+        NslTensor::total_elements(t.shape, t.ndim),
+        "cast_and_publish: t.len ({}) != product(t.shape) — invariant violation",
+        t.len
+    );
+
+    // CFTP v7: GPU dispatch — must come BEFORE any host slice read on
+    // `t.data` (lines below treat `t.data` as a HOST pointer; a GPU
+    // tensor would be silent UB otherwise).
+    if t.device > 0 {
+        return gpu_cast_and_publish(t, target_dtype);
+    }
+
+    let len = t.len as usize;
+
+    let src_f32: Vec<f32> = match t.dtype {
+        DTYPE_F32 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
+            d.to_vec()
+        }
+        DTYPE_FP16 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
+            d.iter().map(|&b| f16_bits_to_f32(b)).collect()
+        }
+        DTYPE_BF16 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
+            d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
+        }
+        other => panic!("cast_and_publish: unsupported source dtype {other} (v6: F32/FP16/BF16)"),
+    };
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+
+    let data: *mut c_void = match target_dtype {
+        DTYPE_F32 => {
+            let p = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = v };
+            }
+            p as *mut c_void
+        }
+        DTYPE_FP16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_f16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        DTYPE_BF16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_bf16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        other => panic!("cast_and_publish: unsupported target dtype {other} (v6: F32/FP16/BF16)"),
+    };
+
+    let out = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device,
+        target_dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    // publish (not bare Box::into_raw) — scope_track participation so the
+    // forward inline-cast shadow buffer is reclaimed on function-scope exit.
+    NslTensor::publish(out)
+}
+
 /// Convert `src` (read as f32) into `dst`'s dtype and write it IN PLACE into
 /// `dst`'s existing buffer. `dst` keeps its identity (pointer/buffer), which
 /// preserves persistent optimizer-state identity across steps. `len` must
@@ -109,6 +402,19 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     let src = unsafe { &*(src_ptr as *const NslTensor) };
     assert_eq!(dst.device, 0, "nsl_tensor_cast_into: GPU dst not supported in v1 (device={})", dst.device);
     assert_eq!(src.device, 0, "nsl_tensor_cast_into: GPU src not supported in v1 (device={})", src.device);
+    // CFTP v6 Finding 2: refuse non-contiguous src/dst — `nsl_tensor_cast_into`
+    // does a linear read and a linear in-place write; a non-contiguous view
+    // would silently corrupt the underlying buffer.
+    assert!(
+        src.is_contiguous(),
+        "nsl_tensor_cast_into: src must be contiguous (ndim={})",
+        src.ndim
+    );
+    assert!(
+        dst.is_contiguous(),
+        "nsl_tensor_cast_into: dst must be contiguous (ndim={})",
+        dst.ndim
+    );
     let len = dst.len as usize;
     assert_eq!(dst.len, src.len, "nsl_tensor_cast_into: length mismatch (dst={}, src={})", dst.len, src.len);
 
@@ -118,14 +424,11 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
             let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
             d.iter().map(|&b| f16_bits_to_f32(b)).collect()
         }
-        DTYPE_INT8 => {
-            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
-            let src_bytes = unsafe { std::slice::from_raw_parts(src.data as *const u8, bytes) };
-            let mut out = vec![0.0f32; len];
-            int8_blockwise::dequant_to_buffer(src_bytes, &mut out);
-            out
+        DTYPE_BF16 => {
+            let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
+            d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other}"),
+        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other} (v6: F32/FP16/BF16)"),
     };
 
     match dst.dtype {
@@ -141,16 +444,13 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *p.add(i) = f32_to_f16_bits(v) };
             }
         }
-        DTYPE_INT8 => {
-            // §3.2 in-place quant: overwrite dst's blockwise buffer with new
-            // INT8 values + scales. dst was allocated via
-            // nsl_tensor_zeros_like_dtype(DTYPE_INT8) so its buffer is sized
-            // for int8_blockwise_byte_size(len).
-            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
-            let buf = unsafe { std::slice::from_raw_parts_mut(dst.data as *mut u8, bytes) };
-            int8_blockwise::quant_to_buffer(&src_f32, buf, false, len as u64);
+        DTYPE_BF16 => {
+            let p = dst.data as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_bf16_bits(v) };
+            }
         }
-        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other}"),
+        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v6: F32/FP16/BF16)"),
     }
 }
 
@@ -180,6 +480,12 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
 pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
     let t = unsafe { &*(template_ptr as *const NslTensor) };
     let dtype = dtype as u16;
+    let elem_size: usize = match dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 => 2,
+        DTYPE_BF16 => 2,
+        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v6: F32=1, FP16=2, BF16=3)"),
+    };
 
     let ndim = t.ndim;
     let len = t.len;
@@ -188,16 +494,8 @@ pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> 
     let shape = NslTensor::copy_shape(t.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    // Compute the data buffer size. INT8 blockwise needs scale storage too.
-    let data_size: usize = match dtype {
-        DTYPE_F32 => (len as usize) * 4,
-        DTYPE_FP16 => (len as usize) * 2,
-        DTYPE_INT8 => int8_blockwise::int8_blockwise_byte_size(len as usize),
-        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other}"),
-    };
-    // Zero-fill is numerically zero for F32/FP16 (0-bits == 0.0). For INT8
-    // blockwise, zero values + zero scales decode as zero-FP32 — paper-
-    // faithful initial state for the optimizer-state buffer.
+    // Zero-fill: 0-bits == 0.0 for both f32 and FP16.
+    let data_size = (len as usize) * elem_size;
     let data = checked_alloc_zeroed(data_size) as *mut std::ffi::c_void;
 
     let tensor = Box::new(NslTensor::new(
@@ -386,6 +684,189 @@ mod tests {
         crate::tensor::nsl_tensor_free(z);
     }
 
+    fn bf16_tensor(vals: &[f32]) -> i64 {
+        let len = vals.len();
+        let data = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *data.add(i) = f32_to_bf16_bits(v) };
+        }
+        let shape = NslTensor::copy_shape([len as i64].as_ptr() as *mut i64, 1);
+        let strides = NslTensor::compute_strides(shape, 1);
+        let t = Box::new(NslTensor::new(
+            data as *mut c_void, shape, strides, 1, len as i64, 0, DTYPE_BF16, 1, 0,
+        ));
+        Box::into_raw(t) as i64
+    }
+
+    /// CFTP v6: bit-pattern equality vs hand-computed bf16 reference.
+    /// bf16 = top 16 bits of f32, so 1.0 = 0x3F800000_f32 -> 0x3F80_bf16.
+    #[test]
+    fn to_bf16_produces_expected_bit_patterns() {
+        // Hand-computed references: bf16 bits = high 16 bits of the f32 bits.
+        let vals = [1.0_f32, -2.0, 0.5, 0.0];
+        let expected_bits: [u16; 4] = [
+            (1.0_f32.to_bits() >> 16) as u16,   // 0x3F80
+            ((-2.0_f32).to_bits() >> 16) as u16, // 0xC000
+            (0.5_f32.to_bits() >> 16) as u16,   // 0x3F00
+            0x0000,
+        ];
+        let src = f32_tensor(&vals);
+        let bf16 = nsl_tensor_to_bf16(src);
+        let t = unsafe { &*(bf16 as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16, "result must be tagged bf16");
+        assert_eq!(t.len, vals.len() as i64);
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, vals.len()) };
+        for i in 0..vals.len() {
+            assert_eq!(
+                bits[i], expected_bits[i],
+                "elem {i}: got 0x{:04X} expected 0x{:04X}",
+                bits[i], expected_bits[i]
+            );
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(bf16);
+    }
+
+    /// Round-trip f32 -> bf16 -> f32 closes within bf16's truncating eps.
+    /// bf16 has 7 explicit mantissa bits so unit roundoff = 2^-7 ≈ 7.8e-3.
+    /// The crate's `f32_to_bf16_bits` truncates (drops low 16 bits), so worst
+    /// case relative error approaches the unit roundoff itself, not 0.5 ULP.
+    /// We use 7.9e-3 (one ULP above 2^-7) to be safe.
+    #[test]
+    fn to_bf16_round_trip_within_epsilon() {
+        let vals = [1.0001_f32, 3.14159265, -2.71828, 1234.5, 1e-3, -1e3];
+        let src = f32_tensor(&vals);
+        let bf16 = nsl_tensor_to_bf16(src);
+        let back = nsl_tensor_to_f32(bf16);
+        let got = read_f32(back);
+        for (i, &v) in vals.iter().enumerate() {
+            let rel = ((got[i] - v) / v).abs();
+            assert!(
+                rel <= 7.9e-3,
+                "elem {i}: v={v} got={} rel_err={} (bf16 truncating eps ~7.8e-3)",
+                got[i],
+                rel
+            );
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(bf16);
+        crate::tensor::nsl_tensor_free(back);
+    }
+
+    /// Round-trip f32 -> fp16 -> f32 closes within fp16's epsilon (~9.8e-4).
+    /// fp16 has 10 mantissa bits, eps ~= 2^-10 ≈ 9.77e-4. Truncating primitive
+    /// gives worst-case ~2 * eps but real-world values stay within ~1.1e-3.
+    #[test]
+    fn to_fp16_round_trip_within_epsilon() {
+        // Avoid subnormal and overflow regions: fp16 range is ~6e-5 to 65504.
+        let vals = [1.0001_f32, 3.14159265, -2.71828, 1234.5, 1.5e-2, -512.0];
+        let src = f32_tensor(&vals);
+        let fp16 = nsl_tensor_to_fp16(src);
+        let back = nsl_tensor_to_f32(fp16);
+        let got = read_f32(back);
+        for (i, &v) in vals.iter().enumerate() {
+            let rel = ((got[i] - v) / v).abs();
+            // Truncating primitive can lose up to ~2 ULP at worst; use 1.1e-3.
+            assert!(
+                rel <= 1.1e-3,
+                "elem {i}: v={v} got={} rel_err={} (fp16 eps ~9.8e-4)",
+                got[i],
+                rel
+            );
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(fp16);
+        crate::tensor::nsl_tensor_free(back);
+    }
+
+    /// Multi-size coverage: small (1), aligned (16), non-aligned (17), large (1024).
+    #[test]
+    fn to_bf16_multi_size_round_trip() {
+        for &n in &[1_usize, 16, 17, 1024] {
+            let vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.125 + 0.1).collect();
+            let src = f32_tensor(&vals);
+            let bf16 = nsl_tensor_to_bf16(src);
+            let back = nsl_tensor_to_f32(bf16);
+            let got = read_f32(back);
+            for (i, &v) in vals.iter().enumerate() {
+                let rel = ((got[i] - v) / v).abs();
+                assert!(
+                    rel <= 7.9e-3,
+                    "n={n} elem {i}: v={v} got={} rel_err={}",
+                    got[i],
+                    rel
+                );
+            }
+            // Cast also preserves shape + strides.
+            let t = unsafe { &*(bf16 as *const NslTensor) };
+            assert_eq!(t.len as usize, n, "len preserved (n={n})");
+            assert_eq!(t.ndim, 1, "ndim preserved (n={n})");
+            crate::tensor::nsl_tensor_free(src);
+            crate::tensor::nsl_tensor_free(bf16);
+            crate::tensor::nsl_tensor_free(back);
+        }
+    }
+
+    /// Confirm the v6 wrappers DELEGATE to the same primitives as nsl_tensor_cast.
+    /// `nsl_tensor_to_bf16(x)` and `nsl_tensor_cast(x, DTYPE_BF16)` must produce
+    /// bit-identical buffers.
+    #[test]
+    fn to_bf16_matches_nsl_tensor_cast_bit_for_bit() {
+        let vals = [1.0_f32, -3.14, 1e-2, 65500.0];
+        let src_a = f32_tensor(&vals);
+        let src_b = f32_tensor(&vals);
+        let via_wrapper = nsl_tensor_to_bf16(src_a);
+        let via_cast = nsl_tensor_cast(src_b, DTYPE_BF16 as i64);
+        let bits_a = unsafe {
+            std::slice::from_raw_parts(
+                (*(via_wrapper as *const NslTensor)).data as *const u16,
+                vals.len(),
+            )
+        };
+        let bits_b = unsafe {
+            std::slice::from_raw_parts(
+                (*(via_cast as *const NslTensor)).data as *const u16,
+                vals.len(),
+            )
+        };
+        assert_eq!(bits_a, bits_b, "wrapper must be bit-identical to nsl_tensor_cast");
+        crate::tensor::nsl_tensor_free(src_a);
+        crate::tensor::nsl_tensor_free(src_b);
+        // Note: via_wrapper was published into scope_track. In tests there is
+        // no enclosing function scope sweep, so an explicit free is fine.
+        crate::tensor::nsl_tensor_free(via_wrapper);
+        crate::tensor::nsl_tensor_free(via_cast);
+    }
+
+    /// Source dtype coverage: bf16 source -> f32 cast (backward symmetry path).
+    #[test]
+    fn nsl_tensor_cast_supports_bf16_source() {
+        let vals = [1.0_f32, -2.0, 0.5];
+        let src = bf16_tensor(&vals);
+        let out = nsl_tensor_cast(src, DTYPE_F32 as i64);
+        let got = read_f32(out);
+        // Exact: bf16 1.0/-2.0/0.5 round-trip with zero error (all exactly representable).
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(got[i], v, "elem {i}: exact bf16 value lost");
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(out);
+    }
+
+    /// zeros_like_dtype now supports BF16.
+    #[test]
+    fn zeros_like_dtype_bf16() {
+        let template = f32_tensor(&[5.0, 6.0, 7.0]);
+        let z = nsl_tensor_zeros_like_dtype(template, DTYPE_BF16 as i64);
+        let t = unsafe { &*(z as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16, "dtype is BF16");
+        assert_eq!(t.len, 3);
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
+        assert!(bits.iter().all(|&b| bf16_bits_to_f32(b) == 0.0), "all zero");
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(z);
+    }
+
     #[test]
     fn zeros_like_dtype_f32_is_f32_zeros() {
         let template = f32_tensor(&[5.0, 6.0]);
@@ -396,65 +877,152 @@ mod tests {
         crate::tensor::nsl_tensor_free(z);
     }
 
+    /// CFTP v7 follow-on (finding 7/2): CPU `f32_to_bf16_bits` now uses
+    /// IEEE-754 RTE (round-to-nearest-even) via `half::bf16::from_f32`,
+    /// matching PTX `cvt.rn.bf16.f32` bit-for-bit on every input. Pin
+    /// the rounding so a regression to the truncating implementation is
+    /// caught immediately.
     #[test]
-    fn cast_f32_to_int8_then_back_within_int8_precision() {
-        // CPDT §3.2: nsl_tensor_cast must now support DTYPE_INT8 as a target +
-        // source dtype (blockwise layout). Roundtrip error bounded by 1/127.
-        let vals: Vec<f32> = (0..64).map(|i| ((i as f32) / 64.0) * 2.0 - 1.0).collect();
-        let src = f32_tensor(&vals);
-        let int8 = nsl_tensor_cast(src, DTYPE_INT8 as i64);
-        assert_ne!(int8, 0);
-        let t = unsafe { &*(int8 as *const NslTensor) };
-        assert_eq!(t.dtype, DTYPE_INT8);
-        assert_eq!(t.len, 64);
-        let back = nsl_tensor_cast(int8, DTYPE_F32 as i64);
-        let got = read_f32(back);
-        for (a, b) in vals.iter().zip(got.iter()) {
-            assert!((a - b).abs() <= 1.0 / 127.0, "roundtrip {a} -> {b}");
-        }
-        crate::tensor::nsl_tensor_free(src);
-        crate::tensor::nsl_tensor_free(int8);
-        crate::tensor::nsl_tensor_free(back);
+    fn f32_to_bf16_bits_uses_rte_not_truncation() {
+        use crate::tensor::f32_to_bf16_bits;
+        // f32 = 0x3F80FFFF (just below 0x3F810000). Lower 16 bits = 0xFFFF
+        // > 0x8000, so RTE rounds UP from 0x3F80 to 0x3F81. Truncation
+        // would yield 0x3F80 (the buggy v6 behavior).
+        let v = f32::from_bits(0x3F80FFFF);
+        let bits = f32_to_bf16_bits(v);
+        assert_eq!(
+            bits, 0x3F81,
+            "f32_to_bf16_bits MUST round-to-nearest-even (got 0x{bits:04X}, \
+             expected 0x3F81). Truncation here would silently disagree with \
+             PTX cvt.rn.bf16.f32 by one full ULP on the CPU staging path."
+        );
+        // Exact halfway: f32 = 0x3F808000. Lower 16 = 0x8000 == halfway.
+        // RTE: round to even (mant LSB = 0) → keep 0x3F80.
+        let v2 = f32::from_bits(0x3F808000);
+        assert_eq!(
+            f32_to_bf16_bits(v2),
+            0x3F80,
+            "RTE halfway with even-LSB neighbour must round DOWN (banker's rounding)"
+        );
+        // Exact halfway with odd LSB: f32 = 0x3F818000. Lower 16 = 0x8000;
+        // mant LSB = 1 (odd) → round UP to 0x3F82.
+        let v3 = f32::from_bits(0x3F818000);
+        assert_eq!(
+            f32_to_bf16_bits(v3),
+            0x3F82,
+            "RTE halfway with odd-LSB neighbour must round UP to the even mantissa"
+        );
+    }
+
+    /// CFTP v7 follow-on (finding 7/2): same RTE pin for fp16.
+    #[test]
+    fn f32_to_f16_bits_uses_rte_not_truncation() {
+        use crate::tensor::f32_to_f16_bits;
+        // f32 = 0x3F80FFFF (mant bits: 0x00FFFF). f16 mant = top 10 of 23 =
+        // 0x00FFFF >> 13 = 7; round bit = bit 12 = 1; sticky = bits 0-11 =
+        // 0xFFF (non-zero). > halfway → round UP from 7 to 8. Expected 0x3C08.
+        // v6 truncation would have produced 0x3C07.
+        let v = f32::from_bits(0x3F80FFFF);
+        let bits = f32_to_f16_bits(v);
+        assert_eq!(
+            bits, 0x3C08,
+            "f32_to_f16_bits MUST round-to-nearest-even (got 0x{bits:04X}, \
+             expected 0x3C08). v6 truncation produced 0x3C07."
+        );
+        // Halfway tie with even neighbour: f32 = 0x3F801000 (mant LSB=0 in
+        // f16). Lower 13 = 0x1000 exactly; sticky = 0; tie → round to even.
+        // f16 mant stays 0 → 0x3C00.
+        let v2 = f32::from_bits(0x3F801000);
+        assert_eq!(
+            f32_to_f16_bits(v2),
+            0x3C00,
+            "RTE halfway with even neighbour must round DOWN"
+        );
+        // Halfway tie with odd neighbour: f32 = 0x3F803000 (f16 base mant=1).
+        // Lower 13 = 0x1000 exact halfway; tie → round to even. Round UP
+        // from 1 to 2 → 0x3C02.
+        let v3 = f32::from_bits(0x3F803000);
+        assert_eq!(
+            f32_to_f16_bits(v3),
+            0x3C02,
+            "RTE halfway with odd neighbour must round UP to even"
+        );
+    }
+
+    /// CFTP v7 follow-on (finding 8): NaN preservation — both bf16 and f16
+    /// primitives previously silently flushed NaN to ±Inf because the
+    /// finite-overflow check (`exp >= 143` for f16; `bits >> 16` for bf16)
+    /// also matched `exp == 255`. Delegating to `half` preserves NaN.
+    #[test]
+    fn f32_to_f16_bits_preserves_nan() {
+        use crate::tensor::f32_to_f16_bits;
+        let nan_bits = f32_to_f16_bits(f32::NAN);
+        // f16 NaN: exp = 0x1F (top 5 bits), mant != 0. f16 +Inf is 0x7C00
+        // (mant == 0); any quiet NaN has mant != 0.
+        let exp = (nan_bits >> 10) & 0x1F;
+        let mant = nan_bits & 0x3FF;
+        assert_eq!(exp, 0x1F, "NaN must produce f16 exp=0x1F (not zero)");
+        assert_ne!(
+            mant, 0,
+            "NaN must produce f16 NaN (mant != 0) — finding-8: previous \
+             implementation collapsed NaN to ±Inf (mant == 0)"
+        );
     }
 
     #[test]
-    fn cast_into_f32_to_int8_persistent_buffer() {
-        // Allocate a persistent INT8 blockwise buffer (zeros), then quant-store
-        // FP32 values into it in-place via cast_into — the §3.2 in-place
-        // "quant FP32 → INT8" half of the FASE-wrap pattern.
-        let template = f32_tensor(&vec![0.0_f32; 64]);
-        let dst_int8 = nsl_tensor_zeros_like_dtype(template, DTYPE_INT8 as i64);
-        let vals: Vec<f32> = (0..64).map(|i| ((i as f32) / 64.0) * 2.0 - 1.0).collect();
-        let src = f32_tensor(&vals);
-        nsl_tensor_cast_into(dst_int8, src);
-        // Read back via nsl_tensor_cast(int8 -> f32).
-        let back = nsl_tensor_cast(dst_int8, DTYPE_F32 as i64);
-        let got = read_f32(back);
-        for (a, b) in vals.iter().zip(got.iter()) {
-            assert!((a - b).abs() <= 1.0 / 127.0, "cast_into {a} -> {b}");
-        }
-        crate::tensor::nsl_tensor_free(template);
-        crate::tensor::nsl_tensor_free(src);
-        crate::tensor::nsl_tensor_free(back);
-        // dst_int8 was allocated via publish (scope-tracked) — free with explicit
-        // free to match the existing FP16 test pattern.
-        crate::tensor::nsl_tensor_free(dst_int8);
+    fn f32_to_bf16_bits_preserves_nan() {
+        use crate::tensor::f32_to_bf16_bits;
+        // sNaN with payload only in low 16 mantissa bits: 0x7F800001.
+        // v6 truncation: bits >> 16 = 0x7F80 = bf16 +Inf (silent NaN→Inf).
+        // v7 (half crate): preserves NaN.
+        let snan = f32::from_bits(0x7F80_0001);
+        let bits = f32_to_bf16_bits(snan);
+        let exp = (bits >> 7) & 0xFF;
+        let mant = bits & 0x7F;
+        assert_eq!(exp, 0xFF, "bf16 NaN must have exp=0xFF");
+        assert_ne!(
+            mant, 0,
+            "bf16 NaN MUST keep a non-zero mantissa (got 0x{bits:04X}). \
+             v6 truncation produced 0x7F80 (= bf16 +Inf), silently \
+             converting NaN to Inf."
+        );
+        // Standard qNaN — always preserved.
+        let qnan_bits = f32_to_bf16_bits(f32::NAN);
+        let qexp = (qnan_bits >> 7) & 0xFF;
+        let qmant = qnan_bits & 0x7F;
+        assert_eq!(qexp, 0xFF);
+        assert_ne!(qmant, 0);
     }
 
+    /// CFTP v6 Finding 2 (HIGH): the contiguity guard precondition is a
+    /// load-bearing invariant — verify both positive forms work today.  The
+    /// negative (refusal) cases cannot use `#[should_panic]` because the
+    /// cast FFIs are `extern "C"` (panic-on-unwind aborts the test runner);
+    /// the assertion itself is verified at the function-prologue line.
+    /// This test exercises the happy path (contiguous tensor) and confirms
+    /// the new `is_contiguous` check does not over-trigger on row-major
+    /// rank-2 inputs (a stride layout the prior tests did not cover).
     #[test]
-    fn zeros_like_dtype_int8_dequants_to_zero() {
-        let template = f32_tensor(&vec![7.0_f32; 64]);
-        let z = nsl_tensor_zeros_like_dtype(template, DTYPE_INT8 as i64);
-        let t = unsafe { &*(z as *const NslTensor) };
-        assert_eq!(t.dtype, DTYPE_INT8);
-        assert_eq!(t.len, 64);
-        let back = nsl_tensor_cast(z, DTYPE_F32 as i64);
-        let got = read_f32(back);
-        for v in &got {
-            assert_eq!(*v, 0.0);
+    fn cast_accepts_rank2_row_major_contiguous() {
+        // 2x2 row-major contiguous: shape=[2,2], strides=[2,1], len=4.
+        let vals = [1.0_f32, 2.0, 3.0, 4.0];
+        let len = vals.len();
+        let data = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *data.add(i) = v };
         }
-        crate::tensor::nsl_tensor_free(template);
-        crate::tensor::nsl_tensor_free(z);
-        crate::tensor::nsl_tensor_free(back);
+        let shape = NslTensor::copy_shape([2_i64, 2].as_ptr() as *mut i64, 2);
+        let strides = NslTensor::compute_strides(shape, 2);
+        let t = Box::new(NslTensor::new(
+            data as *mut c_void, shape, strides, 2, len as i64, 0, DTYPE_F32, 1, 0,
+        ));
+        let src = Box::into_raw(t) as i64;
+        // Should NOT panic — the contiguous, len==product(shape) input is valid.
+        let bf16 = nsl_tensor_to_bf16(src);
+        let t = unsafe { &*(bf16 as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16);
+        assert_eq!(t.len, 4);
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(bf16);
     }
 }

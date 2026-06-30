@@ -36,6 +36,11 @@ pub enum DecisionKind {
     CshaLevel,
     WrgaAdapter,
     CpdtPrecision,
+    /// FASE: whether the optimizer step is fused into the backward pass
+    /// (deferred gradient materialization) for this layer.
+    FaseStep,
+    /// PCA: sequence-packing mode chosen for this layer's attention kernels.
+    PcaPacking,
 }
 
 /// A human-readable record of one ILP decision, suitable for reporting.
@@ -79,6 +84,45 @@ impl HeadImportance {
     }
 }
 
+/// Where a WRGA low-rank adapter is attached.  This is a real decision the
+/// ILP makes (subject to the adapter communication budget), not a fixed
+/// assumption — previously the placement was hardcoded as the string
+/// "q_proj, v_proj" in the decision trace only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AdapterPlacement {
+    /// No adapter (rank 0).
+    #[default]
+    None,
+    /// Attention Q and V projections (2 sites) — the minimal LoRA placement.
+    AttnQV,
+    /// Attention Q, K, V, O projections (4 sites).
+    AttnQKVO,
+    /// Attention Q,K,V,O plus the two FFN projections (6 sites).
+    AttnAndFfn,
+}
+
+impl AdapterPlacement {
+    /// Number of weight projections the adapter is attached to.  Drives both
+    /// the parameter/communication footprint and the (small) compute cost.
+    pub fn proj_sites(self) -> u32 {
+        match self {
+            AdapterPlacement::None => 0,
+            AdapterPlacement::AttnQV => 2,
+            AdapterPlacement::AttnQKVO => 4,
+            AdapterPlacement::AttnAndFfn => 6,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdapterPlacement::None => "none",
+            AdapterPlacement::AttnQV => "q_proj, v_proj",
+            AdapterPlacement::AttnQKVO => "q_proj, k_proj, v_proj, o_proj",
+            AdapterPlacement::AttnAndFfn => "q,k,v,o + ffn_up, ffn_down",
+        }
+    }
+}
+
 /// Integer decision variables for one layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LayerDecision {
@@ -102,6 +146,10 @@ pub struct LayerDecision {
     ///   0 = none, 1 = segment_id, 2 = tile_skip, 3 = multi_seq.
     /// Each mode skips progressively more padded work (paper §4.3.6).
     pub packing_mode: u8,
+    /// Which projections the WRGA adapter is attached to.  `None` when
+    /// `adapter_rank == 0`.  Chosen by the solver as the smallest placement
+    /// whose communication cost fits `adapter_comm_budget`.
+    pub adapter_placement: AdapterPlacement,
 }
 
 impl LayerDecision {
@@ -248,6 +296,14 @@ pub fn solve_layer(
                     for &c in lut.axes_csha_levels.iter().rev() {
                         for &f in lut.axes_ffn_widths.iter().rev() {
                             for &r in &lut.axes_adapter_ranks {
+                                // Adapter placement is a real decision: pick the
+                                // smallest placement whose comm cost fits the
+                                // budget.  If none fits, this rank is infeasible
+                                // (the solver falls back to a smaller rank).
+                                let Some(placement) = best_placement(r, constraints) else {
+                                    continue;
+                                };
+                                let placement_us = placement_cost_us(r, placement);
                                 for heads_config in enumerate_head_configs(constraints) {
                                     state.nodes += 1;
                                     let h_count =
@@ -276,7 +332,8 @@ pub fn solve_layer(
                                     if !importance_ok(&heads_config, constraints) {
                                         continue;
                                     }
-                                    if entry.total_us() >= state.best_cost {
+                                    let cand_cost = entry.total_us() + placement_us;
+                                    if cand_cost >= state.best_cost {
                                         continue; // bound prune
                                     }
                                     let decision = LayerDecision {
@@ -288,8 +345,9 @@ pub fn solve_layer(
                                         optim_v_bits: v_bits,
                                         fase_fused: fase,
                                         packing_mode: pack,
+                                        adapter_placement: placement,
                                     };
-                                    state.best_cost = entry.total_us();
+                                    state.best_cost = cand_cost;
                                     state.best_decision = Some(decision);
                                     state.best_entry = Some(entry);
                                 }
@@ -325,6 +383,23 @@ pub fn solve_layer(
             decision_trace: Vec::new(),
         },
     }
+}
+
+/// Re-evaluate a decision's cost (μs) against the LUT, e.g. after the conflict
+/// resolver has mutated `csha_level` / `adapter_rank` / `fase_fused`.  Returns
+/// `f64::INFINITY` when the (possibly post-resolution) decision is no longer
+/// representable in the LUT.  Used by greedy mode's cost re-evaluation (G3).
+pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstraints) -> f64 {
+    let h_count = (d.active_heads() as u64).max(1);
+    let Some(base) = lut.get(h_count, d.ffn_width, d.csha_level, d.adapter_rank) else {
+        return f64::INFINITY;
+    };
+    if !base.feasible {
+        return f64::INFINITY;
+    }
+    let adj = apply_fase(base, d.fase_fused, c.fase_backward_speedup);
+    let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
+    entry.total_us() + placement_cost_us(d.adapter_rank, d.adapter_placement)
 }
 
 /// Diagnostic counters for [`solve_all_templated`].
@@ -529,6 +604,8 @@ pub fn solve_layer_greedy(
             optim_v_bits: v_bits,
             fase_fused,
             packing_mode,
+            adapter_placement: best_placement(r, constraints)
+                .unwrap_or(AdapterPlacement::None),
         },
         cost_us: entry.total_us(),
         memory_bytes,
@@ -653,6 +730,40 @@ fn importance_ok(config: &[bool], c: &LayerIlpConstraints) -> bool {
     retained >= c.min_retained_importance
 }
 
+/// Small per-(rank·site) compute surcharge so the solver prefers the smallest
+/// adapter placement unless a larger one is genuinely beneficial — a
+/// tie-breaker, not a dominant term.
+const ADAPTER_US_PER_RANK_SITE: f64 = 0.01;
+
+/// Communication footprint of an adapter under sharding, proportional to the
+/// number of adapter parameters that must be synchronized: `rank · sites`.
+/// Compared against [`LayerIlpConstraints::adapter_comm_budget`].
+fn adapter_comm(rank: u64, placement: AdapterPlacement) -> f64 {
+    (rank * placement.proj_sites() as u64) as f64
+}
+
+/// Tie-breaking compute cost of a placement (μs).
+fn placement_cost_us(rank: u64, placement: AdapterPlacement) -> f64 {
+    adapter_comm(rank, placement) * ADAPTER_US_PER_RANK_SITE
+}
+
+/// Choose the adapter placement for a given rank: the smallest-footprint
+/// placement whose communication cost fits the per-layer budget.  Returns
+/// `None` when even the minimal placement exceeds the budget — which makes the
+/// rank itself infeasible, so the solver falls back to a smaller rank.
+fn best_placement(rank: u64, c: &LayerIlpConstraints) -> Option<AdapterPlacement> {
+    if rank == 0 {
+        return Some(AdapterPlacement::None);
+    }
+    [
+        AdapterPlacement::AttnQV,
+        AdapterPlacement::AttnQKVO,
+        AdapterPlacement::AttnAndFfn,
+    ]
+    .into_iter()
+    .find(|&p| adapter_comm(rank, p) <= c.adapter_comm_budget)
+}
+
 /// Build the four human-readable `DecisionTrace` entries (CEP / CSHA / WRGA /
 /// CPDT) for a successfully-solved layer.  Phase 3 Task 2.
 fn build_decision_trace(
@@ -748,7 +859,11 @@ fn build_decision_trace(
     let wrga_chosen = if decision.adapter_rank == 0 {
         "No LoRA adapter (rank=0)".to_string()
     } else {
-        format!("LoRA r={} on q_proj, v_proj", decision.adapter_rank)
+        format!(
+            "LoRA r={} on {}",
+            decision.adapter_rank,
+            decision.adapter_placement.as_str()
+        )
     };
     let wrga_trace = DecisionTrace {
         kind: DecisionKind::WrgaAdapter,
@@ -801,7 +916,52 @@ fn build_decision_trace(
         cross_decision_note: None,
     };
 
-    vec![cep_trace, csha_trace, wrga_trace, cpdt_trace]
+    // ---------- FASE (fused optimizer step) ----------
+    let fase_trace = DecisionTrace {
+        kind: DecisionKind::FaseStep,
+        chosen: if decision.fase_fused {
+            "Fused step (deferred grads)".to_string()
+        } else {
+            "Deferred to standalone optimizer".to_string()
+        },
+        runner_up: None,
+        binding_constraint: Some(if c.allow_fase {
+            "allow_fase = true".to_string()
+        } else {
+            "allow_fase = false — fusion forbidden for this layer".to_string()
+        }),
+        metric_summary: if decision.fase_fused {
+            "Gradient buffers not materialized in HBM; backward writes updates in place.".to_string()
+        } else {
+            "Gradients materialized; optimizer runs as a separate pass.".to_string()
+        },
+        cross_decision_note: None,
+    };
+
+    // ---------- PCA (sequence packing) ----------
+    let pca_mode = match decision.packing_mode {
+        0 => "none",
+        1 => "segment_id",
+        2 => "tile_skip",
+        3 => "multi_seq",
+        _ => "unknown",
+    };
+    let pca_trace = DecisionTrace {
+        kind: DecisionKind::PcaPacking,
+        chosen: format!("Packing mode {} ({})", decision.packing_mode, pca_mode),
+        runner_up: None,
+        binding_constraint: None,
+        metric_summary: if decision.packing_mode == 0 {
+            "No sequence packing — padded positions computed.".to_string()
+        } else {
+            format!("Skips padded work via {pca_mode} packing (paper §4.3.6).")
+        },
+        cross_decision_note: None,
+    };
+
+    vec![
+        cep_trace, csha_trace, wrga_trace, cpdt_trace, fase_trace, pca_trace,
+    ]
 }
 
 fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
@@ -814,6 +974,7 @@ fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
         optim_v_bits: 32,
         fase_fused: false,
         packing_mode: 0,
+        adapter_placement: AdapterPlacement::None,
     }
 }
 
@@ -912,11 +1073,99 @@ mod tests {
     }
 
     #[test]
+    fn decision_trace_covers_all_six_dimensions() {
+        // G13: the explainer trace must cover all six WGGO decision
+        // dimensions, not only the original four (FASE + PCA were missing).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let sol = solve_layer(&lut, &LayerIlpConstraints::default());
+        assert!(sol.feasible);
+        let has = |pred: fn(&DecisionKind) -> bool| sol.decision_trace.iter().any(|t| pred(&t.kind));
+        assert!(has(|k| matches!(k, DecisionKind::CepHeadPrune)));
+        assert!(has(|k| matches!(k, DecisionKind::CshaLevel)));
+        assert!(has(|k| matches!(k, DecisionKind::WrgaAdapter)));
+        assert!(has(|k| matches!(k, DecisionKind::CpdtPrecision)));
+        assert!(
+            has(|k| matches!(k, DecisionKind::FaseStep)),
+            "FASE decision dimension missing from trace"
+        );
+        assert!(
+            has(|k| matches!(k, DecisionKind::PcaPacking)),
+            "PCA decision dimension missing from trace"
+        );
+        assert_eq!(sol.decision_trace.len(), 6);
+    }
+
+    #[test]
     fn memory_budget_excludes_heavy_configs() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let mut constraints = LayerIlpConstraints::default();
         constraints.memory_budget = 1_000; // 1 KB — nothing fits.
         let sol = solve_layer(&lut, &constraints);
+        assert!(!sol.feasible);
+    }
+
+    #[test]
+    fn best_placement_picks_smallest_fitting() {
+        let mut c = LayerIlpConstraints::default(); // adapter_comm_budget = MAX
+        assert_eq!(best_placement(0, &c), Some(AdapterPlacement::None));
+        assert_eq!(best_placement(8, &c), Some(AdapterPlacement::AttnQV));
+        c.adapter_comm_budget = 0.0;
+        assert_eq!(best_placement(8, &c), None);
+        c.adapter_comm_budget = 16.0; // exactly fits AttnQV (8*2), not QKVO (8*4)
+        assert_eq!(best_placement(8, &c), Some(AdapterPlacement::AttnQV));
+    }
+
+    #[test]
+    fn zero_rank_solution_has_no_placement() {
+        // The default solve keeps rank 0 (adapters add cost) → placement None.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let sol = solve_layer(&lut, &LayerIlpConstraints::default());
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.adapter_rank, 0);
+        assert_eq!(sol.decision.adapter_placement, AdapterPlacement::None);
+    }
+
+    #[test]
+    fn adapter_comm_budget_zero_forces_rank_zero() {
+        // No adapter communication permitted → every rank>0 is rejected, so the
+        // solver must fall back to rank 0 (G7 constraint enforcement).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.adapter_comm_budget = 0.0;
+        let sol = solve_layer(&lut, &c);
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.adapter_rank, 0);
+        assert_eq!(sol.decision.adapter_placement, AdapterPlacement::None);
+    }
+
+    #[test]
+    fn forced_rank_yields_smallest_placement() {
+        // LUT offers only rank 8, so the solver must take an adapter and choose
+        // a placement — with an ample comm budget it picks the smallest (G5:
+        // placement is a real chosen decision, not a fixed assumption).
+        let axes = LutAxes {
+            adapter_ranks: vec![8],
+            ..LutAxes::default()
+        };
+        let lut = build_lut(&shape(), h100(), &axes);
+        let sol = solve_layer(&lut, &LayerIlpConstraints::default());
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.adapter_rank, 8);
+        assert_eq!(sol.decision.adapter_placement, AdapterPlacement::AttnQV);
+    }
+
+    #[test]
+    fn forced_rank_with_tight_comm_budget_is_infeasible() {
+        // Only rank 8 available and the comm budget cannot fit even AttnQV
+        // (8*2 = 16) → the layer has no feasible adapter assignment (G7).
+        let axes = LutAxes {
+            adapter_ranks: vec![8],
+            ..LutAxes::default()
+        };
+        let lut = build_lut(&shape(), h100(), &axes);
+        let mut c = LayerIlpConstraints::default();
+        c.adapter_comm_budget = 15.0;
+        let sol = solve_layer(&lut, &c);
         assert!(!sol.feasible);
     }
 

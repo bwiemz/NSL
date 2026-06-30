@@ -15,7 +15,7 @@ use nsl_codegen::{debug_resolve_pre_scan_opts, CompileOptions, WggoImportance};
 
 fn auto_opts() -> CompileOptions {
     let mut opts = CompileOptions::default();
-    opts.wggo_importance = WggoImportance::Auto;
+    opts.wggo.importance = WggoImportance::Auto;
     opts
 }
 
@@ -26,7 +26,7 @@ fn auto_no_decorators_demotes_to_magnitude() {
     let source = include_str!("../../../tests/fixtures/no_attention_mlp.nsl");
     let resolved = debug_resolve_pre_scan_opts(source, auto_opts());
     assert_eq!(
-        resolved.wggo_importance,
+        resolved.wggo.importance,
         WggoImportance::Magnitude,
         "§5.7/§5.4: Auto must demote to Magnitude when no @wggo_target decorators are present"
     );
@@ -41,7 +41,7 @@ fn auto_orphaned_decorators_demotes_to_magnitude() {
     let source = include_str!("../../../tests/fixtures/orphaned_attention.nsl");
     let resolved = debug_resolve_pre_scan_opts(source, auto_opts());
     assert_eq!(
-        resolved.wggo_importance,
+        resolved.wggo.importance,
         WggoImportance::Magnitude,
         "§5.7/§5.5: Auto must demote to Magnitude when decorated model is not reachable from main"
     );
@@ -60,7 +60,7 @@ fn auto_no_calibration_data_demotes_to_magnitude() {
     opts.calibration_data = None;
     let resolved = debug_resolve_pre_scan_opts(source, opts);
     assert_eq!(
-        resolved.wggo_importance,
+        resolved.wggo.importance,
         WggoImportance::Magnitude,
         "§5.7/§5.6: Auto must demote to Magnitude when calibration data is absent"
     );

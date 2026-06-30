@@ -39,6 +39,10 @@ pub struct ModuleData {
     pub freeze_configs: Vec<nsl_semantic::wrga::FreezeConfig>,
     /// `@adapter` decorator configs captured by nsl-semantic.
     pub adapter_configs: Vec<nsl_semantic::wrga::AdapterConfig>,
+    /// CFTP §4.4 G3 `@fused_lm_ce` decorator configs captured by
+    /// nsl-semantic (Sprint 2 — collection only; lowering-site
+    /// substitution deferred to Sprint 2.5).
+    pub fused_ce_configs: Vec<nsl_semantic::cftp::FusedCeConfig>,
     /// M62: per-NodeId weight index resolutions for `self.<field>` accesses
     /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
     /// for the entry module on the multi-file shared-lib path.
@@ -405,6 +409,7 @@ pub fn load_all_modules(
             freeze_configs: analysis.freeze_configs,
             adapter_configs: analysis.adapter_configs,
             weight_index_map: analysis.weight_index_map,
+            fused_ce_configs: analysis.fused_ce_configs,
         });
     }
 

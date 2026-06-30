@@ -1221,6 +1221,37 @@ impl AdjointGenerator {
                 vec![y_bar, q, k, v, fwd_out],
             ),
 
+            // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.
+            // Lowers to a `FusedLinearCeBackwardExtract` op with the inputs
+            // the wengert lowerer expects:
+            //   [grad, x, W, bias, targets, fwd_result]
+            AdjointExpr::FusedLinearCeBackward {
+                grad,
+                x,
+                w,
+                bias,
+                targets,
+                fwd_result,
+                component,
+                vocab_size,
+                hidden_size,
+                batch_size,
+                seq_len,
+                vocab_tile,
+                ignore_index,
+            } => self.emit_op(
+                PrimalOp::FusedLinearCeBackwardExtract {
+                    component,
+                    vocab_size,
+                    hidden_size,
+                    batch_size,
+                    seq_len,
+                    vocab_tile,
+                    ignore_index,
+                },
+                vec![grad, x, w, bias, targets, fwd_result],
+            ),
+
             // --- RoPE backward: apply inverse rotation (rotate by -θ) ---
             // RoPE(x, θ) = R(θ)·x, so d/dx = R(θ)^T = R(-θ).
             // Negating the input is WRONG (that's reflection, not inverse rotation).
@@ -1475,6 +1506,45 @@ pub struct WengertExtractor<'a> {
     /// `MemberAccess` nodes (e.g. the synthesized `self.lora_A_<site>`
     /// accesses whose member Symbol is a sentinel field symbol).
     synth_member_names: HashMap<nsl_ast::NodeId, String>,
+    /// CFTP §4.4 G3 (Sprint 4): the active `@fused_lm_ce(...)` config
+    /// for this train block, if any.  When `enabled = true` AND all
+    /// shape hints (`vocab_size`, `hidden_size`, `batch_size`, `seq_len`)
+    /// are populated, the builtin-recognition pass emits a
+    /// `PrimalOp::FusedLinearCe` for matching `fused_linear_ce(...)` calls
+    /// instead of stepping into the composite stdlib body.  Otherwise the
+    /// composite path is used (preserving v1's safety + the composite-
+    /// fallback regression invariant required by Sprint 4 spec).
+    fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
+    /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1): each successful
+    /// `cross_entropy → FusedLinearCe` auto-substitution records its
+    /// dead upstream chain (`Transpose → Matmul → Add`) here.  The
+    /// prune itself runs at `finalize()` time — by then the entire
+    /// tape is complete, so the "is this VarId still consumed by
+    /// anything else?" check is exact (no false negatives from
+    /// substitution-time scans that haven't yet seen later uses).
+    pending_fused_lce_prunes: Vec<FusedLceMatch>,
+}
+
+/// CFTP §4.4 G3 (Sprint v3-1, review Finding 1):
+/// matcher output for `try_match_fused_linear_ce_pattern`.
+///
+/// Carries both the substitution inputs (`x_var`, `w_var`,
+/// `bias_var`) AND the three upstream op result VarIds that produced
+/// the now-dead `Transpose(W) → Matmul(x, W^T) → Add(matmul, bias)`
+/// chain.  After the substitution emits a `PrimalOp::FusedLinearCe`,
+/// `prune_fused_lce_dead_chain` uses the three result-VarIds to
+/// surgically remove the upstream ops — the lowerer has no DCE and
+/// would otherwise physically run the dead chain, allocating + freeing
+/// a `[B*S, V]` tensor per training step (1.5 GB at the v3-2 fp16
+/// fixture shape).
+#[derive(Debug, Clone, Copy)]
+struct FusedLceMatch {
+    x_var: VarId,
+    w_var: VarId,
+    bias_var: VarId,
+    transpose_result_var: VarId,
+    matmul_result_var: VarId,
+    add_result_var: VarId,
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -1500,7 +1570,22 @@ impl<'a> WengertExtractor<'a> {
             named_param_vars: Vec::new(),
             synth_call_names: HashMap::new(),
             synth_member_names: HashMap::new(),
+            fused_ce_config: None,
+            pending_fused_lce_prunes: Vec::new(),
         }
+    }
+
+    /// CFTP §4.4 G3 (Sprint 4): builder method for plumbing the
+    /// `@fused_lm_ce` decorator config into builtin recognition.  Callers
+    /// (compiler/train-block lowering) thread `compiler.fused_ce_configs[0]`
+    /// here when the active train block carries the decorator and v1's
+    /// opt-in gate is satisfied.
+    pub fn with_fused_ce_config(
+        mut self,
+        cfg: Option<crate::FusedCeDecoratorConfig>,
+    ) -> Self {
+        self.fused_ce_config = cfg;
+        self
     }
 
     fn alloc_var(&mut self) -> VarId {
@@ -1514,6 +1599,256 @@ impl<'a> WengertExtractor<'a> {
         let ty = type_for_op(&op.op);
         self.list.var_types.insert(op.result, ty);
         self.list.ops.push(op);
+    }
+
+    /// CFTP §4.4 G3 (Sprint v3-1) — auto-substitution pattern matcher.
+    ///
+    /// Walks the Wengert list backwards from `logits_var` looking for the
+    /// canonical stdlib `fused_linear_ce` decomposition:
+    ///
+    /// ```text
+    ///   logits_var = Add(Matmul(x, Transpose(W, 0, 1)), bias)
+    /// ```
+    ///
+    /// On match, returns `Some((x_var, W_var, bias_var))`. Returns `None` on
+    /// any structural mismatch (different op chain, missing transpose,
+    /// missing bias add, producers not present in `self.list`, etc.).
+    ///
+    /// The caller (the `"cross_entropy"` builtin recognition arm) checks
+    /// `Some(_)` together with `fused_ce_config.enabled` AND fully-populated
+    /// shape hints before emitting a `PrimalOp::FusedLinearCe` substitution.
+    /// In all other cases the caller falls through to the standard
+    /// `PrimalOp::CrossEntropyLoss` lowering — preserving the regression
+    /// invariant that programs without `@fused_lm_ce` keep the composite path.
+    ///
+    /// Edge cases handled:
+    ///   * `bias` is required by v1's fused FFI signature, so a bare
+    ///     `Matmul(x, Transpose(W))` (no add) does NOT match.  Sprint v4-3
+    ///     deferral: a bias-free PTX variant is feasible but would require
+    ///     emitter forks (`emit_fwd_kernel_no_bias` + `emit_bwd_kernel_no_bias`
+    ///     etc. — comparable LOC to the bf16 sprint).  A cheaper host-side
+    ///     workaround (caller allocates+zeros a `[V]` scratch buffer) was
+    ///     considered for v4-3 but not landed because the upstream
+    ///     decorator/wengert path has no hook to inject scratch alloc
+    ///     today; tracked for v5+.
+    ///   * `Transpose` must be over the last two dims of a 2D weight tensor.
+    ///     Sprint v4-3 widens this beyond the strict stdlib
+    ///     `transpose(W, 0, 1)` rewrite — `transpose(W, 1, 0)` and the
+    ///     negative-dim form `transpose(W, -2, -1)` (encoded via
+    ///     `encode_transpose_dim` as `(usize::MAX - 1, usize::MAX)`) and its
+    ///     swap `transpose(W, -1, -2)` are now all accepted.  All three
+    ///     forms are semantically identical on a 2D tensor — the previous
+    ///     refusal was over-strict and forced idiomatic NSL code (which
+    ///     prefers negative dims for rank-agnostic transposes) onto the
+    ///     slower composite path.
+    ///
+    ///     LATENT 3-D+ RISK (adversarial review Findings 1 + 8): the matcher
+    ///     does NOT structurally verify that `W` is rank-2 — it accepts
+    ///     `W` via the transpose's first input slot regardless of declared
+    ///     rank.  Every PTX emitter indexes `W` as `W[v*H + h]` (rank-2
+    ///     `[V, H]`); a user who wrote `matmul(x, transpose(W3D, -2, -1))
+    ///     + bias` over a rank-3 `W3D` (e.g. an MoE expert stack `[D, V, H]`
+    ///     or a head-major `[heads, V, H]` layout) would have the matcher
+    ///     silently fire, the fused FFI stride through `W3D` as if it were
+    ///     `[V, H]`, and produce wrong forward logits + wrong dW gradients
+    ///     with no diagnostic.
+    ///
+    ///     Current mitigation: the upstream type system rejects non-2D
+    ///     Matmul inputs in most shape configurations, AND the decorator's
+    ///     `(vocab_size, hidden_size)` shape contract — checked by the
+    ///     caller before emitting the substitution — pins the expected
+    ///     `[V, H]` shape.  A 3-D `W` that happens to satisfy `D * V == V`
+    ///     OR a missing-shape-hint path would slip through.  Structural
+    ///     rank-2 enforcement (walk the producer of `w_var`, consult the
+    ///     shape table for `Param` / `Constant` ops) is tracked as a
+    ///     follow-on — the cheapest pin until then is the negative-test
+    ///     coverage codified in `fused_linear_ce_auto_substitution.rs`
+    ///     (rank-3 W → no substitution).
+    ///   * No-transpose W layout (`Matmul(x, W)` with W already `[H, V]`)
+    ///     is NOT accepted.  Sprint v4-3 deferral: the runtime FFI at
+    ///     `crates/nsl-runtime/src/fused_linear_ce.rs` (`w_ptr` doc) and
+    ///     every PTX emitter indexes W as `[V, H]` (`W[v*H + h]`).  An
+    ///     `[H, V]` path needs a new emitter variant + new FFI symbol
+    ///     (`nsl_fused_linear_ce_forward_w_hv` or similar) — comparable
+    ///     LOC to the bf16 sprint; tracked for v5+.
+    ///   * Add operands may appear in either order:
+    ///     `Add(Matmul(...), bias)` and `Add(bias, Matmul(...))` both match.
+    ///
+    /// Returns `FusedLceMatch` carrying both the substitution inputs
+    /// (`x_var`, `w_var`, `bias_var`) AND the three upstream op result
+    /// VarIds (`logits_var` = add result, `matmul_result_var`,
+    /// `w_transposed_var` = transpose result).  The caller uses the
+    /// upstream VarIds to prune the now-dead composite chain from
+    /// `self.list.ops` — without pruning, the lowerer (which iterates
+    /// every op with no DCE — see `wengert_lower.rs:72-94`) would
+    /// physically run the transpose + matmul + add producing a
+    /// `[B*S, V]` tensor that nothing consumes, wasting ~1.5 GB at
+    /// V=49152/H=4096/B=2/S=4096 per training step (review Finding 1).
+    fn try_match_fused_linear_ce_pattern(
+        &self,
+        logits_var: VarId,
+    ) -> Option<FusedLceMatch> {
+        let add_op = self.list.find_producer(logits_var)?;
+        if !matches!(add_op.op, PrimalOp::Add) {
+            return None;
+        }
+        if add_op.inputs.len() != 2 {
+            return None;
+        }
+        // Inspect both Add operands — Matmul may be on either side.
+        let lhs = add_op.inputs[0];
+        let rhs = add_op.inputs[1];
+        let lhs_op = self.list.find_producer(lhs);
+        let rhs_op = self.list.find_producer(rhs);
+        let (matmul_op, bias_var) = match (
+            lhs_op.map(|o| &o.op),
+            rhs_op.map(|o| &o.op),
+        ) {
+            (Some(PrimalOp::Matmul), _) => (lhs_op?, rhs),
+            (_, Some(PrimalOp::Matmul)) => (rhs_op?, lhs),
+            _ => return None,
+        };
+        // Review Finding 3: reject `Add(Matmul, Matmul)` and other
+        // patterns where the "bias" slot would receive a high-rank
+        // tensor.  The arm above picks the FIRST Matmul-producing
+        // operand as the matmul leg and treats the OTHER Add operand
+        // as `bias_var`.  If `bias_var` is itself the output of a
+        // Matmul (e.g. `matmul(x1, W1^T) + matmul(x2, W2^T)`), the
+        // substituted fused FFI will dereference its bias_ptr as a
+        // dense `[V]` vector — reading garbage from a `[B*S, V]`
+        // matmul intermediate.  Same hazard for
+        // `ScaledDotProductAttention` (high-rank output) and `Conv2d`
+        // (if/when it appears).  Refuse the substitution and fall
+        // through to the composite path.
+        if let Some(bias_producer) = self.list.find_producer(bias_var) {
+            if matches!(
+                bias_producer.op,
+                PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
+            ) {
+                return None;
+            }
+        }
+        if matmul_op.inputs.len() != 2 {
+            return None;
+        }
+        let matmul_result_var = matmul_op.result;
+        let x_var = matmul_op.inputs[0];
+        let w_transposed_var = matmul_op.inputs[1];
+        let transpose_op = self.list.find_producer(w_transposed_var)?;
+        // Sprint v4-3: accept any of the four semantically-equivalent
+        // last-two-dim transposes of a 2D weight tensor:
+        //   * `transpose(W, 0, 1)` → `{0, 1}` (stdlib form)
+        //   * `transpose(W, 1, 0)` → `{1, 0}` (operand swap; same matrix)
+        //   * `transpose(W, -2, -1)` → `{usize::MAX - 1, usize::MAX}`
+        //     (negative-dim encoding from `encode_transpose_dim`)
+        //   * `transpose(W, -1, -2)` → `{usize::MAX, usize::MAX - 1}` (swap)
+        //
+        // These four forms are bit-identical on a 2D tensor.  The
+        // pre-v4-3 matcher accepted only the first form, forcing
+        // idiomatic NSL code (which prefers negative-dim transposes for
+        // rank-agnostic code, see `source_ad.rs` lines 556-560/597-598/
+        // 656-672/746-761 where the AD rules themselves emit
+        // `{usize::MAX - 1, usize::MAX}`) onto the slower composite
+        // path.  Higher-dim transposes (e.g. `transpose(W, 0, 2)`) are
+        // STILL refused — those reshape a >2D tensor in ways that the
+        // fused FFI's `[V, H]` indexing cannot honour.
+        const NEG_MINUS_2: usize = usize::MAX - 1;
+        const NEG_MINUS_1: usize = usize::MAX;
+        match transpose_op.op {
+            PrimalOp::Transpose { dim0: 0, dim1: 1 }
+            | PrimalOp::Transpose { dim0: 1, dim1: 0 }
+            | PrimalOp::Transpose {
+                dim0: NEG_MINUS_2,
+                dim1: NEG_MINUS_1,
+            }
+            | PrimalOp::Transpose {
+                dim0: NEG_MINUS_1,
+                dim1: NEG_MINUS_2,
+            } => {}
+            _ => return None,
+        }
+        // `transpose(W, 0, 1)` is recognised in `extract_expr` with inputs
+        // `[W, dim0_const, dim1_const]` (the two dim args get folded to
+        // `PrimalOp::Constant` VarIds even though they aren't used by AD).
+        // Pull W from the first input slot; reject if missing.
+        if transpose_op.inputs.is_empty() {
+            return None;
+        }
+        let w_var = transpose_op.inputs[0];
+        Some(FusedLceMatch {
+            x_var,
+            w_var,
+            bias_var,
+            transpose_result_var: w_transposed_var,
+            matmul_result_var,
+            add_result_var: logits_var,
+        })
+    }
+
+    /// Review Finding 1: prune the upstream `Transpose → Matmul → Add`
+    /// chain that produced `logits_var` after auto-substitution succeeds.
+    ///
+    /// Called by `finalize()` once the entire tape is built, so the
+    /// "is this VarId consumed elsewhere?" check is exact — every op
+    /// that will ever be pushed has already been pushed.  We deliberately
+    /// do NOT consult `self.symbol_to_var`: symbol-bound VarIds that no
+    /// op actually consumes are still dead (Cranelift lowering iterates
+    /// `list.ops`, not the symbol map).
+    ///
+    /// Strategy: for each of the three chain ops, surgically remove it
+    /// from `list.ops` IF its result VarId has no consumers outside the
+    /// chain itself AND isn't the function output.
+    ///
+    /// Returns the number of ops actually removed.  Conservative on
+    /// ambiguity (leaves the op in place) — correctness over pruning.
+    fn prune_fused_lce_dead_chain(list: &mut WengertList, m: &FusedLceMatch) -> usize {
+        // The three op-result VarIds we'd like to remove.  In-chain
+        // consumers don't block removal (Matmul reads transpose, Add
+        // reads matmul) since they themselves are about to be removed.
+        let chain_results = [
+            m.transpose_result_var,
+            m.matmul_result_var,
+            m.add_result_var,
+        ];
+
+        let is_dead = |var: VarId, list: &WengertList| -> bool {
+            // Never remove the function output.
+            if list.output == var {
+                return false;
+            }
+            // Scan all ops; a consumer that's NOT itself in the chain
+            // blocks removal.
+            for op in &list.ops {
+                if chain_results.contains(&op.result) {
+                    continue;
+                }
+                if op.inputs.contains(&var) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let mut removed = 0usize;
+        for target in chain_results {
+            if !is_dead(target, list) {
+                continue;
+            }
+            // Remove the op producing `target`.  Linear scan is O(N)
+            // but we run this at most once per cross_entropy
+            // substitution; N is bounded by the per-fn op count.
+            let before = list.ops.len();
+            list.ops.retain(|op| op.result != target);
+            if list.ops.len() < before {
+                removed += 1;
+                // Leave `var_types` and `var_names` entries in place —
+                // they're lookup-only and harmless once the producing
+                // op is gone.  Removing them would risk breaking
+                // downstream type queries on still-live VarIds that
+                // happen to share an entry.
+            }
+        }
+        removed
     }
 
     fn extract_int_literal(expr: &nsl_ast::expr::Expr) -> Option<i64> {
@@ -1749,6 +2084,21 @@ impl<'a> WengertExtractor<'a> {
 
             // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
+                // G6.1.2 — paper §3.2 closure: pre-register all nested
+                // model contexts implied by this MemberAccess chain
+                // BEFORE computing `is_model_param` below.  Top-down
+                // extraction otherwise computes the classification
+                // before recursing into the inner object, so
+                // `self.blocks[0].attn.wq` would check
+                // `is_model_param("m.blocks.0.attn")` against an empty
+                // map, fall to the data-access branch, then only
+                // register "m.blocks.0" once it recurses all the way
+                // down — too late to fix the classification of the
+                // ancestor frames.  The pre-pass walks bottom-up so all
+                // intermediate contexts are in place before the
+                // classification check.
+                self.preregister_chain_contexts(expr);
+
                 // WRGA B.3.2 Option 3: synthesized adapter accesses carry a
                 // sentinel member Symbol; the real field name lives in
                 // synth_member_names. Consult it FIRST so we recover e.g.
@@ -1789,6 +2139,16 @@ impl<'a> WengertExtractor<'a> {
                         // by recursively resolving the member access chain
                         self.resolve_member_access_prefix(object)
                     }
+                    // G6.1.2 — paper §3.2 closure: subscript on `[Model; N]`
+                    // produces a compound prefix like `"m.blocks.0"` that
+                    // matches what `enumerate_model_tensor_paths` emits in
+                    // the runtime tensor-path table (stmt.rs ~line 6396).
+                    // The `Subscript` arm in `extract_expr` will have
+                    // already registered the indexed context into
+                    // `context_to_model_type` by the time we reach the
+                    // first `.field` access on the result, so the
+                    // Param-classification check below sees it.
+                    ExprKind::Subscript { .. } => self.resolve_member_access_prefix(object),
                     _ => None,
                 };
 
@@ -1809,11 +2169,67 @@ impl<'a> WengertExtractor<'a> {
 
                     // Determine if this is a model parameter (prefix is a known model context)
                     // or a data access (e.g., batch.input_ids). Only model params get gradients.
-                    let is_model_param = self.context_to_model_type.contains_key(&prefix);
+                    //
+                    // G6.1.2 — paper §3.2 closure: not every field access on a
+                    // model context is a tensor Param. `self.blocks` on
+                    // `TinyCoder` is a `[TransformerBlock; N]` array, not a
+                    // tensor. `self.attn` on `TransformerBlock` is a nested
+                    // model, not a tensor. Both must NOT be registered as
+                    // Params — otherwise the gradient-collection scan at
+                    // stmt.rs ~line 4856 fails to match them against the
+                    // runtime `trainable_tensor_param_paths`, surfacing as
+                    // the "0/N trainable params connected" silent grad-miss
+                    // that regressed the prior partial fix attempt.
+                    //
+                    // Discriminator: `model_field_types[parent_model_type]`
+                    // (built by `compiler/collection.rs:411-728`) is
+                    // populated ONLY with non-built-in named types — i.e.
+                    // nested model fields and `[Model; N]` array fields.
+                    // Tensor / int / float / bool / str fields are NEVER
+                    // present (filtered at collection.rs:507-510).  So if
+                    // `field_name` IS in the map, it's a nested model or
+                    // model-array (NOT a tensor) and must be classified as
+                    // a context, not a Param.
+                    let parent_model = self.context_to_model_type.get(&prefix).cloned();
+                    let nested_field_type = parent_model
+                        .as_ref()
+                        .and_then(|pt| self.model_field_types.get(pt))
+                        .and_then(|fields| fields.get(&field_name))
+                        .cloned();
+                    let is_model_param = parent_model.is_some() && nested_field_type.is_none();
 
                     let var = self.alloc_var();
                     self.symbol_to_var.insert(*member, var);
                     self.list.var_names.insert(var, compound.clone());
+
+                    // G6.1.2 — when the field is a SINGULAR nested model
+                    // (not a `[Model; N]` array), register the compound as
+                    // a new context so the next chain link (`.tensor` or
+                    // `.method()`) resolves correctly.  Array fields are
+                    // registered per-index by the `Subscript` arm below;
+                    // doing it here for `[Model; N]` would register a
+                    // mis-shaped "array-context" that wouldn't match any
+                    // runtime path.
+                    //
+                    // Format coupling: `starts_with('[')` here recognizes
+                    // the `format!("[{};{}]", elem_name, size)` produced
+                    // by `compiler/collection.rs::~line 481` for
+                    // `TypeExprKind::FixedArray`.  The two sites must
+                    // stay in sync — if the collection-side format ever
+                    // grows a leading whitespace or a different bracket
+                    // shape, this check silently mis-classifies and
+                    // downstream `is_model_param` accepts the array
+                    // name as a tensor Param.  No test currently catches
+                    // that drift; the coupling is documented here so a
+                    // future maintainer touching collection.rs:481 sees
+                    // the dependency.
+                    if let Some(ref ft) = nested_field_type {
+                        if !ft.starts_with('[') {
+                            self.context_to_model_type
+                                .entry(compound.clone())
+                                .or_insert_with(|| ft.clone());
+                        }
+                    }
 
                     if is_model_param {
                         self.param_symbols.insert(*member);
@@ -2272,8 +2688,156 @@ impl<'a> WengertExtractor<'a> {
                         training: true,
                     },
                     "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm { eps: 1e-5 },
+                    // CFTP §4.4 G3 (Sprint 4): user-facing `fused_linear_ce`.
+                    //
+                    // When the active train block carries `@fused_lm_ce(enabled=true)`
+                    // AND all four shape hints are populated, recognise the call
+                    // as a single `PrimalOp::FusedLinearCe` instead of stepping
+                    // into the stdlib composite (matmul + cross_entropy).
+                    //
+                    // When the decorator is absent or shape hints are missing,
+                    // we INTENTIONALLY return `None` so callers fall through to
+                    // the regular function-body lowering — preserving the
+                    // composite path's bit-identity for inference / disabled
+                    // decorators.  This honours the Sprint 4 regression
+                    // invariant: a program without `@fused_lm_ce` always emits
+                    // the composite.
+                    "fused_linear_ce" => {
+                        if args.len() != 4 {
+                            eprintln!(
+                                "[source-ad] fused_linear_ce expected 4 args (x, W, bias, targets), got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        if let Some(cfg) = self.fused_ce_config.as_ref() {
+                            if cfg.enabled {
+                                if let (Some(v), Some(h), Some(b), Some(s)) = (
+                                    cfg.vocab_size,
+                                    cfg.hidden_size,
+                                    cfg.batch_size,
+                                    cfg.seq_len,
+                                ) {
+                                    let vt = cfg.vocab_tile.unwrap_or(
+                                        crate::fused_linear_ce::FusedLinearCEConfig::default().vocab_tile,
+                                    );
+                                    let is_large = v
+                                        > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                                    let four = vec![
+                                        input_vars[0], input_vars[1],
+                                        input_vars[2], input_vars[3],
+                                    ];
+                                    self.push_op(WengertOp {
+                                        id: self.list.ops.len() as u32,
+                                        result,
+                                        op: PrimalOp::FusedLinearCe {
+                                            vocab_size: v,
+                                            hidden_size: h,
+                                            batch_size: b,
+                                            seq_len: s,
+                                            vocab_tile: vt,
+                                            ignore_index: -100,
+                                            is_large,
+                                        },
+                                        inputs: four,
+                                        saved_for_backward: false,
+                                        checkpointed: false,
+                                    });
+                                    return Some(result);
+                                }
+                            }
+                        }
+                        // Fall through: composite expansion via the regular
+                        // function-body lowering (stdlib `fused_linear_ce`
+                        // body in stdlib/nsl/nn/losses.nsl).
+                        return None;
+                    }
                     // Loss functions
-                    "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
+                    //
+                    // CFTP §4.4 G3 (Sprint v3-1): auto-substitution into the
+                    // fused linear-CE kernel when the surrounding `train` block
+                    // carries `@fused_lm_ce(enabled = true, ...)` AND the
+                    // `cross_entropy(logits, targets)` input was produced by
+                    // the canonical `Add(Matmul(x, Transpose(W, 0, 1)), bias)`
+                    // pattern (the same expansion the stdlib's
+                    // `fused_linear_ce(x, W, bias, targets)` decomposes to).
+                    //
+                    // On a successful match we synthesise a single
+                    // `PrimalOp::FusedLinearCe` with inputs `[x, W, bias,
+                    // targets]` (the same four-input shape Sprint 4's
+                    // explicit-call path uses) and return immediately.  The
+                    // AD rule in `ad_rules.rs` then produces the three
+                    // backward components automatically.
+                    //
+                    // On ANY of the following, we fall through to the
+                    // standard `PrimalOp::CrossEntropyLoss` emission below —
+                    // preserving the composite path's bit-identity:
+                    //   * decorator absent, or `enabled = false`
+                    //   * any of the four shape hints (vocab_size,
+                    //     hidden_size, batch_size, seq_len) is `None`
+                    //   * the upstream chain doesn't match the canonical
+                    //     stdlib decomposition (see
+                    //     `try_match_fused_linear_ce_pattern`)
+                    //
+                    // This is the substitution site that the wengert_lower.rs
+                    // Sprint 2.5 comment near `PrimalOp::CrossEntropyLoss`
+                    // forward-referenced.
+                    "cross_entropy" | "cross_entropy_loss" => {
+                        if args.len() == 2 && input_vars.len() == 2 {
+                            if let Some(cfg) = self.fused_ce_config.as_ref() {
+                                if cfg.enabled {
+                                    if let (Some(v), Some(h), Some(b), Some(s)) = (
+                                        cfg.vocab_size,
+                                        cfg.hidden_size,
+                                        cfg.batch_size,
+                                        cfg.seq_len,
+                                    ) {
+                                        let logits_var = input_vars[0];
+                                        let targets_var = input_vars[1];
+                                        if let Some(m) =
+                                            self.try_match_fused_linear_ce_pattern(logits_var)
+                                        {
+                                            let vt = cfg.vocab_tile.unwrap_or(
+                                                crate::fused_linear_ce::FusedLinearCEConfig::default(
+                                                ).vocab_tile,
+                                            );
+                                            let is_large = v
+                                                > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                                            let four = vec![
+                                                m.x_var, m.w_var, m.bias_var, targets_var,
+                                            ];
+                                            self.push_op(WengertOp {
+                                                id: self.list.ops.len() as u32,
+                                                result,
+                                                op: PrimalOp::FusedLinearCe {
+                                                    vocab_size: v,
+                                                    hidden_size: h,
+                                                    batch_size: b,
+                                                    seq_len: s,
+                                                    vocab_tile: vt,
+                                                    ignore_index: -100,
+                                                    is_large,
+                                                },
+                                                inputs: four,
+                                                saved_for_backward: false,
+                                                checkpointed: false,
+                                            });
+                                            // Review Finding 1: defer the prune of the
+                                            // now-dead upstream composite chain
+                                            // (Transpose → Matmul → Add) until finalize().
+                                            // By then the whole tape is built, so the
+                                            // "is this VarId consumed elsewhere?" check is
+                                            // exact — no false-positive prunes from later
+                                            // ops that haven't been pushed yet.
+                                            self.pending_fused_lce_prunes.push(m);
+                                            return Some(result);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        PrimalOp::CrossEntropyLoss
+                    }
                     "mse_loss" => PrimalOp::MSELoss,
                     "l1_loss" => PrimalOp::L1Loss,
                     // Reductions
@@ -2589,6 +3153,15 @@ impl<'a> WengertExtractor<'a> {
 
             // Subscript: list[index] — non-differentiable metadata access
             ExprKind::Subscript { object, index } => {
+                // G6.1.2 — paper §3.2 closure: pre-register all nested
+                // model contexts implied by this chain before recursing.
+                // See `preregister_chain_contexts` for the rationale —
+                // top-down extraction would otherwise compute
+                // `is_model_param` before the recursive descent that
+                // would register intermediate contexts, locking in the
+                // wrong classification.
+                self.preregister_chain_contexts(expr);
+
                 let obj = self.extract_expr(object)?;
                 if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
                     let idx = self.extract_expr(idx_expr)?;
@@ -3019,8 +3592,131 @@ impl<'a> WengertExtractor<'a> {
         Some(result)
     }
 
+    /// G6.1.2 — paper §3.2 closure: walk a MemberAccess/Subscript chain
+    /// bottom-up and eagerly register all nested-model contexts implied
+    /// by the chain into `context_to_model_type`.
+    ///
+    /// Called from `extract_expr` at the top of every `MemberAccess`
+    /// and `Subscript` arm.  Without this pre-pass, the top-down
+    /// extraction order causes the parent `is_model_param` check to
+    /// run BEFORE the recursive descent that would register an
+    /// intermediate context, locking in a wrong-classification frame
+    /// at every chain depth.
+    ///
+    /// Registration uses `model_field_types` (populated by
+    /// `compiler/collection.rs:411-728`), which contains ONLY non-
+    /// built-in named field types (nested models + `[Model; N]`
+    /// arrays) — Tensor / int / float / bool / str are excluded at
+    /// collection.rs:507-510, so presence in the map is the
+    /// discriminator for "this field is a nested model context, not a
+    /// tensor Param".
+    ///
+    /// Indices must be static integer literals; dynamic indices skip
+    /// registration so the static-AD path falls back safely (tape-AD
+    /// handles dynamic indexing at runtime).
+    fn preregister_chain_contexts(&mut self, expr: &nsl_ast::expr::Expr) {
+        match &expr.kind {
+            ExprKind::MemberAccess { object, member } => {
+                // Descend first so deeper contexts are registered before
+                // we compute this access's compound.
+                self.preregister_chain_contexts(object);
+
+                // If the object resolves to a prefix and the parent
+                // model has this field as a SINGULAR nested model,
+                // register `{prefix}.{field} -> field_type`.  Skip
+                // array fields here — those are handled per-index by
+                // the Subscript arm below (registering a bare-array
+                // compound would mis-shape the context map).
+                if let Some(obj_prefix) = self.resolve_member_access_prefix(object) {
+                    let parent_model = self.context_to_model_type.get(&obj_prefix).cloned();
+                    let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                    if let Some(parent) = parent_model {
+                        if let Some(field_ty) = self
+                            .model_field_types
+                            .get(&parent)
+                            .and_then(|fields| fields.get(&field_name))
+                            .cloned()
+                        {
+                            if !field_ty.starts_with('[') {
+                                let compound = format!("{}.{}", obj_prefix, field_name);
+                                self.context_to_model_type
+                                    .entry(compound)
+                                    .or_insert(field_ty);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Subscript { object, index } => {
+                self.preregister_chain_contexts(object);
+
+                // Static-index subscript on a `[Model; N]` field:
+                // register the indexed compound -> element model type.
+                if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
+                    if let ExprKind::IntLiteral(i) = &idx_expr.kind {
+                        if *i >= 0 {
+                            if let Some(obj_prefix) = self.resolve_member_access_prefix(object) {
+                                if let Some((parent_pref, field_name)) =
+                                    obj_prefix.rsplit_once('.')
+                                {
+                                    let parent_model = self
+                                        .context_to_model_type
+                                        .get(parent_pref)
+                                        .cloned();
+                                    if let Some(field_ty) = parent_model
+                                        .as_ref()
+                                        .and_then(|pt| self.model_field_types.get(pt))
+                                        .and_then(|fields| fields.get(field_name))
+                                        .cloned()
+                                    {
+                                        // Same format coupling as the
+                                        // singular-Model arm above —
+                                        // recognises the
+                                        // `format!("[{};{}]", elem, n)`
+                                        // from
+                                        // `compiler/collection.rs::~481`.
+                                        // Any drift on either side breaks
+                                        // silently; keep these two
+                                        // recognizers in sync.
+                                        if field_ty.starts_with('[') && field_ty.contains(';') {
+                                            let inner = field_ty
+                                                .trim_start_matches('[')
+                                                .trim_end_matches(']');
+                                            if let Some(elem) = inner.split(';').next() {
+                                                let indexed_ctx = format!("{}.{}", obj_prefix, i);
+                                                self.context_to_model_type
+                                                    .entry(indexed_ctx)
+                                                    .or_insert_with(|| elem.trim().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Resolve a nested MemberAccess chain to a compound prefix string.
     /// E.g., `self.attn` -> "m.blocks.0.attn", `block.ffn` -> "m.blocks.0.ffn"
+    ///
+    /// G6.1.2: also handles `Subscript` of array-of-models fields. For
+    /// `self.blocks[0]` this yields `"m.blocks.0"` — matching the
+    /// runtime tensor-path format that `enumerate_model_tensor_paths`
+    /// (stmt.rs ~line 6396) emits.  Subscript indices must be static
+    /// integer literals; dynamic indices return None so the AD path
+    /// falls back safely (tape-AD handles dynamic indexing at runtime).
+    ///
+    /// This is intentionally a PURE STRING WALK with no side effects —
+    /// eager registration of intermediate contexts happens in
+    /// `preregister_chain_contexts`, called at the top of the
+    /// `extract_expr` `MemberAccess` / `Subscript` arms.  Mixing
+    /// registration into resolution would re-introduce the
+    /// lazy-vs-eager asymmetry that regressed the prior partial fix
+    /// attempt.
     fn resolve_member_access_prefix(&self, expr: &nsl_ast::expr::Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::MemberAccess { object, member } => {
@@ -3032,22 +3728,58 @@ impl<'a> WengertExtractor<'a> {
                         })
                     }
                     ExprKind::MemberAccess { .. } => self.resolve_member_access_prefix(object),
+                    ExprKind::Subscript { .. } => self.resolve_member_access_prefix(object),
                     _ => None,
                 };
                 let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
                 obj_prefix.map(|p| format!("{}.{}", p, field_name))
+            }
+            // G6.1.2: array-of-models subscript. `self.blocks[0]` -> "m.blocks.0".
+            ExprKind::Subscript { object, index } => {
+                let obj_prefix = match &object.kind {
+                    ExprKind::SelfRef => self.self_context.clone(),
+                    ExprKind::Ident(sym) => {
+                        self.symbol_name_overrides.get(sym).cloned().or_else(|| {
+                            Some(self.interner.resolve(sym.0).unwrap_or("?").to_string())
+                        })
+                    }
+                    ExprKind::MemberAccess { .. } => self.resolve_member_access_prefix(object),
+                    ExprKind::Subscript { .. } => self.resolve_member_access_prefix(object),
+                    _ => None,
+                }?;
+                let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() else {
+                    return None;
+                };
+                let ExprKind::IntLiteral(i) = &idx_expr.kind else {
+                    return None;
+                };
+                if *i < 0 {
+                    return None;
+                }
+                Some(format!("{}.{}", obj_prefix, i))
             }
             _ => None,
         }
     }
 
     /// Finalize extraction. Returns the WengertList if the graph is static.
-    pub fn finalize(self) -> Option<WengertList> {
-        if self.is_static && !self.list.ops.is_empty() {
-            Some(self.list)
-        } else {
-            None
+    ///
+    /// Side-effect: drains `pending_fused_lce_prunes` and removes the
+    /// dead `Transpose → Matmul → Add` chains the auto-substitution
+    /// path queued during extraction (review Finding 1).  Conservative —
+    /// each chain is only removed once verified to have no remaining
+    /// consumers in the completed tape.
+    pub fn finalize(mut self) -> Option<WengertList> {
+        if !self.is_static || self.list.ops.is_empty() {
+            return None;
         }
+        // Review Finding 1: run all pending fused-LCE prunes against
+        // the COMPLETED tape so the consumer-scan sees every op.
+        let prunes = std::mem::take(&mut self.pending_fused_lce_prunes);
+        for m in &prunes {
+            Self::prune_fused_lce_dead_chain(&mut self.list, m);
+        }
+        Some(self.list)
     }
 
     /// Check if the computation graph is static (no dynamic control flow).

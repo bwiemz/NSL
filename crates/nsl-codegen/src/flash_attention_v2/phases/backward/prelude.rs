@@ -21,7 +21,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    backward_extra_bytes, total_bytes, Direction, SMEM_BUDGET_BYTES,
+    backward_extra_bytes, pca_smem_layout, total_bytes, Direction, SMEM_BUDGET_BYTES,
 };
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
@@ -48,20 +48,12 @@ pub fn backward_total_bytes(config: &FlashAttentionConfig) -> u32 {
 }
 
 fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    // PCA Tier A: when segment_masked the prelude reserves
-    // DEFAULT_SMEM_SEGMENT_BUDGET bytes for the embedded seg_smem region
-    // at the tail of shmem (Blackwell fix; see register-decl comment
-    // below).  Force dynamic SMEM whenever the combined footprint exceeds
-    // the 48 KB static cap so the main shmem[] uses the `extern .shared`
-    // form.  Budget sourced from pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET
-    // so the FA emitter's allocation tracks the planner's residency
-    // ceiling.
-    let seg_overhead = if config.segment_masked {
-        DEFAULT_SMEM_SEGMENT_BUDGET as u32
-    } else {
-        0
-    };
-    backward_total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
+    // Count seg_smem AND smem_doc_starts (when rope_q) via the single-source
+    // layout (matches the forward budget check; doc was previously uncounted).
+    // No embed — backward already embeds seg_smem in the shmem[] tail; doc stays
+    // a separate static `.shared`. This only fixes the static-cap decision.
+    pca_smem_layout(backward_total_bytes(config), config.segment_masked, config.rope_q).total
+        > SMEM_BUDGET_BYTES
 }
 
 /// Emit the backward prelude: header, entry, SMEM, registers, indices.
@@ -171,7 +163,11 @@ pub fn emit(
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
         // PCA Tier A: when segment_masked, reserve DEFAULT_SMEM_SEGMENT_BUDGET
         // bytes at the tail of shmem for the embedded seg_smem (see
-        // register-decl comment).
+        // register-decl comment). NOTE: smem_doc_starts (1028 B, emitted by
+        // emit_doc_starts_smem_load when rope_q) is a SEPARATE static `.shared`
+        // decl — NOT part of this shmem[] size (ptxas allocates it independently;
+        // the device reserves the sum). The static-vs-extern decision counts it
+        // via pca_smem_layout; this decl covers only the core + embedded-seg.
         let seg_overhead: u32 = if config.segment_masked {
             DEFAULT_SMEM_SEGMENT_BUDGET as u32
         } else {
@@ -269,7 +265,7 @@ pub fn emit(
     //   * Task 9 (backward dQ/dK rotation sites in csha_hooks_backward) —
     //     reads smem_doc_starts to compute effective_pos before cs_idx.
     if config.segment_masked && config.rope_q {
-        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
+        ptx.push_str("    // PCA sec.4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
         ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
         // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we

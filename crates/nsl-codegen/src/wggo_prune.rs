@@ -99,13 +99,13 @@ pub fn run(
     applied_plan: &AppliedPlan,
     weight_map: &WeightMap,
 ) -> PruneRewriteResult {
-    use crate::wggo_dp::LayerDecision;
+    use crate::wggo_dp::CoarseDecision;
 
     // Phase 1: validate each Prune decision without mutating wengert.
     let mut plans: Vec<PruneRewritePlan> = Vec::new();
     let mut refusals: Vec<PruneRefusal> = Vec::new();
     for layer in &applied_plan.layers {
-        if !matches!(layer.coarse, LayerDecision::Prune) {
+        if !matches!(layer.coarse, CoarseDecision::Prune) {
             continue;
         }
         match plan_rewrite(wengert, layer, weight_map) {
@@ -719,7 +719,7 @@ mod tests {
     use super::*;
     use crate::wengert::{PrimalOp, WengertOp};
     use crate::wggo_apply::{AppliedLayer, AppliedPlan};
-    use crate::wggo_dp::LayerDecision;
+    use crate::wggo_dp::CoarseDecision;
     use crate::weight_aware::WeightMap;
     use std::collections::HashMap;
 
@@ -756,13 +756,16 @@ mod tests {
         AppliedLayer {
             layer_index: idx,
             layer_name: name.to_string(),
-            coarse: LayerDecision::Prune,
+            coarse: CoarseDecision::Prune,
             pipeline_stage: 0,
             shard_factor: 1,
+            shard_grads: 1,
+            shard_optim: 1,
             active_heads: 0,
             ffn_width: 0,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 0,
             optim_v_bits: 0,
             fase_fused: false,

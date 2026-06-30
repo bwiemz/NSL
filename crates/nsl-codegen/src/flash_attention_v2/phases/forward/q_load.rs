@@ -103,10 +103,17 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 
         // Optional RoPE cos/sin bases (position-indexed by q_row_global).
         // Only needed when the non-CSHA inline path will fire.
+        // NOTE: per-document RoPE position reset on the FORWARD Q side
+        // (effective_pos = q_row_global - doc_starts[seg]) is NOT implemented
+        // here -- the prelude pre-declares the registers but the forward uses
+        // standard positions. Packed rope_q=true forward does not yet reset
+        // per-document (deferred; see project_pca_smem_mixed_layout_crash_disproven
+        // memory + the backward T9 reset which IS implemented). Tracked separately.
         if config.rope_q && !csha_rope_active {
             ptx.push_str("    // RoPE: cos/sin bases for q_row_global\n");
             ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
             ptx.push_str("    ld.param.u64 %rd26, [sin_ptr];\n");
+
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
                 head_dim
@@ -149,13 +156,6 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    bar.sync 0;  // FENCE: all warps finish Q shmem store\n");
 }
 
-// TODO(fa-v2): RoPE register aliasing (%rd30/%rd31 overlap with the
-// q_load store-address math) and sign-flip correctness for HalfSplit
-// style both need to be revisited when a rope_q=true config enters the
-// test matrix. Current implementation is placeholder-correct for
-// rope_q=false (not called) and will be exercised once Task 13's sweep
-// or a dedicated rope test lands.
-#[allow(dead_code)]
 fn emit_rope_rotation_inline(
     ptx: &mut String,
     reg: u32,
@@ -168,8 +168,13 @@ fn emit_rope_rotation_inline(
                 "    // rope halfsplit slice {}: pair across (lane ^ 16)\n",
                 slice_idx
             ));
-            ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for f32 cos/sin row\n");
+            // %rd28 = d (lane + slice_idx*32), set by the caller before this call.
+            // Compute d*4 once for cos, then recompute for sin (%rd31 was
+            // overwritten by the cos add.u64 above, so we must shift again).
+            ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for cos row\n");
             ptx.push_str("    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];  // cos\n");
+            // Recompute d*4 from %rd28 (still valid) so sin addr = sin_base + d*4.
+            ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for sin row (recompute)\n");
             ptx.push_str("    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin\n");
             ptx.push_str(&format!(
                 "    shfl.sync.bfly.b32 %f2, %f{}, 16, 31, 0xFFFFFFFF;  // partner Q\n",
@@ -184,8 +189,10 @@ fn emit_rope_rotation_inline(
                 "    // rope adjacent slice {}: partner = lane^1\n",
                 slice_idx
             ));
-            ptx.push_str("    shl.b64 %rd31, %rd28, 2;\n");
+            // Same fix: recompute d*4 before sin addr.
+            ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for cos row\n");
             ptx.push_str("    add.u64 %rd31, %rd25, %rd31;  ld.global.f32 %f0, [%rd31];\n");
+            ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for sin row (recompute)\n");
             ptx.push_str("    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];\n");
             ptx.push_str(&format!(
                 "    shfl.sync.bfly.b32 %f2, %f{}, 1, 31, 0xFFFFFFFF;\n",

@@ -427,7 +427,7 @@ mod tests {
     fn by_layer_groups_chains_together() {
         let mut ops = Vec::new();
         let mut next = 0u32;
-        let mut push = |o: PrimalOp, inputs: Vec<u32>, ops: &mut Vec<WengertOp>, next: &mut u32| {
+        let push = |o: PrimalOp, inputs: Vec<u32>, ops: &mut Vec<WengertOp>, next: &mut u32| {
             let id = *next;
             ops.push(WengertOp {
                 id,

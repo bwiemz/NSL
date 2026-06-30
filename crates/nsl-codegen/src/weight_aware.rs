@@ -542,6 +542,18 @@ impl WeightMap {
         &self.source_path
     }
 
+    /// Construct a WeightMap directly from entries (used by CEP slicing to build a
+    /// derived map). file_hash is zeroed; source_path notes the synthetic origin.
+    pub fn from_entries(entries: HashMap<String, WeightEntry>) -> Self {
+        let total_bytes = entries.values().map(|e| e.data.len() as u64).sum();
+        WeightMap {
+            entries,
+            file_hash: [0u8; 32],
+            source_path: "<cep-sliced>".to_string(),
+            total_bytes,
+        }
+    }
+
     /// Iterator over all weight names.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(|s| s.as_str())

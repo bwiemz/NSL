@@ -29,6 +29,38 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
 }
 
+/// Allowlist of legal `data:` section config keys. Mirrors
+/// `nsl-semantic/src/checker/block.rs::DATA_SECTION_KEYS` — both must stay
+/// in sync. A key present here but missing in the semantic table will reach
+/// `compile_assign` and fail with an undefined-variable error; a key
+/// present in the semantic table but missing here will reach
+/// `compile_assign` with the same failure mode. v8 ships with a single
+/// canonical key (`source`); future keys should land in both places.
+const DATA_SECTION_KEYS: &[&str] = &["source"];
+
+/// Returns true iff `stmt` is a `data:` section config pair of the form
+/// `<allowlisted-key> = <expr>` (plain `Assign`, plain ident target). These
+/// are PCA-detection metadata consumed via the AST walker in
+/// `pca_activation.rs`; they must not be lowered as variable assignments.
+fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> bool {
+    let StmtKind::Assign {
+        target,
+        op: AssignOp::Assign,
+        ..
+    } = &stmt.kind
+    else {
+        return false;
+    };
+    let ExprKind::Ident(name_sym) = target.kind else {
+        return false;
+    };
+    let name = match interner.resolve(name_sym.0) {
+        Some(n) => n,
+        None => return false,
+    };
+    DATA_SECTION_KEYS.contains(&name)
+}
+
 /// Task 4: WRGA bridge — build a `WrgaInput` from decorator configs stashed on
 /// the Compiler and run `wrga::run` against the primal Wengert list.
 ///
@@ -264,6 +296,21 @@ pub(crate) fn invoke_wrga_if_enabled(
         manual_adapter_owned.iter().map(|s| s.as_str()).collect();
     let hybrid_layers: Vec<&str> = hybrid_owned.iter().map(|s| s.as_str()).collect();
 
+    // WRGA paper §8.3: surface the first non-empty `target=` set on
+    // `WrgaInputs::wrga[*]`. The CLI's `--wrga-target` override pipes through
+    // this field via `apply_wrga_target_override` in the CLI's bridge
+    // functions. Source-level `@wrga(target="...")` decorators do NOT yet
+    // populate this field — both bridge functions still emit `target: None`
+    // pending symbol-resolution wiring — so this `find_map` falls back to the
+    // historical "rtx5070ti" default for the `nsl build` path. Existing build
+    // behaviour is therefore unchanged; only the `nsl check --wrga-analyze`
+    // path produces a non-None target today.
+    let target_override = inputs
+        .wrga
+        .iter()
+        .find_map(|c| c.target.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("rtx5070ti");
+
     let wrga_input = crate::wrga::WrgaInput {
         mode,
         trainable_patterns,
@@ -272,7 +319,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         wengert: list,
         loss_output: list.output,
         weights: None,
-        target: "rtx5070ti",
+        target: target_override,
         budget_params,
         r_min: 2,
         r_max: 16,
@@ -3371,8 +3418,20 @@ impl Compiler<'_> {
                     }
                 }
                 TrainSection::Data(stmts) => {
-                    // Compile data section stmts — typically creates a DataLoader
+                    // Compile data section stmts — typically creates a DataLoader.
+                    // `key = expr` config pairs (e.g. `source = PretrainCorpus`)
+                    // are PCA-detection metadata consumed via the AST walker in
+                    // `pca_activation.rs`; they MUST NOT flow through
+                    // `compile_assign`, which would try to look up `key` as a
+                    // variable. Skip the allowlisted keys here and let
+                    // anything else (statements, future loader builders) go
+                    // through the standard compile path. Keep this list in
+                    // sync with `nsl-semantic/src/checker/block.rs`
+                    // (`DATA_SECTION_KEYS`).
                     for stmt in stmts {
+                        if is_data_section_config_pair(stmt, self.interner) {
+                            continue;
+                        }
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
@@ -4016,7 +4075,14 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
 
             // 2. Try to extract Wengert list from step body
-            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+            //
+            // CFTP §4.4 G3 (Sprint 4): plumb the first `@fused_lm_ce` decorator
+            // into the extractor so `fused_linear_ce(...)` calls inside this
+            // train block can be recognised as a single `PrimalOp::FusedLinearCe`
+            // when v1's enabled + shape-hint preconditions hold.
+            let fused_ce_cfg = self.fused_ce_configs.first().cloned();
+            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
+                .with_fused_ce_config(fused_ce_cfg);
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
@@ -4153,14 +4219,14 @@ impl Compiler<'_> {
                 // the test suite and CLI integration tests.
                 //
                 let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
-                if let Some(ref mode_str) = self.compile_options.wggo_mode {
+                if let Some(ref mode_str) = self.compile_options.wggo.mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
                         // also applied in analyze(), but applying it here
                         // keeps the --wggo-report line honest.
                         let mut analysis_config =
                             crate::wggo_weight_analysis::AnalysisConfig::default();
-                        if let Some(f) = self.compile_options.wggo_prune_fraction {
+                        if let Some(f) = self.compile_options.wggo.prune_fraction {
                             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
                         }
                         // Pass the weights path for magnitude-based scoring
@@ -4172,7 +4238,7 @@ impl Compiler<'_> {
                         // level firing BEFORE compile_main runs, ensuring it's available here
                         // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
                         // calibrate wrapper).
-                        let weights_path = self.compile_options.wggo_weights.as_deref();
+                        let weights_path = self.compile_options.wggo.weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
                             &self.compile_options.target,
@@ -4183,7 +4249,7 @@ impl Compiler<'_> {
                             Some(&self.compile_options),
                         );
                         if let Some(plan) = plan {
-                            if self.compile_options.wggo_report {
+                            if self.compile_options.wggo.report {
                                 eprintln!("{}", plan.render_report());
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
@@ -6919,7 +6985,12 @@ impl Compiler<'_> {
                     step_body = Some((body, *param));
                 }
                 TrainSection::Data(stmts) => {
+                    // See `compile_train_block::TrainSection::Data` for why
+                    // the allowlisted config pairs are skipped.
                     for stmt in stmts {
+                        if is_data_section_config_pair(stmt, self.interner) {
+                            continue;
+                        }
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
