@@ -214,6 +214,7 @@ pub mod wggo_ilp;
 pub mod wggo_overrides;
 pub mod wggo_prune;
 pub mod wggo_schedule;
+pub mod wggo_shape;
 pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;

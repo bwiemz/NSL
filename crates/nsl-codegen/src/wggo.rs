@@ -24,7 +24,8 @@ use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{
     passthrough_plan, solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan,
 };
-use crate::wggo_graph::{build as build_graph, OptGraph};
+use crate::wggo_graph::{build as build_graph, LayerRole, OptGraph};
+use crate::wggo_shape::LayerShapeInfo;
 use crate::wggo_ilp::{
     recost_decision, solve_all_greedy as ilp_solve_all_greedy,
     solve_all_templated as ilp_solve_all_templated, solve_layer as ilp_solve_layer,
@@ -304,9 +305,59 @@ pub fn run(input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
 
+    // 1. Build the layer graph.
+    let graph = build_graph(input.wengert);
+
+    // §2.4 inter-layer shape-compatibility precondition (a *hard* constraint).
+    // Every kept layer's output activation width must match what its successors
+    // consume (or a reshape must bridge them).  On a *provable* incompatibility
+    // WGGO must emit NO structural transforms — it returns a transform-free plan
+    // (empty `AppliedPlan` ⇒ no per-layer overrides ⇒ the type-checked model
+    // compiles unchanged), honoring the project invariant that an unmet
+    // transformation precondition must refuse, never silently weaken.  This is
+    // deliberately stronger than the inter-layer DP's budget degradation: an
+    // over-budget *passthrough* is still a structurally valid model, whereas a
+    // shape-incompatible plan is *wrong*, so we refuse the transforms outright
+    // rather than letting CSHA fusion / adapters / thinning ride on a broken
+    // graph.
+    //
+    // For the uniform residual transformers WGGO targets today the feeder
+    // (`inter_layer_dims`) yields a single `d_model` on every edge, so this is
+    // satisfied-by-construction and never triggers; it becomes binding once
+    // per-layer or dim-changing activation widths are introduced (see the
+    // `wggo_shape` module docs).
+    let shape_warns = shape_warnings(&graph, input.layer_shape.d_model);
+    if !shape_warns.is_empty() {
+        let empty_inter = InterLayerPlan {
+            layers: Vec::new(),
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+            pipeline_stages: 1,
+        };
+        let empty_applied = crate::wggo_apply::AppliedPlan {
+            layers: Vec::new(),
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+        let schedule = build_schedule(&empty_inter, &empty_applied);
+        return WggoPlan {
+            mode: WggoMode::Off,
+            target_gpu: gpu.name.to_string(),
+            graph,
+            inter_layer: empty_inter,
+            per_layer: Vec::new(),
+            resolutions: Vec::new(),
+            applied: empty_applied,
+            schedule,
+            template_stats: TemplateStats::default(),
+            weight_analysis: WeightAnalysisReport::default(),
+            estimated_solve_us: t0.elapsed().as_micros() as u64,
+            warnings: shape_warns,
+        };
+    }
+
     // Off mode: build a trivial plan that passes through decisions.
     if input.mode == WggoMode::Off {
-        let graph = build_graph(input.wengert);
         let n = graph.layers.len();
         let lut = build_lut(&input.layer_shape, gpu, &input.lut_axes);
         let luts: Vec<LayerCostLut> = vec![lut; n.max(1)];
@@ -352,8 +403,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         };
     }
 
-    // 1-2. Build the layer graph and the cost LUT.
-    let graph = build_graph(input.wengert);
+    // 2. Cost LUT.
     let lut = build_lut(&input.layer_shape, gpu, &input.lut_axes);
     let n = graph.layers.len();
     let luts: Vec<LayerCostLut> = vec![lut; n.max(1)];
@@ -476,7 +526,9 @@ pub fn run(input: WggoInput) -> WggoPlan {
         resolutions
     };
 
-    // 8. Apply + communication schedule.
+    // 8. Apply + communication schedule.  (The §2.4 shape-compatibility
+    // precondition was checked up front; a violation would have forced Off
+    // above, so reaching here means the plan is shape-compatible.)
     let applied = apply(&inter, &per_layer);
     let schedule = build_schedule(&inter, &applied);
 
@@ -494,6 +546,65 @@ pub fn run(input: WggoInput) -> WggoPlan {
         estimated_solve_us: t0.elapsed().as_micros() as u64,
         warnings,
     }
+}
+
+/// Inter-layer activation widths for a layer, by transformer role.
+///
+/// Residual-stream sublayers (`Attention` / `Ffn` / `Block`) carry `d_model`
+/// in and out: per-head pruning and FFN thinning are absorbed by the output
+/// projection (`W_O` / `W_down`), so the *inter-layer* tensor width is
+/// invariant under WGGO's structural decisions.  The boundary roles expose one
+/// real width and one unknown — `Embedding` consumes token ids (unknown width)
+/// and produces `d_model`; `LmHead` consumes `d_model` and produces vocab
+/// logits (not an inter-layer activation).  `Other` is an unclassified op group
+/// with no known residual projection, so both widths are unknown.  Unknown
+/// (`None`) widths are treated as compatible by [`crate::wggo_shape::classify`]
+/// (fail-safe — only provable mismatches are flagged).
+fn inter_layer_dims(role: LayerRole, d_model: u64) -> (Option<u64>, Option<u64>) {
+    // A zero `d_model` is a defensively-initialised / unknown shape, not a real
+    // width: report unknown on every edge so the gate stays fail-safe.
+    if d_model == 0 {
+        return (None, None);
+    }
+    match role {
+        LayerRole::Attention | LayerRole::Ffn | LayerRole::Block => (Some(d_model), Some(d_model)),
+        LayerRole::Embedding => (None, Some(d_model)),
+        LayerRole::LmHead => (Some(d_model), None),
+        LayerRole::Other => (None, None),
+    }
+}
+
+/// Build the per-layer [`LayerShapeInfo`] records the §2.4 shape gate validates.
+///
+/// Widths come from [`inter_layer_dims`]; producer edges are the graph's
+/// `depends_on` lists.  `d_model` is the uniform residual-stream width the
+/// driver sizes the model with.
+fn build_shape_infos(graph: &OptGraph, d_model: u64) -> Vec<LayerShapeInfo> {
+    graph
+        .layers
+        .iter()
+        .map(|l| {
+            let (input_dim, output_dim) = inter_layer_dims(l.role, d_model);
+            LayerShapeInfo {
+                layer: l.index,
+                name: l.name.clone(),
+                input_dim,
+                output_dim,
+                depends_on: l.depends_on.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Run the §2.4 shape-compatibility gate over `graph` and return one warning
+/// message per provably-incompatible inter-layer edge (empty when the
+/// constraint holds).  See the gate's call site in [`run`] for how a non-empty
+/// result forces a passthrough refusal.
+fn shape_warnings(graph: &OptGraph, d_model: u64) -> Vec<String> {
+    crate::wggo_shape::validate(&build_shape_infos(graph, d_model))
+        .iter()
+        .map(|v| v.message())
+        .collect()
 }
 
 /// Run Stage 3 over `graph`, using the first layer's `num_heads` as the
@@ -801,6 +912,56 @@ mod tests {
             analysis_config: AnalysisConfig::default(),
             scorer: None,
         }
+    }
+
+    #[test]
+    fn inter_layer_dims_maps_roles_to_residual_widths() {
+        assert_eq!(inter_layer_dims(LayerRole::Attention, 512), (Some(512), Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::Ffn, 512), (Some(512), Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::Block, 512), (Some(512), Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::Embedding, 512), (None, Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::LmHead, 512), (Some(512), None));
+        assert_eq!(inter_layer_dims(LayerRole::Other, 512), (None, None));
+    }
+
+    #[test]
+    fn inter_layer_dims_zero_d_model_is_unknown() {
+        // A zero/defaulted d_model must not synthesise Some(0) widths (which
+        // would otherwise drive false classifications): report unknown.
+        assert_eq!(inter_layer_dims(LayerRole::Block, 0), (None, None));
+        assert_eq!(inter_layer_dims(LayerRole::Attention, 0), (None, None));
+    }
+
+    #[test]
+    fn build_shape_infos_for_residual_blocks_carry_d_model_and_validate_clean() {
+        let w = two_block_wengert();
+        let graph = build_graph(&w);
+        let infos = build_shape_infos(&graph, 512);
+        // Every transformer block exposes d_model on both inter-layer edges.
+        for info in infos.iter().filter(|i| i.name.starts_with("blocks.")) {
+            assert_eq!(info.input_dim, Some(512));
+            assert_eq!(info.output_dim, Some(512));
+        }
+        // The uniform residual chain satisfies §2.4 by construction.
+        assert!(crate::wggo_shape::validate(&infos).is_empty());
+    }
+
+    #[test]
+    fn shape_warnings_empty_for_uniform_residual_graph() {
+        let w = two_block_wengert();
+        let graph = build_graph(&w);
+        assert!(shape_warnings(&graph, 512).is_empty());
+    }
+
+    #[test]
+    fn run_residual_model_emits_no_shape_warnings() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(
+            !plan.warnings.iter().any(|m| m.contains("shape_incompatible")),
+            "uniform residual transformer must not trip the §2.4 shape gate: {:?}",
+            plan.warnings
+        );
     }
 
     #[test]

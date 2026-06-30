@@ -292,6 +292,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_applied_yields_no_overrides() {
+        // Load-bearing invariant for WGGO's §2.4 shape-compatibility refusal:
+        // `wggo::run` emits an empty AppliedPlan when a graph is provably
+        // shape-incompatible, and the consumer must therefore apply *no*
+        // transforms (CSHA/WRGA/CPDT all fall back to defaults).  If this ever
+        // started synthesising default overrides, the refusal would silently
+        // leak transforms onto a broken graph.
+        let empty = crate::wggo_apply::AppliedPlan {
+            layers: Vec::new(),
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+        let over = WggoOverrides::from_applied(&empty);
+        assert!(over.per_layer.is_empty());
+        assert!(over.find(0).is_none());
+    }
+
+    #[test]
     fn map_csha_level_covers_all_valid_raws() {
         assert_eq!(map_csha_level(0), Some(FusionLevel::None));
         assert_eq!(map_csha_level(1), Some(FusionLevel::Level1));
