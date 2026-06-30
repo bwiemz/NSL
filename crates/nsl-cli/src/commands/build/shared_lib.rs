@@ -44,7 +44,8 @@ fn run_build_shared_single(
     // with decorators but without --source-ad.
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.wrga_inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
@@ -72,7 +73,7 @@ fn run_build_shared_single(
         }
     };
 
-    emit_wrga_report(&wrga_plan, wrga_report);
+    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
 
     let stem = file
         .file_stem()
@@ -338,7 +339,10 @@ fn run_build_shared_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(mod_data));
+            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
+                mod_data,
+                &entry_options.wrga_check,
+            ));
             entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
             entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             entry_options.export_functions_out = Some(exports_slot.clone());
@@ -398,7 +402,7 @@ fn run_build_shared_multi(
         obj_files.push(obj_path);
     }
 
-    emit_wrga_report(&entry_wrga_plan, wrga_report);
+    emit_wrga_report(&entry_wrga_plan, wrga_report, &options.wrga_check);
 
     let lib_path = if let Some(out) = output {
         out

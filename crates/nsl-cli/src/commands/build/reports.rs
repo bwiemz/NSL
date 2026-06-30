@@ -2,12 +2,10 @@
 //!
 //! `check_wrga_report_preconditions` fails fast when `--wrga-report` is used
 //! without `--source-ad`; `emit_wrga_report` renders the plan to stdout/file
-//! and offers it to the `--wrga-compare` capture slot. Extracted verbatim from
-//! the former monolithic `build.rs`; behavior is unchanged.
+//! and offers it to the `--wrga-compare` capture slot; `capture_wrga_plan`
+//! stashes the produced plan into the explicit `WrgaCheckContext` slot.
 
 use std::process;
-
-use super::wrga_state::capture_wrga_plan_if_armed;
 
 /// Task 3 (B.1): `--wrga-report` requires `--source-ad`, since WRGA only fires
 /// in the source-AD lowering path. Detect and fail fast rather than silently
@@ -31,16 +29,36 @@ pub(super) fn check_wrga_report_preconditions(
     }
 }
 
+/// Capture the just-produced `WrgaPlan` into the `WrgaCheckContext` plan slot
+/// if and only if `--wrga-compare` populated one (`ctx.plan_capture.is_some()`).
+/// No-op otherwise. Called from every build path just after
+/// `compile_returning_plan` returns. Captures the FIRST non-`None` plan we see,
+/// so multi-file paths that compile multiple modules don't overwrite the
+/// entry-module plan with a dependency's empty one.
+pub(super) fn capture_wrga_plan(
+    plan: &Option<nsl_codegen::wrga::WrgaPlan>,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) {
+    let Some(p) = plan else { return };
+    let Some(slot) = ctx.plan_capture.as_ref() else { return };
+    if let Ok(mut guard) = slot.lock() {
+        if guard.is_none() {
+            *guard = Some(p.clone());
+        }
+    }
+}
+
 /// Task 3 (B.1): emit the WRGA report to stdout or a file. Mirrors the logic in
 /// `run_build_single` / `run_build_multi`.
 pub(super) fn emit_wrga_report(
     wrga_plan: &Option<nsl_codegen::wrga::WrgaPlan>,
     wrga_report: Option<&std::path::Path>,
+    ctx: &nsl_codegen::WrgaCheckContext,
 ) {
     // Always offer the plan to the capture slot; the helper is a no-op when
-    // `--wrga-compare` hasn't armed it. Doing the capture up-here covers every
-    // build path that funnels through `emit_wrga_report`.
-    capture_wrga_plan_if_armed(wrga_plan);
+    // `--wrga-compare` hasn't populated one. Doing the capture up-here covers
+    // every build path that funnels through `emit_wrga_report`.
+    capture_wrga_plan(wrga_plan, ctx);
 
     let Some(report_path) = wrga_report else { return; };
     match wrga_plan {
