@@ -60,9 +60,19 @@ pub struct AdapterSite {
     /// B.3 Task 4: fusion decision for this site, populated after the
     /// fusion pass runs.  `None` when no fusion analysis has been run
     /// (e.g. the prescan path skipped fusion because the target did not
-    /// match).  When `Some(EpilogueFusedLora)` / `Some(ActivationFusedIa3)`
-    /// AND the compile target is sm_80+, the AST rewrite emits the
-    /// single-FFI fused call instead of the unfused triple.
+    /// match).
+    ///
+    /// Variant handling in the AST rewrite (`wrga_adapter_rewrite`):
+    /// - `Some(EpilogueFusedLora)` / `Some(EpilogueFusedGatedLora)` AND
+    ///   target sm >= 80 → single-FFI fused matmul call.
+    /// - `Some(ActivationFusedIa3)` AND target sm >= 80 → single-FFI
+    ///   activation-fused IA³ call.
+    /// - `Some(ReductionFusedAdapter)` (WRGA paper §2.4 pattern 3) → set
+    ///   for IA³ on Sum/Mean/pool sites by the fusion pass; the
+    ///   PTX/FFI emitter for the reduction-fused kernel is deferred,
+    ///   so the rewrite path falls through to the unfused IA³ mul,
+    ///   which is functionally equivalent.
+    /// - Any other variant or `None` → unfused fallback (always correct).
     pub fusion_decision: Option<crate::wrga_fusion::FusionTarget>,
 }
 

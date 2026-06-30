@@ -584,6 +584,7 @@ fn placements_noop(sites: &[AdapterSite], r_max: usize) -> Vec<AdapterPlacement>
         .iter()
         .map(|s| AdapterPlacement {
             name: s.name.clone(),
+            kind: s.kind,
             arithmetic_intensity: 0.0,
             classification: BoundClassification::MemoryBound,
             roofline_slack: 1.0,
@@ -895,6 +896,10 @@ fn infer_sites_from_wengert(
             PrimalOp::LayerNorm { .. } | PrimalOp::RMSNorm { .. } => SiteKind::Norm,
             PrimalOp::Softmax { .. } | PrimalOp::LogSoftmax { .. } => SiteKind::Softmax,
             PrimalOp::Embedding => SiteKind::Embedding,
+            // WRGA §2.4 pattern 3: a trainable param consumed by a
+            // sum/mean reduction is an IA³-style scaling site that can be
+            // folded into the reduction kernel's epilogue.
+            PrimalOp::Sum { .. } | PrimalOp::Mean { .. } => SiteKind::Reduction,
             _ => continue,
         };
         // No shape info in the Wengert list; use a modest default so the
@@ -1443,6 +1448,7 @@ mod tests {
         plan.placements = vec![
             crate::wrga_roofline::AdapterPlacement {
                 name: "A".into(),
+                kind: crate::wrga_roofline::SiteKind::Matmul,
                 arithmetic_intensity: 0.0,
                 classification: BoundClassification::MemoryBound,
                 roofline_slack: 1.0,
@@ -1456,6 +1462,7 @@ mod tests {
             },
             crate::wrga_roofline::AdapterPlacement {
                 name: "B".into(),
+                kind: crate::wrga_roofline::SiteKind::Matmul,
                 arithmetic_intensity: 0.0,
                 classification: BoundClassification::MemoryBound,
                 roofline_slack: 1.0,
@@ -1505,6 +1512,7 @@ mod tests {
         let mut plan = WrgaPlan::test_dummy();
         let mk_placement = |name: &str, rank: usize| crate::wrga_roofline::AdapterPlacement {
             name: name.into(),
+            kind: crate::wrga_roofline::SiteKind::Matmul,
             arithmetic_intensity: 0.0,
             classification: BoundClassification::MemoryBound,
             roofline_slack: 1.0,
@@ -1585,6 +1593,7 @@ mod tests {
     fn mk_lora_placement(name: &str) -> crate::wrga_roofline::AdapterPlacement {
         crate::wrga_roofline::AdapterPlacement {
             name: name.into(),
+            kind: crate::wrga_roofline::SiteKind::Matmul,
             arithmetic_intensity: 0.0,
             classification: crate::cost_model::BoundClassification::MemoryBound,
             roofline_slack: 1.0,
@@ -1948,5 +1957,177 @@ mod tests {
         let mut p3 = vec![mk_lora_placement("blocks.0.attn_norm.weight")];
         assert!(apply_wggo_placement_filter(&mut p3, Some(&over_qv)).is_empty());
         assert_eq!(p3[0].adapter, AdapterKind::Lora);
+    }
+
+    // -----------------------------------------------------------------------
+    // WRGA §2.4 pattern 3 — reduction-fused adapter end-to-end (Gap #5)
+    // -----------------------------------------------------------------------
+
+    /// A Wengert list whose trainable param is consumed by a `Mean` op —
+    /// the classic mean-pool classification head pattern. The end-to-end
+    /// driver must classify this site as `SiteKind::Reduction`, route it
+    /// through IA³, and produce a `FusionTarget::ReductionFusedAdapter`
+    /// in the plan.
+    fn mean_pool_head_like() -> WengertList {
+        // x   (#0) input
+        // wp  (#1) param  head.pool_scale  (trainable)
+        // m   (#2) mean(x * wp, dim=-1)    — pooling site consuming wp
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("head.pool_scale".into()), vec![]),
+            op(2, 2, PrimalOp::Mul, vec![0, 1]),
+            op(3, 3, PrimalOp::Mean { dim: Some(-1) }, vec![2, 1]),
+        ];
+        WengertList {
+            ops,
+            output: 3,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn reduction_site_routes_to_reduction_fused_adapter() {
+        let w = mean_pool_head_like();
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: Vec::new(), // all params trainable
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 3,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+        };
+        let plan = run(input);
+        // Exactly one decision, on the reduction site, with the §2.4
+        // pattern 3 fusion target.
+        let mean_dec = plan
+            .fusion
+            .decisions
+            .iter()
+            .find(|d| d.site == "head.pool_scale")
+            .expect("a fusion decision for the trainable param must exist");
+        assert_eq!(
+            mean_dec.target,
+            crate::wrga_fusion::FusionTarget::ReductionFusedAdapter,
+            "Mean PrimalOp must drive a ReductionFusedAdapter decision; got {:?}",
+            mean_dec.target,
+        );
+        assert!(mean_dec.target.is_fused());
+        assert!(plan.fusion.fused_count() >= 1);
+    }
+
+    #[test]
+    fn sum_op_also_routes_to_reduction_fused_adapter() {
+        // The Sum PrimalOp branch must behave identically to Mean — both
+        // are reduction sites under §2.4 pattern 3.
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("head.sum_scale".into()), vec![]),
+            op(2, 2, PrimalOp::Mul, vec![0, 1]),
+            op(3, 3, PrimalOp::Sum { dim: Some(-1) }, vec![2, 1]),
+        ];
+        let w = WengertList {
+            ops,
+            output: 3,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: Vec::new(),
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 3,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+        };
+        let plan = run(input);
+        let dec = plan
+            .fusion
+            .decisions
+            .iter()
+            .find(|d| d.site == "head.sum_scale")
+            .expect("a fusion decision for the trainable param must exist");
+        assert_eq!(
+            dec.target,
+            crate::wrga_fusion::FusionTarget::ReductionFusedAdapter,
+        );
+    }
+
+    /// Reduction-fused must NOT collide with the §9.3 ablation harness —
+    /// when `skip_fusion_integration` is set, the new variant must NOT
+    /// survive in `plan.fusion`, just like the other Innovations' ablation
+    /// contract. The first assertion pins the actual mechanism (`FusionPlan::default()`
+    /// → empty decisions) so a future refactor that keeps decisions but
+    /// flips them to `StandaloneAdapter` would still produce an empty
+    /// fusion ratio but would break this test loudly; the second pins
+    /// the user-visible ratio.
+    #[test]
+    fn reduction_fused_is_skipped_under_skip_fusion_integration() {
+        let w = mean_pool_head_like();
+        // Build a WrgaInput that actually puts the mean-pool param into
+        // the trainable set (the generic `ablation_input` helper is wired
+        // to `blocks.7.*` and would skip `head.pool_scale`).
+        let mk_input = |abl: WrgaAblation| WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: Vec::new(), // empty ⇒ all params trainable
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 3,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: abl,
+        };
+
+        // Baseline: same model under no ablation MUST produce a
+        // ReductionFusedAdapter decision, otherwise the ablation test
+        // below is testing the wrong thing.
+        let baseline = run(mk_input(WrgaAblation::default()));
+        assert!(
+            baseline.fusion.decisions.iter().any(|d| matches!(
+                d.target,
+                crate::wrga_fusion::FusionTarget::ReductionFusedAdapter
+            )),
+            "test premise broken: baseline run must produce ReductionFusedAdapter \
+             for the mean-pool head fixture; got {:?}",
+            baseline.fusion.decisions.iter().map(|d| &d.target).collect::<Vec<_>>(),
+        );
+
+        let abl = WrgaAblation {
+            skip_fusion_integration: true,
+            ..Default::default()
+        };
+        let plan = run(mk_input(abl));
+        assert!(
+            plan.fusion.decisions.is_empty(),
+            "skip_fusion_integration must replace fusion with FusionPlan::default(); \
+             got {} decisions",
+            plan.fusion.decisions.len(),
+        );
+        assert_eq!(plan.fusion.fusion_ratio(), 0.0);
     }
 }
