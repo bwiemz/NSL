@@ -208,7 +208,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // Publish to the CLI-owned output slot (if any) so `nsl build` can
     // render the plan after compile returns without threading it through
     // every entry-point's return tuple.
-    if let Some(slot) = compiler.compile_options.cpdt_plan_out.as_ref() {
+    if let Some(slot) = compiler.compile_options.cpdt.plan_out.as_ref() {
         if let Ok(mut guard) = slot.lock() {
             *guard = Some(plan.clone());
         }

@@ -62,11 +62,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             }
 
             // CPDT: mirror the `nsl build` setup so precision-adaptive
-            // training executes end-to-end via `nsl run`. The cpdt_mode,
-            // cpdt_cluster and cpdt_plan_out are threaded into the compile
-            // call via CompileOptions fields below (the compiler copies
-            // options.cpdt_cluster into Compiler::cpdt_cluster and reads
-            // compile_options.cpdt_plan_out during train-block codegen).
+            // training executes end-to-end via `nsl run`. The mode, cluster
+            // and plan_out are threaded into the compile call via the grouped
+            // CompileOptions.cpdt field below (the compiler copies
+            // options.cpdt.cluster into Compiler::cpdt_cluster and reads
+            // compile_options.cpdt.plan_out during train-block codegen).
             //
             // --cpdt-report implies --cpdt (full mode unless explicit).
             let cpdt_mode_str: Option<String> = match (cpdt.as_deref(), cpdt_report) {
@@ -308,10 +308,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // cpdt_cluster into Compiler::cpdt_cluster and reads
                 // cpdt_plan_out during train-block codegen via
                 // invoke_cpdt_if_enabled.
-                cpdt_mode,
-                cpdt_cluster: cpdt_cluster.clone(),
-                cpdt_report_requested: cpdt_report,
-                cpdt_plan_out: cpdt_plan_out.clone(),
+                cpdt: nsl_codegen::CpdtOptions {
+                    mode: cpdt_mode,
+                    cluster: cpdt_cluster.clone(),
+                    report_requested: cpdt_report,
+                    plan_out: cpdt_plan_out.clone(),
+                },
                 export_functions_out: None,
                 calibration_data: None,
                 calibration_mode: Some("required".to_string()),

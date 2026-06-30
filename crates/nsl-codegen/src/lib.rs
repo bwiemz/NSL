@@ -713,6 +713,36 @@ pub enum WggoImportance {
     Grad,
 }
 
+/// CPDT: compiler-planned distributed-training options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review). Clone-only
+/// (no `Debug`/`PartialEq`) because `plan_out` is a shared `Arc<Mutex<…>>` slot.
+#[derive(Clone)]
+pub struct CpdtOptions {
+    /// Planner mode (Off/ZeroOnly/Full).
+    pub mode: crate::cpdt::CpdtMode,
+    /// Cluster topology. Required when `mode != Off`.
+    pub cluster: Option<crate::cpdt_zero::ClusterSpec>,
+    /// Whether `--cpdt-report` was requested (stdout full plan).
+    pub report_requested: bool,
+    /// Shared output slot the CLI reads after compile returns.
+    /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers can
+    /// render it without extending every entry-point return type.
+    pub plan_out: Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
+}
+
+impl Default for CpdtOptions {
+    fn default() -> Self {
+        Self {
+            mode: crate::cpdt::CpdtMode::Off,
+            cluster: None,
+            report_requested: false,
+            plan_out: None,
+        }
+    }
+}
+
 /// M53: Worst-case-execution-time (WCET) analysis and certification options.
 ///
 /// Grouped out of [`CompileOptions`] as part of decomposing that god-config
@@ -874,17 +904,8 @@ pub struct CompileOptions {
     pub csha_mode: Option<String>,
     /// CSHA: print the attention-fusion report.
     pub csha_report: bool,
-    /// CPDT: planner mode (Off/ZeroOnly/Full).
-    pub cpdt_mode: crate::cpdt::CpdtMode,
-    /// CPDT: cluster topology.  Required when `cpdt_mode != Off`.
-    pub cpdt_cluster: Option<crate::cpdt_zero::ClusterSpec>,
-    /// CPDT: whether `--cpdt-report` was requested (stdout full plan).
-    pub cpdt_report_requested: bool,
-    /// CPDT: shared output slot the CLI reads after compile returns.
-    /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
-    /// can render it without extending every entry-point return type.
-    pub cpdt_plan_out:
-        Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
+    /// CPDT: compiler-planned distributed-training options.
+    pub cpdt: CpdtOptions,
     /// M62: shared output slot the CLI reads after compile returns so it can
     /// emit a matching C header alongside the shared library. Populated by
     /// `Compiler::finalize` from `features.export_functions`.
@@ -975,10 +996,7 @@ impl Default for CompileOptions {
             wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
-            cpdt_mode: crate::cpdt::CpdtMode::Off,
-            cpdt_cluster: None,
-            cpdt_report_requested: false,
-            cpdt_plan_out: None,
+            cpdt: CpdtOptions::default(),
             export_functions_out: None,
             calibration_data: None,
             calibration_mode: Some("required".to_string()),
