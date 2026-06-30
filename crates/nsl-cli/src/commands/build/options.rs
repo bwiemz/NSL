@@ -359,6 +359,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 shared_lib,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
+                pca_user_strategies: Vec::new(),
                 wrga_fold_allocations,
                 wggo: nsl_codegen::WggoOptions {
                     mode: wggo.clone(),

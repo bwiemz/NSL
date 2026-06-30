@@ -85,6 +85,14 @@ pub struct AnalysisResult {
     /// the lowering-site auto-substitution of composite cross_entropy → the
     /// fused linear-CE kernel).
     pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): validated `@pca(...)` configurations.
+    /// One entry per decorator occurrence. Codegen reads these at the
+    /// CSHA training-PTX synthesis site so that
+    /// `@pca(strategy=per_document)` flips
+    /// `PerDocAdmitConfig::enable_per_doc_cta=true` for the planner.
+    /// Pre-Item-4 the validated config was dropped at
+    /// `nsl_semantic::checker::stmt::stmt_decorator`.
+    pub pca_configs: Vec<crate::cftp::PcaConfig>,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -121,6 +129,7 @@ pub fn analyze_with_imports(
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
     let fused_ce_configs = checker.fused_ce_configs;
+    let pca_configs = checker.pca_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the
@@ -213,5 +222,6 @@ pub fn analyze_with_imports(
         adapter_configs,
         weight_index_map,
         fused_ce_configs,
+        pca_configs,
     }
 }

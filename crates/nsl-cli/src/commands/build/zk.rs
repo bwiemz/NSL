@@ -30,6 +30,7 @@ pub(crate) fn run_build_zk(
     let mut options = options.clone();
     options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;

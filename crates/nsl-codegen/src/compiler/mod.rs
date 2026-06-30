@@ -560,6 +560,15 @@ pub struct Compiler<'a> {
     /// documents the deferred substitution site.
     pub fused_ce_configs: Vec<crate::FusedCeDecoratorConfig>,
 
+    // ── CFTP §4.3 G2 Strategy 3 side-channel (Item 4) ────────────────
+    /// `@pca(strategy=...)` strategies for this compile, forwarded from
+    /// `CompileOptions.pca_user_strategies`. Empty when no `@pca`
+    /// decorator was present. Read by `maybe_synthesize_csha_training_ptx`
+    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at
+    /// least one entry requests `PerDocument`. Pre-Item-4 the validated
+    /// config was dropped by the semantic checker.
+    pub pca_user_strategies: Vec<crate::PcaUserStrategy>,
+
     // ── CPDT side-channel (pipeline integration) ─────────────────────
     /// CPDT mode requested via CLI. `Off` → planner does not run.
     pub cpdt_mode: crate::cpdt::CpdtMode,
@@ -834,6 +843,7 @@ impl<'a> Compiler<'a> {
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
+            pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
             cpdt_cluster: options.cpdt.cluster.clone(),
             cpdt_plan: None,

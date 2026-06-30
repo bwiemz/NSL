@@ -271,6 +271,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 shared_lib: false,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
+                pca_user_strategies: Vec::new(),
                 wrga_fold_allocations: false,
                 wggo: nsl_codegen::WggoOptions::default(),
                 // Phase 4 Task 6: when a train block is detected with --monitor,

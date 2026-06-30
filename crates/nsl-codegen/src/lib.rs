@@ -710,6 +710,55 @@ impl FusedCeDtypeHint {
     }
 }
 
+/// CFTP §4.3 G2 Strategy 3 (Item 4): codegen-side mirror of
+/// `nsl_semantic::cftp::PcaStrategy` carried through `CompileOptions`.
+///
+/// Mirrors the semantic enum 1-for-1 but lives in nsl-codegen so the
+/// codegen crate does not need to depend on nsl-semantic types directly
+/// (same convention as `FusedCeDtypeHint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcaUserStrategy {
+    /// Decorator-default — let the auto planner decide.
+    Auto,
+    /// Force segment-ID-masked kernel even if per-doc CTA would apply.
+    SegmentId,
+    /// Request per-document CTA scheduling. Activates the existing
+    /// `PerDocAdmitConfig::enable_per_doc_cta` gate at the CSHA
+    /// training-PTX synthesis site; admission still has the final say
+    /// (block_q / num_docs / causal / fused-projection gates).
+    PerDocument,
+    /// Disable PCA entirely for this train block (force-fallback to
+    /// the plain FA-2 forward / backward).
+    Off,
+}
+
+impl PcaUserStrategy {
+    /// True iff at least one `@pca(strategy=per_document)` (or its
+    /// aliases) was collected on this compile.
+    pub fn is_per_document(self) -> bool {
+        matches!(self, PcaUserStrategy::PerDocument)
+    }
+
+    /// Map from the semantic `PcaStrategy` enum without forcing
+    /// nsl-codegen to take a direct dependency on its discriminants.
+    /// Callers provide the textual name (`PcaStrategy::as_str`) — keeps
+    /// the wire-format stable across the crate boundary.
+    pub fn from_semantic_str(s: &str) -> Self {
+        match s {
+            "auto" => PcaUserStrategy::Auto,
+            "segment_id" => PcaUserStrategy::SegmentId,
+            "per_document" => PcaUserStrategy::PerDocument,
+            "off" => PcaUserStrategy::Off,
+            // Forward-compat fallback: an unrecognised string from a
+            // newer semantic crate decays to `Auto` rather than crashing
+            // the build. Tests pin all four canonical strings AND the
+            // catch-all so a future rename of `PcaStrategy::Auto::as_str`
+            // does not silently mask via this fallback.
+            _ => PcaUserStrategy::Auto,
+        }
+    }
+}
+
 /// User-facing knob that gates how WGGO scores head importance.
 /// - `Auto`: use gradient scoring when a calibration sidecar is present
 ///   (with per-layer magnitude fallback); otherwise pure magnitude.
@@ -910,6 +959,15 @@ pub struct CompileOptions {
     /// the first `enabled = true` entry to gate the fused linear-CE
     /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
     pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
+    /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
+    /// present. The CSHA training-PTX synthesis site consults this list
+    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at least
+    /// one entry requests `PerDocument`.
+    /// Stored as the codegen-local `PcaUserStrategy` enum so nsl-codegen
+    /// does not depend directly on nsl-semantic types (mirrors the
+    /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
+    pub pca_user_strategies: Vec<PcaUserStrategy>,
     /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
     /// allocations (vs. B.1's observational-only path). Default false.
     pub wrga_fold_allocations: bool,
@@ -1010,6 +1068,7 @@ impl Default for CompileOptions {
             shared_lib: false,
             wrga_inputs: None,
             fused_ce_configs: Vec::new(),
+            pca_user_strategies: Vec::new(),
             wrga_fold_allocations: false,
             wggo: WggoOptions::default(),
             profile_kernels: false,

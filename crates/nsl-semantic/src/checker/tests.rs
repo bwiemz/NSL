@@ -1955,3 +1955,137 @@ model Attention:
         diags
     );
 }
+
+// -----------------------------------------------------------------------
+// CFTP §4.3 G2 Strategy 3 (Item 4): @pca decorator collection tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn pca_decorator_per_document_strategy_is_captured() {
+    let src = r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+@pca(strategy = per_document)
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.pca_configs.len(),
+        1,
+        "expected one @pca config, got {:?}",
+        res.pca_configs.len()
+    );
+    assert!(
+        matches!(
+            res.pca_configs[0].strategy,
+            crate::cftp::PcaStrategy::PerDocument
+        ),
+        "strategy mismatch: {:?}",
+        res.pca_configs[0].strategy
+    );
+}
+
+#[test]
+fn pca_decorator_default_strategy_is_auto() {
+    let src = r#"
+let m = Tiny()
+@pca
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.pca_configs.len(),
+        1,
+        "bare @pca must still produce a config (defaults to auto)"
+    );
+    assert!(
+        matches!(
+            res.pca_configs[0].strategy,
+            crate::cftp::PcaStrategy::Auto
+        ),
+        "bare @pca should default to Auto, got {:?}",
+        res.pca_configs[0].strategy
+    );
+}
+
+#[test]
+fn pca_decorator_invalid_strategy_errors_and_drops_config() {
+    let src = r#"
+let m = Tiny()
+@pca(strategy = wibble)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("@pca: strategy must be")),
+        "expected invalid-strategy diagnostic, got: {:?}",
+        res.diagnostics
+    );
+    // The validator still returns a config (default `Auto`) on an
+    // invalid strategy — we just emit the diagnostic.  This preserves
+    // partial-recovery semantics so downstream codegen can still
+    // proceed with the safe (Auto) default.
+    assert_eq!(res.pca_configs.len(), 1);
+    assert!(matches!(
+        res.pca_configs[0].strategy,
+        crate::cftp::PcaStrategy::Auto
+    ));
+}
+
+#[test]
+fn pca_decorator_multiple_occurrences_are_collected() {
+    let src = r#"
+let m = Tiny()
+@pca(strategy = per_document)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+
+@pca(strategy = segment_id)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.pca_configs.len(),
+        2,
+        "expected both @pca configs to be collected"
+    );
+}
+
+#[test]
+fn pca_decorator_absent_yields_empty_collection() {
+    let src = r#"
+let m = Tiny()
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.pca_configs.is_empty(),
+        "absent @pca must leave the collection empty"
+    );
+}

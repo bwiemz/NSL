@@ -57,6 +57,7 @@ fn run_profile_pre_pass(
         adapter_configs: Vec::new(),
         weight_index_map: std::collections::HashMap::new(),
         fused_ce_configs: Vec::new(),
+        pca_configs: Vec::new(),
     };
 
     // Task 6 + Phase 2.5 Task 4: populate source text/name so

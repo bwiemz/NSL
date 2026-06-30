@@ -440,11 +440,13 @@ impl<'a> TypeChecker<'a> {
                             let resolve = |s: nsl_ast::Symbol| -> String {
                                 self.interner.resolve(s.0).unwrap_or("").to_string()
                             };
-                            crate::cftp::validate_pca_decorator(
+                            if let Some(cfg) = crate::cftp::validate_pca_decorator(
                                 deco,
                                 &resolve,
                                 &mut self.diagnostics,
-                            );
+                            ) {
+                                self.pca_configs.push(cfg);
+                            }
                         }
                         // CFTP §4.4 G3: @fused_lm_ce decorator validation.
                         // Validated configs are captured so codegen can
