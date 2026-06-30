@@ -1126,13 +1126,33 @@ fn cpu_rope_adjacent_pairs(q: &[f32], seq_len: usize, head_dim: usize) -> Vec<f3
 }
 
 /// CPU reference: apply standard RoPE to Q (adjacent-pair convention),
-/// leave K unchanged (rope_q rotates Q only in the CFTP convention),
-/// then run causal unmasked attention.
+/// leave K unchanged, then run causal unmasked attention.
+///
+/// IMPORTANT — STRUCTURAL GAP PINNED BY DESIGN:
+///
+/// Canonical RoPE rotates BOTH Q and K (the dot-product `Q_rot . K_rot` is
+/// what gives positional invariance). This CPU reference INTENTIONALLY does
+/// NOT rotate K, because the kernel branch under test —
+/// `non-CSHA inline path with rope_q=true` — only rotates Q (see the
+/// KNOWN-LIMITATION comment in
+/// `crates/nsl-codegen/src/flash_attention_v2/phases/forward/q_load.rs`).
+/// Without matching the kernel's missing-K-rotation, the reference would
+/// diverge from the GPU output by more than the 4e-2 tolerance and the test
+/// would fail on the structural gap rather than the per-doc RoPE reset
+/// semantics it is intended to pin.
+///
+/// PRODUCTION uses the CSHA-fused-projections path
+/// (csha_hooks.rs::emit_rope_pair_sweep) which rotates BOTH Q and K
+/// correctly. This CPU reference must NOT be reused as a correctness oracle
+/// for the production path — it is purpose-built to mirror the test-only
+/// non-CSHA inline fallback. When the K-side rotation gap is closed in a
+/// follow-on PR, the corresponding CPU reference (likely in a new file)
+/// must rotate K as well.
 fn cpu_reference_rope_then_attention(
     q: &[f32], k: &[f32], v: &[f32],
     batch: usize, heads: usize, seq_len: usize, head_dim: usize,
 ) -> Vec<f32> {
-    // Rotate Q per-row; K/V pass through unchanged.
+    // Rotate Q per-row; K/V pass through unchanged — see docstring above.
     let mut q_rot = q.to_vec();
     for bi in 0..batch {
         for hi in 0..heads {
