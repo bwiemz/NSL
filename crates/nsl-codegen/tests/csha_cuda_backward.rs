@@ -180,6 +180,9 @@ fn run_fused_backward_config(
             active_heads: heads,
             rmsnorm_eps: norm_eps,
             d_model: d_model,
+            // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
+            // the in-kernel RMSNorm prologue active (default).
+            skip_rmsnorm_prologue: false,
         }),
         checkpoint: None,
     };
@@ -326,6 +329,14 @@ fn run_fused_backward_config(
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
             saves.x_raw,
+            // PCA Tier A: segment_ids ptr (trailing) — 0 = unpacked launch.
+            0i64,
+            // Tier B extension — null (no Tier B dispatch for this test).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (legacy topology).
+            0i64,
         )
     };
     if rc_fwd != 0 {
@@ -368,6 +379,15 @@ fn run_fused_backward_config(
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
             dxn_dev,
+            // PCA Task 4B: trailing segment_ids — 0 = unpacked launch.
+            0i64,
+            // Tier B extension — null (no Tier B dispatch for this test).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
+            // means legacy per-q-block topology.
+            0i64,
         )
     };
     if rc_bwd != 0 {
@@ -545,6 +565,7 @@ fn t6_3_matrix_sweep_numerical() {
                         save_activations_for_backward: true,
                         active_heads: heads,
                         rmsnorm_eps: 1e-5, d_model: dm,
+                        skip_rmsnorm_prologue: false,
                     }),
                     checkpoint: None,
                 };

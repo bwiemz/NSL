@@ -4,6 +4,100 @@ use crate::hir::clock_reset::{ClkRef, ResetRef};
 use crate::hir::ids::{RegisterId, WireId};
 use crate::hir::signals::SignalRef;
 
+// --- Wire-array primitives (M57.1 wire-array realization §2) ---
+
+/// Index expression for `SignalRef::WireArrayElement` — resolves to a Verilog
+/// expression at emit time.
+///
+/// M57.1 wire-array realization: the fused MLP emitter declares wire arrays
+/// like `acc_l1 [0:127][0:784]` and references their elements with mixed
+/// literal / genvar / genvar-plus-constant indices (e.g. `acc_l1[_gv_o][_gv_k]`
+/// for reads, `acc_l1[_gv_o][_gv_k + 1]` for ripple writes).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IndexExpr {
+    /// Compile-time literal. Emits `n`.
+    Literal(usize),
+    /// Reference to a genvar declared by an enclosing `GenerateFor`.
+    /// Emits the literal genvar name (e.g. `_gv_o`).
+    Genvar(String),
+    /// Genvar plus a non-negative constant offset. Emits `(name + k)`.
+    /// Used for ripple-write targets like `acc[o][k + 1]`.
+    GenvarPlus(String, i64),
+    /// M57.2: runtime register-valued index. Emits `_r{id}` (e.g. `acc[_r5]`).
+    /// Used for `x_buf[k]`, `W{i}[k][o]`, `h_buf[o]` indexing by FSM counters.
+    Reg(crate::hir::ids::RegisterId),
+    /// M57.2: register plus a constant offset. Emits `(_r{id} + k)`.
+    /// Used for the §3.4 intra-layer bias-seed `b{i}[o+1]`.
+    RegPlus(crate::hir::ids::RegisterId, i64),
+}
+
+/// Module-scope multi-dimensional wire array declaration.
+///
+/// Emits `wire signed [width-1:0] {name} [0:{dims[0]-1}][0:{dims[1]-1}]...;`
+/// at the module level (before any generate blocks). Construction-time
+/// invariant: every `SignalRef::WireArrayElement { array_name: <name>, indices }`
+/// reference must have `indices.len() == dims.len()`. The emitter assumes
+/// well-formed HIR and does not validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+}
+
+/// M57.2: module-scope clocked register array — the sequential sibling of
+/// `WireArray`. Holds activation buffers (`x_buf`, `h_buf`). Declared by
+/// `emit_reg_array`; elements updated by non-blocking `SeqStmt::RegAssign`
+/// inside a `SeqProcess`, and reset per-element in the `negedge rst_n` branch
+/// (see `SeqProcess.reset_arrays`). v1 uses 1D arrays only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+}
+
+/// Drives one element of a `WireArray` from a `SignalRef`.
+///
+/// Emits `assign {array_name}[{idx0}]...[{idxN}] = {src};` at the position
+/// where it appears in the HIR node list. Inside a GenerateFor body, indices
+/// typically include `Genvar` / `GenvarPlus` refs; at module top level, indices
+/// are typically `Literal`.
+///
+/// Construction-time invariant: `indices.len()` matches the corresponding
+/// `WireArray.dims.len()` for the array being driven. The emitter does not
+/// validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignWireArrayElement {
+    pub array_name: String,
+    pub indices: Vec<IndexExpr>,
+    pub src: crate::hir::signals::SignalRef,
+}
+
+/// Module-scope multi-dimensional const array per M57.1 wire-array mini §3.2 +
+/// §4 (Task W5).
+///
+/// Emits
+/// `localparam signed [width-1:0] {name} [0:dims[0]-1][0:dims[1]-1] = '{...values...};`
+/// at the module level (in the LocalParam preamble block). For `dims.len() == 2`
+/// the literal renders as `'{ '{row0}, '{row1}, ... }`; for `dims.len() == 1`
+/// as `'{ cell, cell, ... }`. Higher ranks are not yet supported by the v1
+/// emitter (panics).
+///
+/// Used to lower `W<i>` (`[k_dim, n_outputs]`) and `b<i>` (`[n_outputs]`)
+/// into Verilog arrays indexable by genvar inside the matmul ripple body.
+/// Values are baked at CLI time (Task W6) by the fixture loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalParamArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+    /// Flat values in row-major order. For 2D arrays:
+    /// `values[r * dims[1] + c]` is the cell at `[r][c]`. For 1D, indexed
+    /// linearly. Length must equal `dims.iter().product()`.
+    pub values: Vec<i128>,
+}
+
 // --- Module-boundary nodes ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +147,40 @@ impl LocalParam {
 }
 
 // --- Combinational nodes ---
+
+/// M57.2: combinational equality against a compile-time constant.
+/// Emits `assign _w{out} = ($signed({lhs}) == {rhs});` (1-bit result).
+/// Realizes §3.3 within-state guards (`k == K-1`, `o == N-1`) as Wires so
+/// `SeqStmt::If.cond` stays a `SignalRef::Wire`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmpEq {
+    pub lhs: SignalRef,
+    pub rhs: u64,
+    pub out: WireId,
+}
+
+impl CmpEq {
+    pub fn new(lhs: SignalRef, rhs: u64) -> Self {
+        Self { lhs, rhs, out: WireId::fresh() }
+    }
+}
+
+/// M57.2: combinational add of a compile-time constant. Emits
+/// `assign _w{out} = $signed({src}) + {k};` (result width = `width`).
+/// Realizes §3.3 counter increments (`k+1`, `o+1`) as Wires read by RegAssign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddConst {
+    pub src: SignalRef,
+    pub k: i64,
+    pub out: WireId,
+    pub width: usize,
+}
+
+impl AddConst {
+    pub fn new(src: SignalRef, k: i64, width: usize) -> Self {
+        Self { src, k, out: WireId::fresh(), width }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mul {
@@ -134,7 +262,70 @@ impl SignExtend {
     }
 }
 
-// --- Sequential node ---
+// --- M57.2: declaration-only combinational wire ---
+
+/// M57.2: declaration-only combinational wire. Emits `wire signed [w-1:0] _w{id};`.
+/// Unlike `Wire` (whose `produces_wire` registers the id as a driver), `WireDecl`
+/// only declares — the driving `assign` comes from a separate combinational node
+/// (`Mul`/`Add`/`Max0`/`SignExtend`/`CmpEq`/`AddConst`) with the same id. Used by
+/// the sequential datapath so its wires are explicitly sized (no implicit 1-bit nets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireDecl {
+    pub id: crate::hir::ids::WireId,
+    pub width: usize,
+}
+
+// --- Sequential / clocked nodes ---
+
+/// M57.2: LValue for a `SeqStmt::RegAssign` — a scalar register or one element
+/// of a `RegArray`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeqLValue {
+    Register(crate::hir::ids::RegisterId),
+    RegArrayElement { array_name: String, indices: Vec<IndexExpr> },
+}
+
+/// M57.2: minimal sequential statement language (§2.2). `If` carries boolean
+/// within-state guards (`k==K-1`/`o==N-1`); `Case` carries the multi-way state
+/// selector — kept distinct (§2.2). All assignments are non-blocking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeqStmt {
+    RegAssign { target: SeqLValue, value: SignalRef },
+    If { cond: SignalRef, then_body: Vec<SeqStmt>, else_body: Vec<SeqStmt> },
+    Case { selector: SignalRef, arms: Vec<(u64, Vec<SeqStmt>)>, default: Vec<SeqStmt> },
+    Block(Vec<SeqStmt>),
+}
+
+/// M57.2: clocked process → `always_ff @(posedge clk or negedge rst_n)`.
+/// `reset_body` = scalar register resets; `reset_arrays` = (RegArray name,
+/// element count) for per-element reset for-loops (§4); `body` = the FSM
+/// (a state `Case`). Realizes §4's reset branch fully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqProcess {
+    pub clock: crate::hir::clock_reset::ClkRef,
+    pub reset: crate::hir::clock_reset::ResetRef,
+    pub reset_body: Vec<SeqStmt>,
+    pub reset_arrays: Vec<(String, usize)>,
+    pub body: Vec<SeqStmt>,
+}
+
+// --- Sequential nodes ---
+
+/// M57.2: declaration-only scalar register. Emits just `reg signed [w-1:0] _r{id};`.
+/// Unlike `Register` (which bundles its own `always_ff`), an FSM scalar
+/// (`state`/`o`/`k`/`acc`/`out`) is declared by `RegDecl` and driven by the
+/// single `SeqProcess` always_ff. Read via `SignalRef::Register(id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegDecl {
+    pub id: RegisterId,
+    pub width: usize,
+}
+
+impl RegDecl {
+    pub fn new(width: usize) -> Self {
+        Self { id: RegisterId::fresh(), width }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
@@ -321,5 +512,44 @@ mod tests {
         assert_eq!(async_hi.reset.sync, ResetSync::Async);
         assert_eq!(async_lo.reset.sync, ResetSync::Async);
         assert_eq!(async_lo.reset.polarity, ResetPolarity::Low);
+    }
+
+    #[test]
+    fn index_expr_literal_constructs() {
+        let e = IndexExpr::Literal(5);
+        assert!(matches!(e, IndexExpr::Literal(5)));
+    }
+
+    #[test]
+    fn index_expr_genvar_constructs() {
+        let e = IndexExpr::Genvar("_gv_o".to_string());
+        match e {
+            IndexExpr::Genvar(name) => assert_eq!(name, "_gv_o"),
+            _ => panic!("expected Genvar"),
+        }
+    }
+
+    #[test]
+    fn index_expr_genvar_plus_constructs() {
+        let e = IndexExpr::GenvarPlus("_gv_k".to_string(), 1);
+        match e {
+            IndexExpr::GenvarPlus(name, k) => {
+                assert_eq!(name, "_gv_k");
+                assert_eq!(k, 1);
+            }
+            _ => panic!("expected GenvarPlus"),
+        }
+    }
+
+    #[test]
+    fn wire_array_constructs_with_dims_and_width() {
+        let wa = WireArray {
+            name: "acc_l1".to_string(),
+            dims: vec![128, 785],
+            width: 32,
+        };
+        assert_eq!(wa.name, "acc_l1");
+        assert_eq!(wa.dims, vec![128, 785]);
+        assert_eq!(wa.width, 32);
     }
 }

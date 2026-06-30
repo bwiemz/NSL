@@ -37,13 +37,103 @@ impl Granularity {
     }
 }
 
+/// Structured optimization constraints parsed from `constraints={...}`.
+/// A `None` field means "unconstrained"; the codegen bridge (added in a later
+/// task) will map it to the permissive default (`u64::MAX` / `f64::INFINITY`).
+#[derive(Debug, Clone, Default)]
+pub struct CepConstraints {
+    pub peak_memory_bytes: Option<u64>,
+    pub latency_us: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CepPruneConfig {
     pub target: Option<Symbol>,
     pub sparsity: f64,
     pub granularity: Granularity,
     pub preserve: Vec<String>,
+    pub constraints: CepConstraints,
     pub span: Span,
+}
+
+/// Pattern check only; out-of-range layer indices are caught at build time by
+/// `parse_preserve_layers` in the bridge (the semantic pass does not know `n_layers`).
+///
+/// Returns `true` if the pattern is structurally valid (bare non-negative integer,
+/// "blocks.<n>", or "blocks.<n>.<suffix>"), `false` if it should be rejected.
+fn is_valid_preserve_pattern(p: &str) -> bool {
+    // Bare non-negative integer.
+    if p.parse::<u32>().is_ok() {
+        return true;
+    }
+    // "blocks.<N>" or "blocks.<N>.<suffix>"
+    if let Some(rest) = p.strip_prefix("blocks.") {
+        let head = rest.split('.').next().unwrap_or("");
+        // "blocks.*" or "blocks.*.X" — wildcard spanning layers: reject.
+        if head == "*" || head.is_empty() {
+            return false;
+        }
+        if head.parse::<u32>().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_cep_constraints(
+    arg: &nsl_ast::expr::Arg,
+    deco_label: &str,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> CepConstraints {
+    let mut constraints = CepConstraints::default();
+    match &arg.value.kind {
+        ExprKind::DictLiteral(pairs) => {
+            for (k, v) in pairs {
+                let key = match &k.kind {
+                    ExprKind::Ident(sym) => resolve_sym(*sym),
+                    ExprKind::StringLiteral(s) => s.clone(),
+                    _ => continue,
+                };
+                match key.as_str() {
+                    "peak_memory_bytes" => match &v.kind {
+                        ExprKind::IntLiteral(n) if *n >= 0 => {
+                            constraints.peak_memory_bytes = Some(*n as u64)
+                        }
+                        _ => diagnostics.push(
+                            Diagnostic::error(format!(
+                                "{deco_label}: peak_memory_bytes must be a non-negative integer (bytes)"
+                            ))
+                            .with_label(v.span, "expected integer bytes"),
+                        ),
+                    },
+                    "latency_us" => match &v.kind {
+                        ExprKind::FloatLiteral(f) => constraints.latency_us = Some(*f),
+                        ExprKind::IntLiteral(n) => constraints.latency_us = Some(*n as f64),
+                        _ => diagnostics.push(
+                            Diagnostic::error(format!(
+                                "{deco_label}: latency_us must be a number (microseconds)"
+                            ))
+                            .with_label(v.span, "expected number"),
+                        ),
+                    },
+                    other => diagnostics.push(
+                        Diagnostic::error(format!(
+                            "{deco_label}: unknown constraint '{other}' (expected peak_memory_bytes or latency_us)"
+                        ))
+                        .with_label(k.span, "unknown constraint"),
+                    ),
+                }
+            }
+        }
+        _ => diagnostics.push(
+            Diagnostic::error(format!(
+                "{deco_label}: constraints must be a dict, e.g. {{peak_memory_bytes: 6000000000, latency_us: 3000.0}}"
+            ))
+            .with_label(arg.span, "expected dict"),
+        ),
+    }
+    constraints
 }
 
 pub fn validate_cep_prune_decorator(
@@ -55,6 +145,7 @@ pub fn validate_cep_prune_decorator(
     let mut sparsity: f64 = 0.3;
     let mut granularity = Granularity::HeadAndFfn;
     let mut preserve: Vec<String> = Vec::new();
+    let mut constraints = CepConstraints::default();
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -121,7 +212,19 @@ pub fn validate_cep_prune_decorator(
                     ExprKind::ListLiteral(items) => {
                         for item in items {
                             match &item.kind {
-                                ExprKind::StringLiteral(s) => preserve.push(s.clone()),
+                                ExprKind::StringLiteral(s) => {
+                                    if !is_valid_preserve_pattern(s) {
+                                        diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "@cep_prune: preserve pattern '{s}' is not recognized; \
+                                                use a layer index (e.g. '7') or 'blocks.<n>' / 'blocks.<n>.*' \
+                                                (e.g. 'blocks.0.*')"
+                                            ))
+                                            .with_label(item.span, "unrecognized preserve pattern"),
+                                        );
+                                    }
+                                    preserve.push(s.clone());
+                                }
                                 _ => diagnostics.push(
                                     Diagnostic::error(
                                         "@cep_prune: preserve entries must be strings"
@@ -140,9 +243,7 @@ pub fn validate_cep_prune_decorator(
                     ),
                 },
                 "constraints" => {
-                    // Accept but don't validate deeply here — constraints
-                    // (peak_memory / latency_per_token) are parsed at
-                    // codegen time where they have meaning.
+                    constraints = parse_cep_constraints(arg, "@cep_prune", resolve_sym, diagnostics);
                 }
                 _ => diagnostics.push(
                     Diagnostic::error(format!("@cep_prune: unknown argument '{aname}'"))
@@ -157,6 +258,7 @@ pub fn validate_cep_prune_decorator(
         sparsity,
         granularity,
         preserve,
+        constraints,
         span: deco.span,
     })
 }
@@ -195,6 +297,7 @@ impl NasObjective {
 pub struct CepSearchConfig {
     pub target: Option<Symbol>,
     pub objective: NasObjective,
+    pub constraints: CepConstraints,
     pub span: Span,
 }
 
@@ -205,6 +308,7 @@ pub fn validate_cep_search_decorator(
 ) -> Option<CepSearchConfig> {
     let mut target: Option<Symbol> = None;
     let mut objective = NasObjective::ParamEfficiency;
+    let mut constraints = CepConstraints::default();
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -248,7 +352,7 @@ pub fn validate_cep_search_decorator(
                     }
                 }
                 "constraints" => {
-                    // As with @cep_prune, parsed later.
+                    constraints = parse_cep_constraints(arg, "@cep_search", resolve_sym, diagnostics);
                 }
                 _ => diagnostics.push(
                     Diagnostic::error(format!("@cep_search: unknown argument '{aname}'"))
@@ -261,6 +365,7 @@ pub fn validate_cep_search_decorator(
     Some(CepSearchConfig {
         target,
         objective,
+        constraints,
         span: deco.span,
     })
 }
@@ -293,5 +398,203 @@ mod tests {
             assert_eq!(NasObjective::parse(o.as_str()), Some(o));
         }
         assert!(NasObjective::parse("bogus").is_none());
+    }
+
+    /// Verify that `@cep_prune(constraints={peak_memory_bytes: 6000000000, latency_us: 3000.0})`
+    /// parses into the correct `CepConstraints` fields with zero diagnostics.
+    #[test]
+    fn cep_prune_constraints_dict_parsed() {
+        // Parse a minimal NSL snippet carrying the decorator we want to test.
+        // The model body only needs to be syntactically valid; we only care
+        // about the decorator that wraps it.
+        let src = "\
+@cep_prune(constraints={peak_memory_bytes: 6000000000, latency_us: 3000.0})\n\
+model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
+
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse_result.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            parse_result.diagnostics
+        );
+
+        // Pull the single decorator out of the Decorated statement.
+        let stmt = parse_result.module.stmts.first().expect("expected one stmt");
+        let nsl_ast::stmt::StmtKind::Decorated { ref decorators, .. } = stmt.kind else {
+            panic!("expected Decorated stmt, got {:?}", stmt.kind);
+        };
+        let deco = decorators.first().expect("expected one decorator");
+
+        let resolve_sym = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let mut diagnostics = Vec::new();
+        let cfg = validate_cep_prune_decorator(deco, &resolve_sym, &mut diagnostics)
+            .expect("validate_cep_prune_decorator returned None");
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(
+            cfg.constraints.peak_memory_bytes,
+            Some(6_000_000_000u64),
+            "peak_memory_bytes mismatch"
+        );
+        assert_eq!(
+            cfg.constraints.latency_us,
+            Some(3000.0f64),
+            "latency_us mismatch"
+        );
+    }
+
+    /// Verify that `is_valid_preserve_pattern` accepts and rejects the correct patterns.
+    #[test]
+    fn is_valid_preserve_pattern_rules() {
+        // Valid patterns.
+        assert!(is_valid_preserve_pattern("0"));
+        assert!(is_valid_preserve_pattern("7"));
+        assert!(is_valid_preserve_pattern("blocks.0"));
+        assert!(is_valid_preserve_pattern("blocks.7"));
+        assert!(is_valid_preserve_pattern("blocks.0.*"));
+        assert!(is_valid_preserve_pattern("blocks.7.*"));
+        assert!(is_valid_preserve_pattern("blocks.3.attn"));
+        assert!(is_valid_preserve_pattern("blocks.1.ffn.gate"));
+        // Invalid patterns.
+        assert!(!is_valid_preserve_pattern("foo"));
+        assert!(!is_valid_preserve_pattern("blocks"));
+        assert!(!is_valid_preserve_pattern("blocks.*"));
+        assert!(!is_valid_preserve_pattern("blocks.*.attn"));
+        assert!(!is_valid_preserve_pattern("blocks.abc"));
+        assert!(!is_valid_preserve_pattern("*"));
+        assert!(!is_valid_preserve_pattern(""));
+    }
+
+    /// Verify that a malformed preserve pattern (e.g. "foo") produces a diagnostic
+    /// at check time via the semantic validator.
+    #[test]
+    fn semantic_diagnoses_malformed_preserve_patterns() {
+        let src = "\
+@cep_prune(preserve=[\"foo\", \"blocks.*\"])\n\
+model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
+
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse_result.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            parse_result.diagnostics
+        );
+
+        let stmt = parse_result.module.stmts.first().expect("expected one stmt");
+        let nsl_ast::stmt::StmtKind::Decorated { ref decorators, .. } = stmt.kind else {
+            panic!("expected Decorated stmt, got {:?}", stmt.kind);
+        };
+        let deco = decorators.first().expect("expected one decorator");
+
+        let resolve_sym = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let mut diagnostics = Vec::new();
+        let _cfg = validate_cep_prune_decorator(deco, &resolve_sym, &mut diagnostics);
+
+        // Both "foo" and "blocks.*" should each produce a diagnostic.
+        assert!(
+            diagnostics.len() >= 2,
+            "expected at least 2 diagnostics for 2 bad patterns, got: {diagnostics:?}"
+        );
+        let any_mentions_preserve = diagnostics
+            .iter()
+            .any(|d| d.message.contains("preserve pattern"));
+        assert!(
+            any_mentions_preserve,
+            "expected a diagnostic mentioning 'preserve pattern', got: {diagnostics:?}"
+        );
+    }
+
+    /// Verify that `@cep_prune(preserve=["blocks.0.*", "blocks.7.*"])` (paper §6.1 syntax)
+    /// produces zero diagnostics and the correct preserve list.
+    #[test]
+    fn semantic_accepts_paper_glob_preserve_syntax() {
+        let src = "\
+@cep_prune(preserve=[\"blocks.0.*\", \"blocks.7.*\"])\n\
+model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
+
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse_result.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            parse_result.diagnostics
+        );
+
+        let stmt = parse_result.module.stmts.first().expect("expected one stmt");
+        let nsl_ast::stmt::StmtKind::Decorated { ref decorators, .. } = stmt.kind else {
+            panic!("expected Decorated stmt, got {:?}", stmt.kind);
+        };
+        let deco = decorators.first().expect("expected one decorator");
+
+        let resolve_sym = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let mut diagnostics = Vec::new();
+        let cfg = validate_cep_prune_decorator(deco, &resolve_sym, &mut diagnostics)
+            .expect("validate_cep_prune_decorator returned None");
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics for valid glob patterns: {diagnostics:?}"
+        );
+        assert_eq!(cfg.preserve, vec!["blocks.0.*", "blocks.7.*"]);
+    }
+
+    /// Verify that `@cep_prune(constraints=5)` (a non-dict value) produces a
+    /// diagnostic whose message mentions "must be a dict".
+    #[test]
+    fn cep_prune_constraints_non_dict_is_error() {
+        let src = "\
+@cep_prune(constraints=5)\n\
+model M:\n    fn forward(self) -> f32:\n        return 0.0\n";
+
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
+
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse_result.diagnostics.is_empty(),
+            "parse errors: {:?}",
+            parse_result.diagnostics
+        );
+
+        let stmt = parse_result.module.stmts.first().expect("expected one stmt");
+        let nsl_ast::stmt::StmtKind::Decorated { ref decorators, .. } = stmt.kind else {
+            panic!("expected Decorated stmt, got {:?}", stmt.kind);
+        };
+        let deco = decorators.first().expect("expected one decorator");
+
+        let resolve_sym = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let mut diagnostics = Vec::new();
+        let _cfg = validate_cep_prune_decorator(deco, &resolve_sym, &mut diagnostics);
+
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for non-dict constraints, but got none"
+        );
+        let any_mentions_dict = diagnostics
+            .iter()
+            .any(|d| d.message.contains("must be a dict"));
+        assert!(
+            any_mentions_dict,
+            "expected a diagnostic mentioning 'must be a dict', got: {diagnostics:?}"
+        );
     }
 }

@@ -29,6 +29,38 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
 }
 
+/// Allowlist of legal `data:` section config keys. Mirrors
+/// `nsl-semantic/src/checker/block.rs::DATA_SECTION_KEYS` — both must stay
+/// in sync. A key present here but missing in the semantic table will reach
+/// `compile_assign` and fail with an undefined-variable error; a key
+/// present in the semantic table but missing here will reach
+/// `compile_assign` with the same failure mode. v8 ships with a single
+/// canonical key (`source`); future keys should land in both places.
+const DATA_SECTION_KEYS: &[&str] = &["source"];
+
+/// Returns true iff `stmt` is a `data:` section config pair of the form
+/// `<allowlisted-key> = <expr>` (plain `Assign`, plain ident target). These
+/// are PCA-detection metadata consumed via the AST walker in
+/// `pca_activation.rs`; they must not be lowered as variable assignments.
+fn is_data_section_config_pair(stmt: &Stmt, interner: &nsl_lexer::Interner) -> bool {
+    let StmtKind::Assign {
+        target,
+        op: AssignOp::Assign,
+        ..
+    } = &stmt.kind
+    else {
+        return false;
+    };
+    let ExprKind::Ident(name_sym) = target.kind else {
+        return false;
+    };
+    let name = match interner.resolve(name_sym.0) {
+        Some(n) => n,
+        None => return false,
+    };
+    DATA_SECTION_KEYS.contains(&name)
+}
+
 /// Task 4: WRGA bridge — build a `WrgaInput` from decorator configs stashed on
 /// the Compiler and run `wrga::run` against the primal Wengert list.
 ///
@@ -264,6 +296,21 @@ pub(crate) fn invoke_wrga_if_enabled(
         manual_adapter_owned.iter().map(|s| s.as_str()).collect();
     let hybrid_layers: Vec<&str> = hybrid_owned.iter().map(|s| s.as_str()).collect();
 
+    // WRGA paper §8.3: surface the first non-empty `target=` set on
+    // `WrgaInputs::wrga[*]`. The CLI's `--wrga-target` override pipes through
+    // this field via `apply_wrga_target_override` in the CLI's bridge
+    // functions. Source-level `@wrga(target="...")` decorators do NOT yet
+    // populate this field — both bridge functions still emit `target: None`
+    // pending symbol-resolution wiring — so this `find_map` falls back to the
+    // historical "rtx5070ti" default for the `nsl build` path. Existing build
+    // behaviour is therefore unchanged; only the `nsl check --wrga-analyze`
+    // path produces a non-None target today.
+    let target_override = inputs
+        .wrga
+        .iter()
+        .find_map(|c| c.target.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("rtx5070ti");
+
     let wrga_input = crate::wrga::WrgaInput {
         mode,
         trainable_patterns,
@@ -272,7 +319,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         wengert: list,
         loss_output: list.output,
         weights: None,
-        target: "rtx5070ti",
+        target: target_override,
         budget_params,
         r_min: 2,
         r_max: 16,
@@ -3371,8 +3418,20 @@ impl Compiler<'_> {
                     }
                 }
                 TrainSection::Data(stmts) => {
-                    // Compile data section stmts — typically creates a DataLoader
+                    // Compile data section stmts — typically creates a DataLoader.
+                    // `key = expr` config pairs (e.g. `source = PretrainCorpus`)
+                    // are PCA-detection metadata consumed via the AST walker in
+                    // `pca_activation.rs`; they MUST NOT flow through
+                    // `compile_assign`, which would try to look up `key` as a
+                    // variable. Skip the allowlisted keys here and let
+                    // anything else (statements, future loader builders) go
+                    // through the standard compile path. Keep this list in
+                    // sync with `nsl-semantic/src/checker/block.rs`
+                    // (`DATA_SECTION_KEYS`).
                     for stmt in stmts {
+                        if is_data_section_config_pair(stmt, self.interner) {
+                            continue;
+                        }
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
@@ -3516,6 +3575,60 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
 
+        // CPDT precision-adaptive optimizer execution (v1): build per-param
+        // storage dtype lists aligned with param_list, when active. Inactive ->
+        // None (the existing FP32 path runs verbatim, zero behavior change).
+        //
+        // Borrow discipline: extract the owned dtype Vecs (and the activation
+        // decision) into a local FIRST, which ends the `self.cpdt_plan` borrow.
+        // Only then do the `compile_call_by_name` loop (which borrows `self`
+        // mutably) run. No `unsafe`, no tensor clones.
+        let cpdt_precision_dtypes: Option<(Value, Value)> = {
+            let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
+                // The FASE cast wrapping is emitted only on the non-unified-dispatch
+                // Deferred branch, which runs iff WGGO is inactive. Allocating FP16
+                // m/v on the unified-dispatch (WGGO) path would feed FP16 buffers to
+                // an unwrapped FP32 update → silent corruption. Gate on it.
+                let wrapped_path_active = self.wggo_overrides.is_none();
+                let plan = self.cpdt_plan.as_ref();
+                let active = plan
+                    .map(|p| {
+                        crate::cpdt_precision_exec::precision_active(
+                            matches!(p.mode, crate::cpdt::CpdtMode::Full),
+                            !p.precision.params.is_empty(),
+                            true, // weights_present is implied by a non-empty precision plan
+                            fase_deferred,
+                            wrapped_path_active,
+                        )
+                    })
+                    .unwrap_or(false);
+                if active {
+                    let plan = plan.unwrap();
+                    Some(crate::cpdt_precision_exec::build_dtype_lists(
+                        &plan.precision,
+                        &param_paths,
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some((m_codes, v_codes)) = dtype_data {
+                let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                for &code in &m_codes {
+                    let c = builder.ins().iconst(cl_types::I64, code as i64);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[m_list, c])?;
+                }
+                for &code in &v_codes {
+                    let c = builder.ins().iconst(cl_types::I64, code as i64);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[v_list, c])?;
+                }
+                Some((m_list, v_list))
+            } else {
+                None
+            }
+        };
+
         // FASE Codegen Phase 2: build per-parameter mode table from WGGO's
         // per-layer decisions and emit it as a .rodata byte array. The
         // backward loop below loads `modes[gai]` to choose Deferred vs
@@ -3593,11 +3706,33 @@ impl Compiler<'_> {
             state.current_block = Some(init_body);
 
             let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
-            let buf1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+            // CPDT precision-adaptive: allocate optimizer state at the planned
+            // storage dtype when active; otherwise use the verbatim FP32 path.
+            // `cpdt_precision_dtypes` is `Option<(Value, Value)>` and `Value:
+            // Copy`, so matching by value inside the loop is fine.
+            let buf1 = if let Some((m_list, _)) = cpdt_precision_dtypes {
+                let m_code = self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_zeros_like_dtype",
+                    &[param_i, m_code],
+                )?
+            } else {
+                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+            };
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
-                let buf2 =
-                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+                let buf2 = if let Some((_, v_list)) = cpdt_precision_dtypes {
+                    let v_code =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_zeros_like_dtype",
+                        &[param_i, v_code],
+                    )?
+                } else {
+                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+                };
                 self.compile_call_by_name(builder, "nsl_list_push", &[state_list_2, buf2])?;
             }
 
@@ -3850,6 +3985,27 @@ impl Compiler<'_> {
 
             builder.switch_to_block(after_block);
             builder.seal_block(after_block);
+
+            // PCA Tier A (spec §6.1): when a segment-masked kernel was
+            // synthesized for this module, warn once if no segment_ids ever
+            // appear in the first N steps (DataLoader-never-packs footgun).
+            // Gated on the ACTUAL synthesized config so non-packed training
+            // (the common case) never sees this call. has_seg is the
+            // nsl_dict_contains("segment_ids") i64 result from above.
+            let module_is_masked = self
+                .kernels
+                .flash_attention_context
+                .as_ref()
+                .and_then(|c| c.csha_training_config.as_ref())
+                .map(|cfg| cfg.segment_masked)
+                .unwrap_or(false);
+            if module_is_masked {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_pca_packing_mismatch_check",
+                    &[has_seg],
+                )?;
+            }
         }
 
         let prev_batch_scope = state.flags.in_dataloader_batch_scope;
@@ -3907,8 +4063,15 @@ impl Compiler<'_> {
             // Cycle-10 §5.3 Task 6 wire-up: route per-fn @checkpoint(policy=...)
             // policies collected by EffectChecker through CompileOptions into
             // the extractor. Empty map = byte-identity preserved.
+            //
+            // CFTP §4.4 G3 (Sprint 4): plumb the first `@fused_lm_ce` decorator
+            // into the extractor so `fused_linear_ce(...)` calls inside this
+            // train block can be recognised as a single `PrimalOp::FusedLinearCe`
+            // when v1's enabled + shape-hint preconditions hold.
+            let fused_ce_cfg = self.fused_ce_configs.first().cloned();
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-                .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone());
+                .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone())
+                .with_fused_ce_config(fused_ce_cfg);
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
@@ -4045,14 +4208,14 @@ impl Compiler<'_> {
                 // the test suite and CLI integration tests.
                 //
                 let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
-                if let Some(ref mode_str) = self.compile_options.wggo_mode {
+                if let Some(ref mode_str) = self.compile_options.wggo.mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
                         // also applied in analyze(), but applying it here
                         // keeps the --wggo-report line honest.
                         let mut analysis_config =
                             crate::wggo_weight_analysis::AnalysisConfig::default();
-                        if let Some(f) = self.compile_options.wggo_prune_fraction {
+                        if let Some(f) = self.compile_options.wggo.prune_fraction {
                             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
                         }
                         // Pass the weights path for magnitude-based scoring
@@ -4064,7 +4227,7 @@ impl Compiler<'_> {
                         // level firing BEFORE compile_main runs, ensuring it's available here
                         // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
                         // calibrate wrapper).
-                        let weights_path = self.compile_options.wggo_weights.as_deref();
+                        let weights_path = self.compile_options.wggo.weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
                             &self.compile_options.target,
@@ -4075,7 +4238,7 @@ impl Compiler<'_> {
                             Some(&self.compile_options),
                         );
                         if let Some(plan) = plan {
-                            if self.compile_options.wggo_report {
+                            if self.compile_options.wggo.report {
                                 eprintln!("{}", plan.render_report());
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
@@ -5735,6 +5898,7 @@ impl Compiler<'_> {
                     } else {
                         pb_m
                     };
+                    let wrap_precision = cpdt_precision_dtypes.is_some();
                     self.fase_emit_final_step(
                         builder,
                         pb_theta,
@@ -5743,6 +5907,7 @@ impl Compiler<'_> {
                         pb_v,
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
+                        wrap_precision,
                     )?;
                     let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
@@ -5782,6 +5947,7 @@ impl Compiler<'_> {
                         // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
                         m
                     };
+                    let wrap_precision = cpdt_precision_dtypes.is_some();
                     self.fase_emit_final_step(
                         builder,
                         theta,
@@ -5790,6 +5956,7 @@ impl Compiler<'_> {
                         v,
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
+                        wrap_precision,
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     let fs_one = builder.ins().iconst(cl_types::I64, 1);
@@ -6847,7 +7014,12 @@ impl Compiler<'_> {
                     step_body = Some((body, *param));
                 }
                 TrainSection::Data(stmts) => {
+                    // See `compile_train_block::TrainSection::Data` for why
+                    // the allowlisted config pairs are skipped.
                     for stmt in stmts {
+                        if is_data_section_config_pair(stmt, self.interner) {
+                            continue;
+                        }
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }

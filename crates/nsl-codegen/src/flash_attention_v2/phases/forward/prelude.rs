@@ -3,28 +3,33 @@
 //! budget this phase allocates.
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SMEM_BUDGET_BYTES};
+use crate::flash_attention_v2::smem_layout::{pca_smem_layout, total_bytes, SMEM_BUDGET_BYTES};
 use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
 
-/// Forward SMEM-routing gate that also accounts for PCA Tier A's
-/// `seg_smem` static array (when `config.segment_masked`).  Without
-/// this, CSHA fused+saves + segment_masked configs can push the combined
-/// static SMEM past the 48 KB cap; ptxas accepts but launch fails with
-/// CUDA_ERROR_ILLEGAL_ADDRESS at sync time because the main shmem[] is
-/// silently over-allocated.  Mirrors `backward_needs_dynamic_smem`.
+/// Forward SMEM-routing gate that accounts for PCA Tier A's `seg_smem`
+/// static array AND — when `rope_q` — the `smem_doc_starts` region, via
+/// the single-source `pca_smem_layout` total.
 ///
-/// `seg_smem` is sized to `pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET`
-/// (the upper bound used by `pca_segment::plan_kernel` when deciding
-/// `SegmentResidency::Shared`); the FA emitter's allocation must match
-/// the planner so cooperative loads never write past the buffer.
+/// Previously this added only `DEFAULT_SMEM_SEGMENT_BUDGET` (seg, 32 KB)
+/// to the static-cap check and ignored the `smem_doc_starts` region
+/// (doc, 1028 B).  For a `segment_masked && rope_q` config whose
+/// `total_bytes + seg` is just under the 48 KB static cap, the
+/// unaccounted +1028 B could overflow the cap → ptxas/driver rejection.
+///
+/// Fix: route through `pca_smem_layout(total_bytes, segment_masked,
+/// rope_q).total` so both regions are counted and the decision is
+/// derived from the same formula as the layout.  Regions stay as
+/// separate static `.shared` declarations — the mixed static+extern
+/// layout is probe-validated-safe on sm_120 (we do NOT embed).
+///
+/// Mirrors `backward_needs_dynamic_smem`.
 fn fwd_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    let seg_overhead = if config.segment_masked {
-        DEFAULT_SMEM_SEGMENT_BUDGET as u32
-    } else {
-        0
-    };
-    total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
-        || needs_dynamic_smem(config)
+    // Count seg_smem AND smem_doc_starts (when rope_q) in the static-vs-extern
+    // decision via the single-source layout, so a rope_q config can't under-count
+    // and overflow the 48 KB static cap. Regions stay separate static — the mixed
+    // static+extern layout is probe-validated-safe on sm_120 (we do NOT embed).
+    pca_smem_layout(total_bytes(config), config.segment_masked, config.rope_q).total
+        > SMEM_BUDGET_BYTES
 }
 use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 
@@ -184,6 +189,11 @@ pub fn emit_with_smem_override(
     // before the .visible .entry).  Static configs declare the array here.
     // For Tier B.1, `smem_bytes` is the caller-supplied Tier-B.1 total (q +
     // 4×KV slabs + p_scratch + chunk_staging) rather than the Tier-A baseline.
+    // NOTE: on the forward side `seg_smem` (32 KB, when segment_masked) and
+    // `smem_doc_starts` (1028 B, when rope_q) are SEPARATE static `.shared`
+    // decls — NOT part of `smem_bytes`. ptxas allocates them independently; the
+    // device reserves the sum. The static-vs-extern decision counts them via
+    // pca_smem_layout (fwd_needs_dynamic_smem); this decl is the core region.
     if !fwd_needs_dynamic_smem(config) {
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
         emit_static_smem_decl(ptx, smem_bytes as usize);
@@ -327,7 +337,7 @@ pub fn emit_with_smem_override(
     //   * Tasks 7/8 (forward Q/K rotation sites) — read smem_doc_starts
     //   * Task 9 (backward dQ/dK sites) — read smem_doc_starts
     if config.segment_masked && config.rope_q {
-        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 1-4 + CTA prologue)\n");
+        ptx.push_str("    // PCA sec.4.3 RoPE-reset registers (sites 1-4 + CTA prologue)\n");
         ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
         // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we
@@ -345,7 +355,7 @@ pub fn emit_with_smem_override(
         // collisions if both helpers fire in the same kernel.
         ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
-        ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+        ptx.push_str("    .reg .pred %p_doc_load_done, %p_doc_null;\n");
     }
 
     // §4.3 attention sinks (Sprint 1b cycle-7): named registers for the
@@ -406,7 +416,7 @@ pub fn emit_with_smem_override(
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
-        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
+        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done, %p_seg_null;\n");
         // SMEM buffer sized to pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET so
         // it matches the ceiling pca_segment::plan_kernel uses to pick
         // SegmentResidency::Shared. Kept separate from `shmem` so Q/K/V
@@ -470,6 +480,11 @@ pub fn emit_with_smem_override(
     if config.segment_masked {
         ptx.push_str("\n    // --- PCA Tier A: load segment_ids from global to shared ---\n");
         ptx.push_str("    ld.param.u64 %rd_seg_global, [segment_ids_ptr];\n");
+        // PCA Tier A null-guard (spec §4.2): null segment_ids_ptr → write the
+        // all-zero sentinel (every position in segment 0 → seg[q]!=seg[k] is
+        // uniformly false → no masking). Computed once; predicates the per-
+        // iteration ld.global below so we skip the dereference, never load-then-check.
+        ptx.push_str("    setp.eq.u64 %p_seg_null, %rd_seg_global, 0;\n");
         // Get SMEM generic-space address of seg_smem.  Keep as u64 — do NOT
         // truncate to u32.  On Blackwell (sm_120+) the low 32 bits of the
         // generic address are NOT the raw shared-space offset when the label
@@ -489,7 +504,12 @@ pub fn emit_with_smem_override(
         ptx.push_str("    cvt.u64.u32 %rd_seg_smem, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_seg_smem, %rd_seg_smem, 1;\n");
         ptx.push_str("    add.u64 %rd_seg_smem, %rd_seg_smem, %rd_seg_global;\n");
+        ptx.push_str("    @%p_seg_null bra PCA_SEG_NULL_LD;\n");
         ptx.push_str("    ld.global.u16 %rs_pca, [%rd_seg_smem];\n");
+        ptx.push_str("    bra PCA_SEG_LD_DONE;\n");
+        ptx.push_str("PCA_SEG_NULL_LD:\n");
+        ptx.push_str("    mov.u16 %rs_pca, 0;\n");
+        ptx.push_str("PCA_SEG_LD_DONE:\n");
         // Shared address = seg_base (u64 generic) + i * 2
         ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");
@@ -531,5 +551,95 @@ pub fn emit_with_smem_override(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
+
+    /// Build a minimal `segment_masked && rope_q` config (no CSHA extras).
+    /// `block_q=32, block_kv=32, head_dim=32` gives `total_bytes = 4608 B`
+    /// (well under the 48 KB static cap).
+    fn seg_rope_cfg() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: true,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 75,
+            segment_masked: true,
+            csha: None,
+            checkpoint: None,
+        }
+    }
+
+    /// Verify that `fwd_needs_dynamic_smem` is exactly equivalent to asking
+    /// whether `pca_smem_layout(...).total > SMEM_BUDGET_BYTES`.
+    ///
+    /// The 1028-byte `smem_doc_starts` region (doc) cannot create a
+    /// flip-demonstrating fixture with the allowed tile dims — the gap between
+    /// adjacent `total_bytes` values is always ≥ 256 B, while the window
+    /// `(48 KB − seg − doc, 48 KB − seg]` is only 1028 B wide — so we assert
+    /// the stronger consistency property instead: the budget decision is
+    /// derived from the same formula as the layout, guaranteeing doc is
+    /// counted whenever `rope_q` is set.
+    #[test]
+    fn budget_derives_from_pca_smem_layout_total() {
+        let cfg = seg_rope_cfg();
+        let expected =
+            crate::flash_attention_v2::smem_layout::pca_smem_layout(
+                crate::flash_attention_v2::smem_layout::total_bytes(&cfg),
+                true,
+                true,
+            )
+            .total
+            > crate::flash_attention_v2::smem_layout::SMEM_BUDGET_BYTES;
+        assert_eq!(
+            fwd_needs_dynamic_smem(&cfg),
+            expected,
+            "fwd_needs_dynamic_smem must equal pca_smem_layout(...).total > SMEM_BUDGET_BYTES"
+        );
+    }
+
+    /// A `segment_masked && rope_q` config whose `pca_smem_layout.total`
+    /// includes the doc region must produce the same budget decision as an
+    /// explicit layout query — demonstrating that doc bytes are counted.
+    #[test]
+    fn budget_includes_doc_starts_bytes_for_rope_q() {
+        let cfg = seg_rope_cfg();
+        let t = crate::flash_attention_v2::smem_layout::total_bytes(&cfg);
+        let layout = crate::flash_attention_v2::smem_layout::pca_smem_layout(t, true, true);
+        // doc_off must be Some (doc region present for rope_q=true).
+        assert!(
+            layout.doc_off.is_some(),
+            "pca_smem_layout must record a doc_off when rope_q=true"
+        );
+        // layout.total must exceed base+seg by the 1028-byte doc region
+        // (padded to 16-byte alignment → 1028 B, already 4-byte aligned,
+        // but align_up_u32(after_seg + 1028, 16) may add up to 15 B).
+        let seg_only = crate::flash_attention_v2::smem_layout::pca_smem_layout(t, true, false).total;
+        assert!(
+            layout.total > seg_only,
+            "pca_smem_layout total with rope_q ({}) must exceed seg-only total ({})",
+            layout.total,
+            seg_only,
+        );
+        // Budget decision matches the full layout total.
+        let expected = layout.total > crate::flash_attention_v2::smem_layout::SMEM_BUDGET_BYTES;
+        assert_eq!(
+            fwd_needs_dynamic_smem(&cfg),
+            expected,
+            "budget decision must reflect doc bytes: layout.total={}, budget={}",
+            layout.total,
+            crate::flash_attention_v2::smem_layout::SMEM_BUDGET_BYTES,
+        );
     }
 }

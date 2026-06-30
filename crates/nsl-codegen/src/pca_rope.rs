@@ -77,19 +77,33 @@ pub fn doc_starts_disabled_sentinel(builder: &mut FunctionBuilder<'_>) -> Value 
 /// compile-time constant on FlashAttentionConfig / CshaExtras).
 ///
 /// Sites 1-4 (Tasks 7-9) read from `smem_doc_starts[0..1028]` after this
-/// prologue runs. Sentinel-0 callers (doc_starts_ptr == 0) currently
-/// still execute the load (the PTX dereferences `[doc_starts_ptr]`); a
-/// future task can add a `setp.eq.u64 ..., %rd_doc_starts_ptr, 0` guard
-/// for true identity-position skipping. For now, the codegen-time gate
-/// (segment_masked=false → entire block elided) covers the common case.
+/// prologue runs. Null `doc_starts_ptr` (== 0) is guarded: the per-iteration
+/// `ld.global.s32` is predicated on `%p_doc_null` (`setp.eq.u64 ..., 0` on the
+/// raw param) and writes `0` to `smem_doc_starts` instead of dereferencing,
+/// so RoPE positions become `i - 0 = i` (standard) — the identity path for any
+/// non-packed step. (PCA Tier A activation, spec 2026-05-25 §4.)
 ///
 /// Requires registers declared by the sibling block in
 /// `flash_attention_v2/phases/forward/prelude.rs` (gated on
 /// `segment_masked && rope_q`).
 pub fn emit_doc_starts_smem_load(ptx: &mut String) {
-    ptx.push_str("    // PCA §4.3 — CTA prologue: load this row's doc_starts to SMEM\n");
+    // This 1028-byte `smem_doc_starts` region IS now counted in the static-vs-
+    // extern budget: `fwd_needs_dynamic_smem` / `backward_needs_dynamic_smem`
+    // route through `smem_layout::pca_smem_layout(.., rope_q).total`, which adds
+    // the doc region when rope_q (2026-05-27 budget fix). It remains a SEPARATE
+    // static `.shared` (NOT embedded in shmem[]); on the extern path that means
+    // a static `.shared` coexists with `extern .shared shmem[]` — the Blackwell
+    // mixed-layout pattern — which the 2026-05-12 SMEM probe + a 2026-05-27
+    // reproduce found is SAFE on CUDA 13.2 / driver 591.86 / RTX 5070 Ti (the
+    // illegal-address premise did not reproduce), so the embed was intentionally
+    // not built. See `project_pca_smem_mixed_layout_crash_disproven` (memory).
+    ptx.push_str("    // PCA sec.4.3 -- CTA prologue: load this row's doc_starts to SMEM\n");
     ptx.push_str("    .shared .align 4 .b8 smem_doc_starts[1028];\n");
     ptx.push_str("    ld.param.u64 %rd_doc_starts_ptr, [doc_starts_ptr];\n");
+    // PCA §4.3 null-guard (spec §4.2): null doc_starts_ptr → write the all-zero
+    // sentinel (doc_starts[0]=0 → RoPE position = i - 0 = i → standard positions).
+    // Check the RAW param here, BEFORE the batch-row offset add below.
+    ptx.push_str("    setp.eq.u64 %p_doc_null, %rd_doc_starts_ptr, 0;\n");
     // Narrow %batch_idx (u64) → %r_batch_idx (u32). batch_idx is small.
     ptx.push_str("    cvt.u32.u64 %r_batch_idx, %batch_idx;\n");
     // row_base_offset_bytes = batch_idx * 1028  (= (MAX_NUM_DOCS+1) * 4)
@@ -116,7 +130,12 @@ pub fn emit_doc_starts_smem_load(ptx: &mut String) {
     // Build the HBM (global) source address.
     ptx.push_str("    cvt.u64.u32 %rd_doc_starts_addr, %r_doc_starts_byte_off;\n");
     ptx.push_str("    add.u64 %rd_doc_starts_addr, %rd_doc_starts_addr, %rd_doc_starts_ptr;\n");
+    ptx.push_str("    @%p_doc_null bra V2_PCA_ROPE_DOC_NULL_LD;\n");
     ptx.push_str("    ld.global.s32 %r_doc_start, [%rd_doc_starts_addr];\n");
+    ptx.push_str("    bra V2_PCA_ROPE_DOC_LD_DONE;\n");
+    ptx.push_str("V2_PCA_ROPE_DOC_NULL_LD:\n");
+    ptx.push_str("    mov.s32 %r_doc_start, 0;\n");
+    ptx.push_str("V2_PCA_ROPE_DOC_LD_DONE:\n");
     // Build the SMEM destination address (generic-space u64 from cvta.shared
     // earlier; offset added in u64 to avoid mixed-width arithmetic).
     ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");

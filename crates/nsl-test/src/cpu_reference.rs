@@ -4,6 +4,17 @@
 //! Verilog must produce and produces the same per-element output the Verilator
 //! harness reads from the corresponding test-tap port.
 //!
+//! ## M57.1 §3.5 — bias-as-seed fold
+//!
+//! Post-Task-3.4 the hardware initializes the MAC ripple-chain with
+//! `acc[o][0] = b[o]` and accumulates products on top, rather than computing
+//! a pure matmul and then performing a post-MAC bias-add. By integer
+//! addition's associativity these are bit-exactly equivalent, but the CPU
+//! reference must mirror the hardware structurally so per-op tap comparisons
+//! line up. The standalone bias-add references that existed pre-§3.5
+//! (`cpu_reference_layer1_bias` / `cpu_reference_layer2_bias`) are removed —
+//! they have no callers post-bias-as-seed.
+//!
 //! All additions use `wrapping_add` per precision Pin 1: signed integer
 //! addition with two's-complement wraparound on overflow. v1's accumulators
 //! have sufficient headroom that overflow doesn't occur for the v1 fixture
@@ -17,35 +28,36 @@
 use crate::fixture::FixtureFile;
 
 // ---------------------------------------------------------------------------
-// Per-op reference functions
+// Per-op reference functions (M57.1 §3.5 bias-as-seed)
 // ---------------------------------------------------------------------------
 
-/// Layer 1 matmul: i8 × i8 → i16 (intermediate) → i32 accumulator.
+/// Layer 1 matmul-with-bias: i8 × i8 → i16 (intermediate) → i32 accumulator,
+/// seeded with bias per M57.1 §3.5.
 ///
-/// w1 is stored row-major as `[784, 128]`; indexing `w1[i * n_out + o]`.
-pub fn cpu_reference_layer1_matmul(x: &[i8], w1: &[i8]) -> Vec<i32> {
+/// `w1` is stored row-major as `[784, 128]`; indexing `w1[i * n_out + o]`.
+/// The accumulator is initialized to `b1[o]` and products are summed on top,
+/// matching the post-§3.5 ripple-chain seed in `lower_matmul_with_optional_bias`.
+pub fn cpu_reference_layer1_matmul_with_bias(
+    x: &[i8],
+    w1: &[i8],
+    b1: &[i32],
+) -> Vec<i32> {
     let (n_in, n_out) = (784usize, 128usize);
     assert_eq!(x.len(), n_in, "expected 784-element input");
     assert_eq!(w1.len(), n_in * n_out, "expected 784*128 W1 weights");
+    assert_eq!(b1.len(), n_out, "expected 128-element bias");
 
-    let mut out = vec![0i32; n_out];
+    // M57.1 §3.5: acc = bias (ripple seed). Integer addition is associative,
+    // so this is bit-exactly equivalent to summing products first and adding
+    // bias last; the associativity regression test below pins this property.
+    let mut out: Vec<i32> = b1.to_vec();
     for o in 0..n_out {
-        let mut acc: i32 = 0;
         for i in 0..n_in {
             let prod: i16 = (x[i] as i16) * (w1[i * n_out + o] as i16);
-            acc = acc.wrapping_add(prod as i32);
+            out[o] = out[o].wrapping_add(prod as i32);
         }
-        out[o] = acc;
     }
     out
-}
-
-/// Layer 1 bias-add: i32 + i32 → i32.
-pub fn cpu_reference_layer1_bias(pre: &[i32], b1: &[i32]) -> Vec<i32> {
-    pre.iter()
-        .zip(b1)
-        .map(|(a, b)| a.wrapping_add(*b))
-        .collect()
 }
 
 /// Layer 1 ReLU: max(0, x) preserving i32 width.
@@ -53,35 +65,33 @@ pub fn cpu_reference_layer1_relu(post: &[i32]) -> Vec<i32> {
     post.iter().map(|x| (*x).max(0)).collect()
 }
 
-/// Layer 2 matmul: i32 × i8 (sign-extended to i32) → i64 accumulator.
+/// Layer 2 matmul-with-bias: i32 × i8 (sign-extended to i32) → i64
+/// accumulator, seeded with bias per M57.1 §3.5.
 ///
-/// w2 is stored row-major as `[128, 10]`; indexing `w2[i * n_out + o]`.
+/// `w2` is stored row-major as `[128, 10]`; indexing `w2[i * n_out + o]`.
 /// The i8 weights are sign-extended to i32 before multiplication (matching
-/// the `localparam signed [31:0]` in the emitted Verilog).
-pub fn cpu_reference_layer2_matmul(h: &[i32], w2: &[i8]) -> Vec<i64> {
+/// the `localparam signed [31:0]` in the emitted Verilog). The accumulator
+/// is initialized to `b2[o]` (i64) and the widened products are summed on top.
+pub fn cpu_reference_layer2_matmul_with_bias(
+    h: &[i32],
+    w2: &[i8],
+    b2: &[i64],
+) -> Vec<i64> {
     let (n_in, n_out) = (128usize, 10usize);
     assert_eq!(h.len(), n_in, "expected 128-element hidden layer");
     assert_eq!(w2.len(), n_in * n_out, "expected 128*10 W2 weights");
+    assert_eq!(b2.len(), n_out, "expected 10-element bias");
 
-    let mut out = vec![0i64; n_out];
+    // M57.1 §3.5: acc = bias (ripple seed).
+    let mut out: Vec<i64> = b2.to_vec();
     for o in 0..n_out {
-        let mut acc: i64 = 0;
         for i in 0..n_in {
             let w_i32: i32 = w2[i * n_out + o] as i32; // i8 → i32 sign-extend
             let prod: i64 = (h[i] as i64) * (w_i32 as i64);
-            acc = acc.wrapping_add(prod);
+            out[o] = out[o].wrapping_add(prod);
         }
-        out[o] = acc;
     }
     out
-}
-
-/// Layer 2 bias-add: i64 + i64 → i64.
-pub fn cpu_reference_layer2_bias(pre: &[i64], b2: &[i64]) -> Vec<i64> {
-    pre.iter()
-        .zip(b2)
-        .map(|(a, b)| a.wrapping_add(*b))
-        .collect()
 }
 
 /// Layer 2 ReLU: max(0, x) preserving i64 width.
@@ -97,18 +107,19 @@ pub fn cpu_reference_layer2_relu(post: &[i64]) -> Vec<i64> {
 ///
 /// All per-op tap values are recorded so Layer 2 tests can compare against
 /// Verilator-simulated tap port values.
+///
+/// M57.1 §3.5 (Concern #4): the standalone bias-tap outputs
+/// (`l1_bias` / `l2_bias`) no longer exist post-bias-as-seed; the matmul
+/// fields hold the post-bias accumulator value directly. The bias-tap
+/// descriptors in `fpga_harness.rs` are removed by Task 3.6.
 #[derive(Debug, Clone)]
 pub struct MlpOutput {
-    /// Layer 1 matmul output (pre-bias), length 128.
+    /// Layer 1 matmul-with-bias output (acc = bias + Σ products), length 128.
     pub l1_matmul: Vec<i32>,
-    /// Layer 1 post-bias output, length 128.
-    pub l1_bias: Vec<i32>,
     /// Layer 1 ReLU output (= hidden layer input to L2), length 128.
     pub l1_relu: Vec<i32>,
-    /// Layer 2 matmul output (pre-bias), length 10.
+    /// Layer 2 matmul-with-bias output (acc = bias + Σ products), length 10.
     pub l2_matmul: Vec<i64>,
-    /// Layer 2 post-bias output, length 10.
-    pub l2_bias: Vec<i64>,
     /// Layer 2 ReLU output (= final output), length 10.
     pub l2_relu: Vec<i64>,
 }
@@ -120,19 +131,15 @@ pub fn cpu_reference_v1_mlp(x: &[i8], fixture: &FixtureFile) -> MlpOutput {
     let w2 = fixture.blocks[2].as_i8(); // block 2: W2
     let b2 = fixture.blocks[3].as_i64(); // block 3: b2
 
-    let l1_matmul = cpu_reference_layer1_matmul(x, &w1);
-    let l1_bias = cpu_reference_layer1_bias(&l1_matmul, &b1);
-    let l1_relu = cpu_reference_layer1_relu(&l1_bias);
-    let l2_matmul = cpu_reference_layer2_matmul(&l1_relu, &w2);
-    let l2_bias = cpu_reference_layer2_bias(&l2_matmul, &b2);
-    let l2_relu = cpu_reference_layer2_relu(&l2_bias);
+    let l1_matmul = cpu_reference_layer1_matmul_with_bias(x, &w1, &b1);
+    let l1_relu = cpu_reference_layer1_relu(&l1_matmul);
+    let l2_matmul = cpu_reference_layer2_matmul_with_bias(&l1_relu, &w2, &b2);
+    let l2_relu = cpu_reference_layer2_relu(&l2_matmul);
 
     MlpOutput {
         l1_matmul,
-        l1_bias,
         l1_relu,
         l2_matmul,
-        l2_bias,
         l2_relu,
     }
 }
@@ -146,57 +153,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layer1_matmul_zero_input() {
+    fn layer1_with_bias_zero_input_yields_bias() {
+        // M57.1 §3.5: bias-as-seed means zero input yields bias, not zero.
         let x = vec![0i8; 784];
-        let w1 = vec![127i8; 784 * 128];
-        let out = cpu_reference_layer1_matmul(&x, &w1);
-        assert_eq!(out.len(), 128);
-        assert!(out.iter().all(|&v| v == 0), "zero input => zero matmul");
+        let w = vec![1i8; 784 * 128];
+        let bias = vec![42i32; 128];
+        let out = cpu_reference_layer1_matmul_with_bias(&x, &w, &bias);
+        assert_eq!(out, vec![42i32; 128]);
     }
 
     #[test]
-    fn layer1_matmul_single_active_input() {
-        // x[0] = 1, all others 0; W1[0, o] = (o % 64) to stay in range.
-        // Row-major layout: W1[i, o] = w1[i * n_out + o]; with i=0: w1[o].
+    fn layer1_with_bias_single_element_yields_bias_plus_prod() {
         let mut x = vec![0i8; 784];
         x[0] = 1;
-        let mut w1 = vec![0i8; 784 * 128];
-        // Row 0: W1[0, o] = w1[0*128 + o] = w1[o] for o in 0..128.
-        for (o, slot) in w1.iter_mut().enumerate().take(128) {
-            *slot = (o % 64) as i8;
+        let mut w = vec![0i8; 784 * 128];
+        w[0] = 64;
+        let mut bias = vec![10i32; 128];
+        bias[0] = 10;
+        let out = cpu_reference_layer1_matmul_with_bias(&x, &w, &bias);
+        assert_eq!(out[0], 10 + 64);
+        for o in 1..128 {
+            assert_eq!(out[o], 10);
         }
-        let out = cpu_reference_layer1_matmul(&x, &w1);
-        for (o, &v) in out.iter().enumerate() {
-            assert_eq!(v, (o % 64) as i32, "mismatch at output {o}");
+    }
+
+    #[test]
+    fn relu_clips_negative() {
+        let v = vec![5i32, -3, 0, 17, -1];
+        let r = cpu_reference_layer1_relu(&v);
+        assert_eq!(r, vec![5, 0, 0, 17, 0]);
+    }
+
+    #[test]
+    fn associativity_old_vs_new_bias_handling() {
+        // M57.1 §3.5 regression test: bias-as-seed and post-MAC bias-add produce
+        // identical bit-exact results for integer accumulation (associativity holds).
+        let x = vec![3i8; 784];
+        let w: Vec<i8> = (0..784 * 128).map(|i| (i % 7) as i8 - 3).collect();
+        let bias: Vec<i32> = (0..128).map(|i| (i * 17) as i32 - 1000).collect();
+
+        let new_out = cpu_reference_layer1_matmul_with_bias(&x, &w, &bias);
+
+        let mut old_acc: Vec<i32> = vec![0; 128];
+        for o in 0..128 {
+            for i in 0..784 {
+                let prod = (x[i] as i16) * (w[i * 128 + o] as i16);
+                old_acc[o] = old_acc[o].wrapping_add(prod as i32);
+            }
         }
+        let old_out: Vec<i32> = old_acc
+            .iter()
+            .zip(&bias)
+            .map(|(a, b)| a.wrapping_add(*b))
+            .collect();
+
+        assert_eq!(
+            new_out, old_out,
+            "bias-as-seed must match post-MAC bias-add bit-exactly"
+        );
     }
 
     #[test]
-    fn layer1_relu_clamps_negatives() {
-        let post = vec![-100i32, 0, 100, i32::MIN, i32::MAX];
-        let out = cpu_reference_layer1_relu(&post);
-        assert_eq!(out, vec![0, 0, 100, 0, i32::MAX]);
-    }
-
-    #[test]
-    fn layer2_matmul_sign_extension() {
-        // w2 = -1 (i8 = 0xFF); h = [1, 0, ...0]; expect acc for output 0 = -1.
-        // Row-major layout: W2[i, o] = w2[i * n_out + o]; with i=0: w2[o].
-        let mut h = vec![0i32; 128];
-        h[0] = 1;
-        let mut w2 = vec![0i8; 128 * 10];
-        w2[0] = -1i8; // W2[0, 0]: i=0, o=0 → index 0*10+0 = 0
-        let out = cpu_reference_layer2_matmul(&h, &w2);
-        assert_eq!(out[0], -1i64, "i8 -1 should sign-extend to i64 -1");
-        assert_eq!(out[1], 0i64);
-    }
-
-    #[test]
-    fn wrapping_add_semantics_preserved() {
-        // Verify that wrapping_add is used (not saturating) for bias-add.
-        let pre = vec![i32::MAX];
-        let bias = vec![1i32];
-        let result = cpu_reference_layer1_bias(&pre, &bias);
-        assert_eq!(result[0], i32::MIN, "should wrap around, not saturate");
+    fn layer2_widening_to_i64() {
+        let h = vec![1i32 << 20; 128];
+        let mut w = vec![0i8; 128 * 10];
+        w[0] = 64;
+        let bias = vec![0i64; 10];
+        let out = cpu_reference_layer2_matmul_with_bias(&h, &w, &bias);
+        assert_eq!(out[0], (1i64 << 20) * 64);
     }
 }

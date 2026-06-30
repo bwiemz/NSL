@@ -1,6 +1,40 @@
-# WRGA B.3.2 -- Fused GatedLoRA Backward (DEFERRED)
+# WRGA B.3.2 -- Fused GatedLoRA Backward (DEFERRED INDEFINITELY -- RESOLVED 2026-05-23)
 
-**Status:** deferred pending measurement trigger. Do NOT schedule this milestone without satisfying the trigger below.
+**Status: RESOLVED 2026-05-23 -- trigger does NOT fire on a clean baseline; B.3.2 deferred indefinitely.**
+
+The per-op profiling scope step (`crates/nsl-cli/tests/wrga_b32_per_op_breakdown.rs`)
+ran on current `main` at the prescribed shape (b=32, seq=2048, dim=4096, r=16; RTX 5070 Ti,
+CUDA 13.2; `--source-ad --target cuda_sm80`, `NSL_WRGA_FUSED_CUDA=1`). Results:
+
+| metric | value |
+|---|---|
+| wall / iter | 6,558 ms |
+| GPU / iter | 5,662 ms (86.3% of wall -- GPU-dominated) |
+| host overhead | 896 ms (13.7% -- allocator/tape/CUDA-API/source-AD) |
+
+GPU breakdown: **adapter_fused (forward kernel) 73.4%**, matmul 15.1%, reduction 8.1%,
+elementwise_arith 2.7%, copy_layout 0.9%.
+
+**Trigger evaluation:** forward (adapter_fused) = 4,156 ms; backward (matmul + reduction +
+elementwise + copy) ≈ 1,519 ms. **backward / forward = 0.37x**, far below the 2.5x trigger
+threshold below. The original 106x trigger reading (see `project_wrga_b32_measurement.md`
+history) was taken on a broken substrate -- naive `nsl_matmul_f32` and/or CPU fallback and/or
+the zero-duration profiler bug, all since fixed. On a clean baseline the trigger fails.
+
+**Decision:** B.3.2 (fused GatedLoRA backward kernel) is **deferred indefinitely.** A fused
+backward kernel's ceiling is the backward matmul = 15% of GPU / 13% of wall, and fusion only
+removes HBM round-trips/launch overhead within that slice -- not worth the kernel.
+
+**What to build instead:** the fused **forward** kernel is 73.4% of GPU time (a single ~4.2s
+launch) -- the single-threaded thread-0-only staging pathology. See **WRGA B.4** scope doc
+`docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md`. Allocator optimization is also
+NOT warranted (host overhead is only 13.7%, not the ~99.5% an earlier hypothesis predicted).
+
+The original measurement-gated framing is preserved below for the record.
+
+---
+
+**Status (original):** deferred pending measurement trigger. Do NOT schedule this milestone without satisfying the trigger below.
 
 ## Measurement-gated promotion trigger
 

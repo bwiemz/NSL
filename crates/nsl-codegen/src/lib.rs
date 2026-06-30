@@ -1,3 +1,37 @@
+//! # nsl-codegen — Cranelift IR generation and native compilation
+//!
+//! This crate lowers the type-checked NSL AST into Cranelift IR, emits object
+//! code, and orchestrates the many analysis/optimization passes that run in
+//! between. It is the largest crate in the workspace, so its modules are
+//! organized into the subsystem groups below.
+//!
+//! ## Public API
+//!
+//! The **stable entry points** are re-exported at the crate root:
+//! [`compile`], [`compile_module`], [`compile_entry`], [`CompileOptions`],
+//! [`CodegenError`], and the `compile_*_returning_plan` family.
+//!
+//! For navigating internals, the modules are also surfaced through subsystem
+//! **facade namespaces** that mirror the architecture:
+//!
+//! - [`core`] — the compilation pipeline itself (compiler driver, statement /
+//!   expression lowering, linker, C-export/header emission, ownership).
+//! - [`gpu`] — GPU backends (PTX, AMDGPU, Metal, WGSL) and kernel lowering.
+//! - [`training`] — autodiff (tape + source-to-source), Wengert lists, `vmap`.
+//! - [`quantization`] — FP8, BitNet, AWQ/PCA precision tiering, weight analysis.
+//! - [`distributed`] — tensor / context / pipeline parallelism, MoE, CPDT.
+//! - [`analysis`] — cost model, autotuning, fusion, memory planning, WCET,
+//!   FlashAttention codegen, calibration.
+//! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
+//!   FASE, ZK, FPGA, unikernel, sparse, speculative, multimodal). These APIs
+//!   are **not stable** and may change or be removed between releases.
+//!
+//! These facades re-export the same modules that remain available at the crate
+//! root for backward compatibility; they exist to make the crate navigable and
+//! to flag which subsystems are experimental.
+//!
+//! See `ARCHITECTURE.md` in this crate for a fuller description.
+
 // Clippy style-lint churn new in 1.95+ that's not worth per-site fixes here:
 // - doc_overindented_list_items / doc_lazy_continuation / unused_parens: doc
 //   formatting pedantry that fires on preexisting ASCII diagrams.
@@ -27,34 +61,124 @@
     clippy::len_without_is_empty
 )]
 
+// ===========================================================================
+// Module declarations
+//
+// Every module is declared at the crate root (this keeps internal `crate::foo`
+// paths and existing `nsl_codegen::foo` consumers stable). They are grouped
+// below by subsystem for navigability, and re-surfaced through the facade
+// namespaces (`core`, `gpu`, `training`, `quantization`, `distributed`,
+// `analysis`, `experimental`) defined at the end of this file.
+// ===========================================================================
+
+// --- Core compilation pipeline -------------------------------------------
 pub mod agent;
-pub mod autotune;
 pub mod builtins;
 pub(crate) mod c_export_table;
 pub mod c_header;
 pub mod c_wrapper;
-pub mod calibration;
 pub mod compiler;
 pub mod context;
-pub mod context_parallel;
-pub mod cost_model;
-pub mod deterministic_kernels;
-pub mod profiling;
+pub mod dynamic_shapes;
+pub mod error;
+pub mod expr;
+pub mod ffi_ownership;
+pub mod func;
 pub mod grammar_compiler;
+pub mod linker;
+pub mod ownership;
+pub mod ownership_expr;
 pub mod schema_convert;
+pub mod standalone;
 pub mod stdlib_loader;
+pub mod stmt;
+pub mod stmt_fase;
+pub mod types;
+pub mod use_count;
 
-pub mod ad_rules;
+// --- GPU backends & kernel lowering --------------------------------------
 pub mod backend_amdgpu;
 pub mod backend_metal;
 pub mod backend_ptx;
 pub mod backend_wgsl;
+pub mod deterministic_kernels;
+pub mod gpu_specs;
+pub mod gpu_target;
+pub mod kernel;
+pub mod kernel_ir;
+pub mod kernel_lower;
+pub mod kernel_skeleton;
+pub mod matmul_mma;
+pub mod ptxas_validation;
+
+// --- Autodiff & training -------------------------------------------------
+pub mod ad_rules;
+pub mod source_ad;
+pub mod training_report;
+pub mod vmap;
+pub mod wengert;
+pub mod wengert_lower;
+
+// --- Quantization & precision --------------------------------------------
 pub mod bitnet;
+pub mod fp8;
+pub mod pca_activation;
+pub mod pca_detect;
+pub mod pca_per_doc;
+pub mod pca_rope;
+pub mod pca_segment;
+pub mod pca_tier_b;
+pub mod pca_tile_config;
+pub mod pca_tilerange;
+pub mod pca_tileskip;
+pub mod weight_aware;
+
+// --- Distributed & parallelism -------------------------------------------
+pub mod context_parallel;
+pub mod cpdt;
+pub mod cpdt_comm;
+pub mod cpdt_expert;
+pub mod cpdt_joint;
+pub mod cpdt_optim;
+pub mod cpdt_precision_exec;
+pub mod cpdt_sensitivity;
+pub mod cpdt_tier_apply;
+pub mod cpdt_zero;
+pub mod moe;
+pub mod moe_kernels;
+pub mod pipeline;
+pub mod tensor_parallel;
+
+// --- Cost model, fusion & analysis ---------------------------------------
+pub mod autotune;
+pub mod calibration;
+pub mod cost_model;
+pub mod epilogue_fusion;
+pub mod flash_attention;
+pub mod flash_attention_selector;
+pub mod flash_attention_v2;
+pub mod fused_linear_ce;
+pub mod precision_cast_ptx;
+pub mod fusion;
+pub mod fusion_graph;
+pub mod fusion_report;
+pub mod inspect;
+pub mod memory_planner;
+pub mod profiling;
+pub mod reduction_fusion;
+pub mod serve;
+pub mod wcet;
+
+// --- Experimental research subsystems ------------------------------------
+// These are NOT part of the stable API. See the `experimental` facade.
 pub mod cep;
+pub mod cep_extract;
 pub mod cep_importance;
 pub mod cep_oracle;
 pub mod cep_rewrite;
 pub mod cep_search;
+pub mod cep_emit_source;
+pub mod cep_slice;
 pub mod cfie;
 pub mod cfie_fused_sample;
 pub mod cfie_grammar;
@@ -62,80 +186,22 @@ pub mod cfie_kv_plan;
 pub mod cfie_kv_quant;
 pub mod cfie_persistent;
 pub mod cfie_speculative;
-pub mod cpdt;
-pub mod cpdt_comm;
-pub mod cpdt_expert;
-pub mod cpdt_joint;
-pub mod cpdt_optim;
-pub mod cpdt_sensitivity;
-pub mod cpdt_tier_apply;
-pub mod cpdt_zero;
 pub mod csha;
 pub mod csha_apply;
 pub mod csha_boundary;
 pub mod csha_patterns;
 pub mod csha_pipeline;
 pub mod csha_specialize;
-pub mod dynamic_shapes;
-pub mod epilogue_fusion;
-pub mod error;
-pub mod expr;
 pub mod fase;
 pub mod fase_clip;
 pub mod fase_codegen_table;
 pub mod fase_memory;
 pub mod fase_optimizer;
-pub mod stmt_fase;
-pub mod flash_attention;
-pub mod flash_attention_v2;
-pub mod flash_attention_selector;
-pub mod fp8;
-pub mod func;
-pub mod fusion;
-pub mod fusion_graph;
-pub mod fusion_report;
-pub mod gpu_specs;
-pub mod gpu_target;
-pub mod inspect;
-pub mod kernel;
-pub mod kernel_ir;
-pub mod kernel_lower;
-pub mod kernel_skeleton;
-pub mod linker;
-pub mod memory_planner;
-pub mod moe;
-pub mod moe_kernels;
 pub mod multimodal;
-pub mod ffi_ownership;
-pub mod ownership;
-pub mod ownership_expr;
-pub mod pca_detect;
-pub mod pca_rope;
-pub mod pca_segment;
-pub mod pca_tier_b;
-pub mod pca_tile_config;
-pub mod pca_tilerange;
-pub mod pca_tileskip;
-pub mod training_report;
-pub mod pipeline;
-pub mod ptxas_validation;
-pub mod reduction_fusion;
-pub mod serve;
-pub mod source_ad;
 pub mod sparse;
 pub mod speculative;
-pub mod standalone;
-pub mod stmt;
-pub mod tensor_parallel;
-pub mod types;
 pub mod unikernel;
 pub mod unikernel_boot;
-pub mod use_count;
-pub mod vmap;
-pub mod wcet;
-pub mod weight_aware;
-pub mod wengert;
-pub mod wengert_lower;
 pub mod wggo;
 pub mod wggo_apply;
 pub mod wggo_conflicts;
@@ -144,20 +210,16 @@ pub mod wggo_dp;
 pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
 pub mod wggo_ilp;
+pub mod wggo_overrides;
+pub mod wggo_prune;
 pub mod wggo_schedule;
 pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
-pub mod wggo_overrides;
-pub mod wggo_prune;
 pub use wggo_overrides::{
     OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
 };
-pub mod fpga_error;
-pub mod hir;
-pub mod backend_verilog;
 pub mod wrga;
-pub mod matmul_mma;
 pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
 pub mod wrga_adapter_rewrite;
@@ -170,6 +232,96 @@ pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
+
+// FPGA / hardware-synthesis path (experimental).
+pub mod backend_verilog;
+pub mod fpga_error;
+pub mod hir;
+pub mod kernel_lower_fpga;  // M57.1 §3.3
+
+// ===========================================================================
+// Subsystem facade namespaces
+//
+// These re-export the modules above under architecture-oriented namespaces so
+// the crate is navigable without touching the (backward-compatible) crate-root
+// paths. New code is encouraged to import through these facades.
+// ===========================================================================
+
+/// Core compilation pipeline: the compiler driver, statement/expression
+/// lowering, linking, C-export/header emission, and ownership analysis.
+pub mod core {
+    pub use crate::{
+        agent, builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
+        error, expr, ffi_ownership, func, grammar_compiler, linker, ownership,
+        ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_fase,
+        types, use_count,
+    };
+}
+
+/// GPU code generation: device backends and kernel lowering.
+pub mod gpu {
+    pub use crate::{
+        backend_amdgpu, backend_metal, backend_ptx, backend_wgsl,
+        deterministic_kernels, gpu_specs, gpu_target, kernel, kernel_ir,
+        kernel_lower, kernel_skeleton, matmul_mma, ptxas_validation,
+    };
+}
+
+/// Automatic differentiation and training-time codegen.
+pub mod training {
+    pub use crate::{ad_rules, source_ad, training_report, vmap, wengert, wengert_lower};
+}
+
+/// Quantization and reduced-precision execution.
+pub mod quantization {
+    pub use crate::{
+        bitnet, fp8, pca_activation, pca_detect, pca_per_doc, pca_rope, pca_segment, pca_tier_b,
+        pca_tile_config, pca_tilerange, pca_tileskip, weight_aware,
+    };
+}
+
+/// Distributed execution and parallelism strategies.
+pub mod distributed {
+    pub use crate::{
+        context_parallel, cpdt, cpdt_comm, cpdt_expert, cpdt_joint, cpdt_optim,
+        cpdt_precision_exec, cpdt_sensitivity, cpdt_tier_apply, cpdt_zero, moe,
+        moe_kernels, pipeline, tensor_parallel,
+    };
+}
+
+/// Cost modeling, fusion, memory planning, and other analysis passes.
+pub mod analysis {
+    pub use crate::{
+        autotune, calibration, cost_model, epilogue_fusion, flash_attention,
+        flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion, fusion_graph,
+        fusion_report, inspect, memory_planner, profiling, reduction_fusion, serve,
+        wcet,
+    };
+}
+
+/// Experimental research subsystems. **APIs here are unstable** and may change
+/// or be removed between releases.
+pub mod experimental {
+    pub use crate::{
+        cep, cep_extract, cep_importance, cep_oracle, cep_rewrite, cep_search,
+        cep_emit_source, cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
+        cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
+        csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
+        fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
+        sparse, speculative, unikernel, unikernel_boot, wggo, wggo_apply,
+        wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
+        wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
+        wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
+        wrga_adapter_init, wrga_adapter_inject, wrga_adapter_rewrite,
+        wrga_fused_ptx, wrga_fusion, wrga_kernel_helpers, wrga_memory,
+        wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral, zk,
+    };
+
+    /// FPGA / hardware-synthesis path (Verilog emission, HIR lowering).
+    pub mod fpga {
+        pub use crate::{backend_verilog, fpga_error, hir, kernel_lower_fpga};
+    }
+}
 
 /// Binary-internal modules re-exposed at the library level so integration
 /// tests can reach them without the source code living twice. The actual
@@ -212,6 +364,11 @@ pub use compiler::{
     compile_test, compile_with_zk_info, compile_with_zk_info_returning_plan,
     StandaloneConfig,
 };
+
+/// M57.1 §3.2: re-exported from the (private) `compiler::kernel` module so that
+/// integration tests can pin the production redirect message without copying
+/// the literal. See `tests/fpga_target_redirect.rs`.
+pub use crate::compiler::kernel::FPGA_TARGET_REDIRECT_MSG;
 
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced
 /// during `@train` block lowering.  The plan is returned even when codegen
@@ -469,6 +626,79 @@ pub enum AdapterKind {
     GatedLora,
 }
 
+/// CFTP §4.4 G3 (Sprint 2): codegen-side mirror of
+/// `nsl_semantic::cftp::FusedCeConfig`.
+///
+/// Derived from `AnalysisResult.fused_ce_configs` and forwarded into
+/// `CompileOptions.fused_ce_configs` by the CLI bridge.  Kept as a
+/// codegen-side newtype so nsl-codegen does NOT depend on nsl-semantic
+/// directly (matches the `WrgaInputs` / `FreezeDecoratorConfig` pattern).
+///
+/// v1 carries the two knobs surfaced by the decorator parser:
+///
+/// * `enabled` — whether the fused linear-CE kernel should fire on
+///   matching cross_entropy occurrences inside the decorated `train` block.
+/// * `vocab_tile` — explicit vocab-tile override (must be a multiple of
+///   128, validated in semantic).  `None` falls back to the codegen
+///   default (`FusedLinearCEConfig::default().vocab_tile` = 1024).
+///
+/// Sprint 2 wires only the plumbing; the lowering-site auto-substitution
+/// is documented as deferred to Sprint 2.5 — see the inline marker near
+/// `PrimalOp::CrossEntropyLoss` in `wengert_lower.rs`.
+#[derive(Debug, Clone)]
+pub struct FusedCeDecoratorConfig {
+    /// `enabled = true|false` from the decorator. Defaults to `false` if
+    /// the keyword arg is missing (preserves opt-in semantics).
+    pub enabled: bool,
+    /// `vocab_tile = N` override. `None` → codegen default.
+    pub vocab_tile: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `vocab_size = N` from the decorator.
+    /// Required at codegen time to bake `V` into the synthesised PTX.
+    /// `None` → the fused emitter falls back to the composite
+    /// `cross_entropy` lowering for this train block.
+    pub vocab_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `hidden_size = N` from the decorator.
+    /// Required at codegen time to bake `H` into the synthesised PTX.
+    pub hidden_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `batch_size = N` from the decorator.
+    /// Required at codegen time to size the per-row output buffers.
+    pub batch_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `seq_len = N` from the decorator.
+    /// Required at codegen time to size the per-row output buffers.
+    pub seq_len: Option<u32>,
+    /// CFTP §4.4 G3 v4-2: dtype hint from the decorator, mapped to the
+    /// runtime FFI sentinel: `None`/`F32` → 0, `F16` → 1, `Bf16` → 2.
+    /// Mirror of `nsl_semantic::cftp::FusedCeConfig.dtype`; kept as a
+    /// codegen-local enum so nsl-codegen does not depend on nsl-semantic
+    /// types (same convention as the rest of `FusedCeDecoratorConfig`).
+    pub dtype: Option<FusedCeDtypeHint>,
+}
+
+/// Codegen-side mirror of `nsl_semantic::cftp::FusedCeDtypeHint`.
+///
+/// Maps to the runtime FFI `dtype_tag: i64` sentinel:
+/// * `F32` → 0 (v3-2 / pre-v3-2 byte-identical)
+/// * `F16` → 1 (v3-2 fp16 emitters)
+/// * `Bf16` → 2 (v4-1 bf16 emitters)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedCeDtypeHint {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl FusedCeDtypeHint {
+    /// FFI sentinel value matching the runtime contract.
+    #[inline]
+    pub fn dtype_tag(self) -> i64 {
+        match self {
+            FusedCeDtypeHint::F32 => 0,
+            FusedCeDtypeHint::F16 => 1,
+            FusedCeDtypeHint::Bf16 => 2,
+        }
+    }
+}
+
 /// User-facing knob that gates how WGGO scores head importance.
 /// - `Auto`: use gradient scoring when a calibration sidecar is present
 ///   (with per-layer magnitude fallback); otherwise pure magnitude.
@@ -481,6 +711,94 @@ pub enum WggoImportance {
     Auto,
     Magnitude,
     Grad,
+}
+
+/// WGGO: weight-graph global-optimization options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WggoOptions {
+    /// Global optimization mode ("full", "greedy", "off"). When `None`, WGGO is
+    /// not run. See `crates/nsl-codegen/src/wggo.rs`.
+    pub mode: Option<String>,
+    /// Print the global-optimization report to stderr.
+    pub report: bool,
+    /// Stage 3: path to a `.nslweights` sidecar file.
+    pub weights: Option<std::path::PathBuf>,
+    /// Stage 3: scoring mode (Auto/Magnitude/Grad).
+    pub importance: WggoImportance,
+    /// Stage 3: default fraction of heads allowed to be pruned.
+    pub prune_fraction: Option<f64>,
+}
+
+/// M53: Worst-case-execution-time (WCET) analysis and certification options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WcetOptions {
+    /// Enable WCET analysis for `@real_time` functions.
+    pub enabled: bool,
+    /// GPU target name for WCET analysis (e.g., "Orin", "H100").
+    pub gpu: Option<String>,
+    /// CPU target name for WCET analysis (e.g., "cortex-a78").
+    pub cpu: Option<String>,
+    /// Path to write the WCET certificate JSON.
+    pub report_path: Option<std::path::PathBuf>,
+    /// Safety-margin multiplier for WCET (default: 1.05 = 5%).
+    pub safety_margin: f64,
+    /// Path to write a DO-178C compliance report.
+    pub do178c_report: Option<std::path::PathBuf>,
+    /// WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked).
+    pub target: String,
+    /// FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg").
+    pub fpga_device: Option<String>,
+}
+
+impl Default for WcetOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gpu: None,
+            cpu: None,
+            report_path: None,
+            safety_margin: 1.05,
+            do178c_report: None,
+            target: "gpu".to_string(),
+            fpga_device: None,
+        }
+    }
+}
+
+/// M55: Zero-knowledge proof-circuit emission options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZkOptions {
+    /// Emit a ZK inference circuit alongside compiled output.
+    pub circuit: bool,
+    /// ZK backend to use ("folding", "halo2", or "plonky3").
+    pub backend: String,
+    /// ZK field to use ("m31" or "bn254").
+    pub field: String,
+    /// Also emit a Solidity verifier contract.
+    pub solidity: bool,
+    /// Path to safetensors weight file used as ZK witness.
+    pub weights_path: Option<std::path::PathBuf>,
+}
+
+impl Default for ZkOptions {
+    fn default() -> Self {
+        Self {
+            circuit: false,
+            backend: "folding".to_string(),
+            field: "m31".to_string(),
+            solidity: false,
+            weights_path: None,
+        }
+    }
 }
 
 /// Compiler configuration flags passed from CLI.
@@ -516,37 +834,15 @@ pub struct CompileOptions {
     pub weight_analysis: bool,
     /// M54: Unikernel build configuration (None = normal build)
     pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
-    /// M53: Enable WCET analysis for @real_time functions
-    pub wcet_enabled: bool,
-    /// M53: GPU target name for WCET analysis (e.g., "Orin", "H100")
-    pub wcet_gpu: Option<String>,
-    /// M53: CPU target name for WCET analysis (e.g., "cortex-a78")
-    pub wcet_cpu: Option<String>,
-    /// M53: Path to write WCET certificate JSON
-    pub wcet_report_path: Option<std::path::PathBuf>,
-    /// M53: Safety margin multiplier for WCET (default: 1.05 = 5%)
-    pub wcet_safety_margin: f64,
-    /// M53: Path to write DO-178C compliance report
-    pub do178c_report: Option<std::path::PathBuf>,
-    /// M53: WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked)
-    pub wcet_target: String,
-    /// M53: FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg")
-    pub fpga_device: Option<String>,
+    /// M53: Worst-case-execution-time analysis / certification options.
+    pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
     pub linear_types_enabled: bool,
     /// M38a: Per-function ownership metadata from semantic analysis.
     /// Keys are function names, values have linear_params and shared_params.
     pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
-    /// M55: Emit a ZK inference circuit alongside compiled output.
-    pub zk_circuit: bool,
-    /// M55: ZK backend to use ("folding", "halo2", or "plonky3").
-    pub zk_backend: String,
-    /// M55: ZK field to use ("m31" or "bn254").
-    pub zk_field: String,
-    /// M55: Also emit a Solidity verifier contract.
-    pub zk_solidity: bool,
-    /// M55: Path to safetensors weight file used as ZK witness.
-    pub zk_weights_path: Option<std::path::PathBuf>,
+    /// M55: Zero-knowledge proof-circuit emission options.
+    pub zk: ZkOptions,
     /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
     pub zero_stage: Option<u8>,
     /// Debug training mode: disables fusion, disables FBIP, and emits
@@ -556,14 +852,16 @@ pub struct CompileOptions {
     pub shared_lib: bool,
     /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
     pub wrga_inputs: Option<WrgaInputs>,
+    /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
+    /// nsl-semantic.  Empty when no decorator is present; codegen consults
+    /// the first `enabled = true` entry to gate the fused linear-CE
+    /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
+    pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
     /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
     /// allocations (vs. B.1's observational-only path). Default false.
     pub wrga_fold_allocations: bool,
-    /// WGGO: global optimization mode ("full", "greedy", "off"). When `None`,
-    /// WGGO is not run.  See `crates/nsl-codegen/src/wggo.rs`.
-    pub wggo_mode: Option<String>,
-    /// WGGO: print the global-optimization report to stderr.
-    pub wggo_report: bool,
+    /// WGGO: weight-graph global-optimization options.
+    pub wggo: WggoOptions,
     /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
     pub profile_kernels: bool,
     /// Dev Tools Phase 2: target GPU name for the profile walker.
@@ -582,12 +880,6 @@ pub struct CompileOptions {
     pub health_flush_interval: Option<u64>,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
-    /// WGGO Stage 3: path to a `.nslweights` sidecar file.
-    pub wggo_weights: Option<std::path::PathBuf>,
-    /// WGGO Stage 3: scoring mode (Auto/Magnitude/Grad).
-    pub wggo_importance: WggoImportance,
-    /// WGGO Stage 3: default fraction of heads allowed to be pruned.
-    pub wggo_prune_fraction: Option<f64>,
     /// CSHA: fusion mode.
     pub csha_mode: Option<String>,
     /// CSHA: print the attention-fusion report.
@@ -688,28 +980,17 @@ impl Default for CompileOptions {
             weight_config: weight_aware::WeightAwareConfig::default(),
             weight_analysis: false,
             unikernel_config: None,
-            wcet_enabled: false,
-            wcet_gpu: None,
-            wcet_cpu: None,
-            wcet_report_path: None,
-            wcet_safety_margin: 1.05,
-            do178c_report: None,
-            wcet_target: "gpu".to_string(),
-            fpga_device: None,
+            wcet: WcetOptions::default(),
             linear_types_enabled: false,
             ownership_info: HashMap::new(),
-            zk_circuit: false,
-            zk_backend: "folding".to_string(),
-            zk_field: "m31".to_string(),
-            zk_solidity: false,
-            zk_weights_path: None,
+            zk: ZkOptions::default(),
             zero_stage: None,
             debug_training: false,
             shared_lib: false,
             wrga_inputs: None,
+            fused_ce_configs: Vec::new(),
             wrga_fold_allocations: false,
-            wggo_mode: None,
-            wggo_report: false,
+            wggo: WggoOptions::default(),
             profile_kernels: false,
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
@@ -719,9 +1000,6 @@ impl Default for CompileOptions {
             health_monitor: false,
             health_flush_interval: None,
             inspect_enabled: false,
-            wggo_weights: None,
-            wggo_importance: WggoImportance::Auto,
-            wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
             csha_configs: HashMap::new(),

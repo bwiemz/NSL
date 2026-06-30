@@ -39,17 +39,21 @@ pub struct ModuleData {
     pub freeze_configs: Vec<nsl_semantic::wrga::FreezeConfig>,
     /// `@adapter` decorator configs captured by nsl-semantic.
     pub adapter_configs: Vec<nsl_semantic::wrga::AdapterConfig>,
-    /// Sprint 2 (paper §6.2): per-model `@csha(...)` decorator configs
-    /// captured by nsl-semantic.  Keyed by the decorated model's name (or
-    /// the LHS binding name for `@csha let m = SomeModel()`).  Routed into
-    /// `CompileOptions.csha_configs` so the CSHA hook in
-    /// `nsl-codegen/src/stmt.rs` applies per-model `disable=`, `level=`,
-    /// and `target=` overrides.
-    pub csha_configs: Vec<(String, nsl_semantic::csha::CshaConfig)>,
+    /// CFTP §4.4 G3 `@fused_lm_ce` decorator configs captured by
+    /// nsl-semantic (Sprint 2 — collection only; lowering-site
+    /// substitution deferred to Sprint 2.5).
+    pub fused_ce_configs: Vec<nsl_semantic::cftp::FusedCeConfig>,
     /// M62: per-NodeId weight index resolutions for `self.<field>` accesses
     /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
     /// for the entry module on the multi-file shared-lib path.
     pub weight_index_map: std::collections::HashMap<nsl_ast::NodeId, usize>,
+    /// Sprint 2 (paper §6.2): per-model `@csha(...)` decorator configs
+    /// captured by nsl-semantic. Keyed by the decorated model's name (or
+    /// the LHS binding name for `@csha let m = SomeModel()`). Routed into
+    /// `CompileOptions.csha_configs` so the CSHA hook in
+    /// `nsl-codegen/src/stmt.rs` applies per-model `disable=`, `level=`,
+    /// and `target=` overrides.
+    pub csha_configs: Vec<(String, nsl_semantic::csha::CshaConfig)>,
     /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
     /// per-function `@checkpoint(policy=...)` policies harvested from
     /// `EffectChecker::checkpoint_policies()` at the `analyze_with_imports`
@@ -420,12 +424,17 @@ pub fn load_all_modules(
             wrga_configs: analysis.wrga_configs,
             freeze_configs: analysis.freeze_configs,
             adapter_configs: analysis.adapter_configs,
-            csha_configs: analysis.csha_configs,
             weight_index_map: analysis.weight_index_map,
+            fused_ce_configs: analysis.fused_ce_configs,
+            // Sprint 2 (paper §6.2): forward per-model @csha decorator configs
+            // so disable=/level=/target= overrides reach the codegen-side
+            // CompileOptions.csha_configs map (pipeline::analysis_to_csha_configs
+            // / pipeline::module_data_to_csha_configs).
+            csha_configs: analysis.csha_configs,
             // Cycle-10 §5.3 Task 6 (W9 corrected wire-up point):
             // route EffectChecker::checkpoint_policies() output collected
             // by the just-completed `analyze_with_imports` call into
-            // ModuleData so main.rs can publish it onto
+            // ModuleData so the command handlers can publish it onto
             // `CompileOptions.checkpoint_policies` for codegen to read.
             checkpoint_policies: analysis.checkpoint_policies,
         });

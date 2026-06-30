@@ -1,0 +1,31 @@
+# Canonical analyzable CEP-prune fixture — a tiny coder-rl-shaped GQA model.
+# Must pass `nsl check` cleanly (parse + semantic analysis) with NSL_STDLIB_PATH.
+#   d_model=64, 2 layers, 4 heads, 2 kv heads, head_dim=16, d_ff=128, vocab=256.
+
+from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+
+# SwiGLU feedforward — recognized by the CEP extractor as Activation::SwiGlu.
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+    w_up: Tensor = randn([d_model, d_ff])
+    w_down: Tensor = randn([d_ff, d_model])
+    _dropout_p: Tensor = full([1], dropout_p)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let gate = silu(x @ self.w_gate)
+        let up = x @ self.w_up
+        return (gate * up) @ self.w_down
+
+# Pre-norm transformer block: RMSNorm + GQA + SwiGLU.
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
+    ffn_norm: RMSNorm = RMSNorm(d_model)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+
+@cep_prune(target = h100, sparsity = 0.3, granularity = "head+ffn")
+model TinyCoder:
+    embed: Tensor = randn([256, 64]) * full([1], 0.02)
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 16, 128, 0.1)
+    norm: RMSNorm = RMSNorm(64)

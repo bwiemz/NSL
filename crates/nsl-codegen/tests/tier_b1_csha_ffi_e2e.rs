@@ -256,8 +256,8 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
         x_dev, nw_dev, wq_dev, wk_dev, wv_dev, 0,
         norm_eps.to_bits() as i64,
         0, d_model as i64,
-        // segment_ids_ptr, tier_b sentinels, doc_starts
-        0, 0, 0, 0,
+        // segment_ids_ptr, tier_b sentinels, doc_starts, num_docs_or_zero
+        0, 0, 0, 0, 0,
     );
 
     if rc != 0 {

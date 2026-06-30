@@ -19,6 +19,41 @@ pub enum HirNode {
     SignExtend(SignExtend),
     GenerateFor(GenerateFor),
     GenerateIf(GenerateIf),
+    /// M57.1 wire-array realization: module-scope multi-dimensional wire
+    /// array. Declared once per array; referenced by element via
+    /// `SignalRef::WireArrayElement`. Does not produce a single WireId
+    /// (it declares an N-dimensional family of wires whose drivers are
+    /// `assign`s inside generate blocks).
+    WireArray(WireArray),
+    /// M57.1 wire-array realization (Task W4): driver for one element of a
+    /// WireArray. Inside a GenerateFor body, indices typically include Genvar
+    /// refs; at module top level, indices are typically Literals. Does NOT
+    /// produce a single WireId — it drives a single element of an
+    /// N-dimensional wire family declared by `WireArray`.
+    AssignWireArrayElement(AssignWireArrayElement),
+    /// M57.2: combinational equality against a compile-time constant (Task 3).
+    /// Produces a 1-bit wire: `assign _w{out} = ($signed({lhs}) == {rhs});`.
+    CmpEq(CmpEq),
+    /// M57.2: combinational add of a compile-time constant (Task 4).
+    /// Produces a wire: `assign _w{out} = $signed({src}) + {k};`.
+    AddConst(AddConst),
+    /// M57.2: declaration-only scalar register (Task 5).
+    /// Emits `reg signed [w-1:0] _r{id};` with no bundled always_ff.
+    RegDecl(RegDecl),
+    /// M57.2: module-scope clocked register array (Task 6).
+    /// Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;` with no always_ff.
+    RegArray(RegArray),
+    /// M57.2: clocked process (Task 9). Emits a single `always_ff` block
+    /// covering the FSM state machine, reset branch, and RegArray reset loops.
+    /// Does not produce a single WireId — the process drives registers
+    /// declared by `RegDecl` and elements of arrays declared by `RegArray`.
+    SeqProcess(crate::hir::nodes::SeqProcess),
+    /// M57.2: declaration-only combinational wire. Emits `wire signed [w-1:0] _w{id};`
+    /// with no `assign` — the driving assignment comes from a separate combinational
+    /// node (Mul/Add/Max0/SignExtend/CmpEq/AddConst) with the same WireId.
+    /// `produces_wire` returns `None` so the single-driver invariant in `add_node`
+    /// is not tripped by the companion combinational node.
+    WireDecl(crate::hir::nodes::WireDecl),
 }
 
 impl HirNode {
@@ -31,8 +66,32 @@ impl HirNode {
             HirNode::Add(a) => Some(a.out),
             HirNode::Max0(m) => Some(m.out),
             HirNode::SignExtend(s) => Some(s.dst),
-            // Register, GenerateFor, GenerateIf don't produce a single WireId.
-            _ => None,
+            // M57.2 (Task 3): combinational equality drives one wire.
+            HirNode::CmpEq(c) => Some(c.out),
+            // M57.2 (Task 4): combinational add-constant drives one wire.
+            HirNode::AddConst(a) => Some(a.out),
+            // Register, RegDecl, GenerateFor, GenerateIf, WireArray,
+            // AssignWireArrayElement don't produce a single WireId.
+            // (WireArray declares multi-element wire family;
+            // AssignWireArrayElement drives ONE element of one; single-driver
+            // invariant for each element is the caller's responsibility, same
+            // as GenerateFor body uniqueness.)
+            HirNode::Register(_) => None,
+            // M57.2 (Task 5): RegDecl is declaration-only — no WireId.
+            HirNode::RegDecl(_) => None,
+            // M57.2 (Task 6): RegArray declares an array family — no single WireId.
+            HirNode::RegArray(_) => None,
+            HirNode::GenerateFor(_) => None,
+            HirNode::GenerateIf(_) => None,
+            HirNode::WireArray(_) => None,
+            HirNode::AssignWireArrayElement(_) => None,
+            // M57.2 (Task 9): SeqProcess drives registers in-place — no WireId.
+            HirNode::SeqProcess(_) => None,
+            // M57.2: WireDecl is declaration-only — no WireId driver registered.
+            // The companion combinational node (Mul/Add/etc.) with the same id
+            // registers its own driver; WireDecl must NOT also register to avoid
+            // tripping the single-driver invariant.
+            HirNode::WireDecl(_) => None,
         }
     }
 }
@@ -44,13 +103,27 @@ pub struct HirModule {
     /// pub(crate) — readers access via `nodes()`; writers MUST use `add_node`
     /// so the single-driver invariant (spec §3.4 invariant 1) is enforced.
     pub(crate) bodies: Vec<HirNode>,
-    pub local_params: Vec<LocalParam>,
+    /// pub(crate) — readers access via `local_params()`; writers go through
+    /// `add_local_param`. Task 4.1's CLI-time bake_fixture_into_localparams
+    /// will need mutable access — added then via a dedicated accessor.
+    /// (M57.1 Task 3.2 review follow-up.)
+    pub(crate) local_params: Vec<LocalParam>,
+    /// M57.1 wire-array mini §3.2 / Task W5: module-scope multi-dimensional
+    /// const arrays (`W<i>`, `b<i>`). Accessed via `local_param_arrays()`
+    /// (read) / `local_param_arrays_mut()` (Task W6 CLI baking) /
+    /// `add_local_param_array` (construction).
+    pub(crate) local_param_arrays: Vec<LocalParamArray>,
     /// BTreeMap (not HashMap) for deterministic iteration order across Rust
     /// versions and platforms — Layer 1 Verilog emission snapshots depend on
     /// reproducible output (spec §3.5 / §3 issue 5).
     pub clock_domains: BTreeMap<ClockDomainId, String>,
     pub reset_signals: BTreeMap<ResetSignalId, String>,
     pub test_taps: bool,
+    /// M57.2 (R6): deterministic total latency (in clock cycles) of the
+    /// sequential FSM lowering — carried from `lower_v1_mlp_sequential` to the
+    /// Verilog emitter's header comment. `None` on the combinational path so
+    /// its snapshot/output stays byte-identical.
+    pub cycle_count: Option<u64>,
 
     // Builder state — used by add_node to enforce single-driver invariant.
     driven_wires: HashSet<WireId>,
@@ -75,9 +148,11 @@ impl HirModule {
             ports: Vec::new(),
             bodies: Vec::new(),
             local_params: Vec::new(),
+            local_param_arrays: Vec::new(),
             clock_domains,
             reset_signals,
             test_taps: true,    // v1 default
+            cycle_count: None,  // M57.2: combinational path leaves this None
             driven_wires: HashSet::new(),
         }
     }
@@ -110,6 +185,47 @@ impl HirModule {
     /// `add_node` so the single-driver invariant holds.
     pub fn nodes(&self) -> &[HirNode] {
         &self.bodies
+    }
+
+    /// Read-only access to declared LocalParams. Construction must go through
+    /// `add_local_param`. (M57.1 Task 3.2 review follow-up: field tightened
+    /// to `pub(crate)`; this is the public reader.)
+    pub fn local_params(&self) -> &[LocalParam] {
+        &self.local_params
+    }
+
+    /// Mutable access to declared LocalParams for CLI-time value baking.
+    ///
+    /// Task 4.1 (`nsl fpga-compile`) walks the FixtureFile's blocks and writes
+    /// the parsed weight/bias values into the matching `W<i>_<k>_<o>` and
+    /// `b<i>_<o>` LocalParams by name. This is the only sanctioned mutator —
+    /// `add_local_param` is the construction-time entry point and is preserved
+    /// for the KirToHirPass; this accessor is for post-construction value
+    /// substitution only. Callers must not push/remove entries through it.
+    pub fn local_params_mut(&mut self) -> &mut Vec<LocalParam> {
+        &mut self.local_params
+    }
+
+    /// M57.1 wire-array mini §3.2 / Task W5: register a LocalParamArray
+    /// (the fused-emitter shape for `W<i>` / `b<i>`). The fused matmul
+    /// ripple body reads it via `SignalRef::IndexedLocalParam`.
+    pub fn add_local_param_array(&mut self, lpa: LocalParamArray) {
+        self.local_param_arrays.push(lpa);
+    }
+
+    /// Read-only access to declared LocalParamArrays. Construction via
+    /// `add_local_param_array`. Renders in the LocalParam preamble block of
+    /// the emitted Verilog.
+    pub fn local_param_arrays(&self) -> &[LocalParamArray] {
+        &self.local_param_arrays
+    }
+
+    /// Mutable access to declared LocalParamArrays for CLI-time value baking
+    /// (Task W6). The fixture loader writes parsed weight/bias values into
+    /// the `values` field by `[k][o]` (or `[o]`) index. Callers must not
+    /// push/remove entries through it.
+    pub fn local_param_arrays_mut(&mut self) -> &mut Vec<LocalParamArray> {
+        &mut self.local_param_arrays
     }
 }
 

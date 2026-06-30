@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn model_size_from_applied_plan_sums_per_layer_bytes() {
         use crate::wggo_apply::{AppliedLayer, AppliedPlan};
-        use crate::wggo_dp::LayerDecision as CoarseDecision;
+        use crate::wggo_dp::CoarseDecision;
 
         let plan = AppliedPlan {
             layers: vec![
@@ -343,10 +343,13 @@ mod tests {
                     coarse: CoarseDecision::KeepFull,
                     pipeline_stage: 0,
                     shard_factor: 1,
+                    shard_grads: 1,
+                    shard_optim: 1,
                     active_heads: 8,
                     ffn_width: 4096,
                     csha_level: 0,
                     adapter_rank: 0,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                     optim_m_bits: 32,
                     optim_v_bits: 32,
                     fase_fused: false,
@@ -361,10 +364,13 @@ mod tests {
                     coarse: CoarseDecision::KeepFull,
                     pipeline_stage: 0,
                     shard_factor: 1,
+                    shard_grads: 1,
+                    shard_optim: 1,
                     active_heads: 8,
                     ffn_width: 4096,
                     csha_level: 0,
                     adapter_rank: 0,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
                     optim_m_bits: 32,
                     optim_v_bits: 32,
                     fase_fused: false,

@@ -7,3 +7,6 @@ pub mod softmax;
 pub mod pv_accum;
 pub mod finalize;
 pub mod csha_hooks;
+// G2 Strategy 3 per-doc CTA helpers.
+pub mod per_doc_prelude;
+pub mod per_doc_q_load;

@@ -20,6 +20,8 @@ impl GpuTarget {
             "rocm" | "amd" | "hip" => Some(GpuTarget::Rocm),
             "metal" | "apple" | "mps" => Some(GpuTarget::Metal),
             "webgpu" | "wgsl" => Some(GpuTarget::WebGpu),
+            "fpga" => Some(GpuTarget::Fpga),  // M57.1 §3.2
+
             // WRGA B.3 Task 4: accept `cuda_sm<N>` / `sm<N>` variants.
             s if s.starts_with("cuda_sm") || s.starts_with("sm") => Some(GpuTarget::Cuda),
             _ => None,
@@ -88,9 +90,8 @@ impl GpuTarget {
             GpuTarget::WebGpu => FeatureSet::SHARED_MEMORY | FeatureSet::F16_ARITHMETIC,
             GpuTarget::Fpga => {
                 // FPGA target uses the HIR pipeline (kernel_ir → hir::lower →
-                // backend_verilog), not the SIMT FeatureSet model. M57.1 wires
-                // up parse_target to return GpuTarget::Fpga; until then this
-                // arm is unreachable from CLI but defined for exhaustiveness.
+                // backend_verilog), not the SIMT FeatureSet model — return NONE
+                // because no SIMT feature flags apply to dataflow hardware.
                 FeatureSet::NONE
             }
         }
@@ -205,6 +206,14 @@ mod tests {
         assert_eq!(GpuTarget::parse_target("mps"), Some(GpuTarget::Metal));
         assert_eq!(GpuTarget::parse_target("webgpu"), Some(GpuTarget::WebGpu));
         assert_eq!(GpuTarget::parse_target("vulkan"), None);
+    }
+
+    #[test]
+    fn parse_target_recognizes_fpga() {
+        // M57.1 §3.2: parse_target returns GpuTarget::Fpga for "fpga"/"FPGA".
+        // This activates the previously-runtime-unreachable compiler/kernel.rs:170 arm.
+        assert_eq!(GpuTarget::parse_target("fpga"), Some(GpuTarget::Fpga));
+        assert_eq!(GpuTarget::parse_target("FPGA"), Some(GpuTarget::Fpga));
     }
 
     #[test]

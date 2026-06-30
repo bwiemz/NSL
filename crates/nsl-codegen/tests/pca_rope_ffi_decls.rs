@@ -3,13 +3,21 @@
 //! Verifies the three Cranelift CSHA FFI signature declarations in
 //! `builtins.rs::RUNTIME_FUNCTIONS` have the correct trailing parameters:
 //! segment_ids_ptr (Tier A), tier_b_ptx_ptr + tier_b_name_ptr (Tier B),
-//! and doc_starts_ptr (PCA §4.3). Counts are stable in spec v3:
+//! doc_starts_ptr (PCA §4.3), and num_docs_or_zero (PCA per-doc CTA
+//! Strategy 3 v1, forward FFIs only). Counts are:
 //!
-//!   * `nsl_flash_attention_csha`            — 37 params
-//!   * `nsl_flash_attention_csha_with_saves` — 43 params
-//!   * `nsl_flash_attention_csha_backward`   — 53 params (52 + tier_b2_active)
+//!   * `nsl_flash_attention_csha`            — 38 params (+1 num_docs_or_zero)
+//!   * `nsl_flash_attention_csha_with_saves` — 44 params (+1 num_docs_or_zero)
+//!   * `nsl_flash_attention_csha_backward`   — 54 params (+1 tier_b2_active
+//!     from CSHA Tier B.2 Phase 3 T6 AND +1 num_docs_or_zero added
+//!     Sprint 5; backward kernel currently honours num_docs == 0 only,
+//!     non-zero is a Sprint 6 follow-on per-doc backward)
 //!
-//! Each count = base + segment_ids (Tier A) + 2 tier_b + doc_starts (PCA §4.3).
+//! Each forward count = base + segment_ids (Tier A) + 2 tier_b + doc_starts
+//!                       (PCA §4.3) + num_docs_or_zero (per-doc CTA).
+//! Backward count    = base + segment_ids (Tier A) + 2 tier_b + doc_starts
+//!                     + tier_b2_active (CSHA Tier B.2 Phase 3 T6)
+//!                     + num_docs_or_zero (slot wired, value gated to 0).
 //!
 //! A regression here means a Cranelift call site emitting the call with
 //! N args would now hit a sig-mismatch at IR-finalize time. The targeted
@@ -42,11 +50,12 @@ fn csha_forward_decl_has_doc_starts_trailing_param() {
     let (_, sig) = fns
         .get("nsl_flash_attention_csha")
         .expect("nsl_flash_attention_csha registered");
-    // 24 base + 9 CSHA extras + 1 segment_ids + 2 tier_b + 1 doc_starts = 37 i64 params.
+    // 24 base + 9 CSHA extras + 1 segment_ids + 2 tier_b + 1 doc_starts + 1 num_docs_or_zero
+    //   = 38 i64 params (PCA per-doc CTA Strategy 3 v1).
     assert_eq!(
         sig.params.len(),
-        37,
-        "nsl_flash_attention_csha must accept 37 i64 params (PCA §4.3 Task 3 + Tier B)"
+        38,
+        "nsl_flash_attention_csha must accept 38 i64 params (PCA §4.3 Task 3 + Tier B + per-doc CTA)"
     );
 }
 
@@ -57,11 +66,12 @@ fn csha_with_saves_decl_has_doc_starts_trailing_param() {
     let (_, sig) = fns
         .get("nsl_flash_attention_csha_with_saves")
         .expect("nsl_flash_attention_csha_with_saves registered");
-    // 24 base + 9 CSHA extras + 6 save pointers + 1 segment_ids + 2 tier_b + 1 doc_starts = 43.
+    // 24 base + 9 CSHA extras + 6 save pointers + 1 segment_ids + 2 tier_b
+    //   + 1 doc_starts + 1 num_docs_or_zero = 44.
     assert_eq!(
         sig.params.len(),
-        43,
-        "nsl_flash_attention_csha_with_saves must accept 43 i64 params (PCA §4.3 Task 3 + Tier B)"
+        44,
+        "nsl_flash_attention_csha_with_saves must accept 44 i64 params (PCA §4.3 Task 3 + Tier B + per-doc CTA)"
     );
 }
 
@@ -75,12 +85,13 @@ fn csha_backward_decl_has_doc_starts_trailing_param() {
     // Authoritative count comes from RUNTIME_FUNCTIONS in builtins.rs:
     // 33 base (forward-side, includes the explicit `wo` slot) + 6 saves
     //   + 9 grad outputs (dO + dq/dk/dv + dwq/dwk/dwv + dx + dx_norm)
-    //   + 1 segment_ids + 2 tier_b + 1 doc_starts + 1 tier_b2_active = 53.
-    // (tier_b2_active added in CSHA Tier B.2 Phase 3 T6.)
+    //   + 1 segment_ids + 2 tier_b + 1 doc_starts + 1 tier_b2_active
+    //   + 1 num_docs_or_zero = 54. (tier_b2_active added in CSHA Tier B.2
+    // Phase 3 T6; num_docs_or_zero added in PCA per-doc CTA Sprint 5.)
     assert_eq!(
         sig.params.len(),
-        53,
-        "nsl_flash_attention_csha_backward must accept 53 i64 params \
-         (PCA §4.3 Task 3 + Tier B + CSHA Tier B.2 tier_b2_active)"
+        54,
+        "nsl_flash_attention_csha_backward must accept 54 i64 params \
+         (PCA §4.3 Task 3 + Tier B + CSHA Tier B.2 tier_b2_active + per-doc CTA num_docs_or_zero)"
     );
 }

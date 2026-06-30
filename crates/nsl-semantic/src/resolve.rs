@@ -102,6 +102,12 @@ impl<'a> TypeResolver<'a> {
             "int16" => Type::Int16,
             "int32" => Type::Int32,
             "int64" => Type::Int64,
+            // M57.1 §3.1: short-form aliases. Codebase consistency with
+            // agent.rs/export.rs (which already emit the short form).
+            "i8" => Type::Int8,
+            "i16" => Type::Int16,
+            "i32" => Type::Int32,
+            "i64" => Type::Int64,
             "int4" => Type::Int4,
             "uint8" => Type::Uint8,
             // M35.1 BitNet ternary dtypes (spec §1.1).
@@ -382,6 +388,11 @@ impl<'a> TypeResolver<'a> {
             "int32" => DType::Int32,
             "int16" => DType::Int16,
             "int8" => DType::Int8,
+            // M57.1 §3.1: short-form aliases.
+            "i64" => DType::Int64,
+            "i32" => DType::Int32,
+            "i16" => DType::Int16,
+            "i8" => DType::Int8,
             "int4" => DType::Int4,
             "uint8" => DType::Uint8,
             "bool" => DType::Bool,
@@ -678,5 +689,67 @@ mod tests {
         let bindings = HashMap::from([(t, Type::Int)]);
 
         assert_eq!(substitute_type(&ty, &bindings), ty);
+    }
+
+    // ---------------------------------------------------------------------
+    // M57.1 §3.1 — short-form dtype aliases (i8/i16/i32/i64).
+    //
+    // Codebase consistency: crates/nsl-codegen/src/agent.rs and export.rs
+    // already use the short form; the resolver previously only accepted
+    // long-form (int8/int16/...). These aliases are purely additive — Q4
+    // decision: long-form entries remain.
+    // ---------------------------------------------------------------------
+
+    fn resolve_named_fresh(name: &str) -> Type {
+        let mut interner = nsl_lexer::Interner::new();
+        let sym = Symbol(interner.get_or_intern(name));
+        let scopes = ScopeMap::new();
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
+        let mut resolver = TypeResolver {
+            interner: &interner,
+            scopes: &scopes,
+            diagnostics: &mut diagnostics,
+        };
+        resolver.resolve_named(sym, Span::DUMMY, ScopeId::ROOT)
+    }
+
+    fn resolve_dtype_fresh(name: &str) -> DType {
+        let mut interner = nsl_lexer::Interner::new();
+        let sym = Symbol(interner.get_or_intern(name));
+        let scopes = ScopeMap::new();
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
+        let resolver = TypeResolver {
+            interner: &interner,
+            scopes: &scopes,
+            diagnostics: &mut diagnostics,
+        };
+        resolver.resolve_dtype(sym)
+    }
+
+    #[test]
+    fn resolve_dtype_shorthand_i8_to_type_int8() {
+        // i8 is the canonical short form used by the M57 spec/plan/fixture.
+        // The codebase already uses `i8` in agent.rs and export.rs (M57.1 §3.1).
+        assert_eq!(resolve_named_fresh("i8"), Type::Int8);
+        assert_eq!(resolve_named_fresh("i16"), Type::Int16);
+        assert_eq!(resolve_named_fresh("i32"), Type::Int32);
+        assert_eq!(resolve_named_fresh("i64"), Type::Int64);
+    }
+
+    #[test]
+    fn resolve_dtype_shorthand_i8_to_dtype_int8() {
+        assert_eq!(resolve_dtype_fresh("i8"), DType::Int8);
+        assert_eq!(resolve_dtype_fresh("i16"), DType::Int16);
+        assert_eq!(resolve_dtype_fresh("i32"), DType::Int32);
+        assert_eq!(resolve_dtype_fresh("i64"), DType::Int64);
+    }
+
+    #[test]
+    fn resolve_dtype_long_form_still_works() {
+        // Q4 decision: aliases are purely additive; long-form entries preserved.
+        assert_eq!(resolve_named_fresh("int8"), Type::Int8);
+        assert_eq!(resolve_named_fresh("int16"), Type::Int16);
+        assert_eq!(resolve_dtype_fresh("int8"), DType::Int8);
+        assert_eq!(resolve_dtype_fresh("int16"), DType::Int16);
     }
 }

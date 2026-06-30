@@ -21,10 +21,13 @@ use crate::wengert::WengertList;
 use crate::wggo_apply::{apply, AppliedPlan};
 use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
 use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
-use crate::wggo_dp::{solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan};
+use crate::wggo_dp::{
+    passthrough_plan, solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan,
+};
 use crate::wggo_graph::{build as build_graph, OptGraph};
 use crate::wggo_ilp::{
-    solve_all_greedy as ilp_solve_all_greedy, solve_all_templated as ilp_solve_all_templated,
+    recost_decision, solve_all_greedy as ilp_solve_all_greedy,
+    solve_all_templated as ilp_solve_all_templated, solve_layer as ilp_solve_layer,
     LayerIlpConstraints, LayerIlpSolution, TemplateStats,
 };
 use crate::wggo_schedule::{build_schedule, CommSchedule};
@@ -115,6 +118,9 @@ pub struct WggoPlan {
     pub weight_analysis: WeightAnalysisReport,
     /// Total solver wall-clock time (μs, self-reported — not measured).
     pub estimated_solve_us: u64,
+    /// Graceful-degradation / limitation warnings accumulated during the run
+    /// (e.g. "full mode infeasible, degraded to off").  Empty on a clean run.
+    pub warnings: Vec<String>,
 }
 
 impl WggoPlan {
@@ -147,13 +153,14 @@ impl WggoPlan {
         for layer in &self.applied.layers {
             writeln!(
                 s,
-                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={}, m={}b v={}b, FASE={}, PCA={}",
+                "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={} [{}], m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
                 layer.active_heads, // number of actually-kept heads (no "of total" info here)
                 layer.ffn_width,
                 layer.csha_level,
                 layer.adapter_rank,
+                layer.adapter_placement.as_str(),
                 layer.optim_m_bits,
                 layer.optim_v_bits,
                 if layer.fase_fused { "fused" } else { "deferred" },
@@ -196,6 +203,11 @@ impl WggoPlan {
         )
         .unwrap();
         writeln!(s).unwrap();
+        writeln!(s, "Warnings / limitations: {}", self.warnings.len()).unwrap();
+        for w in &self.warnings {
+            writeln!(s, "  WARNING: {w}").unwrap();
+        }
+        writeln!(s).unwrap();
         write!(s, "{}", self.schedule.render()).unwrap();
         s
     }
@@ -214,6 +226,79 @@ impl WggoPlan {
     }
 }
 
+/// Heuristic per-layer ceiling on adapter-allreduce "cost units"
+/// (`rank · placement_sites · shard_factor`) under ZeRO sharding.  An adapter
+/// whose cost exceeds this on a sharded layer trips the `WrgaVsCpdt` conflict,
+/// and the resolver drops the adapter (CPDT > WRGA).  Deterministic fallback
+/// heuristic — the repo has no measured collective-latency oracle.
+const ADAPTER_COMM_SHARD_BUDGET: f64 = 64.0;
+
+/// Greedy mode escalates conflicting layers to the full ILP when conflict
+/// resolution worsens the estimated step time by more than this fraction (G3).
+const GREEDY_RECOST_THRESHOLD: f64 = 0.05;
+
+/// Build the conflict-detector input table from the inter-layer plan and the
+/// per-layer ILP solutions.  Factored out so it can be rebuilt after greedy
+/// escalation re-solves some layers.
+fn build_layer_decisions(
+    inter: &InterLayerPlan,
+    per_layer: &[LayerIlpSolution],
+) -> Vec<LayerDecisions> {
+    inter
+        .layers
+        .iter()
+        .zip(per_layer.iter())
+        .map(|(inter_layer, sol)| LayerDecisions {
+            layer: inter_layer.layer_index,
+            csha_level: sol.decision.csha_level,
+            head_count: sol.decision.active_heads() as u32,
+            pruned_heads: (sol.decision.keep_head.len() as u32)
+                .saturating_sub(sol.decision.active_heads() as u32),
+            adapter_rank: sol.decision.adapter_rank,
+            shard_factor: inter_layer.shard_params,
+            fase_fused: sol.decision.fase_fused,
+            // Real (non-neutralized) adapter-allreduce cost under sharding so
+            // the WrgaVsCpdt detector is live in production (G8): cost grows
+            // with adapter rank, placement sites, and shard degree.
+            adapter_comm_cost: (sol.decision.adapter_rank
+                * sol.decision.adapter_placement.proj_sites() as u64
+                * inter_layer.shard_params as u64) as f64,
+            adapter_comm_budget: ADAPTER_COMM_SHARD_BUDGET,
+        })
+        .collect()
+}
+
+/// Feed the resolver's verdicts back into the per-layer ILP solutions so
+/// `apply` sees post-resolution decisions (downgraded CSHA, removed adapter,
+/// deferred FASE step).
+fn splice_resolved(per_layer: &mut [LayerIlpSolution], resolved: &[LayerDecisions]) {
+    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
+        sol.decision.csha_level = r.csha_level;
+        sol.decision.adapter_rank = r.adapter_rank;
+        sol.decision.fase_fused = r.fase_fused;
+    }
+}
+
+/// Total re-costed step time across all layers (G3 cost re-evaluation).
+fn recost_total(
+    luts: &[LayerCostLut],
+    per_layer: &[LayerIlpSolution],
+    constraints: &[LayerIlpConstraints],
+) -> f64 {
+    per_layer
+        .iter()
+        .enumerate()
+        .map(|(i, sol)| {
+            let lut = luts.get(i).or_else(|| luts.first());
+            let cons = constraints.get(i).or_else(|| constraints.first());
+            match (lut, cons) {
+                (Some(lut), Some(cons)) => recost_decision(lut, &sol.decision, cons),
+                _ => 0.0,
+            }
+        })
+        .sum()
+}
+
 /// Run the WGGO driver.
 pub fn run(input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
@@ -230,7 +315,10 @@ pub fn run(input: WggoInput) -> WggoPlan {
             importance: input.importance.clone(),
             ..Default::default()
         };
-        let inter = dp_solve(&graph, &luts, &dp_cfg);
+        // Off mode bypasses optimization, so an over-budget passthrough is the
+        // intended behavior rather than a refusal.
+        let inter =
+            dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
             vec![LayerIlpConstraints::default(); n]
         } else {
@@ -260,6 +348,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             template_stats,
             weight_analysis,
             estimated_solve_us: t0.elapsed().as_micros() as u64,
+            warnings: Vec::new(),
         };
     }
 
@@ -275,7 +364,23 @@ pub fn run(input: WggoInput) -> WggoPlan {
         importance: input.importance.clone(),
         ..Default::default()
     };
-    let inter = dp_solve(&graph, &luts, &dp_cfg);
+    // G4 degradation ladder, rung 0: the inter-layer DP is shared by Full and
+    // Greedy, so if it refuses the budget neither optimized mode can proceed —
+    // degrade to Off and run the downstream passes independently, with a
+    // warning, rather than emitting a silently over-budget optimization.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut effective_mode = input.mode;
+    let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(format!(
+                "inter-layer DP infeasible ({e}); degraded {} -> off (downstream passes run independently)",
+                effective_mode.as_str()
+            ));
+            effective_mode = WggoMode::Off;
+            passthrough_plan(&graph, &luts, &dp_cfg, gpu)
+        }
+    };
 
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
@@ -296,15 +401,13 @@ pub fn run(input: WggoInput) -> WggoPlan {
         input.scorer.as_deref(),
     );
     weight_analysis.apply_to(&mut ilp_constraints);
-    // Pre-prune the FASE option on layers CPDT will shard — fusing the
-    // optimizer step into backward conflicts with reduce-scatter ordering,
-    // and the conflict resolver would defer it anyway.
-    for (cons, lp) in ilp_constraints.iter_mut().zip(inter.layers.iter()) {
-        if lp.shard_params > 1 || lp.shard_grads > 1 || lp.shard_optim > 1 {
-            cons.allow_fase = false;
-        }
-    }
-    let (per_layer, template_stats) = match input.mode {
+    // NOTE: FASE is intentionally *not* pre-pruned on sharded layers here.
+    // Letting the ILP pick a fused optimizer step and then resolving the
+    // resulting FaseVsCpdt conflict (DeferFaseStep) is the architecturally
+    // correct path: it keeps the conflict detector live in production (G8) and
+    // surfaces a visible resolution in the report, instead of silently
+    // disabling the option before it can ever conflict.
+    let (mut per_layer, mut template_stats) = match effective_mode {
         WggoMode::Greedy => (
             ilp_solve_all_greedy(&luts, &ilp_constraints),
             TemplateStats::default(),
@@ -312,48 +415,73 @@ pub fn run(input: WggoInput) -> WggoPlan {
         _ => ilp_solve_all_templated(&luts, &ilp_constraints),
     };
 
-    // 6. Build initial LayerDecisions vector for conflict detection.
-    let layer_decisions: Vec<LayerDecisions> = inter
-        .layers
-        .iter()
-        .zip(per_layer.iter())
-        .map(|(inter_layer, sol)| LayerDecisions {
-            layer: inter_layer.layer_index,
-            csha_level: sol.decision.csha_level,
-            head_count: sol.decision.active_heads() as u32,
-            pruned_heads: (sol.decision.keep_head.len() as u32)
-                .saturating_sub(sol.decision.active_heads() as u32),
-            adapter_rank: sol.decision.adapter_rank,
-            shard_factor: inter_layer.shard_params,
-            fase_fused: sol.decision.fase_fused,
-            adapter_comm_cost: 0.0,
-            adapter_comm_budget: f64::MAX,
-        })
-        .collect();
-
-    // 7. Conflict detection + resolution (greedy mode resolves here;
-    //    Full mode still runs the same resolver because the ILP itself
-    //    already honours the hard constraints — remaining conflicts are
-    //    the ones crossing technique boundaries).
-    let (resolved, resolutions) = greedy_resolve(layer_decisions);
-
-    // Feed the resolver's verdicts back into the per-layer ILP solutions so
-    // `apply` sees the post-resolution decisions, not the pre-resolution
-    // ones.  The resolver may have downgraded CSHA, removed an adapter, or
-    // deferred a FASE fused step.
-    let mut per_layer = per_layer;
-    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
-        sol.decision.csha_level = r.csha_level;
-        sol.decision.adapter_rank = r.adapter_rank;
-        sol.decision.fase_fused = r.fase_fused;
+    // G4 degradation ladder, rung 1: if the full branch-and-bound ILP could not
+    // make a single layer feasible, fall back to the greedy solver before
+    // giving up entirely.
+    if effective_mode == WggoMode::Full
+        && !per_layer.is_empty()
+        && per_layer.iter().all(|s| !s.feasible)
+    {
+        warnings.push("full ILP found no feasible layer; degraded full -> greedy".to_string());
+        effective_mode = WggoMode::Greedy;
+        per_layer = ilp_solve_all_greedy(&luts, &ilp_constraints);
+        template_stats = TemplateStats::default();
     }
+
+    // 6-7. Conflict detection + resolution — skipped in Off (or degraded-Off)
+    //      mode, which runs the downstream passes independently.
+    let resolutions = if effective_mode == WggoMode::Off {
+        Vec::new()
+    } else {
+        let layer_decisions = build_layer_decisions(&inter, &per_layer);
+        // Capture the pre-resolution cost so greedy mode can detect a
+        // resolution-induced regression below.
+        let cost_before: f64 = per_layer
+            .iter()
+            .filter(|s| s.cost_us.is_finite())
+            .map(|s| s.cost_us)
+            .sum();
+        let (resolved, mut resolutions) = greedy_resolve(layer_decisions);
+        splice_resolved(&mut per_layer, &resolved);
+
+        // G3 (greedy mode only): re-cost the resolved configuration and, if the
+        // conflict resolution worsened it beyond the threshold, escalate the
+        // conflicting layers to the full ILP and re-resolve.  Greedy's fast
+        // local heuristics can leave a lot on the table once a conflict forces
+        // a change, so spending the full branch-and-bound on just those layers
+        // recovers quality without the cost of a full-model ILP.
+        if effective_mode == WggoMode::Greedy && !resolutions.is_empty() {
+            let cost_after = recost_total(&luts, &per_layer, &ilp_constraints);
+            if cost_after > cost_before * (1.0 + GREEDY_RECOST_THRESHOLD) {
+                let conflicting: std::collections::HashSet<u32> =
+                    resolutions.iter().filter_map(|r| r.layer()).collect();
+                for (i, inter_layer) in inter.layers.iter().enumerate() {
+                    if conflicting.contains(&inter_layer.layer_index) {
+                        // Defensive indexing (mirrors recost_total) — a caller
+                        // may pass fewer ilp_constraints than layers.
+                        if let (Some(lut), Some(cons)) =
+                            (luts.get(i).or_else(|| luts.first()), ilp_constraints.get(i).or_else(|| ilp_constraints.first()))
+                        {
+                            per_layer[i] = ilp_solve_layer(lut, cons);
+                        }
+                    }
+                }
+                // Re-detect + re-resolve on the escalated decisions.
+                let ld2 = build_layer_decisions(&inter, &per_layer);
+                let (resolved2, resolutions2) = greedy_resolve(ld2);
+                splice_resolved(&mut per_layer, &resolved2);
+                resolutions = resolutions2;
+            }
+        }
+        resolutions
+    };
 
     // 8. Apply + communication schedule.
     let applied = apply(&inter, &per_layer);
     let schedule = build_schedule(&inter, &applied);
 
     WggoPlan {
-        mode: input.mode,
+        mode: effective_mode,
         target_gpu: gpu.name.to_string(),
         graph,
         inter_layer: inter,
@@ -364,6 +492,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         template_stats,
         weight_analysis,
         estimated_solve_us: t0.elapsed().as_micros() as u64,
+        warnings,
     }
 }
 
@@ -522,22 +651,30 @@ pub fn run_on_wengert_with_weights(
 
     // Load the weights file up front so its lifetime covers the call.
     // Skip the load when the cache hit already carries the scores.
+    // On failure, capture the message so it lands in the plan's report
+    // (Phase 9 field 6) — not only on stderr (G11).
+    let mut load_warning: Option<String> = None;
     let checkpoint = if cached_report.is_some() {
         None
     } else {
-        weights_path.and_then(|p| {
-            match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
-                Ok(ck) => Some(ck),
-                Err(e) => {
-                    eprintln!(
-                        "[wggo] warning: could not load weights from {}: {} — falling back to uniform scores",
-                        p.display(),
-                        e
-                    );
-                    None
+        match weights_path {
+            Some(p) => {
+                match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
+                    Ok(ck) => Some(ck),
+                    Err(e) => {
+                        let msg = format!(
+                            "could not load weights from {}: {} — falling back to uniform importance scores",
+                            p.display(),
+                            e
+                        );
+                        eprintln!("[wggo] warning: {msg}");
+                        load_warning = Some(msg);
+                        None
+                    }
                 }
             }
-        })
+            None => None,
+        }
     };
     let weights_ref: Option<&dyn WeightProvider> = checkpoint
         .as_ref()
@@ -585,6 +722,13 @@ pub fn run_on_wengert_with_weights(
         scorer,
     };
     let mut plan = run(input);
+
+    // Surface the weights-load failure (if any) in the report itself, not
+    // only on stderr.  Prepended-style: it precedes any degradation warnings
+    // run() may have added.
+    if let Some(msg) = load_warning {
+        plan.warnings.insert(0, msg);
+    }
 
     // Overwrite with cached report when it was a hit — saves both the
     // checkpoint load and the analyzer's per-layer L2 reductions.
@@ -855,10 +999,24 @@ mod tests {
 
     #[test]
     fn schedule_present_for_multi_gpu_run() {
-        // Multi-GPU triggers ZeRO sharding via the inter-layer DP, which
-        // in turn forces the schedule to issue collectives.
+        // Multi-GPU *under memory pressure* triggers ZeRO sharding via the
+        // inter-layer DP, which in turn forces the schedule to issue
+        // collectives.  (Without pressure the DP correctly keeps shard=1 and
+        // the schedule stays empty — sharding is a memory/comm trade-off, not
+        // an unconditional consequence of having multiple GPUs.)
         let w = two_block_wengert();
-        let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
+        let mut inp = toy_input(&w);
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
+        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
+        inp.cluster = ClusterSpec {
+            num_gpus: 8,
+            memory_budget: 2 * sharded + sharded / 2,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        };
+        let plan = run(inp);
         assert!(plan.schedule.total_collectives >= 1);
         let rep = plan.render_report();
         assert!(rep.contains("Communication schedule"));
@@ -869,6 +1027,183 @@ mod tests {
         let w = two_block_wengert();
         let plan = run_on_wengert(&w, "H100", "full", 1).expect("plan");
         assert_eq!(plan.schedule.total_collectives, 0);
+    }
+
+    /// Helper: a memory-pressured cluster that forces the DP to shard every
+    /// layer (the sharded footprint of all layers fits, the unsharded one does
+    /// not) — so the DP stays feasible and conflicts fire via the real path.
+    fn sharded_cluster(inp: &WggoInput) -> ClusterSpec {
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
+        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
+        let n = build_graph(inp.wengert).layers.len() as u64;
+        ClusterSpec {
+            num_gpus: 8,
+            memory_budget: (n + 1) * sharded,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        }
+    }
+
+    #[test]
+    fn fase_vs_cpdt_conflict_fires_and_defers() {
+        // FASE is no longer pre-pruned on sharded layers (G8): the ILP picks a
+        // fused optimizer step and the now-live FaseVsCpdt conflict defers it.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.cluster = sharded_cluster(&inp);
+        let plan = run(inp);
+        assert!(
+            plan.resolutions
+                .iter()
+                .any(|r| matches!(r, Resolution::DeferFaseStep { .. })),
+            "expected a DeferFaseStep resolution, got {:?}",
+            plan.resolutions
+        );
+    }
+
+    #[test]
+    fn wrga_vs_cpdt_conflict_fires_when_sharded() {
+        // Force a large adapter on every layer (no rank-0 option) on a sharded
+        // cluster.  The driver now feeds a real adapter-allreduce cost (G8), so
+        // the WrgaVsCpdt detector fires and the resolver drops the adapter.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.lut_axes = LutAxes {
+            adapter_ranks: vec![16],
+            ..LutAxes::default()
+        };
+        inp.cluster = sharded_cluster(&inp);
+        let plan = run(inp);
+        assert!(
+            plan.resolutions
+                .iter()
+                .any(|r| matches!(r, Resolution::RemoveWrgaAdapter { .. })),
+            "expected a RemoveWrgaAdapter resolution, got {:?}",
+            plan.resolutions
+        );
+    }
+
+    #[test]
+    fn greedy_recost_escalates_conflicting_layers_to_full_ilp() {
+        // Sharded greedy run: the ILP picks a fused FASE step, the FaseVsCpdt
+        // conflict defers it, and (with a large FASE speedup) that deferral is
+        // a big cost regression — so the conflicting layers are re-solved by
+        // the full branch-and-bound ILP (G3).  The greedy solver explores only
+        // a handful of nodes; the full solver explores far more.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.mode = WggoMode::Greedy;
+        inp.cluster = sharded_cluster(&inp);
+        let n = build_graph(&w).layers.len();
+        let mut cons = LayerIlpConstraints::default();
+        cons.fase_backward_speedup = 0.5;
+        inp.ilp_constraints = vec![cons; n];
+        let plan = run(inp);
+        let nodes: Vec<u64> = plan.per_layer.iter().map(|s| s.nodes_explored).collect();
+        assert!(
+            nodes.iter().any(|&n| n > 100),
+            "expected a conflicting layer escalated to the full ILP, got nodes {nodes:?}"
+        );
+    }
+
+    #[test]
+    fn greedy_without_conflicts_does_not_escalate() {
+        // Single-GPU greedy run: no sharding → no conflicts → no escalation, so
+        // the cheap greedy solutions are kept (few nodes explored).
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.mode = WggoMode::Greedy;
+        let plan = run(inp);
+        assert!(
+            plan.resolutions.is_empty(),
+            "single-GPU run should produce no conflicts"
+        );
+        assert!(
+            plan.per_layer.iter().all(|s| s.nodes_explored < 100),
+            "no conflicts → greedy solutions kept, no escalation"
+        );
+    }
+
+    #[test]
+    fn full_mode_degrades_to_off_on_infeasible_budget() {
+        // 1-byte budget, no shard/prune relief → the DP refuses; Full must
+        // degrade gracefully to Off with a warning rather than crash or emit an
+        // over-budget plan (G4).
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.cluster = ClusterSpec {
+            num_gpus: 1,
+            memory_budget: 1,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        };
+        let plan = run(inp);
+        assert_eq!(
+            plan.mode,
+            WggoMode::Off,
+            "Full should degrade to Off when the DP refuses"
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("infeasible")),
+            "degradation must record a warning, got {:?}",
+            plan.warnings
+        );
+        assert!(
+            !plan.applied.layers.is_empty(),
+            "degraded run still produces a usable plan"
+        );
+    }
+
+    #[test]
+    fn report_contains_warnings_section() {
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.cluster = ClusterSpec {
+            num_gpus: 1,
+            memory_budget: 1,
+            max_stages: 1,
+            interconnect_gbs: 300.0,
+        };
+        let rep = run(inp).render_report();
+        assert!(rep.contains("Warnings / limitations:"));
+        assert!(rep.contains("WARNING:"));
+    }
+
+    #[test]
+    fn clean_run_has_no_warnings() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(plan.warnings.is_empty());
+        assert!(plan.render_report().contains("Warnings / limitations: 0"));
+    }
+
+    /// G11: a weights-load failure must surface in the plan's report
+    /// (`warnings` -> "Warnings / limitations" section), not only on stderr.
+    #[test]
+    fn weights_load_failure_surfaces_in_report() {
+        let w = two_block_wengert();
+        let missing = std::path::Path::new("definitely/does/not/exist.nslweights");
+        let plan = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            Some(missing),
+            AnalysisConfig::default(),
+            None,
+        )
+        .expect("plan is still produced via uniform-importance fallback");
+        assert!(
+            plan.warnings.iter().any(|m| m.contains("could not load weights")),
+            "load failure missing from plan.warnings: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.render_report().contains("could not load weights"),
+            "load failure missing from rendered report"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1094,7 +1429,7 @@ mod tests {
         };
 
         let mut opts = CompileOptions::default();
-        opts.wggo_importance = WggoImportance::Auto;
+        opts.wggo.importance = WggoImportance::Auto;
         opts.calibration_sidecar = Some(sidecar);
 
         let w = two_block_wengert();

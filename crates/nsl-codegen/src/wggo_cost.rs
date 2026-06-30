@@ -277,6 +277,43 @@ fn evaluate_single(
     }
 }
 
+/// Communication + optimizer-step latency (μs) for one layer under ZeRO
+/// sharding.
+///
+/// These two cost components are *shard-dependent*, so they are deliberately
+/// kept out of the shard-agnostic [`LayerCostEntry`] LUT and computed here
+/// once the inter-layer DP (or greedy re-cost) has fixed a layer's shard
+/// factors.
+///
+/// **Deterministic fallback heuristic** — the repo has no measured
+/// collective-latency oracle, so this models well-known first-order costs:
+///  * ZeRO comm ≈ `2·param_bytes·(S-1)/S` bytes per step (all-gather params +
+///    reduce-scatter grads) over the inter-GPU interconnect; `shard_comm <= 1`
+///    means no collective, so comm is exactly `0`.
+///  * Adam's optimizer step is memory-bound: it reads+writes the parameter
+///    plus two moment buffers ≈ `6·param_bytes / shard_optim` bytes over HBM
+///    bandwidth (`gpu.peak_bandwidth_gbs`).
+///
+/// Returns `(comm_us, optim_us)`.
+pub fn comm_optim_us(
+    param_bytes: u64,
+    shard_comm: u32,
+    shard_optim: u32,
+    interconnect_gbs: f64,
+    gpu: &GpuSpec,
+) -> (f64, f64) {
+    let comm_us = if shard_comm <= 1 {
+        0.0
+    } else {
+        let s = shard_comm as f64;
+        let bytes = 2.0 * param_bytes as f64 * (s - 1.0) / s;
+        bytes / (interconnect_gbs.max(1.0) * 1e9) * 1e6
+    };
+    let optim_bytes = 6.0 * param_bytes as f64 / (shard_optim.max(1) as f64);
+    let optim_us = optim_bytes / (gpu.peak_bandwidth_gbs.max(1.0) * 1e9) * 1e6;
+    (comm_us, optim_us)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -301,6 +338,37 @@ mod tests {
             n_kv_heads: 4,
             dtype_bytes: 2,
         }
+    }
+
+    #[test]
+    fn comm_is_zero_when_unsharded() {
+        let (comm, _optim) = comm_optim_us(1_000_000, 1, 1, 300.0, h100());
+        assert_eq!(comm, 0.0);
+    }
+
+    #[test]
+    fn comm_grows_with_shard_and_bytes() {
+        let (c2, _) = comm_optim_us(1_000_000, 2, 2, 300.0, h100());
+        let (c8, _) = comm_optim_us(1_000_000, 8, 8, 300.0, h100());
+        let (c8_big, _) = comm_optim_us(4_000_000, 8, 8, 300.0, h100());
+        assert!(c2 > 0.0);
+        assert!(c8 > c2);
+        assert!(c8_big > c8);
+    }
+
+    #[test]
+    fn optim_time_decreases_with_optim_shard() {
+        let (_, o1) = comm_optim_us(1_000_000, 1, 1, 300.0, h100());
+        let (_, o8) = comm_optim_us(1_000_000, 1, 8, 300.0, h100());
+        assert!(o1 > 0.0);
+        assert!(o8 < o1);
+    }
+
+    #[test]
+    fn comm_optim_is_deterministic() {
+        let a = comm_optim_us(1_234_567, 4, 4, 300.0, h100());
+        let b = comm_optim_us(1_234_567, 4, 4, 300.0, h100());
+        assert_eq!(a, b);
     }
 
     #[test]

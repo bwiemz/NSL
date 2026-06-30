@@ -470,6 +470,54 @@ fn csha_tier_b1_chunk_for_kernel(name_ptr: i64) -> Option<u32> {
     std::str::from_utf8(&rest[..end]).ok()?.parse::<u32>().ok()
 }
 
+/// Read the null-terminated kernel name into an owned `String` for
+/// diagnostic logging. Returns `"<null>"` for a zero `name_ptr`. Truncates
+/// at 256 bytes to bound an accidental run-away scan if the pointer
+/// references uninitialised memory.
+#[cfg(feature = "cuda")]
+fn csha_kernel_name_for_diag(name_ptr: i64) -> String {
+    if name_ptr == 0 {
+        return "<null>".into();
+    }
+    unsafe {
+        let c = name_ptr as *const u8;
+        let mut end = 0usize;
+        while end < 256 && *c.add(end) != 0 {
+            end += 1;
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
+    }
+}
+
+/// Detect a per-document CTA kernel by name-suffix.
+///
+/// The per-doc CTA forward kernel emitted by
+/// `nsl_codegen::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`
+/// appends the `_per_doc_cta` suffix to its entry-point name (mirrors the
+/// `_tier_b1_chunk<N>` pattern used by Tier B.1).
+///
+/// When this returns `true`, the FFI dispatch uses:
+///   * `grid_x = num_docs` (from the `num_docs_or_zero` trailing arg)
+///     instead of `ceil(seq/block_q)`
+///   * `block_x = 128` (per-doc kernel is 4 warps, same as FA-2 default)
+///
+/// The signal lives in the kernel name (not a new FFI arg) for the *kernel
+/// identity* — `num_docs_or_zero` carries the *runtime grid_x*.
+///
+/// Safety: caller guarantees `name_ptr`, when non-zero, points to a
+/// null-terminated C string.
+#[cfg(feature = "cuda")]
+fn csha_is_per_doc_cta_kernel(name_ptr: i64) -> bool {
+    if name_ptr == 0 {
+        return false;
+    }
+    let name_bytes = unsafe {
+        std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes()
+    };
+    let marker = b"_per_doc_cta";
+    name_bytes.windows(marker.len()).any(|w| w == marker)
+}
+
 /// Tier B.1 per-call x-scratch RAII holder. Drops free the GPU scratch
 /// buffer after `cuCtxSynchronize`, ensuring the kernel reading from
 /// it has completed.
@@ -618,6 +666,24 @@ pub extern "C" fn nsl_flash_attention_csha(
     // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
+    // PCA per-doc CTA (Strategy 3 v1): number of documents in the batch.
+    // Pass 0 for legacy (non-per-doc) topology; the standard
+    // `grid_x = ceil(seq_len / block_q)` is used. Pass non-zero ONLY when
+    // the dispatched kernel's name carries the `_per_doc_cta` suffix —
+    // grid_x is then overridden to `num_docs_or_zero` per Strategy 3's
+    // one-CTA-per-document launch contract. Mismatched signal/topology
+    // (suffix present + zero count, or zero suffix + nonzero count)
+    // returns -1 with an `eprintln!` diagnostic on `[nsl::flash_attention]`.
+    //
+    // Discussion: an alternative design reads the sentinel from
+    // `doc_starts_ptr` via a synchronous `cuMemcpyDtoH_v2` per launch,
+    // avoiding the ABI change. We rejected that because (1) the D2H
+    // copy adds a host-device round-trip per kernel launch on the
+    // hot per-step path, defeating Strategy 3's whole-point; (2) the
+    // explicit arg makes mismatched callers a compile-time Cranelift
+    // sig error rather than a silent grid_x miscalculation; (3) the
+    // sentinel-0 default is byte-identical for every existing caller.
+    num_docs_or_zero: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -665,7 +731,53 @@ pub extern "C" fn nsl_flash_attention_csha(
         } else {
             heads
         };
-        let grid_x = (seq_len + block_q - 1) / block_q;
+
+        // PCA per-doc CTA (Strategy 3 v1) topology detection.
+        // The kernel name carries `_per_doc_cta` when codegen emitted the
+        // per-doc CTA forward kernel. Launch geometry differs from the
+        // standard FA-2 path:
+        //   * grid_x = num_docs (one CTA per document, NOT ceil(seq/block_q))
+        //   * grid_y = batch * heads (unchanged)
+        //   * grid_z = 1               (unchanged)
+        //   * block_x = 128            (4 warps, same as FA-2 default)
+        // The caller MUST pass `num_docs_or_zero > 0` AND
+        // `doc_starts_ptr != 0` when launching a per-doc CTA variant.
+        let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
+        if per_doc_cta {
+            if num_docs_or_zero <= 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha: per-doc CTA kernel \
+                     ({:?}) requires num_docs_or_zero > 0, got {}",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                    num_docs_or_zero,
+                );
+                return -1;
+            }
+            if doc_starts_ptr == 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha: per-doc CTA kernel \
+                     ({:?}) requires doc_starts_ptr != 0",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                );
+                return -1;
+            }
+        } else if num_docs_or_zero > 0 {
+            // Caller passed a per-doc grid_x but the dispatched kernel is
+            // not a per-doc variant — likely a planner/dispatch bug.
+            eprintln!(
+                "[nsl::flash_attention] nsl_flash_attention_csha: num_docs_or_zero={} provided but \
+                 kernel name {:?} lacks the `_per_doc_cta` suffix",
+                num_docs_or_zero,
+                csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
+
+        let grid_x = if per_doc_cta {
+            num_docs_or_zero
+        } else {
+            (seq_len + block_q - 1) / block_q
+        };
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
         // Tier B.1 launch geometry: the pipelined-MMA codegen emits a
@@ -869,6 +981,7 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr, doc_starts_ptr);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = num_docs_or_zero;
         eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
         -1
     }
@@ -956,6 +1069,10 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
+    // PCA per-doc CTA (Strategy 3 v1): number of documents in the batch.
+    // See `nsl_flash_attention_csha` for the full contract; this variant
+    // mirrors that behaviour exactly.
+    num_docs_or_zero: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -987,7 +1104,44 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         } else {
             heads
         };
-        let grid_x = (seq_len + block_q - 1) / block_q;
+
+        // PCA per-doc CTA (Strategy 3 v1) topology — see the matching
+        // block in `nsl_flash_attention_csha` for the full contract +
+        // alternative-design discussion.
+        let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
+        if per_doc_cta {
+            if num_docs_or_zero <= 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: per-doc CTA kernel \
+                     ({:?}) requires num_docs_or_zero > 0, got {}",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                    num_docs_or_zero,
+                );
+                return -1;
+            }
+            if doc_starts_ptr == 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: per-doc CTA kernel \
+                     ({:?}) requires doc_starts_ptr != 0",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                );
+                return -1;
+            }
+        } else if num_docs_or_zero > 0 {
+            eprintln!(
+                "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: num_docs_or_zero={} provided but \
+                 kernel name {:?} lacks the `_per_doc_cta` suffix",
+                num_docs_or_zero,
+                csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
+
+        let grid_x = if per_doc_cta {
+            num_docs_or_zero
+        } else {
+            (seq_len + block_q - 1) / block_q
+        };
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
         // Tier B.1 launch geometry signal via kernel name suffix; see
@@ -1251,6 +1405,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr, doc_starts_ptr);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = num_docs_or_zero;
         eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
@@ -1358,6 +1513,16 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // kernel-name-suffix sniffing — the dispatch decision is made in codegen
     // (see `tier_b2_hybrid_backward_eligible`) and threaded here. See spec §7.
     tier_b2_active: i64,
+    // PCA per-doc CTA backward (Sprint 5): number of documents in the
+    // batch. Pass 0 for legacy (non-per-doc) topology; the standard
+    // `q_blocks` outer loop drives grid_x=1 launches per q-block. Pass
+    // non-zero ONLY when the dispatched backward kernel's name carries
+    // the `_per_doc_cta` suffix — grid_x is then overridden to
+    // `num_docs_or_zero` per Sprint 5's one-CTA-per-document backward
+    // launch contract, and the `q_blocks` outer loop is skipped.
+    // Mismatched signal/topology (suffix present + zero count, or zero
+    // suffix + nonzero count) returns -1 with an `eprintln!` diagnostic.
+    num_docs_or_zero: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -1439,8 +1604,43 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         } else {
             heads
         };
+        // PCA per-doc CTA (Sprint 5) topology detection. Mirrors the
+        // forward `nsl_flash_attention_csha` dispatch: when the kernel
+        // name carries `_per_doc_cta`, the backward launches with
+        // grid_x=num_docs (one CTA per document) and skips the per-q-block
+        // outer launch loop entirely (the kernel's per-doc prelude derives
+        // %q_start from doc_starts[bid_x] instead of bid_x*block_q +
+        // q_launch_base, so the slens-threaded q-block trick is unused).
+        let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
+        if per_doc_cta {
+            if num_docs_or_zero <= 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_backward: per-doc CTA \
+                     kernel ({:?}) requires num_docs_or_zero > 0, got {}",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                    num_docs_or_zero,
+                );
+                return -1;
+            }
+            if doc_starts_ptr == 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_backward: per-doc CTA \
+                     kernel ({:?}) requires doc_starts_ptr != 0",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                );
+                return -1;
+            }
+        } else if num_docs_or_zero > 0 {
+            eprintln!(
+                "[nsl::flash_attention] nsl_flash_attention_csha_backward: num_docs_or_zero={} \
+                 provided but kernel name {:?} lacks the `_per_doc_cta` suffix",
+                num_docs_or_zero,
+                csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
         let q_blocks = (seq_len + block_q - 1) / block_q;
-        let grid_x = 1i64;
+        let grid_x = if per_doc_cta { num_docs_or_zero } else { 1i64 };
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
         let block_x = 128i64;
@@ -1618,14 +1818,13 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         }
 
         let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
-        for q_block in 0..q_blocks {
-            // Thread the q-block base into seq_lens_ptr slot via `slens`.
-            // Raw-ptr use: `args[16]` holds `&mut slens`, and CUDA's
-            // `cuLaunchKernel` reads the pointee at call time, so each
-            // iteration's assignment is picked up by the next launch.
-            // `black_box` prevents the optimizer from eliding the write
-            // because dataflow analysis can't see the read-through-ptr.
-            slens = (q_block * block_q) as u64;
+        if per_doc_cta {
+            // Per-doc CTA: ONE launch with grid_x=num_docs. The kernel's
+            // per-doc prelude derives %q_start from doc_starts[bid_x],
+            // ignoring %q_launch_base, so the slens-threaded q-block trick
+            // is not needed (and would be incorrect — there is no global
+            // q-block ordinal in the per-doc launch).
+            slens = 0u64;
             let _ = std::hint::black_box(&slens);
             rc = crate::cuda::inner::kernel_launch(
                 effective_ptx_ptr as *const u8,
@@ -1635,8 +1834,27 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
                 &args,
                 shared_mem_bytes as u32,
             );
-            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                break;
+        } else {
+            for q_block in 0..q_blocks {
+                // Thread the q-block base into seq_lens_ptr slot via `slens`.
+                // Raw-ptr use: `args[16]` holds `&mut slens`, and CUDA's
+                // `cuLaunchKernel` reads the pointee at call time, so each
+                // iteration's assignment is picked up by the next launch.
+                // `black_box` prevents the optimizer from eliding the write
+                // because dataflow analysis can't see the read-through-ptr.
+                slens = (q_block * block_q) as u64;
+                let _ = std::hint::black_box(&slens);
+                rc = crate::cuda::inner::kernel_launch(
+                    effective_ptx_ptr as *const u8,
+                    effective_name_ptr as *const u8,
+                    [grid_x, grid_y, grid_z],
+                    [block_x, block_y, block_z],
+                    &args,
+                    shared_mem_bytes as u32,
+                );
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    break;
+                }
             }
         }
 
@@ -1744,6 +1962,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
         let _ = (segment_ids_ptr, doc_starts_ptr, tier_b2_active);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = num_docs_or_zero;
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
@@ -4630,6 +4849,8 @@ mod tests {
             0, 0,
             // PCA §4.3: doc_starts_ptr (0 = identity positions).
             0,
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero (0 = legacy topology).
+            0,
         );
         assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
     }
@@ -4712,6 +4933,7 @@ mod tests {
     /// Updated in PCA Tier A Task 3C: trailing segment_ids_ptr added.
     /// Updated in PCA Tier B Planner P-3.4: two trailing tier_b_* params added.
     /// Updated in PCA §4.3 Task 3: trailing doc_starts_ptr added.
+    /// Updated in PCA per-doc CTA Strategy 3 v1: trailing num_docs_or_zero added.
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn a25_csha_ffi_signature_has_thirty_params() {
@@ -4730,6 +4952,8 @@ mod tests {
             // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr
             i64, i64,
             // PCA §4.3: doc_starts_ptr
+            i64,
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero
             i64,
         ) -> i64 = nsl_flash_attention_csha;
     }

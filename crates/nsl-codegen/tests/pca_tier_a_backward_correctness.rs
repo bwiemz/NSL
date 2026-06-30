@@ -208,7 +208,15 @@ fn flash_attention_forward_reference_with_stats(
         let j_max = if causal { i + 1 } else { seq_len };
         let mut scores = vec![f32::NEG_INFINITY; seq_len];
         let mut max_score = f32::NEG_INFINITY;
-        let seg_i = segment_masked.then(|| seg_ids[i]);
+        // Null-guard mirror: when seg_ids is empty (GPU null-guard case),
+        // treat as unmasked regardless of segment_masked flag — the GPU kernel's
+        // skip-before-dereference guard writes all-zero seg_smem sentinel which
+        // has the same effect as no masking.
+        let seg_i = if segment_masked && !seg_ids.is_empty() {
+            Some(seg_ids[i])
+        } else {
+            None
+        };
 
         for (j, score_slot) in scores.iter_mut().enumerate().take(j_max) {
             if let Some(seg_i) = seg_i {
@@ -316,9 +324,60 @@ fn pca_backward_config(segment_masked: bool) -> FlashAttentionConfig {
             active_heads:                  1,
             rmsnorm_eps:                   1e-5,
             d_model:                       32,
+            skip_rmsnorm_prologue:         false,
         }),
         checkpoint: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parameterized backward config builder — lets callers force the
+// extern-SMEM regime (e.g. head_dim=128, block_q=block_kv=128) and
+// exercise RoPE (rope_q=true).
+//
+// Clones `pca_backward_config(segment_masked)` and overrides the four
+// caller-supplied fields. The CSHA extras (d_model, eps, etc.) are
+// inherited from the base config unchanged.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)] // used by Task 3/5/7 GPU tests
+fn pca_backward_config_sized(
+    head_dim: i64, block_q: i64, block_kv: i64, rope_q: bool, segment_masked: bool,
+) -> FlashAttentionConfig {
+    let mut c = pca_backward_config(segment_masked);
+    c.head_dim = head_dim;
+    c.block_q  = block_q;
+    c.block_kv = block_kv;
+    c.rope_q   = rope_q;
+    c
+}
+
+// ---------------------------------------------------------------------------
+// RoPE cos/sin table generator for backward tests.
+//
+// Generates standard RoPE tables in the [seq_len, half_dim] layout that
+// the CSHA kernel's `emit_rope_pair_sweep` reads.  Element type is f16
+// (the kernel does `ld.global.b16` + `cvt.f32.f16`).
+//
+// Address: (pos * half_dim + i) * 2 bytes  (2 = sizeof(f16))
+// Theta:   pos / 10000^(2*i / head_dim)
+//
+// Returns Vec<u16> of f16 bits, ready for nsl_test_cuda_h2d.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)] // used by Task 3/5/7 GPU tests
+fn rope_cos_sin_tables_f16(seq_len: usize, head_dim: usize) -> (Vec<u16>, Vec<u16>) {
+    let half = head_dim / 2;
+    let mut cos_f16 = vec![0u16; seq_len * half];
+    let mut sin_f16 = vec![0u16; seq_len * half];
+    for pos in 0..seq_len {
+        for i in 0..half {
+            let theta = (pos as f64) * 10_000f64.powf(-(2.0 * i as f64) / head_dim as f64);
+            cos_f16[pos * half + i] = f32_to_f16_bits(theta.cos() as f32);
+            sin_f16[pos * half + i] = f32_to_f16_bits(theta.sin() as f32);
+        }
+    }
+    (cos_f16, sin_f16)
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +691,13 @@ fn launch_pca_backward(
             dxn_dev,
             // PCA Task 4B: trailing segment_ids.
             seg_dev,
+            // Tier B extension — null (not used for Tier A tests)
+            0i64, 0i64,
+            // doc_starts ptr — null (rope_q=false, no doc-aware positions)
+            0i64,
+            // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
+            // means legacy per-q-block topology (Tier A; not per-doc).
+            0i64,
         )
     };
     // DEBUG: sync + report any async fault from the backward launch.
@@ -1209,6 +1275,109 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     eprintln!("Fixture 3 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}", dq_diff, dk_diff, dv_diff, tol);
 }
 
+// ===========================================================================
+// A-4 Test 2: null seg_ids_ptr guard — masked+null must equal unmasked backward
+//
+// Validates the same null-guard in the BACKWARD kernel: when seg_ids_ptr==0
+// the kernel must behave identically to the segment_masked=false path.
+//
+// The launch_pca_backward helper passes seg_dev=0 when segment_masked is
+// true but seg_ids_host is empty (see harness, line 488-501).
+//
+// Tolerance: 5e-3 — matches the file's established backward tolerance.
+//
+// CRITICAL: if cuda_available() is true and the masked-null launch returns
+// None, we PANIC (guard failure), not skip.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn masked_null_seg_ptr_equals_unmasked_backward() {
+    if !cuda_available() {
+        eprintln!("skipped: no CUDA device");
+        return;
+    }
+
+    let seq_len  = 128usize;
+    let head_dim = 32usize;
+    let total    = seq_len * head_dim;
+
+    let mut x      = vec![0f32; total];
+    let mut do_f32 = vec![0f32; total];
+    fill_seeded(&mut x,      0xA4B4_C4D4);
+    fill_seeded(&mut do_f32, 0x5566_7788);
+
+    let n_weights = head_dim * head_dim;
+    let mut wq_f32 = vec![0f32; n_weights];
+    let mut wk_f32 = vec![0f32; n_weights];
+    let mut wv_f32 = vec![0f32; n_weights];
+    fill_seeded(&mut wq_f32, 0x1111_2222);
+    fill_seeded(&mut wk_f32, 0x3333_4444);
+    fill_seeded(&mut wv_f32, 0x5555_6666);
+    let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+    eprintln!("A-4 Test 2 — baseline backward (segment_masked=false)");
+    let baseline = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim,
+        &[],   // empty → seg_dev=0
+        false, // segment_masked=false
+    );
+
+    eprintln!("A-4 Test 2 — masked+null backward (segment_masked=true, empty seg_ids → ptr=0)");
+    let masked_null = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim,
+        &[],   // empty → seg_dev=0 (NULL)
+        true,  // segment_masked=true
+    );
+
+    // CRITICAL: if the GPU is present and the masked-null launch returned None,
+    // the null-guard failed (kernel crashed on NULL dereference).
+    let (dq1, dk1, dv1) = masked_null.unwrap_or_else(|| {
+        panic!(
+            "masked backward kernel crashed on null seg_ids_ptr — A-3 null-guard FAILED \
+             (segment_masked=true, seg_ids_ptr=0 should be safe)"
+        )
+    });
+    let (dq0, dk0, dv0) = baseline.expect(
+        "baseline (segment_masked=false) backward launch failed unexpectedly"
+    );
+
+    for (name, arr) in [
+        ("dq0", &dq0), ("dk0", &dk0), ("dv0", &dv0),
+        ("dq1", &dq1), ("dk1", &dk1), ("dv1", &dv1),
+    ] {
+        assert_no_nan(name, arr, "A-4 Test 2");
+    }
+
+    let (dq_diff, dq_idx) = max_abs_diff(&dq1, &dq0);
+    let (dk_diff, dk_idx) = max_abs_diff(&dk1, &dk0);
+    let (dv_diff, dv_idx) = max_abs_diff(&dv1, &dv0);
+
+    eprintln!(
+        "A-4 Test 2 [masked+null vs unmasked backward]: \
+         dq={:.3e}@[{dq_idx}]  dk={:.3e}@[{dk_idx}]  dv={:.3e}@[{dv_idx}]",
+        dq_diff, dk_diff, dv_diff,
+    );
+    eprintln!("  first 4 dq1 (masked+null): {:?}", &dq1[..4.min(dq1.len())]);
+    eprintln!("  first 4 dq0 (baseline):    {:?}", &dq0[..4.min(dq0.len())]);
+
+    // Tolerance matches the file's established backward budget (5e-3).
+    let tol = 5e-3f32;
+    assert!(dq_diff <= tol, "A-4 Test 2 FAILED: dq={:.3e} > {:.0e}", dq_diff, tol);
+    assert!(dk_diff <= tol, "A-4 Test 2 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
+    assert!(dv_diff <= tol, "A-4 Test 2 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
+    eprintln!(
+        "A-4 Test 2 PASSED: masked+null == unmasked backward, \
+         dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol,
+    );
+}
+
 #[test]
 #[ignore = "debug helper vs full unmasked baseline"]
 fn debug_cpu_reference_matches_full_unmasked_baseline() {
@@ -1272,5 +1441,437 @@ fn debug_cpu_reference_matches_full_unmasked_baseline() {
     eprintln!(
         "  dk maxabs: gpu={:?}@[{gpu_dk_max_idx}] cpu={:?}@[{cpu_dk_max_idx}]",
         gpu_dk_max, cpu_dk_max
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Extended backward launch helper — supports caller-chosen dims, rope_q=true,
+// and optional cos/sin / doc_starts uploads.
+//
+// - cos_sin = Some((cos_f16, sin_f16)): upload both, pass real cos_ptr/sin_ptr.
+//   Slices must be [seq_len * (head_dim/2)] f16 bits each.
+//   Use rope_cos_sin_tables_f16() to generate them.
+// - cos_sin = None: pass 0i64 for cos_ptr and sin_ptr.
+// - doc_starts = Some(ds): upload and pass real doc_starts_ptr.
+// - doc_starts = None: pass 0i64.
+//
+// Returns (dq_f32, dk_f32, dv_f32) or None on failure.
+//
+// Dynamic SMEM: shared_mem_bytes_v2_backward is passed to
+// nsl_flash_attention_csha_backward which calls cuFuncSetAttribute internally
+// for any non-zero value, so large/extern-SMEM configs are handled
+// automatically.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]                    // used by Task 3/5/7 GPU tests
+#[allow(clippy::too_many_arguments)]
+#[allow(unused_unsafe)]                // mirrors launch_pca_backward pattern
+fn launch_pca_backward_ex(
+    x_host:       &[f32],   // [seq_len × head_dim], CSHA raw input
+    wq_f16:       &[u16],   // weight matrices [d_model × head_dim] f16
+    wk_f16:       &[u16],
+    wv_f16:       &[u16],
+    do_host_f16:  &[u16],   // upstream gradient [seq_len × head_dim] f16
+    seq_len:      usize,
+    head_dim:     usize,
+    block_q:      i64,
+    block_kv:     i64,
+    rope_q:       bool,
+    seg_ids_host: &[u16],   // length seq_len; empty → unpacked
+    segment_masked: bool,
+    cos_sin: Option<(&[u16], &[u16])>,
+    doc_starts: Option<&[i32]>,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let batch = 1usize;
+    let heads = 1usize;
+    let dm    = head_dim;   // d_model == head_dim for these fixtures
+    let norm_eps = 1e-5f32;
+    let scale    = 1.0f32 / (head_dim as f32).sqrt();
+
+    let config = pca_backward_config_sized(head_dim as i64, block_q, block_kv, rope_q, segment_masked);
+
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, Direction::Backward) {
+        eprintln!("[pca_bwd_ex] backward validator rejected: {e}");
+        return None;
+    }
+
+    // ── Byte counts ──────────────────────────────────────────────────────────
+    let qkv_f16_bytes = (batch * heads * seq_len * head_dim * 2) as i64;
+    let lse_bytes     = (batch * heads * seq_len * 4) as i64;
+    let x_bytes       = (batch * heads * seq_len * head_dim * 4) as i64;
+    let w_bytes       = (dm * (heads * head_dim) * 2) as i64;
+    let nw_bytes      = (head_dim * 4) as i64;
+    let dw_bytes      = (dm * (heads * head_dim) * 2) as i64;
+    let dx_bytes      = (batch * heads * seq_len * head_dim * 4) as i64;
+    let dxn_bytes     = (batch * seq_len * dm * 4) as i64;
+
+    // ── Allocate device buffers ───────────────────────────────────────────────
+    let q_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let k_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let v_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let out_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
+    let x_dev   = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let nw_dev  = unsafe { nsl_test_cuda_alloc(nw_bytes) };
+    let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+    let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
+
+    let all_dev = [
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
+        wq_dev, wk_dev, wv_dev, do_dev, dq_dev, dk_dev, dv_dev,
+        dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
+    ];
+    for &p in &all_dev {
+        if p == 0 {
+            eprintln!("[pca_bwd_ex] device alloc returned null (OOM?)");
+            free_all(&all_dev);
+            return None;
+        }
+    }
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(
+            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
+        )
+    };
+    let save_ptrs = [saves.q_proj, saves.k_proj, saves.v_proj, saves.row_max, saves.row_sum, saves.x_raw];
+    if save_ptrs.iter().any(|&ptr| ptr == 0) {
+        eprintln!("[pca_bwd_ex] CshaBackwardActivations alloc failed");
+        unsafe { nsl_csha_free_backward_activations(saves); }
+        free_all(&all_dev);
+        return None;
+    }
+
+    // ── Stage trusted forward states on the host ────────────────────────────
+    let x_norm = rmsnorm_rows(x_host, seq_len, head_dim, norm_eps);
+    let q_host_f32 = project_rows_f16_saved(&x_norm, wq_f16, seq_len, head_dim);
+    let k_host_f32 = project_rows_f16_saved(&x_norm, wk_f16, seq_len, head_dim);
+    let v_host_f32 = project_rows_f16_saved(&x_norm, wv_f16, seq_len, head_dim);
+    let (out_host_f32, lse_host, row_max_host, row_sum_host) =
+        flash_attention_forward_reference_with_stats(
+            &q_host_f32, &k_host_f32, &v_host_f32,
+            seq_len, head_dim, scale, config.causal,
+            seg_ids_host, segment_masked,
+        );
+    let q_host_f16: Vec<u16> = q_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let k_host_f16: Vec<u16> = k_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let v_host_f16: Vec<u16> = v_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let out_host_f16: Vec<u16> = out_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+
+    // ── Upload ───────────────────────────────────────────────────────────────
+    let nw_host = vec![1.0f32; head_dim];
+    unsafe {
+        nsl_test_cuda_h2d(q_dev,   q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(k_dev,   k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(v_dev,   v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(out_dev, out_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(lse_dev, lse_host.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(x_dev,   x_host.as_ptr()    as i64, x_bytes);
+        nsl_test_cuda_h2d(nw_dev,  nw_host.as_ptr()   as i64, nw_bytes);
+        nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.q_proj, q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.k_proj, k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.v_proj, v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.row_max, row_max_host.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(saves.row_sum, row_sum_host.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(saves.x_raw, x_host.as_ptr() as i64, x_bytes);
+    }
+
+    // Upload segment_ids if needed.
+    let seg_dev: i64 = if segment_masked && !seg_ids_host.is_empty() {
+        let seg_bytes = (seg_ids_host.len() * 2) as i64;
+        let ptr = unsafe { nsl_test_cuda_alloc(seg_bytes) };
+        if ptr == 0 {
+            eprintln!("[pca_bwd_ex] segment_ids alloc failed");
+            unsafe { nsl_csha_free_backward_activations(saves); }
+            free_all(&all_dev);
+            return None;
+        }
+        unsafe { nsl_test_cuda_h2d(ptr, seg_ids_host.as_ptr() as i64, seg_bytes); }
+        ptr
+    } else {
+        0i64
+    };
+
+    // Upload cos/sin tables (f16) if rope_q is active.
+    let (cos_dev, sin_dev): (i64, i64) = if let Some((cos_f16, sin_f16)) = cos_sin {
+        let half_dim = head_dim / 2;
+        let cs_bytes = (seq_len * half_dim * std::mem::size_of::<u16>()) as i64;
+        let c_ptr = unsafe { nsl_test_cuda_alloc(cs_bytes) };
+        let s_ptr = unsafe { nsl_test_cuda_alloc(cs_bytes) };
+        if c_ptr == 0 || s_ptr == 0 {
+            eprintln!("[pca_bwd_ex] cos/sin alloc failed");
+            if c_ptr != 0 { unsafe { nsl_test_cuda_free(c_ptr); } }
+            if s_ptr != 0 { unsafe { nsl_test_cuda_free(s_ptr); } }
+            if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+            unsafe { nsl_csha_free_backward_activations(saves); }
+            free_all(&all_dev);
+            return None;
+        }
+        unsafe {
+            nsl_test_cuda_h2d(c_ptr, cos_f16.as_ptr() as i64, cs_bytes);
+            nsl_test_cuda_h2d(s_ptr, sin_f16.as_ptr() as i64, cs_bytes);
+        }
+        (c_ptr, s_ptr)
+    } else {
+        (0i64, 0i64)
+    };
+
+    // Upload doc_starts if provided.
+    let doc_starts_dev: i64 = if let Some(ds) = doc_starts {
+        let ds_bytes = (ds.len() * std::mem::size_of::<i32>()) as i64;
+        let ptr = unsafe { nsl_test_cuda_alloc(ds_bytes) };
+        if ptr == 0 {
+            eprintln!("[pca_bwd_ex] doc_starts alloc failed");
+            if cos_dev != 0 { unsafe { nsl_test_cuda_free(cos_dev); } }
+            if sin_dev != 0 { unsafe { nsl_test_cuda_free(sin_dev); } }
+            if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+            unsafe { nsl_csha_free_backward_activations(saves); }
+            free_all(&all_dev);
+            return None;
+        }
+        unsafe { nsl_test_cuda_h2d(ptr, ds.as_ptr() as i64, ds_bytes); }
+        ptr
+    } else {
+        0i64
+    };
+
+    // ── Backward PTX ─────────────────────────────────────────────────────────
+    let mut bwd_ptx_str = match synthesize_backward(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[pca_bwd_ex] synthesize_backward error: {e}");
+            if cos_dev != 0 { unsafe { nsl_test_cuda_free(cos_dev); } }
+            if sin_dev != 0 { unsafe { nsl_test_cuda_free(sin_dev); } }
+            if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+            if doc_starts_dev != 0 { unsafe { nsl_test_cuda_free(doc_starts_dev); } }
+            unsafe { nsl_csha_free_backward_activations(saves); }
+            free_all(&all_dev);
+            return None;
+        }
+    };
+    if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
+    {
+        let dump = std::env::temp_dir().join(format!(
+            "pca_bwd_ex_seg{}_hd{}_bq{}_rope{}.ptx",
+            if segment_masked { "masked" } else { "plain" }, head_dim, block_q,
+            if rope_q { "true" } else { "false" },
+        ));
+        std::fs::write(&dump, bwd_ptx_str.as_bytes()).ok();
+        eprintln!("[pca_bwd_ex] bwd PTX dumped: {}", dump.display());
+    }
+    let bwd_ptx  = bwd_ptx_str.into_bytes();
+    let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
+
+    let bwd_smem_total = shared_mem_bytes_v2_backward(&config);
+    let smem_static_cap: u32 = 49152;
+    let bwd_smem_dyn: i64 = if bwd_smem_total > smem_static_cap {
+        bwd_smem_total as i64
+    } else {
+        0
+    };
+    eprintln!("[pca_bwd_ex] bwd_smem_total={bwd_smem_total} bwd_smem_dyn={bwd_smem_dyn}");
+
+    let rc_bwd = unsafe {
+        nsl_flash_attention_csha_backward(
+            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            scale.to_bits() as i64,
+            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
+            0, 0, 0, 0,                 // paging
+            cos_dev, sin_dev,           // cos_ptr, sin_ptr
+            0, 0,                       // ragged
+            bwd_smem_dyn,
+            bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
+            config.block_q as i64, config.block_kv as i64,
+            if config.causal { 1 } else { 0 },
+            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
+            0, norm_eps.to_bits() as i64,
+            heads as i64, dm as i64,
+            saves.q_proj, saves.k_proj, saves.v_proj,
+            saves.row_max, saves.row_sum,
+            saves.x_raw,
+            do_dev, dq_dev, dk_dev, dv_dev,
+            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            dxn_dev,
+            seg_dev,
+            0i64, 0i64,                 // Tier B extension — null
+            doc_starts_dev,             // doc_starts ptr
+            // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
+            // means legacy per-q-block topology (Tier A; not per-doc).
+            0i64,
+        )
+    };
+    unsafe {
+        let sync_rc = cudarc::driver::sys::cuCtxSynchronize();
+        eprintln!("[pca_bwd_ex] bwd rc={rc_bwd} sync_rc={sync_rc:?}");
+        if !matches!(sync_rc, cudarc::driver::sys::CUresult::CUDA_SUCCESS) {
+            nsl_csha_free_backward_activations(saves);
+            free_all(&all_dev);
+            if seg_dev != 0 { nsl_test_cuda_free(seg_dev); }
+            if cos_dev != 0 { nsl_test_cuda_free(cos_dev); }
+            if sin_dev != 0 { nsl_test_cuda_free(sin_dev); }
+            if doc_starts_dev != 0 { nsl_test_cuda_free(doc_starts_dev); }
+            return None;
+        }
+    }
+    if rc_bwd != 0 {
+        let log = unsafe {
+            let p = nsl_test_cuda_jit_log(bwd_ptx.as_ptr() as i64);
+            if p != 0 {
+                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
+            } else { "<no log>".into() }
+        };
+        eprintln!("[pca_bwd_ex] backward rc={rc_bwd}\nJIT log:\n{log}");
+        unsafe { nsl_csha_free_backward_activations(saves); }
+        free_all(&all_dev);
+        if seg_dev != 0 { nsl_test_cuda_free(seg_dev); }
+        if cos_dev != 0 { nsl_test_cuda_free(cos_dev); }
+        if sin_dev != 0 { nsl_test_cuda_free(sin_dev); }
+        if doc_starts_dev != 0 { nsl_test_cuda_free(doc_starts_dev); }
+        return None;
+    }
+
+    // ── Readback dQ, dK, dV ──────────────────────────────────────────────────
+    let qkv_elems = batch * heads * seq_len * head_dim;
+    let mut dq_raw = vec![0u16; qkv_elems];
+    let mut dk_raw = vec![0u16; qkv_elems];
+    let mut dv_raw = vec![0u16; qkv_elems];
+    nsl_test_cuda_d2h(dq_raw.as_mut_ptr() as i64, dq_dev, (qkv_elems * 2) as i64);
+    nsl_test_cuda_d2h(dk_raw.as_mut_ptr() as i64, dk_dev, (qkv_elems * 2) as i64);
+    nsl_test_cuda_d2h(dv_raw.as_mut_ptr() as i64, dv_dev, (qkv_elems * 2) as i64);
+    let dq: Vec<f32> = dq_raw.iter().map(|&b| f16_to_f32(b)).collect();
+    let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
+    let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+    free_all(&all_dev);
+    if seg_dev != 0 { nsl_test_cuda_free(seg_dev); }
+    if cos_dev != 0 { nsl_test_cuda_free(cos_dev); }
+    if sin_dev != 0 { nsl_test_cuda_free(sin_dev); }
+    if doc_starts_dev != 0 { nsl_test_cuda_free(doc_starts_dev); }
+
+    Some((dq, dk, dv))
+}
+
+// ===========================================================================
+// Test B — doc_starts null-guard == standard positions, BACKWARD (rope_q=true)
+//
+// Validates the doc_starts null-guard in the BACKWARD kernel: when
+// doc_starts_ptr==0 the kernel must produce output IDENTICAL to a run
+// with doc_starts=[0,0,...] (standard positions, null-guard identity).
+//
+// head_dim=32 (matches the backward validator's d_model=head_dim constraint),
+// block=32, seq_len=128.
+//
+// Tolerance: 5e-3 — matches the file's established backward budget.
+//
+// CRITICAL: if cuda_available() is true and either launch returns None,
+// we PANIC (guard failure / kernel crash), not skip.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn doc_starts_null_equals_standard_positions_backward() {
+    if !cuda_available() {
+        eprintln!("skipped: no CUDA device");
+        return;
+    }
+
+    let head_dim = 32usize;
+    let block    = 32i64;
+    let seq_len  = 128usize;
+    let total    = seq_len * head_dim;
+
+    // Inputs.
+    let mut x      = vec![0f32; total];
+    let mut do_f32 = vec![0f32; total];
+    fill_seeded(&mut x,      0xB001);
+    fill_seeded(&mut do_f32, 0xB002);
+
+    let n_weights = head_dim * head_dim;
+    let mut wq_f32 = vec![0f32; n_weights];
+    let mut wk_f32 = vec![0f32; n_weights];
+    let mut wv_f32 = vec![0f32; n_weights];
+    fill_seeded(&mut wq_f32, 0xB003);
+    fill_seeded(&mut wk_f32, 0xB004);
+    fill_seeded(&mut wv_f32, 0xB005);
+    let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+    let (cos, sin) = rope_cos_sin_tables_f16(seq_len, head_dim);
+    let seg_ids  = vec![0u16; seq_len];   // single segment (non-null, mask is no-op)
+    // doc_starts layout: [batch_size, MAX_NUM_DOCS+1] i32, total batch_size * 1028 bytes.
+    // 257 entries per batch row. All zero → doc 0 starts at 0 → standard positions.
+    const MAX_NUM_DOCS_P1: usize = 257;
+    let doc_zero = vec![0i32; MAX_NUM_DOCS_P1];  // 1 batch row of 257 i32s, all zero
+
+    eprintln!("Test B — rope_q=true + doc_starts=[0,...] (standard positions backward)");
+    let with_doc_zero = launch_pca_backward_ex(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim, block, block,
+        /*rope_q=*/true, &seg_ids, /*segment_masked=*/true,
+        Some((&cos, &sin)), Some(&doc_zero),
+    ).unwrap_or_else(|| panic!(
+        "Test B: doc_starts=[0] backward launch failed — this is unexpected (rope_q=true, hd=32)"
+    ));
+
+    eprintln!("Test B — rope_q=true + doc_starts=NULL (null-guard path backward)");
+    let with_doc_null = launch_pca_backward_ex(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim, block, block,
+        true, &seg_ids, true,
+        Some((&cos, &sin)), None,   // None → doc_starts_ptr = 0 (null-guard)
+    ).unwrap_or_else(|| panic!(
+        "Test B: doc_starts=NULL backward launch failed (null-guard must not crash)"
+    ));
+
+    let (dq_zero, dk_zero, dv_zero) = with_doc_zero;
+    let (dq_null, dk_null, dv_null) = with_doc_null;
+
+    assert_no_nan("dq_zero", &dq_zero, "Test B");
+    assert_no_nan("dk_zero", &dk_zero, "Test B");
+    assert_no_nan("dv_zero", &dv_zero, "Test B");
+    assert_no_nan("dq_null", &dq_null, "Test B");
+    assert_no_nan("dk_null", &dk_null, "Test B");
+    assert_no_nan("dv_null", &dv_null, "Test B");
+
+    let (dq_diff, dq_idx) = max_abs_diff(&dq_null, &dq_zero);
+    let (dk_diff, dk_idx) = max_abs_diff(&dk_null, &dk_zero);
+    let (dv_diff, dv_idx) = max_abs_diff(&dv_null, &dv_zero);
+
+    eprintln!(
+        "Test B [doc_starts_null vs doc_starts=[0] backward]: \
+         dq={:.3e}@[{dq_idx}]  dk={:.3e}@[{dk_idx}]  dv={:.3e}@[{dv_idx}]",
+        dq_diff, dk_diff, dv_diff,
+    );
+    eprintln!("  first 4 dq_null: {:?}", &dq_null[..4.min(dq_null.len())]);
+    eprintln!("  first 4 dq_zero: {:?}", &dq_zero[..4.min(dq_zero.len())]);
+
+    let tol = 5e-3f32;
+    assert!(dq_diff <= tol,
+        "Test B FAILED: dq={:.3e} > {:.0e} (null-guard != doc_starts=[0] backward)", dq_diff, tol);
+    assert!(dk_diff <= tol,
+        "Test B FAILED: dk={:.3e} > {:.0e} (null-guard != doc_starts=[0] backward)", dk_diff, tol);
+    assert!(dv_diff <= tol,
+        "Test B FAILED: dv={:.3e} > {:.0e} (null-guard != doc_starts=[0] backward)", dv_diff, tol);
+    eprintln!(
+        "Test B PASSED: doc_starts-null == standard positions backward, \
+         dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol,
     );
 }

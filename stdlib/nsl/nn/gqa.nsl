@@ -1,22 +1,31 @@
 from nsl.nn.rope import RotaryEmbedding
 
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+# Grouped Query Attention.
+#
+# `head_dim` is an EXPLICIT positional parameter (not derived from `d_model // n_heads`)
+# so that CEP-pruned models can keep d_model fixed while shrinking n_heads + the
+# projection widths (wq/wk/wv/wo). When the original model has `n_heads * head_dim ==
+# d_model`, callers pass `d_model // n_heads` and the layout is unchanged; after CEP
+# head pruning, `n_heads * head_dim < d_model` and the projections become rectangular.
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     # Store dims as tensor fields for method access
     _d_model: Tensor = full([1], float(d_model))
     _n_heads: Tensor = full([1], float(n_heads))
     _n_kv_heads: Tensor = full([1], float(n_kv_heads))
-    _head_dim: Tensor = full([1], float(d_model // n_heads))
+    _head_dim: Tensor = full([1], float(head_dim))
     _n_rep: Tensor = full([1], float(n_heads // n_kv_heads))
     _dropout_p: Tensor = full([1], dropout_p)
 
-    # Projections — Xavier initialization: randn * sqrt(2 / (fan_in + fan_out))
-    wq: Tensor = randn([d_model, d_model]) * sqrt(full([1], 2.0 / float(d_model + d_model)))
-    wk: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * (d_model // n_heads))))
-    wv: Tensor = randn([d_model, n_kv_heads * (d_model // n_heads)]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * (d_model // n_heads))))
-    wo: Tensor = randn([d_model, d_model]) * sqrt(full([1], 2.0 / float(d_model + d_model)))
+    # Projections — Xavier initialization: randn * sqrt(2 / (fan_in + fan_out)).
+    # NOTE: wq is now [d_model, n_heads * head_dim] (rectangular under CEP pruning;
+    # square when n_heads * head_dim == d_model). Likewise wo's input axis.
+    wq: Tensor = randn([d_model, n_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_heads * head_dim)))
+    wk: Tensor = randn([d_model, n_kv_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * head_dim)))
+    wv: Tensor = randn([d_model, n_kv_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * head_dim)))
+    wo: Tensor = randn([n_heads * head_dim, d_model]) * sqrt(full([1], 2.0 / float(n_heads * head_dim + d_model)))
 
     # RoPE
-    rope: RotaryEmbedding = RotaryEmbedding(d_model // n_heads, 1024, 10000.0)
+    rope: RotaryEmbedding = RotaryEmbedding(head_dim, 1024, 10000.0)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
         let s = x.shape
@@ -49,14 +58,15 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout
         let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
         let v_exp = v5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
 
-        # Fused attention: uses FlashAttention when on GPU, naive when on CPU
+        # Fused attention: uses FlashAttention when on GPU, naive when on CPU.
+        # Output shape: [batch, heads, seq, head_dim]
         let scale = 1.0 / sqrt(float(hd))
         let attn_out = scaled_dot_product_attention(q_rope, k_exp, v_exp, scale, true)
 
-        # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, d_model]
+        # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, n_heads * head_dim]
         let attn_t = attn_out.transpose(1, 2)
-        let attn_flat = attn_t.reshape([batch, seq_len, dm])
+        let attn_flat = attn_t.reshape([batch, seq_len, nh * hd])
 
-        # Output projection + residual dropout
+        # Output projection back to d_model + residual dropout
         let out = attn_flat @ self.wo
         return dropout(out, dp, training)

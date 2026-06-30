@@ -77,6 +77,12 @@ pub struct TypeChecker<'a> {
     /// extend to per-decorator scope if multi-decorator programs become
     /// useful — see docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
     pub cpdt_decorator_span: Option<nsl_ast::Span>,
+    /// CFTP §4.4 G3: `@fused_lm_ce(...)` configs captured during semantic
+    /// analysis (one per decorated `train` block).  Consumed by codegen
+    /// (Sprint 2.5 will use these to drive automatic substitution of the
+    /// composite cross_entropy path with the fused linear-CE kernel; v1
+    /// only collects + plumbs).
+    pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
     /// M56: Whether `--linear-types` was passed on the command line.
     /// Agent declarations are gated behind this flag (E0610).
     pub linear_types_enabled: bool,
@@ -103,6 +109,7 @@ impl<'a> TypeChecker<'a> {
             adapter_configs: Vec::new(),
             csha_configs: Vec::new(),
             cpdt_decorator_span: None,
+            fused_ce_configs: Vec::new(),
             linear_types_enabled: false,
             agent_decl_spans: Vec::new(),
         }

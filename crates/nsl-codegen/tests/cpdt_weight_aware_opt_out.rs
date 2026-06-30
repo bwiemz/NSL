@@ -30,7 +30,7 @@ use nsl_codegen::cpdt_tier_apply::PrecisionConfig;
 use nsl_codegen::cpdt_zero::{ClusterSpec, ModelSize};
 use nsl_codegen::weight_aware::WeightMap;
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
-use nsl_codegen::wggo_dp::LayerDecision as CoarseDecision;
+use nsl_codegen::wggo_dp::CoarseDecision;
 use nsl_codegen::wggo_overrides::WggoOverrides;
 use nsl_codegen::CompileOptions;
 use nsl_lexer::Interner;
@@ -50,10 +50,13 @@ fn applied_plan_blocks(n_layers: usize) -> AppliedPlan {
             coarse: CoarseDecision::KeepFull,
             pipeline_stage: 0,
             shard_factor: 1,
+            shard_grads: 1,
+            shard_optim: 1,
             active_heads: 8,
             ffn_width: 4096,
             csha_level: 0,
             adapter_rank: 0,
+            adapter_placement: nsl_codegen::wggo_ilp::AdapterPlacement::None,
             optim_m_bits: 8,
             optim_v_bits: 8,
             fase_fused: false,

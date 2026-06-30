@@ -21,7 +21,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    backward_extra_bytes, total_bytes, Direction, SMEM_BUDGET_BYTES,
+    backward_extra_bytes, pca_smem_layout, total_bytes, Direction, SMEM_BUDGET_BYTES,
 };
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
@@ -48,20 +48,12 @@ pub fn backward_total_bytes(config: &FlashAttentionConfig) -> u32 {
 }
 
 fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    // PCA Tier A: when segment_masked the prelude reserves
-    // DEFAULT_SMEM_SEGMENT_BUDGET bytes for the embedded seg_smem region
-    // at the tail of shmem (Blackwell fix; see register-decl comment
-    // below).  Force dynamic SMEM whenever the combined footprint exceeds
-    // the 48 KB static cap so the main shmem[] uses the `extern .shared`
-    // form.  Budget sourced from pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET
-    // so the FA emitter's allocation tracks the planner's residency
-    // ceiling.
-    let seg_overhead = if config.segment_masked {
-        DEFAULT_SMEM_SEGMENT_BUDGET as u32
-    } else {
-        0
-    };
-    backward_total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
+    // Count seg_smem AND smem_doc_starts (when rope_q) via the single-source
+    // layout (matches the forward budget check; doc was previously uncounted).
+    // No embed — backward already embeds seg_smem in the shmem[] tail; doc stays
+    // a separate static `.shared`. This only fixes the static-cap decision.
+    pca_smem_layout(backward_total_bytes(config), config.segment_masked, config.rope_q).total
+        > SMEM_BUDGET_BYTES
 }
 
 /// Emit the backward prelude: header, entry, SMEM, registers, indices.
@@ -184,7 +176,11 @@ pub fn emit(
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
         // PCA Tier A: when segment_masked, reserve DEFAULT_SMEM_SEGMENT_BUDGET
         // bytes at the tail of shmem for the embedded seg_smem (see
-        // register-decl comment).
+        // register-decl comment). NOTE: smem_doc_starts (1028 B, emitted by
+        // emit_doc_starts_smem_load when rope_q) is a SEPARATE static `.shared`
+        // decl — NOT part of this shmem[] size (ptxas allocates it independently;
+        // the device reserves the sum). The static-vs-extern decision counts it
+        // via pca_smem_layout; this decl covers only the core + embedded-seg.
         let seg_overhead: u32 = if config.segment_masked {
             DEFAULT_SMEM_SEGMENT_BUDGET as u32
         } else {
@@ -306,7 +302,7 @@ pub fn emit(
     //   * Task 9 (backward dQ/dK rotation sites in csha_hooks_backward) —
     //     reads smem_doc_starts to compute effective_pos before cs_idx.
     if config.segment_masked && config.rope_q {
-        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
+        ptx.push_str("    // PCA sec.4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
         ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
         // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we
@@ -322,7 +318,7 @@ pub fn emit(
         // %rs_doc_seg: u16 scratch for ld.shared.u16 of segment_ids[abs_row].
         ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
-        ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+        ptx.push_str("    .reg .pred %p_doc_load_done, %p_doc_null;\n");
     }
 
     // PCA Tier A backward: segment-mask helper scratch registers + SMEM buffer.
@@ -351,7 +347,7 @@ pub fn emit(
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
-        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
+        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done, %p_seg_null;\n");
         // Backward-specific: scratch u64 for synthesizing q_global and k_global
         // from within-tile indices for the helper call in ds_compute.
         // %warp_row (u64) and %k_start (u64) are live at ds_compute call sites;
@@ -446,6 +442,10 @@ pub fn emit(
     if config.segment_masked {
         ptx.push_str("\n    // --- PCA Tier A: load segment_ids from global to shared ---\n");
         ptx.push_str("    ld.param.u64 %rd_seg_global, [segment_ids_ptr];\n");
+        // PCA Tier A null-guard (spec §4.2): null segment_ids_ptr → write the
+        // all-zero sentinel (uniform segment 0 → no masking). Mirrors the
+        // forward prelude guard; BW_ labels keep this kernel's symbols unique.
+        ptx.push_str("    setp.eq.u64 %p_seg_null, %rd_seg_global, 0;\n");
         // seg_base = shmem_base + backward_total_bytes — embed seg_smem at
         // the tail of the extern shmem region (see prelude register-decl
         // comment for the Blackwell illegal-address rationale). The launcher
@@ -468,7 +468,12 @@ pub fn emit(
         ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");
         ptx.push_str("    add.u64 %rd_pca_off, %rd_pca_off, %rd_seg_global;\n");
+        ptx.push_str("    @%p_seg_null bra BW_PCA_SEG_NULL_LD;\n");
         ptx.push_str("    ld.global.u16 %rs_pca, [%rd_pca_off];\n");
+        ptx.push_str("    bra BW_PCA_SEG_LD_DONE;\n");
+        ptx.push_str("BW_PCA_SEG_NULL_LD:\n");
+        ptx.push_str("    mov.u16 %rs_pca, 0;\n");
+        ptx.push_str("BW_PCA_SEG_LD_DONE:\n");
         // Shared address = seg_base + i * 2  (u64 throughout — no truncation)
         ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");

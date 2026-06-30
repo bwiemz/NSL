@@ -187,6 +187,31 @@ pub enum AdjointExpr {
     AttentionBackwardK(VarId, VarId, VarId, VarId, VarId, bool),
     /// Attention backward for V: args: (grad, Q, K, V, fwd_result, causal)
     AttentionBackwardV(VarId, VarId, VarId, VarId, VarId, bool),
+    /// CFTP §4.4 G3 (Sprint 4): fused linear-CE backward — per-component extract.
+    ///
+    /// args: (grad, x, W, bias, targets, fwd_result, component,
+    ///        vocab_size, hidden_size, batch_size, seq_len, vocab_tile,
+    ///        ignore_index)
+    ///
+    /// Lowers to `PrimalOp::FusedLinearCeBackwardExtract` with the same
+    /// `component` so the three components share one backward FFI launch
+    /// via the cache `Compiler.fused_ce_bwd_cache` (mirrors the
+    /// `FlashAttentionBackwardExtract` pattern).
+    FusedLinearCeBackward {
+        grad: VarId,
+        x: VarId,
+        w: VarId,
+        bias: VarId,
+        targets: VarId,
+        fwd_result: VarId,
+        component: u8,
+        vocab_size: u32,
+        hidden_size: u32,
+        batch_size: u32,
+        seq_len: u32,
+        vocab_tile: u32,
+        ignore_index: i64,
+    },
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
     /// rotate_half backward: -rotate_half(grad).
@@ -531,6 +556,85 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::CrossEntropyBackward(output_bar, op.inputs[0], op.inputs[1]),
         }],
+        // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward.
+        //
+        // Produces three adjoints — dx, dW, dbias — each via a
+        // `FusedLinearCeBackwardExtract` op that shares one backward
+        // FFI launch via the codegen-side cache.
+        //
+        // inputs: [x, W, bias, targets].  Result is the scalar loss VarId,
+        // which the lowering side uses as the cache key.
+        PrimalOp::FusedLinearCe {
+            vocab_size,
+            hidden_size,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+            is_large: _,
+        } => {
+            let x = op.inputs[0];
+            let w = op.inputs[1];
+            let bias = op.inputs[2];
+            let targets = op.inputs[3];
+            let fwd_result = op.result;
+            vec![
+                InputAdjoint {
+                    input_var: x,
+                    expr: AdjointExpr::FusedLinearCeBackward {
+                        grad: output_bar,
+                        x,
+                        w,
+                        bias,
+                        targets,
+                        fwd_result,
+                        component: 0,
+                        vocab_size: *vocab_size,
+                        hidden_size: *hidden_size,
+                        batch_size: *batch_size,
+                        seq_len: *seq_len,
+                        vocab_tile: *vocab_tile,
+                        ignore_index: *ignore_index,
+                    },
+                },
+                InputAdjoint {
+                    input_var: w,
+                    expr: AdjointExpr::FusedLinearCeBackward {
+                        grad: output_bar,
+                        x,
+                        w,
+                        bias,
+                        targets,
+                        fwd_result,
+                        component: 1,
+                        vocab_size: *vocab_size,
+                        hidden_size: *hidden_size,
+                        batch_size: *batch_size,
+                        seq_len: *seq_len,
+                        vocab_tile: *vocab_tile,
+                        ignore_index: *ignore_index,
+                    },
+                },
+                InputAdjoint {
+                    input_var: bias,
+                    expr: AdjointExpr::FusedLinearCeBackward {
+                        grad: output_bar,
+                        x,
+                        w,
+                        bias,
+                        targets,
+                        fwd_result,
+                        component: 2,
+                        vocab_size: *vocab_size,
+                        hidden_size: *hidden_size,
+                        batch_size: *batch_size,
+                        seq_len: *seq_len,
+                        vocab_tile: *vocab_tile,
+                        ignore_index: *ignore_index,
+                    },
+                },
+            ]
+        }
         PrimalOp::MSELoss => {
             let pred = op.inputs[0];
             let target = op.inputs[1];

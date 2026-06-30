@@ -107,3 +107,21 @@ fn snapshot_v1_mlp_structural_skeleton() {
     let skeleton = elide_localparams(&verilog);
     assert_snapshot!(skeleton);
 }
+
+// ---------------------------------------------------------------------------
+// Task 19 (M57.2): Verilog-emission snapshot of the sequential FSM
+// ---------------------------------------------------------------------------
+
+#[test]
+fn snapshot_sequential_v1_mlp_skeleton() {
+    let kir = v1_mlp_kir();
+    let module = KirToHirPass { test_taps: false, sequential: true }
+        .lower(&kir, "tiny_mlp_seq").unwrap();
+    let verilog = VerilogEmitter::emit_module(&module);
+    // Elide the bulky W/b localparam arrays so the snapshot stays focused on
+    // the FSM structural skeleton (always_ff, state case, bias-seed, relu,
+    // reset loops, out concat). Reuses the same elide_localparams helper as
+    // the combinational snapshot.
+    let skeleton = elide_localparams(&verilog);
+    assert_snapshot!(skeleton);
+}

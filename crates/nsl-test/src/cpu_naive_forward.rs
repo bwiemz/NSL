@@ -45,6 +45,9 @@ pub struct ForwardOutputs {
 /// - `q`, `k`, `v`: f16 slices in row-major [B, H, S, D] order
 /// - `batch`, `heads`, `seq`, `hd`: tensor dimensions
 /// - `causal`: if true, mask upper triangle (k > qi is excluded)
+// The eight q/k/v + dimension args are intrinsic to a naive attention reference;
+// bundling them into a struct would obscure this test helper, not clarify it.
+#[allow(clippy::too_many_arguments)]
 pub fn cpu_naive_forward(
     q: &[f16],
     k: &[f16],
@@ -73,13 +76,13 @@ pub fn cpu_naive_forward(
 
                 // Step 1: compute scaled dot-product S[qi, ki] in f32
                 let mut s_row = vec![f32::NEG_INFINITY; seq];
-                for ki in 0..k_limit {
+                for (ki, s_slot) in s_row[..k_limit].iter_mut().enumerate() {
                     let k_base = ((b * heads + h) * seq + ki) * hd;
-                    let mut s = 0.0f32;
+                    let mut dot = 0.0f32;
                     for di in 0..hd {
-                        s += q[q_base + di].to_f32() * k[k_base + di].to_f32();
+                        dot += q[q_base + di].to_f32() * k[k_base + di].to_f32();
                     }
-                    s_row[ki] = s * scale;
+                    *s_slot = dot * scale;
                 }
 
                 // Step 2: row_max = max over attended positions
@@ -89,17 +92,14 @@ pub fn cpu_naive_forward(
                 row_max[(b * heads + h) * seq + qi] = rmax;
 
                 // Step 3: row_sum = sum_k exp(S[qi,ki] - rmax)
-                let mut rsum = 0.0f32;
-                for ki in 0..k_limit {
-                    rsum += (s_row[ki] - rmax).exp();
-                }
+                let rsum: f32 = s_row[..k_limit].iter().map(|&s| (s - rmax).exp()).sum();
                 row_sum[(b * heads + h) * seq + qi] = rsum;
 
                 // Step 4: O[qi, di] = sum_k P[qi,ki] * v[ki, di]
                 for di in 0..hd {
                     let mut acc = 0.0f32;
-                    for ki in 0..k_limit {
-                        let p = (s_row[ki] - rmax).exp() / rsum;
+                    for (ki, &s) in s_row[..k_limit].iter().enumerate() {
+                        let p = (s - rmax).exp() / rsum;
                         let k_base = ((b * heads + h) * seq + ki) * hd;
                         acc += p * v[k_base + di].to_f32();
                     }

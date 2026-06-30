@@ -94,6 +94,13 @@ pub struct AnalysisResult {
     /// the codegen-side R9 cross-scope refusal predicate at
     /// `flash_attention_v2/mod.rs::synthesize_backward_with_tier`.
     pub paged_kv_models: HashSet<String>,
+    /// CFTP §4.4 G3 (Sprint 2): validated `@fused_lm_ce(...)` configurations
+    /// captured during semantic analysis.  One entry per decorated `train`
+    /// block.  Codegen plumbs these via `CompileOptions.fused_ce_configs`
+    /// (Sprint 2 wires the collection; Sprint 2.5 will use these to drive
+    /// the lowering-site auto-substitution of composite cross_entropy → the
+    /// fused linear-CE kernel).
+    pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -135,6 +142,7 @@ pub fn analyze_with_imports(
     // codegen consumption.
     let checkpoint_policies = checker.effect_checker.checkpoint_policies().clone();
     let paged_kv_models = checker.effect_checker.paged_kv_models().clone();
+    let fused_ce_configs = checker.fused_ce_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the
@@ -212,5 +220,6 @@ pub fn analyze_with_imports(
         weight_index_map,
         checkpoint_policies,
         paged_kv_models,
+        fused_ce_configs,
     }
 }

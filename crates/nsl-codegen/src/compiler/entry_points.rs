@@ -59,6 +59,7 @@ fn run_profile_pre_pass(
         weight_index_map: std::collections::HashMap::new(),
         checkpoint_policies: std::collections::HashMap::new(),
         paged_kv_models: std::collections::HashSet::new(),
+        fused_ce_configs: Vec::new(),
     };
 
     // Task 6 + Phase 2.5 Task 4: populate source text/name so
@@ -256,9 +257,9 @@ fn load_and_register_weights_if_needed(
 ///
 /// Idempotent: if a field is already `Some`, it is left unchanged.
 ///
-/// §5.7: when `opts.wggo_importance == WggoImportance::Auto` and any of the
+/// §5.7: when `opts.wggo.importance == WggoImportance::Auto` and any of the
 /// §5.4/§5.5/§5.6 conditions are met, an informational note is emitted to
-/// stderr and `opts.wggo_importance` is demoted to `WggoImportance::Magnitude`.
+/// stderr and `opts.wggo.importance` is demoted to `WggoImportance::Magnitude`.
 pub(crate) fn run_pre_scan_phase(
     ast: &nsl_ast::Module,
     interner: &Interner,
@@ -288,10 +289,10 @@ pub(crate) fn run_pre_scan_phase(
 
 /// §5.7 soft-fallback for `WggoImportance::Auto`.
 ///
-/// If `opts.wggo_importance == Auto` and any of the §5.4/§5.5/§5.6
+/// If `opts.wggo.importance == Auto` and any of the §5.4/§5.5/§5.6
 /// conditions are met, this function:
 ///   1. Emits a single informational note to stderr.
-///   2. Demotes `opts.wggo_importance` to `WggoImportance::Magnitude`.
+///   2. Demotes `opts.wggo.importance` to `WggoImportance::Magnitude`.
 ///
 /// This is the parallel to [`enforce_grad_mode_refusals`] — same three
 /// conditions, but soft (note + demotion) rather than hard (error).
@@ -305,7 +306,7 @@ fn apply_auto_mode_fallback_note(
 ) {
     use crate::WggoImportance;
 
-    if opts.wggo_importance != WggoImportance::Auto {
+    if opts.wggo.importance != WggoImportance::Auto {
         return;
     }
 
@@ -341,13 +342,13 @@ fn apply_auto_mode_fallback_note(
              to silence: add @wggo_target + calibration data, OR set\n             \
              --wggo-importance=magnitude to opt out of grad scoring entirely."
         );
-        opts.wggo_importance = WggoImportance::Magnitude;
+        opts.wggo.importance = WggoImportance::Magnitude;
     }
 }
 
 /// §5.4-§5.6 refusal checks for grad-mode WGGO.
 ///
-/// Only fires when `opts.wggo_importance == WggoImportance::Grad`.  In `Auto`
+/// Only fires when `opts.wggo.importance == WggoImportance::Grad`.  In `Auto`
 /// or `Magnitude` modes the user never asked for gradient scoring, so there is
 /// nothing to refuse.
 ///
@@ -361,7 +362,7 @@ fn enforce_grad_mode_refusals(
 ) -> Result<(), CodegenError> {
     use crate::WggoImportance;
 
-    if opts.wggo_importance != WggoImportance::Grad {
+    if opts.wggo.importance != WggoImportance::Grad {
         return Ok(());
     }
 
@@ -635,7 +636,7 @@ pub fn compile_returning_plan(
     compiler.compile_pending_lambdas()?;
 
     // M53: Run WCET analysis for @real_time functions (after codegen, before finalize)
-    if compiler.compile_options.wcet_enabled {
+    if compiler.compile_options.wcet.enabled {
         compiler.run_wcet_analysis()?;
     }
 
@@ -770,7 +771,7 @@ fn compile_with_zk_info_best_effort_plan(
         }
 
         // M53: Run WCET analysis for @real_time functions
-        if compiler.compile_options.wcet_enabled {
+        if compiler.compile_options.wcet.enabled {
             compiler.run_wcet_analysis()?;
         }
 
@@ -798,7 +799,7 @@ fn compile_with_zk_info_best_effort_plan(
             let zk_config = {
                 let mut cfg = crate::zk::backend::ZkConfig::default();
                 // Wire --zk-backend flag to select backend
-                cfg.backend = match compiler.compile_options.zk_backend.to_lowercase().as_str() {
+                cfg.backend = match compiler.compile_options.zk.backend.to_lowercase().as_str() {
                     "plonky3" | "fri" => crate::zk::backend::ZkBackendType::Plonky3,
                     "halo2" => crate::zk::backend::ZkBackendType::Halo2,
                     "folding" | "nova" | "" => crate::zk::backend::ZkBackendType::Folding,
@@ -811,7 +812,7 @@ fn compile_with_zk_info_best_effort_plan(
                     }
                 };
                 // Wire --zk-field flag to select finite field
-                cfg.field = match compiler.compile_options.zk_field.to_lowercase().as_str() {
+                cfg.field = match compiler.compile_options.zk.field.to_lowercase().as_str() {
                     "bn254" | "bn256" => crate::zk::backend::ZkField::BN254,
                     "mersenne31" | "m31" | "" => crate::zk::backend::ZkField::Mersenne31,
                     other => {
@@ -822,9 +823,9 @@ fn compile_with_zk_info_best_effort_plan(
                         crate::zk::backend::ZkField::Mersenne31
                     }
                 };
-                cfg.emit_solidity = compiler.compile_options.zk_solidity;
+                cfg.emit_solidity = compiler.compile_options.zk.solidity;
                 // Wire --zk-weights flag to load weight file for witness generation
-                if let Some(ref weights_path) = compiler.compile_options.zk_weights_path {
+                if let Some(ref weights_path) = compiler.compile_options.zk.weights_path {
                     eprintln!(
                         "[nsl] ZK: loading weights from {} for witness generation",
                         weights_path.display()
@@ -934,7 +935,7 @@ fn compile_standalone_best_effort_plan(
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_standalone_main(&ast.stmts)?;
         compiler.compile_pending_lambdas()?;
-        if compiler.compile_options.wcet_enabled {
+        if compiler.compile_options.wcet.enabled {
             compiler.run_wcet_analysis()?;
         }
         // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
@@ -1313,7 +1314,7 @@ pub fn compile_entry_returning_plan(
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     // M53: Run WCET analysis for @real_time functions
-    if compiler.compile_options.wcet_enabled {
+    if compiler.compile_options.wcet.enabled {
         compiler.run_wcet_analysis()?;
     }
     // M31: Print fusion report if enabled
@@ -1408,12 +1409,12 @@ mod tests {
         let source =
             "model NoAttn:\n    weight: Tensor = zeros([4, 4])\n\nfn main():\n    let m = NoAttn()\n";
         let mut opts = crate::CompileOptions::default();
-        opts.wggo_importance = crate::WggoImportance::Auto;
+        opts.wggo.importance = crate::WggoImportance::Auto;
         // No calibration_data, no decorators.
         let (ast, interner) = parse_module(source);
         let resolved = run_pre_scan_phase(&ast, &interner, opts);
         assert_eq!(
-            resolved.wggo_importance,
+            resolved.wggo.importance,
             crate::WggoImportance::Magnitude,
             "§5.7: Auto must demote to Magnitude when no @wggo_target decorators are present"
         );
@@ -1426,12 +1427,12 @@ mod tests {
         // Fixture has @wggo_target + a main() that instantiates the decorated model.
         let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
         let mut opts = crate::CompileOptions::default();
-        opts.wggo_importance = crate::WggoImportance::Auto;
+        opts.wggo.importance = crate::WggoImportance::Auto;
         // calibration_data is None (default) — §5.6 fires.
         let (ast, interner) = parse_module(source);
         let resolved = run_pre_scan_phase(&ast, &interner, opts);
         assert_eq!(
-            resolved.wggo_importance,
+            resolved.wggo.importance,
             crate::WggoImportance::Magnitude,
             "§5.7: Auto must demote to Magnitude when calibration data is absent"
         );
@@ -1447,10 +1448,10 @@ mod tests {
 
         for importance in [crate::WggoImportance::Grad, crate::WggoImportance::Magnitude] {
             let mut opts = crate::CompileOptions::default();
-            opts.wggo_importance = importance;
+            opts.wggo.importance = importance;
             let resolved = run_pre_scan_phase(&ast, &interner, opts);
             assert_eq!(
-                resolved.wggo_importance, importance,
+                resolved.wggo.importance, importance,
                 "§5.7 fallback must not alter non-Auto mode {importance:?}"
             );
         }

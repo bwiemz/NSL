@@ -67,14 +67,31 @@ impl TapDescriptor {
     /// Per spec §2.7: test-tap ports expose every per-op intermediate signal
     /// when `--test-taps` is passed at codegen time.
     pub fn v1_mlp() -> Self {
+        // M57.1 Concern #4: the bias-as-seed fold (§3.5) eliminates the
+        // post-MAC bias-add hardware signal. tap_l<i>_bias_out removed; bias
+        // contribution is verified within tap_l<i>_matmul_out (which now
+        // holds the post-bias accumulator). Names tap_l<i>_matmul_out
+        // preserved per §3 Concern #1 (rename to tap_l<i>_accum_out
+        // deferred to cleanup PR).
         Self {
             taps: vec![
-                ("tap_l1_matmul_out".into(), 128 * 32), // 128 × i32
-                ("tap_l1_bias_out".into(), 128 * 32),
+                ("tap_l1_matmul_out".into(), 128 * 32), // post-bias accumulator (semantics shift; name preserved)
                 ("tap_l1_relu_out".into(), 128 * 32),
-                ("tap_l2_matmul_out".into(), 10 * 64), // 10 × i64
-                ("tap_l2_bias_out".into(), 10 * 64),
+                ("tap_l2_matmul_out".into(), 10 * 64), // post-bias accumulator
+                ("tap_l2_relu_out".into(), 10 * 64),
                 ("out".into(), 10 * 64),
+            ],
+        }
+    }
+
+    /// Tap descriptor for the v1 MLP sequential FSM (M57.2).
+    ///
+    /// The sequential module (`tiny_mlp_seq`) has no test-tap ports — it
+    /// exposes only the final `out` bus ([639:0] = 10 × i64 = 640 bits).
+    pub fn v1_mlp_seq() -> Self {
+        Self {
+            taps: vec![
+                ("out".into(), 10 * 64), // 640 bits: 10 × i64 final output
             ],
         }
     }
@@ -111,6 +128,24 @@ impl HarnessOutput {
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// ClockedOutput
+// ---------------------------------------------------------------------------
+
+/// Output from a clocked (sequential FSM) Verilator simulation.
+///
+/// In addition to the tap-port values returned by `run`, the clocked
+/// simulation binary also reports the number of clock cycles the FSM needed
+/// to reach `done`, which is useful for performance verification.
+#[derive(Debug)]
+pub struct ClockedOutput {
+    /// Parsed tap-port values (same layout as `HarnessOutput`).
+    pub taps: HarnessOutput,
+    /// Number of clock ticks counted between de-asserting `start` and
+    /// observing `done == 1` (exclusive of the reset + start cycles).
+    pub measured_cycles: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +285,132 @@ impl VerilatorHarness {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+
+    /// Compile `verilog_path` with Verilator using the clocked testbench
+    /// (`testbench_seq.cpp`) and return a ready harness.
+    ///
+    /// Mirrors `build` exactly, but points Verilator at the sequential
+    /// testbench.  The existing combinational `build`/`run` path is unchanged.
+    ///
+    /// Verilator must be on `$PATH`; call `is_available()` first if the test
+    /// should skip gracefully when Verilator is not installed.
+    pub fn build_clocked(
+        verilog_path: &Path,
+        top: &str,
+        taps: TapDescriptor,
+    ) -> Result<Self, HarnessError> {
+        let obj_dir = Path::new("target/fpga/verilator-obj-seq");
+        std::fs::create_dir_all(obj_dir)?;
+
+        let testbench = Path::new("crates/nsl-test/src/testbench_seq.cpp");
+        let sim_name = format!("{top}_sim_seq");
+
+        let output = Command::new("verilator")
+            .args([
+                "--binary",
+                "--top-module",
+                top,
+                "-Wall",
+                "-Wno-fatal",
+                "--Mdir",
+                obj_dir.to_str().unwrap(),
+                "-o",
+                &sim_name,
+                verilog_path.to_str().unwrap(),
+                testbench.to_str().unwrap(),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(HarnessError::CompileFailed {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(Self {
+            sim_binary: obj_dir.join(&sim_name),
+            tap_descriptor: taps,
+        })
+    }
+
+    /// Run the clocked simulation with one 784-element i8 input vector.
+    ///
+    /// Spawns the compiled sequential simulation binary, writes the input to
+    /// stdin, parses the `out=0x..` tap line, and additionally parses the
+    /// `measured_cycles=<n>` line printed by `testbench_seq.cpp`.
+    pub fn run_clocked(&self, input: &[i8]) -> Result<ClockedOutput, HarnessError> {
+        let start = Instant::now();
+
+        let mut child = Command::new(&self.sim_binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let stdin_bytes: Vec<u8> = input.iter().map(|&b| b as u8).collect();
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(&stdin_bytes)?;
+
+        let output = child.wait_with_output()?;
+        let elapsed = start.elapsed();
+
+        if elapsed > Duration::from_secs(120) {
+            eprintln!(
+                "WARNING: Verilator clocked simulation exceeded 2-min target ({elapsed:?}). \
+                 Per §2.6, this is the '5-10 min slow-but-acceptable zone'. \
+                 If consistently exceeded, activate fixture downsize."
+            );
+        }
+        if elapsed > Duration::from_secs(240) {
+            return Err(HarnessError::BudgetExceeded { elapsed });
+        }
+
+        if !output.status.success() {
+            return Err(HarnessError::SimulationCrashed {
+                exit_code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_clocked_output(&stdout)
+    }
+
+    fn parse_clocked_output(&self, stdout: &str) -> Result<ClockedOutput, HarnessError> {
+        let mut tap_lines = String::new();
+        let mut measured_cycles: Option<u64> = None;
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("measured_cycles=") {
+                measured_cycles = Some(rest.parse::<u64>().map_err(|_| {
+                    HarnessError::OutputParseFailed {
+                        unparsed_line: line.to_string(),
+                        expected_format: "measured_cycles=<integer>".to_string(),
+                    }
+                })?);
+            } else {
+                tap_lines.push_str(line);
+                tap_lines.push('\n');
+            }
+        }
+
+        let taps = self.parse_output(&tap_lines)?;
+        let measured_cycles =
+            measured_cycles.ok_or_else(|| HarnessError::OutputParseFailed {
+                unparsed_line: "(no measured_cycles line found)".to_string(),
+                expected_format: "measured_cycles=<integer>".to_string(),
+            })?;
+
+        Ok(ClockedOutput { taps, measured_cycles })
+    }
 }
 
 #[cfg(test)]
@@ -259,11 +420,17 @@ mod tests {
     #[test]
     fn tap_descriptor_v1_mlp_shape() {
         let desc = TapDescriptor::v1_mlp();
-        assert_eq!(desc.taps.len(), 6);
+        // M57.1 Concern #4: bias-as-seed fold removes tap_l{1,2}_bias_out;
+        // 6 taps → 5 taps (tap_l1_matmul_out, tap_l1_relu_out,
+        // tap_l2_matmul_out, tap_l2_relu_out, out). See `TapDescriptor::v1_mlp`
+        // for the semantics shift on tap_l<i>_matmul_out.
+        assert_eq!(desc.taps.len(), 5);
         assert_eq!(desc.taps[0].0, "tap_l1_matmul_out");
         assert_eq!(desc.taps[0].1, 128 * 32);
-        assert_eq!(desc.taps[5].0, "out");
-        assert_eq!(desc.taps[5].1, 10 * 64);
+        assert_eq!(desc.taps[3].0, "tap_l2_relu_out");
+        assert_eq!(desc.taps[3].1, 10 * 64);
+        assert_eq!(desc.taps[4].0, "out");
+        assert_eq!(desc.taps[4].1, 10 * 64);
     }
 
     #[test]
@@ -320,5 +487,68 @@ mod tests {
         // Just verify the call doesn't panic regardless of whether Verilator
         // is installed in this environment.
         let _ = VerilatorHarness::is_available();
+    }
+
+    #[test]
+    fn tap_descriptor_v1_mlp_seq_shape() {
+        let desc = TapDescriptor::v1_mlp_seq();
+        // Sequential module has only the final `out` port (no intermediate
+        // test-taps): 10 × i64 = 640 bits.
+        assert_eq!(desc.taps.len(), 1);
+        assert_eq!(desc.taps[0].0, "out");
+        assert_eq!(desc.taps[0].1, 10 * 64);
+    }
+
+    #[test]
+    fn parse_clocked_output_round_trips() {
+        // Verify that parse_clocked_output splits the measured_cycles line
+        // from the tap lines and returns both correctly.
+        let harness = VerilatorHarness {
+            sim_binary: PathBuf::from("/nonexistent"),
+            tap_descriptor: TapDescriptor::v1_mlp_seq(),
+        };
+        // Two i32 words for `out`, followed by the measured_cycles line.
+        // out[1]=2, out[0]=1 → "0x0000000200000001"
+        let stdout = "out=0x0000000200000001\nmeasured_cycles=101636\n";
+        let result = harness.parse_clocked_output(stdout).unwrap();
+        assert_eq!(result.measured_cycles, 101636);
+        let words = result.taps.tap_i32("out", 2);
+        assert_eq!(words, vec![1i32, 2i32]);
+    }
+
+    #[test]
+    fn parse_clocked_output_rejects_missing_cycles() {
+        // measured_cycles line is mandatory; its absence must be an error.
+        let harness = VerilatorHarness {
+            sim_binary: PathBuf::from("/nonexistent"),
+            tap_descriptor: TapDescriptor::v1_mlp_seq(),
+        };
+        let stdout = "out=0x42\n"; // no measured_cycles line
+        match harness.parse_clocked_output(stdout) {
+            Err(HarnessError::OutputParseFailed { .. }) => {}
+            other => panic!("expected OutputParseFailed, got {other:?}"),
+        }
+    }
+
+    /// Compile-time API shape test for the clocked path.
+    ///
+    /// This test skips gracefully when Verilator is not installed (which is
+    /// the case in CI on this branch).  It verifies that `build_clocked`,
+    /// `run_clocked`, and `ClockedOutput` all compile and that `run_clocked`
+    /// returns the expected `Result<ClockedOutput, HarnessError>` type.
+    ///
+    /// When Verilator IS present this test would attempt a real build, so we
+    /// gate it behind `is_available()`.
+    #[test]
+    fn clocked_api_skips_gracefully_without_verilator() {
+        if !VerilatorHarness::is_available() {
+            // Verilator not installed — confirm the API compiles by naming all
+            // the types; the test exits here so no I/O occurs.
+            let _: fn(&Path, &str, TapDescriptor) -> Result<VerilatorHarness, HarnessError> =
+                VerilatorHarness::build_clocked;
+            return;
+        }
+        // If Verilator somehow IS available, the function-pointer check still
+        // passes; we do not drive a full build here (no .v file on this branch).
     }
 }

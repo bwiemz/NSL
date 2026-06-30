@@ -479,11 +479,22 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_packing_metadata_set", &[types::I64, types::I64], None),
     ("nsl_packing_metadata_get_segment_ids", &[], Some(types::I64)),
     ("nsl_packing_metadata_get_doc_starts", &[], Some(types::I64)),
+    // PCA Tier A (spec §6.1) — mismatch warning: warns once if a
+    // segment-masked module sees no segment_ids in the first N steps.
+    ("nsl_pca_packing_mismatch_check", &[types::I64], None),
     // In-place mutation ops (M14)
     ("nsl_tensor_copy_data", &[types::I64, types::I64], None),
     ("nsl_tensor_add_inplace", &[types::I64, types::I64], None),
     ("nsl_tensor_zero_inplace", &[types::I64], None),
     ("nsl_tensor_zeros_like", &[types::I64], Some(types::I64)),
+    // CPDT precision-adaptive optimizer: cast / zeros helpers
+    ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
+    ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
+    // CFTP v6 forward inline-cast wrappers: src_ptr -> new tensor (scope-tracked).
+    ("nsl_tensor_to_bf16", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_to_fp16", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_to_f32", &[types::I64], Some(types::I64)),
     // Gradient clipping (M14)
     ("nsl_clip_grad_norm", &[types::I64, types::F64], None),
     // Collect all tensor params from a model struct (recursive, magic-probed)
@@ -1073,6 +1084,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // tier_b_name_ptr
             // PCA §4.3: doc_starts device pointer (0 = identity positions)
             types::I64, // doc_starts_ptr
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — grid_x
+            // override when the kernel name carries the `_per_doc_cta`
+            // suffix. Pass 0 for all non-per-doc topologies.
+            types::I64, // num_docs_or_zero
         ],
         Some(types::I64),
     ),
@@ -1117,6 +1132,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // tier_b_name_ptr
             // PCA §4.3: doc_starts device pointer (0 = identity positions)
             types::I64, // doc_starts_ptr
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — grid_x
+            // override when the kernel name carries the `_per_doc_cta`
+            // suffix. Pass 0 for all non-per-doc topologies.
+            types::I64, // num_docs_or_zero
         ],
         Some(types::I64),
     ),
@@ -1194,6 +1213,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,                         // tier_b_name_ptr (planner spec §4)
             types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
             types::I64,                         // tier_b2_active (CSHA Tier B.2 Phase 3 T6)
+            types::I64,                         // num_docs_or_zero (PCA per-doc CTA backward, Sprint 5)
         ],
         Some(types::I64),
     ),
@@ -1213,6 +1233,64 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // phase1_name_ptr
             types::I64, // phase2_ptx_ptr
             types::I64, // phase2_name_ptr
+        ],
+        Some(types::I64),
+    ),
+    // CFTP §4.4 G3 (Sprint 4): fused linear-CE FFI signatures.
+    // Sprint v3-2 added trailing `dtype_tag` (0=F32 sentinel preserves
+    // pre-v3-2 ABI; 1=F16). Sprint v4-1 extended the sentinel space
+    // with 2=Bf16 (same single-i64 trailing arg — no ABI bump).
+    // The Cranelift IR call sites in wengert_lower.rs derive the tag
+    // from the @fused_lm_ce(dtype=...) decorator via
+    // `fused_ce_dtype_for_compiler`. Note: v4-2 wengert refuses
+    // tag != 0 pending precision_cast plumbing (see review Finding 2);
+    // direct FFI tests with caller-managed 16-bit HBM allocation
+    // exercise tags 1 and 2 end-to-end.
+    // Forward v1 (small vocab, single CTA per row).
+    (
+        "nsl_fused_linear_ce_forward",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // kname_ptr
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias, targets (raw device ptrs)
+            types::I64, types::I64, // loss_out, lse_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // smem_bytes
+            types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
+        ],
+        Some(types::I64),
+    ),
+    // Forward large-vocab (Sprint 3 two-kernel path, vocab > 8192).
+    (
+        "nsl_fused_linear_ce_forward_large",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // partials_kname_ptr
+            types::I64, // finalize_kname_ptr
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias, targets
+            types::I64, // partials_ptr (caller-owned scratch)
+            types::I64, types::I64, // loss_out, lse_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // num_tiles
+            types::I64, // smem_bytes
+            types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
+        ],
+        Some(types::I64),
+    ),
+    // Backward (shared between v1 and large-vocab forward paths).
+    (
+        "nsl_fused_linear_ce_backward",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // kname_ptr
+            types::I64, // grad_output_bits (f32 bits packed into i64)
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias, targets
+            types::I64, // lse_ptr
+            types::I64, types::I64, types::I64, // dx_out, dW_out, dbias_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // num_valid
+            types::I64, // smem_bytes
+            types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
         ],
         Some(types::I64),
     ),
@@ -2123,4 +2201,46 @@ pub fn declare_runtime_functions(
     }
 
     Ok(fns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUNTIME_FUNCTIONS;
+
+    #[test]
+    fn precision_cast_ops_have_signatures() {
+        let names: Vec<&str> = RUNTIME_FUNCTIONS.iter().map(|(n, _, _)| *n).collect();
+        assert!(names.contains(&"nsl_tensor_cast"), "nsl_tensor_cast missing");
+        assert!(names.contains(&"nsl_tensor_cast_into"), "nsl_tensor_cast_into missing");
+        assert!(
+            names.contains(&"nsl_tensor_zeros_like_dtype"),
+            "nsl_tensor_zeros_like_dtype missing"
+        );
+    }
+
+    /// CFTP v6: forward inline-cast wrapper FFIs are registered with the
+    /// correct Cranelift signature ([I64] -> I64). Required so wengert_lower
+    /// can emit calls to them from compiled NSL.
+    #[test]
+    fn cftp_v6_cast_wrappers_have_signatures() {
+        use cranelift_codegen::ir::types;
+        for &name in &["nsl_tensor_to_bf16", "nsl_tensor_to_fp16", "nsl_tensor_to_f32"] {
+            let entry = RUNTIME_FUNCTIONS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} missing from RUNTIME_FUNCTIONS"));
+            assert_eq!(
+                entry.1,
+                &[types::I64],
+                "{name}: expected params [I64], got {:?}",
+                entry.1
+            );
+            assert_eq!(
+                entry.2,
+                Some(types::I64),
+                "{name}: expected return I64, got {:?}",
+                entry.2
+            );
+        }
+    }
 }

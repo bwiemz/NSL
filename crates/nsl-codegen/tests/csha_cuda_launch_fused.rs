@@ -272,6 +272,9 @@ fn run_fused_config_dmodel(
             rmsnorm_eps:       norm_eps,
             d_model:           d_model as u32,
             save_activations_for_backward: false,
+            // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
+            // the in-kernel RMSNorm prologue active (default).
+            skip_rmsnorm_prologue: false,
         }),
         checkpoint: None,
     };
@@ -514,6 +517,12 @@ fn run_fused_config_dmodel(
             norm_eps.to_bits() as i64,
             active_heads_i,
             d_model as i64,
+            0i64,         // segment_ids_ptr — 0 = unpacked launch
+            // Tier B extension — null (no Tier B dispatch for this test).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (legacy topology).
             0i64,
         )
     };
@@ -596,6 +605,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
             fused_output_proj: false, active_heads: 4,
             rmsnorm_eps: 1e-5, d_model: 32,
             save_activations_for_backward: false,
+            skip_rmsnorm_prologue: false,
         }),
         checkpoint: None,
     };
@@ -792,6 +802,9 @@ fn run_with_saves(
             active_heads: heads,
             rmsnorm_eps: norm_eps,
             d_model: dm as u32,
+            // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
+            // the in-kernel RMSNorm prologue active (default).
+            skip_rmsnorm_prologue: false,
         }),
         checkpoint: None,
     };
@@ -878,6 +891,12 @@ fn run_with_saves(
             heads as i64, dm as i64,
             qp, kp, vp, rmx, rsm, xr,
             seg_ids_dev,
+            // Tier B extension — null (no Tier B dispatch for this test).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (legacy topology).
+            0i64,
         )
     };
     if rc != 0 {
@@ -1156,6 +1175,9 @@ fn t4_csha_backward_ffi_smoke() {
             active_heads: heads as u32,
             rmsnorm_eps: norm_eps,
             d_model: d_model as u32,
+            // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
+            // the in-kernel RMSNorm prologue active (default).
+            skip_rmsnorm_prologue: false,
         }),
         checkpoint: None,
     };
@@ -1243,7 +1265,14 @@ fn t4_csha_backward_ffi_smoke() {
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
             dxn_dev,
-            0,
+            0,  // segment_ids_ptr — 0 = unpacked launch
+            // Tier B extension — null (no Tier B dispatch for this test).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
+            // means legacy per-q-block topology.
+            0i64,
         )
     };
 

@@ -24,7 +24,7 @@ fn assert_error_contains(err_string: &str, fragment: &str) {
 /// data check).
 fn grad_mode_opts_no_data() -> CompileOptions {
     let mut opts = CompileOptions::default();
-    opts.wggo_importance = WggoImportance::Grad;
+    opts.wggo.importance = WggoImportance::Grad;
     opts
 }
 
@@ -33,7 +33,7 @@ fn grad_mode_opts_no_data() -> CompileOptions {
 /// met but calibration data is None, triggering the refusal).
 fn grad_mode_opts_no_data_reachable_model() -> CompileOptions {
     let mut opts = CompileOptions::default();
-    opts.wggo_importance = WggoImportance::Grad;
+    opts.wggo.importance = WggoImportance::Grad;
     // calibration_data remains None — the §5.6 check fires because the source
     // has decorators + reachable model (passes §5.4 and §5.5 preconditions)
     // but calibration_data is missing.
@@ -112,7 +112,7 @@ fn refuse_grad_mode_with_no_calibration_data() {
 #[test]
 fn auto_mode_does_not_refuse_without_decorators() {
     let mut opts = CompileOptions::default();
-    opts.wggo_importance = WggoImportance::Auto;
+    opts.wggo.importance = WggoImportance::Auto;
     // compile_with_options may fail for other reasons (codegen on a minimal
     // fixture) but must NOT fail with the §5.4 refusal message.
     if let Err(e) = compile_with_options(NO_DECORATOR_SOURCE, &opts) {
@@ -129,7 +129,7 @@ fn auto_mode_does_not_refuse_without_decorators() {
 #[test]
 fn magnitude_mode_does_not_refuse_without_decorators() {
     let mut opts = CompileOptions::default();
-    opts.wggo_importance = WggoImportance::Magnitude;
+    opts.wggo.importance = WggoImportance::Magnitude;
     if let Err(e) = compile_with_options(NO_DECORATOR_SOURCE, &opts) {
         let msg = format!("{e}");
         assert!(

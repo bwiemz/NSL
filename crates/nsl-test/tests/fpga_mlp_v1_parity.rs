@@ -44,9 +44,6 @@ where
 /// Verilator simulation, and asserts bit-exact per-op and final-output
 /// match across all 100 deterministic stimuli.
 #[test]
-#[ignore = "M57.1 v1 closure prerequisite: AST->KIR dispatch, HIR port/wire generation, \
-            end-to-end CLI wiring (nsl fpga-compile), and Verilog synthesizability. \
-            See spec §1.5 deferred-roadmap / crates/nsl-test/tests/fpga_mlp_v1_parity.rs header."]
 fn fpga_mlp_v1_parity() {
     if !VerilatorHarness::is_available() {
         eprintln!("SKIPPED: verilator not installed");
@@ -114,24 +111,22 @@ fn fpga_mlp_v1_parity() {
     for (stim_idx, x) in stimuli.iter().enumerate() {
         let hw = harness.run(x).expect("simulator run");
 
-        let cpu_l1_matmul = cpu_reference_layer1_matmul(x, &w1);
-        let cpu_l1_bias = cpu_reference_layer1_bias(&cpu_l1_matmul, &b1);
-        let cpu_l1_relu = cpu_reference_layer1_relu(&cpu_l1_bias);
-        let cpu_l2_matmul = cpu_reference_layer2_matmul(&cpu_l1_relu, &w2);
-        let cpu_l2_bias = cpu_reference_layer2_bias(&cpu_l2_matmul, &b2);
-        let cpu_out = cpu_reference_layer2_relu(&cpu_l2_bias);
+        // M57.1 §3.5: bias is folded into the MAC accumulator seed, so
+        // `tap_l*_matmul_out` holds the post-bias accumulator value. The legacy
+        // `tap_l*_bias_out` taps are removed (Task 3.6 dropped them from
+        // TapDescriptor::v1_mlp), reducing the per-stimulus assertion count
+        // from 6 to 5. Concern #4 (M57.1 spec).
+        let cpu_l1_matmul_with_bias = cpu_reference_layer1_matmul_with_bias(x, &w1, &b1);
+        let cpu_l1_relu = cpu_reference_layer1_relu(&cpu_l1_matmul_with_bias);
+        let cpu_l2_matmul_with_bias = cpu_reference_layer2_matmul_with_bias(&cpu_l1_relu, &w2, &b2);
+        let cpu_l2_relu = cpu_reference_layer2_relu(&cpu_l2_matmul_with_bias);
+        let cpu_out = &cpu_l2_relu;
 
         assert_bit_exact(
             &hw.tap_i32("tap_l1_matmul_out", 128),
-            &cpu_l1_matmul,
+            &cpu_l1_matmul_with_bias,
             stim_idx,
-            "layer1_matmul",
-        );
-        assert_bit_exact(
-            &hw.tap_i32("tap_l1_bias_out", 128),
-            &cpu_l1_bias,
-            stim_idx,
-            "layer1_bias",
+            "layer1_matmul_with_bias",
         );
         assert_bit_exact(
             &hw.tap_i32("tap_l1_relu_out", 128),
@@ -141,19 +136,19 @@ fn fpga_mlp_v1_parity() {
         );
         assert_bit_exact(
             &hw.tap_i64("tap_l2_matmul_out", 10),
-            &cpu_l2_matmul,
+            &cpu_l2_matmul_with_bias,
             stim_idx,
-            "layer2_matmul",
+            "layer2_matmul_with_bias",
         );
         assert_bit_exact(
-            &hw.tap_i64("tap_l2_bias_out", 10),
-            &cpu_l2_bias,
+            &hw.tap_i64("tap_l2_relu_out", 10),
+            &cpu_l2_relu,
             stim_idx,
-            "layer2_bias",
+            "layer2_relu",
         );
         assert_bit_exact(
             &hw.tap_i64("out", 10),
-            &cpu_out,
+            cpu_out,
             stim_idx,
             "final_output",
         );
@@ -233,12 +228,11 @@ fn fpga_mlp_v1_parity_full_diagnostic() {
             }
         };
 
-        let cpu_l1_matmul = cpu_reference_layer1_matmul(x, &w1);
-        let cpu_l1_bias = cpu_reference_layer1_bias(&cpu_l1_matmul, &b1);
-        let cpu_l1_relu = cpu_reference_layer1_relu(&cpu_l1_bias);
-        let cpu_l2_matmul = cpu_reference_layer2_matmul(&cpu_l1_relu, &w2);
-        let cpu_l2_bias = cpu_reference_layer2_bias(&cpu_l2_matmul, &b2);
-        let cpu_out = cpu_reference_layer2_relu(&cpu_l2_bias);
+        // M57.1 §3.5: bias-as-seed (see note in fpga_mlp_v1_parity above).
+        let cpu_l1_matmul = cpu_reference_layer1_matmul_with_bias(x, &w1, &b1);
+        let cpu_l1_relu = cpu_reference_layer1_relu(&cpu_l1_matmul);
+        let cpu_l2_matmul = cpu_reference_layer2_matmul_with_bias(&cpu_l1_relu, &w2, &b2);
+        let cpu_out = cpu_reference_layer2_relu(&cpu_l2_matmul);
 
         let check_i32 = |hw_tap: Vec<i32>, cpu_ref: &[i32], op: &str| {
             for (i, (h, c)) in hw_tap.iter().zip(cpu_ref).enumerate() {
@@ -263,10 +257,10 @@ fn fpga_mlp_v1_parity_full_diagnostic() {
 
         for fail in [
             check_i32(hw.tap_i32("tap_l1_matmul_out", 128), &cpu_l1_matmul, "layer1_matmul"),
-            check_i32(hw.tap_i32("tap_l1_bias_out", 128), &cpu_l1_bias, "layer1_bias"),
+            check_i32(hw.tap_i32("tap_l1_bias_out", 128), &cpu_l1_matmul, "layer1_bias"),
             check_i32(hw.tap_i32("tap_l1_relu_out", 128), &cpu_l1_relu, "layer1_relu"),
             check_i64(hw.tap_i64("tap_l2_matmul_out", 10), &cpu_l2_matmul, "layer2_matmul"),
-            check_i64(hw.tap_i64("tap_l2_bias_out", 10), &cpu_l2_bias, "layer2_bias"),
+            check_i64(hw.tap_i64("tap_l2_bias_out", 10), &cpu_l2_matmul, "layer2_bias"),
             check_i64(hw.tap_i64("out", 10), &cpu_out, "final_output"),
         ]
         .into_iter()

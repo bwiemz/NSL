@@ -1,0 +1,48 @@
+# CFTP v7 — end-to-end fixture for `@fused_lm_ce(dtype = "fp16")`.
+#
+# The orchestrator's task asks for a true `nsl run` subprocess validation
+# of the decorator on real NSL source.  Today the `train`-block compilation
+# path hits an *independent* runtime FFI bitrot:
+#
+#     codegen error: undefined function 'nsl_optim_sgd__sgd_step'
+#
+# This refusal fires from `crates/nsl-codegen/src/stmt.rs` during train-
+# block lowering — well AFTER the `@fused_lm_ce` semantic gate and the
+# wengert auto-substitution that v5/v6 activate.  It is unrelated to the
+# v7 GPU PTX cast kernel; it would block ANY train block, decorator-
+# bearing or not.
+#
+# The companion `nsl-cli` test (`fused_lm_ce_e2e_nsl_source.rs`)
+# therefore exercises the front-end path subprocess-style via `nsl check`
+# (parse + semantic + decorator capture) and DOCUMENTS the train-loop
+# bitrot via an explicit panic message when `nsl run` is invoked.  When
+# the optimizer-runtime registration is fixed, this fixture is already
+# the right shape to drive the full GPU end-to-end loss compare.
+#
+# Shape parameters here match the v5/v6 numerical-pin orchestrator
+# config (V=4096, H=128, B=2, S=32, vocab_tile=1024) so the same CPU f64
+# reference in `crates/nsl-codegen/tests/common/fused_lce_cpu_f64.rs`
+# applies once the train block can JIT to GPU.
+
+from nsl.nn.losses import cross_entropy
+
+model LM:
+    w: Tensor = randn([4096, 128])
+    bias: Tensor = zeros([4096])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return bias_add(x @ self.w.transpose(0, 1), self.bias)
+
+let m = LM()
+let x = randn([2, 32, 128])
+let targets = zeros([2, 32])
+
+@fused_lm_ce(enabled = true, dtype = "fp16", vocab_size = 4096, hidden_size = 128, batch_size = 2, seq_len = 32, vocab_tile = 1024)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let logits = m.forward(x)
+        let loss = cross_entropy(logits, targets)
+    callbacks:
+        on_step(step, loss):
+            print(loss)

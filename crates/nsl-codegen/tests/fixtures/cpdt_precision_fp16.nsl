@@ -1,0 +1,47 @@
+# Multi-tier CPDT precision-adaptive optimizer fixture.
+#
+# Tier split (n_layers=8 hardcoded in invoke_cpdt_if_enabled):
+#   High tier  : embed (Embedding override), final_norm (Norm override),
+#                blocks.0.w (FirstOrLast l=0), blocks.7.w (FirstOrLast l=7)
+#   Medium tier: blocks.1.w .. blocks.6.w (Generic, scored via formula;
+#                weights set to RMS=1e-4 so score=1e-4/4096≈2.44e-8,
+#                between T1=2.232e-8 and T0=6.106e-8)
+#
+# FASE Deferred mode is activated by:
+#   optimizer: AdamW + grad_accumulation > 1
+#
+# Parameter naming uses `blocks: [Block; 8]` array syntax which produces
+# `blocks.0.w`, `blocks.1.w`, ..., `blocks.7.w` paths (dot-separated).
+# The safetensors weights file must have matching tensor names.
+
+from nsl.nn.losses import mse_loss
+
+model Block:
+    w: Tensor = ones([64, 64])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+model TinyNet:
+    embed: Tensor = ones([8, 64])
+    blocks: [Block; 8] = Block()
+    final_norm: Tensor = ones([64])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.embed
+        for block in self.blocks:
+            h = block.forward(h)
+        let scale = self.final_norm
+        return h * scale
+
+let m = TinyNet()
+let x = ones([2, 8])
+let y = zeros([2, 64])
+
+train(model = m, epochs = 2, grad_accumulation = 4):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "cpdt_precision_out.nslm")

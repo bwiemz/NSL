@@ -111,6 +111,9 @@ fn cfg_128(d_model: u32) -> FlashAttentionConfig {
             rmsnorm_eps: 1e-5,
             d_model,
             save_activations_for_backward: false,
+            // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
+            // the in-kernel RMSNorm prologue active (default).
+            skip_rmsnorm_prologue: false,
         }),
         checkpoint: None,
     }
@@ -282,6 +285,14 @@ fn track_b_head_dim_128_d_model_32_launches() {
             norm_eps.to_bits() as i64,
             heads as i64,
             d_model as i64,
+            // PCA Tier A: segment_ids ptr (trailing) — 0 = unpacked launch.
+            0i64,
+            // Tier B extension — null (no Tier B dispatch for this repro).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for this repro).
+            0i64,
+            // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (legacy topology).
+            0i64,
         )
     };
 
