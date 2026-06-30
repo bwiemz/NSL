@@ -134,5 +134,8 @@ fn main_inner() {
                 process::exit(1);
             }
         }
+        Cli::PtxMetadata { file } => {
+            commands::ptx_metadata::run(&file);
+        }
     }
 }

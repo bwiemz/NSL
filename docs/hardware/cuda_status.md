@@ -47,6 +47,33 @@ These are tracked honestly so users don't over-trust the backend:
 - Multi-GPU / NCCL collectives live in the **Experimental** distributed
   subsystem — not covered by this Beta contract.
 
+## Golden CPU-reference test coverage
+
+GPU correctness is gated by **CPU-reference golden tests**: a kernel's output is
+compared against an independent CPU implementation of the same math. The
+pattern splits into two halves so CI stays GPU-free while the GPU path remains
+checkable on real silicon:
+
+- **CPU-reference half** — pure-CPU oracle computation, runs on every
+  `cargo test` (no GPU). This locks the oracle so it cannot silently drift.
+- **GPU half** — `#[cfg(feature = "cuda")]` + `#[ignore]`, launched manually on
+  a GPU box, asserts the kernel matches the oracle within the declared
+  tolerance (bit-exact where achievable).
+
+Representative tests (search the tree for the current set):
+
+| Test | Oracle | Status |
+|------|--------|--------|
+| `crates/nsl-codegen/tests/tier_b2_dq_kernel_cpu_reference.rs` | D pre-pass + dQ reference | CPU half in CI; GPU half `#[ignore]`+cuda |
+| `crates/nsl-test/.../diagnostic_mode` (`compute_d_for_test`) | CSHA backward D | CPU oracle reusable as a bisection probe |
+| FlashAttention-v2 D pre-pass (this doc, "Numerical contract") | rowsum(dO·O) | GPU-validated **bit-exact** on sm_120 |
+| `crates/nsl-codegen/tests/ptx_metadata_public_api.rs` | declared regs / SMEM / target SM parsed from PTX text | CI (no GPU; static analysis) |
+
+The static [`ptx_metadata`](../../crates/nsl-codegen/src/ptx_metadata.rs) report
+(`nsl ptx-metadata <file.ptx>`) complements these: it surfaces per-kernel
+register/shared-memory/target-SM figures from PTX text without a device, so a
+reviewer can sanity-check occupancy assumptions against the golden runs.
+
 ## What to record when validating new silicon
 
 When you validate a kernel on new hardware, add a row to
@@ -54,6 +81,7 @@ When you validate a kernel on new hardware, add a row to
 
 - GPU model + SM (compute capability)
 - CUDA toolkit + driver version
-- Register usage / SMEM per kernel, target occupancy
+- Register usage / SMEM per kernel, target occupancy (cross-check with
+  `nsl ptx-metadata`)
 - Stream/synchronization assumptions
 - Golden tolerance vs CPU reference (bit-exact preferred)
