@@ -1686,7 +1686,7 @@ pub(crate) fn run_run(file: &PathBuf, program_args: &[String], profile_memory: b
     // CPDT: post-compile rendering, mirroring the `nsl build` path. Stderr
     // diagnostics always fire when CPDT ran; the stdout plan only with
     // --cpdt-report. The plan slot was populated during the compile above.
-    if let Some(slot) = options.cpdt_plan_out.as_ref() {
+    if let Some(slot) = options.cpdt.plan_out.as_ref() {
         if let Some(plan) = slot.lock().ok().and_then(|g| g.clone()) {
             for diag in &plan.override_diagnostics {
                 eprintln!(
@@ -1694,7 +1694,7 @@ pub(crate) fn run_run(file: &PathBuf, program_args: &[String], profile_memory: b
                     diag.requested, diag.applied, diag.reason
                 );
             }
-            if options.cpdt_report_requested {
+            if options.cpdt.report_requested {
                 print!("{}", plan.render_report());
                 println!();
                 println!("=== Defaults Assumed ===");
@@ -2116,12 +2116,16 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 health_monitor: false,
                 health_flush_interval: None,
                 inspect_enabled: false,
-                csha_mode: csha.clone(),
-                csha_report,
-                cpdt_mode,
-                cpdt_cluster: cpdt_cluster.clone(),
-                cpdt_report_requested: cpdt_report,
-                cpdt_plan_out: cpdt_plan_out.clone(),
+                csha: nsl_codegen::CshaOptions {
+                    mode: csha.clone(),
+                    report: csha_report,
+                },
+                cpdt: nsl_codegen::CpdtOptions {
+                    mode: cpdt_mode,
+                    cluster: cpdt_cluster.clone(),
+                    report_requested: cpdt_report,
+                    plan_out: cpdt_plan_out.clone(),
+                },
                 export_functions_out: None,
                 calibration_data: calibration_data.clone(),
                 calibration_mode: Some(calibrate.clone()),

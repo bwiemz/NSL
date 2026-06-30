@@ -16,6 +16,7 @@ pub(crate) mod fpga;
 pub(crate) mod init;
 pub(crate) mod export;
 pub(crate) mod profile_merge;
+pub(crate) mod ptx_metadata;
 pub(crate) mod run;
 pub(crate) mod test;
 pub(crate) mod tokenize;

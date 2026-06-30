@@ -221,6 +221,14 @@ pub(crate) enum Cli {
         #[arg(long)]
         seq: bool,
     },
+
+    /// Report static per-kernel PTX metadata (declared registers, shared
+    /// memory, target SM) parsed from a synthesized `.ptx` file. Pure text
+    /// analysis — no GPU or CUDA toolkit required.
+    PtxMetadata {
+        /// Path to a `.ptx` file (NSL- or ptxas-generated).
+        file: PathBuf,
+    },
 }
 
 /// M55: ZK subcommands.
