@@ -390,6 +390,19 @@ pub(crate) struct CheckArgs {
         /// decorators in the source.
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
         pub(crate) wrga_compare: Option<PathBuf>,
+
+        /// WRGA paper §9.3: ablate one or more Innovations from this run.
+        /// Comma-separated tokens from `wengert | roofline | spectral | fusion
+        /// | memory | all | none`. Default `none` (no ablation). `all` is
+        /// shorthand for every Innovation. Combines with `--wrga-analyze` /
+        /// `--wrga-compare` so users can measure the per-Innovation
+        /// contribution to the report.
+        ///
+        /// Examples:
+        ///   nsl check --wrga-analyze --wrga-ablate=fusion model.nsl
+        ///   nsl check --wrga-compare --wrga-ablate=wengert,fusion model.nsl
+        #[arg(long)]
+        pub(crate) wrga_ablate: Option<String>,
 }
 
 #[derive(clap::Args)]

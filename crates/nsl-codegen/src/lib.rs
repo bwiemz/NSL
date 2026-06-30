@@ -595,6 +595,10 @@ pub struct WrgaInputs {
     pub freeze: Vec<FreezeDecoratorConfig>,
     /// Validated `@adapter(...)` configs.
     pub adapter: Vec<AdapterDecoratorConfig>,
+    /// Paper §9.3 ablation harness — per-Innovation skip flags forwarded to
+    /// `wrga::run`. Default `WrgaAblation::default()` (= all false = no
+    /// ablation, standard WRGA). Set via `nsl check --wrga-ablate=<name>`.
+    pub ablation: crate::wrga::WrgaAblation,
 }
 
 #[derive(Debug, Clone)]

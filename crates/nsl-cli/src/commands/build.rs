@@ -85,7 +85,7 @@ fn check_wrga_report_preconditions(
 /// installed by mutating the entry module's `wrga_configs` in
 /// `frontend_with_flags`'s output via a CLI-side passthrough; we do this by
 /// post-processing `WrgaInputs` inside `run_build_inner` — see
-/// `apply_wrga_target_override` below.
+/// `apply_wrga_check_overrides` below.
 ///
 /// Returns the process exit code: `0` on success, `2` on "no WRGA decorators
 /// in source" (so CI can distinguish absence from compile failure), `1` on
@@ -94,7 +94,13 @@ pub(crate) fn run_check_wrga_analyze(
     file: &PathBuf,
     report_path: &std::path::Path,
     wrga_target: Option<&str>,
+    ablation: nsl_codegen::wrga::WrgaAblation,
 ) -> i32 {
+    let _ablation_guard = if ablation.is_active() {
+        Some(WrgaAblationOverrideGuard::set(ablation))
+    } else {
+        None
+    };
     // Pre-check: surface "no decorators" as exit 2 BEFORE running codegen.
     // The build path would silently report "no plan" with exit 0, which the
     // paper's `--wrga-analyze` contract treats as a distinct error class.
@@ -181,7 +187,26 @@ pub(crate) fn run_check_wrga_compare(
     file: &PathBuf,
     report_path: &std::path::Path,
     wrga_target: Option<&str>,
+    ablation: nsl_codegen::wrga::WrgaAblation,
 ) -> i32 {
+    // `--wrga-compare` recovers each site's `(m + n)` weight footprint from
+    // `RankAllocation.adapter_params / rank`. When `--wrga-ablate=spectral`
+    // is active, `spectral_noop` returns `adapter_params: 0` (no SVD ran =
+    // no shape data), which would silently zero every LoRA/AdaLoRA/ReFT row
+    // in the PEFT table. Warn rather than continuing into a misleading report.
+    if ablation.skip_spectral_allocation {
+        eprintln!(
+            "nsl: --wrga-compare: warning — --wrga-ablate=spectral disables the SVD that \
+             recovers per-site weight shapes; the comparison table's LoRA / AdaLoRA / ReFT \
+             rows will all show 0 params. Use --wrga-analyze if you want the bare ablated \
+             plan."
+        );
+    }
+    let _ablation_guard = if ablation.is_active() {
+        Some(WrgaAblationOverrideGuard::set(ablation))
+    } else {
+        None
+    };
     let (_interner, _parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let has_wrga_decorators = !analysis.wrga_configs.is_empty()
         || !analysis.freeze_configs.is_empty()
@@ -284,6 +309,31 @@ thread_local! {
     /// a capture window — no overhead on normal `nsl build` paths.
     static WRGA_PLAN_CAPTURE: std::cell::RefCell<Option<nsl_codegen::wrga::WrgaPlan>>
         = const { std::cell::RefCell::new(None) };
+
+    /// CLI-side override for `WrgaInputs::ablation`. Set by
+    /// `run_check_wrga_analyze` / `run_check_wrga_compare` when the user
+    /// passes `--wrga-ablate=<flags>`. Read by `apply_wrga_check_overrides`
+    /// (which now also forwards ablation) just before the bridge ships to
+    /// codegen. `None` outside a check window so normal `nsl build` paths
+    /// are not affected.
+    static WRGA_ABLATION_OVERRIDE: std::cell::RefCell<Option<nsl_codegen::wrga::WrgaAblation>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard for `WRGA_ABLATION_OVERRIDE`. Mirrors `WrgaTargetOverrideGuard`.
+struct WrgaAblationOverrideGuard;
+
+impl WrgaAblationOverrideGuard {
+    fn set(value: nsl_codegen::wrga::WrgaAblation) -> Self {
+        WRGA_ABLATION_OVERRIDE.with(|c| *c.borrow_mut() = Some(value));
+        Self
+    }
+}
+
+impl Drop for WrgaAblationOverrideGuard {
+    fn drop(&mut self) {
+        WRGA_ABLATION_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
 }
 
 /// RAII guard that arms `WRGA_PLAN_CAPTURE` for the lifetime of the guard,
@@ -329,12 +379,28 @@ fn capture_wrga_plan_if_armed(plan: &Option<nsl_codegen::wrga::WrgaPlan>) {
     });
 }
 
-/// Apply the thread-local `WRGA_TARGET_OVERRIDE` (set by
-/// `run_check_wrga_analyze`) to a freshly-built `WrgaInputs`. No-op when no
-/// override is active. When the source has no `@wrga(...)` decorator at all
-/// (only `@freeze` / `@adapter`), a minimal Auto-mode config is inserted so
-/// the bridge surfaces the user's target choice.
-pub(crate) fn apply_wrga_target_override(inputs: &mut nsl_codegen::WrgaInputs) {
+/// Apply every CLI-side check-mode override onto a freshly-built `WrgaInputs`
+/// before it ships to codegen. Called from both bridge functions in
+/// `pipeline.rs` (single-file `analysis_to_wrga_inputs` and multi-file
+/// `module_data_to_wrga_inputs`).
+///
+/// Two overrides, both populated by `run_check_wrga_analyze` /
+/// `run_check_wrga_compare` via their respective RAII guards and read here:
+///
+/// 1. `WRGA_TARGET_OVERRIDE` (paper §8.3) — copied onto every
+///    `WrgaDecoratorConfig::target`. When the source has no `@wrga(...)` at
+///    all (only `@freeze` / `@adapter`), a minimal Auto-mode config is
+///    inserted so the target choice still reaches the codegen-side
+///    `wrga::run`.
+/// 2. `WRGA_ABLATION_OVERRIDE` (paper §9.3) — copied onto
+///    `WrgaInputs::ablation` so the codegen-side WRGA driver honours the
+///    requested per-Innovation skip flags.
+///
+/// Both overrides share the same trigger surface (only `nsl check
+/// --wrga-analyze | --wrga-compare` sets either), so a single bridge avoids
+/// gratuitous fanout. On normal `nsl build` paths both thread-locals are
+/// `None` and this fn is a quick noop.
+pub(crate) fn apply_wrga_check_overrides(inputs: &mut nsl_codegen::WrgaInputs) {
     WRGA_TARGET_OVERRIDE.with(|c| {
         let Some(target) = c.borrow().clone() else { return };
         for cfg in &mut inputs.wrga {
@@ -347,6 +413,11 @@ pub(crate) fn apply_wrga_target_override(inputs: &mut nsl_codegen::WrgaInputs) {
                 target: Some(target),
                 layers: Vec::new(),
             });
+        }
+    });
+    WRGA_ABLATION_OVERRIDE.with(|c| {
+        if let Some(abl) = *c.borrow() {
+            inputs.ablation = abl;
         }
     });
 }

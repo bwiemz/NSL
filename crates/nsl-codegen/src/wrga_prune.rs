@@ -28,7 +28,7 @@ use crate::wengert::{PrimalOp, VarId, WengertList};
 /// This mirrors the `DataRequired` classification used by `source_ad.rs`: some
 /// ops (e.g. `Matmul`) need at least one input live at backward time; others
 /// (e.g. `Relu`) need the *output* live; and some (e.g. `Add`) need neither.
-fn save_requirements(op: &PrimalOp) -> SaveRequirements {
+pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
     use PrimalOp::*;
     match op {
         // Linear ops — inputs needed
@@ -79,9 +79,9 @@ fn save_requirements(op: &PrimalOp) -> SaveRequirements {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct SaveRequirements {
-    needs_inputs: bool,
-    needs_output: bool,
+pub(crate) struct SaveRequirements {
+    pub(crate) needs_inputs: bool,
+    pub(crate) needs_output: bool,
 }
 
 /// Summary of the pruning pass, suitable for `nsl build --wrga-report`.
