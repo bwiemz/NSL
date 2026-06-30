@@ -713,6 +713,25 @@ pub enum WggoImportance {
     Grad,
 }
 
+/// WGGO: weight-graph global-optimization options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WggoOptions {
+    /// Global optimization mode ("full", "greedy", "off"). When `None`, WGGO is
+    /// not run. See `crates/nsl-codegen/src/wggo.rs`.
+    pub mode: Option<String>,
+    /// Print the global-optimization report to stderr.
+    pub report: bool,
+    /// Stage 3: path to a `.nslweights` sidecar file.
+    pub weights: Option<std::path::PathBuf>,
+    /// Stage 3: scoring mode (Auto/Magnitude/Grad).
+    pub importance: WggoImportance,
+    /// Stage 3: default fraction of heads allowed to be pruned.
+    pub prune_fraction: Option<f64>,
+}
+
 /// M53: Worst-case-execution-time (WCET) analysis and certification options.
 ///
 /// Grouped out of [`CompileOptions`] as part of decomposing that god-config
@@ -841,11 +860,8 @@ pub struct CompileOptions {
     /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
     /// allocations (vs. B.1's observational-only path). Default false.
     pub wrga_fold_allocations: bool,
-    /// WGGO: global optimization mode ("full", "greedy", "off"). When `None`,
-    /// WGGO is not run.  See `crates/nsl-codegen/src/wggo.rs`.
-    pub wggo_mode: Option<String>,
-    /// WGGO: print the global-optimization report to stderr.
-    pub wggo_report: bool,
+    /// WGGO: weight-graph global-optimization options.
+    pub wggo: WggoOptions,
     /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
     pub profile_kernels: bool,
     /// Dev Tools Phase 2: target GPU name for the profile walker.
@@ -864,12 +880,6 @@ pub struct CompileOptions {
     pub health_flush_interval: Option<u64>,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
-    /// WGGO Stage 3: path to a `.nslweights` sidecar file.
-    pub wggo_weights: Option<std::path::PathBuf>,
-    /// WGGO Stage 3: scoring mode (Auto/Magnitude/Grad).
-    pub wggo_importance: WggoImportance,
-    /// WGGO Stage 3: default fraction of heads allowed to be pruned.
-    pub wggo_prune_fraction: Option<f64>,
     /// CSHA: fusion mode.
     pub csha_mode: Option<String>,
     /// CSHA: print the attention-fusion report.
@@ -959,8 +969,7 @@ impl Default for CompileOptions {
             wrga_inputs: None,
             fused_ce_configs: Vec::new(),
             wrga_fold_allocations: false,
-            wggo_mode: None,
-            wggo_report: false,
+            wggo: WggoOptions::default(),
             profile_kernels: false,
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
@@ -970,9 +979,6 @@ impl Default for CompileOptions {
             health_monitor: false,
             health_flush_interval: None,
             inspect_enabled: false,
-            wggo_weights: None,
-            wggo_importance: WggoImportance::Auto,
-            wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
             cpdt_mode: crate::cpdt::CpdtMode::Off,

@@ -4203,14 +4203,14 @@ impl Compiler<'_> {
                 // the test suite and CLI integration tests.
                 //
                 let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
-                if let Some(ref mode_str) = self.compile_options.wggo_mode {
+                if let Some(ref mode_str) = self.compile_options.wggo.mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
                         // Build AnalysisConfig from CLI overrides; clamp is
                         // also applied in analyze(), but applying it here
                         // keeps the --wggo-report line honest.
                         let mut analysis_config =
                             crate::wggo_weight_analysis::AnalysisConfig::default();
-                        if let Some(f) = self.compile_options.wggo_prune_fraction {
+                        if let Some(f) = self.compile_options.wggo.prune_fraction {
                             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);
                         }
                         // Pass the weights path for magnitude-based scoring
@@ -4222,7 +4222,7 @@ impl Compiler<'_> {
                         // level firing BEFORE compile_main runs, ensuring it's available here
                         // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
                         // calibrate wrapper).
-                        let weights_path = self.compile_options.wggo_weights.as_deref();
+                        let weights_path = self.compile_options.wggo.weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
                             &self.compile_options.target,
@@ -4233,7 +4233,7 @@ impl Compiler<'_> {
                             Some(&self.compile_options),
                         );
                         if let Some(plan) = plan {
-                            if self.compile_options.wggo_report {
+                            if self.compile_options.wggo.report {
                                 eprintln!("{}", plan.render_report());
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
