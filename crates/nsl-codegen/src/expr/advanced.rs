@@ -1343,6 +1343,16 @@ impl Compiler<'_> {
         // extra register pressure when no saves are needed.
         let csha_with_saves_ptx_id = ctx.csha_forward_with_saves_ptx_id;
         let csha_with_saves_name_id = ctx.csha_forward_with_saves_name_id;
+        // PCA Tier B planner spec §5: data-section IDs for the Tier-B-on forward
+        // variant. `Some` iff `should_emit_tier_b_at_codegen(training_config)`
+        // produced a Tier-B-on PTX at module-scan time (i.e. segment_masked=true
+        // on the CSHA training config). The Cranelift call site below threads
+        // these into `nsl_flash_attention_csha_with_saves`'s Tier B slot via
+        // `pca_tier_b::tier_b_enabled` / `tier_b_disabled_sentinel` so the
+        // runtime launcher (`should_dispatch_tier_b_at_runtime` in
+        // `nsl-runtime/src/pca_tier_b_runtime.rs`) can pick the variant.
+        let csha_with_saves_tier_b_on_ptx_id = ctx.csha_with_saves_tier_b_on_ptx_id;
+        let csha_with_saves_tier_b_on_name_id = ctx.csha_with_saves_tier_b_on_name_id;
         let csha_training_shmem_bytes = ctx
             .csha_training_config
             .as_ref()
@@ -1613,12 +1623,19 @@ impl Compiler<'_> {
                 // into the per-layer save record so Gap C/D's adjoint emitter
                 // has everything needed to launch `nsl_flash_attention_csha_backward`
                 // from one lookup keyed by layer name.
-                let (bwd_ptx_id, bwd_name_id) = self
+                let (bwd_ptx_id, bwd_name_id, bwd_tier_b_ptx_id, bwd_tier_b_name_id) = self
                     .kernels
                     .flash_attention_context
                     .as_ref()
-                    .map(|c| (c.csha_backward_ptx_data_id, c.csha_backward_name_data_id))
-                    .unwrap_or((None, None));
+                    .map(|c| {
+                        (
+                            c.csha_backward_ptx_data_id,
+                            c.csha_backward_name_data_id,
+                            c.csha_backward_tier_b_on_ptx_id,
+                            c.csha_backward_tier_b_on_name_id,
+                        )
+                    })
+                    .unwrap_or((None, None, None, None));
                 self.csha_forward_saves.insert(
                     layer_key,
                     crate::csha_apply::CshaSavePointers {
@@ -1630,6 +1647,8 @@ impl Compiler<'_> {
                         x_raw: x_raw_v,
                         backward_ptx_data_id: bwd_ptx_id,
                         backward_name_data_id: bwd_name_id,
+                        backward_tier_b_on_ptx_data_id: bwd_tier_b_ptx_id,
+                        backward_tier_b_on_name_data_id: bwd_tier_b_name_id,
                     },
                 );
 
@@ -1675,6 +1694,20 @@ impl Compiler<'_> {
                     "nsl_packing_metadata_get_doc_starts",
                     &[],
                 )?;
+                // PCA Tier B planner spec §5: build the (tier_b_ptx_ptr,
+                // tier_b_name_ptr) sentinel pair for the `_with_saves` FFI call.
+                // When the module-scan emitted a Tier-B-on variant for this config
+                // (segment_masked=true on the CSHA training config), pass the
+                // symbol pair; otherwise the disabled sentinel. The runtime
+                // launcher decides at-launch which variant to dispatch via the
+                // 4-condition gate in `should_dispatch_tier_b_at_runtime`.
+                let tier_b_with_saves =
+                    match (csha_with_saves_tier_b_on_ptx_id, csha_with_saves_tier_b_on_name_id) {
+                        (Some(pid), Some(nid)) => crate::pca_tier_b::tier_b_enabled(
+                            builder, &mut self.module, pid, nid,
+                        ),
+                        _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
+                    };
                 // PR #93 edit 4: stop silently discarding the launch rc.
                 // Previously bound to `_err` and dropped; now we emit a
                 // runtime `brif rc != 0 → trap` so an INVALID_PTX or
@@ -1710,12 +1743,14 @@ impl Compiler<'_> {
                         // thread-local packing registry (set by train block
                         // per step). 0 when uninitialized → identity path.
                         seg_ids_ptr_v,
-                        // Tier B extension (planner spec §4): sentinel 0
-                        // pair carries the Tier-B-on PTX variant. Inactive
-                        // at this call site — the Tier B planner emits the
-                        // dispatch decision at compile-time, not via the
-                        // CSHA forward path.
-                        null, null,
+                        // PCA Tier B planner spec §4: pass the Tier-B-on PTX
+                        // sentinel pair. When non-(0,0), the runtime launcher
+                        // (`should_dispatch_tier_b_at_runtime`) picks the Tier-B-on
+                        // variant if seq_len ∈ [TIER_B_SEQ_LEN_FLOOR=128,
+                        // TIER_B_MAX_BAKED_SEQ_LEN=16384] AND seg_ids non-null;
+                        // otherwise the base PTX. Built above as
+                        // `tier_b_with_saves` from the module-scan-time data IDs.
+                        tier_b_with_saves[0], tier_b_with_saves[1],
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry. 0 when uninitialized → identity path
                         // (no RoPE reset).
@@ -1774,6 +1809,12 @@ impl Compiler<'_> {
                     "nsl_packing_metadata_get_doc_starts",
                     &[],
                 )?;
+                // PCA Tier B planner spec §4: inference path always passes the
+                // disabled sentinel (the `should_emit_tier_b_at_codegen` gate
+                // only fires on the CSHA training config). Built via the helper
+                // for call-site uniformity; the runtime-side
+                // `assert_tier_b_sentinels` panic enforces (0,0) agreement.
+                let tier_b_inference = crate::pca_tier_b::tier_b_disabled_sentinel(builder);
                 let _err = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
@@ -1817,9 +1858,10 @@ impl Compiler<'_> {
                         // PCA Tier A: segment_ids_ptr — read from the
                         // thread-local packing registry.
                         seg_ids_ptr_v,
-                        // Tier B extension (planner spec §4): sentinel 0
-                        // pair carries the Tier-B-on PTX variant.
-                        null, null,
+                        // PCA Tier B planner spec §4: disabled sentinel built
+                        // above as `tier_b_inference` (inference path has no
+                        // Tier-B-on variant; runtime asserts (0,0) agreement).
+                        tier_b_inference[0], tier_b_inference[1],
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry.
                         doc_starts_v,
@@ -1835,6 +1877,13 @@ impl Compiler<'_> {
                 )?;
             }
         } else {
+            // PCA Tier B planner spec §4: the non-CSHA path has no Tier-B-on
+            // emission (the module-scan gate at compiler/kernel.rs only fires
+            // on the CSHA training config). Pass the disabled sentinel via the
+            // helper so the runtime-side `assert_tier_b_sentinels` guard at
+            // nsl_flash_attention entry sees a valid (0, 0) pair instead of
+            // reading stack garbage.
+            let tier_b_non_csha = crate::pca_tier_b::tier_b_disabled_sentinel(builder);
             let _err = self.compile_call_by_name(
                 builder,
                 "nsl_flash_attention",
@@ -1863,6 +1912,10 @@ impl Compiler<'_> {
                     block_q_val,
                     block_kv_val,
                     causal_val,
+                    // PCA Tier B sentinel pair — disabled (no Tier-B-on emission
+                    // for the non-CSHA path).
+                    tier_b_non_csha[0],
+                    tier_b_non_csha[1],
                 ],
             )?;
         }
