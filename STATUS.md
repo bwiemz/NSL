@@ -45,11 +45,18 @@ The boring, must-always-work core.
 - **DataLoader** — zero-copy mmap tokenized-data loading (M19).
 - **CLI** — `nsl check`, `nsl run`, `nsl build`, `nsl fmt`, `nsl test`.
 
-**Stable contract (must stay green, gated by CI):**
+**Compatibility contract:** only the Stable tier above carries a cross-version
+"won't break" promise. That promise is *narrower* than the **CI merge gate** —
+CI blocks every PR on more than just the Stable tier (build, workspace unit
+tests, clippy, the CLI e2e suite on Linux/Windows, and the ONNX-RT and FPGA
+jobs). `.github/workflows/ci.yml` is the source of truth; the table at the
+bottom of this file maps each tier to what CI runs.
 
 ```bash
+# The floor every contributor can reproduce locally:
 cargo build --workspace
 cargo clippy --workspace -- -D warnings
+cargo test --workspace -- --skip e2e_
 ```
 
 ---
@@ -127,10 +134,14 @@ analysis. Group them only alongside that analysis.
 
 ## How this maps to tests
 
-| Tier         | Required on every PR | Nightly / env-gated         | Informational only |
-|--------------|----------------------|-----------------------------|--------------------|
-| Stable       | build, clippy, unit  | —                           | —                  |
-| Beta         | build                | CUDA, ONNX, e2e (toolchain) | perf baselines     |
-| Experimental | build                | FPGA (Yosys/Verilator)      | research compares  |
+| Tier         | CI gate (blocks every PR)                            | Informational / non-blocking              |
+|--------------|------------------------------------------------------|-------------------------------------------|
+| Stable       | build, clippy, workspace unit tests (`--skip e2e_`)  | —                                         |
+| Beta         | CLI e2e (Linux/Windows), ONNX-RT integration job     | real-CUDA-device tests, perf baselines    |
+| Experimental | FPGA Verilator/Yosys job                             | `#[ignore]`'d research tests, macOS e2e   |
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the exact commands per tier.
+CI jobs are cumulative — the Beta/Experimental rows run *in addition to* the
+Stable row on every PR (they are separate, blocking CI jobs, not nightly).
+Non-blocking entries are `continue-on-error` jobs or tests CI cannot run (no GPU
+on the runners). See [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+`.github/workflows/ci.yml` for the exact commands.

@@ -19,8 +19,10 @@ pub(crate) fn run(file: &Path) {
 
     let kernels = nsl_codegen::ptx_metadata::extract_ptx_metadata(&bytes);
     if kernels.is_empty() {
+        // Exit non-zero, so the message is framed as an error (not a warning)
+        // to stay consistent with the exit code for scripting callers.
         eprintln!(
-            "warning: no `.entry` kernels found in {} — is this a PTX module?",
+            "error: no `.entry` kernels found in {} — is this a PTX module?",
             file.display(),
         );
         process::exit(1);

@@ -601,7 +601,7 @@ pub struct Compiler<'a> {
     pub adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
     /// CSHA Tier A.1: bridge result from the most recent CSHA planner run.
     /// Populated by the CSHA hook in `stmt.rs` when
-    /// `CompileOptions.csha_mode` is set to a non-off mode. Consumed by
+    /// `CompileOptions.csha.mode` is set to a non-off mode. Consumed by
     /// `compile_flash_attention_call` to route FA launches through the
     /// CSHA-aware FFI when per-layer extras are available. `None` when
     /// CSHA is disabled or when no `@train` block compiled.
