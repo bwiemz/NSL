@@ -713,6 +713,36 @@ pub enum WggoImportance {
     Grad,
 }
 
+/// M55: Zero-knowledge proof-circuit emission options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZkOptions {
+    /// Emit a ZK inference circuit alongside compiled output.
+    pub circuit: bool,
+    /// ZK backend to use ("folding", "halo2", or "plonky3").
+    pub backend: String,
+    /// ZK field to use ("m31" or "bn254").
+    pub field: String,
+    /// Also emit a Solidity verifier contract.
+    pub solidity: bool,
+    /// Path to safetensors weight file used as ZK witness.
+    pub weights_path: Option<std::path::PathBuf>,
+}
+
+impl Default for ZkOptions {
+    fn default() -> Self {
+        Self {
+            circuit: false,
+            backend: "folding".to_string(),
+            field: "m31".to_string(),
+            solidity: false,
+            weights_path: None,
+        }
+    }
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -767,16 +797,8 @@ pub struct CompileOptions {
     /// M38a: Per-function ownership metadata from semantic analysis.
     /// Keys are function names, values have linear_params and shared_params.
     pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
-    /// M55: Emit a ZK inference circuit alongside compiled output.
-    pub zk_circuit: bool,
-    /// M55: ZK backend to use ("folding", "halo2", or "plonky3").
-    pub zk_backend: String,
-    /// M55: ZK field to use ("m31" or "bn254").
-    pub zk_field: String,
-    /// M55: Also emit a Solidity verifier contract.
-    pub zk_solidity: bool,
-    /// M55: Path to safetensors weight file used as ZK witness.
-    pub zk_weights_path: Option<std::path::PathBuf>,
+    /// M55: Zero-knowledge proof-circuit emission options.
+    pub zk: ZkOptions,
     /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
     pub zero_stage: Option<u8>,
     /// Debug training mode: disables fusion, disables FBIP, and emits
@@ -912,11 +934,7 @@ impl Default for CompileOptions {
             fpga_device: None,
             linear_types_enabled: false,
             ownership_info: HashMap::new(),
-            zk_circuit: false,
-            zk_backend: "folding".to_string(),
-            zk_field: "m31".to_string(),
-            zk_solidity: false,
-            zk_weights_path: None,
+            zk: ZkOptions::default(),
             zero_stage: None,
             debug_training: false,
             shared_lib: false,

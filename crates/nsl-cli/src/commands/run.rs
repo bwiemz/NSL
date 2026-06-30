@@ -261,11 +261,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 wcet_target,
                 fpga_device,
                 // M55: ZK flags not exposed on `run`; use defaults.
-                zk_circuit: false,
-                zk_backend: "folding".to_string(),
-                zk_field: "m31".to_string(),
-                zk_solidity: false,
-                zk_weights_path: None,
+                zk: nsl_codegen::ZkOptions::default(),
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 ownership_info: std::collections::HashMap::new(),
                 zero_stage: zero_stage.map(|s| s as u8),

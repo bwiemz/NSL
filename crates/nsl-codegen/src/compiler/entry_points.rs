@@ -796,7 +796,7 @@ fn compile_with_zk_info_best_effort_plan(
             let zk_config = {
                 let mut cfg = crate::zk::backend::ZkConfig::default();
                 // Wire --zk-backend flag to select backend
-                cfg.backend = match compiler.compile_options.zk_backend.to_lowercase().as_str() {
+                cfg.backend = match compiler.compile_options.zk.backend.to_lowercase().as_str() {
                     "plonky3" | "fri" => crate::zk::backend::ZkBackendType::Plonky3,
                     "halo2" => crate::zk::backend::ZkBackendType::Halo2,
                     "folding" | "nova" | "" => crate::zk::backend::ZkBackendType::Folding,
@@ -809,7 +809,7 @@ fn compile_with_zk_info_best_effort_plan(
                     }
                 };
                 // Wire --zk-field flag to select finite field
-                cfg.field = match compiler.compile_options.zk_field.to_lowercase().as_str() {
+                cfg.field = match compiler.compile_options.zk.field.to_lowercase().as_str() {
                     "bn254" | "bn256" => crate::zk::backend::ZkField::BN254,
                     "mersenne31" | "m31" | "" => crate::zk::backend::ZkField::Mersenne31,
                     other => {
@@ -820,9 +820,9 @@ fn compile_with_zk_info_best_effort_plan(
                         crate::zk::backend::ZkField::Mersenne31
                     }
                 };
-                cfg.emit_solidity = compiler.compile_options.zk_solidity;
+                cfg.emit_solidity = compiler.compile_options.zk.solidity;
                 // Wire --zk-weights flag to load weight file for witness generation
-                if let Some(ref weights_path) = compiler.compile_options.zk_weights_path {
+                if let Some(ref weights_path) = compiler.compile_options.zk.weights_path {
                     eprintln!(
                         "[nsl] ZK: loading weights from {} for witness generation",
                         weights_path.display()

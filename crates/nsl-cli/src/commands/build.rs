@@ -2083,11 +2083,13 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 do178c_report,
                 wcet_target,
                 fpga_device,
-                zk_circuit,
-                zk_backend,
-                zk_field,
-                zk_solidity,
-                zk_weights_path: zk_weights.clone(),
+                zk: nsl_codegen::ZkOptions {
+                    circuit: zk_circuit,
+                    backend: zk_backend,
+                    field: zk_field,
+                    solidity: zk_solidity,
+                    weights_path: zk_weights.clone(),
+                },
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
                 zero_stage: zero_stage.map(|s| s as u8),
