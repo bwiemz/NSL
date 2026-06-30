@@ -633,7 +633,7 @@ pub fn compile_returning_plan(
     compiler.compile_pending_lambdas()?;
 
     // M53: Run WCET analysis for @real_time functions (after codegen, before finalize)
-    if compiler.compile_options.wcet_enabled {
+    if compiler.compile_options.wcet.enabled {
         compiler.run_wcet_analysis()?;
     }
 
@@ -768,7 +768,7 @@ fn compile_with_zk_info_best_effort_plan(
         }
 
         // M53: Run WCET analysis for @real_time functions
-        if compiler.compile_options.wcet_enabled {
+        if compiler.compile_options.wcet.enabled {
             compiler.run_wcet_analysis()?;
         }
 
@@ -796,7 +796,7 @@ fn compile_with_zk_info_best_effort_plan(
             let zk_config = {
                 let mut cfg = crate::zk::backend::ZkConfig::default();
                 // Wire --zk-backend flag to select backend
-                cfg.backend = match compiler.compile_options.zk_backend.to_lowercase().as_str() {
+                cfg.backend = match compiler.compile_options.zk.backend.to_lowercase().as_str() {
                     "plonky3" | "fri" => crate::zk::backend::ZkBackendType::Plonky3,
                     "halo2" => crate::zk::backend::ZkBackendType::Halo2,
                     "folding" | "nova" | "" => crate::zk::backend::ZkBackendType::Folding,
@@ -809,7 +809,7 @@ fn compile_with_zk_info_best_effort_plan(
                     }
                 };
                 // Wire --zk-field flag to select finite field
-                cfg.field = match compiler.compile_options.zk_field.to_lowercase().as_str() {
+                cfg.field = match compiler.compile_options.zk.field.to_lowercase().as_str() {
                     "bn254" | "bn256" => crate::zk::backend::ZkField::BN254,
                     "mersenne31" | "m31" | "" => crate::zk::backend::ZkField::Mersenne31,
                     other => {
@@ -820,9 +820,9 @@ fn compile_with_zk_info_best_effort_plan(
                         crate::zk::backend::ZkField::Mersenne31
                     }
                 };
-                cfg.emit_solidity = compiler.compile_options.zk_solidity;
+                cfg.emit_solidity = compiler.compile_options.zk.solidity;
                 // Wire --zk-weights flag to load weight file for witness generation
-                if let Some(ref weights_path) = compiler.compile_options.zk_weights_path {
+                if let Some(ref weights_path) = compiler.compile_options.zk.weights_path {
                     eprintln!(
                         "[nsl] ZK: loading weights from {} for witness generation",
                         weights_path.display()
@@ -932,7 +932,7 @@ fn compile_standalone_best_effort_plan(
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_standalone_main(&ast.stmts)?;
         compiler.compile_pending_lambdas()?;
-        if compiler.compile_options.wcet_enabled {
+        if compiler.compile_options.wcet.enabled {
             compiler.run_wcet_analysis()?;
         }
         // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
@@ -1311,7 +1311,7 @@ pub fn compile_entry_returning_plan(
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     // M53: Run WCET analysis for @real_time functions
-    if compiler.compile_options.wcet_enabled {
+    if compiler.compile_options.wcet.enabled {
         compiler.run_wcet_analysis()?;
     }
     // M31: Print fusion report if enabled

@@ -713,6 +713,75 @@ pub enum WggoImportance {
     Grad,
 }
 
+/// M53: Worst-case-execution-time (WCET) analysis and certification options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WcetOptions {
+    /// Enable WCET analysis for `@real_time` functions.
+    pub enabled: bool,
+    /// GPU target name for WCET analysis (e.g., "Orin", "H100").
+    pub gpu: Option<String>,
+    /// CPU target name for WCET analysis (e.g., "cortex-a78").
+    pub cpu: Option<String>,
+    /// Path to write the WCET certificate JSON.
+    pub report_path: Option<std::path::PathBuf>,
+    /// Safety-margin multiplier for WCET (default: 1.05 = 5%).
+    pub safety_margin: f64,
+    /// Path to write a DO-178C compliance report.
+    pub do178c_report: Option<std::path::PathBuf>,
+    /// WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked).
+    pub target: String,
+    /// FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg").
+    pub fpga_device: Option<String>,
+}
+
+impl Default for WcetOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gpu: None,
+            cpu: None,
+            report_path: None,
+            safety_margin: 1.05,
+            do178c_report: None,
+            target: "gpu".to_string(),
+            fpga_device: None,
+        }
+    }
+}
+
+/// M55: Zero-knowledge proof-circuit emission options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZkOptions {
+    /// Emit a ZK inference circuit alongside compiled output.
+    pub circuit: bool,
+    /// ZK backend to use ("folding", "halo2", or "plonky3").
+    pub backend: String,
+    /// ZK field to use ("m31" or "bn254").
+    pub field: String,
+    /// Also emit a Solidity verifier contract.
+    pub solidity: bool,
+    /// Path to safetensors weight file used as ZK witness.
+    pub weights_path: Option<std::path::PathBuf>,
+}
+
+impl Default for ZkOptions {
+    fn default() -> Self {
+        Self {
+            circuit: false,
+            backend: "folding".to_string(),
+            field: "m31".to_string(),
+            solidity: false,
+            weights_path: None,
+        }
+    }
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -746,37 +815,15 @@ pub struct CompileOptions {
     pub weight_analysis: bool,
     /// M54: Unikernel build configuration (None = normal build)
     pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
-    /// M53: Enable WCET analysis for @real_time functions
-    pub wcet_enabled: bool,
-    /// M53: GPU target name for WCET analysis (e.g., "Orin", "H100")
-    pub wcet_gpu: Option<String>,
-    /// M53: CPU target name for WCET analysis (e.g., "cortex-a78")
-    pub wcet_cpu: Option<String>,
-    /// M53: Path to write WCET certificate JSON
-    pub wcet_report_path: Option<std::path::PathBuf>,
-    /// M53: Safety margin multiplier for WCET (default: 1.05 = 5%)
-    pub wcet_safety_margin: f64,
-    /// M53: Path to write DO-178C compliance report
-    pub do178c_report: Option<std::path::PathBuf>,
-    /// M53: WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked)
-    pub wcet_target: String,
-    /// M53: FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg")
-    pub fpga_device: Option<String>,
+    /// M53: Worst-case-execution-time analysis / certification options.
+    pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
     pub linear_types_enabled: bool,
     /// M38a: Per-function ownership metadata from semantic analysis.
     /// Keys are function names, values have linear_params and shared_params.
     pub ownership_info: HashMap<String, crate::ownership::FunctionOwnership>,
-    /// M55: Emit a ZK inference circuit alongside compiled output.
-    pub zk_circuit: bool,
-    /// M55: ZK backend to use ("folding", "halo2", or "plonky3").
-    pub zk_backend: String,
-    /// M55: ZK field to use ("m31" or "bn254").
-    pub zk_field: String,
-    /// M55: Also emit a Solidity verifier contract.
-    pub zk_solidity: bool,
-    /// M55: Path to safetensors weight file used as ZK witness.
-    pub zk_weights_path: Option<std::path::PathBuf>,
+    /// M55: Zero-knowledge proof-circuit emission options.
+    pub zk: ZkOptions,
     /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
     pub zero_stage: Option<u8>,
     /// Debug training mode: disables fusion, disables FBIP, and emits
@@ -902,21 +949,10 @@ impl Default for CompileOptions {
             weight_config: weight_aware::WeightAwareConfig::default(),
             weight_analysis: false,
             unikernel_config: None,
-            wcet_enabled: false,
-            wcet_gpu: None,
-            wcet_cpu: None,
-            wcet_report_path: None,
-            wcet_safety_margin: 1.05,
-            do178c_report: None,
-            wcet_target: "gpu".to_string(),
-            fpga_device: None,
+            wcet: WcetOptions::default(),
             linear_types_enabled: false,
             ownership_info: HashMap::new(),
-            zk_circuit: false,
-            zk_backend: "folding".to_string(),
-            zk_field: "m31".to_string(),
-            zk_solidity: false,
-            zk_weights_path: None,
+            zk: ZkOptions::default(),
             zero_stage: None,
             debug_training: false,
             shared_lib: false,

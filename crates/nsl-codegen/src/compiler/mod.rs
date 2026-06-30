@@ -1115,15 +1115,15 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
 
-        let safety_margin = self.compile_options.wcet_safety_margin;
-        let target_kind = self.compile_options.wcet_target.as_str();
+        let safety_margin = self.compile_options.wcet.safety_margin;
+        let target_kind = self.compile_options.wcet.target.as_str();
 
         // Build the WcetTarget based on CLI flags
         let target = match target_kind {
             "fpga" => {
                 let fpga_name = self
                     .compile_options
-                    .fpga_device
+                    .wcet.fpga_device
                     .as_deref()
                     .unwrap_or("xcvu440");
                 let fpga = find_fpga(fpga_name).ok_or_else(|| {
@@ -1148,7 +1148,7 @@ impl<'a> Compiler<'a> {
                 // Default: GPU statistical
                 let gpu_name = self
                     .compile_options
-                    .wcet_gpu
+                    .wcet.gpu
                     .as_deref()
                     .unwrap_or("A100-SXM");
                 let _ = find_gpu(gpu_name).ok_or_else(|| {
@@ -1165,7 +1165,7 @@ impl<'a> Compiler<'a> {
 
         // M53: If --wcet-cpu is specified, validate the CPU model and emit an advisory note.
         // CPU WCET estimates are advisory — they use the CpuSpec database in gpu_specs.rs.
-        if let Some(ref cpu_name) = self.compile_options.wcet_cpu {
+        if let Some(ref cpu_name) = self.compile_options.wcet.cpu {
             if !cpu_name.is_empty() {
                 match crate::gpu_specs::find_cpu(cpu_name) {
                     Some(cpu) => {
@@ -1250,7 +1250,7 @@ impl<'a> Compiler<'a> {
             }
 
             // Emit certificate if requested
-            if let Some(ref cert_path) = self.compile_options.wcet_report_path {
+            if let Some(ref cert_path) = self.compile_options.wcet.report_path {
                 let cert =
                     build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
                 emit_certificate(&cert, cert_path).map_err(|e| {
@@ -1260,7 +1260,7 @@ impl<'a> Compiler<'a> {
             }
 
             // Emit DO-178C report if requested (guarded: FPGA only)
-            if let Some(ref do178c_path) = self.compile_options.do178c_report {
+            if let Some(ref do178c_path) = self.compile_options.wcet.do178c_report {
                 let cert =
                     build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
                 emit_do178c_report(&cert, do178c_path)
