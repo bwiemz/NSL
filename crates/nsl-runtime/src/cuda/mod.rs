@@ -4260,12 +4260,25 @@ pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
 }
 
 /// Free device memory previously returned by `nsl_test_cuda_alloc`.
+///
+/// Routes to `inner::free_device` (raw `cuMemFree_v2`) to match
+/// `nsl_test_cuda_alloc` which calls `inner::alloc_device` (raw `cuMemAlloc_v2`).
+///
+/// Earlier versions called `inner::free_managed`, which early-returns silently
+/// when the pointer is not in `CUDA_ALLOC_SET` — but `alloc_device` never
+/// registers in that set, so every `nsl_test_cuda_free` was a no-op. That leak
+/// (5-9 buffers per `launch_pca_ex`-style helper, accumulating over the suite)
+/// was the empirical root cause of the 2026-05-27 in-suite PCA test flakiness:
+/// later test allocations hit cuMemAlloc OOM recovery / pool-drain paths whose
+/// timing or driver-state perturbation altered bit-exact assertions downstream.
+/// See the 2026-06-29 adversarial-verify workflow on the forward per-doc RoPE
+/// reset reimplementation for the discovery context.
 #[doc(hidden)]
 #[no_mangle]
 pub extern "C" fn nsl_test_cuda_free(ptr: i64) {
     #[cfg(feature = "cuda")]
     {
-        if ptr != 0 { inner::free_managed(ptr as *mut std::ffi::c_void); }
+        if ptr != 0 { inner::free_device(ptr as *mut std::ffi::c_void); }
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = ptr; }
