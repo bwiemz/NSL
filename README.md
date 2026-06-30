@@ -11,7 +11,10 @@ NSL compiles to native code via Cranelift with zero Python or C++ dependencies. 
 - **Native autodiff** — `grad(...)` and `train(...)` use tape AD by default, with `--source-ad` for compile-time lowering when possible
 - **Declarative training** — `train` blocks replace boilerplate training loops
 - **GPU/CUDA native** — `kernel` keyword for custom GPU ops, `.to(cuda)` for device transfer
-- **No GIL, no runtime** — just `nsl run model.nsl`
+- **No Python interpreter, no GIL** — NSL programs link a small native runtime (`libnsl_runtime.a`) for tensors, memory, and accelerator support; there is no Python or PyTorch runtime dependency for core execution. Just `nsl run model.nsl`.
+
+> **Maturity:** NSL is pre-1.0. Subsystems are tiered Stable / Beta /
+> Experimental — see [`STATUS.md`](STATUS.md) before depending on a feature.
 
 ## Installation
 

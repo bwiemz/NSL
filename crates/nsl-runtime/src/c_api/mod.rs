@@ -173,6 +173,36 @@ fn capi_trace(msg: impl AsRef<str>) {
 }
 
 // ---------------------------------------------------------------------------
+// FFI: ABI version
+// ---------------------------------------------------------------------------
+
+/// NSL runtime C-ABI version — **major** component.
+///
+/// Bump this on any *breaking* change to an exported symbol's signature or
+/// semantics, or to the [`NslTensorDesc`] memory layout. A host that links a
+/// runtime whose `nsl_abi_version()` major differs from the major baked into
+/// the generated header (`NSL_ABI_VERSION_MAJOR`) must refuse to run: the ABI
+/// is incompatible.
+pub const NSL_ABI_VERSION_MAJOR: u32 = 1;
+
+/// NSL runtime C-ABI version — **minor** component.
+///
+/// Bump this for backward-compatible additions (new exported symbols, new
+/// trailing optional behavior). A host built against minor `m` can safely use a
+/// runtime with minor `>= m` and the same major.
+pub const NSL_ABI_VERSION_MINOR: u32 = 0;
+
+/// Return the runtime's C-ABI version packed as `(major << 16) | minor`.
+///
+/// Hosts can call this immediately after loading `libnsl_runtime` and compare
+/// against the `NSL_ABI_VERSION_*` macros emitted into the generated C header
+/// to detect runtime/header skew before making any other call.
+#[no_mangle]
+pub extern "C" fn nsl_abi_version() -> i64 {
+    ((NSL_ABI_VERSION_MAJOR as i64) << 16) | (NSL_ABI_VERSION_MINOR as i64)
+}
+
+// ---------------------------------------------------------------------------
 // FFI: Error handling
 // ---------------------------------------------------------------------------
 
@@ -1142,6 +1172,34 @@ pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// Golden ABI guard: the `NslTensorDesc` layout is part of the C-ABI
+    /// contract documented on the struct and emitted into generated headers.
+    /// Any change here is a breaking ABI change and must bump
+    /// `NSL_ABI_VERSION_MAJOR`. This test fails loudly if the layout drifts.
+    #[test]
+    fn nsl_tensor_desc_abi_layout_is_pinned() {
+        assert_eq!(size_of::<NslTensorDesc>(), 48, "NslTensorDesc must be 48 bytes");
+        assert_eq!(align_of::<NslTensorDesc>(), 8, "NslTensorDesc must be 8-byte aligned");
+        assert_eq!(offset_of!(NslTensorDesc, data), 0);
+        assert_eq!(offset_of!(NslTensorDesc, shape), 8);
+        assert_eq!(offset_of!(NslTensorDesc, strides), 16);
+        assert_eq!(offset_of!(NslTensorDesc, ndim), 24);
+        assert_eq!(offset_of!(NslTensorDesc, dtype), 28);
+        assert_eq!(offset_of!(NslTensorDesc, device_type), 32);
+        assert_eq!(offset_of!(NslTensorDesc, device_id), 36);
+        assert_eq!(offset_of!(NslTensorDesc, tape_id), 40);
+    }
+
+    /// The packed `nsl_abi_version()` value must decode to the documented
+    /// major/minor constants — the same numbers the generated header pins.
+    #[test]
+    fn nsl_abi_version_packs_major_minor() {
+        let packed = nsl_abi_version();
+        assert_eq!((packed >> 16) as u32, NSL_ABI_VERSION_MAJOR);
+        assert_eq!((packed & 0xffff) as u32, NSL_ABI_VERSION_MINOR);
+    }
 
     #[test]
     fn test_model_lifecycle() {

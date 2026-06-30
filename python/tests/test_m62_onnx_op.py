@@ -179,6 +179,11 @@ def test_session_load_and_run_calls_nsl_add():
             graph,
             opset_imports=[helper.make_opsetid("com.nsl", 1)],
         )
+        # onnxruntime 1.22.0 supports ONNX IR version <= 10. Newer `onnx`
+        # packages default make_model() to a higher ir_version (e.g. 13),
+        # which ORT rejects with "Unsupported model IR version". Pin it
+        # explicitly so this test is independent of the installed onnx version.
+        model.ir_version = 10
 
         sess = ort.InferenceSession(model.SerializeToString(), sess_opts)
         out = sess.run(
