@@ -74,7 +74,10 @@ pub(crate) fn frontend_with_flags(
 /// Convert WRGA decorator configs captured by nsl-semantic into the codegen-side
 /// `WrgaInputs` newtype (Task 1 of WRGA bridge). Keeps nsl-codegen free of a
 /// direct dependency on nsl-semantic.
-pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::WrgaInputs {
+pub(crate) fn module_data_to_wrga_inputs(
+    m: &crate::loader::ModuleData,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
         WrgaInputs,
@@ -115,7 +118,7 @@ pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_c
             .collect(),
         ablation: Default::default(),
     };
-    crate::commands::build::apply_wrga_check_overrides(&mut inputs);
+    apply_wrga_check_overrides(&mut inputs, ctx);
     inputs
 }
 
@@ -194,7 +197,10 @@ pub(crate) fn module_data_to_fused_ce_configs(
         .collect()
 }
 
-pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
+pub(crate) fn analysis_to_wrga_inputs(
+    a: &nsl_semantic::AnalysisResult,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
         WrgaInputs,
@@ -235,6 +241,42 @@ pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_c
             .collect(),
         ablation: Default::default(),
     };
-    crate::commands::build::apply_wrga_check_overrides(&mut inputs);
+    apply_wrga_check_overrides(&mut inputs, ctx);
     inputs
+}
+
+/// Apply the CLI-side `nsl check --wrga-analyze | --wrga-compare` overrides onto
+/// a freshly-built `WrgaInputs` before it ships to codegen. Both overrides are
+/// carried explicitly on [`nsl_codegen::WrgaCheckContext`] (formerly CLI
+/// thread-locals); on normal `nsl build` paths every field is `None` and this
+/// is a quick no-op.
+///
+/// 1. `target_override` (paper §8.3) — copied onto every
+///    `WrgaDecoratorConfig::target`. When the source has no `@wrga(...)` at all
+///    (only `@freeze` / `@adapter`), a minimal Auto-mode config is inserted so
+///    the target choice still reaches the codegen-side `wrga::run`.
+/// 2. `ablation_override` (paper §9.3) — copied onto `WrgaInputs::ablation` so
+///    the codegen-side WRGA driver honours the requested per-Innovation skip
+///    flags.
+fn apply_wrga_check_overrides(
+    inputs: &mut nsl_codegen::WrgaInputs,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) {
+    if let Some(target) = ctx.target_override.clone() {
+        for cfg in &mut inputs.wrga {
+            cfg.target = Some(target.clone());
+        }
+        if inputs.wrga.is_empty() {
+            inputs.wrga.push(nsl_codegen::WrgaDecoratorConfig {
+                mode: nsl_ast::block::WrgaMode::Auto,
+                budget: None,
+                target: Some(target),
+                layers: Vec::new(),
+                custom_adapter: None,
+            });
+        }
+    }
+    if let Some(abl) = ctx.ablation_override {
+        inputs.ablation = abl;
+    }
 }

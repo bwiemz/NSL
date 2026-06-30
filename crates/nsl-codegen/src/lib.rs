@@ -903,6 +903,34 @@ impl Default for CpdtOptions {
     }
 }
 
+/// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
+///
+/// Replaces the former CLI-side thread-locals (`WRGA_TARGET_OVERRIDE` /
+/// `WRGA_ABLATION_OVERRIDE` / `WRGA_PLAN_CAPTURE`) with explicit state threaded
+/// through [`CompileOptions`], mirroring [`CpdtOptions::plan_out`]. Every field
+/// is `None` on the normal `nsl build` path, so this is zero-overhead there.
+///
+/// The two override fields are consumed CLI-side (the WRGA bridge pre-applies
+/// them onto [`WrgaInputs`] before it reaches codegen); codegen itself never
+/// reads them. `plan_capture` is written by the CLI build paths from the
+/// `WrgaPlan` returned by `compile_returning_plan`.
+#[derive(Clone, Default)]
+pub struct WrgaCheckContext {
+    /// `--wrga-target <gpu>` — copied onto every `WrgaDecoratorConfig::target`
+    /// before the bridge ships `WrgaInputs` to codegen. When the source has no
+    /// `@wrga(...)` at all, a minimal Auto-mode config is synthesised so the
+    /// target choice still reaches `wrga::run`.
+    pub target_override: Option<String>,
+    /// `--wrga-ablate=<flags>` — copied onto `WrgaInputs::ablation`.
+    pub ablation_override: Option<crate::wrga::WrgaAblation>,
+    /// Capture slot for the produced `WrgaPlan`, read by `--wrga-compare` after
+    /// the build returns (mirrors [`CpdtOptions::plan_out`]). `None` outside a
+    /// compare run; captures the FIRST non-`None` plan so multi-file paths
+    /// don't overwrite the entry-module plan with a dependency's empty one.
+    pub plan_capture:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::wrga::WrgaPlan>>>>,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -995,6 +1023,10 @@ pub struct CompileOptions {
     pub csha: CshaOptions,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
+    /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
+    /// Carries the `--wrga-target` / `--wrga-ablate` overrides and the
+    /// `--wrga-compare` plan-capture slot. All-`None` on normal builds.
+    pub wrga_check: WrgaCheckContext,
     /// M62: shared output slot the CLI reads after compile returns so it can
     /// emit a matching C header alongside the shared library. Populated by
     /// `Compiler::finalize` from `features.export_functions`.
@@ -1082,6 +1114,7 @@ impl Default for CompileOptions {
             inspect_enabled: false,
             csha: CshaOptions::default(),
             cpdt: CpdtOptions::default(),
+            wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
             calibration_data: None,
             calibration_mode: Some("required".to_string()),

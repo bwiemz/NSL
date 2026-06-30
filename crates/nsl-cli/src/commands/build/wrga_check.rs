@@ -2,13 +2,32 @@
 //!
 //! Both reuse `run_build_inner` against a per-process temp directory to drive
 //! the only path that produces a `WrgaPlan`, then render the analyze/compare
-//! report and clean up so `nsl check` stays side-effect-free. Extracted
-//! verbatim from the former monolithic `build.rs`; behavior is unchanged.
+//! report and clean up so `nsl check` stays side-effect-free.
+//!
+//! The `--wrga-target` / `--wrga-ablate` overrides and the `--wrga-compare`
+//! plan-capture slot travel explicitly on [`nsl_codegen::WrgaCheckContext`]
+//! (a field of `CompileOptions`), not via thread-locals: each function builds
+//! its own `CompileOptions`, so the context is dropped when the function
+//! returns — no leak into any in-process follow-on CLI invocation.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::normal::run_build_inner;
-use super::wrga_state::{WrgaAblationOverrideGuard, WrgaPlanCaptureGuard, WrgaTargetOverrideGuard};
+
+/// Build the explicit WRGA check-mode context from the CLI flags. `ablation` is
+/// forwarded only when active so the normal (non-ablated) plan is unaffected.
+fn wrga_check_context(
+    wrga_target: Option<&str>,
+    ablation: nsl_codegen::wrga::WrgaAblation,
+    plan_capture: Option<Arc<Mutex<Option<nsl_codegen::wrga::WrgaPlan>>>>,
+) -> nsl_codegen::WrgaCheckContext {
+    nsl_codegen::WrgaCheckContext {
+        target_override: wrga_target.map(str::to_string),
+        ablation_override: ablation.is_active().then_some(ablation),
+        plan_capture,
+    }
+}
 
 /// WRGA paper §8.3: `nsl check --wrga-analyze` — run the WRGA pass on the
 /// source and emit `WrgaPlan::render_report()` without leaving a `.o` behind.
@@ -23,11 +42,9 @@ use super::wrga_state::{WrgaAblationOverrideGuard, WrgaPlanCaptureGuard, WrgaTar
 ///
 /// `wrga_target` (optional) overrides the `target=` field on every
 /// `@wrga(...)` decorator before codegen — so `--wrga-target h100` from the
-/// CLI wins over any source-level `@wrga(target="a100")`. The override is
-/// installed by mutating the entry module's `wrga_configs` in
-/// `frontend_with_flags`'s output via a CLI-side passthrough; we do this by
-/// post-processing `WrgaInputs` inside `run_build_inner` — see
-/// `apply_wrga_check_overrides` below.
+/// CLI wins over any source-level `@wrga(target="a100")`. The override travels
+/// on `opts.wrga_check.target_override` and is applied to `WrgaInputs` by the
+/// CLI WRGA bridge (`pipeline::apply_wrga_check_overrides`).
 ///
 /// Returns the process exit code: `0` on success, `2` on "no WRGA decorators
 /// in source" (so CI can distinguish absence from compile failure), `1` on
@@ -38,11 +55,6 @@ pub(crate) fn run_check_wrga_analyze(
     wrga_target: Option<&str>,
     ablation: nsl_codegen::wrga::WrgaAblation,
 ) -> i32 {
-    let _ablation_guard = if ablation.is_active() {
-        Some(WrgaAblationOverrideGuard::set(ablation))
-    } else {
-        None
-    };
     // Pre-check: surface "no decorators" as exit 2 BEFORE running codegen.
     // The build path would silently report "no plan" with exit 0, which the
     // paper's `--wrga-analyze` contract treats as a distinct error class.
@@ -72,15 +84,12 @@ pub(crate) fn run_check_wrga_analyze(
     }
     let temp_obj = temp_dir.join(format!("{stem}.o"));
 
-    // The WRGA target override travels via a thread-local that the build path
-    // checks just before constructing `WrgaInputs`. This avoids threading a
-    // new param through `run_build_inner`'s six callers. The RAII guard
-    // guarantees the cell is cleared even if `run_build_inner` panics, so the
-    // override cannot leak into any in-process follow-on CLI invocation.
-    let _override_guard = wrga_target.map(|t| WrgaTargetOverrideGuard::set(t.to_string()));
-
+    // The target / ablation overrides travel explicitly on
+    // `opts.wrga_check`; the WRGA bridge reads them when building `WrgaInputs`.
+    // No capture slot — analyze renders via the `--wrga-report` path below.
     let opts = nsl_codegen::CompileOptions {
         source_ad: true,
+        wrga_check: wrga_check_context(wrga_target, ablation, None),
         ..nsl_codegen::CompileOptions::default()
     };
 
@@ -118,8 +127,9 @@ pub(crate) fn run_check_wrga_analyze(
 /// against LoRA / AdaLoRA / GaLore / ReFT) without leaving a `.o` behind.
 ///
 /// Plumbing mirrors `run_check_wrga_analyze` exactly, except:
-/// 1. The CLI-side capture slot is armed before invoking the build so the
-///    plan can be pulled back out after `run_build_inner` returns.
+/// 1. `opts.wrga_check.plan_capture` is populated with a shared slot before
+///    invoking the build, so the plan can be pulled back out after
+///    `run_build_inner` returns (mirrors `CpdtOptions::plan_out`).
 /// 2. `wrga_report` is passed as `None`, suppressing the normal analyze
 ///    report from appearing on stdout (we only want the compare report).
 ///
@@ -144,11 +154,6 @@ pub(crate) fn run_check_wrga_compare(
              plan."
         );
     }
-    let _ablation_guard = if ablation.is_active() {
-        Some(WrgaAblationOverrideGuard::set(ablation))
-    } else {
-        None
-    };
     let (_interner, _parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
     let has_wrga_decorators = !analysis.wrga_configs.is_empty()
         || !analysis.freeze_configs.is_empty()
@@ -173,11 +178,15 @@ pub(crate) fn run_check_wrga_compare(
     }
     let temp_obj = temp_dir.join(format!("{stem}.o"));
 
-    let _override_guard = wrga_target.map(|t| WrgaTargetOverrideGuard::set(t.to_string()));
-    let _capture_guard = WrgaPlanCaptureGuard::arm();
+    // Shared capture slot: the build path writes the produced `WrgaPlan` here
+    // (via `capture_wrga_plan`), and we take it back out below to render the
+    // comparison. Mirrors `CpdtOptions::plan_out`.
+    let plan_capture: Arc<Mutex<Option<nsl_codegen::wrga::WrgaPlan>>> =
+        Arc::new(Mutex::new(None));
 
     let opts = nsl_codegen::CompileOptions {
         source_ad: true,
+        wrga_check: wrga_check_context(wrga_target, ablation, Some(plan_capture.clone())),
         ..nsl_codegen::CompileOptions::default()
     };
 
@@ -201,7 +210,8 @@ pub(crate) fn run_check_wrga_compare(
     }
 
     // Pull the captured plan out and render comparison.
-    let Some(plan) = WrgaPlanCaptureGuard::take() else {
+    let captured = plan_capture.lock().ok().and_then(|mut g| g.take());
+    let Some(plan) = captured else {
         eprintln!(
             "nsl: --wrga-compare: codegen completed but no @train block with WRGA decorators \
              was compiled; nothing to compare"

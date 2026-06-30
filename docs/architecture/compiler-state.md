@@ -56,8 +56,7 @@ Classification key:
 |----------|-------|-------|-------|
 | `nsl-codegen/src/lib.rs` (`debug_hooks`) | `ADJOINT_OPS_DROPPED`, `ALLOC_SLOTS_*_HINT`, `CONSUME_HINTS_CALLS` | TEST | Source-AD / allocator instrumentation counters, read via `debug_*` accessors by tests only. |
 | `nsl-codegen/src/hir/ids.rs` | `WIRE_ID_COUNTER`, `REGISTER_ID_COUNTER`, `GENVAR_ID_COUNTER` | TEST | FPGA HIR id generation with reset hooks so snapshot tests are deterministic. |
-| `nsl-cli/src/commands/build.rs` | `WRGA_TARGET_OVERRIDE` | **MIGRATE** | CLI-side override of the `@wrga(...)` target injected before build and read by the analysis→wrga-inputs bridge. Belongs in `CompileOptions` / `WrgaInputs`. |
-| `nsl-cli/src/commands/build.rs` | `WRGA_PLAN_CAPTURE` | **MIGRATE** | Output slot for the WRGA plan produced during build so the CLI can render it. Should be returned from the compile call (compare `cpdt.plan_out`, which already uses an explicit `Arc<Mutex<…>>` slot on `CompileOptions`). |
+| ~~`nsl-cli` build path~~ | ~~`WRGA_TARGET_OVERRIDE`, `WRGA_ABLATION_OVERRIDE`, `WRGA_PLAN_CAPTURE`~~ | **DONE** | Retired (Phase 2 below). Now carried explicitly on `CompileOptions::wrga_check` (`nsl_codegen::WrgaCheckContext`), mirroring `cpdt.plan_out`. |
 | `nsl-runtime/src/pca_rope_runtime.rs` | `PACKING_METADATA` | **MIGRATE** | Device pointers for `segment_ids`/`doc_starts` set per training step. Real runtime behavior via a global; would race across training threads. Should be an explicit per-step context. |
 | `nsl-runtime/src/tensor/mod.rs` | `TENSOR_SCOPE`, `TRAINING_MODE` | MIGRATE (runtime) | Scope-stack pointer and the global train/eval flag that gates tape recording. Core runtime behavior; documented here for completeness but lower priority than the compile-side globals. |
 | `nsl-runtime/src/cuda/caching_allocator.rs` | `CURRENT_POOL` | MIGRATE (runtime) | Persistent-vs-transient allocation pool selector; not re-entrant. An explicit allocator context would be safer. |
@@ -84,12 +83,15 @@ rule: *new compile/runtime behavior threads through `Compiler` /
 reviewer should push back on any new `thread_local!` that is not TEST or
 FFI/RUNTIME-OK.
 
-**Phase 2 — retire the WRGA build-side globals (non-breaking).**
-`WRGA_TARGET_OVERRIDE` → a field on `WrgaInputs`/`CompileOptions` set by the CLI
-before compile. `WRGA_PLAN_CAPTURE` → an `Arc<Mutex<Option<WrgaPlan>>>` output
-slot on `CompileOptions`, mirroring the existing `cpdt.plan_out` pattern (which
-is the template to copy). These are internal to the CLI→codegen boundary, so
-no public C-ABI changes.
+**Phase 2 — retire the WRGA build-side globals (non-breaking). ✅ DONE.**
+All three (`WRGA_TARGET_OVERRIDE`, `WRGA_ABLATION_OVERRIDE`, `WRGA_PLAN_CAPTURE`)
+plus their RAII guards now live on `CompileOptions::wrga_check`
+(`nsl_codegen::WrgaCheckContext`): the two overrides are CLI-applied onto
+`WrgaInputs` by the WRGA bridge, and `plan_capture` is an
+`Arc<Mutex<Option<WrgaPlan>>>` slot mirroring `cpdt.plan_out`. State now lives on
+a stack-local `CompileOptions` that drops on return/panic, so it can no longer
+leak across in-process CLI calls. Internal to the CLI→codegen boundary, so no
+public C-ABI changes.
 
 **Phase 3 — runtime contexts (larger).** `PACKING_METADATA`, `CURRENT_POOL`,
 `TENSOR_SCOPE`, and `TRAINING_MODE` are runtime concerns that touch hot paths

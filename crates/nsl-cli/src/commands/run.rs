@@ -313,6 +313,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     report_requested: cpdt_report,
                     plan_out: cpdt_plan_out.clone(),
                 },
+                // `nsl run` never sets WRGA check-mode overrides.
+                wrga_check: nsl_codegen::WrgaCheckContext::default(),
                 export_functions_out: None,
                 calibration_data: None,
                 calibration_mode: Some("required".to_string()),

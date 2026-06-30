@@ -11,8 +11,7 @@ use std::process;
 use nsl_errors::SourceMap;
 use nsl_lexer::Interner;
 
-use super::reports::check_wrga_report_preconditions;
-use super::wrga_state::capture_wrga_plan_if_armed;
+use super::reports::{capture_wrga_plan, check_wrga_report_preconditions};
 
 /// Check if a file has any import statements or train blocks by quick-scanning.
 /// Train blocks need multi-file compilation because optimizer stdlib modules
@@ -81,7 +80,8 @@ fn run_build_single(
 
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.wrga_inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
@@ -126,7 +126,7 @@ fn run_build_single(
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
-    capture_wrga_plan_if_armed(&wrga_plan);
+    capture_wrga_plan(&wrga_plan, &options.wrga_check);
     if let Some(report_path) = wrga_report {
         match &wrga_plan {
             Some(p) => {
@@ -334,7 +334,10 @@ fn run_build_multi(
                 }
             }
             let mut entry_options = options.clone();
-            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(mod_data));
+            entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(
+                mod_data,
+                &entry_options.wrga_check,
+            ));
             entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
             entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             let entry_options = &entry_options;
@@ -469,7 +472,7 @@ fn run_build_multi(
 
     // WRGA Milestone B.1: emit `WrgaPlan::render_report()` if --wrga-report was set.
     // Also offer the plan to the CLI-side capture slot (`--wrga-compare`).
-    capture_wrga_plan_if_armed(&entry_wrga_plan);
+    capture_wrga_plan(&entry_wrga_plan, &options.wrga_check);
     if let Some(report_path) = wrga_report {
         match &entry_wrga_plan {
             Some(p) => {

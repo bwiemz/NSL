@@ -387,6 +387,10 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     report_requested: cpdt_report,
                     plan_out: cpdt_plan_out.clone(),
                 },
+                // Normal `nsl build` never sets WRGA check-mode overrides;
+                // `nsl check --wrga-analyze | --wrga-compare` builds its own
+                // CompileOptions with a populated `wrga_check` (wrga_check.rs).
+                wrga_check: nsl_codegen::WrgaCheckContext::default(),
                 export_functions_out: None,
                 calibration_data: calibration_data.clone(),
                 calibration_mode: Some(calibrate.clone()),

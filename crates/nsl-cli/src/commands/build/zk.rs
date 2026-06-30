@@ -28,7 +28,8 @@ pub(crate) fn run_build_zk(
     // present without `--source-ad` (mirroring the single/multi build paths).
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
-    options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
+    options.wrga_inputs =
+        Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
@@ -47,7 +48,7 @@ pub(crate) fn run_build_zk(
         );
 
     // Emit the WRGA report (if requested) before reporting any codegen error.
-    emit_wrga_report(&wrga_plan, wrga_report);
+    emit_wrga_report(&wrga_plan, wrga_report, &options.wrga_check);
 
     let obj_bytes = match bytes_res {
         Ok(bytes) => bytes,
