@@ -133,6 +133,13 @@ impl AdapterPlacement {
     /// * `None`        — `name` is not a recognized attention/FFN projection
     ///   (a norm, embedding, or unknown weight); the placement has no opinion
     ///   and the caller should leave the site untouched.
+    ///
+    /// Recognition is limited to *split* per-projection weight names (see
+    /// [`proj_role`]).  **Fused or non-standard projections** — GPT-2 `c_attn`
+    /// / `c_proj` / `c_fc`, NeoX/Falcon `query_key_value` / `dense*`, Phi/MPT
+    /// `Wqkv`, fused `gate_up_proj` — return `None`, so placement cannot
+    /// constrain those weights (deliberate v1 limitation; the consumer treats
+    /// `None` as fail-safe pass-through).
     pub fn covers_projection(self, name: &str) -> Option<bool> {
         let role = proj_role(name)?;
         let allowed = match self {
