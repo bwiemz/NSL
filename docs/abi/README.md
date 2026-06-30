@@ -34,10 +34,19 @@ The ABI carries an explicit, checkable version:
 - **Minor** — backward-compatible additions (new exported symbols, new optional
   trailing behavior).
 
-The `NslTensorDesc` layout is pinned by a golden test
-(`nsl_tensor_desc_abi_layout_is_pinned` in `crates/nsl-runtime/src/c_api/mod.rs`):
-size 48 bytes, 8-byte aligned, with fixed field offsets. If that test fails, you
-are making a **major** ABI change.
+The `NslTensorDesc` layout is pinned by **two** independent tests, so a drift
+on either the Rust or the generated-header side is caught:
+
+- A Rust golden test (`nsl_tensor_desc_abi_layout_is_pinned` in
+  `crates/nsl-runtime/src/c_api/mod.rs`): size 48 bytes, 8-byte aligned, fixed
+  field offsets.
+- A C-side test (`generated_c_header_compiles_and_pins_abi_layout` in
+  `crates/nsl-codegen/tests/c_header_compiles.rs`) that **compiles the generated
+  C header with a real C compiler** and re-asserts the same `sizeof`/`offsetof`
+  layout plus the `NSL_ABI_VERSION_*` macros via `_Static_assert`. This also
+  guarantees `c_header::emit` keeps producing valid C.
+
+If either test fails, you are making a **major** ABI change.
 
 ## FFI safety contract (every exported symbol)
 
