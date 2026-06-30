@@ -2075,14 +2075,16 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 },
                 weight_analysis: false,
                 unikernel_config,
-                wcet_enabled: wcet,
-                wcet_gpu: None, // reuse --gpu from Check variant; Build uses target for backend
-                wcet_cpu: cpu,
-                wcet_report_path: wcet_cert,
-                wcet_safety_margin: 1.05,
-                do178c_report,
-                wcet_target,
-                fpga_device,
+                wcet: nsl_codegen::WcetOptions {
+                    enabled: wcet,
+                    gpu: None, // reuse --gpu from Check variant; Build uses target for backend
+                    cpu,
+                    report_path: wcet_cert,
+                    safety_margin: 1.05,
+                    do178c_report,
+                    target: wcet_target,
+                    fpga_device,
+                },
                 zk: nsl_codegen::ZkOptions {
                     circuit: zk_circuit,
                     backend: zk_backend,

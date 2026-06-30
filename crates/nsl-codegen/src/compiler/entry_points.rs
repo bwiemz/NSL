@@ -633,7 +633,7 @@ pub fn compile_returning_plan(
     compiler.compile_pending_lambdas()?;
 
     // M53: Run WCET analysis for @real_time functions (after codegen, before finalize)
-    if compiler.compile_options.wcet_enabled {
+    if compiler.compile_options.wcet.enabled {
         compiler.run_wcet_analysis()?;
     }
 
@@ -768,7 +768,7 @@ fn compile_with_zk_info_best_effort_plan(
         }
 
         // M53: Run WCET analysis for @real_time functions
-        if compiler.compile_options.wcet_enabled {
+        if compiler.compile_options.wcet.enabled {
             compiler.run_wcet_analysis()?;
         }
 
@@ -932,7 +932,7 @@ fn compile_standalone_best_effort_plan(
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_standalone_main(&ast.stmts)?;
         compiler.compile_pending_lambdas()?;
-        if compiler.compile_options.wcet_enabled {
+        if compiler.compile_options.wcet.enabled {
             compiler.run_wcet_analysis()?;
         }
         // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
@@ -1311,7 +1311,7 @@ pub fn compile_entry_returning_plan(
     compiler.compile_main(&ast.stmts)?;
     compiler.compile_pending_lambdas()?;
     // M53: Run WCET analysis for @real_time functions
-    if compiler.compile_options.wcet_enabled {
+    if compiler.compile_options.wcet.enabled {
         compiler.run_wcet_analysis()?;
     }
     // M31: Print fusion report if enabled

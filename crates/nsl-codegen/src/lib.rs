@@ -713,6 +713,45 @@ pub enum WggoImportance {
     Grad,
 }
 
+/// M53: Worst-case-execution-time (WCET) analysis and certification options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WcetOptions {
+    /// Enable WCET analysis for `@real_time` functions.
+    pub enabled: bool,
+    /// GPU target name for WCET analysis (e.g., "Orin", "H100").
+    pub gpu: Option<String>,
+    /// CPU target name for WCET analysis (e.g., "cortex-a78").
+    pub cpu: Option<String>,
+    /// Path to write the WCET certificate JSON.
+    pub report_path: Option<std::path::PathBuf>,
+    /// Safety-margin multiplier for WCET (default: 1.05 = 5%).
+    pub safety_margin: f64,
+    /// Path to write a DO-178C compliance report.
+    pub do178c_report: Option<std::path::PathBuf>,
+    /// WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked).
+    pub target: String,
+    /// FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg").
+    pub fpga_device: Option<String>,
+}
+
+impl Default for WcetOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gpu: None,
+            cpu: None,
+            report_path: None,
+            safety_margin: 1.05,
+            do178c_report: None,
+            target: "gpu".to_string(),
+            fpga_device: None,
+        }
+    }
+}
+
 /// M55: Zero-knowledge proof-circuit emission options.
 ///
 /// Grouped out of [`CompileOptions`] as part of decomposing that god-config
@@ -776,22 +815,8 @@ pub struct CompileOptions {
     pub weight_analysis: bool,
     /// M54: Unikernel build configuration (None = normal build)
     pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
-    /// M53: Enable WCET analysis for @real_time functions
-    pub wcet_enabled: bool,
-    /// M53: GPU target name for WCET analysis (e.g., "Orin", "H100")
-    pub wcet_gpu: Option<String>,
-    /// M53: CPU target name for WCET analysis (e.g., "cortex-a78")
-    pub wcet_cpu: Option<String>,
-    /// M53: Path to write WCET certificate JSON
-    pub wcet_report_path: Option<std::path::PathBuf>,
-    /// M53: Safety margin multiplier for WCET (default: 1.05 = 5%)
-    pub wcet_safety_margin: f64,
-    /// M53: Path to write DO-178C compliance report
-    pub do178c_report: Option<std::path::PathBuf>,
-    /// M53: WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked)
-    pub wcet_target: String,
-    /// M53: FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg")
-    pub fpga_device: Option<String>,
+    /// M53: Worst-case-execution-time analysis / certification options.
+    pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
     pub linear_types_enabled: bool,
     /// M38a: Per-function ownership metadata from semantic analysis.
@@ -924,14 +949,7 @@ impl Default for CompileOptions {
             weight_config: weight_aware::WeightAwareConfig::default(),
             weight_analysis: false,
             unikernel_config: None,
-            wcet_enabled: false,
-            wcet_gpu: None,
-            wcet_cpu: None,
-            wcet_report_path: None,
-            wcet_safety_margin: 1.05,
-            do178c_report: None,
-            wcet_target: "gpu".to_string(),
-            fpga_device: None,
+            wcet: WcetOptions::default(),
             linear_types_enabled: false,
             ownership_info: HashMap::new(),
             zk: ZkOptions::default(),
