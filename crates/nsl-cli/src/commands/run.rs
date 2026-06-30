@@ -307,6 +307,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 cpdt_mode,
                 cpdt_cluster: cpdt_cluster.clone(),
                 cpdt_report_requested: cpdt_report,
+                cpdt_moe_roofline_slack: 0.0,
                 cpdt_plan_out: cpdt_plan_out.clone(),
                 export_functions_out: None,
                 calibration_data: None,
