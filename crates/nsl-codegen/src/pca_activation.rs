@@ -47,6 +47,42 @@ pub fn detect_packing_for_stmts(stmts: &[Stmt], interner: &Interner) -> bool {
     false
 }
 
+/// CFTP §4.3 G2 Strategy 3 (Item 4): resolve the first train block's
+/// referenced `DatasetPackingConfig`. Returns `None` when no train block
+/// is present, when its dataset reference cannot be resolved, or when
+/// the resolved dataset has `enabled = false`. Mirrors the resolution
+/// path used by [`detect_packing_for_stmts`] but returns the concrete
+/// config so the planner site can pass it to `pca_per_doc::admit`.
+pub fn resolve_packing_config_for_stmts(
+    stmts: &[Stmt],
+    interner: &Interner,
+) -> Option<DatasetPackingConfig> {
+    let datasets = collect_dataset_configs(stmts, interner);
+    for stmt in stmts {
+        let train_opt = match &stmt.kind {
+            StmtKind::TrainBlock(train) => Some(train),
+            StmtKind::Decorated { stmt: inner, .. } => {
+                if let StmtKind::TrainBlock(train) = &inner.kind {
+                    Some(train)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(train) = train_opt {
+            if let Some(ds_name) = extract_dataset_ref(train, interner) {
+                if let Some(cfg) = datasets.get(&ds_name) {
+                    if cfg.enabled {
+                        return Some(cfg.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn check_train_packs(
     train: &TrainBlock,
     datasets: &std::collections::HashMap<String, DatasetPackingConfig>,

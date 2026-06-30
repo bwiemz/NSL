@@ -143,6 +143,32 @@ pub(crate) fn analysis_to_fused_ce_configs(
         .collect()
 }
 
+/// CFTP §4.3 G2 Strategy 3 (Item 4): bridge `@pca(strategy=...)` configs
+/// from `AnalysisResult` into the codegen-side `PcaUserStrategy` enum.
+/// Mirrors `analysis_to_fused_ce_configs` — keeps nsl-codegen free of a
+/// direct nsl-semantic dependency. Crosses the crate boundary via
+/// `PcaStrategy::as_str` (the wire-format the codegen-side parser
+/// understands; future strategies extend both sides in lock-step).
+pub(crate) fn analysis_to_pca_user_strategies(
+    a: &nsl_semantic::AnalysisResult,
+) -> Vec<nsl_codegen::PcaUserStrategy> {
+    a.pca_configs
+        .iter()
+        .map(|c| nsl_codegen::PcaUserStrategy::from_semantic_str(c.strategy.as_str()))
+        .collect()
+}
+
+/// Mirror of `analysis_to_pca_user_strategies` for the multi-file path
+/// that consumes `ModuleData` rather than `AnalysisResult`.
+pub(crate) fn module_data_to_pca_user_strategies(
+    m: &crate::loader::ModuleData,
+) -> Vec<nsl_codegen::PcaUserStrategy> {
+    m.pca_configs
+        .iter()
+        .map(|c| nsl_codegen::PcaUserStrategy::from_semantic_str(c.strategy.as_str()))
+        .collect()
+}
+
 /// Mirror of `module_data_to_wrga_inputs` for `@fused_lm_ce` configs.
 /// Used by multi-file paths that consume the entry module's `ModuleData`
 /// rather than a single `AnalysisResult`.

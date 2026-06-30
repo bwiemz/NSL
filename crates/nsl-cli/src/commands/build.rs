@@ -484,6 +484,7 @@ fn run_build_shared_single(
     let mut options = options.clone();
     options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
@@ -777,6 +778,7 @@ fn run_build_shared_multi(
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(mod_data));
             entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
+            entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             entry_options.export_functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
@@ -931,6 +933,7 @@ pub(crate) fn run_build_zk(
     let mut options = options.clone();
     options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -1159,6 +1162,7 @@ pub(crate) fn run_build_standalone(
     let mut options = options.clone();
     options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -1297,6 +1301,7 @@ fn run_build_single(
     let mut options = options.clone();
     options.wrga_inputs = Some(crate::pipeline::analysis_to_wrga_inputs(&analysis));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weight_index_map = analysis.weight_index_map.clone();
@@ -1549,6 +1554,7 @@ fn run_build_multi(
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(crate::pipeline::module_data_to_wrga_inputs(mod_data));
             entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
+            entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(
@@ -2170,6 +2176,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 shared_lib,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
+                pca_user_strategies: Vec::new(),
                 wrga_fold_allocations,
                 wggo: nsl_codegen::WggoOptions {
                     mode: wggo.clone(),
