@@ -31,13 +31,22 @@ cargo clippy
 NSL separates tests into tiers so the stable contract stays meaningful. See
 [`STATUS.md`](STATUS.md) for what is Stable vs Beta vs Experimental.
 
-**Required on every PR (the stable green-build contract):**
+**Required on every PR (CI merge gates — `.github/workflows/ci.yml` is the
+source of truth):**
 
 ```bash
-cargo build --workspace                      # zero errors, zero warnings
-cargo clippy --workspace -- -D warnings      # zero warnings
-cargo test --workspace -- --skip e2e_        # workspace unit/integration tests
+cargo build --workspace                              # zero errors, zero warnings
+cargo clippy --workspace -- -D warnings              # zero warnings
+cargo test --workspace -- --skip e2e_                # workspace unit/integration tests
+cargo test -p nsl-cli --test e2e -- --test-threads=1 # CLI smoke/e2e (Linux + Windows)
 ```
+
+The ONNX Runtime (`test-onnx-rt`) and FPGA Verilator/Yosys (`fpga`) CI jobs
+**also block every PR** — they run in dedicated jobs rather than the command
+list above, but a red one blocks merge just the same. The e2e step is
+non-blocking only on macOS (that matrix is `continue-on-error`); locally it
+needs a full toolchain (C linker, optional OpenSSL/CUDA), so a missing-toolchain
+failure on your machine is a local-environment gap, not a relaxed gate.
 
 **Required for the area you touch:**
 
@@ -45,18 +54,12 @@ cargo test --workspace -- --skip e2e_        # workspace unit/integration tests
 - **Codegen changes** should include snapshot tests (`insta`).
 - **Kernel/fusion changes** should include differential tests.
 
-**Nightly / environment-gated (not a per-PR merge blocker):**
+**Non-blocking (informational):**
 
-```bash
-cargo test -p nsl-cli --test e2e -- --test-threads=1   # needs full toolchain (C linker, optional OpenSSL/CUDA)
-# CUDA, ONNX, and FPGA (Verilator/Yosys) suites run in dedicated CI jobs
-```
-
-**Informational / research (Experimental tier — not a merge blocker):**
-
-- `experimental::*` subsystem tests (CEP, CFIE, CSHA, WGGO, WRGA, CPDT, ZK,
-  FPGA, …) and performance-baseline comparisons. These may fail depending on the
-  checkout/environment; treat results against the tier they belong to.
+- the macOS matrix + its e2e step (`continue-on-error`),
+- real-CUDA-device tests (CI runners have no GPU) and `#[ignore]`'d research
+  tests in the `experimental::*` subsystems (CEP, CFIE, CSHA, WGGO, WRGA, CPDT,
+  ZK, FPGA, …), plus performance-baseline comparisons.
 
 ## Pull Request Process
 

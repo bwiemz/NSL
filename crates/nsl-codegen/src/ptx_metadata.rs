@@ -259,7 +259,11 @@ fn parse_target_sm(line: &str) -> Option<u32> {
 /// Parse the byte count out of a `.shared` declaration like
 /// `.shared .align 4 .b8 shared_mem[4096];` → `4096`.
 fn parse_shared_bytes(line: &str) -> Option<u32> {
-    let open = line.rfind('[')?;
+    // First `[` is the array dimension: PTX identifiers cannot contain `[`, so
+    // the only `[` on a well-formed `.shared` line opens `[bytes]`. Using
+    // `find` (not `rfind`) means a trailing comment containing brackets can't
+    // hijack the count.
+    let open = line.find('[')?;
     let close = line[open + 1..].find(']')? + open + 1;
     let inner = line[open + 1..close].trim();
     // Element count × element width. `.bN` element width is N/8 bytes; the
