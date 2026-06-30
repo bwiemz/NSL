@@ -55,6 +55,82 @@ fn static_tensor_numel(ty: &Type) -> Option<i64> {
 }
 
 impl Compiler<'_> {
+    /// CPDT Part III v2.19 — resolve the `(moe_configs_key, MoeInfo)`
+    /// for a `moe_dispatch{,_ffn,_swiglu}` call site under the current
+    /// method's model.
+    ///
+    /// Pre-v2.19, the three call sites parsed `state.current_function_name`
+    /// via `split("__").next()` to derive a model prefix. That was broken
+    /// in two ways:
+    /// 1. `current_function_name` is `None` for model methods —
+    ///    `compile_model_methods` never sets it (only top-level functions
+    ///    do via `func.rs:133`).
+    /// 2. Even if it were set to the mangled `__nsl_model_X_method` name,
+    ///    `split("__").next()` returns the empty string before the leading
+    ///    `__`, matching every key.
+    ///
+    /// In practice, model-method bodies always hit failure (1): the
+    /// `and_then` arm short-circuited on `None`, then the singleton
+    /// fallback below refused for `moe_configs.len() >= 2`. The
+    /// silent-cross-route risk from (2) would have surfaced only if
+    /// the data source had ever been wired to the mangled name — it
+    /// was not, so the bug presented as a hard error at the v4-dims
+    /// derivation rather than as a quiet miscompile.
+    ///
+    /// The v2.19 helper prefers `self.current_method_model_name` (already
+    /// populated in `compile_model_methods.rs:579,735` for model methods)
+    /// and filters by the `"{model_name}."` prefix — the trailing dot
+    /// avoids prefix shadowing between e.g. `Block` and `Block0`. Returns
+    /// `None` when ≥2 keys match the model prefix (multi-MoE-per-model is
+    /// the documented v2.next deferral). Falls back to the singleton path
+    /// for top-level calls / models with zero MoE entries / unknown
+    /// method-model context.
+    ///
+    /// **Footgun**: `agent.rs:424` reuses `current_method_model_name`
+    /// to stash the agent name during agent-body compilation. If a
+    /// user names an agent identically to a `@moe`-bearing model, an
+    /// agent-method call to `moe_dispatch_*` would inherit that
+    /// model's MoE config via the prefix scan. Agents cannot register
+    /// `@moe` decorators themselves (collection.rs only walks
+    /// `ModelDef`), so the collision is a latent footgun rather than
+    /// a current bug — but a v2.next pass that distinguishes agent
+    /// vs. model context would close it cleanly.
+    fn resolve_moe_config_for_call_site(&self) -> Option<(String, crate::moe::MoeInfo)> {
+        if let Some(model_name) = self.current_method_model_name.as_ref() {
+            let prefix = format!("{model_name}.");
+            let mut candidates = self
+                .features
+                .moe_configs
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix));
+            if let Some((k, v)) = candidates.next() {
+                if candidates.next().is_none() {
+                    return Some((k.clone(), v.clone()));
+                }
+                // ≥2 MoE entries under this model — multi-MoE-per-model
+                // is the documented v2.next deferral. Returning None
+                // funnels into the v4 hard-error path; outside CPDT
+                // Full mode the v2 site's silent v1 fallback still
+                // applies (matching pre-v2.19 behaviour for that
+                // code path).
+                return None;
+            }
+            // Zero matches: this model has no @moe decorators. Fall
+            // through to the singleton fallback below (preserves the
+            // pre-v2.19 single-MoE behaviour when the call lives on
+            // a helper model that doesn't itself carry the decorator).
+        }
+        if self.features.moe_configs.len() == 1 {
+            self.features
+                .moe_configs
+                .iter()
+                .next()
+                .map(|(k, v)| (k.clone(), v.clone()))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn compile_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1635,35 +1711,12 @@ impl Compiler<'_> {
                 None
             };
 
-            // Same multi-MoE candidate resolution as v3 — refuse on >=2
-            // matches (multi-MoE disambiguation is v2.next).
-            let config_with_key = state
-                .current_function_name
-                .as_ref()
-                .and_then(|fn_name| {
-                    let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    let candidates: Vec<_> = self
-                        .features
-                        .moe_configs
-                        .iter()
-                        .filter(|(key, _)| key.starts_with(model_prefix))
-                        .collect();
-                    match candidates.as_slice() {
-                        [(key, info)] => Some(((*key).clone(), (*info).clone())),
-                        _ => None,
-                    }
-                })
-                .or_else(|| {
-                    if self.features.moe_configs.len() == 1 {
-                        self.features
-                            .moe_configs
-                            .iter()
-                            .next()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                    } else {
-                        None
-                    }
-                });
+            // CPDT Part III v2.19 — use the model-method-aware helper
+            // so multi-model `@moe` builds resolve each call site to
+            // its own model's MoE config. Multi-MoE-PER-model is the
+            // documented v2.next deferral (helper returns None and
+            // the call site falls into the hard-error path).
+            let config_with_key = self.resolve_moe_config_for_call_site();
             let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
                 match &config_with_key {
                     Some((k, info)) => (
@@ -1935,36 +1988,13 @@ impl Compiler<'_> {
                 None
             };
 
-            // Same multi-MoE candidate resolution as the v2 site —
-            // ensures multi-MoE-per-class fails LOUDLY (refuse on >=2
-            // matches; documented v2.next deferral for disambiguation).
-            let config_with_key = state
-                .current_function_name
-                .as_ref()
-                .and_then(|fn_name| {
-                    let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    let candidates: Vec<_> = self
-                        .features
-                        .moe_configs
-                        .iter()
-                        .filter(|(key, _)| key.starts_with(model_prefix))
-                        .collect();
-                    match candidates.as_slice() {
-                        [(key, info)] => Some(((*key).clone(), (*info).clone())),
-                        _ => None,
-                    }
-                })
-                .or_else(|| {
-                    if self.features.moe_configs.len() == 1 {
-                        self.features
-                            .moe_configs
-                            .iter()
-                            .next()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                    } else {
-                        None
-                    }
-                });
+            // CPDT Part III v2.19 — multi-model `@moe` composition.
+            // The helper picks the call site's MoE config under the
+            // current method's model. Multi-MoE-per-MODEL (≥2 `@moe`
+            // decorators on one model) remains the documented v2.next
+            // deferral and surfaces as `None` here, hitting the v3
+            // hard-error path below.
+            let config_with_key = self.resolve_moe_config_for_call_site();
             let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
                 match &config_with_key {
                     Some((k, info)) => (
@@ -2195,48 +2225,23 @@ impl Compiler<'_> {
             let logits_val = self.compile_expr(builder, state, &args[1].value)?;
             let experts_val = self.compile_expr(builder, state, &args[2].value)?;
 
-            // Look up MoE config by matching model name prefix from mangled
-            // function name. Also capture the matching key so we can scope
-            // the WeightMap lookup below identically to
-            // cpdt_expert_prune::prune_moe_weights_in_map.
+            // CPDT Part III v2.19 — multi-model `@moe` composition.
+            // The helper picks the call site's MoE config under the
+            // current method's model (`self.current_method_model_name`),
+            // filtered by `"{model}."` prefix to scope the WeightMap
+            // lookup identically to `cpdt_expert_prune::prune_moe_weights_in_map`.
             //
-            // Multi-MoE caveat (review finding): when a model has multiple
-            // MoE blocks (`moe_configs` keys like "Block.moe1",
-            // "Block.moe2"), the substring `key.starts_with(model_prefix)`
-            // match collapses both onto the FIRST hit in HashMap iteration
-            // order — which is non-deterministic. v1 of Part III production-
-            // forward intentionally targets the single-MoE-per-class case;
-            // multi-MoE-per-class disambiguation is a v2.next deferral.
-            // To make multi-MoE failures LOUD rather than silent, we count
-            // candidate matches and refuse if more than one matches.
-            let config_with_key = state
-                .current_function_name
-                .as_ref()
-                .and_then(|fn_name| {
-                    let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    let candidates: Vec<_> = self
-                        .features
-                        .moe_configs
-                        .iter()
-                        .filter(|(key, _)| key.starts_with(model_prefix))
-                        .collect();
-                    match candidates.as_slice() {
-                        [(key, info)] => Some(((*key).clone(), (*info).clone())),
-                        _ => None, // 0 or >=2 matches → fall through to single-config fallback or None
-                    }
-                })
-                .or_else(|| {
-                    // Fallback: if only one MoE config exists, use it
-                    if self.features.moe_configs.len() == 1 {
-                        self.features
-                            .moe_configs
-                            .iter()
-                            .next()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                    } else {
-                        None
-                    }
-                });
+            // Multi-MoE-per-MODEL (≥2 `@moe` decorators on different
+            // fields of ONE model) remains the documented v2.next
+            // deferral: the helper returns `None`, the v2 fallback
+            // below kicks in with default `num_experts=8`/`top_k=2`,
+            // and `cfg_key=None`. Subsequent behaviour depends on
+            // `cpdt_mode`: under `CpdtMode::Full` the v2-dims gate
+            // below raises a hard codegen error; outside CPDT Full
+            // the v1 fallback (`nsl_moe_dispatch_full`) emits the
+            // M32 identity skeleton without diagnostic. Both
+            // sub-cases match pre-v2.19 behaviour for the deferral.
+            let config_with_key = self.resolve_moe_config_for_call_site();
             let (cfg_key, num_experts, top_k, capacity_factor) = match &config_with_key {
                 Some((k, info)) => {
                     (Some(k.clone()), info.num_experts, info.top_k, info.capacity_factor)
