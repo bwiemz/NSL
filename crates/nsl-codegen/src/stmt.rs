@@ -347,6 +347,12 @@ pub(crate) fn invoke_wrga_if_enabled(
         // populated by `apply_wrga_check_overrides` in nsl-cli (the bridge
         // that handles both `--wrga-target` and `--wrga-ablate`).
         ablation: inputs.ablation,
+        // Paper §8.2 user-defined custom adapter name (`@wrga(adapter=...)`).
+        // First matching `WrgaDecoratorConfig` wins, falling back to None.
+        custom_adapter: inputs
+            .wrga
+            .iter()
+            .find_map(|c| c.custom_adapter.as_deref()),
     };
     let mut plan = crate::wrga::run(wrga_input);
 

@@ -9,15 +9,23 @@
 //! once all inputs are resolved.
 
 use nsl_ast::block::{WrgaBlock, WrgaMode};
-use nsl_ast::decl::Decorator;
+use nsl_ast::decl::{Decorator, ModelMember};
 use nsl_ast::expr::{Arg, ExprKind};
-use nsl_ast::{Span, Symbol};
+use nsl_ast::stmt::StmtKind;
+use nsl_ast::types::TypeExprKind;
+use nsl_ast::{Module, Span, Symbol};
 use nsl_errors::Diagnostic;
 
 /// Validated `@wrga(...)` configuration.
 #[derive(Debug, Clone)]
 pub struct WrgaConfig {
     pub block: WrgaBlock,
+    /// WRGA paper §8.2: resolved string form of `block.adapter` (the
+    /// `adapter=<Ident>` argument).  Populated at decorator-validation
+    /// time so the codegen bridge does not need access to the interner
+    /// to pass the adapter name through.  `None` when `block.adapter`
+    /// is `None`.
+    pub adapter_name: Option<String>,
 }
 
 /// Validate a single `@wrga(...)` decorator.
@@ -27,6 +35,8 @@ pub struct WrgaConfig {
 /// * `budget = <int>`                  (optional; total adapter parameter cap)
 /// * `target = <identifier>`           (optional; GPU name)
 /// * `layers = ["blocks.6", ...]`      (optional; hybrid-mode layer scope)
+/// * `adapter = <identifier>`          (optional; WRGA paper §8.2 — name of a
+///   user-defined adapter model, e.g. `adapter=GatedLoRA`)
 pub fn validate_wrga_decorator(
     deco: &Decorator,
     resolve_sym: &dyn Fn(Symbol) -> String,
@@ -36,6 +46,7 @@ pub fn validate_wrga_decorator(
     let mut budget: Option<i64> = None;
     let mut target: Option<Symbol> = None;
     let mut layers: Vec<String> = Vec::new();
+    let mut adapter: Option<Symbol> = None;
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -89,6 +100,17 @@ pub fn validate_wrga_decorator(
                     _ => diagnostics.push(
                         Diagnostic::error(
                             "@wrga: target must be an identifier (e.g. h100, rtx5070ti)"
+                                .to_string(),
+                        )
+                        .with_label(arg.span, "expected ident"),
+                    ),
+                },
+                "adapter" => match &arg.value.kind {
+                    ExprKind::Ident(sym) => adapter = Some(*sym),
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@wrga: adapter must be an identifier referring to a `model` \
+                             declaration (WRGA paper §8.2; e.g. `adapter=GatedLoRA`)"
                                 .to_string(),
                         )
                         .with_label(arg.span, "expected ident"),
@@ -149,14 +171,17 @@ pub fn validate_wrga_decorator(
         _ => {}
     }
 
+    let adapter_name = adapter.map(resolve_sym);
     Some(WrgaConfig {
         block: WrgaBlock {
             mode,
             budget,
             target,
             layers,
+            adapter,
             span: deco.span,
         },
+        adapter_name,
     })
 }
 
@@ -418,9 +443,114 @@ pub fn validate_adapter_decorator(
     })
 }
 
+/// WRGA paper §8.2 — post-pass that validates the `adapter=<Ident>` argument
+/// on every `@wrga(...)` decorator against the module's declared models.
+///
+/// Runs after `check_module` so all top-level `model` declarations have been
+/// pre-declared (sub-pass 2 in `checker::collect_top_level_decls`).  Three
+/// failure modes produce diagnostics:
+///
+/// 1. The named symbol resolves to neither a same-file `ModelDef` nor any
+///    other in-scope name — likely a typo.
+/// 2. The same-file model exists but has no `Tensor` field — WRGA needs at
+///    least one trainable parameter to place.
+/// 3. The same-file model exists but has no `forward` method — the @wrga
+///    rewrite has no entry point to call into.
+///
+/// Cross-module imports are accepted on trust: if the adapter symbol is bound
+/// somewhere in scope (via `from foo.peft import GatedLoRA`) but no matching
+/// `ModelDef` is in this file's `stmts`, the post-pass skips the model-shape
+/// checks rather than emitting a false "undeclared adapter" error.  The
+/// codegen integration cycle (which has the full multi-file analysis) will
+/// produce the deeper contract check.
+///
+/// Sub-passes only inspect surface signature shape — the heavy contract
+/// check (forward takes a single `Tensor` arg and returns a `Tensor`) is
+/// deferred to codegen integration, where the existing type-map can be
+/// queried.  This post-pass catches the common-case mistakes (typo,
+/// nonexistent model, empty model body) loudly and early.
+pub fn validate_wrga_custom_adapters(
+    configs: &[WrgaConfig],
+    module: &Module,
+    scopes: &crate::scope::ScopeMap,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for cfg in configs {
+        let Some(adapter_sym) = cfg.block.adapter else {
+            continue;
+        };
+        let adapter_name = resolve_sym(adapter_sym);
+        let model = module.stmts.iter().find_map(|s| match &s.kind {
+            StmtKind::ModelDef(m) if m.name == adapter_sym => Some(m),
+            _ => None,
+        });
+        let Some(model) = model else {
+            // Fallback: an imported adapter (`from foo.peft import GatedLoRA`)
+            // is bound in the module's root scope but never appears in
+            // `module.stmts` as a `ModelDef`.  Trust the import — the deeper
+            // contract check happens at codegen.
+            if scopes.lookup(crate::scope::ScopeId::ROOT, adapter_sym).is_some() {
+                continue;
+            }
+            diags.push(
+                Diagnostic::error(format!(
+                    "@wrga: custom adapter '{adapter_name}' is not a declared model in this \
+                     module and is not in scope (WRGA paper §8.2 requires either `model \
+                     {adapter_name}(...)` to be defined here OR `from <pkg> import \
+                     {adapter_name}` to be in scope before the `@wrga(adapter={adapter_name}, \
+                     ...)` annotation)"
+                ))
+                .with_label(cfg.block.span, "undeclared adapter"),
+            );
+            continue;
+        };
+        let has_tensor_field = model.members.iter().any(|m| match m {
+            ModelMember::LayerDecl { type_ann, .. } => is_tensor_type(&type_ann.kind, resolve_sym),
+            _ => false,
+        });
+        if !has_tensor_field {
+            diags.push(
+                Diagnostic::error(format!(
+                    "@wrga: custom adapter '{adapter_name}' has no `Tensor` field — WRGA \
+                     needs at least one trainable adapter parameter to place at each site \
+                     (paper §8.2)"
+                ))
+                .with_label(model.span, "no Tensor field"),
+            );
+        }
+        let has_forward = model.members.iter().any(|m| {
+            matches!(m, ModelMember::Method(fd, _) if resolve_sym(fd.name) == "forward")
+        });
+        if !has_forward {
+            diags.push(
+                Diagnostic::error(format!(
+                    "@wrga: custom adapter '{adapter_name}' has no `forward` method — the \
+                     WRGA rewrite needs `fn forward(self, x: Tensor) -> Tensor` to call into \
+                     the adapter at each placement site (paper §8.2)"
+                ))
+                .with_label(model.span, "missing forward"),
+            );
+        }
+    }
+    diags
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// `true` if `kind` is a Tensor type annotation in any of NSL's surface
+/// spellings: the dedicated `TypeExprKind::Tensor { ... }` (full
+/// `Tensor<[shape], dtype, device>`), or the bare `Tensor` ident which
+/// parses as `TypeExprKind::Named` with the symbol resolving to "Tensor".
+fn is_tensor_type(kind: &TypeExprKind, resolve_sym: &dyn Fn(Symbol) -> String) -> bool {
+    match kind {
+        TypeExprKind::Tensor { .. } => true,
+        TypeExprKind::Named(sym) => resolve_sym(*sym) == "Tensor",
+        _ => false,
+    }
+}
 
 fn extract_ident(arg: &Arg) -> Option<Symbol> {
     match &arg.value.kind {

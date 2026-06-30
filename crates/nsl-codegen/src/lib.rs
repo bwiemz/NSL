@@ -608,6 +608,11 @@ pub struct WrgaDecoratorConfig {
     pub budget: Option<i64>,
     pub target: Option<String>,
     pub layers: Vec<String>,
+    /// WRGA paper §8.2: name of the user-defined custom adapter model
+    /// (e.g. `"GatedLoRA"`), or `None` for the built-in `lora`/`ia3`/
+    /// `gatedlora` flavour selected by the compiler.  Resolved from the
+    /// `adapter=<Ident>` argument on `@wrga(...)` at the semantic layer.
+    pub custom_adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

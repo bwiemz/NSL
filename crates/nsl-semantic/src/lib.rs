@@ -128,6 +128,23 @@ pub fn analyze_with_imports(
     let (export_diags, weight_index_map) = crate::export::validate_exports(module, interner);
     diagnostics.extend(export_diags);
 
+    // WRGA paper §8.2: validate `@wrga(adapter=<Ident>, ...)` references to
+    // user-defined adapter models.  Runs after `check_module` so all top-
+    // level model declarations are visible; reports undeclared / empty /
+    // forward-less adapters loudly.
+    {
+        let resolve = |sym: nsl_ast::Symbol| {
+            interner.resolve(sym.0).unwrap_or("<unknown>").to_string()
+        };
+        let custom_adapter_diags = crate::wrga::validate_wrga_custom_adapters(
+            &wrga_configs,
+            module,
+            &scopes,
+            &resolve,
+        );
+        diagnostics.extend(custom_adapter_diags);
+    }
+
     // M38a: Run ownership analysis when --linear-types is active.
     // Runs after type checking so we have the TypeMap for tensor type detection.
     let mut ownership_info = HashMap::new();

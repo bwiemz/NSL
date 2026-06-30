@@ -88,6 +88,7 @@ pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_c
                 budget: c.block.budget,
                 target: None,
                 layers: c.block.layers.clone(),
+                custom_adapter: c.adapter_name.clone(),
             })
             .collect(),
         freeze: m
@@ -181,6 +182,7 @@ pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_c
                 budget: c.block.budget,
                 target: None, // Symbol->string resolution happens at codegen if needed
                 layers: c.block.layers.clone(),
+                custom_adapter: c.adapter_name.clone(),
             })
             .collect(),
         freeze: a
