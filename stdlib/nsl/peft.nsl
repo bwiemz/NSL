@@ -1,0 +1,35 @@
+# NSL Standard Library — nsl.peft
+#
+# Parameter-Efficient Fine-Tuning surface (WRGA paper §8.2).
+#
+# Defines the WrgaAdapter marker model that user-defined adapter
+# architectures conceptually attach to.  Importing it via
+# `from nsl.peft import WrgaAdapter` is the intent-marker NSL adopts
+# from the paper's §8.2 example; the WRGA compiler pass keys off the
+# `@wrga(adapter=<Name>, ...)` decorator (semantic-level), not off
+# this base.
+#
+# Custom adapter contract (validated by `validate_custom_adapter_model`
+# in nsl-semantic):
+#   - The class is declared with `model <Name>(<params>):`.
+#   - Has at least one `Tensor` field (the trainable adapter parameter).
+#   - Defines `fn forward(self, x: Tensor) -> Tensor`.
+#
+# Example:
+#
+#   from nsl.peft import WrgaAdapter
+#
+#   model GatedLoRA(d_in: int, d_out: int, rank: int):
+#       a: Tensor = randn([d_in, rank]) * full([1], 0.01)
+#       b: Tensor = zeros([rank, d_out])
+#       gate: Tensor = ones([d_out])
+#
+#       fn forward(self, x: Tensor) -> Tensor:
+#           return self.gate * (x @ self.a @ self.b)
+#
+#   @wrga(mode=auto, adapter=GatedLoRA, target=h100)
+#   let m = NSLCoder.load("pretrained.nslm", weights="model.safetensors")
+
+model WrgaAdapter():
+    fn forward(self, x: Tensor) -> Tensor:
+        return x

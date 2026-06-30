@@ -142,6 +142,12 @@ pub struct WrgaInput<'a> {
     /// more fields to `true` to replace that Innovation's stage with a
     /// deterministic no-op. See [`WrgaAblation`] for the no-op semantics.
     pub ablation: WrgaAblation,
+    /// WRGA paper §8.2: user-defined custom adapter model name (e.g.
+    /// `"GatedLoRA"`).  When `Some`, WRGA surfaces it on the report and
+    /// (in a follow-up cycle) routes adapter emission through this
+    /// user-defined model instead of one of the built-in flavours.
+    /// `None` keeps the compiler-chosen flavour selection.
+    pub custom_adapter: Option<&'a str>,
 }
 
 /// Compiled WRGA plan — consumed by downstream codegen stages.
@@ -163,6 +169,14 @@ pub struct WrgaPlan {
     /// `WrgaAblation::default()` = full WRGA (no ablation). Surfaced in the
     /// report header by `render_report` when active.
     pub ablation: WrgaAblation,
+    /// WRGA paper §8.2: user-defined custom adapter model name carried
+    /// through from `WrgaInput.custom_adapter`.  When `Some`,
+    /// `render_report` prints a `Custom adapter: <name>` header line
+    /// directly below the target hardware.  Codegen integration (using
+    /// the user model for adapter emission) is deferred to a follow-up
+    /// cycle; for now the flavour selection falls back to the existing
+    /// LoRA/IA³/GatedLoRA pipeline regardless of this field.
+    pub custom_adapter: Option<String>,
 }
 
 impl WrgaPlan {
@@ -194,6 +208,7 @@ impl WrgaPlan {
             memory: MemoryPlan::default(),
             override_diagnostics: Vec::new(),
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         }
     }
 
@@ -210,6 +225,17 @@ impl WrgaPlan {
         writeln!(s, "=== WRGA Compilation Report ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
         writeln!(s, "Target hardware: {}", self.target_gpu).unwrap();
+        if let Some(name) = &self.custom_adapter {
+            // Paper §8.2: surface the user-defined custom adapter so the
+            // report reader knows WRGA was asked to instantiate this
+            // model at each placement site.  The trailing parenthetical
+            // is load-bearing: the placement pass still selects among the
+            // built-in lora/ia3/gatedlora flavours in this PR cycle —
+            // wiring the user's adapter graph into placement/fusion is a
+            // follow-up cycle.  Without the note a reader could mistake
+            // the LoRA placements below for instantiations of `<name>`.
+            writeln!(s, "Custom adapter: {name} (placement integration pending)").unwrap();
+        }
         if self.ablation.is_active() {
             // Paper §9.3: when one or more Innovations are ablated, surface
             // which ones in the header so the report's numbers are not
@@ -737,6 +763,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
             d
         },
         ablation: abl,
+        custom_adapter: input.custom_adapter.map(str::to_string),
     }
 }
 
@@ -1031,6 +1058,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Exactly one param (blocks.7.wq) is trainable → exactly one site.
@@ -1061,6 +1089,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         assert_eq!(plan.prune.stats.gradient_targets, 1);
@@ -1085,6 +1114,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Both blocks.6.wq and blocks.6.wk match the layer scope.
@@ -1111,6 +1141,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         assert_eq!(run(make()).render_report(), run(make()).render_report());
     }
@@ -1136,6 +1167,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         assert!(
@@ -1195,6 +1227,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: Some(&over),
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Field exists and is accessible (proves wiring).  No diags expected
@@ -1222,6 +1255,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         assert!(
@@ -1307,6 +1341,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let report = plan.render_compare_report();
@@ -1345,6 +1380,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         assert_eq!(
             run(make()).render_compare_report(),
@@ -1375,6 +1411,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let rows = plan.compute_compare_baselines();
@@ -1425,6 +1462,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let rows = plan.compute_compare_baselines();
@@ -1581,6 +1619,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation,
+            custom_adapter: None,
         }
     }
 
@@ -2005,6 +2044,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Exactly one decision, on the reduction site, with the §2.4
@@ -2057,6 +2097,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let dec = plan
@@ -2101,6 +2142,7 @@ mod tests {
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
             ablation: abl,
+            custom_adapter: None,
         };
 
         // Baseline: same model under no ablation MUST produce a
@@ -2129,5 +2171,97 @@ mod tests {
             plan.fusion.decisions.len(),
         );
         assert_eq!(plan.fusion.fusion_ratio(), 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // WRGA paper §8.2 — custom adapter DSL plumbing (Gap #6)
+    // -----------------------------------------------------------------------
+
+    fn input_with_custom_adapter<'a>(w: &'a WengertList, name: Option<&'a str>) -> WrgaInput<'a> {
+        WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: name,
+        }
+    }
+
+    /// `WrgaInput.custom_adapter = Some(name)` must round-trip onto the
+    /// produced `WrgaPlan.custom_adapter` as an owned `String` of the
+    /// same value.
+    #[test]
+    fn custom_adapter_propagates_from_input_to_plan() {
+        let w = tiny_transformer_like();
+        let plan = run(input_with_custom_adapter(&w, Some("GatedLoRA")));
+        assert_eq!(plan.custom_adapter.as_deref(), Some("GatedLoRA"));
+    }
+
+    /// `None` on the input must stay `None` on the plan — confirms no
+    /// silent default is injected when the DSL isn't used.
+    #[test]
+    fn custom_adapter_none_round_trips_as_none() {
+        let w = tiny_transformer_like();
+        let plan = run(input_with_custom_adapter(&w, None));
+        assert!(plan.custom_adapter.is_none());
+    }
+
+    /// `render_report` must surface the `Custom adapter:` header line
+    /// when `custom_adapter` is set, and only then.  Pins both the
+    /// presence under the §8.2 DSL and the absence under default.
+    #[test]
+    fn render_report_surfaces_custom_adapter_when_set() {
+        let w = tiny_transformer_like();
+        let with_custom = run(input_with_custom_adapter(&w, Some("GatedLoRA"))).render_report();
+        let without_custom = run(input_with_custom_adapter(&w, None)).render_report();
+        assert!(
+            with_custom.contains("Custom adapter: GatedLoRA"),
+            "report must surface custom adapter name; got:\n{with_custom}",
+        );
+        // The trailing parenthetical is load-bearing — without it readers
+        // would mistake the LoRA placements below for instantiations of
+        // <name> (review finding #3).
+        assert!(
+            with_custom.contains("(placement integration pending)"),
+            "report must mark the custom adapter as not-yet-emitted; got:\n{with_custom}",
+        );
+        assert!(
+            !without_custom.contains("Custom adapter:"),
+            "report must NOT surface custom adapter line when unset; got:\n{without_custom}",
+        );
+    }
+
+    /// Custom adapter must NOT break the §9.3 ablation contract — the
+    /// `Custom adapter:` line and the `Ablation:` line can coexist; the
+    /// custom adapter is just a placement target, orthogonal to which
+    /// Innovations are ablated.
+    #[test]
+    fn custom_adapter_coexists_with_ablation_header() {
+        let w = tiny_transformer_like();
+        let mut input = input_with_custom_adapter(&w, Some("GatedLoRA"));
+        input.ablation = WrgaAblation {
+            skip_fusion_integration: true,
+            ..Default::default()
+        };
+        let report = run(input).render_report();
+        assert!(
+            report.contains("Custom adapter: GatedLoRA"),
+            "custom adapter line missing: {report}",
+        );
+        assert!(
+            report.contains("Ablation:"),
+            "ablation line missing: {report}",
+        );
     }
 }

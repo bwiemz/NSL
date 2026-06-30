@@ -142,6 +142,7 @@ pub(crate) fn apply_wrga_check_overrides(inputs: &mut nsl_codegen::WrgaInputs) {
                 budget: None,
                 target: Some(target),
                 layers: Vec::new(),
+                custom_adapter: None,
             });
         }
     });

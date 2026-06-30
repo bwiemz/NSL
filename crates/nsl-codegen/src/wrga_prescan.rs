@@ -118,6 +118,7 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
         memory: MemoryPlan::default(),
         override_diagnostics: Vec::new(),
         ablation: Default::default(),
+        custom_adapter: None,
     };
 
     let inject = wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
