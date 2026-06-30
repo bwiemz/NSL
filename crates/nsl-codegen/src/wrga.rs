@@ -499,12 +499,13 @@ fn apply_wggo_placement_filter(
         let Some(ov) = over.find_by_layer_containing(&p.name) else {
             continue;
         };
-        // Placement only governs layers that actually want an adapter and
-        // carry a concrete projection set.  rank==0 / None is the rank path's
-        // job (`RankForbiddenByWggo`); don't double-report it here.
-        if ov.adapter_rank == 0
-            || ov.adapter_placement == crate::wggo_ilp::AdapterPlacement::None
-        {
+        // rank==0 means WGGO wants no adapter on this layer at all — that is
+        // the rank path's job (`RankForbiddenByWggo`); skipping here avoids a
+        // double-report.  For rank>0 the placement drives the decision via
+        // `covers_projection`, INCLUDING an (invariant-violating) `None`
+        // placement: `None` excludes every projection, so all recognized sites
+        // are forced to Skip with a diagnostic rather than silently adapted.
+        if ov.adapter_rank == 0 {
             continue;
         }
         if ov.adapter_placement.covers_projection(&p.name) == Some(false)
@@ -1316,6 +1317,32 @@ mod tests {
             crate::wggo_overrides::OverrideRejectReason::AdapterSiteOutsidePlacement { .. }
         )));
         assert!(diags.iter().all(|d| d.applied == "skip" && d.requested == "lora"));
+    }
+
+    #[test]
+    fn wggo_placement_none_with_positive_rank_excludes_all_projections() {
+        // Defends against the invariant-violating (rank>0, placement=None)
+        // state: placement None means "zero projections", so every recognized
+        // attention/FFN site must be forced to Skip (with a diagnostic) — never
+        // silently left adapted.  A non-projection site stays untouched.
+        use crate::wrga_roofline::AdapterKind;
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wq"),
+            mk_lora_placement("blocks.0.attn.wv"),
+            mk_lora_placement("blocks.0.attn_norm.weight"), // not a projection
+        ];
+        let over = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::None);
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wq"), AdapterKind::Skip);
+        assert_eq!(kind("blocks.0.attn.wv"), AdapterKind::Skip);
+        assert_eq!(
+            kind("blocks.0.attn_norm.weight"),
+            AdapterKind::Lora,
+            "non-projection site is not governed by placement"
+        );
+        assert_eq!(diags.len(), 2, "wq + wv excluded; norm untouched");
     }
 
     #[test]
