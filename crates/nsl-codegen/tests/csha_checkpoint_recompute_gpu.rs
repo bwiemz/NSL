@@ -456,8 +456,9 @@ fn forward_launch_and_saves(
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
             saves.x_raw,
-            // segment_ids_ptr, tier_b_ptx_ptr, tier_b_name_ptr, doc_starts_ptr.
-            0, 0, 0, 0,
+            // segment_ids_ptr, tier_b_ptx_ptr, tier_b_name_ptr, doc_starts_ptr,
+            // num_docs_or_zero (PCA per-doc CTA Strategy 3 v1 — added post-merge).
+            0, 0, 0, 0, 0,
         )
     };
     if rc_fwd != 0 {
@@ -632,8 +633,9 @@ fn launch_backward_path(
             dwq_dev, dwk_dev, dwv_dev,
             dx_dev,
             dxn_dev,
-            // segment_ids, tier_b_ptx, tier_b_name, doc_starts, tier_b2_active.
-            0, 0, 0, 0, 0,
+            // segment_ids, tier_b_ptx, tier_b_name, doc_starts, tier_b2_active,
+            // num_docs_or_zero (PCA per-doc CTA Sprint 5 — added post-merge).
+            0, 0, 0, 0, 0, 0,
         )
     };
     if rc_bwd != 0 {
