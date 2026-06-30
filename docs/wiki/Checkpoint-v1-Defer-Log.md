@@ -1023,3 +1023,211 @@ The cycle-17 net advance is:
    hidden it. This is forward progress even though Bug 1 isn't closed yet — each cycle
    narrows the suspect surface area.
 
+---
+
+## Cycle 18 (2026-06-30): VERIFICATION-GAIN + T4 CLI restoration + DEGENERATE-PROBE meta-lesson
+
+### Disposition: NO NUMERICAL CLOSURE; meta-lesson value preserved via probe-gated discipline
+
+Cycle 18 ships ONE production-code-changing commit (T4 `--csha-report` CLI restoration)
+and a substantial set of EMPIRICAL FINDINGS from Phase A.2 probe gating. **Zero numerical
+closure** on dq/dk/dv. Paper §6.3 stays STRUCTURAL PARTIAL NUMERICAL UNVERIFIED (unchanged
+from c17). The cycle's net advance is verification-gain: c17's untested hypothesis chain
+collapsed under empirical probing, refining the c19 target with measurable rigor.
+
+### Phase A — 3-chain investigation (5 parallel investigators)
+
+| Chain | Verdict | Confidence | Recommendation |
+|---|---|---|---|
+| dK post-T2 (CHAIN 1) | WEAKLY_SUPPORTED | 68 | Option (c) dk_preRoPE_scratch HBM RMW |
+| dq collapse (CHAIN 2) | WEAKLY_REFUTED stated + 82 alternative | 82 (on alternative) | %scale uninit OR dS=0 upstream |
+| dV catastrophic (CHAIN 3) | WEAKLY_REFUTED stated | 55 | Side-channel oracle BEFORE codegen |
+| G16-3 sanitizer | sm_120 sanitizer REFUTED c16 hypothesis | — | New site at forward kernel +0xB30 |
+| `--csha-report` flag | mechanical restoration from `6bc2ffa1` | — | Ship pure restore (no new logic) |
+
+Synthesizer's NET LEADING CONFIDENCE was 62 — **correctly applying cycle 17 meta-lesson**.
+All chains gated through Phase A.2 empirical probes BEFORE production codegen. Strategy
+C-prime ("no ship and hope") explicitly chosen over Strategy A (3-in-one) per cycle 17
+honesty.
+
+### T1 dq debug-store probe — outcome (b) b_dS_zero (REVERTED before commit)
+
+**Probe scratch dump:**
+- `%scale = 1.250000000e-1` (bits `0x3e000000`) = 1/sqrt(64) — CORRECT
+- `%f_dS = 1.508969477e-10` (bits `0x2f25e9b7`) — f32 noise floor (~0)
+- `%f_dq_0 = 0.000000000e0` — exactly zero
+
+**Phase A 82-confidence hypothesis (`%scale` uninitialized) EMPIRICALLY REFUTED.** This is
+the value of probe-gating: the c18 PRELUDE fix path that would have been taken under
+Strategy A is empirically wrong; a placebo commit was avoided.
+
+**HOWEVER, R11 review refined the interpretation:** The probe at `(row=0, col=0,
+causal=true)` is a **STRUCTURALLY DEGENERATE ZERO BY ARITHMETIC IDENTITY**. At position
+(0,0) with causal masking, the causal window has exactly 1 valid key, so softmax gives
+`P[0,0]=1.0` exactly. Then `D = sum_k P*dP = 1*dP[0,0] = dP[0,0]`, and
+`dS = P*(dP - D) = 1*(dP - dP) = 0` — by arithmetic identity, NOT a ds_compute bug.
+
+**R11's verdict:** the probe machinery is correctly instrumented (post-init, post-compute,
+right lane) — but the SAMPLED COORDINATES are at a structurally degenerate point. The
+`dS≈0 → ds_compute is broken` interpretation is NOT supported by this measurement.
+
+**R1+R3 review additionally BLOCKED the probe ship** on 5 compilation-breaking FFI
+integrity issues (Confidence 100):
+1. `builtins.rs` missing trailing `dbg_scratch_ptr` Cranelift sig entry
+2. `wengert_lower.rs` AD-path call missing trailing null
+3. `pca_rope_ffi_sentinel.rs` both coercions still 54-param (won't compile)
+4. `csha_cycle15_bug1_ablations.rs` direct call missing 6th trailing zero
+5. `pca_backward_kernel_snapshot` insta snapshots stale (probe emitted PTX unconditionally)
+
+**Decision: REVERT T1 probe.** Both reviewers converge against shipping — R1+R3 on compile
+break, R11 on degenerate-position semantics. Probe + T5 PTX dump example stashed in c18
+worktree (`git stash`) for c19 reproducibility. C19 must re-implement with proper
+feature-gating AND probe at a non-degenerate position (row ≥ 1 or `causal=false`).
+
+### T3 dV GPU side-channel oracle — REAL_BUG classification CONFIRMED by R11
+
+**Worst-cell evidence:**
+- j=284 d=37: kernel=-9.105e+02 vs ref=+1.870e-05 (`rel_err=4.869e+07`)
+- j=284 d=56: kernel=+1.025e+03 vs ref=+4.355e-05 (`rel_err=2.354e+07`)
+- j=202 d=34: kernel=+6.980e+03 vs ref=+1.489e-03 (`rel_err=4.687e+06`)
+- 7-order-of-magnitude discrepancy at finite (non-saturated) values
+
+**R11's verdict:** REAL_BUG VALID. The reference oracle (`csha_reference.rs:340-349`)
+correctly computes `d_v[j,d] += sum_i P[i,j] * dO[i,d]` using f32 arithmetic on properly
+f16-rounded inputs. The worst-cell pattern at multiple rows (j=284, 202, 158) with finite
+wrong values cannot be explained by tolerance drift or oracle mismatch.
+
+The `causal=false` ±Inf saturation at j=299 is a SEPARATE phenomenon (known f16 storage
+limit during final scratch→dv_ptr conversion) and is filtered from the worst-cell
+analysis. The causal=true finite-but-wrong cells are independent solid evidence.
+
+**Recommendation:** ESCALATE to c19 with HIGH confidence. C19 dV investigation has solid
+empirical basis.
+
+### T5 G16-3 forward-PTX disassembly — REFACTOR_NEEDED (DEFER_C19)
+
+c16 hypothesis (Phase-4 backward SMEM overshoot into rms_strip at d_model=0) **REFUTED**
+by sm_120 compute-sanitizer triage. New site surfaced: **1024 violations at FORWARD
+kernel offset +0xB30, pattern `0x5 + 0xA*lane` (all ODD = misaligned for f16 reads)**.
+dq/dk/dv came back zero; dwq/dwk/dwv/dx all FAIL — forward never wrote valid Q-proj
+outputs.
+
+T5 disassembly localized:
+- Primary candidate: `ld.shared.b16 %h_save_v, [%rd_save_smem]` at PTX line 358 (and
+  parallel sites 370, 394, 406, 626, 638) — Q/K/V save SMEM read in
+  `emit_save_activations_subset`
+- **Secondary correctness bug surfaced:** `q_load.rs:201` — `fma.rn.f32 %f{reg}, %f{reg},
+  %f0, %f1` IGNORES the shuffled RoPE partner `%f2`; non-fused-projections inline RoPE
+  computes `q*cos+sin` instead of `q*cos+partner*sin`. Independent c19 finding.
+
+**Fix scope: REFACTOR_NEEDED.** Orchestration self-admission at `mod.rs:374-384`:
+"Backward numerical correctness for non-fused path is NOT the goal of this edit."
+Recommend DEFER_C19 with refined hypothesis.
+
+### T4 — CLI `--csha-report` restoration LANDED (commit `a89432f4`)
+
+Pure mechanical restoration from commit `6bc2ffa1`. Refactor commit `5049c2c2` had removed
+`--csha-report` and `--csha` from `CheckArgs`, breaking
+`crates/nsl-cli/tests/csha_check_report_cli.rs` (4 failing tests). Restoration:
+
+- Added `csha: Option<String>` + `csha_report: bool` to `args::CheckArgs` (mirrors
+  `BuildArgs:622/626`)
+- Restored Sprint-3 dispatch body in `commands/check.rs` (~95 LOC after wrga_compare,
+  before cep_search)
+- Uses `crate::pipeline::analysis_to_csha_configs` (the cycle-17 merge `pub(crate)`
+  helper)
+- 143 LOC total
+
+**Test results:** 4/4 csha_check_report_cli tests GREEN; 2286/2286 nsl-codegen lib GREEN;
+25/25 fa_v2_snapshots GREEN; 34/35 nsl-cli test files GREEN. The 1 failing file is the
+pre-existing `calibration_flag_validation.rs` hardcoded-path issue (unrelated, predates
+c18).
+
+**R1+R3 verdict: APPROVE_SHIP.** No high-severity findings.
+
+### Cycle 18 net disposition
+
+| Work item | Cycle 18 outcome (commit SHA) | Cycle 19 carryover |
+|---|---|---|
+| T4 `--csha-report` restore | LANDED `a89432f4` (pure mechanical) | None (closed) |
+| T1 dq probe | REVERTED (compile-block + degenerate-site) | Re-probe at row≥1 or causal=false; feature-gate the emission |
+| Phase A 82-confidence `%scale` hypothesis | EMPIRICALLY REFUTED | `%scale = 0.125` correct; do NOT pursue prelude scale fix |
+| ds_compute pivot (presumed from T1 dS=0) | NOT YET CONFIRMED (R11 flagged degenerate position) | Conditional on c19 re-probe showing dS≠0 at non-degenerate site |
+| T3 dV catastrophic | REAL_BUG CONFIRMED (diagnostic only; no codegen change) | HIGH-confidence dV investigation in c19 |
+| T5 G16-3 forward +0xB30 | REFACTOR_NEEDED (DEFER_C19) | Forward-kernel emit_save_activations_subset audit + q_load.rs:201 RoPE partner bug |
+| q_load.rs:201 RoPE partner bug | SURFACED as side-finding by T5 | Independent c19 fix candidate |
+| `--csha-report` carryover from c17 | LANDED (T4) | None (closed) |
+| `csha_check_report_cli.rs` broken test | RESOLVED via T4 | None (closed) |
+| %rd_dk_* cosmetic rename | STILL DEFERRED | c19+ |
+
+### Cycle-5 invariant disposition (final)
+
+**Section 5.3 numerical evidence NOT CLAIMABLE.** Paper §6.3 49% headline: **STRUCTURAL
+PARTIAL, NUMERICAL UNVERIFIED on Blackwell** (UNCHANGED from c17). R0 retirement HOLDS
+unconditionally.
+
+C18 net advance is honest verification-gain:
+- Phase A 82-confidence `%scale` hypothesis EMPIRICALLY REFUTED before any production
+  change (probe-gated discipline worked)
+- T3 dV REAL_BUG confirmed by independent R11 oracle audit
+- T5 G16-3 hypothesis REFINED (forward kernel, not backward SMEM)
+- T4 mechanical fix LANDED with R1+R3 APPROVE_SHIP
+- ZERO over-claim; ZERO placebo commits; ZERO Phase A.2 outcome-blind production
+  shipments
+
+### Meta-lessons codified for c19
+
+1. **Probe-gating WORKS exactly as cycle 17 specified.** Phase A predicted `%scale` uninit
+   at confidence 82. T1 probe REFUTED in <2 hours. Production code unchanged. Compare to
+   cycle 17 T2 which spent ~4 hours implementing a fix that was later empirically refuted.
+   **Codify: Phase A.2 probe-gating is now MANDATORY for any future c19 hypothesis at
+   confidence ≥70.**
+
+2. **Probe semantics matter as much as probe instrumentation.** R11 found the T1 probe
+   was correctly instrumented but sampled a structurally degenerate cell. The dS≈0
+   measurement was VALID but UNINFORMATIVE — degenerate by arithmetic identity at
+   `(row=0, col=0, causal=true)`. **Codify: every probe must explicitly justify its
+   sampled coordinates as non-degenerate. R11-style oracle review is the gate.**
+
+3. **Implementer "tests green" claims must be verified against the FULL test surface.**
+   T1 subagent reported "probe_landed: true; tests green" but had only run the specific
+   GPU test it cared about. R1+R3 found 5 compile-breaking issues across
+   `builtins.rs`/`wengert_lower.rs`/`pca_rope_ffi_sentinel.rs`/`csha_cycle15_bug1_ablations.rs`/snapshot
+   tests. **Codify: implementer reports MUST include `cargo check -p <crate> --tests`
+   on ALL impacted crates + snapshot tests. Verifier-side independent test runs are the
+   gate.**
+
+4. **Multi-reviewer adversarial review catches what single-reviewer reviews miss.**
+   R1+R3 caught compile-breaks (technical correctness). R11 caught degenerate-position
+   sampling (semantic correctness). Either reviewer alone would have either rubber-stamped
+   the technical fix and pivoted c19 to ds_compute (wasted weeks) OR blocked on compile
+   issues but missed the semantic problem (compile-fix and ship a probe that doesn't
+   actually measure what it claims). Both perspectives were necessary.
+
+5. **Production-code FFI sig changes must include ALL 5 sites (cycle-17 carryover
+   reverified).** The c17 phase2.6 ← main merge required ABI consistency across builtins/
+   wengert_lower/runtime/pca_rope_ffi_decls/pca_rope_ffi_sentinel. The c18 T1 probe
+   subagent attempted to widen the sig and missed 4 of the 5 sites. **Codify: any FFI sig
+   widening checklist enforcement.**
+
+### Cycle 19 prerequisites (carryover from c18)
+
+1. **dS re-probe at non-degenerate coordinates** (R11 PRECONDITION): row ≥ 1 OR causal=false.
+   Feature-gate the probe emission (`#[cfg(feature = "csha_cycle19_probe")]`) so snapshot
+   tests are not affected. ALL 5 FFI sites updated atomically per c17 meta-lesson #5.
+   Probe scratch values dumped, classified into 4-outcome decision tree.
+2. **dV catastrophic investigation** (HIGH confidence): Trace the dV accumulation path
+   from `dv_accum.rs` through finalize.rs emit_store_kv_only V-only RMW. Inspect for
+   thread-id-specific or KV-iter-specific code paths that affect rows j=284/202/158.
+   Compare to dwv path (which is mostly correct).
+3. **G16-3 forward kernel investigation:**
+   - emit_save_activations_subset (`csha_hooks_forward.rs:805-959`) SMEM read ordering
+     under `(save_activations_for_backward && !fused_projections && d_model=0)` gate
+   - q_load.rs:201 RoPE partner shuffle bug — independent fix candidate, single-line
+     surgical likely
+4. **T1 probe re-implementation** with proper feature-flag gating (preserves snapshot
+   byte-identity)
+5. **csha_check_report_cli.rs broken-test class:** consider arch-hardening campaign
+   "broken-test census" sub-task
+6. **%rd_dk_* cosmetic rename:** STILL deferred
+
