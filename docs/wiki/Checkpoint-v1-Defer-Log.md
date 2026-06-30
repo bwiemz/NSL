@@ -856,3 +856,170 @@ target dir cleanup ~14 GB), and (2) redirecting both `TEMP` and `CARGO_TARGET_DI
 to E:. No actual lib compile errors exist on cycle-16 source. Cycle 17 can
 proceed with the same workaround.
 
+---
+
+## Cycle 17 (2026-06-30): STRUCTURAL FIX LANDED + NUMERICAL CLOSURE PARTIAL
+
+### G16-1: Tier B scalar backward Bug 1 — STRUCTURAL FIX LANDED, NUMERICAL PARTIAL (commit `89bb7f05`)
+
+**Phase A** (4 parallel investigators + PTX dump comparator + G16-3 prep + decorator scope →
+synthesizer): 4/4 hypothesis investigators converged on the post-loop `%k_start` site.
+Synthesizer leading verdict H2+H3 COMBINED at confidence 82: post-loop `%k_start` staleness
+AND per-KV-iter dK SMEM zero-init defeating cycle-16's post-loop `emit_store_dk_only`.
+
+**T1 GATE (diagnostic probe; reverted post-measurement):** Injected `mov.u64 %k_start, 0;`
+post-loop. Empirically confirmed `%k_start` IS load-bearing for Path A:
+- dk.max_rel: 1.000 → 1.002 (small but reproducible)
+- dwk.max_rel: 1.181 → 1.020 (decreased; wrong-but-different-wrong as Phase A predicted)
+- dx.max_rel: 1.029 → 1.118
+- dq, dv, dwq, dwv unchanged (separate code paths from dK)
+
+GATE PASS verdict. H1 dispatch-elsewhere concern empirically refuted (Path A reaches the
+`synthesize_backward_with_tier_b` emitter as Phase A predicted).
+
+**T3 PRE (compute-sanitizer baseline):** 0 memcheck errors across 5 variants + 0 racecheck
+hazards. This initially appeared to REFUTE the OOB hypothesis. Closer inspection of the
+subagent's own PTX evidence at `finalize.rs:115-116`:
+
+```
+setp.lt.u64 %p0, %rd43, %rd6;     // %rd43 = row + %k_start, %rd6 = seq_len
+and.pred %p_dk, %p_dk, %p0;        // mask used to predicate all stores
+```
+
+With `%k_start = seq_len` post-loop, the predicate is FALSE for all rows ≥ 0. **The Phase-4
+dK store is dead-code-masked.** No OOB writes occur because no writes occur at all.
+compute-sanitizer's 0-error result is consistent with dead-code masking.
+
+**Refined root cause:** Cycle-16 Option A's post-loop `emit_store_dk_only` is dead code. dK
+HBM ends up as whatever was there from allocation (likely zero). Cycle 15 had no Phase-4
+store either, so both produce byte-identical output. The T3 PRE subagent's STOP
+recommendation was based on a misreading (assumed memory-safety bug; actual is
+correctness bug — store doesn't fire at all). Orchestrator override was sound; PTX-level
+dead-code-mask analysis was concrete.
+
+**T2 architectural fix (commit `89bb7f05`):** Introduced `DropeBranch::{Q, K, Both}` enum +
+`emit_drope_branch` function (backward-compat `emit_drope` wrapper preserved for 12 legacy
+callers). Moved `emit_drope_branch(K)` + `emit_store_dk_only` INSIDE V2_BWD_LOOP_KV body —
+between `emit_store_kv_only` (V-only) and the `%k_start` increment. Each iter rotates+stores
+its own tile's dK using the in-range loop-variable `%k_start`. Post-loop now ONLY emits
+Q-related Phase-3+ work.
+
+**T3 POST (compute-sanitizer validation on T2):** 0 memcheck errors + 0 racecheck hazards.
+T2 is memory-safe + race-free. The in-loop store fires correctly per-iter.
+
+**Path A numerical outcome (`t_recompute_hd64_s512_bq32`):**
+
+| grad | pre-T2 max_abs | pre-T2 max_rel | post-T2 max_abs | post-T2 max_rel | disposition |
+|------|----------------|----------------|------------------|------------------|-------------|
+| dq   | 4.420e0        | 1.000e0        | 4.420e0          | 1.000e0          | UNCHANGED (separate path) |
+| dk   | 4.356e0        | 1.000e0        | 4.356e0          | **2.146e1**      | store now firing; values wrong |
+| dv   | 8.571e0        | 3.979e3        | 8.571e0          | 3.979e3          | UNCHANGED (separate path) |
+| dwq  | 3.403e1        | 1.000e0        | 3.403e1          | 1.000e0          | UNCHANGED |
+| dwk  | 3.664e1        | 1.181e0        | 3.664e1          | **1.711e0**      | drifted (worse) |
+| dwv  | 1.733e1        | 1.032e0        | 1.733e1          | 1.032e0          | UNCHANGED |
+| dx   | 4.691e1        | 1.029e0        | 4.691e1          | **1.043e0**      | drifted (slight) |
+
+**Disposition: STRUCTURAL FIX LANDED, NUMERICAL CLOSURE PARTIAL.** The dead-code mask is
+empirically closed (dk HBM transitioned from all-zero to per-iter writes). However, dk
+max_rel = 21.46 is NOT within Tier B tolerance — Bug 1 has additional defects beyond
+dead-code-masking. **G16-1 NOT closed.**
+
+### New defect surfaced by T2 — cycle 18 carryover
+
+`emit_dproj` reads post-loop dK SMEM. Pre-T2 with dead-code-masked Phase-4 store, post-loop
+dK SMEM contained whatever stale data the per-iter zero-init + dqdk_accum + (skipped)
+emit_drope(K) had left. T2's per-iter zero-init makes post-loop dK SMEM contain ONLY the
+LAST KV iter's rotated tile. emit_dproj now reads this LAST-iter-only tile and produces
+drifted dwk (1.181→1.711) and dx (1.029→1.043).
+
+Likely c18 fix candidates:
+- (a) `dqdk_accum` formula or scale — verify the in-kernel dK accumulation matches the dKdV math
+- (b) `emit_dproj` should compute dwk per-iter (not post-loop), mirroring the dV approach
+- (c) Or: dK SMEM accumulation needs an HBM-scratch flush like dV (in-loop f32 RMW), so
+  post-loop emit_dproj reads a properly-accumulated tile
+- (d) Investigate dq + dv paths separately — both stayed RED through T2; they have their own
+  defects that share no code with the dK chain T2 fixed
+
+### G16-3 — SMEM aliasing at d_model=0 — STILL DEFERRED to c18
+
+Did not investigate further in c17 (compute-sanitizer ran only Path A, not A3 ablation).
+Refined hypothesis from c16 (Phase-4 SMEM overshoot into rms_strip at d_model=0) remains
+untested.
+
+### T4 — CLI decorator regression gates LANDED (commit `be68fd9c`, separate branch)
+
+`crates/nsl-cli/tests/csha_checkpoint_decorator_cli_e2e.rs` (180 LOC):
+
+- **Test A:** `@csha(disable=true)` round-trips through `nsl build --csha-report`; asserts
+  CSHA compilation report header is ABSENT in stderr. Empirically verified as LIVE
+  REGRESSION GATE — reverting `loader.rs:433` causes Test A to fail with the exact
+  expected regression message.
+- **Test B:** `@checkpoint(policy=full)` survives `nsl check`; asserts exit 0 + no
+  "unknown decorator" stderr. Limitation honestly documented: `nsl check` bypasses the
+  multi-file loader, so Test B catches parse/semantic regressions but NOT loader.rs:439.
+  The in-process `pipeline.rs::checkpoint_full_policy_survives_pipeline_handoff` unit test
+  (from the phase2.6 ← main merge restoration) still holds that gate.
+
+Deviations: Test A uses `disable=true` instead of `level=2` because `--csha-report`'s level
+value is the SMEM-clamped post-planning value, not the decorator value (binary present/absent
+is a cleaner observable). Test B uses `nsl check` instead of `nsl check --csha-report`
+because the `--csha-report` flag was removed from `CheckArgs` during refactor `5049c2c2` —
+**existing `csha_check_report_cli.rs` is BROKEN FOR THE SAME REASON** (unrelated to cycle 17;
+carryover to c18 or arch-hardening campaign).
+
+### FFI fix (commit `b65f9d77`)
+
+Post-merge `csha_checkpoint_recompute_gpu.rs` FFI signature drift. The phase2.6 ← origin/main
+merge updated production FFI signatures to 54 params with trailing pair
+`[tier_b2_active, num_docs_or_zero]`, but the merge subagent missed the test file. T1 GATE
+subagent surfaced this and applied minimal trailing `num_docs_or_zero=0` placeholders at
+both call sites (44-arg `nsl_flash_attention_csha_with_saves` and 54-arg
+`nsl_flash_attention_csha_backward`).
+
+### Cycle 17 net disposition
+
+| Work item | Cycle 17 outcome (commit SHA) | Cycle 18 carryover |
+|---|---|---|
+| G16-1 | STRUCTURAL FIX LANDED `89bb7f05` (in-loop dK store + dRoPE-K). NUMERICAL CLOSURE PARTIAL — dk max_rel 21.46 not in tolerance. | (a) `dqdk_accum` formula/scale audit / (b) `emit_dproj` per-iter dwk compute / (c) dK HBM-scratch RMW like dV / (d) dq + dv path investigation |
+| G16-3 | DEFERRED to c18 (untouched in c17) | cuda-memcheck triage with refined hypothesis (Phase-4 SMEM overshoot at d_model=0) |
+| T4 decorator CLI | LANDED `be68fd9c` (Test A live gate; Test B parse-only with documented limitation) | Restore `--csha-report` flag in `CheckArgs` (broken from refactor `5049c2c2`); fix existing `csha_check_report_cli.rs` |
+| FFI test-file fix | LANDED `b65f9d77` | None (closed) |
+| C17-cleanup `%rd_dk_*` rename | DEFERRED (T2 touched the same surface but architectural change took priority) | Cosmetic rename in c18 |
+
+### Cycle-5 invariant disposition (final)
+
+**Section 5.3 numerical evidence NOT CLAIMABLE.** Paper §6.3 49% headline: **STRUCTURAL
+PARTIAL, NUMERICAL UNVERIFIED on Blackwell** (unchanged from c16). R0 retirement HOLDS
+unconditionally.
+
+The cycle-17 net advance is:
+- DEAD-CODE MASK EMPIRICALLY CLOSED (verified by T1 + T2)
+- T2 ARCHITECTURALLY SOUND (verified by T3 POST memcheck + racecheck clean)
+- NEW DEFECT(S) STRUCTURALLY IDENTIFIED (emit_dproj post-loop dK SMEM dependency) FOR c18
+
+### Meta-lessons codified for c18
+
+1. **"Structural witness passing does NOT empirically validate" — REVERIFIED.** Phase A
+   converged on H2+H3 at confidence 82. T2 implemented the predicted fix. T3 POST sanitizer
+   clean. Yet dk max_rel = 21.46 ≠ tolerance. The architectural fix was real and correct;
+   the bug was deeper than the convergent hypothesis. C18 must independently re-verify the
+   dK chain end-to-end.
+
+2. **Pre-existing CI-broken tests are technical debt that masks future regressions.** The
+   `csha_check_report_cli.rs` test broke when refactor `5049c2c2` removed `--csha-report`
+   from `CheckArgs`. No one noticed because the test was already not exercised. T4
+   surfaced this. The arch-hardening campaign should add a "broken test census" to prevent
+   this class of silent debt.
+
+3. **Independent reviewer second-guessing IS valuable — but reviewers can be wrong too.**
+   T3 PRE subagent's STOP recommendation was based on a misreading (assumed memory-safety
+   bug; actual is correctness bug — dead-code mask). Orchestrator override was sound
+   because the PTX-level dead-code-mask analysis was concrete (line numbers, predicate
+   logic). Convergent multi-investigator signal is the right bar for confidence, not
+   single-reviewer veto.
+
+4. **Defect surfacing during incremental fixes is GOOD.** T2's per-iter zero-init made the
+   `emit_dproj` post-loop dK SMEM dependency observable. Cycle 16's dead-code mask had
+   hidden it. This is forward progress even though Bug 1 isn't closed yet — each cycle
+   narrows the suspect surface area.
+
