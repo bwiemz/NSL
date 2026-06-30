@@ -342,6 +342,11 @@ pub(crate) fn invoke_wrga_if_enabled(
         seed: 0xC0DE_FACE,
         inspect_pinned_vars: compiler.inspect_pinned_vars.clone(),
         wggo_overrides: compiler.wggo_overrides.as_ref(),
+        // Paper §9.3 ablation flags — forwarded verbatim from `WrgaInputs`.
+        // No-op for normal `nsl build` (default `WrgaAblation::default()`);
+        // populated by `apply_wrga_check_overrides` in nsl-cli (the bridge
+        // that handles both `--wrga-target` and `--wrga-ablate`).
+        ablation: inputs.ablation,
     };
     let mut plan = crate::wrga::run(wrga_input);
 

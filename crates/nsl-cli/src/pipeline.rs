@@ -112,8 +112,9 @@ pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_c
                 alpha: c.alpha,
             })
             .collect(),
+        ablation: Default::default(),
     };
-    crate::commands::build::apply_wrga_target_override(&mut inputs);
+    crate::commands::build::apply_wrga_check_overrides(&mut inputs);
     inputs
 }
 
@@ -204,7 +205,8 @@ pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_c
                 alpha: c.alpha,
             })
             .collect(),
+        ablation: Default::default(),
     };
-    crate::commands::build::apply_wrga_target_override(&mut inputs);
+    crate::commands::build::apply_wrga_check_overrides(&mut inputs);
     inputs
 }
