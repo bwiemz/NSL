@@ -115,15 +115,30 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // `rope_q=true`, only Q is rotated here — K reaches s_compute UNROTATED
         // (emit_k_tile_load reads K from HBM and stores f16 to SMEM without any
         // RoPE rotation site). Attention scores Q_rot * K_unrot^T are therefore
-        // semantically WRONG on this branch regardless of PCA reset. The CSHA-
-        // fused-projections path (csha_hooks.rs::emit_rope_pair_sweep) is the
-        // production PCA path and rotates both Q AND K correctly under the same
-        // effective_pos. The non-CSHA inline path is exercised only by the
-        // pca_tier_a_forward_correctness rope_q smoke tests (which document the
-        // structural gap and assert no-crash + per-doc reset semantics, not
-        // full RoPE correctness). Adding K-side rotation to emit_k_tile_load is
-        // a separate follow-on (would require a partner-shuffle of K halves in
-        // the kv-tile loop, mirroring emit_rope_rotation_inline below).
+        // semantically WRONG on this branch regardless of PCA reset.
+        //
+        // PRODUCTION IS UNAFFECTED. The CSHA-fused-projections path
+        // (csha_hooks.rs::emit_rope_pair_sweep) is the production PCA RoPE path
+        // and rotates both Q AND K correctly under the same effective_pos. The
+        // production CSHA training-PTX synthesis site
+        // (maybe_synthesize_csha_training_ptx) ALWAYS sets
+        // csha=Some(CshaExtras{level=1, ...}), and the @flash_attention
+        // decorator's inference path uses the same CSHA-fused PTX when RoPE is
+        // active. The non-CSHA + rope_q=true branch is reachable only from
+        // direct PTX synthesis tests that exercise the fallback emitters
+        // (pca_tier_a_forward_correctness::rope_q_forward_*), and those tests
+        // pin only no-crash + per-doc reset semantics, NOT full RoPE
+        // correctness — see the comment on cpu_reference_rope_then_attention,
+        // which explicitly does NOT rotate K so the CPU side matches the
+        // kernel side's structural gap byte-for-byte under this branch.
+        //
+        // Closing this gap requires K-side rotation in emit_k_tile_load: a
+        // partner-shuffle of K halves after the cooperative HBM->SMEM load
+        // (the 128-threads-per-tile-element load pattern does NOT give a
+        // single thread access to BOTH partners of a HalfSplit pair, so the
+        // rotation must be a second sync-rotate-sync pass on the SMEM tile,
+        // mirroring emit_rope_pair_sweep's design). This is tracked as a
+        // separate follow-on PR.
         if config.rope_q && !csha_rope_active {
             ptx.push_str("    // RoPE: cos/sin bases (position = effective_pos when PCA reset active)\n");
             ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
