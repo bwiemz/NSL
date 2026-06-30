@@ -187,8 +187,47 @@ pub fn emit_xnorm_recompute(ptx: &mut String, config: &FlashAttentionConfig) {
 /// flow back correctly through document-reset positions.
 /// Sentinel-disabled paths (segment_masked=false) are byte-stable.
 ///
+/// Cycle 17 G16-1 T2: emit_drope branch selector.
+///
+/// Cycle 16 emitted Q+K together POST-LOOP. Cycle 17 needed to move the K
+/// branch INSIDE the V2_BWD_LOOP_KV body (so the in-loop %k_start register
+/// is in-range when emit_store_dk_only's predicate fires). The Q branch
+/// must stay POST-LOOP because dQ accumulates across all KV iters via
+/// flush-and-reload — rotating dQ in-loop would corrupt the accumulator.
+///
+/// `Both` preserves the pre-cycle-17 behavior used by 12 legacy call sites
+/// (proj_backward, ptxas validation tests, Tier B.2 fixtures).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DropeBranch {
+    /// Emit Q-tile inverse-RoPE only (post-loop in cycle 17).
+    Q,
+    /// Emit K-tile inverse-RoPE only (in-loop in cycle 17).
+    K,
+    /// Emit both Q and K (legacy / Tier B.2 hybrid backward).
+    Both,
+}
+
 /// No-op when `rope_q=false` or `csha=None`.
+///
+/// Backward-compatible wrapper for cycle-16 callers — emits BOTH Q and K
+/// branches. Cycle-17 split callers should use `emit_drope_branch` directly.
 pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    emit_drope_branch(ptx, config, q_tile_iter, DropeBranch::Both);
+}
+
+/// Cycle 17 G16-1 T2: branch-selectable inverse-RoPE.
+///
+/// The single null-guard (cos_ptr/sin_ptr non-null check) is emitted in
+/// every variant — each call site is independently null-safe. Per-branch
+/// label namespaces use {q_tile_iter} so multiple in-loop K emissions
+/// across KV iters get distinct labels via the unique loop-iter ordinal
+/// supplied by the caller.
+pub fn emit_drope_branch(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    branch: DropeBranch,
+) {
     if config.csha.is_none() || !config.rope_q {
         ptx.push_str("    // Tier C dRoPE: rope_q=false, no emission\n");
         return;
@@ -203,29 +242,49 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
     // emit the doc_starts lookup. Mirrors the forward T7+T8 gate.
     let reset_active = config.segment_masked && config.rope_q;
 
+    let branch_tag = match branch {
+        DropeBranch::Q => "Q",
+        DropeBranch::K => "K",
+        DropeBranch::Both => "QK",
+    };
+    // Backward-compat: legacy Both callers expect bare label names
+    // (V2_BWD_DROPE_GUARD_{iter} / V2_BWD_DROPE_ALL_SKIP_{iter}). Branch-
+    // split callers (cycle 17 G16-1 T2) get branch-suffixed labels so
+    // multiple emissions in the same kernel don't collide.
+    let label_suffix = match branch {
+        DropeBranch::Both => format!("{q_tile_iter}"),
+        _ => format!("{branch_tag}_{q_tile_iter}"),
+    };
     ptx.push_str(&format!(
         "    // Tier C backward dRoPE on dQ/dK gradient tiles \
-         (q_tile_iter={q_tile_iter})\n"
+         (q_tile_iter={q_tile_iter}, branch={branch_tag})\n"
     ));
 
-    // Single null-guard shared by dQ and dK.
-    ptx.push_str(&format!("V2_BWD_DROPE_GUARD_{q_tile_iter}:\n"));
+    // Single null-guard shared by dQ and dK. Branch-suffixed label so
+    // Q-only + K-only emissions in the same kernel don't collide.
+    ptx.push_str(&format!("V2_BWD_DROPE_GUARD_{label_suffix}:\n"));
     ptx.push_str("    ld.param.u64 %rd30, [cos_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd31, [sin_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd30, 0;\n");
     ptx.push_str("    setp.eq.u64 %p1, %rd31, 0;\n");
     ptx.push_str("    or.pred %p0, %p0, %p1;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_BWD_DROPE_ALL_SKIP_{q_tile_iter};\n"
+        "    @%p0 bra V2_BWD_DROPE_ALL_SKIP_{label_suffix};\n"
     ));
+
+    // Select which (label, tile_off, rows) entries to emit based on branch.
+    let q_entry = ("Q", dq_off, block_q);
+    let k_entry = ("K", dk_off, block_kv);
+    let entries: &[(&str, u32, u32)] = match branch {
+        DropeBranch::Q => &[q_entry],
+        DropeBranch::K => &[k_entry],
+        DropeBranch::Both => &[q_entry, k_entry],
+    };
 
     // cos/sin rows are indexed by absolute row = q_start + row_local
     // (same stride `half * 4` bytes f32). For the smoke scope q_start=0,
     // but we compute it honestly so wider configs land safely.
-    for (label, tile_off, rows) in [
-        ("Q", dq_off, block_q),
-        ("K", dk_off, block_kv),
-    ] {
+    for &(label, tile_off, rows) in entries {
         let total_pairs = rows * half;
         let pairs_per_lane = total_pairs.div_ceil(128).max(1);
         ptx.push_str(&format!(
@@ -363,7 +422,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
         ));
     }
 
-    ptx.push_str(&format!("V2_BWD_DROPE_ALL_SKIP_{q_tile_iter}:\n"));
+    ptx.push_str(&format!("V2_BWD_DROPE_ALL_SKIP_{label_suffix}:\n"));
 }
 
 // ────────────────────────────────────────────────────────────────────────

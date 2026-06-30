@@ -1682,26 +1682,56 @@ pub fn synthesize_backward_with_tier_b(
         ptx.push_str("    } // end PCA Tier B.2 kv-tile ordinal scope\n");
     }
     phases::backward::finalize::emit_store_kv_only(&mut ptx, config, 0);
+    // Cycle 17 G16-1 T2: in-loop dK inverse-RoPE + dK HBM store. Cycle 16
+    // emitted these POST-LOOP via emit_drope(Both) + emit_store_dk_only.
+    // The post-loop emission was empirically refuted (commit c2c6879b):
+    // emit_store_dk_only's predicate `(row + %k_start) < seq_len` (see
+    // finalize.rs:115-116) evaluates FALSE for every row when %k_start
+    // has been incremented past seq_len at loop exit — the store is
+    // dead-code-masked and Path A is byte-identical to cycle 15.
+    //
+    // T2 fix: rotate+store dK INSIDE the loop where %k_start is the
+    // current KV tile's start (in-range per iter). H2 (per-iter dK SMEM
+    // zero-init) is structurally correct given in-loop store: each iter
+    // zeros dK SMEM, accumulates ONE tile via dqdk_accum, rotates via
+    // in-loop emit_drope_branch(K), stores to HBM via in-loop
+    // emit_store_dk_only, then next iter zeros again. Q branch stays
+    // post-loop because dQ uses cycle-15-correct flush-and-reload that
+    // persists dQ SMEM across all KV iters.
+    //
+    // bar.sync after emit_store_kv_only (above, embedded in finalize.rs
+    // line 206) ensures dV SMEM writes complete before in-loop emit_drope
+    // (K) reads the adjacent dK SMEM region.
+    phases::backward::csha_hooks_backward::emit_drope_branch(
+        &mut ptx,
+        config,
+        0,
+        phases::backward::csha_hooks_backward::DropeBranch::K,
+    );
+    phases::backward::finalize::emit_store_dk_only(&mut ptx, config, 0);
     ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
     ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
     ptx.push_str("    @%p0 bra V2_BWD_LOOP_KV;\n");
     ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete across all KV tiles\n");
 
-    // Phase 3: CSHA hooks (x_norm recompute, inverse RoPE, dW{q,k,v},
-    // dRMSNorm). Each writes directly to HBM except the dRoPE rotation
-    // which mutates the dQ/dK SMEM tiles in place.
+    // Phase 3: CSHA hooks (x_norm recompute, inverse RoPE Q-branch only,
+    // dW{q,k,v}, dRMSNorm). Each writes directly to HBM except the dRoPE
+    // rotation which mutates the dQ SMEM tile in place. Cycle 17 T2: K
+    // branch moved in-loop (above); Q branch stays here.
     phases::backward::csha_hooks_backward::emit_xnorm_recompute(&mut ptx, config);
-    phases::backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
+    phases::backward::csha_hooks_backward::emit_drope_branch(
+        &mut ptx,
+        config,
+        0,
+        phases::backward::csha_hooks_backward::DropeBranch::Q,
+    );
     phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
     phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
 
-    // Phase 4: cooperative global stores of the 7 gradients + final fence.
-    // Cycle-16 G16-1 defect-1+3 fix: emit_store_dk_only writes the fully-
-    // accumulated, post-inverse-RoPE dK SMEM tile to f16 HBM directly. Must
-    // be called AFTER emit_drope (which rotates dK SMEM in-place) and AFTER
-    // the KV outer loop completes (Phase 3 runs post-loop). emit_store_dq_only
-    // follows immediately after (dQ path unchanged).
-    phases::backward::finalize::emit_store_dk_only(&mut ptx, config, 0);
+    // Phase 4: cooperative global stores of the remaining gradients +
+    // final fence. Cycle 17 T2: emit_store_dk_only moved in-loop (above).
+    // Here we only emit dQ; dV is already stored via emit_store_kv_only
+    // (in-loop f32 scratch RMW); dwq/dwk/dwv/dx are hook-managed.
     phases::backward::finalize::emit_store_dq_only(&mut ptx, config, 0);
 
     ptx.push_str("    ret;\n");
