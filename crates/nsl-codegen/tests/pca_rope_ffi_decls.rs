@@ -23,6 +23,8 @@
 //! N args would now hit a sig-mismatch at IR-finalize time. The targeted
 //! count assertions surface the regression before that downstream failure.
 
+#[cfg(feature = "csha_cycle19_probe")]
+use cranelift_codegen::ir::types;
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{builder, Flags};
 use cranelift_module::default_libcall_names;
@@ -95,6 +97,17 @@ fn csha_backward_probe_decl_has_expected_arity() {
         "nsl_flash_attention_csha_backward_probe must accept 56 i64 params \
          (54 original + probe_ds_out_ptr + probe_dv_out_ptr)"
     );
+    // Defence-in-depth (R3): every param must be i64. A stray non-i64 slot
+    // would silently mis-encode pointer args at the Cranelift call site
+    // before the arity assertion caught it.
+    for (i, p) in sig.params.iter().enumerate() {
+        assert_eq!(
+            p.value_type,
+            types::I64,
+            "probe backward FFI param #{i} must be i64, got {:?}",
+            p.value_type
+        );
+    }
 }
 
 #[test]
