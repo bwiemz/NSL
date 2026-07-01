@@ -1976,7 +1976,11 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
 /// `probe_dv_out_ptr`, each 8 f32 slots wide) reserved for a NON-DEGENERATE
 /// probe site at `(batch=0, head=0, q_tile_iter=0, warp_row=1, lane=0,
 /// causal=true)` where `P[1,0]≈0.5`, `P[1,1]≈0.5`, and `dS = 0.25 *
-/// (dP[1,0] - dP[1,1])` is nonzero under random dO. See cycle-18 defer log.
+/// (dP[1,0] - dP[1,1])` is nonzero under random dO. The exact 0.25
+/// coefficient assumes symmetric Q/K (i.e. `S[1,0] ≈ S[1,1]`). Under
+/// fully randomized Q/K the coefficient varies but `dS` remains nonzero
+/// — the coordinate is non-degenerate in both regimes. See cycle-18
+/// defer log.
 ///
 /// **T1 scope is FFI+decl scaffolding ONLY.** The PTX-side probe emission
 /// (Step 6 of the cycle-19 T1 spec) — writing 8 f32 probe slots via
@@ -2074,25 +2078,14 @@ pub extern "C" fn nsl_flash_attention_csha_backward_probe(
         num_docs_or_zero,
     );
 
-    // Honest sentinel: zero the probe slots on host when non-null so callers
-    // observe a well-defined value until T2 wires PTX-side population. The
-    // 8-slot layout matches the cycle-19 spec: {row_max, row_sum, S_pre_mask,
-    // P, dP, rowsum_dP_P, dS, scale*dS}. On non-CUDA builds we still zero
-    // (the pointers may be host-allocated scratch).
+    // T1 scaffolding: probe pointers preserved; PTX-side st.global.f32
+    // population deferred to c20. These branches exist so the parameters are
+    // not dead-code-eliminated by rustc — they carry no runtime effect in T1.
+    // The 8-slot layout the future PTX emitter will target is:
+    // {row_max, row_sum, S_pre_mask, P, dP, rowsum_dP_P, dS, scale*dS}.
+    // Sentinel `0` on either pointer disables that half of the probe write
+    // once c20 wires up PTX-side population.
     if probe_ds_out_ptr != 0 {
-        // SAFETY: caller contract says probe_ds_out_ptr is either 0 or a
-        // valid pointer to an 8-slot f32 buffer. On CUDA callers this
-        // will be a device pointer — we can't safely memset device
-        // memory from host without cuMemsetD32 plumbing, so the sentinel
-        // here is host-only. When called with a device pointer the slots
-        // remain whatever GPU state initialized them; T2 will overwrite
-        // via st.global.f32 from the kernel. This block is DEAD-EFFECT
-        // on device pointers, ACTIVE on host pointers.
-        //
-        // We keep this behavior conservative: only write when the pointer
-        // looks host-addressable (heuristic: within the process VA). A
-        // proper implementation would branch on device residency; for
-        // T1 scaffolding this is a documented known-gap.
         let _ = probe_ds_out_ptr;
     }
     if probe_dv_out_ptr != 0 {
