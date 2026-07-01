@@ -114,10 +114,28 @@ fn cfie_serve_block_populates_plan_from_real_inputs() {
     // Launch accounting is populated.
     assert!(plan.kernel_launches_per_token_cfie < plan.kernel_launches_per_token_baseline);
 
+    // Feature 1 / G7: the static layout must come with an emitted
+    // direct-indexing decode-attention kernel (real PTX, baked strides).
+    let kernel = plan
+        .decode_attention_kernel
+        .as_deref()
+        .expect("static layout must emit the decode-attention kernel");
+    assert_eq!(kernel, "nsl_cfie_decode_attn");
+    let ptx = plan
+        .decode_attention_ptx
+        .as_deref()
+        .expect("PTX must be stored on the plan");
+    assert!(ptx.contains(".visible .entry nsl_cfie_decode_attn"));
+    assert!(
+        !ptx.contains("block_table"),
+        "direct indexing must not reference a block table"
+    );
+
     // The report renders with the real GPU + all six sections.
     let report = plan.render_report();
     assert!(report.contains("CFIE Inference Build Report"));
     assert!(report.contains("H100-SXM"));
+    assert!(report.contains("direct-index decode attention: nsl_cfie_decode_attn emitted"));
     assert!(report.contains("[6] Grammar DFA: disabled"));
 }
 

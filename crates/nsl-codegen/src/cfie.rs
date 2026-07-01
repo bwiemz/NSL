@@ -77,6 +77,12 @@ pub struct CfiePlan {
     pub kernel_launches_per_token_baseline: u32,
     pub kernel_launches_per_token_cfie: u32,
     pub solve_us: u64,
+    /// Feature 1 (G7): the direct-indexing decode-attention kernel,
+    /// emitted by the serve wiring when the KV plan selects a static
+    /// layout and the v1 emitter's preconditions hold.  Consumed by
+    /// the decode-loop lowering when it lands (G16).
+    pub decode_attention_kernel: Option<String>,
+    pub decode_attention_ptx: Option<String>,
 }
 
 impl CfiePlan {
@@ -97,6 +103,15 @@ impl CfiePlan {
         writeln!(s).unwrap();
         writeln!(s, "Optimizations applied:").unwrap();
         writeln!(s, "  [1] KV layout: {} ({})", self.kv.kind.as_str(), self.kv.rationale).unwrap();
+        if let Some(kernel) = self.decode_attention_kernel.as_ref() {
+            writeln!(
+                s,
+                "      direct-index decode attention: {} emitted ({} bytes PTX, launch wiring pending G16)",
+                kernel,
+                self.decode_attention_ptx.as_ref().map_or(0, |p| p.len())
+            )
+            .unwrap();
+        }
         writeln!(
             s,
             "  [2] Fused decode-sample: {} ops ({:.1} KB HBM saved per token)",
@@ -180,6 +195,8 @@ pub fn run(input: CfieInput) -> CfiePlan {
             kernel_launches_per_token_baseline: 500,
             kernel_launches_per_token_cfie: 500,
             solve_us: t0.elapsed().as_micros() as u64,
+            decode_attention_kernel: None,
+            decode_attention_ptx: None,
         };
     }
 
@@ -246,6 +263,8 @@ pub fn run(input: CfieInput) -> CfiePlan {
         kernel_launches_per_token_baseline: baseline,
         kernel_launches_per_token_cfie: cfie_launches,
         solve_us: t0.elapsed().as_micros() as u64,
+        decode_attention_kernel: None,
+        decode_attention_ptx: None,
     }
 }
 

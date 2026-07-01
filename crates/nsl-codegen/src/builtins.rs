@@ -1410,6 +1410,30 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // --- CFIE: KV sequence-slot free-list ---
+    (
+        "nsl_cfie_kv_slots_init",
+        &[types::I64, types::I64], // slot_count, per_slot_tokens
+        Some(types::I64),
+    ),
+    ("nsl_cfie_kv_slot_acquire", &[], Some(types::I64)),
+    ("nsl_cfie_kv_slot_release", &[types::I64], Some(types::I64)),
+    (
+        "nsl_cfie_kv_slot_advance",
+        &[types::I64, types::I64], // slot, n_tokens
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_kv_slot_rollback",
+        &[types::I64, types::I64], // slot, n_tokens
+        Some(types::I64),
+    ),
+    ("nsl_cfie_kv_slots_active", &[], Some(types::I64)),
+    (
+        "nsl_cfie_kv_attach_device",
+        &[types::I64, types::I64], // base, bytes
+        Some(types::I64),
+    ),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",

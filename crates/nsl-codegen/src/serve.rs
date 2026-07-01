@@ -30,6 +30,16 @@ const WORKER_SPEC_TREE_WIDTH_OFFSET: i32 = 32;
 const WORKER_SPEC_TEMP_BITS_OFFSET: i32 = 36;
 const WORKER_EOS_TOKEN_OFFSET: i32 = 40;
 
+/// Values the compiled serve binary passes to the `nsl_cfie_*` init
+/// FFIs, sized from the compile-time CFIE plan.
+struct CfieRuntimeInit {
+    ring_capacity: i64,
+    /// `(slot_count, per_slot_tokens)` for the KV slot free-list —
+    /// present only when the plan selected a static layout and the
+    /// decode-attention kernel was emitted.
+    kv_slots: Option<(i64, i64)>,
+}
+
 struct WorkerConfigSpec {
     max_seq_len: i64,
     kv_blocks: i64,
@@ -196,9 +206,10 @@ impl Compiler<'_> {
         // Extract CFIE config from the serve block, resolve the mode
         // (CLI --cfie > @cfie decorator > implicit via CFIE keys), run
         // the orchestrator, and surface the build report.  The plan
-        // drives the report + the request-ring init call today; kernel-
-        // side consumption lands with audit gaps G7/G9/G16.
-        let cfie_ring_capacity = self.run_cfie_for_serve(serve)?;
+        // drives the report, the request-ring + KV-slot init calls, and
+        // (static layouts) the direct-index decode-attention kernel;
+        // the decode-loop launch path lands with audit gap G16.
+        let cfie_init = self.run_cfie_for_serve(serve)?;
 
         let is_disaggregated = prefill_workers > 1 || decode_workers > 1;
 
@@ -228,14 +239,24 @@ impl Compiler<'_> {
                 &[v_max_batch, v_max_seq_len, v_kv_blocks, v_prefill_chunk],
             )?;
 
-            // CFIE: size the continuous-batching request ring from the
-            // compile-time scheduler plan (audit gap G5 — the runtime
-            // FFI is now reachable from emitted code).  Monolithic
-            // path only; the disaggregated workers keep their M41
-            // queueing until the persistent decode kernel lands (G16).
-            if let Some(capacity) = cfie_ring_capacity {
-                let v_capacity = builder.ins().iconst(cl_types::I64, capacity);
+            // CFIE: size the continuous-batching request ring and the
+            // KV sequence-slot free-list from the compile-time plan
+            // (audit gaps G5/G8 — the runtime FFIs are now reachable
+            // from emitted code).  Monolithic path only; the
+            // disaggregated workers keep their M41 queueing until the
+            // persistent decode kernel lands (G16).
+            if let Some(init) = &cfie_init {
+                let v_capacity = builder.ins().iconst(cl_types::I64, init.ring_capacity);
                 self.compile_call_by_name(builder, "nsl_cfie_ring_init", &[v_capacity])?;
+                if let Some((slot_count, per_slot_tokens)) = init.kv_slots {
+                    let v_slots = builder.ins().iconst(cl_types::I64, slot_count);
+                    let v_tokens = builder.ins().iconst(cl_types::I64, per_slot_tokens);
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_cfie_kv_slots_init",
+                        &[v_slots, v_tokens],
+                    )?;
+                }
             }
 
             for endpoint in &serve.endpoints {
@@ -260,9 +281,12 @@ impl Compiler<'_> {
     /// database + `--weights` WeightMap + serve config keys), print the
     /// build report, and stash the plan on `self.last_cfie_plan`.
     ///
-    /// Returns the request-ring capacity the compiled binary must pass
-    /// to `nsl_cfie_ring_init`, or `None` when CFIE is not active.
-    fn run_cfie_for_serve(&mut self, serve: &ServeBlock) -> Result<Option<i64>, CodegenError> {
+    /// Returns the runtime-init values the compiled binary must pass to
+    /// the `nsl_cfie_*` init FFIs, or `None` when CFIE is not active.
+    fn run_cfie_for_serve(
+        &mut self,
+        serve: &ServeBlock,
+    ) -> Result<Option<CfieRuntimeInit>, CodegenError> {
         let interner = self.interner;
         let resolve = |sym: nsl_ast::Symbol| -> String {
             interner.resolve(sym.0).unwrap_or("").to_string()
@@ -306,7 +330,44 @@ impl Compiler<'_> {
 
         let weights = self.features.weight_map.as_ref();
         let prepared = crate::cfie_serve::prepare(&cfg, mode, gpu, weights)?;
-        let plan = crate::cfie::run(prepared.input);
+        let mut plan = crate::cfie::run(prepared.input);
+
+        // Feature 1 (G7): emit the direct-indexing decode-attention
+        // kernel when the plan selected a static layout and the v1
+        // emitter's preconditions hold.  Precondition misses downgrade
+        // to a report note, not a build failure — the paged path stays
+        // available.
+        let mut kv_slots: Option<(i64, i64)> = None;
+        if plan.kv.uses_direct_indexing() {
+            let per_slot = plan
+                .kv
+                .direct
+                .as_ref()
+                .map(|d| d.per_sequence_max_tokens)
+                .unwrap_or(0);
+            let max_slots = plan.persistent.scheduler.max_active;
+            let attn_cfg = crate::cfie_decode_attention::DecodeAttentionConfig {
+                n_layers: prepared.shape.n_layers,
+                n_heads: prepared.shape.n_heads,
+                n_kv_heads: prepared.shape.n_kv_heads,
+                head_dim: prepared.shape.head_dim,
+                per_slot_max_tokens: per_slot,
+                max_slots,
+                kv_dtype_bytes: 2,
+                sm_version: gpu.sm_version,
+            };
+            let supported = prepared.shape.head_dim <= 128
+                && prepared.shape.n_heads % prepared.shape.n_kv_heads.max(1) == 0
+                && per_slot >= 1
+                && max_slots >= 1
+                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
+            if supported {
+                let (ptx, meta) = crate::cfie_decode_attention::emit(&attn_cfg);
+                plan.decode_attention_kernel = Some(meta.kernel_name);
+                plan.decode_attention_ptx = Some(ptx);
+                kv_slots = Some((max_slots as i64, per_slot as i64));
+            }
+        }
 
         // Build report: the paper's visible artifact (§8).  Provenance +
         // wiring status keep it honest about what this build actually
@@ -333,7 +394,10 @@ impl Compiler<'_> {
 
         let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
         self.last_cfie_plan = Some(plan);
-        Ok(Some(capacity))
+        Ok(Some(CfieRuntimeInit {
+            ring_capacity: capacity,
+            kv_slots,
+        }))
     }
 
     /// M41: Compile a disaggregated serve block.
