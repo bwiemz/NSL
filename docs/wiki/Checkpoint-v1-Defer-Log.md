@@ -1231,3 +1231,128 @@ C18 net advance is honest verification-gain:
    "broken-test census" sub-task
 6. **%rd_dk_* cosmetic rename:** STILL deferred
 
+## Cycle 19 (2026-07-01): T1 FFI variant-B scaffolding LANDED (PARTIAL) + T3 q_load RoPE partner surgical LANDED
+
+### Scope
+
+Cycle 19 delivered T1 dS-probe FFI scaffolding (PARTIAL — ABI variant-B + hygiene
+tests; PTX emission deferred to c20) and T3 q_load.rs RoPE partner-shuffle surgical
+fix (LANDED with RED-then-GREEN structural witness). T2 dV catastrophic trace and
+T4 conditional codegen fix DEFERRED to c20 (blocked on T1 PTX emission).
+
+Phase-A synthesizer (`wbeju206r`) ranked c18 carryover items and refined the FFI
+site count from 5 (c18 belief) to 12 (R4 evidence). Recommended variant-B FFI
+extension via a NEW `_probe` symbol rather than widening the existing 54-param
+signature — leaves the 12 pre-c19 call sites byte-identical.
+
+### T1 — dS probe FFI scaffolding (PARTIAL, ea8e0157 + 3 fixups → aa9402dc)
+
+Variant-B: NEW `nsl_flash_attention_csha_backward_probe` FFI symbol behind the
+`csha_cycle19_probe` Cargo feature (default OFF).
+
+**Landed:**
+- Cargo feature `csha_cycle19_probe` on both nsl-runtime and nsl-codegen
+- Runtime `pub extern "C" fn nsl_flash_attention_csha_backward_probe` — 56 i64
+  params (54 orig + `probe_ds_out_ptr` + `probe_dv_out_ptr`); delegates to the
+  existing 54-param body verbatim
+- Cranelift extern-decl added to `builtins.rs::declare_runtime_functions` under
+  identical cfg; the RUNTIME_FUNCTIONS const is UNTOUCHED
+- Additive 56-arity assertion + per-param `types::I64` type-lock in
+  `pca_rope_ffi_decls.rs` — existing 54-arity assertion on the non-probe symbol
+  is unchanged
+- Additive typed-coercion sentinel in `pca_rope_ffi_sentinel.rs`
+- Grep-hygiene test `csha_backward_ffi_hygiene.rs` locking down the 12 known
+  pre-c19 call sites (would catch a hypothetical 13th site)
+- `#[ignore]`d integration test `csha_cycle19_ds_probe.rs` with honest XFAIL
+  rationale ("PTX-side probe emission deferred to c20")
+- Fixups: stale allowlist entry deleted; sentinel-block comment rewritten;
+  0.25 coefficient doc caveat added; per-param i64 lock
+
+**Deferred (honest PARTIAL per c18 DEGENERATE-PROBE meta-lesson):**
+- PTX-side probe emission: predicated `st.global.f32` writes populating the 8-slot
+  layout `{row_max, row_sum, S_pre_mask, P, dP, rowsum_dP_P, dS, scale*dS}` at
+  `(warp_id==1 && lane==0 && q_tile_iter==0 && batch_idx==0 && head_idx==0)`
+- `PrimalOp::FusedCshaBackwardProbe` variant + wengert_lower dispatch
+- Integration test body (currently `unimplemented!()` under `#[ignore]`)
+
+**Gates green:** default features + `csha_cycle19_probe` feature both compile;
+2286/2286 nsl-codegen lib tests; 25/25 fa_v2_snapshots byte-identical; W13
+CshaSavePointers UNTOUCHED; all 12 pre-c19 FFI sites UNTOUCHED.
+
+### T3 — q_load.rs RoPE partner-shuffle fix (LANDED, 899cbbe0 + d98508d6 + 84bded4a)
+
+Non-CSHA inline forward path bug at `phases/forward/q_load.rs`. The RoPE emitter
+loaded shuffled partner into `%f2` but the follow-up FMA read self (pre-shuffle)
+and treated sin as additive bias, ignoring `%f2` entirely. HalfSplit `@%p0` and
+`@!%p0` bodies were byte-identical (no sign flip).
+
+**Fix:** Two-FMA-per-output encoding per csha_hooks.rs:1584-1595 reference math.
+Adjacent even lane (holds x0) computes `x0*cos + (-partner)*sin = x0*cos - x1*sin`;
+Adjacent odd lane (holds x1) computes `x1*cos + partner*sin = x1*cos + x0*sin`.
+HalfSplit lane<16 mirrors even Adjacent; lane>=16 mirrors odd. Signs correctly
+DIFFER between branches.
+
+**Discipline:** RED-then-GREEN via structural PTX-content test (RED commit
+first, then fix). R11 fixups tightened tests to symmetric branch coverage —
+regression in EITHER branch of EITHER style now fails. Re-verified RED-then-GREEN
+after tightening.
+
+**Gates green:** 2286/2286 lib tests; 25/25 fa_v2_snapshots byte-identical (no
+snapshot touches production `fused_projections=true` path); q_load.rs signature
+unchanged (bypasses 12-site FFI atomicity concern); csha_hooks.rs UNTOUCHED.
+
+**Deferred to c20:** Numerical GPU-vs-CPU witness (`max_rel_err < 1e-3`) —
+requires wiring the non-CSHA v2 rope_q forward launcher at the Rust FFI level.
+CPU oracle is in place; test is `#[cfg(feature = "cuda")]` + `#[ignore]`d.
+
+Orthogonal defect discovered but NOT touched: inline cos/sin indexing may read
+`cos[d]/sin[d]` where reference indexes by `d/2` (pair index). Preserving pre-c19
+behavior; audit deferred to c20.
+
+### Adversarial review (3-lens, wqm5uiw24)
+
+- R1 correctness: APPROVE_SHIP both
+- R3 codegen: APPROVE_SHIP both
+- R11 semantic: APPROVE_WITH_FIXUPS T1, APPROVE_SHIP T3 (fixups applied)
+
+Zero HIGH-severity findings. All medium findings addressed in Phase E fixups.
+
+### §6.3 status
+
+**UNCHANGED:** STRUCTURAL PARTIAL NUMERICAL UNVERIFIED. Cycle 19 did not advance
+numerical closure of dq/dk/dv (T1 PTX emission and T2 dV trace both deferred).
+Cycle 19 DID advance FFI hygiene, feature-flag isolation pattern, and non-CSHA
+forward path structural correctness.
+
+### Meta-lessons codified (extend from c18)
+
+1. **Variant-B FFI extension** (new `_probe` symbol) is the safe pattern for adding
+   probe outputs — leaves the pre-c19 call sites byte-identical, sidesteps R3
+   Cranelift sig-mismatch panic risk.
+2. **Grep-hygiene test** locks the FFI call-site landscape; catches hypothetical
+   13th caller before merge.
+3. **Honest PARTIAL** (scaffolding + XFAIL body) is superior to shipping a green
+   test with trivially-satisfied assertions — matches c18 DEGENERATE-PROBE lesson.
+4. **Symmetric branch coverage** in RED-then-GREEN tests: assert BOTH predicate
+   branches of a split emitter carry the fix, not just one. R11 caught the
+   asymmetric-coverage risk in T3 review; fixups tightened via
+   `lines_under_pred` + `line_consumes_partner` helpers.
+5. **Register-pool discipline:** new registers must fall within pre-declared
+   pool ranges (`%f<48+head_dim/32>`, `%p<8>`, `%r<16>`) — verified downstream
+   emitters do not clobber before use.
+
+### Carryover to c20
+
+1. **T1 PTX emission** — extend variant-B FFI with actual `st.global.f32` probe
+   writes at the 8 sample sites in `ds_compute.rs` + `dqdk_accum.rs`; populate
+   integration test body
+2. **T2 dV catastrophic trace** — use T1 probe scaffold once populated; audit
+   `emit_drope_branch(K)` SMEM footprint; classify into 4-branch outcome tree
+3. **T4 conditional codegen fix** — evidence-driven fix based on T1+T2 classifications
+4. **T3 numerical witness** — wire non-CSHA v2 rope_q forward launcher at FFI
+   level; flip Adjacent/HalfSplit GPU-vs-CPU tests from `#[ignore]` to enforced
+5. **T3 orthogonal:** audit inline cos/sin indexing (`d` vs `d/2`)
+6. **G16-3 forward:** `emit_save_activations_subset` SMEM ordering (deep triage)
+7. **csha_check_report_cli.rs broken-test census** (arch-hardening scoping)
+8. **%rd_dk_* cosmetic rename** — deferred cycles 16+17+18+19
+
