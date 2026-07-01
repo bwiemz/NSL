@@ -61,27 +61,52 @@ fn rope_block_slice<'a>(ptx: &'a str, marker: &str) -> &'a str {
     &tail[..end]
 }
 
-/// Count `fma.rn.f32` instructions in a PTX slice whose source-operand
-/// list contains `%f2` as one of its operands (destination excluded).
-fn fma_uses_f2_partner(slice: &str) -> usize {
-    slice
-        .lines()
-        .filter(|line| line.contains("fma.rn.f32"))
-        .filter(|line| {
-            // Split at commas; operand[0] is destination, rest are sources.
-            let after = match line.find("fma.rn.f32") {
-                Some(pos) => &line[pos..],
-                None => return false,
-            };
-            let parts: Vec<&str> = after.splitn(2, ',').collect();
-            if parts.len() < 2 { return false; }
-            let sources = parts[1];
-            // Match `%f2` as a whole token (not `%f20`, `%f22`, ...).
-            sources
-                .split(|c: char| c == ',' || c.is_whitespace() || c == ';')
-                .any(|tok| tok == "%f2")
-        })
-        .count()
+/// Return true if the line reads `%f2` or `%f3` (partner or -partner) as
+/// a source operand in a partner-consuming instruction (fma/neg/mul/add/mov).
+/// `%f3` counts because the EVEN branch synthesizes `%f3 = neg %f2` and
+/// then feeds `%f3` into the follow-up FMA — dropping `%f3` propagation
+/// would still orphan the partner value.
+fn line_consumes_partner(line: &str) -> bool {
+    let is_partner_op = line.contains("fma.rn.f32")
+        || line.contains("neg.f32")
+        || line.contains("mov.f32")
+        || line.contains("mul.rn.f32")
+        || line.contains("add.rn.f32");
+    if !is_partner_op {
+        return false;
+    }
+    // Sources begin after the first comma (operand[0] is destination).
+    let after_first_comma = match line.find(',') {
+        Some(i) => &line[i + 1..],
+        None => return false,
+    };
+    after_first_comma
+        .split(|c: char| c == ',' || c.is_whitespace() || c == ';')
+        .any(|tok| tok == "%f2" || tok == "%f3")
+}
+
+/// Extract only the lines under a given predicate prefix (e.g. `@%p1` vs
+/// `@!%p1`). Prefix matching is exact on the trimmed-left line to avoid
+/// `@!%p1` false-matching a `@%p1` filter.
+fn lines_under_pred<'a>(slice: &'a str, pred: &str) -> String {
+    let mut out = String::new();
+    for l in slice.lines() {
+        let t = l.trim_start();
+        // Only accept an EXACT prefix match at the start of the line.
+        // For `@%p1`, we must additionally reject `@!%p1`.
+        let ok = if pred == "@%p1" {
+            t.starts_with("@%p1") && !t.starts_with("@!")
+        } else if pred == "@%p0" {
+            t.starts_with("@%p0") && !t.starts_with("@!")
+        } else {
+            t.starts_with(pred)
+        };
+        if ok {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[test]
@@ -89,11 +114,28 @@ fn qload_rope_adjacent_uses_partner_in_fma() {
     let cfg = config_inline_rope(RopeStyle::Adjacent);
     let ptx = ptx_string(&cfg);
     let slice = rope_block_slice(&ptx, "// rope adjacent slice 0");
-    let count = fma_uses_f2_partner(slice);
+
+    // Adjacent splits on `%p1` (p1 == even lane). Both the @%p1 (even, x0)
+    // and @!%p1 (odd, x1) branches must consume the shuffled partner.
+    // Symmetric assertion: a regression in EITHER branch must fail.
+    let p1_lines = lines_under_pred(slice, "@%p1");
+    let np1_lines = lines_under_pred(slice, "@!%p1");
+
+    let p1_uses = p1_lines.lines().any(line_consumes_partner);
+    let np1_uses = np1_lines.lines().any(line_consumes_partner);
+
     assert!(
-        count >= 1,
-        "Adjacent RoPE block must consume the shuffled partner (%f2) in \
-         at least one fma.rn.f32; found 0.\n\nBlock:\n{}",
+        p1_uses,
+        "Adjacent RoPE @%p1 (even, x0) branch must consume the shuffled \
+         partner (%f2 or %f3=neg(%f2)) in a partner-consuming instruction \
+         (fma/neg/mul/add).\n\nBlock:\n{}",
+        slice
+    );
+    assert!(
+        np1_uses,
+        "Adjacent RoPE @!%p1 (odd, x1) branch must consume the shuffled \
+         partner (%f2) in a partner-consuming instruction \
+         (fma/neg/mul/add).\n\nBlock:\n{}",
         slice
     );
 }
@@ -104,72 +146,29 @@ fn qload_rope_halfsplit_uses_partner_in_fma() {
     let ptx = ptx_string(&cfg);
     let slice = rope_block_slice(&ptx, "// rope halfsplit slice 0");
 
-    // A branch "uses %f2" if any predicated instruction (fma or neg) in
-    // that branch reads %f2 as a source operand. `neg.f32 %f3, %f2`
-    // followed by fma using %f3 counts as consumption of the partner —
-    // %f2 is not orphaned. What we're guarding against is the pre-fix
-    // state where NO instruction after the shfl ever mentioned %f2 in a
-    // source position under that predicate.
-    fn branch_uses_f2(slice: &str, pred: &str) -> bool {
-        slice
-            .lines()
-            .filter(|l| l.contains(pred))
-            // Only fma / neg (and mov) can propagate %f2's value.
-            .filter(|l| {
-                l.contains("fma.rn.f32")
-                    || l.contains("neg.f32")
-                    || l.contains("mov.f32")
-                    || l.contains("mul.rn.f32")
-                    || l.contains("add.rn.f32")
-            })
-            .any(|l| {
-                // Skip the destination operand (first after opcode).
-                // A `%f2` in any source position proves consumption.
-                let opcode_end = l.find(|c: char| c.is_whitespace() && l[..].contains("f32")).unwrap_or(0);
-                // Take everything after the first comma (i.e. sources).
-                let after_first_comma = match l.find(',') {
-                    Some(i) => &l[i + 1..],
-                    None => return false,
-                };
-                let _ = opcode_end;
-                after_first_comma
-                    .split(|c: char| c == ',' || c.is_whitespace() || c == ';')
-                    .any(|tok| tok == "%f2")
-            })
-    }
+    // HalfSplit splits on `%p0` (lane < 16). Both the @%p0 (lane<16, x0)
+    // and @!%p0 (lane>=16, x1) branches must consume the shuffled partner
+    // via a partner-consuming instruction (fma/neg/mul/add/mov). The
+    // pre-fix state emitted byte-identical @/@! bodies that both ignored
+    // %f2 — symmetric assertions here catch a regression in either branch.
+    let p0_lines = lines_under_pred(slice, "@%p0");
+    let np0_lines = lines_under_pred(slice, "@!%p0");
 
-    // `@!%p0` starts with `@!%p0` while `@%p0` starts with `@%p0` (no `!`).
-    // We must distinguish them; a naive `.contains("@%p0")` matches both
-    // because `@!%p0` contains `%p0`. Filter on the exact prefix.
-    fn line_pred(line: &str) -> Option<&str> {
-        let t = line.trim_start();
-        if t.starts_with("@!%p0") { Some("@!%p0") }
-        else if t.starts_with("@%p0") { Some("@%p0") }
-        else { None }
-    }
-
-    let mut p0_lines = String::new();
-    let mut np0_lines = String::new();
-    for l in slice.lines() {
-        match line_pred(l) {
-            Some("@%p0") => { p0_lines.push_str(l); p0_lines.push('\n'); }
-            Some("@!%p0") => { np0_lines.push_str(l); np0_lines.push('\n'); }
-            _ => {}
-        }
-    }
-    let has_p0_uses_f2 = branch_uses_f2(&p0_lines, "@%p0");
-    let has_np0_uses_f2 = branch_uses_f2(&np0_lines, "@!%p0");
+    let has_p0_uses = p0_lines.lines().any(line_consumes_partner);
+    let has_np0_uses = np0_lines.lines().any(line_consumes_partner);
 
     assert!(
-        has_p0_uses_f2,
-        "HalfSplit @%p0 branch must consume shuffled partner (%f2) in an \
-         fma.rn.f32.\n\nBlock:\n{}",
+        has_p0_uses,
+        "HalfSplit @%p0 (lane<16, x0) branch must consume shuffled partner \
+         (%f2 or %f3=neg(%f2)) in a partner-consuming instruction \
+         (fma/neg/mul/add).\n\nBlock:\n{}",
         slice
     );
     assert!(
-        has_np0_uses_f2,
-        "HalfSplit @!%p0 branch must consume shuffled partner (%f2) in \
-         an fma.rn.f32.\n\nBlock:\n{}",
+        has_np0_uses,
+        "HalfSplit @!%p0 (lane>=16, x1) branch must consume shuffled \
+         partner (%f2) in a partner-consuming instruction \
+         (fma/neg/mul/add).\n\nBlock:\n{}",
         slice
     );
 }

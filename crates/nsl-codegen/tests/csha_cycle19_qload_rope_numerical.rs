@@ -144,6 +144,11 @@ fn qload_rope_adjacent_matches_cpu_reference() {
 
     // Precompute cos/sin tables in the same layout the kernel reads
     // (row-major [seq, head_dim/2] with duplicated bins for Adjacent).
+    //
+    // Cos/sin table has cos[2k] == cos[2k+1] and sin[2k] == sin[2k+1]
+    // because both lanes of a rotation pair share the same angle. The
+    // sign flip happens in the FMA (partner*sin negated on the x0 branch,
+    // positive on the x1 branch), not in the table.
     let half = head_dim / 2;
     let mut cos_tab = vec![0.0f32; seq * head_dim];
     let mut sin_tab = vec![0.0f32; seq * head_dim];
