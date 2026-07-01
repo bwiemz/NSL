@@ -47,7 +47,12 @@ const ALLOW_LIST: &[&str] = &[
     "crates/nsl-codegen/tests/csha_dx_norm_readback_diag.rs",
     "crates/nsl-codegen/tests/pca_tier_a_backward_correctness.rs",
     "crates/nsl-codegen/tests/tier_b2_full_backward_cpu_reference.rs",
-    "crates/nsl-codegen/tests/pca_backward_kernel_snapshot.rs",
+    // NOTE: Files without any `nsl_flash_attention_csha_backward(` matches
+    // are auto-skipped by the scanner (see `contents.contains(&call_marker)`
+    // guard below). Allow-list entries should therefore only include files
+    // that *actually contain* the symbol — a stale entry here is harmless
+    // but misleading. `pca_backward_kernel_snapshot.rs` was previously
+    // listed but contains 0 matches; it has been removed for hygiene.
     // c19 hygiene test itself (mentions the symbol in string constants).
     "crates/nsl-codegen/tests/csha_backward_ffi_hygiene.rs",
 ];
