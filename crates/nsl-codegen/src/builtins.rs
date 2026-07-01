@@ -2200,6 +2200,38 @@ pub fn declare_runtime_functions(
         fns.insert(name.to_string(), (func_id, sig));
     }
 
+    // CSHA cycle 19 T1 (variant-B): register the new probe FFI symbol behind
+    // the `csha_cycle19_probe` feature. Signature = 54 original i64 params
+    // (byte-identical to `nsl_flash_attention_csha_backward`) + 2 trailing
+    // i64 probe pointers = 56. Non-default; wired only by c19 probe tests.
+    // See `docs/superpowers` c19 T1 spec + project_csha_paper_completion_cycle18.md.
+    #[cfg(feature = "csha_cycle19_probe")]
+    {
+        let mut sig = module.make_signature();
+        sig.call_conv = call_conv;
+        for _ in 0..56 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+
+        let func_id = module
+            .declare_function(
+                "nsl_flash_attention_csha_backward_probe",
+                Linkage::Import,
+                &sig,
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare runtime fn 'nsl_flash_attention_csha_backward_probe': {e}"
+                ))
+            })?;
+
+        fns.insert(
+            "nsl_flash_attention_csha_backward_probe".to_string(),
+            (func_id, sig),
+        );
+    }
+
     Ok(fns)
 }
 

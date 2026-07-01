@@ -58,3 +58,9 @@ bench-internal = []
 # Runtime env vars `NSL_MATMUL_PEDANTIC=1` / `NSL_MATMUL_TF32=1` take
 # precedence over this Cargo feature.
 strict-matmul = []
+# CSHA cycle 19 T1: probe FFI that adds trailing probe_ds_out_ptr / probe_dv_out_ptr
+# slots to `nsl_flash_attention_csha_backward_probe` (variant-B new symbol; the
+# 54-param original is untouched). Default OFF; the feature is enabled only by
+# c19 probe test invocations and never in production builds. See project memory
+# `project_csha_paper_completion_cycle18.md` DEGENERATE-PROBE meta-lesson.
+csha_cycle19_probe = []

@@ -75,6 +75,28 @@ fn csha_with_saves_decl_has_doc_starts_trailing_param() {
     );
 }
 
+/// CSHA cycle 19 T1 (variant-B) — additive arity assertion for the NEW
+/// `nsl_flash_attention_csha_backward_probe` symbol. Registered only under
+/// the `csha_cycle19_probe` Cargo feature. The count is the existing 54
+/// backward params + 2 trailing probe pointers = 56. This test intentionally
+/// leaves the 54-arity assertion on the non-probe symbol UNTOUCHED (per
+/// cycle-19 T1 spec: "DO NOT edit the existing `54` literal").
+#[cfg(feature = "csha_cycle19_probe")]
+#[test]
+fn csha_backward_probe_decl_has_expected_arity() {
+    let mut module = make_module();
+    let fns = declare_runtime_functions(&mut module, CallConv::SystemV).expect("declare");
+    let (_, sig) = fns
+        .get("nsl_flash_attention_csha_backward_probe")
+        .expect("nsl_flash_attention_csha_backward_probe registered under csha_cycle19_probe");
+    assert_eq!(
+        sig.params.len(),
+        56,
+        "nsl_flash_attention_csha_backward_probe must accept 56 i64 params \
+         (54 original + probe_ds_out_ptr + probe_dv_out_ptr)"
+    );
+}
+
 #[test]
 fn csha_backward_decl_has_doc_starts_trailing_param() {
     let mut module = make_module();

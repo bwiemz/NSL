@@ -39,6 +39,9 @@ test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
 calibrate = ["dep:rand"]
 debug_kernel_instrumentation = []
+# CSHA cycle 19 T1: propagate the runtime `csha_cycle19_probe` feature so codegen
+# can cfg-gate the Cranelift extern-decl for the new probe FFI symbol. Default OFF.
+csha_cycle19_probe = ["nsl-runtime/csha_cycle19_probe"]
 
 [dev-dependencies]
 string-interner.workspace = true
