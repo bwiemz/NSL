@@ -362,14 +362,58 @@ pub fn optimizer_us(
     fase_fused: bool,
     peak_bandwidth_gbs: f64,
 ) -> f64 {
-    let elements = param_bytes as f64 / dtype_bytes.max(1) as f64;
-    let m_bytes = elements * (m_bits as f64 / 8.0);
-    let v_bytes = elements * (v_bits as f64 / 8.0);
     let param_rw = 2.0 * param_bytes as f64; // master read + write
     let grad_read = if fase_fused { 0.0 } else { param_bytes as f64 };
-    let moment_rw = 2.0 * m_bytes + 2.0 * v_bytes; // m, v each read + write
+    // m and v are each read + written once.  Their combined resident size comes
+    // from the *same* helper the memory model uses (`moment_state_bytes`), so the
+    // latency and memory views of the optimizer state can never disagree on how
+    // large the moments are (audit gap #3).
+    let moment_rw = 2.0 * moment_state_bytes(param_bytes, dtype_bytes, m_bits, v_bits) as f64;
     let total_bytes = param_rw + grad_read + moment_rw;
     total_bytes / (peak_bandwidth_gbs.max(1.0) * 1e9) * 1e6
+}
+
+/// Combined resident size (bytes) of the two Adam moment buffers `m`, `v` for a
+/// parameter tensor, at their chosen per-moment precisions.
+///
+/// `param_bytes` / `dtype_bytes` gives the parameter *element* count; each
+/// moment stores one value per element, sized by its bit-width.  This is the
+/// single definition of "how big are the optimizer moments" shared by the
+/// latency model ([`optimizer_us`]) and the resident-memory model
+/// ([`resident_training_bytes`]).  `param_bytes` is an element count times
+/// `dtype_bytes`, so the integer division is exact.
+pub fn moment_state_bytes(param_bytes: u64, dtype_bytes: u64, m_bits: u8, v_bits: u8) -> u64 {
+    let elements = param_bytes / dtype_bytes.max(1);
+    let m_bytes = elements.saturating_mul(m_bits as u64) / 8;
+    let v_bytes = elements.saturating_mul(v_bits as u64) / 8;
+    m_bytes.saturating_add(v_bytes)
+}
+
+/// Resident training memory for one layer under ZeRO sharding — the single
+/// formula shared by the Level-1 DP ([`crate::wggo_dp`]) and the Level-2 ILP
+/// ([`crate::wggo_ilp`]) so the two levels can never diverge on what "resident
+/// memory" means (audit gap #3):
+///
+/// ```text
+/// (param + optimizer_state) / shard + activation
+/// ```
+///
+/// ZeRO shards the parameters and optimizer state (the Adam moments) `shard`
+/// ways; activations are not sharded.  `shard == 0` is treated as `1`.
+///
+/// The two levels supply `optimizer_state_bytes` differently *by design* — the
+/// coarse DP has no precision variable and sizes moments at parameter precision
+/// (`2·param`), while the ILP, which decides moment precision (gap #2), sizes
+/// them exactly via [`moment_state_bytes`].  The **formula** is identical; only
+/// the fidelity of its optimizer-state input differs.
+pub fn resident_training_bytes(
+    param_bytes: u64,
+    optimizer_state_bytes: u64,
+    activation_bytes: u64,
+    shard: u32,
+) -> u64 {
+    let sharded = param_bytes.saturating_add(optimizer_state_bytes) / (shard.max(1) as u64);
+    sharded.saturating_add(activation_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +502,47 @@ mod tests {
         let a = comm_optim_us(1_234_567, 4, 4, 300.0, h100());
         let b = comm_optim_us(1_234_567, 4, 4, 300.0, h100());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn moment_state_bytes_is_precision_and_dtype_aware() {
+        // 1024 param bytes at 2 bytes/element ⇒ 512 parameter elements; each of
+        // the two Adam moments holds one value per element, sized by its bits.
+        assert_eq!(moment_state_bytes(1024, 2, 32, 32), 512 * 4 + 512 * 4); // 4096
+        assert_eq!(moment_state_bytes(1024, 2, 16, 16), 512 * 2 + 512 * 2); // 2048
+        assert_eq!(moment_state_bytes(1024, 2, 8, 8), 512 * 1 + 512 * 1); //   1024
+        // Monotone in precision.
+        assert!(moment_state_bytes(1024, 2, 32, 32) > moment_state_bytes(1024, 2, 16, 16));
+        assert!(moment_state_bytes(1024, 2, 16, 16) > moment_state_bytes(1024, 2, 8, 8));
+        // The two moments are sized independently (m vs v may differ).
+        assert_eq!(moment_state_bytes(1024, 2, 8, 32), 512 * 1 + 512 * 4); // 2560
+    }
+
+    #[test]
+    fn resident_training_bytes_shards_optimizer_not_activation() {
+        // (param + optimizer_state) / shard + activation.
+        assert_eq!(resident_training_bytes(1000, 2000, 500, 1), 3500);
+        // Sharding divides the param+optimizer block only.
+        assert_eq!(resident_training_bytes(1000, 2000, 500, 3), 3000 / 3 + 500);
+        // shard == 0 is treated as 1 (never divide by zero).
+        assert_eq!(resident_training_bytes(1000, 2000, 500, 0), 3500);
+        // Activation is not sharded: it adds one-for-one at any shard factor.
+        assert_eq!(
+            resident_training_bytes(1000, 2000, 900, 4) - resident_training_bytes(1000, 2000, 500, 4),
+            400
+        );
+    }
+
+    #[test]
+    fn resident_training_bytes_matches_legacy_dp_formula() {
+        // The Level-1 DP's historical formula was `3·param/shard + activation`
+        // (moments sized at parameter precision ⇒ optimizer_state = 2·param).
+        // Routing it through the shared formula must be behaviour-identical,
+        // including integer-division flooring.
+        for &(p, a, s) in &[(1000u64, 500u64, 1u32), (1200, 100, 4), (777, 33, 8)] {
+            let legacy = 3u64 * p / (s as u64) + a;
+            assert_eq!(resident_training_bytes(p, 2 * p, a, s), legacy);
+        }
     }
 
     #[test]
