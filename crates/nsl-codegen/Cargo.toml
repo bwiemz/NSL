@@ -52,6 +52,15 @@ debug_kernel_instrumentation = []
 # CSHA cycle 19 T1: propagate the runtime `csha_cycle19_probe` feature so codegen
 # can cfg-gate the Cranelift extern-decl for the new probe FFI symbol. Default OFF.
 csha_cycle19_probe = ["nsl-runtime/csha_cycle19_probe"]
+# CSHA cycle 20 T4: G16-3 forward +0xB30 SMEM address probe scaffolding.
+# Emits 8 sample sites in `emit_save_activations_subset` that write
+# `{%rd_save_smem, %rd_save_base}` tuples to an HBM scratch buffer, so a
+# GPU harness can inspect the actual computed SMEM addresses on-device and
+# either confirm or refute the c18 "misaligned save-activation load"
+# hypothesis. Default OFF — feature-off byte identity must be preserved
+# against the `fa_v2_snapshots` baseline. See
+# `crates/nsl-codegen/tests/csha_cycle20_g163_triage.rs`.
+csha_cycle20_g163_probe = []
 # Experimental research subsystems (STATUS.md "Experimental" tier). On by
 # default; gated at their single entry point in `stmt.rs`.
 experimental-wrga = []

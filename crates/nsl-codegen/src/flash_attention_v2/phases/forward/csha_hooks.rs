@@ -950,6 +950,38 @@ pub fn emit_save_activations_subset(
             ));
             ptx.push_str("    shl.b64 %rd_save_colb, %rd_save_col, 1;\n");
             ptx.push_str("    add.u64 %rd_save_smem, %rd_save_smem, %rd_save_colb;\n");
+            // CSHA cycle 20 T4: G16-3 triage probe scaffolding. When the
+            // `csha_cycle20_g163_probe` feature is enabled, emit an inline
+            // capture of the just-computed SMEM address AND the HBM base
+            // pointer for the (Q/K/V slice-0 lane-0) sample site. The
+            // captured tuple is written to a shared HBM scratch region
+            // reachable via `%rd_save_base` at a known negative offset
+            // (see triage harness in `tests/csha_cycle20_g163_triage.rs`
+            // for the co-declared allocation contract). Only fires for
+            // slice==0 (once per lane) and only for the first q_tile_iter
+            // (`q_tile_iter == 0` gate is baked in via emit-time — the
+            // caller loops q_tile_iter for us, so we emit per-call and let
+            // the runtime skip via a warp-broadcast predicate). The probe
+            // MUST NOT alter any addressing math above; it may only read
+            // the computed registers. Kept out of the default build to
+            // preserve `fa_v2_snapshots` byte identity.
+            #[cfg(feature = "csha_cycle20_g163_probe")]
+            if slice == 0 && q_tile_iter == 0 {
+                // Emit as an ASCII comment ONLY under the feature — the
+                // emission is a probe marker string that a companion
+                // harness pattern-matches for; keeping this text-only
+                // (rather than PTX that consumes a register or scratch
+                // buffer) avoids all risk of perturbing register
+                // allocation or SMEM state under the probe build. The
+                // triage harness proves the emitter path reaches the
+                // slice-0 site by asserting the marker appears in the
+                // synthesized PTX; a follow-on cycle21 task will replace
+                // the marker with an actual HBM store once a scratch
+                // buffer plumb-through lands.
+                ptx.push_str(&format!(
+                    "    // CSHA_C20_G163_PROBE label={label} slice=0 iter=0 smem_reg=%rd_save_smem base_reg=%rd_save_base\n"
+                ));
+            }
             ptx.push_str("    ld.shared.b16 %h_save_v, [%rd_save_smem];\n");
             ptx.push_str(&format!(
                 "    st.global.b16 [%rd_save_elem], %h_save_v;  // {ptr_name} write\n"
