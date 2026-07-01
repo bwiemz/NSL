@@ -166,6 +166,17 @@ pub fn emit(
     if cfg!(feature = "debug_kernel_instrumentation") && tier_b_admitted {
         params.push((".param .u64", "skip_decisions_ptr"));
     }
+
+    // CSHA cycle 20 T1 — dS-probe trailing pointers. Feature-gated so
+    // default builds keep the 25/25 fa_v2_snapshots byte-identical. Under
+    // the feature the runtime launcher unconditionally passes 2 trailing
+    // null pointers (sentinel 0 → %p_probe_active=false → probe stores
+    // fall through even at (batch=0, head=0, warp=1, lane=0)); only the
+    // c19 T1 test dispatch site passes a non-null probe_ds_out_ptr.
+    if cfg!(feature = "csha_cycle19_probe") {
+        params.push((".param .u64", "probe_ds_out_ptr"));
+        params.push((".param .u64", "probe_dv_out_ptr"));
+    }
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
         ptx.push_str(&format!("    {} {}{}\n", ty, pname, comma));
@@ -413,6 +424,22 @@ pub fn emit(
     ptx.push_str("    ld.param.u64 %rd_bwd_dk_scratch, [dk_scratch_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dv_scratch, [dv_scratch_ptr];\n");
     ptx.push_str("    ld.param.u64 %q_launch_base, [seq_lens_ptr];\n");
+
+    // CSHA cycle 20 T1 — probe pointer + gate registers. Feature-gated
+    // so default builds are byte-identical. See `phases/backward/probe.rs`
+    // for the per-site store emission that consumes these registers.
+    if cfg!(feature = "csha_cycle19_probe") {
+        ptx.push_str("    .reg .u64 %rd_probe_ds, %rd_probe_dv, %rd_probe_slot;\n");
+        ptx.push_str("    .reg .pred %p_probe_active, %p_probe_gate;\n");
+        ptx.push_str("    .reg .pred %p_probe_w, %p_probe_l, %p_probe_b, %p_probe_h;\n");
+        ptx.push_str("    ld.param.u64 %rd_probe_ds, [probe_ds_out_ptr];\n");
+        ptx.push_str("    ld.param.u64 %rd_probe_dv, [probe_dv_out_ptr];\n");
+        // %p_probe_active = (%rd_probe_ds != 0). When callers thread a
+        // sentinel 0 (all non-probe launches under feature ON) this
+        // predicate stays false and every downstream probe store is
+        // silently skipped — the byte-identity of gradients is preserved.
+        ptx.push_str("    setp.ne.u64 %p_probe_active, %rd_probe_ds, 0;\n");
+    }
 
     // Thread/block indices — identical to forward.
     emit_thread_lane_warp_register_init(ptx);

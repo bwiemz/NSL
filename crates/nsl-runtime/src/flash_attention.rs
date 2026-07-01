@@ -1751,7 +1751,30 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut dk_scratch = dk_scratch_raw as u64;
         let mut dv_scratch = dv_scratch_raw as u64;
 
-        let args: [*mut c_void; 49] = [
+        // CSHA cycle 20 T1 — probe pointer trailing slots. Under the
+        // `csha_cycle19_probe` feature the backward PTX prelude declares
+        // two additional `.param .u64 probe_{ds,dv}_out_ptr` slots at
+        // the end of the param block, so every launcher path must thread
+        // these two u64s or the launch fails with CUDA_ERROR_INVALID_VALUE.
+        // Non-probe callers (i.e. the 54-param `nsl_flash_attention_csha_backward`
+        // FFI) always pass zeros here — the probe stores gated by
+        // `%p_probe_active = (probe_ds_out_ptr != 0)` fall through, so
+        // gradient outputs remain byte-identical.
+        //
+        // The `nsl_flash_attention_csha_backward_probe` wrapper (cycle 19
+        // scaffolding, feature-gated separately below) is currently a
+        // delegate-only body that drops probe pointers on the floor —
+        // wiring them through to `csha_backward_impl` is deferred to
+        // T2 per the c19 defer log and this task's HONEST PARTIAL fallback.
+        // The PTX-side machinery lands so that a future T2 refactor only
+        // needs to touch the launcher signature.
+        #[cfg(feature = "csha_cycle19_probe")]
+        let mut probe_ds_slot: u64 = 0;
+        #[cfg(feature = "csha_cycle19_probe")]
+        let mut probe_dv_slot: u64 = 0;
+
+        #[cfg(feature = "csha_cycle19_probe")]
+        let args: [*mut c_void; 51] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -1804,6 +1827,70 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             // PCA Tier A Task 4B: segment_ids trailing slot.
             &mut seg_ids as *mut _ as *mut c_void,
             // PCA §4.3: doc_starts trailing slot.
+            &mut doc_starts as *mut _ as *mut c_void,
+            // CSHA cycle 20 T1: probe_ds_out_ptr + probe_dv_out_ptr
+            // trailing slots. Sentinel 0 → %p_probe_active=false →
+            // probe stores fall through. Only the probe FFI wrapper
+            // (feature-gated) will one day overwrite these before launch.
+            &mut probe_ds_slot as *mut _ as *mut c_void,
+            &mut probe_dv_slot as *mut _ as *mut c_void,
+        ];
+
+        // Suppress unused-var warnings on the non-probe cfg branch.
+        #[cfg(feature = "csha_cycle19_probe")]
+        let _ = (&probe_ds_slot, &probe_dv_slot);
+
+        // Non-probe cfg: byte-identical 49-slot args array.
+        #[cfg(not(feature = "csha_cycle19_probe"))]
+        let args: [*mut c_void; 49] = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut sids as *mut _ as *mut c_void,
+            &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
+            &mut nw as *mut _ as *mut c_void,
+            &mut wq as *mut _ as *mut c_void,
+            &mut wk as *mut _ as *mut c_void,
+            &mut wv as *mut _ as *mut c_void,
+            &mut wo as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ah as *mut _ as *mut c_void,
+            &mut dm as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut kpj as *mut _ as *mut c_void,
+            &mut vpj as *mut _ as *mut c_void,
+            &mut rmax as *mut _ as *mut c_void,
+            &mut rsum as *mut _ as *mut c_void,
+            &mut xraw as *mut _ as *mut c_void,
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_q as *mut _ as *mut c_void,
+            &mut d_k as *mut _ as *mut c_void,
+            &mut d_v as *mut _ as *mut c_void,
+            &mut d_wq as *mut _ as *mut c_void,
+            &mut d_wk as *mut _ as *mut c_void,
+            &mut d_wv as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_xn as *mut _ as *mut c_void,
+            &mut dk_scratch as *mut _ as *mut c_void,
+            &mut dv_scratch as *mut _ as *mut c_void,
+            &mut seg_ids as *mut _ as *mut c_void,
             &mut doc_starts as *mut _ as *mut c_void,
         ];
 
