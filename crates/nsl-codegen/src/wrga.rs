@@ -985,8 +985,21 @@ fn run_spectral(
     } else {
         spectral.len().max(1) * input.r_max
     };
-    let (ranks, override_diags) =
-        allocate_ranks(&spectral, budget, input.r_min, input.r_max, Some(&slack), input.wggo_overrides);
+    // `snap_to_grid = false`: the realized per-projection rank is left off-grid
+    // (the current behaviour).  Paper §2.2 declares `r[l,w] ∈ {0,2,4,8,16}`, and
+    // `allocate_ranks` can floor the realized rank onto that grid (audit gap #5),
+    // but errata E3 lists snapping as an open sub-decision awaiting author
+    // sign-off, so it stays off by default.  Flip this to `true` (or surface it
+    // as a `WrgaInput`/CLI option) to activate paper-grid ranks.
+    let (ranks, override_diags) = allocate_ranks(
+        &spectral,
+        budget,
+        input.r_min,
+        input.r_max,
+        Some(&slack),
+        input.wggo_overrides,
+        false,
+    );
 
     (spectral, ranks, override_diags)
 }
@@ -1295,7 +1308,7 @@ mod tests {
                 shard_factor: 0,
             }],
         };
-        let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over));
+        let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over), false);
         assert!(
             diags.iter().any(|d| matches!(
                 d.reason,

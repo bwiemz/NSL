@@ -392,6 +392,26 @@ pub struct RankAllocation {
     pub adapter_params: usize,
 }
 
+/// The paper's declared per-weight adapter-rank domain: `r[l,w] ∈ {0,2,4,8,16}`
+/// (§2.2).  `0` means "no adapter".
+pub const RANK_GRID: [usize; 5] = [0, 2, 4, 8, 16];
+
+/// Snap a raw integer rank DOWN to the largest [`RANK_GRID`] value it does not
+/// exceed, so the realized `r[l,w]` lives in the paper's declared domain
+/// (audit gap #5).
+///
+/// Flooring (rather than rounding to nearest) is deliberate: it never increases
+/// a rank, so a total-parameter budget the caller already satisfied stays
+/// satisfied.  Ranks at or above the grid top (`16`) map to `16`.
+pub fn snap_rank_to_grid(rank: usize) -> usize {
+    RANK_GRID
+        .iter()
+        .rev()
+        .copied()
+        .find(|&g| g <= rank)
+        .unwrap_or(0)
+}
+
 /// The existing paper §2.3 per-site formula, extracted as a helper.
 ///
 /// Returns the spectral rank for site `s`, derived from its effective-rank
@@ -446,6 +466,7 @@ pub fn allocate_ranks(
     r_max: usize,
     per_site_slack: Option<&HashMap<String, f64>>,
     overrides: Option<&crate::wggo_overrides::WggoOverrides>,
+    snap_to_grid: bool,
 ) -> (Vec<RankAllocation>, Vec<crate::wggo_overrides::OverrideDiagnostic>) {
     use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
     use std::cmp::Ordering;
@@ -497,6 +518,9 @@ pub fn allocate_ranks(
                 effective_rank: 0.0,
                 adapter_params: r_min * (s.shape[0] + s.shape[1]),
             });
+        }
+        if snap_to_grid {
+            snap_allocations_to_grid(&mut allocations, spectral);
         }
         return (allocations, diags);
     }
@@ -626,7 +650,39 @@ pub fn allocate_ranks(
         }
     } } // end `if overrides.is_some() { loop { ... } }`
 
+    // ── Step 3: Paper-grid snap (audit gap #5, opt-in) ─────────────────────
+    // Floor every realized rank onto the paper's declared domain {0,2,4,8,16}
+    // (§2.2).  Snapping only *lowers* ranks, so the `r_total` budget enforced by
+    // Step 2 stays satisfied — no second downgrade pass is needed.
+    if snap_to_grid {
+        snap_allocations_to_grid(&mut allocations, spectral);
+    }
+
     (allocations, diags)
+}
+
+/// Floor every allocation's rank onto [`RANK_GRID`] (audit gap #5) and keep
+/// `adapter_params` consistent with the snapped rank.
+///
+/// Applied at *both* `allocate_ranks` exits (the degenerate zero-score path and
+/// the normal path) so that `snap_to_grid = true` guarantees an on-grid result
+/// regardless of which path produced the allocation.  `adapter_params` is
+/// recomputed from `m + n` (looked up by name), which stays correct even when a
+/// rank snaps to 0.  Assumes `r_min` is itself a grid value (it is `2` in
+/// production); with an off-grid `r_min` the floor can drop a rank below it.
+fn snap_allocations_to_grid(allocations: &mut [RankAllocation], spectral: &[SpectralAnalysis]) {
+    for a in allocations.iter_mut() {
+        let snapped = snap_rank_to_grid(a.rank);
+        if snapped != a.rank {
+            let m_plus_n = spectral
+                .iter()
+                .find(|s| s.name == a.name)
+                .map(|s| s.shape[0] + s.shape[1])
+                .unwrap_or(0);
+            a.rank = snapped;
+            a.adapter_params = snapped * m_plus_n;
+        }
+    }
 }
 
 /// Sum of adapter parameters across a plan.
@@ -741,7 +797,7 @@ mod tests {
                 truncated_rank: 4,
             },
         ];
-        let (plan, diags) = allocate_ranks(&spectral, 16, 1, 16, None, None);
+        let (plan, diags) = allocate_ranks(&spectral, 16, 1, 16, None, None, false);
         assert!(diags.is_empty());
         assert_eq!(plan.len(), 2);
         // "a" has 8× the effective rank of "b" → gets most of the budget.
@@ -761,7 +817,7 @@ mod tests {
             effective_rank: 0.0,
             truncated_rank: 4,
         }];
-        let (plan, _diags) = allocate_ranks(&spectral, 8, 2, 16, None, None);
+        let (plan, _diags) = allocate_ranks(&spectral, 8, 2, 16, None, None, false);
         assert_eq!(plan[0].rank, 2);
     }
 
@@ -786,7 +842,7 @@ mod tests {
         let mut slack = HashMap::new();
         slack.insert("memory_bound".to_string(), 2.0);
         slack.insert("compute_bound".to_string(), 0.25);
-        let (plan, _diags) = allocate_ranks(&spectral, 16, 1, 16, Some(&slack), None);
+        let (plan, _diags) = allocate_ranks(&spectral, 16, 1, 16, Some(&slack), None, false);
         // Memory-bound site should get more rank because of its larger slack.
         let mem = plan.iter().find(|r| r.name == "memory_bound").unwrap();
         let com = plan.iter().find(|r| r.name == "compute_bound").unwrap();
@@ -871,7 +927,7 @@ mod override_tests {
     #[test]
     fn allocate_ranks_no_overrides_preserves_spectral_behavior() {
         let spectral = spectral_fixture_4_layers();
-        let (alloc, diags) = allocate_ranks(&spectral, 256, 2, 16, None, None);
+        let (alloc, diags) = allocate_ranks(&spectral, 256, 2, 16, None, None, false);
         assert!(diags.is_empty(), "no overrides → no diagnostics");
         assert_eq!(alloc.len(), 4);
         for a in &alloc {
@@ -891,7 +947,7 @@ mod override_tests {
             ("blocks.3", 4),
         ]);
         // Budget large enough that no downgrade fires.
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
         assert!(diags.is_empty(), "all requests fit; no diagnostics, got: {diags:?}");
         let ranks: Vec<usize> = alloc.iter().map(|a| a.rank).collect();
         assert_eq!(ranks, vec![8, 8, 4, 4]);
@@ -908,7 +964,7 @@ mod override_tests {
             ("blocks.2", 4),
             ("blocks.3", 4),
         ]);
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
         assert_eq!(alloc[0].rank, 16, "clamped to r_max");
         let clamp_diag = diags
             .iter()
@@ -935,7 +991,7 @@ mod override_tests {
             ("blocks.2", 4),
             ("blocks.3", 4),
         ]);
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
         assert_eq!(alloc[0].rank, 2, "clamped to r_min");
         assert!(
             diags.iter().any(|d| {
@@ -960,7 +1016,7 @@ mod override_tests {
             ("blocks.2", 4),
             ("blocks.3", 4),
         ]);
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
         assert!(
             alloc.iter().all(|a| a.name != "blocks.0.attn.wq"),
             "blocks.0 projection must be excluded from allocation"
@@ -991,7 +1047,7 @@ mod override_tests {
             ("blocks.3", 4),
         ]);
         // r_total large enough that non-degenerate layers aren't clamped.
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
         assert!(
             alloc.iter().all(|a| a.name != "blocks.0.attn.wq"),
             "blocks.0 excluded"
@@ -1021,7 +1077,7 @@ mod override_tests {
             ("blocks.3", 16),
         ]);
         let tight_budget = 4 * 16 * 64 / 2; // = 2048
-        let (alloc, diags) = allocate_ranks(&spectral, tight_budget, 2, 16, None, Some(&over));
+        let (alloc, diags) = allocate_ranks(&spectral, tight_budget, 2, 16, None, Some(&over), false);
         assert!(
             total_params(&alloc) <= tight_budget,
             "final total {} must fit budget {}",
@@ -1079,10 +1135,86 @@ mod override_tests {
         let over = overrides_with_ranks(&[("blocks.0", 8), ("blocks.1", 8)]);
         let total_at_8 = 2 * 8 * 64_usize;  // 1024
         let tight = total_at_8 - 64;        // 960 — exactly 1 rank step under
-        let (alloc, _diags) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over));
+        let (alloc, _diags) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over), false);
         let b0 = alloc.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap();
         let b1 = alloc.iter().find(|a| a.name == "blocks.1.attn.wq").unwrap();
         assert_eq!(b0.rank, 7, "lower-priority layer loses 1 rank");
         assert_eq!(b1.rank, 8, "higher-priority layer keeps full rank");
+    }
+
+    // ── Test 9: paper-grid snap (audit gap #5) ───────────────────────────
+
+    #[test]
+    fn snap_rank_to_grid_floors_to_paper_grid() {
+        // Paper §2.2 declares r[l,w] ∈ {0,2,4,8,16}.  Snapping floors each rank
+        // DOWN to the largest grid value it does not exceed (budget-safe: never
+        // increases the adapter-parameter total).
+        assert_eq!(snap_rank_to_grid(0), 0);
+        assert_eq!(snap_rank_to_grid(1), 0);
+        assert_eq!(snap_rank_to_grid(2), 2);
+        assert_eq!(snap_rank_to_grid(3), 2);
+        assert_eq!(snap_rank_to_grid(4), 4);
+        assert_eq!(snap_rank_to_grid(5), 4);
+        assert_eq!(snap_rank_to_grid(7), 4);
+        assert_eq!(snap_rank_to_grid(8), 8);
+        assert_eq!(snap_rank_to_grid(15), 8);
+        assert_eq!(snap_rank_to_grid(16), 16);
+        // Ranks above the grid top clamp to the largest grid value.
+        assert_eq!(snap_rank_to_grid(17), 16);
+        assert_eq!(snap_rank_to_grid(1000), 16);
+        // Every output is a member of the declared grid.
+        for r in 0..=64 {
+            assert!(RANK_GRID.contains(&snap_rank_to_grid(r)));
+        }
+    }
+
+    #[test]
+    fn allocate_ranks_snap_floors_realized_ranks_and_preserves_budget() {
+        // Same scenario as the downgrade test: `blocks.0` downgrades to the
+        // OFF-grid rank 7.  With `snap_to_grid = true` it must floor onto the
+        // paper grid {0,2,4,8,16}.
+        let spectral = vec![
+            SpectralAnalysis {
+                name: "blocks.0.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 2],
+                effective_rank: 2.0,
+                truncated_rank: 2,
+            },
+            SpectralAnalysis {
+                name: "blocks.1.attn.wq".into(),
+                shape: [32, 32],
+                singular_values: vec![1.0; 10],
+                effective_rank: 10.0,
+                truncated_rank: 10,
+            },
+        ];
+        let over = overrides_with_ranks(&[("blocks.0", 8), ("blocks.1", 8)]);
+        let tight = 2 * 8 * 64_usize - 64; // 960 — forces blocks.0 down to 7
+
+        // Opt-in is off by default: the off-grid rank 7 survives.
+        let (off, _) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over), false);
+        assert_eq!(
+            off.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap().rank,
+            7,
+            "snap=false leaves the realized rank off-grid"
+        );
+
+        // Opt-in on: 7 floors to 4; the on-grid 8 is unchanged.
+        let (on, _) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over), true);
+        let b0 = on.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap();
+        let b1 = on.iter().find(|a| a.name == "blocks.1.attn.wq").unwrap();
+        assert_eq!(b0.rank, 4, "off-grid 7 floors to grid value 4");
+        assert_eq!(b1.rank, 8, "on-grid 8 is unchanged");
+        for a in &on {
+            assert!(RANK_GRID.contains(&a.rank), "rank {} not on paper grid", a.rank);
+            // adapter_params stays consistent with the snapped rank (m+n = 64).
+            assert_eq!(a.adapter_params, a.rank * 64);
+        }
+        // Budget-safe: snapping DOWN never increases the total, and it still fits.
+        let total_off: usize = off.iter().map(|a| a.adapter_params).sum();
+        let total_on: usize = on.iter().map(|a| a.adapter_params).sum();
+        assert!(total_on <= total_off, "snap must not increase total params");
+        assert!(total_on <= tight, "snapped total must fit the budget");
     }
 }
