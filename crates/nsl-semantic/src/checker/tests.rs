@@ -991,19 +991,48 @@ model Toy:
     );
 }
 
-/// Regression: an adapter symbol that is in-scope as a non-model
-/// declaration (mimicking the `from foo.peft import GatedLoRA` case where
-/// the imported name lives in the root scope but never appears as a local
-/// `ModelDef`) must NOT trigger the "undeclared adapter" error.  The
-/// post-pass falls back to a scope lookup and trusts the import — the
-/// deeper contract check lands at codegen.
+/// Regression: an adapter symbol that resolves to a same-file `struct` (not
+/// a `model`) must be rejected outright, not silently trusted.  Earlier this
+/// fell into the cross-module-import trust fallback even though the struct's
+/// full shape is visible right here in this file — a `struct` can never
+/// declare a `forward` method, so it can never satisfy the adapter contract.
 #[test]
-fn wrga_decorator_custom_adapter_in_scope_via_non_model_is_accepted() {
+fn wrga_decorator_custom_adapter_naming_a_same_file_struct_is_rejected() {
     let src = r#"
 struct GatedLoRA:
     placeholder: int
 
 @wrga(mode=auto, adapter=GatedLoRA)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    let wrong_kind_errors: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .filter(|d| format!("{:?}", d).contains("is a `struct`, not a `model`"))
+        .collect();
+    assert!(
+        !wrong_kind_errors.is_empty(),
+        "post-pass must reject a same-file struct named as `adapter=`; \
+         got diagnostics: {:?}",
+        res.diagnostics,
+    );
+}
+
+/// A genuinely external adapter symbol — one that is in scope (e.g. a
+/// builtin, standing in for `from foo.peft import GatedLoRA`) but has no
+/// declaration of any kind in this file's `stmts` — must NOT trigger the
+/// "undeclared adapter" error. The post-pass falls back to a scope lookup
+/// and trusts the import — the deeper contract check lands at codegen.
+#[test]
+fn wrga_decorator_custom_adapter_in_scope_via_non_local_symbol_is_accepted() {
+    let src = r#"
+@wrga(mode=auto, adapter=print)
 model Toy:
     w: Tensor = zeros([4, 4])
 
@@ -1019,7 +1048,7 @@ model Toy:
         .collect();
     assert!(
         undeclared_errors.is_empty(),
-        "post-pass must accept an in-scope (but non-ModelDef) adapter symbol; \
+        "post-pass must accept an in-scope symbol with no same-file declaration; \
          got undeclared-adapter errors: {:?}",
         undeclared_errors,
     );

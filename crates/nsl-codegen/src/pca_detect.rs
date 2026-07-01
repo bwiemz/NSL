@@ -164,6 +164,42 @@ pub fn detect(
     }
 }
 
+/// Apply an explicit user `@pca(strategy=per_document)` request on top of
+/// [`detect`]'s statistics-only auto-detection result.
+///
+/// `detect`'s thresholds (`per_doc_threshold`, `max_cv`) are tuned for the
+/// *unannotated* `strategy=auto` case — they exist to pick a sane default
+/// when the user didn't say what they wanted. An explicit `per_document`
+/// request is an opt-in, not a hint: it must not be silently downgraded to
+/// `SegmentIdMasked` just because the dataset's mean-doc-length or
+/// coefficient-of-variation falls outside the auto-detect's comfort zone.
+/// This only overrides the *strategy label*; every downstream admission
+/// gate in [`crate::pca_per_doc::admit`] (causal-only, no CSHA fused
+/// projections, max-doc-len vs. `block_q`, num-docs ceiling) still runs
+/// unmodified and can still refuse the request for structural reasons.
+///
+/// `NoPacking` is left untouched: forcing `PerDocumentCta` when packing
+/// isn't even enabled would be nonsensical, and [`crate::pca_per_doc::admit`]
+/// doesn't accept it as a strategy override target for that case either
+/// (there's no `DatasetPackingConfig` data to schedule CTAs over).
+pub fn apply_user_strategy_override(
+    mut detection: PcaDetection,
+    user_requested_per_document: bool,
+) -> PcaDetection {
+    if user_requested_per_document
+        && detection.strategy != PcaStrategy::NoPacking
+        && detection.strategy != PcaStrategy::PerDocumentCta
+    {
+        detection.rationale = format!(
+            "user explicitly requested @pca(strategy=per_document) — overriding auto-detect, \
+             which would have picked segment_id_masked ({})",
+            detection.rationale
+        );
+        detection.strategy = PcaStrategy::PerDocumentCta;
+    }
+    detection
+}
+
 /// Compile-time validation that a packing configuration will not
 /// exceed the u16 segment-count ceiling. Spec §4 invariant #3.
 pub fn validate_config(cfg: &DatasetPackingConfig) -> Result<(), String> {
@@ -275,6 +311,75 @@ mod tests {
         assert_eq!(d.eliminated_mask_bytes_per_batch, 2048u64 * 2048 * 2);
         // Segment IDs: 2048 × 2 bytes = 4 KB (u16 per position).
         assert_eq!(d.segment_id_bytes_per_batch, 2048 * 2);
+    }
+
+    // -----------------------------------------------------------------
+    // `apply_user_strategy_override` — explicit `@pca(strategy=per_document)`
+    // must not be silently downgraded by the auto-detect heuristic.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn user_override_forces_per_doc_cta_when_auto_detect_would_pick_seg_id() {
+        // Long, high-variance docs: `detect()` alone picks SegmentIdMasked.
+        let cfg = DatasetPackingConfig {
+            enabled: true,
+            max_sequence_length: 1024,
+            mean_doc_length: Some(512),
+            doc_length_stddev: Some(200),
+            separator_token_id: Some(2),
+        };
+        let auto = detect(&cfg, &PcaDetectConfig::default(), 2);
+        assert_eq!(auto.strategy, PcaStrategy::SegmentIdMasked);
+
+        let overridden = apply_user_strategy_override(auto, true);
+        assert_eq!(overridden.strategy, PcaStrategy::PerDocumentCta);
+        assert!(
+            overridden.rationale.contains("user explicitly requested"),
+            "override must be visible in the rationale: {}",
+            overridden.rationale
+        );
+    }
+
+    #[test]
+    fn user_override_is_noop_without_explicit_request() {
+        let cfg = DatasetPackingConfig {
+            enabled: true,
+            max_sequence_length: 1024,
+            mean_doc_length: Some(512),
+            doc_length_stddev: Some(200),
+            separator_token_id: Some(2),
+        };
+        let auto = detect(&cfg, &PcaDetectConfig::default(), 2);
+        let not_overridden = apply_user_strategy_override(auto.clone(), false);
+        assert_eq!(not_overridden.strategy, auto.strategy);
+        assert_eq!(not_overridden.rationale, auto.rationale);
+    }
+
+    #[test]
+    fn user_override_does_not_force_per_doc_cta_when_packing_disabled() {
+        // Packing not enabled at all — there's no per-document schedule to
+        // force; overriding to `PerDocumentCta` here would be nonsensical.
+        let auto = detect(&DatasetPackingConfig::default(), &PcaDetectConfig::default(), 2);
+        assert_eq!(auto.strategy, PcaStrategy::NoPacking);
+
+        let overridden = apply_user_strategy_override(auto, true);
+        assert_eq!(overridden.strategy, PcaStrategy::NoPacking);
+    }
+
+    #[test]
+    fn user_override_is_noop_when_auto_detect_already_agrees() {
+        let cfg = DatasetPackingConfig {
+            enabled: true,
+            max_sequence_length: 1024,
+            mean_doc_length: Some(200),
+            doc_length_stddev: Some(50),
+            separator_token_id: Some(2),
+        };
+        let auto = detect(&cfg, &PcaDetectConfig::default(), 2);
+        assert_eq!(auto.strategy, PcaStrategy::PerDocumentCta);
+
+        let overridden = apply_user_strategy_override(auto.clone(), true);
+        assert_eq!(overridden.rationale, auto.rationale);
     }
 
     #[test]
