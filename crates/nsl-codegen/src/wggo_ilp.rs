@@ -381,7 +381,7 @@ pub fn solve_layer(
                                     if entry.smem_bytes > constraints.smem_budget {
                                         continue;
                                     }
-                                    if entry.param_bytes + entry.activation_bytes
+                                    if ilp_resident_bytes(&entry, lut, m_bits, v_bits)
                                         > constraints.memory_budget
                                     {
                                         continue;
@@ -435,10 +435,12 @@ pub fn solve_layer(
         Some(decision) => {
             let entry = state.best_entry.unwrap();
             let decision_trace = build_decision_trace(&decision, &entry, constraints);
+            let memory_bytes =
+                ilp_resident_bytes(&entry, lut, decision.optim_m_bits, decision.optim_v_bits);
             LayerIlpSolution {
                 decision,
                 cost_us: state.best_cost,
-                memory_bytes: entry.param_bytes + entry.activation_bytes,
+                memory_bytes,
                 smem_bytes: entry.smem_bytes,
                 nodes_explored: state.nodes,
                 feasible: true,
@@ -483,6 +485,27 @@ pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstr
             d.fase_fused,
             lut.peak_bandwidth_gbs,
         )
+}
+
+/// Resident memory the ILP charges a candidate layer: the shared
+/// training-memory formula ([`crate::wggo_cost::resident_training_bytes`]) with
+/// the layer's chosen moment precision, sized **unsharded** (`shard = 1`).
+///
+/// The Level-2 ILP is a per-layer admission gate that runs before — and
+/// independently of — the Level-1 DP's ZeRO-shard choice, so it takes the
+/// conservative worst case: a layer that fits unsharded fits under any sharding.
+/// Routing through the same formula the DP uses is what closes the gap-#3
+/// divergence — the ILP used to charge a bare `param + activation`, silently
+/// dropping the optimizer state (the Adam moments) the DP always counted.
+fn ilp_resident_bytes(entry: &LayerCostEntry, lut: &LayerCostLut, m_bits: u8, v_bits: u8) -> u64 {
+    let optimizer_state =
+        crate::wggo_cost::moment_state_bytes(entry.param_bytes, lut.dtype_bytes, m_bits, v_bits);
+    crate::wggo_cost::resident_training_bytes(
+        entry.param_bytes,
+        optimizer_state,
+        entry.activation_bytes,
+        1,
+    )
 }
 
 /// Diagnostic counters for [`solve_all_templated`].
@@ -665,7 +688,7 @@ pub fn solve_layer_greedy(
         packing_mode,
         &constraints.packing_savings,
     );
-    let memory_bytes = entry.param_bytes + entry.activation_bytes;
+    let memory_bytes = ilp_resident_bytes(&entry, lut, m_bits, v_bits);
     let feasible = base.feasible
         && entry.smem_bytes <= constraints.smem_budget
         && memory_bytes <= constraints.memory_budget;
@@ -1197,6 +1220,71 @@ mod tests {
         constraints.memory_budget = 1_000; // 1 KB — nothing fits.
         let sol = solve_layer(&lut, &constraints);
         assert!(!sol.feasible);
+    }
+
+    #[test]
+    fn ilp_resident_bytes_counts_moments_precision_aware_unsharded() {
+        // Gap #3: the ILP's resident charge must include the Adam moments (it
+        // used to be bare `param + activation`), sized at the chosen precision,
+        // and computed unsharded (the ILP can't see the DP's shard choice).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let e = lut.argmin_feasible().unwrap().4;
+        assert!(e.param_bytes > 0);
+        let bare = e.param_bytes + e.activation_bytes;
+        let hi = ilp_resident_bytes(&e, &lut, 32, 32);
+        assert!(hi > bare, "resident must count optimizer state: {hi} !> {bare}");
+        let lo = ilp_resident_bytes(&e, &lut, 8, 8);
+        assert!(lo < hi, "lower moment precision ⇒ less resident memory");
+        assert!(lo >= bare, "still charges some optimizer state");
+        // Exactly the shared formula, sized unsharded (shard = 1).
+        let expect = crate::wggo_cost::resident_training_bytes(
+            e.param_bytes,
+            crate::wggo_cost::moment_state_bytes(e.param_bytes, lut.dtype_bytes, 32, 32),
+            e.activation_bytes,
+            1,
+        );
+        assert_eq!(hi, expect);
+    }
+
+    #[test]
+    fn solve_layer_reports_resident_memory_with_optimizer_state() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let sol = solve_layer(&lut, &c);
+        assert!(sol.feasible);
+        // Reconstruct the winning entry exactly as `recost_decision` does, then
+        // confirm the reported memory is the shared resident formula for it.
+        let d = &sol.decision;
+        let base = lut
+            .get((d.active_heads() as u64).max(1), d.ffn_width, d.csha_level, d.adapter_rank)
+            .unwrap();
+        let entry = apply_packing(
+            apply_fase(base, d.fase_fused, c.fase_backward_speedup),
+            d.packing_mode,
+            &c.packing_savings,
+        );
+        let expect = ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits);
+        assert_eq!(sol.memory_bytes, expect);
+        assert!(sol.memory_bytes > entry.param_bytes + entry.activation_bytes);
+    }
+
+    #[test]
+    fn solve_layer_greedy_reports_resident_memory_with_optimizer_state() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let sol = solve_layer_greedy(&lut, &c);
+        assert!(sol.feasible);
+        let d = &sol.decision;
+        let base = lut
+            .get((d.active_heads() as u64).max(1), d.ffn_width, d.csha_level, d.adapter_rank)
+            .unwrap();
+        let entry = apply_packing(
+            apply_fase(base, d.fase_fused, c.fase_backward_speedup),
+            d.packing_mode,
+            &c.packing_savings,
+        );
+        let expect = ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits);
+        assert_eq!(sol.memory_bytes, expect);
     }
 
     #[test]
