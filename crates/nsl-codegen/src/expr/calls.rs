@@ -1203,18 +1203,27 @@ impl Compiler<'_> {
                 return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
 
-            // M34: Check for context parallelism (ring attention).
+            // M34: `@context_parallel` decorator (ring attention).
             //
-            // CPDT Part III v2.20 — multi-model `@context_parallel`
-            // composition. Pre-v2.20 used the same broken
-            // `state.current_function_name.split("__").next()` pattern
-            // as the MoE sites (fixed in v2.19): `current_function_name`
-            // is None for model methods, AND `split("__").next()` on a
-            // mangled name returns the empty string. In practice the
-            // lookup always returned None, silently skipping the
-            // ring-attention codepath whenever the call lived inside a
-            // model method body — `@context_parallel` was effectively a
-            // no-op for any non-top-level caller.
+            // CPDT Part III v2.19 fixed the multi-model lookup via
+            // `resolve_decorator_config_for_call_site`; v2.20 generalized
+            // the helper; v2.21 fixed the F64/I64 scale mismatch. But
+            // v2.20 bug #2 (codegen/FFI positional misalignment — only
+            // position 0 aligns; every non-zero slot carries semantically
+            // wrong bytes) and bug #3 (runtime impl in
+            // `crates/nsl-runtime/src/context_parallel/ffi.rs` returns 0
+            // unconditionally) remained. Both are M34-completion work
+            // requiring a runtime redesign, not v2.x scope.
+            //
+            // v2.22 (this cycle): delete the buggy ring-attention FFI
+            // chain entirely and fall through to the naive attention
+            // path below. `@context_parallel` becomes advisory — the
+            // build emits a WARNING that the ring-attention runtime is
+            // incomplete, but the method still produces mathematically
+            // correct (undistributed) output via the naive
+            // softmax(QK^T · scale)V path. When M34 lands, someone
+            // rewires the emission against the finalized runtime FFI
+            // shape here, and the warning + fallback go away together.
             let cp_config = crate::moe::resolve_decorator_config_for_call_site(
                 self.current_method_model_name.as_deref(),
                 &self.features.context_parallel_configs,
@@ -1223,124 +1232,14 @@ impl Compiler<'_> {
 
             if let Some(cp_info) = cp_config {
                 eprintln!(
-                    "[nsl] Context parallelism active: ring_size={}",
+                    "[nsl] warning: @context_parallel(ring_size={}) recognized but the ring-attention runtime is incomplete (M34 in progress); falling through to naive attention. Output is mathematically correct but not distributed.",
                     cp_info.ring_size
                 );
-
-                // Initialize context parallel context:
-                // nsl_cp_init(ring_size, local_seq_len, num_heads, num_kv_heads, head_dim, dtype)
-                // Pass zeros for dims inferred by runtime; dtype=1 means f32.
-                let ring_size = builder
-                    .ins()
-                    .iconst(cl_types::I64, cp_info.ring_size as i64);
-                let zero = builder.ins().iconst(cl_types::I64, 0);
-                let dtype_val = builder.ins().iconst(cl_types::I64, 1); // f32
-                let cp_ctx = self.compile_call_by_name(
-                    builder,
-                    "nsl_cp_init",
-                    &[ring_size, zero, zero, zero, zero, dtype_val],
-                )?;
-
-                // Partition Q across the ring:
-                // nsl_sequence_partition(tensor, batch, seq_len, hidden, ring_size, rank, overlap)
-                // Runtime infers dims from tensor shape; rank=0 (host rank), overlap=0.
-                let q_part = self.compile_call_by_name(
-                    builder,
-                    "nsl_sequence_partition",
-                    &[q_val, zero, zero, zero, ring_size, zero, zero],
-                )?;
-
-                // Ring attention core:
-                // nsl_ring_attention(cp_ctx, q_part, k, v, scale, causal,
-                //                    null, null, null, null, null, null, null)
-                // Trailing nulls are reserved for future paged/GQA extensions.
-                //
-                // CPDT Part III v2.21 — bit-cast scale to `scale_bits: i64`
-                // using the same polymorphic pattern as `wengert_lower.rs:355-388`
-                // (F64→fdemote→F32→bitcast→I32→uextend→I64). Pre-v2.21 the
-                // codegen passed `scale_val` (F64 for the `0.125` literal)
-                // directly into the I64-declared FFI slot and the Cranelift
-                // verifier rejected the type mismatch. This closes v2.20
-                // deferral bug #1 (Cranelift type rejection); the runtime
-                // FFI signature is uniformly i64 for all 13 slots so the
-                // scale value now type-checks. Bugs #2 (codegen/FFI
-                // positional misalignment) and #3 (runtime impl stub)
-                // remain — see the v2.21 test docstring for the
-                // narrower-scope v2.next deferral.
-                let scale_ty = builder.func.dfg.value_type(scale_val);
-                let scale_bits_i64 = if scale_ty == cl_types::F64 {
-                    let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_val);
-                    let scale_bits_i32 = builder.ins().bitcast(
-                        cl_types::I32,
-                        cranelift_codegen::ir::MemFlags::new(),
-                        scale_f32,
-                    );
-                    builder.ins().uextend(cl_types::I64, scale_bits_i32)
-                } else if scale_ty == cl_types::F32 {
-                    let scale_bits_i32 = builder.ins().bitcast(
-                        cl_types::I32,
-                        cranelift_codegen::ir::MemFlags::new(),
-                        scale_val,
-                    );
-                    builder.ins().uextend(cl_types::I64, scale_bits_i32)
-                } else {
-                    // Integer/pointer case: `scale_val` is an NslTensor
-                    // handle (rank-0 tensor for expressions like
-                    // `1.0/sqrt(head_dim)`). Extract the scalar via
-                    // `nsl_tensor_item` (F64), then narrow to F32 bits.
-                    // Same recovery path as `wengert_lower.rs:382-389`
-                    // — see that comment for the "%scale silently
-                    // reading pointer-lower-32-bits" gotcha the naïve
-                    // path warned about.
-                    let scale_f64 = self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_item",
-                        &[scale_val],
-                    )?;
-                    let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
-                    let scale_bits_i32 = builder.ins().bitcast(
-                        cl_types::I32,
-                        cranelift_codegen::ir::MemFlags::new(),
-                        scale_f32,
-                    );
-                    builder.ins().uextend(cl_types::I64, scale_bits_i32)
-                };
-                let causal_flag = builder
-                    .ins()
-                    .iconst(cl_types::I64, if causal { 1 } else { 0 });
-                let null = builder.ins().iconst(cl_types::I64, 0);
-                let ring_result = self.compile_call_by_name(
-                    builder,
-                    "nsl_ring_attention",
-                    &[
-                        cp_ctx,
-                        q_part,
-                        k_val,
-                        v_val,
-                        scale_bits_i64,
-                        causal_flag,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                    ],
-                )?;
-
-                // Gather partitioned outputs back to full sequence:
-                // nsl_sequence_gather(result, ring_size, batch, seq_len, hidden, rank, overlap, null)
-                let output = self.compile_call_by_name(
-                    builder,
-                    "nsl_sequence_gather",
-                    &[ring_result, ring_size, zero, zero, zero, zero, zero, null],
-                )?;
-
-                // Destroy context parallel context.
-                self.compile_call_by_name(builder, "nsl_cp_destroy", &[cp_ctx])?;
-
-                return Ok(output);
+                // Fall through to the naive path below. Do NOT emit
+                // any `nsl_cp_init` / `nsl_sequence_partition` /
+                // `nsl_ring_attention` / `nsl_sequence_gather` /
+                // `nsl_cp_destroy` FFI calls — all previously landed
+                // in stub runtime slots and produced wrong output.
             }
 
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V

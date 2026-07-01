@@ -315,8 +315,6 @@ pub struct FeatureConfigs {
     pub world_size: usize,
     /// M34: Context parallelism configs — "ModelName.layer_name" → ContextParallelInfo
     pub context_parallel_configs: HashMap<String, crate::context_parallel::ContextParallelInfo>,
-    /// M34: Ring size for context parallelism
-    pub cp_ring_size: usize,
     /// M41: Whether this serve block uses disaggregated inference.
     pub disaggregated: bool,
     /// M41: Number of prefill workers (from serve config).
@@ -394,7 +392,6 @@ impl FeatureConfigs {
             activation_states: HashMap::new(),
             world_size: options.world_size,
             context_parallel_configs: HashMap::new(),
-            cp_ring_size: 1,
             disaggregated: false,
             prefill_workers: 1,
             decode_workers: 1,

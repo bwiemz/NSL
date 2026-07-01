@@ -1686,70 +1686,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     // --- M34: Context parallelism (ring attention) ---
-    (
-        "nsl_cp_init",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_sequence_partition",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_ring_attention",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_ring_send_recv",
-        &[types::I64, types::I64, types::I64, types::I64, types::I64],
-        Some(types::I64),
-    ),
-    (
-        "nsl_sequence_gather",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    ("nsl_cp_destroy", &[types::I64], Some(types::I64)),
+    // CPDT Part III v2.22 — extern signatures REMOVED. The codegen at
+    // `expr/calls.rs` no longer emits `nsl_cp_init` / `nsl_sequence_partition`
+    // / `nsl_ring_attention` / `nsl_ring_send_recv` / `nsl_sequence_gather`
+    // / `nsl_cp_destroy` FFI calls — `@context_parallel` falls through to
+    // the naive attention path with an M34 advisory warning. The runtime
+    // stubs in `crates/nsl-runtime/src/context_parallel/ffi.rs` remain
+    // linked but unused (returned 0 unconditionally, never called from
+    // Cranelift-emitted code). When M34 lands with a finalized runtime
+    // FFI shape, the extern table + emission + runtime impl all get
+    // rewired together against the new shape.
     // --- M35: FP8 compute ---
     (
         "nsl_fp8_cast",

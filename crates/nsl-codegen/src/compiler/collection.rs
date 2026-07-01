@@ -567,7 +567,6 @@ impl Compiler<'_> {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.features.cp_ring_size = info.ring_size;
                                     self.features
                                         .context_parallel_configs
                                         .insert(layer_key, info);
