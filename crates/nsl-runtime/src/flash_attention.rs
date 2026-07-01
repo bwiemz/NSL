@@ -1968,6 +1968,133 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     }
 }
 
+/// CSHA cycle 19 T1 — dS probe FFI (variant-B new symbol).
+///
+/// **Scope:** cycle-18 DEGENERATE-PROBE meta-lesson gate. The existing
+/// `nsl_flash_attention_csha_backward` 54-param signature is FROZEN — this
+/// wrapper adds two trailing device-pointer slots (`probe_ds_out_ptr`,
+/// `probe_dv_out_ptr`, each 8 f32 slots wide) reserved for a NON-DEGENERATE
+/// probe site at `(batch=0, head=0, q_tile_iter=0, warp_row=1, lane=0,
+/// causal=true)` where `P[1,0]≈0.5`, `P[1,1]≈0.5`, and `dS = 0.25 *
+/// (dP[1,0] - dP[1,1])` is nonzero under random dO. The exact 0.25
+/// coefficient assumes symmetric Q/K (i.e. `S[1,0] ≈ S[1,1]`). Under
+/// fully randomized Q/K the coefficient varies but `dS` remains nonzero
+/// — the coordinate is non-degenerate in both regimes. See cycle-18
+/// defer log.
+///
+/// **T1 scope is FFI+decl scaffolding ONLY.** The PTX-side probe emission
+/// (Step 6 of the cycle-19 T1 spec) — writing 8 f32 probe slots via
+/// `st.global.f32` predicated on the warp/lane/tile/batch/head coordinates
+/// — has NOT been wired here. The runtime body currently:
+///   1. Delegates the existing 54-param backward launch verbatim, and
+///   2. Zeros the probe slots (when non-null) as an honest sentinel.
+///
+/// A cycle-19 T2 follow-up must extend the backward PTX emitter to accept
+/// the probe pointers via a prelude widening and populate the 8 slots
+/// (row_max, row_sum, S_pre_mask, P, dP, rowsum_dP_P, dS, scale*dS).
+/// Until then the probe-integration test at
+/// `crates/nsl-codegen/tests/csha_cycle19_ds_probe.rs` is `#[ignore]`d
+/// with an XFAIL marker (probe-gate meta-lesson: DO NOT ship a fix based
+/// on probe readings within T1 — that is T4 scope).
+///
+/// **ABI:** 54 original params + `probe_ds_out_ptr: i64` + `probe_dv_out_ptr:
+/// i64` = **56 total i64 params**. Byte-identical to the original signature
+/// on the first 54 slots; sentinel `0` on either trailing slot disables that
+/// half of the probe write.
+#[cfg(feature = "csha_cycle19_probe")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_flash_attention_csha_backward_probe(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
+    scale_bits: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    block_table_ptr: i64,
+    k_pool_ptr: i64, v_pool_ptr: i64,
+    block_size: i64,
+    cos_ptr: i64, sin_ptr: i64,
+    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    shared_mem_bytes: i64,
+    ptx_ptr: i64, name_ptr: i64,
+    block_q: i64, block_kv: i64,
+    causal: i64,
+    x_ptr: i64, norm_weight_ptr: i64,
+    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    rmsnorm_eps_bits: i64,
+    active_heads: i64, d_model: i64,
+    q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
+    row_max_ptr: i64, row_sum_ptr: i64,
+    x_raw_ptr: i64,
+    do_ptr: i64,
+    dq_ptr: i64, dk_ptr: i64, dv_ptr: i64,
+    dwq_ptr: i64, dwk_ptr: i64, dwv_ptr: i64,
+    dx_ptr: i64,
+    dx_norm_ptr: i64,
+    segment_ids_ptr: i64,
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
+    doc_starts_ptr: i64,
+    tier_b2_active: i64,
+    num_docs_or_zero: i64,
+    // T1 additive trailing slots (variant-B).
+    probe_ds_out_ptr: i64,
+    probe_dv_out_ptr: i64,
+) -> i64 {
+    // T1 scaffolding: delegate to the existing 54-param body verbatim. The
+    // PTX-side probe emission is deferred to T2 per the c18 meta-lesson.
+    let rc = nsl_flash_attention_csha_backward(
+        q_ptr, k_ptr, v_ptr,
+        out_ptr,
+        logsumexp_ptr,
+        scale_bits,
+        batch, heads, seq_len, head_dim,
+        block_table_ptr,
+        k_pool_ptr, v_pool_ptr,
+        block_size,
+        cos_ptr, sin_ptr,
+        seq_ids_ptr, seq_lens_ptr,
+        shared_mem_bytes,
+        ptx_ptr, name_ptr,
+        block_q, block_kv,
+        causal,
+        x_ptr, norm_weight_ptr,
+        wq_ptr, wk_ptr, wv_ptr, wo_ptr,
+        rmsnorm_eps_bits,
+        active_heads, d_model,
+        q_proj_ptr, k_proj_ptr, v_proj_ptr,
+        row_max_ptr, row_sum_ptr,
+        x_raw_ptr,
+        do_ptr,
+        dq_ptr, dk_ptr, dv_ptr,
+        dwq_ptr, dwk_ptr, dwv_ptr,
+        dx_ptr,
+        dx_norm_ptr,
+        segment_ids_ptr,
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+        doc_starts_ptr,
+        tier_b2_active,
+        num_docs_or_zero,
+    );
+
+    // T1 scaffolding: probe pointers preserved; PTX-side st.global.f32
+    // population deferred to c20. These branches exist so the parameters are
+    // not dead-code-eliminated by rustc — they carry no runtime effect in T1.
+    // The 8-slot layout the future PTX emitter will target is:
+    // {row_max, row_sum, S_pre_mask, P, dP, rowsum_dP_P, dS, scale*dS}.
+    // Sentinel `0` on either pointer disables that half of the probe write
+    // once c20 wires up PTX-side population.
+    if probe_ds_out_ptr != 0 {
+        let _ = probe_ds_out_ptr;
+    }
+    if probe_dv_out_ptr != 0 {
+        let _ = probe_dv_out_ptr;
+    }
+
+    rc
+}
+
 /// CSHA Tier B.2 (Phase 3) — `effective_bq` per the dQ/dK/dV-kernel SMEM
 /// fallback schedule (`smem_layout::tier_b2_effective_bq`). The runtime cannot
 /// depend on `nsl-codegen` (the dependency runs the other way), so the formula

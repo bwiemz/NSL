@@ -23,6 +23,8 @@
 //! N args would now hit a sig-mismatch at IR-finalize time. The targeted
 //! count assertions surface the regression before that downstream failure.
 
+#[cfg(feature = "csha_cycle19_probe")]
+use cranelift_codegen::ir::types;
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{builder, Flags};
 use cranelift_module::default_libcall_names;
@@ -73,6 +75,39 @@ fn csha_with_saves_decl_has_doc_starts_trailing_param() {
         44,
         "nsl_flash_attention_csha_with_saves must accept 44 i64 params (PCA §4.3 Task 3 + Tier B + per-doc CTA)"
     );
+}
+
+/// CSHA cycle 19 T1 (variant-B) — additive arity assertion for the NEW
+/// `nsl_flash_attention_csha_backward_probe` symbol. Registered only under
+/// the `csha_cycle19_probe` Cargo feature. The count is the existing 54
+/// backward params + 2 trailing probe pointers = 56. This test intentionally
+/// leaves the 54-arity assertion on the non-probe symbol UNTOUCHED (per
+/// cycle-19 T1 spec: "DO NOT edit the existing `54` literal").
+#[cfg(feature = "csha_cycle19_probe")]
+#[test]
+fn csha_backward_probe_decl_has_expected_arity() {
+    let mut module = make_module();
+    let fns = declare_runtime_functions(&mut module, CallConv::SystemV).expect("declare");
+    let (_, sig) = fns
+        .get("nsl_flash_attention_csha_backward_probe")
+        .expect("nsl_flash_attention_csha_backward_probe registered under csha_cycle19_probe");
+    assert_eq!(
+        sig.params.len(),
+        56,
+        "nsl_flash_attention_csha_backward_probe must accept 56 i64 params \
+         (54 original + probe_ds_out_ptr + probe_dv_out_ptr)"
+    );
+    // Defence-in-depth (R3): every param must be i64. A stray non-i64 slot
+    // would silently mis-encode pointer args at the Cranelift call site
+    // before the arity assertion caught it.
+    for (i, p) in sig.params.iter().enumerate() {
+        assert_eq!(
+            p.value_type,
+            types::I64,
+            "probe backward FFI param #{i} must be i64, got {:?}",
+            p.value_type
+        );
+    }
 }
 
 #[test]
