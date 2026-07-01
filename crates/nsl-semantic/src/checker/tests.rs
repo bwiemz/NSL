@@ -480,6 +480,195 @@ dataset dup_fields("demo"):
     );
 }
 
+// -----------------------------------------------------------------------
+// CFTP v9 M4: `mean_doc_length` / `doc_length_stddev` accept Float literals
+// -----------------------------------------------------------------------
+
+#[test]
+fn v9_m4_mean_doc_length_accepts_float_literal() {
+    // Calibration tools naturally emit fractional averages like 384.7.
+    // The semantic checker must accept these; codegen rounds to u32.
+    let src = r#"
+dataset calibrated("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = 384.7
+    doc_length_stddev = 42.5
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(
+        errs.is_empty(),
+        "v9 M4: Float literal for mean_doc_length/doc_length_stddev must not error; got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn v9_m4_mean_doc_length_still_accepts_int_literal() {
+    // Backwards compatibility: existing Int-literal fixtures must keep working.
+    let src = r#"
+dataset intcorpus("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = 384
+    doc_length_stddev = 42
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(
+        errs.is_empty(),
+        "v9 M4: Int literal must still be accepted (regression guard); got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn v9_m4_mean_doc_length_rejects_string() {
+    // The widening is Int|Float only — not "anything goes". String must still error.
+    let src = r#"
+dataset weird("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = "not a number"
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("mean_doc_length must be int or float")),
+        "v9 M4: String must error with 'int or float' message; got: {:?}",
+        diags
+    );
+}
+
+// -----------------------------------------------------------------------
+// CFTP v9 L4: non-negative literal validation for length stats
+// -----------------------------------------------------------------------
+
+#[test]
+fn v9_l4_mean_doc_length_rejects_negative_int() {
+    let src = r#"
+dataset bad_stats("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = -50
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset mean_doc_length must be non-negative")),
+        "v9 L4: negative Int must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_doc_length_stddev_rejects_negative_float() {
+    let src = r#"
+dataset bad_stats("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    doc_length_stddev = -3.14
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset doc_length_stddev must be non-negative")),
+        "v9 L4: negative Float must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_sequence_length_rejects_negative() {
+    // Pre-v9 gap: `sequence_length` also silently wraps to a huge u32
+    // downstream when negative. v9 L4 closes this for all length fields.
+    let src = r#"
+dataset seq_len_bad("demo"):
+    source = "data.bin"
+    sequence_length = -100
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset sequence_length must be non-negative")),
+        "v9 L4: negative sequence_length must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_max_sequence_length_rejects_negative() {
+    let src = r#"
+dataset ms_bad("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    max_sequence_length = -1024
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset max_sequence_length must be non-negative")),
+        "v9 L4: negative max_sequence_length must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_separator_token_id_still_allows_any_int() {
+    // separator_token_id is a token id (which can legally be negative
+    // as a sentinel). It intentionally stays out of the L4 non-negative
+    // check. This test pins that behavior so a future L4 extension
+    // doesn't accidentally sweep it in.
+    let src = r#"
+dataset with_neg_sep("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    separator_token_id = -1
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(
+        errs.is_empty(),
+        "v9 L4: separator_token_id must continue accepting any i64 (including negative sentinels); got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn v9_l4_zero_length_still_allowed() {
+    // Zero is not negative — the L4 check must not accidentally refuse it.
+    // Downstream `pca_activation::validate_config` refuses zero mean_doc_length
+    // separately (that's a semantic error, not a "wrong sign" one).
+    let src = r#"
+dataset zero_ok("demo"):
+    source = "data.bin"
+    sequence_length = 0
+"#;
+    let diags = check_source(src);
+    // The L4 check itself should not fire. (Other checks may fire but not
+    // the "must be non-negative" message.)
+    assert!(
+        !diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("must be non-negative")),
+        "v9 L4: zero is not negative; must not trip the L4 check; got: {:?}",
+        diags
+    );
+}
+
 #[test]
 fn test_tokenizer_vocab_size_type_mismatch_reports_error() {
     let src = r#"
