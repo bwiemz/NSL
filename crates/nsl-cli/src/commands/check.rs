@@ -89,6 +89,47 @@ pub(crate) fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_
 }
 
 
+/// Paper §9.3: parse the `--wrga-ablate=<flags>` value into a `WrgaAblation`.
+///
+/// Tokens: `wengert | roofline | spectral | fusion | memory | all | none`,
+/// comma-separated. Whitespace around tokens is permitted. `all` sets every
+/// skip flag; `none` is a no-op (default). Unknown tokens produce a single
+/// distinct error message listing the valid set, so users get a clear hint
+/// rather than a silent partial parse.
+pub(crate) fn parse_wrga_ablation(
+    s: &str,
+) -> Result<nsl_codegen::wrga::WrgaAblation, String> {
+    use nsl_codegen::wrga::WrgaAblation;
+    let mut out = WrgaAblation::default();
+    for raw in s.split(',') {
+        let tok = raw.trim();
+        match tok {
+            "" | "none" => {}
+            "wengert" => out.skip_wengert_pruning = true,
+            "roofline" => out.skip_roofline_placement = true,
+            "spectral" => out.skip_spectral_allocation = true,
+            "fusion" => out.skip_fusion_integration = true,
+            "memory" => out.skip_memory_planning = true,
+            "all" => {
+                out = WrgaAblation {
+                    skip_wengert_pruning: true,
+                    skip_roofline_placement: true,
+                    skip_spectral_allocation: true,
+                    skip_fusion_integration: true,
+                    skip_memory_planning: true,
+                };
+            }
+            other => {
+                return Err(format!(
+                    "unknown ablation flag '{other}' (valid: wengert, roofline, spectral, \
+                     fusion, memory, all, none)"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn dispatch(args: crate::args::CheckArgs) {
     let crate::args::CheckArgs {
             file,
@@ -122,6 +163,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             wrga_compare,
             csha,
             csha_report,
+            wrga_ablate,
     } = args;
 
             if cep_search && cep_profile {
@@ -130,6 +172,27 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             }
             if wrga_analyze.is_some() && wrga_compare.is_some() {
                 eprintln!("error: --wrga-analyze and --wrga-compare are mutually exclusive");
+                std::process::exit(1);
+            }
+            // Paper §9.3: `--wrga-ablate=<flags>` parses up front so an
+            // invalid token errors out before we touch the codegen pipeline.
+            // The parsed ablation is then forwarded into the analyze/compare
+            // path via the same thread-local override pattern used for
+            // `--wrga-target`.
+            let parsed_ablation = match wrga_ablate.as_deref() {
+                None => nsl_codegen::wrga::WrgaAblation::default(),
+                Some(s) => match parse_wrga_ablation(s) {
+                    Ok(abl) => abl,
+                    Err(e) => {
+                        eprintln!("error: --wrga-ablate: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            };
+            if parsed_ablation.is_active() && wrga_analyze.is_none() && wrga_compare.is_none() {
+                eprintln!(
+                    "error: --wrga-ablate requires --wrga-analyze or --wrga-compare"
+                );
                 std::process::exit(1);
             }
             // WRGA paper §8.3: `--wrga-analyze` short-circuits the check path
@@ -141,6 +204,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     &file,
                     report_path,
                     wrga_target.as_deref(),
+                    parsed_ablation,
                 ));
             }
             // WRGA paper §8.3: `--wrga-compare` — same dispatch shape as
@@ -150,6 +214,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     &file,
                     report_path,
                     wrga_target.as_deref(),
+                    parsed_ablation,
                 ));
             }
 
@@ -198,8 +263,8 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     );
                 } else {
                     let mut opts = nsl_codegen::CompileOptions::default();
-                    opts.csha_mode = Some(mode_str);
-                    opts.csha_report = csha_report;
+                    opts.csha.mode = Some(mode_str);
+                    opts.csha.report = csha_report;
                     // Force source-AD so the train block lowers to a
                     // Wengert list (the planner runs against
                     // `extractor.wengert_list()`). Without this the

@@ -43,6 +43,12 @@ pub struct ModuleData {
     /// nsl-semantic (Sprint 2 — collection only; lowering-site
     /// substitution deferred to Sprint 2.5).
     pub fused_ce_configs: Vec<nsl_semantic::cftp::FusedCeConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca` decorator configs
+    /// captured by nsl-semantic. Routed into the compiler so the CSHA
+    /// training-PTX synthesis site can flip
+    /// `PerDocAdmitConfig::enable_per_doc_cta=true` when a
+    /// `@pca(strategy=per_document)` config is present.
+    pub pca_configs: Vec<nsl_semantic::cftp::PcaConfig>,
     /// M62: per-NodeId weight index resolutions for `self.<field>` accesses
     /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
     /// for the entry module on the multi-file shared-lib path.
@@ -437,6 +443,7 @@ pub fn load_all_modules(
             // ModuleData so the command handlers can publish it onto
             // `CompileOptions.checkpoint_policies` for codegen to read.
             checkpoint_policies: analysis.checkpoint_policies,
+            pca_configs: analysis.pca_configs,
         });
     }
 

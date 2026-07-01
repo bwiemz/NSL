@@ -202,6 +202,12 @@ pub struct WrgaBlock {
     pub target: Option<Symbol>,
     /// Explicit layer selection for `mode=hybrid`.
     pub layers: Vec<String>,
+    /// WRGA paper §8.2: user-defined custom adapter model.  When set,
+    /// the name (a Symbol resolving to a `model` declaration in scope)
+    /// tells WRGA to instantiate this user-defined adapter at each
+    /// selected site instead of one of the built-in `lora`/`ia3`/
+    /// `gatedlora` kinds.  Defaults to `None` (compiler-chosen kind).
+    pub adapter: Option<Symbol>,
     pub span: Span,
 }
 

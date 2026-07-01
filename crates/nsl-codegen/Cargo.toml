@@ -33,7 +33,17 @@ cudarc = { version = "0.19.4", default-features = false, features = ["driver", "
 rand = { version = "0.9", optional = true }
 
 [features]
-default = []
+# `default` enables every experimental subsystem, so the normal build and the
+# full test suite are unchanged (the experimental-* gates below are compiled
+# *out* in a default build, making it byte-identical to before they existed).
+# A downstream build can opt OUT of a research subsystem with
+# `--no-default-features` plus the subset it wants; the opted-out pass becomes
+# a no-op at its entry point. This is phase-1 *behavioral* gating: it disables
+# the pass but does not yet strip the subsystem's modules from the binary
+# (module-level cfg cascade is staged — see STATUS.md and
+# docs/architecture/compiler-state.md). Additional subsystems (WGGO, CSHA, ZK,
+# FPGA) follow the same entry-point pattern as the gating is extended.
+default = ["experimental-wrga", "experimental-cpdt"]
 cuda = ["nsl-runtime/cuda", "dep:cudarc"]
 test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
@@ -42,6 +52,10 @@ debug_kernel_instrumentation = []
 # CSHA cycle 19 T1: propagate the runtime `csha_cycle19_probe` feature so codegen
 # can cfg-gate the Cranelift extern-decl for the new probe FFI symbol. Default OFF.
 csha_cycle19_probe = ["nsl-runtime/csha_cycle19_probe"]
+# Experimental research subsystems (STATUS.md "Experimental" tier). On by
+# default; gated at their single entry point in `stmt.rs`.
+experimental-wrga = []
+experimental-cpdt = []
 
 [dev-dependencies]
 string-interner.workspace = true

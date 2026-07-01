@@ -140,7 +140,10 @@ fn compile_training_to_object(src: &str) -> Option<Vec<u8>> {
         return None;
     }
     let opts = CompileOptions {
-        csha_mode: Some("auto".into()),
+        csha: nsl_codegen::CshaOptions {
+            mode: Some("auto".into()),
+            ..Default::default()
+        },
         // CSHA's backward dispatcher only runs under source AD (M40
         // source-to-source AD).  Without this flag the train block
         // falls back to tape-based AD, which bypasses

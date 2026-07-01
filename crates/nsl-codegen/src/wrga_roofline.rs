@@ -30,6 +30,11 @@ pub enum SiteKind {
     Softmax,
     /// Embedding lookup (always memory-bound).
     Embedding,
+    /// Reduction op (sum, mean, pool). Always memory-bound at typical
+    /// transformer head shapes; supports WRGA §2.4 pattern 3 — the adapter
+    /// scaling vector is folded into the reduction kernel's epilogue with
+    /// zero extra HBM traffic.
+    Reduction,
 }
 
 /// Adapter architectures WRGA can choose between.
@@ -82,6 +87,14 @@ impl AdapterSite {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdapterPlacement {
     pub name: String,
+    /// Site classification carried through from the upstream
+    /// [`AdapterSite`].  Defaults to `Matmul` for legacy callers that
+    /// construct an `AdapterPlacement` without a real site; the fusion
+    /// pass falls back to a name heuristic when the kind is unspecified.
+    /// Carrying it here lets `wrga_fusion::decide` dispatch §2.4 pattern
+    /// 3 (reduction-fused IA³) on the authoritative op type instead of
+    /// guessing from the param name.
+    pub kind: SiteKind,
     /// Arithmetic intensity computed from the site's shape at the runtime
     /// batch×seq.
     pub arithmetic_intensity: f64,
@@ -134,6 +147,15 @@ fn site_cost(site: &AdapterSite) -> (u64, u64, u64) {
             let d = site.shape.last().copied().unwrap_or(1);
             let bytes = b * s * d * site.dtype_bytes;
             (0, bytes, bytes)
+        }
+        SiteKind::Reduction => {
+            // Total elements is the product of the operand shape times
+            // batch*seq; dim size is the leading shape entry (the axis
+            // being reduced when no other hint is available).  Always
+            // memory-bound at realistic transformer-head shapes.
+            let d = site.shape.first().copied().unwrap_or(1).max(1);
+            let total = b * s * d;
+            crate::cost_model::reduction_cost(total, d, site.dtype_bytes)
         }
     }
 }
@@ -192,6 +214,21 @@ fn choose_adapter(
             0,
             "embedding table is atypically compute-bound — skip",
         ),
+        // WRGA §2.4 pattern 3: reduction sites (sum, mean, pool) get an
+        // IA³-style scaling vector folded into the reduction kernel's
+        // epilogue.  Always memory-bound at realistic transformer-head
+        // shapes, so this is the free-ALU case.
+        (SiteKind::Reduction, BoundClassification::MemoryBound)
+        | (SiteKind::Reduction, BoundClassification::Balanced) => (
+            AdapterKind::Ia3,
+            0,
+            "memory-bound reduction (sum/mean): IA³ scaling fuses into the reduction epilogue, zero extra HBM traffic",
+        ),
+        (SiteKind::Reduction, BoundClassification::ComputeBound) => (
+            AdapterKind::Skip,
+            0,
+            "compute-bound reduction is atypical (large fan-in per reduce step) — skip",
+        ),
         (_, BoundClassification::Unknown) => (
             AdapterKind::Skip,
             0,
@@ -220,6 +257,7 @@ pub fn place_adapters(
             let (kind, rank, why) = choose_adapter(class, site.kind, r_min, r_max);
             AdapterPlacement {
                 name: site.name.clone(),
+                kind: site.kind,
                 arithmetic_intensity: ai,
                 classification: class,
                 roofline_slack: slack,
@@ -286,6 +324,28 @@ mod tests {
         ));
         assert!(p.suggested_rank <= 16);
         assert!(matches!(p.adapter, AdapterKind::Lora | AdapterKind::Skip));
+    }
+
+    #[test]
+    fn reduction_site_is_memory_bound_and_gets_ia3() {
+        // WRGA §2.4 pattern 3: a reduction site (sum/mean/pool) at
+        // realistic transformer-head shape is memory-bound and routes to
+        // an IA³-style scaling vector — the upstream fusion pass then
+        // turns this into ReductionFusedAdapter.
+        let gpu = test_gpu();
+        let sites = vec![AdapterSite::new(
+            "head.mean_pool",
+            SiteKind::Reduction,
+            vec![512],
+            2,
+        )
+        .with_batch(8, 128)];
+        let plan = place_adapters(&sites, gpu, 2, 16);
+        assert_eq!(plan[0].classification, BoundClassification::MemoryBound);
+        assert_eq!(plan[0].adapter, AdapterKind::Ia3);
+        assert!(plan[0]
+            .rationale
+            .contains("reduction"));
     }
 
     #[test]

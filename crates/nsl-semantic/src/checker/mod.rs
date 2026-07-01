@@ -83,6 +83,14 @@ pub struct TypeChecker<'a> {
     /// composite cross_entropy path with the fused linear-CE kernel; v1
     /// only collects + plumbs).
     pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
+    /// CFTP §4.3 G2 Strategy 3: `@pca(...)` configs captured during
+    /// semantic analysis (one per decorated `train` / `dataset` block).
+    /// Consumed by codegen at `maybe_synthesize_csha_training_ptx` to
+    /// route the planner to the per-document CTA kernel when the user
+    /// explicitly requests `@pca(strategy=per_document)`.
+    /// Replaces the pre-Item-4 behaviour where `validate_pca_decorator`
+    /// returned a value that was immediately dropped.
+    pub pca_configs: Vec<crate::cftp::PcaConfig>,
     /// M56: Whether `--linear-types` was passed on the command line.
     /// Agent declarations are gated behind this flag (E0610).
     pub linear_types_enabled: bool,
@@ -110,6 +118,7 @@ impl<'a> TypeChecker<'a> {
             csha_configs: Vec::new(),
             cpdt_decorator_span: None,
             fused_ce_configs: Vec::new(),
+            pca_configs: Vec::new(),
             linear_types_enabled: false,
             agent_decl_spans: Vec::new(),
         }

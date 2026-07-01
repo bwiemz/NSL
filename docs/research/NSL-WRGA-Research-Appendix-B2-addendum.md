@@ -1,4 +1,11 @@
-# NSL-WRGA Research -- Appendix B addendum (pending integration into next PDF regeneration)
+# NSL-WRGA Research -- Appendix B addendum (HISTORICAL, superseded)
+
+> **Status:** **SUPERSEDED** by `NSL-WRGA-Research-Appendix-B.md`. The
+> integration-ready manuscript folds B.2 / B.3 / B.5 / B.6 from this file into a
+> clean appendix and adds rules B.7 / B.8 / B.9. This file is retained as the
+> discoveries-in-context historical record so future readers can trace how each
+> rule emerged from its surfacing incident; treat the manuscript as
+> authoritative for paper-integration purposes.
 
 **Added:** 2026-04-18 as part of B.3.1 milestone close-out
 **Target:** Appendix B (institutional-memory retrospectives), new subsection B.2

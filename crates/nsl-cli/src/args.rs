@@ -221,6 +221,14 @@ pub(crate) enum Cli {
         #[arg(long)]
         seq: bool,
     },
+
+    /// Report static per-kernel PTX metadata (declared registers, shared
+    /// memory, target SM) parsed from a synthesized `.ptx` file. Pure text
+    /// analysis — no GPU or CUDA toolkit required.
+    PtxMetadata {
+        /// Path to a `.ptx` file (NSL- or ptxas-generated).
+        file: PathBuf,
+    },
 }
 
 /// M55: ZK subcommands.
@@ -405,6 +413,19 @@ pub(crate) struct CheckArgs {
         /// plus the backward-tier choice. No kernels are emitted.
         #[arg(long)]
         pub(crate) csha_report: bool,
+
+        /// WRGA paper §9.3: ablate one or more Innovations from this run.
+        /// Comma-separated tokens from `wengert | roofline | spectral | fusion
+        /// | memory | all | none`. Default `none` (no ablation). `all` is
+        /// shorthand for every Innovation. Combines with `--wrga-analyze` /
+        /// `--wrga-compare` so users can measure the per-Innovation
+        /// contribution to the report.
+        ///
+        /// Examples:
+        ///   nsl check --wrga-analyze --wrga-ablate=fusion model.nsl
+        ///   nsl check --wrga-compare --wrga-ablate=wengert,fusion model.nsl
+        #[arg(long)]
+        pub(crate) wrga_ablate: Option<String>,
 }
 
 #[derive(clap::Args)]

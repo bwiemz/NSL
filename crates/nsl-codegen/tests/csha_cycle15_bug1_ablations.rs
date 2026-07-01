@@ -333,7 +333,9 @@ fn run_ablation(
             saves.q_proj, saves.k_proj, saves.v_proj,
             saves.row_max, saves.row_sum,
             saves.x_raw,
-            0, 0, 0, 0,
+            // segment_ids_ptr, tier_b_ptx_ptr, tier_b_name_ptr, doc_starts_ptr,
+            // num_docs_or_zero (PCA per-doc CTA Strategy 3 v1 — 5 trailing args).
+            0, 0, 0, 0, 0,
         )
     };
 
@@ -417,7 +419,9 @@ fn run_ablation(
             dwq_dev, dwk_dev, dwv_dev,
             dx_dev,
             dxn_dev,
-            0, 0, 0, 0, 0,
+            // segment_ids, tier_b_ptx, tier_b_name, doc_starts, tier_b2_active,
+            // num_docs_or_zero (PCA per-doc CTA Sprint 5 — 6 trailing args).
+            0, 0, 0, 0, 0, 0,
         )
     };
     if rc_bwd != 0 {

@@ -61,24 +61,22 @@ fn two_doc_packed_e2e_scaffold() {
     eprintln!("on-GPU smoke scaffold ready; full launch pending T11 follow-on");
 }
 
-// NOTE (A-4 Task 4 — doc_starts null-guard, Test 4): Numerical validation of
-// the doc_starts null-guard (when doc_starts_ptr==0, emit_doc_starts_smem_load
-// writes doc_start=0 for every position → standard non-packed RoPE positions)
-// is deferred here because this file contains only a PTX-synthesis scaffold
-// with no actual GPU launch plumbing. Building a full launch helper
-// (upload Q/K/V + cos/sin + doc_starts, JIT compile, kernel launch, readback)
-// from scratch in this file was assessed as disproportionate effort relative
-// to the null-guard's risk surface.
+// NOTE (A-4 Task 4 — doc_starts null-guard, Test 4): Numerical GPU validation
+// of the doc_starts null-guard under `rope_q=true` (when doc_starts_ptr==0,
+// emit_doc_starts_smem_load writes doc_start=0 for every position → standard
+// non-packed RoPE positions) is SHIPPED in
+// `pca_tier_a_forward_correctness::rope_q_forward_doc_starts_null_equals_doc_zero_baseline`
+// (Item 3 / PR #274). That test launches the kernel twice — once with
+// doc_starts=[0,0,...,0] and once with doc_starts_ptr=0 — and asserts
+// bit-exact output equivalence (max_abs == 0.0). The backward equivalent
+// ships in `pca_tier_a_backward_correctness::doc_starts_null_equals_standard_positions_backward`
+// at 5e-3 tolerance.
 //
-// Structural validation (snapshot) already covers the doc_starts null-guard:
+// Structural validation (snapshot) also covers the doc_starts null-guard:
 // the `emit_doc_starts_smem_load` guard uses the identical skip-before-dereference
 // mechanism (`@%p_doc_null bra ...NULL_DOC_LD` / `mov.u32 %doc_start, 0`) as the
 // seg_ids guard, which IS numerically validated end-to-end by A-4 Tests 1 and 2
 // (forward + backward, both confirming masked+null == unmasked within tolerance).
 // The two guards were added in the same A-3 commit; any structural regression in
 // either would break the snapshot tests.
-//
-// When T11 wires the doc_starts dataloader path, this scaffold should expand to a
-// real launch and add: launch with doc_starts_ptr=0 → assert output equals
-// rope_q=true run with uniform doc_start=0 positions, within 5e-3.
 

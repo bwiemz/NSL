@@ -24,7 +24,8 @@ use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{
     passthrough_plan, solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan,
 };
-use crate::wggo_graph::{build as build_graph, OptGraph};
+use crate::wggo_graph::{build as build_graph, LayerRole, OptGraph};
+use crate::wggo_shape::LayerShapeInfo;
 use crate::wggo_ilp::{
     recost_decision, solve_all_greedy as ilp_solve_all_greedy,
     solve_all_templated as ilp_solve_all_templated, solve_layer as ilp_solve_layer,
@@ -304,9 +305,59 @@ pub fn run(input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
 
+    // 1. Build the layer graph.
+    let graph = build_graph(input.wengert);
+
+    // §2.4 inter-layer shape-compatibility precondition (a *hard* constraint).
+    // Every kept layer's output activation width must match what its successors
+    // consume (or a reshape must bridge them).  On a *provable* incompatibility
+    // WGGO must emit NO structural transforms — it returns a transform-free plan
+    // (empty `AppliedPlan` ⇒ no per-layer overrides ⇒ the type-checked model
+    // compiles unchanged), honoring the project invariant that an unmet
+    // transformation precondition must refuse, never silently weaken.  This is
+    // deliberately stronger than the inter-layer DP's budget degradation: an
+    // over-budget *passthrough* is still a structurally valid model, whereas a
+    // shape-incompatible plan is *wrong*, so we refuse the transforms outright
+    // rather than letting CSHA fusion / adapters / thinning ride on a broken
+    // graph.
+    //
+    // For the uniform residual transformers WGGO targets today the feeder
+    // (`inter_layer_dims`) yields a single `d_model` on every edge, so this is
+    // satisfied-by-construction and never triggers; it becomes binding once
+    // per-layer or dim-changing activation widths are introduced (see the
+    // `wggo_shape` module docs).
+    let shape_warns = shape_warnings(&graph, input.layer_shape.d_model);
+    if !shape_warns.is_empty() {
+        let empty_inter = InterLayerPlan {
+            layers: Vec::new(),
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+            pipeline_stages: 1,
+        };
+        let empty_applied = crate::wggo_apply::AppliedPlan {
+            layers: Vec::new(),
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+        let schedule = build_schedule(&empty_inter, &empty_applied);
+        return WggoPlan {
+            mode: WggoMode::Off,
+            target_gpu: gpu.name.to_string(),
+            graph,
+            inter_layer: empty_inter,
+            per_layer: Vec::new(),
+            resolutions: Vec::new(),
+            applied: empty_applied,
+            schedule,
+            template_stats: TemplateStats::default(),
+            weight_analysis: WeightAnalysisReport::default(),
+            estimated_solve_us: t0.elapsed().as_micros() as u64,
+            warnings: shape_warns,
+        };
+    }
+
     // Off mode: build a trivial plan that passes through decisions.
     if input.mode == WggoMode::Off {
-        let graph = build_graph(input.wengert);
         let n = graph.layers.len();
         let lut = build_lut(&input.layer_shape, gpu, &input.lut_axes);
         let luts: Vec<LayerCostLut> = vec![lut; n.max(1)];
@@ -320,7 +371,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         let inter =
             dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-            vec![LayerIlpConstraints::default(); n]
+            default_constraints_for(&graph)
         } else {
             input.ilp_constraints
         };
@@ -352,8 +403,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         };
     }
 
-    // 1-2. Build the layer graph and the cost LUT.
-    let graph = build_graph(input.wengert);
+    // 2. Cost LUT.
     let lut = build_lut(&input.layer_shape, gpu, &input.lut_axes);
     let n = graph.layers.len();
     let luts: Vec<LayerCostLut> = vec![lut; n.max(1)];
@@ -385,7 +435,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
     let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-        vec![LayerIlpConstraints::default(); n]
+        default_constraints_for(&graph)
     } else {
         input.ilp_constraints
     };
@@ -476,7 +526,9 @@ pub fn run(input: WggoInput) -> WggoPlan {
         resolutions
     };
 
-    // 8. Apply + communication schedule.
+    // 8. Apply + communication schedule.  (The §2.4 shape-compatibility
+    // precondition was checked up front; a violation would have forced Off
+    // above, so reaching here means the plan is shape-compatible.)
     let applied = apply(&inter, &per_layer);
     let schedule = build_schedule(&inter, &applied);
 
@@ -494,6 +546,109 @@ pub fn run(input: WggoInput) -> WggoPlan {
         estimated_solve_us: t0.elapsed().as_micros() as u64,
         warnings,
     }
+}
+
+/// Inter-layer activation widths for a layer, by transformer role.
+///
+/// Residual-stream sublayers (`Attention` / `Ffn` / `Block`) carry `d_model`
+/// in and out: per-head pruning and FFN thinning are absorbed by the output
+/// projection (`W_O` / `W_down`), so the *inter-layer* tensor width is
+/// invariant under WGGO's structural decisions.  The boundary roles expose one
+/// real width and one unknown — `Embedding` consumes token ids (unknown width)
+/// and produces `d_model`; `LmHead` consumes `d_model` and produces vocab
+/// logits (not an inter-layer activation).  `Other` is an unclassified op group
+/// with no known residual projection, so both widths are unknown.  Unknown
+/// (`None`) widths are treated as compatible by [`crate::wggo_shape::classify`]
+/// (fail-safe — only provable mismatches are flagged).
+/// Conservative role-based numerical-sensitivity floor for the per-layer ILP.
+///
+/// The ILP now costs optimizer precision ([`crate::wggo_cost::optimizer_us`]),
+/// so with no sensitivity signal it would recommend the cheapest (8-bit) Adam
+/// moments for *every* layer — including the numerically fragile ones.
+/// Production callers pass no explicit `ilp_constraints`, and the weight-
+/// analysis stage populates importance but never sensitivity, so without this
+/// floor the embeddings / LM-head / norms would be advised down to 8-bit.
+/// Assign a coarse floor by [`LayerRole`]: fragile layers are pinned to high
+/// precision; the transformer blocks — where low-bit Adam moments are well
+/// established — may be lowered.
+///
+/// The graph builder buckets most non-`blocks.N` params (embeddings, norms, the
+/// LM head, the raw input) into the catch-all `Other` role, so `Other` is held
+/// at ≥16-bit as the conservative default.  This is intentionally coarse; a
+/// gradient/spectral per-layer sensitivity score (cf. `cpdt_sensitivity`) is the
+/// natural refinement.  Note the optimizer-precision decision is currently
+/// *advisory* — it is surfaced in the plan/report but not yet lowered to
+/// optimizer codegen (`PerLayerOverride` does not carry it), so this governs the
+/// recommendation, not yet generated code.
+fn role_sensitivity_floor(role: LayerRole) -> f64 {
+    match role {
+        // ≥ critical_prec_threshold (0.9 default) → forces 32-bit moments.
+        LayerRole::Embedding | LayerRole::LmHead => 0.95,
+        // ≥ high_prec_threshold (0.5 default) → forces ≥16-bit.
+        LayerRole::Other => 0.6,
+        // The bulk transformer compute may use low-bit Adam moments.
+        LayerRole::Attention | LayerRole::Ffn | LayerRole::Block => 0.0,
+    }
+}
+
+/// Per-layer default ILP constraints with the [`role_sensitivity_floor`]
+/// applied (used when the caller supplies no explicit `ilp_constraints`).
+fn default_constraints_for(graph: &OptGraph) -> Vec<LayerIlpConstraints> {
+    graph
+        .layers
+        .iter()
+        .map(|l| LayerIlpConstraints {
+            sensitivity: role_sensitivity_floor(l.role),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn inter_layer_dims(role: LayerRole, d_model: u64) -> (Option<u64>, Option<u64>) {
+    // A zero `d_model` is a defensively-initialised / unknown shape, not a real
+    // width: report unknown on every edge so the gate stays fail-safe.
+    if d_model == 0 {
+        return (None, None);
+    }
+    match role {
+        LayerRole::Attention | LayerRole::Ffn | LayerRole::Block => (Some(d_model), Some(d_model)),
+        LayerRole::Embedding => (None, Some(d_model)),
+        LayerRole::LmHead => (Some(d_model), None),
+        LayerRole::Other => (None, None),
+    }
+}
+
+/// Build the per-layer [`LayerShapeInfo`] records the §2.4 shape gate validates.
+///
+/// Widths come from [`inter_layer_dims`]; producer edges are the graph's
+/// `depends_on` lists.  `d_model` is the uniform residual-stream width the
+/// driver sizes the model with.
+fn build_shape_infos(graph: &OptGraph, d_model: u64) -> Vec<LayerShapeInfo> {
+    graph
+        .layers
+        .iter()
+        .map(|l| {
+            let (input_dim, output_dim) = inter_layer_dims(l.role, d_model);
+            LayerShapeInfo {
+                layer: l.index,
+                name: l.name.clone(),
+                input_dim,
+                output_dim,
+                depends_on: l.depends_on.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Run the §2.4 shape-compatibility gate over `graph` and return one warning
+/// message per provably-incompatible inter-layer edge (empty when the
+/// constraint holds).  See the gate's call site in [`run`] for how a non-empty
+/// result forces a passthrough refusal.
+fn shape_warnings(graph: &OptGraph, d_model: u64) -> Vec<String> {
+    crate::wggo_shape::validate(&build_shape_infos(graph, d_model))
+        .iter()
+        .map(|v| v.message())
+        .collect()
 }
 
 /// Run Stage 3 over `graph`, using the first layer's `num_heads` as the
@@ -804,6 +959,92 @@ mod tests {
     }
 
     #[test]
+    fn inter_layer_dims_maps_roles_to_residual_widths() {
+        assert_eq!(inter_layer_dims(LayerRole::Attention, 512), (Some(512), Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::Ffn, 512), (Some(512), Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::Block, 512), (Some(512), Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::Embedding, 512), (None, Some(512)));
+        assert_eq!(inter_layer_dims(LayerRole::LmHead, 512), (Some(512), None));
+        assert_eq!(inter_layer_dims(LayerRole::Other, 512), (None, None));
+    }
+
+    #[test]
+    fn inter_layer_dims_zero_d_model_is_unknown() {
+        // A zero/defaulted d_model must not synthesise Some(0) widths (which
+        // would otherwise drive false classifications): report unknown.
+        assert_eq!(inter_layer_dims(LayerRole::Block, 0), (None, None));
+        assert_eq!(inter_layer_dims(LayerRole::Attention, 0), (None, None));
+    }
+
+    #[test]
+    fn build_shape_infos_for_residual_blocks_carry_d_model_and_validate_clean() {
+        let w = two_block_wengert();
+        let graph = build_graph(&w);
+        let infos = build_shape_infos(&graph, 512);
+        // Every transformer block exposes d_model on both inter-layer edges.
+        for info in infos.iter().filter(|i| i.name.starts_with("blocks.")) {
+            assert_eq!(info.input_dim, Some(512));
+            assert_eq!(info.output_dim, Some(512));
+        }
+        // The uniform residual chain satisfies §2.4 by construction.
+        assert!(crate::wggo_shape::validate(&infos).is_empty());
+    }
+
+    #[test]
+    fn shape_warnings_empty_for_uniform_residual_graph() {
+        let w = two_block_wengert();
+        let graph = build_graph(&w);
+        assert!(shape_warnings(&graph, 512).is_empty());
+    }
+
+    #[test]
+    fn run_residual_model_emits_no_shape_warnings() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(
+            !plan.warnings.iter().any(|m| m.contains("shape_incompatible")),
+            "uniform residual transformer must not trip the §2.4 shape gate: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn role_sensitivity_floor_pins_fragile_roles_high_and_blocks_low() {
+        assert!(role_sensitivity_floor(LayerRole::Embedding) >= 0.9);
+        assert!(role_sensitivity_floor(LayerRole::LmHead) >= 0.9);
+        assert!(role_sensitivity_floor(LayerRole::Other) >= 0.5);
+        assert!(role_sensitivity_floor(LayerRole::Other) < 0.9);
+        assert_eq!(role_sensitivity_floor(LayerRole::Block), 0.0);
+        assert_eq!(role_sensitivity_floor(LayerRole::Attention), 0.0);
+        assert_eq!(role_sensitivity_floor(LayerRole::Ffn), 0.0);
+    }
+
+    #[test]
+    fn run_applies_role_sensitivity_floor_to_optimizer_precision() {
+        // End-to-end: the now-precision-aware ILP must NOT advise 8-bit Adam
+        // moments for the fragile catch-all `Other` bucket (embeddings/norms/
+        // head/input land here), while the transformer blocks may use 8-bit.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        for layer in &plan.applied.layers {
+            if layer.layer_name.starts_with("blocks.") {
+                assert_eq!(
+                    layer.optim_m_bits, 8,
+                    "block {} should allow low-bit moments",
+                    layer.layer_name
+                );
+            } else {
+                assert!(
+                    layer.optim_m_bits >= 16,
+                    "fragile layer {} must keep >=16-bit moments, got {}",
+                    layer.layer_name,
+                    layer.optim_m_bits
+                );
+            }
+        }
+    }
+
+    #[test]
     fn full_mode_produces_plan_with_applied_layers() {
         let w = two_block_wengert();
         let plan = run(toy_input(&w));
@@ -975,12 +1216,13 @@ mod tests {
 
     #[test]
     fn template_stats_reuse_identical_blocks() {
-        // The two-block toy Wengert produces two layers with identical
-        // shape and constraints, so Full mode should solve once and
-        // replicate.
+        // The two-block toy Wengert produces two `blocks.N` layers (role
+        // Block) plus the catch-all `other` bucket.  The role-based sensitivity
+        // floor gives Block and Other distinct constraints, so Full mode solves
+        // two templates (Block, Other) and the second block reuses the first.
         let w = two_block_wengert();
         let plan = run(toy_input(&w));
-        assert_eq!(plan.template_stats.templates_solved, 1);
+        assert_eq!(plan.template_stats.templates_solved, 2);
         assert!(plan.template_stats.template_hits >= 1);
         let rep = plan.render_report();
         assert!(rep.contains("Templates:"));

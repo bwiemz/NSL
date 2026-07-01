@@ -408,6 +408,17 @@ pub struct CshaSavePointers {
     /// backward remains the fallback.
     pub backward_ptx_data_id: Option<cranelift_module::DataId>,
     pub backward_name_data_id: Option<cranelift_module::DataId>,
+    /// PCA Tier B planner spec §5: data-section IDs for the Tier-B-on
+    /// backward PTX + name. Mirror of
+    /// `FlashAttentionCompileContext.csha_backward_tier_b_on_{ptx,name}_id`.
+    /// `Some` iff `should_emit_tier_b_at_codegen(training_config)` produced
+    /// a Tier-B-on variant; `None` for non-`segment_masked` configs. The
+    /// `wengert_lower` backward emitter passes these to
+    /// `nsl_flash_attention_csha_backward` via `pca_tier_b::tier_b_enabled`
+    /// so the runtime launcher can pick the Tier-B-on variant when the
+    /// 4-condition gate in `should_dispatch_tier_b_at_runtime` is satisfied.
+    pub backward_tier_b_on_ptx_data_id: Option<cranelift_module::DataId>,
+    pub backward_tier_b_on_name_data_id: Option<cranelift_module::DataId>,
 }
 
 // ---------------------------------------------------------------------------

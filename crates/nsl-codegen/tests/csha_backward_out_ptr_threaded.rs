@@ -70,6 +70,8 @@ fn csha_save_pointers_carries_forward_out_value() {
         sin:     Value::from_u32(408),
         backward_ptx_data_id: None,
         backward_name_data_id: None,
+        backward_tier_b_on_ptx_data_id: None,
+        backward_tier_b_on_name_data_id: None,
     };
 
     // The `out` field MUST be addressable and round-trip the value we
@@ -107,6 +109,8 @@ fn csha_save_pointers_carries_rope_cos_and_sin_values() {
         sin:     Value::from_u32(508),
         backward_ptx_data_id: None,
         backward_name_data_id: None,
+        backward_tier_b_on_ptx_data_id: None,
+        backward_tier_b_on_name_data_id: None,
     };
 
     // Distinct sentinels prove the two slots are independent fields, not

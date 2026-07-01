@@ -74,7 +74,10 @@ pub(crate) fn frontend_with_flags(
 /// Convert WRGA decorator configs captured by nsl-semantic into the codegen-side
 /// `WrgaInputs` newtype (Task 1 of WRGA bridge). Keeps nsl-codegen free of a
 /// direct dependency on nsl-semantic.
-pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::WrgaInputs {
+pub(crate) fn module_data_to_wrga_inputs(
+    m: &crate::loader::ModuleData,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
         WrgaInputs,
@@ -88,6 +91,7 @@ pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_c
                 budget: c.block.budget,
                 target: None,
                 layers: c.block.layers.clone(),
+                custom_adapter: c.adapter_name.clone(),
             })
             .collect(),
         freeze: m
@@ -112,8 +116,9 @@ pub(crate) fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_c
                 alpha: c.alpha,
             })
             .collect(),
+        ablation: Default::default(),
     };
-    crate::commands::build::apply_wrga_target_override(&mut inputs);
+    apply_wrga_check_overrides(&mut inputs, ctx);
     inputs
 }
 
@@ -139,6 +144,32 @@ pub(crate) fn analysis_to_fused_ce_configs(
                 nsl_semantic::cftp::FusedCeDtypeHint::Bf16 => nsl_codegen::FusedCeDtypeHint::Bf16,
             }),
         })
+        .collect()
+}
+
+/// CFTP §4.3 G2 Strategy 3 (Item 4): bridge `@pca(strategy=...)` configs
+/// from `AnalysisResult` into the codegen-side `PcaUserStrategy` enum.
+/// Mirrors `analysis_to_fused_ce_configs` — keeps nsl-codegen free of a
+/// direct nsl-semantic dependency. Crosses the crate boundary via
+/// `PcaStrategy::as_str` (the wire-format the codegen-side parser
+/// understands; future strategies extend both sides in lock-step).
+pub(crate) fn analysis_to_pca_user_strategies(
+    a: &nsl_semantic::AnalysisResult,
+) -> Vec<nsl_codegen::PcaUserStrategy> {
+    a.pca_configs
+        .iter()
+        .map(|c| nsl_codegen::PcaUserStrategy::from_semantic_str(c.strategy.as_str()))
+        .collect()
+}
+
+/// Mirror of `analysis_to_pca_user_strategies` for the multi-file path
+/// that consumes `ModuleData` rather than `AnalysisResult`.
+pub(crate) fn module_data_to_pca_user_strategies(
+    m: &crate::loader::ModuleData,
+) -> Vec<nsl_codegen::PcaUserStrategy> {
+    m.pca_configs
+        .iter()
+        .map(|c| nsl_codegen::PcaUserStrategy::from_semantic_str(c.strategy.as_str()))
         .collect()
 }
 
@@ -206,7 +237,10 @@ pub(crate) fn module_data_to_checkpoint_policies(
     m.checkpoint_policies.clone()
 }
 
-pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
+pub(crate) fn analysis_to_wrga_inputs(
+    a: &nsl_semantic::AnalysisResult,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
         WrgaInputs,
@@ -220,6 +254,7 @@ pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_c
                 budget: c.block.budget,
                 target: None, // Symbol->string resolution happens at codegen if needed
                 layers: c.block.layers.clone(),
+                custom_adapter: c.adapter_name.clone(),
             })
             .collect(),
         freeze: a
@@ -244,9 +279,46 @@ pub(crate) fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_c
                 alpha: c.alpha,
             })
             .collect(),
+        ablation: Default::default(),
     };
-    crate::commands::build::apply_wrga_target_override(&mut inputs);
+    apply_wrga_check_overrides(&mut inputs, ctx);
     inputs
+}
+
+/// Apply the CLI-side `nsl check --wrga-analyze | --wrga-compare` overrides onto
+/// a freshly-built `WrgaInputs` before it ships to codegen. Both overrides are
+/// carried explicitly on [`nsl_codegen::WrgaCheckContext`] (formerly CLI
+/// thread-locals); on normal `nsl build` paths every field is `None` and this
+/// is a quick no-op.
+///
+/// 1. `target_override` (paper §8.3) — copied onto every
+///    `WrgaDecoratorConfig::target`. When the source has no `@wrga(...)` at all
+///    (only `@freeze` / `@adapter`), a minimal Auto-mode config is inserted so
+///    the target choice still reaches the codegen-side `wrga::run`.
+/// 2. `ablation_override` (paper §9.3) — copied onto `WrgaInputs::ablation` so
+///    the codegen-side WRGA driver honours the requested per-Innovation skip
+///    flags.
+fn apply_wrga_check_overrides(
+    inputs: &mut nsl_codegen::WrgaInputs,
+    ctx: &nsl_codegen::WrgaCheckContext,
+) {
+    if let Some(target) = ctx.target_override.clone() {
+        for cfg in &mut inputs.wrga {
+            cfg.target = Some(target.clone());
+        }
+        if inputs.wrga.is_empty() {
+            inputs.wrga.push(nsl_codegen::WrgaDecoratorConfig {
+                mode: nsl_ast::block::WrgaMode::Auto,
+                budget: None,
+                target: Some(target),
+                layers: Vec::new(),
+                custom_adapter: None,
+            });
+        }
+    }
+    if let Some(abl) = ctx.ablation_override {
+        inputs.ablation = abl;
+    }
 }
 
 #[cfg(test)]

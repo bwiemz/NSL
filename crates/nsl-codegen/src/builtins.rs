@@ -1048,6 +1048,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,
             types::I64, // block_q, block_kv
             types::I64, // causal (0=false, 1=true)
+            // PCA Tier B planner spec §4 — must match the runtime signature
+            // (nsl_runtime::flash_attention::nsl_flash_attention, lines 149-150).
+            // Non-CSHA path has no Tier-B-on emission, so the caller always
+            // passes the disabled sentinel (0, 0). Without these slots in the
+            // Cranelift signature, the runtime's `assert_tier_b_sentinels`
+            // entry guard reads stack garbage and may abort.
+            types::I64, // tier_b_ptx_ptr  (always 0 from non-CSHA caller)
+            types::I64, // tier_b_name_ptr (always 0 from non-CSHA caller)
         ],
         Some(types::I64),
     ),

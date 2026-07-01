@@ -811,6 +811,73 @@ impl Compiler<'_> {
             ..base_config
         };
 
+        // ── CFTP §4.3 G2 Strategy 3 (Item 4): per-doc CTA admission ─
+        // If the user wrote `@pca(strategy=per_document)` AND the
+        // train block's dataset is packed AND `pca_per_doc::admit`
+        // accepts the (detection, fa_config, packing_cfg) triplet,
+        // we route the with-saves forward and the fused backward to
+        // the per-document CTA PTX synthesisers in place of the
+        // segment-masked Tier A path. Admission failure (e.g. CSHA
+        // fused_projections=true, max_doc_len > block_q, num_docs >
+        // 256) falls through to the standard Tier A synthesis below.
+        //
+        // The `_per_doc_cta` kernel-name suffix is the ABI signal the
+        // FFI dispatcher (`nsl_flash_attention_csha_with_saves` /
+        // `nsl_flash_attention_csha_backward`) already detects to walk
+        // `doc_starts` and override `grid_x = num_docs`.
+        let per_doc_plan = if self
+            .pca_user_strategies
+            .iter()
+            .any(|s| s.is_per_document())
+            && segment_masked
+            && !training_config
+                .csha
+                .as_ref()
+                .is_some_and(|c| c.fused_projections)
+        {
+            if let Some(packing_cfg) =
+                crate::pca_activation::resolve_packing_config_for_stmts(stmts, self.interner)
+            {
+                let detection = crate::pca_detect::detect(
+                    &packing_cfg,
+                    &crate::pca_detect::PcaDetectConfig::default(),
+                    2,
+                );
+                let admit_cfg = crate::pca_per_doc::PerDocAdmitConfig {
+                    enable_per_doc_cta: true,
+                    ..crate::pca_per_doc::PerDocAdmitConfig::default()
+                };
+                match crate::pca_per_doc::admit(
+                    &detection,
+                    &training_config,
+                    &packing_cfg,
+                    &admit_cfg,
+                ) {
+                    Ok(plan) => {
+                        eprintln!(
+                            "[pca-per-doc] admitted: {}",
+                            plan.reason
+                        );
+                        Some(plan)
+                    }
+                    Err(reason) => {
+                        eprintln!(
+                            "[pca-per-doc] refused: {:?} — falling through to Tier A",
+                            reason
+                        );
+                        None
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[pca-per-doc] refused: train block's dataset packing config could not be resolved — falling through to Tier A"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
         // ── Forward with saves ─────────────────────────────
         // PCA Tier B Planner (planner spec §5): use the emission helper so the
         // call site picks up the Tier-B-on variant when the training config has
@@ -830,41 +897,77 @@ impl Compiler<'_> {
                 &training_config, &mut diags,
             );
         for d in diags { eprintln!("warning: {d}"); }
-        let fwd_emission =
-            crate::pca_tier_b::emit_tier_b_variants_for_config(&training_config);
-        let fwd_kernel_name = fwd_emission.base_kernel_name.clone();
-
-        let fwd_ptx_id = self.embed_raw_data(
-            &format!("__nsl_flash_ptx_csha_saves_{}", fwd_kernel_name),
-            fwd_emission.base_ptx,
-        )?;
-        let mut fwd_name_bytes = fwd_kernel_name.as_bytes().to_vec();
-        fwd_name_bytes.push(0);
-        let fwd_name_id = self.embed_raw_data(
-            &format!("__nsl_flash_name_csha_saves_{}", fwd_kernel_name),
-            fwd_name_bytes,
-        )?;
-
-        // Tier-B-on variant: embed only when the emission helper produced one.
-        let (fwd_tier_b_ptx_id, fwd_tier_b_name_id) = match (
-            fwd_emission.tier_b_on_ptx,
-            fwd_emission.tier_b_on_kernel_name,
-        ) {
-            (Some(on_ptx), Some(on_name)) => {
-                let on_ptx_id = self.embed_raw_data(
-                    &format!("__nsl_flash_ptx_csha_saves_{}", on_name),
-                    on_ptx,
+        // Item 4: when per-doc CTA admission succeeds, route the
+        // with-saves forward PTX to the per-document CTA emitter and
+        // SKIP Tier-B-on variant emission (per-doc is its own dispatch
+        // tier — see runtime `csha_is_per_doc_cta_kernel`). When
+        // admission fails or the user did not request `per_document`,
+        // emit the standard Tier A / Tier B-on variants below.
+        let (fwd_kernel_name, fwd_ptx_id, fwd_name_id, fwd_tier_b_ptx_id, fwd_tier_b_name_id) =
+            if let Some(plan) = per_doc_plan.as_ref() {
+                let pd_name = crate::flash_attention_v2::per_doc_cta::per_doc_cta_kernel_name(
+                    &plan.fa_config,
+                );
+                let pd_ptx_bytes =
+                    crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward(
+                        plan,
+                        &training_config,
+                    );
+                let pd_ptx_id = self.embed_raw_data(
+                    &format!("__nsl_flash_ptx_csha_saves_{}", pd_name),
+                    pd_ptx_bytes,
                 )?;
-                let mut on_name_bytes = on_name.as_bytes().to_vec();
-                on_name_bytes.push(0);
-                let on_name_id = self.embed_raw_data(
-                    &format!("__nsl_flash_name_csha_saves_{}", on_name),
-                    on_name_bytes,
+                let mut pd_name_bytes = pd_name.as_bytes().to_vec();
+                pd_name_bytes.push(0);
+                let pd_name_id = self.embed_raw_data(
+                    &format!("__nsl_flash_name_csha_saves_{}", pd_name),
+                    pd_name_bytes,
                 )?;
-                (Some(on_ptx_id), Some(on_name_id))
-            }
-            _ => (None, None),
-        };
+                (pd_name, pd_ptx_id, pd_name_id, None, None)
+            } else {
+                let fwd_emission =
+                    crate::pca_tier_b::emit_tier_b_variants_for_config(&training_config);
+                let fwd_kernel_name = fwd_emission.base_kernel_name.clone();
+
+                let fwd_ptx_id = self.embed_raw_data(
+                    &format!("__nsl_flash_ptx_csha_saves_{}", fwd_kernel_name),
+                    fwd_emission.base_ptx,
+                )?;
+                let mut fwd_name_bytes = fwd_kernel_name.as_bytes().to_vec();
+                fwd_name_bytes.push(0);
+                let fwd_name_id = self.embed_raw_data(
+                    &format!("__nsl_flash_name_csha_saves_{}", fwd_kernel_name),
+                    fwd_name_bytes,
+                )?;
+
+                // Tier-B-on variant: embed only when the emission helper produced one.
+                let (fwd_tier_b_ptx_id, fwd_tier_b_name_id) = match (
+                    fwd_emission.tier_b_on_ptx,
+                    fwd_emission.tier_b_on_kernel_name,
+                ) {
+                    (Some(on_ptx), Some(on_name)) => {
+                        let on_ptx_id = self.embed_raw_data(
+                            &format!("__nsl_flash_ptx_csha_saves_{}", on_name),
+                            on_ptx,
+                        )?;
+                        let mut on_name_bytes = on_name.as_bytes().to_vec();
+                        on_name_bytes.push(0);
+                        let on_name_id = self.embed_raw_data(
+                            &format!("__nsl_flash_name_csha_saves_{}", on_name),
+                            on_name_bytes,
+                        )?;
+                        (Some(on_ptx_id), Some(on_name_id))
+                    }
+                    _ => (None, None),
+                };
+                (
+                    fwd_kernel_name,
+                    fwd_ptx_id,
+                    fwd_name_id,
+                    fwd_tier_b_ptx_id,
+                    fwd_tier_b_name_id,
+                )
+            };
 
         // ── Fused backward ─────────────────────────────────
         // The Tier C fused-backward validator has a tighter SMEM budget
@@ -872,9 +975,16 @@ impl Compiler<'_> {
         // leave the backward IDs None — Gap C/D will detect this and
         // fall through to the legacy tape-op backward path.
         //
-        // Sprint 1 T1.4: `synthesize_backward_combined` returns a single
-        // PTX module containing BOTH the scalar v2 backward entry AND
-        // the four Tier B.2 hybrid entries (`tier_b2_d_prepass`,
+        // Item 4: when per-doc CTA admission succeeded for the forward,
+        // route the backward through `synthesize_per_doc_cta_backward`
+        // as well. The runtime detects the `_per_doc_cta` suffix on the
+        // backward name buffer and launches with `grid_x = num_docs`
+        // (see `flash_attention.rs:1543`). The Tier-B-on backward
+        // variant is skipped (per-doc is its own tier).
+        //
+        // Sprint 1 T1.4: outside the per-doc branch, `synthesize_backward_combined`
+        // returns a single PTX module containing BOTH the scalar v2 backward entry
+        // AND the four Tier B.2 hybrid entries (`tier_b2_d_prepass`,
         // `tier_b2_dq_kernel`, `tier_b2_dkdv_kernel`,
         // `tier_b2_proj_backward`) when the config is hybrid-eligible.
         // The runtime branches on `tier_b2_active` (computed at Wengert
@@ -882,6 +992,37 @@ impl Compiler<'_> {
         // launch from this one loaded module. For ineligible configs
         // the output is byte-identical to plain `synthesize_backward`.
         let (bwd_ptx_id, bwd_name_id, bwd_tier_b_ptx_id, bwd_tier_b_name_id) =
+            if let Some(plan) = per_doc_plan.as_ref() {
+                match crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_backward(
+                    plan,
+                    &training_config,
+                ) {
+                    Ok(pd_bwd_ptx) => {
+                        let pd_bwd_name =
+                            crate::flash_attention_v2::per_doc_cta::per_doc_cta_backward_kernel_name(
+                                &plan.fa_config,
+                            );
+                        let pd_bwd_ptx_id = self.embed_raw_data(
+                            &format!("__nsl_flash_ptx_csha_bwd_{}", pd_bwd_name),
+                            pd_bwd_ptx,
+                        )?;
+                        let mut pd_bwd_name_bytes = pd_bwd_name.as_bytes().to_vec();
+                        pd_bwd_name_bytes.push(0);
+                        let pd_bwd_name_id = self.embed_raw_data(
+                            &format!("__nsl_flash_name_csha_bwd_{}", pd_bwd_name),
+                            pd_bwd_name_bytes,
+                        )?;
+                        (Some(pd_bwd_ptx_id), Some(pd_bwd_name_id), None, None)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pca-per-doc] backward PTX synthesis failed — falling back to no \
+                             backward: {e}"
+                        );
+                        (None, None, None, None)
+                    }
+                }
+            } else {
             match crate::flash_attention_v2::synthesize_backward_combined(&training_config) {
                 Ok(bwd_ptx_string) => {
                     // IMPORTANT: the backward PTX's `.visible .entry` is
@@ -960,6 +1101,7 @@ impl Compiler<'_> {
                     );
                     (None, None, None, None)
                 }
+            }
             };
 
         if let Some(ctx) = self.kernels.flash_attention_context.as_mut() {

@@ -60,6 +60,7 @@ fn run_profile_pre_pass(
         checkpoint_policies: std::collections::HashMap::new(),
         paged_kv_models: std::collections::HashSet::new(),
         fused_ce_configs: Vec::new(),
+        pca_configs: Vec::new(),
     };
 
     // Task 6 + Phase 2.5 Task 4: populate source text/name so

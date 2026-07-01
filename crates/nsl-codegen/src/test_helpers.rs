@@ -115,6 +115,7 @@ pub fn run_pre_pass_only(
             checkpoint_policies: std::collections::HashMap::new(),
             paged_kv_models: std::collections::HashSet::new(),
             fused_ce_configs: Vec::new(),
+            pca_configs: Vec::new(),
         };
         // walk_ops may fail on trivial test inputs (no fn/train block).  The
         // production path is non-fatal; mirror that so the source-text

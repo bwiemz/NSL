@@ -250,28 +250,35 @@ $ nsl run examples/m14_sgd_basic.nsl
 2.8855583667755127     # epoch 5
 ```
 
-Validation commands live in `.github/workflows/ci.yml`. They fall into two
-tiers — please read results against the tier they belong to:
+Validation is defined by `.github/workflows/ci.yml`; that workflow is the
+source of truth. Read local results against the tier a command belongs to.
 
-**Stable / supported (must stay green; gated by CI):**
+**CI merge gates (must be green to merge — blocking on Linux + Windows):**
 
-- `cargo build --workspace` ✅
-- `cargo clippy --workspace -- -D warnings` ✅
+- `cargo build --workspace`
+- `cargo test --workspace -- --skip e2e_`
+- `cargo clippy --workspace -- -D warnings`
+- `cargo test -p nsl-cli --test e2e -- --test-threads=1` (CLI smoke/e2e)
+- the ONNX Runtime integration job (`test-onnx-rt`) and the FPGA
+  Verilator/Yosys job (`fpga`)
 
-**Research / environment-dependent (informational; not a merge blocker):**
+Locally, the test and e2e steps can surface *environment-specific* failures
+(missing C linker, OpenSSL, or CUDA) that do not occur on CI's pinned
+toolchain — that is a local-environment gap, not a relaxation of the gate.
 
-- `cargo test --workspace -- --skip e2e_` ⚠️ may fail on individual
-  experimental-subsystem tests depending on the checkout/environment (e.g.
-  `crates/nsl-cli/tests/cpdt_cli.rs::bare_cpdt_report_enables_full_mode`).
-- `cargo test -p nsl-cli --test e2e -- --test-threads=1` ⚠️ the CLI smoke/e2e
-  suite needs a full toolchain (C linker, optional OpenSSL/CUDA) and reports
-  environment-specific failures (e.g. OpenSSL linker errors) where those are
-  unavailable.
+**Non-blocking (informational):**
 
-The experimental subsystems (`experimental::*` in `nsl-codegen` /
-`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, ZK, FPGA, …) are exercised by
-research tests that are not part of the stable green-build contract. See each
-crate's `ARCHITECTURE.md` for the stable-vs-experimental boundary.
+- the macOS matrix and its e2e step (`continue-on-error`),
+- the WGGO merge-gate preview job,
+- `#[ignore]`'d research tests and real-CUDA-device tests (CI runners have no GPU).
+
+The **compatibility contract** — what is promised not to break across
+versions — is narrower than the CI gate: it is the **Stable** tier in
+[`STATUS.md`](STATUS.md) (frontend, semantic analysis, CPU codegen/runtime,
+fusion, DataLoader, core CLI). Beta and Experimental subsystems (`experimental::*`
+in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, ZK, FPGA, …) are
+exercised by CI but may change shape between releases. See each crate's
+`ARCHITECTURE.md` for the stable-vs-experimental module boundary.
 
 ### Recommended Training Config (RTX 5070 Ti, 16GB VRAM)
 

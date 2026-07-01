@@ -127,6 +127,58 @@ fn wrga_analyze_with_path_writes_to_file() {
     assert!(contents.contains("Frozen parameters"));
 }
 
+/// WRGA paper §8.2 — `@wrga(adapter=<UserModel>)` must survive end-to-end
+/// from source through the semantic checker, the codegen WrgaInputs bridge,
+/// the WrgaInput→WrgaPlan plumbing, and finally render in the report's
+/// header.  Pins the cross-crate bridge layer that the in-crate unit tests
+/// don't exercise.  The trailing `(placement integration pending)` marker is
+/// load-bearing — review finding #3 was that without it the line was
+/// misleading.
+#[test]
+fn wrga_analyze_surfaces_custom_adapter_name_end_to_end() {
+    const SRC_CUSTOM_ADAPTER: &str = r#"from nsl.nn.losses import mse_loss
+
+model GatedLoRA:
+    a: Tensor = zeros([2, 1])
+    b: Tensor = zeros([1, 2])
+    gate: Tensor = ones([2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return self.gate * (x @ self.a @ self.b)
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@wrga(mode=auto, adapter=GatedLoRA, target=h100)
+@freeze(include=["m.w"])
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+"#;
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    fs::write(&src_path, SRC_CUSTOM_ADAPTER).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .arg("check")
+        .arg(&src_path)
+        .arg("--wrga-analyze");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Custom adapter: GatedLoRA"))
+        .stdout(predicate::str::contains("(placement integration pending)"));
+}
+
 /// `--wrga-target` overrides the WRGA target GPU; the report must reflect it.
 #[test]
 fn wrga_analyze_with_target_overrides_gpu_in_report() {

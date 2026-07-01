@@ -230,6 +230,80 @@ fn forward_rotation_sites_skip_effective_pos_when_disabled() {
 }
 
 // ---------------------------------------------------------------------------
+// Non-CSHA inline q_load.rs path — when csha is None (or fused_projections is
+// false), the inline RoPE applies via emit_rope_rotation_inline in q_load.rs.
+// PCA §4.3 site 1 reroutes cos/sin row through effective_pos_q just like the
+// CSHA fused path does (csha_hooks.rs). Sentinel paths stay byte-stable.
+// ---------------------------------------------------------------------------
+
+fn config_segment_masked_with_rope_no_csha() -> FlashAttentionConfig {
+    FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::Adjacent,
+        gqa_group_size: 1,
+        tree_mask: false,
+        num_sink_tokens: 0,
+        gpu_sm: 75,
+        segment_masked: true,
+        checkpoint: None,
+        csha: None,
+    }
+}
+
+#[test]
+fn inline_q_load_computes_effective_pos_when_reset_active_and_csha_off() {
+    let cfg = config_segment_masked_with_rope_no_csha();
+    let ptx = ptx_string(&cfg);
+    assert!(
+        ptx.contains("// PCA sec.4.3 site 1: forward Q effective_pos"),
+        "Inline q_load path must emit the site 1 marker when segment_masked && rope_q && csha=None"
+    );
+    assert!(
+        ptx.contains("sub.s32 %r_effective_pos_q"),
+        "Inline q_load path must compute effective_pos_q via sub.s32"
+    );
+    assert!(
+        ptx.contains("mul.lo.u64 %rd27, %rd27, "),
+        "Inline q_load path must reroute the cos/sin row through %rd27 (effective_pos*head_dim)"
+    );
+}
+
+#[test]
+fn inline_q_load_skips_effective_pos_when_segment_masked_off() {
+    let mut cfg = config_segment_masked_with_rope_no_csha();
+    cfg.segment_masked = false;
+    let ptx = ptx_string(&cfg);
+    assert!(
+        !ptx.contains("// PCA sec.4.3 site 1: forward Q effective_pos"),
+        "Inline q_load path must NOT emit the site 1 marker when segment_masked=false"
+    );
+    assert!(
+        !ptx.contains("%r_effective_pos_q"),
+        "Inline q_load path must NOT reference effective_pos_q when segment_masked=false"
+    );
+}
+
+#[test]
+fn inline_q_load_ptx_assembles_on_sm75_and_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("ptxas not found — skipping");
+        return;
+    };
+    let cfg = config_segment_masked_with_rope_no_csha();
+    let ptx = synthesize_flash_attention_ptx_v2(&cfg);
+    for sm in ["sm_75", "sm_120"] {
+        if let Err(stderr) = assemble_ptx(&ptxas, &ptx, sm) {
+            panic!("ptxas rejected inline q_load PTX for {sm}:\n{stderr}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T9 — backward dQ + dK de-rotation sites consume the doc_starts SMEM table.
 //
 // Inverse-rotation math:
