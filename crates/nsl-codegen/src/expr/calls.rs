@@ -1254,6 +1254,57 @@ impl Compiler<'_> {
                 // nsl_ring_attention(cp_ctx, q_part, k, v, scale, causal,
                 //                    null, null, null, null, null, null, null)
                 // Trailing nulls are reserved for future paged/GQA extensions.
+                //
+                // CPDT Part III v2.21 — bit-cast scale to `scale_bits: i64`
+                // using the same polymorphic pattern as `wengert_lower.rs:355-388`
+                // (F64→fdemote→F32→bitcast→I32→uextend→I64). Pre-v2.21 the
+                // codegen passed `scale_val` (F64 for the `0.125` literal)
+                // directly into the I64-declared FFI slot and the Cranelift
+                // verifier rejected the type mismatch. This closes v2.20
+                // deferral bug #1 (Cranelift type rejection); the runtime
+                // FFI signature is uniformly i64 for all 13 slots so the
+                // scale value now type-checks. Bugs #2 (codegen/FFI
+                // positional misalignment) and #3 (runtime impl stub)
+                // remain — see the v2.21 test docstring for the
+                // narrower-scope v2.next deferral.
+                let scale_ty = builder.func.dfg.value_type(scale_val);
+                let scale_bits_i64 = if scale_ty == cl_types::F64 {
+                    let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_val);
+                    let scale_bits_i32 = builder.ins().bitcast(
+                        cl_types::I32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        scale_f32,
+                    );
+                    builder.ins().uextend(cl_types::I64, scale_bits_i32)
+                } else if scale_ty == cl_types::F32 {
+                    let scale_bits_i32 = builder.ins().bitcast(
+                        cl_types::I32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        scale_val,
+                    );
+                    builder.ins().uextend(cl_types::I64, scale_bits_i32)
+                } else {
+                    // Integer/pointer case: `scale_val` is an NslTensor
+                    // handle (rank-0 tensor for expressions like
+                    // `1.0/sqrt(head_dim)`). Extract the scalar via
+                    // `nsl_tensor_item` (F64), then narrow to F32 bits.
+                    // Same recovery path as `wengert_lower.rs:382-389`
+                    // — see that comment for the "%scale silently
+                    // reading pointer-lower-32-bits" gotcha the naïve
+                    // path warned about.
+                    let scale_f64 = self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_item",
+                        &[scale_val],
+                    )?;
+                    let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
+                    let scale_bits_i32 = builder.ins().bitcast(
+                        cl_types::I32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        scale_f32,
+                    );
+                    builder.ins().uextend(cl_types::I64, scale_bits_i32)
+                };
                 let causal_flag = builder
                     .ins()
                     .iconst(cl_types::I64, if causal { 1 } else { 0 });
@@ -1266,7 +1317,7 @@ impl Compiler<'_> {
                         q_part,
                         k_val,
                         v_val,
-                        scale_val,
+                        scale_bits_i64,
                         causal_flag,
                         null,
                         null,
