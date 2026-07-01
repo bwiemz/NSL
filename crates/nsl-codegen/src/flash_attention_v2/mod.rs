@@ -340,21 +340,23 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // values that the Tier C save path will read below.
             phases::q_load::emit(&mut ptx, config, q_iter);
 
-            // Tier C: save post-RoPE Q/K activations for backward (gated on flag).
-            // Split QK vs V: Q lives in q_offset and is stable after q_load; K
-            // lives at kv_offset but V aliases the same slot, so K must be
-            // saved immediately after its HBM load and BEFORE v_tile_load
-            // overwrites the slot.  SaveSet::V runs after v_tile_load below.
-            phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
-            );
-
             // K/V-tile loop.
             ptx.push_str("    mov.u64 %k_start, 0;\n");
             ptx.push_str("    mov.u64 %k_max, %rd6;                        // seq_len\n");
             ptx.push_str(&format!("V2_LOOP_KV_START_{}:\n", q_iter));
 
             emit_k_tile_load(&mut ptx, config, q_iter);
+            // Cycle 20 T3 BUG A FIX: Tier C QK save moved to AFTER
+            // emit_k_tile_load. Previously the save ran BEFORE the K tile
+            // load, reading uninitialised SMEM at %k_smem_base. Q is
+            // loop-invariant (post-RoPE Q in q_offset is stable across KV
+            // iterations), so re-emitting the save per KV iter is a wasted
+            // HBM write but correctness-safe (same Q values). K SMEM is
+            // now populated when the save reads it. SaveSet::V still runs
+            // after v_tile_load below.
+            phases::csha_hooks::emit_save_activations_subset(
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
+            );
             phases::s_compute::emit(&mut ptx, config, q_iter, tier_b);
             phases::softmax::emit(&mut ptx, config, q_iter);
             // Tier C: persist row_max/row_sum to HBM IMMEDIATELY after
@@ -371,17 +373,88 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // the previous post-loop placement for correctness.
             phases::csha_hooks::emit_save_softmax_state(&mut ptx, config, q_iter);
             emit_v_tile_load(&mut ptx, config, q_iter);
-            // Tier C: save V from v_smem (which aliases K after v_tile_load).
-            // NOTE: under the non-fused path the save addressing uses
-            // `q_start+warp_row` which is Q-indexed; under the standard KV
-            // loop this matches the K/V tile layout only at k_start=0.
-            // Backward numerical correctness for non-fused path is NOT the
-            // goal of this edit — the goal is to ensure the forward PTX
-            // assembles and launch rc=0 so structural gradients flow; a
-            // proper addressing rewrite is tracked as a separate follow-up.
-            phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::V,
-            );
+            // Cycle 20 T3 BUG B FIX: inline V-save with K/V-indexed row
+            // addressing (uses %k_start, not %q_start). Previously called
+            // emit_save_activations_subset(SaveSet::V) which hard-codes
+            // %q_start+warp_row row indexing — correct only at k_start=0.
+            // This inline version covers all block_kv rows per KV-loop
+            // iteration by looping (block_kv/4) rows per warp, and writes
+            // to HBM row = k_start + warp_id + row_step*4. See BUG B in
+            // 2026-07-01 T3 report.
+            if config
+                .csha
+                .as_ref()
+                .is_some_and(|c| c.save_activations_for_backward)
+            {
+                let head_dim = config.head_dim as u32;
+                let slices_per_lane = (head_dim / 32).max(1);
+                let kv_off = smem_layout::kv_offset(config);
+                let rows_per_warp = ((config.block_kv as u32) / 4).max(1);
+                ptx.push_str("    // -- Cycle 20 T3: inline V-save (k_start-indexed) --\n");
+                // Init v_smem_base (non-fused: V aliases K at kv_offset).
+                ptx.push_str(&format!(
+                    "    add.u64 %v_smem_base, %shmem_base, {}; // T3: V tile at kv_offset\n",
+                    kv_off
+                ));
+                ptx.push_str("    bar.sync 0;  // T3 FENCE: V SMEM tile complete\n");
+                ptx.push_str("    ld.param.u64 %rd_save_base, [v_proj_ptr];\n");
+                ptx.push_str("    setp.eq.u64 %p_save_null, %rd_save_base, 0;\n");
+                ptx.push_str(&format!(
+                    "    @%p_save_null bra V2_CSHA_SAVE_V_T3_SKIP_{};\n",
+                    q_iter
+                ));
+                // batch*heads*seq_len base contribution (row-independent).
+                ptx.push_str("    mul.lo.u64 %rd_save_bh, %batch_idx, %rd5;\n");
+                ptx.push_str("    add.u64 %rd_save_bh, %rd_save_bh, %head_idx;\n");
+                ptx.push_str("    mul.lo.u64 %rd_save_bh, %rd_save_bh, %rd6;\n");
+                for row_step in 0..rows_per_warp {
+                    // kv_row = warp_id + row_step*4 (row within block_kv tile)
+                    ptx.push_str(&format!(
+                        "    add.u32 %r_save_wrow, %warp_id, {}; // T3 kv_row (step {})\n",
+                        row_step * 4,
+                        row_step
+                    ));
+                    ptx.push_str("    cvt.u64.u32 %rd_save_wrow, %r_save_wrow;\n");
+                    // HBM row = k_start + kv_row  (T3 BUG B FIX: was q_start)
+                    ptx.push_str("    add.u64 %rd_save_off, %rd_save_bh, %k_start;\n");
+                    ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %rd_save_wrow;\n");
+                    ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd7;\n");
+                    for slice in 0..slices_per_lane {
+                        ptx.push_str("    cvt.u64.u32 %rd_save_col, %lane;\n");
+                        if slices_per_lane > 1 {
+                            ptx.push_str(&format!(
+                                "    mul.lo.u64 %rd_save_col, %rd_save_col, {};\n",
+                                slices_per_lane
+                            ));
+                        }
+                        if slice > 0 {
+                            ptx.push_str(&format!(
+                                "    add.u64 %rd_save_col, %rd_save_col, {};\n",
+                                slice
+                            ));
+                        }
+                        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_off, %rd_save_col;\n");
+                        ptx.push_str("    shl.b64 %rd_save_elem, %rd_save_elem, 1;\n");
+                        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_elem;\n");
+                        ptx.push_str(&format!(
+                            "    mul.lo.u64 %rd_save_smem, %rd_save_wrow, {};\n",
+                            head_dim * 2
+                        ));
+                        ptx.push_str(
+                            "    add.u64 %rd_save_smem, %v_smem_base, %rd_save_smem;\n",
+                        );
+                        ptx.push_str("    shl.b64 %rd_save_colb, %rd_save_col, 1;\n");
+                        ptx.push_str(
+                            "    add.u64 %rd_save_smem, %rd_save_smem, %rd_save_colb;\n",
+                        );
+                        ptx.push_str("    ld.shared.b16 %h_save_v, [%rd_save_smem];\n");
+                        ptx.push_str("    st.global.b16 [%rd_save_elem], %h_save_v;\n");
+                    }
+                }
+                ptx.push_str(&format!("V2_CSHA_SAVE_V_T3_SKIP_{}:\n", q_iter));
+            } else {
+                ptx.push_str("    // CSHA Tier C V-save: save_activations=false, no emission\n");
+            }
             phases::pv_accum::emit(&mut ptx, config, q_iter);
 
             // PCA Tier B: KV_TILE_SKIP_TB_{q_iter} label emitted ONLY when
