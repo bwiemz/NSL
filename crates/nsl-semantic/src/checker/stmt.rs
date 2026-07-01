@@ -337,16 +337,27 @@ impl<'a> TypeChecker<'a> {
                             );
                         }
 
-                        // CFIE: @cfie decorator validation
+                        // CFIE: @cfie decorator validation.  Only serve
+                        // blocks consume it (codegen gates on ServeBlock
+                        // too) — anywhere else it would be a silent no-op.
                         if dname == "cfie" {
-                            let resolve = |s: nsl_ast::Symbol| -> String {
-                                self.interner.resolve(s.0).unwrap_or("").to_string()
-                            };
-                            crate::cfie::validate_cfie_decorator(
-                                deco,
-                                &resolve,
-                                &mut self.diagnostics,
-                            );
+                            if matches!(stmt.kind, StmtKind::ServeBlock(_)) {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
+                                };
+                                crate::cfie::validate_cfie_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
+                            } else {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@cfie can only be applied to serve blocks".to_string(),
+                                    )
+                                    .with_label(deco.span, "invalid @cfie target"),
+                                );
+                            }
                         }
 
                         // CPDT: @cpdt decorator validation. Phase 1 requires

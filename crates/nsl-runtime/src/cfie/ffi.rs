@@ -112,8 +112,9 @@ pub unsafe extern "C" fn nsl_cfie_ring_pop(
     }
 }
 
-/// Current in-flight request count — diagnostic hook exposed for the
-/// `nsl check --cfie-status` CLI.
+/// Current in-flight request count — diagnostic hook for host-side
+/// monitoring and tests.  (CLI surface today: `nsl build --cfie` /
+/// `--cfie-report`; a live-status subcommand is future work.)
 #[no_mangle]
 pub extern "C" fn nsl_cfie_ring_len() -> i64 {
     match global().lock() {

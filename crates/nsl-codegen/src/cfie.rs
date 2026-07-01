@@ -2,8 +2,11 @@
 //!
 //! Composes the six CFIE passes (KV plan, fused sample, speculative,
 //! persistent decode + scheduler, KV quant, grammar) into a single
-//! [`CfiePlan`] the backend consumes.  Produces a human-readable
-//! report matching paper §8's sample output.
+//! [`CfiePlan`].  Invoked from `serve.rs::run_cfie_for_serve` (Tier-A
+//! wiring) with inputs assembled by `cfie_serve.rs`.  Today the plan
+//! drives the build report and the request-ring init call; kernel-side
+//! consumers land with audit gaps G7/G9/G11/G13/G16/G18.  Produces a
+//! human-readable report matching paper §8's sample output.
 
 use serde::Serialize;
 

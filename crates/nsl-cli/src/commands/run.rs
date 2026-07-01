@@ -274,6 +274,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 pca_user_strategies: Vec::new(),
                 wrga_fold_allocations: false,
                 wggo: nsl_codegen::WggoOptions::default(),
+                cfie: nsl_codegen::CfieOptions::default(),
                 // Phase 4 Task 6: when a train block is detected with --monitor,
                 // the health monitor takes over; disable the Phase 1/2 kernel
                 // timing path so they don't stomp on each other.

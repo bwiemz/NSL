@@ -143,7 +143,8 @@ impl Compiler<'_> {
                         max_batch = *v;
                     }
                 }
-                "max_seq_len" => {
+                // CFIE: the paper spells this key `max_seq`; accept both.
+                "max_seq_len" | "max_seq" => {
                     if let nsl_ast::expr::ExprKind::IntLiteral(v) = &entry.value.kind {
                         max_seq_len = *v;
                     }
@@ -173,6 +174,10 @@ impl Compiler<'_> {
                         kv_transfer_backend = s.clone();
                     }
                 }
+                // CFIE config keys: consumed by `run_cfie_for_serve`
+                // below — not runtime expressions.
+                "kv_layout" | "kv_quant" | "target_gpu" | "n_layers" | "n_kv_heads"
+                | "kv_heads" | "n_heads" | "head_dim" | "d_model" | "d_ff" | "vocab_size" => {}
                 _ => {
                     self.compile_expr(builder, state, &entry.value)?;
                 }
@@ -186,6 +191,14 @@ impl Compiler<'_> {
         if self.features.decode_workers > 1 {
             decode_workers = self.features.decode_workers as i64;
         }
+
+        // ── CFIE Tier-A wiring (audit gap G1) ────────────────────────
+        // Extract CFIE config from the serve block, resolve the mode
+        // (CLI --cfie > @cfie decorator > implicit via CFIE keys), run
+        // the orchestrator, and surface the build report.  The plan
+        // drives the report + the request-ring init call today; kernel-
+        // side consumption lands with audit gaps G7/G9/G16.
+        let cfie_ring_capacity = self.run_cfie_for_serve(serve)?;
 
         let is_disaggregated = prefill_workers > 1 || decode_workers > 1;
 
@@ -215,6 +228,16 @@ impl Compiler<'_> {
                 &[v_max_batch, v_max_seq_len, v_kv_blocks, v_prefill_chunk],
             )?;
 
+            // CFIE: size the continuous-batching request ring from the
+            // compile-time scheduler plan (audit gap G5 — the runtime
+            // FFI is now reachable from emitted code).  Monolithic
+            // path only; the disaggregated workers keep their M41
+            // queueing until the persistent decode kernel lands (G16).
+            if let Some(capacity) = cfie_ring_capacity {
+                let v_capacity = builder.ins().iconst(cl_types::I64, capacity);
+                self.compile_call_by_name(builder, "nsl_cfie_ring_init", &[v_capacity])?;
+            }
+
             for endpoint in &serve.endpoints {
                 for stmt in &endpoint.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
@@ -230,6 +253,87 @@ impl Compiler<'_> {
         }
 
         Ok(())
+    }
+
+    /// CFIE Tier-A wiring: extract serve-block CFIE config, resolve the
+    /// mode, run the six-pass orchestrator against real inputs (GPU
+    /// database + `--weights` WeightMap + serve config keys), print the
+    /// build report, and stash the plan on `self.last_cfie_plan`.
+    ///
+    /// Returns the request-ring capacity the compiled binary must pass
+    /// to `nsl_cfie_ring_init`, or `None` when CFIE is not active.
+    fn run_cfie_for_serve(&mut self, serve: &ServeBlock) -> Result<Option<i64>, CodegenError> {
+        let interner = self.interner;
+        let resolve = |sym: nsl_ast::Symbol| -> String {
+            interner.resolve(sym.0).unwrap_or("").to_string()
+        };
+        let cfg = crate::cfie_serve::extract(serve, &resolve);
+
+        let decorator_mode = self.cfie_decorator_mode.take();
+        let decorator_target = self.cfie_decorator_target.take();
+
+        let Some(mode) = crate::cfie_serve::resolve_mode(
+            self.compile_options.cfie.mode_override.as_deref(),
+            decorator_mode,
+            &cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        if mode == crate::cfie::CfieMode::Off {
+            // Explicit opt-out: leave the M29/M41 dynamic path untouched.
+            return Ok(None);
+        }
+
+        // GPU resolution: serve config key > @cfie(target=...) > CLI
+        // default.  An unknown GPU is a hard error — planning against a
+        // guessed budget is exactly what the CFIE audit flagged.
+        let gpu_name = cfg
+            .target_gpu
+            .clone()
+            .or(decorator_target)
+            .unwrap_or_else(|| self.compile_options.target_gpu.clone());
+        let gpu = crate::gpu_specs::find_gpu(&gpu_name).ok_or_else(|| {
+            CodegenError::new(format!(
+                "CFIE: unknown target GPU '{gpu_name}'; known GPUs: {}",
+                crate::gpu_specs::GPU_DATABASE
+                    .iter()
+                    .map(|g| g.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+        let weights = self.features.weight_map.as_ref();
+        let prepared = crate::cfie_serve::prepare(&cfg, mode, gpu, weights)?;
+        let plan = crate::cfie::run(prepared.input);
+
+        // Build report: the paper's visible artifact (§8).  Provenance +
+        // wiring status keep it honest about what this build actually
+        // bakes into the binary.
+        let mut report = plan.render_report();
+        report.push_str(&format!(
+            "Model-shape provenance: {}\n",
+            prepared.shape.provenance
+        ));
+        report.push_str(
+            "Kernel wiring: plan + request-ring init in this build; \
+             kernel-side consumption tracked by CFIE audit gaps \
+             G7/G9/G11/G13/G16/G18.\n",
+        );
+        eprint!("{report}");
+        if let Some(path) = self.compile_options.cfie.report_path.clone() {
+            if let Err(e) = std::fs::write(&path, &report) {
+                eprintln!(
+                    "warning: --cfie-report: failed to write {}: {e}",
+                    path.display()
+                );
+            }
+        }
+
+        let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
+        self.last_cfie_plan = Some(plan);
+        Ok(Some(capacity))
     }
 
     /// M41: Compile a disaggregated serve block.

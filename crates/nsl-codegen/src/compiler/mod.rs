@@ -29,7 +29,8 @@ use crate::error::CodegenError;
 // Re-export the free functions for `pub use compiler::{...}` in lib.rs
 pub use entry_points::{
     compile, compile_entry, compile_module, compile_module_with_imports,
-    compile_module_with_imports_best_effort_plan, compile_module_with_imports_returning_plan,
+    compile_module_with_imports_best_effort_plan, compile_module_with_imports_best_effort_plans,
+    compile_module_with_imports_returning_plan,
     compile_entry_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_zk_info,
@@ -550,6 +551,19 @@ pub struct Compiler<'a> {
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 
+    // ── CFIE side-channel (Tier-A wiring) ────────────────────────────
+    /// `@cfie(mode=..., target=...)` decorator values captured in the
+    /// `Decorated` stmt arm before the inner serve block compiles.
+    /// Consumed (taken) by `compile_serve_block`.
+    pub cfie_decorator_mode: Option<crate::cfie::CfieMode>,
+    /// `@cfie(target=h100)` GPU-name override, same lifecycle as
+    /// `cfie_decorator_mode`.
+    pub cfie_decorator_target: Option<String>,
+    /// The most recent `CfiePlan` produced while compiling a serve
+    /// block, kept for observability (build report / future `nsl
+    /// check` surface).  `None` when no serve block opted into CFIE.
+    pub last_cfie_plan: Option<crate::cfie::CfiePlan>,
+
     // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
     /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
     /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
@@ -842,6 +856,9 @@ impl<'a> Compiler<'a> {
             fused_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            cfie_decorator_mode: None,
+            cfie_decorator_target: None,
+            last_cfie_plan: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
