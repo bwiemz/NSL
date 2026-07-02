@@ -13,6 +13,7 @@
 //! finish before the kernel exits.
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::phases::backward::probe::maybe_emit_dv_probe_store;
 
 pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
@@ -192,6 +193,19 @@ pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
             ));
             ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
             ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
+
+            // CSHA cycle 20 T2 — dV_final probe (slot 3). Samples the SMEM
+            // cell AFTER all q-block FMAs have landed, on the k=0 unroll
+            // (one representative cell). The helper's runtime gate ensures
+            // only (batch=0, head=0, warp_id=1, lane=0) with tid_x==0
+            // reaches the store; combined with k==0, exactly one thread
+            // per CTA emits. Cross-check against slot 4 (register-FMA
+            // reconstruction from dv_accum) bisects hypothesis (iii)
+            // inter-phase SMEM corruption vs (iv) accumulator-write bug.
+            if k == 0 {
+                maybe_emit_dv_probe_store(ptx, config, 3, "%f_dk_tmp", q_tile_iter);
+            }
+
             // HBM f32 scratch RMW: load, add, store — all in f32.
             ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;\n");
             ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
