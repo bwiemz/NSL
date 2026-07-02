@@ -1439,6 +1439,125 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64], // base, bytes
         Some(types::I64),
     ),
+    // --- CFIE Cycle 6: compiled-engine registration/lifecycle + launch
+    // FFIs (frozen ABI).  All params/returns i64; f32 kernel params are
+    // passed as f32::to_bits in the LOW 32 bits.  Kernel kinds:
+    // 0=decode_attn, 1=fused_sample, 2=decode_block, 3=spec_verify,
+    // 4=spec_reject, 5=quant_attn (layer_idx meaningful only for 5). ---
+    (
+        "nsl_cfie_register_kernel",
+        &[
+            types::I64, // kind
+            types::I64, // layer_idx
+            types::I64, // ptx_ptr
+            types::I64, // ptx_len (excludes NUL)
+            types::I64, // name_ptr
+            types::I64, // name_len (excludes NUL)
+            types::I64, // grid_x
+            types::I64, // block_x
+            types::I64, // smem_dyn_bytes
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_kv_pool_alloc", &[types::I64], Some(types::I64)), // bytes
+    ("nsl_cfie_engine_finalize", &[], Some(types::I64)),
+    ("nsl_cfie_engine_destroy", &[], Some(types::I64)),
+    (
+        "nsl_cfie_launch_decode_attn",
+        &[
+            types::I64, // q_ptr
+            types::I64, // out_ptr
+            types::I64, // layer_idx
+            types::I64, // slot_idx
+            types::I64, // seq_len
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_fused_sample",
+        &[
+            types::I64, // hidden_ptr
+            types::I64, // norm_w_ptr
+            types::I64, // lm_head_ptr
+            types::I64, // out_token_ptr
+            types::I64, // rng_seed
+            types::I64, // grammar_state
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_decode_block",
+        &[
+            types::I64, // x_in
+            types::I64, // x_out
+            types::I64, // wq
+            types::I64, // wk
+            types::I64, // wv
+            types::I64, // wo
+            types::I64, // w_gate
+            types::I64, // w_up
+            types::I64, // w_down
+            types::I64, // norm1_w
+            types::I64, // norm2_w
+            types::I64, // layer_idx
+            types::I64, // slot_idx
+            types::I64, // pos
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_spec_verify",
+        &[
+            types::I64, // q_ptr
+            types::I64, // out_ptr
+            types::I64, // layer_idx
+            types::I64, // slot_idx
+            types::I64, // seq_len
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_spec_reject",
+        &[
+            types::I64, // target_probs_ptr
+            types::I64, // draft_probs_ptr
+            types::I64, // draft_tokens_ptr
+            types::I64, // rng_seed
+            types::I64, // out_accepted_ptr
+            types::I64, // out_correction_token_ptr
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_quant_attn",
+        &[
+            types::I64, // layer_idx (selects the (5, layer) registration)
+            types::I64, // q_ptr
+            types::I64, // out_ptr
+            types::I64, // slot_idx
+            types::I64, // seq_len
+            types::I64, // k_scale_bits (f32 bits, low 32)
+            types::I64, // v_scale_bits (f32 bits, low 32)
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_decode_step",
+        &[
+            types::I64, // x_buf_a
+            types::I64, // x_buf_b
+            types::I64, // layer_weights_ptr (host array: n_layers x 9 device ptrs)
+            types::I64, // n_layers
+            types::I64, // norm_w_ptr (final-norm gamma)
+            types::I64, // lm_head_ptr
+            types::I64, // slot_idx
+            types::I64, // pos
+            types::I64, // rng_seed
+            types::I64, // grammar_state
+            types::I64, // out_token_ptr (device u32)
+        ],
+        Some(types::I64),
+    ),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",
@@ -2398,5 +2517,43 @@ mod tests {
                 entry.2
             );
         }
+    }
+
+    /// CFIE Cycle 6: the engine registration/lifecycle + launch FFIs
+    /// are declared with the frozen ABI's arities — all-i64 params,
+    /// i64 return — so `declare_runtime_functions` picks them up and
+    /// the serve emission can `compile_call_by_name` them.
+    #[test]
+    fn cfie_cycle6_engine_ffis_have_frozen_abi_signatures() {
+        use cranelift_codegen::ir::types;
+        let arity = |name: &str| -> usize {
+            let entry = RUNTIME_FUNCTIONS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} missing from RUNTIME_FUNCTIONS"));
+            assert!(
+                entry.1.iter().all(|&t| t == types::I64),
+                "{name}: every param must be I64 (frozen ABI), got {:?}",
+                entry.1
+            );
+            assert_eq!(
+                entry.2,
+                Some(types::I64),
+                "{name}: must return I64, got {:?}",
+                entry.2
+            );
+            entry.1.len()
+        };
+        assert_eq!(arity("nsl_cfie_register_kernel"), 9);
+        assert_eq!(arity("nsl_cfie_kv_pool_alloc"), 1);
+        assert_eq!(arity("nsl_cfie_engine_finalize"), 0);
+        assert_eq!(arity("nsl_cfie_engine_destroy"), 0);
+        assert_eq!(arity("nsl_cfie_launch_decode_attn"), 5);
+        assert_eq!(arity("nsl_cfie_launch_fused_sample"), 6);
+        assert_eq!(arity("nsl_cfie_launch_decode_block"), 14);
+        assert_eq!(arity("nsl_cfie_launch_spec_verify"), 5);
+        assert_eq!(arity("nsl_cfie_launch_spec_reject"), 6);
+        assert_eq!(arity("nsl_cfie_launch_quant_attn"), 7);
+        assert_eq!(arity("nsl_cfie_decode_step"), 11);
     }
 }

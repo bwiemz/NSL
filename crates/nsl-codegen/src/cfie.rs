@@ -46,6 +46,143 @@ impl CfieMode {
     }
 }
 
+/// Host launch geometry for one emitted CFIE kernel — the values the
+/// compiled serve binary passes to `nsl_cfie_register_kernel` at init
+/// (Cycle 6 frozen ABI).  1-D launches only: every current CFIE kernel
+/// is `grid=(grid_x,1,1) block=(block_x,1,1)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CfieLaunchSpec {
+    pub grid_x: u32,
+    pub block_x: u32,
+    /// DYNAMIC shared-memory bytes for the launch.  0 for every current
+    /// CFIE kernel — they all declare static `.shared` inside the
+    /// module — the field exists for future extern-`.shared` kernels.
+    pub smem_dyn_bytes: u32,
+}
+
+/// Which kernel family a build registers with the runtime engine.
+/// Exactly ONE family registers per build: the quant family bakes the
+/// mixed-precision pool layout from `cfie_kv_quant_ptx::pool_layout`,
+/// which is incompatible with the uniform-f16 pool the decode-attn /
+/// decode-block / spec kernels bake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfieKernelFamily {
+    /// decode_attn / decode_block / spec kernels (uniform f16 KV pool)
+    /// plus the fused sampler.
+    Uniform,
+    /// per-layer KV-quant attention kernels (mixed-precision KV pool)
+    /// plus the fused sampler.
+    Quant,
+}
+
+impl CfieKernelFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CfieKernelFamily::Uniform => "uniform",
+            CfieKernelFamily::Quant => "quant",
+        }
+    }
+}
+
+/// Compile-time family chooser (pure): quant wins whenever the
+/// per-layer quant kernels were emitted, because their pool layout is
+/// mutually exclusive with the uniform pool (see [`CfieKernelFamily`]).
+pub fn choose_kernel_family(plan: &CfiePlan) -> CfieKernelFamily {
+    if plan.quant_attention_kernels.is_empty() {
+        CfieKernelFamily::Uniform
+    } else {
+        CfieKernelFamily::Quant
+    }
+}
+
+/// One `nsl_cfie_register_kernel` call the compiled serve binary makes
+/// at init.  Kinds per the frozen Cycle-6 ABI: 0=decode_attn,
+/// 1=fused_sample, 2=decode_block, 3=spec_verify, 4=spec_reject,
+/// 5=quant_attn.  `layer_idx` is meaningful only for kind 5 (0 for all
+/// other kinds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfieKernelReg {
+    pub kind: u8,
+    pub layer_idx: u32,
+    pub name: String,
+    pub ptx: String,
+    pub grid_x: u32,
+    pub block_x: u32,
+    pub smem_dyn: u32,
+}
+
+/// Build the registration list for the chosen kernel family (pure over
+/// the plan).  Kernels register only when BOTH the PTX and a launch
+/// spec exist; the fused sampler (kind 1) registers in both families —
+/// it is the host decode loop's (`nsl_cfie_decode_step`) second stage.
+pub fn kernel_registrations(plan: &CfiePlan) -> Vec<CfieKernelReg> {
+    fn reg(
+        kind: u8,
+        layer_idx: u32,
+        name: &str,
+        ptx: &str,
+        spec: CfieLaunchSpec,
+    ) -> CfieKernelReg {
+        CfieKernelReg {
+            kind,
+            layer_idx,
+            name: name.to_string(),
+            ptx: ptx.to_string(),
+            grid_x: spec.grid_x,
+            block_x: spec.block_x,
+            smem_dyn: spec.smem_dyn_bytes,
+        }
+    }
+    let mut regs = Vec::new();
+    match choose_kernel_family(plan) {
+        CfieKernelFamily::Quant => {
+            if let Some(spec) = plan.quant_attention_launch {
+                for (idx, (name, ptx)) in plan.quant_attention_kernels.iter().enumerate() {
+                    regs.push(reg(5, idx as u32, name, ptx, spec));
+                }
+            }
+        }
+        CfieKernelFamily::Uniform => {
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.decode_attention_kernel.as_ref(),
+                plan.decode_attention_ptx.as_ref(),
+                plan.decode_attention_launch,
+            ) {
+                regs.push(reg(0, 0, name, ptx, spec));
+            }
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.decode_block_kernel.as_ref(),
+                plan.decode_block_ptx.as_ref(),
+                plan.decode_block_launch,
+            ) {
+                regs.push(reg(2, 0, name, ptx, spec));
+            }
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.spec_verify_kernel.as_ref(),
+                plan.spec_verify_ptx.as_ref(),
+                plan.spec_verify_launch,
+            ) {
+                regs.push(reg(3, 0, name, ptx, spec));
+            }
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.spec_reject_kernel.as_ref(),
+                plan.spec_reject_ptx.as_ref(),
+                plan.spec_reject_launch,
+            ) {
+                regs.push(reg(4, 0, name, ptx, spec));
+            }
+        }
+    }
+    if let (Some(name), Some(ptx), Some(spec)) = (
+        plan.fused_sample_kernel.as_ref(),
+        plan.fused_sample_ptx.as_ref(),
+        plan.fused_sample_launch,
+    ) {
+        regs.push(reg(1, 0, name, ptx, spec));
+    }
+    regs
+}
+
 /// Driver input.
 pub struct CfieInput<'a> {
     pub mode: CfieMode,
@@ -120,9 +257,35 @@ pub struct CfiePlan {
     /// `(kernel_name, ptx)` per layer.  NOTE: the quant kernel family
     /// uses the mixed-precision pool layout from
     /// `cfie_kv_quant_ptx::pool_layout`, which differs from the
-    /// uniform-f16 pool the base/block/verify kernels bake; the decode
-    /// loop selects ONE family per build at integration time.
+    /// uniform-f16 pool the base/block/verify kernels bake; the
+    /// compile-time chooser ([`choose_kernel_family`]) registers ONE
+    /// family per build.
     pub quant_attention_kernels: Vec<(String, String)>,
+    /// Feature 2 (F2): the fused decode-sample kernel (RMSNorm +
+    /// LM-head matvec + top-k/top-p + multinomial in ONE launch, only
+    /// the token id touches HBM).  Emitted by the serve wiring when
+    /// the sampler program is fused and the emitter preconditions hold
+    /// (d_model 1..=8192, vocab_size a positive multiple of the
+    /// 128-wide tile, top_k 1..=64).  When a grammar mask exists the
+    /// initialized `.global` fragment is spliced into this module so
+    /// the host resolves `nsl_cfie_grammar_mask` via
+    /// `cuModuleGetGlobal` at engine finalize.
+    pub fused_sample_kernel: Option<String>,
+    pub fused_sample_ptx: Option<String>,
+    /// Launch geometry per kernel family, registered with
+    /// `nsl_cfie_register_kernel` at serve init.  Set alongside the
+    /// matching kernel/ptx pair; the quant layers share one spec.
+    pub decode_attention_launch: Option<CfieLaunchSpec>,
+    pub fused_sample_launch: Option<CfieLaunchSpec>,
+    pub decode_block_launch: Option<CfieLaunchSpec>,
+    pub spec_verify_launch: Option<CfieLaunchSpec>,
+    pub spec_reject_launch: Option<CfieLaunchSpec>,
+    pub quant_attention_launch: Option<CfieLaunchSpec>,
+    /// Whether the compiled binary actually carries the Cycle-6 runtime
+    /// wiring (register/pool/finalize/destroy emission).  Monolithic
+    /// serve sets this; the disaggregated path does NOT emit the wiring
+    /// and the report must not claim it (`false` for hand-built plans).
+    pub runtime_wiring_emitted: bool,
 }
 
 impl CfiePlan {
@@ -136,6 +299,15 @@ impl CfiePlan {
 
     pub fn render_report(&self) -> String {
         use std::fmt::Write as _;
+        // Wiring suffix, truthful per serve path: monolithic serve
+        // emits the register/pool/finalize calls; the disaggregated
+        // path (and hand-built plans) does not, so the report must not
+        // claim registration there.
+        let wiring = if self.runtime_wiring_emitted {
+            "registered at serve init; host decode loop = nsl_cfie_decode_step"
+        } else {
+            "runtime wiring NOT emitted on this serve path (report-only)"
+        };
         let mut s = String::new();
         writeln!(s, "=== CFIE Inference Build Report ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
@@ -146,7 +318,7 @@ impl CfiePlan {
         if let Some(kernel) = self.decode_attention_kernel.as_ref() {
             writeln!(
                 s,
-                "      direct-index decode attention: {} emitted ({} bytes PTX, launch wiring pending G16)",
+                "      direct-index decode attention: {} emitted ({} bytes PTX, {wiring})",
                 kernel,
                 self.decode_attention_ptx.as_ref().map_or(0, |p| p.len())
             )
@@ -159,6 +331,15 @@ impl CfiePlan {
             self.sampling.hbm_bytes_saved as f64 / 1024.0
         )
         .unwrap();
+        if let Some(kernel) = self.fused_sample_kernel.as_ref() {
+            writeln!(
+                s,
+                "      fused sampler kernel: {} emitted ({} bytes PTX, {wiring})",
+                kernel,
+                self.fused_sample_ptx.as_ref().map_or(0, |p| p.len())
+            )
+            .unwrap();
+        }
         if let Some(spec) = self.speculative.as_ref() {
             writeln!(
                 s,
@@ -171,7 +352,7 @@ impl CfiePlan {
             if let Some(kernel) = self.spec_verify_kernel.as_ref() {
                 writeln!(
                     s,
-                    "      verify attention: {} emitted ({} bytes PTX, tree mask baked, launch wiring pending decode-loop integration)",
+                    "      verify attention: {} emitted ({} bytes PTX, tree mask baked, {wiring})",
                     kernel,
                     self.spec_verify_ptx.as_ref().map_or(0, |p| p.len())
                 )
@@ -180,7 +361,7 @@ impl CfiePlan {
             if let Some(kernel) = self.spec_reject_kernel.as_ref() {
                 writeln!(
                     s,
-                    "      rejection epilogue: {} emitted ({} bytes PTX, launch wiring pending decode-loop integration)",
+                    "      rejection epilogue: {} emitted ({} bytes PTX, {wiring})",
                     kernel,
                     self.spec_reject_ptx.as_ref().map_or(0, |p| p.len())
                 )
@@ -200,7 +381,7 @@ impl CfiePlan {
         if let Some(kernel) = self.decode_block_kernel.as_ref() {
             writeln!(
                 s,
-                "      persistent decode block: {} emitted ({} bytes PTX, launch wiring pending decode-loop integration)",
+                "      persistent decode block: {} emitted ({} bytes PTX, {wiring})",
                 kernel,
                 self.decode_block_ptx.as_ref().map_or(0, |p| p.len())
             )
@@ -217,11 +398,34 @@ impl CfiePlan {
             writeln!(
                 s,
                 "      per-layer decode-attention kernels: {} emitted \
-                 (precision baked per layer; mixed-precision pool layout — \
-                 the decode loop selects one kernel family at integration)",
+                 (precision baked per layer)",
                 self.quant_attention_kernels.len()
             )
             .unwrap();
+            // Family exclusivity: the chooser registers the quant
+            // family INSTEAD OF decode-block/spec — never both.  Only
+            // claimed when a launch spec exists (i.e. the serve wiring
+            // actually selected the family, not a hand-built plan) and
+            // worded per path so it never contradicts the family line.
+            if self.quant_attention_launch.is_some() {
+                if self.runtime_wiring_emitted {
+                    writeln!(
+                        s,
+                        "      quant family registered exclusively at serve init; \
+                         decode-block/spec kernels NOT registered \
+                         (mixed-precision pool layout is incompatible)"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "      quant family selected exclusively (report-only on \
+                         this path); decode-block/spec kernels excluded \
+                         (mixed-precision pool layout is incompatible)"
+                    )
+                    .unwrap();
+                }
+            }
         }
         if let Some(dfa) = self.grammar.as_ref() {
             writeln!(
@@ -233,12 +437,21 @@ impl CfiePlan {
             )
             .unwrap();
             if let Some(mask) = self.grammar_mask_ptx.as_ref() {
-                writeln!(
-                    s,
-                    "      mask baked into module image ({} bytes PTX, launch wiring pending G16)",
-                    mask.len()
-                )
-                .unwrap();
+                if self.fused_sample_ptx.is_some() {
+                    writeln!(
+                        s,
+                        "      mask baked into module image ({} bytes PTX, spliced into the fused sampler module; host binds it via cuModuleGetGlobal at engine finalize)",
+                        mask.len()
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "      mask baked into module image ({} bytes PTX, fused sampler not emitted this build - mask unbound)",
+                        mask.len()
+                    )
+                    .unwrap();
+                }
             }
         } else {
             writeln!(s, "  [6] Grammar DFA: disabled").unwrap();
@@ -255,6 +468,26 @@ impl CfiePlan {
         writeln!(s, "Continuous batching: on ({} active slots, ring capacity {})",
                  self.persistent.scheduler.max_active,
                  self.persistent.scheduler.ring_buffer.capacity).unwrap();
+        let regs = kernel_registrations(self);
+        if regs.is_empty() {
+            writeln!(s, "Kernel family: none registered (no kernels emitted this build)")
+                .unwrap();
+        } else {
+            writeln!(
+                s,
+                "Kernel family: {} — {} kernel(s); {wiring}",
+                choose_kernel_family(self).as_str(),
+                regs.len()
+            )
+            .unwrap();
+        }
+        writeln!(
+            s,
+            "Note: endpoint-driven generation still requires model binding — \
+             serve blocks carry no model reference yet, so the compiled \
+             decode loop is driven by tests/host callers until binding lands."
+        )
+        .unwrap();
         writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }
@@ -290,6 +523,15 @@ pub fn run(input: CfieInput) -> CfiePlan {
             spec_reject_ptx: None,
             grammar_mask_ptx: None,
             quant_attention_kernels: Vec::new(),
+            fused_sample_kernel: None,
+            fused_sample_ptx: None,
+            decode_attention_launch: None,
+            fused_sample_launch: None,
+            decode_block_launch: None,
+            spec_verify_launch: None,
+            spec_reject_launch: None,
+            quant_attention_launch: None,
+            runtime_wiring_emitted: false,
         };
     }
 
@@ -370,6 +612,15 @@ pub fn run(input: CfieInput) -> CfiePlan {
         spec_reject_ptx: None,
         grammar_mask_ptx: None,
         quant_attention_kernels: Vec::new(),
+        fused_sample_kernel: None,
+        fused_sample_ptx: None,
+        decode_attention_launch: None,
+        fused_sample_launch: None,
+        decode_block_launch: None,
+        spec_verify_launch: None,
+        spec_reject_launch: None,
+        quant_attention_launch: None,
+        runtime_wiring_emitted: false,
     }
 }
 
@@ -543,5 +794,117 @@ mod tests {
         let plan = run(input);
         assert!(plan.speculative.is_none());
         assert!(plan.kv_quant.layers.is_empty());
+    }
+
+    // ── Cycle 6: family chooser + registration list (pure fns) ──────
+
+    const SPEC_1X128: CfieLaunchSpec = CfieLaunchSpec {
+        grid_x: 1,
+        block_x: 128,
+        smem_dyn_bytes: 0,
+    };
+
+    #[test]
+    fn family_chooser_quant_wins_when_quant_kernels_exist() {
+        let mut plan = run(nslcoder_input());
+        assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Uniform);
+        plan.quant_attention_kernels = vec![("k".into(), "p".into())];
+        assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Quant);
+    }
+
+    #[test]
+    fn kernel_registrations_uniform_family_lists_emitted_kernels_plus_sampler() {
+        let mut plan = run(nslcoder_input());
+        plan.decode_attention_kernel = Some("attn".into());
+        plan.decode_attention_ptx = Some("ptx_attn".into());
+        plan.decode_attention_launch = Some(CfieLaunchSpec {
+            grid_x: 8,
+            block_x: 128,
+            smem_dyn_bytes: 0,
+        });
+        plan.decode_block_kernel = Some("blk".into());
+        plan.decode_block_ptx = Some("ptx_blk".into());
+        plan.decode_block_launch = Some(SPEC_1X128);
+        plan.spec_reject_kernel = Some("rej".into());
+        plan.spec_reject_ptx = Some("ptx_rej".into());
+        plan.spec_reject_launch = Some(CfieLaunchSpec {
+            grid_x: 1,
+            block_x: 32,
+            smem_dyn_bytes: 0,
+        });
+        plan.fused_sample_kernel = Some("samp".into());
+        plan.fused_sample_ptx = Some("ptx_samp".into());
+        plan.fused_sample_launch = Some(SPEC_1X128);
+
+        let regs = kernel_registrations(&plan);
+        assert_eq!(
+            regs.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![0, 2, 4, 1],
+            "uniform family: whichever of 0/2/3/4 exist, plus kind 1"
+        );
+        assert!(regs.iter().all(|r| r.layer_idx == 0));
+        assert!(regs.iter().all(|r| r.smem_dyn == 0));
+        let attn = &regs[0];
+        assert_eq!((attn.grid_x, attn.block_x), (8, 128));
+        let rej = regs.iter().find(|r| r.kind == 4).unwrap();
+        assert_eq!((rej.grid_x, rej.block_x), (1, 32));
+    }
+
+    #[test]
+    fn kernel_registrations_quant_family_excludes_uniform_kv_kernels() {
+        let mut plan = run(nslcoder_input());
+        // Uniform kernels emitted on the plan...
+        plan.decode_attention_kernel = Some("attn".into());
+        plan.decode_attention_ptx = Some("ptx_attn".into());
+        plan.decode_attention_launch = Some(SPEC_1X128);
+        plan.decode_block_kernel = Some("blk".into());
+        plan.decode_block_ptx = Some("ptx_blk".into());
+        plan.decode_block_launch = Some(SPEC_1X128);
+        // ...but the quant family wins registration.
+        plan.quant_attention_kernels = vec![
+            ("q0".into(), "ptx_q0".into()),
+            ("q1".into(), "ptx_q1".into()),
+        ];
+        plan.quant_attention_launch = Some(CfieLaunchSpec {
+            grid_x: 4,
+            block_x: 128,
+            smem_dyn_bytes: 0,
+        });
+        plan.fused_sample_kernel = Some("samp".into());
+        plan.fused_sample_ptx = Some("ptx_samp".into());
+        plan.fused_sample_launch = Some(SPEC_1X128);
+
+        let regs = kernel_registrations(&plan);
+        assert_eq!(
+            regs.iter().map(|r| (r.kind, r.layer_idx)).collect::<Vec<_>>(),
+            vec![(5, 0), (5, 1), (1, 0)],
+            "quant family: kind 5 per layer + kind 1; kinds 0/2/3/4 excluded"
+        );
+        assert_eq!(regs[0].name, "q0");
+        assert_eq!(regs[1].name, "q1");
+    }
+
+    #[test]
+    fn kernel_registrations_skip_kernels_without_launch_spec() {
+        let mut plan = run(nslcoder_input());
+        plan.decode_attention_kernel = Some("attn".into());
+        plan.decode_attention_ptx = Some("ptx_attn".into());
+        // decode_attention_launch deliberately left None.
+        assert!(kernel_registrations(&plan).is_empty());
+    }
+
+    #[test]
+    fn report_family_line_none_without_kernels_and_named_with() {
+        let mut plan = run(nslcoder_input());
+        assert!(plan
+            .render_report()
+            .contains("Kernel family: none registered"));
+        plan.fused_sample_kernel = Some("nsl_cfie_fused_sample".into());
+        plan.fused_sample_ptx = Some("ptx".into());
+        plan.fused_sample_launch = Some(SPEC_1X128);
+        let rep = plan.render_report();
+        assert!(rep.contains("Kernel family: uniform"));
+        assert!(rep.contains("fused sampler kernel: nsl_cfie_fused_sample emitted"));
+        assert!(!rep.contains("launch wiring pending"));
     }
 }
