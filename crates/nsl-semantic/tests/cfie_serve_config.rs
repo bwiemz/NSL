@@ -45,6 +45,7 @@ serve Inference:
 
     grammar:
         schema: "output_schema.json"
+        tokenizer: "vocab.txt"
 
     @endpoint
     fn generate(prompt: str) -> str:
@@ -143,13 +144,43 @@ fn grammar_without_schema_is_rejected() {
     // sanity: still valid
     assert!(analyze_errs(&src).is_empty());
     let src2 = VALID_CFIE_SERVE.replace(
-        "    grammar:\n        schema: \"output_schema.json\"\n",
+        "    grammar:\n        schema: \"output_schema.json\"\n        tokenizer: \"vocab.txt\"\n",
         "    grammar:\n        strict: true\n",
     );
     let errs = analyze_errs(&src2);
     assert!(
         errs.iter().any(|m| m.contains("schema")),
         "expected missing-schema error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn grammar_tokenizer_must_be_a_string() {
+    let src = VALID_CFIE_SERVE.replace("tokenizer: \"vocab.txt\"", "tokenizer: 5");
+    let errs = analyze_errs(&src);
+    assert!(
+        errs.iter().any(|m| m.contains("tokenizer")),
+        "expected tokenizer error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn grammar_without_tokenizer_is_semantically_valid() {
+    // Codegen refuses schema-without-tokenizer (G12); semantically the
+    // key is optional so the refusal can carry the actionable message.
+    let src = VALID_CFIE_SERVE.replace("        tokenizer: \"vocab.txt\"\n", "");
+    let errs = analyze_errs(&src);
+    assert!(errs.is_empty(), "expected clean analysis, got: {errs:?}");
+}
+
+#[test]
+fn unknown_grammar_key_names_both_expected_keys() {
+    let src = VALID_CFIE_SERVE.replace("tokenizer: \"vocab.txt\"", "vocab: \"vocab.txt\"");
+    let errs = analyze_errs(&src);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("expected schema or tokenizer")),
+        "expected unknown-key error, got: {errs:?}"
     );
 }
 

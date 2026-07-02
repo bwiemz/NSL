@@ -20,6 +20,7 @@ use nsl_ast::Symbol;
 
 use crate::cfie::{CfieInput, CfieMode};
 use crate::cfie_fused_sample::{LmHeadShape, SamplingParams, SamplingStrategy};
+use crate::cfie_grammar::{dfa_from_json_schema, CompiledDfa, TokenVocab};
 use crate::cfie_kv_plan::{KvBudget, KvShape};
 use crate::cfie_kv_quant::KvQuantConfig;
 use crate::cfie_persistent::{GpuBudget, PersistentModel};
@@ -78,6 +79,9 @@ pub struct CfieServeConfig {
     pub sampling: Option<SamplingSection>,
     pub speculative: Option<SpeculativeSection>,
     pub grammar_schema: Option<String>,
+    /// Tokenizer vocab path (`.txt` = one token per line, `.json` =
+    /// string array) — required to token-project the schema (G12).
+    pub grammar_tokenizer: Option<String>,
 }
 
 impl CfieServeConfig {
@@ -161,8 +165,10 @@ pub fn extract(serve: &ServeBlock, resolve: &dyn Fn(Symbol) -> String) -> CfieSe
             "speculative" => cfg.speculative = Some(extract_speculative(sub, resolve)),
             "grammar" => {
                 for entry in &sub.entries {
-                    if resolve(entry.key) == "schema" {
-                        cfg.grammar_schema = entry_string(entry, resolve);
+                    match resolve(entry.key).as_str() {
+                        "schema" => cfg.grammar_schema = entry_string(entry, resolve),
+                        "tokenizer" => cfg.grammar_tokenizer = entry_string(entry, resolve),
+                        _ => {}
                     }
                 }
             }
@@ -487,15 +493,36 @@ pub fn prepare<'a>(
     gpu: &'a GpuSpec,
     weights: Option<&'a WeightMap>,
 ) -> Result<PreparedCfie<'a>, CodegenError> {
-    if let Some(schema) = &cfg.grammar_schema {
-        return Err(CodegenError::new(format!(
-            "CFIE grammar fusion: JSON-schema '{schema}' requires the \
-             schema->token-DFA pipeline (grammar_compiler + tokenizer \
-             alignment), which is not yet wired into CFIE (audit gap \
-             G12). Remove the `grammar:` section or use the runtime \
-             @grammar path until it lands."
-        )));
-    }
+    // Grammar (G12): a schema needs a tokenizer vocab to be projected
+    // from the byte-level DFA to token level — without one there is
+    // nothing kernel-consumable, so refuse rather than half-compile.
+    let grammar_dfa: Option<CompiledDfa> = match (&cfg.grammar_schema, &cfg.grammar_tokenizer) {
+        (Some(schema), Some(tokenizer)) => {
+            let schema_src = std::fs::read_to_string(schema).map_err(|e| {
+                CodegenError::new(format!(
+                    "CFIE grammar: cannot read schema '{schema}': {e}"
+                ))
+            })?;
+            let vocab = TokenVocab::load(std::path::Path::new(tokenizer))
+                .map_err(|e| CodegenError::new(format!("CFIE grammar: {e}")))?;
+            let dfa = dfa_from_json_schema(&schema_src, &vocab).map_err(|e| {
+                CodegenError::new(format!(
+                    "CFIE grammar fusion (schema '{schema}'): {e}"
+                ))
+            })?;
+            Some(dfa)
+        }
+        (Some(schema), None) => {
+            return Err(CodegenError::new(format!(
+                "CFIE grammar fusion: JSON-schema '{schema}' cannot be \
+                 token-projected without a tokenizer vocabulary (audit \
+                 gap G12). Add `tokenizer: \"vocab.txt\"` (one token \
+                 per line) or `tokenizer: \"vocab.json\"` (JSON string \
+                 array) to the grammar: section, or remove the section."
+            )));
+        }
+        _ => None,
+    };
     if let Some(draft) = cfg.speculative.as_ref().and_then(|s| s.draft_path.as_deref()) {
         // Accepting a draft-model path that is never loaded would be a
         // silent failure; refuse until compiled-speculative draft
@@ -512,6 +539,21 @@ pub fn prepare<'a>(
     }
 
     let shape = resolve_model_shape(cfg, weights);
+
+    // The sampler kernel's grammar-mask row stride is baked from the
+    // LM-head vocab; a tokenizer of a different size would silently
+    // index the wrong rows once the mask is bound (G16 seam) — enforce
+    // equality at the only point that sees both numbers.
+    if let Some(dfa) = grammar_dfa.as_ref() {
+        if dfa.vocab_size != shape.vocab_size {
+            return Err(CodegenError::new(format!(
+                "CFIE grammar fusion: tokenizer vocabulary has {} tokens but the \
+                 model's vocab_size is {} — the baked mask row stride requires \
+                 them to match. Fix the tokenizer file or the vocab_size key.",
+                dfa.vocab_size, shape.vocab_size
+            )));
+        }
+    }
 
     let max_seq = cfg.max_seq.unwrap_or(4096).max(1) as u32;
     let max_batch = cfg.max_batch.unwrap_or(32).max(1) as u32;
@@ -583,6 +625,7 @@ pub fn prepare<'a>(
         speculative,
         speculative_acceptance: DEFAULT_SPECULATIVE_ACCEPTANCE,
         grammar: None,
+        grammar_dfa,
     };
 
     Ok(PreparedCfie { input, shape })
@@ -664,17 +707,91 @@ mod tests {
     }
 
     #[test]
-    fn grammar_section_refuses_loudly() {
+    fn grammar_schema_without_tokenizer_refuses_loudly() {
         let mut cfg = cfg_with(Some("static"));
         cfg.grammar_schema = Some("schema.json".to_string());
         let gpu = find_gpu("H100").unwrap();
         let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
             Err(e) => e,
-            Ok(_) => panic!("grammar schema must refuse until G12 lands"),
+            Ok(_) => panic!("schema without tokenizer cannot be token-projected"),
         };
         assert!(
-            err.message.contains("G12"),
-            "refusal must cite the audit gap: {}",
+            err.message.contains("G12") && err.message.contains("tokenizer"),
+            "refusal must cite the audit gap and the fix: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn grammar_schema_with_tokenizer_compiles_token_dfa() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("schema.json");
+        std::fs::write(&schema, r#"{"type": "boolean"}"#).unwrap();
+        let vocab = dir.path().join("vocab.txt");
+        std::fs::write(&vocab, "true\nfalse\nx\n").unwrap();
+
+        let mut cfg = cfg_with(Some("static"));
+        // The mask row stride is baked from the LM-head vocab, so the
+        // tokenizer size must equal the model vocab_size.
+        cfg.vocab_size = Some(3);
+        cfg.grammar_schema = Some(schema.display().to_string());
+        cfg.grammar_tokenizer = Some(vocab.display().to_string());
+        let gpu = find_gpu("H100").unwrap();
+        let prepared = prepare(&cfg, CfieMode::Full, gpu, None).unwrap();
+        let dfa = prepared
+            .input
+            .grammar_dfa
+            .as_ref()
+            .expect("schema + tokenizer must yield a token DFA");
+        assert_eq!(dfa.vocab_size, 3);
+        // Tokens "true"/"false" valid from start; "x" is not.
+        assert!(dfa.is_valid(dfa.start_state, 0));
+        assert!(dfa.is_valid(dfa.start_state, 1));
+        assert!(!dfa.is_valid(dfa.start_state, 2));
+
+        let plan = crate::cfie::run(prepared.input);
+        assert!(plan.grammar.is_some());
+        assert!(plan.sampling.params.grammar_masked);
+    }
+
+    #[test]
+    fn grammar_tokenizer_vocab_size_mismatch_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("schema.json");
+        std::fs::write(&schema, r#"{"type": "boolean"}"#).unwrap();
+        let vocab = dir.path().join("vocab.txt");
+        std::fs::write(&vocab, "true\nfalse\nx\n").unwrap();
+
+        let mut cfg = cfg_with(Some("static"));
+        // cfg_with sets vocab_size = 49152; the 3-token tokenizer must
+        // refuse instead of silently mis-striding the baked mask.
+        cfg.grammar_schema = Some(schema.display().to_string());
+        cfg.grammar_tokenizer = Some(vocab.display().to_string());
+        let gpu = find_gpu("H100").unwrap();
+        let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
+            Err(e) => e,
+            Ok(_) => panic!("vocab-size mismatch must refuse"),
+        };
+        assert!(
+            err.message.contains("vocab_size"),
+            "refusal must explain the mismatch: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn grammar_missing_files_refuse_with_context() {
+        let mut cfg = cfg_with(Some("static"));
+        cfg.grammar_schema = Some("does_not_exist.json".to_string());
+        cfg.grammar_tokenizer = Some("also_missing.txt".to_string());
+        let gpu = find_gpu("H100").unwrap();
+        let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
+            Err(e) => e,
+            Ok(_) => panic!("missing schema file must refuse"),
+        };
+        assert!(
+            err.message.contains("does_not_exist.json"),
+            "error must name the file: {}",
             err.message
         );
     }

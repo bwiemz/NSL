@@ -11,7 +11,7 @@
 use serde::Serialize;
 
 use crate::cfie_fused_sample::{emit_program as emit_sample, FusedSampleProgram, LmHeadShape, SamplingParams};
-use crate::cfie_grammar::{compile as compile_dfa, CompiledDfa, GrammarSpec};
+use crate::cfie_grammar::{compile as compile_dfa, minimise as minimise_dfa, CompiledDfa, GrammarSpec};
 use crate::cfie_kv_plan::{plan as plan_kv, KvBudget, KvLayoutPlan, KvShape};
 use crate::cfie_kv_quant::{plan as plan_kv_quant, KvQuantConfig, KvQuantPlan};
 use crate::cfie_persistent::{plan as plan_persistent, GpuBudget, PersistentModel, PersistentPlan};
@@ -62,6 +62,10 @@ pub struct CfieInput<'a> {
     pub speculative: Option<SpeculativeConfig>,
     pub speculative_acceptance: f32,
     pub grammar: Option<GrammarSpec>,
+    /// Pre-compiled token-level DFA (the G12 schema->token pipeline in
+    /// `cfie_grammar::dfa_from_json_schema`).  Takes precedence over
+    /// `grammar` when both are set.
+    pub grammar_dfa: Option<CompiledDfa>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +87,12 @@ pub struct CfiePlan {
     /// the decode-loop lowering when it lands (G16).
     pub decode_attention_kernel: Option<String>,
     pub decode_attention_ptx: Option<String>,
+    /// Feature 6 (G11): the initialized `.global` PTX fragment baking
+    /// the grammar's valid-token bitmask into the module image.
+    /// Emitted by the serve wiring when `grammar` is set; the decode
+    /// loop binds its device address to the sampler's
+    /// `grammar_mask_ptr` param when it lands (G16).
+    pub grammar_mask_ptx: Option<String>,
 }
 
 impl CfiePlan {
@@ -155,6 +165,14 @@ impl CfiePlan {
                 100.0 * dfa.density()
             )
             .unwrap();
+            if let Some(mask) = self.grammar_mask_ptx.as_ref() {
+                writeln!(
+                    s,
+                    "      mask baked into module image ({} bytes PTX, launch wiring pending G16)",
+                    mask.len()
+                )
+                .unwrap();
+            }
         } else {
             writeln!(s, "  [6] Grammar DFA: disabled").unwrap();
         }
@@ -197,6 +215,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
             solve_us: t0.elapsed().as_micros() as u64,
             decode_attention_kernel: None,
             decode_attention_ptx: None,
+            grammar_mask_ptx: None,
         };
     }
 
@@ -205,7 +224,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
 
     // 2. Fused sampler.  Enable grammar masking when a grammar is set.
     let mut sampling_params = input.sampling;
-    sampling_params.grammar_masked = input.grammar.is_some();
+    sampling_params.grammar_masked = input.grammar.is_some() || input.grammar_dfa.is_some();
     let sampling = emit_sample(sampling_params, input.lm_head);
 
     // 3. Persistent decode + scheduler.
@@ -232,12 +251,16 @@ pub fn run(input: CfieInput) -> CfiePlan {
         None
     };
 
-    // 6. Grammar DFA (optional).
+    // 6. Grammar DFA (optional).  Pre-compiled token DFAs (G12 serve
+    // pipeline) win over edge-list specs; both get Hopcroft-minimised
+    // (the audit flagged `minimise` as implemented-but-never-called) —
+    // fewer states means a smaller baked mask, same language.
     let grammar = if input.mode == CfieMode::Full {
         input
-            .grammar
-            .as_ref()
-            .and_then(|spec| compile_dfa(spec).ok())
+            .grammar_dfa
+            .clone()
+            .or_else(|| input.grammar.as_ref().and_then(|spec| compile_dfa(spec).ok()))
+            .map(|dfa| minimise_dfa(&dfa))
     } else {
         None
     };
@@ -265,6 +288,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
         solve_us: t0.elapsed().as_micros() as u64,
         decode_attention_kernel: None,
         decode_attention_ptx: None,
+        grammar_mask_ptx: None,
     }
 }
 
@@ -313,6 +337,7 @@ mod tests {
             speculative: Some(SpeculativeConfig::default()),
             speculative_acceptance: 0.6,
             grammar: None,
+            grammar_dfa: None,
         }
     }
 
@@ -343,6 +368,48 @@ mod tests {
         assert!(plan.grammar.is_some());
         // The sampler must have grammar masking turned on.
         assert!(plan.sampling.params.grammar_masked);
+    }
+
+    #[test]
+    fn grammar_dfa_input_wins_and_is_minimised() {
+        use crate::cfie_grammar::GrammarEdge;
+        // 4-state DFA with two merge-equivalent middle states; Hopcroft
+        // must collapse them (proves cfie::run actually calls minimise).
+        let spec = GrammarSpec {
+            num_states: 4,
+            vocab_size: 32_000,
+            start_state: 0,
+            accept_states: vec![3],
+            edges: vec![
+                GrammarEdge { from: 0, token_id: 0, to: 1 },
+                GrammarEdge { from: 0, token_id: 1, to: 2 },
+                GrammarEdge { from: 1, token_id: 0, to: 3 },
+                GrammarEdge { from: 2, token_id: 0, to: 3 },
+            ],
+        };
+        let dfa = crate::cfie_grammar::compile(&spec).unwrap();
+        let mut input = nslcoder_input();
+        input.grammar_dfa = Some(dfa.clone());
+        let plan = run(input);
+        let planned = plan.grammar.expect("grammar_dfa must reach the plan");
+        assert!(
+            planned.num_states < dfa.num_states,
+            "minimise must merge equivalent states: {} vs {}",
+            planned.num_states,
+            dfa.num_states
+        );
+        assert!(plan.sampling.params.grammar_masked);
+    }
+
+    #[test]
+    fn report_includes_baked_mask_line_when_present() {
+        let mut input = nslcoder_input();
+        input.grammar = Some(GrammarSpec::sequence(&[5, 6, 7], 32_000));
+        let mut plan = run(input);
+        let dfa = plan.grammar.as_ref().unwrap();
+        plan.grammar_mask_ptx = Some(crate::cfie_grammar_ptx::emit_mask_global(dfa));
+        let rep = plan.render_report();
+        assert!(rep.contains("mask baked into module image"));
     }
 
     #[test]

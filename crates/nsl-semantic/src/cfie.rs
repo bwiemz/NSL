@@ -464,10 +464,25 @@ fn validate_grammar_section(
                     );
                 }
             }
+            "tokenizer" => {
+                // Vocab path (`.txt` one token per line, `.json` string
+                // array) — required by codegen to token-project the
+                // schema DFA (audit gap G12).
+                if !matches!(&entry.value.kind, ExprKind::StringLiteral(_)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "grammar tokenizer must be a vocab path string".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid tokenizer"),
+                    );
+                }
+            }
             other => {
                 diagnostics.push(
-                    Diagnostic::error(format!("unknown grammar key '{other}'; expected schema"))
-                        .with_label(entry.span, "unknown key"),
+                    Diagnostic::error(format!(
+                        "unknown grammar key '{other}'; expected schema or tokenizer"
+                    ))
+                    .with_label(entry.span, "unknown key"),
                 );
             }
         }

@@ -995,7 +995,14 @@ fn parse_serve_sub_block(p: &mut Parser) -> nsl_ast::block::ServeSubBlock {
 
 fn parse_serve_config_entry(p: &mut Parser) -> nsl_ast::block::ServeConfigEntry {
     let start = p.current_span();
-    let (key, _) = p.expect_ident();
+    // `tokenizer` lexes as a keyword (tokenizer blocks) but is also the
+    // CFIE grammar-section vocab key; accept it as a plain entry key.
+    let key = if p.at(&TokenKind::Tokenizer) {
+        p.advance();
+        p.intern("tokenizer")
+    } else {
+        p.expect_ident().0
+    };
 
     p.expect(&TokenKind::Colon);
 

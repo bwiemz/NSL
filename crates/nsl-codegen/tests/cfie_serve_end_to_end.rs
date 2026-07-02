@@ -196,7 +196,9 @@ fn main():
 }
 
 #[test]
-fn grammar_section_fails_compile_with_g12_refusal() {
+fn grammar_schema_without_tokenizer_fails_compile_with_g12_refusal() {
+    // Schema without a tokenizer vocab cannot be token-projected; the
+    // refusal must tell the user to add `tokenizer:` (audit gap G12).
     let src = r#"
 fn main():
     serve WithGrammar:
@@ -221,13 +223,71 @@ fn main():
     );
     let err = match res {
         Err(e) => e,
-        Ok(_) => panic!("grammar: section must refuse until G12 lands"),
+        Ok(_) => panic!("schema without tokenizer must refuse"),
     };
     assert!(
-        err.message.contains("G12"),
-        "refusal must cite the audit gap: {}",
+        err.message.contains("G12") && err.message.contains("tokenizer"),
+        "refusal must cite the audit gap and the fix: {}",
         err.message
     );
+}
+
+#[test]
+fn grammar_schema_with_tokenizer_bakes_mask_into_plan() {
+    let dir = std::env::temp_dir().join("nsl_cfie_grammar_e2e");
+    let _ = std::fs::create_dir_all(&dir);
+    let schema_path = dir.join("schema.json");
+    std::fs::write(&schema_path, r#"{"type": "boolean"}"#).unwrap();
+    let vocab_path = dir.join("vocab.txt");
+    std::fs::write(&vocab_path, "true\nfalse\ntr\nue\nx\n").unwrap();
+
+    // Forward slashes keep the NSL string literal free of escapes.
+    let schema_str = schema_path.display().to_string().replace('\\', "/");
+    let vocab_str = vocab_path.display().to_string().replace('\\', "/");
+    let src = format!(
+        r#"
+fn main():
+    serve WithGrammar:
+        kv_layout: "static"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        vocab_size: 5
+
+        grammar:
+            schema: "{schema_str}"
+            tokenizer: "{vocab_str}"
+
+        @endpoint
+        fn handle(prompt: str) -> str:
+            let x = 0
+"#
+    );
+    let plan = compile_cfie(&src, &CompileOptions::default())
+        .expect("grammar section must activate CFIE");
+
+    // The token-level DFA reached the plan (5-token vocab).
+    let dfa = plan.grammar.as_ref().expect("token DFA on the plan");
+    assert_eq!(dfa.vocab_size, 5);
+    assert!(plan.sampling.params.grammar_masked);
+
+    // G11: the mask global is baked as an initialized .global fragment.
+    let mask = plan
+        .grammar_mask_ptx
+        .as_deref()
+        .expect("grammar mask PTX on the plan");
+    assert!(mask.starts_with(".global .align 1 .b8 nsl_cfie_grammar_mask["));
+    assert!(mask.bytes().all(|b| b < 128), "PTX must be ASCII-only");
+
+    // Report shows the DFA section plus the baked-mask line.
+    let report = plan.render_report();
+    assert!(report.contains("[6] Grammar DFA:"));
+    assert!(report.contains("mask baked into module image"));
+
+    let _ = std::fs::remove_file(&schema_path);
+    let _ = std::fs::remove_file(&vocab_path);
 }
 
 #[test]

@@ -369,6 +369,14 @@ impl Compiler<'_> {
             }
         }
 
+        // Feature 6 (G11): bake the grammar's valid-token bitmask into
+        // the module image as an initialized .global — the data is a
+        // compile-time constant; the decode loop binds its device
+        // address to the sampler's grammar_mask_ptr param (G16).
+        if let Some(dfa) = plan.grammar.as_ref() {
+            plan.grammar_mask_ptx = Some(crate::cfie_grammar_ptx::emit_mask_global(dfa));
+        }
+
         // Build report: the paper's visible artifact (§8).  Provenance +
         // wiring status keep it honest about what this build actually
         // bakes into the binary.
