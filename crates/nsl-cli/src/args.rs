@@ -589,7 +589,9 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) zk_circuit: bool,
 
-        /// M55: ZK proving backend: folding (default), halo2, or plonky3
+        /// M55: ZK proving backend. Only "folding" (default) is implemented;
+        /// "halo2" (deprecated, circuit lowering removed) and "plonky3"
+        /// (prover not yet wired into compilation) are refused at build time.
         #[arg(long, default_value = "folding")]
         pub(crate) zk_backend: String,
 
