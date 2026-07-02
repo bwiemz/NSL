@@ -213,6 +213,62 @@ pub(crate) fn resolve_dims_for_target(
     Some((inp, out))
 }
 
+/// Collect the model classes that declare a field named `field_name`,
+/// consulting `model_tensor_field_shapes` first (the shape-bearing map
+/// populated by `collect_models` for Tensor fields) and falling back to
+/// `model_field_types` only when the shape map has no match (B.2.1
+/// Task 5.5 priority order — do not widen or reorder these sources).
+///
+/// The returned candidates are sorted lexicographically so that "use the
+/// first candidate" tie-breaking is deterministic across runs and
+/// platforms; raw `HashMap` iteration order is randomised per process and
+/// previously made ambiguous-target injection nondeterministic.
+pub(crate) fn candidate_models_for_field<'a>(
+    tensor_shapes: &'a std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    field_types: &'a std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    field_name: &str,
+) -> Vec<&'a String> {
+    let mut candidates: Vec<&String> = tensor_shapes
+        .iter()
+        .filter(|(_, fields)| fields.contains_key(field_name))
+        .map(|(name, _)| name)
+        .collect();
+    if candidates.is_empty() {
+        candidates = field_types
+            .iter()
+            .filter(|(_, fields)| fields.contains_key(field_name))
+            .map(|(name, _)| name)
+            .collect();
+    }
+    candidates.sort();
+    candidates
+}
+
+/// Build the diagnostic for an `@adapter` target that names a submodel
+/// field instead of a weight tensor.
+///
+/// The target resolver (`run_with_compiler`) splits the target string
+/// exactly once on `'.'` and looks the second segment up as a field name
+/// across all known model classes — so only 2-segment `<model>.<field>`
+/// targets can ever resolve.  A 3-segment path such as `"m.sub.weight"`
+/// can NEVER work (the resolver would search for a field literally named
+/// `"sub.weight"`), so the hint must steer users to the 2-segment
+/// `<InnerClass>.<field>` form naming the inner model's weight field.
+pub(crate) fn submodel_target_hint(target: &str, inner_class: &str) -> String {
+    let class = if inner_class.trim().is_empty() {
+        "<InnerClass>"
+    } else {
+        inner_class.trim()
+    };
+    format!(
+        "[wrga] @adapter target '{target}': targets a submodel, not a weight tensor; \
+         the target resolver only supports 2-segment `<model>.<field>` paths, so \
+         adapt the inner model's weight with the 2-segment form \"<InnerClass>.<field>\" \
+         (e.g., \"{class}.<weight_field>\"); \
+         submodel-level decorators are not yet supported"
+    )
+}
+
 /// Wrapper over [`run`] that additionally resolves real `input_dim` /
 /// `output_dim` values on each produced `AdapterSite` by consulting the
 /// compiler's `model_field_types` registry.  On any resolution failure an
@@ -238,21 +294,13 @@ pub fn run_with_compiler(
 
         // B.2.1 Task 5.5: search `model_tensor_field_shapes` (the
         // shape-bearing map populated by `collect_models` for Tensor
-        // fields) before falling back to `model_field_types`.
+        // fields) before falling back to `model_field_types`.  Candidates
+        // come back lexicographically sorted so "using first" below is
+        // deterministic across runs/platforms.
         let tensor_shapes = &compiler.models.model_tensor_field_shapes;
         let field_types = &compiler.models.model_field_types;
-        let mut candidates: Vec<&String> = tensor_shapes
-            .iter()
-            .filter(|(_, fields)| fields.contains_key(field_name))
-            .map(|(name, _)| name)
-            .collect();
-        if candidates.is_empty() {
-            candidates = field_types
-                .iter()
-                .filter(|(_, fields)| fields.contains_key(field_name))
-                .map(|(name, _)| name)
-                .collect();
-        }
+        let mut candidates =
+            candidate_models_for_field(tensor_shapes, field_types, field_name);
         if candidates.is_empty() {
             eprintln!(
                 "[wrga] @adapter target '{}': field '{}' not found in any known model; \
@@ -264,7 +312,7 @@ pub fn run_with_compiler(
         if candidates.len() > 1 {
             eprintln!(
                 "[wrga] @adapter target '{}': field '{}' ambiguous across models {:?}; \
-                 using first; follow-up: thread let-binding type map",
+                 using lexicographically-first; follow-up: thread let-binding type map",
                 target, field_name, candidates
             );
         }
@@ -287,12 +335,7 @@ pub fn run_with_compiler(
             })
             .unwrap_or_default();
         if !type_str.trim_start().starts_with("Tensor<") {
-            eprintln!(
-                "[wrga] @adapter target '{}': targets a submodel, not a weight tensor; \
-                 adapt the submodel's inner weight directly (e.g., \"{}.weight\") \
-                 or use a submodel-level decorator (not yet supported)",
-                target, target,
-            );
+            eprintln!("{}", submodel_target_hint(&target, &type_str));
             continue;
         }
         match resolve_dims_for_target(&model_name, field_name, tensor_shapes)
@@ -391,6 +434,104 @@ mod tests {
         assert_eq!(
             site_id_for("m.w", AdapterKind::GatedLora),
             "m_w__gatedlora",
+        );
+    }
+
+    #[test]
+    fn submodel_hint_suggests_working_two_segment_form() {
+        let hint = submodel_target_hint("m.sub", "Inner");
+        assert!(
+            hint.contains("\"<InnerClass>.<field>\""),
+            "hint must name the 2-segment <InnerClass>.<field> form: {hint}",
+        );
+        assert!(
+            hint.contains("2-segment"),
+            "hint must explain the resolver's 2-segment limit: {hint}",
+        );
+        assert!(
+            hint.contains("\"Inner.<weight_field>\""),
+            "hint must show a concrete example using the inner class name: {hint}",
+        );
+        assert!(
+            !hint.contains("m.sub.weight"),
+            "hint must NOT suggest the 3-segment '<target>.weight' form — the \
+             resolver splits once on '.' so that form can never resolve: {hint}",
+        );
+        assert!(
+            hint.contains("not yet supported"),
+            "hint must still refuse loudly on submodel-level decorators: {hint}",
+        );
+    }
+
+    #[test]
+    fn submodel_hint_tolerates_empty_inner_class() {
+        let hint = submodel_target_hint("m.sub", "  ");
+        assert!(
+            hint.contains("\"<InnerClass>.<weight_field>\""),
+            "empty inner class must fall back to a placeholder: {hint}",
+        );
+    }
+
+    #[test]
+    fn candidate_selection_is_deterministic_across_insertion_orders() {
+        use std::collections::HashMap;
+        let tensor_type = "Tensor<[32, 16], f32>".to_string();
+        // Two insertion orders (and 32 fresh HashMaps, whose SipHash seeds
+        // differ) must always agree: lexicographically-first wins.
+        for i in 0..32 {
+            let mut shapes: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut fields = HashMap::new();
+            fields.insert("w".to_string(), tensor_type.clone());
+            if i % 2 == 0 {
+                shapes.insert("Zeta".to_string(), fields.clone());
+                shapes.insert("Alpha".to_string(), fields.clone());
+            } else {
+                shapes.insert("Alpha".to_string(), fields.clone());
+                shapes.insert("Zeta".to_string(), fields.clone());
+            }
+            let empty: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let candidates = candidate_models_for_field(&shapes, &empty, "w");
+            assert_eq!(
+                candidates,
+                vec![&"Alpha".to_string(), &"Zeta".to_string()],
+                "candidates must be sorted so 'use first' is stable (iteration {i})",
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_selection_falls_back_to_field_types_sorted() {
+        use std::collections::HashMap;
+        let shapes: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut fields = HashMap::new();
+        fields.insert("sub".to_string(), "Inner".to_string());
+        field_types.insert("Outer2".to_string(), fields.clone());
+        field_types.insert("Outer1".to_string(), fields);
+        let candidates = candidate_models_for_field(&shapes, &field_types, "sub");
+        assert_eq!(
+            candidates,
+            vec![&"Outer1".to_string(), &"Outer2".to_string()],
+            "field_types fallback candidates must also be sorted",
+        );
+    }
+
+    #[test]
+    fn candidate_selection_prefers_shape_map_over_field_types() {
+        use std::collections::HashMap;
+        let mut shapes: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut shape_fields = HashMap::new();
+        shape_fields.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
+        shapes.insert("ShapeModel".to_string(), shape_fields);
+        let mut field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut type_fields = HashMap::new();
+        type_fields.insert("w".to_string(), "Inner".to_string());
+        field_types.insert("AaaTypeModel".to_string(), type_fields);
+        let candidates = candidate_models_for_field(&shapes, &field_types, "w");
+        assert_eq!(
+            candidates,
+            vec![&"ShapeModel".to_string()],
+            "shape-map hits must exclude field_types candidates (B.2.1 Task 5.5 order)",
         );
     }
 }
