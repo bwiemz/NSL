@@ -143,6 +143,9 @@ pub(crate) fn analysis_to_fused_ce_configs(
                 nsl_semantic::cftp::FusedCeDtypeHint::F16 => nsl_codegen::FusedCeDtypeHint::F16,
                 nsl_semantic::cftp::FusedCeDtypeHint::Bf16 => nsl_codegen::FusedCeDtypeHint::Bf16,
             }),
+            // CFTP v10 (item 3): forward the AST NodeId so codegen can
+            // dispatch the right decorator per train block.
+            train_block_stmt_id: c.train_block_stmt_id,
         })
         .collect()
 }
@@ -193,6 +196,9 @@ pub(crate) fn module_data_to_fused_ce_configs(
                 nsl_semantic::cftp::FusedCeDtypeHint::F16 => nsl_codegen::FusedCeDtypeHint::F16,
                 nsl_semantic::cftp::FusedCeDtypeHint::Bf16 => nsl_codegen::FusedCeDtypeHint::Bf16,
             }),
+            // CFTP v10 (item 3): forward the AST NodeId so codegen can
+            // dispatch the right decorator per train block.
+            train_block_stmt_id: c.train_block_stmt_id,
         })
         .collect()
 }
