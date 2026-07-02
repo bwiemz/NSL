@@ -147,6 +147,64 @@ impl Default for ClusterSpec {
     }
 }
 
+/// ZeRO sharding stage — the single per-layer sharding decision (errata E1 /
+/// audit gap #6).  ZeRO is a **nested chain**, not three independent factors:
+/// each higher stage shards a superset of the previous stage's tensors, so a
+/// single ordered stage captures the real design space without the incoherent
+/// cross-product (e.g. sharded params but replicated gradients) that no runtime
+/// implements.
+///
+/// - `Ddp`         (stage 0): replicate everything (plain data-parallel).
+/// - `Os`          (stage 1): shard the optimizer state (Adam `m`, `v`).
+/// - `OsGrad`      (stage 2): + shard the gradients.
+/// - `OsGradParam` (stage 3): + shard the parameters (full FSDP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ZeroStage {
+    Ddp,
+    Os,
+    OsGrad,
+    OsGradParam,
+}
+
+impl ZeroStage {
+    /// Every stage, in increasing sharding order.
+    pub const ALL: [ZeroStage; 4] = [
+        ZeroStage::Ddp,
+        ZeroStage::Os,
+        ZeroStage::OsGrad,
+        ZeroStage::OsGradParam,
+    ];
+
+    /// Decode a stage index `0..=3`.
+    pub fn from_index(i: u8) -> Option<ZeroStage> {
+        match i {
+            0 => Some(ZeroStage::Ddp),
+            1 => Some(ZeroStage::Os),
+            2 => Some(ZeroStage::OsGrad),
+            3 => Some(ZeroStage::OsGradParam),
+            _ => None,
+        }
+    }
+
+    /// Per-component shard factors `(param, grad, optim)` for `num_gpus`.
+    ///
+    /// A single GPU cannot shard, so every stage collapses to `(1, 1, 1)`.
+    /// Otherwise the nested chain shards optimizer state at stage ≥ 1,
+    /// gradients at stage ≥ 2, and parameters at stage 3.
+    pub fn shards(self, num_gpus: u32) -> (u32, u32, u32) {
+        let n = num_gpus.max(1);
+        if n == 1 {
+            return (1, 1, 1);
+        }
+        match self {
+            ZeroStage::Ddp => (1, 1, 1),
+            ZeroStage::Os => (1, 1, n),
+            ZeroStage::OsGrad => (1, n, n),
+            ZeroStage::OsGradParam => (n, n, n),
+        }
+    }
+}
+
 /// Weight-level importance score per layer (optional; from weight-aware
 /// analysis).  Layers whose importance is below [`DpConfig::prune_floor`]
 /// are eligible for pruning in Level 1.
@@ -165,6 +223,20 @@ pub struct DpConfig {
     /// Layers with importance below this (but above `prune_floor`) are
     /// thinned.
     pub thin_floor: f64,
+    /// Opt-in ZeRO-stage search (audit gap #6).  When `false` (default) the DP
+    /// weighs the legacy binary shard factor `{1, num_gpus}` and behaves exactly
+    /// as before.  When `true` and `num_gpus > 1`, it instead enumerates the
+    /// full ZeRO-stage chain [`ZeroStage::ALL`] per layer — the partial stages
+    /// (optimizer-only, +gradients) trade less memory for less communication.
+    /// Off by default because errata E1 lists the stage enum as a future
+    /// extension awaiting author sign-off.
+    ///
+    /// **Activation follow-up:** some downstream consumers still read only
+    /// `LayerPlan.shard_params` (e.g. the CPDT `shard_factor` in `wggo.rs`), so a
+    /// partial stage (say stage 1 with `shard_params = 1` but `shard_optim = N`)
+    /// would under-report its sharding to them. Update those consumers to honour
+    /// all three factors before enabling this in production.
+    pub zero_stage_search: bool,
 }
 
 impl Default for DpConfig {
@@ -174,6 +246,7 @@ impl Default for DpConfig {
             importance: ImportanceScores::default(),
             prune_floor: 0.05,
             thin_floor: 0.25,
+            zero_stage_search: false,
         }
     }
 }
@@ -229,16 +302,19 @@ fn layer_cost(decision: CoarseDecision, lut_best: Option<LayerCostEntry>) -> (f6
 /// Number of discretized memory buckets the knapsack DP tracks.
 const NB: usize = 256;
 
-/// One candidate `(decision, shard)` assignment for a single layer, with its
-/// resolved cost and resident-memory footprint.
+/// One candidate `(decision, sharding)` assignment for a single layer, with its
+/// resolved cost and resident-memory footprint.  The three shard factors are
+/// equal in the legacy binary path and follow the [`ZeroStage`] nested chain
+/// under `zero_stage_search`.
 #[derive(Debug, Clone, Copy)]
 struct Cand {
     decision: CoarseDecision,
-    shard: u32,
+    shard_param: u32,
+    shard_grad: u32,
+    shard_optim: u32,
     /// forward + backward + comm + optimizer latency (μs).
     cost_us: f64,
-    /// Resident memory for this layer: `(param + Adam m,v) / shard +
-    /// activation`.
+    /// Per-GPU resident memory for this layer (bytes).
     resident: u64,
     param_bytes: u64,
     activation_bytes: u64,
@@ -259,36 +335,72 @@ fn resident_bytes(param_bytes: u64, activation_bytes: u64, shard: u32) -> u64 {
     crate::wggo_cost::resident_training_bytes(param_bytes, optimizer_state, activation_bytes, shard)
 }
 
-/// Enumerate the `(decision, shard)` candidates for one layer.
+/// Enumerate the `(decision, sharding)` candidates for one layer.
 ///
-/// Shard options are `{1}` on a single GPU and `{1, num_gpus}` on a cluster —
-/// the DP chooses sharding as a real memory/communication trade-off rather
-/// than forcing `shard = num_gpus` uniformly.
+/// Default (`zero_stage_search = false`): the legacy binary shard factor —
+/// `{1}` on a single GPU and `{1, num_gpus}` on a cluster, applied uniformly to
+/// params/grads/optim, with the coarse `3·param/shard` memory model.
+///
+/// `zero_stage_search = true` (and `num_gpus > 1`): the full ZeRO-stage chain
+/// [`ZeroStage::ALL`], where each stage shards params/grads/optim independently
+/// (nested chain) and carries the faithful per-component memory model
+/// (including gradient memory), so the partial stages are genuinely distinct
+/// memory/comm points the DP can choose between.
 fn layer_candidates(
     layer: &Layer,
     cfg: &DpConfig,
     lut_best: Option<LayerCostEntry>,
     gpu: &GpuSpec,
 ) -> Vec<Cand> {
-    let shard_opts: Vec<u32> = if cfg.cluster.num_gpus > 1 {
-        vec![1, cfg.cluster.num_gpus]
-    } else {
-        vec![1]
-    };
+    let n = cfg.cluster.num_gpus;
     let mut out = Vec::new();
     for decision in candidate_decisions(layer, cfg) {
         let (compute_us, _bytes, param_bytes, activation_bytes) = layer_cost(decision, lut_best);
-        for &shard in &shard_opts {
-            let (comm_us, optim_us) =
-                comm_optim_us(param_bytes, shard, shard, cfg.cluster.interconnect_gbs, gpu);
-            out.push(Cand {
-                decision,
-                shard,
-                cost_us: compute_us + comm_us + optim_us,
-                resident: resident_bytes(param_bytes, activation_bytes, shard),
-                param_bytes,
-                activation_bytes,
-            });
+        if cfg.zero_stage_search && n > 1 {
+            // Faithful ZeRO-stage search (audit gap #6).
+            for stage in ZeroStage::ALL {
+                let (sp, sg, so) = stage.shards(n);
+                let (comm_us, optim_us) = crate::wggo_cost::zero_stage_costs(
+                    param_bytes, sp, sg, so, cfg.cluster.interconnect_gbs, gpu,
+                );
+                let resident = crate::wggo_cost::resident_training_bytes_sharded(
+                    param_bytes,
+                    param_bytes, // gradients are the same size as parameters
+                    2u64.saturating_mul(param_bytes), // Adam m + v
+                    activation_bytes,
+                    sp,
+                    sg,
+                    so,
+                );
+                out.push(Cand {
+                    decision,
+                    shard_param: sp,
+                    shard_grad: sg,
+                    shard_optim: so,
+                    cost_us: compute_us + comm_us + optim_us,
+                    resident,
+                    param_bytes,
+                    activation_bytes,
+                });
+            }
+        } else {
+            // Legacy binary shard factor — byte-identical to pre-gap-#6.
+            let shard_opts: [u32; 2] = [1, n];
+            let take = if n > 1 { 2 } else { 1 };
+            for &shard in &shard_opts[..take] {
+                let (comm_us, optim_us) =
+                    comm_optim_us(param_bytes, shard, shard, cfg.cluster.interconnect_gbs, gpu);
+                out.push(Cand {
+                    decision,
+                    shard_param: shard,
+                    shard_grad: shard,
+                    shard_optim: shard,
+                    cost_us: compute_us + comm_us + optim_us,
+                    resident: resident_bytes(param_bytes, activation_bytes, shard),
+                    param_bytes,
+                    activation_bytes,
+                });
+            }
         }
     }
     out
@@ -463,9 +575,9 @@ pub fn solve(
             name: layer.name.clone(),
             decision: c.decision,
             pipeline_stage: *stage_of.get(idx).unwrap_or(&0),
-            shard_params: c.shard,
-            shard_grads: c.shard,
-            shard_optim: c.shard,
+            shard_params: c.shard_param,
+            shard_grads: c.shard_grad,
+            shard_optim: c.shard_optim,
             estimated_us: c.cost_us,
             estimated_bytes: c.resident,
             param_bytes: c.param_bytes,
@@ -585,6 +697,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_stage_shards_follow_the_nested_chain() {
+        let n = 8;
+        // (param, grad, optim) shard factors for each ZeRO stage.
+        assert_eq!(ZeroStage::Ddp.shards(n), (1, 1, 1)); // stage 0: nothing sharded
+        assert_eq!(ZeroStage::Os.shards(n), (1, 1, n)); // stage 1: optimizer state
+        assert_eq!(ZeroStage::OsGrad.shards(n), (1, n, n)); // stage 2: + gradients
+        assert_eq!(ZeroStage::OsGradParam.shards(n), (n, n, n)); // stage 3: + parameters
+        // A single GPU collapses every stage to no sharding.
+        for st in ZeroStage::ALL {
+            assert_eq!(st.shards(1), (1, 1, 1));
+        }
+        // The chain is monotone: each higher stage shards a superset of tensors.
+        for st in ZeroStage::ALL {
+            let (p, g, o) = st.shards(n);
+            assert!(o >= g && g >= p, "sharding is nested optim ⊇ grad ⊇ param");
+        }
+        // Index round-trip.
+        assert_eq!(ZeroStage::from_index(0), Some(ZeroStage::Ddp));
+        assert_eq!(ZeroStage::from_index(3), Some(ZeroStage::OsGradParam));
+        assert_eq!(ZeroStage::from_index(4), None);
+    }
+
+    #[test]
     fn low_importance_layers_get_thinned_or_pruned() {
         let g = toy_graph(4);
         let lut = build_lut(&shape(), gpu(), &LutAxes::default());
@@ -699,6 +834,47 @@ mod tests {
         };
         let plan = solve(&g, &[lut], &cfg, gpu()).expect("feasible");
         assert!(plan.layers.iter().all(|l| l.shard_params == 1));
+    }
+
+    #[test]
+    fn zero_stage_search_picks_partial_sharding_the_binary_model_cannot() {
+        // Same ample-budget, 8-GPU setup as `dp_no_shard_when_budget_ample`
+        // (which keeps shard=1 under the legacy binary model). With ZeRO-stage
+        // search ON, sharding only the optimizer state (stage 1) is a strict
+        // win — no extra collective, yet less optimizer-step HBM traffic — so
+        // the DP picks a PARTIAL stage the binary {1,N} model cannot express.
+        let g = toy_graph(4);
+        let luts = [build_lut(&shape(), gpu(), &LutAxes::default())];
+        let cfg = DpConfig {
+            cluster: ClusterSpec {
+                num_gpus: 8,
+                memory_budget: 80u64 * 1024 * 1024 * 1024,
+                max_stages: 1,
+                interconnect_gbs: 300.0,
+            },
+            importance: ImportanceScores {
+                per_layer: vec![1.0; 4],
+            },
+            zero_stage_search: true,
+            ..Default::default()
+        };
+        let plan = solve(&g, &luts, &cfg, gpu()).expect("feasible");
+        for l in &plan.layers {
+            assert_eq!(l.shard_optim, 8, "optimizer state sharded (stage ≥ 1)");
+            assert_eq!(l.shard_params, 1, "parameters replicated (stage < 3)");
+            // Every plan is a real ZeRO stage: optim ⊇ grad ⊇ param.
+            assert!(l.shard_optim >= l.shard_grads && l.shard_grads >= l.shard_params);
+        }
+        // Contrast: flag OFF reproduces the legacy all-replicated outcome.
+        let legacy = DpConfig {
+            zero_stage_search: false,
+            ..cfg.clone()
+        };
+        let legacy_plan = solve(&g, &luts, &legacy, gpu()).expect("feasible");
+        assert!(legacy_plan
+            .layers
+            .iter()
+            .all(|l| l.shard_params == 1 && l.shard_optim == 1));
     }
 
     #[test]
