@@ -23,6 +23,7 @@ use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     backward_ds_offset, backward_p_offset, backward_rms_strip_offset,
 };
+use crate::flash_attention_v2::phases::backward::probe::maybe_emit_probe_store;
 
 /// Compute per-row softmax-backward correction `D[i] = sum_d dO[i, d] * O[i, d]`
 /// and store to `strip[warp_row]` in SMEM (overwrite).
@@ -162,6 +163,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mov.f32 %row_sum, 0f3F800000;\n");
     ptx.push_str(&format!("V2_BWD_ROW_STATS_DONE_{q_tile_iter}:\n"));
 
+    // ── cycle-20 T1 probe slots 0+1: row_max, row_sum ──
+    maybe_emit_probe_store(ptx, config, 0, "%row_max", q_tile_iter);
+    maybe_emit_probe_store(ptx, config, 1, "%row_sum", q_tile_iter);
+
     // ── Pass 1: compute S[row, lane], P[row, lane], dP[row, lane] ─────────
     ptx.push_str(&format!("V2_BWD_DP_LOOP_{q_tile_iter}:\n"));
 
@@ -200,6 +205,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     // S *= scale  (= 1/sqrt(head_dim))
     ptx.push_str("    mul.f32 %f_P, %f_P, %scale;\n");
 
+    // ── cycle-20 T1 probe slot 2: S_pre_mask (S scaled, pre causal/segment) ──
+    maybe_emit_probe_store(ptx, config, 2, "%f_P", q_tile_iter);
+
     // Mask invalid KV columns first: k_global >= seq_len must behave like
     // a masked score regardless of causal / segment settings.
     ptx.push_str("    cvt.u64.u32 %rd42, %lane;\n");
@@ -237,6 +245,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.f32 %f_P, %f_P, %log2e;\n");
     ptx.push_str("    ex2.approx.f32 %f_P, %f_P;\n");
     ptx.push_str("    div.approx.f32 %f_P, %f_P, %row_sum;\n");
+
+    // ── cycle-20 T1 probe slot 3: P (post normalization) ──
+    maybe_emit_probe_store(ptx, config, 3, "%f_P", q_tile_iter);
 
     // Store P[warp_row, lane] to SMEM at backward_p_offset + (warp_row*block_kv + lane)*4.
     ptx.push_str(&format!(
@@ -298,12 +309,18 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mov.f32 %f_dP, 0f00000000;\n");
     ptx.push_str(&format!("V2_BWD_DP_DONE_{q_tile_iter}:\n"));
 
+    // ── cycle-20 T1 probe slot 4: dP (row_max, lane) ──
+    maybe_emit_probe_store(ptx, config, 4, "%f_dP", q_tile_iter);
+
     ptx.push_str("    shl.b64 %rd45, %warp_row, 2;\n");
     ptx.push_str(&format!(
         "    add.u64 %rd45, %rd45, {};\n", backward_rms_strip_offset(config)
     ));
     ptx.push_str("    add.u64 %rd45, %shmem_base, %rd45;\n");
     ptx.push_str("    ld.shared.f32 %f_rowsum_dP_P, [%rd45];\n");
+
+    // ── cycle-20 T1 probe slot 5: rowsum_dP_P (D correction from SMEM strip) ──
+    maybe_emit_probe_store(ptx, config, 5, "%f_rowsum_dP_P", q_tile_iter);
 
     // Ensure P stores are visible to dv_accum (and to anyone reading P later).
     ptx.push_str("    bar.sync 0;  // P tile visible to dv_accum\n");
@@ -312,6 +329,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str(&format!("V2_BWD_DS_{q_tile_iter}:\n"));
     ptx.push_str("    sub.f32 %f0, %f_dP, %f_rowsum_dP_P;\n");
     ptx.push_str("    mul.f32 %f_dS, %f_P, %f0;\n");
+
+    // ── cycle-20 T1 probe slot 6: raw dS (pre scale multiplication) ──
+    maybe_emit_probe_store(ptx, config, 6, "%f_dS", q_tile_iter);
 
     // SMEM slot: backward_ds_offset + (warp_row * block_kv + lane) * 4
     ptx.push_str(&format!(
@@ -343,7 +363,7 @@ mod tests {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -351,6 +371,7 @@ mod tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

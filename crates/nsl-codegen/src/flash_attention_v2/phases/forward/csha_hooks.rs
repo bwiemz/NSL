@@ -9,10 +9,118 @@
 
 use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
 
-/// Emit the §A.4 active_heads guard. When `csha_active_heads` param is
-/// non-zero and `head_idx >= csha_active_heads`, the kernel returns
-/// immediately (dead-head pruning). Null guard: param=0 means "no
-/// pruning, run all heads".
+/// Cycle 13 save-suppression gate for K_proj and V_proj saves under
+/// `@checkpoint(policy="full")`.
+///
+/// Returns `true` if the K/V save site should emit its `st.global.b16`
+/// store (the historical, byte-identical behavior). Returns `false` if
+/// the save should be SUPPRESSED — the K/V tensors will be reconstructed
+/// on the backward pass by `emit_kv_recompute -> emit_one_recompute_matmul`.
+///
+/// # Invariant: orthogonal flags
+///
+/// `save_activations_for_backward` and `checkpoint` STAY ORTHOGONAL.
+/// They are never collapsed into a single flag:
+///   * `save_activations_for_backward == false` ⇒ no saves at all (the
+///     existing early-return at `emit_save_activations_subset` line 759
+///     handles this; this helper is not even consulted).
+///   * `checkpoint == Some(Full)` (with cascade admission) ⇒ K/V saves
+///     SUPPRESSED specifically; Q_proj, row_max, row_sum, out are
+///     RETAINED (see Phase A facet 2 — backward q_load reads q_proj_ptr
+///     unconditionally; `D = rowsum(dO ⊙ O)` needs `out`; ds_compute
+///     needs the LSE).
+///
+/// # REACHABILITY corollary (cycle 12)
+///
+/// Suppression fires ONLY when `validate_checkpoint_eligibility(cfg)`
+/// admits the config. If R3/R7/R8.1/R9/R10/R11/R12 reject (for example
+/// `segment_masked=true` hits R12), this returns `true` (= emit saves
+/// as the fallback path). This honors the cycle-12 invariant that the
+/// forward-emit decision and the backward-dispatch decision consult the
+/// SAME cascade so the kernel never reads uninitialized HBM.
+///
+/// HBM-byte savings claim is unvalidated until cycle 14 (Blackwell
+/// measurement).
+pub(super) fn should_emit_kv_save(cfg: &FlashAttentionConfig) -> bool {
+    use crate::flash_attention::CheckpointPolicy;
+    use crate::flash_attention_v2::validate_checkpoint_eligibility;
+
+    let want_save = cfg
+        .csha
+        .as_ref()
+        .is_some_and(|c| c.save_activations_for_backward);
+    if !want_save {
+        // save_activations=false: the early-return at line 759 of
+        // emit_save_activations_subset already handles this. Return
+        // false defensively so any future caller can rely on the
+        // helper meaning "should this specific K/V save site emit?"
+        return false;
+    }
+    let policy_full = cfg
+        .checkpoint
+        .as_ref()
+        .is_some_and(|c| c.policy == CheckpointPolicy::Full);
+    let cascade_ok = validate_checkpoint_eligibility(cfg).is_ok();
+    let suppress = policy_full && cascade_ok;
+    !suppress
+}
+
+/// # CSHA paper §5.2 (dead-head elimination) — v1 envelope
+///
+/// Two-tier elimination, both shipped pre-cycle-2:
+///   * **Launcher truncation** (primary): when `csha.active_heads > 0` and
+///     < total heads, the `nsl_flash_attention_csha*` runtime launches
+///     `gridDim.y = batch * effective_heads` (see
+///     `nsl-runtime/src/flash_attention.rs` near line 654 for the forward
+///     CSHA path, with parallel sites near 976 / 1428 / 2145 for
+///     scalar+fused backward variants). Blocks for dead heads NEVER
+///     launch — no wasted SM cycles. Formula pinned by the
+///     `a4_grid_y_*` unit tests in that file.
+///   * **In-kernel guard** (this function, defense in depth): runtime
+///     predicate that short-circuits the block prologue when the block's
+///     head index would have been classified dead. Cheap, ASCII-PTX,
+///     no SMEM cost. The guard reads the `csha_active_heads` *kernel
+///     param* (not the codegen-time `config.csha.active_heads` literal)
+///     so a single emitted kernel handles any pruning count the launcher
+///     supplies, including the "no pruning" sentinel.
+///
+/// v1 envelope (cycle-2 audit):
+///   * `csha_active_heads == 0` is a SENTINEL meaning "all heads live" —
+///     the guard's first `setp.eq.u32 %r10, 0` branches over the
+///     head-index check, so no head is ejected. In a paired launch the
+///     launcher reports `effective_heads = heads` so the grid runs the
+///     full head count too.
+///   * `csha_active_heads > 0` triggers BOTH launcher truncation AND the
+///     in-kernel `ret` — defense in depth: kernel stays safe if a future
+///     caller forgets to truncate `gridDim.y` or constructs a grid
+///     against a different active_heads than the kernel was specialised
+///     against (cache-hit misrouting).
+///   * Emission is gated only on `config.csha.is_some()`; the v2 hooks
+///     variant emits the same PTX for any `csha.active_heads` value
+///     because the predicate lives in the kernel param, not in a
+///     compile-time literal. The legacy classic-path emitter at
+///     `flash_attention.rs::emit_csha_active_heads_guard` IS literal-
+///     gated (used by the non-v2 emitter); these two emitters cover
+///     different dispatch paths and must stay numerically equivalent
+///     at runtime.
+///
+/// Deferred to a future cycle (paper §5.2 v2):
+///   * Per-active-head codegen specialization — emit N variant kernels,
+///     one per active-head set, replacing the runtime guard with
+///     compile-time dead code elimination. Trades binary size for
+///     hot-path predicate cost.
+///   * Per-head mixed precision (depends on FP8 M35 — paper §3.3).
+///
+/// # Emission contract
+///
+/// When `config.csha.is_none()`: emits a single comment line only — no
+/// PTX instructions, no labels. This is what the non-CSHA dispatch
+/// (classic FA-2 path with `csha: None`) ships.
+///
+/// When `config.csha.is_some()`: emits the full guard prelude — `ld.param`
+/// of `csha_active_heads`, sentinel-zero skip branch (`@%p0 bra
+/// V2_CSHA_ACTIVE_HEADS_SKIP`), head-index compare, conditional `ret`,
+/// and the `V2_CSHA_ACTIVE_HEADS_SKIP:` label.
 pub fn emit_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig) {
     if config.csha.is_none() {
         ptx.push_str("    // CSHA A.4 active_heads guard: csha=None, no emission\n");
@@ -34,6 +142,30 @@ pub fn emit_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig) 
 /// for the warp's query row and writes the result back into the x
 /// buffer in-place. Null-guarded on `csha_x_ptr`.
 pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    // Forward-path entry point: delegate to the namespaced variant with
+    // an empty suffix to preserve byte-identity. Verified against the
+    // `fa_v2_snapshots` baseline (25/25 byte-identical post-cycle-10).
+    emit_prologue_namespaced(ptx, config, q_tile_iter, "");
+}
+
+/// Cycle-10 §5.3 Task 8: namespaced `emit_prologue` variant.
+///
+/// `namespace_suffix` is appended to every PTX *label* this function
+/// emits (`V2_CSHA_PROLOGUE_SKIP_{q_tile_iter}{suffix}`). PTX registers
+/// (`%rd52`, `%f0`, etc.) are NOT suffixed because they are declared
+/// in the kernel prelude and shared across all phase emitters; the
+/// backward recompute path will reload them per call, not re-declare
+/// them.
+///
+/// Forward path passes `suffix = ""` to preserve byte-identity. Backward
+/// recompute path (Task 9) will pass a backward-suitable suffix like
+/// `"_bwd_{q_tile_iter}"` via `emit_prologue_recompute` below.
+pub fn emit_prologue_namespaced(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    namespace_suffix: &str,
+) {
     if config.csha.is_none() {
         ptx.push_str("    // CSHA A.2.2 prologue: csha=None, no emission\n");
         return;
@@ -49,8 +181,8 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     ptx.push_str("    ld.param.u64 %rd52, [csha_x_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd52, 0;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_CSHA_PROLOGUE_SKIP_{};\n",
-        q_tile_iter
+        "    @%p0 bra V2_CSHA_PROLOGUE_SKIP_{}{};\n",
+        q_tile_iter, namespace_suffix
     ));
 
     // Tier C: load x_raw_ptr once (for the per-slice raw-x save below).
@@ -143,8 +275,29 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         ptx.push_str("    st.global.f32 [%rd54], %f2;\n");
     }
 
-    ptx.push_str(&format!("V2_CSHA_PROLOGUE_SKIP_{}:\n", q_tile_iter));
+    ptx.push_str(&format!(
+        "V2_CSHA_PROLOGUE_SKIP_{}{}:\n",
+        q_tile_iter, namespace_suffix
+    ));
     ptx.push_str("    bar.sync 0;  // FENCE: all prologue writes complete\n");
+}
+
+/// Cycle-10 §5.3 Task 8: backward-suitable wrapper around
+/// `emit_prologue_namespaced`.
+///
+/// Used by the backward dispatch fork (Task 9) under
+/// `CheckpointPolicy::Full` to re-emit the prologue at backward-pass
+/// time with a backward-distinguished label namespace, so the
+/// recomputed labels (e.g. `V2_CSHA_PROLOGUE_SKIP_0_bwd_0`) do not
+/// collide with the forward-pass labels still resident in the same
+/// PTX text section.
+pub fn emit_prologue_recompute(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    namespace_suffix: &str,
+) {
+    emit_prologue_namespaced(ptx, config, q_tile_iter, namespace_suffix);
 }
 
 /// Emit the §A.2.3 matmul projection (Q/K/V fused projection).
@@ -721,6 +874,25 @@ pub fn emit_save_activations_subset(
         SaveSet::V  => &all[2..3],
     };
     for &(label, ptr_name, smem_base) in entries {
+        // Cycle 13: per-tensor K/V suppression gate under @checkpoint(policy="full").
+        // Q_proj is RETAINED (backward q_load reads it). Only K_proj and V_proj are
+        // suppressed; the backward path reconstructs them via emit_kv_recompute ->
+        // emit_one_recompute_matmul. See should_emit_kv_save doc for orthogonality
+        // and REACHABILITY invariants.
+        if matches!(ptr_name, "k_proj_ptr" | "v_proj_ptr") && !should_emit_kv_save(config) {
+            ptx.push_str(&format!(
+                "    // -- Save {label} activation: SUPPRESSED under @checkpoint(policy=\"full\") --\n"
+            ));
+            ptx.push_str(&format!(
+                "    // {ptr_name} write: SUPPRESSED under @checkpoint(policy=\"full\")\n"
+            ));
+            ptx.push_str(&format!(
+                "    // recomputed via emit_kv_recompute -> emit_one_recompute_matmul[w{}]\n",
+                label.to_ascii_lowercase()
+            ));
+            ptx.push_str("    // HBM-byte savings claim unvalidated until cycle 14\n");
+            continue;
+        }
         ptx.push_str(&format!(
             "    // -- Save {label} activation to HBM via [{ptr_name}] --\n"
         ));
@@ -778,6 +950,38 @@ pub fn emit_save_activations_subset(
             ));
             ptx.push_str("    shl.b64 %rd_save_colb, %rd_save_col, 1;\n");
             ptx.push_str("    add.u64 %rd_save_smem, %rd_save_smem, %rd_save_colb;\n");
+            // CSHA cycle 20 T4: G16-3 triage probe scaffolding. When the
+            // `csha_cycle20_g163_probe` feature is enabled, emit an inline
+            // capture of the just-computed SMEM address AND the HBM base
+            // pointer for the (Q/K/V slice-0 lane-0) sample site. The
+            // captured tuple is written to a shared HBM scratch region
+            // reachable via `%rd_save_base` at a known negative offset
+            // (see triage harness in `tests/csha_cycle20_g163_triage.rs`
+            // for the co-declared allocation contract). Only fires for
+            // slice==0 (once per lane) and only for the first q_tile_iter
+            // (`q_tile_iter == 0` gate is baked in via emit-time — the
+            // caller loops q_tile_iter for us, so we emit per-call and let
+            // the runtime skip via a warp-broadcast predicate). The probe
+            // MUST NOT alter any addressing math above; it may only read
+            // the computed registers. Kept out of the default build to
+            // preserve `fa_v2_snapshots` byte identity.
+            #[cfg(feature = "csha_cycle20_g163_probe")]
+            if slice == 0 && q_tile_iter == 0 {
+                // Emit as an ASCII comment ONLY under the feature — the
+                // emission is a probe marker string that a companion
+                // harness pattern-matches for; keeping this text-only
+                // (rather than PTX that consumes a register or scratch
+                // buffer) avoids all risk of perturbing register
+                // allocation or SMEM state under the probe build. The
+                // triage harness proves the emitter path reaches the
+                // slice-0 site by asserting the marker appears in the
+                // synthesized PTX; a follow-on cycle21 task will replace
+                // the marker with an actual HBM store once a scratch
+                // buffer plumb-through lands.
+                ptx.push_str(&format!(
+                    "    // CSHA_C20_G163_PROBE label={label} slice=0 iter=0 smem_reg=%rd_save_smem base_reg=%rd_save_base\n"
+                ));
+            }
             ptx.push_str("    ld.shared.b16 %h_save_v, [%rd_save_smem];\n");
             ptx.push_str(&format!(
                 "    st.global.b16 [%rd_save_elem], %h_save_v;  // {ptr_name} write\n"
@@ -1464,7 +1668,9 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            checkpoint: None,
         }
     }
 
@@ -1480,7 +1686,9 @@ mod tests {
             rope_style: RopeStyle::Adjacent,  // emit_rope_pair_sweep implements Adjacent (x[2i], x[2i+1])
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            checkpoint: None,
         }
     }
 
@@ -1655,12 +1863,14 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 fused_output_proj: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -1813,12 +2023,14 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state(&mut ptx, &cfg, 0);
@@ -1850,13 +2062,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "");
@@ -1879,13 +2092,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "wrow");
@@ -1921,13 +2135,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "wid");
@@ -1949,13 +2164,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "qstart");
@@ -1976,13 +2192,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut off = String::new();
         emit_save_softmax_state_with_diag(&mut off, &cfg, 0, "");
@@ -2006,13 +2223,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "fmax");
@@ -2038,13 +2256,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "newmax");
@@ -2065,13 +2284,14 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "fsum");
@@ -2097,12 +2317,14 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: false,
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state(&mut ptx, &cfg, 0);
@@ -2158,5 +2380,69 @@ mod tests {
             "K RoPE must run before S-compute; \
              found ROPE_K @ byte {rope_k_idx} but S-compute @ byte {attn_body_idx}"
         );
+    }
+
+    // ── Cycle-10 §5.3 Task 8: namespaced emit_prologue tests ──────────────
+
+    #[test]
+    fn cycle10_task8_forward_path_byte_identical() {
+        // emit_prologue is now a thin shim around emit_prologue_namespaced
+        // with suffix="". The PTX bytes must match a direct
+        // emit_prologue_namespaced(..., "") call exactly — this is the
+        // contract that guarantees fa_v2_snapshots byte-identity.
+        let cfg = cfg_with_projections();
+        let mut a = String::new();
+        let mut b = String::new();
+        emit_prologue(&mut a, &cfg, 0);
+        emit_prologue_namespaced(&mut b, &cfg, 0, "");
+        assert_eq!(a, b, "forward path must equal namespaced empty-suffix call");
+
+        // Specifically: emitted label uses the unsuffixed form.
+        assert!(
+            a.contains("V2_CSHA_PROLOGUE_SKIP_0:"),
+            "forward label must be V2_CSHA_PROLOGUE_SKIP_0 (no suffix); got: {}",
+            a
+        );
+        assert!(
+            !a.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd"),
+            "forward must NOT include backward-suffixed label"
+        );
+    }
+
+    #[test]
+    fn cycle10_task8_emit_prologue_recompute_uses_suffix() {
+        // emit_prologue_recompute is the backward-path entry point. With
+        // a backward-distinguishing suffix the emitted labels must carry
+        // the suffix so they don't collide with forward labels in the
+        // same PTX text section.
+        let cfg = cfg_with_projections();
+        let mut ptx = String::new();
+        emit_prologue_recompute(&mut ptx, &cfg, 0, "_bwd_0");
+        assert!(
+            ptx.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd_0:"),
+            "backward-suffixed label V2_CSHA_PROLOGUE_SKIP_0_bwd_0 missing; got: {}",
+            ptx
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd_0;"),
+            "branch target to V2_CSHA_PROLOGUE_SKIP_0_bwd_0 missing; got: {}",
+            ptx
+        );
+    }
+
+    #[test]
+    fn cycle10_task8_no_csha_short_circuits_with_or_without_suffix() {
+        // The csha=None bail-out is independent of the suffix.
+        let mut cfg = cfg_with_projections();
+        cfg.csha = None;
+        let mut a = String::new();
+        let mut b = String::new();
+        emit_prologue(&mut a, &cfg, 0);
+        emit_prologue_recompute(&mut b, &cfg, 0, "_bwd_0");
+        assert_eq!(
+            a, b,
+            "csha=None short-circuit must be suffix-independent"
+        );
+        assert!(a.contains("csha=None"));
     }
 }

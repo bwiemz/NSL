@@ -1,0 +1,16 @@
+# Sprint 1 cycle-3 fixture (paper §4 tree-mask end-to-end wiring).
+#
+# Pins the decorator-to-codegen wiring: bare `@tree_mask` alongside
+# `@flash_attention` must reach `FlashAttentionConfig::tree_mask=true`,
+# which (a) appends the `_t1_` variant tag to the synthesized kernel
+# name and (b) emits the `dfs_enter_ptr`/`dfs_exit_ptr` parameters +
+# DFS-enter/DFS-exit ancestor check in PTX.
+#
+# Body is intentionally trivial — the integration test only inspects
+# the compile context, the synthesized kernel name, and the PTX byte
+# stream, none of which depend on the function body.
+
+@flash_attention
+@tree_mask
+fn forward():
+    pass

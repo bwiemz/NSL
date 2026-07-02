@@ -3,7 +3,28 @@
 //! Pipeline: Phase 1 (local inference) → Phase 2 (call graph propagation) → Phase 3 (assertion validation)
 
 use std::collections::{HashMap, HashSet};
-use nsl_errors::Diagnostic;
+use nsl_errors::{Diagnostic, FileId};
+
+// ---------------------------------------------------------------------------
+// CheckpointPolicy — cycle-10 §5.3 paper checkpointing-aware backward policy
+// ---------------------------------------------------------------------------
+//
+// Mirrors `nsl_codegen::flash_attention::CheckpointPolicy` deliberately:
+// the semantic layer must NOT depend on nsl-codegen (would invert the
+// crate-dependency direction). The codegen-side reads this semantic
+// effect record via `EffectChecker::checkpoint_policies()` and translates.
+//
+// v1 ships a single variant (`Full`) per cycle-10 Refuter 3 invariant
+// inversion: `Selective`, `SelectivePostnorm`, `Custom` are reserved for
+// v2/v3 and are refused at the kwarg parser. See
+// `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`.
+
+/// Paper §5.3 checkpointing-aware backward policy (semantic-layer copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckpointPolicy {
+    /// Full prologue recompute during backward (v1 only variant).
+    Full,
+}
 
 // ---------------------------------------------------------------------------
 // EffectSet — bitset of computational effects
@@ -143,6 +164,30 @@ pub struct EffectChecker {
     /// Functions annotated @checkpoint.
     checkpointed_fns: HashSet<String>,
 
+    /// Cycle-10 §5.3 paper checkpointing-aware backward: functions
+    /// annotated `@checkpoint(policy="full")` carry an explicit
+    /// `CheckpointPolicy::Full` entry here. `@checkpoint(policy="none")`
+    /// and bare `@checkpoint` (with deprecation warning, Path B per T3)
+    /// only populate `checkpointed_fns` so the M14 tape-fallback
+    /// backward continues to apply. The codegen-side dispatch fork
+    /// (Task 9) reads this map to decide whether to emit the
+    /// prologue-recompute kernel namespace.
+    checkpoint_policies: HashMap<String, CheckpointPolicy>,
+
+    /// Cycle-10 §5.3 Path B (T3): track which source files have already
+    /// received the bare-`@checkpoint` deprecation warning so we emit at
+    /// most one diagnostic per file (vs once per call site). Cycle 11
+    /// promotes the warning to a hard error and this set goes away.
+    pub emitted_checkpoint_deprecation: HashSet<FileId>,
+
+    /// Cycle-10 §5.3 R9 cross-scope plumbing (T6): models annotated
+    /// `@paged_kv` are recorded here so the dispatch fork (Task 9) can
+    /// refuse the `@checkpoint(policy="full")` + `@paged_kv` composition
+    /// before either side fires. v1 records membership only; the
+    /// cross-scope check fires at codegen time. Multi-call-graph
+    /// resolution deferred to v4.
+    paged_kv_models: HashSet<String>,
+
     /// Functions with an explicit `Rng` parameter. Their Random effect is
     /// "controlled" — deterministic given the same seed. @deterministic
     /// validation skips the Random check for these functions.
@@ -159,6 +204,9 @@ impl EffectChecker {
             pure_fns: HashSet::new(),
             deterministic_fns: HashSet::new(),
             checkpointed_fns: HashSet::new(),
+            checkpoint_policies: HashMap::new(),
+            emitted_checkpoint_deprecation: HashSet::new(),
+            paged_kv_models: HashSet::new(),
             explicit_rng_fns: HashSet::new(),
             diagnostics: Vec::new(),
         }
@@ -185,6 +233,38 @@ impl EffectChecker {
     /// Mark a function as @checkpoint.
     pub fn mark_checkpointed(&mut self, name: &str) {
         self.checkpointed_fns.insert(name.to_string());
+    }
+
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 3):
+    /// associate an explicit policy with a `@checkpoint(...)` function.
+    /// Callers that flow through here MUST also call `mark_checkpointed`
+    /// so the R4 validator (`@checkpoint requires @pure`) still applies.
+    pub fn mark_checkpointed_with_policy(&mut self, name: &str, policy: CheckpointPolicy) {
+        self.checkpoint_policies.insert(name.to_string(), policy);
+    }
+
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 3):
+    /// public accessor consumed by the codegen-side wire-up at
+    /// `crates/nsl-cli/src/loader.rs` (Task 6) to pass policies into
+    /// `WengertExtractor::with_checkpoint_policy`.
+    pub fn checkpoint_policies(&self) -> &HashMap<String, CheckpointPolicy> {
+        &self.checkpoint_policies
+    }
+
+    /// Cycle-10 §5.3 R9 cross-scope plumbing (Task 4): record a
+    /// `@paged_kv`-decorated model name. The dispatch fork at
+    /// `flash_attention_v2/mod.rs::synthesize_backward_with_tier`
+    /// (Task 9) consults this set to refuse the
+    /// `policy="full"` + `@paged_kv` composition.
+    pub fn mark_paged_kv_model(&mut self, name: &str) {
+        self.paged_kv_models.insert(name.to_string());
+    }
+
+    /// Cycle-10 §5.3 R9 cross-scope plumbing (Task 4): public accessor
+    /// for the `@paged_kv` model set. Codegen consumes this for the
+    /// cross-scope refusal predicate.
+    pub fn paged_kv_models(&self) -> &HashSet<String> {
+        &self.paged_kv_models
     }
 
     /// Mark a function as having an explicit `Rng` parameter.
@@ -263,17 +343,28 @@ impl EffectChecker {
             }
         }
 
-        // @checkpoint: requires @pure (recomputation must produce same result)
+        // @checkpoint: requires @pure (recomputation must produce same result).
+        //
+        // Cycle-10 §5.3 (T10): the generic `is_pure()` check covers all four
+        // non-pure flags (IO, Random, Mutation, Communication) — not just
+        // Random. We keep the existing message wording for backwards
+        // compatibility, and append a one-sentence note for the
+        // Random-effect case explaining that per-Q-tile RNG channel routing
+        // is deferred to v2.
         for name in self.checkpointed_fns.clone() {
             let effects = self.fn_effects.get(&name).copied().unwrap_or(EffectSet::PURE);
             if !effects.is_pure() {
-                self.diagnostics.push(
-                    Diagnostic::error(format!(
-                        "@checkpoint function '{}' has effects: {} — \
-                         @checkpoint recomputes during backward, requires @pure",
-                        name, effects.display()
-                    )),
+                let mut msg = format!(
+                    "@checkpoint function '{}' has effects: {} — \
+                     @checkpoint recomputes during backward, requires @pure",
+                    name, effects.display()
                 );
+                if effects.contains(EffectSet::RANDOM) {
+                    msg.push_str(
+                        "; per-Q-tile RNG channel for Random effects deferred to v2"
+                    );
+                }
+                self.diagnostics.push(Diagnostic::error(msg));
             }
         }
     }
@@ -433,6 +524,45 @@ mod tests {
         checker.analyze();
         assert_eq!(checker.diagnostics.len(), 1);
         assert!(checker.diagnostics[0].message.contains("@checkpoint"));
+    }
+
+    // Cycle-10 §5.3 Task 3: R4 message picks up the RNG note for
+    // Random-effect functions while preserving the generic wording.
+    #[test]
+    fn checkpoint_random_effect_appends_rng_v2_note() {
+        let mut checker = EffectChecker::new();
+        // `block` calls `randn` which is a builtin Random source.
+        checker.register_function("block", EffectSet::PURE, vec!["randn".into()]);
+        checker.mark_checkpointed("block");
+        checker.analyze();
+        assert_eq!(checker.diagnostics.len(), 1);
+        assert!(
+            checker.diagnostics[0].message.contains("requires @pure"),
+            "generic message must remain"
+        );
+        assert!(
+            checker.diagnostics[0]
+                .message
+                .contains("per-Q-tile RNG channel for Random effects deferred to v2"),
+            "Random effect must append the v2-deferral note"
+        );
+    }
+
+    // Cycle-10 §5.3 Task 3: R4 message does NOT append the RNG note for
+    // non-Random non-pure effects (IO/Mutation/Communication).
+    #[test]
+    fn checkpoint_io_effect_does_not_append_rng_note() {
+        let mut checker = EffectChecker::new();
+        checker.register_function("block", EffectSet::PURE, vec!["print".into()]);
+        checker.mark_checkpointed("block");
+        checker.analyze();
+        assert_eq!(checker.diagnostics.len(), 1);
+        assert!(
+            !checker.diagnostics[0]
+                .message
+                .contains("RNG channel"),
+            "non-Random effects must NOT append the RNG v2 note"
+        );
     }
 
     #[test]

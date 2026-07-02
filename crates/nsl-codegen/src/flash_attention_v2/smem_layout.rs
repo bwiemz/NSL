@@ -151,12 +151,99 @@ pub fn backward_rms_strip_offset(config: &FlashAttentionConfig) -> u32 {
     backward_dx_norm_offset(config) + (config.block_q as u32) * dm * 4
 }
 
+/// SMEM rebasing base for the standalone Tier B.2 `proj_backward` kernel.
+///
+/// The proj-backward kernel (Phase 3 T4) reuses the scalar fused-backward
+/// prelude + emitters, which place the dQ/dK/dV/x_norm/dx_norm/rms tiles AFTER
+/// the full forward layout (`total_bytes` + P + dS). As a *standalone* kernel
+/// proj_backward never touches the forward Q/KV/SP/weight tiles nor the P/dS
+/// tiles, so allocating SMEM up through the absolute `backward_rms_strip_offset`
+/// (~137 KB at hd=64, ~113 KB at hd=128) blows past the 99 KB dynamic-SMEM
+/// device cap and the launch fails with `CUDA_ERROR_INVALID_VALUE`.
+///
+/// `synthesize_proj_backward` therefore shifts `%shmem_base` DOWN by this base
+/// (`backward_dq_offset`, the lowest offset the proj kernel references) so the
+/// SAME emitter offsets land in a compacted region starting at allocation byte
+/// 0. The launch then only needs `tier_b2_proj_backward_smem_bytes` (~88 KB).
+/// All proj references go through `%shmem_base + backward_{dq,dv,dk,x_norm,
+/// dx_norm,rms}_offset`, and all rebase consistently because the shift is a
+/// single subtract applied once after the prelude.
+pub fn tier_b2_proj_backward_smem_base(config: &FlashAttentionConfig) -> u32 {
+    backward_dq_offset(config)
+}
+
+/// Compacted dynamic-SMEM byte count for the standalone proj-backward kernel
+/// after the `%shmem_base` rebase (see `tier_b2_proj_backward_smem_base`).
+/// Equals the span from the lowest referenced tile (dQ) through the end of the
+/// highest (the rms strip).
+pub fn tier_b2_proj_backward_smem_bytes(config: &FlashAttentionConfig) -> u32 {
+    let rms_end = backward_rms_strip_offset(config) + (config.block_q as u32) * 4;
+    rms_end - tier_b2_proj_backward_smem_base(config)
+}
+
+/// Cycle-11 §4 update: extra SMEM scratch the `policy="full"` recompute
+/// path needs on top of the existing forward + backward tiles to hold the
+/// re-derived prologue values during backward.
+///
+/// **Cycle-11 3-tile strategy (NOT 6).** Cycle 10 reserved 6 tiles
+/// (x_norm, Q_proj, K_proj, V_proj, Q_rope, K_rope) conservatively. The
+/// cycle-11 functional-substitution wiring observes that K_proj and V_proj
+/// can be written back into the existing `%k_smem_base` / `%v_smem_base`
+/// slots (overwriting the now-unused kv_load tiles — those are dispatched
+/// off when `checkpoint.is_some()`). Q_proj is the only producer whose
+/// downstream consumer survives, but in v1.1 the only required NEW SMEM
+/// surface is the **xnorm scratch** read by both projection-recompute
+/// matmuls. K_rope rotation is applied in place on `%k_smem_base` via
+/// `emit_rope_k_epilogue` (same as forward), needing no extra scratch.
+///
+/// Byte math: **1 tile × f16** =
+///
+///   recompute_extra_bytes = 1 * block_q * head_dim * 2
+///                         = 2 * bq * hd  (bytes)
+///
+/// At hd=64, bq=64 this is 2*64*64 = 8192 = 8 KB.
+/// At hd=256, bq=128 it is 2*256*128 = 65536 = 64 KB (the R5 large-config
+/// refusal still trips because the forward+backward base layout at
+/// hd=256/bq=128 exceeds 99 KB on its own; the recompute term is no longer
+/// the dominant overflow source but the cap-check still rejects).
+pub fn recompute_extra_bytes(config: &FlashAttentionConfig) -> usize {
+    let bq = config.block_q as usize;
+    let hd = config.head_dim as usize;
+    // Cycle-11: single xnorm scratch tile (f16). K_proj/V_proj reuse
+    // `%k_smem_base`/`%v_smem_base`; K_rope rotates in place.
+    bq * hd * 2
+}
+
+/// Cycle-11 §4 helper: byte offset of the new xnorm scratch tile within
+/// the dynamic-SMEM region, used by `emit_prologue_recompute_from_raw`
+/// to write the recomputed `x_norm[block_q, head_dim]` (f16, row-major,
+/// stride `head_dim*2`).
+///
+/// The xnorm scratch slot lives at the very top of the recompute extra
+/// region (immediately past the forward + backward layouts). Total budget
+/// allocated for this slot is `recompute_extra_bytes(config)` =
+/// `block_q * head_dim * 2` bytes — exactly one tile.
+pub fn recompute_xnorm_offset(config: &FlashAttentionConfig) -> u32 {
+    // Anchor at the end of the backward extra region — the forward tiles
+    // occupy `total_bytes(config)`, the backward extra (`dQ`/`dK`/`dV`/
+    // `x_norm`/`dx_norm`/`rms_strip`/`P`) sits after, and the recompute
+    // xnorm scratch comes last.
+    total_bytes(config) + backward_extra_bytes(config)
+}
+
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
 ///
 /// `direction` controls whether the backward-pass extra SMEM tiles are
 /// added to the budget before the 99 KB cap check. Forward: unchanged
 /// from Tier A. Backward (Tier C): adds `backward_extra_bytes` to the
 /// forward total.
+///
+/// Cycle-10 §5.3 Task 7 (R5): when `config.checkpoint.is_some()` with
+/// `CheckpointPolicy::Full`, the prologue-recompute scratch tiles
+/// (`recompute_extra_bytes`) are added on top of the forward + backward
+/// extra. If the total exceeds `SMEM_DYNAMIC_BUDGET_BYTES` the validator
+/// returns a refusal whose message contains the substring "exceeds device"
+/// (R5 testable contract).
 pub fn validate_scalar_v2_config(
     config: &FlashAttentionConfig,
     direction: Direction,
@@ -218,6 +305,19 @@ pub fn validate_scalar_v2_config(
         Direction::Forward => 0,
         Direction::Backward => backward_extra_bytes(config),
     };
+    // Cycle-10 §5.3 Task 7 (R5): policy=Full needs prologue-recompute
+    // scratch on top of the forward + backward layouts. Add only when
+    // a CheckpointExtras carrier is present; absence preserves
+    // byte-identity.
+    let recompute_extra = if let Some(ref ckpt) = config.checkpoint {
+        match ckpt.policy {
+            crate::flash_attention::CheckpointPolicy::Full => {
+                recompute_extra_bytes(config) as u32
+            }
+        }
+    } else {
+        0
+    };
     // PCA Tier A: when `segment_masked`, the FA prelude reserves a
     // `DEFAULT_SMEM_SEGMENT_BUDGET`-byte `seg_smem` region (+ a 1028-byte
     // `smem_doc_starts` region when `rope_q`) — separately-declared static SMEM
@@ -233,11 +333,32 @@ pub fn validate_scalar_v2_config(
     } else {
         0
     };
-    let total = pca_smem_layout(fwd_total + extra, config.segment_masked, config.rope_q).total;
+    // pca_smem_layout handles segment_masked + rope_q segment regions;
+    // recompute_extra is layered on top for checkpoint policy=Full (cycle-10 R5).
+    let total = pca_smem_layout(fwd_total + extra, config.segment_masked, config.rope_q).total
+        + recompute_extra;
     let q_region  = kv_start;              // Q region: [0, kv_start)
     let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
     let sp_region = fwd_total - sp_start;  // SP + weight + save region: [sp_start, fwd_total)
     if total > SMEM_DYNAMIC_BUDGET_BYTES {
+        // Cycle-10 §5.3 Task 7 (R5): when the overflow is driven by the
+        // policy="full" recompute term, emit a refusal whose message
+        // contains the substring "exceeds device" so callers / tests can
+        // discriminate this from forward / backward exhaustion.
+        if recompute_extra > 0 {
+            return Err(ConfigError(format!(
+                "checkpoint policy=\"full\" SMEM {} KB exceeds device {} KB \
+                 at hd={}, block_q={} (forward={} backward_extra={} recompute_extra={} seg={})",
+                total / 1024,
+                SMEM_DYNAMIC_BUDGET_BYTES / 1024,
+                config.head_dim,
+                config.block_q,
+                fwd_total,
+                extra,
+                recompute_extra,
+                seg_overhead,
+            )));
+        }
         return Err(ConfigError(match direction {
             Direction::Forward => format!(
                 "SMEM total {} bytes ({:.1} KB) exceeds 99 KB dynamic SMEM budget \
@@ -278,9 +399,17 @@ pub fn kv_offset(config: &FlashAttentionConfig) -> u32 {
     (config.block_q * config.head_dim * 2) as u32
 }
 
-/// S/P scratch region starts immediately after the KV tile (block_kv × head_dim × 2 bytes, f16).
+/// S/P scratch region starts immediately after the KV tile.
+///
+/// KV slab spans `effective_block_kv × head_dim × 2` bytes — at
+/// `num_sink_tokens == 0` this is identical to
+/// `block_kv × head_dim × 2` (byte-identity invariant); when sinks are
+/// enabled (Sprint 1b cycle-7) the sink rows are pinned at the front of
+/// the slab and the SP region shifts up by `sink_slab_bytes(config)` so
+/// the rolling K/V rows don't stomp it.
 pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
-    kv_offset(config) + (config.block_kv * config.head_dim * 2) as u32
+    let effective_bkv = crate::flash_attention_v2::sinks::effective_block_kv(config) as u32;
+    kv_offset(config) + effective_bkv * (config.head_dim as u32) * 2
 }
 
 /// S/P scratch region size (bytes).
@@ -292,7 +421,13 @@ pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
 /// time; without the expanded region each S-pass overwrites the previous iter's P.
 pub fn sp_bytes(config: &FlashAttentionConfig) -> u32 {
     let warps     = 4u32;
-    let block_kv  = config.block_kv as u32;
+    // §4.3 sinks (Sprint 1a precursor): SP scratch holds one S/P slot per
+    // (warp, kv-row). The kv-row count is `effective_block_kv` — what
+    // s_compute writes to and softmax / pv_accum read. If sp_bytes used
+    // raw `block_kv` while s_compute wrote to `effective_block_kv`-many
+    // rows the S-store would overflow into adjacent SMEM regions. At
+    // num_sink_tokens==0, this is identical to `config.block_kv` (no-op).
+    let block_kv  = crate::flash_attention_v2::sinks::effective_block_kv(config) as u32;
     let base      = warps * block_kv * 4;
     if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let iters = (config.block_q as u32).div_ceil(4);
@@ -766,9 +901,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -807,6 +944,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
@@ -814,6 +952,7 @@ mod tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -952,12 +1091,14 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 120,
             segment_masked: false,
             csha: Some(CshaExtras {
                 level: 2,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -1028,6 +1169,125 @@ mod tests {
         assert!(result.is_ok(),
             "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}", result);
         assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
+    }
+
+    // ── Cycle-10 §5.3 Task 7 (R5): policy="full" SMEM budget tests ────────
+    //
+    // The validator must add `recompute_extra_bytes(config)` to the SMEM
+    // total whenever `config.checkpoint = Some(Full)`. Small configs still
+    // fit the 99 KB dynamic budget; large configs must refuse with the
+    // testable substring "exceeds device".
+
+    fn checkpoint_full_cfg(block_q: i64, head_dim: i64) -> FlashAttentionConfig {
+        use crate::flash_attention::{CheckpointExtras, CheckpointPolicy};
+        FlashAttentionConfig {
+            block_q,
+            block_kv: block_q,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: None,
+            checkpoint: Some(CheckpointExtras {
+                policy: CheckpointPolicy::Full,
+                paged_kv_collision: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                r0_bypass: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn cycle11_recompute_extra_bytes_byte_math() {
+        // Cycle-11 §4: shrunk to 1 xnorm scratch tile (was 6 in cycle-10).
+        // K_proj/V_proj reuse %k_smem_base / %v_smem_base; K_rope rotates
+        // in place. Only the f16 xnorm scratch needs new SMEM.
+        //
+        // At hd=64, bq=64: 1 * 64 * 64 * 2 = 8192 bytes.
+        let mut cfg = base_cfg();
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        assert_eq!(recompute_extra_bytes(&cfg), 8192);
+
+        // At hd=256, bq=128: 1 * 128 * 256 * 2 = 65536 bytes.
+        cfg.block_q = 128;
+        cfg.block_kv = 128;
+        cfg.head_dim = 256;
+        assert_eq!(recompute_extra_bytes(&cfg), 65536);
+    }
+
+    #[test]
+    fn cycle11_recompute_xnorm_offset_above_backward_region() {
+        // The xnorm scratch slot must sit ABOVE the backward extra region
+        // so it can't collide with dQ/dK/dV/x_norm/rms_strip/P. This pins
+        // the offset to total_bytes + backward_extra_bytes — any future
+        // refactor that shifts either tile must re-validate this offset.
+        let mut cfg = base_cfg();
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        let off = recompute_xnorm_offset(&cfg);
+        assert!(off >= total_bytes(&cfg) + backward_extra_bytes(&cfg));
+    }
+
+    #[test]
+    fn cycle10_task7_small_full_policy_fits_budget() {
+        // hd=64, block_q=64 + policy=Full: forward (~9 KB) + 0 backward extra
+        // + ~48 KB recompute < 99 KB. Validator accepts on the Forward path.
+        let cfg = checkpoint_full_cfg(64, 64);
+        let result = validate_scalar_v2_config(&cfg, Direction::Forward);
+        assert!(
+            result.is_ok(),
+            "hd=64 bq=64 + policy=Full must fit the 99 KB budget; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn cycle10_task7_large_full_policy_exceeds_device() {
+        // hd=256, block_q=128 + policy=Full: ~384 KB recompute term alone
+        // dwarfs the 99 KB budget. Validator must refuse with the R5
+        // substring "exceeds device" and identify the policy="full" branch.
+        let cfg = checkpoint_full_cfg(128, 256);
+        let err = validate_scalar_v2_config(&cfg, Direction::Forward)
+            .expect_err("hd=256 bq=128 + policy=Full must overflow the budget");
+        let msg = err.0;
+        assert!(
+            msg.contains("exceeds device"),
+            "R5 error must contain substring 'exceeds device'; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("policy=\"full\""),
+            "R5 error must identify policy=\"full\" branch; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn cycle10_task7_no_policy_preserves_byte_identity() {
+        // checkpoint=None must add zero bytes to the budget at any size.
+        // Verifies the byte-identity invariant for the default path.
+        let mut cfg = base_cfg();
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        cfg.checkpoint = None;
+
+        // Same config WITHOUT the checkpoint must accept on the Forward path.
+        let result = validate_scalar_v2_config(&cfg, Direction::Forward);
+        assert!(
+            result.is_ok(),
+            "hd=64 bq=64 without checkpoint must fit; got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1142,7 +1402,7 @@ pub fn tier_b2_dq_dO_offset(config: &FlashAttentionConfig) -> u32 {
     tier_b2_dq_v_offset(config) + bkv * hd * 2
 }
 
-/// dS scratch tile offset. f32 `[effective_bq, effective_bkv]`.
+/// dS scratch tile offset. f16 `[effective_bq, effective_bkv]`.
 /// Written by the `dP = dO @ V^T` + softmax-backward combine.
 /// Lives immediately after the dO tile.
 pub fn tier_b2_dq_ds_offset(config: &FlashAttentionConfig) -> u32 {
@@ -1157,7 +1417,7 @@ pub fn tier_b2_dq_ds_offset(config: &FlashAttentionConfig) -> u32 {
 pub fn tier_b2_dq_wk_chunk_offset(config: &FlashAttentionConfig) -> u32 {
     let bq = tier_b2_effective_bq(config);
     let bkv = tier_b2_effective_bkv(config);
-    tier_b2_dq_ds_offset(config) + bq * bkv * 4
+    tier_b2_dq_ds_offset(config) + bq * bkv * 2
 }
 
 /// Wv chunk staging region offset. f16 `[TIER_B2_RMSNORM_CHUNK, head_dim]`.
@@ -1211,16 +1471,70 @@ pub fn tier_b2_dq_total_smem_bytes(config: &FlashAttentionConfig) -> u32 {
     tier_b2_dq_k_colmajor_offset(config) + tier_b2_dq_k_colmajor_bytes(config)
 }
 
-// Phase 3 dK/dV-kernel SMEM offset stubs — return 0 for now, filled in
-// when the dK/dV-kernel lands. Declared here for forward-compat so callers
-// can reference them without a Phase 3 stub PR.
+// Phase 3 dK/dV-kernel SMEM layout accessors.
+//
+// Layout (low → high address, all f16 = 2 bytes/element):
+//   [Q row-major]    eb * hd * 2
+//   [K row-major]    eb * hd * 2
+//   [V row-major]    eb * hd * 2
+//   [dO row-major]   eb * hd * 2
+//   [Wk chunk]       CHUNK * hd * 2
+//   [Wv chunk]       CHUNK * hd * 2
+//   [x_q chunk]      eb * CHUNK * 2
+//   [x_kv chunk]     eb * CHUNK * 2
+//   [Q col-major]    eb * hd * 2
+//   [dO col-major]   eb * hd * 2
+//   [P col-major]    eb * eb * 2   (attention weight tile, A-operand scatter)
+//   [dS col-major]   eb * eb * 2   (softmax grad tile)
+//
+// Total = 4*eb*hd*2 + 2*CHUNK*hd*2 + 2*eb*CHUNK*2 + 2*eb*hd*2 + 2*eb*eb*2
+//       = 12*eb*hd + 4*eb^2 + 16*hd + 16*eb   (bytes, with CHUNK=4)
+
+// Row-major tiles (mirror tier_b2_dq_* chain).
 pub fn tier_b2_dkdv_q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_k_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_v_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_k_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_v_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_k_offset(config) + tier_b2_effective_bkv(config) * config.head_dim as u32 * 2
+}
 #[allow(non_snake_case)]
-pub fn tier_b2_dkdv_dO_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_ds_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_total_smem_bytes(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_dO_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_v_offset(config) + tier_b2_effective_bkv(config) * config.head_dim as u32 * 2
+}
+// Chunk staging (mirror dQ's Wk/Wv/x_q/x_kv, base = after dO).
+pub fn tier_b2_dkdv_wk_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_dO_offset(config) + tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_wv_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_wk_chunk_offset(config) + TIER_B2_RMSNORM_CHUNK * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_x_q_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_wv_chunk_offset(config) + TIER_B2_RMSNORM_CHUNK * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_x_kv_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_x_q_chunk_offset(config) + tier_b2_effective_bq(config) * TIER_B2_RMSNORM_CHUNK * 2
+}
+// Col-major B-operand re-stage bands ([hd, eb] f16, col_stride eb*2).
+pub fn tier_b2_dkdv_q_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_x_kv_chunk_offset(config) + tier_b2_effective_bkv(config) * TIER_B2_RMSNORM_CHUNK * 2
+}
+#[allow(non_snake_case)]
+pub fn tier_b2_dkdv_dO_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_q_colmajor_offset(config) + tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+// Col-major A-operand scatter bands ([ek, eb] viewed row-major = P^T/dS^T, f16).
+pub fn tier_b2_dkdv_p_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_dO_colmajor_offset(config) + tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_ds_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_p_colmajor_offset(config)
+        + tier_b2_effective_bq(config) * tier_b2_effective_bkv(config) * 2
+}
+pub fn tier_b2_dkdv_total_smem_bytes(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_ds_colmajor_offset(config)
+        + tier_b2_effective_bq(config) * tier_b2_effective_bkv(config) * 2
+}
 
 #[cfg(test)]
 mod tier_b2_dq_offset_tests {
@@ -1232,9 +1546,10 @@ mod tier_b2_dq_offset_tests {
             block_q: 64, block_kv: 64, head_dim: 128,
             causal: true, paged: false,
             rope_q: false, rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         }
     }
 
@@ -1347,5 +1662,74 @@ mod tier_b2_dq_offset_tests {
         let last_band_size = tier_b2_dq_k_colmajor_bytes(&cfg);
         assert_eq!(total_with, last_band_start + last_band_size,
             "total must equal K-colmajor offset + K-colmajor bytes");
+    }
+
+    #[test]
+    fn tier_b2_dq_ds_band_is_f16_sized() {
+        // Spec bug #2: dS staged f16 (bq*bkv*2), not f32. The dS band size is
+        // the gap between ds_offset and the next band (wk_chunk).
+        for &hd in &[32u32, 64, 128] {
+            let cfg = FlashAttentionConfig { head_dim: hd as i64, ..canonical_hd128_cfg() };
+            let bq = tier_b2_effective_bq(&cfg);
+            let bkv = tier_b2_effective_bkv(&cfg);
+            let ds_band = tier_b2_dq_wk_chunk_offset(&cfg) - tier_b2_dq_ds_offset(&cfg);
+            assert_eq!(ds_band, bq * bkv * 2,
+                "hd={hd}: dS band must be f16-sized (bq*bkv*2={}), got {ds_band}", bq * bkv * 2);
+            assert!(tier_b2_dq_total_smem_bytes(&cfg) <= SMEM_DYNAMIC_BUDGET_BYTES,
+                "hd={hd}: total SMEM exceeds 99 KB budget");
+        }
+    }
+
+    // === dK/dV-kernel SMEM layout (Phase 3a Task 1) ===
+
+    #[test]
+    fn tier_b2_dkdv_total_matches_spec_schedule() {
+        // (head_dim, requested bq=bkv, expected total bytes) per spec section 3.2.
+        // Totals = 12*b*hd + 4*b^2 + 16*hd + 16*b at effective_bq.
+        let cases = [
+            (32i64, 32i64, 17408u32),  // smoke
+            (32, 64, 42496),           // sweep
+            (64, 64, 67584),           // no fallback
+            (128, 64, 55808),          // effective bq=32 fallback
+        ];
+        for (hd, bq, expected) in cases {
+            let mut cfg = canonical_hd128_cfg();
+            cfg.head_dim = hd;
+            cfg.block_q = bq;
+            cfg.block_kv = bq;
+            assert_eq!(tier_b2_dkdv_total_smem_bytes(&cfg), expected,
+                "dK/dV total SMEM at hd={} bq={}", hd, bq);
+        }
+    }
+
+    #[test]
+    fn tier_b2_dkdv_total_under_budget_at_all_in_scope_hd() {
+        for &hd in &[32i64, 64, 128] {
+            let mut cfg = canonical_hd128_cfg();
+            cfg.head_dim = hd;
+            cfg.block_q = 64;
+            cfg.block_kv = 64;
+            assert!(tier_b2_dkdv_total_smem_bytes(&cfg) <= SMEM_DYNAMIC_BUDGET_BYTES,
+                "hd={} dK/dV SMEM over 99 KB cap", hd);
+        }
+    }
+
+    #[test]
+    fn tier_b2_dkdv_bands_are_non_overlapping_and_ordered() {
+        let cfg = canonical_hd128_cfg(); // hd=128 -> effective bq=bkv=32
+        let eb = tier_b2_effective_bq(&cfg);
+        let hd = cfg.head_dim as u32;
+        assert_eq!(tier_b2_dkdv_q_offset(&cfg), 0);
+        assert_eq!(tier_b2_dkdv_k_offset(&cfg), eb * hd * 2);
+        assert_eq!(tier_b2_dkdv_v_offset(&cfg), 2 * eb * hd * 2);
+        assert_eq!(tier_b2_dkdv_dO_offset(&cfg), 3 * eb * hd * 2);
+        let q_col = tier_b2_dkdv_q_colmajor_offset(&cfg);
+        let do_col = tier_b2_dkdv_dO_colmajor_offset(&cfg);
+        let p_col = tier_b2_dkdv_p_colmajor_offset(&cfg);
+        let ds_col = tier_b2_dkdv_ds_colmajor_offset(&cfg);
+        assert!(q_col < do_col && do_col < p_col && p_col < ds_col,
+            "col bands must be strictly ordered: q={q_col} dO={do_col} p={p_col} ds={ds_col}");
+        assert!(ds_col + eb * eb * 2 <= tier_b2_dkdv_total_smem_bytes(&cfg),
+            "last col band must fit within total");
     }
 }

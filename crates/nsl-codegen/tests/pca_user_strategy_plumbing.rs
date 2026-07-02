@@ -114,8 +114,10 @@ fn per_doc_kernel_name_matches_emitter_entry_name() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75,
         segment_masked: true,
+        checkpoint: None,
         csha: Some(CshaExtras {
             level: 1,
             save_activations_for_backward: true,

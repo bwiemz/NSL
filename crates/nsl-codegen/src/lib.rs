@@ -1086,6 +1086,27 @@ pub struct CompileOptions {
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
     pub csha: CshaOptions,
+    /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
+    /// captured by the semantic checker, keyed by the decorated model's name
+    /// (the `<Type>` in `model <Type>:` or the LHS binding name in
+    /// `@csha let m = SomeModel()`).  The CSHA hook in
+    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
+    /// `model_type_name` in this map and:
+    ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
+    ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
+    ///   * `target   = Some(T)` -> override `csha::run_on_wengert`'s target.
+    /// Empty map = no `@csha` decorators in the program (the default), which
+    /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
+    pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+    /// per-function `@checkpoint(policy=...)` policies collected by
+    /// `EffectChecker::checkpoint_policies()` and routed through the
+    /// `nsl-cli` loader (`crates/nsl-cli/src/loader.rs:414`). Consumed
+    /// by extractor construction sites in `stmt.rs` /
+    /// `binary_codegen.rs` via `WengertExtractor::with_checkpoint_policies`.
+    /// Empty map = no checkpointing transformations = byte-identity preserved.
+    pub checkpoint_policies:
+        HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
     /// CPDT (compiler-planned distributed training) options.
     pub cpdt: CpdtOptions,
     /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
@@ -1179,6 +1200,8 @@ impl Default for CompileOptions {
             health_flush_interval: None,
             inspect_enabled: false,
             csha: CshaOptions::default(),
+            csha_configs: HashMap::new(),
+            checkpoint_policies: HashMap::new(),
             cpdt: CpdtOptions::default(),
             wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,

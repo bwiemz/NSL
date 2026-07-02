@@ -135,7 +135,7 @@ fn forward_saves_match_cpu_reference() {
         block_q: block_q as i64, block_kv: block_kv as i64, head_dim: head_dim as i64,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -148,6 +148,7 @@ fn forward_saves_match_cpu_reference() {
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
 
     smem_layout::validate_scalar_v2_config(&config, Direction::Forward)

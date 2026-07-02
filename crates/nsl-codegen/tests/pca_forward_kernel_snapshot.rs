@@ -31,9 +31,11 @@ fn minimal_segment_masked_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 
@@ -49,9 +51,11 @@ fn segment_masked_config_64x64x64() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

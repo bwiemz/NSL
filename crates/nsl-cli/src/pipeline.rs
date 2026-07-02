@@ -203,6 +203,46 @@ pub(crate) fn module_data_to_fused_ce_configs(
         .collect()
 }
 
+/// Sprint 2 (paper §6.2): convert the semantic side-table of validated
+/// `@csha(...)` decorators into the `HashMap<String, CshaConfig>` shape
+/// `CompileOptions.csha_configs` expects. The CSHA hook in
+/// `nsl-codegen/src/stmt.rs` looks up `model_type_name` here and applies the
+/// per-model `disable=` / `level=` / `target=` overrides. Empty when the
+/// program has no `@csha` decorators.
+pub(crate) fn analysis_to_csha_configs(
+    a: &nsl_semantic::AnalysisResult,
+) -> std::collections::HashMap<String, nsl_semantic::csha::CshaConfig> {
+    a.csha_configs.iter().cloned().collect()
+}
+
+/// Mirror of `analysis_to_csha_configs` for multi-file paths that consume the
+/// entry module's `ModuleData` rather than a single `AnalysisResult`.
+pub(crate) fn module_data_to_csha_configs(
+    m: &crate::loader::ModuleData,
+) -> std::collections::HashMap<String, nsl_semantic::csha::CshaConfig> {
+    m.csha_configs.iter().cloned().collect()
+}
+
+/// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+/// expose `EffectChecker::checkpoint_policies()` (already published on
+/// `AnalysisResult.checkpoint_policies`) in the
+/// `HashMap<String, CheckpointPolicy>` shape `CompileOptions.checkpoint_policies`
+/// expects. Empty when no `@checkpoint(policy="...")` decorators are present.
+pub(crate) fn analysis_to_checkpoint_policies(
+    a: &nsl_semantic::AnalysisResult,
+) -> std::collections::HashMap<String, nsl_semantic::effects::CheckpointPolicy> {
+    a.checkpoint_policies.clone()
+}
+
+/// Mirror of `analysis_to_checkpoint_policies` for multi-file paths that
+/// consume the entry module's `ModuleData` rather than a single
+/// `AnalysisResult`.
+pub(crate) fn module_data_to_checkpoint_policies(
+    m: &crate::loader::ModuleData,
+) -> std::collections::HashMap<String, nsl_semantic::effects::CheckpointPolicy> {
+    m.checkpoint_policies.clone()
+}
+
 pub(crate) fn analysis_to_wrga_inputs(
     a: &nsl_semantic::AnalysisResult,
     ctx: &nsl_codegen::WrgaCheckContext,
@@ -284,5 +324,88 @@ fn apply_wrga_check_overrides(
     }
     if let Some(abl) = ctx.ablation_override {
         inputs.ablation = abl;
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_decorator_cli_wireup_tests {
+    //! Lock-in test for the phase2.6 <- main merge regression that silently
+    //! dropped `ModuleData.csha_configs` + `ModuleData.checkpoint_policies`
+    //! and the two corresponding `pipeline::*` helpers when taking main's
+    //! refactored loader.rs. Without these helpers the per-model
+    //! `@csha(disable|level|target)` decorator effects and ALL
+    //! `@checkpoint(policy="full")` decorator effects silently no-op
+    //! because the codegen-side consumers (stmt.rs train/grad extractors,
+    //! compiler/kernel.rs CSHA training PTX backward,
+    //! calibration/binary_codegen.rs model_backward) read empty maps.
+    //!
+    //! This test exists ONLY to prevent the regression from silently
+    //! re-occurring; it asserts the helper return-type round-trips
+    //! non-empty when the analysis has captured the decorator.
+    //! Keep it minimal — full per-flag round-trip coverage lives in
+    //! crates/nsl-semantic/tests/csha_decorator_binding.rs.
+    use super::*;
+    use nsl_errors::FileId;
+    use nsl_lexer::Interner;
+
+    fn analyze_source(src: &str) -> nsl_semantic::AnalysisResult {
+        let mut interner = Interner::new();
+        let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        nsl_semantic::analyze(&parse_result.module, &mut interner)
+    }
+
+    /// Lock-in: `@checkpoint(policy="full")` on a fn body must flow from
+    /// `AnalysisResult.checkpoint_policies` through
+    /// `pipeline::analysis_to_checkpoint_policies` non-empty.  If this
+    /// asserts empty, the loader->CompileOptions wiring has regressed
+    /// (the codegen-side `WengertExtractor::with_checkpoint_policies`
+    /// installer will silently no-op and `@checkpoint(policy="full")`
+    /// will have zero effect on backward-pass codegen).
+    #[test]
+    fn checkpoint_full_policy_survives_pipeline_handoff() {
+        let src = r#"
+@checkpoint(policy="full")
+fn forward_step(x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
+    return x
+"#;
+        let analysis = analyze_source(src);
+        let policies = analysis_to_checkpoint_policies(&analysis);
+        assert!(
+            !policies.is_empty(),
+            "regression: @checkpoint(policy=\"full\") was captured by \
+             semantic analysis ({} entry/entries) but pipeline helper \
+             returned an empty map — the phase2.6<-main loader.rs merge \
+             likely dropped ModuleData.checkpoint_policies again. \
+             analysis.checkpoint_policies = {:?}",
+            analysis.checkpoint_policies.len(),
+            analysis.checkpoint_policies,
+        );
+    }
+
+    /// Companion lock-in for the @csha decorator wiring (Sprint 2 — paper
+    /// §6.2). Same regression class as the checkpoint case above:
+    /// `ModuleData.csha_configs` was dropped along with checkpoint_policies
+    /// in the merge, so per-model @csha overrides silently no-op.
+    #[test]
+    fn csha_decorator_survives_pipeline_handoff() {
+        let src = r#"
+@csha(level=2)
+model Toy:
+    layer lin: Linear<16, 16>
+
+    fn forward(self, x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
+        return self.lin(x)
+"#;
+        let analysis = analyze_source(src);
+        let configs = analysis_to_csha_configs(&analysis);
+        assert!(
+            !configs.is_empty(),
+            "regression: @csha(level=2) was captured by semantic analysis \
+             ({} entry/entries) but pipeline helper returned an empty map. \
+             analysis.csha_configs = {:?}",
+            analysis.csha_configs.len(),
+            analysis.csha_configs,
+        );
     }
 }

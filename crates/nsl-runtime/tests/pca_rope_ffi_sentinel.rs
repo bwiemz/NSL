@@ -101,9 +101,100 @@ fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
+        // CSHA Tier B.2 (Phase 3 T6): tier_b2_active flag (arity-consistency
+        // update — this test predates the flag; see the dedicated test below).
+        i64,
         // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — CFTP v2 follow-on.
         i64,
     ) -> i64 = nsl_flash_attention_csha_backward;
+}
+
+/// CSHA-TIER-B2-FFI: `nsl_flash_attention_csha_backward` accepts the trailing
+/// `tier_b2_active: i64` flag param (Phase 3 T6).
+///
+/// The Tier B.2 4-kernel backward launch branch is selected by an explicit flag
+/// rather than kernel-name-suffix sniffing. This coercion fails to compile if
+/// the FFI signature does not append `tier_b2_active: i64` after `doc_starts_ptr`.
+/// Sentinel value `0` preserves today's scalar single-kernel behavior exactly.
+#[test]
+fn csha_backward_ffi_accepts_trailing_tier_b2_active() {
+    let _: extern "C" fn(
+        i64, i64, i64, i64, i64, i64,   // q, k, v, out, lse, scale_bits
+        i64, i64, i64, i64,             // batch, heads, seq_len, head_dim
+        i64, i64, i64, i64,             // block_table, k_pool, v_pool, block_size
+        i64, i64,                       // cos, sin
+        i64, i64,                       // seq_ids, seq_lens
+        i64, i64, i64,                  // shmem_bytes, ptx, name
+        i64, i64, i64,                  // block_q, block_kv, causal
+        // CSHA extras (9):
+        i64, i64, i64, i64, i64, i64,   // x, norm_weight, Wq, Wk, Wv, Wo
+        i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
+        // Saved activations (6):
+        i64, i64, i64, i64, i64, i64,
+        // dO + 8 gradient outputs:
+        i64,                            // do_ptr
+        i64, i64, i64,                  // dq, dk, dv
+        i64, i64, i64,                  // dwq, dwk, dwv
+        i64,                            // dx
+        i64,                            // dx_norm
+        // PCA Tier A: segment_ids_ptr
+        i64,
+        // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
+        i64, i64,
+        // PCA §4.3: doc_starts_ptr
+        i64,
+        // CSHA Tier B.2 (Phase 3 T6): tier_b2_active — the trailing flag.
+        i64,
+        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — CFTP v2 follow-on.
+        i64,
+    ) -> i64 = nsl_flash_attention_csha_backward;
+}
+
+/// CSHA cycle 19 T1 (variant-B) — additive typed-coercion sentinel for the
+/// NEW `nsl_flash_attention_csha_backward_probe` symbol. The 54-param
+/// `nsl_flash_attention_csha_backward` signature is FROZEN (see the
+/// sentinel above); this coercion locks in that the probe wrapper appends
+/// exactly two i64 pointer slots for `probe_ds_out_ptr` + `probe_dv_out_ptr`
+/// after the existing 54 params. Gated on `csha_cycle19_probe` so a
+/// default-features build stays byte-identical.
+#[cfg(feature = "csha_cycle19_probe")]
+#[test]
+fn csha_backward_probe_ffi_signature_locked() {
+    use nsl_runtime::flash_attention::nsl_flash_attention_csha_backward_probe;
+
+    let _: extern "C" fn(
+        i64, i64, i64, i64, i64, i64,   // q, k, v, out, lse, scale_bits
+        i64, i64, i64, i64,             // batch, heads, seq_len, head_dim
+        i64, i64, i64, i64,             // block_table, k_pool, v_pool, block_size
+        i64, i64,                       // cos, sin
+        i64, i64,                       // seq_ids, seq_lens
+        i64, i64, i64,                  // shmem_bytes, ptx, name
+        i64, i64, i64,                  // block_q, block_kv, causal
+        // CSHA extras (9):
+        i64, i64, i64, i64, i64, i64,   // x, norm_weight, Wq, Wk, Wv, Wo
+        i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
+        // Saved activations (6):
+        i64, i64, i64, i64, i64, i64,
+        // dO + 8 gradient outputs:
+        i64,                            // do_ptr
+        i64, i64, i64,                  // dq, dk, dv
+        i64, i64, i64,                  // dwq, dwk, dwv
+        i64,                            // dx
+        i64,                            // dx_norm
+        // PCA Tier A: segment_ids_ptr
+        i64,
+        // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr
+        i64, i64,
+        // PCA §4.3: doc_starts_ptr
+        i64,
+        // CSHA Tier B.2: tier_b2_active
+        i64,
+        // PCA per-doc CTA: num_docs_or_zero
+        i64,
+        // CSHA cycle 19 T1 (variant-B): the two NEW trailing probe pointers.
+        i64,                            // probe_ds_out_ptr
+        i64,                            // probe_dv_out_ptr
+    ) -> i64 = nsl_flash_attention_csha_backward_probe;
 }
 
 /// PCA-FFI-4 (non-CUDA): sentinel-0 path returns -1 cleanly on a no-CUDA

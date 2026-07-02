@@ -303,6 +303,15 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     mode: csha.clone(),
                     report: csha_report,
                 },
+                // CSHA Sprint 2: default to empty here; `run_build_inner` /
+                // `run_run` route through `run_build_single` (build.rs) which
+                // overwrites this from semantic analysis via
+                // pipeline::analysis_to_csha_configs.
+                csha_configs: std::collections::HashMap::new(),
+                // Cycle-10 §5.3 Task 6: default to empty here; overwritten
+                // downstream in `run_build_single` via
+                // pipeline::analysis_to_checkpoint_policies. Empty = byte-identity.
+                checkpoint_policies: std::collections::HashMap::new(),
                 // CPDT: thread the planner mode + cluster + plan-out slot into
                 // codegen exactly as `nsl build` does — the compiler copies
                 // cpdt.cluster into Compiler::cpdt_cluster and reads

@@ -412,16 +412,79 @@ impl<'a> TypeChecker<'a> {
                             );
                         }
 
-                        // CSHA: @csha decorator validation
+                        // CSHA: @csha decorator validation.
+                        //
+                        // Sprint 2 (paper §6.2 binding fix): the validator
+                        // returns a `CshaConfig` describing the per-model
+                        // `level=`, `target=`, and `disable=` requests. Before
+                        // Sprint 2 the result was dropped on the floor, so
+                        // `@csha(disable=true)` parsed cleanly but had zero
+                        // codegen effect. Now we capture it keyed by the
+                        // decorated model's name (or the LHS binding name for
+                        // `@csha let m = SomeModel()`), and the CLI forwards
+                        // the side-table into `CompileOptions.csha_configs`
+                        // so the CSHA hook in `nsl-codegen/src/stmt.rs` can
+                        // look it up by `model_type_name` and:
+                        //   * `disabled=true`  -> skip the CSHA pipeline.
+                        //   * `level=Some(L)`  -> clamp the planner's mode.
+                        //   * `target=Some(T)` -> override the planner target.
                         if dname == "csha" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
                                 self.interner.resolve(s.0).unwrap_or("").to_string()
                             };
-                            crate::csha::validate_csha_decorator(
+                            if let Some(cfg) = crate::csha::validate_csha_decorator(
                                 deco,
                                 &resolve,
                                 &mut self.diagnostics,
-                            );
+                            ) {
+                                // Resolve the model-or-binding name we want
+                                // to key the config by. Two shapes are
+                                // supported:
+                                //   1. `@csha(...) model Foo: ...`
+                                //   2. `@csha(...) let m = SomeModel()`
+                                // Case 2 keys by the LHS binding name (e.g.
+                                // "m") which is what the codegen hook will
+                                // see as `model_type_name` only when the
+                                // semantic type maps `m` back to its struct.
+                                // To keep this side-table useful in both
+                                // cases we record whichever name we can
+                                // recover here, and codegen does a HashMap
+                                // lookup either way.
+                                let model_name: Option<String> = match &stmt.kind {
+                                    StmtKind::ModelDef(model_def) => Some(
+                                        self.interner
+                                            .resolve(model_def.name.0)
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    ),
+                                    StmtKind::VarDecl { pattern, .. } => {
+                                        if let nsl_ast::pattern::PatternKind::Ident(sym)
+                                            = &pattern.kind
+                                        {
+                                            Some(
+                                                self.interner
+                                                    .resolve(sym.0)
+                                                    .unwrap_or("")
+                                                    .to_string(),
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(name) = model_name {
+                                    if !name.is_empty() {
+                                        self.csha_configs.push((name, cfg));
+                                    }
+                                }
+                                // Silently drop on non-model / non-binding
+                                // targets: the validator already accepted the
+                                // decorator on a syntactically valid form,
+                                // and the existing per-target diagnostics
+                                // (e.g. "@csha can only be applied to a
+                                // model") would be a follow-up to add.
+                            }
                         }
 
                         // WGGO: @wggo decorator validation
@@ -610,11 +673,152 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
-                        // M51: @checkpoint — register with effect checker (requires @pure)
+                        // M51 + cycle-10 §5.3 (Task 3): @checkpoint —
+                        // register with effect checker (requires @pure)
+                        // and parse the optional `policy=...` kwarg.
+                        //
+                        // - Bare `@checkpoint`            → R0 deprecation
+                        //                                   warning (Path B
+                        //                                   per T3); treated
+                        //                                   as policy="none"
+                        //                                   (M14 tape
+                        //                                   fallback).
+                        // - `policy="full"`               → semantic policy
+                        //                                   = Full + tape
+                        //                                   fallback marker.
+                        // - `policy="none"`               → tape fallback
+                        //                                   marker only.
+                        // - `policy="selective"`          → ERROR (reserved
+                        //   `policy="selective_postnorm"`   for §5.3 v2/v3).
+                        //   `policy="custom"`
+                        // - any other value               → ERROR (valid-list
+                        //                                   diagnostic).
                         if dname == "checkpoint" {
                             if let StmtKind::FnDef(fn_def) = &stmt.kind {
                                 let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
-                                self.effect_checker.mark_checkpointed(&fn_name);
+
+                                // Walk deco.args for the optional `policy=` kwarg.
+                                let mut explicit_policy: Option<&str> = None;
+                                let mut policy_arg_span: Option<nsl_ast::Span> = None;
+                                let mut had_args = false;
+                                if let Some(ref args) = deco.args {
+                                    for arg in args {
+                                        had_args = true;
+                                        let Some(ref name_sym) = arg.name else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(
+                                                    "@checkpoint: positional arguments are not allowed".to_string(),
+                                                )
+                                                .with_label(arg.span, "expected `policy = \"...\"`")
+                                            );
+                                            continue;
+                                        };
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname != "policy" {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!(
+                                                    "@checkpoint: unknown argument '{aname}'"
+                                                ))
+                                                .with_label(arg.span, "unknown argument")
+                                            );
+                                            continue;
+                                        }
+                                        match &arg.value.kind {
+                                            ExprKind::StringLiteral(s) => {
+                                                explicit_policy = Some(match s.as_str() {
+                                                    "full" => "full",
+                                                    "none" => "none",
+                                                    "selective" => "selective",
+                                                    "selective_postnorm" => "selective_postnorm",
+                                                    "custom" => "custom",
+                                                    _ => "__invalid__",
+                                                });
+                                                // Stash the originally-typed string for diagnostics.
+                                                if explicit_policy == Some("__invalid__") {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error(format!(
+                                                            "@checkpoint policy must be one of: \"full\", \"none\", \"selective\" (refused), \"selective_postnorm\" (refused), \"custom\" (refused); got \"{s}\""
+                                                        ))
+                                                        .with_label(arg.span, "invalid policy value")
+                                                    );
+                                                }
+                                                policy_arg_span = Some(arg.span);
+                                            }
+                                            _ => {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error(
+                                                        "@checkpoint policy must be a string literal".to_string(),
+                                                    )
+                                                    .with_label(arg.span, "expected string literal")
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                match explicit_policy {
+                                    Some("full") => {
+                                        self.effect_checker.mark_checkpointed(&fn_name);
+                                        self.effect_checker.mark_checkpointed_with_policy(
+                                            &fn_name,
+                                            crate::effects::CheckpointPolicy::Full,
+                                        );
+                                    }
+                                    Some("none") => {
+                                        // M14 tape fallback continues; no codegen-side policy.
+                                        self.effect_checker.mark_checkpointed(&fn_name);
+                                    }
+                                    Some("selective") => {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(
+                                                "@checkpoint(policy=\"selective\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
+                                            )
+                                            .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
+                                        );
+                                    }
+                                    Some("selective_postnorm") => {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(
+                                                "@checkpoint(policy=\"selective_postnorm\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
+                                            )
+                                            .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
+                                        );
+                                    }
+                                    Some("custom") => {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(
+                                                "@checkpoint(policy=\"custom\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
+                                            )
+                                            .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
+                                        );
+                                    }
+                                    Some("__invalid__") => {
+                                        // Diagnostic already pushed above.
+                                    }
+                                    Some(_) => unreachable!(),
+                                    None => {
+                                        // No `policy=` kwarg present (had_args may be true if
+                                        // other kwargs were tried — those already errored).
+                                        // Bare `@checkpoint` (no args at all) → R0 deprecation
+                                        // warning (once per source file) + treat as policy="none".
+                                        if !had_args {
+                                            let file_id = deco.span.file_id;
+                                            if self.effect_checker.emitted_checkpoint_deprecation.insert(file_id) {
+                                                self.diagnostics.push(
+                                                    Diagnostic::warning(
+                                                        "@checkpoint without policy= is deprecated; specify policy=\"full\" (shipped) or policy=\"none\" (no-op). Hard refusal in cycle 11.".to_string(),
+                                                    )
+                                                    .with_label(deco.span, "bare @checkpoint")
+                                                );
+                                            }
+                                            self.effect_checker.mark_checkpointed(&fn_name);
+                                        } else {
+                                            // had_args true but no valid policy= seen — caller
+                                            // already got an error per-arg. Still mark for R4.
+                                            self.effect_checker.mark_checkpointed(&fn_name);
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -819,6 +1023,142 @@ impl<'a> TypeChecker<'a> {
                                     Diagnostic::error("@gqa requires 'groups' argument")
                                         .with_label(deco.span, "missing 'groups'")
                                 );
+                            }
+                        }
+
+                        if dname == "tree_mask" {
+                            // Paper §4 tree-mask: bare companion decorator on
+                            // an @flash_attention fn. v1 is bare (no args);
+                            // arg-less form mirrors the PTX-side gate plumbed
+                            // through `FlashAttentionConfig::tree_mask`.
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@tree_mask requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            if let Some(ref args) = deco.args {
+                                if !args.is_empty() {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@tree_mask takes no arguments in v1 (bare decorator only)")
+                                            .with_label(deco.span, "unexpected arguments")
+                                    );
+                                }
+                            }
+                        }
+
+                        if dname == "paged_kv" {
+                            // Sprint 2 cycle-3 (paper §3.2 paged KV): companion
+                            // decorator on an @flash_attention fn. Mirrors the
+                            // @tree_mask / @gqa companion-required pattern so
+                            // standalone use (which silently fell through the
+                            // function-level decorator scan pre-Sprint-2)
+                            // surfaces as a semantic error instead of a no-op.
+                            //
+                            // Note: the same decorator on a model-block layer
+                            // is handled by `checker/model.rs`, which validates
+                            // the arg names/types but does NOT require a
+                            // companion (model layers don't carry the
+                            // @flash_attention decorator — they wire paged KV
+                            // through the model graph instead). This arm is
+                            // therefore intentionally function-scope only.
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@paged_kv requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            // Arg validation: only `block_size` is recognised
+                            // at function scope; other args are model-level
+                            // (see `checker/model.rs::paged_kv`) and would be
+                            // silently ignored by `compiler/kernel.rs:1005-1022`,
+                            // so surface them as errors at the function level
+                            // to mirror the kernel.rs extraction rules.
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname == "block_size" {
+                                            if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                if *n <= 0 {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error("@paged_kv 'block_size' must be a positive integer")
+                                                            .with_label(arg.span, "must be > 0")
+                                                    );
+                                                }
+                                            } else {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error("@paged_kv 'block_size' argument must be an integer literal")
+                                                        .with_label(arg.span, "expected integer")
+                                                );
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!("@paged_kv unknown argument '{}' at function scope (only 'block_size' is recognised here)", aname))
+                                                    .with_label(arg.span, "unknown argument")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if dname == "attention_sink" {
+                            // Sprint 2 cycle-4 (paper §4.3 attention sinks):
+                            // companion decorator on an @flash_attention fn.
+                            // v0 API surface: extracts `tokens=N` (positive
+                            // integer literal) into `FlashAttentionConfig::
+                            // num_sink_tokens`. The SMEM-layout codegen that
+                            // actually pins the first N tokens is DEFERRED to
+                            // a future sprint — until then, the field is
+                            // wired through the pipeline but the kernel does
+                            // not emit any sink-specific PTX.
+                            //
+                            // Mirrors @paged_kv 'block_size' arg validation:
+                            //   - companion-required on @flash_attention,
+                            //   - unknown args rejected,
+                            //   - 'tokens' must be a positive integer literal.
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@attention_sink requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname == "tokens" {
+                                            if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                if *n <= 0 {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error("@attention_sink 'tokens' must be a positive integer")
+                                                            .with_label(arg.span, "must be > 0")
+                                                    );
+                                                }
+                                            } else {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error("@attention_sink 'tokens' argument must be an integer literal")
+                                                        .with_label(arg.span, "expected integer")
+                                                );
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!("@attention_sink unknown argument '{}' at function scope (only 'tokens' is recognised here)", aname))
+                                                    .with_label(arg.span, "unknown argument")
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
 

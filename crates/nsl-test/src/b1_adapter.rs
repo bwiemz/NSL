@@ -265,9 +265,11 @@ pub fn run_b1_forward_and_adapt(
         rope_style: cfg.rope_style,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: cfg.gpu_sm,
         segment_masked: false,
         csha: Some(b1_csha),
+        checkpoint: None,
     };
     assert!(
         seq <= b1_cfg.block_kv as usize,

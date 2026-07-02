@@ -138,18 +138,78 @@ pub enum RopeStyle {
 }
 
 /// Configuration for a FlashAttention PTX kernel variant.
+///
+/// Construction sites: ~115 across the codebase (no `#[derive(Default)]` —
+/// every site must thread every field). When adding a new field, search for
+/// `FlashAttentionConfig {` and update all literals (cycle-4 Sprint 2 worked
+/// example: `num_sink_tokens` threading at 113 sites).
 #[derive(Clone, Debug)]
 pub struct FlashAttentionConfig {
+    /// Q-tile height: rows of `Q` (and `O`) loaded into SMEM per CTA.
+    /// Must be a power of two ≥ 16 (kernels emit 16-row warp bands).
+    /// Cycle-2 Sprint 3 split the dkdv backward `%band_row_base` into
+    /// `_q`/`_kv` axes so this can differ from `block_kv` (asymmetric
+    /// tiles per forward PR #101); the dkdv dispatch predicate still
+    /// gates `bq==bkv` until a caller surfaces demand.
     pub block_q: i64,
+    /// KV-tile height: rows of `K`/`V` loaded into SMEM per CTA. Same
+    /// constraints as `block_q`. Common values: 32, 64, 128 (the SMEM
+    /// ladder in `compiler/kernel.rs`).
     pub block_kv: i64,
+    /// Per-head dimension. Drives the SMEM ladder dispatch — Cycle 1
+    /// shipped hd=32/64/128/256 variants per paper §6.4.
     pub head_dim: i64,
+    /// Lower-triangular mask: `S[q, k] = -inf` when `k > q`. Defaults
+    /// to `true` for the `@flash_attention` decorator (cycle-1 invariant).
+    /// Cycle 1 added intra-tile element masking (paper §4.1); the
+    /// compile-time `num_q_iters` elision is also gated here.
     pub causal: bool,
+    /// Paged KV cache: K/V are sourced via a `block_table_ptr`
+    /// indirection (M25 runtime, paper §3.2 inference-only).
+    /// **Mutually exclusive with `segment_masked`** — see
+    /// `validate()` for the enforcement.
     pub paged: bool,
+    /// Apply RoPE rotation to Q (and K when `csha.fused_projections`)
+    /// inside the kernel. Cycle-1 shipped the rotation PTX; cycle-2
+    /// Sprint 1 wired cos/sin through `CshaSavePointers` so the
+    /// forward/backward share pointers. Today both are null in the
+    /// production path (rope-effectively-off) — Phase 3c-2 will source
+    /// non-null tensors per `WIRE-HERE` callouts.
     pub rope_q: bool,
+    /// RoPE pairing convention. The scalar forward emitter handles
+    /// BOTH `RopeStyle::Adjacent` (GPT-NeoX / GPT-J: pair `x[2i]`
+    /// with `x[2i+1]`) and `RopeStyle::HalfSplit` (LLaMA / Qwen: pair
+    /// `x[i]` with `x[i + hd/2]`) — see `flash_attention.rs:1324` for
+    /// the match. The CSHA-fused kernel emitter (`emit_rope_pair_sweep`
+    /// in `csha_hooks.rs`) currently only implements `Adjacent` and
+    /// asserts on `HalfSplit`; CSHA-fused `HalfSplit` support is
+    /// reserved for future work.
     pub rope_style: RopeStyle,
+    /// Grouped-query attention group size: `H_q / H_kv`. `1` is MHA
+    /// (no sharing); `8` is typical for Llama-3-8B. Cycle-1 Sprint 5
+    /// added the zero-copy stride pattern in Tier B/CSHA codegen (paper
+    /// §4.2) so K/V are read with `kv_head = q_head / gqa_group_size`
+    /// rather than replicated in HBM.
     pub gqa_group_size: u32,
     /// M33: Whether this attention uses a tree-structured causal mask for speculative decoding.
     pub tree_mask: bool,
+    /// Paper §4.3: attention sinks. Number of always-attended initial
+    /// tokens (typically 4) to stabilize streaming attention with rolling
+    /// KV cache.
+    ///
+    /// v0 API-surface state (Sprint 2 cycle-4 + Sprint 2 cycle-5 refusal):
+    /// the decorator + config + semantic validation ARE wired through,
+    /// but the SMEM-cache codegen is DEFERRED to a future sprint. Configs
+    /// with `num_sink_tokens > 0` are REFUSED at codegen with a clear
+    /// error rather than silently producing rope-effectively-off output.
+    /// The only value that flows through to PTX synthesis today is `0`
+    /// (the sentinel "sinks disabled" state — users who want disabled
+    /// simply omit the `@attention_sink` decorator entirely). When the
+    /// SMEM-emission sprint lands, lift the refusal in
+    /// `compiler/kernel.rs::attention_sink` and extend the integration
+    /// test in `attention_sink_decorator_integration.rs` with a gated
+    /// PTX probe.
+    pub num_sink_tokens: u32,
     /// Target GPU SM version for PTX target selection (default: 52).
     pub gpu_sm: u32,
     /// PCA Tier A: when `true`, the emitter produces a segment-aware
@@ -163,12 +223,32 @@ pub struct FlashAttentionConfig {
     /// `NSL-CSHA-Research.PDF`.
     #[doc(hidden)]
     pub csha: Option<CshaExtras>,
+    /// Paper §5.3 checkpointing-aware backward extensions. `None` (the
+    /// default) preserves classic backward (M14 tape fallback or fused
+    /// CSHA backward). `Some(..)` selects a compiler-synthesized
+    /// checkpointing strategy that recomputes prologue activations
+    /// during backward instead of materializing/retaining them.
+    ///
+    /// v1 ships `policy="full"` only (single-variant invariant inversion
+    /// per cycle-10 Refuter 3). Other policies are reserved for v2/v3.
+    /// See `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`.
+    #[doc(hidden)]
+    pub checkpoint: Option<CheckpointExtras>,
 }
 
 impl FlashAttentionConfig {
-    /// Spec §3.2 invariant: segment_masked + paged are mutually
-    /// exclusive; paged KV cache is inference-only, packed
-    /// pretraining doesn't use it.
+    /// Spec §3.2 invariant: `segment_masked` + `paged` are mutually
+    /// exclusive; paged KV cache is inference-only, packed pretraining
+    /// (PCA Tier A — segment-aware causal attention for packed
+    /// documents) doesn't use it.
+    ///
+    /// **Note**: this validator is only invoked by tests today; it is
+    /// NOT load-bearing on the production PTX synthesis path. Most
+    /// invariants are enforced by codegen-time refusals (e.g., the
+    /// `num_sink_tokens > 0` refusal at `compiler/kernel.rs::attention_sink`
+    /// added cycle-5 Sprint 2) or by the semantic checker. Adding new
+    /// validation here is fine but does not protect production callers
+    /// until they explicitly invoke `validate()`.
     pub fn validate(&self) -> Result<(), String> {
         if self.segment_masked && self.paged {
             return Err(
@@ -178,6 +258,91 @@ impl FlashAttentionConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// Paper §5.3 checkpointing-aware backward policy.
+///
+/// v1 ships a single variant (`Full`) per cycle-10 Refuter 3 invariant
+/// inversion: the policy enum exists so that the kwarg parser can refuse
+/// unsupported variants without inventing API surface that has no test
+/// coverage. `Selective`, `SelectivePostnorm`, `Custom` are reserved for
+/// v2/v3 and are explicitly refused at the semantic layer.
+///
+/// `Full` recomputes the entire prologue (RMSNorm + Q/K/V projections +
+/// RoPE) during backward instead of materializing it from HBM saves.
+/// See `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckpointPolicy {
+    /// Full prologue recompute during backward (v1 only variant).
+    Full,
+}
+
+/// Paper §5.3 checkpointing-aware backward configuration carrier.
+///
+/// Mirrors the `CshaExtras` sub-struct pattern: adding a single
+/// `Option<CheckpointExtras>` field to `FlashAttentionConfig` keeps
+/// the ~371 in-tree construction sites near-zero churn (cycle-10 T2).
+#[derive(Clone, Debug)]
+pub struct CheckpointExtras {
+    /// Active checkpointing policy. v1 ships `CheckpointPolicy::Full`.
+    pub policy: CheckpointPolicy,
+    /// Cycle-10 §5.3 Task 9 R9 carrier: set to `true` at wire-up time when
+    /// the enclosing `@checkpoint` function is invoked from inside a
+    /// `@paged_kv`-decorated model. The codegen-side dispatch fork in
+    /// `flash_attention_v2/mod.rs::synthesize_backward_with_recompute`
+    /// refuses (R9 substring) when this is true.
+    ///
+    /// Full call-graph propagation is deferred to v4 (T6). v1 trusts the
+    /// wire-up site to set this; unit tests exercise the refusal directly.
+    pub paged_kv_collision: bool,
+
+    /// Cycle-11 §2 test-only R0 bypass seam. When `true`, the R0 refusal
+    /// at `flash_attention_v2/mod.rs::synthesize_backward_with_recompute`
+    /// is skipped and the structurally-validated PTX recompute path is
+    /// emitted instead. Field exists ONLY under the `test` cfg or the
+    /// `test-helpers` Cargo feature — in production builds the field is
+    /// removed at compile time and R0 is unconditional.
+    ///
+    /// Construct via `bypass_r0_for_testing()` (chained builder), never
+    /// directly. Audit production by grepping `bypass_r0_for_testing` —
+    /// it must occur ONLY in `#[cfg(test)]` or test-helper modules.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub r0_bypass: bool,
+}
+
+impl CheckpointExtras {
+    /// Construct a `Full`-policy carrier with no paged-kv collision (the
+    /// default v1 shape). Used by tests and by the semantic wire-up when
+    /// `@paged_kv` is NOT in the enclosing model's decorator set.
+    pub fn full() -> Self {
+        Self {
+            policy: CheckpointPolicy::Full,
+            paged_kv_collision: false,
+            #[cfg(any(test, feature = "test-helpers"))]
+            r0_bypass: false,
+        }
+    }
+
+    /// Cycle-11 §2 test-only R0-bypass builder.
+    ///
+    /// **Cycle-12 status: test-helpers seam, no longer needed for R0 lift.**
+    /// R0 was retired in cycle 12 (see `synthesize_backward_with_recompute`
+    /// doc comment). The cfg-gated `r0_bypass` field and this builder
+    /// remain so cycle-11 tests that constructed configs with the bypass
+    /// continue to compile and pass — the field is now a no-op flag, and
+    /// the production R0 refusal it once skipped no longer exists.
+    ///
+    /// Returns a carrier with `r0_bypass=true`. In cycle 11 the R0
+    /// refusal at `synthesize_backward_with_recompute` consulted
+    /// `r0_bypass` and skipped the refusal when set. In production the
+    /// field doesn't exist (cfg-gated out) — so calls to this builder
+    /// from non-test code would fail to compile, which is the desired
+    /// audit posture.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn bypass_r0_for_testing(mut self) -> Self {
+        self.r0_bypass = true;
+        self
     }
 }
 
@@ -231,6 +396,19 @@ pub struct CshaExtras {
     /// narrow+chunkify pre-pass externally. Default false (RMSNorm
     /// prologue runs as before; current callers see no behavior change).
     pub skip_rmsnorm_prologue: bool,
+    /// **Sprint 8 (paper §4.1) — compile-time seq_len.**  When `Some(s)`,
+    /// the Tier B.2 dq/dkdv emitters treat the sequence length as a
+    /// compile-time constant and elide the runtime `ceil(seq_len / bq)` /
+    /// `ceil(seq_len / bkv)` shift sequence in `emit_q_iter_count_setup` /
+    /// `emit_kv_iter_count_setup`, replacing it with a single
+    /// `mov.u32 %num_q_iters, <const>` (and same for `%num_kv_iters`).
+    /// When the single-tile criterion holds (`s <= block_q` and
+    /// `s <= block_kv`) and `causal` is true, the outer tile-skip
+    /// predicate is folded to the constant `1` (single tile is always
+    /// active; per-element intra-tile masking still handles correctness).
+    /// `None` (default) preserves the existing runtime path and produces
+    /// byte-identical PTX to the pre-Sprint-8 emitters.
+    pub static_seq_len: Option<u32>,
 }
 
 impl CshaExtras {
@@ -247,7 +425,31 @@ impl CshaExtras {
             d_model: 0,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }
+    }
+
+    /// Cycle-12 R3 augmentation: Level-1 preset with `fused_projections=true`
+    /// AND `save_activations_for_backward=true` so the forward path stages
+    /// `x_raw` + `Wk/Wv` for the backward kv-recompute. Matches the
+    /// cycle-12-eligible R3 predicate
+    /// (`level >= 1 && fused_rmsnorm && fused_projections`).
+    ///
+    /// `d_model` must be set externally (mirrors `level2`/`level3`); the
+    /// fused-projections SMEM tile size depends on it.
+    ///
+    /// Used by:
+    ///   - tests/checkpoint_cycle11_structural.rs build_bypass_config
+    ///   - tests/checkpoint_v1_integration.rs base_fusible (via field set)
+    ///   - compiler/kernel.rs T1 wire-up (when @checkpoint policy=Full is
+    ///     present on a fn in the @train block)
+    pub fn level1_with_fused_proj(rmsnorm_eps: f32) -> Self {
+        let mut x = Self::level1(rmsnorm_eps);
+        x.fused_projections = true;
+        // T4 (cycle 12): auto-enable forward x_raw save so backward
+        // kv-recompute reads non-null x_raw_ptr.
+        x.save_activations_for_backward = true;
+        x
     }
 
     /// CSHA level 2 preset — full projection pipelining.
@@ -262,6 +464,7 @@ impl CshaExtras {
             d_model,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }
     }
 
@@ -5918,13 +6121,53 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
             "flash_attn_p0_r0_hs_g1_c1_t0_q64_kv64"
+        );
+    }
+
+    // Cycle-10 Task 1: verify the sub-struct pattern keeps `checkpoint`
+    // disabled by default so that classic kernels remain byte-identical
+    // (per §5.3 v1 invariant inversion and T2 mitigation).
+    #[test]
+    fn flash_attention_config_default_checkpoint_is_none() {
+        let config = FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: None,
+            checkpoint: None,
+        };
+        assert!(config.checkpoint.is_none());
+        // Also verify the Some(..) constructor works and round-trips.
+        let policied = FlashAttentionConfig {
+            checkpoint: Some(CheckpointExtras {
+                policy: CheckpointPolicy::Full,
+                paged_kv_collision: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                r0_bypass: false,
+            }),
+            ..config.clone()
+        };
+        assert_eq!(
+            policied.checkpoint.as_ref().map(|c| c.policy),
+            Some(CheckpointPolicy::Full)
         );
     }
 
@@ -5940,9 +6183,11 @@ mod tests {
             rope_style: RopeStyle::Adjacent,
             gqa_group_size: 4,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -5962,9 +6207,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         // (64 + 64) * 128 * 2 = 32768 bytes (32 KB)
         assert_eq!(shared_mem_bytes(&config), 32768);
@@ -5984,9 +6231,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         assert_eq!(shared_mem_bytes(&config), 49152);
         // This exceeds 48KB — the semantic checker should reject this combination
@@ -6004,9 +6253,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap(); // strip null
@@ -6031,9 +6282,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
         let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len() - 1]).unwrap();
@@ -6058,9 +6311,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6081,9 +6336,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6104,9 +6361,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 4,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6142,9 +6401,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: true,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6515,9 +6776,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras::level1(1e-5)),
+            checkpoint: None,
         }
     }
 
@@ -6532,9 +6795,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -6614,9 +6879,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras::level2(1e-5, 512)),
+            checkpoint: None,
         }
     }
 
@@ -7102,9 +7369,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         };
 
         // Case 1: paged=true alone is fine.

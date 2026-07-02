@@ -12,6 +12,7 @@
 pub mod smem_layout;
 pub mod register_budget;
 pub mod phases;
+pub mod sinks;
 pub mod tier_b1;
 pub mod tier_b2;
 pub mod per_doc_cta;
@@ -61,8 +62,14 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
     tier_b: Option<(u32, SegmentResidency)>,
 ) -> Vec<u8> {
     // CSHA Tier B.1 dispatch (orthogonal to PCA Tier B; see docstring).
+    // Sprint 3 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal —
+    // mirrors `is_tier_b1_dispatch`. The pipelined-MMA forward does not
+    // understand sinks; falling through to Tier A v2 here picks up Sprint
+    // 1b's sink-aware narrow path. Lift point: a future sprint with
+    // sink-aware Tier B.1 kernels.
     let want_tier_b1 = config.csha.as_ref().is_some_and(|c| c.level >= 2)
-        && config.gpu_sm >= 80;
+        && config.gpu_sm >= 80
+        && config.num_sink_tokens == 0;
     if want_tier_b1 {
         match tier_b1::chunk_config::select(config) {
             Ok(chunk) => {
@@ -333,21 +340,23 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // values that the Tier C save path will read below.
             phases::q_load::emit(&mut ptx, config, q_iter);
 
-            // Tier C: save post-RoPE Q/K activations for backward (gated on flag).
-            // Split QK vs V: Q lives in q_offset and is stable after q_load; K
-            // lives at kv_offset but V aliases the same slot, so K must be
-            // saved immediately after its HBM load and BEFORE v_tile_load
-            // overwrites the slot.  SaveSet::V runs after v_tile_load below.
-            phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
-            );
-
             // K/V-tile loop.
             ptx.push_str("    mov.u64 %k_start, 0;\n");
             ptx.push_str("    mov.u64 %k_max, %rd6;                        // seq_len\n");
             ptx.push_str(&format!("V2_LOOP_KV_START_{}:\n", q_iter));
 
             emit_k_tile_load(&mut ptx, config, q_iter);
+            // Cycle 20 T3 BUG A FIX: Tier C QK save moved to AFTER
+            // emit_k_tile_load. Previously the save ran BEFORE the K tile
+            // load, reading uninitialised SMEM at %k_smem_base. Q is
+            // loop-invariant (post-RoPE Q in q_offset is stable across KV
+            // iterations), so re-emitting the save per KV iter is a wasted
+            // HBM write but correctness-safe (same Q values). K SMEM is
+            // now populated when the save reads it. SaveSet::V still runs
+            // after v_tile_load below.
+            phases::csha_hooks::emit_save_activations_subset(
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
+            );
             phases::s_compute::emit(&mut ptx, config, q_iter, tier_b);
             phases::softmax::emit(&mut ptx, config, q_iter);
             // Tier C: persist row_max/row_sum to HBM IMMEDIATELY after
@@ -364,17 +373,88 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // the previous post-loop placement for correctness.
             phases::csha_hooks::emit_save_softmax_state(&mut ptx, config, q_iter);
             emit_v_tile_load(&mut ptx, config, q_iter);
-            // Tier C: save V from v_smem (which aliases K after v_tile_load).
-            // NOTE: under the non-fused path the save addressing uses
-            // `q_start+warp_row` which is Q-indexed; under the standard KV
-            // loop this matches the K/V tile layout only at k_start=0.
-            // Backward numerical correctness for non-fused path is NOT the
-            // goal of this edit — the goal is to ensure the forward PTX
-            // assembles and launch rc=0 so structural gradients flow; a
-            // proper addressing rewrite is tracked as a separate follow-up.
-            phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::V,
-            );
+            // Cycle 20 T3 BUG B FIX: inline V-save with K/V-indexed row
+            // addressing (uses %k_start, not %q_start). Previously called
+            // emit_save_activations_subset(SaveSet::V) which hard-codes
+            // %q_start+warp_row row indexing — correct only at k_start=0.
+            // This inline version covers all block_kv rows per KV-loop
+            // iteration by looping (block_kv/4) rows per warp, and writes
+            // to HBM row = k_start + warp_id + row_step*4. See BUG B in
+            // 2026-07-01 T3 report.
+            if config
+                .csha
+                .as_ref()
+                .is_some_and(|c| c.save_activations_for_backward)
+            {
+                let head_dim = config.head_dim as u32;
+                let slices_per_lane = (head_dim / 32).max(1);
+                let kv_off = smem_layout::kv_offset(config);
+                let rows_per_warp = ((config.block_kv as u32) / 4).max(1);
+                ptx.push_str("    // -- Cycle 20 T3: inline V-save (k_start-indexed) --\n");
+                // Init v_smem_base (non-fused: V aliases K at kv_offset).
+                ptx.push_str(&format!(
+                    "    add.u64 %v_smem_base, %shmem_base, {}; // T3: V tile at kv_offset\n",
+                    kv_off
+                ));
+                ptx.push_str("    bar.sync 0;  // T3 FENCE: V SMEM tile complete\n");
+                ptx.push_str("    ld.param.u64 %rd_save_base, [v_proj_ptr];\n");
+                ptx.push_str("    setp.eq.u64 %p_save_null, %rd_save_base, 0;\n");
+                ptx.push_str(&format!(
+                    "    @%p_save_null bra V2_CSHA_SAVE_V_T3_SKIP_{};\n",
+                    q_iter
+                ));
+                // batch*heads*seq_len base contribution (row-independent).
+                ptx.push_str("    mul.lo.u64 %rd_save_bh, %batch_idx, %rd5;\n");
+                ptx.push_str("    add.u64 %rd_save_bh, %rd_save_bh, %head_idx;\n");
+                ptx.push_str("    mul.lo.u64 %rd_save_bh, %rd_save_bh, %rd6;\n");
+                for row_step in 0..rows_per_warp {
+                    // kv_row = warp_id + row_step*4 (row within block_kv tile)
+                    ptx.push_str(&format!(
+                        "    add.u32 %r_save_wrow, %warp_id, {}; // T3 kv_row (step {})\n",
+                        row_step * 4,
+                        row_step
+                    ));
+                    ptx.push_str("    cvt.u64.u32 %rd_save_wrow, %r_save_wrow;\n");
+                    // HBM row = k_start + kv_row  (T3 BUG B FIX: was q_start)
+                    ptx.push_str("    add.u64 %rd_save_off, %rd_save_bh, %k_start;\n");
+                    ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %rd_save_wrow;\n");
+                    ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd7;\n");
+                    for slice in 0..slices_per_lane {
+                        ptx.push_str("    cvt.u64.u32 %rd_save_col, %lane;\n");
+                        if slices_per_lane > 1 {
+                            ptx.push_str(&format!(
+                                "    mul.lo.u64 %rd_save_col, %rd_save_col, {};\n",
+                                slices_per_lane
+                            ));
+                        }
+                        if slice > 0 {
+                            ptx.push_str(&format!(
+                                "    add.u64 %rd_save_col, %rd_save_col, {};\n",
+                                slice
+                            ));
+                        }
+                        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_off, %rd_save_col;\n");
+                        ptx.push_str("    shl.b64 %rd_save_elem, %rd_save_elem, 1;\n");
+                        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_elem;\n");
+                        ptx.push_str(&format!(
+                            "    mul.lo.u64 %rd_save_smem, %rd_save_wrow, {};\n",
+                            head_dim * 2
+                        ));
+                        ptx.push_str(
+                            "    add.u64 %rd_save_smem, %v_smem_base, %rd_save_smem;\n",
+                        );
+                        ptx.push_str("    shl.b64 %rd_save_colb, %rd_save_col, 1;\n");
+                        ptx.push_str(
+                            "    add.u64 %rd_save_smem, %rd_save_smem, %rd_save_colb;\n",
+                        );
+                        ptx.push_str("    ld.shared.b16 %h_save_v, [%rd_save_smem];\n");
+                        ptx.push_str("    st.global.b16 [%rd_save_elem], %h_save_v;\n");
+                    }
+                }
+                ptx.push_str(&format!("V2_CSHA_SAVE_V_T3_SKIP_{}:\n", q_iter));
+            } else {
+                ptx.push_str("    // CSHA Tier C V-save: save_activations=false, no emission\n");
+            }
             phases::pv_accum::emit(&mut ptx, config, q_iter);
 
             // PCA Tier B: KV_TILE_SKIP_TB_{q_iter} label emitted ONLY when
@@ -416,10 +496,96 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
 /// overwriting the fused result.  When `csha_wk_ptr` is null (caller
 /// pre-projected K/V via classic k_ptr) the load runs normally.
 fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
-    let total_k_elems = (config.block_kv as u32) * (config.head_dim as u32);
+    // §4.3 attention sinks (Sprint 1a precursor): the rolling load covers
+    // `block_kv` rows; when sinks are enabled the sink pre-load below
+    // covers an additional `num_sink_tokens` rows so the K SMEM slab
+    // matches `effective_block_kv` rows that s_compute / softmax /
+    // pv_accum / sp_bytes consume. At num_sink_tokens==0 this is
+    // identical to `config.block_kv` and emits byte-identical PTX
+    // (snapshot invariant).
+    let rolling_k_elems = (config.block_kv as u32) * (config.head_dim as u32);
     let fused_k = config.csha.as_ref().is_some_and(|c| c.fused_projections);
+    let kv_off = smem_layout::kv_offset(config);
+    let n_sink = config.num_sink_tokens;
+    let head_dim = config.head_dim as u32;
+    // SMEM byte offset of the rolling K rows: skip past the sink slab if
+    // sinks are enabled. At num_sink_tokens==0 this is `kv_off` —
+    // byte-identical to pre-Sprint-1b.
+    let rolling_kv_off = kv_off + n_sink * head_dim * 2;
 
     ptx.push_str("    // K tile load: 128 threads cooperatively load block_kv*head_dim elems\n");
+
+    // §4.3 sinks (Sprint 1b cycle-7): emit sink K pre-load at the front
+    // of the KV SMEM slab. Reads `num_sink_tokens * head_dim` f16 values
+    // from `sink_k_ptr` (the producer materialises sinks at narrow
+    // precision; see runtime FFI Task E for the null-ptr guard). Falls
+    // through to the rolling K load below which writes to a shifted SMEM
+    // offset so it doesn't stomp on the sinks. Skipped entirely when
+    // num_sink_tokens==0 → byte-identical to pre-Sprint-1b.
+    //
+    // Sprint 2 cycle-8 §4.3 multi-tile: the sink-load is wrapped with a
+    // PTX-level conditional gating on `%k_start == 0` so the sinks load
+    // ONLY when the live K outer-loop iterator is at iter-0. For
+    // subsequent iters within the SAME outer K loop, the sink rows
+    // persist immutable in SMEM (the rolling K load writes into the
+    // shifted `rolling_kv_off` slot which sits past the sink slab, so
+    // the slab is never clobbered). The conditional itself is gated on
+    // `num_sink_tokens > 0` at codegen time — at zero sinks NEITHER the
+    // setp/bra NOR the load body emits → byte-identical PTX (cycle-7
+    // Sprint 1a snapshot invariant).
+    //
+    // NOTE on fused-path semantics (cycle-8 holistic-review finding):
+    // In the fused S/PV orchestrator, the K outer loop is RESTARTED at
+    // each q_iter (`%k_start = 0` reset at the top of each q_iter's S
+    // pass). This means `setp.ne %k_start, 0` fires false at iter-0 of
+    // EVERY q_iter, so the sink K rows re-load once per q_iter rather
+    // than once per kernel invocation. The data is idempotent (same f16
+    // values written to the same SMEM slots), so this is a PERFORMANCE
+    // regression for multi-q_iter configs (~num_sink_tokens × head_dim
+    // wasted bytes per q_iter), NOT a correctness bug. A future cycle
+    // could add a function-scope `%p_sinks_loaded` predicate to load
+    // truly once per kernel. v1 accepts the per-q_iter reload as the
+    // honest cost of the simplest correct lift.
+    if n_sink > 0 {
+        let sink_elems = n_sink * head_dim;
+        ptx.push_str(&format!(
+            "    // sinks v1: pre-load {n_sink} sink K rows from sink_k_ptr -> kv_offset (front of slab)\n"
+        ));
+        // Sprint 2 cycle-8 §4.3 multi-tile: sinks load ONLY when kv_iter == 0.
+        // For subsequent iters, sink rows persist in SMEM from the first load.
+        ptx.push_str("    setp.ne.u64 %p_skip_sinks, %k_start, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p_skip_sinks bra V2_K_SINK_LOAD_SKIP_{};\n",
+            q_iter
+        ));
+        ptx.push_str("    ld.param.u64 %rd_sink_base, [sink_k_ptr];\n");
+        ptx.push_str("    cvt.u64.u32 %rd_sink_idx, %tid_x;\n");
+        ptx.push_str(&format!("V2_LOOP_K_SINK_LOAD_{}:\n", q_iter));
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_sink, %rd_sink_idx, {sink_elems};\n"
+        ));
+        ptx.push_str(&format!(
+            "    @!%p_sink bra V2_K_SINK_LOAD_DONE_{};\n",
+            q_iter
+        ));
+        // Sink table is f16 (2 bytes/elem) — matches sink_slab_bytes().
+        ptx.push_str("    shl.b64 %rd_sink_off, %rd_sink_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_sink_src, %rd_sink_base, %rd_sink_off;\n");
+        ptx.push_str("    ld.global.b16 %h0, [%rd_sink_src];\n");
+        // SMEM dest at kv_offset + idx * 2 (f16 stride).
+        ptx.push_str(&format!(
+            "    add.u64 %rd_sink_dst, %rd_sink_off, {kv_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_sink_dst, %rd_sink_dst, %shmem_base;\n");
+        ptx.push_str("    st.shared.b16 [%rd_sink_dst], %h0;\n");
+        ptx.push_str("    add.u64 %rd_sink_idx, %rd_sink_idx, 128;\n");
+        ptx.push_str(&format!(
+            "    bra V2_LOOP_K_SINK_LOAD_{};\n",
+            q_iter
+        ));
+        ptx.push_str(&format!("V2_K_SINK_LOAD_DONE_{}:\n", q_iter));
+        ptx.push_str(&format!("V2_K_SINK_LOAD_SKIP_{}:\n", q_iter));
+    }
 
     // When fused K projection is enabled, null-guard the HBM load: if
     // csha_wk_ptr is non-null the projection already filled SMEM; skip.
@@ -433,8 +599,25 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     }
 
     // K base global address.
-    ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads\n");
-    ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;         // + head\n");
+    // GQA zero-copy stride (paper s4.2): when gqa_group_size > 1, divide
+    // head_idx by the group size before composing the row index, so
+    // multiple Q-heads alias to the same kv-head slot in the K tensor.
+    // Byte-identical no-op when gqa_group_size == 1.
+    if config.gqa_group_size > 1 {
+        ptx.push_str(&format!(
+            "    // GQA: kv_head = q_head / {} (paper s4.2 zero-copy)\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str(&format!(
+            "    div.u64 %rd57, %head_idx, {};\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %rd57;             // + kv_head\n");
+    } else {
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;         // + head\n");
+    }
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len\n");
     ptx.push_str("    add.u64 %rd58, %rd58, %k_start;           // + k_start\n");
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim\n");
@@ -447,16 +630,26 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ptx.push_str("    ld.global.f32 %f0, [%rd61];\n");
     ptx.push_str("    cvt.rn.f16.f32 %h0, %f0;\n");
     ptx.push_str("    shl.b64 %rd60, %rd59, 1;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd60, %rd60, {};                 // + kv_offset\n",
-        smem_layout::kv_offset(config)
-    ));
+    // Preserve pre-Sprint-1b comment text at num_sink_tokens=0 (snapshot
+    // byte-identity invariant); add a sink-slab note only when sinks
+    // shift the SMEM destination.
+    if n_sink == 0 {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};                 // + kv_offset\n",
+            rolling_kv_off
+        ));
+    } else {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};                 // + kv_offset + sink slab\n",
+            rolling_kv_off
+        ));
+    }
     ptx.push_str("    add.u64 %smem_addr, %rd60, %shmem_base;\n");
     ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
     ptx.push_str("    add.u64 %rd59, %rd59, 128;\n");
     ptx.push_str(&format!(
         "    setp.lt.u64 %p0, %rd59, {};\n",
-        total_k_elems
+        rolling_k_elems
     ));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_K_LOAD_{};\n", q_iter));
 
@@ -473,10 +666,65 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
 /// projection sweep has already written projected V into SMEM — skip the
 /// HBM load to avoid overwriting the fused result.
 fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
-    let total_v_elems = (config.block_kv as u32) * (config.head_dim as u32);
+    // §4.3 attention sinks (Sprint 1a precursor): see emit_k_tile_load.
+    // The rolling load covers `block_kv` rows; when sinks are enabled the
+    // sink pre-load below covers an additional `num_sink_tokens` rows so
+    // the V SMEM slab matches `effective_block_kv` rows. At
+    // num_sink_tokens==0 emits byte-identical PTX to pre-Sprint-1b.
+    let rolling_v_elems = (config.block_kv as u32) * (config.head_dim as u32);
     let fused_v = config.csha.as_ref().is_some_and(|c| c.fused_projections);
+    let kv_off = smem_layout::kv_offset(config);
+    let n_sink = config.num_sink_tokens;
+    let head_dim = config.head_dim as u32;
+    let rolling_kv_off = kv_off + n_sink * head_dim * 2;
 
     ptx.push_str("    // V tile load: cooperative, reuses K region\n");
+
+    // §4.3 sinks (Sprint 1b cycle-7): emit sink V pre-load at the front
+    // of the KV SMEM slab. Symmetric to the K sink pre-load. Skipped
+    // entirely when num_sink_tokens==0 → byte-identical to pre-Sprint-1b.
+    //
+    // Sprint 2 cycle-8 §4.3 multi-tile: same kv_iter==0 gating as the K
+    // sink pre-load — sinks load only on the first KV iteration and
+    // persist across subsequent ones. Symmetric guard so the V slab
+    // matches the K slab's "load once, persist" semantics.
+    if n_sink > 0 {
+        let sink_elems = n_sink * head_dim;
+        ptx.push_str(&format!(
+            "    // sinks v1: pre-load {n_sink} sink V rows from sink_v_ptr -> kv_offset (front of slab)\n"
+        ));
+        // Sprint 2 cycle-8 §4.3 multi-tile: sinks load ONLY when kv_iter == 0.
+        ptx.push_str("    setp.ne.u64 %p_skip_sinks, %k_start, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p_skip_sinks bra V2_V_SINK_LOAD_SKIP_{};\n",
+            q_iter
+        ));
+        ptx.push_str("    ld.param.u64 %rd_sink_base, [sink_v_ptr];\n");
+        ptx.push_str("    cvt.u64.u32 %rd_sink_idx, %tid_x;\n");
+        ptx.push_str(&format!("V2_LOOP_V_SINK_LOAD_{}:\n", q_iter));
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_sink, %rd_sink_idx, {sink_elems};\n"
+        ));
+        ptx.push_str(&format!(
+            "    @!%p_sink bra V2_V_SINK_LOAD_DONE_{};\n",
+            q_iter
+        ));
+        ptx.push_str("    shl.b64 %rd_sink_off, %rd_sink_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_sink_src, %rd_sink_base, %rd_sink_off;\n");
+        ptx.push_str("    ld.global.b16 %h0, [%rd_sink_src];\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_sink_dst, %rd_sink_off, {kv_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_sink_dst, %rd_sink_dst, %shmem_base;\n");
+        ptx.push_str("    st.shared.b16 [%rd_sink_dst], %h0;\n");
+        ptx.push_str("    add.u64 %rd_sink_idx, %rd_sink_idx, 128;\n");
+        ptx.push_str(&format!(
+            "    bra V2_LOOP_V_SINK_LOAD_{};\n",
+            q_iter
+        ));
+        ptx.push_str(&format!("V2_V_SINK_LOAD_DONE_{}:\n", q_iter));
+        ptx.push_str(&format!("V2_V_SINK_LOAD_SKIP_{}:\n", q_iter));
+    }
 
     // When fused V projection is enabled, null-guard: skip if csha_wv_ptr != 0.
     if fused_v {
@@ -488,8 +736,23 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
         ));
     }
 
-    ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;\n");
-    ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;\n");
+    // GQA zero-copy stride (paper s4.2): kv_head = q_head / gqa_group_size.
+    // Byte-identical no-op when gqa_group_size == 1.
+    if config.gqa_group_size > 1 {
+        ptx.push_str(&format!(
+            "    // GQA: kv_head = q_head / {} (paper s4.2 zero-copy)\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str(&format!(
+            "    div.u64 %rd57, %head_idx, {};\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %rd57;             // + kv_head\n");
+    } else {
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;\n");
+    }
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd6;\n");
     ptx.push_str("    add.u64 %rd58, %rd58, %k_start;\n");
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd7;\n");
@@ -502,16 +765,26 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ptx.push_str("    ld.global.f32 %f0, [%rd61];\n");
     ptx.push_str("    cvt.rn.f16.f32 %h0, %f0;\n");
     ptx.push_str("    shl.b64 %rd60, %rd59, 1;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd60, %rd60, {};\n",
-        smem_layout::kv_offset(config)
-    ));
+    // Preserve pre-Sprint-1b emission verbatim at num_sink_tokens=0
+    // (the V-load line had NO trailing comment originally); add a
+    // sink-slab note only when sinks shift the SMEM destination.
+    if n_sink == 0 {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};\n",
+            rolling_kv_off
+        ));
+    } else {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};                 // + kv_offset + sink slab\n",
+            rolling_kv_off
+        ));
+    }
     ptx.push_str("    add.u64 %smem_addr, %rd60, %shmem_base;\n");
     ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
     ptx.push_str("    add.u64 %rd59, %rd59, 128;\n");
     ptx.push_str(&format!(
         "    setp.lt.u64 %p0, %rd59, {};\n",
-        total_v_elems
+        rolling_v_elems
     ));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_V_LOAD_{};\n", q_iter));
 
@@ -632,8 +905,20 @@ pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
 /// the CSHA pipelined level is requested AND the target GPU supports
 /// the cp.async + m16n8k16 path. Mirrors the dispatch predicate in
 /// `synthesize_flash_attention_ptx_v2` exactly.
+///
+/// Sprint 3 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal.
+/// The Tier B.1 pipelined-MMA forward kernel does NOT understand the
+/// persistent sink slab — neither `projection_mma::emit_kv_projection_chunk_loop`
+/// nor `attention_mma::emit_phase_b_attention` reserves SMEM rows for
+/// sinks, and the cp.async prologue kicks (`pipeline::emit_prologue_kicks`)
+/// would not pre-load the sink rows. Returning `false` here forces the
+/// dispatch to fall through to the Tier A v2 path, which Sprint 1b made
+/// sink-aware for the narrow single-tile configuration. Lift point: when
+/// a future sprint lands sink-aware Tier B.1 cp.async + MMA kernels.
 pub fn is_tier_b1_dispatch(config: &FlashAttentionConfig) -> bool {
-    config.csha.as_ref().is_some_and(|c| c.level >= 2) && config.gpu_sm >= 80
+    config.csha.as_ref().is_some_and(|c| c.level >= 2)
+        && config.gpu_sm >= 80
+        && config.num_sink_tokens == 0
 }
 
 /// Central dispatch toggle for PCA Tier B PTX emission.
@@ -676,13 +961,24 @@ pub fn shared_mem_bytes_v2(config: &FlashAttentionConfig) -> u32 {
 /// layout, and the seg_smem region lives in the same extern shmem
 /// allocation per the Blackwell static+extern fix
 /// (see `phases/backward/prelude.rs::backward_needs_dynamic_smem`).
+///
+/// G16-2 fix: when `config.checkpoint = Some(Full)`, the kv_recompute path
+/// writes to a recomputed x_norm scratch tile starting at
+/// `smem_layout::recompute_xnorm_offset`, which sits immediately AFTER the
+/// `backward_total_bytes` region. The launch must grant those extra bytes or
+/// the store fires CUDA_ERROR_ILLEGAL_ADDRESS.
 pub fn shared_mem_bytes_v2_backward(config: &FlashAttentionConfig) -> u32 {
     let seg_overhead = if config.segment_masked {
         crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    phases::backward::prelude::backward_total_bytes(config) + seg_overhead
+    let recompute_extra = if config.checkpoint.is_some() {
+        smem_layout::recompute_extra_bytes(config) as u32
+    } else {
+        0
+    };
+    phases::backward::prelude::backward_total_bytes(config) + seg_overhead + recompute_extra
 }
 
 /// SMEM byte count for a v2 forward kernel including Tier B contribution.
@@ -757,6 +1053,31 @@ pub fn synthesize_backward_with_tier(
     use crate::flash_attention_v2::tier_b2::BackwardTier;
     use crate::flash_attention_v2::tier_b2::backward::synthesize_tier_b2_backward;
 
+    // Cycle-10 §5.3 Task 9 FIRST-CHECK: route to recompute path when
+    // `@checkpoint(policy="full")` is active. Must run BEFORE the
+    // existing sinks refusal so that R8.1 (checkpoint + sinks-v2
+    // outside verified smoke set) can fire with its specific substring
+    // instead of being shadowed by the generic Sprint-2 cycle-7
+    // backward sinks refusal.
+    if config.checkpoint.is_some() {
+        return synthesize_backward_with_recompute(config);
+    }
+
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`
+    // before dispatching to either tier. Both downstream paths
+    // (`synthesize_backward` -> `synthesize_backward_with_tier_b`, and
+    // `synthesize_tier_b2_backward`) would silently emit sink-unaware
+    // gradients without this check. See `synthesize_backward_with_tier_b`
+    // and `synthesize_backward_combined` for the same per-entry-point
+    // refusal pattern.
+    let (eligible, why) = sinks::attention_sinks_v1_backward_eligible(config);
+    if !eligible {
+        return Err(format!(
+            "Sprint 2 cycle-7 backward sinks refusal at tier-dispatch entry: {}",
+            why.unwrap_or("(unknown reason)")
+        ));
+    }
+
     match backward_dispatch_tier(config) {
         BackwardTier::TierB2 { .. } => {
             // Phase 1: stub returns NotImplemented; transparently fall
@@ -769,6 +1090,292 @@ pub fn synthesize_backward_with_tier(
         }
         BackwardTier::Scalar => synthesize_backward(config),
     }
+}
+
+/// Cycle-12 §1: backward synthesizer for `@checkpoint(policy="full")` —
+/// R0 narrowed to R3/R11/R12 in cycle 12.
+///
+/// R0 narrowed to R3/R11/R12 in cycle 12: the unconditional R0 catch-all
+/// refusal was retired; the cycle-11 structurally-validated PTX path is
+/// now reachable in production for the cycle-12-eligible configuration
+/// set (`level >= 1 && fused_rmsnorm && fused_projections`,
+/// `!(segment_masked && rope_q)`, `!(segment_masked && checkpoint)`,
+/// `num_sink_tokens == 0`, `!paged_kv_collision`, `block_q == block_kv`,
+/// `!tier_b2_hybrid_backward_compile_time_eligible`). Configs outside
+/// the eligible set must refuse with one of the specific R3/R7/R8.1/
+/// R9/R10/R11/R12 messages — there is no catch-all in cycle 12.
+///
+/// Refusal cascade (cycle 12): R3 (augmented for fused_projections) →
+/// R7 → R9 → R10 → R8.1 → R11 (Tier B.2 + checkpoint composition) →
+/// R12 (segment_masked + checkpoint composition) → SMEM validator →
+/// fall-through to `synthesize_backward_with_tier_b` for the
+/// eligible-config functional emit path.
+///
+/// The cfg-gated `r0_bypass` field on `CheckpointExtras` remains for
+/// cycle-11 test compatibility — it is now a no-op (test-helpers seam,
+/// no longer needed for R0 lift). New tests should not consult it.
+///
+/// Byte-identity invariant (W11 / Gate 1): when `config.checkpoint.is_none()`
+/// the dispatch fork in `synthesize_backward_with_tier` never reaches this
+/// function, so no checkpoint-related PTX is emitted on the no-decorator
+/// path — `fa_v2_snapshots` remains byte-identical.
+/// Cycle-12 Phase F: cycle-5 invariant `feedback_deferral_must_refuse`
+/// requires refusals to fire at EVERY entry point. Reviewer 1 (on
+/// cycle-12 Phase D) found the R3/R11/R12 cascade lived ONLY inside
+/// `synthesize_backward_with_recompute`, but production routes through
+/// `synthesize_backward_combined` → `synthesize_backward` →
+/// `synthesize_backward_with_tier_b(config, None)`, which NEVER calls
+/// `synthesize_backward_with_recompute`. So R3/R11/R12 were functionally
+/// dead under the production call chain.
+///
+/// This helper centralises the R3/R7/R8.1/R9/R10/R11/R12 sequence so
+/// it can be called from BOTH the direct dispatch fork
+/// (`synthesize_backward_with_recompute`) AND the production entry
+/// (`synthesize_backward_with_tier_b`). When `config.checkpoint.is_none()`
+/// the helper is a no-op — preserving the byte-identity invariant of
+/// the no-decorator path (`fa_v2_snapshots` 25/25 byte-identical).
+pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> Result<(), String> {
+    use crate::flash_attention::CheckpointPolicy;
+    use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
+
+    // No carrier ⇒ no checkpoint policy in play ⇒ nothing to gate.
+    let Some(extras) = config.checkpoint.as_ref() else {
+        return Ok(());
+    };
+    let CheckpointPolicy::Full = extras.policy;
+
+    // ── R3 (cycle-12 augmented): Non-Level-1-fusible prologue ────────
+    // Cycle 12 augmented R3 with the `fused_projections` requirement —
+    // without staged x_raw + Wk/Wv on the forward path, the backward
+    // kv-recompute would silently no-op (the x_raw_ptr null guard at
+    // csha_hooks_backward.rs early-exits when x_raw is null, leaving
+    // K/V SMEM tiles never written).
+    let prologue_ok = config
+        .csha
+        .as_ref()
+        .map(|c| c.level >= 1 && c.fused_rmsnorm && c.fused_projections)
+        .unwrap_or(false);
+    if !prologue_ok {
+        return Err(
+            "@checkpoint(policy=\"full\") requires RMSNorm + fused-projections + RoPE \
+             prologue (Level-1 boundary-fusion chain with x_raw + Wk/Wv staged for \
+             backward recompute) on the forward path; config has no fusible prologue \
+             (level/fused_rmsnorm/fused_projections gate failed). Set \
+             @csha(level=1, fused_rmsnorm=true, fused_projections=true) on the forward \
+             function to enable kv-recompute backward."
+                .to_string(),
+        );
+    }
+
+    // ── R7: PCA packing with rope_q=true under @checkpoint ───────
+    if config.segment_masked && config.rope_q {
+        return Err(
+            "PCA packing with rope_q=true under @checkpoint deferred to v4: \
+             the segment-aware causal mask shares index machinery with the \
+             RoPE-Q write-back path; safe composition requires the v4 \
+             rotated-Q SMEM-staging refactor"
+                .to_string(),
+        );
+    }
+
+    // ── R9: @paged_kv model + @checkpoint fn composition ─────────
+    if extras.paged_kv_collision {
+        return Err(
+            "@checkpoint composition with @paged_kv requires scatter-on-recompute; \
+             deferred to v4: paged KV cache pages are not byte-stable across the \
+             recompute boundary in v1"
+                .to_string(),
+        );
+    }
+
+    // ── R10: Asymmetric tile (block_q != block_kv) + @checkpoint ─
+    if config.block_q != config.block_kv {
+        return Err(format!(
+            "checkpoint policy=\"full\" requires block_q == block_kv in v1; \
+             asymmetric-tile composition deferred to v2 (got block_q={}, block_kv={})",
+            config.block_q, config.block_kv
+        ));
+    }
+
+    // ── R8.1: sinks-v2 + @checkpoint — UNCONDITIONAL in v1 ───────
+    // The cycle-9 spec carved out an "unless (hd, S) is in verified
+    // smoke set" exception, but Reviewer 1 found the carve-out
+    // referenced `static_seq_len.unwrap_or(0)` which is ALWAYS 0 in
+    // production (`CshaExtras::level1` does not set static_seq_len),
+    // so the carve-out was structurally unreachable. Phase F drops
+    // it and makes R8.1 honest about being unconditional. The
+    // smoke-set carve-out is deferred to v2 (requires GPU
+    // validation), and re-evaluating it requires plumbing
+    // static_seq_len through the wire-up site first.
+    if config.num_sink_tokens > 0 {
+        return Err(
+            "checkpoint policy=\"full\" + sinks-v2 composition refused in v1; \
+             smoke-set carve-out deferred to v2 (requires GPU validation)"
+                .to_string(),
+        );
+    }
+
+    // ── R11 (cycle-12 new): Tier B.2 hybrid backward + @checkpoint ─
+    // Tier B.2 hybrid four-kernel backward composes with @checkpoint
+    // only via a coordinated dq/dkdv/d_prepass/proj recompute lift —
+    // deferred to cycle 13. v1 must refuse rather than silently routing
+    // the hybrid path through scalar-v2 kv-recompute (which would
+    // produce wrong gradients for the dq/dkdv MMA tiles).
+    if tier_b2_hybrid_backward_compile_time_eligible(config) {
+        return Err(
+            "@checkpoint(policy=\"full\") + Tier B.2 hybrid backward composition \
+             deferred to cycle 13; configure for scalar-v2 backward or remove \
+             @checkpoint"
+                .to_string(),
+        );
+    }
+
+    // ── R12 (cycle-12 new): segment_masked (PCA Tier-B) + @checkpoint ─
+    // PCA Tier-B planner and kv-recompute are not co-emitted in v1; the
+    // segment-aware tile-active predicate would gate recompute writes
+    // unpredictably. Deferred to a co-emission lift in a later cycle.
+    if config.segment_masked {
+        return Err(
+            "@checkpoint(policy=\"full\") + paged-segment-masked composition deferred; \
+             PCA Tier-B planner and kv-recompute not co-emitted"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn synthesize_backward_with_recompute(
+    config: &FlashAttentionConfig,
+) -> Result<String, String> {
+    // Carrier presence is guaranteed by the dispatch fork at
+    // `synthesize_backward_with_tier`. If a caller hits this entry
+    // point directly with `checkpoint: None`, refuse loudly rather
+    // than silently routing to the no-decorator backward.
+    if config.checkpoint.is_none() {
+        return Err(
+            "synthesize_backward_with_recompute called without \
+             config.checkpoint set; v1 only services policy=\"full\""
+                .to_string(),
+        );
+    }
+
+    // Cycle-12 Phase F: centralised R3/R7/R8.1/R9/R10/R11/R12 cascade.
+    // This is also called from `synthesize_backward_with_tier_b` so the
+    // refusals fire from the production call chain too — closing the
+    // cycle-5 invariant gap Reviewer 1 caught.
+    validate_checkpoint_eligibility(config)?;
+
+    // SMEM budget extension (Cut 7 / R5): re-run the scalar v2 validator
+    // with the checkpoint carrier in place so `recompute_extra_bytes` is
+    // counted.
+    smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
+        .map_err(|e| format!("backward validator (checkpoint=Full) rejected: {e}"))?;
+
+    // Cycle-12 functional emission landing point — R0 retired. The
+    // refusal cascade above narrows to the eligible-config subset; this
+    // call routes into the tier-b scalar synthesizer whose
+    // `checkpoint.is_some()` dispatch fork at the kv_load call site
+    // swaps the HBM-load emitters for `emit_kv_recompute`, which writes
+    // recomputed K/V into `%k_smem_base` / `%v_smem_base` for the
+    // downstream `ds_compute` / `dv_accum` / `dqdk_accum` consumers.
+    // GPU numerical validation (G4: atol=5e-4 rtol=5e-3 at hd in
+    // {64,128}, S in {512, 2048, 4096}) runs in cycle 13 (cuda-gated
+    // harness).
+    synthesize_backward_with_tier_b(config, None)
+}
+
+/// Sprint 1 T1.4: emit a single PTX module containing BOTH the scalar
+/// Tier C backward AND the Tier B.2 hybrid four-kernel backward when the
+/// config is compile-time eligible for the hybrid path. Otherwise return
+/// the scalar PTX unchanged.
+///
+/// The runtime FFI (`csha_tier_b2_backward_launch`) branches on
+/// `tier_b2_active` (computed at Wengert lowering, Sprint 1 T1.3) to pick
+/// either the scalar single-entry path or the four-kernel hybrid path.
+/// Both entries must live in the same loaded module so a single
+/// `cuModuleLoadData` + per-path `cuModuleGetFunction` lookup work; this
+/// function is what production codegen at `compiler/kernel.rs:822` calls
+/// to embed that combined module.
+///
+/// Header-union convention mirrors `synthesize_tier_b2_backward`:
+///   * Single `.version 8.7 / .target sm_80 / .address_size 64` (sm_80
+///     is mandatory for the dq/dkdv MMA path; sm_75-targeted bodies run
+///     fine on sm_80+ via JIT).
+///   * Single `.extern .shared .align 16 .b8 shmem[];` module-level
+///     declaration. Both the scalar backward (when its SMEM exceeds the
+///     48 KB static cap) and the hybrid kernels reference `shmem` via
+///     this extern; one extern is sufficient. Static `.shared` decls
+///     emitted INSIDE individual entry bodies are function-scoped and
+///     shadow the extern locally — no symbol collision.
+///   * Each component's body (everything from `.visible .entry`
+///     onward) is concatenated verbatim via `strip_module_header`.
+///
+/// **No-op guarantee**: for ineligible configs (head_dim not
+/// hybrid-compatible, csha.level<2, gpu_sm<80, rope_q=true,
+/// active_heads!=1, d_model!=head_dim, no CSHA, ...), the output is
+/// byte-identical to `synthesize_backward(config)`.
+pub fn synthesize_backward_combined(
+    config: &FlashAttentionConfig,
+) -> Result<String, String> {
+    use crate::flash_attention_v2::tier_b2::backward::{
+        strip_module_header, synthesize_tier_b2_backward,
+    };
+    use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
+
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`
+    // at the combined-module entry too. `synthesize_backward` (called
+    // immediately below) already refuses via `synthesize_backward_with_tier_b`,
+    // but this explicit check keeps the per-entry-point refusal contract
+    // visible at the hybrid path's front door. Otherwise, a future
+    // refactor that bypasses `synthesize_backward` (e.g., directly
+    // synthesizing only the hybrid four-kernel module) could silently
+    // reintroduce the silent-correctness gap.
+    let (eligible, why) = sinks::attention_sinks_v1_backward_eligible(config);
+    if !eligible {
+        return Err(format!(
+            "Sprint 2 cycle-7 backward sinks refusal at combined entry: {}",
+            why.unwrap_or("(unknown reason)")
+        ));
+    }
+
+    // Always synthesize the scalar backward first — it is the fallback
+    // path the runtime takes when `tier_b2_active=0`, and we must
+    // preserve its validator-rejection behaviour (the caller in
+    // `compiler/kernel.rs` swallows the Err to fall back to the legacy
+    // tape-op backward).
+    let scalar_ptx = synthesize_backward(config)?;
+
+    if !tier_b2_hybrid_backward_compile_time_eligible(config) {
+        // Ineligible: byte-identical to scalar. Runtime will never set
+        // `tier_b2_active=1` for this config, so the hybrid entries
+        // would be dead weight.
+        return Ok(scalar_ptx);
+    }
+
+    // Eligible: synthesize the hybrid four-kernel module and union the
+    // headers. If hybrid synthesis fails (e.g. UnsupportedHeadDim that
+    // the compile-time predicate didn't catch — should be unreachable
+    // today but defensive), fall back to scalar so the runtime still
+    // has SOMETHING to launch.
+    let hybrid_ptx = match synthesize_tier_b2_backward(config) {
+        Ok(p) => p,
+        Err(_) => return Ok(scalar_ptx),
+    };
+
+    let mut combined = String::new();
+    // Single union header. `.version 8.7` is the highest any component
+    // emits; `.target sm_80` is required by the Tier B.2 MMA kernels
+    // and JIT-runs the sm_75-targeted scalar body fine. One shmem
+    // extern serves all entries that reference dynamic SMEM.
+    combined.push_str(".version 8.7\n");
+    combined.push_str(".target sm_80\n");
+    combined.push_str(".address_size 64\n\n");
+    combined.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+    combined.push_str(strip_module_header(&scalar_ptx));
+    combined.push_str("\n\n");
+    combined.push_str(strip_module_header(&hybrid_ptx));
+    Ok(combined)
 }
 
 /// Tier C backward orchestrator with optional PCA Tier B.2 support.
@@ -792,6 +1399,39 @@ pub fn synthesize_backward_with_tier_b(
     config: &FlashAttentionConfig,
     tier_b: Option<(u32, SegmentResidency)>,
 ) -> Result<String, String> {
+    // Cycle-12 Phase F (Reviewer 1 NEEDS_FIXES): refuse R3/R7/R8.1/R9/
+    // R10/R11/R12 from the production entry too. Production routes
+    // `synthesize_backward_combined` → `synthesize_backward` → here
+    // WITHOUT going through `synthesize_backward_with_recompute`, so
+    // without this call the cycle-12 refusal cascade would be
+    // unreachable from the production call chain — violating the
+    // cycle-5 invariant `feedback_deferral_must_refuse`. When
+    // `config.checkpoint.is_none()` this is a no-op, preserving the
+    // `fa_v2_snapshots` 25/25 byte-identity invariant for the
+    // no-decorator path.
+    validate_checkpoint_eligibility(config)?;
+
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
+    // The forward eligibility predicate already refuses
+    // `csha.save_activations_for_backward = true` + `num_sink_tokens > 0`
+    // at the compiler/kernel.rs front door, but the cycle-5
+    // `feedback_deferral_must_refuse` invariant says refusals must
+    // be at EVERY entry point — not just the decorator extraction
+    // site. A caller that bypasses kernel.rs (e.g., direct codegen
+    // call in a test that constructs FlashAttentionConfig by hand)
+    // would otherwise silently emit backward PTX that does NOT
+    // understand the persistent sink slab — producing wrong
+    // gradients with no error. Lift point: when a future v2 sprint
+    // lands sink-aware dQ/dK/dV kernels, update
+    // `sinks::attention_sinks_v1_backward_eligible` to allow it.
+    let (eligible, why) = sinks::attention_sinks_v1_backward_eligible(config);
+    if !eligible {
+        return Err(format!(
+            "Sprint 2 cycle-7 backward sinks refusal: {}",
+            why.unwrap_or("(unknown reason)")
+        ));
+    }
+
     smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
         .map_err(|e| format!("backward validator rejected: {e}"))?;
 
@@ -931,8 +1571,19 @@ pub fn synthesize_backward_with_tier_b(
         ));
         ptx.push_str("    cvt.u32.u64 %r_qt_ord_TB_BWD, %rd_qt_ord_TB_BWD;\n");
     }
-    phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
-    phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
+    // Cycle-11 Task 4 dispatch fork: when `@checkpoint` decorated the
+    // enclosing fn, the kv_load emitters (which expect K/V to be already
+    // resident in HBM) are replaced with `emit_kv_recompute`, which
+    // re-derives K/V into `%k_smem_base`/`%v_smem_base` from saved
+    // x_raw_ptr + W_k/W_v projection weights. R0 still guards production
+    // (lifted only via the cfg-gated `bypass_r0_for_testing()` seam);
+    // this fork is reached only when R0 is bypassed under test.
+    if config.checkpoint.is_some() {
+        phases::backward::csha_hooks_backward::emit_kv_recompute(&mut ptx, config, "MAIN");
+    } else {
+        phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
+        phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
+    }
     for (tag, off, total, per_thread) in [
         ("DV", dv_off, dk_dv_cells, cells_per_thread),
         ("DK", dk_off, dk_dv_cells, cells_per_thread),
@@ -1104,20 +1755,56 @@ pub fn synthesize_backward_with_tier_b(
         ptx.push_str("    } // end PCA Tier B.2 kv-tile ordinal scope\n");
     }
     phases::backward::finalize::emit_store_kv_only(&mut ptx, config, 0);
+    // Cycle 17 G16-1 T2: in-loop dK inverse-RoPE + dK HBM store. Cycle 16
+    // emitted these POST-LOOP via emit_drope(Both) + emit_store_dk_only.
+    // The post-loop emission was empirically refuted (commit c2c6879b):
+    // emit_store_dk_only's predicate `(row + %k_start) < seq_len` (see
+    // finalize.rs:115-116) evaluates FALSE for every row when %k_start
+    // has been incremented past seq_len at loop exit — the store is
+    // dead-code-masked and Path A is byte-identical to cycle 15.
+    //
+    // T2 fix: rotate+store dK INSIDE the loop where %k_start is the
+    // current KV tile's start (in-range per iter). H2 (per-iter dK SMEM
+    // zero-init) is structurally correct given in-loop store: each iter
+    // zeros dK SMEM, accumulates ONE tile via dqdk_accum, rotates via
+    // in-loop emit_drope_branch(K), stores to HBM via in-loop
+    // emit_store_dk_only, then next iter zeros again. Q branch stays
+    // post-loop because dQ uses cycle-15-correct flush-and-reload that
+    // persists dQ SMEM across all KV iters.
+    //
+    // bar.sync after emit_store_kv_only (above, embedded in finalize.rs
+    // line 206) ensures dV SMEM writes complete before in-loop emit_drope
+    // (K) reads the adjacent dK SMEM region.
+    phases::backward::csha_hooks_backward::emit_drope_branch(
+        &mut ptx,
+        config,
+        0,
+        phases::backward::csha_hooks_backward::DropeBranch::K,
+    );
+    phases::backward::finalize::emit_store_dk_only(&mut ptx, config, 0);
     ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
     ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
     ptx.push_str("    @%p0 bra V2_BWD_LOOP_KV;\n");
     ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete across all KV tiles\n");
 
-    // Phase 3: CSHA hooks (x_norm recompute, inverse RoPE, dW{q,k,v},
-    // dRMSNorm). Each writes directly to HBM except the dRoPE rotation
-    // which mutates the dQ/dK SMEM tiles in place.
+    // Phase 3: CSHA hooks (x_norm recompute, inverse RoPE Q-branch only,
+    // dW{q,k,v}, dRMSNorm). Each writes directly to HBM except the dRoPE
+    // rotation which mutates the dQ SMEM tile in place. Cycle 17 T2: K
+    // branch moved in-loop (above); Q branch stays here.
     phases::backward::csha_hooks_backward::emit_xnorm_recompute(&mut ptx, config);
-    phases::backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
+    phases::backward::csha_hooks_backward::emit_drope_branch(
+        &mut ptx,
+        config,
+        0,
+        phases::backward::csha_hooks_backward::DropeBranch::Q,
+    );
     phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
     phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
 
-    // Phase 4: cooperative global stores of the 7 gradients + final fence.
+    // Phase 4: cooperative global stores of the remaining gradients +
+    // final fence. Cycle 17 T2: emit_store_dk_only moved in-loop (above).
+    // Here we only emit dQ; dV is already stored via emit_store_kv_only
+    // (in-loop f32 scratch RMW); dwq/dwk/dwv/dx are hook-managed.
     phases::backward::finalize::emit_store_dq_only(&mut ptx, config, 0);
 
     ptx.push_str("    ret;\n");
@@ -1140,7 +1827,7 @@ mod backward_orchestrator_tests {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: true,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -1148,6 +1835,7 @@ mod backward_orchestrator_tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -1246,9 +1934,10 @@ mod backward_orchestrator_tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         };
         let ptx = synthesize_backward(&cfg).expect("synth backward");
 
@@ -1337,9 +2026,10 @@ mod backward_orchestrator_tests {
             block_q: 32, block_kv: 32, head_dim: 64,
             causal: true, paged: false,
             rope_q: false, rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         };
         let result = synthesize_backward_with_tier(&cfg);
         // Phase 1: tier_b2 emitter is a stub; the wrapper falls back
@@ -1350,5 +2040,186 @@ mod backward_orchestrator_tests {
             ptx.contains(".visible .entry"),
             "fallback PTX should be a valid kernel"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 5 — GQA zero-copy stride pattern (paper s4.2) for the
+    // Tier A / v2 forward emitter. The K-tile load (emit_k_tile_load)
+    // and V-tile load (emit_v_tile_load) at mod.rs must emit a
+    // compile-time-literal `div.u64 %rd57, %head_idx, N` when
+    // gqa_group_size > 1 and substitute %rd57 for %head_idx in the row
+    // index composition. gqa_group_size==1 must remain byte-identical
+    // to the pre-Sprint-5 baseline.
+    // -----------------------------------------------------------------
+
+    fn fwd_v2_cfg(gqa: u32) -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: gqa, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
+            segment_masked: false,
+            csha: None,
+            checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn v2_forward_emits_gqa_divisor_when_group_size_gt_one() {
+        let cfg = fwd_v2_cfg(4);
+        let ptx_bytes = synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx = String::from_utf8_lossy(
+            &ptx_bytes[..ptx_bytes.len().saturating_sub(1)]
+        ).into_owned();
+
+        // The forward K-tile and V-tile loads each emit one div.u64
+        // for the GQA group size literal.
+        let div_count = ptx.matches("div.u64 %rd57, %head_idx, 4;").count();
+        assert!(
+            div_count >= 2,
+            "forward must emit >= 2 GQA div.u64 emissions (K-load + V-load), got {div_count}.\nPTX excerpt around `div.u64`:\n{}",
+            ptx.lines().filter(|l| l.contains("div.u64") || l.contains("head_idx")).collect::<Vec<_>>().join("\n")
+        );
+
+        // The kv-head intermediate %rd57 must reach the row-index chain
+        // in both K-load and V-load.
+        let kvh_uses = ptx.matches("add.u64 %rd58, %rd58, %rd57;").count();
+        assert!(
+            kvh_uses >= 2,
+            "kv_head register %rd57 must feed both K-load and V-load row indices; got {kvh_uses}"
+        );
+    }
+
+    #[test]
+    fn v2_forward_byte_identical_at_gqa_one() {
+        let cfg = fwd_v2_cfg(1);
+        let ptx_bytes = synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx = String::from_utf8_lossy(
+            &ptx_bytes[..ptx_bytes.len().saturating_sub(1)]
+        ).into_owned();
+
+        // No GQA div.u64 must be emitted with the %rd57 destination
+        // and the gqa-paper s4.2 comment must be absent at gqa=1.
+        assert!(
+            !ptx.contains("div.u64 %rd57, %head_idx"),
+            "gqa_group_size=1 must NOT emit forward GQA div.u64 (byte-identity)"
+        );
+        assert!(
+            !ptx.contains("paper s4.2 zero-copy"),
+            "gqa_group_size=1 must NOT emit the s4.2 zero-copy annotation"
+        );
+        // The original Q-head wiring must still be present (proves we
+        // took the no-op branch, not a third branch that silently broke).
+        assert!(
+            ptx.contains("add.u64 %rd58, %rd58, %head_idx;         // + head"),
+            "gqa_group_size=1 K-load must wire %head_idx directly"
+        );
+        assert!(
+            ptx.contains("add.u64 %rd58, %rd58, %head_idx;\n"),
+            "gqa_group_size=1 V-load must wire %head_idx directly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sinks_tier_b1_dispatch_tests {
+    //! Sprint 3 cycle-7 (§4.3 attention sinks v1): unit tests for the
+    //! Tier B.1 dispatch refusal under `num_sink_tokens > 0`. Mirrors the
+    //! Sprint 2 `tier_b2_hybrid_backward_eligible` sinks refusal pattern.
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    fn tier_b1_otherwise_eligible_cfg() -> FlashAttentionConfig {
+        // Otherwise-eligible: csha.level=2 + gpu_sm=120 (Blackwell). The
+        // ONLY axis we mutate per test is `num_sink_tokens` so the refusal
+        // proof is sinks-axis-only.
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: true, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
+            gpu_sm: 120, segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                d_model: 2048,
+                ..CshaExtras::default()
+            }),
+            checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_true_when_otherwise_eligible_and_zero_sinks() {
+        // Proves the test config is on the "happy path" of dispatch so
+        // the sinks-axis refusal below is the load-bearing axis.
+        let cfg = tier_b1_otherwise_eligible_cfg();
+        assert!(
+            is_tier_b1_dispatch(&cfg),
+            "otherwise-eligible config with num_sink_tokens=0 must dispatch to Tier B.1"
+        );
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_false_when_sinks_enabled() {
+        // The Tier B.1 pipelined-MMA forward kernel does not understand
+        // the persistent sink slab — the predicate must return `false`
+        // so dispatch falls through to Tier A v2 (sink-aware per
+        // Sprint 1b). cycle-5 `feedback_deferral_must_refuse` invariant.
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.num_sink_tokens = 4;
+        assert!(
+            !is_tier_b1_dispatch(&cfg),
+            "Tier B.1 dispatch must refuse num_sink_tokens > 0 (defense-in-depth)"
+        );
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_false_when_level_below_2() {
+        // Pin: dropping csha.level to 1 alone makes the predicate `false`.
+        // Proves the level >= 2 check is separable from the sinks check.
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.csha.as_mut().unwrap().level = 1;
+        assert!(!is_tier_b1_dispatch(&cfg));
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_false_when_gpu_sm_below_80() {
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.gpu_sm = 75;
+        assert!(!is_tier_b1_dispatch(&cfg));
+    }
+
+    /// Sprint 3 cycle-7: when `synthesize_flash_attention_ptx_v2_with_tier_b`
+    /// sees a sinks-enabled config that would otherwise route to Tier B.1,
+    /// it must fall through to Tier A v2 (which is sink-aware per Sprint 1b)
+    /// rather than emit the Tier B.1 single-iter scaffold sentinel.
+    #[test]
+    fn sinks_enabled_falls_through_to_tier_a_v2_not_tier_b1() {
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        // Sprint 1b narrow-config so the Tier A v2 path accepts sinks.
+        cfg.causal = false;
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        cfg.num_sink_tokens = 4;
+        let ptx = synthesize_flash_attention_ptx_v2(&cfg);
+        let s = String::from_utf8_lossy(&ptx);
+        assert!(
+            !s.contains("Tier B.1 single-iter scaffold complete"),
+            "sinks-enabled config must NOT route to Tier B.1 scaffold (defense-in-depth); got: {}",
+            &s[..s.len().min(200)]
+        );
+    }
+
+    /// Sprint 3 cycle-7: direct call to `tier_b1::synthesize` with a
+    /// sinks-enabled config MUST panic with a Sprint-3-citing message.
+    /// Defense in depth in case a caller bypasses the v2 entry path.
+    #[test]
+    #[should_panic(expected = "Sprint 3 cycle-7 refusal")]
+    fn tier_b1_synthesize_panics_when_sinks_enabled() {
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.num_sink_tokens = 4;
+        // `chunk` arg is irrelevant — the panic fires before any emission.
+        let _ = tier_b1::synthesize(&cfg, 32);
     }
 }

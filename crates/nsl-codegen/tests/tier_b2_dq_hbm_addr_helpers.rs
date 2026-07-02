@@ -1,4 +1,4 @@
-use nsl_codegen::flash_attention_v2::tier_b2::backward::dq::hbm_addr::{
+use nsl_codegen::flash_attention_v2::tier_b2::backward::hbm_addr::{
     emit_4d_byte_offset, emit_3d_byte_offset,
 };
 

@@ -9,6 +9,14 @@
 //! D is a compile-time constant; sizeof(dtype) is compile-time (f16=2, f32=4).
 //!
 //! Callers must declare a `%row_index_tmp` u32 scratch register before invoking.
+//!
+//! GQA zero-copy stride pattern (paper §4.2): when `gqa_group_size > 1` the
+//! K and V tensors share `head_idx` slots across Q-heads — for K/V address
+//! computations the head register must be divided by `gqa_group_size` before
+//! the stride formula is applied. The `emit_kv_head_divisor` helper emits
+//! the compile-time-literal `div.u32` and returns the kv-head register name;
+//! when `gqa_group_size == 1` it is a no-op that returns the Q-head register
+//! unchanged, preserving byte-identical PTX for the non-GQA path.
 
 /// Emit PTX that computes a 4D byte offset into `out_reg` (u64).
 ///
@@ -68,9 +76,62 @@ pub fn emit_3d_byte_offset(
     ));
 }
 
+/// Emit GQA kv-head divisor as a compile-time literal `div.u32`.
+///
+/// When `gqa_group_size == 1` this is a no-op and returns `q_head_reg`
+/// unchanged so that callers' subsequent `emit_4d_byte_offset(..., kv_reg, ...)`
+/// passes the same register as before — byte-identical PTX is preserved for
+/// the non-GQA path.
+///
+/// When `gqa_group_size > 1` this emits
+///   `div.u32 %dst, %q_head_reg, {gqa_group_size};`
+/// and returns the destination register name `dst_reg`.
+///
+/// Paper §4.2: zero-copy GQA expansion — the same KV data is addressed with
+/// a different thread-to-output mapping via integer-division on head index.
+/// `dst_reg` MUST be a caller-pre-declared u32 scratch register; callers are
+/// expected to add the `.reg .u32 %xxx_kv_head;` decl alongside their other
+/// register declarations (this helper assumes the decl already exists).
+pub fn emit_kv_head_divisor<'a>(
+    ptx: &mut String,
+    q_head_reg: &'a str,
+    dst_reg: &'a str,
+    gqa_group_size: u32,
+) -> &'a str {
+    if gqa_group_size <= 1 {
+        // Byte-identical no-op path: caller continues to use the Q-head register.
+        q_head_reg
+    } else {
+        ptx.push_str(&format!(
+            "    // GQA: kv_head = q_head / {gqa_group_size} (paper s4.2 zero-copy)\n"
+        ));
+        ptx.push_str(&format!(
+            "    div.u32 {dst_reg}, {q_head_reg}, {gqa_group_size};\n"
+        ));
+        dst_reg
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emit_kv_head_divisor_noop_when_gqa_one() {
+        let mut ptx = String::new();
+        let out = emit_kv_head_divisor(&mut ptx, "%head", "%kv_head", 1);
+        assert_eq!(out, "%head", "gqa=1 must return the q_head register");
+        assert!(ptx.is_empty(), "gqa=1 must emit no PTX (byte-identity)");
+    }
+
+    #[test]
+    fn emit_kv_head_divisor_emits_div_when_gqa_gt_one() {
+        let mut ptx = String::new();
+        let out = emit_kv_head_divisor(&mut ptx, "%head", "%kv_head", 4);
+        assert_eq!(out, "%kv_head", "gqa>1 must return the kv_head register");
+        assert!(ptx.contains("div.u32 %kv_head, %head, 4;"),
+            "expected `div.u32 %kv_head, %head, 4;` in PTX, got:\n{}", ptx);
+    }
 
     #[test]
     fn emit_4d_byte_offset_canonical() {

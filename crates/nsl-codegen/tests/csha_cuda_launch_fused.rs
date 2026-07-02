@@ -262,6 +262,7 @@ fn run_fused_config_dmodel(
         rope_style:      RopeStyle::HalfSplit,
         gqa_group_size:  1,
         tree_mask:       false,
+        num_sink_tokens: 0,
         gpu_sm:          75, segment_masked: false, csha: Some(CshaExtras {
             level:             2,
             fused_rmsnorm:     true,
@@ -275,6 +276,7 @@ fn run_fused_config_dmodel(
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
 
     // Pre-validate before calling select_emitter: v1 is deleted so out-of-matrix
@@ -335,6 +337,7 @@ fn run_fused_config_dmodel(
             // Standard path: d_model == head_dim, CPU reference handles both.
             let shape = CshaShape {
                 seq, heads: 1, head_dim, d_model: head_dim, causal, norm_eps,
+                rope_q: true,
             };
             let inputs = CshaInputs {
                 x: &x_h, wq: &wq_f32, wk: &wk_f32, wv: &wv_f32,
@@ -362,6 +365,7 @@ fn run_fused_config_dmodel(
             // CPU ref with d_model=d_model, head_dim=head_dim, norm already done.
             let shape = CshaShape {
                 seq, heads: 1, head_dim, d_model, causal, norm_eps,
+                rope_q: true,
             };
             // Use all-ones norm_weight and pass pre-normalised x_norm_dmodel
             // as the x input, with identity norm (norm_eps=0, weight=1 ensures
@@ -596,13 +600,14 @@ fn fused_csha_32x32x32_heads4_nocausal() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2, fused_rmsnorm: true, fused_projections: true,
             fused_output_proj: false, active_heads: 4,
             rmsnorm_eps: 1e-5, d_model: 32,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
     assert_eq!(
         select_emitter(&probe),
@@ -788,7 +793,7 @@ fn run_with_saves(
         block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
         causal, paged: false, rope_q,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -801,6 +806,7 @@ fn run_with_saves(
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
 
     if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
@@ -1162,7 +1168,7 @@ fn t4_csha_backward_ffi_smoke() {
         block_q, block_kv, head_dim,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2, fused_rmsnorm: true, fused_projections: true,
             fused_output_proj: false,
             save_activations_for_backward: true,
@@ -1173,6 +1179,7 @@ fn t4_csha_backward_ffi_smoke() {
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
 
     let mut ptx_str = synthesize_backward(&config)

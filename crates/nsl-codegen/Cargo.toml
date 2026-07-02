@@ -49,6 +49,18 @@ test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
 calibrate = ["dep:rand"]
 debug_kernel_instrumentation = []
+# CSHA cycle 19 T1: propagate the runtime `csha_cycle19_probe` feature so codegen
+# can cfg-gate the Cranelift extern-decl for the new probe FFI symbol. Default OFF.
+csha_cycle19_probe = ["nsl-runtime/csha_cycle19_probe"]
+# CSHA cycle 20 T4: G16-3 forward +0xB30 SMEM address probe scaffolding.
+# Emits 8 sample sites in `emit_save_activations_subset` that write
+# `{%rd_save_smem, %rd_save_base}` tuples to an HBM scratch buffer, so a
+# GPU harness can inspect the actual computed SMEM addresses on-device and
+# either confirm or refute the c18 "misaligned save-activation load"
+# hypothesis. Default OFF — feature-off byte identity must be preserved
+# against the `fa_v2_snapshots` baseline. See
+# `crates/nsl-codegen/tests/csha_cycle20_g163_triage.rs`.
+csha_cycle20_g163_probe = []
 # Experimental research subsystems (STATUS.md "Experimental" tier). On by
 # default; gated at their single entry point in `stmt.rs`.
 experimental-wrga = []
@@ -75,6 +87,39 @@ required-features = ["calibrate"]
 [[bin]]
 name = "build_wggo_fixtures"
 path = "src/bin/build_wggo_fixtures.rs"
+
+# Cycle-11 Task 4 structural probes. The G3a-G3d gates exercise the
+# `bypass_r0_for_testing()` builder on `CheckpointExtras`, which is
+# `#[cfg(any(test, feature = "test-helpers"))]`-gated. Integration
+# tests compile as separate crates, so `cfg(test)` is NOT active on
+# the `nsl-codegen` lib — we MUST enable the `test-helpers` feature.
+[[test]]
+name = "checkpoint_cycle11_structural"
+path = "tests/checkpoint_cycle11_structural.rs"
+required-features = ["test-helpers"]
+
+# Cycle-15 Task 1: backward prelude RoPE register block structural witnesses.
+# Uses bypass_r0_for_testing() so test-helpers feature is required (same
+# rationale as checkpoint_cycle11_structural above).
+[[test]]
+name = "cycle15_backward_prelude_rope"
+path = "tests/cycle15_backward_prelude_rope.rs"
+required-features = ["test-helpers"]
+
+# Cycle-16 Task 2: G16-1 structural witnesses for the 3-defect coordinated
+# dK backward fix (Option A). Uses bypass_r0_for_testing() + emit_store_kv_only
+# direct call, so test-helpers feature is required.
+[[test]]
+name = "cycle16_g16_1_witnesses"
+path = "tests/cycle16_g16_1_witnesses.rs"
+required-features = ["test-helpers"]
+
+# Cycle-16 Task 3: G16-2 + G16-3 triage witnesses. Structural tests only;
+# GPU smoke tests are gated on feature = "cuda" + #[ignore] so they never
+# run in default CI. No bypass_r0 needed -- no bypass_r0_for_testing() calls.
+[[test]]
+name = "csha_cycle16_g16_2_g16_3_triage"
+path = "tests/csha_cycle16_g16_2_g16_3_triage.rs"
 
 [[bin]]
 name = "bench"

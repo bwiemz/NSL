@@ -171,7 +171,7 @@ fn run_fused_backward_config(
         block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
         causal, paged: false, rope_q,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -184,6 +184,7 @@ fn run_fused_backward_config(
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
 
     // Budget check.
@@ -239,6 +240,7 @@ fn run_fused_backward_config(
     let shape = CshaShape {
         seq, heads: h, head_dim: hd, d_model: dm,
         causal, norm_eps,
+        rope_q: true,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_host);
 
@@ -557,7 +559,7 @@ fn t6_3_matrix_sweep_numerical() {
                     block_q: bq as i64, block_kv: bkv as i64, head_dim: hd as i64,
                     causal, paged: false, rope_q,
                     rope_style: RopeStyle::Adjacent,
-                    gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+                    gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                         level: 2, fused_rmsnorm: true, fused_projections: true,
                         fused_output_proj: false,
                         save_activations_for_backward: true,
@@ -565,6 +567,7 @@ fn t6_3_matrix_sweep_numerical() {
                         rmsnorm_eps: 1e-5, d_model: dm,
                         skip_rmsnorm_prologue: false,
                     }),
+                    checkpoint: None,
                 };
                 if let Err(e) = smem_layout::validate_scalar_v2_config(
                     &pre_cfg, Direction::Backward,

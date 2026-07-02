@@ -494,8 +494,19 @@ pub fn synthesize_per_doc_cta_backward(
     //        .param .u64 _segment_ids_placeholder,
     //        .param .u64 doc_starts_ptr
     //    )
+    // Under `csha_cycle19_probe` feature, the backward prelude appends
+    // two trailing `.param .u64 probe_{ds,dv}_out_ptr` slots — so the
+    // standard tail is `probe_dv_out_ptr\n)` instead of `dv_scratch_ptr\n)`.
+    // Both match paths keep the segment_ids + doc_starts insertion
+    // between the last standard param and the closing paren.
+    #[cfg(not(feature = "csha_cycle19_probe"))]
     let std_tail = "    .param .u64 dv_scratch_ptr\n)";
+    #[cfg(not(feature = "csha_cycle19_probe"))]
     let new_tail = "    .param .u64 dv_scratch_ptr,\n    .param .u64 _segment_ids_placeholder,\n    .param .u64 doc_starts_ptr\n)";
+    #[cfg(feature = "csha_cycle19_probe")]
+    let std_tail = "    .param .u64 probe_dv_out_ptr\n)";
+    #[cfg(feature = "csha_cycle19_probe")]
+    let new_tail = "    .param .u64 probe_dv_out_ptr,\n    .param .u64 _segment_ids_placeholder,\n    .param .u64 doc_starts_ptr\n)";
     if !ptx.contains(std_tail) {
         return Err(
             "per-doc backward synth: expected standard backward param-list tail \
@@ -686,9 +697,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75,
             segment_masked: false, // per-doc: segment_masked always false
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -808,8 +821,11 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: true, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 75,
             segment_masked: false, csha: None,
+            checkpoint: None,
         }
     }
 

@@ -4192,6 +4192,10 @@ impl Compiler<'_> {
 
             // 2. Try to extract Wengert list from step body
             //
+            // Cycle-10 §5.3 Task 6 wire-up: route per-fn @checkpoint(policy=...)
+            // policies collected by EffectChecker through CompileOptions into
+            // the extractor. Empty map = byte-identity preserved.
+            //
             // CFTP §4.4 G3 (Sprint 4): plumb the `@fused_lm_ce` decorator into
             // the extractor so `fused_linear_ce(...)` calls inside this train
             // block can be recognised as a single `PrimalOp::FusedLinearCe`
@@ -4206,6 +4210,7 @@ impl Compiler<'_> {
             // checker's pre-v10 refusal note.
             let fused_ce_cfg = self.active_fused_ce_config.clone();
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
+                .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone())
                 .with_fused_ce_config(fused_ce_cfg);
 
             // Wire model method bodies and field types for inline expansion
@@ -4458,7 +4463,55 @@ impl Compiler<'_> {
                 // decisions from WGGO are honoured (or rejected with a
                 // diagnostic) by CSHA.
                 if let Some(ref mode_str) = self.compile_options.csha.mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                    // Sprint 2 (paper §6.2 binding fix): consult the
+                    // per-model `@csha(...)` config captured by the semantic
+                    // checker, keyed by the model type the current train
+                    // block is compiling against.  We resolve effective
+                    // mode_str / target / disable HERE so the rest of the
+                    // hook stays uniform.
+                    let per_model_cfg = self
+                        .compile_options
+                        .csha_configs
+                        .get(&model_type_name)
+                        .cloned();
+                    let model_disabled = per_model_cfg
+                        .as_ref()
+                        .map(|c| c.disabled)
+                        .unwrap_or(false);
+                    // `level=` on the decorator clamps the planner's mode.
+                    // We prefer the decorator over `--csha` because the
+                    // decorator is the per-model authorial intent, not the
+                    // global build switch.  Mapping mirrors `CshaMode::parse`.
+                    let effective_mode_string: String = per_model_cfg
+                        .as_ref()
+                        .and_then(|c| {
+                            c.level.map(|l| match l {
+                                nsl_semantic::csha::CshaLevel::Boundary => {
+                                    "boundary".to_string()
+                                }
+                                nsl_semantic::csha::CshaLevel::Pipeline => {
+                                    "pipeline".to_string()
+                                }
+                                nsl_semantic::csha::CshaLevel::Block => {
+                                    "block".to_string()
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| mode_str.clone());
+                    let effective_mode_str = effective_mode_string.as_str();
+                    // `target=` on the decorator overrides the global GPU
+                    // target for CSHA planning only (does NOT affect the
+                    // rest of codegen — that runs on the global target).
+                    let effective_target: &str = per_model_cfg
+                        .as_ref()
+                        .and_then(|c| c.target.as_deref())
+                        .unwrap_or(self.compile_options.target.as_str());
+
+                    let disabled_by_decorator = model_disabled;
+                    let disabled_by_flag = mode_str == "off"
+                        || mode_str == "disable"
+                        || mode_str == "disabled";
+                    if !disabled_by_decorator && !disabled_by_flag {
                         // H.1: when `@flash_attention(head_dim=N)` is on a
                         // method, `compile_flash_attention_kernels` has
                         // already populated `flash_attention_context.config.head_dim`
@@ -4486,8 +4539,8 @@ impl Compiler<'_> {
                             });
                         if let Some(plan) = crate::csha::run_on_wengert(
                             extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
+                            effective_target,
+                            effective_mode_str,
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
                             csha_shape_override, // H.1: forward decorator head_dim to the planner
                             8,    // default head count; weight-informed path refines this
@@ -7707,7 +7760,11 @@ impl Compiler<'_> {
     ) -> Result<Option<(Value, Value)>, CodegenError> {
         eprintln!("[nsl] Using source-to-source AD for grad block");
 
-        let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+        // Cycle-10 §5.3 Task 6 wire-up (grad block): route per-fn
+        // @checkpoint(policy=...) policies into the extractor. Empty map
+        // = byte-identity preserved.
+        let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
+            .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone());
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
         extractor.set_model_field_types(self.models.model_field_types.clone());
         // WRGA B.3.2 Option 3: plumb synth overrides so the extractor

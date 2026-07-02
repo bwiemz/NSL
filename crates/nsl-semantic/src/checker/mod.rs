@@ -65,6 +65,12 @@ pub struct TypeChecker<'a> {
     pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
     /// WRGA: `@adapter(...)` configs captured during semantic analysis.
     pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
+    /// CSHA Sprint 2: `@csha(...)` configs captured during semantic analysis,
+    /// keyed by the decorated model's name (or the LHS binding name for
+    /// `@csha let m = SomeModel()`). Consumed by `nsl-codegen` via the
+    /// `CompileOptions.csha_configs` side-channel so per-model `level=`,
+    /// `target=`, and `disable=` actually affect codegen.
+    pub csha_configs: Vec<(String, crate::csha::CshaConfig)>,
     /// Span of the first `@cpdt` decorator seen in this module. Phase 1
     /// requires exactly one `@cpdt` decorator per program; a second
     /// decorator emits a diagnostic error naming both spans. Phase 2 may
@@ -109,6 +115,7 @@ impl<'a> TypeChecker<'a> {
             wrga_configs: Vec::new(),
             freeze_configs: Vec::new(),
             adapter_configs: Vec::new(),
+            csha_configs: Vec::new(),
             cpdt_decorator_span: None,
             fused_ce_configs: Vec::new(),
             pca_configs: Vec::new(),

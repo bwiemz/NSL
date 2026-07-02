@@ -13,6 +13,7 @@
 //! finish before the kernel exits.
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::phases::backward::probe::maybe_emit_dv_probe_store;
 
 pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
@@ -65,26 +66,92 @@ pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
     ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
 }
 
+/// Phase 4: cooperative SMEM->HBM store of the post-inverse-RoPE dK tile.
+///
+/// Called AFTER emit_drope (which rotates the dK SMEM tile in-place) and
+/// after all KV tiles have been processed (so SMEM holds the fully accumulated
+/// dK, not just the last tile's contribution). Mirrors emit_store_dq_only but
+/// uses block_kv rows and k_start for the HBM address, writing f16 dK directly.
+///
+/// Cycle-16 G16-1 defect-1+3 fix: the prior approach wrote dK to f32 scratch
+/// inside the KV outer loop (emit_store_kv_only), so Phase 3 saw only the
+/// last-tile dK (staleness = defect-1) and the scratch was never de-rotated
+/// by inverse RoPE before host-side conversion (defect-3). This function reads
+/// the fully-accumulated, post-dRoPE SMEM tile and writes f16 HBM directly.
+pub fn emit_store_dk_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let head_dim = config.head_dim as u32;
+    let block_kv = config.block_kv as u32;
+    let dk_smem_off = crate::flash_attention_v2::smem_layout::backward_dk_offset(config);
+    let dk_cells = block_kv * head_dim;
+    let dk_cells_per_thread = dk_cells.div_ceil(128);
+
+    ptx.push_str(&format!(
+        "    // Phase 4 dK store (q_tile_iter={q_tile_iter}): post-inverse-RoPE dK SMEM->HBM\n"
+    ));
+    ptx.push_str("    // -- DK store via [dk_ptr] (coop SMEM->HBM, full tile, f16) --\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dk, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_STORE_DK_SKIP_{q_tile_iter};\n"
+    ));
+    ptx.push_str("    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;\n");
+    ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %k_start;\n");
+    ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;\n");
+    ptx.push_str("    shl.b64 %rd_dk_base, %rd_dk_base, 1;  // * 2 bytes (f16)\n");
+    ptx.push_str("    add.u64 %rd_dk_base, %rd_bwd_dk, %rd_dk_base;\n");
+    for k in 0..dk_cells_per_thread {
+        let thread_cell = k * 128;
+        ptx.push_str("    cvt.u64.u32 %rd_dk_idx, %tid_x;\n");
+        if thread_cell > 0 {
+            ptx.push_str(&format!(
+                "    add.u64 %rd_dk_idx, %rd_dk_idx, {};\n", thread_cell
+            ));
+        }
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_dk, %rd_dk_idx, {};\n", dk_cells
+        ));
+        ptx.push_str("    div.u64 %rd42, %rd_dk_idx, %rd7;\n");
+        ptx.push_str("    add.u64 %rd43, %rd42, %k_start;\n");
+        ptx.push_str("    setp.lt.u64 %p0, %rd43, %rd6;\n");
+        ptx.push_str("    and.pred %p_dk, %p_dk, %p0;\n");
+        ptx.push_str("    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dk_smem, %rd_dk_smem, {dk_smem_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
+        ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
+        ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
+        ptx.push_str("    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;\n");
+        ptx.push_str("    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;\n");
+    }
+    ptx.push_str(&format!("V2_BWD_STORE_DK_SKIP_{q_tile_iter}:\n"));
+}
 pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    // Cycle-16 G16-1: V only. dK now stored post-inverse-RoPE via
+    // emit_store_dk_only in Phase 4 (called in mod.rs after emit_drmsnorm,
+    // before emit_store_dq_only). The prior DK RMW into f32 scratch here
+    // was defect-1: it ran INSIDE the KV outer loop, so Phase 3 saw only
+    // the last-tile dK contribution (staleness). Defect-3 was that the
+    // HBM output was pre-inverse-RoPE (scratch never got de-rotated).
     let head_dim = config.head_dim as u32;
     let total_cells = (config.block_kv as u32) * head_dim;
     let cells_per_thread = total_cells.div_ceil(128);
-    let dk_smem_off = crate::flash_attention_v2::smem_layout::backward_dk_offset(config);
     let dv_smem_off = crate::flash_attention_v2::smem_layout::backward_dv_offset(config);
 
     ptx.push_str(&format!(
-        "    // Tier C backward finalize -- DK/DV f32-scratch accumulate (q_tile_iter={q_tile_iter})\n"
+        "    // Tier C backward finalize -- DV f32-scratch accumulate (V only; q_tile_iter={q_tile_iter})\n"
     ));
-    // Option A: write dK / dV to f32 scratch pointers instead of the
-    // f16 dk/dv output tensors. Each q-block launch's kernel does
+    // Option A: write dV to f32 scratch pointer instead of the f16 dv
+    // output tensor. Each q-block launch's kernel does
     // `ld.global.f32 / add.f32 / st.global.f32` RMW into scratch; a
-    // host-side conversion kernel writes scratch → f16 after all
+    // host-side conversion kernel writes scratch -> f16 after all
     // q-blocks complete. Avoids the f16 saturation-to-inf path.
     //
-    // HBM byte-stride is * 4 (f32), not * 2 (f16) — index math below
+    // HBM byte-stride is * 4 (f32), not * 2 (f16) -- index math below
     // uses `shl.b64 ..., 2` to align with the scratch f32 layout.
     for (label, ptr_reg, ptr_name, smem_off) in [
-        ("DK", "%rd_bwd_dk_scratch", "dk_scratch_ptr", dk_smem_off),
         ("DV", "%rd_bwd_dv_scratch", "dv_scratch_ptr", dv_smem_off),
     ] {
         ptx.push_str(&format!(
@@ -126,6 +193,19 @@ pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
             ));
             ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
             ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
+
+            // CSHA cycle 20 T2 — dV_final probe (slot 3). Samples the SMEM
+            // cell AFTER all q-block FMAs have landed, on the k=0 unroll
+            // (one representative cell). The helper's runtime gate ensures
+            // only (batch=0, head=0, warp_id=1, lane=0) with tid_x==32
+            // reaches the store; combined with k==0, exactly one thread
+            // per CTA emits. Cross-check against slot 4 (register-FMA
+            // reconstruction from dv_accum) bisects hypothesis (iii)
+            // inter-phase SMEM corruption vs (iv) accumulator-write bug.
+            if k == 0 {
+                maybe_emit_dv_probe_store(ptx, config, 3, "%f_dk_tmp", q_tile_iter);
+            }
+
             // HBM f32 scratch RMW: load, add, store — all in f32.
             ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;\n");
             ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
@@ -225,7 +305,7 @@ mod tests {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -233,6 +313,7 @@ mod tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -242,17 +323,18 @@ mod tests {
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
 
-        // dq still stores f16 directly to dq_ptr (no scratch path for dQ —
+        // dq still stores f16 directly to dq_ptr (no scratch path for dQ --
         // each q-block writes a disjoint slice so f16 overwrite is safe).
         assert!(ptx.contains("dq_ptr") && ptx.contains("st.global.b16"));
-        // dK / dV now RMW into f32 scratch (Option A saturation fix).
-        // `dk_scratch_ptr` / `dv_scratch_ptr` and `st.global.f32` are the
-        // current kv-store signals; `dk_ptr` / `dv_ptr` live only in the
-        // param block now.
-        assert!(ptx.contains("dk_scratch_ptr"));
+        // Cycle-16 G16-1: dV still RMW into f32 scratch (Option A).
+        // dK now stored as f16 via emit_store_dk_only (mod.rs Phase 4),
+        // NOT called from emit(). So emit() output has dv_scratch_ptr but
+        // not dk_scratch_ptr.
+        assert!(!ptx.contains("dk_scratch_ptr"),
+            "emit() must not reference dk_scratch_ptr (dK now via emit_store_dk_only)");
         assert!(ptx.contains("dv_scratch_ptr"));
         assert!(ptx.contains("st.global.f32"),
-            "dK/dV must RMW into f32 scratch (not f16)");
+            "dV must still RMW into f32 scratch (saturation fix)");
         assert!(ptx.contains("dwq_ptr"));
         assert!(ptx.contains("dwk_ptr"));
         assert!(ptx.contains("dwv_ptr"));
@@ -262,10 +344,9 @@ mod tests {
 
     #[test]
     fn backward_finalize_dx_is_f32_others_are_f16() {
-        // After the Option A saturation fix, dK/dV accumulate in f32 scratch
-        // (see `emit_store_kv_only`). Finalize emits `st.global.b16` only for
-        // dQ now; dK/dV use `st.global.f32` into scratch, and a host-side
-        // conversion kernel writes f16 dK/dV outputs after all q-blocks.
+        // Cycle-16 G16-1: dV still accumulates in f32 scratch (Option A).
+        // dK now stored as f16 directly via emit_store_dk_only (mod.rs).
+        // emit() calls emit_store_kv_only (V only), no dk_scratch_ptr.
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
@@ -282,7 +363,6 @@ mod tests {
         emit(&mut ptx, &cfg, 0);
         for label in [
             "V2_BWD_STORE_DQ_SKIP_0:",
-            "V2_BWD_STORE_DK_SKIP_0:",
             "V2_BWD_STORE_DV_SKIP_0:",
             "V2_BWD_STORE_DWQ_SKIP_0:",
             "V2_BWD_STORE_DWK_SKIP_0:",
@@ -291,6 +371,9 @@ mod tests {
         ] {
             assert!(ptx.contains(label), "null-guard skip missing: {label}");
         }
+        // DK_SKIP comes from emit_store_dk_only (not in emit()): verify absent.
+        assert!(!ptx.contains("V2_BWD_STORE_DK_SKIP_0:"),
+            "DK_SKIP must not appear in emit() -- it belongs to emit_store_dk_only");
     }
 
     #[test]

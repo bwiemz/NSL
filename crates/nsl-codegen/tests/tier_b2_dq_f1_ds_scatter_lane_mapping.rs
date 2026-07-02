@@ -10,17 +10,24 @@ fn canonical_cfg() -> FlashAttentionConfig {
         block_q: 64, block_kv: 64, head_dim: 32,
         causal: false, paged: false,
         rope_q: false, rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false,
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false,
         csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        checkpoint: None,
     }
 }
 
 #[test]
-fn f1_ds_scatter_emits_real_st_shared_f32() {
+fn f1_ds_scatter_emits_real_st_shared_f16() {
+    // dS is staged f16 (Task 7): the dQ-matmul A-frag reads it as packed f16, so the
+    // scatter converts f32->f16 (cvt.rn.f16.f32) and stores b16, NOT f32.
     let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-    assert!(ptx.contains("st.shared.f32"),
-        "expected real st.shared.f32 emission for dS scatter");
+    assert!(ptx.contains("cvt.rn.f16.f32"),
+        "expected f32->f16 conversion before the dS scatter");
+    assert!(ptx.contains("st.shared.b16"),
+        "expected real st.shared.b16 emission for the f16 dS scatter");
+    assert!(!ptx.contains("st.shared.f32"),
+        "dS scatter must no longer store f32");
 }
 
 #[test]
@@ -59,20 +66,21 @@ fn f1_ds_scatter_uses_row_stride_term() {
     use nsl_codegen::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
     let cfg = canonical_cfg();
     let bkv = tier_b2_effective_bkv(&cfg);
-    let row_stride = bkv * 4; // f32 row-major dS
+    let row_stride = bkv * 2; // f16 row-major dS (Task 7: was bkv*4 f32)
     let ptx = synthesize_dq_kernel(&cfg).unwrap();
-    assert!(ptx.contains(&format!("{row_stride}")),
-        "expected row_stride {row_stride} (bkv*4) in dS address arithmetic");
+    // Match the row-stride multiply specifically (8*row_stride for the hi-row offset),
+    // not a bare literal that could appear elsewhere in the kernel.
+    assert!(ptx.contains(&format!("mul.lo.u32 %f1_row_lo_off, %f1_lane_div4, {row_stride}")),
+        "expected dS f16 row_stride {row_stride} (bkv*2) in the scatter row-offset multiply");
 }
 
 #[test]
 fn f1_ds_scatter_emits_exactly_4_stores_per_lane() {
     let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-    // Each lane writes 4 f32 dS values per kv_iter; the emitter emits 4 st.shared.f32
-    // instructions per kv_iter pass.
-    let st_count = ptx.matches("st.shared.f32").count();
+    // Each lane writes 4 f16 dS values per n-tile (Task 7: f16 b16 stores, was f32).
+    let st_count = ptx.matches("st.shared.b16").count();
     assert!(st_count >= 4,
-        "expected at least 4 st.shared.f32 for 4 ds elements per lane, got {st_count}");
+        "expected at least 4 st.shared.b16 for 4 ds elements per lane, got {st_count}");
 }
 
 #[test]

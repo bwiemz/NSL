@@ -1,0 +1,22 @@
+# Sprint 2 cycle-8 fixture (paper §4.3 attention sinks v2 multi-tile lift).
+#
+# Pins the multi-tile-only lifted-axis path: `@autotune(block_q=[64],
+# block_kv=[128])` materialises `block_q != block_kv` via the autotune
+# middle-value selector. causal=false (overridden), no rope, no gqa,
+# no paged/segment_masked/tree_mask, no @train, no CSHA fusion.
+#
+# Under Sprint 2 cycle-8 the multi-tile (block_q != block_kv) axis is
+# LIFTED from refused (cycle-7 Sprint 1b emitted "block_q != block_kv
+# (deferred to Sprint 2)") to accepted. The integration test asserts
+# compile success + the gated %p_skip_sinks PTX register appears in the
+# K/V load block (kv_iter==0 first-load gate so sink rows persist across
+# subsequent iters without being reloaded/clobbered).
+#
+# Body is trivial — the test inspects the compile context + embedded PTX,
+# not function body semantics.
+
+@flash_attention(causal=false)
+@autotune(block_q=[64], block_kv=[128])
+@attention_sink(tokens=4)
+fn forward():
+    pass

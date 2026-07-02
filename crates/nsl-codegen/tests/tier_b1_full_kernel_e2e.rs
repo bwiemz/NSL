@@ -226,6 +226,7 @@ fn canonical_config(skip_rmsnorm: bool) -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 120,
         segment_masked: false,
         csha: Some(CshaExtras {
@@ -234,6 +235,7 @@ fn canonical_config(skip_rmsnorm: bool) -> FlashAttentionConfig {
             skip_rmsnorm_prologue: skip_rmsnorm,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 
@@ -298,6 +300,7 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
         },
         &CshaShape {
             seq, heads, head_dim, d_model, causal, norm_eps,
+            rope_q: true,
         },
     );
 

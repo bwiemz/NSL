@@ -35,7 +35,7 @@ pub mod vmap;
 pub mod wggo;
 pub mod wrga;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nsl_ast::{Module, Symbol};
 use nsl_errors::Diagnostic;
@@ -73,11 +73,27 @@ pub struct AnalysisResult {
     pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
     /// WRGA: validated `@adapter(...)` configurations.
     pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
+    /// CSHA Sprint 2: validated `@csha(...)` configurations, keyed by the
+    /// decorated model's name (or the LHS binding name for
+    /// `@csha let m = SomeModel()`). The CLI converts these into the
+    /// `CompileOptions.csha_configs` side-channel that the CSHA hook in
+    /// `nsl-codegen/src/stmt.rs` consults per-model so `level=`, `target=`,
+    /// and `disable=` take observable effect on codegen.
+    pub csha_configs: Vec<(String, crate::csha::CshaConfig)>,
     /// M62: Maps each `self.<field>` MemberAccess expression NodeId (inside an
     /// `@export` model method) to the declaration-order index of that field in
     /// the model's tensor-weight list.  Consumed by codegen to lower
     /// `self.W` → `load(weight_ptrs + index * 8)`.
     pub weight_index_map: WeightIndexMap,
+    /// Cycle-10 §5.3 (Task 3): per-function checkpointing policies, as
+    /// parsed from `@checkpoint(policy="...")` kwargs. Consumed by the
+    /// `nsl-cli` loader at `crates/nsl-cli/src/loader.rs` (Task 6) to
+    /// pass into `WengertExtractor::with_checkpoint_policy`.
+    pub checkpoint_policies: HashMap<String, crate::effects::CheckpointPolicy>,
+    /// Cycle-10 §5.3 (Task 4): models annotated `@paged_kv`. Consumed by
+    /// the codegen-side R9 cross-scope refusal predicate at
+    /// `flash_attention_v2/mod.rs::synthesize_backward_with_tier`.
+    pub paged_kv_models: HashSet<String>,
     /// CFTP §4.4 G3 (Sprint 2): validated `@fused_lm_ce(...)` configurations
     /// captured during semantic analysis.  One entry per decorated `train`
     /// block.  Codegen plumbs these via `CompileOptions.fused_ce_configs`
@@ -128,6 +144,12 @@ pub fn analyze_with_imports(
     let wrga_configs = checker.wrga_configs;
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
+    let csha_configs = checker.csha_configs;
+    // Cycle-10 §5.3 (Tasks 3/4): extract checkpoint policies and
+    // @paged_kv membership from the effect checker for downstream
+    // codegen consumption.
+    let checkpoint_policies = checker.effect_checker.checkpoint_policies().clone();
+    let paged_kv_models = checker.effect_checker.paged_kv_models().clone();
     let fused_ce_configs = checker.fused_ce_configs;
     let pca_configs = checker.pca_configs;
 
@@ -220,7 +242,10 @@ pub fn analyze_with_imports(
         wrga_configs,
         freeze_configs,
         adapter_configs,
+        csha_configs,
         weight_index_map,
+        checkpoint_policies,
+        paged_kv_models,
         fused_ce_configs,
         pca_configs,
     }

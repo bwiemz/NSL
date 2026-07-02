@@ -53,6 +53,22 @@ pub struct ModuleData {
     /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
     /// for the entry module on the multi-file shared-lib path.
     pub weight_index_map: std::collections::HashMap<nsl_ast::NodeId, usize>,
+    /// Sprint 2 (paper §6.2): per-model `@csha(...)` decorator configs
+    /// captured by nsl-semantic. Keyed by the decorated model's name (or
+    /// the LHS binding name for `@csha let m = SomeModel()`). Routed into
+    /// `CompileOptions.csha_configs` so the CSHA hook in
+    /// `nsl-codegen/src/stmt.rs` applies per-model `disable=`, `level=`,
+    /// and `target=` overrides.
+    pub csha_configs: Vec<(String, nsl_semantic::csha::CshaConfig)>,
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+    /// per-function `@checkpoint(policy=...)` policies harvested from
+    /// `EffectChecker::checkpoint_policies()` at the `analyze_with_imports`
+    /// call site below. Routed into `CompileOptions.checkpoint_policies`
+    /// so the codegen-side `WengertExtractor::with_checkpoint_policies`
+    /// installer can stamp the prologue + emit a `PrologueRecompute` marker.
+    /// Empty map = no checkpointing = byte-identity preserved.
+    pub checkpoint_policies:
+        std::collections::HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
 }
 
 /// The complete module graph for a compilation unit.
@@ -416,6 +432,17 @@ pub fn load_all_modules(
             adapter_configs: analysis.adapter_configs,
             weight_index_map: analysis.weight_index_map,
             fused_ce_configs: analysis.fused_ce_configs,
+            // Sprint 2 (paper §6.2): forward per-model @csha decorator configs
+            // so disable=/level=/target= overrides reach the codegen-side
+            // CompileOptions.csha_configs map (pipeline::analysis_to_csha_configs
+            // / pipeline::module_data_to_csha_configs).
+            csha_configs: analysis.csha_configs,
+            // Cycle-10 §5.3 Task 6 (W9 corrected wire-up point):
+            // route EffectChecker::checkpoint_policies() output collected
+            // by the just-completed `analyze_with_imports` call into
+            // ModuleData so the command handlers can publish it onto
+            // `CompileOptions.checkpoint_policies` for codegen to read.
+            checkpoint_policies: analysis.checkpoint_policies,
             pca_configs: analysis.pca_configs,
         });
     }

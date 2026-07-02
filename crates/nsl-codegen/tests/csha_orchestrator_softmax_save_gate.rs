@@ -7,7 +7,7 @@ fn forward_synthesis_includes_row_max_hbm_save_under_save_activations_without_fu
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, segment_masked: false, gpu_sm: 89,
+        tree_mask: false, num_sink_tokens: 0, segment_masked: false, gpu_sm: 89,
         csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,
@@ -15,6 +15,7 @@ fn forward_synthesis_includes_row_max_hbm_save_under_save_activations_without_fu
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let ptx_bytes = synthesize_flash_attention_ptx_v2(&cfg);
     let ptx = String::from_utf8_lossy(&ptx_bytes);

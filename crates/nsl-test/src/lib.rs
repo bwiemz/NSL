@@ -9,6 +9,7 @@
 pub mod b1_adapter;
 pub mod cpu_naive_backward;
 pub mod cpu_naive_forward;
+pub mod cpu_naive_prologue;
 pub mod diagnostic_mode;
 
 pub mod cpu_reference;

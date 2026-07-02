@@ -29,6 +29,7 @@ fn minimal_segment_masked_backward_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: true,
         csha: Some(CshaExtras {
@@ -37,6 +38,7 @@ fn minimal_segment_masked_backward_config() -> FlashAttentionConfig {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

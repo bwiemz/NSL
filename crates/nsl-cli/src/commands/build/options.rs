@@ -387,6 +387,16 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     mode: csha.clone(),
                     report: csha_report,
                 },
+                // CSHA Sprint 2: default to empty here; the six build-path
+                // entry points (run_build_shared_single, run_build_shared_multi,
+                // run_build_zk, run_build_standalone, run_build_single,
+                // run_build_multi) overwrite this from semantic analysis via
+                // pipeline::{analysis,module_data}_to_csha_configs.
+                csha_configs: std::collections::HashMap::new(),
+                // Cycle-10 §5.3 Task 6: default to empty here; overwritten
+                // per build path by pipeline::{analysis,module_data}_to_checkpoint_policies
+                // once the semantic checker has run. Empty = byte-identity.
+                checkpoint_policies: std::collections::HashMap::new(),
                 cpdt: nsl_codegen::CpdtOptions {
                     mode: cpdt_mode,
                     cluster: cpdt_cluster.clone(),

@@ -78,9 +78,11 @@ fn cfg_32_32_32() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 
@@ -96,9 +98,11 @@ fn cfg_64_64_64() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

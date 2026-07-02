@@ -697,21 +697,60 @@ impl Compiler<'_> {
         let resolved_d_model = self
             .resolve_csha_d_model_from_stmts(stmts)
             .unwrap_or(base_config.head_dim as u32);
-        // Minimum-invasive CSHA preset: boundary level + saves. Level 0
-        // is explicitly rejected by the kernel-name encoder, so we use
-        // level=1 without turning on any fusion flags — the only bit
-        // that actually matters for Gap B is
-        // `save_activations_for_backward=true`.
-        let csha_extras = crate::flash_attention::CshaExtras {
-            level: 1,
-            fused_rmsnorm: false,
-            fused_projections: false,
-            fused_output_proj: false,
-            active_heads: 0,
-            rmsnorm_eps: 1e-5,
-            d_model: resolved_d_model,
-            save_activations_for_backward: true,
-            skip_rmsnorm_prologue: false,
+        // Cycle-12 T1 wire-up: derive @checkpoint(policy=Full) presence
+        // from `compile_options.checkpoint_policies`. v1 ships a single
+        // policy variant (Full) per cycle-10 Refuter 3; we use ANY entry
+        // in the map as the trigger for routing the backward through
+        // `synthesize_backward_with_recompute`. The map being non-empty
+        // is the in-tree signal that the user wrote `@checkpoint` on a
+        // training-loop function.
+        //
+        // The fn-name-keyed lookup (which fn carries @checkpoint) is
+        // deferred to a follow-on cycle where the compile_flash_attention
+        // pipeline gains per-fn context — today the CSHA training PTX
+        // emission is module-scoped (one training_config per module
+        // owning the @train block).
+        let checkpoint_full_active = self
+            .compile_options
+            .checkpoint_policies
+            .values()
+            .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Full));
+        let training_checkpoint = if checkpoint_full_active {
+            Some(crate::flash_attention::CheckpointExtras::full())
+        } else {
+            None
+        };
+
+        // Cycle-12 T4: when `@checkpoint(policy=Full)` is active, the
+        // backward kv-recompute path requires the forward to stage
+        // x_raw + Wk/Wv. The cycle-12 R3 augmentation refuses configs
+        // that don't satisfy `fused_projections=true`, so we MUST flip
+        // the preset to the fused-projections preset when checkpoint is
+        // Some. Otherwise (the pre-cycle-12 default), keep the cycle-11
+        // minimum-invasive preset with `save_activations_for_backward`
+        // alone.
+        let csha_extras = if checkpoint_full_active {
+            let mut x = crate::flash_attention::CshaExtras::level1_with_fused_proj(1e-5);
+            x.d_model = resolved_d_model;
+            // T4 (defense-in-depth): `level1_with_fused_proj` already
+            // sets save_activations_for_backward=true, but reassert here
+            // so a future builder refactor doesn't silently break the
+            // x_raw save channel (the cycle-11 silent-garbage bug).
+            x.save_activations_for_backward = true;
+            x
+        } else {
+            crate::flash_attention::CshaExtras {
+                level: 1,
+                fused_rmsnorm: false,
+                fused_projections: false,
+                fused_output_proj: false,
+                active_heads: 0,
+                rmsnorm_eps: 1e-5,
+                d_model: resolved_d_model,
+                save_activations_for_backward: true,
+                skip_rmsnorm_prologue: false,
+                static_seq_len: None,
+            }
         };
         // Tier C's backward emitter (ds_compute/dqdk_accum/dv_accum)
         // currently hard-asserts `block_kv=32` (T3.3–T3.5 landed with
@@ -760,6 +799,12 @@ impl Compiler<'_> {
         let backward_block_q: i64 = 32;
         let training_config = crate::flash_attention::FlashAttentionConfig {
             csha: Some(csha_extras),
+            // Cycle-12 T1: route @checkpoint(policy=Full) into the
+            // backward synthesizer. None preserves cycle-11 baseline
+            // (kv_load HBM path); Some routes the dispatch fork into
+            // `synthesize_backward_with_recompute` -> cycle-11
+            // `emit_kv_recompute` substitution.
+            checkpoint: training_checkpoint,
             block_q: backward_block_q,
             block_kv: backward_block_kv,
             segment_masked,
@@ -936,6 +981,16 @@ impl Compiler<'_> {
         // backward name buffer and launches with `grid_x = num_docs`
         // (see `flash_attention.rs:1543`). The Tier-B-on backward
         // variant is skipped (per-doc is its own tier).
+        //
+        // Sprint 1 T1.4: outside the per-doc branch, `synthesize_backward_combined`
+        // returns a single PTX module containing BOTH the scalar v2 backward entry
+        // AND the four Tier B.2 hybrid entries (`tier_b2_d_prepass`,
+        // `tier_b2_dq_kernel`, `tier_b2_dkdv_kernel`,
+        // `tier_b2_proj_backward`) when the config is hybrid-eligible.
+        // The runtime branches on `tier_b2_active` (computed at Wengert
+        // lowering from the runtime seq_len) to choose which path to
+        // launch from this one loaded module. For ineligible configs
+        // the output is byte-identical to plain `synthesize_backward`.
         let (bwd_ptx_id, bwd_name_id, bwd_tier_b_ptx_id, bwd_tier_b_name_id) =
             if let Some(plan) = per_doc_plan.as_ref() {
                 match crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_backward(
@@ -968,7 +1023,7 @@ impl Compiler<'_> {
                     }
                 }
             } else {
-            match crate::flash_attention_v2::synthesize_backward(&training_config) {
+            match crate::flash_attention_v2::synthesize_backward_combined(&training_config) {
                 Ok(bwd_ptx_string) => {
                     // IMPORTANT: the backward PTX's `.visible .entry` is
                     // generated by `phases::backward::prelude::kernel_name`,
@@ -1086,6 +1141,29 @@ impl Compiler<'_> {
         let mut rope_q = false;
         let mut rope_style = crate::flash_attention::RopeStyle::HalfSplit;
         let mut gqa_group_size: u32 = 1;
+        // Paper §4 tree-mask: bare `@tree_mask` decorator flips `config.tree_mask`,
+        // which in turn (a) gates the PTX-side DFS-enter/DFS-exit ancestor check
+        // shipped in M33 and (b) appends a variant tag to the kernel name so the
+        // runtime dispatch picks the tree_mask kernel. v1 is a bare decorator;
+        // any args are rejected (mirrors `@paged_kv` block_size validation).
+        let mut tree_mask = false;
+        // Paper §4.3: attention sinks. Number of always-attended initial
+        // tokens for streaming attention with rolling KV cache. v0 API
+        // surface (Sprint 2 cycle-4): the decorator + config field are
+        // wired end-to-end, but the SMEM-layout codegen that would
+        // materialize the sink cache is DEFERRED to a future sprint.
+        // `0` is the sentinel for "sinks disabled".
+        //
+        // Sprint 2 cycle-5: the only previous assignment site was replaced
+        // with an unconditional refusal in the `attention_sink` arm below.
+        // Sprint 1b cycle-7 LIFTS that refusal for the narrow Tier A
+        // forward single-tile config — the decorator-extraction arm now
+        // assigns `num_sink_tokens = N` for any `tokens=N` literal, and
+        // each FlashAttentionConfig construction site below consults
+        // `attention_sinks_v1_eligible` to refuse non-narrow configs with
+        // an axis-specific blocking reason + future Sprint citation
+        // (cycle-5 `feedback_deferral_must_refuse` invariant).
+        let mut num_sink_tokens: u32 = 0;
         // DOC-GAP F.2: optional `head_dim` argument on `@flash_attention`.
         // Default 64 matches historical behaviour; set explicitly via
         // `@flash_attention(head_dim=32)` to pick a config that fits the
@@ -1188,6 +1266,59 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                "tree_mask" => {
+                    // Paper §4 v1: bare decorator only. Reject any args
+                    // (positional or named) with a clear error so future args
+                    // (e.g. a max-depth budget) require an explicit spec
+                    // update + extraction-site change rather than silently
+                    // being ignored.
+                    if let Some(ref args) = deco.args {
+                        if !args.is_empty() {
+                            return Err(CodegenError::new(
+                                "@tree_mask takes no arguments in v1 (bare decorator only)".to_string(),
+                            ));
+                        }
+                    }
+                    tree_mask = true;
+                }
+                "attention_sink" => {
+                    // Sprint 2 cycle-4 paper §4.3 API-surface landing.
+                    // Sprint 2 cycle-5 added an unconditional refusal for
+                    // `tokens>0` to close the silent-correctness gap that
+                    // v0 left open (decorator parsed, but no SMEM emission).
+                    // Sprint 1b cycle-7 (this commit) LIFTS that refusal
+                    // for the narrow Tier A forward single-tile config —
+                    // assign `num_sink_tokens = N` here and let the
+                    // per-construction-site `attention_sinks_v1_eligible`
+                    // check below refuse non-narrow configs with an axis-
+                    // specific blocking reason + future Sprint citation.
+                    //
+                    // Semantic validation (`stmt.rs`) catches negative /
+                    // zero / non-literal / unknown-arg cases up front,
+                    // so this loop only handles the happy path. tokens=0
+                    // cannot be written (semantic rejects it); users who
+                    // want sinks disabled simply OMIT the decorator
+                    // (num_sink_tokens stays at the local-default 0 and
+                    // flows through eligibility unchanged via the early
+                    // `if config.num_sink_tokens == 0` return).
+                    if let Some(ref args) = deco.args {
+                        for arg in args {
+                            if let Some(ref name_sym) = arg.name {
+                                let aname = self
+                                    .interner
+                                    .resolve(name_sym.0)
+                                    .unwrap_or("");
+                                if aname == "tokens" {
+                                    if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                        if *n > 0 {
+                                            num_sink_tokens = *n as u32;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1200,6 +1331,42 @@ impl Compiler<'_> {
         // sm_52 limit. When paged, block_kv must be a multiple of block_size.
         // The "primary" context uses the middle-value fallback (or the single
         // default when @autotune is absent).
+
+        // Sprint 1b cycle-7: helper to reject @attention_sink configs that
+        // are not v1-narrow. Called at EACH FlashAttentionConfig
+        // construction site below (one for each path: autotune-variant,
+        // autotune-primary, single-config) so the eligibility check sees
+        // the FULLY-MATERIALIZED config and the error message names the
+        // exact failing axis + future Sprint that lifts it.
+        //
+        // Header format makes the user's input visible up front (`@attention_sink(tokens={n})`)
+        // and the body cites paper §4.3 v1 narrowness + the eligibility
+        // predicate's blocking_reason (axis + Sprint). Disabled-sinks
+        // (num_sink_tokens==0) configs short-circuit eligibility and never
+        // hit this path.
+        fn reject_if_sinks_ineligible(
+            config: &crate::flash_attention::FlashAttentionConfig,
+        ) -> Result<(), CodegenError> {
+            if config.num_sink_tokens == 0 {
+                return Ok(());
+            }
+            let (eligible, why) =
+                crate::flash_attention_v2::sinks::attention_sinks_v1_eligible(config);
+            if eligible {
+                return Ok(());
+            }
+            let blocking = why.unwrap_or("(unknown axis)");
+            Err(CodegenError::new(format!(
+                "@attention_sink(tokens={n}) - v1 narrowness violation: {blocking}.\n\n\
+                 v1 supports: Tier A scalar forward, single-tile \
+                 (block_q==block_kv==seq_len), causal=false, rope_q=false, \
+                 gqa_group_size=1, paged=false, segment_masked=false, \
+                 tree_mask=false, no @train (no backward), no \
+                 csha.fused_projections.",
+                n = config.num_sink_tokens,
+                blocking = blocking,
+            )))
+        }
 
         let has_autotune = decorators.iter().any(|d| {
             d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
@@ -1262,11 +1429,16 @@ impl Compiler<'_> {
                     rope_q,
                     rope_style,
                     gqa_group_size,
-                    tree_mask: false,
+                    tree_mask,
+                    num_sink_tokens,
                     gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                     segment_masked: false,
                     csha: None,
+                    checkpoint: None,
                 };
+
+                // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
+                reject_if_sinks_ineligible(&test_config)?;
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
                 let mut diags = Vec::<String>::new();
@@ -1341,11 +1513,16 @@ impl Compiler<'_> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
-                tree_mask: false,
+                tree_mask,
+                num_sink_tokens,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
+                checkpoint: None,
             };
+
+            // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
+            reject_if_sinks_ineligible(&config)?;
 
             let mut diags = Vec::<String>::new();
             let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
@@ -1448,11 +1625,16 @@ impl Compiler<'_> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
-                tree_mask: false,
+                tree_mask,
+                num_sink_tokens,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
+                checkpoint: None,
             };
+
+            // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
+            reject_if_sinks_ineligible(&config)?;
 
             // PCA Tier B Planner (planner spec §5): use the emission helper.
             // Single-config path sets `segment_masked: false`, so

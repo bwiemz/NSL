@@ -338,6 +338,7 @@ mod tests {
             est_time_us: 0.0,
             baseline_time_us: 0.0,
             downgrade_reason: None,
+            backward_tier: crate::csha_pipeline::BackwardTierReport::Scalar,
         }
     }
 

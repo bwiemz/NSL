@@ -18,7 +18,9 @@ fn base_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false, csha: None,
+        checkpoint: None,
     }
 }
 
@@ -29,16 +31,19 @@ fn configs_to_lint() -> Vec<FlashAttentionConfig> {
         // CSHA level 1 — boundary fusion (prologue norm + epilogue RoPE)
         FlashAttentionConfig {
             csha: Some(CshaExtras::level1(1e-5_f32)),
+            checkpoint: None,
             ..base_config()
         },
         // CSHA level 2 — full projection pipelining
         FlashAttentionConfig {
             csha: Some(CshaExtras::level2(1e-5_f32, 128)),
+            checkpoint: None,
             ..base_config()
         },
         // CSHA level 3 — full-block fusion
         FlashAttentionConfig {
             csha: Some(CshaExtras::level3(1e-5_f32, 128)),
+            checkpoint: None,
             ..base_config()
         },
     ]

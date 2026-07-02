@@ -120,7 +120,9 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 120, segment_masked: false, csha: Some(CshaExtras::level2(1e-5, 32)),
+        checkpoint: None,
     }
 }
 
@@ -135,7 +137,9 @@ fn non_csha_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 120, segment_masked: false, csha: None,
+        checkpoint: None,
     }
 }
 
@@ -178,7 +182,8 @@ fn v2_kernel_assembles_on_sm75_full_matrix() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
 
     // Subset of the supported matrix that exercises the corners.
@@ -323,11 +328,13 @@ fn a3_v2_fused_projections_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             d_model: 128,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();
@@ -392,11 +399,13 @@ fn a4_v2_rope_q_fused_projections_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             d_model: 128,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();
@@ -461,12 +470,14 @@ fn a5_v2_fused_output_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             fused_output_proj: true,
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();
@@ -528,12 +539,14 @@ fn csha_tier_c_save_activations_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 128,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();
@@ -604,6 +617,7 @@ fn csha_tier_c_save_nonfused_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             // THE REGRESSION CONFIG: training dispatch sets this combo.
             fused_projections: false,
@@ -611,6 +625,7 @@ fn csha_tier_c_save_nonfused_assembles_on_sm75_sm90_sm120() {
             d_model: 128,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();

@@ -150,6 +150,18 @@ pub fn emit_with_smem_override(
     if config.segment_masked && config.rope_q {
         params.push((".param .u64", "doc_starts_ptr"));
     }
+    // §4.3 attention sinks (Sprint 1b cycle-7): sink K/V pointers only
+    // when num_sink_tokens > 0. Appended at the tail so num_sink_tokens=0
+    // signatures stay byte-identical to pre-Sprint-1b (the snapshot
+    // invariant). Conditional emission mirrors the cycle-3 review-fix
+    // pattern: only declared in PTX when the feature is actually live;
+    // the runtime FFI dispatch site (Sprint 1b Task E in
+    // nsl-runtime::flash_attention) threads the matching pointers
+    // through only on the sink-enabled launch path.
+    if config.num_sink_tokens > 0 {
+        params.push((".param .u64", "sink_k_ptr"));
+        params.push((".param .u64", "sink_v_ptr"));
+    }
     // PCA Tier B M3 instrumentation (B1.5-3): per-tile skip-decision HBM
     // buffer pointer. Only declared when:
     //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
@@ -282,7 +294,7 @@ pub fn emit_with_smem_override(
     // declared unconditionally because ptxas prunes unused virtual regs.
     if config.csha.as_ref().is_some_and(|c| c.save_activations_for_backward) {
         ptx.push_str(
-            "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
+            "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb, %rd_save_bh;\n",
         );
         ptx.push_str("    .reg .u32 %r_save_wrow, %r_save_qlo;\n");
         ptx.push_str("    .reg .f32 %f_diag, %f_sdx_fmax, %f_sdx_nmax, %f_sdx_fsum;\n");
@@ -344,6 +356,33 @@ pub fn emit_with_smem_override(
         ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
         ptx.push_str("    .reg .pred %p_doc_load_done, %p_doc_null;\n");
+    }
+
+    // §4.3 attention sinks (Sprint 1b cycle-7): named registers for the
+    // sink K/V pre-load emitted by emit_{k,v}_tile_load. Gated on
+    // num_sink_tokens > 0 so disabled-sinks PTX is byte-identical to
+    // pre-Sprint-1b (snapshot invariant). The named registers (not pool
+    // slots) avoid collisions with the existing %rd<64> / %p<8> numbered
+    // pools that the rolling-load arithmetic uses.
+    if config.num_sink_tokens > 0 {
+        ptx.push_str("    // sinks v1: sink K/V pre-load scratch registers\n");
+        ptx.push_str("    .reg .u64 %rd_sink_base, %rd_sink_idx, %rd_sink_off, %rd_sink_src, %rd_sink_dst;\n");
+        ptx.push_str("    .reg .pred %p_sink;\n");
+        // Sprint 2 cycle-8 §4.3 multi-tile: %p_skip_sinks gates the sink
+        // K/V pre-load on `%k_start == 0` so the sinks load once on the
+        // first KV iteration and persist across subsequent iters. Used
+        // by emit_k_tile_load + emit_v_tile_load in mod.rs.
+        ptx.push_str("    .reg .pred %p_skip_sinks;\n");
+        // Sprint 2 cycle-8 §4.3 causal bypass: %rd_num_sink_tokens_reg
+        // holds the num_sink_tokens compile-time constant as a u64
+        // register so s_compute can compare k_global against it without
+        // needing a new kernel param (FFI signature is unchanged from
+        // Sprint 1b). Initialized via mov.u64 below.
+        ptx.push_str("    .reg .u64 %rd_num_sink_tokens_reg;\n");
+        ptx.push_str(&format!(
+            "    mov.u64 %rd_num_sink_tokens_reg, {};\n",
+            config.num_sink_tokens
+        ));
     }
 
     // PCA Tier A: segment-mask helper scratch registers + SMEM buffer.
@@ -534,9 +573,11 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75,
             segment_masked: true,
             csha: None,
+            checkpoint: None,
         }
     }
 

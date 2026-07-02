@@ -19,6 +19,7 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::phases::q_load::Q_BASE;
 use crate::flash_attention_v2::phases::softmax::emit_direct_hbm_store_of_reg;
+use crate::flash_attention_v2::sinks::effective_block_kv;
 use crate::flash_attention_v2::smem_layout::{kv_offset, sp_offset};
 use crate::pca_segment::SegmentResidency;
 
@@ -36,7 +37,10 @@ pub fn emit(
 ) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
-    let block_kv = config.block_kv as u32;
+    // §4.3 sinks (Sprint 1a precursor): the inner k-loop bound and the
+    // S-store stride must match the row count in the SMEM KV slab. At
+    // num_sink_tokens==0 this is identical to `config.block_kv`.
+    let block_kv = effective_block_kv(config) as u32;
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     let capture = config
         .csha
@@ -91,7 +95,12 @@ pub fn emit(
     //     Codified in `docs/superpowers/specs/2026-05-13-tier-b-b15-3-skip-ratio-investigation.md`.
     if let Some((seq_len, residency)) = tier_b {
         if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-            let log2_bkv = block_kv.trailing_zeros();
+            // PCA Tier B kvt-ordinal: derives the HBM kv-tile index from
+            // %k_start, which advances by HBM `config.block_kv` per outer
+            // iteration (mod.rs k_start += block_kv). Use the HBM-side
+            // stride here, NOT effective_block_kv (the sink slab does not
+            // add to HBM kv-tile stride). Byte-identical at num_sink_tokens==0.
+            let log2_bkv = (config.block_kv as u32).trailing_zeros();
             let range_table_base =
                 crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                     config,
@@ -292,6 +301,39 @@ pub fn emit(
         ptx.push_str("    cvt.u64.u32 %rd35, %r3;\n");
         ptx.push_str("    add.u64 %rd35, %q_start, %rd35;            // q_row_global\n");
         ptx.push_str("    setp.gt.u64 %p0, %rd34, %rd35;\n");
+        // Sprint 2 cycle-8 §4.3 attention sinks causal-bypass: sinks
+        // always attend regardless of query position (paper §4.3
+        // "regardless of query position"). Sinks live at k_global ∈ [0,
+        // num_sink_tokens).
+        //
+        // CRITICAL %p0 semantics: at `s_compute.rs:349` the consumer is
+        // `@%p0 mov.f32 %f0, 0xFF800000;` — `%p0 == true` means "this
+        // row IS masked (set to -inf)". The cycle-8 dispatch spec
+        // originally proposed `setp.lt + or.pred` which would have
+        // FORCE-MASKED sinks (opposite of intended). The correct AND-
+        // bypass logic (caught by the Sprint 2 implementer pre-merge):
+        //     setp.ge.u64 %p_sink, %rd34, %rd_num_sink_tokens_reg;
+        //     and.pred    %p0,     %p0,    %p_sink;
+        // %p_sink = "k_global >= num_sink_tokens" → true for NON-sink
+        // rows, false for sink rows. AND with the causal mask leaves
+        // non-sink causal-violating rows masked, but folds sink rows
+        // to `false` regardless of %p0's causal value — sink rows are
+        // ALWAYS attended. The %p_sink register and
+        // %rd_num_sink_tokens_reg are declared in the forward prelude
+        // (gated on num_sink_tokens > 0). At num_sink_tokens=0 NEITHER
+        // instruction is emitted → causal-only PTX is byte-identical
+        // to pre-Sprint-2 (snapshot invariant).
+        //
+        // Walkthrough (cycle-8 holistic-review-verified):
+        //   k=2,  N=4,  q=5  → setp.gt(2,5)=false   AND setp.ge(2,4)=false  = false. Sink attended.
+        //   k=10, N=4,  q=5  → setp.gt(10,5)=true   AND setp.ge(10,4)=true  = true.  Non-sink, k>q, masked.
+        //   k=10, N=4,  q=15 → setp.gt(10,15)=false AND setp.ge(10,4)=true  = false. Non-sink, k<=q, attended.
+        if config.num_sink_tokens > 0 {
+            ptx.push_str(
+                "    setp.ge.u64 %p_sink, %rd34, %rd_num_sink_tokens_reg;  // not a sink row\n",
+            );
+            ptx.push_str("    and.pred %p0, %p0, %p_sink;                            // sink-bypass: never mask sinks\n");
+        }
         // PCA Tier A: extend %p0 with cross-segment disjunction (spec §5.1).
         // Guard: only when BOTH causal (so %p0 is already set) AND segment_masked.
         // If !causal && segment_masked, %p0 is uninitialized; we skip rather than

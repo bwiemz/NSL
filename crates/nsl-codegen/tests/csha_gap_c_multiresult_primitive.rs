@@ -140,6 +140,11 @@ fn clear_csha_per_function_caches_empties_both_maps() {
             row_max: Value::from_u32(403),
             row_sum: Value::from_u32(404),
             x_raw:   Value::from_u32(405),
+            // Sprint 1 T1.1: forward attention output handle.
+            out:     Value::from_u32(406),
+            // Sprint 1 cycle-2: RoPE cos/sin Values stashed alongside `out`.
+            cos:     Value::from_u32(407),
+            sin:     Value::from_u32(408),
             backward_ptx_data_id: None,
             backward_name_data_id: None,
         },

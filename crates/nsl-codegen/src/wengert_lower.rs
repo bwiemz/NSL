@@ -561,6 +561,19 @@ fn emit_fused_forward_under_claim(
         "nsl_packing_metadata_get_doc_starts",
         &[],
     )?;
+    // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named locals so the
+    // save record can stash them. Forward and backward must agree on cos/sin;
+    // the save record is the structural channel.
+    //
+    // WIRE-HERE: when future work threads a real cos/sin tensor source
+    // (e.g. resolved from a @param input or a wengert-side synthesis op),
+    // REPLACE the two `null` assignments below with the resolved Cranelift
+    // Value handles. The backward FFI call at the `nsl_flash_attention_csha_backward`
+    // invocation later in this function consumes them from `saves.cos` /
+    // `saves.sin` — once these locals are non-null, backward picks them up
+    // with no further edits.
+    let rope_cos_v = null;
+    let rope_sin_v = null;
     // PCA Tier B planner spec §5: build the (tier_b_ptx_ptr, tier_b_name_ptr)
     // sentinel pair for the @train fused-AD forward FFI call. MUST mirror the
     // backward at line ~2027 — both sites read from the SAME
@@ -599,7 +612,7 @@ fn emit_fused_forward_under_claim(
             scale_bits,
             batch, heads, seq_len, head_dim,
             null, null, null, null, // paged
-            null, null,             // RoPE
+            rope_cos_v, rope_sin_v, // RoPE
             null, null,             // seq_ids, seq_lens
             shmem_val,
             ptx_ptr, name_ptr,
@@ -673,6 +686,19 @@ fn emit_fused_forward_under_claim(
             row_max: row_max_v,
             row_sum: row_sum_v,
             x_raw: x_raw_v,
+            // Sprint 1 T1.1: retain the forward attention output handle
+            // so the Tier B.2 hybrid backward's D pre-pass can compute
+            // D = rowsum(dO * O). The runtime resolves the device data
+            // pointer via `csha_tensor_data_ptr(out_ptr)` (see
+            // `nsl_flash_attention_csha_backward`).
+            out: out_val,
+            // Sprint 1 (cycle-2): stash the same RoPE cos/sin Values the
+            // forward FFI was handed so the Tier B.2 hybrid backward reads
+            // identical pointers (today both null → both forward and
+            // backward skip rotation via the in-kernel null-guard,
+            // self-consistent rope-effectively-off).
+            cos: rope_cos_v,
+            sin: rope_sin_v,
             backward_ptx_data_id: bwd_ptx_id,
             backward_name_data_id: bwd_name_id,
             backward_tier_b_on_ptx_data_id: bwd_tier_b_ptx_id,
@@ -1825,7 +1851,12 @@ fn lower_single_op(
                 .flash_attention_context
                 .as_ref()
                 .and_then(|c| c.csha_training_config.clone());
-            let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes) =
+            // Sprint 1 T1.3: capture the compile-time Tier B.2 hybrid-backward
+            // eligibility decision while the config is in scope. The runtime
+            // `seq_len == block_q` check happens below using the Cranelift
+            // `seq_len` Value already extracted via `nsl_tensor_shape_dim`.
+            let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes,
+                 tier_b2_compile_time_eligible) =
                 match training_cfg {
                     Some(cfg) => {
                         // Backward kernel sizes shmem differently than forward:
@@ -1846,7 +1877,9 @@ fn lower_single_op(
                             .as_ref()
                             .map(|c| c.rmsnorm_eps.to_bits() as i64)
                             .unwrap_or(1e-5f32.to_bits() as i64);
-                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes)
+                        let b2_ct =
+                            crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible(&cfg);
+                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes, b2_ct)
                     }
                     None => {
                         // No training config — the backward launch cannot
@@ -2031,6 +2064,36 @@ fn lower_single_op(
                 &[],
             )?;
 
+            // CSHA Tier B.2 (Phase 3 T6 / Sprint 1 T1.3): tier_b2_active flag.
+            //
+            // Semantics — the flag is `1` iff
+            //   tier_b2_hybrid_backward_compile_time_eligible(config)   // compile-time
+            //   && seq_len == config.block_q                            // runtime
+            // matching `tier_b2_hybrid_backward_eligible(config, seq_len)`
+            // bit-for-bit (invariant unit-tested in `dispatch::tests`).
+            //
+            // Decomposition rationale:
+            //   - All Tier-B.2 dispatch checks except `seq_len == block_q` depend
+            //     only on the `FlashAttentionConfig` baked in at lowering time.
+            //   - `seq_len` is a runtime tensor shape dim (extracted above via
+            //     `nsl_tensor_shape_dim`), so the seq comparison must be emitted
+            //     as Cranelift IR.
+            //
+            // When the config is ineligible we emit a literal `iconst(0)` —
+            // ptxas trivially constant-folds the dead hybrid launch branch
+            // in the FFI. When the config is eligible the runtime compares
+            // the live seq_len against `block_q` and `uextend`s the i1 to i64.
+            // FFI gates the 4-kernel hybrid launch on this being non-zero;
+            // the scalar single-kernel path remains the fallback.
+            let tier_b2_active_flag = if tier_b2_compile_time_eligible {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let block_q_i64 = builder.ins().iconst(cl_types::I64, block_q);
+                let seq_eq_bq = builder.ins().icmp(IntCC::Equal, seq_len, block_q_i64);
+                builder.ins().uextend(cl_types::I64, seq_eq_bq)
+            } else {
+                builder.ins().iconst(cl_types::I64, 0)
+            };
+
             // PCA Tier B planner spec §5: build the (tier_b_ptx_ptr,
             // tier_b_name_ptr) sentinel pair for the backward FFI. When the
             // module-scan emitted a Tier-B-on backward variant for this config
@@ -2055,6 +2118,15 @@ fn lower_single_op(
                 _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
             };
 
+            // Sprint 1 T1.1: source the forward attention output `O`
+            // handle from the per-layer save record (populated by the
+            // forward CSHA launch site in this same FunctionBuilder
+            // scope). The Tier B.2 hybrid backward's D pre-pass
+            // (kernel 1) computes D = rowsum(dO * O) and reads O via
+            // `csha_tensor_data_ptr(out_ptr)`. Pre-T1.1 we passed
+            // `null` here and the D pre-pass silently produced
+            // D == 0; see PARITY-GATE NOTE in
+            // `crates/nsl-runtime/src/flash_attention.rs::nsl_flash_attention_csha_backward`.
             let _rc = call(
                 compiler,
                 builder,
@@ -2062,12 +2134,12 @@ fn lower_single_op(
                 &[
                     // Forward-side 36 args (mirrors _with_saves order).
                     q_ptr, k_ptr, v_ptr,
-                    null,                 // out_ptr
+                    saves.out,            // out_ptr (Sprint 1 T1.1)
                     null,                 // logsumexp_ptr
                     scale_bits,
                     batch, heads, seq_len, hd_val,
                     null, null, null, null,    // paged (block_table, k_pool, v_pool, block_size)
-                    null, null,                 // RoPE cos/sin
+                    saves.cos, saves.sin,       // RoPE cos/sin (Sprint 1 cycle-2: sourced from forward save record)
                     null, null,                 // seq_ids, seq_lens
                     shmem_val,
                     bwd_ptx_ptr, bwd_name_ptr,
@@ -2106,6 +2178,14 @@ fn lower_single_op(
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
+                    // CSHA Tier B.2 (Phase 3 T6 / Sprint 1 T1.3): tier_b2_active flag.
+                    // Computed above as the AND of the compile-time
+                    // `tier_b2_hybrid_backward_compile_time_eligible(config)`
+                    // predicate and the runtime `seq_len == block_q` icmp.
+                    // FFI's 4-kernel hybrid launch fires iff this is non-zero;
+                    // otherwise the scalar single-kernel path remains active
+                    // (byte-identical to pre-Sprint-1 behavior).
+                    tier_b2_active_flag,
                     // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero
                     // trailing sentinel. AD-side never emits a per-doc CTA
                     // backward today (the planner gate that activates the
@@ -2201,6 +2281,19 @@ fn lower_single_op(
                 "nsl_tensor_compare",
                 &[inputs[0], inputs[1], cmp_val],
             )
+        }
+        // Paper §5.3 checkpointing-aware backward marker (cycle-10 Task 2).
+        //
+        // Lowering treats this as a structural no-op: the marker exists in
+        // the Wengert use-def graph so that the source-AD reverse-walk and
+        // the downstream codegen dispatch can both observe "this subgraph
+        // was checkpointed; values were not persisted across the forward /
+        // backward boundary." The actual recompute PTX is emitted by the
+        // backward-kernel emitter (`emit_prologue_recompute`, Task 8) — at
+        // wengert-lower time we just emit a null placeholder result so the
+        // var_map stays well-formed.
+        PrimalOp::PrologueRecompute { subgraph_id: _ } => {
+            Ok(builder.ins().iconst(cl_types::I64, 0))
         }
 
         // === Non-differentiable passthroughs ===

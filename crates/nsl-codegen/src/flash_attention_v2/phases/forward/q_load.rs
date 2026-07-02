@@ -244,8 +244,32 @@ fn emit_rope_rotation_inline(
                 reg
             ));
             ptx.push_str("    setp.lt.u32 %p0, %lane, 16;\n");
-            ptx.push_str(&format!("    @%p0  fma.rn.f32 %f{}, %f{}, %f0, %f1;\n", reg, reg));
-            ptx.push_str(&format!("    @!%p0 fma.rn.f32 %f{}, %f{}, %f0, %f1;\n", reg, reg));
+            // Reference math (csha_hooks.rs:1584-1595):
+            //   new_x0 = x0*cos - x1*sin
+            //   new_x1 = x0*sin + x1*cos
+            // HalfSplit: lanes  <16 hold x0 (self=x0, partner=x1);
+            //            lanes >=16 hold x1 (self=x1, partner=x0).
+            // -- @%p0  branch: new_x0 = self*cos - partner*sin
+            //      encode as: t = self*cos + 0 ; new = (-partner)*sin + t
+            ptx.push_str("    @%p0  neg.f32 %f3, %f2;                          // -partner (x1)\n");
+            ptx.push_str(&format!(
+                "    @%p0  fma.rn.f32 %f{r}, %f{r}, %f0, 0f00000000;   // self*cos\n",
+                r = reg
+            ));
+            ptx.push_str(&format!(
+                "    @%p0  fma.rn.f32 %f{r}, %f3, %f1, %f{r};          // + (-partner)*sin\n",
+                r = reg
+            ));
+            // -- @!%p0 branch: new_x1 = partner*sin + self*cos
+            //      encode as: t = self*cos + 0 ; new = partner*sin + t
+            ptx.push_str(&format!(
+                "    @!%p0 fma.rn.f32 %f{r}, %f{r}, %f0, 0f00000000;   // self*cos\n",
+                r = reg
+            ));
+            ptx.push_str(&format!(
+                "    @!%p0 fma.rn.f32 %f{r}, %f2, %f1, %f{r};          // + partner*sin\n",
+                r = reg
+            ));
         }
         RopeStyle::Adjacent => {
             ptx.push_str(&format!(
@@ -258,10 +282,38 @@ fn emit_rope_rotation_inline(
             ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for sin row (recompute)\n");
             ptx.push_str("    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];\n");
             ptx.push_str(&format!(
-                "    shfl.sync.bfly.b32 %f2, %f{}, 1, 31, 0xFFFFFFFF;\n",
+                "    shfl.sync.bfly.b32 %f2, %f{}, 1, 31, 0xFFFFFFFF;  // partner Q\n",
                 reg
             ));
-            ptx.push_str(&format!("    fma.rn.f32 %f{}, %f{}, %f0, %f1;\n", reg, reg));
+            // Reference math (csha_hooks.rs:1584-1595):
+            //   new_x0 = x0*cos - x1*sin
+            //   new_x1 = x0*sin + x1*cos
+            // Adjacent: even lanes hold x0 (self=x0, partner=x1);
+            //           odd  lanes hold x1 (self=x1, partner=x0).
+            // Split via `lane & 1`:
+            //   even (p1=true) : new = self*cos - partner*sin
+            //   odd  (p1=false): new = partner*sin + self*cos
+            ptx.push_str("    and.b32 %r1, %lane, 1;                           // parity bit\n");
+            ptx.push_str("    setp.eq.u32 %p1, %r1, 0;                        // p1 <=> even lane\n");
+            // Even lane (holds x0): new_x0 = self*cos + (-partner)*sin
+            ptx.push_str("    @%p1  neg.f32 %f3, %f2;                          // -partner (x1)\n");
+            ptx.push_str(&format!(
+                "    @%p1  fma.rn.f32 %f{r}, %f{r}, %f0, 0f00000000;  // self*cos\n",
+                r = reg
+            ));
+            ptx.push_str(&format!(
+                "    @%p1  fma.rn.f32 %f{r}, %f3, %f1, %f{r};         // + (-partner)*sin\n",
+                r = reg
+            ));
+            // Odd lane (holds x1): new_x1 = self*cos + partner*sin
+            ptx.push_str(&format!(
+                "    @!%p1 fma.rn.f32 %f{r}, %f{r}, %f0, 0f00000000;  // self*cos\n",
+                r = reg
+            ));
+            ptx.push_str(&format!(
+                "    @!%p1 fma.rn.f32 %f{r}, %f2, %f1, %f{r};         // + partner*sin\n",
+                r = reg
+            ));
         }
     }
 }

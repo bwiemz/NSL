@@ -110,9 +110,11 @@ mod selector_tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -129,6 +131,7 @@ mod selector_tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm,
             segment_masked: false,
             csha: Some(CshaExtras {
@@ -141,7 +144,9 @@ mod selector_tests {
                 d_model: head_dim as u32,
                 save_activations_for_backward: false,
                 skip_rmsnorm_prologue: false,
+                static_seq_len: None,
             }),
+            checkpoint: None,
         }
     }
 

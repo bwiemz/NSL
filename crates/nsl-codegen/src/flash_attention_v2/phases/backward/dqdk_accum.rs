@@ -23,6 +23,7 @@ use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     backward_dk_offset, backward_ds_offset,
 };
+use crate::flash_attention_v2::phases::backward::probe::maybe_emit_probe_store;
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     assert_eq!(
@@ -71,6 +72,21 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    add.u64 %rd30, %shmem_base, %rd30;\n");
     ptx.push_str("    ld.shared.f32 %f_dS, [%rd30];\n");
     ptx.push_str("    mul.f32 %f_dS, %f_dS, %scale;\n");
+
+    // ── cycle-20 T1 probe slot 7: scale*dS (post-scale application) ──
+    // slot 7 (scale*dS): sampled at col=block_kv-1 (last KV column of this
+    // iter); slot 7 fires once per KV col but retains the LAST value;
+    // consumers must interpret as col=block_kv-1.
+    //
+    // Rationale: `maybe_emit_probe_store` gates on
+    // (warp_id==1, lane==0, batch==0, head==0, probe_active) but does NOT
+    // expose an extra-predicate hook to compose a col==0 gate into
+    // `%p_probe_gate` before the warp/lane setp overwrites `%p_probe_w`.
+    // Adding such a hook (R11 option (a)) is deferred; we accept last-col
+    // sampling (R11 option (b)) and document the coord in probe.rs +
+    // csha_cycle19_ds_probe.rs so T5/c21 consumers compare against the
+    // CPU reference at col=block_kv-1 (NOT col=0).
+    maybe_emit_probe_store(ptx, config, 7, "%f_dS", q_tile_iter);
 
     // K[col, :] base
     ptx.push_str(&format!(
@@ -204,7 +220,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: hd,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -212,6 +228,7 @@ mod tests {
                 d_model: dm,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

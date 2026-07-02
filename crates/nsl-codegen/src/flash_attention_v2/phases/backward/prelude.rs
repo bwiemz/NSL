@@ -71,8 +71,21 @@ pub fn emit(
     // a misrouted caller can't produce an invalid kernel.
     let _ = Direction::Backward;
 
+    // Cycle 14: mirror forward prelude's gpu_sm-aware target selection.
+    // Tier B.2 hybrid backward and forward both target sm_80 when
+    // `gpu_sm >= 80`; scalar Tier C backward stayed on sm_75 because it
+    // pre-dated the dispatch. With `gpu_sm=80` configs now reaching this
+    // emitter (Blackwell + RTX 5070 Ti harness), keeping sm_75 here
+    // would mismatch the forward target inside the same module — and
+    // would block the G14-C `.target sm_80` assertion. sm_75 PTX
+    // continues to JIT cleanly when `gpu_sm < 80`.
     use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
-    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
+    let target_sm = if config.gpu_sm >= 80 {
+        TargetSm::Sm80
+    } else {
+        TargetSm::Sm75
+    };
+    emit_ptx_header(ptx, PtxVersion::V8_7, target_sm);
 
     let dyn_smem = backward_needs_dynamic_smem(config);
     if dyn_smem {
@@ -152,6 +165,17 @@ pub fn emit(
         .unwrap_or(false);
     if cfg!(feature = "debug_kernel_instrumentation") && tier_b_admitted {
         params.push((".param .u64", "skip_decisions_ptr"));
+    }
+
+    // CSHA cycle 20 T1 — dS-probe trailing pointers. Feature-gated so
+    // default builds keep the 25/25 fa_v2_snapshots byte-identical. Under
+    // the feature the runtime launcher unconditionally passes 2 trailing
+    // null pointers (sentinel 0 → %p_probe_active=false → probe stores
+    // fall through even at (batch=0, head=0, warp=1, lane=0)); only the
+    // c19 T1 test dispatch site passes a non-null probe_ds_out_ptr.
+    if cfg!(feature = "csha_cycle19_probe") {
+        params.push((".param .u64", "probe_ds_out_ptr"));
+        params.push((".param .u64", "probe_dv_out_ptr"));
     }
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
@@ -256,6 +280,30 @@ pub fn emit(
     // backward phase emitters can use the same addressing helpers).
     ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     ptx.push_str("    .reg .u64 %warp_row;\n");
+
+    // CSHA RoPE pair-sweep register block (matches forward prelude).
+    // Required by emit_kv_recompute -> emit_rope_k_epilogue under
+    // checkpoint=Some(Full) backward path. Cycle-15 cross-prelude fix.
+    // Gated on rope_q && csha.is_some() -- mirrors forward prelude gate
+    // at phases/forward/prelude.rs "CSHA A.2.4 RoPE epilogue registers".
+    if config.rope_q && config.csha.is_some() {
+        // HBM pointer registers for cos/sin tables.
+        ptx.push_str("    .reg .u64 %rd_rope_cos, %rd_rope_sin, %rd_rope_addr;\n");
+        ptx.push_str("    .reg .u64 %rd_rope_cs_idx, %rd_rope_x0_off, %rd_rope_x1_off;\n");
+        // f32 accumulators for rotation math.
+        ptx.push_str("    .reg .f32 %f_rope_cos, %f_rope_sin;\n");
+        ptx.push_str("    .reg .f32 %f_rope_x0, %f_rope_x1, %f_rope_y0, %f_rope_y1;\n");
+        ptx.push_str("    .reg .f32 %f_rope_neg_x1;\n");
+        // f16 scratch for pair loads/stores.
+        ptx.push_str("    .reg .b16 %h_rope_pair, %h_rope_y0, %h_rope_y1;\n");
+        // u32 loop/index registers.
+        ptx.push_str("    .reg .u32 %r_rope_tid, %r_rope_pair_idx;\n");
+        ptx.push_str("    .reg .u32 %r_rope_row, %r_rope_dim_pair;\n");
+        ptx.push_str("    .reg .u32 %r_rope_cs_off, %r_rope_smem_row_off;\n");
+        ptx.push_str("    .reg .u32 %r_rope_x0_col, %r_rope_x0_off, %r_rope_x1_off;\n");
+        // Predicate registers for null-guard and loop exit.
+        ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
+    }
 
     // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue) — backward
     // mirror of the forward prelude.rs PCA §4.3 register block. Gated on
@@ -376,6 +424,28 @@ pub fn emit(
     ptx.push_str("    ld.param.u64 %rd_bwd_dk_scratch, [dk_scratch_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dv_scratch, [dv_scratch_ptr];\n");
     ptx.push_str("    ld.param.u64 %q_launch_base, [seq_lens_ptr];\n");
+
+    // CSHA cycle 20 T1 — probe pointer + gate registers. Feature-gated
+    // so default builds are byte-identical. See `phases/backward/probe.rs`
+    // for the per-site store emission that consumes these registers.
+    if cfg!(feature = "csha_cycle19_probe") {
+        ptx.push_str("    .reg .u64 %rd_probe_ds, %rd_probe_dv, %rd_probe_slot;\n");
+        ptx.push_str("    .reg .pred %p_probe_active, %p_probe_active_dv, %p_probe_gate;\n");
+        ptx.push_str("    .reg .pred %p_probe_w, %p_probe_l, %p_probe_b, %p_probe_h;\n");
+        ptx.push_str("    ld.param.u64 %rd_probe_ds, [probe_ds_out_ptr];\n");
+        ptx.push_str("    ld.param.u64 %rd_probe_dv, [probe_dv_out_ptr];\n");
+        // %p_probe_active    = (%rd_probe_ds != 0) — gates dS-side stores.
+        // %p_probe_active_dv = (%rd_probe_dv != 0) — gates dV-side stores.
+        // The two predicates are INDEPENDENT so ordering of ds_compute /
+        // dv_accum / dqdk_accum / finalize is not load-bearing (a mirror
+        // caller passing probe_ds=0 && probe_dv!=0 must not fault on dS
+        // stores, and vice-versa a probe_ds!=0 && probe_dv=0 caller must
+        // not have its dS slot-7 store suppressed by the dV setp). See
+        // `phases/backward/probe.rs` for the per-site emission that
+        // consumes these registers (R11 fix, cycle-20 T2 fixup).
+        ptx.push_str("    setp.ne.u64 %p_probe_active, %rd_probe_ds, 0;\n");
+        ptx.push_str("    setp.ne.u64 %p_probe_active_dv, %rd_probe_dv, 0;\n");
+    }
 
     // Thread/block indices — identical to forward.
     emit_thread_lane_warp_register_init(ptx);
@@ -502,7 +572,7 @@ mod tests {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -510,6 +580,7 @@ mod tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

@@ -399,6 +399,21 @@ pub(crate) struct CheckArgs {
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
         pub(crate) wrga_compare: Option<PathBuf>,
 
+        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
+        /// "block", or "off").  Passing `--csha` without a value enables
+        /// auto mode.  Mirrors `nsl run --csha` / `nsl build --csha`;
+        /// drives the planner-only diagnostic surfaced by `--csha-report`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+        pub(crate) csha: Option<String>,
+
+        /// CSHA: print the attention-fusion report (paper §6.3) to stderr.
+        /// Mirrors `nsl run --csha-report` / `nsl build --csha-report`.
+        /// Runs the planner against the file's train block (if any) and
+        /// emits the per-layer Boundary / Pipeline / Block tier decisions
+        /// plus the backward-tier choice. No kernels are emitted.
+        #[arg(long)]
+        pub(crate) csha_report: bool,
+
         /// WRGA paper §9.3: ablate one or more Innovations from this run.
         /// Comma-separated tokens from `wengert | roofline | spectral | fusion
         /// | memory | all | none`. Default `none` (no ablation). `all` is

@@ -300,6 +300,11 @@ impl CshaPlan {
                 plan.speedup(),
             )
             .unwrap();
+            // Sprint 3 (paper §6.3 visibility): per-layer backward tier so
+            // `nsl check --csha-report` and `nsl build --csha-report` users can
+            // audit whether each layer routes through the Tier B.2 MMA backward
+            // or falls back to scalar Tier C.
+            writeln!(s, "  Backward: {}", plan.backward_tier.as_label()).unwrap();
             if let Some(ref reason) = plan.downgrade_reason {
                 writeln!(s, "  Downgrade: {}", reason).unwrap();
             }
@@ -753,6 +758,29 @@ mod tests {
         assert!(r.contains("Boundary scan"));
         assert!(r.contains("Layer blocks.0"));
         assert!(r.contains("HBM traffic"));
+    }
+
+    #[test]
+    fn report_contains_backward_tier_line_per_layer() {
+        // Sprint 3 (paper §6.3 visibility): the per-layer report must
+        // include a `Backward: ...` line so users can audit which backward
+        // kernel family CSHA picked at training time.
+        let w = attn_block();
+        let plan = run(toy_input(&w, CshaMode::Auto));
+        let r = plan.render_report();
+        assert!(
+            r.contains("Backward:"),
+            "render_report must include a 'Backward:' line per layer; got:\n{r}"
+        );
+        // For the toy attn block (hd=64, csha auto), the line must end with
+        // EITHER 'Tier B.2 (hybrid, ...)' (when planner admits Tier B.2)
+        // OR 'Tier C (scalar)' (default fallback). Both are valid labels.
+        let has_label = r.contains("Tier B.2 (hybrid")
+            || r.contains("Tier C (scalar)");
+        assert!(
+            has_label,
+            "Backward: line must use one of the documented labels; got:\n{r}"
+        );
     }
 
     #[test]

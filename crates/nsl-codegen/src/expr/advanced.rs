@@ -1636,6 +1636,21 @@ impl Compiler<'_> {
                         )
                     })
                     .unwrap_or((None, None, None, None));
+                // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named locals
+                // BEFORE the save insert so both the save record and the
+                // forward FFI agree on the same Cranelift Values. Forward and
+                // backward must see identical cos/sin — the save record is
+                // the structural channel that closes H1.
+                //
+                // WIRE-HERE: when future work threads a real cos/sin tensor
+                // source (e.g. resolved from a @param input or a wengert-side
+                // synthesis op), REPLACE the two `null` assignments below with
+                // the resolved Cranelift Value handles. The backward FFI in
+                // wengert_lower.rs consumes them from `saves.cos` / `saves.sin`
+                // — once these locals are non-null, backward picks them up
+                // with no further edits.
+                let rope_cos_v = null;
+                let rope_sin_v = null;
                 self.csha_forward_saves.insert(
                     layer_key,
                     crate::csha_apply::CshaSavePointers {
@@ -1645,6 +1660,20 @@ impl Compiler<'_> {
                         row_max: row_max_v,
                         row_sum: row_sum_v,
                         x_raw: x_raw_v,
+                        // Sprint 1 T1.1: retain the forward attention
+                        // output handle (already allocated above as
+                        // `out_val` via `nsl_tensor_zeros_like`/`_on`
+                        // and threaded into the with-saves FFI below).
+                        // The Tier B.2 hybrid backward's D pre-pass
+                        // reads O via `csha_tensor_data_ptr(out_ptr)`.
+                        out: out_val,
+                        // Sprint 1 (cycle-2): stash the same null RoPE cos/sin
+                        // Values the forward FFI is handed (below) so the
+                        // Tier B.2 hybrid backward reads identical pointers
+                        // (today both null → both forward and backward skip
+                        // rotation, self-consistent rope-effectively-off).
+                        cos: rope_cos_v,
+                        sin: rope_sin_v,
                         backward_ptx_data_id: bwd_ptx_id,
                         backward_name_data_id: bwd_name_id,
                         backward_tier_b_on_ptx_data_id: bwd_tier_b_ptx_id,
@@ -1715,6 +1744,10 @@ impl Compiler<'_> {
                 // with a deterministic trap (`TrapCode::unwrap_user(3)`)
                 // instead of silently producing zero-initialised save
                 // buffers that then NaN the backward pass.
+                // Sprint 1 (cycle-2): pass the same hoisted RoPE cos/sin Values
+                // (declared above before the save insert) to the FFI so the
+                // save record and the FFI call agree on identical Cranelift
+                // Values — the structural channel that closes H1.
                 let launch_rc = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha_with_saves",
@@ -1723,9 +1756,9 @@ impl Compiler<'_> {
                         lse_val,
                         scale_bits,
                         batch, heads, seq_len, head_dim,
-                        null, null, null, null, // paged
-                        null, null,             // RoPE
-                        null, null,             // seq_ids, seq_lens
+                        null, null, null, null,         // paged
+                        rope_cos_v, rope_sin_v, // RoPE
+                        null, null,                     // seq_ids, seq_lens
                         save_shmem_val,
                         save_ptx_ptr, save_name_ptr,
                         block_q_val, block_kv_val,

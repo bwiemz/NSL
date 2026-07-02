@@ -124,6 +124,7 @@ fn dx_norm_hbm_buffer_is_populated() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75,
         segment_masked: false,
         csha: Some(CshaExtras {
@@ -139,6 +140,7 @@ fn dx_norm_hbm_buffer_is_populated() {
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
         }),
+        checkpoint: None,
     };
 
     smem_layout::validate_scalar_v2_config(&config, Direction::Backward)

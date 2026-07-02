@@ -1,0 +1,20 @@
+# Sprint 1b cycle-7 fixture (paper §4.3 attention sinks v1 narrow config).
+#
+# Pins the narrow eligibility path: causal=false (overridden from the
+# default true via `@flash_attention(causal=false)`), no rope, no gqa,
+# no paged/segment_masked/tree_mask, no @train, no CSHA fusion.
+#
+# Under Sprint 1b the cycle-5 refusal is LIFTED for this configuration
+# and the compile succeeds. The integration test then probes the
+# emitted PTX for the gated sink_k_ptr parameter declaration to confirm
+# that conditional-emission landed (mirrors the cycle-3 review-fix
+# pattern: gated emission probe, not an unconditional emission probe).
+#
+# Body is intentionally trivial — the integration test only inspects the
+# compile context and the embedded PTX, which do not depend on the
+# function body.
+
+@flash_attention(causal=false)
+@attention_sink(tokens=4)
+fn forward():
+    pass

@@ -8,8 +8,9 @@ fn cfg_hd(d: i64) -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: d, causal: false, paged: false,
         rope_q: false, rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 80, segment_masked: false,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 80, segment_masked: false,
         csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        checkpoint: None,
     }
 }
 

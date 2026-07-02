@@ -1,0 +1,26 @@
+# Sprint 2 cycle-3 fixture (paper §3.2 paged-KV end-to-end wiring).
+#
+# Pins the decorator-to-codegen wiring: bare `@paged_kv` alongside
+# `@flash_attention` must reach `FlashAttentionConfig::paged=true`,
+# which (a) appends the `_p1_` variant tag to the synthesized kernel
+# name and (b) emits the block-table indirection block in PTX
+# (`flash_attention.rs:1622-1649`).
+#
+# `block_size=32` exercises the @paged_kv arg-parsing path
+# (`compiler/kernel.rs:1007-1020`). Note: `block_size` is consumed at
+# compile time only for the `block_kv % block_size` alignment check
+# (`compiler/kernel.rs:1167`); it is NOT stored on
+# `FlashAttentionConfig`, so the integration test cannot pin it
+# through the compile context. The runtime kernel parameter
+# `.param .u64 block_size` is wired at launch time, not codegen time.
+# The single-config codepath defaults to `block_kv=64`, so
+# `block_size=32` divides cleanly and the alignment validation passes.
+#
+# Body is intentionally trivial — the integration test only inspects
+# the compile context, the synthesized kernel name, and the PTX byte
+# stream, none of which depend on the function body.
+
+@flash_attention
+@paged_kv(block_size=32)
+fn forward():
+    pass

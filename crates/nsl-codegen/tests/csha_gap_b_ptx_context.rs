@@ -133,6 +133,7 @@ fn with_saves_ptx_contains_csha_save_labels() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_rmsnorm: false,
@@ -142,7 +143,15 @@ fn with_saves_ptx_contains_csha_save_labels() {
             rmsnorm_eps: 1e-5,
             d_model: 0,
             save_activations_for_backward: save,
+            // Sprint 1 cycle-5 bitrot fix: post-cycle-2-Sprint-8
+            // CshaExtras added skip_rmsnorm_prologue + static_seq_len
+            // but this test's struct literal was never updated. Cycle-4
+            // holistic reviewer surfaced it; the fix is just defaulting
+            // both since this test exercises a pre-RMSNorm-skip path.
+            skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
+        checkpoint: None,
     };
 
     let ptx_with_saves = synthesize_flash_attention_ptx_v2(&mk(true));

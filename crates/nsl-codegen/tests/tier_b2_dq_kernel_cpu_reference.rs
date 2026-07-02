@@ -95,6 +95,32 @@ fn tol_for_head_dim(hd: u32) -> f32 {
     }
 }
 
+/// Tiered RELATIVE tolerance for the dQ parity gate (Phase 2.7 non-vacuous gate).
+///
+/// Scales with f16 MMA accumulation depth (~head_dim). Used as
+/// `max_abs <= rel_tol * max|dq_ref|` so the gate is independent of the absolute
+/// magnitude of dQ — a zero/degenerate output yields rel error ~= 1.0 and FAILS,
+/// unlike the prior absolute-only gate which passed a zero-output kernel whenever
+/// `max|dq_ref|` happened to fall below the absolute tolerance (the ×0.1-input
+/// vacuity that hid the stats-stub bug; see project memory + dq.rs stats loads).
+fn rel_tol_for_head_dim(hd: u32) -> f32 {
+    if hd >= 128 {
+        8e-2
+    } else if hd >= 64 {
+        5e-2
+    } else {
+        3e-2
+    }
+}
+
+/// dO scale for the dQ parity gate. The shared `generate_d_o` emits ×0.1 values,
+/// which makes the true dQ ~6e-5 — far below the absolute tolerance, rendering the
+/// gate vacuous. dQ is linear in dO, so scaling dO lifts the dQ signal well above
+/// the f16 noise floor, making the relative gate meaningful. Applied consistently
+/// to the GPU D-pre-pass input, the GPU dQ-kernel input, and the CPU reference, so
+/// D / dP / dS / dQ all scale together (self-consistent).
+const DQ_GATE_DO_SCALE: f32 = 1024.0;
+
 fn canonical_hd32_cfg() -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 32,
@@ -106,6 +132,7 @@ fn canonical_hd32_cfg() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: false,
         // d_model=128 matches the T2.7 reference (tier_b1_save_activations_gpu)
@@ -113,6 +140,7 @@ fn canonical_hd32_cfg() -> FlashAttentionConfig {
         // (bare ..Default::default()) defeats the B1Forward path's unwrap_or(128)
         // fallback (which only fires for csha=None) and zero-sizes every B.1 input.
         csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
+        checkpoint: None,
     }
 }
 
@@ -127,6 +155,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: false,
         // d_model=128 matches the T2.7 reference (tier_b1_save_activations_gpu)
@@ -134,6 +163,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
         // (bare ..Default::default()) defeats the B1Forward path's unwrap_or(128)
         // fallback (which only fires for csha=None) and zero-sizes every B.1 input.
         csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
+        checkpoint: None,
     }
 }
 
@@ -242,9 +272,11 @@ fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         };
         let hd = case.hd as usize;
 
@@ -337,11 +369,16 @@ fn tier_b2_dq_sweep_b1_forward() {
     // (tiles_per_warp_qkt vs tiles_per_warp_pv divergence) is FIXED -- the stats
     // are now re-keyed by absolute query row via a dedicated SMEM region
     // (commit e854bad8), GPU-validated at hd=32/64/128 in
-    // tier_b1_save_activations_gpu. seq=32 (B.1 single-block: launcher forces
-    // block_kv=32). bq follows the dQ-kernel Path-A schedule.
+    // tier_b1_save_activations_gpu.
+    //
+    // bq = bkv = 32 for ALL hd here: the B.1 single-block forward processes seq=32
+    // as ONE block of block_kv=32, so the dQ kernel must use a matching bkv (a full
+    // tile, bkv == seq). The dQ kernel has NO seq-boundary masking yet, so bkv > seq
+    // (e.g. the old bq=64 with seq=32) sums OOB kv positions into dQ and yields
+    // garbage -- the partial-tile / arbitrary-seq case is a documented Phase-4
+    // follow-on (see dq.rs module doc). A realistic planner never picks bkv > seq.
     for &hd in &[32i64, 64, 128] {
-        let bq = if hd == 128 { 32 } else { 64 };
-        validate_dq_for_source(&cfg(bq, hd), FSource::B1Forward, 32);
+        validate_dq_for_source(&cfg(32, hd), FSource::B1Forward, 32);
     }
 }
 
@@ -362,7 +399,14 @@ fn validate_dq_for_source(cfg: &FlashAttentionConfig, source: FSource, seq: usiz
     let hd = cfg.head_dim as usize;
 
     let inputs = generate_forward_inputs(cfg, source, seq);
-    let d_o = generate_d_o(cfg, seq);
+    // Scale dO so the true dQ is substantial (Phase 2.7 non-vacuous gate). dQ is
+    // linear in dO; the shared ×0.1 generator otherwise leaves dq_ref ~6e-5, below
+    // tolerance. Used consistently below for the GPU D-pre-pass, the GPU dQ-kernel,
+    // and the CPU reference, so D/dP/dS/dQ scale together.
+    let d_o: Vec<half::f16> = generate_d_o(cfg, seq)
+        .iter()
+        .map(|x| half::f16::from_f32(x.to_f32() * DQ_GATE_DO_SCALE))
+        .collect();
 
     // Comparator reads Q/K/V/O from fwd (Phase 2.6 comparator fix), NOT raw inputs.
     let fwd = compute_forward_for_test(&inputs, cfg, source, seq);
@@ -385,15 +429,42 @@ fn validate_dq_for_source(cfg: &FlashAttentionConfig, source: FSource, seq: usiz
         .zip(dq_ref.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    let tol = tol_for_head_dim(hd as u32);
+    let max_ref = dq_ref.iter().map(|a| a.abs()).fold(0.0f32, f32::max);
+    let max_gpu = dq_gpu.iter().map(|a| a.abs()).fold(0.0f32, f32::max);
+    let rel = if max_ref > 0.0 { max_abs / max_ref } else { max_abs };
+    let rel_tol = rel_tol_for_head_dim(hd as u32);
     eprintln!(
-        "[validate_dq FSource={:?}] hd={} bq={} seq={} max_abs={:.6e} tol={:.6e}",
-        source, hd, cfg.block_q, seq, max_abs, tol
+        "[validate_dq FSource={:?}] hd={} bq={} seq={} max|dq_gpu|={:.6e} max|dq_ref|={:.6e} \
+         max_abs={:.6e} rel={:.4e} rel_tol={:.4e}",
+        source, hd, cfg.block_q, seq, max_gpu, max_ref, max_abs, rel, rel_tol
     );
+    // Non-vacuous gate (Phase 2.7). The prior gate (`max_abs <= absolute_tol`)
+    // passed a ZERO-output kernel whenever max|dq_ref| fell below tol — which it
+    // did under the ×0.1 inputs, hiding the dq.rs stats-stub bug (dQ == 0).
+    // (1) reference-magnitude floor: ensure the test actually exercises a
+    //     substantial dQ (else the gate is meaningless).
     assert!(
-        max_abs <= tol,
-        "FSource={:?} hd={} bq={} seq={}: max_abs {} > tol {}",
-        source, hd, cfg.block_q, seq, max_abs, tol
+        max_ref > 1e-3,
+        "FSource={:?} hd={}: reference |dQ|={:.3e} too small for a meaningful gate \
+         (raise DQ_GATE_DO_SCALE) — vacuous-gate guard",
+        source, hd, max_ref
+    );
+    // (2) zero-output guard: a kernel that emits ~0 (e.g. stub softmax stats ->
+    //     P=0 -> dQ=0) must FAIL, regardless of tolerance.
+    assert!(
+        max_gpu >= 0.25 * max_ref,
+        "FSource={:?} hd={} seq={}: dQ-kernel output is near-zero \
+         (max|dq_gpu|={:.3e} << max|dq_ref|={:.3e}) — kernel not computing dQ \
+         (stub stats?). ZERO-OUTPUT GUARD.",
+        source, hd, seq, max_gpu, max_ref
+    );
+    // (3) relative-error gate: catches magnitude/shape errors the absolute gate
+    //     misses at small dq_ref.
+    assert!(
+        rel <= rel_tol,
+        "FSource={:?} hd={} seq={}: relative error {:.4e} > rel_tol {:.4e} \
+         (max_abs={:.3e}, max|dq_ref|={:.3e})",
+        source, hd, seq, rel, rel_tol, max_abs, max_ref
     );
 }
 

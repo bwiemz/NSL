@@ -1176,8 +1176,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         None,
     ),
     // Gap D / Tier C (extended by Gap I.5 Option A): CSHA fused backward
-    // launch. 45 i64 args matching the wengert_lower.rs
-    // `PrimalOp::FusedCshaBackward` emission order:
+    // launch. i64 args matching the wengert_lower.rs
+    // `PrimalOp::FusedCshaBackward` emission order, plus the trailing
+    // tier_b2_active flag (CSHA Tier B.2 Phase 3 T6):
     //   36-arg forward-side prelude mirrored off `_with_saves`,
     //   + 6 forward-saved activation pointers,
     //   + dO input + 8 gradient outputs
@@ -1219,6 +1220,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,                         // tier_b_ptx_ptr (planner spec §4)
             types::I64,                         // tier_b_name_ptr (planner spec §4)
             types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
+            types::I64,                         // tier_b2_active (CSHA Tier B.2 Phase 3 T6)
             types::I64,                         // num_docs_or_zero (PCA per-doc CTA backward, Sprint 5)
         ],
         Some(types::I64),
@@ -2266,6 +2268,38 @@ pub fn declare_runtime_functions(
             })?;
 
         fns.insert(name.to_string(), (func_id, sig));
+    }
+
+    // CSHA cycle 19 T1 (variant-B): register the new probe FFI symbol behind
+    // the `csha_cycle19_probe` feature. Signature = 54 original i64 params
+    // (byte-identical to `nsl_flash_attention_csha_backward`) + 2 trailing
+    // i64 probe pointers = 56. Non-default; wired only by c19 probe tests.
+    // See `docs/superpowers` c19 T1 spec + project_csha_paper_completion_cycle18.md.
+    #[cfg(feature = "csha_cycle19_probe")]
+    {
+        let mut sig = module.make_signature();
+        sig.call_conv = call_conv;
+        for _ in 0..56 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+
+        let func_id = module
+            .declare_function(
+                "nsl_flash_attention_csha_backward_probe",
+                Linkage::Import,
+                &sig,
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare runtime fn 'nsl_flash_attention_csha_backward_probe': {e}"
+                ))
+            })?;
+
+        fns.insert(
+            "nsl_flash_attention_csha_backward_probe".to_string(),
+            (func_id, sig),
+        );
     }
 
     Ok(fns)

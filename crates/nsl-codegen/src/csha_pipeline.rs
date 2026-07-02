@@ -91,6 +91,37 @@ impl Default for TileConfig {
     }
 }
 
+/// Which backward kernel family this layer's planner picked.
+///
+/// Sprint 3 (paper §6.3 visibility): rendered alongside the per-layer
+/// forward tier in [`crate::csha::CshaPlan::render_report`] so users can
+/// audit `nsl check --csha-report` and see whether each attention layer
+/// gets the hybrid Tier B.2 MMA backward or the scalar Tier C fallback.
+///
+/// Decoupled from the `flash_attention_v2::tier_b2::BackwardTier` runtime
+/// enum so this struct doesn't depend on the `tier_b2` module's exact
+/// layout: the planner only needs to surface "scalar vs tier_b2" with the
+/// tier_b2 tile dims when applicable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BackwardTierReport {
+    /// Scalar v2 backward (current default; lower throughput).
+    Scalar,
+    /// Tier B.2 MMA backward — planner-pinned `bq`, `bkv`, `chunk`.
+    TierB2 { bq: u32, bkv: u32, chunk: u32 },
+}
+
+impl BackwardTierReport {
+    /// Human-readable label used by [`crate::csha::CshaPlan::render_report`].
+    pub fn as_label(&self) -> String {
+        match self {
+            BackwardTierReport::Scalar => "Tier C (scalar)".to_string(),
+            BackwardTierReport::TierB2 { bq, bkv, chunk } => {
+                format!("Tier B.2 (hybrid, bq={bq}, bkv={bkv}, chunk={chunk})")
+            }
+        }
+    }
+}
+
 /// Per-layer feasibility + cost result.
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerPlan {
@@ -116,6 +147,12 @@ pub struct LayerPlan {
     /// Human-readable reason when `level` had to be downgraded from the
     /// requested level.
     pub downgrade_reason: Option<String>,
+    /// Sprint 3 (paper §6.3): which backward kernel family the planner
+    /// will dispatch for this layer at training time. `Scalar` when the
+    /// Tier B.2 preconditions don't hold (level<2, sm<80, hd not in
+    /// {64,128,256}, or SMEM over budget); `TierB2 { bq, bkv, chunk }`
+    /// when the hybrid backward is eligible.
+    pub backward_tier: BackwardTierReport,
 }
 
 impl LayerPlan {
@@ -356,6 +393,12 @@ pub fn plan_layer(
     let baseline_us = est_latency_us(baseline_hbm, gpu);
     let fused_us = est_latency_us(fused_hbm, gpu);
 
+    // Sprint 3 (paper §6.3 visibility): derive backward tier per layer so the
+    // CSHA report can surface "Tier B.2 (hybrid)" vs "Tier C (scalar)" alongside
+    // the forward tier. Uses the same dispatch predicate the training pipeline
+    // calls at codegen time so the report matches what would actually fire.
+    let backward_tier = layer_backward_tier_report(shape, tiles, gpu, level);
+
     LayerPlan {
         layer,
         level,
@@ -367,6 +410,62 @@ pub fn plan_layer(
         est_time_us: fused_us,
         baseline_time_us: baseline_us,
         downgrade_reason,
+        backward_tier,
+    }
+}
+
+/// Construct a representative `FlashAttentionConfig` from a planner layer
+/// + shape + GPU and ask `backward_dispatch_tier` what backward kernel
+/// would fire for it. Maps the planner's `FusionLevel` to the kernel's
+/// `csha.level: u8` (Boundary=1, Pipeline=2, Block=3); `FusionLevel::None`
+/// yields `BackwardTierReport::Scalar` without consulting the dispatcher
+/// (no CSHA -> no Tier B.2 by definition).
+///
+/// This is a planner-side bridge: it does NOT emit code or affect the
+/// dispatcher's runtime decision. It only mirrors what the dispatcher
+/// would pick given the same inputs, so `--csha-report` can show it.
+fn layer_backward_tier_report(
+    shape: LayerShape,
+    tiles: TileConfig,
+    gpu: &GpuSpec,
+    level: FusionLevel,
+) -> BackwardTierReport {
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use crate::flash_attention_v2::tier_b2::BackwardTier;
+
+    let csha_level: u8 = match level {
+        FusionLevel::None => return BackwardTierReport::Scalar,
+        FusionLevel::Boundary => 1,
+        FusionLevel::Pipeline => 2,
+        FusionLevel::Block => 3,
+    };
+
+    let cfg = FlashAttentionConfig {
+        block_q: tiles.block_q as i64,
+        block_kv: tiles.block_kv as i64,
+        head_dim: tiles.head_dim as i64,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        num_sink_tokens: 0,
+        gpu_sm: gpu.sm_version,
+        segment_masked: false,
+        csha: Some(CshaExtras {
+            level: csha_level,
+            d_model: shape.d_model as u32,
+            ..Default::default()
+        }),
+        checkpoint: None,
+    };
+
+    match backward_dispatch_tier(&cfg) {
+        BackwardTier::Scalar => BackwardTierReport::Scalar,
+        BackwardTier::TierB2 { bq, bkv, chunk } => {
+            BackwardTierReport::TierB2 { bq, bkv, chunk }
+        }
     }
 }
 
@@ -679,6 +778,65 @@ mod tests {
             plan.downgrade_reason
         );
         assert!(plan.downgrade_reason.is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // Sprint 3 (paper §6.3 visibility): backward_tier field
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn backward_tier_is_tier_b2_for_hd128_sm80_pipeline() {
+        // Canonical Tier B.2 admission: hd=128, Ampere+ SM, level=2 (Pipeline).
+        // Picks up the per-hd ladder bq=64, chunk=4 (see tier_b2/dispatch.rs).
+        let gpu = h100();
+        let shape = LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 1024,
+            head_dim: 128,
+            n_kv_heads: 8,
+            dtype_bytes: 2,
+        };
+        let plan = plan_layer("blocks.0", shape, gpu, FusionLevel::Pipeline);
+        match plan.backward_tier {
+            BackwardTierReport::TierB2 { bq, bkv, chunk } => {
+                assert_eq!(bq, 64, "hd=128 ladder pins bq=64");
+                assert_eq!(bkv, 64, "hd=128 ladder pins bkv=64");
+                assert_eq!(chunk, 4, "hd=128 ladder pins chunk=4");
+            }
+            BackwardTierReport::Scalar => {
+                panic!(
+                    "expected Tier B.2 for hd=128 sm=90 level=Pipeline, got Scalar (plan={:?})",
+                    plan
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backward_tier_is_scalar_for_level_none() {
+        // FusionLevel::None has no CSHA -> Tier B.2 can't fire.
+        let gpu = h100();
+        let plan = plan_layer("blocks.0", small_shape(), gpu, FusionLevel::None);
+        assert_eq!(plan.backward_tier, BackwardTierReport::Scalar);
+    }
+
+    #[test]
+    fn backward_tier_is_scalar_for_boundary_level() {
+        // FusionLevel::Boundary maps to csha.level=1 -> dispatch rejects with LevelTooLow.
+        let gpu = h100();
+        let plan = plan_layer("blocks.0", small_shape(), gpu, FusionLevel::Boundary);
+        assert_eq!(plan.backward_tier, BackwardTierReport::Scalar);
+    }
+
+    #[test]
+    fn backward_tier_label_distinguishes_scalar_from_tier_b2() {
+        assert!(BackwardTierReport::Scalar.as_label().contains("Tier C"));
+        assert!(BackwardTierReport::Scalar.as_label().contains("scalar"));
+        let label = BackwardTierReport::TierB2 { bq: 64, bkv: 64, chunk: 4 }.as_label();
+        assert!(label.contains("Tier B.2"), "label='{label}'");
+        assert!(label.contains("hybrid"), "label='{label}'");
+        assert!(label.contains("bq=64"), "label='{label}'");
     }
 
     #[test]
