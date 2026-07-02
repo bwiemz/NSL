@@ -45,6 +45,10 @@ test-hooks = ["nsl-codegen/test-hooks"]
 # enables nsl-runtime's ONNX Runtime custom-op surface (`RegisterCustomOps`) in the
 # .so/.dll produced by `nsl build --shared-lib`.
 onnx-rt-op = ["nsl-runtime/onnx-rt-op"]
+# CSHA cycle 19 T1 — propagate to nsl-codegen + nsl-runtime so the CLI
+# builds cleanly with the dS-probe machinery enabled. Non-invasive on
+# default feature configurations.
+csha_cycle19_probe = ["nsl-codegen/csha_cycle19_probe", "nsl-runtime/csha_cycle19_probe"]
 
 [dev-dependencies]
 tempfile = "3"

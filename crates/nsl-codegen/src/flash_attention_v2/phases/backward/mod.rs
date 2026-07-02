@@ -12,3 +12,7 @@ pub mod dv_accum;
 pub mod dqdk_accum;
 pub mod csha_hooks_backward;
 pub mod finalize;
+/// CSHA cycle 20 T1 — dS-probe emission helper. Feature-gated at
+/// emission time; unconditional no-op stub compiled when the
+/// `csha_cycle19_probe` Cargo feature is off.
+pub mod probe;
