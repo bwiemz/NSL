@@ -899,6 +899,137 @@ pub(crate) mod inner {
         // ordered; profiler flush performs single sync at program end
         res
     }
+
+    // ------------------------------------------------------------------
+    // CFIE engine raw-handle helpers (CFIE Cycle 6 decode-loop wiring).
+    //
+    // `kernel_launch` above re-resolves the CUfunction on every call
+    // (cuModuleGetFunction per launch) — acceptable for training-step
+    // kernels, far too slow for a per-token decode loop.  The CFIE
+    // engine resolves each kernel ONCE at finalize time via
+    // `load_module_once` + `get_function`, then launches through
+    // `launch_function_raw`, which does nothing but cuLaunchKernel.
+    //
+    // Handles cross this boundary as `usize`: CUmodule / CUfunction are
+    // opaque driver pointers and not `Send` on their own, so the CFIE
+    // engine stores the casts behind its own global Mutex — the same
+    // pattern CudaState uses for `module_cache`.
+    // ------------------------------------------------------------------
+
+    /// Load a PTX module once, reusing the content-hash module cache
+    /// shared with `kernel_launch` (loading is one-time, so the FNV-1a
+    /// hash cost is fine here; launching must NOT re-hash).  `ptx_nul`
+    /// must be NUL-terminated.  Returns the CUmodule as `usize`, or
+    /// `Err(positive CUresult code)`.
+    pub(crate) fn load_module_once(ptx_nul: &[u8]) -> Result<usize, u32> {
+        debug_assert_eq!(ptx_nul.last(), Some(&0u8), "PTX must be NUL-terminated");
+        let s = state();
+        let mut guard = s.lock().unwrap();
+        unsafe { cuCtxSetCurrent(guard.context); }
+        // FNV-1a over the PTX bytes excluding the trailing NUL — matches
+        // the hash `kernel_launch` computes by scanning to the NUL, so
+        // CFIE modules and kernel_launch modules share one cache entry.
+        let mut h: u64 = 14695981039346656037u64;
+        for &b in &ptx_nul[..ptx_nul.len().saturating_sub(1)] {
+            h ^= b as u64;
+            h = h.wrapping_mul(1099511628211u64);
+        }
+        if let Some(m) = guard.module_cache.get(&h) {
+            return Ok(*m as usize);
+        }
+        let mut module: CUmodule = std::ptr::null_mut();
+        let res = unsafe { cuModuleLoadData(&mut module, ptx_nul.as_ptr() as *const c_void) };
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res as u32);
+        }
+        guard.module_cache.insert(h, module);
+        Ok(module as usize)
+    }
+
+    /// Resolve a kernel entry point in a module returned by
+    /// `load_module_once`.  Returns the CUfunction as `usize`, or
+    /// `Err(positive CUresult code)`.
+    pub(crate) fn get_function(module: usize, name: &std::ffi::CStr) -> Result<usize, u32> {
+        ensure_context();
+        let mut func: CUfunction = std::ptr::null_mut();
+        let res = unsafe { cuModuleGetFunction(&mut func, module as CUmodule, name.as_ptr()) };
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res as u32);
+        }
+        Ok(func as usize)
+    }
+
+    /// Look up a module-scope global (e.g. the CFIE grammar-mask
+    /// table).  Returns `(device_address, size_bytes)` on success, or
+    /// `Err(positive CUresult code)` — the caller distinguishes
+    /// CUDA_ERROR_NOT_FOUND (symbol absent, legal) from real failures.
+    pub(crate) fn module_get_global(
+        module: usize,
+        name: &std::ffi::CStr,
+    ) -> Result<(u64, usize), u32> {
+        ensure_context();
+        let mut dptr: CUdeviceptr = 0;
+        let mut bytes: usize = 0;
+        let res = unsafe {
+            cuModuleGetGlobal_v2(&mut dptr, &mut bytes, module as CUmodule, name.as_ptr())
+        };
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res as u32);
+        }
+        Ok((dptr as u64, bytes))
+    }
+
+    /// Launch an already-resolved CUfunction on the NULL stream — no
+    /// module load, no function lookup, no PTX hashing.  The CFIE
+    /// decode loop calls this once per kernel per token.  Honors
+    /// NSL_CUDA_SYNC=1 like `kernel_launch`, but returns the async
+    /// error code instead of panicking so the engine FFIs can surface
+    /// it per the CFIE ABI.  Returns 0 on success or the positive
+    /// CUresult code.
+    pub(crate) fn launch_function_raw(
+        func: usize,
+        grid: [u32; 3],
+        block: [u32; 3],
+        args: &[*mut c_void],
+        smem_dyn_bytes: u32,
+    ) -> u32 {
+        ensure_context();
+        if smem_dyn_bytes > 0 {
+            // Dynamic-SMEM opt-in for future extern-.shared CFIE kernels
+            // (mirrors kernel_launch).  All current CFIE kernels declare
+            // static .shared in-module and pass 0 here.
+            let res = unsafe {
+                cuFuncSetAttribute(
+                    func as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_dyn_bytes as i32,
+                )
+            };
+            if res != CUresult::CUDA_SUCCESS {
+                return res as u32;
+            }
+        }
+        let mut kernel_args: Vec<*mut c_void> = args.to_vec();
+        let res = unsafe {
+            cuLaunchKernel(
+                func as CUfunction,
+                grid[0], grid[1], grid[2],
+                block[0], block[1], block[2],
+                smem_dyn_bytes, std::ptr::null_mut(),
+                kernel_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if res != CUresult::CUDA_SUCCESS {
+            return res as u32;
+        }
+        if sync_mode_enabled() {
+            let sync = unsafe { cuCtxSynchronize() };
+            if sync != CUresult::CUDA_SUCCESS {
+                return sync as u32;
+            }
+        }
+        0
+    }
 }
 
 #[cfg(feature = "cuda")]

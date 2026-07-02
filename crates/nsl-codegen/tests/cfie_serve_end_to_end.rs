@@ -8,7 +8,9 @@
 //! point compiles function bodies, not synthesized top-level mains
 //! (same convention as `wrga_freeze_end_to_end.rs`).
 
-use nsl_codegen::cfie::CfiePlan;
+use nsl_codegen::cfie::{
+    choose_kernel_family, kernel_registrations, CfieKernelFamily, CfieLaunchSpec, CfiePlan,
+};
 use nsl_codegen::CompileOptions;
 
 const CFIE_SERVE_SRC: &str = r#"
@@ -202,6 +204,52 @@ fn cfie_serve_block_populates_plan_from_real_inputs() {
         "auto plan must produce at least one INT8 layer kernel"
     );
 
+    // Feature 2 / Cycle 6: the fused decode-sample kernel is emitted
+    // (vocab 49152 is a multiple of the 128 tile, top_k 50 in 1..=64,
+    // d_model 512 <= 8192) with the single-CTA launch geometry.
+    assert_eq!(
+        plan.fused_sample_kernel.as_deref(),
+        Some("nsl_cfie_fused_sample")
+    );
+    let fs_ptx = plan
+        .fused_sample_ptx
+        .as_deref()
+        .expect("fused-sample PTX must be stored on the plan");
+    assert!(fs_ptx.contains(".visible .entry nsl_cfie_fused_sample"));
+    assert!(
+        !fs_ptx.contains("nsl_cfie_grammar_mask"),
+        "no grammar section -> no mask splice"
+    );
+    assert_eq!(
+        plan.fused_sample_launch,
+        Some(CfieLaunchSpec {
+            grid_x: 1,
+            block_x: 128,
+            smem_dyn_bytes: 0
+        })
+    );
+
+    // Cycle 6 family chooser: kv_quant "auto" mixed INT8 in, so the
+    // QUANT family wins registration — kind 5 per layer + the kind-1
+    // sampler; the emitted decode-block/spec kernels stay on the plan
+    // but are NOT registered (mixed-precision pool layout).
+    assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Quant);
+    let regs = kernel_registrations(&plan);
+    assert_eq!(
+        regs.iter().map(|r| (r.kind, r.layer_idx)).collect::<Vec<_>>(),
+        (0..8u32).map(|l| (5u8, l)).chain([(1u8, 0u32)]).collect::<Vec<_>>(),
+        "quant family: 8 per-layer kernels + fused sampler, nothing else"
+    );
+    assert!(regs.iter().all(|r| r.smem_dyn == 0));
+    assert!(
+        regs.iter().all(|r| r.kind != 2),
+        "decode_block emitted on the plan but must NOT register in the quant family"
+    );
+    // grid_x = n_heads (4 = d_model 512 / head_dim 128) for the
+    // attention kernels; 1 for the sampler.
+    assert!(regs.iter().filter(|r| r.kind == 5).all(|r| r.grid_x == 4));
+    assert_eq!(regs.last().unwrap().grid_x, 1);
+
     // The report renders with the real GPU + all six sections.
     let report = plan.render_report();
     assert!(report.contains("CFIE Inference Build Report"));
@@ -212,6 +260,83 @@ fn cfie_serve_block_populates_plan_from_real_inputs() {
     assert!(report.contains("rejection epilogue: nsl_cfie_spec_reject emitted"));
     assert!(report.contains("per-layer decode-attention kernels: 8 emitted"));
     assert!(report.contains("[6] Grammar DFA: disabled"));
+    // Cycle 6 report lines: fused sampler, truthful wiring status, and
+    // the quant-family exclusivity note.
+    assert!(report.contains("fused sampler kernel: nsl_cfie_fused_sample emitted"));
+    assert!(report.contains("registered at serve init"));
+    assert!(report.contains("host decode loop = nsl_cfie_decode_step"));
+    assert!(report.contains("Kernel family: quant"));
+    assert!(report.contains(
+        "decode-block/spec kernels NOT registered (mixed-precision pool layout is incompatible)"
+    ));
+    assert!(
+        !report.contains("launch wiring pending"),
+        "the pending-wiring honesty notes must be replaced by truthful lines"
+    );
+}
+
+#[test]
+fn uniform_fp16_kv_quant_registers_uniform_family() {
+    // Same paper config but kv_quant "uniform_fp16": every layer stays
+    // FP16 -> no per-layer quant kernels -> the UNIFORM family
+    // registers (decode_attn + decode_block + spec verify/reject +
+    // fused sampler).
+    let src = r#"
+fn main():
+    serve Inference:
+        max_batch: 64
+        max_seq: 2048
+        kv_layout: "static"
+        kv_quant: "uniform_fp16"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        d_ff: 1408
+        vocab_size: 49152
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            top_p: 0.9
+            fused: true
+
+        speculative:
+            tokens: 5
+            method: "tree"
+            tree_width: 2
+
+        @endpoint
+        fn generate(prompt: str) -> str:
+            let x = 0
+"#;
+    let plan = compile_cfie(src, &CompileOptions::default()).expect("CFIE active");
+    assert!(
+        plan.quant_attention_kernels.is_empty(),
+        "uniform_fp16 must not emit the per-layer quant family"
+    );
+    assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Uniform);
+    assert!(plan.decode_block_kernel.is_some());
+
+    let regs = kernel_registrations(&plan);
+    assert_eq!(
+        regs.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        vec![0, 2, 3, 4, 1],
+        "uniform family: decode_attn + decode_block + verify + reject + sampler"
+    );
+    assert!(regs.iter().all(|r| r.layer_idx == 0));
+    // Attention-style kernels launch one CTA per head (4 heads);
+    // decode_block and the sampler are single-CTA; reject is one warp.
+    assert_eq!(regs[0].grid_x, 4);
+    assert_eq!((regs[1].grid_x, regs[1].block_x), (1, 128));
+    assert_eq!(regs[2].grid_x, 4);
+    assert_eq!((regs[3].grid_x, regs[3].block_x), (1, 32));
+    assert_eq!((regs[4].grid_x, regs[4].block_x), (1, 128));
+
+    let report = plan.render_report();
+    assert!(report.contains("Kernel family: uniform"));
+    assert!(!report.contains("mixed-precision pool layout is incompatible"));
 }
 
 #[test]
@@ -360,6 +485,94 @@ fn main():
     let report = plan.render_report();
     assert!(report.contains("[6] Grammar DFA:"));
     assert!(report.contains("mask baked into module image"));
+
+    // Cycle 6 miss path: vocab 5 is not a multiple of the 128-wide
+    // sampler tile, so the fused-sample kernel is skipped and the mask
+    // stays unbound (the report says so instead of overclaiming).
+    assert!(plan.fused_sample_kernel.is_none());
+    assert!(report.contains("fused sampler not emitted this build - mask unbound"));
+
+    let _ = std::fs::remove_file(&schema_path);
+    let _ = std::fs::remove_file(&vocab_path);
+}
+
+#[test]
+fn grammar_mask_is_spliced_into_fused_sampler_module() {
+    // A 128-token vocab satisfies the sampler's tile precondition, so
+    // the fused-sample kernel is emitted AND the grammar mask .global
+    // fragment is spliced into its module (Cycle 6) — the host resolves
+    // "nsl_cfie_grammar_mask" via cuModuleGetGlobal at engine finalize.
+    let dir = std::env::temp_dir().join("nsl_cfie_grammar_splice_e2e");
+    let _ = std::fs::create_dir_all(&dir);
+    let schema_path = dir.join("schema.json");
+    std::fs::write(&schema_path, r#"{"type": "boolean"}"#).unwrap();
+    let vocab_path = dir.join("vocab128.txt");
+    let mut vocab = String::from("true\nfalse\n");
+    for i in 0..126 {
+        vocab.push_str(&format!("tok{i}\n"));
+    }
+    std::fs::write(&vocab_path, vocab).unwrap();
+
+    let schema_str = schema_path.display().to_string().replace('\\', "/");
+    let vocab_str = vocab_path.display().to_string().replace('\\', "/");
+    let src = format!(
+        r#"
+fn main():
+    serve WithGrammar:
+        kv_layout: "static"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        vocab_size: 128
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            fused: true
+
+        grammar:
+            schema: "{schema_str}"
+            tokenizer: "{vocab_str}"
+
+        @endpoint
+        fn handle(prompt: str) -> str:
+            let x = 0
+"#
+    );
+    let plan = compile_cfie(&src, &CompileOptions::default())
+        .expect("grammar section must activate CFIE");
+
+    assert!(plan.grammar.is_some());
+    assert!(plan.sampling.params.grammar_masked);
+    assert_eq!(
+        plan.fused_sample_kernel.as_deref(),
+        Some("nsl_cfie_fused_sample")
+    );
+    let fs_ptx = plan
+        .fused_sample_ptx
+        .as_deref()
+        .expect("fused-sample PTX on the plan");
+    assert!(
+        fs_ptx.contains("nsl_cfie_grammar_mask["),
+        "mask .global must be spliced into the sampler module"
+    );
+    // Module-scope placement: header, then mask, then the kernel entry.
+    let addr = fs_ptx.find(".address_size 64").expect("module header");
+    let mask = fs_ptx.find("nsl_cfie_grammar_mask").unwrap();
+    let entry = fs_ptx.find(".visible .entry nsl_cfie_fused_sample").unwrap();
+    assert!(addr < mask && mask < entry);
+    // The spliced module registers as the kind-1 kernel.
+    let regs = kernel_registrations(&plan);
+    let samp = regs
+        .iter()
+        .find(|r| r.kind == 1)
+        .expect("fused sampler must register");
+    assert!(samp.ptx.contains("nsl_cfie_grammar_mask["));
+
+    let report = plan.render_report();
+    assert!(report.contains("spliced into the fused sampler module"));
 
     let _ = std::fs::remove_file(&schema_path);
     let _ = std::fs::remove_file(&vocab_path);

@@ -271,7 +271,10 @@ use crate::cfie::kv_slots::KvSlotAllocator;
 
 static GLOBAL_KV_SLOTS: OnceLock<Mutex<Option<KvSlotAllocator>>> = OnceLock::new();
 
-fn kv_slots_global() -> &'static Mutex<Option<KvSlotAllocator>> {
+/// Shared with `cfie::engine` — the KV-pool alloc/destroy FFIs attach
+/// and detach the device buffer, and the launch FFIs inject
+/// `device_base()` as the kernels' `kv_base` parameter.
+pub(crate) fn kv_slots_global() -> &'static Mutex<Option<KvSlotAllocator>> {
     GLOBAL_KV_SLOTS.get_or_init(|| Mutex::new(None))
 }
 
@@ -428,14 +431,14 @@ pub extern "C" fn nsl_cfie_kv_attach_device(base: i64, bytes: i64) -> i64 {
 #[cfg(test)]
 mod kv_slot_tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
-    // These tests share GLOBAL_KV_SLOTS; serialize them.  The ring
-    // tests' lock is private to their module, so this mod owns its own.
+    // These tests share GLOBAL_KV_SLOTS with the engine tests in
+    // engine.rs — both modules must serialize under the SAME lock or
+    // `cargo test --lib cfie` interleaves slot-allocator mutations
+    // across modules (reproduced flake).
     fn kv_serial_lock() -> MutexGuard<'static, ()> {
-        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-        let m = SERIAL.get_or_init(|| Mutex::new(()));
-        m.lock().unwrap_or_else(|e| e.into_inner())
+        crate::cfie::test_serial_lock()
     }
 
     fn deinit_kv_slots() {
