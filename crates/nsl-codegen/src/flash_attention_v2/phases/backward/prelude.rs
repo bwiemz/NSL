@@ -430,15 +430,21 @@ pub fn emit(
     // for the per-site store emission that consumes these registers.
     if cfg!(feature = "csha_cycle19_probe") {
         ptx.push_str("    .reg .u64 %rd_probe_ds, %rd_probe_dv, %rd_probe_slot;\n");
-        ptx.push_str("    .reg .pred %p_probe_active, %p_probe_gate;\n");
+        ptx.push_str("    .reg .pred %p_probe_active, %p_probe_active_dv, %p_probe_gate;\n");
         ptx.push_str("    .reg .pred %p_probe_w, %p_probe_l, %p_probe_b, %p_probe_h;\n");
         ptx.push_str("    ld.param.u64 %rd_probe_ds, [probe_ds_out_ptr];\n");
         ptx.push_str("    ld.param.u64 %rd_probe_dv, [probe_dv_out_ptr];\n");
-        // %p_probe_active = (%rd_probe_ds != 0). When callers thread a
-        // sentinel 0 (all non-probe launches under feature ON) this
-        // predicate stays false and every downstream probe store is
-        // silently skipped — the byte-identity of gradients is preserved.
+        // %p_probe_active    = (%rd_probe_ds != 0) — gates dS-side stores.
+        // %p_probe_active_dv = (%rd_probe_dv != 0) — gates dV-side stores.
+        // The two predicates are INDEPENDENT so ordering of ds_compute /
+        // dv_accum / dqdk_accum / finalize is not load-bearing (a mirror
+        // caller passing probe_ds=0 && probe_dv!=0 must not fault on dS
+        // stores, and vice-versa a probe_ds!=0 && probe_dv=0 caller must
+        // not have its dS slot-7 store suppressed by the dV setp). See
+        // `phases/backward/probe.rs` for the per-site emission that
+        // consumes these registers (R11 fix, cycle-20 T2 fixup).
         ptx.push_str("    setp.ne.u64 %p_probe_active, %rd_probe_ds, 0;\n");
+        ptx.push_str("    setp.ne.u64 %p_probe_active_dv, %rd_probe_dv, 0;\n");
     }
 
     // Thread/block indices — identical to forward.

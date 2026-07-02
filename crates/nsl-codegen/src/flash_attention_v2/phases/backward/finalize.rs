@@ -197,7 +197,7 @@ pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
             // CSHA cycle 20 T2 — dV_final probe (slot 3). Samples the SMEM
             // cell AFTER all q-block FMAs have landed, on the k=0 unroll
             // (one representative cell). The helper's runtime gate ensures
-            // only (batch=0, head=0, warp_id=1, lane=0) with tid_x==0
+            // only (batch=0, head=0, warp_id=1, lane=0) with tid_x==32
             // reaches the store; combined with k==0, exactly one thread
             // per CTA emits. Cross-check against slot 4 (register-FMA
             // reconstruction from dv_accum) bisects hypothesis (iii)

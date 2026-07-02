@@ -151,14 +151,21 @@ pub fn maybe_emit_dv_probe_store(
     ptx.push_str(&format!(
         "    // ── cycle-20 T2 dV probe slot {slot_idx} := {value_reg} ──\n"
     ));
-    // Compose per-site gate: p_probe_active_dv (rd_probe_dv != 0) &&
-    // %warp_id == 1 && %lane == 0 && %batch_idx == 0 && %head_idx == 0.
-    // We build `%p_probe_active_dv` locally each call so multi-site
-    // reuse doesn't require an extra prelude register slot; the ds-side
-    // %p_probe_active predicate is intentionally NOT reused (a null
-    // probe_ds pointer with a non-null probe_dv pointer would incorrectly
-    // suppress dV emission).
-    ptx.push_str("    setp.ne.u64 %p_probe_active, %rd_probe_dv, 0;\n");
+    // Compose per-site gate: %p_probe_active_dv (rd_probe_dv != 0, set
+    // ONCE in prelude) && %warp_id == 1 && %lane == 0 && %batch_idx == 0
+    // && %head_idx == 0.
+    //
+    // R11 fix (cycle-20 T2 fixup): earlier drafts re-derived
+    // %p_probe_active from %rd_probe_dv here, which CLOBBERED the
+    // prelude-set %p_probe_active (derived from %rd_probe_ds). Since
+    // dv_accum emission runs BEFORE dqdk_accum in the backward pipeline,
+    // that clobber silently suppressed the dS slot-7 store (probe_ds!=0
+    // && probe_dv==0 caller) and null-faulted the dS pipeline (probe_ds==0
+    // && probe_dv!=0 caller). The fix: the prelude now emits a SEPARATE
+    // %p_probe_active_dv predicate; the ds-side helper still consumes
+    // %p_probe_active, and this helper references %p_probe_active_dv —
+    // making dS and dV probe activation ORDER-INDEPENDENT across the
+    // entire backward emission sequence.
     ptx.push_str("    setp.eq.u32 %p_probe_w, %warp_id, 1;\n");
     ptx.push_str("    setp.eq.u32 %p_probe_l, %lane, 0;\n");
     ptx.push_str("    and.pred %p_probe_gate, %p_probe_w, %p_probe_l;\n");
@@ -166,7 +173,7 @@ pub fn maybe_emit_dv_probe_store(
     ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_b;\n");
     ptx.push_str("    setp.eq.u64 %p_probe_h, %head_idx, 0;\n");
     ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_h;\n");
-    ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_active;\n");
+    ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_active_dv;\n");
     // Compute slot address: %rd_probe_slot = %rd_probe_dv + byte_off.
     if byte_off == 0 {
         ptx.push_str("    mov.u64 %rd_probe_slot, %rd_probe_dv;\n");
@@ -294,12 +301,30 @@ mod tests {
     }
 
     #[test]
-    fn dv_probe_gate_uses_dv_pointer_not_ds() {
+    fn dv_probe_uses_separate_active_predicate() {
+        // R11 fix (cycle-20 T2 fixup): the dV helper must reference the
+        // prelude-set %p_probe_active_dv register (NOT %p_probe_active).
+        // This ensures dS and dV probes have independent activation and
+        // ordering of ds_compute / dv_accum / dqdk_accum / finalize does
+        // not silently suppress or null-fault either probe pipeline.
         let c = cfg();
         let mut ptx = String::new();
         maybe_emit_dv_probe_store(&mut ptx, &c, 2, "%f1", 0);
-        // Gate must derive %p_probe_active from %rd_probe_dv, NOT %rd_probe_ds.
-        assert!(ptx.contains("setp.ne.u64 %p_probe_active, %rd_probe_dv, 0"),
-            "dV gate must test the dV pointer for null, not dS");
+        assert!(
+            ptx.contains("and.pred %p_probe_gate, %p_probe_gate, %p_probe_active_dv"),
+            "dV gate AND-chain must consume %p_probe_active_dv (separate predicate)"
+        );
+        // And crucially — the helper must NOT re-derive %p_probe_active
+        // (would clobber the ds-side prelude register).
+        assert!(
+            !ptx.contains("setp.ne.u64 %p_probe_active,"),
+            "dV helper must not re-derive %p_probe_active — that would \
+             clobber the prelude-set dS predicate (R11)"
+        );
+        // Nor should the AND-chain reference the ds-side %p_probe_active.
+        assert!(
+            !ptx.contains("and.pred %p_probe_gate, %p_probe_gate, %p_probe_active;"),
+            "dV gate must NOT reference %p_probe_active (ds-side predicate)"
+        );
     }
 }
