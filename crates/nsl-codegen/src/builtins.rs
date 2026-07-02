@@ -1686,16 +1686,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     // --- M34: Context parallelism (ring attention) ---
-    // CPDT Part III v2.22 — extern signatures REMOVED. The codegen at
-    // `expr/calls.rs` no longer emits `nsl_cp_init` / `nsl_sequence_partition`
-    // / `nsl_ring_attention` / `nsl_ring_send_recv` / `nsl_sequence_gather`
-    // / `nsl_cp_destroy` FFI calls — `@context_parallel` falls through to
-    // the naive attention path with an M34 advisory warning. The runtime
-    // stubs in `crates/nsl-runtime/src/context_parallel/ffi.rs` remain
-    // linked but unused (returned 0 unconditionally, never called from
-    // Cranelift-emitted code). When M34 lands with a finalized runtime
-    // FFI shape, the extern table + emission + runtime impl all get
-    // rewired together against the new shape.
+    // Extern signatures REMOVED across two cycles:
+    //   * CPDT Part III v2.22 unlinked the ring FFI chain from codegen
+    //     (`nsl_cp_init` / `nsl_sequence_partition` / `nsl_ring_attention`
+    //     / `nsl_ring_send_recv` / `nsl_sequence_gather` / `nsl_cp_destroy`)
+    //     and fell `@context_parallel` through to naive attention.
+    //   * M34 v1 (this cycle) deleted the six runtime stubs themselves from
+    //     `crates/nsl-runtime/src/context_parallel/ffi.rs` (they were dead
+    //     symbols with wrong positional layouts) and shipped the
+    //     single-node ring-attention composer
+    //     (`run_ring_attention_full`) verified against `naive_attention`
+    //     on a matrix of shapes and ring sizes. Multi-device distribution
+    //     is deferred until NCCL/IPC lands.
+    // When multi-device distribution lands, a fresh runtime FFI shape gets
+    // designed and the extern table + emission + runtime impl all get
+    // wired together against the new shape.
     // --- M35: FP8 compute ---
     (
         "nsl_fp8_cast",

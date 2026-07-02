@@ -1205,25 +1205,32 @@ impl Compiler<'_> {
 
             // M34: `@context_parallel` decorator (ring attention).
             //
-            // CPDT Part III v2.19 fixed the multi-model lookup via
-            // `resolve_decorator_config_for_call_site`; v2.20 generalized
-            // the helper; v2.21 fixed the F64/I64 scale mismatch. But
-            // v2.20 bug #2 (codegen/FFI positional misalignment — only
-            // position 0 aligns; every non-zero slot carries semantically
-            // wrong bytes) and bug #3 (runtime impl in
-            // `crates/nsl-runtime/src/context_parallel/ffi.rs` returns 0
-            // unconditionally) remained. Both are M34-completion work
-            // requiring a runtime redesign, not v2.x scope.
+            // History: v2.19 fixed the multi-model lookup; v2.20 generalized
+            // the helper; v2.21 fixed the F64/I64 scale mismatch; v2.22
+            // deleted the buggy ring-attention FFI chain (bugs #2/#3) and
+            // fell everything through to naive attention with a blanket
+            // "M34 in progress" warning.
             //
-            // v2.22 (this cycle): delete the buggy ring-attention FFI
-            // chain entirely and fall through to the naive attention
-            // path below. `@context_parallel` becomes advisory — the
-            // build emits a WARNING that the ring-attention runtime is
-            // incomplete, but the method still produces mathematically
-            // correct (undistributed) output via the naive
-            // softmax(QK^T · scale)V path. When M34 lands, someone
-            // rewires the emission against the finalized runtime FFI
-            // shape here, and the warning + fallback go away together.
+            // M34 v1 (this cycle): the runtime layer at
+            // `crates/nsl-runtime/src/context_parallel/` now composes
+            // partition → online-softmax → gather end-to-end in
+            // `run_ring_attention_full` with matrix regression tests
+            // (2/4/8-way ring, causal + non-causal, 3/6/8/16-token
+            // sequences). What's still deferred is the multi-device
+            // send/recv (NCCL / IPC / process coordination) that would
+            // give the ring wall-clock benefit — until that lands, single
+            // node = naive attention wall-clock, and there's no point
+            // rewiring codegen against a runtime FFI whose distribution
+            // slots would all be no-ops.
+            //
+            // Warning policy:
+            //   ring_size == 1: SEMANTIC IDENTITY — no warning. The user
+            //     explicitly asked for a 1-rank ring, which is just
+            //     attention. The decorator carries planning intent but
+            //     doesn't need to nag at compile time.
+            //   ring_size >= 2: emit a warning that names the real gap —
+            //     "multi-device distribution deferred" — so users know the
+            //     forward is correct but not sharded across GPUs.
             let cp_config = crate::moe::resolve_decorator_config_for_call_site(
                 self.current_method_model_name.as_deref(),
                 &self.features.context_parallel_configs,
@@ -1231,15 +1238,18 @@ impl Compiler<'_> {
             .map(|(_, info)| info);
 
             if let Some(cp_info) = cp_config {
-                eprintln!(
-                    "[nsl] warning: @context_parallel(ring_size={}) recognized but the ring-attention runtime is incomplete (M34 in progress); falling through to naive attention. Output is mathematically correct but not distributed.",
-                    cp_info.ring_size
-                );
-                // Fall through to the naive path below. Do NOT emit
-                // any `nsl_cp_init` / `nsl_sequence_partition` /
-                // `nsl_ring_attention` / `nsl_sequence_gather` /
-                // `nsl_cp_destroy` FFI calls — all previously landed
-                // in stub runtime slots and produced wrong output.
+                if cp_info.ring_size >= 2 {
+                    eprintln!(
+                        "[nsl] warning: @context_parallel(ring_size={}) — single-device ring math is verified in the runtime (crates/nsl-runtime/src/context_parallel/attention.rs::run_ring_attention_full), but multi-device distribution (send/recv, NCCL) is deferred; forward runs correctly on this device without sharding K/V across ranks.",
+                        cp_info.ring_size
+                    );
+                }
+                // Fall through to the naive path below either way. Do NOT
+                // emit any ring-attention FFI chain — none exists at the
+                // runtime FFI boundary yet (the v2.22-era stubs were
+                // deleted in M34 v1). When real distribution lands, the
+                // fresh FFI shape gets wired in here and this branch
+                // stops falling through.
             }
 
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V

@@ -21,7 +21,12 @@ pub fn extract_context_parallel_decorator<'a>(
                     if let Some(name_sym) = arg.name {
                         if resolve_sym(name_sym) == "ring_size" {
                             if let ExprKind::IntLiteral(v) = &arg.value.kind {
-                                if *v >= 2 {
+                                // M34 v1: accept ring_size >= 1 (semantic
+                                // identity for r=1). The semantic layer at
+                                // crates/nsl-semantic/src/context_parallel.rs
+                                // enforces >= 1 with a user-facing diagnostic;
+                                // r=0 never reaches here.
+                                if *v >= 1 {
                                     ring_size = *v as usize;
                                 }
                             }
