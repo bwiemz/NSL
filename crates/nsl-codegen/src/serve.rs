@@ -187,7 +187,8 @@ impl Compiler<'_> {
                 // CFIE config keys: consumed by `run_cfie_for_serve`
                 // below — not runtime expressions.
                 "kv_layout" | "kv_quant" | "target_gpu" | "n_layers" | "n_kv_heads"
-                | "kv_heads" | "n_heads" | "head_dim" | "d_model" | "d_ff" | "vocab_size" => {}
+                | "kv_heads" | "n_heads" | "head_dim" | "d_model" | "d_ff" | "vocab_size"
+                | "rope_theta" | "norm_eps" => {}
                 _ => {
                     self.compile_expr(builder, state, &entry.value)?;
                 }
@@ -369,12 +370,195 @@ impl Compiler<'_> {
             }
         }
 
+        // Feature 4 (G16): emit the persistent decode-block kernel only
+        // when the planner sustained full Level-3 block fusion — the
+        // paper's whole-layer claim; Level1/2 stay plan-level with the
+        // honest report note — AND the same static-layout preconditions
+        // as the decode-attention kernel hold (the block appends into
+        // the same baked KV pool that kernel reads).
+        if plan.persistent.fusion == crate::cfie_persistent::FusionLevel::Level3
+            && plan.kv.uses_direct_indexing()
+        {
+            let per_slot = plan
+                .kv
+                .direct
+                .as_ref()
+                .map(|d| d.per_sequence_max_tokens)
+                .unwrap_or(0);
+            let max_slots = plan.persistent.scheduler.max_active;
+            let s = &prepared.shape;
+            let supported = s.head_dim >= 2
+                && s.head_dim % 2 == 0
+                && s.head_dim <= 128
+                && s.d_model >= 1
+                && s.d_model <= 8192
+                && s.d_ff >= 1
+                && s.d_ff <= 32768
+                && s.n_heads % s.n_kv_heads.max(1) == 0
+                && s.n_heads * s.head_dim <= 8192
+                && per_slot >= 1
+                && max_slots >= 1
+                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
+            if supported {
+                let blk_cfg = crate::cfie_persistent_ptx::DecodeBlockConfig {
+                    d_model: s.d_model,
+                    head_dim: s.head_dim,
+                    n_heads: s.n_heads,
+                    n_kv_heads: s.n_kv_heads,
+                    d_ff: s.d_ff,
+                    per_slot_max_tokens: per_slot,
+                    max_slots,
+                    n_layers: s.n_layers,
+                    // Serve keys with the common-architecture defaults;
+                    // a model with a different RoPE base (e.g. 500000)
+                    // or norm epsilon MUST set them or the baked
+                    // constants are numerically wrong.
+                    rope_theta: cfg.rope_theta.unwrap_or(10_000.0) as f32,
+                    eps: cfg.norm_eps.unwrap_or(1e-5) as f32,
+                    sm_version: gpu.sm_version,
+                };
+                let (ptx, meta) = crate::cfie_persistent_ptx::emit(&blk_cfg);
+                // Static .shared declarations are capped at 48 KB per
+                // CTA; a bigger footprint would fail module load, so
+                // downgrade to plan-level instead of shipping dead PTX.
+                if meta.smem_bytes <= 48 * 1024 {
+                    plan.decode_block_kernel = Some(meta.kernel_name);
+                    plan.decode_block_ptx = Some(ptx);
+                }
+            }
+        }
+
+        // Feature 3 (G13/G14): emit the compiled speculative
+        // verification kernels — tree-mask verify attention (each node
+        // row's ancestor mask a baked u64 immediate; no mask tensor
+        // parameter) + rejection-sampling epilogue.  Requires the same
+        // static direct-index KV pool the decode kernels bake: the
+        // verify kernel reads draft rows the host appends at
+        // seq_len..seq_len+num_nodes, and the host rolls rejected rows
+        // back via nsl_cfie_kv_slot_rollback.  Non-tree methods verify
+        // a linear K+1 chain (a width-1 tree mask).
+        let spec_inputs = plan.speculative.as_ref().map(|spec| {
+            let mask = match spec.tree_mask.as_ref() {
+                Some(m) => m.clone(),
+                None => crate::cfie_speculative::build_tree_mask(spec.config.k_tokens + 1, 1),
+            };
+            (mask, spec.config.k_tokens)
+        });
+        if let Some((mask, k_tokens)) = spec_inputs {
+            if plan.kv.uses_direct_indexing() {
+                let per_slot = plan
+                    .kv
+                    .direct
+                    .as_ref()
+                    .map(|d| d.per_sequence_max_tokens)
+                    .unwrap_or(0);
+                let max_slots = plan.persistent.scheduler.max_active;
+                let s = &prepared.shape;
+                let num_nodes = mask.num_nodes;
+                let supported = s.head_dim >= 1
+                    && s.head_dim <= 128
+                    && s.n_heads % s.n_kv_heads.max(1) == 0
+                    && num_nodes >= 1
+                    // K+1 <= 33: a node row's mask bits fit one u64
+                    // immediate; wider trees stay plan-level.
+                    && num_nodes <= 33
+                    && per_slot >= num_nodes
+                    && max_slots >= 1
+                    && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64
+                    && k_tokens >= 1
+                    && (k_tokens as u64) * (s.vocab_size as u64) <= u32::MAX as u64;
+                if supported {
+                    let verify_cfg = crate::cfie_speculative_ptx::VerifyAttentionConfig {
+                        n_heads: s.n_heads,
+                        n_kv_heads: s.n_kv_heads,
+                        head_dim: s.head_dim,
+                        per_slot_max_tokens: per_slot,
+                        max_slots,
+                        num_nodes,
+                        mask_bits: crate::cfie_speculative_ptx::mask_bits_from_tree(&mask),
+                        sm_version: gpu.sm_version,
+                    };
+                    let (vptx, vmeta) =
+                        crate::cfie_speculative_ptx::emit_verify_attention(&verify_cfg);
+                    let reject_cfg = crate::cfie_speculative_ptx::RejectionConfig {
+                        k_tokens,
+                        vocab_size: s.vocab_size,
+                        sm_version: gpu.sm_version,
+                    };
+                    let (rptx, rmeta) =
+                        crate::cfie_speculative_ptx::emit_rejection_kernel(&reject_cfg);
+                    plan.spec_verify_kernel = Some(vmeta.kernel_name);
+                    plan.spec_verify_ptx = Some(vptx);
+                    plan.spec_reject_kernel = Some(rmeta.kernel_name);
+                    plan.spec_reject_ptx = Some(rptx);
+                }
+            }
+        }
+
         // Feature 6 (G11): bake the grammar's valid-token bitmask into
         // the module image as an initialized .global — the data is a
         // compile-time constant; the decode loop binds its device
         // address to the sampler's grammar_mask_ptr param (G16).
         if let Some(dfa) = plan.grammar.as_ref() {
             plan.grammar_mask_ptx = Some(crate::cfie_grammar_ptx::emit_mask_global(dfa));
+        }
+
+        // Feature 5 (G18): per-layer decode-attention kernels with the
+        // KV-quant plan's precision baked into each layer's load path.
+        // Emitted only when the plan mixes in INT8 (an all-FP16 plan is
+        // exactly the base kernel) and every decision is FP16/INT8 (the
+        // v1 emitter refuses INT4/BF16).  This family bakes the
+        // mixed-precision pool layout, which differs from the uniform
+        // f16 pool the base/block/verify kernels assume — the decode
+        // loop picks ONE family per build at integration time.
+        if plan.kv.uses_direct_indexing() && !plan.kv_quant.layers.is_empty() {
+            use crate::cfie_kv_quant::KvPrecision;
+            let s = &prepared.shape;
+            let precisions: Vec<(KvPrecision, KvPrecision)> = plan
+                .kv_quant
+                .layers
+                .iter()
+                .map(|l| (l.k_precision, l.v_precision))
+                .collect();
+            let all_supported = precisions.iter().all(|(k, v)| {
+                matches!(k, KvPrecision::Fp16 | KvPrecision::Int8)
+                    && matches!(v, KvPrecision::Fp16 | KvPrecision::Int8)
+            });
+            let any_int8 = precisions.iter().any(|(k, v)| {
+                matches!(k, KvPrecision::Int8) || matches!(v, KvPrecision::Int8)
+            });
+            let per_slot = plan
+                .kv
+                .direct
+                .as_ref()
+                .map(|d| d.per_sequence_max_tokens)
+                .unwrap_or(0);
+            let max_slots = plan.persistent.scheduler.max_active;
+            let supported = all_supported
+                && any_int8
+                && precisions.len() as u32 == s.n_layers
+                && s.head_dim >= 1
+                && s.head_dim <= 128
+                && s.n_heads % s.n_kv_heads.max(1) == 0
+                && per_slot >= 1
+                && max_slots >= 1
+                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
+            if supported {
+                let qcfg = crate::cfie_kv_quant_ptx::QuantDecodeAttentionConfig {
+                    n_layers: s.n_layers,
+                    n_heads: s.n_heads,
+                    n_kv_heads: s.n_kv_heads,
+                    head_dim: s.head_dim,
+                    per_slot_max_tokens: per_slot,
+                    max_slots,
+                    sm_version: gpu.sm_version,
+                    layer_precisions: precisions,
+                };
+                plan.quant_attention_kernels = crate::cfie_kv_quant_ptx::emit_all(&qcfg)
+                    .into_iter()
+                    .map(|(ptx, meta)| (meta.kernel_name, ptx))
+                    .collect();
+            }
         }
 
         // Build report: the paper's visible artifact (§8).  Provenance +
@@ -386,9 +570,9 @@ impl Compiler<'_> {
             prepared.shape.provenance
         ));
         report.push_str(
-            "Kernel wiring: plan + request-ring init in this build; \
-             kernel-side consumption tracked by CFIE audit gaps \
-             G7/G9/G11/G13/G16/G18.\n",
+            "Kernel wiring: plan + request-ring + KV-slot init in this \
+             build; kernel launch paths land with the decode-loop \
+             integration cycle.\n",
         );
         eprint!("{report}");
         if let Some(path) = self.compile_options.cfie.report_path.clone() {

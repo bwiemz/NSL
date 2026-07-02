@@ -23,7 +23,7 @@ use crate::cfie_fused_sample::{LmHeadShape, SamplingParams, SamplingStrategy};
 use crate::cfie_grammar::{dfa_from_json_schema, CompiledDfa, TokenVocab};
 use crate::cfie_kv_plan::{KvBudget, KvShape};
 use crate::cfie_kv_quant::KvQuantConfig;
-use crate::cfie_persistent::{GpuBudget, PersistentModel};
+use crate::cfie_persistent::PersistentModel;
 use crate::cfie_speculative::{DraftMethod, SpeculativeConfig};
 use crate::error::CodegenError;
 use crate::gpu_specs::GpuSpec;
@@ -76,6 +76,12 @@ pub struct CfieServeConfig {
     pub d_model: Option<i64>,
     pub d_ff: Option<i64>,
     pub vocab_size: Option<i64>,
+    /// RoPE base for the decode-block kernel's baked rotation
+    /// constants (default 10000.0 — Llama-2-family; set 500000.0 for
+    /// Llama-3-family models or the baked angles are wrong).
+    pub rope_theta: Option<f64>,
+    /// RMSNorm epsilon baked into the decode-block kernel (default 1e-5).
+    pub norm_eps: Option<f64>,
     pub sampling: Option<SamplingSection>,
     pub speculative: Option<SpeculativeSection>,
     pub grammar_schema: Option<String>,
@@ -155,6 +161,8 @@ pub fn extract(serve: &ServeBlock, resolve: &dyn Fn(Symbol) -> String) -> CfieSe
             "d_model" => cfg.d_model = entry_int(entry),
             "d_ff" => cfg.d_ff = entry_int(entry),
             "vocab_size" => cfg.vocab_size = entry_int(entry),
+            "rope_theta" => cfg.rope_theta = entry_float(entry),
+            "norm_eps" => cfg.norm_eps = entry_float(entry),
             _ => {}
         }
     }
@@ -587,11 +595,7 @@ pub fn prepare<'a>(
         d_ff: shape.d_ff,
         dtype_bytes: shape.dtype_bytes,
     };
-    let gpu_budget = GpuBudget {
-        smem_per_sm: (gpu.l1_cache_kb as u32) * 1024,
-        num_sms: gpu.num_sms,
-        kernel_launch_us: gpu.kernel_launch_overhead_ns as f64 / 1000.0,
-    };
+    let gpu_budget = crate::cfie_persistent::gpu_budget_from_spec(gpu);
 
     let speculative = cfg.speculative.as_ref().map(|s| {
         let mut spec = SpeculativeConfig::default();

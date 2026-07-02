@@ -87,12 +87,42 @@ pub struct CfiePlan {
     /// the decode-loop lowering when it lands (G16).
     pub decode_attention_kernel: Option<String>,
     pub decode_attention_ptx: Option<String>,
+    /// Feature 4 (G16): the persistent decode-block kernel (one CTA =
+    /// one layer's decode step for one token).  Emitted by the serve
+    /// wiring only when `persistent.fusion` is Level3 — the full-block
+    /// claim; Level1/2 stay plan-level — and the emitter preconditions
+    /// hold.  Consumed by the decode-loop lowering when it lands.
+    pub decode_block_kernel: Option<String>,
+    pub decode_block_ptx: Option<String>,
+    /// Feature 3 (G13/G14): compiled speculative verification kernels.
+    /// `spec_verify_*` is the tree-mask verification attention (each
+    /// node row's ancestor mask baked as a u64 immediate — no mask
+    /// tensor parameter); `spec_reject_*` is the rejection-sampling
+    /// epilogue (Leviathan residual + xorshift64* PRNG).  Emitted by
+    /// the serve wiring when `speculative` is planned AND the KV plan
+    /// selected the static direct-index layout both kernels bake their
+    /// pool strides from.  Consumed by the decode-loop lowering when
+    /// it lands.
+    pub spec_verify_kernel: Option<String>,
+    pub spec_verify_ptx: Option<String>,
+    pub spec_reject_kernel: Option<String>,
+    pub spec_reject_ptx: Option<String>,
     /// Feature 6 (G11): the initialized `.global` PTX fragment baking
     /// the grammar's valid-token bitmask into the module image.
     /// Emitted by the serve wiring when `grammar` is set; the decode
     /// loop binds its device address to the sampler's
     /// `grammar_mask_ptr` param when it lands (G16).
     pub grammar_mask_ptx: Option<String>,
+    /// Feature 5 (G18): per-layer decode-attention kernels with the
+    /// KV-quant plan's precision baked into each layer's load path
+    /// (`nsl_cfie_decode_attn_l{N}` — INT8 layers dequantize in
+    /// registers, FP16 layers load directly; no runtime dispatch).
+    /// `(kernel_name, ptx)` per layer.  NOTE: the quant kernel family
+    /// uses the mixed-precision pool layout from
+    /// `cfie_kv_quant_ptx::pool_layout`, which differs from the
+    /// uniform-f16 pool the base/block/verify kernels bake; the decode
+    /// loop selects ONE family per build at integration time.
+    pub quant_attention_kernels: Vec<(String, String)>,
 }
 
 impl CfiePlan {
@@ -138,6 +168,24 @@ impl CfiePlan {
                 spec.expected_speedup
             )
             .unwrap();
+            if let Some(kernel) = self.spec_verify_kernel.as_ref() {
+                writeln!(
+                    s,
+                    "      verify attention: {} emitted ({} bytes PTX, tree mask baked, launch wiring pending decode-loop integration)",
+                    kernel,
+                    self.spec_verify_ptx.as_ref().map_or(0, |p| p.len())
+                )
+                .unwrap();
+            }
+            if let Some(kernel) = self.spec_reject_kernel.as_ref() {
+                writeln!(
+                    s,
+                    "      rejection epilogue: {} emitted ({} bytes PTX, launch wiring pending decode-loop integration)",
+                    kernel,
+                    self.spec_reject_ptx.as_ref().map_or(0, |p| p.len())
+                )
+                .unwrap();
+            }
         } else {
             writeln!(s, "  [3] Compiled speculative: disabled").unwrap();
         }
@@ -149,6 +197,15 @@ impl CfiePlan {
             self.persistent.baseline_launches_per_layer
         )
         .unwrap();
+        if let Some(kernel) = self.decode_block_kernel.as_ref() {
+            writeln!(
+                s,
+                "      persistent decode block: {} emitted ({} bytes PTX, launch wiring pending decode-loop integration)",
+                kernel,
+                self.decode_block_ptx.as_ref().map_or(0, |p| p.len())
+            )
+            .unwrap();
+        }
         writeln!(
             s,
             "  [5] Per-layer KV quant: {} INT8 layers, {:.1}% memory savings",
@@ -156,6 +213,16 @@ impl CfiePlan {
             100.0 * self.kv_quant.memory_savings_ratio()
         )
         .unwrap();
+        if !self.quant_attention_kernels.is_empty() {
+            writeln!(
+                s,
+                "      per-layer decode-attention kernels: {} emitted \
+                 (precision baked per layer; mixed-precision pool layout — \
+                 the decode loop selects one kernel family at integration)",
+                self.quant_attention_kernels.len()
+            )
+            .unwrap();
+        }
         if let Some(dfa) = self.grammar.as_ref() {
             writeln!(
                 s,
@@ -215,7 +282,14 @@ pub fn run(input: CfieInput) -> CfiePlan {
             solve_us: t0.elapsed().as_micros() as u64,
             decode_attention_kernel: None,
             decode_attention_ptx: None,
+            decode_block_kernel: None,
+            decode_block_ptx: None,
+            spec_verify_kernel: None,
+            spec_verify_ptx: None,
+            spec_reject_kernel: None,
+            spec_reject_ptx: None,
             grammar_mask_ptx: None,
+            quant_attention_kernels: Vec::new(),
         };
     }
 
@@ -288,7 +362,14 @@ pub fn run(input: CfieInput) -> CfiePlan {
         solve_us: t0.elapsed().as_micros() as u64,
         decode_attention_kernel: None,
         decode_attention_ptx: None,
+        decode_block_kernel: None,
+        decode_block_ptx: None,
+        spec_verify_kernel: None,
+        spec_verify_ptx: None,
+        spec_reject_kernel: None,
+        spec_reject_ptx: None,
         grammar_mask_ptx: None,
+        quant_attention_kernels: Vec::new(),
     }
 }
 

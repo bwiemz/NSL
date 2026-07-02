@@ -131,11 +131,86 @@ fn cfie_serve_block_populates_plan_from_real_inputs() {
         "direct indexing must not reference a block table"
     );
 
+    // Feature 4 / G16: the paper config (d_model 512, head_dim 128 ->
+    // 4 derived heads, 4 KV heads, d_ff 1408) fits Level-3 block
+    // fusion on H100 (256 KB SMEM/SM vs ~8 KB modelled residency), so
+    // plan() selects level3 and the serve wiring must emit the
+    // persistent decode-block kernel alongside the plan.
+    assert_eq!(plan.persistent.fusion.as_str(), "level3");
+    let blk = plan
+        .decode_block_kernel
+        .as_deref()
+        .expect("level3 + static layout must emit the decode-block kernel");
+    assert_eq!(blk, "nsl_cfie_decode_block");
+    let blk_ptx = plan
+        .decode_block_ptx
+        .as_deref()
+        .expect("decode-block PTX must be stored on the plan");
+    assert!(blk_ptx.contains(".visible .entry nsl_cfie_decode_block"));
+    // Same baked KV layout as the decode-attention kernel.
+    assert!(blk_ptx.contains("//   token_stride        = 512"));
+
+    // Feature 3 / G13+G14: the tree draft (tokens=5, width=2) yields a
+    // BFS tree of 1+2+4+8+16 = 31 nodes; both verification kernels are
+    // emitted against the same static KV pool.
+    let tree = spec.tree_mask.as_ref().expect("tree method builds a mask");
+    assert_eq!(tree.num_nodes, 31);
+    let vk = plan
+        .spec_verify_kernel
+        .as_deref()
+        .expect("tree speculative + static layout must emit the verify kernel");
+    assert_eq!(vk, "nsl_cfie_spec_verify_attn");
+    let vptx = plan
+        .spec_verify_ptx
+        .as_deref()
+        .expect("verify PTX must be stored on the plan");
+    assert!(vptx.contains(".visible .entry nsl_cfie_spec_verify_attn"));
+    // One baked u64 mask immediate per node row — no mask parameter.
+    assert_eq!(vptx.matches("mov.u64 %rd_mask, 0x").count(), 31);
+    assert!(!vptx.contains("mask_ptr"));
+    // Same baked KV layout as the decode kernels.
+    assert!(vptx.contains("//   token_stride        = 512"));
+    let rk = plan
+        .spec_reject_kernel
+        .as_deref()
+        .expect("speculative must emit the rejection epilogue");
+    assert_eq!(rk, "nsl_cfie_spec_reject");
+    assert!(plan
+        .spec_reject_ptx
+        .as_deref()
+        .expect("reject PTX must be stored on the plan")
+        .contains(".visible .entry nsl_cfie_spec_reject"));
+
+    // Feature 5 / G18: kv_quant "auto" mixes INT8 into the middle
+    // layers, so the per-layer decode-attention kernel family must be
+    // emitted (one kernel per layer, precision baked into each).
+    assert_eq!(
+        plan.quant_attention_kernels.len(),
+        8,
+        "auto kv_quant on the 8-layer fixture must emit one kernel per layer"
+    );
+    assert!(plan
+        .quant_attention_kernels
+        .iter()
+        .any(|(name, ptx)| name == "nsl_cfie_decode_attn_l0"
+            && ptx.contains(".visible .entry nsl_cfie_decode_attn_l0")));
+    // At least one INT8 layer dequantizes in registers.
+    assert!(
+        plan.quant_attention_kernels
+            .iter()
+            .any(|(_, ptx)| ptx.contains("cvt.rn.f32.s8")),
+        "auto plan must produce at least one INT8 layer kernel"
+    );
+
     // The report renders with the real GPU + all six sections.
     let report = plan.render_report();
     assert!(report.contains("CFIE Inference Build Report"));
     assert!(report.contains("H100-SXM"));
     assert!(report.contains("direct-index decode attention: nsl_cfie_decode_attn emitted"));
+    assert!(report.contains("persistent decode block: nsl_cfie_decode_block emitted"));
+    assert!(report.contains("verify attention: nsl_cfie_spec_verify_attn emitted"));
+    assert!(report.contains("rejection epilogue: nsl_cfie_spec_reject emitted"));
+    assert!(report.contains("per-layer decode-attention kernels: 8 emitted"));
     assert!(report.contains("[6] Grammar DFA: disabled"));
 }
 
