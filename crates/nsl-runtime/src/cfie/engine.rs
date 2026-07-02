@@ -381,6 +381,20 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
     0
 }
 
+/// Test/diagnostic accessor: the KV pool device base recorded by
+/// `nsl_cfie_kv_pool_alloc`, or 0 when no pool is allocated.  The GPU
+/// parity tests seed K/V rows by uploading through this base; the
+/// production launch path never needs it (the launch FFIs inject the
+/// base from the slot allocator's attach record).
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_cfie_kv_pool_base() -> i64 {
+    match engine().lock() {
+        Ok(g) => g.pool_base as i64,
+        Err(_) => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Launch plumbing (cuda builds only)
 // ---------------------------------------------------------------------------
@@ -1230,6 +1244,14 @@ mod tests {
         }
 
         deinit_kv_slots();
+        reset_engine();
+    }
+
+    #[test]
+    fn pool_base_accessor_returns_zero_when_unallocated() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        assert_eq!(nsl_cfie_kv_pool_base(), 0);
         reset_engine();
     }
 
