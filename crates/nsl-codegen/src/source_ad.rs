@@ -1146,21 +1146,32 @@ impl AdjointGenerator {
             }
 
             // --- Conv/Pool backward ---
-            AdjointExpr::ConvTransposeInput(y_bar, weight, stride, padding) => self.emit_op(
-                PrimalOp::ConvTranspose2d { stride, padding },
-                vec![y_bar, weight],
+            // Conv2d gradients are REFUSED in source AD (deferral must refuse).
+            // Neither conv arm is reachable today: no extractor emits
+            // `PrimalOp::Conv2d`, so conv models fall back to the tape-based
+            // backward, which implements the correct nested-loop gradients.
+            // These panics exist so that if Conv2d extraction is ever added
+            // without implementing correct source-AD conv gradients, the
+            // compiler fails loudly instead of silently emitting wrong math.
+            AdjointExpr::ConvTransposeInput(_y_bar, _weight, _stride, _padding) => panic!(
+                "[source-ad] Conv2d input gradients are not supported in source AD; \
+                 use the tape AD fallback (do not extract PrimalOp::Conv2d). The \
+                 previous lowering emitted PrimalOp::ConvTranspose2d, whose only \
+                 lowering approximates it with a plain nsl_tensor_conv2d call -- \
+                 not a true transposed convolution -- and would produce incorrect \
+                 input gradients. Implement a real conv_transpose2d (stride \
+                 upsampling + full padding + flipped kernel) before enabling \
+                 Conv2d in source AD."
             ),
-            AdjointExpr::ConvTransposeWeight(input, y_bar) => {
-                // Conv weight gradient requires im2col + matmul (cross-correlation),
-                // not a plain matmul on 4D tensors. The tape-based backward in
-                // backward.rs implements the correct nested loop. For source-AD,
-                // we transpose the input and compute the correlation via matmul
-                // on the flattened spatial dimensions.
-                // TODO(M40c): implement proper im2col + matmul for 4D conv grad.
-                // For now, transpose input and matmul (correct for 2D FC-like convs).
-                let input_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![input]);
-                self.emit_op(PrimalOp::Matmul, vec![input_t, y_bar])
-            }
+            AdjointExpr::ConvTransposeWeight(_input, _y_bar) => panic!(
+                "[source-ad] Conv2d weight gradients are not supported in source AD; \
+                 use the tape AD fallback (do not extract PrimalOp::Conv2d). The \
+                 previous transpose+matmul lowering was incorrect for 4D \
+                 convolution -- the weight gradient requires im2col + matmul \
+                 (cross-correlation of the input with grad_output), not \
+                 transpose(input) @ grad. Implement im2col before enabling \
+                 Conv2d in source AD."
+            ),
             AdjointExpr::MaxPoolBackward(y_bar, indices) => {
                 // MaxPool backward: scatter grad to argmax positions
                 self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices])
@@ -4186,6 +4197,31 @@ mod tests {
             "reduce_to_shape inputs must be (raw_mul_result, target), got {:?}",
             ops[1].inputs,
         );
+    }
+
+    /// Deferral-must-refuse: the `ConvTransposeWeight` arm previously lowered
+    /// Conv2d weight gradients as `transpose(input) @ grad`, which is
+    /// mathematically wrong for 4D convolution (requires im2col + matmul).
+    /// The arm is unreachable from any extractor today (nothing emits
+    /// `PrimalOp::Conv2d`; conv falls back to tape AD), but it must refuse
+    /// loudly rather than silently emit wrong gradients if ever reached.
+    #[test]
+    #[should_panic(expected = "Conv2d weight gradients are not supported in source AD")]
+    fn lower_adjoint_expr_conv_weight_grad_refuses() {
+        let mut gen = AdjointGenerator::new(200);
+        let _ = gen.lower_adjoint_expr(AdjointExpr::ConvTransposeWeight(0, 100));
+    }
+
+    /// Sibling refusal: `ConvTransposeInput` previously emitted
+    /// `PrimalOp::ConvTranspose2d`, whose only lowering (wengert_lower.rs)
+    /// is a documented approximation that calls plain `nsl_tensor_conv2d`
+    /// -- not a transposed convolution -- so the input-gradient arm was
+    /// equally silently-wrong-if-reached and must refuse the same way.
+    #[test]
+    #[should_panic(expected = "Conv2d input gradients are not supported in source AD")]
+    fn lower_adjoint_expr_conv_input_grad_refuses() {
+        let mut gen = AdjointGenerator::new(200);
+        let _ = gen.lower_adjoint_expr(AdjointExpr::ConvTransposeInput(100, 1, 1, 0));
     }
 
     /// CPDT Part II activation: the source-AD lowering of `Mul`'s backward
