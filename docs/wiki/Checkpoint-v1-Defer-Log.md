@@ -1356,3 +1356,97 @@ forward path structural correctness.
 7. **csha_check_report_cli.rs broken-test census** (arch-hardening scoping)
 8. **%rd_dk_* cosmetic rename** — deferred cycles 16+17+18+19
 
+## Cycle 20 (2026-07-01): T1 dS-probe emit + launcher refactor LANDED, T2 dV probe LANDED, T3 non-fused save 2 bugs LANDED, T4 G16-3 triage LANDED (classification (d))
+
+### Scope
+
+Cycle 20 shipped **4 tasks LANDED** (T1 + T2 + T3 + T4) plus **T5 DEFERRED_C21**
+(blocked on GPU access). Phase-A synthesizer delivered post-c20 CSHA paper
+closure estimate: **5–7 cycles** across 5 buckets, confidence **62%**.
+
+### T1 — dS probe emit + launcher refactor (`f2005719` + `5b351cb9` + `271a2763`)
+
+- probe.rs module + 8 gated `st.global.f32` at ds_compute (slots 0-6) + dqdk_accum (slot 7)
+- Runtime FFI refactored: private `csha_backward_impl(..., Option<(u64,u64)>)`;
+  public 54-param wraps with `None`; probe FFI wraps with `Some((ds, dv))`
+- c19 XFAIL test: compile-time ABI check (56-i64 signature validator) + GPU body
+  #[ignore]d pending c21
+- R11 fixup: dead col-gate deleted; slot 7 doc corrected (samples col=block_kv-1)
+
+### T2 — dV probe extension (`a50b55ba` + `5b8badb6`)
+
+- 5 dV probe slots at (warp_id=1, lane=0): slots 0/1/2/4 at dv_accum, slot 3 at
+  finalize (SMEM readback)
+- **Bisection contract:** slot 3 vs slot 4 — equality REFUTES (iii)
+  inter-phase SMEM corruption; inequality bisects to (iv) accumulator-write
+- R11 fixup: separate `%p_probe_active_dv` — dS/dV probes now use INDEPENDENT
+  active predicates
+- Static analysis in Phase A **REFUTED hypothesis (iii)** via SMEM-layout audit;
+  (iv) is HIGHEST prior for c21 T5
+
+### T3 — non-fused save 2 bugs (`bf67b3af` + `94b8da18`)
+
+- **Bug A:** K-save moved AFTER `emit_k_tile_load` (pre-fix: uninitialized %k_smem_base)
+- **Bug B:** V-save `k_start + kv_row` (K/V-indexed) instead of `q_start + warp_row`
+- **R3 BLOCK fixup:** `%rd_save_bh` declared in `phases/forward/prelude.rs:297`;
+  regression test extended with `t3_all_rd_save_regs_declared` scan
+  (RED-then-GREEN verified)
+- 2 non-fused snapshots re-baked; fused-path untouched
+- **Known-limitation:** K-save via `csha_hooks.rs:917-919` still uses Q-indexed
+  row math — pre-existing, scoped out; c21 followup
+
+### T4 — G16-3 forward `+0xB30` triage (`21ee08e9`)
+
+**Static-analysis classification (d): c18 hypothesis REFUTED.** For head_dim=64,
+SMEM address `base(16-aligned) + wrow·128 + col·2` is always even; per-lane
+stride is 4 bytes; neither matches `0x5 + 0xA·lane` (10-byte stride, odd base).
+`emit_save_activations_subset` is NOT the offending emitter. FFI alignment audit
+clean (256-byte cuMemAlloc guarantee).
+
+c21 requires SASS mapping via `cuobjdump` on sm_120 hardware.
+
+### Adversarial review (3-lens, `whkdaq335` + `wnbvjmlba`)
+
+- **R1:** APPROVE_SHIP T1/T3/T4; APPROVE_WITH_FIXUPS T2
+- **R3:** APPROVE_SHIP T1/T2/T4; **BLOCK T3** (undeclared `%rd_save_bh`, conf 95)
+- **R11:** **BLOCK T1** (dead col-gate, conf 9/10); **BLOCK T2** (register clobber,
+  conf 9/10); APPROVE_WITH_FIXUPS T3/T4
+
+All 3 HIGH-severity BLOCK findings resolved via parallel fixup workflow.
+Post-merge: 2349/2349 default lib + 2358/2358 probe-on + 25/25 fa_v2_snapshots
+byte-identical + `csha_backward_ffi_hygiene` 1/1.
+
+### §6.3 status
+
+**UNCHANGED:** STRUCTURAL PARTIAL NUMERICAL UNVERIFIED. Substantial machinery
+shipped (probe FFI end-to-end, dV bisection contract, non-fused save fixes)
+but numerical closure requires GPU access → c21.
+
+### Meta-lessons codified
+
+1. **Feature-flag probe machinery is landable without GPU access** — compile-verified
+   plumbing (ABI check, snapshot byte-identity, unit tests) shippable pre-observation
+2. **Shared prelude registers are load-bearing across helper boundaries** — R11 caught
+   `%p_probe_active` clobber; rule: distinct registers per helper OR documented ordering
+3. **Text-level regression tests miss ptxas hazards** — R3 caught `%rd_save_bh`;
+   rule: emit-path tests must include register-scan assertion
+4. **Static analysis can REFUTE hypotheses** — Phase A refuted (iii) dV and c18 G16-3
+   without wasted implementation cycles
+5. **Honest PARTIAL splits by dependency** — T1 partial (PTX emit) + T1-followup
+   (launcher) landed independently with independent review
+6. **Cycle-start drift check** — `git log --oneline origin/main ^HEAD | wc -l`
+   confirmed only 4 non-CSHA commits; catch-up deferred to close-out
+
+### Carryover to c21
+
+1. **T5:** GPU dispatch + numerical CPU-reference matching (dS at row=1,col=0;
+   dV at j=284/202/158 for bisection)
+2. **G16-1 emit_dproj 2nd defect** — dk max_rel=21.46 (c17 residual)
+3. **G16-3 SASS mapping** — cuobjdump on sm_120; c18/c20 candidates REFUTED
+4. **T3 K-save Q-indexing residual** — pre-existing `csha_hooks.rs:917-919`
+5. **Non-CSHA cos/sin indexing** (c19 T3 orthogonal)
+6. **§5 paper docs audit** (1 cycle mostly-docs)
+7. **§6.3 GPU oracle regeneration** (once dV+G16-3 close)
+8. **Integration + release-readiness** (1 cycle final)
+
+
