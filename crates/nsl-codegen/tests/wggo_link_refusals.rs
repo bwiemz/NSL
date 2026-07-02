@@ -4,10 +4,14 @@
 //! §5.2 is fully tested here via symbol-presence inspection on real emitted .o
 //! files — no actual linker execution needed.
 //!
-//! §5.1 (runtime batch-shape mismatch → exit-3) is verified at the IR level:
-//! we check that `nsl_calib_model_backward` is exported and the wrapper contains
-//! the shape-validation iconst.i32(3) return path.  A subprocess-execution test
-//! is deferred until a calibration subprocess harness is available.
+//! §5.1 (runtime batch-shape mismatch → exit-3) is verified at two levels:
+//! at the IR level we check that `nsl_calib_model_backward` is exported and
+//! the wrapper contains the shape-validation iconst.i32(3) return path, and
+//! at the subprocess level `backward_batch_shape_mismatch_subprocess_returns_3`
+//! executes the real linked calibration binary against deliberately
+//! mismatched runtime data (via the test-only
+//! `HarnessConfig.runtime_data_override` fault-injection seam) and asserts
+//! the structured status-3 refusal surfaces through `real_subprocess_entry`.
 
 use std::path::PathBuf;
 
@@ -50,6 +54,47 @@ fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
         parsed.diagnostics
     );
     (parsed.module, interner)
+}
+
+/// Parse + analyze the WGGO merge-gate fixture (`wggo_attention_mlp_real.nsl`)
+/// into a compile bundle for `real_subprocess_entry`. Mirrors
+/// `wggo_fixture_compile_bundle` in `wggo_backward_pipeline.rs` (test binaries
+/// are separate crates, so the helper cannot be shared without a common
+/// support module).
+fn wggo_fixture_compile_bundle(
+) -> std::sync::Arc<nsl_codegen::calibration::CalibrationCompileBundle> {
+    let source = std::fs::read_to_string(fixture("wggo_attention_mlp_real.nsl"))
+        .expect("merge-gate fixture readable");
+    let mut interner = Interner::new();
+    let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
+    assert!(
+        lex_diags.iter().all(|d| !matches!(d.level, Level::Error)),
+        "fixture must lex cleanly: {lex_diags:?}"
+    );
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, Level::Error)),
+        "fixture must parse cleanly: {:?}",
+        parsed.diagnostics
+    );
+    let mut analysis_interner = interner.clone();
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut analysis_interner);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, Level::Error)),
+        "fixture must pass semantic analysis: {:?}",
+        analysis.diagnostics
+    );
+    std::sync::Arc::new(nsl_codegen::calibration::CalibrationCompileBundle {
+        ast: parsed.module,
+        interner: analysis_interner,
+        type_map: analysis.type_map.clone(),
+    })
 }
 
 /// Compile options WITHOUT `calibration_grad_retention` — calib_model.o
@@ -322,51 +367,124 @@ fn backward_wrapper_exported_with_shape_validation() {
     );
 }
 
-/// §5.1 (subprocess-level): defensive test for the runtime status-3 path
-/// (per-batch shape mismatch returned by `nsl_calib_model_{forward,backward}`).
+/// §5.1 (subprocess-level): end-to-end fault-injection test for the runtime
+/// status-3 path (per-batch shape mismatch returned by
+/// `nsl_calib_model_{forward,backward}` and surfaced by the scaffolding's
+/// mid-loop status check).
 ///
-/// The calibration subprocess harness IS now available — PRs #144/#146/#148/#149
-/// closed the hop chain that previously blocked it, and
-/// `wggo_backward_pipeline::end_to_end_backward_subprocess_matches_analytical_reference`
-/// proves the end-to-end path works. What's still missing is a way to trigger
-/// the status-3 branch from outside the wrapper: `real_subprocess_entry` uses
-/// the SAME calibration data file for both compile-time shape derivation
-/// (`peek_batch_seq`) and runtime feeding, so the wrapper's
-/// `batch_elem_count == expected_elem_count` check is unsatisfiable-by-fault
-/// — they always agree by construction. Reaching the mismatch path needs
-/// either (a) a heterogeneous calibration data loader that returns
-/// varying-size batches (none exists today; `load_bin` rejects mismatched
-/// payloads at load time) or (b) plumbing to invoke the linked calibration
-/// binary with a data file distinct from the one used for compile-time
-/// metadata. Neither is on a current roadmap.
+/// `real_subprocess_entry` normally uses the SAME calibration data file for
+/// both compile-time shape derivation (`peek_batch_seq`) and runtime feeding,
+/// so the wrapper's `batch_elem_count == expected_elem_count` check is
+/// unsatisfiable by construction. The test-only
+/// `HarnessConfig.runtime_data_override` seam splits the two roles:
 ///
-/// Coverage today: the IR-level Task-14 unit tests in
-/// `binary_codegen::backward_wrapper` directly assert the wrapper emits the
-/// `icmp + brif` to the status-3 return on shape mismatch, which is
-/// equivalent at the binary level.
+/// 1. The model object is compiled against the real WGGO merge-gate fixture
+///    (`wggo_calib_data.safetensors`, shape [8, 4, 32] → per-call input
+///    [1, seq=4, dim=32] = 128 f32 elements).
+/// 2. The linked calibration binary is executed with argv[1] pointing at a
+///    deliberately mismatched rank-3 NSLB batch file ([8, 8, 32] → 256 f32
+///    elements per batch).
+/// 3. The wrapper refuses each batch with status 3; the scaffolding writes
+///    the structured "batch shape mismatch" detail to the sidecar path and
+///    exits 3; `real_subprocess_entry` folds both into the surfaced
+///    `HarnessError::Infrastructure` reason.
+///
+/// The fixture registers only the WGGO gradient hook (no AWQ projections),
+/// so the arena-based first-batch preflight is skipped and the wrapper's
+/// per-batch check is the sole gate — exactly the §5.1 path under test.
 #[test]
-#[ignore = "§5.1 (defensive): subprocess status-3 path is validated at the IR \
-            level by binary_codegen::backward_wrapper unit tests. Triggering \
-            it end-to-end requires either heterogeneous calibration data \
-            (no loader supports this) or a refactor of real_subprocess_entry \
-            to accept distinct compile-vs-runtime data paths. Tracked as \
-            future infrastructure work — not a WGGO Phase 2 blocker."]
 fn backward_batch_shape_mismatch_subprocess_returns_3() {
-    // When this test is un-ignored, the harness should:
-    // 1. Build a real calib_model.o + scaffolding.o with backward enabled.
-    // 2. Link and execute the resulting binary.
-    // 3. Pass calibration data whose batch_elem_count != batch*seq*channels.
-    // 4. Assert the subprocess exits with status code 3.
-    //
-    // Blocking detail: step 3 needs a data path with per-batch size different
-    // from what `peek_batch_seq` reported during compile. The simplest
-    // delivery is an optional `runtime_data_override: Option<PathBuf>` on
-    // `HarnessConfig` (test-only) plus a paired fixture file with mismatched
-    // shape — see the issue tracker for design discussion.
-    unimplemented!(
-        "see #[ignore] message: subprocess status-3 trigger needs \
-         heterogeneous-data loader or compile/runtime path split"
+    use nsl_codegen::calibration::binary_codegen::real_subprocess_entry;
+    use nsl_codegen::calibration::wggo_gradient_hook::WggoGradientHook;
+    use nsl_codegen::calibration::{HarnessConfig, HarnessError, HarnessMode, HookRegistry};
+
+    let data_path = fixture("wggo_calib_data.safetensors");
+    let weights_path = fixture("wggo_calib_weights.safetensors");
+    assert!(data_path.exists(), "fixture missing: {}", data_path.display());
+    assert!(
+        weights_path.exists(),
+        "fixture missing: {}",
+        weights_path.display()
     );
+
+    // Compile bundle + WGGO targets from the merge-gate fixture — same
+    // construction as the green-path merge gate in wggo_backward_pipeline.rs,
+    // so any failure here isolates to the injected runtime data.
+    let compile_bundle = wggo_fixture_compile_bundle();
+    let targets = nsl_codegen::calibration::discovery::pre_scan_wggo_targets_from_ast(
+        &compile_bundle.ast,
+        &compile_bundle.interner,
+    );
+    assert!(
+        !targets.is_empty(),
+        "fixture must yield at least one @wggo_target for the backward path"
+    );
+
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(WggoGradientHook::new(targets)));
+
+    // Mismatched runtime data: rank-3 NSLB [8, 8, 32] vs fixture [8, 4, 32].
+    // Per-batch payload 8*32 = 256 f32 elements vs the compile-time expected
+    // 1*4*32 = 128 (model object compiled with calibration_batch_seq (1, 4)).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "nsl-wggo-status3-{nanos}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create unique temp dir");
+    let override_path = tmp_dir.join("mismatched_calib.bin");
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"NSLB");
+    blob.extend_from_slice(&3u32.to_le_bytes()); // rank 3
+    for dim in [8u32, 8, 32] {
+        blob.extend_from_slice(&dim.to_le_bytes());
+    }
+    // 8 batches x (8*32) f32 each. Values never reach compute — the wrapper
+    // refuses on element count first — but use a non-zero ramp so an
+    // accidentally-accepted run cannot masquerade as a degenerate-zero result.
+    for i in 0..(8u32 * 8 * 32) {
+        blob.extend_from_slice(&(((i % 17) as f32) * 0.25 + 0.5).to_le_bytes());
+    }
+    std::fs::write(&override_path, blob).expect("write mismatched NSLB data file");
+
+    let cfg = HarnessConfig {
+        checkpoints: vec![weights_path],
+        calibration_data: data_path,
+        samples: 8,
+        batch_size: 1,
+        timeout_secs: 60,
+        mode: HarnessMode::Required,
+        // WGGO-only flow: no AWQ projections, so the arena preflight is
+        // skipped and the wrapper's per-batch check is the sole gate.
+        projections: Vec::new(),
+        compile_bundle: Some(compile_bundle),
+        runtime_data_override: Some(override_path),
+    };
+
+    let result = real_subprocess_entry(&cfg, &registry);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    match result {
+        Err(HarnessError::Infrastructure { reason }) => {
+            assert!(
+                reason.contains("status 3"),
+                "expected subprocess status-3 refusal, got: {reason}"
+            );
+            assert!(
+                reason.contains("batch shape mismatch"),
+                "expected structured batch-shape-mismatch detail (written by the \
+                 subprocess to the sidecar path) in the surfaced reason, got: {reason}"
+            );
+        }
+        Ok(out) => panic!(
+            "mismatched runtime data must NOT produce a sidecar; got outcome {:?}",
+            out.outcome_repr
+        ),
+        Err(other) => panic!("expected Infrastructure(status 3), got {other:?}"),
+    }
 }
 
 /// PR 1b regression: when `calibration_grad_retention` is non-empty, the

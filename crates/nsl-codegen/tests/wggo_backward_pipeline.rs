@@ -240,6 +240,7 @@ fn end_to_end_backward_subprocess_matches_analytical_reference() {
         // derived from the AST inside real_subprocess_entry.
         projections: Vec::new(),
         compile_bundle: Some(compile_bundle),
+        runtime_data_override: None,
     };
 
     let sidecar = real_subprocess_entry(&cfg, &registry)

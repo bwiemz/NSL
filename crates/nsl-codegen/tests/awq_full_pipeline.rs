@@ -638,6 +638,7 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
         mode: HarnessMode::Required,
         projections,
         compile_bundle: Some(compile_bundle),
+        runtime_data_override: None,
     };
 
     let sidecar = real_subprocess_entry(&cfg, &registry)
@@ -695,6 +696,7 @@ fn snapshot_awq_sidecar_baseline() {
         mode: HarnessMode::Required,
         projections,
         compile_bundle: Some(compile_bundle),
+        runtime_data_override: None,
     };
 
     let sidecar = real_subprocess_entry(&cfg, &registry)

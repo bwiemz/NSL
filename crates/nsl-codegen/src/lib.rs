@@ -1435,6 +1435,9 @@ pub fn compile_and_calibrate(
                         .clone()
                         .unwrap_or_default(),
                     compile_bundle: compiler.compile_options.calibration_compile_bundle.clone(),
+                    // Test-only fault-injection seam — production never
+                    // overrides the subprocess's runtime data file.
+                    runtime_data_override: None,
                 };
                 match crate::calibration::binary_codegen::real_subprocess_entry(&cfg, &registry) {
                     Ok(out) => {
