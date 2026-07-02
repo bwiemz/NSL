@@ -2625,8 +2625,14 @@ fn build_fused_ce_cfg(
 }
 
 /// CFTP v4-2: derive the FFI dtype_tag + emitter Dtype from the active
-/// `@fused_lm_ce` decorator config. Reads `compiler.fused_ce_configs[0]`
-/// (which is the only entry — a train block carries at most one decorator).
+/// `@fused_lm_ce` decorator config.
+///
+/// CFTP v10 (item 3): reads `compiler.active_fused_ce_config`, which
+/// `compile_train_block` installs from the entry in `fused_ce_configs`
+/// whose `train_block_stmt_id` matches the current train block.
+/// Pre-v10 this was `fused_ce_configs.first()`, silently binding every
+/// train block to the FIRST decorator's dtype — see the semantic checker
+/// note this fix reversed.
 ///
 /// Returns `(dtype_tag, emitter_dtype)`:
 /// * `(0, Dtype::F32)` for `dtype = "f32"` or absent decorator
@@ -2652,8 +2658,8 @@ fn fused_ce_dtype_for_compiler(
     // it codifies the documented `disabled → composite preserved` invariant
     // as a single-source-of-truth filter.
     match compiler
-        .fused_ce_configs
-        .first()
+        .active_fused_ce_config
+        .as_ref()
         .filter(|c| c.enabled)
         .and_then(|c| c.dtype)
     {
@@ -3180,14 +3186,16 @@ fn lower_fused_linear_ce_backward_extract(
         // `(B*S*H + V*H + V) * 2 bytes` (which assumed one cast per
         // forward+backward step, not two).  Defensive dtype check: the
         // cached dtype_tag MUST match the current backward dtype_tag —
-        // a mismatch means `fused_ce_configs[0].dtype` was mutated
+        // a mismatch means `active_fused_ce_config.dtype` (CFTP v10
+        // item 3; pre-v10: `fused_ce_configs[0].dtype`) was mutated
         // between forward and backward emission (e.g., a curriculum
-        // that flips dtype mid-step), in which case reusing the cached
-        // cast bytes would silently feed the wrong byte layout to the
-        // kernel.  Fall back to a fresh cast emission on miss so a
-        // separately-compiled backward without a forward cache entry
-        // still works (this is the path taken by backward-only
-        // compilation pipelines).
+        // that flips dtype mid-step, or the backward runs under a
+        // DIFFERENT train block's active config than the forward),
+        // in which case reusing the cached cast bytes would silently
+        // feed the wrong byte layout to the kernel.  Fall back to a
+        // fresh cast emission on miss so a separately-compiled
+        // backward without a forward cache entry still works (this
+        // is the path taken by backward-only compilation pipelines).
         let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) = match compiler
             .fused_ce_fwd_casts
             .get(&fwd_result_key)
@@ -3197,7 +3205,7 @@ fn lower_fused_linear_ce_backward_extract(
                 if cached_dtype != dtype_tag {
                     return Err(CodegenError::new(format!(
                         "FusedLinearCeBackwardExtract: cached forward cast dtype_tag={} \
-                         != current backward dtype_tag={} — `fused_ce_configs[0].dtype` \
+                         != current backward dtype_tag={} — `active_fused_ce_config.dtype` \
                          was mutated between forward and backward emission. \
                          This violates the v6 single-source-of-truth invariant \
                          (`fused_ce_dtype_for_compiler` must return the same value \

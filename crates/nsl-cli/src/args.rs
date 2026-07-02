@@ -682,6 +682,19 @@ pub(crate) struct BuildArgs {
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
 
+        /// CFIE: compiler-fused inference-engine mode ("full",
+        /// "sampling", or "off").  Passing `--cfie` without a value
+        /// enables full mode.  Overrides the serve block's `@cfie`
+        /// decorator; serve-block CFIE keys (kv_layout, sampling:, ...)
+        /// activate CFIE even without this flag.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        pub(crate) cfie: Option<String>,
+
+        /// CFIE: also write the inference build report to this file.
+        /// The report always prints to stderr when CFIE is active.
+        #[arg(long, value_name = "PATH")]
+        pub(crate) cfie_report: Option<PathBuf>,
+
         /// Path to calibration dataset (.bin or .safetensors).  When
         /// omitted, calibration is skipped entirely.
         #[arg(long, value_name = "PATH")]

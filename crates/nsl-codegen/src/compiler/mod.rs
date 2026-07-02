@@ -29,7 +29,8 @@ use crate::error::CodegenError;
 // Re-export the free functions for `pub use compiler::{...}` in lib.rs
 pub use entry_points::{
     compile, compile_entry, compile_module, compile_module_with_imports,
-    compile_module_with_imports_best_effort_plan, compile_module_with_imports_returning_plan,
+    compile_module_with_imports_best_effort_plan, compile_module_with_imports_best_effort_plans,
+    compile_module_with_imports_returning_plan,
     compile_entry_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_zk_info,
@@ -177,6 +178,18 @@ pub struct ModelMetadata {
     /// accidentally treat tensor shapes as nested model types. Consumed
     /// by `wrga_adapter_inject::resolve_dims_for_target`.
     pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
+    /// CFTP v10 (item 5): declared tensor rank of `model.field` weight
+    /// declarations, keyed as `model_name -> field_name -> rank`.
+    /// Populated by `collection.rs` when a model field is annotated as
+    /// `Tensor<[..N dims..], dtype>` OR carries a shape-literal initializer
+    /// such as `zeros([D, V, H])`.  Consumed by the source-AD extractor
+    /// (`register_param_with_rank` at model-field Param registration
+    /// sites) so the fused-linear-CE matcher can refuse rank-3+ `W`
+    /// operands even when the weight is loaded via `self.field` — the
+    /// exact MoE-expert-stack scenario item 5 was introduced to close.
+    /// Distinct from `model_tensor_field_shapes`, which stores 2-D
+    /// shapes as strings for the WRGA adapter injector only.
+    pub model_field_ranks: HashMap<String, HashMap<String, usize>>,
     /// M62 Task 5: impl FuncId + signature for @export model methods.
     /// Key: (model_name, method_name). Consumed by Task 6 when compiling
     /// the impl body so it can reference the declared FuncId.
@@ -216,6 +229,7 @@ impl ModelMetadata {
             paged_kv_configs: HashMap::new(),
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
+            model_field_ranks: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
             agent_var_types: HashMap::new(),
             agent_auto_device_params: HashMap::new(),
@@ -550,15 +564,40 @@ pub struct Compiler<'a> {
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 
+    // ── CFIE side-channel (Tier-A wiring) ────────────────────────────
+    /// `@cfie(mode=..., target=...)` decorator values captured in the
+    /// `Decorated` stmt arm before the inner serve block compiles.
+    /// Consumed (taken) by `compile_serve_block`.
+    pub cfie_decorator_mode: Option<crate::cfie::CfieMode>,
+    /// `@cfie(target=h100)` GPU-name override, same lifecycle as
+    /// `cfie_decorator_mode`.
+    pub cfie_decorator_target: Option<String>,
+    /// The most recent `CfiePlan` produced while compiling a serve
+    /// block, kept for observability (build report / future `nsl
+    /// check` surface).  `None` when no serve block opted into CFIE.
+    pub last_cfie_plan: Option<crate::cfie::CfiePlan>,
+
     // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
     /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
     /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
-    /// is present.  Sprint 2 stores these without consuming them; Sprint
-    /// 2.5 will read `fused_ce_configs[0].enabled` at the cross_entropy
-    /// lowering site to drive substitution toward `nsl_fused_linear_ce_*`
-    /// FFIs.  The marker comment in `wengert_lower.rs::PrimalOp::CrossEntropyLoss`
-    /// documents the deferred substitution site.
+    /// is present.  CFTP v10 (item 3) allows multiple entries — one per
+    /// decorated `train` block, each tagged with its
+    /// `train_block_stmt_id`.  Codegen looks up the right entry via
+    /// `set_active_fused_ce_config_for_train_block` at the start of each
+    /// train-block lowering.
     pub fused_ce_configs: Vec<crate::FusedCeDecoratorConfig>,
+
+    /// CFTP v10 (item 3): the fused-CE decorator config for the train block
+    /// currently being lowered, if any.  Set by `compile_train_block` /
+    /// `compile_train_block_pipelined` via
+    /// `set_active_fused_ce_config_for_train_block` on entry (looked up
+    /// from `fused_ce_configs` by `train_block_stmt_id`) and cleared on
+    /// exit.  Downstream consumers — `fused_ce_dtype_for_compiler` in
+    /// `wengert_lower.rs` and the source-AD extraction site in
+    /// `stmt.rs` — read this field instead of `fused_ce_configs.first()`,
+    /// so a second `@fused_lm_ce` on a different train block no longer
+    /// leaks the first block's dtype hint.
+    pub active_fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
 
     // ── CFTP §4.3 G2 Strategy 3 side-channel (Item 4) ────────────────
     /// `@pca(strategy=...)` strategies for this compile, forwarded from
@@ -842,7 +881,11 @@ impl<'a> Compiler<'a> {
             fused_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            cfie_decorator_mode: None,
+            cfie_decorator_target: None,
+            last_cfie_plan: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
+            active_fused_ce_config: None,
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
             cpdt_cluster: options.cpdt.cluster.clone(),
@@ -880,6 +923,40 @@ impl<'a> Compiler<'a> {
     /// Resolve a Symbol to its interned string.
     pub fn resolve_sym(&self, sym: Symbol) -> &str {
         self.interner.resolve(sym.0).unwrap_or("<unknown>")
+    }
+
+    /// CFTP v10 (item 3): install the fused-CE decorator config for the
+    /// train block whose `Stmt.id == stmt_id`, if any.  Returns the
+    /// previous `active_fused_ce_config` so callers can restore it on exit
+    /// (mirrors the FASE/PCA `saved_*` pattern used by nested blocks).
+    ///
+    /// Consumers — `fused_ce_dtype_for_compiler` in `wengert_lower.rs` and
+    /// the source-AD extraction site in `stmt.rs` — read
+    /// `active_fused_ce_config` instead of `fused_ce_configs.first()`, so
+    /// a second `@fused_lm_ce` on a different train block does not leak the
+    /// first block's dtype hint or shape metadata.
+    pub fn set_active_fused_ce_config_for_train_block(
+        &mut self,
+        stmt_id: nsl_ast::NodeId,
+    ) -> Option<crate::FusedCeDecoratorConfig> {
+        let saved = self.active_fused_ce_config.clone();
+        self.active_fused_ce_config = self
+            .fused_ce_configs
+            .iter()
+            .find(|c| c.train_block_stmt_id == stmt_id)
+            .cloned();
+        saved
+    }
+
+    /// CFTP v10 (item 3): restore the `active_fused_ce_config` slot to a
+    /// value previously returned by
+    /// [`set_active_fused_ce_config_for_train_block`].  Called on exit
+    /// from `compile_train_block` / `compile_train_block_pipelined`.
+    pub fn restore_active_fused_ce_config(
+        &mut self,
+        saved: Option<crate::FusedCeDecoratorConfig>,
+    ) {
+        self.active_fused_ce_config = saved;
     }
 
     /// Get the inferred type of an AST node by NodeId.

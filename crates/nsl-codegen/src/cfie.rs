@@ -2,13 +2,16 @@
 //!
 //! Composes the six CFIE passes (KV plan, fused sample, speculative,
 //! persistent decode + scheduler, KV quant, grammar) into a single
-//! [`CfiePlan`] the backend consumes.  Produces a human-readable
-//! report matching paper §8's sample output.
+//! [`CfiePlan`].  Invoked from `serve.rs::run_cfie_for_serve` (Tier-A
+//! wiring) with inputs assembled by `cfie_serve.rs`.  Today the plan
+//! drives the build report and the request-ring init call; kernel-side
+//! consumers land with audit gaps G7/G9/G11/G13/G16/G18.  Produces a
+//! human-readable report matching paper §8's sample output.
 
 use serde::Serialize;
 
 use crate::cfie_fused_sample::{emit_program as emit_sample, FusedSampleProgram, LmHeadShape, SamplingParams};
-use crate::cfie_grammar::{compile as compile_dfa, CompiledDfa, GrammarSpec};
+use crate::cfie_grammar::{compile as compile_dfa, minimise as minimise_dfa, CompiledDfa, GrammarSpec};
 use crate::cfie_kv_plan::{plan as plan_kv, KvBudget, KvLayoutPlan, KvShape};
 use crate::cfie_kv_quant::{plan as plan_kv_quant, KvQuantConfig, KvQuantPlan};
 use crate::cfie_persistent::{plan as plan_persistent, GpuBudget, PersistentModel, PersistentPlan};
@@ -59,6 +62,10 @@ pub struct CfieInput<'a> {
     pub speculative: Option<SpeculativeConfig>,
     pub speculative_acceptance: f32,
     pub grammar: Option<GrammarSpec>,
+    /// Pre-compiled token-level DFA (the G12 schema->token pipeline in
+    /// `cfie_grammar::dfa_from_json_schema`).  Takes precedence over
+    /// `grammar` when both are set.
+    pub grammar_dfa: Option<CompiledDfa>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +81,48 @@ pub struct CfiePlan {
     pub kernel_launches_per_token_baseline: u32,
     pub kernel_launches_per_token_cfie: u32,
     pub solve_us: u64,
+    /// Feature 1 (G7): the direct-indexing decode-attention kernel,
+    /// emitted by the serve wiring when the KV plan selects a static
+    /// layout and the v1 emitter's preconditions hold.  Consumed by
+    /// the decode-loop lowering when it lands (G16).
+    pub decode_attention_kernel: Option<String>,
+    pub decode_attention_ptx: Option<String>,
+    /// Feature 4 (G16): the persistent decode-block kernel (one CTA =
+    /// one layer's decode step for one token).  Emitted by the serve
+    /// wiring only when `persistent.fusion` is Level3 — the full-block
+    /// claim; Level1/2 stay plan-level — and the emitter preconditions
+    /// hold.  Consumed by the decode-loop lowering when it lands.
+    pub decode_block_kernel: Option<String>,
+    pub decode_block_ptx: Option<String>,
+    /// Feature 3 (G13/G14): compiled speculative verification kernels.
+    /// `spec_verify_*` is the tree-mask verification attention (each
+    /// node row's ancestor mask baked as a u64 immediate — no mask
+    /// tensor parameter); `spec_reject_*` is the rejection-sampling
+    /// epilogue (Leviathan residual + xorshift64* PRNG).  Emitted by
+    /// the serve wiring when `speculative` is planned AND the KV plan
+    /// selected the static direct-index layout both kernels bake their
+    /// pool strides from.  Consumed by the decode-loop lowering when
+    /// it lands.
+    pub spec_verify_kernel: Option<String>,
+    pub spec_verify_ptx: Option<String>,
+    pub spec_reject_kernel: Option<String>,
+    pub spec_reject_ptx: Option<String>,
+    /// Feature 6 (G11): the initialized `.global` PTX fragment baking
+    /// the grammar's valid-token bitmask into the module image.
+    /// Emitted by the serve wiring when `grammar` is set; the decode
+    /// loop binds its device address to the sampler's
+    /// `grammar_mask_ptr` param when it lands (G16).
+    pub grammar_mask_ptx: Option<String>,
+    /// Feature 5 (G18): per-layer decode-attention kernels with the
+    /// KV-quant plan's precision baked into each layer's load path
+    /// (`nsl_cfie_decode_attn_l{N}` — INT8 layers dequantize in
+    /// registers, FP16 layers load directly; no runtime dispatch).
+    /// `(kernel_name, ptx)` per layer.  NOTE: the quant kernel family
+    /// uses the mixed-precision pool layout from
+    /// `cfie_kv_quant_ptx::pool_layout`, which differs from the
+    /// uniform-f16 pool the base/block/verify kernels bake; the decode
+    /// loop selects ONE family per build at integration time.
+    pub quant_attention_kernels: Vec<(String, String)>,
 }
 
 impl CfiePlan {
@@ -94,6 +143,15 @@ impl CfiePlan {
         writeln!(s).unwrap();
         writeln!(s, "Optimizations applied:").unwrap();
         writeln!(s, "  [1] KV layout: {} ({})", self.kv.kind.as_str(), self.kv.rationale).unwrap();
+        if let Some(kernel) = self.decode_attention_kernel.as_ref() {
+            writeln!(
+                s,
+                "      direct-index decode attention: {} emitted ({} bytes PTX, launch wiring pending G16)",
+                kernel,
+                self.decode_attention_ptx.as_ref().map_or(0, |p| p.len())
+            )
+            .unwrap();
+        }
         writeln!(
             s,
             "  [2] Fused decode-sample: {} ops ({:.1} KB HBM saved per token)",
@@ -110,6 +168,24 @@ impl CfiePlan {
                 spec.expected_speedup
             )
             .unwrap();
+            if let Some(kernel) = self.spec_verify_kernel.as_ref() {
+                writeln!(
+                    s,
+                    "      verify attention: {} emitted ({} bytes PTX, tree mask baked, launch wiring pending decode-loop integration)",
+                    kernel,
+                    self.spec_verify_ptx.as_ref().map_or(0, |p| p.len())
+                )
+                .unwrap();
+            }
+            if let Some(kernel) = self.spec_reject_kernel.as_ref() {
+                writeln!(
+                    s,
+                    "      rejection epilogue: {} emitted ({} bytes PTX, launch wiring pending decode-loop integration)",
+                    kernel,
+                    self.spec_reject_ptx.as_ref().map_or(0, |p| p.len())
+                )
+                .unwrap();
+            }
         } else {
             writeln!(s, "  [3] Compiled speculative: disabled").unwrap();
         }
@@ -121,6 +197,15 @@ impl CfiePlan {
             self.persistent.baseline_launches_per_layer
         )
         .unwrap();
+        if let Some(kernel) = self.decode_block_kernel.as_ref() {
+            writeln!(
+                s,
+                "      persistent decode block: {} emitted ({} bytes PTX, launch wiring pending decode-loop integration)",
+                kernel,
+                self.decode_block_ptx.as_ref().map_or(0, |p| p.len())
+            )
+            .unwrap();
+        }
         writeln!(
             s,
             "  [5] Per-layer KV quant: {} INT8 layers, {:.1}% memory savings",
@@ -128,6 +213,16 @@ impl CfiePlan {
             100.0 * self.kv_quant.memory_savings_ratio()
         )
         .unwrap();
+        if !self.quant_attention_kernels.is_empty() {
+            writeln!(
+                s,
+                "      per-layer decode-attention kernels: {} emitted \
+                 (precision baked per layer; mixed-precision pool layout — \
+                 the decode loop selects one kernel family at integration)",
+                self.quant_attention_kernels.len()
+            )
+            .unwrap();
+        }
         if let Some(dfa) = self.grammar.as_ref() {
             writeln!(
                 s,
@@ -137,6 +232,14 @@ impl CfiePlan {
                 100.0 * dfa.density()
             )
             .unwrap();
+            if let Some(mask) = self.grammar_mask_ptx.as_ref() {
+                writeln!(
+                    s,
+                    "      mask baked into module image ({} bytes PTX, launch wiring pending G16)",
+                    mask.len()
+                )
+                .unwrap();
+            }
         } else {
             writeln!(s, "  [6] Grammar DFA: disabled").unwrap();
         }
@@ -177,6 +280,16 @@ pub fn run(input: CfieInput) -> CfiePlan {
             kernel_launches_per_token_baseline: 500,
             kernel_launches_per_token_cfie: 500,
             solve_us: t0.elapsed().as_micros() as u64,
+            decode_attention_kernel: None,
+            decode_attention_ptx: None,
+            decode_block_kernel: None,
+            decode_block_ptx: None,
+            spec_verify_kernel: None,
+            spec_verify_ptx: None,
+            spec_reject_kernel: None,
+            spec_reject_ptx: None,
+            grammar_mask_ptx: None,
+            quant_attention_kernels: Vec::new(),
         };
     }
 
@@ -185,7 +298,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
 
     // 2. Fused sampler.  Enable grammar masking when a grammar is set.
     let mut sampling_params = input.sampling;
-    sampling_params.grammar_masked = input.grammar.is_some();
+    sampling_params.grammar_masked = input.grammar.is_some() || input.grammar_dfa.is_some();
     let sampling = emit_sample(sampling_params, input.lm_head);
 
     // 3. Persistent decode + scheduler.
@@ -212,12 +325,16 @@ pub fn run(input: CfieInput) -> CfiePlan {
         None
     };
 
-    // 6. Grammar DFA (optional).
+    // 6. Grammar DFA (optional).  Pre-compiled token DFAs (G12 serve
+    // pipeline) win over edge-list specs; both get Hopcroft-minimised
+    // (the audit flagged `minimise` as implemented-but-never-called) —
+    // fewer states means a smaller baked mask, same language.
     let grammar = if input.mode == CfieMode::Full {
         input
-            .grammar
-            .as_ref()
-            .and_then(|spec| compile_dfa(spec).ok())
+            .grammar_dfa
+            .clone()
+            .or_else(|| input.grammar.as_ref().and_then(|spec| compile_dfa(spec).ok()))
+            .map(|dfa| minimise_dfa(&dfa))
     } else {
         None
     };
@@ -243,6 +360,16 @@ pub fn run(input: CfieInput) -> CfiePlan {
         kernel_launches_per_token_baseline: baseline,
         kernel_launches_per_token_cfie: cfie_launches,
         solve_us: t0.elapsed().as_micros() as u64,
+        decode_attention_kernel: None,
+        decode_attention_ptx: None,
+        decode_block_kernel: None,
+        decode_block_ptx: None,
+        spec_verify_kernel: None,
+        spec_verify_ptx: None,
+        spec_reject_kernel: None,
+        spec_reject_ptx: None,
+        grammar_mask_ptx: None,
+        quant_attention_kernels: Vec::new(),
     }
 }
 
@@ -291,6 +418,7 @@ mod tests {
             speculative: Some(SpeculativeConfig::default()),
             speculative_acceptance: 0.6,
             grammar: None,
+            grammar_dfa: None,
         }
     }
 
@@ -321,6 +449,48 @@ mod tests {
         assert!(plan.grammar.is_some());
         // The sampler must have grammar masking turned on.
         assert!(plan.sampling.params.grammar_masked);
+    }
+
+    #[test]
+    fn grammar_dfa_input_wins_and_is_minimised() {
+        use crate::cfie_grammar::GrammarEdge;
+        // 4-state DFA with two merge-equivalent middle states; Hopcroft
+        // must collapse them (proves cfie::run actually calls minimise).
+        let spec = GrammarSpec {
+            num_states: 4,
+            vocab_size: 32_000,
+            start_state: 0,
+            accept_states: vec![3],
+            edges: vec![
+                GrammarEdge { from: 0, token_id: 0, to: 1 },
+                GrammarEdge { from: 0, token_id: 1, to: 2 },
+                GrammarEdge { from: 1, token_id: 0, to: 3 },
+                GrammarEdge { from: 2, token_id: 0, to: 3 },
+            ],
+        };
+        let dfa = crate::cfie_grammar::compile(&spec).unwrap();
+        let mut input = nslcoder_input();
+        input.grammar_dfa = Some(dfa.clone());
+        let plan = run(input);
+        let planned = plan.grammar.expect("grammar_dfa must reach the plan");
+        assert!(
+            planned.num_states < dfa.num_states,
+            "minimise must merge equivalent states: {} vs {}",
+            planned.num_states,
+            dfa.num_states
+        );
+        assert!(plan.sampling.params.grammar_masked);
+    }
+
+    #[test]
+    fn report_includes_baked_mask_line_when_present() {
+        let mut input = nslcoder_input();
+        input.grammar = Some(GrammarSpec::sequence(&[5, 6, 7], 32_000));
+        let mut plan = run(input);
+        let dfa = plan.grammar.as_ref().unwrap();
+        plan.grammar_mask_ptx = Some(crate::cfie_grammar_ptx::emit_mask_global(dfa));
+        let rep = plan.render_report();
+        assert!(rep.contains("mask baked into module image"));
     }
 
     #[test]

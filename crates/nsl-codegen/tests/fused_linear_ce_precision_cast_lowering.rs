@@ -63,6 +63,7 @@ fn cfg_for_dtype_hint(
         batch_size: Some(BATCH),
         seq_len: Some(SEQ),
         dtype: hint,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     }
 }
 

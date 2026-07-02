@@ -29,6 +29,36 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
 }
 
+/// CFTP v10 (item 5): return the declared tensor rank of `ty` when it is
+/// unambiguously a tensor with a non-empty shape.
+///
+/// `nsl_semantic::types::Shape::unknown()` and `Shape::scalar()` both
+/// produce `Shape { dims: vec![] }`, so we cannot distinguish an
+/// unannotated `Tensor` from a genuine rank-0 scalar tensor.  We treat
+/// empty shape as UNKNOWN (`None`) so the matcher preserves its
+/// conservative-fire behaviour for unannotated code — the load-bearing
+/// rank check runs only when the frontend gave us a rank ≥ 1 to check.
+/// A `Borrow(Tensor)` is unwrapped so annotated `&Tensor<[V,H]>`
+/// parameters (common for `W` in NSL step signatures) participate too.
+fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
+    let inner = match ty {
+        Type::Borrow(inner) => inner.as_ref(),
+        other => other,
+    };
+    let rank = match inner {
+        Type::Tensor { shape, .. }
+        | Type::Param { shape, .. }
+        | Type::Buffer { shape, .. }
+        | Type::Sparse { shape, .. } => shape.rank(),
+        _ => return None,
+    };
+    if rank == 0 {
+        None
+    } else {
+        Some(rank)
+    }
+}
+
 /// Allowlist of legal `data:` section config keys. Mirrors
 /// `nsl-semantic/src/checker/block.rs::DATA_SECTION_KEYS` — both must stay
 /// in sync. A key present here but missing in the semantic table will reach
@@ -1370,7 +1400,11 @@ impl Compiler<'_> {
             }
 
             StmtKind::TrainBlock(train) => {
-                self.compile_train_block(builder, state, train)?;
+                // CFTP v10 (item 3): thread the enclosing `Stmt.id` so
+                // `compile_train_block` can look up its `@fused_lm_ce`
+                // config by AST NodeId instead of hitting
+                // `fused_ce_configs.first()`.
+                self.compile_train_block(builder, state, train, stmt.id)?;
             }
 
             StmtKind::StructDef(_)
@@ -1429,6 +1463,43 @@ impl Compiler<'_> {
                                             self.cpdt_weight_aware = b;
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // CFIE Tier-A wiring (audit gap G4): capture
+                    // `@cfie(mode=..., target=...)` on a serve block so
+                    // `compile_serve_block` consumes it instead of the
+                    // config being validated-then-dropped.
+                    if d.name.len() == 1
+                        && self.resolve_sym(d.name[0]) == "cfie"
+                        && matches!(stmt.kind, StmtKind::ServeBlock(_))
+                    {
+                        // A bare `@cfie` means "enable, full mode".
+                        self.cfie_decorator_mode = Some(crate::cfie::CfieMode::Full);
+                        if let Some(args) = &d.args {
+                            for arg in args {
+                                let Some(name_sym) = arg.name else { continue };
+                                let aname = self.resolve_sym(name_sym).to_string();
+                                match (aname.as_str(), &arg.value.kind) {
+                                    ("mode", nsl_ast::expr::ExprKind::Ident(sym)) => {
+                                        let m = self.resolve_sym(*sym).to_string();
+                                        self.cfie_decorator_mode =
+                                            crate::cfie::CfieMode::parse(&m);
+                                    }
+                                    ("mode", nsl_ast::expr::ExprKind::StringLiteral(s)) => {
+                                        self.cfie_decorator_mode =
+                                            crate::cfie::CfieMode::parse(s);
+                                    }
+                                    ("target", nsl_ast::expr::ExprKind::Ident(sym)) => {
+                                        self.cfie_decorator_target =
+                                            Some(self.resolve_sym(*sym).to_string());
+                                    }
+                                    ("target", nsl_ast::expr::ExprKind::StringLiteral(s)) => {
+                                        self.cfie_decorator_target = Some(s.clone());
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -3286,11 +3357,45 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
         train: &nsl_ast::block::TrainBlock,
+        // CFTP v10 (item 3): AST NodeId of the enclosing `TrainBlock`
+        // `Stmt`, used to install the correct `@fused_lm_ce` decorator
+        // config into `self.active_fused_ce_config` before source-AD
+        // extraction and fused-LCE dtype resolution.
+        train_block_stmt_id: nsl_ast::NodeId,
     ) -> Result<(), CodegenError> {
         // M43b: Pipeline parallel detection
         if self.features.pipeline_config.is_some() {
-            return self.compile_train_block_pipelined(builder, state, train);
+            return self.compile_train_block_pipelined(
+                builder,
+                state,
+                train,
+                train_block_stmt_id,
+            );
         }
+
+        // CFTP v10 (item 3): install the fused-CE config for THIS train
+        // block; restored on exit unconditionally so an Err bubble does
+        // not leave stale state for the next train block.  Doing it here
+        // (rather than at the dispatcher) keeps the invariant local to
+        // the two `compile_train_block*` entry points, so no future
+        // reentry loses the slot.
+        let saved_active_fused_ce =
+            self.set_active_fused_ce_config_for_train_block(train_block_stmt_id);
+        let result = self.compile_train_block_inner(builder, state, train);
+        self.restore_active_fused_ce_config(saved_active_fused_ce);
+        result
+    }
+
+    /// CFTP v10 (item 3): pulled out so `compile_train_block` can wrap it
+    /// with a `set_active_fused_ce_config_for_train_block` prologue and a
+    /// matching restore epilogue — regardless of which early-return path
+    /// the body takes.
+    fn compile_train_block_inner(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        train: &nsl_ast::block::TrainBlock,
+    ) -> Result<(), CodegenError> {
 
         let saved_variables = state.variables.clone();
         let saved_variable_types = state.variable_types.clone();
@@ -4091,11 +4196,19 @@ impl Compiler<'_> {
             // policies collected by EffectChecker through CompileOptions into
             // the extractor. Empty map = byte-identity preserved.
             //
-            // CFTP §4.4 G3 (Sprint 4): plumb the first `@fused_lm_ce` decorator
-            // into the extractor so `fused_linear_ce(...)` calls inside this
-            // train block can be recognised as a single `PrimalOp::FusedLinearCe`
+            // CFTP §4.4 G3 (Sprint 4): plumb the `@fused_lm_ce` decorator into
+            // the extractor so `fused_linear_ce(...)` calls inside this train
+            // block can be recognised as a single `PrimalOp::FusedLinearCe`
             // when v1's enabled + shape-hint preconditions hold.
-            let fused_ce_cfg = self.fused_ce_configs.first().cloned();
+            //
+            // CFTP v10 (item 3): read `active_fused_ce_config`, which is set
+            // in `compile_train_block` from the fused_ce_configs entry whose
+            // `train_block_stmt_id` matches THIS train block.  Pre-v10 this
+            // read was `fused_ce_configs.first()`, silently binding EVERY
+            // train block's substitution to the FIRST decorator's shape/dtype
+            // hints — see `feedback_deferral_must_refuse` and the semantic
+            // checker's pre-v10 refusal note.
+            let fused_ce_cfg = self.active_fused_ce_config.clone();
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
                 .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone())
                 .with_fused_ce_config(fused_ce_cfg);
@@ -4103,6 +4216,13 @@ impl Compiler<'_> {
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
             extractor.set_model_field_types(self.models.model_field_types.clone());
+            // CFTP v10 (item 5): thread per-model-field rank info so the
+            // source-AD extractor can populate `known_ranks` when it
+            // registers a model-field weight as a `Param` leaf.  This
+            // closes the LATENT 3-D+ RISK on the MoE expert stack
+            // scenario (`self.experts.weight: [D, V, H]` accessed via
+            // `matmul(x, transpose(self.experts.weight, -2, -1)) + bias`).
+            extractor.set_model_field_ranks(self.models.model_field_ranks.clone());
             // WRGA B.3.2 Option 3: plumb synth overrides so the extractor
             // resolves sentinel-Ident callees/members emitted by the
             // adapter rewrite (fused FFI name + adapter field names).
@@ -4112,9 +4232,21 @@ impl Compiler<'_> {
             // Register the model variable as a model instance so method calls get inlined
             extractor.register_model_instance(model_sym, &model_type_name);
 
-            // Pre-register outer variables visible in the step body as inputs
+            // Pre-register outer variables visible in the step body as inputs.
+            //
+            // CFTP v10 (item 5): thread the rank derived from the semantic
+            // `variable_types` table so
+            // `try_match_fused_linear_ce_pattern` can refuse rank-3+ `W`
+            // operands.  A missing/zero-rank entry stays `None` → matcher
+            // preserves its pre-v10 conservative-fire behaviour on
+            // unannotated `Tensor` params.  See
+            // [`resolvable_tensor_rank`].
             for &sym in state.variables.keys() {
-                extractor.register_input(sym);
+                let rank = state
+                    .variable_types
+                    .get(&sym)
+                    .and_then(resolvable_tensor_rank);
+                extractor.register_input_with_rank(sym, rank);
             }
 
             let extraction_ok = extractor.extract_stmts(&step_body.stmts);
@@ -6928,6 +7060,26 @@ impl Compiler<'_> {
     /// M43c; the initial implementation runs the full model in a single
     /// process with logical stage-to-stage communication.
     fn compile_train_block_pipelined(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        train: &nsl_ast::block::TrainBlock,
+        // CFTP v10 (item 3): matches `compile_train_block`; installs the
+        // fused-CE decorator config for THIS train block before the
+        // pipelined lowering runs and restores it before returning.
+        train_block_stmt_id: nsl_ast::NodeId,
+    ) -> Result<(), CodegenError> {
+        let saved_active_fused_ce =
+            self.set_active_fused_ce_config_for_train_block(train_block_stmt_id);
+        let result = self.compile_train_block_pipelined_inner(builder, state, train);
+        self.restore_active_fused_ce_config(saved_active_fused_ce);
+        result
+    }
+
+    /// CFTP v10 (item 3): pipelined-body analogue of
+    /// [`compile_train_block_inner`] so the `active_fused_ce_config`
+    /// prologue/epilogue can wrap the pipelined path uniformly.
+    fn compile_train_block_pipelined_inner(
         &mut self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,

@@ -160,6 +160,23 @@ impl<'a> TypeChecker<'a> {
             }
             self.check_expr(&entry.value);
         }
+        // CFIE sections (`sampling:` / `speculative:` / `grammar:`): the
+        // entries are literal configuration values validated by
+        // `cfie::validate_serve_config` below — deliberately NOT
+        // `check_expr`'d so enum-like values stay plain literals.
+        for sub in &serve.sub_blocks {
+            for entry in &sub.entries {
+                if let Some(ref type_ann) = entry.type_ann {
+                    self.resolve_type(type_ann);
+                }
+            }
+        }
+        {
+            let resolve = |s: nsl_ast::Symbol| -> String {
+                self.interner.resolve(s.0).unwrap_or("").to_string()
+            };
+            crate::cfie::validate_serve_config(serve, &resolve, &mut self.diagnostics);
+        }
         for endpoint in &serve.endpoints {
             for param in &endpoint.params {
                 if let Some(ref type_ann) = param.type_ann {

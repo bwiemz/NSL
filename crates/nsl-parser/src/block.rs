@@ -907,6 +907,7 @@ pub fn parse_serve_block_stmt(p: &mut Parser) -> Stmt {
     p.skip_newlines();
 
     let mut config = Vec::new();
+    let mut sub_blocks = Vec::new();
     let mut endpoints = Vec::new();
 
     while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
@@ -929,6 +930,18 @@ pub fn parse_serve_block_stmt(p: &mut Parser) -> Stmt {
             continue;
         }
 
+        // CFIE nested section: `key:` with nothing after the colon on
+        // the same line, followed by an indented run of config entries
+        // (e.g. `sampling:` / `speculative:` / `grammar:`).
+        if matches!(p.peek(), TokenKind::Ident(_))
+            && matches!(p.peek_at(1), TokenKind::Colon)
+            && matches!(p.peek_at(2), TokenKind::Newline)
+        {
+            let sb = parse_serve_sub_block(p);
+            sub_blocks.push(sb);
+            continue;
+        }
+
         // Config entry: key [: Type] = expr  OR  key: expr
         let entry = parse_serve_config_entry(p);
         config.push(entry);
@@ -941,6 +954,7 @@ pub fn parse_serve_block_stmt(p: &mut Parser) -> Stmt {
         kind: StmtKind::ServeBlock(nsl_ast::block::ServeBlock {
             name,
             config,
+            sub_blocks,
             endpoints,
             span,
         }),
@@ -949,9 +963,46 @@ pub fn parse_serve_block_stmt(p: &mut Parser) -> Stmt {
     }
 }
 
-fn parse_serve_config_entry(p: &mut Parser) -> nsl_ast::block::ServeConfigEntry {
+/// Parse a nested serve section: `key:` NEWLINE INDENT (config entry)* DEDENT.
+fn parse_serve_sub_block(p: &mut Parser) -> nsl_ast::block::ServeSubBlock {
     let start = p.current_span();
     let (key, _) = p.expect_ident();
+    p.expect(&TokenKind::Colon);
+    p.skip_newlines();
+
+    let mut entries = Vec::new();
+    if p.eat(&TokenKind::Indent) {
+        p.skip_newlines();
+        while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+            let entry = parse_serve_config_entry(p);
+            entries.push(entry);
+            p.skip_newlines();
+        }
+        p.eat(&TokenKind::Dedent);
+    } else {
+        p.diagnostics.push(
+            nsl_errors::Diagnostic::error(
+                "expected an indented block of `key: value` entries after this serve section"
+                    .to_string(),
+            )
+            .with_label(start, "empty serve section"),
+        );
+    }
+
+    let span = start.merge(p.prev_span());
+    nsl_ast::block::ServeSubBlock { key, entries, span }
+}
+
+fn parse_serve_config_entry(p: &mut Parser) -> nsl_ast::block::ServeConfigEntry {
+    let start = p.current_span();
+    // `tokenizer` lexes as a keyword (tokenizer blocks) but is also the
+    // CFIE grammar-section vocab key; accept it as a plain entry key.
+    let key = if p.at(&TokenKind::Tokenizer) {
+        p.advance();
+        p.intern("tokenizer")
+    } else {
+        p.expect_ident().0
+    };
 
     p.expect(&TokenKind::Colon);
 
@@ -1061,9 +1112,77 @@ mod serve_tests {
         if let nsl_ast::stmt::StmtKind::ServeBlock(sb) = &result.module.stmts[0].kind {
             assert_eq!(sb.config.len(), 2);
             assert_eq!(sb.endpoints.len(), 1);
+            assert!(sb.sub_blocks.is_empty());
         } else {
             panic!("Expected ServeBlock");
         }
+    }
+
+    #[test]
+    fn parse_serve_block_with_cfie_sub_blocks() {
+        let source = "serve Inference:\n    max_batch: 32\n    kv_layout: \"static\"\n\n    sampling:\n        temperature: 0.7\n        top_k: 50\n        top_p: 0.9\n        fused: true\n\n    speculative:\n        tokens: 5\n        method: \"tree\"\n        tree_width: 2\n\n    @endpoint\n    fn generate(prompt: str) -> str:\n        return prompt\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let file_id = nsl_errors::FileId(0);
+        let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
+        let result = crate::parse(&tokens, &mut interner);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected parser diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.module.stmts.len(), 1);
+        if let nsl_ast::stmt::StmtKind::ServeBlock(sb) = &result.module.stmts[0].kind {
+            assert_eq!(sb.config.len(), 2, "flat config: max_batch + kv_layout");
+            assert_eq!(sb.sub_blocks.len(), 2, "sampling + speculative sections");
+            assert_eq!(sb.endpoints.len(), 1);
+            let sampling = &sb.sub_blocks[0];
+            assert_eq!(interner.resolve(sampling.key.0), Some("sampling"));
+            assert_eq!(sampling.entries.len(), 4);
+            let speculative = &sb.sub_blocks[1];
+            assert_eq!(interner.resolve(speculative.key.0), Some("speculative"));
+            assert_eq!(speculative.entries.len(), 3);
+        } else {
+            panic!("Expected ServeBlock");
+        }
+    }
+
+    #[test]
+    fn serve_sub_block_entries_after_section_still_parse() {
+        // A flat entry AFTER a nested section must not be swallowed by it.
+        let source = "serve S:\n    sampling:\n        top_k: 50\n    max_seq: 2048\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let file_id = nsl_errors::FileId(0);
+        let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
+        let result = crate::parse(&tokens, &mut interner);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected parser diagnostics: {:?}",
+            result.diagnostics
+        );
+        if let nsl_ast::stmt::StmtKind::ServeBlock(sb) = &result.module.stmts[0].kind {
+            assert_eq!(sb.sub_blocks.len(), 1);
+            assert_eq!(sb.sub_blocks[0].entries.len(), 1);
+            assert_eq!(sb.config.len(), 1, "max_seq after the section");
+        } else {
+            panic!("Expected ServeBlock");
+        }
+    }
+
+    #[test]
+    fn serve_empty_sub_block_diagnoses() {
+        let source = "serve S:\n    sampling:\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let file_id = nsl_errors::FileId(0);
+        let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
+        let result = crate::parse(&tokens, &mut interner);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("serve section")),
+            "expected empty-section diagnostic, got: {:?}",
+            result.diagnostics
+        );
     }
 }
 

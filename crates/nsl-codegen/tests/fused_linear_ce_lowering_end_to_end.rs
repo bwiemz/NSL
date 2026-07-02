@@ -102,6 +102,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         batch_size: Some(2),
         seq_len: Some(64),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(src, Some(cfg)).expect("extraction must succeed");
     let fused: Vec<_> = list
@@ -158,6 +159,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         batch_size: Some(1),
         seq_len: Some(64),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(src, Some(cfg)).expect("extraction must succeed");
     let is_large = list
@@ -190,6 +192,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         batch_size: Some(2),
         seq_len: Some(64),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(src, Some(cfg));
     if let Some(list) = list {
@@ -220,6 +223,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         batch_size: Some(2),
         seq_len: Some(64),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(src, Some(cfg));
     if let Some(list) = list {
@@ -324,6 +328,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         batch_size: Some(1),
         seq_len: Some(64),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(src, Some(cfg)).expect("extraction must succeed");
     let is_large = list

@@ -7,10 +7,13 @@
 //!   * A **lock-free ring buffer** in CPU-pinned memory through which
 //!     the host pushes new requests; the persistent decode kernel
 //!     dequeues from it at the top of every decode iteration.
-//!   * A small **bump allocator** for KV blocks when the static
-//!     envelope can't hold every request.
+//!   * A **KV slot free-list**: the compile-time KV pass reserves one
+//!     contiguous device buffer of `slot_count x per_slot_tokens`;
+//!     the serve scheduler hands whole sequence slots out of a LIFO
+//!     free-list — no block allocator.
 //!   * Stubs for the DFA/grammar state-machine read path so the FFI
 //!     surface is always linkable even on single-GPU builds.
 
 pub mod ffi;
+pub mod kv_slots;
 pub mod ring_buffer;

@@ -1374,6 +1374,68 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_serve_completed_count", &[], Some(types::I64)),
     ("nsl_serve_preempt", &[types::I64], Some(types::I64)),
     ("nsl_serve_destroy", &[], Some(types::I64)),
+    // --- CFIE: continuous-batching request ring + grammar-table helper ---
+    ("nsl_cfie_ring_init", &[types::I64], Some(types::I64)),
+    (
+        "nsl_cfie_ring_push",
+        &[
+            types::I64,
+            types::I64, // sequence_id, prompt_ptr
+            types::I64,
+            types::I64, // prompt_len, max_new_tokens
+            types::I64,
+            types::I64, // grammar_start_state, sampling_packed
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_ring_pop",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // six out-pointers mirroring ring_push fields
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_ring_len", &[], Some(types::I64)),
+    (
+        "nsl_cfie_grammar_transition",
+        &[
+            types::I64, // table_ptr
+            types::I64,
+            types::I64, // num_states, vocab_size
+            types::I64,
+            types::I64, // state, token
+        ],
+        Some(types::I64),
+    ),
+    // --- CFIE: KV sequence-slot free-list ---
+    (
+        "nsl_cfie_kv_slots_init",
+        &[types::I64, types::I64], // slot_count, per_slot_tokens
+        Some(types::I64),
+    ),
+    ("nsl_cfie_kv_slot_acquire", &[], Some(types::I64)),
+    ("nsl_cfie_kv_slot_release", &[types::I64], Some(types::I64)),
+    (
+        "nsl_cfie_kv_slot_advance",
+        &[types::I64, types::I64], // slot, n_tokens
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_kv_slot_rollback",
+        &[types::I64, types::I64], // slot, n_tokens
+        Some(types::I64),
+    ),
+    ("nsl_cfie_kv_slots_active", &[], Some(types::I64)),
+    (
+        "nsl_cfie_kv_attach_device",
+        &[types::I64, types::I64], // base, bytes
+        Some(types::I64),
+    ),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",
