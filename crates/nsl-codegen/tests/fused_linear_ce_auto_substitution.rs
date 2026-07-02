@@ -43,6 +43,20 @@ fn extract_first_fn(
     src: &str,
     cfg: Option<FusedCeDecoratorConfig>,
 ) -> Option<nsl_codegen::wengert::WengertList> {
+    extract_first_fn_with_ranks(src, cfg, &[])
+}
+
+/// CFTP v10 (item 5): extract the first FnDef's Wengert list, threading
+/// per-parameter rank annotations through
+/// `WengertExtractor::register_input_with_rank`.  Parameter names in
+/// `ranks` that don't appear in the fn's parameter list are ignored;
+/// parameters not listed default to unknown rank (matching the
+/// pre-v10 behaviour that leaves the matcher conservatively firing).
+fn extract_first_fn_with_ranks(
+    src: &str,
+    cfg: Option<FusedCeDecoratorConfig>,
+    ranks: &[(&str, usize)],
+) -> Option<nsl_codegen::wengert::WengertList> {
     let mut interner_box = Box::new(Interner::new());
     let (tokens, _) =
         nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner_box);
@@ -62,7 +76,12 @@ fn extract_first_fn(
         })
         .expect("test src must contain a fn");
     for param in &fn_def.params {
-        extractor.register_input(param.name);
+        let param_name = interner_static.resolve(param.name.0).unwrap_or("?");
+        let rank = ranks
+            .iter()
+            .find(|(name, _)| *name == param_name)
+            .map(|(_, r)| *r);
+        extractor.register_input_with_rank(param.name, rank);
     }
     let ok = extractor.extract_stmts(&fn_def.body.stmts);
     if !ok {
@@ -131,6 +150,7 @@ fn auto_substitution_fires_when_decorator_enabled_and_pattern_matches() {
         batch_size: Some(2),
         seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -195,6 +215,7 @@ fn decorator_disabled_preserves_composite_cross_entropy() {
         batch_size: Some(2),
         seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -240,6 +261,7 @@ fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
         batch_size: Some(2),
         seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     // No upstream Matmul or Add — `cross_entropy` is called on a bare
     // function parameter.  The matcher MUST refuse.
@@ -270,6 +292,7 @@ fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
             batch_size: Some(2),
             seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
         }),
     )
     .expect("extraction must succeed");
@@ -297,6 +320,7 @@ fn auto_substitution_routes_large_vocab_to_two_kernel_path() {
         batch_size: Some(1),
         seq_len: Some(64),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -341,6 +365,7 @@ fn auto_substitution_prunes_dead_composite_upstream_chain() {
         batch_size: Some(2),
         seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -424,6 +449,7 @@ fn ambiguous_add_matmul_matmul_pattern_is_rejected() {
         batch_size: Some(2),
         seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(ADD_MATMUL_MATMUL_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -495,6 +521,7 @@ fn negative_dim_transpose_substitutes() {
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
 
     for (label, src) in [
@@ -540,6 +567,7 @@ fn bias_free_pattern_deferred_to_v5() {
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(NO_BIAS_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -622,27 +650,283 @@ fn rank_check_absent_matcher_fires_regardless_of_w_rank() {
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(RANK_AGNOSTIC_NEG_DIM_SRC, Some(cfg))
         .expect("extraction must succeed");
-    // CURRENT BEHAVIOUR (adversarial review Findings 1 + 8): matcher
-    // has no rank table and fires regardless of W's declared rank.
-    // The negative-dim transpose form is precisely the form most likely
-    // to come from rank-agnostic NSL code (which is exactly the source
-    // most likely to be ≥3D).  Documented LATENT HAZARD: callers must
-    // ensure W is rank-2 at the type-system layer + the decorator's
-    // (vocab_size, hidden_size) hint must pin the expected shape.
-    //
-    // If a future sprint adds structural rank-2 enforcement at the
-    // matcher (walking the producer of w_var + consulting a shape
-    // table), update this assertion from `1` to `0` and add a
-    // separate positive test for the rank-2 path.
+    // CFTP v10 (item 5): CURRENT BEHAVIOUR — rank enforcement is
+    // conservative-fire when rank is UNKNOWN.  The parser+extractor
+    // here don't infer rank from the bare `Tensor` param annotation, so
+    // `known_ranks` stays empty and the matcher preserves its pre-v10
+    // fire behaviour.  This is intentional: unannotated code must not
+    // regress on the auto-substitution optimisation.  Programs with an
+    // annotated `Tensor<[V, H]>` param get the structural check via the
+    // compiler's `register_input_with_rank` plumbing in `stmt.rs`
+    // (`resolvable_tensor_rank`) — pinned by
+    // `rank_3_annotated_w_refuses_substitution` +
+    // `rank_2_annotated_w_still_substitutes` below.
     assert_eq!(
         count_fused(&list),
         1,
-        "current matcher does NOT enforce W rank — see source_ad.rs \
-         rustdoc 'LATENT 3-D+ RISK'. Flip to 0 when rank-2 enforcement \
-         lands."
+        "unknown-rank path stays fire-conservative (rank annotations \
+         are the frontend's job; the matcher only refuses when it can \
+         PROVE non-2D)"
+    );
+}
+
+// ─── CFTP v10 item 5: rank-3 W refuses substitution ─────────────────────
+//
+// When the compiler threads a rank-3 annotation via
+// `register_input_with_rank` (mirroring the AST/semantic path in
+// `resolvable_tensor_rank`), the matcher must REFUSE the substitution.
+// This is the structural close on the LATENT 3-D+ RISK documented in
+// `source_ad.rs::try_match_fused_linear_ce_pattern`.
+
+#[test]
+fn rank_3_annotated_w_refuses_substitution() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
+    };
+    let list = extract_first_fn_with_ranks(
+        AUTO_SUB_SRC,
+        Some(cfg),
+        // Announce rank-3 W (e.g. an MoE expert stack [D, V, H]).  Every
+        // fused-CE PTX emitter indexes W as `W[v*H + h]` (rank-2 [V, H]) —
+        // firing on rank-3 would produce wrong forward logits + wrong dW
+        // gradients with no diagnostic.  Item 5 refuses.
+        &[("w", 3)],
+    )
+    .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "item 5 structural enforcement: rank-3 W must refuse the fused \
+         substitution — the fused FFI would silently stride through the \
+         rank-3 tensor as if it were [V, H]"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "rank-3 W falls through to composite CE (correct + safe)"
+    );
+}
+
+// ─── CFTP v10 item 5: rank-2 W still substitutes ────────────────────────
+//
+// The positive counterpart — when the compiler PROVES rank-2, the
+// matcher fires as before.  Guards against a future refactor that
+// accidentally makes the check refuse rank-2 too (or defaults `rank`
+// to `Some(0)` instead of `None` for the unknown case, causing every
+// program to be refused).
+
+// ─── CFTP v10 item 5 (reviewer-flagged gap closure): rank-3 MODEL FIELD W refuses ─
+//
+// The initial item-5 fix only populated `known_ranks` from
+// step-body parameter type annotations.  Reviewer flagged this
+// as leaving the exact MoE expert stack scenario unprotected —
+// weight tensors accessed via `self.field` bypass
+// `register_input_with_rank` entirely and land in
+// `named_param_vars` via `extract_expr`'s MemberAccess arm.
+//
+// This test walks the FULL member-access Param-registration
+// path: it declares a model with a 3-D weight, wires the
+// extractor with `set_model_field_ranks` (mirroring what
+// `stmt.rs::compile_train_block` does at runtime from
+// `Compiler::models.model_field_ranks`), then extracts a
+// forward body that does `matmul(x, transpose(self.w, -2, -1))
+// + bias` → `cross_entropy(...)`.
+//
+// Pre-fix: matcher fires (0 → 1 fused ops), silently striding
+// through a rank-3 tensor as if it were `[V, H]`.
+// Post-fix: matcher refuses; composite CE takes over.
+
+const MODEL_FIELD_MEMBER_ACCESS_SRC: &str = r#"
+model Tiny:
+    w: Tensor
+
+    fn forward(self, x: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+        let w_t = transpose(self.w, -2, -1)
+        let logits = matmul(x, w_t) + bias
+        return cross_entropy(logits, targets)
+"#;
+
+/// Extract the first model's `forward` method as if
+/// `compile_train_block` were calling it — populates
+/// `model_field_ranks` for the model's tensor fields.
+fn extract_first_model_forward(
+    src: &str,
+    cfg: Option<FusedCeDecoratorConfig>,
+    // Model-field ranks keyed as (model_type, field) -> rank.
+    model_field_ranks: &[(&'static str, &'static str, usize)],
+) -> Option<nsl_codegen::wengert::WengertList> {
+    let mut interner_box = Box::new(Interner::new());
+    let (tokens, _) =
+        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner_box);
+    let parsed = nsl_parser::parse(&tokens, &mut interner_box);
+    let module = parsed.module;
+    let interner_static: &'static Interner = Box::leak(interner_box);
+
+    // Locate the first ModelDef and its `forward` method.  Models keep
+    // fields + methods in a single `members` vec, so we scan for the
+    // `Method` variant matching `forward`.
+    let (model_type, forward) = module
+        .stmts
+        .iter()
+        .find_map(|s| match &s.kind {
+            nsl_ast::stmt::StmtKind::ModelDef(model) => {
+                let model_name =
+                    interner_static.resolve(model.name.0).unwrap_or("?").to_string();
+                let forward = model.members.iter().find_map(|m| match m {
+                    nsl_ast::decl::ModelMember::Method(fn_def, _) => {
+                        if interner_static.resolve(fn_def.name.0).unwrap_or("") == "forward" {
+                            Some(fn_def.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })?;
+                Some((model_name, forward))
+            }
+            _ => None,
+        })
+        .expect("test src must contain a model with a `forward` method");
+
+    let mut extractor =
+        WengertExtractor::new(interner_static).with_fused_ce_config(cfg);
+    // Mirror what stmt.rs::compile_train_block installs so the
+    // MemberAccess arm can resolve `self.w`.
+    let mut ranks: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, usize>,
+    > = std::collections::HashMap::new();
+    for (model, field, rank) in model_field_ranks {
+        ranks
+            .entry((*model).to_string())
+            .or_default()
+            .insert((*field).to_string(), *rank);
+    }
+    extractor.set_model_field_ranks(ranks);
+
+    // Set up the self context so `self.w` resolves via
+    // `context_to_model_type["self"] = "Tiny"`.
+    let self_sym = forward.params.first().expect("`self` param").name;
+    extractor.register_model_instance(self_sym, &model_type);
+    extractor.set_self_context(Some("self".to_string()));
+
+    // Register the remaining step-body inputs.
+    for param in forward.params.iter().skip(1) {
+        extractor.register_input_with_rank(param.name, None);
+    }
+
+    let ok = extractor.extract_stmts(&forward.body.stmts);
+    if !ok {
+        return None;
+    }
+    extractor.finalize()
+}
+
+#[test]
+fn rank_3_model_field_w_refuses_substitution() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
+    };
+    let list = extract_first_model_forward(
+        MODEL_FIELD_MEMBER_ACCESS_SRC,
+        Some(cfg),
+        // Announce rank-3 for `Tiny.w` — mimicking what
+        // `collection.rs` would record for `w: Tensor<[D, V, H]>`
+        // or `w = zeros([D, V, H])`.
+        &[("Tiny", "w", 3)],
+    )
+    .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "reviewer-flagged gap: rank-3 W accessed via `self.w` must \
+         refuse the fused substitution — the fused FFI would silently \
+         stride through the rank-3 tensor as if it were [V, H]"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "composite CE must take over on the refused path"
+    );
+}
+
+#[test]
+fn rank_2_model_field_w_still_substitutes() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
+    };
+    let list = extract_first_model_forward(
+        MODEL_FIELD_MEMBER_ACCESS_SRC,
+        Some(cfg),
+        &[("Tiny", "w", 2)],
+    )
+    .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "rank-2 model-field W must still substitute — item 5's refusal \
+         is scoped to provable non-2D"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "composite CE must NOT appear alongside the fused op"
+    );
+}
+
+#[test]
+fn rank_2_annotated_w_still_substitutes() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
+    };
+    let list = extract_first_fn_with_ranks(
+        AUTO_SUB_SRC,
+        Some(cfg),
+        &[("w", 2)],
+    )
+    .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "rank-2 W must still substitute — the item 5 check only refuses \
+         provable-non-2D operands"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "composite CE must NOT also appear alongside the fused op"
     );
 }
 
@@ -656,6 +940,7 @@ fn no_transpose_pattern_deferred_to_v5() {
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: None,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(NO_TRANSPOSE_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -711,6 +996,7 @@ fn wengert_recognition_is_dtype_orthogonal_under_bf16_hint() {
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: Some(FusedCeDtypeHint::Bf16),
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed under bf16 hint");
@@ -742,6 +1028,7 @@ fn wengert_recognition_is_dtype_orthogonal_under_fp16_hint() {
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: Some(FusedCeDtypeHint::F16),
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed under fp16 hint");
@@ -767,6 +1054,7 @@ fn sprint4_explicit_call_path_still_works() {
         batch_size: Some(2),
         seq_len: Some(32),
             dtype: None,
+            train_block_stmt_id: nsl_ast::NodeId::dummy(),
     };
     let list = extract_first_fn(EXPLICIT_CALL_SRC, Some(cfg))
         .expect("extraction must succeed");

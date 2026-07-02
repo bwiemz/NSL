@@ -44,6 +44,7 @@ fn analysis_to_fused_ce_configs(
                     nsl_codegen::FusedCeDtypeHint::Bf16
                 }
             }),
+            train_block_stmt_id: c.train_block_stmt_id,
         })
         .collect()
 }

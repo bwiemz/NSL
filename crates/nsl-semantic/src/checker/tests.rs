@@ -968,15 +968,24 @@ train(model = m, epochs = 1):
     );
 }
 
-/// CFTP v5 follow-on Finding 1 (HIGH): a SECOND `@fused_lm_ce` decorator
-/// in the same compilation unit must be REFUSED.  The codegen reads
-/// `fused_ce_configs.first()` for every train block's dtype dispatch, so a
-/// silently-accepted second decorator would corrupt the second train block's
-/// HBM-layout contract (e.g. `@fused_lm_ce(dtype="fp16")` first +
-/// `@fused_lm_ce(dtype="bf16")` second → second block silently uses fp16
-/// dispatch against bf16 buffers).  See `feedback_deferral_must_refuse`.
+/// CFTP v10 (item 3) LIFTED: two `@fused_lm_ce` decorators on DIFFERENT
+/// train blocks in the same compilation unit are now ACCEPTED.  Codegen
+/// dispatches each block to its own config via the
+/// `train_block_stmt_id` field.
+///
+/// Pre-v10 (v5 follow-on Finding 1 HIGH), codegen read
+/// `fused_ce_configs.first()` for every train block, silently binding
+/// EVERY block to the FIRST decorator's dtype/vocab hint — so the
+/// checker had to refuse the second decorator entirely. Item 3
+/// installs per-block dispatch (`active_fused_ce_config` +
+/// `set_active_fused_ce_config_for_train_block`), lifting the refusal.
+///
+/// This test pins:
+///   * both configs land in `AnalysisResult.fused_ce_configs`
+///   * each config's `train_block_stmt_id` matches its train-block Stmt id
+///   * no refusal diagnostic fires
 #[test]
-fn fused_lm_ce_duplicate_decorator_is_refused() {
+fn fused_lm_ce_two_train_blocks_each_get_own_config() {
     let src = r#"
 model Tiny:
     w: Tensor = ones([2, 1])
@@ -1001,23 +1010,83 @@ train(model = m, epochs = 1):
         let pred = m.forward(x)
 "#;
     let res = analyze_source(src);
-    // Only the FIRST decorator's config is collected; the second is refused.
+    // Both configs collected — item 3 lift.
+    assert_eq!(
+        res.fused_ce_configs.len(),
+        2,
+        "expected TWO collected configs (item 3 per-block dispatch), got {:?}",
+        res.fused_ce_configs.len()
+    );
+    // Each carries a distinct train_block_stmt_id.
+    assert_ne!(
+        res.fused_ce_configs[0].train_block_stmt_id,
+        res.fused_ce_configs[1].train_block_stmt_id,
+        "two decorators on two different train blocks must carry distinct \
+         `train_block_stmt_id` so codegen can route them independently",
+    );
+    // The dummy id (validator's placeholder) must NOT survive — the
+    // push site is responsible for overwriting with the real Stmt.id.
+    assert_ne!(
+        res.fused_ce_configs[0].train_block_stmt_id,
+        nsl_ast::NodeId::dummy(),
+        "the push-site overwrite of `train_block_stmt_id` did not fire — \
+         codegen would then match on `dummy()` and dispatch would silently \
+         fail for BOTH blocks",
+    );
+    assert_ne!(
+        res.fused_ce_configs[1].train_block_stmt_id,
+        nsl_ast::NodeId::dummy(),
+        "the push-site overwrite of `train_block_stmt_id` did not fire for \
+         the second block",
+    );
+    // First config's vocab_tile matches source order; second config's does too.
+    assert_eq!(res.fused_ce_configs[0].vocab_tile, Some(1024));
+    assert_eq!(res.fused_ce_configs[1].vocab_tile, Some(128));
+    // No refusal diagnostic (pre-v10 test would assert this fires; now
+    // its absence pins the lift).
+    assert!(
+        !res.diagnostics.iter().any(|d| format!("{:?}", d)
+            .contains("at most one decorator")),
+        "unexpected duplicate-decorator refusal after item 3 lift: {:?}",
+        res.diagnostics
+    );
+}
+
+/// CFTP v10 (item 3): same-block duplicate `@fused_lm_ce` STILL refused.
+/// The lift is per-train-block, not per-compilation-unit; two decorators
+/// on the SAME train block would fight over the single dispatch slot
+/// (`active_fused_ce_config` is 1:1 with the train block).  Refuse per
+/// `feedback_deferral_must_refuse`.
+#[test]
+fn fused_lm_ce_same_block_duplicate_decorator_still_refused() {
+    let src = r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+@fused_lm_ce(enabled = true, vocab_tile = 1024)
+@fused_lm_ce(enabled = true, vocab_tile = 128)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#;
+    let res = analyze_source(src);
     assert_eq!(
         res.fused_ce_configs.len(),
         1,
-        "duplicate @fused_lm_ce: expected exactly one collected config (the first), \
-         got {:?}",
+        "same-block duplicate: exactly one config survives (the first), got {:?}",
         res.fused_ce_configs.len()
-    );
-    assert_eq!(
-        res.fused_ce_configs[0].vocab_tile,
-        Some(1024),
-        "the FIRST decorator's vocab_tile must be the surviving config",
     );
     assert!(
         res.diagnostics.iter().any(|d| format!("{:?}", d)
-            .contains("at most one decorator is allowed per compilation unit")),
-        "expected duplicate-decorator refusal diagnostic, got: {:?}",
+            .contains("at most one decorator per")),
+        "expected same-block duplicate-decorator refusal diagnostic, got: {:?}",
         res.diagnostics
     );
 }

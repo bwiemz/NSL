@@ -683,6 +683,12 @@ pub struct FusedCeDecoratorConfig {
     /// codegen-local enum so nsl-codegen does not depend on nsl-semantic
     /// types (same convention as the rest of `FusedCeDecoratorConfig`).
     pub dtype: Option<FusedCeDtypeHint>,
+    /// CFTP v10 (item 3): AST NodeId of the `train` block Stmt this
+    /// decorator belongs to.  Codegen looks up the active config for
+    /// each train block by matching this id — so multiple decorators
+    /// in one compilation unit each dispatch to their own train block.
+    /// Mirror of `nsl_semantic::cftp::FusedCeConfig.train_block_stmt_id`.
+    pub train_block_stmt_id: nsl_ast::NodeId,
 }
 
 /// Codegen-side mirror of `nsl_semantic::cftp::FusedCeDtypeHint`.

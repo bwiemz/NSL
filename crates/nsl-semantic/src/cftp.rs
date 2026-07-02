@@ -268,6 +268,13 @@ pub struct FusedCeConfig {
     pub dtype: Option<FusedCeDtypeHint>,
     /// Source span of the decorator (for diagnostics).
     pub span: Span,
+    /// CFTP v10 (item 3): AST NodeId of the enclosing `train` block Stmt.
+    /// Codegen uses this to dispatch the correct config for each train block
+    /// when multiple `@fused_lm_ce` decorators appear in the same compilation
+    /// unit.  Set by the checker at the push site after
+    /// [`validate_fused_ce_decorator`] returns; the validator itself writes
+    /// [`nsl_ast::NodeId::dummy`] here.
+    pub train_block_stmt_id: nsl_ast::NodeId,
 }
 
 /// Parse and validate a `@fused_lm_ce(enabled = true, vocab_tile = 1024)`
@@ -467,6 +474,10 @@ pub fn validate_fused_ce_decorator(
         seq_len,
         dtype,
         span: deco.span,
+        // CFTP v10 (item 3): the validator has no view of the enclosing
+        // train-block Stmt; the caller (`checker/stmt.rs`) overwrites this
+        // with the real Stmt id after we return.  See the push site.
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     })
 }
 

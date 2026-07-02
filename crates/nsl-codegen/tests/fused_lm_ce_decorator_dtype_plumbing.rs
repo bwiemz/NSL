@@ -51,6 +51,7 @@ fn bridge(
                 nsl_semantic::cftp::FusedCeDtypeHint::F16 => FusedCeDtypeHint::F16,
                 nsl_semantic::cftp::FusedCeDtypeHint::Bf16 => FusedCeDtypeHint::Bf16,
             }),
+            train_block_stmt_id: c.train_block_stmt_id,
         })
         .collect()
 }
