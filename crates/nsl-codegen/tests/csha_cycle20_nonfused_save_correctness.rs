@@ -125,6 +125,63 @@ fn t3_bug_b_v_save_uses_k_start_not_q_start() {
     );
 }
 
+/// R3 regression: every `%rd_save_*` virtual register referenced in the
+/// emitted PTX must have a matching `.reg .u64 %rd_save_<name>`
+/// declaration. Missed declarations (e.g. `%rd_save_bh` in the T3
+/// inline V-save block) fail `ptxas` at runtime `cuModuleLoadData` but
+/// pass snapshot tests because no snapshot exercises the non-fused-save
+/// config path.
+#[test]
+fn t3_all_rd_save_regs_declared() {
+    use std::collections::HashSet;
+
+    let ptx_bytes = synthesize_flash_attention_ptx_v2(&non_fused_save_config());
+    let ptx = String::from_utf8(ptx_bytes).expect("PTX must be valid UTF-8");
+
+    // Collect referenced %rd_save_<name> identifiers (excluding declaration lines).
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut declared: HashSet<String> = HashSet::new();
+    for line in ptx.lines() {
+        let trimmed = line.trim_start();
+        let is_decl = trimmed.starts_with(".reg ");
+        // Manual scan: find every "%rd_save_" occurrence and grab the identifier chars.
+        let bytes = line.as_bytes();
+        let needle = b"%rd_save_";
+        let mut i = 0usize;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let start = i + 1; // skip '%'
+                let mut end = start + b"rd_save_".len();
+                while end < bytes.len() {
+                    let c = bytes[end];
+                    if c.is_ascii_alphanumeric() || c == b'_' {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let ident = std::str::from_utf8(&bytes[start..end]).unwrap().to_string();
+                if is_decl {
+                    declared.insert(ident);
+                } else {
+                    referenced.insert(ident);
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    let missing: Vec<&String> = referenced.difference(&declared).collect();
+    assert!(
+        missing.is_empty(),
+        "R3 regressed: emitted PTX references undeclared %rd_save_* registers: {missing:?}\n\
+         declared={declared:?}\n\
+         referenced={referenced:?}"
+    );
+}
+
 /// Cross-check: the fused-projections path is UNAFFECTED by the T3
 /// fixes. Emit a fused config and confirm no T3 marker appears (the
 /// fused orchestrator uses its own K/V save sites that route through
