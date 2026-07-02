@@ -294,7 +294,7 @@ pub fn emit_with_smem_override(
     // declared unconditionally because ptxas prunes unused virtual regs.
     if config.csha.as_ref().is_some_and(|c| c.save_activations_for_backward) {
         ptx.push_str(
-            "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
+            "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb, %rd_save_bh;\n",
         );
         ptx.push_str("    .reg .u32 %r_save_wrow, %r_save_qlo;\n");
         ptx.push_str("    .reg .f32 %f_diag, %f_sdx_fmax, %f_sdx_nmax, %f_sdx_fsum;\n");
