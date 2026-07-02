@@ -565,6 +565,140 @@ fn f16_conversion_helpers_sanity() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CPDT Part II S5: FullBuffer-sub-arm wrap envelope coverage
+// ---------------------------------------------------------------------------
+//
+// The S5 wrap inside `emit_stdlib_optim_call` (stmt_fase.rs:608) emits the
+// same dequant→step→quant envelope as `fase_emit_final_step` but for the
+// stdlib optimizer FFI path. The structural difference vs the Deferred-arm
+// wrap is the single-state alias handling: when SGD/Lion/Muon pass
+// `s2 == s1` as a placeholder, the wrap casts s1 once, runs the step, casts
+// back to s1's storage dtype, and frees the working tensor — without
+// touching s2's slot. This test exercises that single-state alias path
+// in-process using the same runtime ops the codegen emits.
+
+const SGD_LR: f32 = 1e-2;
+const SGD_MOMENTUM: f32 = 0.9;
+const SGD_WD: f32 = 1e-4;
+
+/// Pure-Rust SGD-with-momentum step matching `nsl.optim.sgd`'s recipe:
+///   v_t   = momentum*v_{t-1} + g_t
+///   theta = theta - lr*(v_t + wd*theta)
+fn sgd_step_f32(theta: &mut [f32], v: &mut [f32], grad: &[f32]) {
+    for i in 0..theta.len() {
+        v[i] = SGD_MOMENTUM * v[i] + grad[i];
+        theta[i] -= SGD_LR * (v[i] + SGD_WD * theta[i]);
+    }
+}
+
+/// Mirrors what `emit_stdlib_optim_call` emits at FullBuffer-arm SGD with
+/// `wrap_precision=true`: cast(s1, F32) → SGD step on F32 working tensor →
+/// cast_into(orig_s1, work_s1) → free(work_s1). s2 aliases s1 and is not
+/// independently touched (the `wrap_s2 = s1 != s2` guard skips its branch).
+fn run_sgd_wrap_envelope(theta_init: &[f32]) -> Vec<f32> {
+    let len = theta_init.len();
+    let mut theta = theta_init.to_vec();
+
+    // v_state at FP16 — single momentum buffer; mirrors state_list_1[i].
+    let zeros = vec![0.0_f32; len];
+    let tmp_f32 = make_f32_tensor(&zeros);
+    let v_state = nsl_tensor_cast(tmp_f32, DTYPE_FP16);
+    nsl_tensor_free(tmp_f32);
+
+    for step in 1..=N_STEPS {
+        let grad = gradients_for_step(step);
+
+        // S5 wrap envelope IN: dequant FP16 → F32 (orig→work cast).
+        let v_work = nsl_tensor_cast(v_state, DTYPE_F32);
+
+        // F32 SGD step (the stdlib FFI's equivalent — done in-process).
+        let mut v_vals = read_f32_tensor(v_work, len);
+        sgd_step_f32(&mut theta, &mut v_vals, &grad);
+        let v_updated = make_f32_tensor(&v_vals);
+
+        // S5 wrap envelope OUT: quant F32 → FP16 (work→orig cast_into).
+        nsl_tensor_cast_into(v_state, v_updated);
+        nsl_tensor_free(v_updated);
+        nsl_tensor_free(v_work);
+    }
+
+    nsl_tensor_free(v_state);
+    theta
+}
+
+/// Pure-Rust SGD reference with truncating-FP16 momentum (Mode B).
+fn run_sgd_truncate_reference(theta_init: &[f32]) -> Vec<f32> {
+    let len = theta_init.len();
+    let mut theta = theta_init.to_vec();
+    let mut v = vec![0.0_f32; len];
+    for step in 1..=N_STEPS {
+        let grad = gradients_for_step(step);
+        sgd_step_f32(&mut theta, &mut v, &grad);
+        for vi in v.iter_mut() {
+            *vi = trunc_fp16(*vi);
+        }
+    }
+    theta
+}
+
+/// Pure-Rust SGD reference with full F32 momentum (Mode A — drift gate).
+fn run_sgd_fp32_reference(theta_init: &[f32]) -> Vec<f32> {
+    let len = theta_init.len();
+    let mut theta = theta_init.to_vec();
+    let mut v = vec![0.0_f32; len];
+    for step in 1..=N_STEPS {
+        let grad = gradients_for_step(step);
+        sgd_step_f32(&mut theta, &mut v, &grad);
+    }
+    theta
+}
+
+/// CPDT Part II Sprint 5: validates the FullBuffer-arm wrap envelope for the
+/// single-state alias path (SGD-class). Mirrors the AdamW validation suite
+/// but exercises the `s1 == s2` branch instead of the multi-state branch.
+///
+/// Three-way comparison:
+///   - Mode B (cast correctness): wrap-envelope ≡ truncating-Rust SGD (rel < 1e-5)
+///   - Mode A (precision claim):  wrap-envelope ~ FP32-SGD reference   (rel < 5e-2)
+///   - SGD-specific: the v_state buffer is the SOLE state slot — no v2/s2
+///     aliasing artifacts (the codegen passes `wrap_s2=false` for SGD;
+///     this test does the same by never allocating a second buffer).
+#[test]
+fn cpdt_fp16_sgd_fullbuffer_wrap_envelope_validation() {
+    let theta_init = initial_params();
+
+    let result_wrap     = run_sgd_wrap_envelope(&theta_init);
+    let result_mode_b   = run_sgd_truncate_reference(&theta_init);
+    let result_mode_a   = run_sgd_fp32_reference(&theta_init);
+
+    let rel_err_b = max_rel_err(&result_wrap, &result_mode_b);
+    println!(
+        "[SGD Mode B] wrap-envelope vs truncating-Rust ref: max rel_err = {rel_err_b:.2e}"
+    );
+    assert!(
+        rel_err_b < 1e-5,
+        "SGD Mode B FAILED: wrap-envelope and truncating-Rust reference diverge by \
+         {rel_err_b:.2e} (gate: < 1e-5). The S5 cast/cast_into emission does NOT \
+         match pure-Rust truncation for the single-state path."
+    );
+
+    let rel_err_a = max_rel_err(&result_wrap, &result_mode_a);
+    println!(
+        "[SGD Mode A] wrap-envelope vs FP32 reference: max rel_err = {rel_err_a:.2e}"
+    );
+    assert!(
+        rel_err_a < 5e-2,
+        "SGD Mode A FAILED: FP16-momentum SGD diverges from FP32 SGD by {rel_err_a:.2e} \
+         (gate: < 5e-2). FP16 momentum precision loss exceeds the EMA-bounded budget."
+    );
+
+    println!();
+    println!("=== CPDT FP16 SGD FullBuffer-wrap-envelope validation: ALL PASSED ===");
+    println!("  Mode B (cast correctness): rel_err = {rel_err_b:.2e}  < 1e-5  PASS");
+    println!("  Mode A (FP16 vs FP32):     rel_err = {rel_err_a:.2e}  < 5e-2  PASS");
+}
+
 /// Spot-check: compiled-mechanism cast ops faithfully implement pure-Rust
 /// IEEE-754 round-to-nearest-even (bit-exact round-trip for a set of
 /// representative values). Post-v7 the runtime uses `half::f16::from_f32`

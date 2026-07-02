@@ -491,6 +491,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
     ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
+    // CPDT §3.2: INT8 blockwise quantization (the headline 4× memory result)
+    ("nsl_tensor_quant_int8_blockwise", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_dequant_int8_blockwise", &[types::I64], Some(types::I64)),
     // CFTP v6 forward inline-cast wrappers: src_ptr -> new tensor (scope-tracked).
     ("nsl_tensor_to_bf16", &[types::I64], Some(types::I64)),
     ("nsl_tensor_to_fp16", &[types::I64], Some(types::I64)),
@@ -1574,6 +1577,83 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // CPDT Part III v1 production-forward (M32 gap closure): same as v1
+    // plus `experts_ptr`, `hidden_dim`, `intermediate_dim` (3 extra i64
+    // args, total 8). Returns NslTensor `[total_tokens, intermediate_dim]`
+    // (note: trailing dim differs from v1's `[total_tokens, hidden_dim]`
+    // identity output). See crates/nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v2",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    // CPDT Part III v2.2 paper-faithful MoE FFN: per-expert kernel is
+    // `up → SiLU → down` instead of v2's single matmul. 10 i64 args:
+    // tokens, logits, experts_up, experts_down, num_experts, top_k,
+    // capacity_factor_bits, hidden_dim, intermediate_dim, activation_kind,
+    // experts_up_bias_ptr, experts_down_bias_ptr (v2.11: bias args are
+    // nullable — pass 0 for no bias).
+    // Returns NslTensor `[total_tokens, hidden_dim]` (back to hidden,
+    // unlike v2's intermediate). See nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v3",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    // CPDT Part III v2.5+v2.8 Mixtral gated MoE FFN: per-expert kernel is
+    // `gate_act(gate) * up → down` where gate_act is selected by
+    // gate_activation_kind. 11 i64 args: tokens, logits, experts_gate,
+    // experts_up, experts_down, num_experts, top_k, capacity_factor_bits,
+    // hidden_dim, intermediate_dim, gate_activation_kind (v2.8: 1=SwiGLU,
+    // 2=GeGLU, 3=ReGLU). Output shape matches v3
+    // `[total_tokens, hidden_dim]`. See nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v4",
+        // v2.14: 14 i64 args. Positions 12+13+14 are
+        // experts_{gate,up,down}_bias_ptr (nullable, 0 = no bias).
+        // Codegen always emits iconst(0) for these in the 5-arg
+        // source form; the 8-arg form threads source-supplied bias
+        // expressions through (mirrors v3's 4/6 pattern in v2.12).
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // --- M33: Speculative decoding runtime functions ---
     (
         "nsl_speculative_draft",
@@ -1678,70 +1758,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     // --- M34: Context parallelism (ring attention) ---
-    (
-        "nsl_cp_init",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_sequence_partition",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_ring_attention",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_ring_send_recv",
-        &[types::I64, types::I64, types::I64, types::I64, types::I64],
-        Some(types::I64),
-    ),
-    (
-        "nsl_sequence_gather",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    ("nsl_cp_destroy", &[types::I64], Some(types::I64)),
+    // Extern signatures REMOVED across two cycles:
+    //   * CPDT Part III v2.22 unlinked the ring FFI chain from codegen
+    //     (`nsl_cp_init` / `nsl_sequence_partition` / `nsl_ring_attention`
+    //     / `nsl_ring_send_recv` / `nsl_sequence_gather` / `nsl_cp_destroy`)
+    //     and fell `@context_parallel` through to naive attention.
+    //   * M34 v1 (this cycle) deleted the six runtime stubs themselves from
+    //     `crates/nsl-runtime/src/context_parallel/ffi.rs` (they were dead
+    //     symbols with wrong positional layouts) and shipped the
+    //     single-node ring-attention composer
+    //     (`run_ring_attention_full`) verified against `naive_attention`
+    //     on a matrix of shapes and ring sizes. Multi-device distribution
+    //     is deferred until NCCL/IPC lands.
+    // When multi-device distribution lands, a fresh runtime FFI shape gets
+    // designed and the extern table + emission + runtime impl all get
+    // wired together against the new shape.
     // --- M35: FP8 compute ---
     (
         "nsl_fp8_cast",
@@ -2318,6 +2349,29 @@ mod tests {
             names.contains(&"nsl_tensor_zeros_like_dtype"),
             "nsl_tensor_zeros_like_dtype missing"
         );
+    }
+
+    #[test]
+    fn int8_blockwise_ops_have_signatures() {
+        // CPDT §3.2 — the headline 4× memory result. These signatures must
+        // match the runtime exports in nsl-runtime/src/tensor/int8_blockwise.rs
+        // and the ownership table in ffi_ownership.rs (both produce new owned
+        // tensors).
+        let table: Vec<(&str, &[cranelift_codegen::ir::Type], Option<cranelift_codegen::ir::Type>)> =
+            RUNTIME_FUNCTIONS
+                .iter()
+                .filter(|(n, _, _)| {
+                    *n == "nsl_tensor_quant_int8_blockwise"
+                        || *n == "nsl_tensor_dequant_int8_blockwise"
+                })
+                .map(|(n, p, r)| (*n, *p, *r))
+                .collect();
+        assert_eq!(table.len(), 2, "INT8 blockwise op pair missing");
+        for (name, params, ret) in &table {
+            assert_eq!(*ret, Some(cranelift_codegen::ir::types::I64), "{name} must return i64");
+            assert!(params.iter().all(|t| *t == cranelift_codegen::ir::types::I64),
+                "{name} params must all be I64");
+        }
     }
 
     /// CFTP v6: forward inline-cast wrapper FFIs are registered with the

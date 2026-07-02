@@ -138,14 +138,18 @@ pub mod weight_aware;
 pub mod context_parallel;
 pub mod cpdt;
 pub mod cpdt_comm;
+pub mod cpdt_decorator;
 pub mod cpdt_expert;
+pub mod cpdt_expert_prune;
 pub mod cpdt_joint;
+pub mod cpdt_moe_capacity;
 pub mod cpdt_optim;
 pub mod cpdt_precision_exec;
 pub mod cpdt_sensitivity;
 pub mod cpdt_tier_apply;
 pub mod cpdt_zero;
 pub mod moe;
+pub mod moe_hf_pack;
 pub mod moe_kernels;
 pub mod pipeline;
 pub mod tensor_parallel;
@@ -948,6 +952,13 @@ pub struct CpdtOptions {
     pub cluster: Option<crate::cpdt_zero::ClusterSpec>,
     /// Whether `--cpdt-report` was requested (stdout full plan).
     pub report_requested: bool,
+    /// CPDT Part III §4.1: roofline-derived MoE `capacity_factor` override
+    /// slack — fraction of theoretical peak the planner targets when
+    /// upper-bounding `capacity_factor`. Default 0.0 = no override
+    /// (paper-faithful behavior). Set via `--cpdt-moe-roofline-slack`.
+    /// Consumed by
+    /// [`crate::cpdt_moe_capacity::apply_roofline_capacity_override`].
+    pub moe_roofline_slack: f64,
     /// Shared output slot the CLI reads after compile returns.
     /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
     /// can render it without extending every entry-point return type.
@@ -961,6 +972,7 @@ impl Default for CpdtOptions {
             mode: crate::cpdt::CpdtMode::Off,
             cluster: None,
             report_requested: false,
+            moe_roofline_slack: 0.0,
             plan_out: None,
         }
     }

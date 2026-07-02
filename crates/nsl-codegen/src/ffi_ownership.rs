@@ -57,6 +57,9 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_cast", OwnedNewResult);
     m.insert("nsl_tensor_zeros_like", OwnedNewResult);
     m.insert("nsl_tensor_zeros_like_dtype", OwnedNewResult);
+    // CPDT §3.2: INT8 blockwise quant/dequant (both produce freshly-allocated tensors).
+    m.insert("nsl_tensor_quant_int8_blockwise", OwnedNewResult);
+    m.insert("nsl_tensor_dequant_int8_blockwise", OwnedNewResult);
     m.insert("nsl_tensor_ones_like", OwnedNewResult);
     // Shape ops that produce new storage
     m.insert("nsl_tensor_reshape", OwnedNewResult);

@@ -54,6 +54,13 @@ fn static_tensor_numel(ty: &Type) -> Option<i64> {
     Some(total)
 }
 
+// CPDT Part III v2.19 introduced the per-model decorator-config
+// resolver to fix multi-model `@moe` composition; v2.20 generalized
+// the resolver to `crate::moe::resolve_decorator_config_for_call_site`
+// and applied it to `@context_parallel` + `@speculative` too. See
+// that function's rustdoc for the resolution rules and the agent/
+// model name-collision footgun.
+
 impl Compiler<'_> {
     pub(crate) fn compile_call(
         &mut self,
@@ -1196,87 +1203,53 @@ impl Compiler<'_> {
                 return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
 
-            // M34: Check for context parallelism (ring attention)
-            // Look up config using the model name prefix from the mangled function name
-            // ("ModelName__method_name"), mirroring the MoE/speculative patterns.
-            let cp_config = state.current_function_name.as_ref().and_then(|fn_name| {
-                let model_prefix = fn_name.split("__").next().unwrap_or("");
-                self.features
-                    .context_parallel_configs
-                    .iter()
-                    .find(|(key, _)| key.starts_with(model_prefix))
-                    .map(|(_, info)| info.clone())
-            });
+            // M34: `@context_parallel` decorator (ring attention).
+            //
+            // History: v2.19 fixed the multi-model lookup; v2.20 generalized
+            // the helper; v2.21 fixed the F64/I64 scale mismatch; v2.22
+            // deleted the buggy ring-attention FFI chain (bugs #2/#3) and
+            // fell everything through to naive attention with a blanket
+            // "M34 in progress" warning.
+            //
+            // M34 v1 (this cycle): the runtime layer at
+            // `crates/nsl-runtime/src/context_parallel/` now composes
+            // partition → online-softmax → gather end-to-end in
+            // `run_ring_attention_full` with matrix regression tests
+            // (2/4/8-way ring, causal + non-causal, 3/6/8/16-token
+            // sequences). What's still deferred is the multi-device
+            // send/recv (NCCL / IPC / process coordination) that would
+            // give the ring wall-clock benefit — until that lands, single
+            // node = naive attention wall-clock, and there's no point
+            // rewiring codegen against a runtime FFI whose distribution
+            // slots would all be no-ops.
+            //
+            // Warning policy:
+            //   ring_size == 1: SEMANTIC IDENTITY — no warning. The user
+            //     explicitly asked for a 1-rank ring, which is just
+            //     attention. The decorator carries planning intent but
+            //     doesn't need to nag at compile time.
+            //   ring_size >= 2: emit a warning that names the real gap —
+            //     "multi-device distribution deferred" — so users know the
+            //     forward is correct but not sharded across GPUs.
+            let cp_config = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.context_parallel_configs,
+            )
+            .map(|(_, info)| info);
 
             if let Some(cp_info) = cp_config {
-                eprintln!(
-                    "[nsl] Context parallelism active: ring_size={}",
-                    cp_info.ring_size
-                );
-
-                // Initialize context parallel context:
-                // nsl_cp_init(ring_size, local_seq_len, num_heads, num_kv_heads, head_dim, dtype)
-                // Pass zeros for dims inferred by runtime; dtype=1 means f32.
-                let ring_size = builder
-                    .ins()
-                    .iconst(cl_types::I64, cp_info.ring_size as i64);
-                let zero = builder.ins().iconst(cl_types::I64, 0);
-                let dtype_val = builder.ins().iconst(cl_types::I64, 1); // f32
-                let cp_ctx = self.compile_call_by_name(
-                    builder,
-                    "nsl_cp_init",
-                    &[ring_size, zero, zero, zero, zero, dtype_val],
-                )?;
-
-                // Partition Q across the ring:
-                // nsl_sequence_partition(tensor, batch, seq_len, hidden, ring_size, rank, overlap)
-                // Runtime infers dims from tensor shape; rank=0 (host rank), overlap=0.
-                let q_part = self.compile_call_by_name(
-                    builder,
-                    "nsl_sequence_partition",
-                    &[q_val, zero, zero, zero, ring_size, zero, zero],
-                )?;
-
-                // Ring attention core:
-                // nsl_ring_attention(cp_ctx, q_part, k, v, scale, causal,
-                //                    null, null, null, null, null, null, null)
-                // Trailing nulls are reserved for future paged/GQA extensions.
-                let causal_flag = builder
-                    .ins()
-                    .iconst(cl_types::I64, if causal { 1 } else { 0 });
-                let null = builder.ins().iconst(cl_types::I64, 0);
-                let ring_result = self.compile_call_by_name(
-                    builder,
-                    "nsl_ring_attention",
-                    &[
-                        cp_ctx,
-                        q_part,
-                        k_val,
-                        v_val,
-                        scale_val,
-                        causal_flag,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                    ],
-                )?;
-
-                // Gather partitioned outputs back to full sequence:
-                // nsl_sequence_gather(result, ring_size, batch, seq_len, hidden, rank, overlap, null)
-                let output = self.compile_call_by_name(
-                    builder,
-                    "nsl_sequence_gather",
-                    &[ring_result, ring_size, zero, zero, zero, zero, zero, null],
-                )?;
-
-                // Destroy context parallel context.
-                self.compile_call_by_name(builder, "nsl_cp_destroy", &[cp_ctx])?;
-
-                return Ok(output);
+                if cp_info.ring_size >= 2 {
+                    eprintln!(
+                        "[nsl] warning: @context_parallel(ring_size={}) — single-device ring math is verified in the runtime (crates/nsl-runtime/src/context_parallel/attention.rs::run_ring_attention_full), but multi-device distribution (send/recv, NCCL) is deferred; forward runs correctly on this device without sharding K/V across ranks.",
+                        cp_info.ring_size
+                    );
+                }
+                // Fall through to the naive path below either way. Do NOT
+                // emit any ring-attention FFI chain — none exists at the
+                // runtime FFI boundary yet (the v2.22-era stubs were
+                // deleted in M34 v1). When real distribution lands, the
+                // fresh FFI shape gets wired in here and this branch
+                // stops falling through.
             }
 
             // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
@@ -1580,7 +1553,571 @@ impl Compiler<'_> {
             );
         }
 
+        // CPDT Part III v2.5 SwiGLU MoE FFN lowering:
+        // `moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up,
+        // experts_down)` is the 5-arg variant that emits
+        // `nsl_moe_dispatch_full_v4` (Mixtral's default FFN structure).
+        // Coexists with v2 `moe_dispatch` and v3 `moe_dispatch_ffn`;
+        // users opt in by switching intrinsics.
+        //
+        // No silent fallback to v3/v2 — users that call this intrinsic
+        // explicitly want SwiGLU. Failure is loud, message lists the
+        // expected WeightMap keys.
+        if func_name == "moe_dispatch_swiglu" {
+            // CPDT Part III v2.14 — `moe_dispatch_swiglu` accepts the
+            // 5-arg form (no bias) for the Mixtral-without-bias case
+            // (the SwiGLU paper convention) OR the 8-arg form (...,
+            // experts_gate_bias, experts_up_bias, experts_down_bias)
+            // for the rare biased variant (e.g., NSL-converted GPT-2
+            // ported to SwiGLU). The v2.14 FFI (14 i64 args) accepts
+            // both forms via the nullable bias pointers. Mirrors v3's
+            // 4/6 arity pattern from v2.12.
+            if args.len() != 5 && args.len() != 8 {
+                // v2.14 fix F7 (IMPORTANT adversarial review): cite a
+                // concrete biased-v4 family. v3's F7 names GPT-2/OPT
+                // for the bias case (well-known); v4 biased variants
+                // are rarer but T5-style models with SwiGLU + bias do
+                // exist (and any NSL-converted GeGLU/ReGLU MoE could
+                // ship biases). Naming the convention makes the
+                // 8-arg form recognizable.
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch_swiglu() takes 5 arguments (tokens, router_logits, experts_gate, \
+                     experts_up, experts_down) OR 8 arguments (..., experts_gate_bias, \
+                     experts_up_bias, experts_down_bias). The 8-arg form is required when the \
+                     loaded weight bundle has v4 FFN biases — all 3 (gate, up, down) are \
+                     required if any are present (v4 paper convention; mirrors v3's GPT-2 / OPT \
+                     pattern but with 3 directions instead of 2). The 5-arg form is the default \
+                     for the Mixtral / DeepSeek convention which omits FFN bias.",
+                ));
+            }
+            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
+            let experts_gate_val = self.compile_expr(builder, state, &args[2].value)?;
+            let experts_up_val = self.compile_expr(builder, state, &args[3].value)?;
+            let experts_down_val = self.compile_expr(builder, state, &args[4].value)?;
+            // v2.14: 8-arg form compiles 3 bias expressions; 5-arg
+            // leaves bias_vals = None and emits iconst(0)/iconst(0)/
+            // iconst(0) at the call site (preserves v2.5/v2.7 v4
+            // emission byte-identical for bias-free MoE).
+            let bias_vals: Option<(_, _, _)> = if args.len() == 8 {
+                let g = self.compile_expr(builder, state, &args[5].value)?;
+                let u = self.compile_expr(builder, state, &args[6].value)?;
+                let d = self.compile_expr(builder, state, &args[7].value)?;
+                Some((g, u, d))
+            } else {
+                None
+            };
+
+            // CPDT Part III v2.19 — use the model-method-aware helper
+            // so multi-model `@moe` builds resolve each call site to
+            // its own model's MoE config. Multi-MoE-PER-model is the
+            // documented v2.next deferral (helper returns None and
+            // the call site falls into the hard-error path).
+            let config_with_key = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.moe_configs,
+            );
+            let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
+                match &config_with_key {
+                    Some((k, info)) => (
+                        Some(k.clone()),
+                        info.num_experts,
+                        info.top_k,
+                        info.capacity_factor,
+                        info.activation,
+                        info.weight_prefix.clone(),
+                    ),
+                    // Fallback path is unreachable when v4 dims resolve
+                    // (config_with_key=None ⇒ lookup_key=None ⇒
+                    // v4_dims=None ⇒ hard error before activation is
+                    // consumed). Mirrors the v3 arm's use of
+                    // MoeActivation::default() so a future flip of the
+                    // default can't silently diverge v3 vs v4 fallbacks.
+                    None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::default(), None),
+                };
+
+            // CPDT Part III v2.8 — gate-activation selection.
+            // v4 now accepts gate_activation_kind ∈ {1, 2, 3}
+            // (SwiGLU/GeGLU/ReGLU). `@moe(activation="…")` is the source
+            // of truth, mapping silu→1, gelu→2, relu→3.
+            //
+            // Identity is REFUSED at the codegen boundary (matching the
+            // runtime FFI's upfront gate). A GLU with identity gate
+            // degenerates to `gate * up @ down`, which is structurally
+            // non-Mixtral; callers that genuinely want no gate should
+            // use `moe_dispatch_ffn` (v3 FFI, 2-weight FFN) with
+            // `@moe(activation="identity")`, not v4.
+            if activation == crate::moe::MoeActivation::Identity {
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch_swiglu: @moe(activation=\"identity\") is invalid \
+                     for the SwiGLU FFI — a GLU with identity gate degenerates to \
+                     `gate * up @ down`, which is not a known production MoE \
+                     structure. Use `moe_dispatch_ffn` (v3 FFI) for a 2-weight FFN \
+                     without a gate activation. Valid v4 activations: silu \
+                     (SwiGLU, default), gelu (GeGLU), relu (ReGLU)."
+                        .to_string(),
+                ));
+            }
+
+            let num_experts_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
+            let top_k_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, top_k as i64);
+            let cap_bits = builder.ins().iconst(
+                cranelift_codegen::ir::types::I64,
+                capacity_factor.to_bits() as i64,
+            );
+            let gate_activation_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, activation as i64);
+
+            // CPDT Part III v2.7 — `@moe(weight_prefix="…")` overrides
+            // the moe_configs key for WeightMap lookups. When Some,
+            // the v4 arm derives dims under that prefix (so a user
+            // running against an HF Mixtral safetensors file can say
+            // `weight_prefix="model.layers.0.block_sparse_moe"` even
+            // though NSL field names cannot contain `.`).
+            let lookup_key = weight_prefix.as_ref().or(cfg_key.as_ref()).cloned();
+            let v4_dims = if let (Some(key), Some(weight_map)) =
+                (lookup_key.as_ref(), self.features.weight_map.as_ref())
+            {
+                crate::moe::derive_v4_dims(weight_map, key, num_experts)
+            } else {
+                None
+            };
+
+            // CPDT Part III v2.14 fix F1 (IMPORTANT adversarial review):
+            // orphan-bias pre-pass for v4, symmetric to v2.12 F2 for v3.
+            // If bias entries are present but the weight dims fail to
+            // resolve (e.g., malformed bundle: biases present but
+            // missing or mis-shaped weight tensors), surface a bias-
+            // aware error BEFORE falling through to the generic v4-
+            // dims-not-resolvable diagnostic. Without this gate the
+            // user only sees "missing experts.gate/up/down.weight"
+            // with no hint that orphan v4 biases also exist in the
+            // bundle and would have activated with the right weight
+            // pack.
+            if v4_dims.is_none() {
+                if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    if crate::moe::any_v4_bias_entry_present(weight_map, key) {
+                        return Err(crate::error::CodegenError::new(format!(
+                            "moe_dispatch_swiglu: WeightMap under '{key}' contains v4 bias \
+                             entries (`experts.gate.bias` and/or `experts.up.bias` and/or \
+                             `experts.down.bias`) BUT the v4 weight dimensions could not \
+                             be resolved (missing or mis-shaped `experts.gate.weight` / \
+                             `experts.up.weight` / `experts.down.weight`). This is an \
+                             orphaned-bias bundle: the biases would never activate \
+                             because their parent projections are absent. Fix the bundle \
+                             by adding the missing weight tensors (and re-running any \
+                             auto-pack step), or remove the orphaned biases."
+                        )));
+                    }
+                }
+            }
+
+            if let Some((hidden_dim, intermediate_dim)) = v4_dims {
+                // CPDT Part III v2.14 source-activation gate. Mirrors
+                // v3's v2.12 detection: when the WeightMap has v4
+                // biases, the source MUST use the 8-arg form so the
+                // bias pointers reach the FFI; the 5-arg form would
+                // silently drop them. Partial / mis-shaped biases
+                // also refuse here with actionable element counts.
+                let weight_map_has_biases = if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    match crate::moe::detect_v4_biases(
+                        weight_map,
+                        key,
+                        num_experts,
+                        hidden_dim,
+                        intermediate_dim,
+                    ) {
+                        Ok(opt) => opt.is_some(),
+                        Err(msg) => {
+                            return Err(crate::error::CodegenError::new(format!(
+                                "moe_dispatch_swiglu: {msg}"
+                            )));
+                        }
+                    }
+                } else {
+                    false
+                };
+                if weight_map_has_biases && bias_vals.is_none() {
+                    return Err(crate::error::CodegenError::new(format!(
+                        "moe_dispatch_swiglu: WeightMap under '{}' has v4 FFN biases \
+                         (`experts.gate.bias` + `experts.up.bias` + `experts.down.bias`), but \
+                         the call site uses the 5-arg form (no bias). To activate the loaded \
+                         biases, add the bias model fields and call the 8-arg form: \
+                         `moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up, \
+                         experts_down, experts_gate_bias, experts_up_bias, experts_down_bias)`. \
+                         Or, to drop the loaded biases, remove them from the weight bundle.",
+                        lookup_key.as_deref().unwrap_or("?")
+                    )));
+                }
+
+                let hidden_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    hidden_dim as i64,
+                );
+                let intermediate_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    intermediate_dim as i64,
+                );
+                // v2.14: bias args. The 5-arg form emits 3 separate
+                // iconst(0) values (matches v2.12 F1 Cranelift IR
+                // hygiene — no Value reuse across arg slots). The
+                // 8-arg form threads the compiled bias expressions.
+                let (bias_gate_arg, bias_up_arg, bias_down_arg) = match bias_vals {
+                    Some((g, u, d)) => (g, u, d),
+                    None => {
+                        let zg = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        let zu = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        let zd = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        (zg, zu, zd)
+                    }
+                };
+                let result = self.compile_call_by_name(
+                    builder,
+                    "nsl_moe_dispatch_full_v4",
+                    &[
+                        tokens_val,
+                        logits_val,
+                        experts_gate_val,
+                        experts_up_val,
+                        experts_down_val,
+                        num_experts_val,
+                        top_k_val,
+                        cap_bits,
+                        hidden_val,
+                        intermediate_val,
+                        gate_activation_val,
+                        bias_gate_arg,
+                        bias_up_arg,
+                        bias_down_arg,
+                    ],
+                )?;
+                return Ok(result);
+            }
+
+            // No silent fallback. SwiGLU is opt-in.
+            return Err(crate::error::CodegenError::new(format!(
+                "moe_dispatch_swiglu: v4 (SwiGLU) requires resolvable router + \
+                 experts.gate + experts.up + experts.down entries in the WeightMap. \
+                 None of the standard names resolved under the lookup prefix{}, or \
+                 their shapes were inconsistent (router must be [hidden, num_experts]; \
+                 each of experts.gate / experts.up must be [num_experts, hidden * \
+                 intermediate]; experts.down must be [num_experts, intermediate * \
+                 hidden]; all three projections must agree on intermediate). Pass \
+                 --weights with a safetensors bundle containing <prefix>.router.weight \
+                 AND <prefix>.experts.gate.weight AND <prefix>.experts.up.weight AND \
+                 <prefix>.experts.down.weight (with `.weight` suffix optional). Raw HF \
+                 Mixtral safetensors use per-expert experts.{{e}}.w1/w2/w3 — v2.6's \
+                 packing primitive (auto-run at WeightMap::load since v2.7) rewrites \
+                 them in place under the HF prefix; declare `@moe(weight_prefix=\"...\")` \
+                 in source to point this lookup at that prefix. For biased v4 \
+                 checkpoints, also include <prefix>.experts.{{gate,up,down}}.bias and \
+                 call the 8-arg form of moe_dispatch_swiglu (v2.14).",
+                lookup_key
+                    .as_deref()
+                    .map(|k| format!(" '{}'", k))
+                    .unwrap_or_default(),
+            )));
+        }
+
+        // CPDT Part III v2.3 paper-faithful MoE FFN lowering:
+        // `moe_dispatch_ffn(tokens, logits, experts_up, experts_down)` is
+        // the opt-in 4-arg variant that emits `nsl_moe_dispatch_full_v3`.
+        // It coexists with the 3-arg `moe_dispatch` (v1/v2 path) — users
+        // opt into v3 by switching source intrinsics; existing v1/v2
+        // callers are unaffected.
+        //
+        // Shape-derivation rules (mirror v1/v2 with the up/down split):
+        //   - cpdt_mode == Full → require both router AND experts.up AND
+        //     experts.down to resolve in the WeightMap under the matching
+        //     MoeConfig key with consistent dims. None → hard CodegenError.
+        //   - cpdt_mode != Full → if v3 dims resolve, emit v3; otherwise
+        //     return an error (no silent v2 fallback from this site —
+        //     callers using moe_dispatch_ffn explicitly want v3).
+        //
+        // Activation: hardcoded SiLU (activation_kind=1) for v2.3.
+        // Per-decorator `@moe(activation="gelu" | "swiglu" | ...)` is a
+        // v2.4 deferral — when added it threads through the existing
+        // `extract_moe_decorator` path in moe.rs.
+        if func_name == "moe_dispatch_ffn" {
+            // CPDT Part III v2.12 — `moe_dispatch_ffn` accepts the 4-arg
+            // form (tokens, logits, experts_up, experts_down) for the
+            // bias-free case (Llama-1+, Mixtral SwiGLU pre-bias variant)
+            // OR the 6-arg form (..., experts_up_bias, experts_down_bias)
+            // for GPT-2 / OPT FFN-bias families. Source-level activation
+            // gate: when the WeightMap has bias entries but the 4-arg
+            // form is used, refuse loudly (see the detect_v3_biases call
+            // below). The v2.11 FFI signature (12 i64 args) accepts both
+            // forms via the nullable bias pointers.
+            if args.len() != 4 && args.len() != 6 {
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch_ffn() takes 4 arguments (tokens, router_logits, \
+                     experts_up, experts_down) OR 6 arguments (..., experts_up_bias, \
+                     experts_down_bias). The 6-arg form is required when the loaded \
+                     weight bundle has FFN biases (GPT-2 / OPT convention); the 4-arg \
+                     form is required when it does not (Llama-1+ / Mixtral).",
+                ));
+            }
+            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
+            let experts_up_val = self.compile_expr(builder, state, &args[2].value)?;
+            let experts_down_val = self.compile_expr(builder, state, &args[3].value)?;
+            // v2.12: 6-arg form compiles the bias expressions. The
+            // 4-arg form leaves these as None and emits `iconst(0)` at
+            // the call site below (preserves v2.5/v2.7 byte-identical
+            // emission for bias-free MoE).
+            let bias_vals: Option<(_, _)> = if args.len() == 6 {
+                let bias_up_val = self.compile_expr(builder, state, &args[4].value)?;
+                let bias_down_val = self.compile_expr(builder, state, &args[5].value)?;
+                Some((bias_up_val, bias_down_val))
+            } else {
+                None
+            };
+
+            // CPDT Part III v2.19 — multi-model `@moe` composition.
+            // The helper picks the call site's MoE config under the
+            // current method's model. Multi-MoE-per-MODEL (≥2 `@moe`
+            // decorators on one model) remains the documented v2.next
+            // deferral and surfaces as `None` here, hitting the v3
+            // hard-error path below.
+            let config_with_key = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.moe_configs,
+            );
+            let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
+                match &config_with_key {
+                    Some((k, info)) => (
+                        Some(k.clone()),
+                        info.num_experts,
+                        info.top_k,
+                        info.capacity_factor,
+                        info.activation,
+                        info.weight_prefix.clone(),
+                    ),
+                    // No MoeConfig matched. Fall back to single-MoE defaults
+                    // for the numeric fields and the default activation
+                    // (SiLU). The error path below still fires loud when v3
+                    // dims can't be derived.
+                    None => (
+                        None,
+                        8,
+                        2,
+                        1.25f32,
+                        crate::moe::MoeActivation::default(),
+                        None,
+                    ),
+                };
+
+            let num_experts_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
+            let top_k_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, top_k as i64);
+            let cap_bits = builder.ins().iconst(
+                cranelift_codegen::ir::types::I64,
+                capacity_factor.to_bits() as i64,
+            );
+
+            // CPDT Part III v2.7 — `@moe(weight_prefix="…")` overrides
+            // the moe_configs key for WeightMap lookups (same pattern as
+            // the v4 arm above). Lets a user point the v3 lowering at
+            // an HF-style prefix that contains `.` (NSL field names
+            // can't).
+            let lookup_key = weight_prefix.as_ref().or(cfg_key.as_ref()).cloned();
+            let v3_dims = if let (Some(key), Some(weight_map)) =
+                (lookup_key.as_ref(), self.features.weight_map.as_ref())
+            {
+                crate::moe::derive_v3_dims(weight_map, key, num_experts)
+            } else {
+                None
+            };
+
+            // CPDT Part III v2.12 fix F2 (HIGH adversarial review): if
+            // bias entries are present but the weight dims fail to
+            // resolve (e.g., the user shipped a malformed bundle with
+            // biases but missing weights), surface a bias-aware error
+            // BEFORE falling through to the generic v3-dims-not-
+            // resolvable diagnostic. Otherwise the user sees only
+            // "missing experts.up.weight" and never realizes their
+            // bundle also has orphaned bias entries that would have
+            // activated with the right weight pack.
+            if v3_dims.is_none() {
+                if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    if crate::moe::any_v3_bias_entry_present(weight_map, key) {
+                        return Err(crate::error::CodegenError::new(format!(
+                            "moe_dispatch_ffn: WeightMap under '{key}' contains v3 bias \
+                             entries (`experts.up.bias` and/or `experts.down.bias`) BUT \
+                             the v3 weight dimensions could not be resolved (missing or \
+                             mis-shaped `experts.up.weight` / `experts.down.weight`). \
+                             This is an orphaned-bias bundle: the biases would never \
+                             activate because their parent projections are absent. Fix \
+                             the bundle by adding the missing weight tensors (and \
+                             re-running any auto-pack step), or remove the orphaned \
+                             biases."
+                        )));
+                    }
+                }
+            }
+
+            if let Some((hidden_dim, intermediate_dim)) = v3_dims {
+                // CPDT Part III v2.12 source-activation gate. When the
+                // WeightMap has v3 biases, the source MUST use the 6-arg
+                // form so the bias pointers reach the FFI; the 4-arg
+                // form would silently drop them. Partial / mis-shaped
+                // biases also refuse here so the diagnostic lands at
+                // codegen with the actionable element counts.
+                let weight_map_has_biases = if let (Some(key), Some(weight_map)) =
+                    (lookup_key.as_ref(), self.features.weight_map.as_ref())
+                {
+                    match crate::moe::detect_v3_biases(
+                        weight_map,
+                        key,
+                        num_experts,
+                        hidden_dim,
+                        intermediate_dim,
+                    ) {
+                        Ok(opt) => opt.is_some(),
+                        Err(msg) => {
+                            return Err(crate::error::CodegenError::new(format!(
+                                "moe_dispatch_ffn: {msg}"
+                            )));
+                        }
+                    }
+                } else {
+                    false
+                };
+                if weight_map_has_biases && bias_vals.is_none() {
+                    return Err(crate::error::CodegenError::new(format!(
+                        "moe_dispatch_ffn: WeightMap under '{}' has v3 FFN biases \
+                         (`experts.up.bias` + `experts.down.bias`), but the call site \
+                         uses the 4-arg form (no bias). To activate the loaded biases, \
+                         add the bias model fields and call the 6-arg form: \
+                         `moe_dispatch_ffn(tokens, logits, experts_up, experts_down, \
+                         experts_up_bias, experts_down_bias)`. Or, to drop the loaded \
+                         biases, remove them from the weight bundle.",
+                        lookup_key.as_deref().unwrap_or("?")
+                    )));
+                }
+                let hidden_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    hidden_dim as i64,
+                );
+                let intermediate_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    intermediate_dim as i64,
+                );
+                // CPDT Part III v2.4: activation_kind sourced from
+                // MoeInfo.activation (the @moe(activation="…") kwarg
+                // or the SiLU default). The enum's `repr(i64)` matches
+                // the runtime FFI's literal switch on 0/1/2/3 — pinned
+                // by `moe_activation_repr_matches_ffi_contract` in
+                // moe.rs tests.
+                let activation_kind_val = builder
+                    .ins()
+                    .iconst(cranelift_codegen::ir::types::I64, activation as i64);
+                // CPDT Part III v2.12 — bias args. The runtime FFI's
+                // experts_up_bias_ptr + experts_down_bias_ptr (null=0
+                // means no bias). The 4-arg `moe_dispatch_ffn` form
+                // emits `iconst(0)` here so v2.5/v2.7 v3 emission stays
+                // byte-identical for bias-free MoE. The 6-arg form
+                // threads the compiled bias expressions through the
+                // FFI; v2.11's upfront-dtype + device-CPU + len gates
+                // validate them at runtime entry.
+                let (bias_up_arg, bias_down_arg) = match bias_vals {
+                    Some((u, d)) => (u, d),
+                    None => {
+                        // v2.12 fix F1 (HIGH adversarial review): emit
+                        // two separate `iconst(0)` Values rather than
+                        // aliasing one Value into two call-arg slots.
+                        // Cranelift's IR technically permits a Value to
+                        // be reused across arg positions, but the
+                        // verifier in debug builds has flagged this
+                        // pattern in past Cranelift versions. Two
+                        // iconsts cost zero (constant-folded by the
+                        // backend) and eliminate the brittleness.
+                        let zero_up = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        let zero_down = builder
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, 0_i64);
+                        (zero_up, zero_down)
+                    }
+                };
+                let result = self.compile_call_by_name(
+                    builder,
+                    "nsl_moe_dispatch_full_v3",
+                    &[
+                        tokens_val,
+                        logits_val,
+                        experts_up_val,
+                        experts_down_val,
+                        num_experts_val,
+                        top_k_val,
+                        cap_bits,
+                        hidden_val,
+                        intermediate_val,
+                        activation_kind_val,
+                        bias_up_arg,
+                        bias_down_arg,
+                    ],
+                )?;
+                return Ok(result);
+            }
+
+            // No silent fallback from moe_dispatch_ffn. Users that call
+            // this intrinsic explicitly want v3; if v3 dims can't
+            // resolve, the build fails loudly. This is stricter than
+            // moe_dispatch's v1-fallback for non-CPDT — that fallback
+            // exists for source-API backward compat, which isn't a
+            // concern here (moe_dispatch_ffn is a new entry point).
+            return Err(crate::error::CodegenError::new(format!(
+                "moe_dispatch_ffn: v3 (paper-faithful FFN) requires resolvable router + \
+                 experts.up + experts.down entries in the WeightMap. None of the standard \
+                 names resolved under the lookup prefix{}, or their shapes were inconsistent \
+                 (router must be [hidden, num_experts]; experts.up must be [num_experts, \
+                 hidden * intermediate]; experts.down must be [num_experts, intermediate * \
+                 hidden]; up- and down-derived intermediate dims must agree). Pass --weights \
+                 with a safetensors bundle that contains <prefix>.router.weight AND \
+                 <prefix>.experts.up.weight AND <prefix>.experts.down.weight (with `.weight` \
+                 suffix optional). Declare `@moe(weight_prefix=\"...\")` in source to point \
+                 this lookup at a non-NSL-identifier prefix (e.g., an HF Mixtral path \
+                 segment with dots). For GPT-2 / OPT FFN-bias checkpoints, also include \
+                 <prefix>.experts.up.bias + <prefix>.experts.down.bias and call the 6-arg \
+                 form of moe_dispatch_ffn (v2.12).",
+                lookup_key
+                    .as_deref()
+                    .map(|k| format!(" '{}'", k))
+                    .unwrap_or_default(),
+            )));
+        }
+
         // M32: MoE dispatch intrinsic
+        //
+        // CPDT Part III v1 production-forward (M32 gap closure): when an
+        // expert WeightMap entry is resolvable AND its shape implies a
+        // well-formed `(hidden_dim, intermediate_dim)` split, emit
+        // `nsl_moe_dispatch_full_v2` against the real expert weight tensor
+        // (replaces the M32 identity skeleton at moe/ffi.rs:287). Otherwise
+        // fall through to the v1 identity emission — silent-fallback to be
+        // hard-erred in S4.
         if func_name == "moe_dispatch" {
             if args.len() != 3 {
                 return Err(crate::error::CodegenError::new(
@@ -1589,36 +2126,33 @@ impl Compiler<'_> {
             }
             let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
             let logits_val = self.compile_expr(builder, state, &args[1].value)?;
-            let _experts_val = self.compile_expr(builder, state, &args[2].value)?;
+            let experts_val = self.compile_expr(builder, state, &args[2].value)?;
 
-            // Look up MoE config from decorator extraction, using model name prefix
-            // from the mangled function name ("ModelName__method_name") to correctly
-            // resolve the right config in multi-layer models instead of grabbing an
-            // arbitrary entry via .values().next().
-            // Look up MoE config by matching model name prefix from mangled function name.
-            // Try both "ModelName__method" pattern and any config key matching.
-            let config = state
-                .current_function_name
-                .as_ref()
-                .and_then(|fn_name| {
-                    let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    self.features
-                        .moe_configs
-                        .iter()
-                        .find(|(key, _)| key.starts_with(model_prefix))
-                        .map(|(_, info)| info.clone())
-                })
-                .or_else(|| {
-                    // Fallback: if only one MoE config exists, use it
-                    if self.features.moe_configs.len() == 1 {
-                        self.features.moe_configs.values().next().cloned()
-                    } else {
-                        None
-                    }
-                });
-            let (num_experts, top_k, capacity_factor) = match config {
-                Some(info) => (info.num_experts, info.top_k, info.capacity_factor),
-                None => (8, 2, 1.25f32), // defaults
+            // CPDT Part III v2.19 — multi-model `@moe` composition.
+            // The helper picks the call site's MoE config under the
+            // current method's model (`self.current_method_model_name`),
+            // filtered by `"{model}."` prefix to scope the WeightMap
+            // lookup identically to `cpdt_expert_prune::prune_moe_weights_in_map`.
+            //
+            // Multi-MoE-per-MODEL (≥2 `@moe` decorators on different
+            // fields of ONE model) remains the documented v2.next
+            // deferral: the helper returns `None`, the v2 fallback
+            // below kicks in with default `num_experts=8`/`top_k=2`,
+            // and `cfg_key=None`. Subsequent behaviour depends on
+            // `cpdt_mode`: under `CpdtMode::Full` the v2-dims gate
+            // below raises a hard codegen error; outside CPDT Full
+            // the v1 fallback (`nsl_moe_dispatch_full`) emits the
+            // M32 identity skeleton without diagnostic. Both
+            // sub-cases match pre-v2.19 behaviour for the deferral.
+            let config_with_key = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.moe_configs,
+            );
+            let (cfg_key, num_experts, top_k, capacity_factor) = match &config_with_key {
+                Some((k, info)) => {
+                    (Some(k.clone()), info.num_experts, info.top_k, info.capacity_factor)
+                }
+                None => (None, 8, 2, 1.25f32), // defaults
             };
 
             let num_experts_val = builder
@@ -1632,8 +2166,70 @@ impl Compiler<'_> {
                 capacity_factor.to_bits() as i64,
             );
 
-            // Call nsl_moe_dispatch_full(tokens, logits, num_experts, top_k, capacity_factor_bits)
-            // Returns a new NslTensor with the MoE output
+            // CPDT Part III v1: derive (hidden_dim, intermediate_dim) from
+            // the WeightMap router/experts shapes via the shared helper
+            // `crate::moe::derive_v2_dims`. None → silent v1 fallback (S4
+            // promotes that path to a hard compile error for cpdt_mode=Full).
+            let v2_dims = if let (Some(key), Some(weight_map)) =
+                (cfg_key.as_ref(), self.features.weight_map.as_ref())
+            {
+                crate::moe::derive_v2_dims(weight_map, key, num_experts)
+            } else {
+                None
+            };
+
+            if let Some((hidden_dim, intermediate_dim)) = v2_dims {
+                let hidden_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    hidden_dim as i64,
+                );
+                let intermediate_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    intermediate_dim as i64,
+                );
+                let result = self.compile_call_by_name(
+                    builder,
+                    "nsl_moe_dispatch_full_v2",
+                    &[
+                        tokens_val,
+                        logits_val,
+                        experts_val,
+                        num_experts_val,
+                        top_k_val,
+                        cap_bits,
+                        hidden_val,
+                        intermediate_val,
+                    ],
+                )?;
+                return Ok(result);
+            }
+
+            // CPDT Part III v1 (S4) — no silent v1 fallback when CPDT is
+            // active. When `cpdt_mode == Full` AND v2 emission failed, raise
+            // a hard compile error so the running program does not silently
+            // route through the M32 identity skeleton (which would mask a
+            // broken WeightMap / mismatched router/experts shapes).
+            // Non-CPDT consumers still get v1 (the M32 fallback) since they
+            // have no expectation of the production-forward path.
+            if matches!(self.cpdt_mode, crate::cpdt::CpdtMode::Full) {
+                return Err(crate::error::CodegenError::new(format!(
+                    "moe_dispatch: CPDT Full mode requires resolvable router + experts \
+                     entries in the WeightMap. None of the standard names resolved under \
+                     the MoeConfig key{}, or their shapes were inconsistent (router must be \
+                     [hidden, num_experts]; experts must be [num_experts, hidden * \
+                     intermediate]). Pass --weights with a safetensors bundle that \
+                     contains <key>.router.weight (or gate.weight / router / gate) AND \
+                     <key>.experts.weight (or experts).",
+                    cfg_key
+                        .as_deref()
+                        .map(|k| format!(" '{}'", k))
+                        .unwrap_or_default(),
+                )));
+            }
+
+            // Non-CPDT fallback: emit v1 (M32 identity skeleton). Kept for
+            // backward compatibility with consumers that don't supply a
+            // WeightMap and don't activate CPDT.
             let result = self.compile_call_by_name(
                 builder,
                 "nsl_moe_dispatch_full",
@@ -1657,16 +2253,21 @@ impl Compiler<'_> {
             let verifier_logits = self.compile_expr(builder, state, &args[2].value)?;
             let vocab_size = self.compile_expr(builder, state, &args[3].value)?;
 
-            // Look up @speculative config using model name prefix from the mangled
-            // function name ("ModelName__method_name"), mirroring the MoE pattern (M32).
-            let config = state.current_function_name.as_ref().and_then(|fn_name| {
-                let model_prefix = fn_name.split("__").next().unwrap_or("");
-                self.features
-                    .speculative_configs
-                    .iter()
-                    .find(|(key, _)| key.starts_with(model_prefix))
-                    .map(|(_, info)| info.clone())
-            });
+            // CPDT Part III v2.20 — multi-model `@speculative`
+            // composition. Pre-v2.20 used the same broken
+            // `current_function_name.split("__").next()` pattern as the
+            // MoE sites (fixed in v2.19): `current_function_name` is
+            // None for model methods, so the lookup always returned
+            // None and `speculative_decode` silently fell through to
+            // hard-coded defaults (`temperature=0.0`, `num_tokens=5`,
+            // `method=Draft`, `tree_width=4`) regardless of user
+            // `@speculative(...)` values — making the decorator a no-op
+            // inside any model method body.
+            let config = crate::moe::resolve_decorator_config_for_call_site(
+                self.current_method_model_name.as_deref(),
+                &self.features.speculative_configs,
+            )
+            .map(|(_, info)| info);
 
             let (temperature, num_tokens, method_id, tree_width) = match &config {
                 Some(info) => (

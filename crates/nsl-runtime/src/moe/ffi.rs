@@ -355,3 +355,1023 @@ pub extern "C" fn nsl_moe_dispatch_full(
 
     Box::into_raw(result) as i64
 }
+
+/// CPDT Part III v1 production-forward (M32 gap closure): high-level MoE
+/// dispatch that routes tokens through REAL per-expert FFN weights — no
+/// identity skeleton. Single-matmul "expert" semantics (matches the
+/// granular-op reference at crates/nsl-codegen/tests/cpdt_expert_prune.rs
+/// `moe_forward`): for each routed token, output = sorted_tokens × W_expert.
+///
+/// ABI: distinct symbol from `nsl_moe_dispatch_full` (kept byte-identical).
+/// v2 adds `experts_ptr` (NslTensor packed `[n_experts, hidden_dim *
+/// intermediate_dim]` row-major, f32 only) plus the two shape dimensions.
+///
+/// OUTPUT SHAPE: `[total_tokens, intermediate_dim]` (NOT `[total_tokens,
+/// hidden_dim]` — every paper-faithful MoE expert FFN changes the trailing
+/// dim from hidden to intermediate). Callers that previously consumed v1's
+/// hidden-dim identity output must adjust accordingly.
+///
+/// REFUSALS (return 0 — caller MUST treat as compile-time error):
+///   - experts_ptr == 0
+///   - num_experts == 0
+///   - top_k not in {1, 2} — `route_topk` itself asserts this; v2 fails
+///     closed at the FFI boundary rather than panicking inside the router.
+///   - experts.dtype != tokens.dtype (mixed-dtype silent-corruption hazard)
+///   - experts.len != num_experts * hidden_dim * intermediate_dim
+///
+/// GATING-WEIGHT BROADCAST: top_k > 1 now uses the real per-token-per-
+/// expert routing weights from `routing.sorted_assignment_weights`
+/// (router-normalized so the surviving pair sums to 1.0 per token).
+/// `gather_tokens` performs the weighted sum across each token's
+/// surviving assignments.
+///
+/// Deferrals (v2.next): bias, activation, down-proj, capacity overflow
+/// handling, GPU expert_parallel_matmul, FP16 experts.
+#[no_mangle]
+pub extern "C" fn nsl_moe_dispatch_full_v2(
+    tokens_ptr: i64,
+    logits_ptr: i64,
+    experts_ptr: i64,
+    num_experts: i64,
+    top_k: i64,
+    capacity_factor_bits: i64,
+    hidden_dim: i64,
+    intermediate_dim: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use crate::memory::checked_alloc;
+    use std::os::raw::c_void;
+
+    // ── Refusal gates — return 0 (null) on bad input ────────────────────
+    if experts_ptr == 0 || num_experts <= 0 || hidden_dim <= 0 || intermediate_dim <= 0 {
+        return 0;
+    }
+    // route_topk asserts top_k in {1, 2}. Fail closed at the FFI boundary
+    // instead of letting the assertion panic across the C ABI.
+    if top_k != 1 && top_k != 2 {
+        return 0;
+    }
+
+    let tokens = NslTensor::from_ptr(tokens_ptr);
+    let logits = NslTensor::from_ptr(logits_ptr);
+    let experts = NslTensor::from_ptr(experts_ptr);
+
+    // Mixed-dtype refusal: v1 byte-slices experts dtype-agnostically at
+    // compile time (cpdt_expert_prune::MixedDtypeUnsupported), but at
+    // runtime v2 needs a uniform dtype to safely interpret the buffer.
+    if experts.dtype != tokens.dtype {
+        return 0;
+    }
+
+    let num_experts_us = num_experts as usize;
+    let hidden_dim_us = hidden_dim as usize;
+    let intermediate_dim_us = intermediate_dim as usize;
+    let top_k = top_k as usize;
+    let capacity_factor = f32::from_bits(capacity_factor_bits as u32) as f64;
+
+    // Shape check: experts must be exactly [num_experts, hidden * intermediate].
+    let expected_experts_elems = num_experts_us
+        .saturating_mul(hidden_dim_us)
+        .saturating_mul(intermediate_dim_us);
+    if (experts.len as usize) != expected_experts_elems {
+        return 0;
+    }
+
+    let total_tokens = if logits.ndim >= 2 {
+        (unsafe { *logits.shape.offset(0) }) as usize
+    } else {
+        logits.len as usize / num_experts_us
+    };
+
+    // Read logits/tokens/experts as f32 — supporting both NSL CPU f64 default
+    // (dtype=0) and explicit f32 (dtype=1). For dtype symmetry we cast all
+    // three to f32 for the matmul.
+    let read_f32 = |t: &NslTensor| -> Vec<f32> {
+        if t.dtype == 0 {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, t.len as usize) };
+            data.iter().map(|&v| v as f32).collect()
+        } else {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, t.len as usize) };
+            data.to_vec()
+        }
+    };
+
+    let logits_f32 = read_f32(&logits);
+    let tokens_f32 = read_f32(&tokens);
+    let experts_f32 = read_f32(&experts);
+
+    // Route tokens — same as v1.
+    let routing = router::route_topk(
+        &logits_f32,
+        total_tokens,
+        num_experts_us,
+        top_k,
+        capacity_factor,
+    );
+    let total_assigned = routing.total_assigned as usize;
+
+    // Scatter tokens into sorted-by-expert layout [total_assigned, hidden].
+    let sorted_tokens = dispatch::scatter_tokens(
+        &tokens_f32,
+        &routing.sorted_token_indices,
+        hidden_dim_us,
+    );
+
+    // Per-expert matmul: sorted_outputs[t, j] = Σ_k sorted_tokens[t, k] * W_e[k, j]
+    // where t ranges over [boundaries[e], boundaries[e+1]) for expert e. Mirrors
+    // nsl_expert_parallel_matmul (ffi.rs:85) inline-replicated so we don't
+    // need to allocate an intermediate raw-buffer just for that FFI call.
+    let mut sorted_outputs = vec![0.0_f32; total_assigned * intermediate_dim_us];
+    let boundaries = &routing.expert_boundaries;
+    for e in 0..num_experts_us {
+        let start = boundaries[e] as usize;
+        let end = boundaries[e + 1] as usize;
+        if start == end {
+            continue;
+        }
+        let w_off = e * hidden_dim_us * intermediate_dim_us;
+        for t in start..end {
+            let tok_off = t * hidden_dim_us;
+            let out_off = t * intermediate_dim_us;
+            for j in 0..intermediate_dim_us {
+                let mut sum = 0.0_f32;
+                for k in 0..hidden_dim_us {
+                    sum += sorted_tokens[tok_off + k]
+                        * experts_f32[w_off + k * intermediate_dim_us + j];
+                }
+                sorted_outputs[out_off + j] = sum;
+            }
+        }
+    }
+
+    // Gather back to token order using the real per-(token, expert)
+    // routing weights from sorted_assignment_weights. For top_k=1 every
+    // weight is 1.0 (single-element softmax), so this remains bit-exact
+    // against the prior uniform-1.0 path. For top_k=2 each surviving
+    // assignment carries its router-normalized share; gather_tokens
+    // accumulates the weighted sum back to the original token row.
+    let output_f32 = dispatch::gather_tokens(
+        &sorted_outputs,
+        &routing.sorted_token_indices,
+        &routing.sorted_assignment_weights,
+        total_tokens,
+        top_k,
+        intermediate_dim_us,
+    );
+
+    // Allocate output NslTensor with shape [total_tokens, intermediate_dim].
+    // This is the v1↔v2 ABI difference downstream callers must absorb.
+    let output_len = total_tokens * intermediate_dim_us;
+    let out_dtype = tokens.dtype;
+    let data: *mut c_void = if out_dtype == 0 {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f64>()) as *mut f64;
+        for (i, &val) in output_f32.iter().enumerate().take(output_len) {
+            unsafe { *ptr.add(i) = val as f64 };
+        }
+        ptr as *mut c_void
+    } else {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(output_f32.as_ptr(), ptr, output_len);
+        }
+        ptr as *mut c_void
+    };
+
+    // Output is always 2D: [total_tokens, intermediate_dim].
+    let ndim: i64 = 2;
+    let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape = total_tokens as i64;
+        *shape.add(1) = intermediate_dim;
+    }
+    let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *strides.add(1) = 1;
+        *strides = intermediate_dim;
+    }
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        output_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
+
+    Box::into_raw(result) as i64
+}
+
+/// CPDT Part III v2.2 — paper-faithful MoE FFN.
+///
+/// Layers a second matmul + activation on top of v2's single-matmul
+/// "expert", producing the standard MoE FFN structure used by
+/// Mixtral / DeepSeek MoE / etc.:
+///
+///   x_up   = x_token  @ W_up_e                # [hidden] -> [intermediate]
+///   x_act  = activation(x_up)                 # in-place; SiLU = x * sigmoid(x)
+///   x_down = x_act    @ W_down_e              # [intermediate] -> [hidden]
+///   out    = Σ_e routing_weight[t, e] * x_down
+///
+/// Output shape is `[total_tokens, hidden_dim]` — distinct from v2 which
+/// stopped at intermediate_dim. Downstream consumers reading the
+/// trailing dim of v3 vs v2 outputs will see different sizes.
+///
+/// CONTRACT vs v1/v2:
+///   - v1 (`nsl_moe_dispatch_full`): identity skeleton; output ==
+///     scattered tokens at hidden_dim. KEPT BYTE-IDENTICAL.
+///   - v2 (`nsl_moe_dispatch_full_v2`): real W_up matmul; output at
+///     intermediate_dim. KEPT BYTE-IDENTICAL.
+///   - v3 (this fn): adds activation + W_down; output back at
+///     hidden_dim. Routing/scatter/gather pipeline IS SHARED with
+///     v2 — only the per-expert compute kernel differs.
+///
+/// WEIGHTS LAYOUT (both packed [n_experts, ...] row-major):
+///   - experts_up_ptr   shape == [n_experts, hidden_dim * intermediate_dim]
+///   - experts_down_ptr shape == [n_experts, intermediate_dim * hidden_dim]
+///
+/// ACTIVATION SELECTION:
+///   - activation_kind == 0 → identity (no activation; only useful to
+///     differentiate v3-vs-v2 at the test level; production should use
+///     a real activation)
+///   - activation_kind == 1 → SiLU = x * sigmoid(x). Mixtral / DeepSeek
+///     MoE default.
+///   - activation_kind == 2 → GELU (tanh approximation):
+///       0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3))).
+///     Matches PyTorch's `F.gelu(approximate='tanh')`. Used by GPT-2
+///     and earlier transformer FFNs.
+///   - activation_kind == 3 → ReLU = max(0, x). Pre-modern; included
+///     mostly for completeness + as a sanity-check baseline.
+///   - activation_kind ∈ other → refused (return 0). SwiGLU = (silu(gate)
+///     ⊙ up) @ down needs a third weight matrix and is a separate
+///     v2.5 FFI variant (v4).
+///
+/// BIAS (CPDT Part III v2.11):
+///   - experts_up_bias_ptr   == 0 → no bias on the up-matmul (preserves v2.5
+///     v3 behavior bit-exact: callers that pass 0 here get the unbiased
+///     `x_up = token @ W_up_e` baseline).
+///   - experts_up_bias_ptr   != 0 → packed `[n_experts, intermediate_dim]`,
+///     applied as `x_up[j] += bias_up[e * intermediate_dim + j]` BEFORE
+///     the activation step (matches GPT-2 / OPT FFN convention; Llama-1
+///     onward explicitly omits FFN bias and would pass 0 here).
+///   - experts_down_bias_ptr == 0 → no bias on the down-matmul.
+///   - experts_down_bias_ptr != 0 → packed `[n_experts, hidden_dim]`,
+///     applied as `x_down[h] += bias_down[e * hidden_dim + h]` AFTER the
+///     down-matmul, BEFORE the routing-weighted gather.
+///   - Each bias is independently null-able — callers can have bias on
+///     only one of the two projections (e.g., some GPT-2 variants).
+///   - Bias dtype must match the corresponding expert tensor.
+///
+/// REFUSALS (return 0):
+///   - any of experts_up_ptr, experts_down_ptr is null
+///   - num_experts/hidden/intermediate <= 0
+///   - top_k ∉ {1, 2} (route_topk asserts {1,2})
+///   - activation_kind ∉ {0, 1, 2, 3}
+///   - mixed dtype between tokens / experts_up / experts_down
+///   - experts_up.len   != n_experts * hidden * intermediate
+///   - experts_down.len != n_experts * intermediate * hidden
+///   - experts_up_bias_ptr != 0 AND bias.dtype != tokens.dtype
+///   - experts_up_bias_ptr != 0 AND bias.len != n_experts * intermediate_dim
+///   - experts_down_bias_ptr != 0 AND bias.dtype != tokens.dtype
+///   - experts_down_bias_ptr != 0 AND bias.len != n_experts * hidden_dim
+///
+/// Deferrals (v2.next): bias on v4 (SwiGLU/GeGLU/ReGLU — most Mixtral-
+/// family architectures explicitly omit bias on the gated FFN, so v4
+/// bias is lower-priority), capacity-overflow renorm, GPU
+/// expert_parallel_matmul, FP16/mixed-precision experts.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_moe_dispatch_full_v3(
+    tokens_ptr: i64,
+    logits_ptr: i64,
+    experts_up_ptr: i64,
+    experts_down_ptr: i64,
+    num_experts: i64,
+    top_k: i64,
+    capacity_factor_bits: i64,
+    hidden_dim: i64,
+    intermediate_dim: i64,
+    activation_kind: i64,
+    experts_up_bias_ptr: i64,
+    experts_down_bias_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use crate::memory::checked_alloc;
+    use std::os::raw::c_void;
+
+    // ── Refusal gates ──────────────────────────────────────────────────
+    if experts_up_ptr == 0 || experts_down_ptr == 0
+        || num_experts <= 0 || hidden_dim <= 0 || intermediate_dim <= 0
+    {
+        return 0;
+    }
+    if top_k != 1 && top_k != 2 {
+        return 0;
+    }
+    if !(0..=3).contains(&activation_kind) {
+        return 0;
+    }
+
+    let tokens = NslTensor::from_ptr(tokens_ptr);
+    let logits = NslTensor::from_ptr(logits_ptr);
+    let experts_up = NslTensor::from_ptr(experts_up_ptr);
+    let experts_down = NslTensor::from_ptr(experts_down_ptr);
+
+    // Uniform dtype required across tokens / both expert tensors. v2.next
+    // will add mixed-precision; for v2.2 we mirror v2's refusal.
+    if experts_up.dtype != tokens.dtype || experts_down.dtype != tokens.dtype {
+        return 0;
+    }
+    // CPDT Part III v2.11 fix F1 (IMPORTANT adversarial review) —
+    // read_f32 only handles dtype==0 (f64) and dtype==1 (f32). Any other
+    // dtype (2=f16, 3=bf16, 256+=custom) would be reinterpreted as f32
+    // and trigger a heap OOB read on 2-byte-stride buffers. Refuse here
+    // upfront — FP16/mixed-precision experts is a documented v2.next
+    // deferral; this gate enforces it rather than silently corrupting.
+    // Makes the matched-dtype checks above transitive: all expert/bias
+    // tensors are also restricted to {0,1}.
+    if tokens.dtype != 0 && tokens.dtype != 1 {
+        return 0;
+    }
+    // CPDT Part III v2.11 fix F2 (IMPORTANT adversarial review) —
+    // read_f32 dereferences tokens.data as a CPU pointer
+    // (`from_raw_parts`). A GPU-resident tensor (device=1) here would
+    // segfault. Refuse non-CPU device upfront. The matched-device check
+    // below extends this to expert and bias tensors transitively.
+    if tokens.device != 0 {
+        return 0;
+    }
+    if experts_up.device != 0 || experts_down.device != 0 {
+        return 0;
+    }
+
+    let num_experts_us = num_experts as usize;
+    let hidden_dim_us = hidden_dim as usize;
+    let intermediate_dim_us = intermediate_dim as usize;
+    let top_k = top_k as usize;
+    let capacity_factor = f32::from_bits(capacity_factor_bits as u32) as f64;
+
+    // Shape checks.
+    let expected_up = num_experts_us
+        .saturating_mul(hidden_dim_us)
+        .saturating_mul(intermediate_dim_us);
+    let expected_down = num_experts_us
+        .saturating_mul(intermediate_dim_us)
+        .saturating_mul(hidden_dim_us);
+    if (experts_up.len as usize) != expected_up || (experts_down.len as usize) != expected_down {
+        return 0;
+    }
+
+    // CPDT Part III v2.11 — bias materialization. Each bias is
+    // independently nullable (0 = no bias). Validated upfront (dtype +
+    // device + length) so the per-expert inner loop can rely on a
+    // properly-shaped CPU buffer. Materialize as f32 Vec to share the
+    // read_f32 closure below without re-reading shape on every inner
+    // iteration.
+    let expected_up_bias = num_experts_us.saturating_mul(intermediate_dim_us);
+    let expected_down_bias = num_experts_us.saturating_mul(hidden_dim_us);
+    let up_bias_opt = if experts_up_bias_ptr == 0 {
+        None
+    } else {
+        let bias = NslTensor::from_ptr(experts_up_bias_ptr);
+        if bias.dtype != tokens.dtype
+            || bias.device != 0
+            || (bias.len as usize) != expected_up_bias
+        {
+            return 0;
+        }
+        Some(bias)
+    };
+    let down_bias_opt = if experts_down_bias_ptr == 0 {
+        None
+    } else {
+        let bias = NslTensor::from_ptr(experts_down_bias_ptr);
+        if bias.dtype != tokens.dtype
+            || bias.device != 0
+            || (bias.len as usize) != expected_down_bias
+        {
+            return 0;
+        }
+        Some(bias)
+    };
+
+    let total_tokens = if logits.ndim >= 2 {
+        (unsafe { *logits.shape.offset(0) }) as usize
+    } else {
+        logits.len as usize / num_experts_us
+    };
+
+    let read_f32 = |t: &NslTensor| -> Vec<f32> {
+        if t.dtype == 0 {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, t.len as usize) };
+            data.iter().map(|&v| v as f32).collect()
+        } else {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, t.len as usize) };
+            data.to_vec()
+        }
+    };
+
+    let logits_f32 = read_f32(&logits);
+    let tokens_f32 = read_f32(&tokens);
+    let experts_up_f32 = read_f32(&experts_up);
+    let experts_down_f32 = read_f32(&experts_down);
+    // v2.11 — materialize bias buffers (if present) up front so the
+    // per-expert hot loop avoids re-reading dtype on each iteration.
+    // NslTensor::from_ptr returns &mut NslTensor, so the closure
+    // takes an explicit reborrow to match read_f32's &NslTensor sig.
+    let up_bias_f32_opt: Option<Vec<f32>> = up_bias_opt.as_ref().map(|t| read_f32(&**t));
+    let down_bias_f32_opt: Option<Vec<f32>> = down_bias_opt.as_ref().map(|t| read_f32(&**t));
+
+    let routing = router::route_topk(
+        &logits_f32, total_tokens, num_experts_us, top_k, capacity_factor,
+    );
+    let total_assigned = routing.total_assigned as usize;
+
+    let sorted_tokens = dispatch::scatter_tokens(
+        &tokens_f32, &routing.sorted_token_indices, hidden_dim_us,
+    );
+
+    // Per-expert up-matmul → activation → down-matmul. Output buffer is
+    // sized for hidden_dim trailing axis (back to the input size).
+    let mut sorted_outputs = vec![0.0_f32; total_assigned * hidden_dim_us];
+    // Intermediate scratch reused per expert range to avoid reallocating.
+    let mut intermediate = vec![0.0_f32; intermediate_dim_us];
+    let boundaries = &routing.expert_boundaries;
+    for e in 0..num_experts_us {
+        let start = boundaries[e] as usize;
+        let end = boundaries[e + 1] as usize;
+        if start == end {
+            continue;
+        }
+        let up_off = e * hidden_dim_us * intermediate_dim_us;
+        let down_off = e * intermediate_dim_us * hidden_dim_us;
+        // v2.11 bias offsets — per-expert slice [intermediate_dim] for
+        // up_bias, [hidden_dim] for down_bias. Hoisted outside the
+        // per-token loop so each bias[e * dim + j] read becomes an
+        // index-by-j into the same slice.
+        let up_bias_off = e * intermediate_dim_us;
+        let down_bias_off = e * hidden_dim_us;
+        for t in start..end {
+            let tok_off = t * hidden_dim_us;
+            let out_off = t * hidden_dim_us;
+
+            // x_up[j] = Σ_k token[k] * W_up[e][k, j]  + bias_up[e, j]
+            for j in 0..intermediate_dim_us {
+                let mut sum = 0.0_f32;
+                for k in 0..hidden_dim_us {
+                    sum += sorted_tokens[tok_off + k]
+                        * experts_up_f32[up_off + k * intermediate_dim_us + j];
+                }
+                if let Some(b) = &up_bias_f32_opt {
+                    sum += b[up_bias_off + j];
+                }
+                intermediate[j] = sum;
+            }
+
+            // Activation. activation_kind selects the elementwise
+            // nonlinearity. All variants are numerically safe for all
+            // finite f32; NaN inputs propagate NaN (caller's
+            // responsibility, consistent with the rest of moe/ffi.rs).
+            //
+            //   0 → identity (skip)
+            //   1 → SiLU = x * sigmoid(x)
+            //   2 → GELU (tanh approximation, matches torch.gelu approx="tanh")
+            //   3 → ReLU = max(0, x)
+            match activation_kind {
+                0 => {}
+                1 => {
+                    for v in intermediate.iter_mut() {
+                        let s = 1.0_f32 / (1.0_f32 + (-*v).exp());
+                        *v *= s;
+                    }
+                }
+                2 => {
+                    // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+                    // 0.7978845608 = sqrt(2.0 / std::f32::consts::PI), precomputed
+                    // as an f32 constant to avoid bringing the dependency into
+                    // this inner loop.
+                    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+                    const GELU_CUBIC: f32 = 0.044715_f32;
+                    for v in intermediate.iter_mut() {
+                        let x = *v;
+                        let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
+                        *v = 0.5_f32 * x * (1.0_f32 + inner.tanh());
+                    }
+                }
+                3 => {
+                    for v in intermediate.iter_mut() {
+                        if *v < 0.0_f32 {
+                            *v = 0.0_f32;
+                        }
+                    }
+                }
+                _ => unreachable!("activation_kind {} bypassed the upfront refusal gate", activation_kind),
+            }
+
+            // x_down[h] = Σ_j x_act[j] * W_down[e][j, h]  + bias_down[e, h]
+            for h in 0..hidden_dim_us {
+                let mut sum = 0.0_f32;
+                for j in 0..intermediate_dim_us {
+                    sum += intermediate[j]
+                        * experts_down_f32[down_off + j * hidden_dim_us + h];
+                }
+                if let Some(b) = &down_bias_f32_opt {
+                    sum += b[down_bias_off + h];
+                }
+                sorted_outputs[out_off + h] = sum;
+            }
+        }
+    }
+
+    // Gather back with the real routing weights — same alignment as v2.1.
+    let output_f32 = dispatch::gather_tokens(
+        &sorted_outputs,
+        &routing.sorted_token_indices,
+        &routing.sorted_assignment_weights,
+        total_tokens,
+        top_k,
+        hidden_dim_us,
+    );
+
+    let output_len = total_tokens * hidden_dim_us;
+    let out_dtype = tokens.dtype;
+    let data: *mut c_void = if out_dtype == 0 {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f64>()) as *mut f64;
+        for (i, &val) in output_f32.iter().enumerate().take(output_len) {
+            unsafe { *ptr.add(i) = val as f64 };
+        }
+        ptr as *mut c_void
+    } else {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(output_f32.as_ptr(), ptr, output_len);
+        }
+        ptr as *mut c_void
+    };
+
+    let ndim: i64 = 2;
+    let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape = total_tokens as i64;
+        *shape.add(1) = hidden_dim;
+    }
+    let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *strides.add(1) = 1;
+        *strides = hidden_dim;
+    }
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        output_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
+
+    Box::into_raw(result) as i64
+}
+
+/// CPDT Part III v2.5+v2.8 — Mixtral-style gated MoE FFN (SwiGLU /
+/// GeGLU / ReGLU).
+///
+/// SwiGLU is the dominant production MoE activation (Mixtral, DeepSeek
+/// MoE, Llama-3 dense FFNs). It uses a THIRD weight matrix beyond v3's
+/// up + down, splitting the up-projection into a gate path and a
+/// straight path, then element-wise multiplying after the nonlinearity.
+/// v2.8 generalized v4 to also support GeGLU (gelu-gated, PaLM/Gemini)
+/// and ReGLU (relu-gated, T5 variants) via the new
+/// `gate_activation_kind` selector:
+///
+///   x_gate = token  @ W_gate[e]              # [hidden] -> [intermediate]
+///   x_up   = token  @ W_up[e]                # [hidden] -> [intermediate]
+///   x_act  = gate_act(x_gate) * x_up         # GLU step; gate_act ∈
+///                                            #   {silu, gelu, relu}
+///                                            #   per gate_activation_kind
+///   x_down = x_act  @ W_down[e]              # [intermediate] -> [hidden]
+///   out    = sum over e of routing_weight[t, e] * x_down
+///
+/// Output shape `[total_tokens, hidden_dim]` — same as v3 (returns to
+/// the input hidden dim via down-proj).
+///
+/// CONTRACT vs v1/v2/v3:
+///   - v1 (`nsl_moe_dispatch_full`): identity skeleton at hidden_dim.
+///   - v2 (`nsl_moe_dispatch_full_v2`): real W_up matmul; output at
+///     intermediate_dim.
+///   - v3 (`nsl_moe_dispatch_full_v3`): W_up -> activation -> W_down,
+///     output at hidden_dim, single scalar activation.
+///   - v4 (this fn): GATE + W_up -> selectable gate-activation multiply
+///     (silu/gelu/relu, see GATE-ACTIVATION SELECTION below) -> W_down,
+///     output at hidden_dim. Routing / scatter / gather pipeline IS
+///     SHARED with v2/v3; only the per-expert kernel is new.
+///
+/// WEIGHTS LAYOUT (all packed `[n_experts, ...]` row-major):
+///   - experts_gate_ptr shape == [n_experts, hidden_dim * intermediate_dim]
+///   - experts_up_ptr   shape == [n_experts, hidden_dim * intermediate_dim]
+///   - experts_down_ptr shape == [n_experts, intermediate_dim * hidden_dim]
+///
+/// GATE-ACTIVATION SELECTION (CPDT Part III v2.8):
+///   - gate_activation_kind == 1 → SwiGLU = silu(gate) * up. Mixtral /
+///     DeepSeek MoE / Llama-3 dense FFN default.
+///   - gate_activation_kind == 2 → GeGLU  = gelu(gate) * up. Used by
+///     PaLM / Gemini dense FFNs; numerically close to SwiGLU but with
+///     PyTorch's tanh-approx GELU (matches `F.gelu(approximate='tanh')`).
+///   - gate_activation_kind == 3 → ReGLU  = relu(gate) * up. Used by
+///     some smaller models (T5 variants); cheaper than SwiGLU/GeGLU
+///     since relu is branch-only.
+///   - gate_activation_kind ∈ other → refused (return 0). Identity (0)
+///     is explicitly REFUSED here: a GLU with identity gate degenerates
+///     to `gate * up @ down`, which is NOT any known production MoE
+///     structure. Callers that genuinely want no gate activation should
+///     use the v3 FFI (`nsl_moe_dispatch_full_v3`) with
+///     activation_kind=0 — that is a 2-weight FFN, not a 3-weight GLU.
+///
+/// The gate-activation arg is a non-breaking signature extension over
+/// the v2.5/v2.7 v4 FFI: callers that pass 1 here get the v2.5 SwiGLU
+/// behavior bit-for-bit.
+///
+/// REFUSALS (return 0):
+///   - tokens_ptr or logits_ptr is null
+///   - any of experts_gate_ptr, experts_up_ptr, experts_down_ptr is null
+///   - num_experts/hidden/intermediate <= 0
+///   - top_k not in {1, 2} (route_topk asserts {1, 2})
+///   - gate_activation_kind ∉ {1, 2, 3}
+///   - mixed dtype between tokens / experts_{gate, up, down}
+///   - experts_gate.len != n_experts * hidden * intermediate
+///   - experts_up.len   != n_experts * hidden * intermediate
+///   - experts_down.len != n_experts * intermediate * hidden
+///   - v2.14: tokens.dtype ∉ {0=f64, 1=f32} (read_f32 OOB-reads other dtypes)
+///   - v2.14: any of tokens / experts_* / bias_* not on CPU (device != 0)
+///   - v2.14: any non-null bias_ptr with mismatched dtype/device or wrong len
+///
+/// v2.14 (CPDT Part III v2.14) — bias args. The FFI gains 3 nullable
+/// bias pointers at positions 12+13+14. Application ordering matches
+/// the v3 paper-faithful convention for the bias-before-activation
+/// invariant:
+///   - gate_bias added to gate matmul output BEFORE the SwiGLU/GeGLU/
+///     ReGLU activation (so `act(gate @ x + gate_bias) * (up @ x + up_bias)`)
+///   - up_bias added to up matmul output BEFORE the GLU multiply
+///   - down_bias added to down matmul output BEFORE gather/sum
+/// Expected bias shape (FFI checks total elem count only):
+///   - gate_bias: n_experts * intermediate_dim
+///   - up_bias:   n_experts * intermediate_dim
+///   - down_bias: n_experts * hidden_dim
+/// Any combination of {gate, up, down} biases is independently
+/// optional — null pointer means no bias for that direction (matches
+/// v2.11's v3 convention).
+///
+/// Deferrals (v2.next): capacity-overflow renorm, GPU
+/// expert_parallel_matmul, FP16/mixed-precision experts (relax F1
+/// upfront dtype refusal).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_moe_dispatch_full_v4(
+    tokens_ptr: i64,
+    logits_ptr: i64,
+    experts_gate_ptr: i64,
+    experts_up_ptr: i64,
+    experts_down_ptr: i64,
+    num_experts: i64,
+    top_k: i64,
+    capacity_factor_bits: i64,
+    hidden_dim: i64,
+    intermediate_dim: i64,
+    gate_activation_kind: i64,
+    experts_gate_bias_ptr: i64,
+    experts_up_bias_ptr: i64,
+    experts_down_bias_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use crate::memory::checked_alloc;
+    use std::os::raw::c_void;
+
+    // Refusal gates. Null pointers MUST be rejected BEFORE any
+    // NslTensor::from_ptr — that call materializes a `&mut NslTensor`
+    // from the raw integer, and forming a reference from a null
+    // pointer is instant UB under Rust's reference-creation rules
+    // (the debug_assert! on the magic field reads the struct AFTER
+    // the reference is formed, and is elided in release). v4 is a
+    // public `#[no_mangle] extern "C"` boundary, so direct FFI
+    // callers (C ABI, tests, third-party wrappers) can pass 0 here.
+    if tokens_ptr == 0 || logits_ptr == 0 {
+        return 0;
+    }
+    if experts_gate_ptr == 0
+        || experts_up_ptr == 0
+        || experts_down_ptr == 0
+        || num_experts <= 0
+        || hidden_dim <= 0
+        || intermediate_dim <= 0
+    {
+        return 0;
+    }
+    if top_k != 1 && top_k != 2 {
+        return 0;
+    }
+    // v2.8 — gate_activation_kind must be in {1, 2, 3} (SwiGLU/GeGLU/
+    // ReGLU). Identity (0) is structurally non-Mixtral; refuse so a
+    // caller passing 0 cannot silently emit `gate * up @ down`.
+    if !(1..=3).contains(&gate_activation_kind) {
+        return 0;
+    }
+
+    let tokens = NslTensor::from_ptr(tokens_ptr);
+    let logits = NslTensor::from_ptr(logits_ptr);
+    let experts_gate = NslTensor::from_ptr(experts_gate_ptr);
+    let experts_up = NslTensor::from_ptr(experts_up_ptr);
+    let experts_down = NslTensor::from_ptr(experts_down_ptr);
+
+    // v2.14 (carry-over from v2.11 F1+F2): upfront dtype + device gates.
+    // `read_f32` only handles dtype {0, 1}; other dtypes would silently
+    // OOB-read. All tensors must live on CPU (device 0) — GPU pointers
+    // dereferenced as host pointers segfault.
+    if tokens.dtype != 0 && tokens.dtype != 1 {
+        return 0;
+    }
+    if tokens.device != 0 {
+        return 0;
+    }
+    if experts_gate.device != 0 || experts_up.device != 0 || experts_down.device != 0 {
+        return 0;
+    }
+
+    if experts_gate.dtype != tokens.dtype
+        || experts_up.dtype != tokens.dtype
+        || experts_down.dtype != tokens.dtype
+    {
+        return 0;
+    }
+
+    let num_experts_us = num_experts as usize;
+    let hidden_dim_us = hidden_dim as usize;
+    let intermediate_dim_us = intermediate_dim as usize;
+    let top_k = top_k as usize;
+    let capacity_factor = f32::from_bits(capacity_factor_bits as u32) as f64;
+
+    let expected_gate_up = num_experts_us
+        .saturating_mul(hidden_dim_us)
+        .saturating_mul(intermediate_dim_us);
+    let expected_down = num_experts_us
+        .saturating_mul(intermediate_dim_us)
+        .saturating_mul(hidden_dim_us);
+    if (experts_gate.len as usize) != expected_gate_up
+        || (experts_up.len as usize) != expected_gate_up
+        || (experts_down.len as usize) != expected_down
+    {
+        return 0;
+    }
+
+    // v2.14 bias validation: each non-null bias must (a) be CPU, (b)
+    // match tokens.dtype, (c) have the expected total elem count for
+    // its direction. Validated BEFORE any allocation so a failure
+    // can't leave the caller with half-materialized state.
+    let expected_gate_bias = num_experts_us.saturating_mul(intermediate_dim_us);
+    let expected_up_bias = num_experts_us.saturating_mul(intermediate_dim_us);
+    let expected_down_bias = num_experts_us.saturating_mul(hidden_dim_us);
+    let gate_bias_opt = if experts_gate_bias_ptr == 0 {
+        None
+    } else {
+        let b = NslTensor::from_ptr(experts_gate_bias_ptr);
+        if b.dtype != tokens.dtype
+            || b.device != 0
+            || (b.len as usize) != expected_gate_bias
+        {
+            return 0;
+        }
+        Some(b)
+    };
+    let up_bias_opt = if experts_up_bias_ptr == 0 {
+        None
+    } else {
+        let b = NslTensor::from_ptr(experts_up_bias_ptr);
+        if b.dtype != tokens.dtype
+            || b.device != 0
+            || (b.len as usize) != expected_up_bias
+        {
+            return 0;
+        }
+        Some(b)
+    };
+    let down_bias_opt = if experts_down_bias_ptr == 0 {
+        None
+    } else {
+        let b = NslTensor::from_ptr(experts_down_bias_ptr);
+        if b.dtype != tokens.dtype
+            || b.device != 0
+            || (b.len as usize) != expected_down_bias
+        {
+            return 0;
+        }
+        Some(b)
+    };
+
+    let total_tokens = if logits.ndim >= 2 {
+        (unsafe { *logits.shape.offset(0) }) as usize
+    } else {
+        logits.len as usize / num_experts_us
+    };
+
+    let read_f32 = |t: &NslTensor| -> Vec<f32> {
+        if t.dtype == 0 {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, t.len as usize) };
+            data.iter().map(|&v| v as f32).collect()
+        } else {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, t.len as usize) };
+            data.to_vec()
+        }
+    };
+
+    let logits_f32 = read_f32(&logits);
+    let tokens_f32 = read_f32(&tokens);
+    let experts_gate_f32 = read_f32(&experts_gate);
+    let experts_up_f32 = read_f32(&experts_up);
+    let experts_down_f32 = read_f32(&experts_down);
+    // v2.14 bias materialization. Hoisted outside the kernel loops so
+    // the bias buffer is materialized once per FFI call, not per
+    // (expert, token) pair. Type annotation pins the closure-reborrow
+    // pattern (NslTensor::from_ptr returns &'static mut so
+    // .as_ref().map(read_f32) hits a &&mut NslTensor vs &NslTensor
+    // mismatch; explicit `|t| read_f32(&**t)` works around the
+    // double-mut-ref).
+    let gate_bias_f32_opt: Option<Vec<f32>> =
+        gate_bias_opt.as_ref().map(|t| read_f32(&**t));
+    let up_bias_f32_opt: Option<Vec<f32>> =
+        up_bias_opt.as_ref().map(|t| read_f32(&**t));
+    let down_bias_f32_opt: Option<Vec<f32>> =
+        down_bias_opt.as_ref().map(|t| read_f32(&**t));
+
+    let routing = router::route_topk(
+        &logits_f32, total_tokens, num_experts_us, top_k, capacity_factor,
+    );
+    let total_assigned = routing.total_assigned as usize;
+
+    let sorted_tokens = dispatch::scatter_tokens(
+        &tokens_f32, &routing.sorted_token_indices, hidden_dim_us,
+    );
+
+    let mut sorted_outputs = vec![0.0_f32; total_assigned * hidden_dim_us];
+    let mut gate_scratch = vec![0.0_f32; intermediate_dim_us];
+    let mut up_scratch = vec![0.0_f32; intermediate_dim_us];
+    let boundaries = &routing.expert_boundaries;
+    for e in 0..num_experts_us {
+        let start = boundaries[e] as usize;
+        let end = boundaries[e + 1] as usize;
+        if start == end {
+            continue;
+        }
+        let gate_off = e * hidden_dim_us * intermediate_dim_us;
+        let up_off = e * hidden_dim_us * intermediate_dim_us;
+        let down_off = e * intermediate_dim_us * hidden_dim_us;
+        // v2.14 per-expert bias offsets hoisted once per expert
+        // (matches the v2.11 v3 pattern at ffi.rs around line ~770).
+        let gate_bias_off = e * intermediate_dim_us;
+        let up_bias_off = e * intermediate_dim_us;
+        let down_bias_off = e * hidden_dim_us;
+        for t in start..end {
+            let tok_off = t * hidden_dim_us;
+            let out_off = t * hidden_dim_us;
+
+            // Combined gate+up matmul — token bytes loaded once per
+            // k-iteration and applied to both gate and up weights.
+            // v2.14: biases applied inside this j-loop BEFORE the GLU
+            // activation step that follows. This matches the v2.11 v3
+            // bias-before-activation invariant (and the SwiGLU paper
+            // formulation for the rare biased variant).
+            for j in 0..intermediate_dim_us {
+                let mut sum_g = 0.0_f32;
+                let mut sum_u = 0.0_f32;
+                for k in 0..hidden_dim_us {
+                    let tk = sorted_tokens[tok_off + k];
+                    sum_g += tk * experts_gate_f32[gate_off + k * intermediate_dim_us + j];
+                    sum_u += tk * experts_up_f32[up_off + k * intermediate_dim_us + j];
+                }
+                if let Some(b) = &gate_bias_f32_opt {
+                    sum_g += b[gate_bias_off + j];
+                }
+                if let Some(b) = &up_bias_f32_opt {
+                    sum_u += b[up_bias_off + j];
+                }
+                gate_scratch[j] = sum_g;
+                up_scratch[j] = sum_u;
+            }
+
+            // GLU step (v2.8): x_act[j] = gate_act(x_gate[j]) * x_up[j].
+            // Writes back into up_scratch so the down-matmul reads a
+            // single buffer. The match-on-kind hoist is outside the j-
+            // loop so the branch is taken once per (expert, token), not
+            // once per intermediate cell. Numerical edges (subnormals,
+            // ±Inf) for SiLU/GELU/ReLU are identical to v3's tested
+            // activation_kind {1, 2, 3} branches — same formulae.
+            match gate_activation_kind {
+                1 => {
+                    // SwiGLU = silu(gate) * up
+                    for j in 0..intermediate_dim_us {
+                        let g = gate_scratch[j];
+                        let s = 1.0_f32 / (1.0_f32 + (-g).exp());
+                        up_scratch[j] = (g * s) * up_scratch[j];
+                    }
+                }
+                2 => {
+                    // GeGLU = gelu(gate) * up. tanh-approx, matches
+                    // torch.gelu(approximate='tanh') and the v3
+                    // activation_kind=2 branch.
+                    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+                    const GELU_CUBIC: f32 = 0.044715_f32;
+                    for j in 0..intermediate_dim_us {
+                        let x = gate_scratch[j];
+                        let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
+                        let gelu_x = 0.5_f32 * x * (1.0_f32 + inner.tanh());
+                        up_scratch[j] = gelu_x * up_scratch[j];
+                    }
+                }
+                3 => {
+                    // ReGLU = relu(gate) * up
+                    for j in 0..intermediate_dim_us {
+                        let g = gate_scratch[j];
+                        let relu_g = if g < 0.0_f32 { 0.0_f32 } else { g };
+                        up_scratch[j] = relu_g * up_scratch[j];
+                    }
+                }
+                _ => unreachable!(
+                    "gate_activation_kind {} bypassed the upfront refusal gate",
+                    gate_activation_kind
+                ),
+            }
+
+            // x_down[h] = sum over j of x_act[j] * W_down[e][j, h]
+            // v2.14: down_bias added BEFORE the gather (which writes
+            // into sorted_outputs and is consumed by dispatch::gather).
+            // Bias-before-gather matches the v3 convention at v2.11's
+            // FFI — the gather is an output-projection step in MoE.
+            for h in 0..hidden_dim_us {
+                let mut sum = 0.0_f32;
+                for j in 0..intermediate_dim_us {
+                    sum += up_scratch[j]
+                        * experts_down_f32[down_off + j * hidden_dim_us + h];
+                }
+                if let Some(b) = &down_bias_f32_opt {
+                    sum += b[down_bias_off + h];
+                }
+                sorted_outputs[out_off + h] = sum;
+            }
+        }
+    }
+
+    let output_f32 = dispatch::gather_tokens(
+        &sorted_outputs,
+        &routing.sorted_token_indices,
+        &routing.sorted_assignment_weights,
+        total_tokens,
+        top_k,
+        hidden_dim_us,
+    );
+
+    let output_len = total_tokens * hidden_dim_us;
+    let out_dtype = tokens.dtype;
+    let data: *mut c_void = if out_dtype == 0 {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f64>()) as *mut f64;
+        for (i, &val) in output_f32.iter().enumerate().take(output_len) {
+            unsafe { *ptr.add(i) = val as f64 };
+        }
+        ptr as *mut c_void
+    } else {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(output_f32.as_ptr(), ptr, output_len);
+        }
+        ptr as *mut c_void
+    };
+
+    let ndim: i64 = 2;
+    let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape = total_tokens as i64;
+        *shape.add(1) = hidden_dim;
+    }
+    let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *strides.add(1) = 1;
+        *strides = hidden_dim;
+    }
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        output_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
+
+    Box::into_raw(result) as i64
+}

@@ -82,7 +82,12 @@ pub fn csha_dispatch_for_op(mark: &FusionMark, op_idx: u32) -> CshaDispatchDecis
 /// Primitive and compound backward operations used in adjoint expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdjointExpr {
-    MulElementwise(VarId, VarId),
+    /// MulElementwise(grad, other, target) — emits `grad * other` then
+    /// `reduce_to_shape(prod, target)`. `target` is the input variable whose
+    /// gradient we are accumulating; the reduce-to-shape is a no-op when no
+    /// broadcasting occurred, and a sum-reduction over the broadcast axes
+    /// when it did. Mirrors `MatmulTransposeRight`'s third-field pattern.
+    MulElementwise(VarId, VarId, VarId),
     MatmulTransposeLeft(VarId, VarId),
     /// MatmulTransposeRight(a, grad, b) — grad_b = reduce_to_shape(a.T @ grad, b)
     /// The third field `b` is the original weight for shape reduction.
@@ -264,11 +269,19 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         PrimalOp::Mul => vec![
             InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::MulElementwise(output_bar, op.inputs[1]),
+                expr: AdjointExpr::MulElementwise(
+                    output_bar,
+                    op.inputs[1],
+                    op.inputs[0],
+                ),
             },
             InputAdjoint {
                 input_var: op.inputs[1],
-                expr: AdjointExpr::MulElementwise(output_bar, op.inputs[0]),
+                expr: AdjointExpr::MulElementwise(
+                    output_bar,
+                    op.inputs[0],
+                    op.inputs[1],
+                ),
             },
         ],
         PrimalOp::Div => vec![
@@ -853,8 +866,14 @@ mod tests {
     fn test_mul_rule() {
         let op = make_op(2, PrimalOp::Mul, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::MulElementwise(100, 1)));
-        assert!(matches!(adj[1].expr, AdjointExpr::MulElementwise(100, 0)));
+        assert!(matches!(
+            adj[0].expr,
+            AdjointExpr::MulElementwise(100, 1, 0)
+        ));
+        assert!(matches!(
+            adj[1].expr,
+            AdjointExpr::MulElementwise(100, 0, 1)
+        ));
     }
 
     #[test]

@@ -623,7 +623,40 @@ impl Compiler<'_> {
         beta2_const: cranelift_codegen::ir::Value,
         eps_const: cranelift_codegen::ir::Value,
         step_count_var: cranelift_frontend::Variable,
+        // CPDT precision-adaptive optimizer execution (FullBuffer sub-arm,
+        // S5 follow-on): when true, dequant s1 (and s2 when distinct) from
+        // FP16/INT8 → F32 into owned working tensors, run the unchanged F32
+        // stdlib FFI on those, then quant the results back into the original
+        // FP16/INT8 buffers via nsl_tensor_cast_into and free the working
+        // tensors. When false, the wrap branch emits zero new IR — the
+        // call-pattern is byte-identical to pre-S5. The `s1 != s2` guard
+        // mirrors `fase_emit_final_step`: single-state optimizers
+        // (SGD/Lion/Muon) alias s2 to s1, and double-casting that alias
+        // would corrupt the buffer on cast_into-back.
+        wrap_precision: bool,
     ) -> Result<(), crate::error::CodegenError> {
+        // CPDT FP16/INT8 wrap envelope (S5). theta and grad are NOT wrapped
+        // — params stay in their natural dtype (FP32 by default); CPDT §3.2
+        // v1 targets optimizer-state memory only. Only s1/s2 are wrapped.
+        let orig_s1 = s1;
+        let orig_s2 = s2;
+        let wrap_s2 = wrap_precision && s1 != s2;
+        let (s1, s2) = if wrap_precision {
+            let f32_code = builder.ins().iconst(cl_types::I64, 1); // DTYPE_F32
+            let ws1 = self.compile_call_by_name(builder, "nsl_tensor_cast", &[s1, f32_code])?;
+            let ws2 = if wrap_s2 {
+                self.compile_call_by_name(builder, "nsl_tensor_cast", &[s2, f32_code])?
+            } else {
+                // SGD/Lion/Muon: s2 is an alias for s1. Aliasing ws2 to ws1
+                // preserves the invariant that the FFI sees the same
+                // pointer in both slots (the helper ignores s2 anyway for
+                // these optimizers).
+                ws1
+            };
+            (ws1, ws2)
+        } else {
+            (s1, s2)
+        };
         match optimizer_name {
             "sgd" => {
                 self.compile_call_by_name(
@@ -690,6 +723,30 @@ impl Compiler<'_> {
                 )));
             }
         }
+        // CPDT FP16/INT8 wrap envelope (S5) — close. Quant-cast the working
+        // F32 results back into the originally-typed storage buffers, then
+        // free the working tensors. Mirrors fase_emit_final_step's exit.
+        //
+        // Asymmetry note vs fase_emit_final_step: that helper folds the
+        // m_ptr==v_ptr alias into a single combined `wrap_precision` flag
+        // at entry, so the entire cast branch is gated by a single
+        // condition. Here we instead use `wrap_precision` for the s1
+        // cast/cast_into (always paired) and a separate `wrap_s2` for
+        // the s2 pair — when SGD aliases s2==s1 we still cast s1 once
+        // and cast it back once, but skip the s2 work to avoid
+        // double-cast-into / double-free of the same buffer. Net effect
+        // for SGD: 1 cast in, 1 cast_into out, 1 free. For multi-state
+        // optimizers with distinct s1/s2: 2 cast in, 2 cast_into out,
+        // 2 free. Both shapes leak nothing and preserve the original
+        // buffer identities.
+        if wrap_precision {
+            self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_s1, s1])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[s1])?;
+            if wrap_s2 {
+                self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_s2, s2])?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[s2])?;
+            }
+        }
         Ok(())
     }
 
@@ -730,6 +787,12 @@ impl Compiler<'_> {
         eps_const: cranelift_codegen::ir::Value,
         grad_accumulation_steps: i64,
         grad_clip_threshold: f64,
+        // CPDT precision-adaptive optimizer execution: when Some, the
+        // Deferred sub-arm wraps `fase_emit_final_step` in nsl_tensor_cast
+        // (dequant FP16/INT8 → F32) and nsl_tensor_cast_into (quant back).
+        // None preserves the prior FP32-only behavior bit-identically.
+        // Threaded from stmt.rs's `cpdt_precision_dtypes` binding.
+        cpdt_precision_dtypes: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
     ) -> Result<(), crate::error::CodegenError> {
         use cranelift_codegen::ir::{condcodes::IntCC, InstBuilder};
 
@@ -862,14 +925,16 @@ impl Compiler<'_> {
                     &[m_partial, cf],
                 )?;
             }
-            // CPDT precision wrapping is NOT applied on this unified-dispatch path
-            // (the WGGO path, live via stmt.rs's `if let Some(mtb) = mode_table_base`).
-            // wrap_precision=false here is SAFE because the FP16-allocation gate
-            // (`precision_active`) requires `wrapped_path_active = wggo_overrides.is_none()`,
-            // so when WGGO routes here the gate refuses FP16 allocation and m/v stay
-            // FP32 — no FP16 buffer ever reaches this unwrapped update. Threading the
-            // wrap through here (to let CPDT precision activate on the WGGO path) is a
-            // documented follow-on; see cpdt_precision_exec::precision_active.
+            // CPDT precision wrapping is now THREADED through this unified-dispatch
+            // path. `cpdt_precision_dtypes.is_some()` ⇔ the caller built FP16/INT8
+            // dtype lists for m/v; `fase_emit_final_step` wraps the F32 update with
+            // nsl_tensor_cast/cast_into (and its own `m_ptr != v_ptr` SGD guard
+            // prevents double-cast on single-state optimizers). When None, the
+            // wrap branch is skipped and the emitted IR is byte-identical to the
+            // pre-threading hardcoded `false`. The matching `wrapped_path_active`
+            // gate at stmt.rs:3533 is what actually decides whether the caller
+            // passes Some vs None — relaxing that gate is the S4 step that
+            // activates the wrap end-to-end on the WGGO path.
             self.fase_emit_final_step(
                 builder,
                 theta,
@@ -878,7 +943,7 @@ impl Compiler<'_> {
                 s2,
                 &fase_plan.recipe,
                 Some((bc1_inv, bc2_inv)),
-                false,
+                cpdt_precision_dtypes.is_some(),
             )?;
         }
         builder.ins().jump(iter_join, &[]);
@@ -888,6 +953,14 @@ impl Compiler<'_> {
         builder.seal_block(fullbuf_blk);
         let grad =
             self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, opt_i])?;
+        // S5: CPDT FP16/INT8 wrap envelope is THREADED through the FullBuffer
+        // sub-arm. Pre-S5 this arm hardcoded `wrap_precision=false`, so a
+        // mixed mode table that routed any FP16-tier param through here
+        // would have fed FP16 buffers to the F32 stdlib FFI (silent
+        // corruption). The structural mode-table guard at stmt.rs (added in
+        // the S4 review-fix) refused FP16 allocation whenever the table
+        // contained ANY FullBuffer byte; with this arm now wrapping, that
+        // guard can be lifted.
         self.emit_stdlib_optim_call(
             builder,
             optimizer_name,
@@ -905,6 +978,7 @@ impl Compiler<'_> {
             beta2_const,
             eps_const,
             step_count_var,
+            cpdt_precision_dtypes.is_some(),
         )?;
         builder.ins().jump(iter_join, &[]);
 

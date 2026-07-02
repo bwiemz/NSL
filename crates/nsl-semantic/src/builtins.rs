@@ -989,6 +989,43 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // CPDT Part III v2.3: paper-faithful MoE FFN intrinsic
+    // (`moe_dispatch_ffn(tokens, logits, experts_up, experts_down)`).
+    // Opt-in 4-arg variant that lowers to `nsl_moe_dispatch_full_v3`
+    // (up → SiLU → down). Coexists with the 3-arg `moe_dispatch`
+    // (v1/v2 path); users opt into v3 by switching intrinsics.
+    def(
+        "moe_dispatch_ffn",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown, Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
+    // CPDT Part III v2.5+v2.8: Mixtral's gated MoE FFN intrinsic
+    // (`moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up,
+    // experts_down)`). 5-arg opt-in that lowers to
+    // `nsl_moe_dispatch_full_v4`. Gate activation selected by
+    // `@moe(activation="silu"|"gelu"|"relu")` — default silu→SwiGLU,
+    // gelu→GeGLU (v2.8), relu→ReGLU (v2.8). `@moe(activation="identity")`
+    // is refused at codegen (use `moe_dispatch_ffn` v3 for a 2-weight
+    // FFN). Coexists with v2 / v3 source intrinsics.
+    def(
+        "moe_dispatch_swiglu",
+        Type::Function {
+            params: vec![
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+            ],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // M33: Speculative decode step intrinsic
     def(
         "speculative_decode",

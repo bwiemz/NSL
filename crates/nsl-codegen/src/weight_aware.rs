@@ -192,6 +192,21 @@ pub struct WeightEntry {
 }
 
 impl WeightEntry {
+    /// Construct a `WeightEntry` from raw bytes. Computes `num_elements` from
+    /// `shape`, leaves `sparsity` unanalyzed and `eliminated` false.
+    pub fn new(name: String, data: Vec<u8>, shape: Vec<usize>, dtype: WeightDType) -> Self {
+        let num_elements = if shape.is_empty() { 1 } else { shape.iter().product() };
+        WeightEntry {
+            name,
+            data,
+            shape,
+            dtype,
+            num_elements,
+            sparsity: None,
+            eliminated: false,
+        }
+    }
+
     /// Compute the quantization scale for this weight tensor.
     /// scale = max(|w|) / dtype_max, used for FP8/INT8 quantization.
     /// Returns None for floating-point weights that don't need scaling.
@@ -462,6 +477,41 @@ impl WeightMap {
     /// Retrieve a mutable weight entry for annotation.
     pub fn get_mut(&mut self, name: &str) -> Option<&mut WeightEntry> {
         self.entries.get_mut(name)
+    }
+
+    /// Insert (or replace) a weight entry, keeping `total_bytes` consistent.
+    pub fn insert(&mut self, entry: WeightEntry) {
+        if let Some(old) = self.entries.get(&entry.name) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.data.len() as u64);
+        }
+        self.total_bytes += entry.data.len() as u64;
+        self.entries.insert(entry.name.clone(), entry);
+    }
+
+    /// Remove a weight entry by name, returning it. Keeps `total_bytes`
+    /// consistent. Returns `None` if the entry was not present.
+    ///
+    /// Used by CPDT Part III v2.6 HF Mixtral packing to consume per-expert
+    /// HF source entries after their bytes have been packed into NSL
+    /// convention.
+    pub fn remove(&mut self, name: &str) -> Option<WeightEntry> {
+        let entry = self.entries.remove(name)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.data.len() as u64);
+        Some(entry)
+    }
+
+    /// Construct an empty `WeightMap` for tests + library callers that
+    /// need to compose entries programmatically (e.g., CPDT Part III v2.6
+    /// HF Mixtral packing tests). The `file_hash` is zeroed and
+    /// `source_path` is empty — neither field is load-bearing for the
+    /// `get` / `insert` / `remove` / `entries` surface.
+    pub fn new_for_test() -> Self {
+        WeightMap {
+            entries: HashMap::new(),
+            file_hash: [0u8; 32],
+            source_path: String::new(),
+            total_bytes: 0,
+        }
     }
 
     /// SHA-256 hash of the original safetensors file.
@@ -1459,5 +1509,33 @@ mod tests {
         assert_eq!(integrity.compile_hash, hash);
         assert_eq!(integrity.hash_hex.len(), 64);
         assert!(integrity.hash_hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn weight_entry_new_computes_num_elements() {
+        let e = WeightEntry::new(
+            "w".to_string(),
+            vec![0u8; 4 * 3 * 4], // 12 f32 elements
+            vec![4, 3],
+            WeightDType::F32,
+        );
+        assert_eq!(e.num_elements, 12);
+        assert!(!e.eliminated);
+        assert_eq!(e.shape, vec![4, 3]);
+    }
+
+    #[test]
+    fn weight_map_insert_adds_entry_and_bytes() {
+        let mut wm = WeightMap::default();
+        let before = wm.total_bytes();
+        wm.insert(WeightEntry::new(
+            "router".to_string(),
+            vec![0u8; 16],
+            vec![2, 2],
+            WeightDType::F32,
+        ));
+        assert_eq!(wm.len(), 1);
+        assert!(wm.get("router").is_some());
+        assert_eq!(wm.total_bytes(), before + 16);
     }
 }

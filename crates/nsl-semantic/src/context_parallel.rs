@@ -20,12 +20,16 @@ pub fn validate_context_parallel_decorator(
                 match aname.as_str() {
                     "ring_size" => {
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                            if *n < 2 {
+                            if *n < 1 {
+                                // M34 v1: allow ring_size=1 (semantic identity —
+                                // useful for tooling that programmatically emits
+                                // ring_size = num_gpus which can legitimately be 1).
+                                // ring_size=0 remains illegal.
                                 diagnostics.push(
                                     Diagnostic::error(
-                                        "@context_parallel: ring_size must be >= 2".to_string(),
+                                        "@context_parallel: ring_size must be >= 1".to_string(),
                                     )
-                                    .with_label(arg.span, "must be >= 2"),
+                                    .with_label(arg.span, "must be >= 1"),
                                 );
                             } else {
                                 ring_size = Some(*n as usize);

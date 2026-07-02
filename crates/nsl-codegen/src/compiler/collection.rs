@@ -573,12 +573,18 @@ impl Compiler<'_> {
                                     self.features.shard_configs.insert(layer_key, info);
                                 }
                             }
-                            // M32: @moe decorator extraction
+                            // M32: @moe decorator extraction (+ v2.4 activation parse).
+                            // Errors out of extract_moe_decorator are
+                            // INVALID-VALUE-FATAL (e.g. `@moe(activation="gleu")`):
+                            // surface them as CodegenError so the build
+                            // fails LOUDLY rather than silently defaulting.
                             if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "moe" {
-                                if let Some(info) = crate::moe::extract_moe_decorator(
+                                let extracted = crate::moe::extract_moe_decorator(
                                     std::slice::from_ref(deco),
                                     &|sym| self.resolve_sym(sym),
-                                ) {
+                                )
+                                .map_err(crate::error::CodegenError::new)?;
+                                if let Some(info) = extracted {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
@@ -598,7 +604,6 @@ impl Compiler<'_> {
                                     let model_name = self.resolve_sym(md.name).to_string();
                                     let layer_name_str = self.resolve_sym(*field_sym).to_string();
                                     let layer_key = format!("{}.{}", model_name, layer_name_str);
-                                    self.features.cp_ring_size = info.ring_size;
                                     self.features
                                         .context_parallel_configs
                                         .insert(layer_key, info);
