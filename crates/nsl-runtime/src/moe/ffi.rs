@@ -226,10 +226,22 @@ pub extern "C" fn nsl_moe_all_to_all(
 /// Takes the tokens NslTensor and logits NslTensor (both as i64 pointers),
 /// plus MoE config. Returns a new NslTensor with the MoE output.
 ///
-/// For the CPU fallback, each expert is treated as an identity transform
-/// (output = input weighted by gating). The full pipeline with actual expert
-/// weights requires extracting weight tensors from the expert model array,
-/// which will be wired when FixedModelArray weight access is implemented.
+/// For the CPU fallback, each expert is treated as an identity transform and
+/// the gather is gating-weighted (output = input weighted by gating):
+///   - top_k=1: the single surviving weight per token is exactly 1.0
+///     (single-element renormalization is IEEE x/x), so the output is
+///     bit-exact pass-through when no capacity drop occurs — for f32 token
+///     tensors; f64 inputs roundtrip through the pre-existing f64->f32->f64
+///     conversion pipeline as before and are not bit-exact.
+///   - top_k=2: the two surviving copies combine with their renormalized
+///     gate weights, summing to 1.0 per token (NOT a uniform-1.0
+///     double-count).
+///   - Capacity-dropped assignments contribute 0, so affected tokens get a
+///     partial sum (< 1.0 total weight) — same semantics as v2/v3/v4.
+///
+/// Real per-expert FFN weights live in `nsl_moe_dispatch_full_v2` (+ v3/v4);
+/// this v1 identity skeleton is the documented M32 backward-compat fallback
+/// for non-CPDT builds (CPDT Full refuses it via the S4 hard error).
 #[no_mangle]
 pub extern "C" fn nsl_moe_dispatch_full(
     tokens_ptr: i64,
@@ -286,18 +298,21 @@ pub extern "C" fn nsl_moe_dispatch_full(
     // Identity expert transform: expert_outputs = scattered tokens
     let expert_outputs = scattered;
 
-    // For top_k=1: each sorted position has weight 1.0 (the only selected expert).
-    // For top_k=2: we'd need to track which sorted positions correspond to which
-    // (token, k) pairs. For now, use uniform weight = 1.0 for all sorted positions.
-    // This is correct for top_k=1. For top_k=2 with identity experts, the gather
-    // will double-count (weight 1.0 each), but the output shape is still correct.
-    let gather_weights = vec![1.0f32; routing.total_assigned as usize];
-
-    // Gather back to original token order
+    // Gather back to original token order using the router's real
+    // per-sorted-position gating weights (`sorted_assignment_weights`, the
+    // same pipeline v2/v3/v4 consume at their gathers):
+    //   - top_k=1: every surviving weight is exactly 1.0 (single-element
+    //     renormalization is IEEE x/x), so this is bit-identical to the
+    //     historical uniform-1.0 gather.
+    //   - top_k=2: each surviving assignment carries its renormalized
+    //     softmax share; the two copies sum to 1.0 per token instead of
+    //     double-counting at weight 1.0 each (the pre-fix behavior).
+    //   - Capacity-dropped assignments contribute 0 (partial sum for the
+    //     affected token), consistent with v2/v3/v4.
     let output_f32 = dispatch::gather_tokens(
         &expert_outputs,
         &routing.sorted_token_indices,
-        &gather_weights,
+        &routing.sorted_assignment_weights,
         total_tokens,
         top_k,
         hidden_dim,
@@ -362,7 +377,9 @@ pub extern "C" fn nsl_moe_dispatch_full(
 /// granular-op reference at crates/nsl-codegen/tests/cpdt_expert_prune.rs
 /// `moe_forward`): for each routed token, output = sorted_tokens × W_expert.
 ///
-/// ABI: distinct symbol from `nsl_moe_dispatch_full` (kept byte-identical).
+/// ABI: distinct symbol from `nsl_moe_dispatch_full` (v1 retained as the
+/// non-CPDT backward-compat fallback; its gather is now gating-weighted, so
+/// v1 top_k=1 output is unchanged and top_k=2 no longer double-counts).
 /// v2 adds `experts_ptr` (NslTensor packed `[n_experts, hidden_dim *
 /// intermediate_dim]` row-major, f32 only) plus the two shape dimensions.
 ///
@@ -581,8 +598,9 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
 /// trailing dim of v3 vs v2 outputs will see different sizes.
 ///
 /// CONTRACT vs v1/v2:
-///   - v1 (`nsl_moe_dispatch_full`): identity skeleton; output ==
-///     scattered tokens at hidden_dim. KEPT BYTE-IDENTICAL.
+///   - v1 (`nsl_moe_dispatch_full`): identity skeleton at hidden_dim;
+///     gating-weighted combine of the scattered tokens (top_k=1 is exact
+///     pass-through).
 ///   - v2 (`nsl_moe_dispatch_full_v2`): real W_up matmul; output at
 ///     intermediate_dim. KEPT BYTE-IDENTICAL.
 ///   - v3 (this fn): adds activation + W_down; output back at
@@ -962,7 +980,8 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
 /// the input hidden dim via down-proj).
 ///
 /// CONTRACT vs v1/v2/v3:
-///   - v1 (`nsl_moe_dispatch_full`): identity skeleton at hidden_dim.
+///   - v1 (`nsl_moe_dispatch_full`): identity skeleton at hidden_dim
+///     (gating-weighted combine).
 ///   - v2 (`nsl_moe_dispatch_full_v2`): real W_up matmul; output at
 ///     intermediate_dim.
 ///   - v3 (`nsl_moe_dispatch_full_v3`): W_up -> activation -> W_down,

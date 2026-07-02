@@ -2115,8 +2115,10 @@ impl Compiler<'_> {
         // expert WeightMap entry is resolvable AND its shape implies a
         // well-formed `(hidden_dim, intermediate_dim)` split, emit
         // `nsl_moe_dispatch_full_v2` against the real expert weight tensor
-        // (replaces the M32 identity skeleton at moe/ffi.rs:287). Otherwise
-        // fall through to the v1 identity emission — silent-fallback to be
+        // (replaces the M32 identity skeleton `nsl_moe_dispatch_full` in
+        // nsl-runtime/src/moe/ffi.rs; that v1 gather is gating-weighted, so
+        // top_k=2 combines instead of double-counting). Otherwise fall
+        // through to the v1 identity emission — silent-fallback to be
         // hard-erred in S4.
         if func_name == "moe_dispatch" {
             if args.len() != 3 {
