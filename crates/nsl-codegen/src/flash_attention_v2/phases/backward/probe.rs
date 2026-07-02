@@ -131,6 +131,101 @@ pub fn maybe_emit_probe_store(
     // Feature off — probe emission is a compile-time no-op.
 }
 
+/// CSHA cycle 20 T2 — dV-probe emission helper.
+///
+/// Analogous to `maybe_emit_probe_store` but writes to `%rd_probe_dv`
+/// (loaded once in prelude from `.param .u64 probe_dv_out_ptr`). Uses a
+/// 5-slot layout for the dV-side chain:
+///
+///   Slot 0: dV_P            — %f_P read at dv_accum FMA site
+///   Slot 1: dV_accum_pre    — %f0 SMEM cell PRE-FMA at dv_accum
+///   Slot 2: dV_dO_f32       — %f1 dO cvt.f32.f16 result at dv_accum
+///   Slot 3: dV_final        — final dV SMEM cell at finalize readback
+///   Slot 4: dV_cross_check  — reconstructed slot0 * slot2 + slot1
+///                             (FMA reconstruction, matches slot 3 iff
+///                             the SMEM path is intact — bisects
+///                             hypothesis (iii) inter-phase corruption
+///                             vs (iv) accumulator write path)
+///
+/// **Coord gate.** The 5 stores are gated at the same runtime coord as
+/// the T1 dS probe (batch=0, head=0, warp_id==1, lane==0) so both probes
+/// sample the SAME representative cell. The additional coord fields
+/// documented in the T2 task (row_global=1, r1=0, lane=20, warp of d=37,
+/// kv_outer_iter=8) are the ORACLE-SIDE coordinates the CPU reference
+/// will compare against; the PTX-side gate stays uniform with dS to keep
+/// the helper reusable. Follow-on c21 refinements can widen the gate
+/// signature if per-slot coord differentiation becomes necessary.
+///
+/// **Feature OFF:** unconditional no-op (function body compiled out).
+/// **Feature ON, q_tile_iter != 0:** unconditional no-op.
+/// **Feature ON, q_tile_iter == 0:** emits gate composition + one
+/// predicated `st.global.f32` per call.
+#[cfg(feature = "csha_cycle19_probe")]
+pub fn maybe_emit_dv_probe_store(
+    ptx: &mut String,
+    _config: &FlashAttentionConfig,
+    slot_idx: u32,
+    value_reg: &str,
+    q_tile_iter: u32,
+) {
+    if q_tile_iter != 0 {
+        return;
+    }
+    assert!(slot_idx < 5, "cycle-20 T2 dV probe layout is 5 slots wide (got {slot_idx})");
+    let byte_off = slot_idx * 4;
+
+    ptx.push_str(&format!(
+        "    // ── cycle-20 T2 dV probe slot {slot_idx} := {value_reg} ──\n"
+    ));
+    // Compose per-site gate: %p_probe_active_dv (rd_probe_dv != 0, set
+    // ONCE in prelude) && %warp_id == 1 && %lane == 0 && %batch_idx == 0
+    // && %head_idx == 0.
+    //
+    // R11 fix (cycle-20 T2 fixup): earlier drafts re-derived
+    // %p_probe_active from %rd_probe_dv here, which CLOBBERED the
+    // prelude-set %p_probe_active (derived from %rd_probe_ds). Since
+    // dv_accum emission runs BEFORE dqdk_accum in the backward pipeline,
+    // that clobber silently suppressed the dS slot-7 store (probe_ds!=0
+    // && probe_dv==0 caller) and null-faulted the dS pipeline (probe_ds==0
+    // && probe_dv!=0 caller). The fix: the prelude now emits a SEPARATE
+    // %p_probe_active_dv predicate; the ds-side helper still consumes
+    // %p_probe_active, and this helper references %p_probe_active_dv —
+    // making dS and dV probe activation ORDER-INDEPENDENT across the
+    // entire backward emission sequence.
+    ptx.push_str("    setp.eq.u32 %p_probe_w, %warp_id, 1;\n");
+    ptx.push_str("    setp.eq.u32 %p_probe_l, %lane, 0;\n");
+    ptx.push_str("    and.pred %p_probe_gate, %p_probe_w, %p_probe_l;\n");
+    ptx.push_str("    setp.eq.u64 %p_probe_b, %batch_idx, 0;\n");
+    ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_b;\n");
+    ptx.push_str("    setp.eq.u64 %p_probe_h, %head_idx, 0;\n");
+    ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_h;\n");
+    ptx.push_str("    and.pred %p_probe_gate, %p_probe_gate, %p_probe_active_dv;\n");
+    // Compute slot address: %rd_probe_slot = %rd_probe_dv + byte_off.
+    if byte_off == 0 {
+        ptx.push_str("    mov.u64 %rd_probe_slot, %rd_probe_dv;\n");
+    } else {
+        ptx.push_str(&format!(
+            "    add.u64 %rd_probe_slot, %rd_probe_dv, {byte_off};\n"
+        ));
+    }
+    ptx.push_str(&format!(
+        "    @%p_probe_gate st.global.f32 [%rd_probe_slot], {value_reg};\n"
+    ));
+}
+
+/// Feature-OFF stub — compile-time no-op keeping call sites cfg-free.
+#[cfg(not(feature = "csha_cycle19_probe"))]
+#[inline(always)]
+pub fn maybe_emit_dv_probe_store(
+    _ptx: &mut String,
+    _config: &FlashAttentionConfig,
+    _slot_idx: u32,
+    _value_reg: &str,
+    _q_tile_iter: u32,
+) {
+    // Feature off — dV probe emission is a compile-time no-op.
+}
+
 #[cfg(all(test, feature = "csha_cycle19_probe"))]
 mod tests {
     use super::*;
@@ -189,5 +284,73 @@ mod tests {
         maybe_emit_probe_store(&mut ptx, &c, 7, "%f_dS", 0);
         assert!(ptx.contains("add.u64 %rd_probe_slot, %rd_probe_ds, 28"),
             "slot 7 byte offset is 7*4=28");
+    }
+
+    // ── cycle 20 T2 dV-probe helper tests ──
+
+    #[test]
+    fn dv_probe_store_emits_gated_stg_at_q_tile_iter_zero() {
+        let c = cfg();
+        let mut ptx = String::new();
+        maybe_emit_dv_probe_store(&mut ptx, &c, 0, "%f_P", 0);
+        assert!(ptx.contains("st.global.f32"), "must emit store");
+        assert!(ptx.contains("%p_probe_gate"), "must be predicated");
+        assert!(ptx.contains("%rd_probe_dv"),
+            "must reference prelude-declared dV probe pointer register");
+    }
+
+    #[test]
+    fn dv_probe_store_is_noop_at_nonzero_q_tile_iter() {
+        let c = cfg();
+        let mut ptx = String::new();
+        maybe_emit_dv_probe_store(&mut ptx, &c, 0, "%f_P", 1);
+        assert!(ptx.is_empty(),
+            "cycle-20 T2 dV probe: q_tile_iter != 0 emission is a no-op");
+    }
+
+    #[test]
+    fn dv_probe_store_slot_zero_uses_direct_mov() {
+        let c = cfg();
+        let mut ptx = String::new();
+        maybe_emit_dv_probe_store(&mut ptx, &c, 0, "%f_P", 0);
+        assert!(ptx.contains("mov.u64 %rd_probe_slot, %rd_probe_dv"),
+            "slot 0 should use mov not add");
+    }
+
+    #[test]
+    fn dv_probe_store_slot_four_uses_add_16_offset() {
+        let c = cfg();
+        let mut ptx = String::new();
+        maybe_emit_dv_probe_store(&mut ptx, &c, 4, "%f_dk_tmp", 0);
+        assert!(ptx.contains("add.u64 %rd_probe_slot, %rd_probe_dv, 16"),
+            "slot 4 byte offset is 4*4=16");
+    }
+
+    #[test]
+    fn dv_probe_uses_separate_active_predicate() {
+        // R11 fix (cycle-20 T2 fixup): the dV helper must reference the
+        // prelude-set %p_probe_active_dv register (NOT %p_probe_active).
+        // This ensures dS and dV probes have independent activation and
+        // ordering of ds_compute / dv_accum / dqdk_accum / finalize does
+        // not silently suppress or null-fault either probe pipeline.
+        let c = cfg();
+        let mut ptx = String::new();
+        maybe_emit_dv_probe_store(&mut ptx, &c, 2, "%f1", 0);
+        assert!(
+            ptx.contains("and.pred %p_probe_gate, %p_probe_gate, %p_probe_active_dv"),
+            "dV gate AND-chain must consume %p_probe_active_dv (separate predicate)"
+        );
+        // And crucially — the helper must NOT re-derive %p_probe_active
+        // (would clobber the ds-side prelude register).
+        assert!(
+            !ptx.contains("setp.ne.u64 %p_probe_active,"),
+            "dV helper must not re-derive %p_probe_active — that would \
+             clobber the prelude-set dS predicate (R11)"
+        );
+        // Nor should the AND-chain reference the ds-side %p_probe_active.
+        assert!(
+            !ptx.contains("and.pred %p_probe_gate, %p_probe_gate, %p_probe_active;"),
+            "dV gate must NOT reference %p_probe_active (ds-side predicate)"
+        );
     }
 }

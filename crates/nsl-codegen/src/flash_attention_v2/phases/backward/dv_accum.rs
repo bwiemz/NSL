@@ -22,6 +22,7 @@
 //!   dO  — HBM via `%rd_bwd_do` (backward prelude loaded the pointer).
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::phases::backward::probe::maybe_emit_dv_probe_store;
 use crate::flash_attention_v2::smem_layout::{
     backward_dv_offset, backward_p_offset,
 };
@@ -139,8 +140,39 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         }
         ptx.push_str("    ld.global.b16 %h0, [%rd38];\n");
         ptx.push_str("    cvt.f32.f16 %f1, %h0;\n");
+
+        // CSHA cycle 20 T2 — dV probe stores at k=0 (one representative
+        // sample per (row, col) pair). The runtime gate composed inside
+        // the helper further narrows to (batch=0, head=0, warp_id=1,
+        // lane=0), so only one thread across the CTA emits the write.
+        // Emitting at k=0 keeps the code-size delta bounded (5 gate
+        // sequences per Q-row iter, not d_per_warp × 5).
+        //
+        //   Slot 0 (dV_P):         %f_P — P value read for this FMA
+        //   Slot 1 (dV_accum_pre): %f0  — SMEM cell PRE-FMA
+        //   Slot 2 (dV_dO_f32):    %f1  — dO cvt.f32.f16 result
+        //
+        // Feature OFF → these are compile-time no-ops (byte-identical
+        // PTX to the pre-T2 baseline).
+        if k == 0 {
+            maybe_emit_dv_probe_store(ptx, config, 0, "%f_P", q_tile_iter);
+            maybe_emit_dv_probe_store(ptx, config, 1, "%f0", q_tile_iter);
+            maybe_emit_dv_probe_store(ptx, config, 2, "%f1", q_tile_iter);
+        }
+
         ptx.push_str("    fma.rn.f32 %f0, %f_P, %f1, %f0;\n");
         ptx.push_str("    st.shared.f32 [%rd37], %f0;\n");
+
+        // CSHA cycle 20 T2 — slot 4 cross-check. %f0 immediately after
+        // fma.rn.f32 holds P*dO + prev_accum — the SAME value that will
+        // later be read from SMEM at finalize (slot 3). Storing it here
+        // bypasses the SMEM roundtrip. If slot 3 (SMEM readback) equals
+        // slot 4 (register FMA result), the SMEM store/load path is
+        // intact and hypothesis (iii) inter-phase corruption is REFUTED.
+        // If they differ, corruption is between fma and finalize.
+        if k == 0 {
+            maybe_emit_dv_probe_store(ptx, config, 4, "%f0", q_tile_iter);
+        }
     }
 
     ptx.push_str("    add.u32 %r1, %r1, 1;\n");
