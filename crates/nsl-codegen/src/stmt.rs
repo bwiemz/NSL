@@ -1467,6 +1467,43 @@ impl Compiler<'_> {
                             }
                         }
                     }
+
+                    // CFIE Tier-A wiring (audit gap G4): capture
+                    // `@cfie(mode=..., target=...)` on a serve block so
+                    // `compile_serve_block` consumes it instead of the
+                    // config being validated-then-dropped.
+                    if d.name.len() == 1
+                        && self.resolve_sym(d.name[0]) == "cfie"
+                        && matches!(stmt.kind, StmtKind::ServeBlock(_))
+                    {
+                        // A bare `@cfie` means "enable, full mode".
+                        self.cfie_decorator_mode = Some(crate::cfie::CfieMode::Full);
+                        if let Some(args) = &d.args {
+                            for arg in args {
+                                let Some(name_sym) = arg.name else { continue };
+                                let aname = self.resolve_sym(name_sym).to_string();
+                                match (aname.as_str(), &arg.value.kind) {
+                                    ("mode", nsl_ast::expr::ExprKind::Ident(sym)) => {
+                                        let m = self.resolve_sym(*sym).to_string();
+                                        self.cfie_decorator_mode =
+                                            crate::cfie::CfieMode::parse(&m);
+                                    }
+                                    ("mode", nsl_ast::expr::ExprKind::StringLiteral(s)) => {
+                                        self.cfie_decorator_mode =
+                                            crate::cfie::CfieMode::parse(s);
+                                    }
+                                    ("target", nsl_ast::expr::ExprKind::Ident(sym)) => {
+                                        self.cfie_decorator_target =
+                                            Some(self.resolve_sym(*sym).to_string());
+                                    }
+                                    ("target", nsl_ast::expr::ExprKind::StringLiteral(s)) => {
+                                        self.cfie_decorator_target = Some(s.clone());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Check for @no_grad and @fuse on nested function definitions

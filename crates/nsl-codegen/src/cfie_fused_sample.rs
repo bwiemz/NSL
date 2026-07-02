@@ -1,4 +1,4 @@
-//! CFIE — fused LM_head + softmax + top-k + top-p + sample kernel.
+//! CFIE — fused RMSNorm + LM_head + softmax + top-k + top-p + sample kernel.
 //!
 //! Paper §4: the final-token-selection path in vLLM / TRT-LLM launches
 //! 4-6 separate kernels and round-trips the `[1, vocab_size]` logits
@@ -50,6 +50,9 @@ pub struct SamplingParams {
     /// Whether a logits bias vector applies post-matmul (e.g. EOS
     /// penalty).  Causes an extra `ApplyLogitsBias` op.
     pub logits_bias: bool,
+    /// Whether the final RMSNorm is fused into the kernel (paper decode
+    /// pipeline stage 1).  Default true — the paper always fuses it.
+    pub rms_norm: bool,
 }
 
 impl Default for SamplingParams {
@@ -61,6 +64,7 @@ impl Default for SamplingParams {
             top_p: 0.9,
             grammar_masked: false,
             logits_bias: false,
+            rms_norm: true,
         }
     }
 }
@@ -95,6 +99,10 @@ impl LmHeadShape {
 pub enum FusedSampleOp {
     /// Load the hidden state `[1, d_model]` into SMEM.
     LoadHidden,
+    /// RMSNorm the hidden state in SMEM (sum of squares, rsqrt of the
+    /// mean, scale by gamma) before the LM-head matmul.  Emitted right
+    /// after `LoadHidden`: the norm reads the raw hidden state.
+    RmsNorm,
     /// For the current vocab tile, compute `logits_tile = hidden @
     /// W_tile`, scale by `1 / temperature`, and leave the tile in
     /// SMEM / registers.
@@ -179,8 +187,11 @@ fn bytes_saved_vs_unfused(shape: &LmHeadShape) -> u64 {
 /// Build the fused program for given sampler parameters + LM-head shape.
 pub fn emit_program(params: SamplingParams, shape: LmHeadShape) -> FusedSampleProgram {
     let num_tiles = shape.num_vocab_tiles();
-    let mut ops = Vec::with_capacity((num_tiles as usize) * 4 + 6);
+    let mut ops = Vec::with_capacity((num_tiles as usize) * 4 + 7);
     ops.push(FusedSampleOp::LoadHidden);
+    if params.rms_norm {
+        ops.push(FusedSampleOp::RmsNorm);
+    }
 
     let inv_temp = if params.temperature > 0.0 {
         1.0 / params.temperature
@@ -316,6 +327,31 @@ mod tests {
             .count();
         assert_eq!(off_count, 0);
         assert_eq!(on_count as u32, shape().num_vocab_tiles());
+    }
+
+    #[test]
+    fn rms_norm_emitted_by_default_right_after_load_hidden() {
+        let prog = emit_program(SamplingParams::default(), shape());
+        assert!(matches!(prog.ops[0], FusedSampleOp::LoadHidden));
+        assert!(matches!(prog.ops[1], FusedSampleOp::RmsNorm));
+        let rms_count = prog
+            .ops
+            .iter()
+            .filter(|op| matches!(op, FusedSampleOp::RmsNorm))
+            .count();
+        assert_eq!(rms_count, 1);
+    }
+
+    #[test]
+    fn rms_norm_can_be_disabled() {
+        let params = SamplingParams {
+            rms_norm: false,
+            ..Default::default()
+        };
+        let prog = emit_program(params, shape());
+        assert!(!prog.ops.iter().any(|op| matches!(op, FusedSampleOp::RmsNorm)));
+        assert!(matches!(prog.ops[0], FusedSampleOp::LoadHidden));
+        assert!(matches!(prog.ops[1], FusedSampleOp::MatmulTile { .. }));
     }
 
     #[test]

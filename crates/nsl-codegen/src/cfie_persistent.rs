@@ -65,6 +65,18 @@ impl Default for GpuBudget {
     }
 }
 
+/// Build the planner budget from a `gpu_specs` database entry — the
+/// single place the GpuSpec -> GpuBudget field mapping lives (audit
+/// gap G17: hand-built budgets in the serve wiring drifted from the
+/// database).  `l1_cache_kb` is the unified L1/SMEM carveout per SM.
+pub fn gpu_budget_from_spec(spec: &crate::gpu_specs::GpuSpec) -> GpuBudget {
+    GpuBudget {
+        smem_per_sm: spec.l1_cache_kb * 1024,
+        num_sms: spec.num_sms,
+        kernel_launch_us: spec.kernel_launch_overhead_ns as f64 / 1000.0,
+    }
+}
+
 /// Model shape the persistent kernel wraps.
 #[derive(Debug, Clone, Copy)]
 pub struct PersistentModel {
@@ -159,18 +171,39 @@ fn l2_smem_bytes(model: &PersistentModel) -> u32 {
     (2 * tile + weight_slice)
 }
 
+/// FFN staging tile width for the Level-3 residency model — matches
+/// the decode-block kernel's per-tile silu(gate)*up chunk.
+const L3_FFN_TILE: u32 = 128;
+
 fn l3_smem_bytes(model: &PersistentModel) -> u32 {
-    // Level 3: full block fusion.  SMEM holds four attention tiles +
-    // an FFN scratchpad (tile_rows × chunk_d_ff × dtype) + a residual
-    // staging slab.  Paper §6 estimates ~128 KB for d_model=512 on
-    // H100; we use a chunked-FFN formulation that matches that figure.
-    let tile = 64 * model.head_dim * model.dtype_bytes;
-    // Chunked FFN scratch: a 64-row × `d_ff/8`-column slab keeps the
-    // on-chip footprint ≤ 32 KB for typical d_ff ∈ {1024, 1408, 2048}.
-    let ffn_chunk_cols = (model.d_ff / 8).max(64);
-    let ffn_scratch = 64 * ffn_chunk_cols * model.dtype_bytes;
-    let residual = 16 * 1024;
-    (4 * tile + ffn_scratch + residual)
+    // Level 3: full block fusion for single-token decode.  Paper §6's
+    // worked example: d_model=4096 (7B models) needs ~128 KB — feasible
+    // on H100 (228 KB/SM) but not on older GPUs.  The audit flagged the
+    // old formula for ignoring d_model entirely; this models the actual
+    // Level-3 residency of the ONE-CTA-per-layer decode block:
+    //   * x + x_normed residual-stream buffers: 2 * d_model * 4 (f32),
+    //   * attention workspace, one concurrent head (the single CTA
+    //     walks Q heads sequentially): the decode-attention SMEM shape
+    //     head_dim*4 (q row) + 512 (score tile) + 8 (rescale + l),
+    //   * q + attn_out staging for ALL heads (kept resident across the
+    //     sequential head walk): 2 * n_heads * head_dim * 4 — the
+    //     decode-block kernel allocates exactly this; omitting it made
+    //     the planner claim Level 3 for shapes whose emitted kernel
+    //     exceeds the serve wiring's 48 KB static-.shared gate
+    //     (adversarial-review finding),
+    //   * FFN staging: gate/up tiles of width min(T, d_ff) at T=128
+    //     (2 * tile * 4) + the d_model-wide down-projection accumulator
+    //     (d_model * 4).
+    // Both d_model (3x, dominant) and d_ff (up to the tile cap) scale
+    // the footprint.  Note this can undercut l1/l2, which stage 64-row
+    // batching tiles / pipelined weight slices — the deepest-first
+    // cascade in `choose_fusion` still picks the cheapest-deepest level.
+    let x_buffers = 2 * model.d_model * 4;
+    let attn_workspace = model.head_dim * 4 + 512 + 8;
+    let qo_buffers = 2 * model.n_heads * model.head_dim * 4;
+    let ffn_tile = model.d_ff.min(L3_FFN_TILE);
+    let ffn_staging = 2 * ffn_tile * 4 + model.d_model * 4;
+    x_buffers + attn_workspace + qo_buffers + ffn_staging
 }
 
 fn scheduler_smem_bytes(max_active: u32) -> u32 {
@@ -317,18 +350,49 @@ mod tests {
 
     #[test]
     fn launch_reduction_improves_with_higher_fusion() {
+        // The Level-3 residency model (single-token decode block) can
+        // undercut Level 1's 64-row batching tile for small d_model, so
+        // forcing a Level-1 pick needs a model where l3 > l1: d_model
+        // dominates l3 (3 * d_model * 4) but never enters l1.
+        let mut big = nslcoder_model();
+        big.d_model = 8192; // l3 ~= 100 KB; l1 stays 12 KB
+        assert!(l3_smem_bytes(&big) > l1_smem_bytes(&big));
+
         let l1_budget = GpuBudget {
-            smem_per_sm: l1_smem_bytes(&nslcoder_model()) + scheduler_smem_bytes(8) + 1_000,
+            smem_per_sm: l1_smem_bytes(&big) + scheduler_smem_bytes(8) + 1_000,
             num_sms: 64,
             kernel_launch_us: 5.0,
         };
-        let p1 = plan(&nslcoder_model(), &l1_budget, 8);
+        let p1 = plan(&big, &l1_budget, 8);
         assert_eq!(p1.fusion, FusionLevel::Level1);
 
         let l3_budget = GpuBudget::default();
-        let p3 = plan(&nslcoder_model(), &l3_budget, 8);
+        let p3 = plan(&big, &l3_budget, 8);
         assert_eq!(p3.fusion, FusionLevel::Level3);
         assert!(p3.launch_reduction() > p1.launch_reduction());
+    }
+
+    #[test]
+    fn l3_smem_scales_with_d_model_and_d_ff() {
+        // The audit's gap-#G17 complaint: the old formula ignored
+        // d_model.  Both axes must move the footprint.
+        let base = nslcoder_model();
+        let mut wider = base;
+        wider.d_model = base.d_model * 2;
+        assert!(l3_smem_bytes(&wider) > l3_smem_bytes(&base));
+
+        let mut tiny_ff = base;
+        tiny_ff.d_ff = 32; // below the 128-wide staging tile
+        assert!(l3_smem_bytes(&tiny_ff) < l3_smem_bytes(&base));
+    }
+
+    #[test]
+    fn gpu_budget_from_spec_maps_database_fields() {
+        let h100 = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
+        let b = gpu_budget_from_spec(h100);
+        assert_eq!(b.smem_per_sm, 256 * 1024);
+        assert_eq!(b.num_sms, 132);
+        assert!((b.kernel_launch_us - 5.0).abs() < 1e-9);
     }
 
     #[test]

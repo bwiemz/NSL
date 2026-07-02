@@ -1,0 +1,35 @@
+# CFIE: compiler-fused inference-engine serve block (paper §8 config).
+# `kv_layout: "static"` opts into compile-time KV planning; the build
+# prints the CFIE Inference Build Report.  Build with:
+#   nsl build examples/cfie_serve_static.nsl
+#   nsl build --cfie-report report.txt examples/cfie_serve_static.nsl
+
+serve CfieInference:
+    max_batch: 64
+    max_seq: 2048
+    kv_layout: "static"
+    kv_quant: "auto"
+    target_gpu: "h100"
+    n_layers: 8
+    n_kv_heads: 4
+    head_dim: 128
+    d_model: 512
+    d_ff: 1408
+    vocab_size: 49152
+
+    sampling:
+        temperature: 0.7
+        top_k: 50
+        top_p: 0.9
+        fused: true
+
+    speculative:
+        tokens: 5
+        method: "tree"
+        tree_width: 2
+
+    @endpoint
+    fn generate(prompt: str) -> str:
+        let x = 0
+
+print("cfie serve static ok")

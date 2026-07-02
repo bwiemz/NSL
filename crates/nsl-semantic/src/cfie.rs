@@ -178,6 +178,324 @@ pub fn validate_cfie_decorator(
 }
 
 // ---------------------------------------------------------------------------
+// Serve-block CFIE config validation
+// ---------------------------------------------------------------------------
+
+/// Known nested serve sections and the keys each accepts.
+const KNOWN_SECTIONS: &[&str] = &["sampling", "speculative", "grammar"];
+
+fn expr_as_name(
+    value: &nsl_ast::expr::Expr,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+) -> Option<String> {
+    match &value.kind {
+        ExprKind::StringLiteral(s) => Some(s.clone()),
+        ExprKind::Ident(sym) => Some(resolve_sym(*sym)),
+        _ => None,
+    }
+}
+
+fn expr_as_f64(value: &nsl_ast::expr::Expr) -> Option<f64> {
+    match &value.kind {
+        ExprKind::FloatLiteral(f) => Some(*f),
+        ExprKind::IntLiteral(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
+fn expr_as_i64(value: &nsl_ast::expr::Expr) -> Option<i64> {
+    match &value.kind {
+        ExprKind::IntLiteral(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn expr_as_bool(value: &nsl_ast::expr::Expr) -> Option<bool> {
+    match &value.kind {
+        ExprKind::BoolLiteral(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Validate CFIE-specific serve-block configuration: the flat
+/// `kv_layout` / `kv_quant` / `max_seq` / `target_gpu` keys and the
+/// nested `sampling:` / `speculative:` / `grammar:` sections.
+///
+/// Non-CFIE keys are left alone (they are validated by the M29/M41
+/// serve checks); unknown *sections* are hard errors because a nested
+/// section that silently does nothing is exactly the failure mode the
+/// CFIE audit flagged.
+pub fn validate_serve_config(
+    serve: &nsl_ast::block::ServeBlock,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for entry in &serve.config {
+        let key = resolve_sym(entry.key);
+        match key.as_str() {
+            "kv_layout" => {
+                let parsed = expr_as_name(&entry.value, resolve_sym)
+                    .and_then(|s| KvLayoutChoice::parse(&s));
+                if parsed.is_none() {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "kv_layout must be \"static\", \"paged\", or \"auto\"".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid kv_layout"),
+                    );
+                }
+            }
+            "kv_quant" => {
+                let parsed = expr_as_name(&entry.value, resolve_sym)
+                    .and_then(|s| KvQuantChoice::parse(&s));
+                if parsed.is_none() {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "kv_quant must be \"auto\", \"uniform_fp16\", \"uniform_int8\", or \"off\""
+                                .to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid kv_quant"),
+                    );
+                }
+            }
+            "max_seq" => {
+                if !matches!(expr_as_i64(&entry.value), Some(v) if v >= 1) {
+                    diagnostics.push(
+                        Diagnostic::error("max_seq must be a positive integer".to_string())
+                            .with_label(entry.value.span, "invalid max_seq"),
+                    );
+                }
+            }
+            "target_gpu" => {
+                if expr_as_name(&entry.value, resolve_sym).is_none() {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "target_gpu must be a GPU name string (e.g. \"h100\")".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid target_gpu"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for sub in &serve.sub_blocks {
+        let section = resolve_sym(sub.key);
+        match section.as_str() {
+            "sampling" => validate_sampling_section(sub, resolve_sym, diagnostics),
+            "speculative" => validate_speculative_section(sub, resolve_sym, diagnostics),
+            "grammar" => validate_grammar_section(sub, resolve_sym, diagnostics),
+            other => {
+                diagnostics.push(
+                    Diagnostic::error(format!(
+                        "unknown serve section '{other}:'; expected one of: {}",
+                        KNOWN_SECTIONS.join(", ")
+                    ))
+                    .with_label(sub.span, "unknown section"),
+                );
+            }
+        }
+    }
+}
+
+fn validate_sampling_section(
+    sub: &nsl_ast::block::ServeSubBlock,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for entry in &sub.entries {
+        let key = resolve_sym(entry.key);
+        match key.as_str() {
+            "temperature" => {
+                if !matches!(expr_as_f64(&entry.value), Some(t) if (0.0..=10.0).contains(&t)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "sampling temperature must be a number in [0, 10]".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid temperature"),
+                    );
+                }
+            }
+            "top_k" => {
+                if !matches!(expr_as_i64(&entry.value), Some(k) if (1..=1024).contains(&k)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "sampling top_k must be an integer in [1, 1024]".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid top_k"),
+                    );
+                }
+            }
+            "top_p" => {
+                if !matches!(expr_as_f64(&entry.value), Some(p) if p > 0.0 && p <= 1.0) {
+                    diagnostics.push(
+                        Diagnostic::error("sampling top_p must be a number in (0, 1]".to_string())
+                            .with_label(entry.value.span, "invalid top_p"),
+                    );
+                }
+            }
+            "fused" => {
+                if expr_as_bool(&entry.value).is_none() {
+                    diagnostics.push(
+                        Diagnostic::error("sampling fused must be true or false".to_string())
+                            .with_label(entry.value.span, "invalid fused"),
+                    );
+                }
+            }
+            other => {
+                diagnostics.push(
+                    Diagnostic::error(format!(
+                        "unknown sampling key '{other}'; expected temperature, top_k, top_p, or fused"
+                    ))
+                    .with_label(entry.span, "unknown key"),
+                );
+            }
+        }
+    }
+}
+
+fn validate_speculative_section(
+    sub: &nsl_ast::block::ServeSubBlock,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut method: Option<String> = None;
+    let mut has_tree_width = false;
+    for entry in &sub.entries {
+        let key = resolve_sym(entry.key);
+        match key.as_str() {
+            "draft" => {
+                // A path to a compiled draft model (`"draft.nslm"`).
+                // Richer forms (DraftModel.load(...)) are a codegen
+                // concern once compiled-speculative kernels land.
+                if !matches!(&entry.value.kind, ExprKind::StringLiteral(_)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "speculative draft must be a .nslm path string".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid draft"),
+                    );
+                }
+            }
+            "tokens" => {
+                if !matches!(expr_as_i64(&entry.value), Some(k) if (1..=32).contains(&k)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "speculative tokens must be an integer in [1, 32]".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid tokens"),
+                    );
+                }
+            }
+            "method" => {
+                let parsed = expr_as_name(&entry.value, resolve_sym);
+                match parsed.as_deref() {
+                    Some("standard") | Some("tree") | Some("medusa") | Some("lookahead") => {
+                        method = parsed;
+                    }
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "speculative method must be \"standard\", \"tree\", \"medusa\", or \"lookahead\""
+                                .to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid method"),
+                    ),
+                }
+            }
+            "tree_width" => {
+                has_tree_width = true;
+                if !matches!(expr_as_i64(&entry.value), Some(w) if (1..=8).contains(&w)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "speculative tree_width must be an integer in [1, 8]".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid tree_width"),
+                    );
+                }
+            }
+            "temperature" => {
+                if !matches!(expr_as_f64(&entry.value), Some(t) if (0.0..=10.0).contains(&t)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "speculative temperature must be a number in [0, 10]".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid temperature"),
+                    );
+                }
+            }
+            other => {
+                diagnostics.push(
+                    Diagnostic::error(format!(
+                        "unknown speculative key '{other}'; expected draft, tokens, method, tree_width, or temperature"
+                    ))
+                    .with_label(entry.span, "unknown key"),
+                );
+            }
+        }
+    }
+    if has_tree_width && method.as_deref() != Some("tree") {
+        diagnostics.push(
+            Diagnostic::warning(
+                "speculative tree_width has no effect unless method = \"tree\"".to_string(),
+            )
+            .with_label(sub.span, "tree_width without tree method"),
+        );
+    }
+}
+
+fn validate_grammar_section(
+    sub: &nsl_ast::block::ServeSubBlock,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut has_schema = false;
+    for entry in &sub.entries {
+        let key = resolve_sym(entry.key);
+        match key.as_str() {
+            "schema" => {
+                has_schema = true;
+                if !matches!(&entry.value.kind, ExprKind::StringLiteral(_)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "grammar schema must be a JSON-schema path string".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid schema"),
+                    );
+                }
+            }
+            "tokenizer" => {
+                // Vocab path (`.txt` one token per line, `.json` string
+                // array) — required by codegen to token-project the
+                // schema DFA (audit gap G12).
+                if !matches!(&entry.value.kind, ExprKind::StringLiteral(_)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "grammar tokenizer must be a vocab path string".to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid tokenizer"),
+                    );
+                }
+            }
+            other => {
+                diagnostics.push(
+                    Diagnostic::error(format!(
+                        "unknown grammar key '{other}'; expected schema or tokenizer"
+                    ))
+                    .with_label(entry.span, "unknown key"),
+                );
+            }
+        }
+    }
+    if !has_schema {
+        diagnostics.push(
+            Diagnostic::error("grammar section requires a schema key".to_string())
+                .with_label(sub.span, "missing schema"),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

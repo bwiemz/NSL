@@ -181,12 +181,19 @@ pub mod cep_search;
 pub mod cep_emit_source;
 pub mod cep_slice;
 pub mod cfie;
+pub mod cfie_decode_attention;
 pub mod cfie_fused_sample;
 pub mod cfie_grammar;
+pub mod cfie_grammar_ptx;
 pub mod cfie_kv_plan;
 pub mod cfie_kv_quant;
+pub mod cfie_kv_quant_ptx;
 pub mod cfie_persistent;
+pub mod cfie_persistent_ptx;
+pub mod cfie_sample_ptx;
+pub mod cfie_serve;
 pub mod cfie_speculative;
+pub mod cfie_speculative_ptx;
 pub mod csha;
 pub mod csha_apply;
 pub mod csha_boundary;
@@ -385,6 +392,41 @@ pub fn debug_compile_and_return_plan_from_ast(
     options: &CompileOptions,
 ) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
     debug_compile_and_return_plan_with_imports(ast, interner, type_map, &[], options)
+}
+
+/// CFIE Tier-A observability: compile a module through the full
+/// pipeline and return the [`crate::cfie::CfiePlan`] produced while
+/// compiling its serve block (`None` when no serve block opted into
+/// CFIE).  Mirrors [`debug_compile_and_return_plan_from_ast`].
+pub fn debug_compile_and_return_cfie_plan_from_ast(
+    ast: &nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    type_map: &nsl_semantic::checker::TypeMap,
+    options: &CompileOptions,
+) -> Result<Option<crate::cfie::CfiePlan>, CodegenError> {
+    let (res, _wrga_plan, cfie_plan) =
+        crate::compiler::compile_module_with_imports_best_effort_plans(
+            ast,
+            interner,
+            type_map,
+            "",
+            &[],
+            HashMap::new(),
+            std::collections::HashSet::new(),
+            false,
+            options,
+        );
+    match (res, cfie_plan) {
+        (Ok(_), plan) => Ok(plan),
+        (Err(e), Some(plan)) => {
+            eprintln!(
+                "[debug_compile_and_return_cfie_plan] codegen failed but a CFIE plan was produced: {}",
+                e.message
+            );
+            Ok(Some(plan))
+        }
+        (Err(e), None) => Err(e),
+    }
 }
 
 fn debug_compile_and_return_plan_with_imports(
@@ -798,6 +840,21 @@ pub struct WggoOptions {
     pub prune_fraction: Option<f64>,
 }
 
+/// CFIE: compiler-fused inference-engine options (paper: docs/research/CFIE.pdf).
+///
+/// Grouped as a cohesive sub-struct per the architecture-hardening
+/// CompileOptions decomposition convention (cf. [`CshaOptions`] /
+/// [`CpdtOptions`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CfieOptions {
+    /// CLI mode override (`--cfie full|sampling|off`).  `None` defers to
+    /// the serve block's `@cfie` decorator / config keys.
+    pub mode_override: Option<String>,
+    /// Write the CFIE build report to this path in addition to stderr
+    /// (`--cfie-report <path>`).
+    pub report_path: Option<std::path::PathBuf>,
+}
+
 /// M53: Worst-case-execution-time (WCET) analysis and certification options.
 ///
 /// Grouped out of [`CompileOptions`] as part of decomposing that god-config
@@ -1007,6 +1064,8 @@ pub struct CompileOptions {
     pub wrga_fold_allocations: bool,
     /// WGGO: weight-graph global-optimization options.
     pub wggo: WggoOptions,
+    /// CFIE: compiler-fused inference-engine options.
+    pub cfie: CfieOptions,
     /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
     pub profile_kernels: bool,
     /// Dev Tools Phase 2: target GPU name for the profile walker.
@@ -1109,6 +1168,7 @@ impl Default for CompileOptions {
             pca_user_strategies: Vec::new(),
             wrga_fold_allocations: false,
             wggo: WggoOptions::default(),
+            cfie: CfieOptions::default(),
             profile_kernels: false,
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
