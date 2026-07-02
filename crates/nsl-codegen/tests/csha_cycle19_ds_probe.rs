@@ -32,6 +32,15 @@
 //!     P[1,0] ≈ 0.5, P[1,1] ≈ 0.5,
 //!     dS = 0.25 · (dP[1,0] − dP[1,1]) — NONZERO under random dO.
 //!
+//! **Slot 7 col-coordinate note (R11 cycle-20 T1-fixup).** Slots 0-6 are
+//! emitted from ds_compute BEFORE the col-loop advances and naturally
+//! sample col=0. Slot 7 (scale*dS) is emitted from `dqdk_accum` INSIDE
+//! the KV-col loop; `maybe_emit_probe_store` provides no col-gate hook,
+//! so slot 7 fires once per col and retains the LAST column's value —
+//! it samples col=block_kv-1, NOT col=0. Any T5/c21 CPU-reference
+//! matching for slot 7 MUST compare against the reference at
+//! col=block_kv-1.
+//!
 //! **Numerical interpretation deferred to T5/c21.** This test only proves
 //! the plumbing works — that the probe slots receive non-zero, finite
 //! writes when the probe FFI is dispatched. Exact reference matching is

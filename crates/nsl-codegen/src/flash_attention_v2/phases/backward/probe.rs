@@ -6,6 +6,17 @@
 //! sampled at the non-degenerate coordinate
 //! `(batch=0, head=0, q_tile_iter=0, warp_row=1, lane=0, causal=true)`.
 //!
+//! **Per-slot column coordinate.**
+//!   * Slots 0-6 (row_max, row_sum, S_pre_mask, P, dP, rowsum_dP_P, dS)
+//!     are emitted from ds_compute BEFORE the col-loop advances, i.e. they
+//!     naturally sample col=0 under the (warp_id==1, lane==0, ...) gate.
+//!   * Slot 7 (scale*dS) is emitted from `dqdk_accum` INSIDE the KV-col
+//!     loop. `maybe_emit_probe_store` provides no col-gate hook, so the
+//!     store fires once per col iteration and slot 7 retains the LAST
+//!     column's value — i.e. it samples col=block_kv-1, NOT col=0.
+//!     Consumers (T5/c21 CPU-reference matching) MUST interpret slot 7
+//!     at col=block_kv-1.
+//!
 //! **Feature gating.** The probe machinery is gated at PTX-emission time
 //! by the `csha_cycle19_probe` Cargo feature — when the feature is OFF,
 //! `maybe_emit_probe_store` is a compile-time no-op AND the prelude does
@@ -28,7 +39,9 @@
 //!
 //! Each store predicate falls through on ANY of the gate conditions
 //! failing — the compile-time `q_tile_iter != 0` check simply skips
-//! emission entirely.
+//! emission entirely. **No col-gate hook** — see the per-slot column
+//! coordinate note above; slot 7's col=block_kv-1 sampling is a
+//! consequence of this limitation.
 //!
 //! **Non-CSHA config safety.** Callers should invoke this helper only
 //! from backward emission sites — the register prerequisites (`%warp_id`,
@@ -50,6 +63,19 @@ use crate::flash_attention::FlashAttentionConfig;
 /// **Feature ON, q_tile_iter != 0:** unconditional no-op.
 /// **Feature ON, q_tile_iter == 0:** emits 3 setp/and.pred + one
 /// predicated `st.global.f32`.
+///
+/// **Col-gate limitation (future maintainers).** This helper composes a
+/// fixed gate (probe_active AND warp_id==1 AND lane==0 AND batch==0 AND
+/// head==0) into `%p_probe_gate`. It does NOT accept an extra predicate
+/// to compose an additional gate (e.g. `col==0`) BEFORE the internal
+/// `setp.eq.u32 %p_probe_w, %warp_id, 1` overwrites `%p_probe_w`. As a
+/// result, callers emitting from inside a col-loop (slot 7 at
+/// `dqdk_accum`) cause the store to fire once per col iteration; the
+/// slot retains the LAST column's value. If a tight col=0 (or arbitrary
+/// extra-predicate) gate is required, extend this API with an
+/// `Option<&str>` extra-predicate register that composes into
+/// `%p_probe_gate` before line 73 — see R11 (cycle-20 T1-fixup) for the
+/// design.
 #[cfg(feature = "csha_cycle19_probe")]
 pub fn maybe_emit_probe_store(
     ptx: &mut String,

@@ -74,28 +74,19 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.f32 %f_dS, %f_dS, %scale;\n");
 
     // ── cycle-20 T1 probe slot 7: scale*dS (post-scale application) ──
-    // The col-loop iterates all block_kv columns; the probe coord is col=0.
-    // The `maybe_emit_probe_store` helper already gates on
-    // (warp_id==1, lane==0, batch==0, head==0, probe_active). We add a
-    // col-loop-specific gate on `%r1 == 0` to pin the probe to col 0 —
-    // otherwise the store would fire once per col iteration and overwrite
-    // slot 7 with the last column's value.
-    if cfg!(feature = "csha_cycle19_probe") {
-        ptx.push_str("    setp.eq.u32 %p_probe_w, %r1, 0; // col==0 gate\n");
-    }
+    // slot 7 (scale*dS): sampled at col=block_kv-1 (last KV column of this
+    // iter); slot 7 fires once per KV col but retains the LAST value;
+    // consumers must interpret as col=block_kv-1.
+    //
+    // Rationale: `maybe_emit_probe_store` gates on
+    // (warp_id==1, lane==0, batch==0, head==0, probe_active) but does NOT
+    // expose an extra-predicate hook to compose a col==0 gate into
+    // `%p_probe_gate` before the warp/lane setp overwrites `%p_probe_w`.
+    // Adding such a hook (R11 option (a)) is deferred; we accept last-col
+    // sampling (R11 option (b)) and document the coord in probe.rs +
+    // csha_cycle19_ds_probe.rs so T5/c21 consumers compare against the
+    // CPU reference at col=block_kv-1 (NOT col=0).
     maybe_emit_probe_store(ptx, config, 7, "%f_dS", q_tile_iter);
-    // Note: %p_probe_w is re-used above as a scratch predicate for the
-    // col==0 gate; the probe helper immediately overwrites it with the
-    // warp_id==1 setp, so the extra col gate composes into %p_probe_gate
-    // via the AND chain the helper emits — INCORRECT unless we compose.
-    // To keep the col gate load-bearing, we OR the col gate into the
-    // active predicate by patching %p_probe_active with an AND:
-    // NOTE (partial): this emission fires 32× per warp — slot 7 is
-    // overwritten by cols 1..31 after col=0. Numerical interpretation of
-    // slot 7 in T4 must account for reading the last-col value, NOT col=0.
-    // Deferring the tight col-gate composition to a T2 follow-on (would
-    // need a small extension to `maybe_emit_probe_store` API for an
-    // optional extra predicate — out of scope for T1).
 
     // K[col, :] base
     ptx.push_str(&format!(
