@@ -350,6 +350,52 @@ fn snapshot_kir_with_barrier_ptx() {
     insta::assert_snapshot!("kir_barrier_kernel_ptx", ptx_str);
 }
 
+/// Locks down the transcendental math lowering: Exp must pre-scale by
+/// log2(e) (0f3FB8AA3B) before ex2.approx (e^x, not 2^x), Log must
+/// post-scale by ln(2) (0f3F317218) after lg2.approx (ln, not log2), and
+/// Tanh must expand to 2*sigmoid(2x) - 1 instead of a silent mov identity.
+#[test]
+fn snapshot_kir_unary_math_ptx() {
+    use nsl_codegen::backend_ptx::lower_kir_to_ptx;
+    use nsl_codegen::kernel_ir::*;
+
+    let mut b = KirBuilder::new("unary_math_kernel");
+    let x_ptr = b.add_param(
+        "x",
+        KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+        AddressSpace::Global,
+    );
+    let out_ptr = b.add_param(
+        "out",
+        KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global),
+        AddressSpace::Global,
+    );
+
+    let entry = b.new_block();
+    b.set_block(entry);
+    let tid = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::GlobalId(tid, 0));
+    let x_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+    b.emit(KirOp::PtrOffset(x_addr, x_ptr, tid));
+    let x_val = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Load(x_val, x_addr, AddressSpace::Global));
+    let e = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Exp(e, x_val));
+    let l = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Log(l, e));
+    let t = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Tanh(t, l));
+    let out_addr = b.new_typed_var(KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global));
+    b.emit(KirOp::PtrOffset(out_addr, out_ptr, tid));
+    b.emit(KirOp::Store(out_addr, t, AddressSpace::Global));
+    b.terminate(KirTerminator::Return);
+
+    let ir = b.finalize();
+    let ptx = lower_kir_to_ptx(&ir);
+    let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
+    insta::assert_snapshot!("kir_unary_math_ptx", ptx_str);
+}
+
 // ---------------------------------------------------------------------------
 // Fusion graph structure snapshots
 // ---------------------------------------------------------------------------

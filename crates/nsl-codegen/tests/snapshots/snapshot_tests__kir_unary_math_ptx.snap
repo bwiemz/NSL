@@ -1,0 +1,45 @@
+---
+source: crates/nsl-codegen/tests/snapshot_tests.rs
+expression: ptx_str
+---
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry unary_math_kernel(.param .u64 param_x, .param .u64 param_out) {
+    .reg .u32 %r<1004>;
+    .reg .u64 %rd<1004>;
+    .reg .f32 %f<1004>;
+    .reg .pred %p<1004>;
+
+    ld.param.u64 %rd0, [param_x];
+    ld.param.u64 %rd1, [param_out];
+
+BB0:
+    mov.u32 %r1002, %ctaid.x;
+    mov.u32 %r1003, %ntid.x;
+    mul.lo.u32 %r1002, %r1002, %r1003;
+    mov.u32 %r2, %tid.x;
+    add.u32 %r2, %r1002, %r2;
+    cvt.u64.u32 %rd3, %r2;
+    mul.lo.u64 %rd3, %rd3, 4;
+    add.u64 %rd3, %rd0, %rd3;
+    ld.global.f32 %f4, [%rd3];
+    mul.f32 %f5, %f4, 0f3FB8AA3B;
+    ex2.approx.f32 %f5, %f5;
+    lg2.approx.f32 %f6, %f5;
+    mul.f32 %f6, %f6, 0f3F317218;
+    add.f32 %f7, %f6, %f6;
+    neg.f32 %f7, %f7;
+    mul.f32 %f7, %f7, 0f3FB8AA3B;
+    ex2.approx.f32 %f7, %f7;
+    add.f32 %f7, %f7, 0f3F800000;
+    rcp.approx.f32 %f7, %f7;
+    add.f32 %f7, %f7, %f7;
+    sub.f32 %f7, %f7, 0f3F800000;
+    cvt.u64.u32 %rd8, %r2;
+    mul.lo.u64 %rd8, %rd8, 4;
+    add.u64 %rd8, %rd1, %rd8;
+    st.global.f32 [%rd8], %f7;
+    ret;
+}
