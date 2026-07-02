@@ -106,3 +106,59 @@ int64_t (*nsl_abi_version_ptr)(void) = &nsl_abi_version;
         header,
     );
 }
+
+/// The generated C header pins the ABI version it was built against via the
+/// `NSL_ABI_VERSION_MAJOR` / `_MINOR` macros. This is a **golden** check: it
+/// compares the emitted macros against hard-coded expected values, not against
+/// the runtime constants. Comparing the parsed macro to the runtime constant
+/// would be tautological — `c_header::emit` writes the macro *from* that same
+/// constant, so the two can never disagree.
+///
+/// Anchoring to a literal instead means an ABI bump is a deliberate two-step:
+/// change the runtime constants **and** these goldens in the same PR. A bump of
+/// one without the other turns this test red. Pure text comparison (no C
+/// compiler), so it runs everywhere including Windows runners without a
+/// toolchain.
+#[test]
+fn c_header_abi_version_matches_golden() {
+    // Bump these together with `nsl_runtime::c_api::NSL_ABI_VERSION_{MAJOR,MINOR}`
+    // whenever the C ABI changes.
+    const EXPECTED_ABI_MAJOR: u32 = 1;
+    const EXPECTED_ABI_MINOR: u32 = 0;
+
+    // Anchor the runtime constants to the goldens (catches an undocumented bump
+    // of the constants without updating this test / the ABI policy).
+    assert_eq!(
+        nsl_runtime::c_api::NSL_ABI_VERSION_MAJOR, EXPECTED_ABI_MAJOR,
+        "runtime NSL_ABI_VERSION_MAJOR changed; update this golden and confirm the bump is intentional",
+    );
+    assert_eq!(
+        nsl_runtime::c_api::NSL_ABI_VERSION_MINOR, EXPECTED_ABI_MINOR,
+        "runtime NSL_ABI_VERSION_MINOR changed; update this golden and confirm the bump is intentional",
+    );
+
+    let header = nsl_codegen::c_header::emit(&[], "version_check");
+    let macro_u32 = |name: &str| -> u32 {
+        let needle = format!("#define {name} ");
+        let start = header
+            .find(&needle)
+            .unwrap_or_else(|| panic!("generated header is missing `{name}`:\n{header}"));
+        let rest = &header[start + needle.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{name}` macro value is not a u32: {rest:?}"))
+    };
+
+    // And anchor the *emitted header* to the goldens (catches a header generator
+    // that hard-codes a value diverging from the runtime, independent of the
+    // constants above).
+    assert_eq!(
+        macro_u32("NSL_ABI_VERSION_MAJOR"), EXPECTED_ABI_MAJOR,
+        "generated header NSL_ABI_VERSION_MAJOR diverges from the expected ABI version",
+    );
+    assert_eq!(
+        macro_u32("NSL_ABI_VERSION_MINOR"), EXPECTED_ABI_MINOR,
+        "generated header NSL_ABI_VERSION_MINOR diverges from the expected ABI version",
+    );
+}

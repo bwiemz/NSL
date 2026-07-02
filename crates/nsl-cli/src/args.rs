@@ -221,6 +221,14 @@ pub(crate) enum Cli {
         #[arg(long)]
         seq: bool,
     },
+
+    /// Report static per-kernel PTX metadata (declared registers, shared
+    /// memory, target SM) parsed from a synthesized `.ptx` file. Pure text
+    /// analysis — no GPU or CUDA toolkit required.
+    PtxMetadata {
+        /// Path to a `.ptx` file (NSL- or ptxas-generated).
+        file: PathBuf,
+    },
 }
 
 /// M55: ZK subcommands.
@@ -390,6 +398,19 @@ pub(crate) struct CheckArgs {
         /// decorators in the source.
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "-")]
         pub(crate) wrga_compare: Option<PathBuf>,
+
+        /// WRGA paper §9.3: ablate one or more Innovations from this run.
+        /// Comma-separated tokens from `wengert | roofline | spectral | fusion
+        /// | memory | all | none`. Default `none` (no ablation). `all` is
+        /// shorthand for every Innovation. Combines with `--wrga-analyze` /
+        /// `--wrga-compare` so users can measure the per-Innovation
+        /// contribution to the report.
+        ///
+        /// Examples:
+        ///   nsl check --wrga-analyze --wrga-ablate=fusion model.nsl
+        ///   nsl check --wrga-compare --wrga-ablate=wengert,fusion model.nsl
+        #[arg(long)]
+        pub(crate) wrga_ablate: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -645,6 +666,19 @@ pub(crate) struct BuildArgs {
         /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
+
+        /// CFIE: compiler-fused inference-engine mode ("full",
+        /// "sampling", or "off").  Passing `--cfie` without a value
+        /// enables full mode.  Overrides the serve block's `@cfie`
+        /// decorator; serve-block CFIE keys (kv_layout, sampling:, ...)
+        /// activate CFIE even without this flag.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        pub(crate) cfie: Option<String>,
+
+        /// CFIE: also write the inference build report to this file.
+        /// The report always prints to stderr when CFIE is active.
+        #[arg(long, value_name = "PATH")]
+        pub(crate) cfie_report: Option<PathBuf>,
 
         /// Path to calibration dataset (.bin or .safetensors).  When
         /// omitted, calibration is skipped entirely.

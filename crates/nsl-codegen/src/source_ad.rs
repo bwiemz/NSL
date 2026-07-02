@@ -1487,6 +1487,15 @@ pub struct WengertExtractor<'a> {
     model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
     /// Model field type info: model_type -> field_name -> type_string
     model_field_types: HashMap<String, HashMap<String, String>>,
+    /// CFTP v10 (item 5): model field rank info: `model_type -> field_name -> rank`.
+    /// Mirrors `Compiler::models.model_field_ranks`; threaded here by
+    /// `set_model_field_ranks` from the compile-train-block prologue so
+    /// the two model-field `Param` registration sites in `extract_expr`
+    /// (`MemberAccess` and pipe-RHS-as-ident) can look up rank BEFORE
+    /// pushing a `PrimalOp::Param` and populate `known_ranks` — which
+    /// closes the fused-LCE matcher's LATENT 3-D+ RISK on weights
+    /// accessed via `self.field` (e.g. an MoE expert stack).
+    model_field_ranks: HashMap<String, HashMap<String, usize>>,
     /// Context prefix -> model type name mapping (e.g., "m" -> "NSLCoder", "m.blocks.0" -> "TransformerBlock")
     context_to_model_type: HashMap<String, String>,
     /// Override resolved names for symbols (loop var -> "m.blocks.0")
@@ -1515,6 +1524,25 @@ pub struct WengertExtractor<'a> {
     /// composite path is used (preserving v1's safety + the composite-
     /// fallback regression invariant required by Sprint 4 spec).
     fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
+    /// CFTP v10 (item 5): known tensor rank per VarId, when the frontend
+    /// could derive it (from an annotated function-parameter type or a
+    /// rank-preserving op).  Populated by `register_input_with_rank` /
+    /// `register_param_with_rank` when the compiler threads the AST
+    /// `TypeExpr` rank through, and by the extractor for rank-preserving
+    /// ops emitted downstream (e.g. `Transpose`).
+    ///
+    /// Consulted by `try_match_fused_linear_ce_pattern` to refuse the
+    /// auto-substitution when `W` is known to be non-2D — closes the
+    /// LATENT 3-D+ RISK documented on the matcher (rank-3 W stack of a
+    /// per-expert MoE layout that would otherwise silently produce
+    /// wrong forward logits + wrong dW gradients with no diagnostic).
+    ///
+    /// Absent-key semantics: the matcher CANNOT prove non-2D from the
+    /// current information, so it falls through to the pre-v10 behaviour
+    /// (fire).  This preserves backwards compatibility with tests that
+    /// use unannotated `Tensor` params while structurally rejecting
+    /// programs that DID annotate a non-2D `W`.
+    known_ranks: HashMap<VarId, usize>,
     /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1): each successful
     /// `cross_entropy → FusedLinearCe` auto-substitution records its
     /// dead upstream chain (`Transpose → Matmul → Add`) here.  The
@@ -1564,6 +1592,7 @@ impl<'a> WengertExtractor<'a> {
             self_context: None,
             model_method_bodies: HashMap::new(),
             model_field_types: HashMap::new(),
+            model_field_ranks: HashMap::new(),
             context_to_model_type: HashMap::new(),
             symbol_name_overrides: HashMap::new(),
             model_instance_types: HashMap::new(),
@@ -1571,15 +1600,17 @@ impl<'a> WengertExtractor<'a> {
             synth_call_names: HashMap::new(),
             synth_member_names: HashMap::new(),
             fused_ce_config: None,
+            known_ranks: HashMap::new(),
             pending_fused_lce_prunes: Vec::new(),
         }
     }
 
     /// CFTP §4.4 G3 (Sprint 4): builder method for plumbing the
     /// `@fused_lm_ce` decorator config into builtin recognition.  Callers
-    /// (compiler/train-block lowering) thread `compiler.fused_ce_configs[0]`
-    /// here when the active train block carries the decorator and v1's
-    /// opt-in gate is satisfied.
+    /// (compiler/train-block lowering) thread
+    /// `compiler.active_fused_ce_config` (CFTP v10 item 3; pre-v10:
+    /// `compiler.fused_ce_configs[0]`) here when the active train block
+    /// carries the decorator and v1's opt-in gate is satisfied.
     pub fn with_fused_ce_config(
         mut self,
         cfg: Option<crate::FusedCeDecoratorConfig>,
@@ -1775,6 +1806,27 @@ impl<'a> WengertExtractor<'a> {
             return None;
         }
         let w_var = transpose_op.inputs[0];
+        // CFTP v10 (item 5): structural rank-2 enforcement.
+        //
+        // When the compiler was able to derive the rank of `w_var` from the
+        // enclosing AST type annotation (via
+        // `register_input_with_rank` / `register_param_with_rank`) OR
+        // propagated the rank through a rank-preserving op (Transpose),
+        // consult it.  A `known_ranks` entry != 2 means the matcher would
+        // otherwise silently fire on a rank-3 W3D (e.g. an MoE expert
+        // stack `[D, V, H]`), stride through it as if it were `[V, H]`,
+        // and produce wrong forward logits + wrong dW gradients with no
+        // diagnostic (documented LATENT 3-D+ RISK).  Refuse the
+        // substitution so the composite CE path takes over.
+        //
+        // Absent-key semantics: we can't PROVE non-2D, so we conservatively
+        // fire — matching the pre-v10 behaviour for unannotated
+        // `Tensor` params.
+        if let Some(&r) = self.known_ranks.get(&w_var) {
+            if r != 2 {
+                return None;
+            }
+        }
         Some(FusedLceMatch {
             x_var,
             w_var,
@@ -1889,12 +1941,30 @@ impl<'a> WengertExtractor<'a> {
 
     /// Register a parameter symbol (needs gradient).
     pub fn register_param(&mut self, sym: nsl_ast::Symbol) {
+        self.register_param_with_rank(sym, None);
+    }
+
+    /// CFTP v10 (item 5): register a parameter symbol AND record its
+    /// declared tensor rank when the compiler can derive it from the
+    /// enclosing AST type annotation.  A `Some(2)` here is what unlocks
+    /// the rank-2 acceptance path in
+    /// `try_match_fused_linear_ce_pattern`; a `Some(3+)` triggers the
+    /// structural refusal.  Pass `None` when rank is unknown to preserve
+    /// the pre-v10 behaviour (matcher fires).
+    pub fn register_param_with_rank(
+        &mut self,
+        sym: nsl_ast::Symbol,
+        rank: Option<usize>,
+    ) {
         let var = self.alloc_var();
         self.symbol_to_var.insert(sym, var);
         self.param_symbols.insert(sym);
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
         self.list.var_names.insert(var, name.clone());
+        if let Some(r) = rank {
+            self.known_ranks.insert(var, r);
+        }
         self.push_op(WengertOp {
             id: self.list.ops.len() as u32,
             result: var,
@@ -1907,11 +1977,27 @@ impl<'a> WengertExtractor<'a> {
 
     /// Register an input symbol (data, no gradient).
     pub fn register_input(&mut self, sym: nsl_ast::Symbol) {
+        self.register_input_with_rank(sym, None);
+    }
+
+    /// CFTP v10 (item 5): register an input symbol AND record its
+    /// declared tensor rank when the compiler can derive it from the
+    /// enclosing AST type annotation.  See
+    /// [`register_param_with_rank`] for the load-bearing invariant this
+    /// unlocks.
+    pub fn register_input_with_rank(
+        &mut self,
+        sym: nsl_ast::Symbol,
+        rank: Option<usize>,
+    ) {
         let var = self.alloc_var();
         self.symbol_to_var.insert(sym, var);
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
         self.list.var_names.insert(var, name.clone());
+        if let Some(r) = rank {
+            self.known_ranks.insert(var, r);
+        }
         self.push_op(WengertOp {
             id: self.list.ops.len() as u32,
             result: var,
@@ -1935,6 +2021,18 @@ impl<'a> WengertExtractor<'a> {
     /// Maps model_type -> field_name -> type_string (e.g., "[TransformerBlock;8]").
     pub fn set_model_field_types(&mut self, types: HashMap<String, HashMap<String, String>>) {
         self.model_field_types = types;
+    }
+
+    /// CFTP v10 (item 5): install per-model-field rank info so the two
+    /// model-field `Param` registration sites in `extract_expr` can
+    /// populate `known_ranks` — closing the LATENT 3-D+ RISK for W
+    /// operands loaded via `self.field`.  Maps
+    /// `model_type -> field_name -> rank`.
+    pub fn set_model_field_ranks(
+        &mut self,
+        ranks: HashMap<String, HashMap<String, usize>>,
+    ) {
+        self.model_field_ranks = ranks;
     }
 
     /// WRGA B.3.2 Option 3: install the compiler's synth_call_names map so
@@ -2234,6 +2332,24 @@ impl<'a> WengertExtractor<'a> {
                     if is_model_param {
                         self.param_symbols.insert(*member);
                         self.named_param_vars.push((compound.clone(), var));
+                        // CFTP v10 (item 5): populate `known_ranks` when
+                        // the enclosing model recorded a declared rank
+                        // for this field (via `collection.rs`).  Without
+                        // this, a rank-3 model-field weight (e.g. an MoE
+                        // expert stack `self.experts.weight:[D,V,H]`)
+                        // would leave `known_ranks` empty and the
+                        // fused-LCE matcher would silently fire on it —
+                        // reintroducing the LATENT 3-D+ RISK on the
+                        // most common weight-access path.
+                        if let Some(pt) = parent_model.as_ref() {
+                            if let Some(&r) = self
+                                .model_field_ranks
+                                .get(pt)
+                                .and_then(|fields| fields.get(&field_name))
+                            {
+                                self.known_ranks.insert(var, r);
+                            }
+                        }
                         self.push_op(WengertOp {
                             id: self.list.ops.len() as u32,
                             result: var,
@@ -2337,6 +2453,26 @@ impl<'a> WengertExtractor<'a> {
                                     self.list.var_names.insert(var, compound.clone());
                                     self.param_symbols.insert(*sym);
                                     self.named_param_vars.push((compound.clone(), var));
+                                    // CFTP v10 (item 5): mirror the
+                                    // MemberAccess-site rank plumbing so
+                                    // pipe-RHS model-field accesses
+                                    // (`x |> q_proj`) also populate
+                                    // `known_ranks` — otherwise a rank-3
+                                    // `q_proj` field would slip past the
+                                    // matcher via the pipe form only.
+                                    if let Some(pt) = self
+                                        .context_to_model_type
+                                        .get(&ctx)
+                                        .cloned()
+                                    {
+                                        if let Some(&r) = self
+                                            .model_field_ranks
+                                            .get(&pt)
+                                            .and_then(|fields| fields.get(&ident_name))
+                                        {
+                                            self.known_ranks.insert(var, r);
+                                        }
+                                    }
                                     self.push_op(WengertOp {
                                         id: self.list.ops.len() as u32,
                                         result: var,

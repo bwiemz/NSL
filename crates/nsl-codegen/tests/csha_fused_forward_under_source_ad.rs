@@ -102,7 +102,10 @@ fn compile_source_ad_csha_to_object(src: &str) -> Option<Vec<u8>> {
         return None;
     }
     let opts = CompileOptions {
-        csha_mode: Some("auto".into()),
+        csha: nsl_codegen::CshaOptions {
+            mode: Some("auto".into()),
+            ..Default::default()
+        },
         // Option 3a only fires under source-AD; tape-AD bypasses the
         // dispatcher entirely.
         source_ad: true,

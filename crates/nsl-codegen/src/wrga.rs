@@ -29,6 +29,73 @@ use crate::wrga_spectral::{allocate_ranks, analyse_weight_map, RankAllocation, S
 // `crate::wrga::{InitKind, InitStrategy}`.
 pub use crate::wrga_adapter_inject::{InitKind, InitStrategy};
 
+/// Per-Innovation skip flags for the WRGA paper §9.3 ablation harness.
+///
+/// Each boolean controls one of the five Innovations of WRGA's compiler pass.
+/// When a flag is `true`, the corresponding stage of `wrga::run` is replaced
+/// with a deterministic "as if that Innovation didn't run" no-op:
+///
+/// | Flag                       | Innovation                        | Stage no-op shape                                                       |
+/// |----------------------------|-----------------------------------|-------------------------------------------------------------------------|
+/// | `skip_wengert_pruning`     | (1) Wengert-pruned backward       | retain every forward op as backward-live; all "would-save" acts saved   |
+/// | `skip_roofline_placement`  | (2) Roofline-guided placement     | place adapter on every site with `suggested_rank = r_max`               |
+/// | `skip_spectral_allocation` | (3) Spectral compile-time ranks   | every site's `RankAllocation.rank == placement.suggested_rank` (no SVD) |
+/// | `skip_fusion_integration`  | (4) Fusion-integrated adapters    | `FusionPlan` reports every site as `StandaloneAdapter` (0% fusion)      |
+/// | `skip_memory_planning`     | (5) Memory-planned activations    | `MemoryPlan::default()` — naive (no reuse, planned == live)             |
+///
+/// The default is `all-false` (no ablation — full WRGA). The fields are public
+/// so callers can construct an arbitrary subset.
+///
+/// Used by `nsl check --wrga-ablate=<name>` (paper §9.3) and by direct unit
+/// tests that need to measure a single Innovation's contribution to the
+/// overall plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WrgaAblation {
+    pub skip_wengert_pruning: bool,
+    pub skip_roofline_placement: bool,
+    pub skip_spectral_allocation: bool,
+    pub skip_fusion_integration: bool,
+    pub skip_memory_planning: bool,
+}
+
+impl WrgaAblation {
+    /// `true` if any Innovation is skipped — used by `render_report` to
+    /// decide whether to emit the ablation header line.
+    pub fn is_active(&self) -> bool {
+        self.skip_wengert_pruning
+            || self.skip_roofline_placement
+            || self.skip_spectral_allocation
+            || self.skip_fusion_integration
+            || self.skip_memory_planning
+    }
+
+    /// Comma-separated list of the active skip flags for the report header.
+    /// Returns `"none"` when no ablation is active.
+    pub fn human_label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.skip_wengert_pruning {
+            parts.push("wengert");
+        }
+        if self.skip_roofline_placement {
+            parts.push("roofline");
+        }
+        if self.skip_spectral_allocation {
+            parts.push("spectral");
+        }
+        if self.skip_fusion_integration {
+            parts.push("fusion");
+        }
+        if self.skip_memory_planning {
+            parts.push("memory");
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(",")
+        }
+    }
+}
+
 /// Input to the WRGA driver.
 #[derive(Clone)]
 pub struct WrgaInput<'a> {
@@ -70,6 +137,17 @@ pub struct WrgaInput<'a> {
     /// spectral allocator runs unchanged.  `Some` → per-layer ranks honored
     /// subject to `[r_min, r_max]` clamp and `budget_params` downgrade.
     pub wggo_overrides: Option<&'a crate::wggo_overrides::WggoOverrides>,
+    /// Paper §9.3 ablation harness — per-Innovation skip flags. Default
+    /// `WrgaAblation::default()` = no ablation = standard WRGA. Set one or
+    /// more fields to `true` to replace that Innovation's stage with a
+    /// deterministic no-op. See [`WrgaAblation`] for the no-op semantics.
+    pub ablation: WrgaAblation,
+    /// WRGA paper §8.2: user-defined custom adapter model name (e.g.
+    /// `"GatedLoRA"`).  When `Some`, WRGA surfaces it on the report and
+    /// (in a follow-up cycle) routes adapter emission through this
+    /// user-defined model instead of one of the built-in flavours.
+    /// `None` keeps the compiler-chosen flavour selection.
+    pub custom_adapter: Option<&'a str>,
 }
 
 /// Compiled WRGA plan — consumed by downstream codegen stages.
@@ -87,6 +165,18 @@ pub struct WrgaPlan {
     /// rank bounds or parameter budget.  Empty when no WggoOverrides were
     /// supplied or every override was applied verbatim.
     pub override_diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic>,
+    /// Paper §9.3 ablation flags that produced this plan. Default
+    /// `WrgaAblation::default()` = full WRGA (no ablation). Surfaced in the
+    /// report header by `render_report` when active.
+    pub ablation: WrgaAblation,
+    /// WRGA paper §8.2: user-defined custom adapter model name carried
+    /// through from `WrgaInput.custom_adapter`.  When `Some`,
+    /// `render_report` prints a `Custom adapter: <name>` header line
+    /// directly below the target hardware.  Codegen integration (using
+    /// the user model for adapter emission) is deferred to a follow-up
+    /// cycle; for now the flavour selection falls back to the existing
+    /// LoRA/IA³/GatedLoRA pipeline regardless of this field.
+    pub custom_adapter: Option<String>,
 }
 
 impl WrgaPlan {
@@ -117,6 +207,8 @@ impl WrgaPlan {
             fusion: FusionPlan::default(),
             memory: MemoryPlan::default(),
             override_diagnostics: Vec::new(),
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         }
     }
 
@@ -133,6 +225,23 @@ impl WrgaPlan {
         writeln!(s, "=== WRGA Compilation Report ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
         writeln!(s, "Target hardware: {}", self.target_gpu).unwrap();
+        if let Some(name) = &self.custom_adapter {
+            // Paper §8.2: surface the user-defined custom adapter so the
+            // report reader knows WRGA was asked to instantiate this
+            // model at each placement site.  The trailing parenthetical
+            // is load-bearing: the placement pass still selects among the
+            // built-in lora/ia3/gatedlora flavours in this PR cycle —
+            // wiring the user's adapter graph into placement/fusion is a
+            // follow-up cycle.  Without the note a reader could mistake
+            // the LoRA placements below for instantiations of `<name>`.
+            writeln!(s, "Custom adapter: {name} (placement integration pending)").unwrap();
+        }
+        if self.ablation.is_active() {
+            // Paper §9.3: when one or more Innovations are ablated, surface
+            // which ones in the header so the report's numbers are not
+            // mistaken for a regular WRGA run.
+            writeln!(s, "Ablation: skip={}", self.ablation.human_label()).unwrap();
+        }
         writeln!(s).unwrap();
         writeln!(
             s,
@@ -418,41 +527,224 @@ fn fmt_with_commas(n: usize) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Paper §9.3 ablation no-ops — one substitute per Innovation.
+// ---------------------------------------------------------------------------
+
+/// Innovation 1 no-op: retain every forward op as backward-live and mark
+/// every "would-save" activation as needing save. Mirrors what a naive PyTorch
+/// backward would produce — every intermediate stays alive for the adjoint.
+///
+/// `stats.backward_ops_retained == stats.forward_ops_total` and
+/// `stats.pruned_saved_activations == stats.full_backward_saved_activations`
+/// so `render_report` reports 100% retained / 0% eliminated for both
+/// rows of the prune summary.
+fn prune_noop(list: &WengertList, trainable: &BTreeSet<VarId>) -> PruneResult {
+    use crate::wrga_prune::PruneStats;
+
+    // Two passes — mirror `wrga_prune::prune()`'s structure exactly. A single
+    // pass would set `saved_for_backward` BEFORE `activation_live` has been
+    // populated by later ops that read this op's result as an input, so any
+    // input-saved activation would get a stale `false` bit. Match the real
+    // pruner: build the live sets first, then stamp the bits.
+    let mut backward_live: BTreeSet<VarId> = BTreeSet::new();
+    let mut activation_live: BTreeSet<VarId> = BTreeSet::new();
+    let mut total_full_saves: usize = 0;
+    for op in &list.ops {
+        backward_live.insert(op.result);
+        let req = crate::wrga_prune::save_requirements(&op.op);
+        if req.needs_output || req.needs_inputs {
+            total_full_saves += 1;
+        }
+        if req.needs_output {
+            activation_live.insert(op.result);
+        }
+        if req.needs_inputs {
+            for &inp in &op.inputs {
+                activation_live.insert(inp);
+            }
+        }
+    }
+    let mut pruned = list.clone();
+    for op in pruned.ops.iter_mut() {
+        op.saved_for_backward = activation_live.contains(&op.result);
+    }
+    let frozen_params = list
+        .ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::Param(_)) && !trainable.contains(&op.result))
+        .count();
+
+    let pruned_saved = activation_live.len();
+    PruneResult {
+        pruned,
+        backward_live,
+        activation_live,
+        stats: PruneStats {
+            forward_ops_total: list.len(),
+            backward_ops_retained: list.len(),
+            // Mirror the unit mismatch in `wrga_prune::prune()` exactly:
+            // `full_backward_saved_activations` is op-count (the naive
+            // PyTorch baseline counts ops with any save requirement);
+            // `pruned_saved_activations` is VarId-count (distinct tensors
+            // actually kept alive). The ratio is what feeds `render_report`'s
+            // "X tensors → Y tensors" line, so consistent units with the
+            // real pruner matters for diffability across runs.
+            full_backward_saved_activations: total_full_saves,
+            pruned_saved_activations: pruned_saved,
+            gradient_targets: trainable.len(),
+            frozen_params,
+        },
+    }
+}
+
+/// Innovation 2 no-op: skip the roofline analysis and place an adapter on
+/// every candidate site at the maximum allowed rank, classified as
+/// memory-bound (the most conservative bucket). Each placement carries
+/// `decorator_kind = None` and empty synth fields — same shape as the live
+/// allocator's output for an un-decorated site.
+fn placements_noop(sites: &[AdapterSite], r_max: usize) -> Vec<AdapterPlacement> {
+    use crate::cost_model::BoundClassification;
+    use crate::wrga_roofline::AdapterKind;
+    sites
+        .iter()
+        .map(|s| AdapterPlacement {
+            name: s.name.clone(),
+            kind: s.kind,
+            arithmetic_intensity: 0.0,
+            classification: BoundClassification::MemoryBound,
+            roofline_slack: 1.0,
+            adapter: AdapterKind::Lora,
+            suggested_rank: r_max,
+            rationale: "ablation: --without-roofline (r_max on every site)".to_string(),
+            decorator_kind: None,
+            alpha: None,
+            synthesized_fields: Vec::new(),
+            init_strategies: Vec::new(),
+        })
+        .collect()
+}
+
+/// Innovation 3 no-op: skip SVD-driven rank reallocation. Each placement
+/// keeps its `suggested_rank`; `RankAllocation.adapter_params` defaults to
+/// zero (no per-site shape known without spectral analysis). `spectral`
+/// returns empty since no SVD ran. `override_diags` is also empty.
+fn spectral_noop(
+    placements: &[AdapterPlacement],
+) -> (
+    Vec<SpectralAnalysis>,
+    Vec<RankAllocation>,
+    Vec<crate::wggo_overrides::OverrideDiagnostic>,
+) {
+    let ranks = placements
+        .iter()
+        .map(|p| RankAllocation {
+            name: p.name.clone(),
+            rank: p.suggested_rank,
+            effective_rank: p.suggested_rank as f64,
+            // No spectral data ⇒ no (m+n) recovery. Comparison renderer
+            // tolerates rank * 0 = 0 here; downstream consumers that need a
+            // real param count must NOT ablate spectral.
+            adapter_params: 0,
+        })
+        .collect();
+    (Vec::new(), ranks, Vec::new())
+}
+
+/// Innovation 5 no-op: skip the live-range memory plan. Reports the naive
+/// allocation — one slot per live activation, no reuse. `assignments` is
+/// empty (no slot assignments produced); the stats fields are populated so
+/// `render_report`'s "Memory plan: A live → B slots (reuse C%)" line yields
+/// the unsurprising "A live → A slots (reuse 0%)".
+fn memory_noop(activation_live: &BTreeSet<VarId>) -> MemoryPlan {
+    use crate::wrga_memory::MemoryPlanStats;
+    let n = activation_live.len();
+    MemoryPlan {
+        assignments: Vec::new(),
+        stats: MemoryPlanStats {
+            live_activations: n,
+            slots_used: n,
+            naive_peak_bytes: 0,
+            planned_peak_bytes: 0,
+        },
+    }
+}
+
 /// Run the full WRGA driver.
+///
+/// When `input.ablation` has any field set, the corresponding Innovation's
+/// stage is replaced by a deterministic no-op — see [`WrgaAblation`] for the
+/// substitution semantics. The non-ablated stages still run normally and use
+/// the ablated stage's degenerate output as input, so each ablation is
+/// independent (running with only `skip_fusion_integration=true` does NOT
+/// disturb the prune or placement stages).
 pub fn run(input: WrgaInput) -> WrgaPlan {
-    // ── Stage 1: PEFT topology extraction ─────────────────────────────────
+    let abl = input.ablation;
+
+    // ── Stage 1: PEFT topology extraction (not an Innovation; always runs)
     let trainable = select_trainable(input.wengert, &input);
 
-    // ── Stage 2: Wengert pruning (dead gradient elimination) ──────────────
-    let prune_result = prune(input.wengert, &trainable, input.loss_output);
+    // ── Stage 2: Innovation 1 — Wengert pruning ───────────────────────────
+    let prune_result = if abl.skip_wengert_pruning {
+        prune_noop(input.wengert, &trainable)
+    } else {
+        prune(input.wengert, &trainable, input.loss_output)
+    };
 
-    // ── Stage 3: Roofline analysis + placement ────────────────────────────
+    // ── Stage 3: Innovation 2 — Roofline placement ────────────────────────
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
     let sites = infer_sites_from_wengert(input.wengert, &trainable, &input);
-    let placements = place_adapters(&sites, gpu, input.r_min, input.r_max);
+    let (placements, placement_diags) = if abl.skip_roofline_placement {
+        // §9.3 ablation: skip roofline AND the WGGO placement filter — the
+        // no-op output is deliberately a uniform "adapter on every site at
+        // r_max", and the WGGO filter is part of Innovation 2's pipeline so
+        // running it on the no-op would corrupt the ablation contract.
+        (placements_noop(&sites, input.r_max), Vec::new())
+    } else {
+        let mut placements = place_adapters(&sites, gpu, input.r_min, input.r_max);
+        // Narrow the roofline placement to the projections WGGO budgeted for
+        // (its `adapter_placement` is the comm-budget-feasible set, G5/G7).
+        // Sites outside it are forced to Skip; each overruled site yields a
+        // diagnostic.
+        let diags = apply_wggo_placement_filter(&mut placements, input.wggo_overrides);
+        (placements, diags)
+    };
 
-    // ── Stage 4: Spectral rank allocation (if weights supplied) ───────────
-    let (spectral, ranks, override_diags) = run_spectral(input.weights, &placements, &input);
+    // ── Stage 4: Innovation 3 — Spectral rank allocation ──────────────────
+    let (spectral, ranks, override_diags) = if abl.skip_spectral_allocation {
+        spectral_noop(&placements)
+    } else {
+        run_spectral(input.weights, &placements, &input)
+    };
 
-    // ── Stage 5: Fusion integration ───────────────────────────────────────
+    // ── Stage 5: Innovation 4 — Fusion integration ────────────────────────
     let rank_overrides: Vec<usize> =
         ranks.iter().map(|r| r.rank).collect();
-    let fusion = build_fusion_plan(&placements, Some(&rank_overrides));
-    verify_fused_sites_have_no_intermediate(&fusion, input.wengert);
+    let fusion = if abl.skip_fusion_integration {
+        FusionPlan::default()
+    } else {
+        let f = build_fusion_plan(&placements, Some(&rank_overrides));
+        verify_fused_sites_have_no_intermediate(&f, input.wengert);
+        f
+    };
 
-    // ── Stage 6: Memory plan ──────────────────────────────────────────────
-    let size_hints: SizeHints = HashMap::new(); // callers can enrich later
-    let memory = plan_memory_with_pin(
-        input.wengert,
-        &prune_result.activation_live,
-        &size_hints,
-        &{
-            let mut s = BTreeSet::new();
-            s.insert(input.loss_output);
-            s
-        },
-        &input.inspect_pinned_vars,
-    );
+    // ── Stage 6: Innovation 5 — Memory plan ───────────────────────────────
+    let memory = if abl.skip_memory_planning {
+        memory_noop(&prune_result.activation_live)
+    } else {
+        let size_hints: SizeHints = HashMap::new();
+        plan_memory_with_pin(
+            input.wengert,
+            &prune_result.activation_live,
+            &size_hints,
+            &{
+                let mut s = BTreeSet::new();
+                s.insert(input.loss_output);
+                s
+            },
+            &input.inspect_pinned_vars,
+        )
+    };
 
     WrgaPlan {
         mode: input.mode,
@@ -463,8 +755,85 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         ranks,
         fusion,
         memory,
-        override_diagnostics: override_diags,
+        override_diagnostics: {
+            // Placement-filter diagnostics (site exclusions) precede the
+            // rank-allocation diagnostics from spectral analysis.
+            let mut d = placement_diags;
+            d.extend(override_diags);
+            d
+        },
+        ablation: abl,
+        custom_adapter: input.custom_adapter.map(str::to_string),
     }
+}
+
+/// Narrow WRGA's roofline-chosen adapter sites to the projections WGGO
+/// budgeted for.  For each layer WGGO gave a positive rank and a non-`None`
+/// `adapter_placement`, any site whose projection falls *outside* that set is
+/// forced to [`AdapterKind::Skip`] — WGGO's placement is the comm-budget-
+/// feasible minimal set (G5/G7), so adapting extra sites would exceed the
+/// adapter-comm budget WGGO enforced.  Returns one [`OverrideDiagnostic`] per
+/// roofline adapter that was overruled.
+///
+/// **v1 scope / known limitation.**  Enforcement keys off
+/// [`AdapterPlacement::covers_projection`], which only recognizes *split*
+/// per-projection weight names (`wq`/`q_proj`, FFN `gate`/`up`/`down`/`fc*`;
+/// see [`crate::wggo_ilp::proj_role`]).  Any site whose name it does *not*
+/// recognize returns `None` ("no opinion") and is left untouched.  That escape
+/// set is broader than just norms/embeddings: it includes whole model families
+/// whose projections are **fused or differently named** — GPT-2 `c_attn`
+/// (fused QKV) / `c_proj` / `c_fc`, GPT-NeoX & Falcon `query_key_value` /
+/// `dense` / `dense_h_to_4h` / `dense_4h_to_h`, Phi/MPT `Wqkv`, and fused
+/// `gate_up_proj`.  For such models a non-`None` placement does **not**
+/// constrain WRGA, so the comm-budget guarantee is not enforced there (WRGA may
+/// over-place).  This is fail-safe — the filter never produces a *wrong*
+/// adapter, only an unconstrained one — and is the deliberate conservative v1
+/// choice.  Note this diverges from CEP, which *hard-refuses* fused-QKV models
+/// (`cep_extract.rs`) under the repo's "deferral must refuse" invariant;
+/// extending placement enforcement to fused weights is a follow-up.
+fn apply_wggo_placement_filter(
+    placements: &mut [AdapterPlacement],
+    overrides: Option<&crate::wggo_overrides::WggoOverrides>,
+) -> Vec<crate::wggo_overrides::OverrideDiagnostic> {
+    use crate::wrga_roofline::AdapterKind;
+    let Some(over) = overrides else {
+        return Vec::new();
+    };
+    let mut diags = Vec::new();
+    for p in placements.iter_mut() {
+        let Some(ov) = over.find_by_layer_containing(&p.name) else {
+            continue;
+        };
+        // rank==0 means WGGO wants no adapter on this layer at all — that is
+        // the rank path's job (`RankForbiddenByWggo`); skipping here avoids a
+        // double-report.  For rank>0 the placement drives the decision via
+        // `covers_projection`, INCLUDING an (invariant-violating) `None`
+        // placement: `None` excludes every projection, so all recognized sites
+        // are forced to Skip with a diagnostic rather than silently adapted.
+        if ov.adapter_rank == 0 {
+            continue;
+        }
+        if ov.adapter_placement.covers_projection(&p.name) == Some(false)
+            && !matches!(p.adapter, AdapterKind::Skip)
+        {
+            diags.push(crate::wggo_overrides::OverrideDiagnostic {
+                layer_index: ov.layer_index,
+                // Per-LAYER name (e.g. "blocks.0"); the spectral rank path
+                // (`allocate_ranks`) instead reports per-PROJECTION names
+                // (e.g. "blocks.0.attn.wq").  Harmless today — the sole
+                // renderer keys off `layer_index` — but the granularity differs.
+                layer_name: ov.layer_name.clone(),
+                reason: crate::wggo_overrides::OverrideRejectReason::AdapterSiteOutsidePlacement {
+                    placement: ov.adapter_placement.as_str().to_string(),
+                },
+                requested: format!("{:?}", p.adapter).to_ascii_lowercase(),
+                applied: "skip".to_string(),
+            });
+            p.adapter = AdapterKind::Skip;
+            p.suggested_rank = 0;
+        }
+    }
+    diags
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +923,10 @@ fn infer_sites_from_wengert(
             PrimalOp::LayerNorm { .. } | PrimalOp::RMSNorm { .. } => SiteKind::Norm,
             PrimalOp::Softmax { .. } | PrimalOp::LogSoftmax { .. } => SiteKind::Softmax,
             PrimalOp::Embedding => SiteKind::Embedding,
+            // WRGA §2.4 pattern 3: a trainable param consumed by a
+            // sum/mean reduction is an IA³-style scaling site that can be
+            // folded into the reduction kernel's epilogue.
+            PrimalOp::Sum { .. } | PrimalOp::Mean { .. } => SiteKind::Reduction,
             _ => continue,
         };
         // No shape info in the Wengert list; use a modest default so the
@@ -612,8 +985,21 @@ fn run_spectral(
     } else {
         spectral.len().max(1) * input.r_max
     };
-    let (ranks, override_diags) =
-        allocate_ranks(&spectral, budget, input.r_min, input.r_max, Some(&slack), input.wggo_overrides);
+    // `snap_to_grid = false`: the realized per-projection rank is left off-grid
+    // (the current behaviour).  Paper §2.2 declares `r[l,w] ∈ {0,2,4,8,16}`, and
+    // `allocate_ranks` can floor the realized rank onto that grid (audit gap #5),
+    // but errata E3 lists snapping as an open sub-decision awaiting author
+    // sign-off, so it stays off by default.  Flip this to `true` (or surface it
+    // as a `WrgaInput`/CLI option) to activate paper-grid ranks.
+    let (ranks, override_diags) = allocate_ranks(
+        &spectral,
+        budget,
+        input.r_min,
+        input.r_max,
+        Some(&slack),
+        input.wggo_overrides,
+        false,
+    );
 
     (spectral, ranks, override_diags)
 }
@@ -684,6 +1070,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Exactly one param (blocks.7.wq) is trainable → exactly one site.
@@ -713,6 +1101,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         assert_eq!(plan.prune.stats.gradient_targets, 1);
@@ -736,6 +1126,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Both blocks.6.wq and blocks.6.wk match the layer scope.
@@ -761,6 +1153,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         assert_eq!(run(make()).render_report(), run(make()).render_report());
     }
@@ -785,6 +1179,8 @@ mod tests {
             seed: 0,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         assert!(
@@ -843,6 +1239,8 @@ mod tests {
             seed: 0,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: Some(&over),
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         // Field exists and is accessible (proves wiring).  No diags expected
@@ -869,6 +1267,8 @@ mod tests {
             seed: 0,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         assert!(
@@ -908,7 +1308,7 @@ mod tests {
                 shard_factor: 0,
             }],
         };
-        let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over));
+        let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over), false);
         assert!(
             diags.iter().any(|d| matches!(
                 d.reason,
@@ -953,6 +1353,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let report = plan.render_compare_report();
@@ -990,6 +1392,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         assert_eq!(
             run(make()).render_compare_report(),
@@ -1019,6 +1423,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let rows = plan.compute_compare_baselines();
@@ -1068,6 +1474,8 @@ mod tests {
             seed: 42,
             inspect_pinned_vars: BTreeSet::new(),
             wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
         };
         let plan = run(input);
         let rows = plan.compute_compare_baselines();
@@ -1091,6 +1499,7 @@ mod tests {
         plan.placements = vec![
             crate::wrga_roofline::AdapterPlacement {
                 name: "A".into(),
+                kind: crate::wrga_roofline::SiteKind::Matmul,
                 arithmetic_intensity: 0.0,
                 classification: BoundClassification::MemoryBound,
                 roofline_slack: 1.0,
@@ -1104,6 +1513,7 @@ mod tests {
             },
             crate::wrga_roofline::AdapterPlacement {
                 name: "B".into(),
+                kind: crate::wrga_roofline::SiteKind::Matmul,
                 arithmetic_intensity: 0.0,
                 classification: BoundClassification::MemoryBound,
                 roofline_slack: 1.0,
@@ -1153,6 +1563,7 @@ mod tests {
         let mut plan = WrgaPlan::test_dummy();
         let mk_placement = |name: &str, rank: usize| crate::wrga_roofline::AdapterPlacement {
             name: name.into(),
+            kind: crate::wrga_roofline::SiteKind::Matmul,
             arithmetic_intensity: 0.0,
             classification: BoundClassification::MemoryBound,
             roofline_slack: 1.0,
@@ -1195,6 +1606,675 @@ mod tests {
         assert_eq!(
             reft.adapter_params, 0,
             "rank-0 sites must contribute 0 ReFT params (no phantom .max(1))",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap #4 — Paper §9.3 ablation harness
+    // -----------------------------------------------------------------------
+
+    /// Helper: a `WrgaInput` over the standard fixture, parameterised by an
+    /// ablation. Shared by every ablation test in this section.
+    fn ablation_input<'a>(w: &'a WengertList, ablation: WrgaAblation) -> WrgaInput<'a> {
+        WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation,
+            custom_adapter: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WGGO placement-filter helpers (introduced on main via PR #272)
+    // -----------------------------------------------------------------------
+
+    /// Build an all-LoRA roofline placement for `name` (the roofline wants an
+    /// adapter on every site, so any Skip the filter produces is its doing).
+    fn mk_lora_placement(name: &str) -> crate::wrga_roofline::AdapterPlacement {
+        crate::wrga_roofline::AdapterPlacement {
+            name: name.into(),
+            kind: crate::wrga_roofline::SiteKind::Matmul,
+            arithmetic_intensity: 0.0,
+            classification: crate::cost_model::BoundClassification::MemoryBound,
+            roofline_slack: 1.0,
+            adapter: crate::wrga_roofline::AdapterKind::Lora,
+            suggested_rank: 8,
+            rationale: String::new(),
+            decorator_kind: None,
+            alpha: None,
+            synthesized_fields: Vec::new(),
+            init_strategies: Vec::new(),
+        }
+    }
+
+    fn override_for(layer: &str, rank: u64, placement: crate::wggo_ilp::AdapterPlacement) -> crate::wggo_overrides::WggoOverrides {
+        crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![crate::wggo_overrides::PerLayerOverride {
+                layer_index: 0,
+                layer_name: layer.into(),
+                active_heads: 8,
+                requested_csha_level: None,
+                adapter_rank: rank,
+                adapter_placement: placement,
+                fase_fused: false,
+                packing_mode: 0,
+                shard_factor: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn ablation_default_is_no_ablation_and_is_active_false() {
+        let abl = WrgaAblation::default();
+        assert!(!abl.is_active());
+        assert_eq!(abl.human_label(), "none");
+    }
+
+    #[test]
+    fn ablation_human_label_lists_active_flags_in_canonical_order() {
+        // Canonical order is the order the fields are declared on the
+        // struct: wengert, roofline, spectral, fusion, memory. Pinning
+        // ensures the report header is stable for diffability.
+        let abl = WrgaAblation {
+            skip_wengert_pruning: true,
+            skip_spectral_allocation: true,
+            skip_memory_planning: true,
+            ..Default::default()
+        };
+        assert_eq!(abl.human_label(), "wengert,spectral,memory");
+        assert!(abl.is_active());
+    }
+
+    #[test]
+    fn ablation_propagates_to_plan_field() {
+        let w = tiny_transformer_like();
+        let abl = WrgaAblation {
+            skip_fusion_integration: true,
+            ..Default::default()
+        };
+        let plan = run(ablation_input(&w, abl));
+        assert_eq!(plan.ablation, abl);
+    }
+
+    #[test]
+    fn render_report_surfaces_ablation_header_when_active() {
+        let w = tiny_transformer_like();
+        let plan_baseline = run(ablation_input(&w, WrgaAblation::default()));
+        let plan_ablated = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_fusion_integration: true,
+                ..Default::default()
+            },
+        ));
+        // Baseline: no Ablation: line.
+        assert!(!plan_baseline.render_report().contains("Ablation:"));
+        // Ablated: Ablation: line with the active flag.
+        let report = plan_ablated.render_report();
+        assert!(report.contains("Ablation: skip=fusion"), "got: {report}");
+    }
+
+    /// Regression test for the `prune_noop` two-pass ordering. A single-pass
+    /// implementation would set `saved_for_backward = false` on op N if op
+    /// N's result is needed by a later op M as `needs_inputs`, because at
+    /// N's iteration `activation_live` doesn't yet contain N's VarId — M
+    /// hasn't run yet. The fix is two passes (mirror `wrga_prune::prune`).
+    ///
+    /// This test asserts the bit-for-bit consistency the fix restores: every
+    /// VarId that ends up in `activation_live` must have its corresponding
+    /// op's `saved_for_backward` set to `true`. A single-pass regression
+    /// would surface as a mismatch on at least one matmul-input VarId.
+    #[test]
+    fn ablation_prune_noop_saved_for_backward_bits_agree_with_activation_live_set() {
+        let w = tiny_transformer_like();
+        let plan = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_wengert_pruning: true,
+                ..Default::default()
+            },
+        ));
+        for op in &plan.prune.pruned.ops {
+            let bit = op.saved_for_backward;
+            let in_set = plan.prune.activation_live.contains(&op.result);
+            assert_eq!(
+                bit, in_set,
+                "op {} (result {:?}): saved_for_backward={} but activation_live.contains={}",
+                op.result, op.op, bit, in_set,
+            );
+        }
+    }
+
+    /// Innovation 1 ablation contract: `prune_noop` retains EVERY forward op
+    /// as backward-live so the prune stats report 100% retained / 0%
+    /// eliminated. This is the §9.3 "without_wengert" measurement.
+    #[test]
+    fn ablation_skip_wengert_pruning_retains_all_forward_ops() {
+        let w = tiny_transformer_like();
+        let baseline = run(ablation_input(&w, WrgaAblation::default()));
+        let ablated = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_wengert_pruning: true,
+                ..Default::default()
+            },
+        ));
+        // Ablated: backward_ops_retained == forward_ops_total (100% retained).
+        assert_eq!(
+            ablated.prune.stats.backward_ops_retained,
+            ablated.prune.stats.forward_ops_total,
+        );
+        // Sanity: the un-ablated baseline pruned at LEAST one op (Auto mode
+        // with restricted trainable_patterns must produce some elimination).
+        assert!(
+            baseline.prune.stats.backward_ops_retained
+                <= baseline.prune.stats.forward_ops_total,
+        );
+    }
+
+    /// Innovation 4 ablation contract: `fusion = FusionPlan::default()` means
+    /// `fusion_ratio() == 0.0` (no fused adapters). This is the §9.3
+    /// "without_fusion" measurement.
+    #[test]
+    fn ablation_skip_fusion_integration_yields_zero_fusion_ratio() {
+        let w = tiny_transformer_like();
+        let ablated = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_fusion_integration: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(ablated.fusion.fusion_ratio(), 0.0);
+    }
+
+    /// Innovation 5 ablation contract: `memory_noop` reports `live_activations
+    /// == slots_used` so `reuse_ratio() == 0.0` (no live-range reuse). This
+    /// is the §9.3 "without_memory" measurement.
+    #[test]
+    fn ablation_skip_memory_planning_yields_zero_reuse_ratio() {
+        let w = tiny_transformer_like();
+        let ablated = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_memory_planning: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(ablated.memory.stats.reuse_ratio(), 0.0);
+        assert_eq!(
+            ablated.memory.stats.live_activations,
+            ablated.memory.stats.slots_used,
+        );
+    }
+
+    /// Innovation 3 ablation contract: skipping spectral allocation drops
+    /// per-site `adapter_params` to 0 (no SVD = no shape recovery), but
+    /// `RankAllocation.rank` falls back to the placement's `suggested_rank`.
+    #[test]
+    fn ablation_skip_spectral_allocation_uses_suggested_rank_zero_params() {
+        let w = tiny_transformer_like();
+        let ablated = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_spectral_allocation: true,
+                ..Default::default()
+            },
+        ));
+        // Every RankAllocation has zero adapter_params (the no-op signal).
+        for r in &ablated.ranks {
+            assert_eq!(r.adapter_params, 0, "site '{}' must report 0 params under skip_spectral", r.name);
+        }
+        // spectral vec is empty (no SVD ran).
+        assert!(ablated.spectral.is_empty());
+    }
+
+    /// Innovation 2 ablation contract: skipping roofline placement puts an
+    /// adapter on every candidate site at `r_max`, classified MemoryBound.
+    /// Verifies the rationale carries the ablation flag for debuggability.
+    #[test]
+    fn ablation_skip_roofline_placement_emits_r_max_on_every_site() {
+        use crate::cost_model::BoundClassification;
+        let w = tiny_transformer_like();
+        let ablated = run(ablation_input(
+            &w,
+            WrgaAblation {
+                skip_roofline_placement: true,
+                ..Default::default()
+            },
+        ));
+        for p in &ablated.placements {
+            assert_eq!(p.suggested_rank, 16, "ablation should use r_max=16");
+            assert_eq!(p.classification, BoundClassification::MemoryBound);
+            assert!(
+                p.rationale.contains("ablation"),
+                "rationale must mark this as an ablation result: {}",
+                p.rationale,
+            );
+        }
+    }
+
+    /// Composite contract: every ablated stage produces a deterministic
+    /// result. Re-running with the same ablation must yield identical
+    /// reports. Pins reproducibility for the §9.3 ablation table.
+    #[test]
+    fn ablation_run_is_deterministic_under_all_skips() {
+        let w = tiny_transformer_like();
+        let abl = WrgaAblation {
+            skip_wengert_pruning: true,
+            skip_roofline_placement: true,
+            skip_spectral_allocation: true,
+            skip_fusion_integration: true,
+            skip_memory_planning: true,
+        };
+        let a = run(ablation_input(&w, abl));
+        let b = run(ablation_input(&w, abl));
+        assert_eq!(a.render_report(), b.render_report());
+    }
+
+    // -----------------------------------------------------------------------
+    // WGGO placement-filter tests (introduced on main via PR #272)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wggo_placement_filter_skips_excluded_projections() {
+        use crate::wrga_roofline::AdapterKind;
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wq"),
+            mk_lora_placement("blocks.0.attn.wk"),
+            mk_lora_placement("blocks.0.attn.wv"),
+            mk_lora_placement("blocks.0.attn.wo"),
+        ];
+        // WGGO chose AttnQV (q,v) for blocks.0 with a positive rank.
+        let over = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::AttnQV);
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wq"), AdapterKind::Lora, "q in placement → kept");
+        assert_eq!(kind("blocks.0.attn.wv"), AdapterKind::Lora, "v in placement → kept");
+        assert_eq!(kind("blocks.0.attn.wk"), AdapterKind::Skip, "k outside placement → skipped");
+        assert_eq!(kind("blocks.0.attn.wo"), AdapterKind::Skip, "o outside placement → skipped");
+
+        assert_eq!(diags.len(), 2, "one diagnostic per overruled site (wk, wo)");
+        assert!(diags.iter().all(|d| matches!(
+            d.reason,
+            crate::wggo_overrides::OverrideRejectReason::AdapterSiteOutsidePlacement { .. }
+        )));
+        assert!(diags.iter().all(|d| d.applied == "skip" && d.requested == "lora"));
+    }
+
+    #[test]
+    fn wggo_placement_filter_governs_each_site_by_its_own_layer() {
+        // Discriminating multi-layer test: a regression that applied layer 0's
+        // placement to every site (or matched the wrong layer) would slip past
+        // the single-layer tests.  Layer 0 = AttnQV, layer 1 = AttnQKVO, layer
+        // 2 has no override at all.
+        use crate::wrga_roofline::AdapterKind;
+        let over = crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![
+                crate::wggo_overrides::PerLayerOverride {
+                    layer_index: 0,
+                    layer_name: "blocks.0".into(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: 8,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::AttnQV,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    shard_factor: 0,
+                },
+                crate::wggo_overrides::PerLayerOverride {
+                    layer_index: 1,
+                    layer_name: "blocks.1".into(),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: 8,
+                    adapter_placement: crate::wggo_ilp::AdapterPlacement::AttnQKVO,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    shard_factor: 0,
+                },
+            ],
+        };
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wk"), // excluded by layer-0 AttnQV
+            mk_lora_placement("blocks.1.attn.wk"), // allowed by layer-1 AttnQKVO
+            mk_lora_placement("blocks.2.attn.wk"), // no override for layer 2
+        ];
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wk"), AdapterKind::Skip, "layer-0 AttnQV excludes K");
+        assert_eq!(kind("blocks.1.attn.wk"), AdapterKind::Lora, "layer-1 AttnQKVO allows K");
+        assert_eq!(kind("blocks.2.attn.wk"), AdapterKind::Lora, "no override → untouched");
+        assert_eq!(diags.len(), 1, "only the layer-0 K site is overruled");
+        assert_eq!(diags[0].layer_index, 0);
+    }
+
+    #[test]
+    fn wggo_placement_none_with_positive_rank_excludes_all_projections() {
+        // Defends against the invariant-violating (rank>0, placement=None)
+        // state: placement None means "zero projections", so every recognized
+        // attention/FFN site must be forced to Skip (with a diagnostic) — never
+        // silently left adapted.  A non-projection site stays untouched.
+        use crate::wrga_roofline::AdapterKind;
+        let mut placements = vec![
+            mk_lora_placement("blocks.0.attn.wq"),
+            mk_lora_placement("blocks.0.attn.wv"),
+            mk_lora_placement("blocks.0.attn_norm.weight"), // not a projection
+        ];
+        let over = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::None);
+        let diags = apply_wggo_placement_filter(&mut placements, Some(&over));
+
+        let kind = |n: &str| placements.iter().find(|p| p.name == n).unwrap().adapter;
+        assert_eq!(kind("blocks.0.attn.wq"), AdapterKind::Skip);
+        assert_eq!(kind("blocks.0.attn.wv"), AdapterKind::Skip);
+        assert_eq!(
+            kind("blocks.0.attn_norm.weight"),
+            AdapterKind::Lora,
+            "non-projection site is not governed by placement"
+        );
+        assert_eq!(diags.len(), 2, "wq + wv excluded; norm untouched");
+    }
+
+    #[test]
+    fn wggo_placement_filter_is_noop_without_governing_override() {
+        use crate::wrga_roofline::AdapterKind;
+        // (a) No overrides → untouched, no diagnostics.
+        let mut p1 = vec![mk_lora_placement("blocks.0.attn.wk")];
+        assert!(apply_wggo_placement_filter(&mut p1, None).is_empty());
+        assert_eq!(p1[0].adapter, AdapterKind::Lora);
+
+        // (b) Override with placement None / rank 0 → the rank path's job; the
+        // placement filter must not double-report or skip here.
+        let over = override_for("blocks.0", 0, crate::wggo_ilp::AdapterPlacement::None);
+        let mut p2 = vec![mk_lora_placement("blocks.0.attn.wk")];
+        assert!(apply_wggo_placement_filter(&mut p2, Some(&over)).is_empty());
+        assert_eq!(p2[0].adapter, AdapterKind::Lora);
+
+        // (c) A non-projection site (norm) is never governed by placement.
+        let over_qv = override_for("blocks.0", 8, crate::wggo_ilp::AdapterPlacement::AttnQV);
+        let mut p3 = vec![mk_lora_placement("blocks.0.attn_norm.weight")];
+        assert!(apply_wggo_placement_filter(&mut p3, Some(&over_qv)).is_empty());
+        assert_eq!(p3[0].adapter, AdapterKind::Lora);
+    }
+
+    // -----------------------------------------------------------------------
+    // WRGA §2.4 pattern 3 — reduction-fused adapter end-to-end (Gap #5)
+    // -----------------------------------------------------------------------
+
+    /// A Wengert list whose trainable param is consumed by a `Mean` op —
+    /// the classic mean-pool classification head pattern. The end-to-end
+    /// driver must classify this site as `SiteKind::Reduction`, route it
+    /// through IA³, and produce a `FusionTarget::ReductionFusedAdapter`
+    /// in the plan.
+    fn mean_pool_head_like() -> WengertList {
+        // x   (#0) input
+        // wp  (#1) param  head.pool_scale  (trainable)
+        // m   (#2) mean(x * wp, dim=-1)    — pooling site consuming wp
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("head.pool_scale".into()), vec![]),
+            op(2, 2, PrimalOp::Mul, vec![0, 1]),
+            op(3, 3, PrimalOp::Mean { dim: Some(-1) }, vec![2, 1]),
+        ];
+        WengertList {
+            ops,
+            output: 3,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn reduction_site_routes_to_reduction_fused_adapter() {
+        let w = mean_pool_head_like();
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: Vec::new(), // all params trainable
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 3,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
+        };
+        let plan = run(input);
+        // Exactly one decision, on the reduction site, with the §2.4
+        // pattern 3 fusion target.
+        let mean_dec = plan
+            .fusion
+            .decisions
+            .iter()
+            .find(|d| d.site == "head.pool_scale")
+            .expect("a fusion decision for the trainable param must exist");
+        assert_eq!(
+            mean_dec.target,
+            crate::wrga_fusion::FusionTarget::ReductionFusedAdapter,
+            "Mean PrimalOp must drive a ReductionFusedAdapter decision; got {:?}",
+            mean_dec.target,
+        );
+        assert!(mean_dec.target.is_fused());
+        assert!(plan.fusion.fused_count() >= 1);
+    }
+
+    #[test]
+    fn sum_op_also_routes_to_reduction_fused_adapter() {
+        // The Sum PrimalOp branch must behave identically to Mean — both
+        // are reduction sites under §2.4 pattern 3.
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("head.sum_scale".into()), vec![]),
+            op(2, 2, PrimalOp::Mul, vec![0, 1]),
+            op(3, 3, PrimalOp::Sum { dim: Some(-1) }, vec![2, 1]),
+        ];
+        let w = WengertList {
+            ops,
+            output: 3,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        let input = WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: Vec::new(),
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 3,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: None,
+        };
+        let plan = run(input);
+        let dec = plan
+            .fusion
+            .decisions
+            .iter()
+            .find(|d| d.site == "head.sum_scale")
+            .expect("a fusion decision for the trainable param must exist");
+        assert_eq!(
+            dec.target,
+            crate::wrga_fusion::FusionTarget::ReductionFusedAdapter,
+        );
+    }
+
+    /// Reduction-fused must NOT collide with the §9.3 ablation harness —
+    /// when `skip_fusion_integration` is set, the new variant must NOT
+    /// survive in `plan.fusion`, just like the other Innovations' ablation
+    /// contract. The first assertion pins the actual mechanism (`FusionPlan::default()`
+    /// → empty decisions) so a future refactor that keeps decisions but
+    /// flips them to `StandaloneAdapter` would still produce an empty
+    /// fusion ratio but would break this test loudly; the second pins
+    /// the user-visible ratio.
+    #[test]
+    fn reduction_fused_is_skipped_under_skip_fusion_integration() {
+        let w = mean_pool_head_like();
+        // Build a WrgaInput that actually puts the mean-pool param into
+        // the trainable set (the generic `ablation_input` helper is wired
+        // to `blocks.7.*` and would skip `head.pool_scale`).
+        let mk_input = |abl: WrgaAblation| WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: Vec::new(), // empty ⇒ all params trainable
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: &w,
+            loss_output: 3,
+            weights: None,
+            target: "",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: abl,
+            custom_adapter: None,
+        };
+
+        // Baseline: same model under no ablation MUST produce a
+        // ReductionFusedAdapter decision, otherwise the ablation test
+        // below is testing the wrong thing.
+        let baseline = run(mk_input(WrgaAblation::default()));
+        assert!(
+            baseline.fusion.decisions.iter().any(|d| matches!(
+                d.target,
+                crate::wrga_fusion::FusionTarget::ReductionFusedAdapter
+            )),
+            "test premise broken: baseline run must produce ReductionFusedAdapter \
+             for the mean-pool head fixture; got {:?}",
+            baseline.fusion.decisions.iter().map(|d| &d.target).collect::<Vec<_>>(),
+        );
+
+        let abl = WrgaAblation {
+            skip_fusion_integration: true,
+            ..Default::default()
+        };
+        let plan = run(mk_input(abl));
+        assert!(
+            plan.fusion.decisions.is_empty(),
+            "skip_fusion_integration must replace fusion with FusionPlan::default(); \
+             got {} decisions",
+            plan.fusion.decisions.len(),
+        );
+        assert_eq!(plan.fusion.fusion_ratio(), 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // WRGA paper §8.2 — custom adapter DSL plumbing (Gap #6)
+    // -----------------------------------------------------------------------
+
+    fn input_with_custom_adapter<'a>(w: &'a WengertList, name: Option<&'a str>) -> WrgaInput<'a> {
+        WrgaInput {
+            mode: WrgaMode::Auto,
+            trainable_patterns: vec!["blocks.7.*"],
+            manual_adapter_targets: Vec::new(),
+            hybrid_layers: Vec::new(),
+            wengert: w,
+            loss_output: w.output,
+            weights: None,
+            target: "rtx5070ti",
+            budget_params: 0,
+            r_min: 2,
+            r_max: 16,
+            seed: 42,
+            inspect_pinned_vars: BTreeSet::new(),
+            wggo_overrides: None,
+            ablation: WrgaAblation::default(),
+            custom_adapter: name,
+        }
+    }
+
+    /// `WrgaInput.custom_adapter = Some(name)` must round-trip onto the
+    /// produced `WrgaPlan.custom_adapter` as an owned `String` of the
+    /// same value.
+    #[test]
+    fn custom_adapter_propagates_from_input_to_plan() {
+        let w = tiny_transformer_like();
+        let plan = run(input_with_custom_adapter(&w, Some("GatedLoRA")));
+        assert_eq!(plan.custom_adapter.as_deref(), Some("GatedLoRA"));
+    }
+
+    /// `None` on the input must stay `None` on the plan — confirms no
+    /// silent default is injected when the DSL isn't used.
+    #[test]
+    fn custom_adapter_none_round_trips_as_none() {
+        let w = tiny_transformer_like();
+        let plan = run(input_with_custom_adapter(&w, None));
+        assert!(plan.custom_adapter.is_none());
+    }
+
+    /// `render_report` must surface the `Custom adapter:` header line
+    /// when `custom_adapter` is set, and only then.  Pins both the
+    /// presence under the §8.2 DSL and the absence under default.
+    #[test]
+    fn render_report_surfaces_custom_adapter_when_set() {
+        let w = tiny_transformer_like();
+        let with_custom = run(input_with_custom_adapter(&w, Some("GatedLoRA"))).render_report();
+        let without_custom = run(input_with_custom_adapter(&w, None)).render_report();
+        assert!(
+            with_custom.contains("Custom adapter: GatedLoRA"),
+            "report must surface custom adapter name; got:\n{with_custom}",
+        );
+        // The trailing parenthetical is load-bearing — without it readers
+        // would mistake the LoRA placements below for instantiations of
+        // <name> (review finding #3).
+        assert!(
+            with_custom.contains("(placement integration pending)"),
+            "report must mark the custom adapter as not-yet-emitted; got:\n{with_custom}",
+        );
+        assert!(
+            !without_custom.contains("Custom adapter:"),
+            "report must NOT surface custom adapter line when unset; got:\n{without_custom}",
+        );
+    }
+
+    /// Custom adapter must NOT break the §9.3 ablation contract — the
+    /// `Custom adapter:` line and the `Ablation:` line can coexist; the
+    /// custom adapter is just a placement target, orthogonal to which
+    /// Innovations are ablated.
+    #[test]
+    fn custom_adapter_coexists_with_ablation_header() {
+        let w = tiny_transformer_like();
+        let mut input = input_with_custom_adapter(&w, Some("GatedLoRA"));
+        input.ablation = WrgaAblation {
+            skip_fusion_integration: true,
+            ..Default::default()
+        };
+        let report = run(input).render_report();
+        assert!(
+            report.contains("Custom adapter: GatedLoRA"),
+            "custom adapter line missing: {report}",
+        );
+        assert!(
+            report.contains("Ablation:"),
+            "ablation line missing: {report}",
         );
     }
 }

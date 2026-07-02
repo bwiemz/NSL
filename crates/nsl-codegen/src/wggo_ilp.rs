@@ -121,6 +121,66 @@ impl AdapterPlacement {
             AdapterPlacement::AttnAndFfn => "q,k,v,o + ffn_up, ffn_down",
         }
     }
+
+    /// Whether a weight/site `name` falls inside this placement's allowed
+    /// projection set.  Used by WRGA to narrow its roofline-chosen adapter
+    /// sites to the projections WGGO budgeted for (the placement encodes a
+    /// comm-budget-feasible minimal set — see G5/G7).
+    ///
+    /// Returns:
+    /// * `Some(true)`  — `name` is a recognized projection inside the set.
+    /// * `Some(false)` — `name` is a recognized projection *outside* the set.
+    /// * `None`        — `name` is not a recognized attention/FFN projection
+    ///   (a norm, embedding, or unknown weight); the placement has no opinion
+    ///   and the caller should leave the site untouched.
+    ///
+    /// Recognition is limited to *split* per-projection weight names (see
+    /// [`proj_role`]).  **Fused or non-standard projections** — GPT-2 `c_attn`
+    /// / `c_proj` / `c_fc`, NeoX/Falcon `query_key_value` / `dense*`, Phi/MPT
+    /// `Wqkv`, fused `gate_up_proj` — return `None`, so placement cannot
+    /// constrain those weights (deliberate v1 limitation; the consumer treats
+    /// `None` as fail-safe pass-through).
+    pub fn covers_projection(self, name: &str) -> Option<bool> {
+        let role = proj_role(name)?;
+        let allowed = match self {
+            AdapterPlacement::None => false,
+            AdapterPlacement::AttnQV => matches!(role, ProjRole::Q | ProjRole::V),
+            AdapterPlacement::AttnQKVO => {
+                matches!(role, ProjRole::Q | ProjRole::K | ProjRole::V | ProjRole::O)
+            }
+            AdapterPlacement::AttnAndFfn => true, // Q/K/V/O + Ffn — every recognized role
+        };
+        Some(allowed)
+    }
+}
+
+/// Attention / FFN projection role inferred from a weight name's final
+/// dotted component (after stripping a trailing `.weight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjRole {
+    Q,
+    K,
+    V,
+    O,
+    Ffn,
+}
+
+/// Classify a weight/site name into a [`ProjRole`], tolerating the common
+/// naming variants (`wq` / `w_q` / `q_proj`, FFN `gate`/`up`/`down`/`fc*`).
+/// Returns `None` for names that are not attention/FFN projections.
+pub fn proj_role(name: &str) -> Option<ProjRole> {
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+    let last = base.rsplit('.').next().unwrap_or(base).to_ascii_lowercase();
+    match last.as_str() {
+        "wq" | "w_q" | "q_proj" | "query" => Some(ProjRole::Q),
+        "wk" | "w_k" | "k_proj" | "key" => Some(ProjRole::K),
+        "wv" | "w_v" | "v_proj" | "value" => Some(ProjRole::V),
+        "wo" | "w_o" | "o_proj" | "out_proj" => Some(ProjRole::O),
+        "w_gate" | "gate_proj" | "w_up" | "up_proj" | "w_down" | "down_proj" | "fc1" | "fc2" => {
+            Some(ProjRole::Ffn)
+        }
+        _ => None,
+    }
 }
 
 /// Integer decision variables for one layer.
@@ -263,14 +323,11 @@ pub fn solve_layer(
     lut: &LayerCostLut,
     constraints: &LayerIlpConstraints,
 ) -> LayerIlpSolution {
-    // Pre-compute global cheapest feasible entry as an initial bound.
-    let initial_best = lut.argmin_feasible().map(|(_, _, _, _, e)| e.total_us());
     let mut state = SolverState {
         best_cost: f64::INFINITY,
         best_decision: None,
         best_entry: None,
         nodes: 0,
-        global_lower_bound: initial_best.unwrap_or(0.0),
     };
 
     // Walk the domain.  The ordering matters: try (largest feasible CSHA,
@@ -324,7 +381,7 @@ pub fn solve_layer(
                                     if entry.smem_bytes > constraints.smem_budget {
                                         continue;
                                     }
-                                    if entry.param_bytes + entry.activation_bytes
+                                    if ilp_resident_bytes(&entry, lut, m_bits, v_bits)
                                         > constraints.memory_budget
                                     {
                                         continue;
@@ -332,7 +389,22 @@ pub fn solve_layer(
                                     if !importance_ok(&heads_config, constraints) {
                                         continue;
                                     }
-                                    let cand_cost = entry.total_us() + placement_us;
+                                    // Objective = forward + backward (LUT) +
+                                    // adapter-comm (placement) + optimizer step.
+                                    // The optimizer term is what makes `m_bits` /
+                                    // `v_bits` / `fase` affect the cost at all —
+                                    // without it the ILP's objective is blind to
+                                    // its own precision/FASE decisions (paper §2.3
+                                    // optimizer_time term).
+                                    let optim_us = crate::wggo_cost::optimizer_us(
+                                        entry.param_bytes,
+                                        lut.dtype_bytes,
+                                        m_bits,
+                                        v_bits,
+                                        fase,
+                                        lut.peak_bandwidth_gbs,
+                                    );
+                                    let cand_cost = entry.total_us() + placement_us + optim_us;
                                     if cand_cost >= state.best_cost {
                                         continue; // bound prune
                                     }
@@ -363,10 +435,12 @@ pub fn solve_layer(
         Some(decision) => {
             let entry = state.best_entry.unwrap();
             let decision_trace = build_decision_trace(&decision, &entry, constraints);
+            let memory_bytes =
+                ilp_resident_bytes(&entry, lut, decision.optim_m_bits, decision.optim_v_bits);
             LayerIlpSolution {
                 decision,
                 cost_us: state.best_cost,
-                memory_bytes: entry.param_bytes + entry.activation_bytes,
+                memory_bytes,
                 smem_bytes: entry.smem_bytes,
                 nodes_explored: state.nodes,
                 feasible: true,
@@ -399,7 +473,39 @@ pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstr
     }
     let adj = apply_fase(base, d.fase_fused, c.fase_backward_speedup);
     let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
-    entry.total_us() + placement_cost_us(d.adapter_rank, d.adapter_placement)
+    // Mirror `solve_layer`'s objective exactly so a re-cost after conflict
+    // resolution is comparable: forward+backward + adapter-comm + optimizer.
+    entry.total_us()
+        + placement_cost_us(d.adapter_rank, d.adapter_placement)
+        + crate::wggo_cost::optimizer_us(
+            entry.param_bytes,
+            lut.dtype_bytes,
+            d.optim_m_bits,
+            d.optim_v_bits,
+            d.fase_fused,
+            lut.peak_bandwidth_gbs,
+        )
+}
+
+/// Resident memory the ILP charges a candidate layer: the shared
+/// training-memory formula ([`crate::wggo_cost::resident_training_bytes`]) with
+/// the layer's chosen moment precision, sized **unsharded** (`shard = 1`).
+///
+/// The Level-2 ILP is a per-layer admission gate that runs before — and
+/// independently of — the Level-1 DP's ZeRO-shard choice, so it takes the
+/// conservative worst case: a layer that fits unsharded fits under any sharding.
+/// Routing through the same formula the DP uses is what closes the gap-#3
+/// divergence — the ILP used to charge a bare `param + activation`, silently
+/// dropping the optimizer state (the Adam moments) the DP always counted.
+fn ilp_resident_bytes(entry: &LayerCostEntry, lut: &LayerCostLut, m_bits: u8, v_bits: u8) -> u64 {
+    let optimizer_state =
+        crate::wggo_cost::moment_state_bytes(entry.param_bytes, lut.dtype_bytes, m_bits, v_bits);
+    crate::wggo_cost::resident_training_bytes(
+        entry.param_bytes,
+        optimizer_state,
+        entry.activation_bytes,
+        1,
+    )
 }
 
 /// Diagnostic counters for [`solve_all_templated`].
@@ -465,6 +571,11 @@ fn lut_eq(a: &LayerCostLut, b: &LayerCostLut) -> bool {
         || a.axes_csha_levels != b.axes_csha_levels
         || a.axes_adapter_ranks != b.axes_adapter_ranks
         || a.entries.len() != b.entries.len()
+        // `dtype_bytes` / `peak_bandwidth_gbs` feed `optimizer_us`, so two LUTs
+        // that differ only in those (mixed-precision layers, or different GPU
+        // targets) must NOT share a templated solution.
+        || a.dtype_bytes != b.dtype_bytes
+        || a.peak_bandwidth_gbs.to_bits() != b.peak_bandwidth_gbs.to_bits()
     {
         return false;
     }
@@ -577,7 +688,7 @@ pub fn solve_layer_greedy(
         packing_mode,
         &constraints.packing_savings,
     );
-    let memory_bytes = entry.param_bytes + entry.activation_bytes;
+    let memory_bytes = ilp_resident_bytes(&entry, lut, m_bits, v_bits);
     let feasible = base.feasible
         && entry.smem_bytes <= constraints.smem_budget
         && memory_bytes <= constraints.memory_budget;
@@ -607,7 +718,16 @@ pub fn solve_layer_greedy(
             adapter_placement: best_placement(r, constraints)
                 .unwrap_or(AdapterPlacement::None),
         },
-        cost_us: entry.total_us(),
+        cost_us: entry.total_us()
+            + placement_cost_us(r, best_placement(r, constraints).unwrap_or(AdapterPlacement::None))
+            + crate::wggo_cost::optimizer_us(
+                entry.param_bytes,
+                lut.dtype_bytes,
+                m_bits,
+                v_bits,
+                fase_fused,
+                lut.peak_bandwidth_gbs,
+            ),
         memory_bytes,
         smem_bytes: entry.smem_bytes,
         nodes_explored: nodes,
@@ -657,8 +777,6 @@ struct SolverState {
     best_decision: Option<LayerDecision>,
     best_entry: Option<LayerCostEntry>,
     nodes: u64,
-    #[allow(dead_code)]
-    global_lower_bound: f64,
 }
 
 /// Pick the lowest precision (in bits) that the sensitivity floor allows.
@@ -1105,6 +1223,108 @@ mod tests {
     }
 
     #[test]
+    fn ilp_resident_bytes_counts_moments_precision_aware_unsharded() {
+        // Gap #3: the ILP's resident charge must include the Adam moments (it
+        // used to be bare `param + activation`), sized at the chosen precision,
+        // and computed unsharded (the ILP can't see the DP's shard choice).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let e = lut.argmin_feasible().unwrap().4;
+        assert!(e.param_bytes > 0);
+        let bare = e.param_bytes + e.activation_bytes;
+        let hi = ilp_resident_bytes(&e, &lut, 32, 32);
+        assert!(hi > bare, "resident must count optimizer state: {hi} !> {bare}");
+        let lo = ilp_resident_bytes(&e, &lut, 8, 8);
+        assert!(lo < hi, "lower moment precision ⇒ less resident memory");
+        assert!(lo >= bare, "still charges some optimizer state");
+        // Exactly the shared formula, sized unsharded (shard = 1).
+        let expect = crate::wggo_cost::resident_training_bytes(
+            e.param_bytes,
+            crate::wggo_cost::moment_state_bytes(e.param_bytes, lut.dtype_bytes, 32, 32),
+            e.activation_bytes,
+            1,
+        );
+        assert_eq!(hi, expect);
+    }
+
+    #[test]
+    fn solve_layer_reports_resident_memory_with_optimizer_state() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let sol = solve_layer(&lut, &c);
+        assert!(sol.feasible);
+        // Reconstruct the winning entry exactly as `recost_decision` does, then
+        // confirm the reported memory is the shared resident formula for it.
+        let d = &sol.decision;
+        let base = lut
+            .get((d.active_heads() as u64).max(1), d.ffn_width, d.csha_level, d.adapter_rank)
+            .unwrap();
+        let entry = apply_packing(
+            apply_fase(base, d.fase_fused, c.fase_backward_speedup),
+            d.packing_mode,
+            &c.packing_savings,
+        );
+        let expect = ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits);
+        assert_eq!(sol.memory_bytes, expect);
+        assert!(sol.memory_bytes > entry.param_bytes + entry.activation_bytes);
+    }
+
+    #[test]
+    fn solve_layer_greedy_reports_resident_memory_with_optimizer_state() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let sol = solve_layer_greedy(&lut, &c);
+        assert!(sol.feasible);
+        let d = &sol.decision;
+        let base = lut
+            .get((d.active_heads() as u64).max(1), d.ffn_width, d.csha_level, d.adapter_rank)
+            .unwrap();
+        let entry = apply_packing(
+            apply_fase(base, d.fase_fused, c.fase_backward_speedup),
+            d.packing_mode,
+            &c.packing_savings,
+        );
+        let expect = ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits);
+        assert_eq!(sol.memory_bytes, expect);
+    }
+
+    #[test]
+    fn proj_role_classifies_naming_variants() {
+        assert_eq!(proj_role("blocks.0.attn.wq"), Some(ProjRole::Q));
+        assert_eq!(proj_role("model.layers.3.self_attn.q_proj.weight"), Some(ProjRole::Q));
+        assert_eq!(proj_role("blocks.0.attn.w_k"), Some(ProjRole::K));
+        assert_eq!(proj_role("blocks.0.attn.wv"), Some(ProjRole::V));
+        assert_eq!(proj_role("blocks.0.attn.out_proj"), Some(ProjRole::O));
+        assert_eq!(proj_role("blocks.0.mlp.gate_proj"), Some(ProjRole::Ffn));
+        assert_eq!(proj_role("blocks.0.ffn.fc1"), Some(ProjRole::Ffn));
+        // Not projections:
+        assert_eq!(proj_role("blocks.0.attn_norm.weight"), None);
+        assert_eq!(proj_role("embed.weight"), None);
+        assert_eq!(proj_role("var_42"), None);
+    }
+
+    #[test]
+    fn covers_projection_respects_placement_set() {
+        use AdapterPlacement::*;
+        // AttnQV: Q and V in, K and O out.
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wq"), Some(true));
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wv"), Some(true));
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wk"), Some(false));
+        assert_eq!(AttnQV.covers_projection("blocks.0.attn.wo"), Some(false));
+        // AttnQKVO: all four attn projections in, FFN out.
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.attn.wk"), Some(true));
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.attn.wo"), Some(true));
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.mlp.fc1"), Some(false));
+        // AttnAndFfn: everything recognized is in.
+        assert_eq!(AttnAndFfn.covers_projection("blocks.0.mlp.fc1"), Some(true));
+        assert_eq!(AttnAndFfn.covers_projection("blocks.0.attn.wk"), Some(true));
+        // None excludes every projection.
+        assert_eq!(None.covers_projection("blocks.0.attn.wq"), Some(false));
+        // Unrecognized names: no opinion regardless of placement.
+        assert_eq!(AttnQKVO.covers_projection("blocks.0.attn_norm.weight"), Option::None);
+        assert_eq!(AttnAndFfn.covers_projection("embed.weight"), Option::None);
+    }
+
+    #[test]
     fn best_placement_picks_smallest_fitting() {
         let mut c = LayerIlpConstraints::default(); // adapter_comm_budget = MAX
         assert_eq!(best_placement(0, &c), Some(AdapterPlacement::None));
@@ -1177,6 +1397,48 @@ mod tests {
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
         assert_eq!(sol.decision.csha_level, 0);
+    }
+
+    #[test]
+    fn lut_eq_distinguishes_dtype_bytes_and_bandwidth() {
+        // Both fields feed `optimizer_us`, so two LUTs that differ only in them
+        // must NOT be treated as the same template (else `solve_all_templated`
+        // would reuse a solution costed for a different optimizer dtype/target).
+        let a = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut b = a.clone();
+        b.dtype_bytes = a.dtype_bytes + 2;
+        assert!(!lut_eq(&a, &b));
+        let mut c = a.clone();
+        c.peak_bandwidth_gbs = a.peak_bandwidth_gbs * 2.0;
+        assert!(!lut_eq(&a, &c));
+        assert!(lut_eq(&a, &a.clone())); // identical ⇒ equal
+    }
+
+    #[test]
+    fn low_sensitivity_picks_low_optimizer_precision() {
+        // Gap #2: with the optimizer-cost term in the objective, a layer with
+        // no numerical-sensitivity floor now prefers the cheapest (lowest-bit)
+        // moments.  Before the fix the ILP always returned 32/32 because the
+        // objective was independent of precision.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints::default(); // sensitivity = 0
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.optim_m_bits, 8);
+        assert_eq!(sol.decision.optim_v_bits, 8);
+    }
+
+    #[test]
+    fn full_and_greedy_agree_on_optimizer_precision_at_low_sensitivity() {
+        // Both solvers now minimize the same objective, so they converge on the
+        // same (lowest-allowed) optimizer precision — previously the full ILP
+        // returned 32/32 while greedy returned 8/8 for the same layer.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default();
+        let full = solve_layer(&lut, &c);
+        let greedy = solve_layer_greedy(&lut, &c);
+        assert_eq!(full.decision.optim_m_bits, greedy.decision.optim_m_bits);
+        assert_eq!(full.decision.optim_v_bits, greedy.decision.optim_v_bits);
     }
 
     #[test]

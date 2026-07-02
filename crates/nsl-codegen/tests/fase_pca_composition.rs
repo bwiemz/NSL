@@ -354,15 +354,32 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// v9 L5: locate the pre-built `nsl` binary next to the test executable.
+///
+/// `nsl` lives in the sibling `nsl-cli` crate, so Cargo does NOT set
+/// `CARGO_BIN_EXE_nsl` for `nsl-codegen`'s integration tests. Instead
+/// we walk up from `current_exe()`:
+///   `target/<profile>/deps/<test-binary>` → `target/<profile>/nsl(.exe)`
+///
+/// This is markedly faster than `cargo run -p nsl-cli` (avoids the
+/// per-invocation freshness scan / lock contention). Mirrors the
+/// documented pattern in
+/// `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`.
+fn nsl_bin() -> PathBuf {
+    let mut dir = std::env::current_exe().expect("locate test executable");
+    dir.pop(); // drop the test-binary file name
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    dir.join(format!("nsl{}", std::env::consts::EXE_SUFFIX))
+}
+
 fn run_check(format: Option<&str>) -> (i32, String, String) {
     let root = workspace_root();
-    let cargo_toml = root.join("Cargo.toml");
     let stdlib_path = root.join("stdlib");
 
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "--manifest-path"])
-        .arg(&cargo_toml)
-        .args(["-p", "nsl-cli", "--", "check"]);
+    let mut cmd = Command::new(nsl_bin());
+    cmd.arg("check");
     match format {
         Some(f) => {
             cmd.arg(format!("--training-report={}", f));

@@ -85,6 +85,14 @@ pub struct AnalysisResult {
     /// the lowering-site auto-substitution of composite cross_entropy → the
     /// fused linear-CE kernel).
     pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): validated `@pca(...)` configurations.
+    /// One entry per decorator occurrence. Codegen reads these at the
+    /// CSHA training-PTX synthesis site so that
+    /// `@pca(strategy=per_document)` flips
+    /// `PerDocAdmitConfig::enable_per_doc_cta=true` for the planner.
+    /// Pre-Item-4 the validated config was dropped at
+    /// `nsl_semantic::checker::stmt::stmt_decorator`.
+    pub pca_configs: Vec<crate::cftp::PcaConfig>,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -121,12 +129,30 @@ pub fn analyze_with_imports(
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
     let fused_ce_configs = checker.fused_ce_configs;
+    let pca_configs = checker.pca_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the
     // weight-index side-table for codegen consumption.
     let (export_diags, weight_index_map) = crate::export::validate_exports(module, interner);
     diagnostics.extend(export_diags);
+
+    // WRGA paper §8.2: validate `@wrga(adapter=<Ident>, ...)` references to
+    // user-defined adapter models.  Runs after `check_module` so all top-
+    // level model declarations are visible; reports undeclared / empty /
+    // forward-less adapters loudly.
+    {
+        let resolve = |sym: nsl_ast::Symbol| {
+            interner.resolve(sym.0).unwrap_or("<unknown>").to_string()
+        };
+        let custom_adapter_diags = crate::wrga::validate_wrga_custom_adapters(
+            &wrga_configs,
+            module,
+            &scopes,
+            &resolve,
+        );
+        diagnostics.extend(custom_adapter_diags);
+    }
 
     // M38a: Run ownership analysis when --linear-types is active.
     // Runs after type checking so we have the TypeMap for tensor type detection.
@@ -196,5 +222,6 @@ pub fn analyze_with_imports(
         adapter_configs,
         weight_index_map,
         fused_ce_configs,
+        pca_configs,
     }
 }

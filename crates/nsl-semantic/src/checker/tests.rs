@@ -480,6 +480,195 @@ dataset dup_fields("demo"):
     );
 }
 
+// -----------------------------------------------------------------------
+// CFTP v9 M4: `mean_doc_length` / `doc_length_stddev` accept Float literals
+// -----------------------------------------------------------------------
+
+#[test]
+fn v9_m4_mean_doc_length_accepts_float_literal() {
+    // Calibration tools naturally emit fractional averages like 384.7.
+    // The semantic checker must accept these; codegen rounds to u32.
+    let src = r#"
+dataset calibrated("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = 384.7
+    doc_length_stddev = 42.5
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(
+        errs.is_empty(),
+        "v9 M4: Float literal for mean_doc_length/doc_length_stddev must not error; got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn v9_m4_mean_doc_length_still_accepts_int_literal() {
+    // Backwards compatibility: existing Int-literal fixtures must keep working.
+    let src = r#"
+dataset intcorpus("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = 384
+    doc_length_stddev = 42
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(
+        errs.is_empty(),
+        "v9 M4: Int literal must still be accepted (regression guard); got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn v9_m4_mean_doc_length_rejects_string() {
+    // The widening is Int|Float only — not "anything goes". String must still error.
+    let src = r#"
+dataset weird("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = "not a number"
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("mean_doc_length must be int or float")),
+        "v9 M4: String must error with 'int or float' message; got: {:?}",
+        diags
+    );
+}
+
+// -----------------------------------------------------------------------
+// CFTP v9 L4: non-negative literal validation for length stats
+// -----------------------------------------------------------------------
+
+#[test]
+fn v9_l4_mean_doc_length_rejects_negative_int() {
+    let src = r#"
+dataset bad_stats("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    mean_doc_length = -50
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset mean_doc_length must be non-negative")),
+        "v9 L4: negative Int must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_doc_length_stddev_rejects_negative_float() {
+    let src = r#"
+dataset bad_stats("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    doc_length_stddev = -3.14
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset doc_length_stddev must be non-negative")),
+        "v9 L4: negative Float must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_sequence_length_rejects_negative() {
+    // Pre-v9 gap: `sequence_length` also silently wraps to a huge u32
+    // downstream when negative. v9 L4 closes this for all length fields.
+    let src = r#"
+dataset seq_len_bad("demo"):
+    source = "data.bin"
+    sequence_length = -100
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset sequence_length must be non-negative")),
+        "v9 L4: negative sequence_length must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_max_sequence_length_rejects_negative() {
+    let src = r#"
+dataset ms_bad("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    max_sequence_length = -1024
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("dataset max_sequence_length must be non-negative")),
+        "v9 L4: negative max_sequence_length must be refused up-front; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn v9_l4_separator_token_id_still_allows_any_int() {
+    // separator_token_id is a token id (which can legally be negative
+    // as a sentinel). It intentionally stays out of the L4 non-negative
+    // check. This test pins that behavior so a future L4 extension
+    // doesn't accidentally sweep it in.
+    let src = r#"
+dataset with_neg_sep("demo"):
+    source = "data.bin"
+    sequence_length = 1024
+    packing = true
+    separator_token_id = -1
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(
+        errs.is_empty(),
+        "v9 L4: separator_token_id must continue accepting any i64 (including negative sentinels); got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn v9_l4_zero_length_still_allowed() {
+    // Zero is not negative — the L4 check must not accidentally refuse it.
+    // Downstream `pca_activation::validate_config` refuses zero mean_doc_length
+    // separately (that's a semantic error, not a "wrong sign" one).
+    let src = r#"
+dataset zero_ok("demo"):
+    source = "data.bin"
+    sequence_length = 0
+"#;
+    let diags = check_source(src);
+    // The L4 check itself should not fire. (Other checks may fire but not
+    // the "must be non-negative" message.)
+    assert!(
+        !diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("must be non-negative")),
+        "v9 L4: zero is not negative; must not trip the L4 check; got: {:?}",
+        diags
+    );
+}
+
 #[test]
 fn test_tokenizer_vocab_size_type_mismatch_reports_error() {
     let src = r#"
@@ -779,15 +968,24 @@ train(model = m, epochs = 1):
     );
 }
 
-/// CFTP v5 follow-on Finding 1 (HIGH): a SECOND `@fused_lm_ce` decorator
-/// in the same compilation unit must be REFUSED.  The codegen reads
-/// `fused_ce_configs.first()` for every train block's dtype dispatch, so a
-/// silently-accepted second decorator would corrupt the second train block's
-/// HBM-layout contract (e.g. `@fused_lm_ce(dtype="fp16")` first +
-/// `@fused_lm_ce(dtype="bf16")` second → second block silently uses fp16
-/// dispatch against bf16 buffers).  See `feedback_deferral_must_refuse`.
+/// CFTP v10 (item 3) LIFTED: two `@fused_lm_ce` decorators on DIFFERENT
+/// train blocks in the same compilation unit are now ACCEPTED.  Codegen
+/// dispatches each block to its own config via the
+/// `train_block_stmt_id` field.
+///
+/// Pre-v10 (v5 follow-on Finding 1 HIGH), codegen read
+/// `fused_ce_configs.first()` for every train block, silently binding
+/// EVERY block to the FIRST decorator's dtype/vocab hint — so the
+/// checker had to refuse the second decorator entirely. Item 3
+/// installs per-block dispatch (`active_fused_ce_config` +
+/// `set_active_fused_ce_config_for_train_block`), lifting the refusal.
+///
+/// This test pins:
+///   * both configs land in `AnalysisResult.fused_ce_configs`
+///   * each config's `train_block_stmt_id` matches its train-block Stmt id
+///   * no refusal diagnostic fires
 #[test]
-fn fused_lm_ce_duplicate_decorator_is_refused() {
+fn fused_lm_ce_two_train_blocks_each_get_own_config() {
     let src = r#"
 model Tiny:
     w: Tensor = ones([2, 1])
@@ -812,23 +1010,83 @@ train(model = m, epochs = 1):
         let pred = m.forward(x)
 "#;
     let res = analyze_source(src);
-    // Only the FIRST decorator's config is collected; the second is refused.
+    // Both configs collected — item 3 lift.
+    assert_eq!(
+        res.fused_ce_configs.len(),
+        2,
+        "expected TWO collected configs (item 3 per-block dispatch), got {:?}",
+        res.fused_ce_configs.len()
+    );
+    // Each carries a distinct train_block_stmt_id.
+    assert_ne!(
+        res.fused_ce_configs[0].train_block_stmt_id,
+        res.fused_ce_configs[1].train_block_stmt_id,
+        "two decorators on two different train blocks must carry distinct \
+         `train_block_stmt_id` so codegen can route them independently",
+    );
+    // The dummy id (validator's placeholder) must NOT survive — the
+    // push site is responsible for overwriting with the real Stmt.id.
+    assert_ne!(
+        res.fused_ce_configs[0].train_block_stmt_id,
+        nsl_ast::NodeId::dummy(),
+        "the push-site overwrite of `train_block_stmt_id` did not fire — \
+         codegen would then match on `dummy()` and dispatch would silently \
+         fail for BOTH blocks",
+    );
+    assert_ne!(
+        res.fused_ce_configs[1].train_block_stmt_id,
+        nsl_ast::NodeId::dummy(),
+        "the push-site overwrite of `train_block_stmt_id` did not fire for \
+         the second block",
+    );
+    // First config's vocab_tile matches source order; second config's does too.
+    assert_eq!(res.fused_ce_configs[0].vocab_tile, Some(1024));
+    assert_eq!(res.fused_ce_configs[1].vocab_tile, Some(128));
+    // No refusal diagnostic (pre-v10 test would assert this fires; now
+    // its absence pins the lift).
+    assert!(
+        !res.diagnostics.iter().any(|d| format!("{:?}", d)
+            .contains("at most one decorator")),
+        "unexpected duplicate-decorator refusal after item 3 lift: {:?}",
+        res.diagnostics
+    );
+}
+
+/// CFTP v10 (item 3): same-block duplicate `@fused_lm_ce` STILL refused.
+/// The lift is per-train-block, not per-compilation-unit; two decorators
+/// on the SAME train block would fight over the single dispatch slot
+/// (`active_fused_ce_config` is 1:1 with the train block).  Refuse per
+/// `feedback_deferral_must_refuse`.
+#[test]
+fn fused_lm_ce_same_block_duplicate_decorator_still_refused() {
+    let src = r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+@fused_lm_ce(enabled = true, vocab_tile = 1024)
+@fused_lm_ce(enabled = true, vocab_tile = 128)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#;
+    let res = analyze_source(src);
     assert_eq!(
         res.fused_ce_configs.len(),
         1,
-        "duplicate @fused_lm_ce: expected exactly one collected config (the first), \
-         got {:?}",
+        "same-block duplicate: exactly one config survives (the first), got {:?}",
         res.fused_ce_configs.len()
-    );
-    assert_eq!(
-        res.fused_ce_configs[0].vocab_tile,
-        Some(1024),
-        "the FIRST decorator's vocab_tile must be the surviving config",
     );
     assert!(
         res.diagnostics.iter().any(|d| format!("{:?}", d)
-            .contains("at most one decorator is allowed per compilation unit")),
-        "expected duplicate-decorator refusal diagnostic, got: {:?}",
+            .contains("at most one decorator per")),
+        "expected same-block duplicate-decorator refusal diagnostic, got: {:?}",
         res.diagnostics
     );
 }
@@ -861,6 +1119,187 @@ model Toy:
         "mode mismatch: {:?}",
         cfg.block.mode
     );
+}
+
+/// WRGA paper §8.2 — custom adapter DSL acceptance.  `@wrga(adapter=<Ident>)`
+/// must parse, capture the symbol's resolved name on `WrgaConfig.adapter_name`,
+/// and survive the post-pass validator when the named model exists with both a
+/// Tensor field and a `forward` method.
+#[test]
+fn wrga_decorator_custom_adapter_parses_and_resolves_name() {
+    let src = r#"
+model GatedLoRA:
+    a: Tensor = zeros([4, 2])
+    b: Tensor = zeros([2, 4])
+    gate: Tensor = ones([4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return self.gate * (x @ self.a @ self.b)
+
+@wrga(mode=auto, adapter=GatedLoRA, target=h100)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "no semantic errors expected, got: {:?}",
+        res.diagnostics,
+    );
+    assert_eq!(res.wrga_configs.len(), 1);
+    let cfg = &res.wrga_configs[0];
+    assert!(cfg.block.adapter.is_some(), "block.adapter symbol must be set");
+    assert_eq!(
+        cfg.adapter_name.as_deref(),
+        Some("GatedLoRA"),
+        "adapter_name must carry the resolved string form",
+    );
+}
+
+/// Typo in the adapter name must produce a clear error pointing at the
+/// `@wrga(...)` site.  Defends against silently using the wrong (or no)
+/// adapter at compile time.
+#[test]
+fn wrga_decorator_custom_adapter_undeclared_errors() {
+    let src = r#"
+@wrga(mode=auto, adapter=DoesNotExist)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    let errors: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|d| format!("{:?}", d).contains("DoesNotExist")
+                && format!("{:?}", d).contains("not a declared model")),
+        "expected an undeclared-adapter error mentioning 'DoesNotExist', got: {:?}",
+        errors,
+    );
+}
+
+/// A custom adapter with NO Tensor field is rejected — WRGA needs at least
+/// one trainable parameter to place at each site.
+#[test]
+fn wrga_decorator_custom_adapter_missing_tensor_field_errors() {
+    let src = r#"
+model EmptyAdapter:
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+@wrga(mode=auto, adapter=EmptyAdapter)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    let errors: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|d| format!("{:?}", d).contains("no `Tensor` field")),
+        "expected a no-Tensor-field error, got: {:?}",
+        errors,
+    );
+}
+
+/// A custom adapter that omits `forward` is rejected — the rewrite has no
+/// entry point to call into.
+#[test]
+fn wrga_decorator_custom_adapter_missing_forward_errors() {
+    let src = r#"
+model ForwardlessAdapter:
+    a: Tensor = zeros([4, 4])
+
+@wrga(mode=auto, adapter=ForwardlessAdapter)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    let errors: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|d| format!("{:?}", d).contains("no `forward` method")),
+        "expected a no-forward-method error, got: {:?}",
+        errors,
+    );
+}
+
+/// Regression: an adapter symbol that is in-scope as a non-model
+/// declaration (mimicking the `from foo.peft import GatedLoRA` case where
+/// the imported name lives in the root scope but never appears as a local
+/// `ModelDef`) must NOT trigger the "undeclared adapter" error.  The
+/// post-pass falls back to a scope lookup and trusts the import — the
+/// deeper contract check lands at codegen.
+#[test]
+fn wrga_decorator_custom_adapter_in_scope_via_non_model_is_accepted() {
+    let src = r#"
+struct GatedLoRA:
+    placeholder: int
+
+@wrga(mode=auto, adapter=GatedLoRA)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    let undeclared_errors: Vec<_> = res
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .filter(|d| format!("{:?}", d).contains("undeclared adapter"))
+        .collect();
+    assert!(
+        undeclared_errors.is_empty(),
+        "post-pass must accept an in-scope (but non-ModelDef) adapter symbol; \
+         got undeclared-adapter errors: {:?}",
+        undeclared_errors,
+    );
+}
+
+/// Sanity: an existing @wrga decorator without `adapter=` must continue to
+/// parse with `adapter_name == None` (no behaviour regression).
+#[test]
+fn wrga_decorator_without_adapter_leaves_adapter_name_none() {
+    let src = r#"
+@wrga(mode=auto, budget=10000, target=h100)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    assert_eq!(res.wrga_configs.len(), 1);
+    let cfg = &res.wrga_configs[0];
+    assert!(cfg.block.adapter.is_none());
+    assert!(cfg.adapter_name.is_none());
 }
 
 #[test]
@@ -1772,5 +2211,139 @@ model Attention:
         }),
         "method-typed self.<method> arg must surface as `not found in model` (methods are not in the field-type map); got: {:?}",
         diags
+    );
+}
+
+// -----------------------------------------------------------------------
+// CFTP §4.3 G2 Strategy 3 (Item 4): @pca decorator collection tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn pca_decorator_per_document_strategy_is_captured() {
+    let src = r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+@pca(strategy = per_document)
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.pca_configs.len(),
+        1,
+        "expected one @pca config, got {:?}",
+        res.pca_configs.len()
+    );
+    assert!(
+        matches!(
+            res.pca_configs[0].strategy,
+            crate::cftp::PcaStrategy::PerDocument
+        ),
+        "strategy mismatch: {:?}",
+        res.pca_configs[0].strategy
+    );
+}
+
+#[test]
+fn pca_decorator_default_strategy_is_auto() {
+    let src = r#"
+let m = Tiny()
+@pca
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.pca_configs.len(),
+        1,
+        "bare @pca must still produce a config (defaults to auto)"
+    );
+    assert!(
+        matches!(
+            res.pca_configs[0].strategy,
+            crate::cftp::PcaStrategy::Auto
+        ),
+        "bare @pca should default to Auto, got {:?}",
+        res.pca_configs[0].strategy
+    );
+}
+
+#[test]
+fn pca_decorator_invalid_strategy_errors_and_drops_config() {
+    let src = r#"
+let m = Tiny()
+@pca(strategy = wibble)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("@pca: strategy must be")),
+        "expected invalid-strategy diagnostic, got: {:?}",
+        res.diagnostics
+    );
+    // The validator still returns a config (default `Auto`) on an
+    // invalid strategy — we just emit the diagnostic.  This preserves
+    // partial-recovery semantics so downstream codegen can still
+    // proceed with the safe (Auto) default.
+    assert_eq!(res.pca_configs.len(), 1);
+    assert!(matches!(
+        res.pca_configs[0].strategy,
+        crate::cftp::PcaStrategy::Auto
+    ));
+}
+
+#[test]
+fn pca_decorator_multiple_occurrences_are_collected() {
+    let src = r#"
+let m = Tiny()
+@pca(strategy = per_document)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+
+@pca(strategy = segment_id)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.pca_configs.len(),
+        2,
+        "expected both @pca configs to be collected"
+    );
+}
+
+#[test]
+fn pca_decorator_absent_yields_empty_collection() {
+    let src = r#"
+let m = Tiny()
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.pca_configs.is_empty(),
+        "absent @pca must leave the collection empty"
     );
 }

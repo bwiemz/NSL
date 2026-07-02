@@ -34,6 +34,13 @@ pub enum FusionTarget {
     /// `y = W₀x + sigmoid(gate) · α · B·(A·x)`.  Requires sm >= 80 so the
     /// gate sigmoid can run in a warp-efficient epilogue thread-block.
     EpilogueFusedGatedLora { rank: usize },
+    /// WRGA §2.4 pattern 3: fold an IA³-style scaling vector into a
+    /// reduction kernel's epilogue (sum, mean, pool).  The scaling happens
+    /// inside the reduction's last stage so no extra HBM round-trip is
+    /// added.  Distinct from [`FusionTarget::ActivationFusedIa3`] (which
+    /// targets norm/softmax kernels) so downstream emitters and the
+    /// fusion-report dispatch use the correct kernel shape.
+    ReductionFusedAdapter,
     /// The adapter cannot be fused: emit as a separate kernel.  This is always
     /// correct, just slower (extra HBM round-trip).
     StandaloneAdapter,
@@ -48,6 +55,7 @@ impl FusionTarget {
             FusionTarget::EpilogueFusedLora { .. }
                 | FusionTarget::ActivationFusedIa3
                 | FusionTarget::EpilogueFusedGatedLora { .. }
+                | FusionTarget::ReductionFusedAdapter
         )
     }
 }
@@ -127,7 +135,12 @@ pub fn build_fusion_plan(
             None => p.suggested_rank,
         };
         let (target, rationale, extra_bytes) = decide(p, eff_rank);
-        let site_kind = infer_site_kind(&p.name, p.arithmetic_intensity);
+        // Prefer the authoritative SiteKind carried on the placement (set
+        // by the upstream `place_adapters` from the original `AdapterSite`)
+        // over the name-based heuristic, which can't always recover the
+        // op type from a param name (e.g., `head.gamma` consumed by a
+        // mean reduction reads as Norm in the heuristic).
+        let site_kind = resolve_site_kind(p);
         decisions.push(FusionDecision {
             site: p.name.clone(),
             site_kind,
@@ -142,6 +155,20 @@ pub fn build_fusion_plan(
     }
 }
 
+/// Authoritative site-kind for `p`. Prefers the kind the upstream
+/// `place_adapters` carried on the placement; for placements built via
+/// legacy struct-literal callers the kind defaults to `Matmul`, in which
+/// case we fall back to the name heuristic (matching pre-Gap-#5 behaviour
+/// for those callers).
+fn resolve_site_kind(p: &AdapterPlacement) -> SiteKind {
+    // Anything other than the `Matmul` default was set deliberately by an
+    // upstream pass that knows the op kind; trust it.
+    if p.kind != SiteKind::Matmul {
+        return p.kind;
+    }
+    infer_site_kind(&p.name, p.arithmetic_intensity)
+}
+
 /// Heuristic: recover the site kind from the name when not supplied by the
 /// upstream placement record.  (Kept private — external callers should pass
 /// real `AdapterSite` records.)
@@ -153,11 +180,38 @@ fn infer_site_kind(name: &str, ai: f64) -> SiteKind {
         SiteKind::Norm
     } else if lname.contains("embed") {
         SiteKind::Embedding
+    } else if is_reduction_name(&lname) {
+        SiteKind::Reduction
     } else if ai >= 1.0 {
         SiteKind::Matmul
     } else {
         SiteKind::Norm
     }
+}
+
+/// WRGA §2.4 pattern 3 name-based fallback for reduction sites
+/// (mean-pool classification heads, sum-reduction projections, etc.).
+///
+/// We require either:
+/// 1. A dot-delimited token equal to `reduce` / `pool` / `sum` / `mean`,
+///    so structured names like `head.reduce_proj.weight` or
+///    `classifier.global_pool` match but `dimensionality_reduction_proj`
+///    and `feature_reducer_weight` do not, or
+/// 2. The whole name ends with one of the explicit op tokens
+///    (`.sum` / `.mean` / `.reduce` / `.pool`), the form NSL emits when a
+///    Wengert op's result variable is the site.
+///
+/// Substring-only matching (`lname.contains("reduce")`) was rejected by
+/// review because matmul-shaped projection weights with descriptive names
+/// like `reduce_op_result_proj` would silently flip to `ReductionFusedAdapter`,
+/// causing the rewrite to fall through to the unfused IA³ mul instead of
+/// the unfused LoRA epilogue.
+fn is_reduction_name(lname: &str) -> bool {
+    const TOKENS: &[&str] = &["reduce", "pool", "sum", "mean"];
+    if TOKENS.iter().any(|tok| lname.ends_with(&format!(".{tok}"))) {
+        return true;
+    }
+    lname.split('.').any(|tok| TOKENS.contains(&tok))
 }
 
 fn decide(p: &AdapterPlacement, rank: usize) -> (FusionTarget, String, u64) {
@@ -169,18 +223,31 @@ fn decide(p: &AdapterPlacement, rank: usize) -> (FusionTarget, String, u64) {
         ),
         AdapterKind::Ia3 => {
             // IA³ is a per-output scaling vector — always fusible into the
-            // host kernel's epilogue (norm / softmax).
-            (
-                FusionTarget::ActivationFusedIa3,
-                "IA³ scaling fused into host kernel epilogue, zero extra HBM traffic".into(),
-                0,
-            )
+            // host kernel's epilogue.  Dispatch on site kind so the
+            // downstream emitter and the fusion report attribute the fusion
+            // to the right kernel shape: reduction sites get the WRGA §2.4
+            // pattern 3 variant, everyone else gets the norm/softmax-style
+            // activation-fused variant.
+            let site_kind = resolve_site_kind(p);
+            if site_kind == SiteKind::Reduction {
+                (
+                    FusionTarget::ReductionFusedAdapter,
+                    "IA³ scaling fused into reduction kernel epilogue (§2.4 pattern 3), zero extra HBM traffic".into(),
+                    0,
+                )
+            } else {
+                (
+                    FusionTarget::ActivationFusedIa3,
+                    "IA³ scaling fused into host kernel epilogue, zero extra HBM traffic".into(),
+                    0,
+                )
+            }
         }
         AdapterKind::Lora => {
             // LoRA fuses into the matmul epilogue provided the site *is* a
             // matmul.  For softmax / norm LoRA can't epilogue-fuse, and we
             // fall back to a standalone adapter kernel.
-            let site_kind = infer_site_kind(&p.name, p.arithmetic_intensity);
+            let site_kind = resolve_site_kind(p);
             if site_kind == SiteKind::Matmul {
                 // B.3.1: if the user decorated this as GatedLoRA, emit the
                 // dedicated EpilogueFusedGatedLora variant so the AST rewrite
@@ -279,8 +346,13 @@ mod tests {
         ai: f64,
         class: BoundClassification,
     ) -> AdapterPlacement {
+        // Legacy callers (and these tests) use the name heuristic — leave
+        // `kind` at the `Matmul` default so `resolve_site_kind` falls back
+        // to `infer_site_kind`. Tests that need the §2.4 pattern 3 path
+        // exercise it via a reduction-recognisable name.
         AdapterPlacement {
             name: name.into(),
+            kind: SiteKind::Matmul,
             arithmetic_intensity: ai,
             classification: class,
             roofline_slack: 1.0,
@@ -348,6 +420,146 @@ mod tests {
         let plan = build_fusion_plan(&p, None);
         assert_eq!(plan.decisions[0].target, FusionTarget::NoOp);
         assert_eq!(plan.total_count(), 0);
+    }
+
+    #[test]
+    fn ia3_on_reduction_site_uses_reduction_fused_variant() {
+        // WRGA §2.4 pattern 3: an IA³ adapter on a reduction-named site
+        // produces ReductionFusedAdapter, distinct from the norm/softmax
+        // ActivationFusedIa3 variant.  Site name uses a bare `pool` token
+        // so the heuristic recognises it under the strict dot-delimited
+        // rule (see `is_reduction_name`).
+        let p = vec![placement(
+            "classifier.pool.scale",
+            AdapterKind::Ia3,
+            0,
+            0.5,
+            BoundClassification::MemoryBound,
+        )];
+        let plan = build_fusion_plan(&p, None);
+        assert_eq!(
+            plan.decisions[0].target,
+            FusionTarget::ReductionFusedAdapter,
+        );
+        assert!(plan.decisions[0].target.is_fused());
+        assert_eq!(plan.fused_count(), 1);
+        assert!(plan.decisions[0]
+            .rationale
+            .contains("§2.4 pattern 3"));
+    }
+
+    #[test]
+    fn ia3_on_norm_still_uses_activation_fused_variant() {
+        // Regression: the §2.4 pattern 3 split must not steal IA³ on norm
+        // sites — those still flow to ActivationFusedIa3.
+        let p = vec![placement(
+            "blocks.6.norm",
+            AdapterKind::Ia3,
+            0,
+            1.0,
+            BoundClassification::MemoryBound,
+        )];
+        let plan = build_fusion_plan(&p, None);
+        assert_eq!(
+            plan.decisions[0].target,
+            FusionTarget::ActivationFusedIa3,
+        );
+    }
+
+    #[test]
+    fn reduction_name_token_detected_via_dot_delimited_match() {
+        // The infer_site_kind heuristic accepts (a) any dot-delimited
+        // path component equal to one of {reduce, pool, sum, mean}, and
+        // (b) `ends_with(".<token>")` for the same tokens.  Substring
+        // matching is deliberately rejected — names like
+        // `reduce_op_result_proj` (a matmul-shaped projection that
+        // architecturally describes a reducing role) must NOT flip to
+        // Reduction.
+        for name in &[
+            "head.reduce",            // bare token in path
+            "head.global.pool",       // bare "pool" token mid-path
+            "head.classifier.sum",    // bare "sum" suffix
+            "head.classifier.mean",   // bare "mean" suffix
+        ] {
+            let p = vec![placement(
+                name,
+                AdapterKind::Ia3,
+                0,
+                0.5,
+                BoundClassification::MemoryBound,
+            )];
+            let plan = build_fusion_plan(&p, None);
+            assert_eq!(
+                plan.decisions[0].target,
+                FusionTarget::ReductionFusedAdapter,
+                "name '{name}' should map to ReductionFusedAdapter",
+            );
+        }
+    }
+
+    #[test]
+    fn reduction_name_heuristic_does_not_flip_matmul_names_with_embedded_tokens() {
+        // Regression guard for review finding #3: matmul-shaped projections
+        // whose names happen to contain `reduce` / `pool` / `sum` / `mean`
+        // as a SUB-token must NOT be misclassified as Reduction sites,
+        // which would silently route them to the unfused IA³ mul instead
+        // of the LoRA epilogue fast path.
+        for name in &[
+            "head.reduce_op_result_proj",     // "reduce" embedded in token
+            "blocks.0.feature_reducer.weight",// "reducer" embedded
+            "head.pool_q_proj",               // "pool" embedded
+            "head.mean_q_proj",               // "mean" embedded
+            "head.sum_attention.weight",      // "sum" embedded
+        ] {
+            // LoRA, AI=70 (compute-bound matmul-ish) so the fall-through
+            // would otherwise land on Matmul.
+            let p = vec![placement(
+                name,
+                AdapterKind::Lora,
+                4,
+                70.0,
+                BoundClassification::ComputeBound,
+            )];
+            let plan = build_fusion_plan(&p, None);
+            assert_eq!(
+                plan.decisions[0].target,
+                FusionTarget::EpilogueFusedLora { rank: 4 },
+                "name '{name}' must classify as Matmul, not Reduction",
+            );
+        }
+    }
+
+    #[test]
+    fn reduction_fused_counts_toward_fused_ratio() {
+        // A mixed batch — one matmul-LoRA, one norm-IA³, one reduce-IA³ —
+        // should report fusion_ratio = 1.0 because all three are fused.
+        let p = vec![
+            placement(
+                "blocks.6.wq",
+                AdapterKind::Lora,
+                4,
+                70.0,
+                BoundClassification::ComputeBound,
+            ),
+            placement(
+                "blocks.6.norm",
+                AdapterKind::Ia3,
+                0,
+                1.0,
+                BoundClassification::MemoryBound,
+            ),
+            placement(
+                "head.pool.scale",
+                AdapterKind::Ia3,
+                0,
+                0.5,
+                BoundClassification::MemoryBound,
+            ),
+        ];
+        let plan = build_fusion_plan(&p, None);
+        assert_eq!(plan.fused_count(), 3);
+        assert_eq!(plan.total_count(), 3);
+        assert!((plan.fusion_ratio() - 1.0).abs() < 1e-9);
     }
 
     #[test]

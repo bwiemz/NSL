@@ -90,6 +90,7 @@ fn cfg_for_dtype_hint(hint: Option<FusedCeDtypeHint>) -> FusedCeDecoratorConfig 
         batch_size: Some(2),
         seq_len: Some(32),
         dtype: hint,
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     }
 }
 

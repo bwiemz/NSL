@@ -255,7 +255,10 @@ train(model = m, epochs = 1):
     }
 
     let opts = CompileOptions {
-        csha_mode: Some("auto".into()),
+        csha: nsl_codegen::CshaOptions {
+            mode: Some("auto".into()),
+            ..Default::default()
+        },
         // Post-Gap-F, `compile_flash_attention_kernels` descends into
         // `ModelMember::Method` decorators (the fix for DOC-GAP A).
         // That path feeds through `parse_gpu_sm_from_target`, which

@@ -57,6 +57,7 @@ fn run_profile_pre_pass(
         adapter_configs: Vec::new(),
         weight_index_map: std::collections::HashMap::new(),
         fused_ce_configs: Vec::new(),
+        pca_configs: Vec::new(),
     };
 
     // Task 6 + Phase 2.5 Task 4: populate source text/name so
@@ -1210,9 +1211,43 @@ pub fn compile_module_with_imports_best_effort_plan(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> (Result<Vec<u8>, CodegenError>, Option<crate::wrga::WrgaPlan>) {
+    let (result, wrga_plan, _cfie_plan) = compile_module_with_imports_best_effort_plans(
+        ast,
+        interner,
+        type_map,
+        module_prefix,
+        imported_fns,
+        imported_struct_layouts,
+        imported_model_names,
+        dump_ir,
+        options,
+    );
+    (result, wrga_plan)
+}
+
+/// Like [`compile_module_with_imports_best_effort_plan`] but also
+/// surfaces the CFIE plan produced while compiling any serve block
+/// (CFIE Tier-A wiring observability, mirroring the WRGA pattern).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn compile_module_with_imports_best_effort_plans(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    module_prefix: &str,
+    imported_fns: &[(String, String, Signature)],
+    imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
+    imported_model_names: HashSet<String>,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+) -> (
+    Result<Vec<u8>, CodegenError>,
+    Option<crate::wrga::WrgaPlan>,
+    Option<crate::cfie::CfiePlan>,
+) {
     let mut compiler = match Compiler::new(interner, type_map, options) {
         Ok(c) => c,
-        Err(e) => return (Err(e), None),
+        Err(e) => return (Err(e), None, None),
     };
     install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
     compiler.dump_ir = dump_ir;
@@ -1271,12 +1306,13 @@ pub fn compile_module_with_imports_best_effort_plan(
         Ok(())
     })();
     let plan = compiler.last_wrga_plan.clone();
+    let cfie_plan = compiler.last_cfie_plan.clone();
     // Dev Tools Phase 2, Task 6: write the profile manifest before finalize.
     if pre_finalize.is_ok() {
         write_manifest_if_needed(&mut compiler, options);
     }
     let result = pre_finalize.and_then(|()| compiler.finalize());
-    (result, plan)
+    (result, plan, cfie_plan)
 }
 
 

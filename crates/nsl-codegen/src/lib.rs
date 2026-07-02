@@ -109,6 +109,7 @@ pub mod kernel_ir;
 pub mod kernel_lower;
 pub mod kernel_skeleton;
 pub mod matmul_mma;
+pub mod ptx_metadata;
 pub mod ptxas_validation;
 
 // --- Autodiff & training -------------------------------------------------
@@ -184,12 +185,19 @@ pub mod cep_search;
 pub mod cep_emit_source;
 pub mod cep_slice;
 pub mod cfie;
+pub mod cfie_decode_attention;
 pub mod cfie_fused_sample;
 pub mod cfie_grammar;
+pub mod cfie_grammar_ptx;
 pub mod cfie_kv_plan;
 pub mod cfie_kv_quant;
+pub mod cfie_kv_quant_ptx;
 pub mod cfie_persistent;
+pub mod cfie_persistent_ptx;
+pub mod cfie_sample_ptx;
+pub mod cfie_serve;
 pub mod cfie_speculative;
+pub mod cfie_speculative_ptx;
 pub mod csha;
 pub mod csha_apply;
 pub mod csha_boundary;
@@ -217,6 +225,7 @@ pub mod wggo_ilp;
 pub mod wggo_overrides;
 pub mod wggo_prune;
 pub mod wggo_schedule;
+pub mod wggo_shape;
 pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
@@ -267,7 +276,7 @@ pub mod gpu {
     pub use crate::{
         backend_amdgpu, backend_metal, backend_ptx, backend_wgsl,
         deterministic_kernels, gpu_specs, gpu_target, kernel, kernel_ir,
-        kernel_lower, kernel_skeleton, matmul_mma, ptxas_validation,
+        kernel_lower, kernel_skeleton, matmul_mma, ptx_metadata, ptxas_validation,
     };
 }
 
@@ -387,6 +396,41 @@ pub fn debug_compile_and_return_plan_from_ast(
     options: &CompileOptions,
 ) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
     debug_compile_and_return_plan_with_imports(ast, interner, type_map, &[], options)
+}
+
+/// CFIE Tier-A observability: compile a module through the full
+/// pipeline and return the [`crate::cfie::CfiePlan`] produced while
+/// compiling its serve block (`None` when no serve block opted into
+/// CFIE).  Mirrors [`debug_compile_and_return_plan_from_ast`].
+pub fn debug_compile_and_return_cfie_plan_from_ast(
+    ast: &nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    type_map: &nsl_semantic::checker::TypeMap,
+    options: &CompileOptions,
+) -> Result<Option<crate::cfie::CfiePlan>, CodegenError> {
+    let (res, _wrga_plan, cfie_plan) =
+        crate::compiler::compile_module_with_imports_best_effort_plans(
+            ast,
+            interner,
+            type_map,
+            "",
+            &[],
+            HashMap::new(),
+            std::collections::HashSet::new(),
+            false,
+            options,
+        );
+    match (res, cfie_plan) {
+        (Ok(_), plan) => Ok(plan),
+        (Err(e), Some(plan)) => {
+            eprintln!(
+                "[debug_compile_and_return_cfie_plan] codegen failed but a CFIE plan was produced: {}",
+                e.message
+            );
+            Ok(Some(plan))
+        }
+        (Err(e), None) => Err(e),
+    }
 }
 
 fn debug_compile_and_return_plan_with_imports(
@@ -599,6 +643,10 @@ pub struct WrgaInputs {
     pub freeze: Vec<FreezeDecoratorConfig>,
     /// Validated `@adapter(...)` configs.
     pub adapter: Vec<AdapterDecoratorConfig>,
+    /// Paper §9.3 ablation harness — per-Innovation skip flags forwarded to
+    /// `wrga::run`. Default `WrgaAblation::default()` (= all false = no
+    /// ablation, standard WRGA). Set via `nsl check --wrga-ablate=<name>`.
+    pub ablation: crate::wrga::WrgaAblation,
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +655,11 @@ pub struct WrgaDecoratorConfig {
     pub budget: Option<i64>,
     pub target: Option<String>,
     pub layers: Vec<String>,
+    /// WRGA paper §8.2: name of the user-defined custom adapter model
+    /// (e.g. `"GatedLoRA"`), or `None` for the built-in `lora`/`ia3`/
+    /// `gatedlora` flavour selected by the compiler.  Resolved from the
+    /// `adapter=<Ident>` argument on `@wrga(...)` at the semantic layer.
+    pub custom_adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -676,6 +729,12 @@ pub struct FusedCeDecoratorConfig {
     /// codegen-local enum so nsl-codegen does not depend on nsl-semantic
     /// types (same convention as the rest of `FusedCeDecoratorConfig`).
     pub dtype: Option<FusedCeDtypeHint>,
+    /// CFTP v10 (item 3): AST NodeId of the `train` block Stmt this
+    /// decorator belongs to.  Codegen looks up the active config for
+    /// each train block by matching this id — so multiple decorators
+    /// in one compilation unit each dispatch to their own train block.
+    /// Mirror of `nsl_semantic::cftp::FusedCeConfig.train_block_stmt_id`.
+    pub train_block_stmt_id: nsl_ast::NodeId,
 }
 
 /// Codegen-side mirror of `nsl_semantic::cftp::FusedCeDtypeHint`.
@@ -699,6 +758,55 @@ impl FusedCeDtypeHint {
             FusedCeDtypeHint::F32 => 0,
             FusedCeDtypeHint::F16 => 1,
             FusedCeDtypeHint::Bf16 => 2,
+        }
+    }
+}
+
+/// CFTP §4.3 G2 Strategy 3 (Item 4): codegen-side mirror of
+/// `nsl_semantic::cftp::PcaStrategy` carried through `CompileOptions`.
+///
+/// Mirrors the semantic enum 1-for-1 but lives in nsl-codegen so the
+/// codegen crate does not need to depend on nsl-semantic types directly
+/// (same convention as `FusedCeDtypeHint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcaUserStrategy {
+    /// Decorator-default — let the auto planner decide.
+    Auto,
+    /// Force segment-ID-masked kernel even if per-doc CTA would apply.
+    SegmentId,
+    /// Request per-document CTA scheduling. Activates the existing
+    /// `PerDocAdmitConfig::enable_per_doc_cta` gate at the CSHA
+    /// training-PTX synthesis site; admission still has the final say
+    /// (block_q / num_docs / causal / fused-projection gates).
+    PerDocument,
+    /// Disable PCA entirely for this train block (force-fallback to
+    /// the plain FA-2 forward / backward).
+    Off,
+}
+
+impl PcaUserStrategy {
+    /// True iff at least one `@pca(strategy=per_document)` (or its
+    /// aliases) was collected on this compile.
+    pub fn is_per_document(self) -> bool {
+        matches!(self, PcaUserStrategy::PerDocument)
+    }
+
+    /// Map from the semantic `PcaStrategy` enum without forcing
+    /// nsl-codegen to take a direct dependency on its discriminants.
+    /// Callers provide the textual name (`PcaStrategy::as_str`) — keeps
+    /// the wire-format stable across the crate boundary.
+    pub fn from_semantic_str(s: &str) -> Self {
+        match s {
+            "auto" => PcaUserStrategy::Auto,
+            "segment_id" => PcaUserStrategy::SegmentId,
+            "per_document" => PcaUserStrategy::PerDocument,
+            "off" => PcaUserStrategy::Off,
+            // Forward-compat fallback: an unrecognised string from a
+            // newer semantic crate decays to `Auto` rather than crashing
+            // the build. Tests pin all four canonical strings AND the
+            // catch-all so a future rename of `PcaStrategy::Auto::as_str`
+            // does not silently mask via this fallback.
+            _ => PcaUserStrategy::Auto,
         }
     }
 }
@@ -734,6 +842,21 @@ pub struct WggoOptions {
     pub importance: WggoImportance,
     /// Stage 3: default fraction of heads allowed to be pruned.
     pub prune_fraction: Option<f64>,
+}
+
+/// CFIE: compiler-fused inference-engine options (paper: docs/research/CFIE.pdf).
+///
+/// Grouped as a cohesive sub-struct per the architecture-hardening
+/// CompileOptions decomposition convention (cf. [`CshaOptions`] /
+/// [`CpdtOptions`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CfieOptions {
+    /// CLI mode override (`--cfie full|sampling|off`).  `None` defers to
+    /// the serve block's `@cfie` decorator / config keys.
+    pub mode_override: Option<String>,
+    /// Write the CFIE build report to this path in addition to stderr
+    /// (`--cfie-report <path>`).
+    pub report_path: Option<std::path::PathBuf>,
 }
 
 /// M53: Worst-case-execution-time (WCET) analysis and certification options.
@@ -805,6 +928,84 @@ impl Default for ZkOptions {
     }
 }
 
+/// CSHA (compiler-specialized hardware attention) codegen options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone, Debug, Default)]
+pub struct CshaOptions {
+    /// Fusion mode (`None` = off; e.g. `Some("auto".into())`).
+    pub mode: Option<String>,
+    /// Print the attention-fusion report.
+    pub report: bool,
+}
+
+/// CPDT (compiler-planned distributed training) options.
+///
+/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
+/// struct into cohesive sub-structs (architecture-hardening review).
+#[derive(Clone)]
+pub struct CpdtOptions {
+    /// Planner mode (Off/ZeroOnly/Full).
+    pub mode: crate::cpdt::CpdtMode,
+    /// Cluster topology.  Required when `mode != Off`.
+    pub cluster: Option<crate::cpdt_zero::ClusterSpec>,
+    /// Whether `--cpdt-report` was requested (stdout full plan).
+    pub report_requested: bool,
+    /// CPDT Part III §4.1: roofline-derived MoE `capacity_factor` override
+    /// slack — fraction of theoretical peak the planner targets when
+    /// upper-bounding `capacity_factor`. Default 0.0 = no override
+    /// (paper-faithful behavior). Set via `--cpdt-moe-roofline-slack`.
+    /// Consumed by
+    /// [`crate::cpdt_moe_capacity::apply_roofline_capacity_override`].
+    pub moe_roofline_slack: f64,
+    /// Shared output slot the CLI reads after compile returns.
+    /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
+    /// can render it without extending every entry-point return type.
+    pub plan_out:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
+}
+
+impl Default for CpdtOptions {
+    fn default() -> Self {
+        Self {
+            mode: crate::cpdt::CpdtMode::Off,
+            cluster: None,
+            report_requested: false,
+            moe_roofline_slack: 0.0,
+            plan_out: None,
+        }
+    }
+}
+
+/// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
+///
+/// Replaces the former CLI-side thread-locals (`WRGA_TARGET_OVERRIDE` /
+/// `WRGA_ABLATION_OVERRIDE` / `WRGA_PLAN_CAPTURE`) with explicit state threaded
+/// through [`CompileOptions`], mirroring [`CpdtOptions::plan_out`]. Every field
+/// is `None` on the normal `nsl build` path, so this is zero-overhead there.
+///
+/// The two override fields are consumed CLI-side (the WRGA bridge pre-applies
+/// them onto [`WrgaInputs`] before it reaches codegen); codegen itself never
+/// reads them. `plan_capture` is written by the CLI build paths from the
+/// `WrgaPlan` returned by `compile_returning_plan`.
+#[derive(Clone, Default)]
+pub struct WrgaCheckContext {
+    /// `--wrga-target <gpu>` — copied onto every `WrgaDecoratorConfig::target`
+    /// before the bridge ships `WrgaInputs` to codegen. When the source has no
+    /// `@wrga(...)` at all, a minimal Auto-mode config is synthesised so the
+    /// target choice still reaches `wrga::run`.
+    pub target_override: Option<String>,
+    /// `--wrga-ablate=<flags>` — copied onto `WrgaInputs::ablation`.
+    pub ablation_override: Option<crate::wrga::WrgaAblation>,
+    /// Capture slot for the produced `WrgaPlan`, read by `--wrga-compare` after
+    /// the build returns (mirrors [`CpdtOptions::plan_out`]). `None` outside a
+    /// compare run; captures the FIRST non-`None` plan so multi-file paths
+    /// don't overwrite the entry-module plan with a dependency's empty one.
+    pub plan_capture:
+        Option<std::sync::Arc<std::sync::Mutex<Option<crate::wrga::WrgaPlan>>>>,
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -861,11 +1062,22 @@ pub struct CompileOptions {
     /// the first `enabled = true` entry to gate the fused linear-CE
     /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
     pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
+    /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
+    /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
+    /// present. The CSHA training-PTX synthesis site consults this list
+    /// to flip `PerDocAdmitConfig::enable_per_doc_cta=true` when at least
+    /// one entry requests `PerDocument`.
+    /// Stored as the codegen-local `PcaUserStrategy` enum so nsl-codegen
+    /// does not depend directly on nsl-semantic types (mirrors the
+    /// `FusedCeDecoratorConfig` / `WrgaInputs` pattern).
+    pub pca_user_strategies: Vec<PcaUserStrategy>,
     /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
     /// allocations (vs. B.1's observational-only path). Default false.
     pub wrga_fold_allocations: bool,
     /// WGGO: weight-graph global-optimization options.
     pub wggo: WggoOptions,
+    /// CFIE: compiler-fused inference-engine options.
+    pub cfie: CfieOptions,
     /// Dev Tools Phase 2: enable the kernel-profile pre-pass.
     pub profile_kernels: bool,
     /// Dev Tools Phase 2: target GPU name for the profile walker.
@@ -884,27 +1096,14 @@ pub struct CompileOptions {
     pub health_flush_interval: Option<u64>,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
-    /// CSHA: fusion mode.
-    pub csha_mode: Option<String>,
-    /// CSHA: print the attention-fusion report.
-    pub csha_report: bool,
-    /// CPDT: planner mode (Off/ZeroOnly/Full).
-    pub cpdt_mode: crate::cpdt::CpdtMode,
-    /// CPDT: cluster topology.  Required when `cpdt_mode != Off`.
-    pub cpdt_cluster: Option<crate::cpdt_zero::ClusterSpec>,
-    /// CPDT: whether `--cpdt-report` was requested (stdout full plan).
-    pub cpdt_report_requested: bool,
-    /// CPDT Part III §4.1: roofline-derived MoE capacity_factor override
-    /// slack — fraction of theoretical peak the planner targets when
-    /// upper-bounding `capacity_factor`. Default 0.0 = no override (paper-
-    /// faithful behavior). Set via `--cpdt-moe-roofline-slack`. Consumed
-    /// by `cpdt_moe_capacity::apply_roofline_capacity_override`.
-    pub cpdt_moe_roofline_slack: f64,
-    /// CPDT: shared output slot the CLI reads after compile returns.
-    /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
-    /// can render it without extending every entry-point return type.
-    pub cpdt_plan_out:
-        Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
+    /// CSHA (compiler-specialized hardware attention) codegen options.
+    pub csha: CshaOptions,
+    /// CPDT (compiler-planned distributed training) options.
+    pub cpdt: CpdtOptions,
+    /// WRGA check-mode override context (`nsl check --wrga-analyze | --wrga-compare`).
+    /// Carries the `--wrga-target` / `--wrga-ablate` overrides and the
+    /// `--wrga-compare` plan-capture slot. All-`None` on normal builds.
+    pub wrga_check: WrgaCheckContext,
     /// M62: shared output slot the CLI reads after compile returns so it can
     /// emit a matching C header alongside the shared library. Populated by
     /// `Compiler::finalize` from `features.export_functions`.
@@ -978,8 +1177,10 @@ impl Default for CompileOptions {
             shared_lib: false,
             wrga_inputs: None,
             fused_ce_configs: Vec::new(),
+            pca_user_strategies: Vec::new(),
             wrga_fold_allocations: false,
             wggo: WggoOptions::default(),
+            cfie: CfieOptions::default(),
             profile_kernels: false,
             target_gpu: "h100".to_string(),
             dtype: "bf16".to_string(),
@@ -989,13 +1190,9 @@ impl Default for CompileOptions {
             health_monitor: false,
             health_flush_interval: None,
             inspect_enabled: false,
-            csha_mode: None,
-            csha_report: false,
-            cpdt_mode: crate::cpdt::CpdtMode::Off,
-            cpdt_cluster: None,
-            cpdt_report_requested: false,
-            cpdt_moe_roofline_slack: 0.0,
-            cpdt_plan_out: None,
+            csha: CshaOptions::default(),
+            cpdt: CpdtOptions::default(),
+            wrga_check: WrgaCheckContext::default(),
             export_functions_out: None,
             calibration_data: None,
             calibration_mode: Some("required".to_string()),

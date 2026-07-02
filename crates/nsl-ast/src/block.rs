@@ -202,6 +202,12 @@ pub struct WrgaBlock {
     pub target: Option<Symbol>,
     /// Explicit layer selection for `mode=hybrid`.
     pub layers: Vec<String>,
+    /// WRGA paper §8.2: user-defined custom adapter model.  When set,
+    /// the name (a Symbol resolving to a `model` declaration in scope)
+    /// tells WRGA to instantiate this user-defined adapter at each
+    /// selected site instead of one of the built-in `lora`/`ia3`/
+    /// `gatedlora` kinds.  Defaults to `None` (compiler-chosen kind).
+    pub adapter: Option<Symbol>,
     pub span: Span,
 }
 
@@ -236,11 +242,15 @@ impl WrgaMode {
 }
 
 /// serve Name:
-///     config entries + @endpoint functions
+///     config entries + nested sub-blocks + @endpoint functions
 #[derive(Debug, Clone, Serialize)]
 pub struct ServeBlock {
     pub name: Symbol,
     pub config: Vec<ServeConfigEntry>,
+    /// CFIE: nested config sections (`speculative:` / `sampling:` /
+    /// `grammar:`) — a bare `key:` followed by an indented run of
+    /// ordinary config entries.
+    pub sub_blocks: Vec<ServeSubBlock>,
     pub endpoints: Vec<EndpointDef>,
     pub span: Span,
 }
@@ -250,6 +260,16 @@ pub struct ServeConfigEntry {
     pub key: Symbol,
     pub type_ann: Option<TypeExpr>,
     pub value: Expr,
+    pub span: Span,
+}
+
+/// A nested serve config section: `sampling:` + indented `key: value`
+/// entries.  Which section names are meaningful is a semantic concern
+/// (see nsl-semantic's CFIE validation); the parser accepts any ident.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServeSubBlock {
+    pub key: Symbol,
+    pub entries: Vec<ServeConfigEntry>,
     pub span: Span,
 }
 

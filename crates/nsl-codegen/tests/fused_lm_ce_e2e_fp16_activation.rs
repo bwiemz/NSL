@@ -106,6 +106,7 @@ fn cfg_fp16() -> FusedCeDecoratorConfig {
         batch_size: Some(B as u32),
         seq_len: Some(S as u32),
         dtype: Some(FusedCeDtypeHint::F16),
+        train_block_stmt_id: nsl_ast::NodeId::dummy(),
     }
 }
 

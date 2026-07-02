@@ -453,8 +453,45 @@ impl Compiler<'_> {
                                                 .or_default()
                                                 .insert(field_name.clone(), type_str);
                                         }
+                                        // CFTP v10 (item 5): record rank for
+                                        // every derivable shape, not just
+                                        // rank-2, so the fused-LCE matcher
+                                        // can refuse rank-3+ model-field W
+                                        // operands (e.g. MoE expert stack
+                                        // `self.experts.weight: [D, V, H]`).
+                                        // Zero-rank means the initializer
+                                        // literal was empty — treat as
+                                        // unknown per resolvable_tensor_rank
+                                        // conventions.
+                                        if !shape.is_empty() {
+                                            self.models
+                                                .model_field_ranks
+                                                .entry(name.clone())
+                                                .or_default()
+                                                .insert(field_name.clone(), shape.len());
+                                        }
                                     }
                                 }
+                            }
+                        }
+
+                        // CFTP v10 (item 5): also derive rank from an
+                        // explicit `Tensor<[..], dtype>` type annotation on
+                        // the field.  Model fields typically annotate
+                        // shape at the type-annotation layer even when the
+                        // initializer is opaque (e.g. `zeros_like(...)` or
+                        // an external load).  Non-empty declared shape ⇒
+                        // known rank.
+                        if let nsl_ast::types::TypeExprKind::Tensor { shape, .. } =
+                            &type_ann.kind
+                        {
+                            if !shape.is_empty() {
+                                self.models
+                                    .model_field_ranks
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .entry(field_name.clone())
+                                    .or_insert(shape.len());
                             }
                         }
 

@@ -160,6 +160,23 @@ impl<'a> TypeChecker<'a> {
             }
             self.check_expr(&entry.value);
         }
+        // CFIE sections (`sampling:` / `speculative:` / `grammar:`): the
+        // entries are literal configuration values validated by
+        // `cfie::validate_serve_config` below — deliberately NOT
+        // `check_expr`'d so enum-like values stay plain literals.
+        for sub in &serve.sub_blocks {
+            for entry in &sub.entries {
+                if let Some(ref type_ann) = entry.type_ann {
+                    self.resolve_type(type_ann);
+                }
+            }
+        }
+        {
+            let resolve = |s: nsl_ast::Symbol| -> String {
+                self.interner.resolve(s.0).unwrap_or("").to_string()
+            };
+            crate::cfie::validate_serve_config(serve, &resolve, &mut self.diagnostics);
+        }
         for endpoint in &serve.endpoints {
             for param in &endpoint.params {
                 if let Some(ref type_ann) = param.type_ann {
@@ -441,27 +458,35 @@ impl<'a> TypeChecker<'a> {
                 "shuffle" | "packing" => {
                     self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
                 }
-                // PCA-related length fields (paper §4.2 / pca_activation.rs
-                // ::extract_dataset_packing). Keep this arm in sync with the
-                // five fields that `extract_dataset_packing` reads:
-                //   - `max_sequence_length` and its alias `max_seq_len` drive
-                //     packing-config detection;
-                //   - `mean_doc_length` + `doc_length_stddev` feed the PCA
-                //     strategy planner;
-                //   - `separator_token_id` is the document separator id used
-                //     by §4.4 (fused linear-CE separator skipping).
-                // v9 follow-on: widen `mean_doc_length`/`doc_length_stddev`
-                // to also accept Float literals (calibration tools may emit
-                // 384.7) and add a non-negative literal check at semantic
-                // time to refuse nonsense stats up-front.
+                // v9 M4: `mean_doc_length` / `doc_length_stddev` accept
+                // BOTH Int and Float literals. Real-corpus calibration
+                // tools naturally emit fractional averages (e.g. `384.7`);
+                // forcing users to hand-round was a papercut.
+                // pca_activation.rs::extract_dataset_packing rounds Float
+                // to u32 (nearest-even) — the storage stays u32.
+                //
+                // v9 L4: all length fields (including the pre-v9 gap on
+                // `sequence_length` / `max_sequence_length` / `max_seq_len`)
+                // refuse a negative literal at semantic time. Negatives
+                // would silently wrap to a huge u32 downstream and misroute
+                // PCA planning / dataset stride math.
+                //
+                // `separator_token_id` accepts any i64 (token ids include
+                // 0; negative sentinels are legal for absent-separator
+                // configs), so it stays out of the non-negative check.
+                "mean_doc_length" | "doc_length_stddev" => {
+                    self.check_int_or_float_expr(&entry.value, &format!("dataset {key}"));
+                    self.check_non_negative_literal(&entry.value, key.as_str());
+                }
                 "sequence_length"
-                | "max_samples"
+                | "max_sequence_length"
+                | "max_seq_len" => {
+                    self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
+                    self.check_non_negative_literal(&entry.value, key.as_str());
+                }
+                "max_samples"
                 | "shuffle_buffer"
                 | "pack_separator"
-                | "max_sequence_length"
-                | "max_seq_len"
-                | "mean_doc_length"
-                | "doc_length_stddev"
                 | "separator_token_id" => {
                     self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
                 }
@@ -523,6 +548,65 @@ impl<'a> TypeChecker<'a> {
                     display_type(&ty)
                 ))
                 .with_label(expr.span, "wrong type"),
+            );
+        }
+    }
+
+    /// v9 M4: type-check an expression that accepts BOTH Int and Float.
+    /// Used by PCA length-stat fields (`mean_doc_length`, `doc_length_stddev`)
+    /// where calibration tools may emit `384.7` instead of `385`.
+    /// The Int|Float union stays a semantic-time contract — codegen's
+    /// `pca_activation::extract_dataset_packing` rounds Float to u32.
+    fn check_int_or_float_expr(&mut self, expr: &Expr, context: &str) {
+        let ty = self.check_expr(expr);
+        // Accept either Int or Float. Int is `is_assignable(_, &Type::Int)`
+        // and Float is `is_assignable(_, &Type::Float)`; anything else fails.
+        if !is_assignable(&ty, &Type::Int) && !is_assignable(&ty, &Type::Float) {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "{context} must be int or float, got {}",
+                    display_type(&ty)
+                ))
+                .with_label(expr.span, "wrong type"),
+            );
+        }
+    }
+
+    /// v9 L4: refuse a negative literal at semantic time for fields that
+    /// must be non-negative (`sequence_length`, `max_sequence_length`,
+    /// `max_seq_len`, `mean_doc_length`, `doc_length_stddev`). Wraps to
+    /// a huge u32 downstream in `pca_activation::extract_dataset_packing`
+    /// without this check, silently misrouting PCA planning.
+    ///
+    /// Only pins syntactic negative literals — expression-derived negatives
+    /// (`sequence_length = -x`, `sequence_length = 0 - 5`) fall through
+    /// since expression-level constant folding is out of scope for a
+    /// semantic-checker level pin. Users writing `-100` get the error.
+    fn check_non_negative_literal(&mut self, expr: &Expr, field: &str) {
+        // Two shapes to catch: `IntLiteral(-N)` (lexer emits negative int)
+        // and `Unary(-, IntLiteral(N))` / `Unary(-, FloatLiteral(N))`
+        // (unary-minus over a positive literal — most common source form).
+        let negative = match &expr.kind {
+            ExprKind::IntLiteral(n) => *n < 0,
+            ExprKind::FloatLiteral(f) => f.is_sign_negative() && *f != 0.0,
+            ExprKind::UnaryOp {
+                op: nsl_ast::operator::UnaryOp::Neg,
+                operand,
+            } => matches!(
+                operand.kind,
+                ExprKind::IntLiteral(n) if n > 0
+            ) || matches!(
+                &operand.kind,
+                ExprKind::FloatLiteral(f) if *f > 0.0
+            ),
+            _ => false,
+        };
+        if negative {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "dataset {field} must be non-negative"
+                ))
+                .with_label(expr.span, "negative value"),
             );
         }
     }

@@ -271,8 +271,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 shared_lib: false,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
+                pca_user_strategies: Vec::new(),
                 wrga_fold_allocations: false,
                 wggo: nsl_codegen::WggoOptions::default(),
+                cfie: nsl_codegen::CfieOptions::default(),
                 // Phase 4 Task 6: when a train block is detected with --monitor,
                 // the health monitor takes over; disable the Phase 1/2 kernel
                 // timing path so they don't stomp on each other.
@@ -297,18 +299,24 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 health_monitor: detected_train_block,
                 health_flush_interval: None,
                 inspect_enabled: inspect,
-                csha_mode: csha.clone(),
-                csha_report,
+                csha: nsl_codegen::CshaOptions {
+                    mode: csha.clone(),
+                    report: csha_report,
+                },
                 // CPDT: thread the planner mode + cluster + plan-out slot into
                 // codegen exactly as `nsl build` does — the compiler copies
-                // cpdt_cluster into Compiler::cpdt_cluster and reads
-                // cpdt_plan_out during train-block codegen via
+                // cpdt.cluster into Compiler::cpdt_cluster and reads
+                // cpdt.plan_out during train-block codegen via
                 // invoke_cpdt_if_enabled.
-                cpdt_mode,
-                cpdt_cluster: cpdt_cluster.clone(),
-                cpdt_report_requested: cpdt_report,
-                cpdt_moe_roofline_slack: 0.0,
-                cpdt_plan_out: cpdt_plan_out.clone(),
+                cpdt: nsl_codegen::CpdtOptions {
+                    mode: cpdt_mode,
+                    cluster: cpdt_cluster.clone(),
+                    report_requested: cpdt_report,
+                    moe_roofline_slack: 0.0,
+                    plan_out: cpdt_plan_out.clone(),
+                },
+                // `nsl run` never sets WRGA check-mode overrides.
+                wrga_check: nsl_codegen::WrgaCheckContext::default(),
                 export_functions_out: None,
                 calibration_data: None,
                 calibration_mode: Some("required".to_string()),

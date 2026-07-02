@@ -245,9 +245,18 @@ struct Cand {
 }
 
 /// Resident-memory model for a layer: parameters plus the two Adam moment
-/// buffers (`3·param`) sharded `shard` ways, plus un-sharded activations.
+/// buffers sharded `shard` ways, plus un-sharded activations.
+///
+/// The Level-1 DP is coarse — it has no optimizer-precision variable — so it
+/// sizes the two moments at parameter precision (`optimizer_state = 2·param`,
+/// giving the historical `3·param/shard + activation`).  It routes through the
+/// one shared formula ([`crate::wggo_cost::resident_training_bytes`]) that the
+/// Level-2 ILP also uses, so the two levels can never diverge on the memory
+/// model (audit gap #3); only the fidelity of the optimizer-state input differs
+/// (the ILP sizes moments at their chosen precision).
 fn resident_bytes(param_bytes: u64, activation_bytes: u64, shard: u32) -> u64 {
-    3u64.saturating_mul(param_bytes) / (shard.max(1) as u64) + activation_bytes
+    let optimizer_state = 2u64.saturating_mul(param_bytes);
+    crate::wggo_cost::resident_training_bytes(param_bytes, optimizer_state, activation_bytes, shard)
 }
 
 /// Enumerate the `(decision, shard)` candidates for one layer.

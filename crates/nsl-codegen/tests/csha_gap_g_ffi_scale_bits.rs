@@ -118,7 +118,10 @@ fn compile_program(src: &str) -> Result<Vec<u8>, String> {
         ));
     }
     let opts = CompileOptions {
-        csha_mode: Some("auto".into()),
+        csha: nsl_codegen::CshaOptions {
+            mode: Some("auto".into()),
+            ..Default::default()
+        },
         target: "sm_75".to_string(),
         ..Default::default()
     };

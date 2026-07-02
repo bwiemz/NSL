@@ -31,6 +31,11 @@ pub enum OverrideRejectReason {
     RankClampedToBounds { r_min: u32, r_max: u32 },
     RankForbiddenByWggo,
     BudgetExceededDowngraded { original_rank: u32, final_rank: u32 },
+    /// WRGA's roofline wanted an adapter on a projection that falls outside
+    /// WGGO's chosen `adapter_placement` for the layer (the comm-budget-feasible
+    /// minimal set, G5/G7).  WRGA forces the site to `Skip` to respect the
+    /// placement; `placement` is the WGGO set that excluded it.
+    AdapterSiteOutsidePlacement { placement: String },
     // CPDT:
     /// WGGO's recommended shard factor doesn't divide world_size.
     ShardFactorIncompatibleWithWorldSize { recommended: u32, world_size: u32 },
@@ -284,6 +289,24 @@ mod tests {
         let over = WggoOverrides::from_applied(&sample_applied());
         assert!(over.find(7).is_some());
         assert!(over.find(99).is_none());
+    }
+
+    #[test]
+    fn empty_applied_yields_no_overrides() {
+        // Load-bearing invariant for WGGO's §2.4 shape-compatibility refusal:
+        // `wggo::run` emits an empty AppliedPlan when a graph is provably
+        // shape-incompatible, and the consumer must therefore apply *no*
+        // transforms (CSHA/WRGA/CPDT all fall back to defaults).  If this ever
+        // started synthesising default overrides, the refusal would silently
+        // leak transforms onto a broken graph.
+        let empty = crate::wggo_apply::AppliedPlan {
+            layers: Vec::new(),
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+        let over = WggoOverrides::from_applied(&empty);
+        assert!(over.per_layer.is_empty());
+        assert!(over.find(0).is_none());
     }
 
     #[test]

@@ -101,23 +101,86 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // RoPE branch here to prevent double-rotation.
         let csha_rope_active = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
-        // Optional RoPE cos/sin bases (position-indexed by q_row_global).
+        // Optional RoPE cos/sin bases (position-indexed by q_row_global or effective_pos).
         // Only needed when the non-CSHA inline path will fire.
-        // NOTE: per-document RoPE position reset on the FORWARD Q side
-        // (effective_pos = q_row_global - doc_starts[seg]) is NOT implemented
-        // here -- the prelude pre-declares the registers but the forward uses
-        // standard positions. Packed rope_q=true forward does not yet reset
-        // per-document (deferred; see project_pca_smem_mixed_layout_crash_disproven
-        // memory + the backward T9 reset which IS implemented). Tracked separately.
+        //
+        // PCA sec.4.3 site 1: when segment_masked && rope_q, route the cos/sin
+        // row through effective_pos = q_row_global - smem_doc_starts[seg_smem[q_row_global]]
+        // instead of the raw q_row_global, implementing per-document RoPE position
+        // reset. Bit-identical to the backward T9 sites 3+4 in csha_hooks_backward.rs
+        // so dQ flows back correctly through reset positions. Registers declared
+        // by the prelude under the same gate (segment_masked && rope_q).
+        //
+        // KNOWN-LIMITATION (non-CSHA inline path only): when `csha=None` and
+        // `rope_q=true`, only Q is rotated here — K reaches s_compute UNROTATED
+        // (emit_k_tile_load reads K from HBM and stores f16 to SMEM without any
+        // RoPE rotation site). Attention scores Q_rot * K_unrot^T are therefore
+        // semantically WRONG on this branch regardless of PCA reset.
+        //
+        // PRODUCTION IS UNAFFECTED. The CSHA-fused-projections path
+        // (csha_hooks.rs::emit_rope_pair_sweep) is the production PCA RoPE path
+        // and rotates both Q AND K correctly under the same effective_pos. The
+        // production CSHA training-PTX synthesis site
+        // (maybe_synthesize_csha_training_ptx) ALWAYS sets
+        // csha=Some(CshaExtras{level=1, ...}), and the @flash_attention
+        // decorator's inference path uses the same CSHA-fused PTX when RoPE is
+        // active. The non-CSHA + rope_q=true branch is reachable only from
+        // direct PTX synthesis tests that exercise the fallback emitters
+        // (pca_tier_a_forward_correctness::rope_q_forward_*), and those tests
+        // pin only no-crash + per-doc reset semantics, NOT full RoPE
+        // correctness — see the comment on cpu_reference_rope_then_attention,
+        // which explicitly does NOT rotate K so the CPU side matches the
+        // kernel side's structural gap byte-for-byte under this branch.
+        //
+        // Closing this gap requires K-side rotation in emit_k_tile_load: a
+        // partner-shuffle of K halves after the cooperative HBM->SMEM load
+        // (the 128-threads-per-tile-element load pattern does NOT give a
+        // single thread access to BOTH partners of a HalfSplit pair, so the
+        // rotation must be a second sync-rotate-sync pass on the SMEM tile,
+        // mirroring emit_rope_pair_sweep's design). This is tracked as a
+        // separate follow-on PR.
         if config.rope_q && !csha_rope_active {
-            ptx.push_str("    // RoPE: cos/sin bases for q_row_global\n");
+            ptx.push_str("    // RoPE: cos/sin bases (position = effective_pos when PCA reset active)\n");
             ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
             ptx.push_str("    ld.param.u64 %rd26, [sin_ptr];\n");
 
-            ptx.push_str(&format!(
-                "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
-                head_dim
-            ));
+            if config.segment_masked {
+                ptx.push_str("    // PCA sec.4.3 site 1: forward Q effective_pos = q_row_global - doc_starts[seg]\n");
+                // abs_pos = q_row_global (narrowed to u32; seq_len < 2^31 per pca_segment ceiling).
+                ptx.push_str("    cvt.u32.u64 %r_abs_pos, %rd21;\n");
+                // sid = seg_smem[abs_pos] (u16 entries; byte offset abs_pos*2 from
+                // %seg_base, the cvta.shared.u64 generic address set in the prelude).
+                ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_abs_pos, 2;\n");
+                ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+                ptx.push_str("    add.u64 %rd_doc_smem_addr, %seg_base, %rd_doc_smem_addr;\n");
+                ptx.push_str("    ld.shared.u16 %rs_doc_seg, [%rd_doc_smem_addr];\n");
+                ptx.push_str("    cvt.u32.u16 %r_doc_starts_idx, %rs_doc_seg;\n");
+                // doc_start = smem_doc_starts[sid] (i32, 4 bytes per entry).
+                ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_doc_starts_idx, 4;\n");
+                ptx.push_str("    cvta.shared.u64 %r_doc_smem_base, smem_doc_starts;\n");
+                ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+                ptx.push_str("    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n");
+                ptx.push_str("    ld.shared.s32 %r_doc_start, [%rd_doc_smem_addr];\n");
+                // effective_pos = abs_pos - doc_start (s32; non-negative under packing
+                // invariants from pca_rope::plan, so the result fits in u32).
+                ptx.push_str("    sub.s32 %r_effective_pos_q, %r_abs_pos, %r_doc_start;\n");
+                // Zero-extend the (non-negative) effective_pos into the u64 cos/sin row
+                // scratch. Use cvt.u64.u32 — NOT cvt.u64.s32 — to match the backward T9
+                // sites bit-for-bit (csha_hooks_backward.rs uses u32). If a packing
+                // invariant violation ever produced a "negative" doc_start, the s32 form
+                // would propagate sign bits while the backward zero-extended; using u32
+                // here keeps the forward/backward address computation byte-identical.
+                ptx.push_str("    cvt.u64.u32 %rd27, %r_effective_pos_q;\n");
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd27, %rd27, {};          // effective_pos * head_dim\n",
+                    head_dim
+                ));
+            } else {
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
+                    head_dim
+                ));
+            }
             ptx.push_str("    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes\n");
             ptx.push_str("    add.u64 %rd25, %rd25, %rd27;              // cos row base\n");
             ptx.push_str("    add.u64 %rd26, %rd26, %rd27;              // sin row base\n");

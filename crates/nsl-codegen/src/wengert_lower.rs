@@ -561,6 +561,34 @@ fn emit_fused_forward_under_claim(
         "nsl_packing_metadata_get_doc_starts",
         &[],
     )?;
+    // PCA Tier B planner spec §5: build the (tier_b_ptx_ptr, tier_b_name_ptr)
+    // sentinel pair for the @train fused-AD forward FFI call. MUST mirror the
+    // backward at line ~2027 — both sites read from the SAME
+    // `flash_attention_context.csha_with_saves_tier_b_on_*` fields the
+    // module-scan emitter populated, so the forward and backward dispatch
+    // consistently under the runtime gate. Without this, the forward picks
+    // BASE PTX while the backward picks Tier-B-on → backward computes dQ/dK/dV
+    // on tiles the forward skipped → cross-document gradient leak.
+    let (fwd_tier_b_ptx_id, fwd_tier_b_name_id) = compiler
+        .kernels
+        .flash_attention_context
+        .as_ref()
+        .map(|c| {
+            (
+                c.csha_with_saves_tier_b_on_ptx_id,
+                c.csha_with_saves_tier_b_on_name_id,
+            )
+        })
+        .unwrap_or((None, None));
+    let tier_b_with_saves_fused = match (fwd_tier_b_ptx_id, fwd_tier_b_name_id) {
+        (Some(pid), Some(nid)) => crate::pca_tier_b::tier_b_enabled(
+            builder,
+            &mut compiler.module,
+            pid,
+            nid,
+        ),
+        _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
+    };
     let launch_rc = call(
         compiler,
         builder,
@@ -588,11 +616,15 @@ fn emit_fused_forward_under_claim(
             // PCA Tier A: segment_ids_ptr — read from the thread-local
             // packing registry (set by train block per step).
             seg_ids_ptr_v,
-            // Tier B extension (planner spec §4): sentinel 0 pair carries
-            // the Tier-B-on PTX variant.  Inactive in this @train fused
-            // forward path — the planner's dispatch decision is emitted
-            // at compile time, not via this CSHA forward launcher.
-            null, null,
+            // PCA Tier B planner spec §4: pass the Tier-B-on PTX sentinel
+            // pair built above. The backward at line ~2027 reads from the
+            // SAME context fields (`csha_with_saves_tier_b_on_*`), so when
+            // segment_masked=true and the module-scan emitter produced a
+            // Tier-B-on variant, BOTH forward and backward dispatch to
+            // Tier-B-on under the runtime gate. When no Tier-B-on variant
+            // exists (segment_masked=false or emission rejected by the
+            // validator) both fall back to the base kernel.
+            tier_b_with_saves_fused[0], tier_b_with_saves_fused[1],
             // PCA §4.3: doc_starts_ptr — read from the same registry.
             doc_starts_v,
             // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero.  0 here —
@@ -619,12 +651,19 @@ fn emit_fused_forward_under_claim(
     }
 
     // --- 8. Stash save-pointer Values for Gap D.1 backward lowerer. ---
-    let (bwd_ptx_id, bwd_name_id) = compiler
+    let (bwd_ptx_id, bwd_name_id, bwd_tier_b_ptx_id, bwd_tier_b_name_id) = compiler
         .kernels
         .flash_attention_context
         .as_ref()
-        .map(|c| (c.csha_backward_ptx_data_id, c.csha_backward_name_data_id))
-        .unwrap_or((None, None));
+        .map(|c| {
+            (
+                c.csha_backward_ptx_data_id,
+                c.csha_backward_name_data_id,
+                c.csha_backward_tier_b_on_ptx_id,
+                c.csha_backward_tier_b_on_name_id,
+            )
+        })
+        .unwrap_or((None, None, None, None));
     compiler.csha_forward_saves.insert(
         layer.to_string(),
         crate::csha_apply::CshaSavePointers {
@@ -636,6 +675,8 @@ fn emit_fused_forward_under_claim(
             x_raw: x_raw_v,
             backward_ptx_data_id: bwd_ptx_id,
             backward_name_data_id: bwd_name_id,
+            backward_tier_b_on_ptx_data_id: bwd_tier_b_ptx_id,
+            backward_tier_b_on_name_data_id: bwd_tier_b_name_id,
         },
     );
 
@@ -1990,6 +2031,30 @@ fn lower_single_op(
                 &[],
             )?;
 
+            // PCA Tier B planner spec §5: build the (tier_b_ptx_ptr,
+            // tier_b_name_ptr) sentinel pair for the backward FFI. When the
+            // module-scan emitted a Tier-B-on backward variant for this config
+            // (mirror of the forward `_with_saves` Tier-B-on emission gated on
+            // `should_emit_tier_b_at_codegen(training_config)`), pass the
+            // symbol pair; otherwise the disabled sentinel. The runtime
+            // launcher decides at-launch via the 4-condition gate in
+            // `should_dispatch_tier_b_at_runtime`. Forward and backward MUST
+            // dispatch consistently — if the forward picks Tier-B-on, the
+            // backward MUST too, else the backward computes gradients for
+            // tiles the forward skipped (gradients leak across documents).
+            let tier_b_bwd = match (
+                saves.backward_tier_b_on_ptx_data_id,
+                saves.backward_tier_b_on_name_data_id,
+            ) {
+                (Some(pid), Some(nid)) => crate::pca_tier_b::tier_b_enabled(
+                    builder,
+                    &mut compiler.module,
+                    pid,
+                    nid,
+                ),
+                _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
+            };
+
             let _rc = call(
                 compiler,
                 builder,
@@ -2028,11 +2093,16 @@ fn lower_single_op(
                     // thread-local packing registry (same value the
                     // forward at line ~565 read on this step).
                     seg_ids_ptr_v,
-                    // Tier B extension (planner spec §4): sentinel 0 pair
-                    // matches the forward call above. Backward never
-                    // re-decides Tier B dispatch — it just consumes the
-                    // forward's saves, so sentinels here are correct.
-                    null, null,
+                    // PCA Tier B planner spec §4: pass the Tier-B-on sentinel
+                    // pair built above as `tier_b_bwd`. MUST mirror the forward
+                    // `_with_saves` call's dispatch decision — the runtime
+                    // launcher uses the SAME 4-condition gate
+                    // (`should_dispatch_tier_b_at_runtime`) so as long as both
+                    // sites pass the same sentinel pair, dispatch stays
+                    // consistent. Mismatched dispatch (forward Tier-B-on +
+                    // backward base, or vice versa) computes gradients on
+                    // tiles the forward skipped → leaks across documents.
+                    tier_b_bwd[0], tier_b_bwd[1],
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
@@ -2462,8 +2532,14 @@ fn build_fused_ce_cfg(
 }
 
 /// CFTP v4-2: derive the FFI dtype_tag + emitter Dtype from the active
-/// `@fused_lm_ce` decorator config. Reads `compiler.fused_ce_configs[0]`
-/// (which is the only entry — a train block carries at most one decorator).
+/// `@fused_lm_ce` decorator config.
+///
+/// CFTP v10 (item 3): reads `compiler.active_fused_ce_config`, which
+/// `compile_train_block` installs from the entry in `fused_ce_configs`
+/// whose `train_block_stmt_id` matches the current train block.
+/// Pre-v10 this was `fused_ce_configs.first()`, silently binding every
+/// train block to the FIRST decorator's dtype — see the semantic checker
+/// note this fix reversed.
 ///
 /// Returns `(dtype_tag, emitter_dtype)`:
 /// * `(0, Dtype::F32)` for `dtype = "f32"` or absent decorator
@@ -2489,8 +2565,8 @@ fn fused_ce_dtype_for_compiler(
     // it codifies the documented `disabled → composite preserved` invariant
     // as a single-source-of-truth filter.
     match compiler
-        .fused_ce_configs
-        .first()
+        .active_fused_ce_config
+        .as_ref()
         .filter(|c| c.enabled)
         .and_then(|c| c.dtype)
     {
@@ -3017,14 +3093,16 @@ fn lower_fused_linear_ce_backward_extract(
         // `(B*S*H + V*H + V) * 2 bytes` (which assumed one cast per
         // forward+backward step, not two).  Defensive dtype check: the
         // cached dtype_tag MUST match the current backward dtype_tag —
-        // a mismatch means `fused_ce_configs[0].dtype` was mutated
+        // a mismatch means `active_fused_ce_config.dtype` (CFTP v10
+        // item 3; pre-v10: `fused_ce_configs[0].dtype`) was mutated
         // between forward and backward emission (e.g., a curriculum
-        // that flips dtype mid-step), in which case reusing the cached
-        // cast bytes would silently feed the wrong byte layout to the
-        // kernel.  Fall back to a fresh cast emission on miss so a
-        // separately-compiled backward without a forward cache entry
-        // still works (this is the path taken by backward-only
-        // compilation pipelines).
+        // that flips dtype mid-step, or the backward runs under a
+        // DIFFERENT train block's active config than the forward),
+        // in which case reusing the cached cast bytes would silently
+        // feed the wrong byte layout to the kernel.  Fall back to a
+        // fresh cast emission on miss so a separately-compiled
+        // backward without a forward cache entry still works (this
+        // is the path taken by backward-only compilation pipelines).
         let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) = match compiler
             .fused_ce_fwd_casts
             .get(&fwd_result_key)
@@ -3034,7 +3112,7 @@ fn lower_fused_linear_ce_backward_extract(
                 if cached_dtype != dtype_tag {
                     return Err(CodegenError::new(format!(
                         "FusedLinearCeBackwardExtract: cached forward cast dtype_tag={} \
-                         != current backward dtype_tag={} — `fused_ce_configs[0].dtype` \
+                         != current backward dtype_tag={} — `active_fused_ce_config.dtype` \
                          was mutated between forward and backward emission. \
                          This violates the v6 single-source-of-truth invariant \
                          (`fused_ce_dtype_for_compiler` must return the same value \
