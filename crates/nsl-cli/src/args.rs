@@ -294,15 +294,20 @@ pub(crate) struct CheckArgs {
         #[arg(long)]
         pub(crate) shapes: bool,
 
-        /// M37: Run roofline performance analysis
+        /// M37: Run roofline performance analysis (delegates to the
+        /// `nsl profile` engine with its defaults; use `nsl profile`
+        /// directly for entry-point/dim/JSON control)
         #[arg(long)]
         pub(crate) perf: bool,
 
-        /// M37: Target GPU for performance analysis (e.g., "H100", "A100-PCIe")
+        /// M37: Target GPU for performance analysis (e.g., "H100",
+        /// "A100-PCIe"); requires --perf
         #[arg(long)]
         pub(crate) gpu: Option<String>,
 
-        /// M37: Write Chrome tracing JSON to file
+        /// M37: Write Chrome tracing JSON to file. NOT IMPLEMENTED on
+        /// `nsl check` — refused with an error; use
+        /// `nsl debug <file.nsltrace> --export-chrome <out>` instead
         #[arg(long)]
         pub(crate) trace: Option<String>,
 
