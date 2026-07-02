@@ -1,0 +1,10 @@
+# Negative test: `==` is not a supported operator inside `kernel` blocks.
+# Previously `if i == 0:` compiled the condition to a garbage register and
+# silently dropped the whole if-body; now it must be a loud compile error.
+
+kernel bad_eq(a, out):
+    let i = thread_id()
+    if i == 0:
+        out[i] = a[i]
+
+print("should_not_compile")
