@@ -1,0 +1,28 @@
+# End-to-end regression for the stdlib Lion optimizer, which depends on the
+# element-wise tensor `sign` builtin (`update = sign(β₁m + (1-β₁)g)`).
+#
+# Lion's signature property: because the update is `sign(...)`, each weight
+# moves by exactly `lr` per step, independent of the gradient magnitude. Here
+# the gradient is strictly positive (pred=2 > y=0), so sign = +1 and each weight
+# decreases by exactly lr: 1.0 - 0.01 = 0.99. The `assert_close` guard makes
+# this self-checking — wrong numbers abort with a nonzero exit before the print.
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 1):
+    optimizer: Lion(lr = 0.01, beta1 = 0.9, beta2 = 0.99)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+assert_close(m.w, full([2, 1], 0.99), 0.0001, 0.0001)
+print("lion-verified")
