@@ -815,6 +815,41 @@ impl Compiler<'_> {
             }
         }
 
+        // G22: estimated decode latency + throughput from the explicit
+        // roofline cost model.  Computed here because this is the only
+        // point with the resolved model shape, the weights precision, the
+        // per-layer KV-quant plan, and the GPU spec all in scope.  The
+        // baseline KV footprint is the plan's uniform-FP16 count when the
+        // quant pass ran (Full mode); otherwise a shape-derived fallback.
+        {
+            let s = &prepared.shape;
+            let baseline_kv_stored = if plan.kv_quant.bytes_per_token_uniform_fp16 > 0 {
+                plan.kv_quant.bytes_per_token_uniform_fp16
+            } else {
+                // Uniform FP16 KV per stored token across all layers:
+                // 2 (K+V) * n_kv_heads * head_dim * 2 bytes * n_layers.
+                2 * (s.n_kv_heads as u64) * (s.head_dim as u64) * 2 * (s.n_layers as u64)
+            };
+            let cost_inputs = crate::cfie_cost::CostModelInputs {
+                n_layers: s.n_layers,
+                n_heads: s.n_heads,
+                n_kv_heads: s.n_kv_heads,
+                head_dim: s.head_dim,
+                d_model: s.d_model,
+                d_ff: s.d_ff,
+                vocab_size: s.vocab_size,
+                weight_dtype_bytes: s.dtype_bytes,
+                cfie_launches_per_token: plan.kernel_launches_per_token_cfie,
+                baseline_launches_per_token: plan.kernel_launches_per_token_baseline,
+                kv_quant: &plan.kv_quant,
+                baseline_kv_bytes_per_stored_token: baseline_kv_stored,
+                max_seq: cfg.max_seq.unwrap_or(4096).max(1) as u32,
+                batch: plan.persistent.scheduler.max_active,
+                gpu,
+            };
+            plan.cost_estimate = Some(crate::cfie_cost::estimate(&cost_inputs));
+        }
+
         // Build report: the paper's visible artifact (§8).  Provenance +
         // wiring status keep it honest about what this build actually
         // bakes into the binary.

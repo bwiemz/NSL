@@ -639,3 +639,170 @@ fn decode_step_token_sequence_matches_cpu_chain() {
 
     assert_eq!(nsl_cfie_engine_destroy(), 0);
 }
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn decode_step_pos_mismatch_refuses_minus3_and_rolls_back() {
+    if !cuda_available() {
+        return;
+    }
+    // G21 edge: nsl_cfie_decode_step books the token via
+    // kv_slot_advance(slot, 1) BEFORE any launch; if the resulting length
+    // disagrees with the caller's pos (`new_len != pos + 1`), it MUST
+    // un-book (rollback) and return -3 without corrupting slot state.
+    // Proof: a good pos-0 step, a bad pos-5 step that must -3 + roll back,
+    // then a good pos-1 step whose token still matches the CPU chain.
+    let sampler_params = SamplingParams {
+        strategy: SamplingStrategy::Greedy,
+        temperature: 0.0,
+        top_k: TOP_K,
+        ..Default::default()
+    };
+    let program = emit_program(
+        sampler_params,
+        LmHeadShape {
+            d_model: D_MODEL as u32,
+            vocab_size: VOCAB as u32,
+            vocab_tile: 128,
+            dtype_bytes: 2,
+        },
+    );
+    let (s_ptx, s_meta) = emit_sampler(
+        &program,
+        &FusedSampleKernelConfig {
+            d_model: D_MODEL as u32,
+            vocab_size: VOCAB as u32,
+            vocab_tile: 128,
+            top_k: TOP_K,
+            sm_version: 80,
+            grammar_states: 0,
+        },
+    );
+    let ptx = setup_engine(Some((&s_ptx, &s_meta.kernel_name, s_meta.block_dim)));
+
+    let slot = nsl_cfie_kv_slot_acquire();
+    assert_eq!(slot, 0);
+
+    let cfg = block_cfg();
+    let l0 = seeded_layer_weights(0xA0);
+    let l1 = seeded_layer_weights(0xA1);
+    let dev0 = DevLayerWeights::upload(&l0);
+    let dev1 = DevLayerWeights::upload(&l1);
+    let mut table = [0u64; N_LAYERS * 9];
+    table[..9].copy_from_slice(&dev0.ptrs());
+    table[9..].copy_from_slice(&dev1.ptrs());
+
+    let mut gamma = vec![0f32; D_MODEL];
+    fill_seeded(&mut gamma, 0xF1);
+    for g in gamma.iter_mut() {
+        *g = 1.0 + 0.1 * *g;
+    }
+    let mut lm_head = vec![0f32; VOCAB * D_MODEL];
+    fill_seeded(&mut lm_head, 0xF2);
+
+    let x_a = DevBuf::alloc(D_MODEL * 4);
+    let x_b = DevBuf::alloc(D_MODEL * 4);
+    let gamma_dev = DevBuf::alloc(D_MODEL * 4);
+    h2d_f32(gamma_dev.ptr(), &gamma);
+    let lm_bits: Vec<u16> = lm_head.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let lm_dev = DevBuf::alloc(lm_bits.len() * 2);
+    h2d_u16(lm_dev.ptr(), &lm_bits);
+    let lm_rounded: Vec<f32> = lm_head.iter().map(|&x| f16_round(x)).collect();
+    let tok_dev = DevBuf::alloc(4);
+
+    let (mut kv0_k, mut kv0_v) = (Vec::<f32>::new(), Vec::<f32>::new());
+    let (mut kv1_k, mut kv1_v) = (Vec::<f32>::new(), Vec::<f32>::new());
+
+    // Helper: one GPU decode_step at `pos` with a per-pos seeded x.
+    let step = |pos: i64, x_host: &[f32]| -> i64 {
+        h2d_f32(x_a.ptr(), x_host);
+        nsl_cfie_decode_step(
+            x_a.ptr(),
+            x_b.ptr(),
+            table.as_ptr() as i64,
+            N_LAYERS as i64,
+            gamma_dev.ptr(),
+            lm_dev.ptr(),
+            slot,
+            pos,
+            0x5EED_0000 + pos,
+            0,
+            tok_dev.ptr(),
+        )
+    };
+    // Helper: the CPU token for `pos`, advancing the per-layer KV chains.
+    let cpu_token = |pos: u32,
+                         x_host: &[f32],
+                         kv0_k: &mut Vec<f32>,
+                         kv0_v: &mut Vec<f32>,
+                         kv1_k: &mut Vec<f32>,
+                         kv1_v: &mut Vec<f32>|
+     -> u32 {
+        let x1 = cpu_block(&cfg, x_host, &dev0.rounded, kv0_k, kv0_v, pos);
+        let x2 = cpu_block(&cfg, &x1, &dev1.rounded, kv1_k, kv1_v, pos);
+        cpu_reference_sample(
+            &program,
+            &x2,
+            &gamma,
+            &lm_rounded,
+            None,
+            (0x5EED_0000 + pos as i64) as u64,
+        )
+    };
+
+    // (1) pos 0: a clean step. Slot len advances 0 -> 1.
+    let mut x0 = vec![0f32; D_MODEL];
+    fill_seeded(&mut x0, 0xD00D);
+    let rc0 = step(0, &x0);
+    if rc0 != 0 {
+        panic_with_jit_log("nsl_cfie_decode_step (pos 0)", rc0, &ptx);
+    }
+    let gpu0 = d2h_u32_one(tok_dev.ptr());
+    let cpu0 = cpu_token(0, &x0, &mut kv0_k, &mut kv0_v, &mut kv1_k, &mut kv1_v);
+    assert_eq!(gpu0, cpu0, "pos 0 token must match the CPU chain");
+    assert_eq!(
+        nsl_cfie_kv_slot_advance(slot, 0),
+        1,
+        "slot len must be 1 after the pos-0 step"
+    );
+
+    // (2) pos 5 with current len 1: advance books to 2, 2 != 5 + 1, so
+    // the step MUST roll back and return -3. The CPU KV chains are NOT
+    // touched (the GPU rolled its book-keeping AND wrote no KV rows).
+    let mut x_bad = vec![0f32; D_MODEL];
+    fill_seeded(&mut x_bad, 0xBAD5);
+    let rc_bad = step(5, &x_bad);
+    assert_eq!(rc_bad, -3, "pos/len mismatch must refuse with -3");
+    assert_eq!(
+        nsl_cfie_kv_slot_advance(slot, 0),
+        1,
+        "the rejected step's advance must have been rolled back (len still 1)"
+    );
+
+    // (3) pos 1: the correct next position now succeeds and its token
+    // still matches the CPU chain — proving the failed step corrupted
+    // neither the slot book-keeping nor the device KV cache.
+    let mut x1 = vec![0f32; D_MODEL];
+    fill_seeded(&mut x1, 0xD00E);
+    let rc1 = step(1, &x1);
+    if rc1 != 0 {
+        panic_with_jit_log("nsl_cfie_decode_step (pos 1 after refusal)", rc1, &ptx);
+    }
+    let gpu1 = d2h_u32_one(tok_dev.ptr());
+    let cpu1 = cpu_token(1, &x1, &mut kv0_k, &mut kv0_v, &mut kv1_k, &mut kv1_v);
+    assert_eq!(
+        gpu1, cpu1,
+        "pos 1 token must match the CPU chain — no state corruption from the -3 refusal"
+    );
+    assert_eq!(
+        nsl_cfie_kv_slot_advance(slot, 0),
+        2,
+        "slot len must be 2 after the recovered pos-1 step"
+    );
+    eprintln!(
+        "decode_step -3 recovery: tokens [{}, {}] (pos-5 refused with -3, rolled back)",
+        gpu0, gpu1
+    );
+
+    assert_eq!(nsl_cfie_engine_destroy(), 0);
+}

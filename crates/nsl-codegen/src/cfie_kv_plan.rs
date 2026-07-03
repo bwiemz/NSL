@@ -85,6 +85,14 @@ pub struct KvBudget {
     /// Desired block size (tokens per KV block).  The planner snaps
     /// this to the nearest cache-line-aligned value.  Paper default: 256.
     pub block_size: u32,
+    /// GPU-derived coalescing granularity in tokens (G24a): the block
+    /// size is floored to at least this many tokens so a full
+    /// warp/warp-group's worth of KV tokens lands in one contiguous
+    /// block, keeping the flash-decode inner loop's loads coalesced.
+    /// Set from `GpuSpec::warp_group_size()` in `cfie_serve::prepare`;
+    /// the default (128, the Hopper warp-group width and the standard
+    /// 128-byte L1 line) leaves the paper's 256-token block untouched.
+    pub snap_granularity: u32,
 }
 
 impl Default for KvBudget {
@@ -96,6 +104,7 @@ impl Default for KvBudget {
             max_seq: 2048,
             max_batch: 64,
             block_size: 256,
+            snap_granularity: 128,
         }
     }
 }
@@ -157,15 +166,34 @@ impl KvLayoutPlan {
 // Planner
 // ---------------------------------------------------------------------------
 
-/// Snap `block_size` to the nearest cache-line-aligned integer ≥ 64.
-fn snap_block_size(requested: u32) -> u32 {
+/// Snap `block_size` to a power-of-two candidate, then align to the
+/// GPU-derived coalescing granularity (G24a).
+///
+/// The candidate ladder {64,128,256,512,1024} is the largest power-of-two
+/// block that does not exceed the request.  On top of that the block is
+/// floored to a full coalescing line (`granularity` tokens — a warp/
+/// warp-group's KV footprint, from `GpuSpec::warp_group_size()`), so the
+/// flash-decode inner loop's KV loads stay coalesced on the target GPU.
+///
+/// `granularity` is snapped UP to a power of two first, so the result is
+/// always a power of two: the coalescing floor can only raise the block to
+/// the next power-of-two line, never to an off-ladder value like 288.  With
+/// the production granularities (32 or 128 from `warp_group_size()`) this is
+/// a no-op and the paper's 256-token block is unchanged; the floor only
+/// bumps blocks up on GPUs whose warp-group is wider than the request.
+fn snap_block_size(requested: u32, granularity: u32) -> u32 {
     let candidates = [64u32, 128, 256, 512, 1024];
-    for &c in candidates.iter().rev() {
-        if requested >= c {
-            return c;
-        }
-    }
-    64
+    let base = candidates
+        .iter()
+        .rev()
+        .copied()
+        .find(|&c| requested >= c)
+        .unwrap_or(64);
+    // Power-of-two granularity keeps the result on the power-of-two ladder
+    // (a non-power-of-two `next_multiple_of` could inflate 256 -> 288); a
+    // block below one full line would leave lanes idle on the first KV tile.
+    let g = next_pow2(granularity.max(1));
+    base.max(g).next_multiple_of(g)
 }
 
 fn next_pow2(n: u32) -> u32 {
@@ -196,7 +224,7 @@ pub fn plan(shape: &KvShape, budget: &KvBudget) -> KvLayoutPlan {
         };
     }
 
-    let block_size = snap_block_size(budget.block_size);
+    let block_size = snap_block_size(budget.block_size, budget.snap_granularity);
     let bytes_per_block = bytes_per_token * block_size as u64;
 
     // How many blocks fit in the available budget?
@@ -302,6 +330,7 @@ mod tests {
             max_seq: 2048,
             max_batch: 64,
             block_size: 256,
+            snap_granularity: 128,
         };
         let plan = plan(&nslcoder_shape(), &budget);
         assert_eq!(plan.kind, LayoutKind::Static);
@@ -321,6 +350,7 @@ mod tests {
             max_seq: 4096,
             max_batch: 128,
             block_size: 256,
+            snap_granularity: 128,
         };
         let plan = plan(&nslcoder_shape(), &budget);
         // Too tight for everyone to hold full seq, but enough blocks for
@@ -340,6 +370,7 @@ mod tests {
             max_seq: 4096,
             max_batch: 256,
             block_size: 256,
+            snap_granularity: 128,
         };
         let plan = plan(&nslcoder_shape(), &budget);
         assert_eq!(plan.kind, LayoutKind::Paged);
@@ -357,11 +388,34 @@ mod tests {
 
     #[test]
     fn block_size_snaps_to_power_of_two_ish() {
-        assert_eq!(snap_block_size(256), 256);
-        assert_eq!(snap_block_size(300), 256);
-        assert_eq!(snap_block_size(500), 256);
-        assert_eq!(snap_block_size(600), 512);
-        assert_eq!(snap_block_size(100), 64);
+        // Default granularity (128) leaves the paper's power-of-two
+        // ladder untouched for requests >= 128.
+        assert_eq!(snap_block_size(256, 128), 256);
+        assert_eq!(snap_block_size(300, 128), 256);
+        assert_eq!(snap_block_size(500, 128), 256);
+        assert_eq!(snap_block_size(600, 128), 512);
+        // A 100-token request snaps down to 64, but the 128-token
+        // coalescing floor raises it to a full warp-group line.
+        assert_eq!(snap_block_size(100, 128), 128);
+    }
+
+    #[test]
+    fn block_size_granularity_is_gpu_derived() {
+        // Older 32-wide-warp GPUs allow a smaller coalescing floor: a
+        // 100-token request snaps to 64 and 64 is already a multiple of
+        // 32, so it stays 64 (paper behaviour on older parts).
+        assert_eq!(snap_block_size(100, 32), 64);
+        // Hopper's 128-wide warp group forces at least 128 tokens/block.
+        assert_eq!(snap_block_size(64, 128), 128);
+        // The paper's 256 clears both floors identically.
+        assert_eq!(snap_block_size(256, 32), 256);
+        assert_eq!(snap_block_size(256, 128), 256);
+        // Result is always a whole number of coalescing lines.
+        for req in [10u32, 64, 100, 200, 256, 700, 2000] {
+            for g in [32u32, 128] {
+                assert_eq!(snap_block_size(req, g) % g, 0, "req={req} g={g}");
+            }
+        }
     }
 
     #[test]
@@ -373,6 +427,7 @@ mod tests {
             max_seq: 8192,
             max_batch: 512, // deliberately over-subscribed
             block_size: 256,
+            snap_granularity: 128,
         };
         let plan = plan(&nslcoder_shape(), &budget);
         if let Some(bump) = plan.bump.as_ref() {

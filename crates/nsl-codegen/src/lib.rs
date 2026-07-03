@@ -184,6 +184,7 @@ pub mod cep_search;
 pub mod cep_emit_source;
 pub mod cep_slice;
 pub mod cfie;
+pub mod cfie_cost;
 pub mod cfie_decode_attention;
 pub mod cfie_fused_sample;
 pub mod cfie_grammar;

@@ -1,8 +1,11 @@
 //! CFIE C-ABI surface.
 //!
-//! The compiled persistent-decode kernel calls these from PTX / CPU
-//! fallback.  Single-GPU builds ship working Rust implementations;
-//! multi-GPU deployments will replace them with CUDA-specific paths.
+//! The compiled serve binary calls these from host code (the decode loop
+//! and the serve-init wiring emitted by `serve.rs`).  Single-GPU builds
+//! ship working Rust implementations — the request ring is one
+//! process-global `Mutex<RingBuffer>` pushed by the host — and a
+//! GPU-side-consumer path (the persistent kernel dequeuing on-device)
+//! is the intended endpoint, not the current behaviour.
 
 use std::sync::{Mutex, OnceLock};
 

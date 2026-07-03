@@ -250,10 +250,79 @@ fn cfie_serve_block_populates_plan_from_real_inputs() {
     assert!(regs.iter().filter(|r| r.kind == 5).all(|r| r.grid_x == 4));
     assert_eq!(regs.last().unwrap().grid_x, 1);
 
+    // G22: the cost model populated the estimate, and the report prints
+    // the two paper lines (latency + throughput).  Parse the numbers
+    // rather than pinning exact floats — assert cfie < baseline, both
+    // positive, throughput positive, and ASCII-only ("us", never a
+    // Unicode micro sign).
+    let est = plan
+        .cost_estimate
+        .as_ref()
+        .expect("run_cfie_for_serve must populate the cost estimate");
+    assert!(est.cfie_us_per_token > 0.0);
+    assert!(est.baseline_us_per_token > 0.0);
+    assert!(
+        est.cfie_us_per_token < est.baseline_us_per_token,
+        "CFIE latency ({}) must beat baseline ({})",
+        est.cfie_us_per_token,
+        est.baseline_us_per_token
+    );
+    assert!(est.throughput_tok_s > 0.0);
+
     // The report renders with the real GPU + all six sections.
     let report = plan.render_report();
     assert!(report.contains("CFIE Inference Build Report"));
     assert!(report.contains("H100-SXM"));
+
+    // G22 report lines, well-formed.
+    let latency_line = report
+        .lines()
+        .find(|l| l.starts_with("Estimated decode latency:"))
+        .expect("report must contain the latency line");
+    // The estimate lines must be ASCII-only: the paper's microsecond
+    // renders as "us", never a Unicode micro sign.
+    assert!(
+        latency_line.bytes().all(|b| b < 128),
+        "latency line must be ASCII-only (us, never a Unicode micro sign): {latency_line}"
+    );
+    assert!(latency_line.contains("us/token"));
+    assert!(latency_line.contains("baseline"));
+    assert!(latency_line.contains("bandwidth-roofline model"));
+    // Parse the two floats out of "... 82.3us/token (vs 210.1us baseline) ..."
+    let nums: Vec<f64> = latency_line
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|s| !s.is_empty() && s.contains('.'))
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+    assert!(
+        nums.len() >= 2,
+        "latency line must expose two parseable floats: {latency_line}"
+    );
+    let (rep_cfie, rep_baseline) = (nums[0], nums[1]);
+    assert!(rep_cfie > 0.0 && rep_baseline > 0.0);
+    assert!(
+        rep_cfie < rep_baseline,
+        "rendered CFIE latency ({rep_cfie}) must be < baseline ({rep_baseline})"
+    );
+    let tput_line = report
+        .lines()
+        .find(|l| l.starts_with("Estimated throughput"))
+        .expect("report must contain the throughput line");
+    assert!(
+        tput_line.bytes().all(|b| b < 128),
+        "throughput line must be ASCII-only: {tput_line}"
+    );
+    assert!(tput_line.contains("tok/s"));
+    // This fixture sets max_batch: 64, so the throughput line reports
+    // the scheduler's max_active (64), not the paper's 32.
+    assert!(
+        tput_line.contains("batch=64"),
+        "throughput batch must match the fixture's max_batch: {tput_line}"
+    );
+    assert!(est.batch == 64);
+    // At least one digit in the throughput figure.
+    assert!(tput_line.chars().any(|c| c.is_ascii_digit()));
+    assert!(report.contains("cost-model assumptions:"));
     assert!(report.contains("direct-index decode attention: nsl_cfie_decode_attn emitted"));
     assert!(report.contains("persistent decode block: nsl_cfie_decode_block emitted"));
     assert!(report.contains("verify attention: nsl_cfie_spec_verify_attn emitted"));

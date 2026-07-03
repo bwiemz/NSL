@@ -579,6 +579,10 @@ pub fn prepare<'a>(
         max_seq,
         max_batch,
         block_size: 256,
+        // G24a: coalescing granularity from the GPU's warp-group width
+        // (128 on Hopper/Blackwell, 32 on older parts).  The paper's
+        // 256-token block clears the 128-token floor unchanged.
+        snap_granularity: gpu.warp_group_size(),
     };
     let lm_head = LmHeadShape {
         d_model: shape.d_model,
