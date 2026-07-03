@@ -31,18 +31,21 @@ pub fn is_gds_available() -> bool {
 // GDS read (with mmap fallback)
 // ---------------------------------------------------------------------------
 
-/// Read data from a file into a GPU buffer.
+/// Read data from a file into a GPU device buffer.
 ///
 /// If GDS is available, uses cuFileReadAsync for zero-copy NVMe→GPU DMA.
-/// Otherwise, falls back to:
-///   1. mmap the file region
-///   2. cudaMemcpyAsync from host-mapped memory to GPU
+/// Otherwise, falls back to: read the file region into a host buffer, then
+/// copy host→device (`cuMemcpyHtoD`). The fallback therefore requires the
+/// `cuda` feature; without it, a GPU destination cannot be filled and the
+/// call refuses rather than silently leaving the buffer untouched.
 ///
-/// `gpu_buf`: device pointer (must be registered with cuFileBufRegister on GDS path)
+/// `gpu_buf`: destination device pointer (must be non-null; on the GDS path it
+///            must be registered with cuFileBufRegister)
 /// `offset`: byte offset in the file
-/// `size`: number of bytes to read
+/// `size`: number of bytes to read (must be > 0)
 ///
-/// Returns 0 on success, negative on error.
+/// Returns `Ok(())` on success, `Err` on I/O failure, a null/zero-size
+/// destination, or (fallback path) a build without the `cuda` feature.
 pub fn gds_read(
     path: &Path,
     gpu_buf: *mut c_void,
@@ -72,14 +75,26 @@ fn gds_read_cufile(
     Err(io::Error::new(io::ErrorKind::Unsupported, "cuFile not linked — use mmap fallback"))
 }
 
-/// Fallback path: read file → host buffer → cudaMemcpyAsync to GPU.
+/// Fallback path: read file → host staging buffer → `cuMemcpyHtoD` to the
+/// device destination. Requires the `cuda` feature (a GPU destination cannot
+/// be filled without it); refuses null/zero-size destinations.
 fn gds_read_mmap_fallback(
     path: &Path,
-    _gpu_buf: *mut c_void,
+    gpu_buf: *mut c_void,
     offset: u64,
     size: u64,
 ) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
+
+    // Refuse loudly rather than "succeeding" without transferring anything —
+    // the previous no-op left the destination buffer untouched (garbage on
+    // the device) while returning Ok.
+    if gpu_buf.is_null() || size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gds_read: destination device buffer must be non-null and size must be > 0",
+        ));
+    }
 
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
@@ -87,11 +102,21 @@ fn gds_read_mmap_fallback(
     let mut host_buf = vec![0u8; size as usize];
     file.read_exact(&mut host_buf)?;
 
-    // On a real GPU system, we would cudaMemcpyAsync(gpu_buf, host_buf.as_ptr(), size, H2D, stream)
-    // For CPU-only testing: just verify the read succeeded
-    // The actual GPU memcpy is handled by the caller when gpu_buf is a device pointer.
-
-    Ok(())
+    // Copy the host staging buffer into the device destination. `memcpy_htod`
+    // calls `ensure_context()` internally, so no extra context management is
+    // needed here (mirrors disaggregated::checkpoint model-load staging).
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::inner::memcpy_htod(gpu_buf, host_buf.as_ptr() as *const c_void, size as usize);
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "gds_read mmap fallback: filling a GPU destination requires the cuda feature",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +196,12 @@ pub extern "C" fn nsl_data_gds_available() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use std::io::Write;
+
+    /// A non-null but never-dereferenced sentinel destination for tests that
+    /// exercise the guards / I/O errors before any device copy happens.
+    const FAKE_DST: *mut c_void = 0x1000 as *mut c_void;
 
     #[test]
     fn test_gds_not_available_by_default() {
@@ -180,32 +210,74 @@ mod tests {
     }
 
     #[test]
-    fn test_mmap_fallback_reads_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("nsl_test_gds_fallback.bin");
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(b"hello gds world!").unwrap();
-        }
+    fn mmap_fallback_refuses_null_destination() {
+        // A null destination previously "succeeded" while copying nothing.
+        let err = gds_read_mmap_fallback(Path::new("unused"), std::ptr::null_mut(), 0, 16)
+            .expect_err("null destination must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 
-        // Read via mmap fallback (gpu_buf is null — just testing the host read path)
-        let result = gds_read_mmap_fallback(&path, std::ptr::null_mut(), 0, 16);
-        assert!(result.is_ok());
-
-        // Read with offset
-        let result = gds_read_mmap_fallback(&path, std::ptr::null_mut(), 6, 3);
-        assert!(result.is_ok());
-
-        std::fs::remove_file(&path).ok();
+    #[test]
+    fn mmap_fallback_refuses_zero_size() {
+        let err = gds_read_mmap_fallback(Path::new("unused"), FAKE_DST, 0, 0)
+            .expect_err("zero size must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn test_gds_read_nonexistent_file() {
-        let result = gds_read(
-            Path::new("/nonexistent/file.bin"),
-            std::ptr::null_mut(),
-            0, 100, 0,
-        );
+        // Non-null destination so the guard passes and the file-open failure
+        // (not the null guard) is what produces the error.
+        let result = gds_read(Path::new("/nonexistent/file.bin"), FAKE_DST, 0, 100, 0);
         assert!(result.is_err());
+    }
+
+    /// Without the `cuda` feature, filling a GPU destination is impossible, so
+    /// the fallback must refuse loudly after the host read rather than
+    /// pretending to have transferred the bytes.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn mmap_fallback_refuses_without_cuda() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nsl_test_gds_nocuda_{}.bin", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"sixteen__bytes!!").unwrap();
+        }
+        let result = gds_read_mmap_fallback(&path, FAKE_DST, 0, 16);
+        std::fs::remove_file(&path).ok();
+        let err = result.expect_err("fallback must refuse a GPU destination without cuda");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// GPU correctness: the fallback stages the file bytes into a real device
+    /// buffer. Copy them back and confirm they match. Requires a GPU; run with
+    /// `--features cuda -- --include-ignored`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn mmap_fallback_h2d_copies_bytes_to_device() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nsl_test_gds_h2d_{}.bin", std::process::id()));
+        let payload: [u8; 16] = *b"GDS_H2D_PAYLOAD!";
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&payload).unwrap();
+        }
+
+        let dev = crate::cuda::inner::alloc_device(payload.len());
+        let result = gds_read_mmap_fallback(&path, dev, 0, payload.len() as u64);
+
+        let mut back = [0u8; 16];
+        crate::cuda::inner::memcpy_dtoh(
+            back.as_mut_ptr() as *mut c_void,
+            dev as *const c_void,
+            payload.len(),
+        );
+        crate::cuda::inner::free_device(dev);
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.is_ok(), "H2D fallback must succeed: {result:?}");
+        assert_eq!(back, payload, "device buffer must hold the file bytes after H2D");
     }
 }
