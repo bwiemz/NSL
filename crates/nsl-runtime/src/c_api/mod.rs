@@ -841,9 +841,20 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
 
         // Convert to f32 (the standard NSL runtime format for loaded weights).
         // Unsupported dtypes hard-error naming the tensor — the Err propagates
-        // to nsl_model_create, which does set_error + returns 0.
-        let f32_data = convert_weight_to_f32(view.dtype(), raw_data, len as usize)
-            .map_err(|e| format!("tensor '{name}' in '{path}': {e}"))?;
+        // to nsl_model_create, which does set_error + returns 0. Before bailing,
+        // free the tensors already allocated this call: they are not yet owned
+        // by any NslModel, so nothing else would ever reclaim them.
+        let f32_data = match convert_weight_to_f32(view.dtype(), raw_data, len as usize) {
+            Ok(d) => d,
+            Err(e) => {
+                for &ptr in &weight_ptrs {
+                    if ptr != 0 {
+                        crate::tensor::nsl_tensor_free(ptr);
+                    }
+                }
+                return Err(format!("tensor '{name}' in '{path}': {e}"));
+            }
+        };
 
         // Allocate NslTensor
         let data_size = (len as usize) * std::mem::size_of::<f32>();
@@ -921,8 +932,26 @@ fn convert_weight_to_f32(
                 half::bf16::from_bits(u16::from_le_bytes(bytes)).to_f32()
             })
             .collect()),
+        // Integer weights convert to f32 (same semantics as the NSL builtin
+        // safetensors loader — keeps the two loaders' supported sets in sync).
+        safetensors::Dtype::I32 => Ok(data
+            .chunks_exact(std::mem::size_of::<i32>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk.try_into().expect("i32 chunks are 4 bytes");
+                i32::from_le_bytes(bytes) as f32
+            })
+            .collect()),
+        safetensors::Dtype::I64 => Ok(data
+            .chunks_exact(std::mem::size_of::<i64>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 8] = chunk.try_into().expect("i64 chunks are 8 bytes");
+                i64::from_le_bytes(bytes) as f32
+            })
+            .collect()),
         other => Err(format!(
-            "unsupported dtype {other:?}; supported dtypes: F32, F64, F16, BF16"
+            "unsupported dtype {other:?}; supported dtypes: F32, F64, F16, BF16, I32, I64"
         )),
     }
 }
@@ -1504,5 +1533,41 @@ mod tests {
         assert!(err.contains("quant.blob"), "error must name the tensor: {err}");
         assert!(err.contains("U8"), "error must name the dtype: {err}");
         nsl_clear_error();
+    }
+
+    /// I32/I64 checkpoints load via the C-API path (parity with the NSL builtin
+    /// safetensors loader, which already supported them).
+    #[cfg(feature = "interop")]
+    #[test]
+    fn convert_weight_to_f32_supports_i32_i64() {
+        let i32_bytes = (-3i32).to_le_bytes();
+        let i32_out = convert_weight_to_f32(safetensors::Dtype::I32, &i32_bytes, 1).unwrap();
+        assert_eq!(i32_out, vec![-3.0f32]);
+
+        let i64_bytes = 7i64.to_le_bytes();
+        let i64_out = convert_weight_to_f32(safetensors::Dtype::I64, &i64_bytes, 1).unwrap();
+        assert_eq!(i64_out, vec![7.0f32]);
+
+        // The refusal list now advertises I32/I64 too.
+        let err = convert_weight_to_f32(safetensors::Dtype::U8, &[0u8], 1).unwrap_err();
+        for supported in ["F32", "F64", "F16", "BF16", "I32", "I64"] {
+            assert!(err.contains(supported), "error must list {supported}: {err}");
+        }
+    }
+
+    /// The mid-loop refusal frees the tensors allocated for earlier entries
+    /// (they are not yet owned by any NslModel). Calling twice would abort on a
+    /// double-free if the cleanup were wrong, so a clean second failure pins the
+    /// no-leak / no-double-free error path.
+    #[cfg(feature = "interop")]
+    #[test]
+    fn load_safetensors_weights_error_path_is_clean_and_repeatable() {
+        let tmp = write_temp_safetensors_with_u8_tensor();
+        let path = tmp.path().to_str().unwrap();
+
+        for _ in 0..2 {
+            let err = load_safetensors_weights(path).unwrap_err();
+            assert!(err.contains("quant.blob"), "error must name the tensor: {err}");
+        }
     }
 }
