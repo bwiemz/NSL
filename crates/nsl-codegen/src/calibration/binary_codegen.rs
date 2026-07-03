@@ -233,7 +233,22 @@ pub fn real_subprocess_entry(
     };
 
     // Spawn the subprocess passing paths as CLI args.
-    let data_path_str = cfg.calibration_data.to_string_lossy().into_owned();
+    //
+    // Test-only fault injection: `runtime_data_override` swaps the data file
+    // the SUBPROCESS reads at runtime (argv[1]) without touching the
+    // compile-time shape derivation above (`peek_batch_seq` on
+    // `calibration_data`). This is the only seam that consults the override;
+    // it exists so e2e tests can reach the wrapper's status-3 per-batch
+    // shape-mismatch refusal, which is otherwise unsatisfiable because
+    // compile-time and runtime read the same file. Production always sets
+    // it to None, and the cached driver (`run_harness_simulated`) rejects
+    // Some(_) outright to protect cache-key integrity.
+    let data_path_str = cfg
+        .runtime_data_override
+        .as_ref()
+        .unwrap_or(&cfg.calibration_data)
+        .to_string_lossy()
+        .into_owned();
     let sidecar_path_str = sidecar_path.to_string_lossy().into_owned();
     let outcome = run_subprocess(
         &binary_path,

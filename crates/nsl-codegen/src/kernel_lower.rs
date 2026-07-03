@@ -3,8 +3,13 @@
 //!
 //! Translates a parsed `KernelDef` AST node into the backend-agnostic `KernelIR`.
 //! Handles the portable subset: arithmetic, thread indexing, memory access, barriers.
-//! Complex kernel bodies that use NSL features beyond the portable subset should
-//! fall back to the existing direct AST->PTX path in `kernel.rs`.
+//! Kernel bodies that use NSL features beyond the portable subset are REFUSED
+//! with a `CodegenError` — there is NO automatic fallback to the direct
+//! AST->PTX path in `kernel.rs` (that path is only dispatched for the default
+//! CUDA target; this KIR path serves `--target rocm|metal|webgpu`). Stores
+//! (`out[i] = v`) and control flow on this path are deferred to M47c, so the
+//! statement lowering refuses them loudly rather than silently dropping them
+//! into corrupt generated artifacts.
 //!
 //! ## Type Inference
 //! Parameters carry their AST type annotations through to KIR via a type map.
@@ -21,7 +26,9 @@ use nsl_ast::stmt::{Block, StmtKind};
 use nsl_ast::types::TypeExprKind;
 use nsl_lexer::Interner;
 
+use crate::error::CodegenError;
 use crate::gpu_target::GpuTarget;
+use crate::kernel::{binop_symbol, expr_kind_name, stmt_kind_name};
 use crate::kernel_ir::*;
 
 // ---------------------------------------------------------------------------
@@ -170,8 +177,14 @@ pub fn build_param_type_map(kernel: &KernelDef, interner: &Interner) -> HashMap<
 /// - `interner`: string interner for resolving symbol names
 /// - `_target`: the GPU target (used for feature validation in future)
 ///
-/// Returns a `KernelIR` ready for backend lowering (e.g., `backend_ptx::lower_kir_to_ptx`).
-pub fn lower_kernel_to_ir(kernel: &KernelDef, interner: &Interner, _target: GpuTarget) -> KernelIR {
+/// Returns a `KernelIR` ready for backend lowering (e.g., `backend_ptx::lower_kir_to_ptx`),
+/// or a `CodegenError` refusal when the kernel body uses constructs outside the
+/// portable KIR subset (M47c defers stores and control flow on this path).
+pub fn lower_kernel_to_ir(
+    kernel: &KernelDef,
+    interner: &Interner,
+    _target: GpuTarget,
+) -> Result<KernelIR, CodegenError> {
     let name = interner
         .resolve(kernel.name.0)
         .unwrap_or("__kernel")
@@ -207,13 +220,13 @@ pub fn lower_kernel_to_ir(kernel: &KernelDef, interner: &Interner, _target: GpuT
     lowerer.builder.set_block(entry);
 
     // Lower body statements
-    lower_block(&mut lowerer, &kernel.body, interner);
+    lower_block(&mut lowerer, &kernel.body, interner)?;
 
     // Terminate the current block if not already terminated
     lowerer.builder.terminate(KirTerminator::Return);
 
     lowerer.builder.set_workgroup_size([256, 1, 1]);
-    lowerer.builder.finalize()
+    Ok(lowerer.builder.finalize())
 }
 
 /// Internal lowering state.
@@ -223,6 +236,8 @@ struct KernelLowerer {
     var_map: HashMap<String, VarId>,
     /// Map from variable name -> KirType (for type propagation)
     type_map: HashMap<String, KirType>,
+    /// Kernel name, used in refusal diagnostics.
+    kernel_name: String,
 }
 
 impl KernelLowerer {
@@ -231,6 +246,7 @@ impl KernelLowerer {
             builder: KirBuilder::new(name),
             var_map: HashMap::new(),
             type_map: HashMap::new(),
+            kernel_name: name.to_string(),
         }
     }
 
@@ -239,37 +255,73 @@ impl KernelLowerer {
     fn var_type(&self, name: &str) -> KirType {
         self.type_map.get(name).cloned().unwrap_or(KirType::F32)
     }
-}
 
-/// Lower a block of statements.
-fn lower_block(lowerer: &mut KernelLowerer, block: &Block, interner: &Interner) {
-    for stmt in &block.stmts {
-        lower_stmt(lowerer, stmt, interner);
+    /// Build a refusal error for a construct outside the portable KIR subset.
+    fn refuse(&self, construct: &str, detail: &str) -> CodegenError {
+        CodegenError::new(format!(
+            "kernel '{}': {} is not supported by the portable KIR lowering used \
+             for non-CUDA GPU targets (rocm/metal/webgpu). {}",
+            self.kernel_name, construct, detail
+        ))
     }
 }
 
+/// Standard detail text for KIR-path statement refusals: cites the M47c
+/// deferral so the error reads as "not yet implemented", not a regression.
+const KIR_M47C_DETAIL: &str = "Stores (`out[i] = v`), `if`, and loops on this \
+path land with M47c; until then the KIR lowering handles only straight-line \
+`let` bindings and expression statements over arithmetic, comparisons, element \
+loads (a[i]), and the builtins thread_id(), block_idx(), block_dim(), \
+global_id(), sync_threads(). Non-CUDA targets cannot execute kernels at \
+runtime before M47c; use the default CUDA target for runnable kernels.";
+
+/// Lower a block of statements.
+fn lower_block(
+    lowerer: &mut KernelLowerer,
+    block: &Block,
+    interner: &Interner,
+) -> Result<(), CodegenError> {
+    for stmt in &block.stmts {
+        lower_stmt(lowerer, stmt, interner)?;
+    }
+    Ok(())
+}
+
 /// Lower a single statement.
-fn lower_stmt(lowerer: &mut KernelLowerer, stmt: &nsl_ast::stmt::Stmt, interner: &Interner) {
+fn lower_stmt(
+    lowerer: &mut KernelLowerer,
+    stmt: &nsl_ast::stmt::Stmt,
+    interner: &Interner,
+) -> Result<(), CodegenError> {
     match &stmt.kind {
         StmtKind::VarDecl { pattern, value, .. } => {
             // Extract variable name from pattern
-            if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
-                let name = interner.resolve(sym.0).unwrap_or("_v").to_string();
-                if let Some(expr) = value {
-                    let (var_id, inferred_type) = lower_expr_typed(lowerer, expr, interner);
-                    lowerer.var_map.insert(name.clone(), var_id);
-                    // Task 5: record inferred type for this local variable
-                    lowerer.type_map.insert(name, inferred_type);
-                }
-            }
+            let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind else {
+                return Err(lowerer.refuse("destructuring `let` pattern", KIR_M47C_DETAIL));
+            };
+            let name = interner.resolve(sym.0).unwrap_or("_v").to_string();
+            let Some(expr) = value else {
+                return Err(
+                    lowerer.refuse("`let` declaration without an initializer", KIR_M47C_DETAIL)
+                );
+            };
+            let (var_id, inferred_type) = lower_expr_typed(lowerer, expr, interner)?;
+            lowerer.var_map.insert(name.clone(), var_id);
+            // Task 5: record inferred type for this local variable
+            lowerer.type_map.insert(name, inferred_type);
+            Ok(())
         }
         StmtKind::Expr(expr) => {
             // Expression statement (e.g., function call like sync_threads())
-            lower_expr_typed(lowerer, expr, interner);
+            lower_expr_typed(lowerer, expr, interner)?;
+            Ok(())
         }
-        _ => {
-            // Other statement kinds (if/else, for, etc.) are not yet supported
-            // in the portable KIR lowering. They fall back to direct AST->PTX.
+        other => {
+            // Statement kinds outside the portable KIR subset (assignments /
+            // stores, if/else, loops, ...) used to be SILENTLY DROPPED here,
+            // corrupting the generated artifact. Refuse loudly instead; the
+            // capability is deferred to M47c.
+            Err(lowerer.refuse(stmt_kind_name(other), KIR_M47C_DETAIL))
         }
     }
 }
@@ -292,7 +344,7 @@ fn lower_expr_typed(
     lowerer: &mut KernelLowerer,
     expr: &Expr,
     interner: &Interner,
-) -> (VarId, KirType) {
+) -> Result<(VarId, KirType), CodegenError> {
     match &expr.kind {
         ExprKind::IntLiteral(val) => {
             let dst = lowerer.builder.new_typed_var(KirType::U32);
@@ -303,7 +355,7 @@ fn lower_expr_typed(
                     value: ConstValue::U32(*val as u32),
                 },
             ));
-            (dst, KirType::U32)
+            Ok((dst, KirType::U32))
         }
         ExprKind::FloatLiteral(val) => {
             let dst = lowerer.builder.new_typed_var(KirType::F32);
@@ -314,22 +366,28 @@ fn lower_expr_typed(
                     value: ConstValue::F32(*val as f32),
                 },
             ));
-            (dst, KirType::F32)
+            Ok((dst, KirType::F32))
         }
         ExprKind::Ident(sym) => {
             let name = interner.resolve(sym.0).unwrap_or("_");
             if let Some(&var_id) = lowerer.var_map.get(name) {
                 let ty = lowerer.var_type(name);
-                (var_id, ty)
+                Ok((var_id, ty))
             } else {
-                // Unknown variable -- allocate a placeholder
-                let dst = lowerer.builder.new_typed_var(KirType::U32);
-                (dst, KirType::U32)
+                // Unknown variable — used to fabricate an UNINITIALIZED
+                // placeholder register. Refuse instead.
+                Err(CodegenError::new(format!(
+                    "kernel '{}': unknown identifier '{}' in kernel body. Kernel \
+                     code can only reference kernel parameters and locals declared \
+                     with `let` inside the kernel; module-level constants are not \
+                     visible here - pass the value as a kernel parameter.",
+                    lowerer.kernel_name, name
+                )))
             }
         }
         ExprKind::BinaryOp { left, op, right } => {
-            let (a, a_ty) = lower_expr_typed(lowerer, left, interner);
-            let (b, b_ty) = lower_expr_typed(lowerer, right, interner);
+            let (a, a_ty) = lower_expr_typed(lowerer, left, interner)?;
+            let (b, b_ty) = lower_expr_typed(lowerer, right, interner)?;
 
             // Comparison operators always produce Bool
             match op {
@@ -345,7 +403,7 @@ fn lower_expr_typed(
                     };
                     let cmp_dst = lowerer.builder.new_typed_var(KirType::Bool);
                     lowerer.builder.emit(KirOp::Cmp(cmp_dst, a, b, cmp_op));
-                    return (cmp_dst, KirType::Bool);
+                    return Ok((cmp_dst, KirType::Bool));
                 }
                 _ => {}
             }
@@ -379,56 +437,86 @@ fn lower_expr_typed(
                 BinOp::Sub => KirOp::Sub(dst, a, b),
                 BinOp::Mul => KirOp::Mul(dst, a, b),
                 BinOp::Div => KirOp::Div(dst, a, b),
-                _ => {
-                    // Unsupported binary op -- return a as fallback
-                    return (a, result_ty);
+                other => {
+                    // Unsupported binary op — used to silently REUSE the left
+                    // operand as the "result". Refuse instead.
+                    return Err(CodegenError::new(format!(
+                        "kernel '{}': binary operator '{}' is not supported by the \
+                         portable KIR lowering. Supported arithmetic: + - * /; \
+                         supported comparisons: < <= > >= == !=.",
+                        lowerer.kernel_name,
+                        binop_symbol(*other)
+                    )));
                 }
             };
             lowerer.builder.emit(kir_op);
-            (dst, result_ty)
+            Ok((dst, result_ty))
         }
         ExprKind::Call { callee, args: _ } => {
             // Recognize builtins: thread_id(), sync_threads(), block_idx(), etc.
-            if let ExprKind::Ident(sym) = &callee.kind {
-                let name = interner.resolve(sym.0).unwrap_or("");
-                match name {
-                    "thread_id" => {
-                        let dst = lowerer.builder.new_typed_var(KirType::U32);
-                        lowerer.builder.emit(KirOp::ThreadId(dst, 0));
-                        return (dst, KirType::U32);
-                    }
-                    "block_idx" => {
-                        let dst = lowerer.builder.new_typed_var(KirType::U32);
-                        lowerer.builder.emit(KirOp::BlockIdx(dst, 0));
-                        return (dst, KirType::U32);
-                    }
-                    "block_dim" => {
-                        let dst = lowerer.builder.new_typed_var(KirType::U32);
-                        lowerer.builder.emit(KirOp::BlockDim(dst, 0));
-                        return (dst, KirType::U32);
-                    }
-                    "global_id" => {
-                        let dst = lowerer.builder.new_typed_var(KirType::U32);
-                        lowerer.builder.emit(KirOp::GlobalId(dst, 0));
-                        return (dst, KirType::U32);
-                    }
-                    "sync_threads" => {
-                        lowerer.builder.emit(KirOp::Barrier);
-                        // Barrier has no result value; return a dummy
-                        let dst = lowerer.builder.new_typed_var(KirType::U32);
-                        return (dst, KirType::U32);
-                    }
-                    _ => {}
+            let ExprKind::Ident(sym) = &callee.kind else {
+                return Err(lowerer.refuse(
+                    "an indirect or method call",
+                    "Only direct calls to the kernel builtins thread_id(), \
+                     block_idx(), block_dim(), global_id(), sync_threads() are supported.",
+                ));
+            };
+            let name = interner.resolve(sym.0).unwrap_or("");
+            match name {
+                "thread_id" => {
+                    let dst = lowerer.builder.new_typed_var(KirType::U32);
+                    lowerer.builder.emit(KirOp::ThreadId(dst, 0));
+                    Ok((dst, KirType::U32))
+                }
+                "block_idx" => {
+                    let dst = lowerer.builder.new_typed_var(KirType::U32);
+                    lowerer.builder.emit(KirOp::BlockIdx(dst, 0));
+                    Ok((dst, KirType::U32))
+                }
+                "block_dim" => {
+                    let dst = lowerer.builder.new_typed_var(KirType::U32);
+                    lowerer.builder.emit(KirOp::BlockDim(dst, 0));
+                    Ok((dst, KirType::U32))
+                }
+                "global_id" => {
+                    let dst = lowerer.builder.new_typed_var(KirType::U32);
+                    lowerer.builder.emit(KirOp::GlobalId(dst, 0));
+                    Ok((dst, KirType::U32))
+                }
+                "sync_threads" => {
+                    lowerer.builder.emit(KirOp::Barrier);
+                    // Barrier has no result value; return a DEFINED zero so a
+                    // (nonsensical but legal) `let x = sync_threads()` cannot
+                    // bind an uninitialized KIR value. Mirrors the CUDA path,
+                    // which zero-initializes its dummy register.
+                    let dst = lowerer.builder.new_typed_var(KirType::U32);
+                    lowerer.builder.emit(KirOp::Const(
+                        dst,
+                        KirConst {
+                            ty: KirType::U32,
+                            value: ConstValue::U32(0),
+                        },
+                    ));
+                    Ok((dst, KirType::U32))
+                }
+                _ => {
+                    // Unrecognized call — used to fabricate a fresh F32 with no
+                    // defining op (uninitialized value). Refuse instead.
+                    Err(CodegenError::new(format!(
+                        "kernel '{}': call to unsupported function '{}' in kernel \
+                         body. Supported kernel builtins on the portable KIR path: \
+                         thread_id(), block_idx(), block_dim(), global_id(), \
+                         sync_threads(). Math intrinsics (sqrt, exp, ...) are not \
+                         implemented.",
+                        lowerer.kernel_name, name
+                    )))
                 }
             }
-            // Unrecognized call -- return a placeholder
-            let dst = lowerer.builder.new_typed_var(KirType::F32);
-            (dst, KirType::F32)
         }
         ExprKind::Subscript { object, index } => {
             // a[tid] -> PtrOffset + Load
             // The loaded value's type comes from dereferencing the pointer type.
-            let (base, base_ty) = lower_expr_typed(lowerer, object, interner);
+            let (base, base_ty) = lower_expr_typed(lowerer, object, interner)?;
 
             // Determine the element type by dereferencing the pointer
             let elem_ty = match &base_ty {
@@ -436,39 +524,56 @@ fn lower_expr_typed(
                 _ => KirType::F32, // fallback
             };
 
-            if let SubscriptKind::Index(idx_expr) = index.as_ref() {
-                let (offset, _) = lower_expr_typed(lowerer, idx_expr, interner);
-                let addr = lowerer.builder.new_typed_var(KirType::Ptr(
-                    Box::new(elem_ty.clone()),
-                    AddressSpace::Global,
+            let SubscriptKind::Index(idx_expr) = index.as_ref() else {
+                // Unsupported subscript kind — used to fabricate an undefined
+                // variable of the element type. Refuse instead.
+                return Err(lowerer.refuse(
+                    "slice / multi-dimensional subscript",
+                    "Only single-element indexing, e.g. `a[i]`, is supported.",
                 ));
-                lowerer.builder.emit(KirOp::PtrOffset(addr, base, offset));
-                let val = lowerer.builder.new_typed_var(elem_ty.clone());
-                lowerer
-                    .builder
-                    .emit(KirOp::Load(val, addr, AddressSpace::Global));
-                (val, elem_ty)
-            } else {
-                // Unsupported subscript kind
-                let dst = lowerer.builder.new_typed_var(elem_ty.clone());
-                (dst, elem_ty)
-            }
+            };
+            let (offset, _) = lower_expr_typed(lowerer, idx_expr, interner)?;
+            let addr = lowerer.builder.new_typed_var(KirType::Ptr(
+                Box::new(elem_ty.clone()),
+                AddressSpace::Global,
+            ));
+            lowerer.builder.emit(KirOp::PtrOffset(addr, base, offset));
+            let val = lowerer.builder.new_typed_var(elem_ty.clone());
+            lowerer
+                .builder
+                .emit(KirOp::Load(val, addr, AddressSpace::Global));
+            Ok((val, elem_ty))
         }
         ExprKind::UnaryOp { op, operand } => {
-            let (src, src_ty) = lower_expr_typed(lowerer, operand, interner);
+            let (src, src_ty) = lower_expr_typed(lowerer, operand, interner)?;
             match op {
                 nsl_ast::operator::UnaryOp::Neg => {
                     let dst = lowerer.builder.new_typed_var(src_ty.clone());
                     lowerer.builder.emit(KirOp::Neg(dst, src));
-                    (dst, src_ty)
+                    Ok((dst, src_ty))
                 }
-                _ => (src, src_ty),
+                nsl_ast::operator::UnaryOp::Not => {
+                    // Used to silently return the operand UNCHANGED (i.e. `not x`
+                    // evaluated to `x`). Refuse instead.
+                    Err(lowerer.refuse(
+                        "the unary `not` operator",
+                        "Only unary negation (`-x`) is supported.",
+                    ))
+                }
             }
         }
-        _ => {
-            // Unsupported expression -- return a placeholder variable
-            let dst = lowerer.builder.new_typed_var(KirType::F32);
-            (dst, KirType::F32)
+        // `(a + b) * 0.5` — parentheses are pure grouping; lower the inner
+        // expression directly.
+        ExprKind::Paren(inner) => lower_expr_typed(lowerer, inner, interner),
+        other => {
+            // Unsupported expression — used to fabricate an undefined F32
+            // placeholder variable. Refuse instead.
+            Err(lowerer.refuse(
+                &format!("{} expression", expr_kind_name(other)),
+                "Only literals, identifiers, arithmetic/comparison binary ops, \
+                 unary negation, element loads (a[i]), and the kernel builtins \
+                 are supported on the portable KIR path.",
+            ))
         }
     }
 }
@@ -476,8 +581,12 @@ fn lower_expr_typed(
 /// Legacy wrapper: lower an expression returning only the VarId.
 /// Used by code that doesn't need the type information.
 #[allow(dead_code)]
-fn lower_expr(lowerer: &mut KernelLowerer, expr: &Expr, interner: &Interner) -> VarId {
-    lower_expr_typed(lowerer, expr, interner).0
+fn lower_expr(
+    lowerer: &mut KernelLowerer,
+    expr: &Expr,
+    interner: &Interner,
+) -> Result<VarId, CodegenError> {
+    Ok(lower_expr_typed(lowerer, expr, interner)?.0)
 }
 
 #[cfg(test)]
@@ -824,7 +933,8 @@ mod tests {
         let entry = lowerer.builder.new_block();
         lowerer.builder.set_block(entry);
 
-        let (_, result_ty) = lower_expr_typed(&mut lowerer, &add_expr, &interner);
+        let (_, result_ty) = lower_expr_typed(&mut lowerer, &add_expr, &interner)
+            .expect("typed add expression must lower");
         assert_eq!(
             result_ty,
             KirType::F64,
@@ -907,7 +1017,8 @@ mod tests {
         let entry = lowerer.builder.new_block();
         lowerer.builder.set_block(entry);
 
-        let (_, result_ty) = lower_expr_typed(&mut lowerer, &add_expr, &interner);
+        let (_, result_ty) = lower_expr_typed(&mut lowerer, &add_expr, &interner)
+            .expect("typed add expression must lower");
         assert_eq!(result_ty, KirType::F32, "I32 + F32 should promote to F32");
     }
 
@@ -919,7 +1030,8 @@ mod tests {
     fn test_lower_empty_kernel() {
         let mut interner = make_interner();
         let kernel = make_empty_kernel(&mut interner);
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
 
         assert_eq!(ir.name, "test_kernel");
         assert_eq!(ir.params.len(), 0);
@@ -931,7 +1043,8 @@ mod tests {
     fn test_lower_params() {
         let mut interner = make_interner();
         let kernel = make_kernel_with_params(&mut interner);
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
 
         assert_eq!(ir.name, "add_kernel");
         assert_eq!(ir.params.len(), 2);
@@ -978,7 +1091,8 @@ mod tests {
             span: dummy_span(),
         };
 
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
 
         assert_eq!(
             ir.params[0].ty,
@@ -1044,7 +1158,8 @@ mod tests {
             span: dummy_span(),
         };
 
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
 
         // Should have ops: Const(1.0), Const(2.0), Add
         assert!(
@@ -1092,7 +1207,8 @@ mod tests {
             span: dummy_span(),
         };
 
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
 
         // sync_threads() should set SHARED_MEMORY feature
         assert!(
@@ -1108,12 +1224,45 @@ mod tests {
 
     #[test]
     fn test_local_variable_type_inference() {
-        // let x = a[idx]  -> x should be F64 if a is Ptr(F64)
+        // let idx = global_id(); let x = a[idx]  -> x should be F64 if a is Ptr(F64)
+        //
+        // NOTE: this test originally referenced `idx` WITHOUT declaring it,
+        // relying on the old fabrication path that minted an uninitialized
+        // placeholder for unknown identifiers. Unknown identifiers now refuse
+        // (deferral-must-refuse), so the test declares `idx` properly.
         let mut interner = make_interner();
         let name_sym = nsl_ast::Symbol(interner.get_or_intern("local_infer_kernel"));
         let a_sym_param = nsl_ast::Symbol(interner.get_or_intern("a"));
         let idx_sym = nsl_ast::Symbol(interner.get_or_intern("idx"));
         let x_sym = nsl_ast::Symbol(interner.get_or_intern("x"));
+
+        // Build: let idx = global_id()
+        let global_id_call = Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(Expr {
+                    kind: ExprKind::Ident(nsl_ast::Symbol(interner.get_or_intern("global_id"))),
+                    span: dummy_span(),
+                    id: NodeId::next(),
+                }),
+                args: Vec::new(),
+            },
+            span: dummy_span(),
+            id: NodeId::next(),
+        };
+        let idx_decl = Stmt {
+            kind: StmtKind::VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: PatternKind::Ident(idx_sym),
+                    span: dummy_span(),
+                    id: NodeId::next(),
+                },
+                type_ann: None,
+                value: Some(global_id_call),
+            },
+            span: dummy_span(),
+            id: NodeId::next(),
+        };
 
         // Build: let x = a[idx]
         let a_subscript = Expr {
@@ -1159,14 +1308,15 @@ mod tests {
             }],
             return_type: None,
             body: Block {
-                stmts: vec![var_decl],
+                stmts: vec![idx_decl, var_decl],
                 span: dummy_span(),
             },
             decorators: Vec::new(),
             span: dummy_span(),
         };
 
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
 
         // The load from a[idx] should produce an F64 value.
         // Check that the loaded variable has F64 type in var_types.
@@ -1323,7 +1473,8 @@ mod tests {
             span: dummy_span(),
         };
 
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
         let ptx_bytes = crate::backend_ptx::lower_kir_to_ptx(&ir);
         let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]).to_string();
 
@@ -1467,7 +1618,8 @@ mod tests {
             span: dummy_span(),
         };
 
-        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda);
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("portable-subset kernel must lower");
         let ptx_bytes = crate::backend_ptx::lower_kir_to_ptx(&ir);
         let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]).to_string();
 
@@ -1516,5 +1668,121 @@ mod tests {
         assert_eq!(dtype_str_to_kir("bool"), KirType::Bool);
         assert_eq!(dtype_str_to_kir("fp8"), KirType::F16);
         assert_eq!(dtype_str_to_kir("unknown"), KirType::F32); // fallback
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusal coverage: constructs outside the portable KIR subset must
+    // produce a loud CodegenError instead of fabricating values / silently
+    // dropping statements.
+    // -----------------------------------------------------------------------
+
+    /// Parse NSL source and return the first `kernel` definition found.
+    fn parse_first_kernel(src: &str) -> (KernelDef, Interner) {
+        let mut interner = make_interner();
+        let (tokens, lex_diags) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let errs: Vec<_> = lex_diags
+            .iter()
+            .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+            .collect();
+        assert!(errs.is_empty(), "lex errors: {errs:?}");
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        let errs: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+            .collect();
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        for stmt in &parsed.module.stmts {
+            if let StmtKind::KernelDef(k) = &stmt.kind {
+                return (k.clone(), interner);
+            }
+        }
+        panic!("no kernel definition in test source");
+    }
+
+    /// Lower the first kernel in `src`, expecting a refusal; returns the message.
+    fn lower_err(src: &str) -> String {
+        let (kernel, interner) = parse_first_kernel(src);
+        match lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda) {
+            Ok(_) => panic!("expected refusal, but kernel lowered successfully"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_paren_expression_lowers_as_grouping() {
+        // `(1.0 + 2.0) * 0.5` — parentheses are pure grouping and must lower
+        // via the inner expression (the old catch-all fabricated an undefined
+        // F32 placeholder for Paren).
+        let (kernel, interner) =
+            parse_first_kernel("kernel k_paren(a):\n    let x = (1.0 + 2.0) * 0.5\n");
+        lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("parenthesized arithmetic must lower");
+    }
+
+    #[test]
+    fn test_refuses_store_with_m47c_deferral() {
+        // Stores are unimplemented on the KIR path (silently dropped before
+        // this change); the refusal must cite the M47c deferral.
+        let err = lower_err(
+            "kernel k_store(a, out):\n    let i = thread_id()\n    out[i] = a[i]\n",
+        );
+        assert!(err.contains("k_store"), "err: {err}");
+        assert!(err.contains("assignment"), "err: {err}");
+        assert!(err.contains("M47c"), "err: {err}");
+    }
+
+    #[test]
+    fn test_refuses_if_stmt_with_m47c_deferral() {
+        let err = lower_err(
+            "kernel k_if(a):\n    let i = thread_id()\n    if i < 4:\n        let x = a[i]\n",
+        );
+        assert!(err.contains("if statement"), "err: {err}");
+        assert!(err.contains("M47c"), "err: {err}");
+    }
+
+    #[test]
+    fn test_refuses_for_loop_with_m47c_deferral() {
+        let err = lower_err(
+            "kernel k_for(a):\n    for j in range(0, 4):\n        let x = a[j]\n",
+        );
+        assert!(err.contains("for loop"), "err: {err}");
+        assert!(err.contains("M47c"), "err: {err}");
+    }
+
+    #[test]
+    fn test_refuses_unknown_identifier() {
+        let err = lower_err("kernel k_ident(a):\n    let x = MISSING\n");
+        assert!(err.contains("MISSING"), "err: {err}");
+        assert!(err.contains("unknown identifier"), "err: {err}");
+    }
+
+    #[test]
+    fn test_refuses_unknown_call() {
+        let err = lower_err("kernel k_call(a):\n    let x = sqrt(2.0)\n");
+        assert!(err.contains("sqrt"), "err: {err}");
+        assert!(err.contains("global_id"), "err: {err}");
+    }
+
+    #[test]
+    fn test_refuses_mod_binop() {
+        let err = lower_err("kernel k_mod(a):\n    let x = 5 % 2\n");
+        assert!(err.contains("'%'"), "err: {err}");
+    }
+
+    #[test]
+    fn test_refuses_unary_not() {
+        let err = lower_err("kernel k_not(a):\n    let x = not 1\n");
+        assert!(err.contains("not"), "err: {err}");
+    }
+
+    #[test]
+    fn test_eq_comparison_is_supported_on_kir_path() {
+        // Contrast with kernel.rs: the KIR path DOES lower == (CmpOp::Eq).
+        let (kernel, interner) =
+            parse_first_kernel("kernel k_eq(a):\n    let x = 1 == 2\n");
+        let ir = lower_kernel_to_ir(&kernel, &interner, GpuTarget::Cuda)
+            .expect("== comparison must lower on the KIR path");
+        assert!(ir.is_well_formed());
     }
 }

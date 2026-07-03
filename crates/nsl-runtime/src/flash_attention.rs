@@ -4199,8 +4199,27 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
     }
 }
 
-/// Free the 5 HBM buffers allocated by `nsl_csha_alloc_backward_activations`.
+/// Free the 6 HBM buffers allocated by `nsl_csha_alloc_backward_activations`.
 /// Safe to call with zero pointers — they are silently skipped.
+///
+/// The buffers come from `inner::alloc_device` (raw `cuMemAlloc`), so they
+/// MUST be released via `inner::free_device` (raw `cuMemFree`) — the
+/// documented pair.  This function previously routed through
+/// `inner::free_managed`, which consults `CUDA_ALLOC_SET` (populated only
+/// by `alloc_managed`) and silently early-returns for unregistered
+/// pointers: every "free" was a no-op and each alloc/free cycle leaked all
+/// six buffers (~B*H*S*(10*D+8) bytes per CSHA layer per step).
+///
+/// Synchronizes the context before freeing when any pointer is live:
+/// callers invoke this right after asynchronous kernel launches that still
+/// read/write the buffers (`nsl_flash_attention_csha_backward` on the
+/// @train path; the with-saves forward on the scope-immediate inference
+/// path in `expr/advanced.rs`), and `kernel_launch` does NOT synchronize
+/// (outside opt-in `--cuda-sync`).  Same sync-then-free pattern as
+/// `PrepassScratch::drop`.  Do NOT "fix" the pairing by registering the
+/// pointers in `CUDA_ALLOC_SET` instead — that would route the frees
+/// through the caching allocator, whose reuse semantics differ from raw
+/// `cuMemFree`.
 #[no_mangle]
 pub unsafe extern "C" fn nsl_csha_free_backward_activations(
     a: CshaBackwardActivations,
@@ -4208,12 +4227,23 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations(
     #[cfg(feature = "cuda")]
     {
         use crate::cuda::inner;
-        if a.q_proj != 0 { inner::free_managed(a.q_proj as *mut std::ffi::c_void); }
-        if a.k_proj != 0 { inner::free_managed(a.k_proj as *mut std::ffi::c_void); }
-        if a.v_proj != 0 { inner::free_managed(a.v_proj as *mut std::ffi::c_void); }
-        if a.row_max != 0 { inner::free_managed(a.row_max as *mut std::ffi::c_void); }
-        if a.row_sum != 0 { inner::free_managed(a.row_sum as *mut std::ffi::c_void); }
-        if a.x_raw != 0 { inner::free_managed(a.x_raw as *mut std::ffi::c_void); }
+        let any_live = a.q_proj != 0
+            || a.k_proj != 0
+            || a.v_proj != 0
+            || a.row_max != 0
+            || a.row_sum != 0
+            || a.x_raw != 0;
+        if !any_live {
+            return;
+        }
+        inner::ensure_context();
+        cudarc::driver::sys::cuCtxSynchronize();
+        if a.q_proj != 0 { inner::free_device(a.q_proj as *mut std::ffi::c_void); }
+        if a.k_proj != 0 { inner::free_device(a.k_proj as *mut std::ffi::c_void); }
+        if a.v_proj != 0 { inner::free_device(a.v_proj as *mut std::ffi::c_void); }
+        if a.row_max != 0 { inner::free_device(a.row_max as *mut std::ffi::c_void); }
+        if a.row_sum != 0 { inner::free_device(a.row_sum as *mut std::ffi::c_void); }
+        if a.x_raw != 0 { inner::free_device(a.x_raw as *mut std::ffi::c_void); }
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = a; }
@@ -4295,6 +4325,50 @@ mod tests {
         assert_ne!(r.row_sum, 0, "row_sum alloc failed");
         assert_ne!(r.x_raw, 0, "x_raw alloc failed");
         unsafe { nsl_csha_free_backward_activations(r); }
+    }
+
+    /// Leak regression for the alloc/free pairing bug (2026-07-02):
+    /// the six save buffers come from `inner::alloc_device` (raw
+    /// `cuMemAlloc`, never registered in `CUDA_ALLOC_SET`), but
+    /// `nsl_csha_free_backward_activations` used to free them via
+    /// `inner::free_managed`, which silently early-returns for
+    /// unregistered pointers.  Every free was a no-op, so each
+    /// alloc→free cycle leaked all six buffers.
+    ///
+    /// Detection: loop alloc→free 50× on a ~5 MB buffer set and compare
+    /// driver-reported free memory (`cuMemGetInfo`) before vs. after.
+    /// Broken pairing leaks ~250 MB; the assertion threshold of 128 MB
+    /// leaves generous headroom for concurrent tests / desktop VRAM
+    /// noise while still catching the regression by a wide margin.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn csha_free_backward_activations_returns_memory_to_driver() {
+        // batch=2, heads=8, seq=512, head_dim=64:
+        //   q/k/v_proj: 2*8*512*64 f16 = 1 MB each
+        //   row_max/row_sum: 2*8*512 f32 = 32 KB each
+        //   x_raw: 2*8*512*64 f32 = 2 MB
+        // ≈ 5.06 MB per iteration, ≈ 253 MB across 50 iterations.
+        const ITERS: usize = 50;
+        const MAX_ALLOWED_DROP_BYTES: usize = 128 * 1024 * 1024;
+
+        let (free_before, _total) = crate::cuda::inner::query_vram();
+        for _ in 0..ITERS {
+            let r = unsafe { nsl_csha_alloc_backward_activations(2, 8, 512, 64) };
+            assert_ne!(r.q_proj, 0, "q_proj alloc failed");
+            assert_ne!(r.x_raw, 0, "x_raw alloc failed");
+            unsafe { nsl_csha_free_backward_activations(r); }
+        }
+        let (free_after, _total) = crate::cuda::inner::query_vram();
+
+        let dropped = free_before.saturating_sub(free_after);
+        assert!(
+            dropped < MAX_ALLOWED_DROP_BYTES,
+            "csha save-buffer alloc/free cycle leaked device memory: \
+             free VRAM dropped by {} bytes over {} iterations \
+             (before={}, after={}). The free path must release the raw \
+             `alloc_device` buffers via `free_device`, not `free_managed`.",
+            dropped, ITERS, free_before, free_after,
+        );
     }
 
     /// Naive attention forward for reference: O = softmax(Q @ K^T * scale) @ V

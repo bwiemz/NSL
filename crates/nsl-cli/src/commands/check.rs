@@ -137,9 +137,9 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             dump_ast,
             dump_types,
             shapes,
-            perf: _perf,
-            gpu: _gpu,
-            trace: _trace,
+            perf,
+            gpu,
+            trace,
             linear_types,
             nan_analysis,
             deterministic,
@@ -168,6 +168,23 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
 
             if cep_search && cep_profile {
                 eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
+                std::process::exit(1);
+            }
+            // M37: `--trace` on `nsl check` was parsed-but-dormant for a long
+            // time (users got silence and no trace file). Deferral must
+            // refuse: fail loudly until compile-time trace synthesis exists.
+            if trace.is_some() {
+                eprintln!(
+                    "error: --trace is not implemented on `nsl check`; use \
+                     `nsl debug <file.nsltrace> --export-chrome <out>` for runtime traces"
+                );
+                std::process::exit(1);
+            }
+            // M37: `--gpu` only selects the target for the `--perf` report;
+            // alone it would do nothing, so refuse instead of silently
+            // accepting it.
+            if gpu.is_some() && !perf {
+                eprintln!("error: --gpu requires --perf");
                 std::process::exit(1);
             }
             if wrga_analyze.is_some() && wrga_compare.is_some() {
@@ -386,7 +403,40 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                 }
             }
             crate::commands::check::run_check(&file, dump_tokens, dump_ast, dump_types, linear_types);
-            // M37: --perf, --gpu, --trace flags parsed but dormant.
+
+            // M37: `--perf` delegates to the predictive profile engine — the
+            // exact same walk `nsl profile <file>` runs, with that command's
+            // defaults (bf16, batch=1, seq=2048, fusion on). `--gpu` picks
+            // the roofline target; without it we default to "h100" like
+            // `nsl profile`. This only runs after `run_check` succeeded
+            // (run_check exits non-zero on lex/parse/type errors), so the
+            // report never renders for a broken file.
+            if perf {
+                let profile_args = nsl_cli::profile::ProfileArgs {
+                    file: file.clone(),
+                    target: gpu.clone().unwrap_or_else(|| "h100".to_string()),
+                    dtype: "bf16".to_string(),
+                    batch: 1,
+                    seq: 2048,
+                    dim: vec![],
+                    fusion: true,
+                    memory: false,
+                    entry: "auto".to_string(),
+                    json: false,
+                    explain_wggo: false,
+                };
+                match nsl_cli::profile::run_profile(&profile_args) {
+                    Ok(report) => println!("{report}"),
+                    Err(e) => {
+                        eprintln!("error: --perf: {e}");
+                        eprintln!(
+                            "hint: for entry-point/dim/JSON control use `nsl profile {} --entry ...`",
+                            file.display()
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
 
             if nan_analysis {
                 // M45: Run compile-time NaN risk analysis via AST walker.
