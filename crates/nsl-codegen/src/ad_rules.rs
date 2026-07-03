@@ -2,7 +2,7 @@
 
 use crate::csha_apply::FusionMark;
 use crate::flash_attention_v2::smem_layout::{self, Direction};
-use crate::wengert::{PrimalOp, VarId, WengertOp};
+use crate::wengert::{ConvGradKind, PrimalOp, VarId, WengertOp};
 
 /// Tier C (T5.2): decision the reverse-walk dispatcher makes when it
 /// encounters a Wengert op that belongs to a CSHA-claimed chain.
@@ -168,10 +168,10 @@ pub enum AdjointExpr {
     SliceBackward(VarId, i64, i64, i64, i64),
 
     // Convolution/pooling backward
-    /// Conv2d backward for input: conv_transpose(grad, weight, stride, padding)
-    ConvTransposeInput(VarId, VarId, usize, usize),
-    /// Conv2d backward for weight: conv(input^T, grad)
-    ConvTransposeWeight(VarId, VarId),
+    /// Conv2d gradient: `(kind, grad_output, input, weight, stride, padding)`.
+    /// Lowers to `PrimalOp::Conv2dBackward`, delegating to the runtime FFI that
+    /// wraps the verified nested-loop `conv2d_backward` (shared with tape AD).
+    Conv2dBackward(ConvGradKind, VarId, VarId, VarId, usize, usize),
     /// MaxPool backward: grad * (input == max_value). args: (grad, argmax_indices)
     MaxPoolBackward(VarId, VarId),
     /// AvgPool backward: grad / pool_size, broadcast to pool region
@@ -535,16 +535,50 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }],
 
         // --- Convolution ---
-        PrimalOp::Conv2d { stride, padding } => vec![
-            InputAdjoint {
-                input_var: op.inputs[0],
-                expr: AdjointExpr::ConvTransposeInput(output_bar, op.inputs[1], *stride, *padding),
-            },
-            InputAdjoint {
-                input_var: op.inputs[1],
-                expr: AdjointExpr::ConvTransposeWeight(op.inputs[0], output_bar),
-            },
-        ],
+        PrimalOp::Conv2d { stride, padding } => {
+            // inputs = [input, weight] or [input, weight, bias]. Every gradient
+            // uses the full (grad_output, input, weight) triple + stride/padding.
+            let (input, weight) = (op.inputs[0], op.inputs[1]);
+            let mut adjoints = vec![
+                InputAdjoint {
+                    input_var: input,
+                    expr: AdjointExpr::Conv2dBackward(
+                        ConvGradKind::Input,
+                        output_bar,
+                        input,
+                        weight,
+                        *stride,
+                        *padding,
+                    ),
+                },
+                InputAdjoint {
+                    input_var: weight,
+                    expr: AdjointExpr::Conv2dBackward(
+                        ConvGradKind::Weight,
+                        output_bar,
+                        input,
+                        weight,
+                        *stride,
+                        *padding,
+                    ),
+                },
+            ];
+            // Bias gradient only when a bias tensor was passed (3rd input).
+            if op.inputs.len() >= 3 {
+                adjoints.push(InputAdjoint {
+                    input_var: op.inputs[2],
+                    expr: AdjointExpr::Conv2dBackward(
+                        ConvGradKind::Bias,
+                        output_bar,
+                        input,
+                        weight,
+                        *stride,
+                        *padding,
+                    ),
+                });
+            }
+            adjoints
+        }
 
         // --- Pooling ---
         PrimalOp::MaxPool2d { .. } => vec![InputAdjoint {
@@ -1235,6 +1269,8 @@ mod tests {
 
     #[test]
     fn test_conv2d_backward() {
+        // No bias: inputs [input=0, weight=1] -> 2 adjoints (input, weight).
+        // Each adjoint carries (kind, grad_output=100, input=0, weight=1, stride, padding).
         let op = make_op(
             2,
             PrimalOp::Conv2d {
@@ -1247,16 +1283,40 @@ mod tests {
         assert_eq!(
             adj.len(),
             2,
-            "Conv2d should produce 2 adjoints (input, weight)"
+            "Conv2d without bias should produce 2 adjoints (input, weight)"
         );
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::ConvTransposeInput(100, 1, 1, 0)
+            AdjointExpr::Conv2dBackward(ConvGradKind::Input, 100, 0, 1, 1, 0)
         ));
+        assert_eq!(adj[0].input_var, 0);
         assert!(matches!(
             adj[1].expr,
-            AdjointExpr::ConvTransposeWeight(0, 100)
+            AdjointExpr::Conv2dBackward(ConvGradKind::Weight, 100, 0, 1, 1, 0)
         ));
+        assert_eq!(adj[1].input_var, 1);
+
+        // With bias: inputs [input=0, weight=1, bias=2] -> 3 adjoints, and the
+        // stride/padding are threaded through to every gradient.
+        let op_b = make_op(
+            3,
+            PrimalOp::Conv2d {
+                stride: 2,
+                padding: 1,
+            },
+            vec![0, 1, 2],
+        );
+        let adj_b = apply_ad_rule(&op_b, 100);
+        assert_eq!(
+            adj_b.len(),
+            3,
+            "Conv2d with bias should produce 3 adjoints (input, weight, bias)"
+        );
+        assert!(matches!(
+            adj_b[2].expr,
+            AdjointExpr::Conv2dBackward(ConvGradKind::Bias, 100, 0, 1, 2, 1)
+        ));
+        assert_eq!(adj_b[2].input_var, 2);
     }
 
     #[test]

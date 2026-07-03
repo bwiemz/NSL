@@ -928,6 +928,187 @@ fn conv2d_backward(
     (dx_ptr, dw_ptr, db_ptr)
 }
 
+// ---------------------------------------------------------------------------
+// Source-AD conv2d backward FFIs
+// ---------------------------------------------------------------------------
+// These wrap the tape-AD `conv2d_backward` so the source-AD (Wengert) compiler
+// can lower Conv2d gradients to the SAME verified nested-loop math — the result
+// is byte-identical to the tape path, which is what makes enabling Conv2d
+// extraction in source AD a safe no-regression change.
+//
+// Each FFI returns exactly one of (grad_input, grad_weight, grad_bias) and frees
+// the other two, so each is a single-output op matching the Wengert list's
+// one-output-per-node model. Computing all three inside every call is redundant
+// across the three FFIs; a fused variant returning all three at once would avoid
+// that, but conv-in-source-AD is not a hot path and reusing the proven kernel
+// verbatim was prioritised over micro-optimising the backward. Args mirror
+// `conv2d_backward`: (grad_output, input, weight, stride_h, stride_w, pad_h, pad_w).
+
+/// Materialize `grad` to the conv2d output shape `[N, C_out, H_out, W_out]` that
+/// `conv2d_backward` indexes into.
+///
+/// In source AD the gradient reaching a conv from a reducing loss (e.g.
+/// `sum(conv_out)`) is a *scalar*: `Sum`'s backward emits a `Broadcast` that
+/// stays scalar and relies on downstream elementwise ops to broadcast
+/// implicitly — but `conv2d_backward` reads `grad.shape[2]`/`[3]` for
+/// `H_out`/`W_out`, so a scalar (ndim 0) would read out of bounds. This restores
+/// the output-shaped gradient by filling (scalar case) or copying (matching
+/// element count). If the return value differs from `grad_ptr`, the caller owns
+/// and must free it. Refuses loudly on an element count that cannot be
+/// reconciled with the conv output.
+fn materialize_conv_output_grad(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
+
+    // Shapes live on the host even for GPU tensors, so this is device-agnostic.
+    let n = unsafe { *input.shape.add(0) };
+    let h = unsafe { *input.shape.add(2) } as usize;
+    let w = unsafe { *input.shape.add(3) } as usize;
+    let c_out = unsafe { *weight.shape.add(0) };
+    let kh = unsafe { *weight.shape.add(2) } as usize;
+    let kw = unsafe { *weight.shape.add(3) } as usize;
+    let h_out = (h + 2 * pad_h - kh) / stride_h + 1;
+    let w_out = (w + 2 * pad_w - kw) / stride_w + 1;
+    let shape = [n, c_out, h_out as i64, w_out as i64];
+    let expected = (n as usize) * (c_out as usize) * h_out * w_out;
+    let glen = grad.len as usize;
+
+    // Already the exact output-shaped 4D gradient (the common case when the conv
+    // feeds further layers): use it as-is, no allocation.
+    if grad.ndim == 4
+        && glen == expected
+        && unsafe { *grad.shape.add(0) } == n
+        && unsafe { *grad.shape.add(1) } == c_out
+        && unsafe { *grad.shape.add(2) } as usize == h_out
+        && unsafe { *grad.shape.add(3) } as usize == w_out
+    {
+        return grad_ptr;
+    }
+
+    // A gradient needing reshaping/broadcasting is read on the host; round-trip
+    // through the CPU when it lives on the device so the scalar reads are valid,
+    // then move the rebuilt gradient back to the original device.
+    #[cfg(feature = "cuda")]
+    if grad.device > 0 {
+        let device = grad.device;
+        let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
+        let cpu_out =
+            materialize_conv_output_grad(grad_cpu, input_ptr, weight_ptr, stride_h, stride_w, pad_h, pad_w);
+        tensor_free(grad_cpu);
+        let dev_out = nsl_tensor_to_device(cpu_out, device as i64);
+        tensor_free(cpu_out);
+        return dev_out;
+    }
+
+    if glen == 1 {
+        // Scalar gradient (e.g. sum-loss): broadcast the single value.
+        return create_tensor_with_shape_dtype(&shape, grad.read_scalar_as_f64(0), grad.dtype);
+    }
+    if glen == expected {
+        // Right element count, wrong layout (e.g. flattened): copy in order.
+        let out_ptr = create_tensor_with_shape_dtype(&shape, 0.0, grad.dtype);
+        let out = NslTensor::from_ptr(out_ptr);
+        for i in 0..expected {
+            out.write_scalar_from_f64(i, grad.read_scalar_as_f64(i));
+        }
+        return out_ptr;
+    }
+
+    eprintln!(
+        "nsl: conv2d backward received a gradient with {glen} elements, but the \
+         conv output is [{n}, {c_out}, {h_out}, {w_out}] ({expected} elements); \
+         cannot materialize the output gradient."
+    );
+    std::process::abort();
+}
+
+/// Run `conv2d_backward` with the gradient materialized to the conv output shape.
+fn conv2d_backward_source_ad(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
+) -> (i64, i64, i64) {
+    let (sh, sw, ph, pw) = (
+        stride_h as usize,
+        stride_w as usize,
+        pad_h as usize,
+        pad_w as usize,
+    );
+    let grad = materialize_conv_output_grad(grad_ptr, input_ptr, weight_ptr, sh, sw, ph, pw);
+    let result = conv2d_backward(grad, input_ptr, weight_ptr, sh, sw, ph, pw);
+    if grad != grad_ptr {
+        tensor_free(grad);
+    }
+    result
+}
+
+/// Conv2d input gradient (shape == input). See module note above.
+#[no_mangle]
+pub extern "C" fn nsl_conv2d_input_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
+) -> i64 {
+    let (dx, dw, db) =
+        conv2d_backward_source_ad(grad_ptr, input_ptr, weight_ptr, stride_h, stride_w, pad_h, pad_w);
+    tensor_free(dw);
+    tensor_free(db);
+    dx
+}
+
+/// Conv2d weight gradient (shape == weight). See module note above.
+#[no_mangle]
+pub extern "C" fn nsl_conv2d_weight_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
+) -> i64 {
+    let (dx, dw, db) =
+        conv2d_backward_source_ad(grad_ptr, input_ptr, weight_ptr, stride_h, stride_w, pad_h, pad_w);
+    tensor_free(dx);
+    tensor_free(db);
+    dw
+}
+
+/// Conv2d bias gradient (shape == [C_out]). See module note above.
+#[no_mangle]
+pub extern "C" fn nsl_conv2d_bias_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
+) -> i64 {
+    let (dx, dw, db) =
+        conv2d_backward_source_ad(grad_ptr, input_ptr, weight_ptr, stride_h, stride_w, pad_h, pad_w);
+    tensor_free(dx);
+    tensor_free(dw);
+    db
+}
+
 /// MaxPool2d backward: scatter gradient to argmax positions
 fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);

@@ -70,6 +70,14 @@ pub struct WengertOp {
     pub checkpointed: bool,
 }
 
+/// Which gradient a `PrimalOp::Conv2dBackward` computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvGradKind {
+    Input,
+    Weight,
+    Bias,
+}
+
 /// Primitive operations in the computation graph.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PrimalOp {
@@ -171,6 +179,15 @@ pub enum PrimalOp {
     },
     /// Transposed convolution (deconvolution) — used in Conv2d backward for input gradient.
     ConvTranspose2d {
+        stride: usize,
+        padding: usize,
+    },
+    /// Conv2d gradient (source AD). `kind` selects grad_input/grad_weight/grad_bias;
+    /// inputs are `[grad_output, input, weight]`. Lowers to the matching
+    /// `nsl_conv2d_{input,weight,bias}_backward` FFI, which wraps the same
+    /// verified nested-loop `conv2d_backward` the tape path uses.
+    Conv2dBackward {
+        kind: ConvGradKind,
         stride: usize,
         padding: usize,
     },

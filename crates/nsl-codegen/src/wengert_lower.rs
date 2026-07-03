@@ -6,7 +6,7 @@
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::wengert::{
-    type_for_op, CompareKind, PrimalOp, VarId, WengertList, WengertOp, WengertType,
+    type_for_op, CompareKind, ConvGradKind, PrimalOp, VarId, WengertList, WengertOp, WengertType,
 };
 use crate::CodegenError;
 use cranelift_codegen::ir::{types as cl_types, InstBuilder, Value};
@@ -1238,6 +1238,29 @@ fn lower_single_op(
                 builder,
                 "nsl_tensor_conv2d",
                 &[inputs[0], inputs[1], bias, sh, sw, ph, pw],
+            )
+        }
+        PrimalOp::Conv2dBackward {
+            kind,
+            stride,
+            padding,
+        } => {
+            // inputs = [grad_output, input, weight]. Delegate to the runtime FFI
+            // returning the selected gradient (wraps the verified conv2d_backward).
+            let fname = match kind {
+                ConvGradKind::Input => "nsl_conv2d_input_backward",
+                ConvGradKind::Weight => "nsl_conv2d_weight_backward",
+                ConvGradKind::Bias => "nsl_conv2d_bias_backward",
+            };
+            let sh = builder.ins().iconst(cl_types::I64, *stride as i64);
+            let sw = builder.ins().iconst(cl_types::I64, *stride as i64);
+            let ph = builder.ins().iconst(cl_types::I64, *padding as i64);
+            let pw = builder.ins().iconst(cl_types::I64, *padding as i64);
+            call(
+                compiler,
+                builder,
+                fname,
+                &[inputs[0], inputs[1], inputs[2], sh, sw, ph, pw],
             )
         }
 
