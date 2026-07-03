@@ -51,13 +51,31 @@ pub enum KvPrecision {
 }
 
 impl KvPrecision {
+    /// Whole bytes for a SINGLE element.  Int4 packs two elements per
+    /// byte, so a single element still costs one byte here (you cannot
+    /// store half a byte in isolation) — this is the coarse per-element
+    /// figure.  For accurate multi-element sizing use
+    /// [`Self::bytes_for_elems`], which is half-byte exact for Int4.
     pub fn byte_width(self) -> u32 {
         match self {
             KvPrecision::Fp16 | KvPrecision::Bf16 => 2,
             KvPrecision::Int8 => 1,
-            KvPrecision::Int4 => 1, // 2× per byte — approx for reporting
+            KvPrecision::Int4 => 1, // one element rounds up to a byte
         }
     }
+
+    /// Exact byte footprint of `n` elements at this precision (G24b).
+    /// Int4 packs two 4-bit elements per byte, so `n` elements take
+    /// `ceil(n / 2)` bytes; every other precision is `n * byte_width`.
+    /// This is the figure the KV byte accounting and pool sizing must
+    /// use so an odd element count is charged the right half-byte.
+    pub fn bytes_for_elems(self, n: u64) -> u64 {
+        match self {
+            KvPrecision::Int4 => n.div_ceil(2),
+            _ => n * (self.byte_width() as u64),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             KvPrecision::Fp16 => "fp16",
@@ -358,8 +376,10 @@ pub fn plan(cfg: &KvQuantConfig, weights: Option<&WeightMap>) -> KvQuantPlan {
         };
         let sens = classify(score, cfg);
         let (kp, vp) = precisions_for(sens);
+        // G24b: half-byte-exact sizing — Int4 K/V halves charge
+        // ceil(n/2) bytes, not one byte per element.
         total_selected_bytes +=
-            bytes_per_head_token * (kp.byte_width() as u64 + vp.byte_width() as u64);
+            kp.bytes_for_elems(bytes_per_head_token) + vp.bytes_for_elems(bytes_per_head_token);
         cumulative_fp16 += total_fp16_bytes;
         layers.push(LayerKvDecision {
             layer,
@@ -472,6 +492,34 @@ mod tests {
         assert_eq!(KvPrecision::Fp16.byte_width(), 2);
         assert_eq!(KvPrecision::Bf16.byte_width(), 2);
         assert_eq!(KvPrecision::Int8.byte_width(), 1);
+    }
+
+    #[test]
+    fn bytes_for_elems_is_half_byte_exact_for_int4() {
+        // G24b: Int4 packs two elements per byte -> ceil(n/2).
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(0), 0);
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(1), 1); // odd: rounds up
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(2), 1);
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(3), 2); // odd
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(4), 2);
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(511), 256); // odd
+        assert_eq!(KvPrecision::Int4.bytes_for_elems(512), 256);
+        // Other precisions are exactly n * byte_width.
+        assert_eq!(KvPrecision::Int8.bytes_for_elems(7), 7);
+        assert_eq!(KvPrecision::Fp16.bytes_for_elems(7), 14);
+        assert_eq!(KvPrecision::Bf16.bytes_for_elems(7), 14);
+    }
+
+    #[test]
+    fn int4_never_over_counts_vs_int8() {
+        // For any element count, Int4 must cost <= Int8 (half or one
+        // fewer byte on odd counts), and roughly half.
+        for n in [1u64, 2, 3, 8, 63, 64, 129, 256, 1000] {
+            let i4 = KvPrecision::Int4.bytes_for_elems(n);
+            let i8 = KvPrecision::Int8.bytes_for_elems(n);
+            assert!(i4 <= i8, "Int4 {i4} must not exceed Int8 {i8} for n={n}");
+            assert_eq!(i4, n.div_ceil(2));
+        }
     }
 
     #[test]

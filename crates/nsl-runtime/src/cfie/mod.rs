@@ -4,9 +4,14 @@
 //! speculative tree structure, grammar DFA transitions, and decode
 //! fusion into the compiled kernel.  What remains at runtime is:
 //!
-//!   * A **lock-free ring buffer** in CPU-pinned memory through which
-//!     the host pushes new requests; the persistent decode kernel
-//!     dequeues from it at the top of every decode iteration.
+//!   * A **request ring buffer** in host memory through which the host
+//!     pushes new-request descriptors.  The `ring_buffer` type itself is
+//!     a genuine single-producer/single-consumer atomic ring, but the
+//!     FFI surface today wraps ONE process-global instance in a `Mutex`
+//!     (`ffi::GLOBAL_RING`) that the host decode loop pops from — the
+//!     persistent decode kernel does not yet dequeue from it on-device.
+//!     The lock-free, GPU-side-consumer design is the intended endpoint
+//!     once the on-device scheduler lands.
 //!   * A **KV slot free-list**: the compile-time KV pass reserves one
 //!     contiguous device buffer of `slot_count x per_slot_tokens`;
 //!     the serve scheduler hands whole sequence slots out of a LIFO

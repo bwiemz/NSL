@@ -462,6 +462,36 @@ fn seeded_reject_fixture(seed: u64) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
     (target, draft_probs, draft_tokens)
 }
 
+/// k-parameterized twin of `seeded_reject_fixture`: same row-stochastic
+/// target + mixed-outcome draft profile, but for an arbitrary k_tokens
+/// (used by the k=1 and k=32 config edges).  vocab is fixed at R_VOCAB.
+fn seeded_reject_fixture_k(k: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
+    let mut raw = vec![0f32; k * R_VOCAB];
+    fill_seeded(&mut raw, seed);
+    let mut target = vec![0f32; k * R_VOCAB];
+    for j in 0..k {
+        let row = &raw[j * R_VOCAB..(j + 1) * R_VOCAB];
+        let shifted: Vec<f32> = row.iter().map(|&x| x + 0.5).collect(); // [0, 1)
+        let sum: f32 = shifted.iter().sum();
+        for (t, s) in target[j * R_VOCAB..(j + 1) * R_VOCAB].iter_mut().zip(&shifted) {
+            *t = s / sum;
+        }
+    }
+    let mut dp_raw = vec![0f32; k];
+    fill_seeded(&mut dp_raw, seed.wrapping_add(1));
+    let draft_probs: Vec<f32> = dp_raw
+        .iter()
+        .map(|&x| (0.75 + 0.5 * x) / R_VOCAB as f32)
+        .collect();
+    let mut tok_raw = vec![0f32; k];
+    fill_seeded(&mut tok_raw, seed.wrapping_add(2));
+    let draft_tokens: Vec<u32> = tok_raw
+        .iter()
+        .map(|&x| (((x + 0.5) * R_VOCAB as f32) as u32).min(R_VOCAB as u32 - 1))
+        .collect();
+    (target, draft_probs, draft_tokens)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -505,6 +535,28 @@ fn spec_verify_mid_pool_layer1_slot1_ignores_decoy_regions() {
     // seq 9 + 7 nodes = 16 rows: exactly the full slot.
     let seq = PER_SLOT - cfg.num_nodes as usize;
     run_verify_and_compare(&cfg, &ptx, 1, 1, seq, 0xACE5);
+
+    assert_eq!(nsl_cfie_engine_destroy(), 0);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn spec_verify_seq_len_zero_tree_mask_only_matches_cpu() {
+    if !cuda_available() {
+        return;
+    }
+    // G21 edge: an empty committed prefix. Only the num_nodes draft rows
+    // live in the pool at [0, num_nodes); attention is tree-mask-ONLY
+    // (cpu_reference_verify's `idx.extend(0..0)` contributes no prefix
+    // tokens, so each node attends solely to its mask-allowed ancestors).
+    let cfg = verify_cfg();
+    let ptx = setup_verify_engine(&cfg);
+    assert_eq!(nsl_cfie_kv_slot_acquire(), 0);
+
+    // seq_len 0: rows = 0 + 7 nodes; run_verify_and_compare uploads the
+    // draft rows at pool positions [0, num_nodes) and passes seq_len 0.
+    // Same 5e-3 budget as the prefixed cases (expect ~1e-7).
+    run_verify_and_compare(&cfg, &ptx, 0, 0, 0, 0x0EDA);
 
     assert_eq!(nsl_cfie_engine_destroy(), 0);
 }
@@ -618,6 +670,82 @@ fn spec_reject_seeded_profiles_and_zero_seed_guard_match_cpu_exactly() {
         "6 seeded profiles all accepted {:?} tokens — fixture too degenerate",
         outcomes
     );
+
+    assert_eq!(nsl_cfie_engine_destroy(), 0);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn spec_reject_k_tokens_edges_match_cpu_exactly() {
+    if !cuda_available() {
+        return;
+    }
+    // G21 edge: the k_tokens extremes of the 1..=32 serve-side clamp.
+    // The kernel bakes k_tokens into its emitted PTX, so each edge needs
+    // its own engine; setup_reject_engine tears the previous one down.
+
+    // --- k = 1: a single drafted token, both accept and reject seeds. ---
+    let cfg1 = RejectionConfig {
+        k_tokens: 1,
+        vocab_size: R_VOCAB as u32,
+        sm_version: 80,
+    };
+    let ptx1 = setup_reject_engine(&cfg1);
+
+    // (1a) accept: all target mass on the drafted token -> ratio 1 >= r,
+    // so the lone row accepts and the sentinel is published.
+    let dt_acc: Vec<u32> = vec![7];
+    let mut target_acc = vec![0f32; R_VOCAB];
+    target_acc[dt_acc[0] as usize] = 1.0;
+    let dp_acc = vec![0.5f32];
+    let (acc, corr) =
+        run_reject_and_compare(&cfg1, &ptx1, &target_acc, &dp_acc, &dt_acc, 0x1A, "k1-accept");
+    assert_eq!(acc, 1, "k=1 full-mass draft must accept");
+    assert_eq!(corr, u32::MAX, "k=1 all-accept publishes the sentinel");
+
+    // (1b) reject: ZERO target mass on the drafted token -> ratio 0 < r,
+    // the lone row rejects at j = 0 and samples its residual.
+    let (mut target_rej, draft_probs_rej, draft_tokens_rej) = seeded_reject_fixture_k(1, 0x1B);
+    let tok0 = draft_tokens_rej[0] as usize;
+    let moved = target_rej[tok0];
+    target_rej[tok0] = 0.0;
+    target_rej[(tok0 + 1) % R_VOCAB] += moved;
+    let (acc, corr) = run_reject_and_compare(
+        &cfg1,
+        &ptx1,
+        &target_rej,
+        &draft_probs_rej,
+        &draft_tokens_rej,
+        0x1C,
+        "k1-reject",
+    );
+    assert_eq!(acc, 0, "k=1 zero-mass draft must reject at j = 0");
+    assert!(corr != u32::MAX && (corr as usize) < R_VOCAB);
+
+    // --- k = 32: the config max; a seeded mixed-outcome profile walked
+    // to bit-exact parity across all 32 rows. ---
+    let cfg32 = RejectionConfig {
+        k_tokens: 32,
+        vocab_size: R_VOCAB as u32,
+        sm_version: 80,
+    };
+    let ptx32 = setup_reject_engine(&cfg32);
+    let (target32, draft_probs32, draft_tokens32) = seeded_reject_fixture_k(32, 0x3200);
+    let (acc, corr) = run_reject_and_compare(
+        &cfg32,
+        &ptx32,
+        &target32,
+        &draft_probs32,
+        &draft_tokens32,
+        0x3201,
+        "k32-mixed",
+    );
+    assert!(acc >= 0 && acc <= 32, "accepted count within [0, 32]");
+    if acc < 32 {
+        assert!((corr as usize) < R_VOCAB, "a rejection publishes a real token");
+    } else {
+        assert_eq!(corr, u32::MAX, "an all-accept walk publishes the sentinel");
+    }
 
     assert_eq!(nsl_cfie_engine_destroy(), 0);
 }

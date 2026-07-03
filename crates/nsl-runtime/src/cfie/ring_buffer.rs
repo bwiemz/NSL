@@ -1,14 +1,17 @@
-//! Lock-free SPSC ring buffer used by CFIE's persistent decode kernel.
+//! Lock-free SPSC ring buffer for CFIE's request queue.
 //!
 //! The host (single producer) pushes new-request descriptors at the
-//! tail; the GPU-side scheduler (single consumer) pops them from the
-//! head.  We use **sequenced monotonic atomics** so the GPU can read
-//! the tail index without coordinating a fence with the host — the
-//! index never goes backwards and stale reads just delay the pickup
-//! by one iteration.
+//! tail; a single consumer pops them from the head.  We use **sequenced
+//! monotonic atomics** so a consumer can read the tail index without
+//! coordinating a fence with the host — the index never goes backwards
+//! and stale reads just delay the pickup by one iteration.
 //!
-//! On a multi-GPU deployment the actual GPU-side consumer lives in
-//! PTX; on single-GPU test builds the consumer is a simple CPU-side
+//! Status today: this data structure is genuinely lock-free, but the
+//! shipped consumer is a **host-side** loop (see `ffi.rs`, which also
+//! guards the single global instance with a `Mutex` for the C-ABI push
+//! path).  The intended endpoint is a GPU-side consumer living in the
+//! persistent-decode PTX that dequeues on-device; that path is not wired
+//! yet.  On single-GPU test builds the consumer is a simple CPU-side
 //! helper used for validation.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

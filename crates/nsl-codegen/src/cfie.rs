@@ -3,13 +3,24 @@
 //! Composes the six CFIE passes (KV plan, fused sample, speculative,
 //! persistent decode + scheduler, KV quant, grammar) into a single
 //! [`CfiePlan`].  Invoked from `serve.rs::run_cfie_for_serve` (Tier-A
-//! wiring) with inputs assembled by `cfie_serve.rs`.  Today the plan
-//! drives the build report and the request-ring init call; kernel-side
-//! consumers land with audit gaps G7/G9/G11/G13/G16/G18.  Produces a
-//! human-readable report matching paper §8's sample output.
+//! wiring) with inputs assembled by `cfie_serve.rs`.
+//!
+//! What the plan drives today (post-Cycle-6): all five kernel families
+//! emit real PTX (G7/G13/G16/G18/F2), and on the monolithic serve path
+//! `serve.rs` embeds that PTX and emits the `nsl_cfie_register_kernel` /
+//! `nsl_cfie_kv_pool_alloc` / `nsl_cfie_engine_finalize` calls, so the
+//! chosen kernel family is registered with the runtime engine at serve
+//! init.  Per-token launches then go through the host decode loop
+//! (`nsl_cfie_decode_step`).  Still pending: endpoint-driven generation
+//! needs model binding — serve blocks carry no model reference yet, so
+//! the compiled decode loop is exercised by tests/host callers until
+//! that binding lands.  The disaggregated serve path emits none of the
+//! runtime wiring and the report says so (`runtime_wiring_emitted`).
+//! Produces a human-readable report matching paper §8's sample output.
 
 use serde::Serialize;
 
+use crate::cfie_cost::CfieCostEstimate;
 use crate::cfie_fused_sample::{emit_program as emit_sample, FusedSampleProgram, LmHeadShape, SamplingParams};
 use crate::cfie_grammar::{compile as compile_dfa, minimise as minimise_dfa, CompiledDfa, GrammarSpec};
 use crate::cfie_kv_plan::{plan as plan_kv, KvBudget, KvLayoutPlan, KvShape};
@@ -220,15 +231,18 @@ pub struct CfiePlan {
     pub solve_us: u64,
     /// Feature 1 (G7): the direct-indexing decode-attention kernel,
     /// emitted by the serve wiring when the KV plan selects a static
-    /// layout and the v1 emitter's preconditions hold.  Consumed by
-    /// the decode-loop lowering when it lands (G16).
+    /// layout and the v1 emitter's preconditions hold.  Registered with
+    /// the runtime engine at serve init (uniform family) and launched by
+    /// the host decode loop (`nsl_cfie_decode_step`); still awaiting
+    /// endpoint model binding to be driven by real requests.
     pub decode_attention_kernel: Option<String>,
     pub decode_attention_ptx: Option<String>,
     /// Feature 4 (G16): the persistent decode-block kernel (one CTA =
     /// one layer's decode step for one token).  Emitted by the serve
     /// wiring only when `persistent.fusion` is Level3 — the full-block
     /// claim; Level1/2 stay plan-level — and the emitter preconditions
-    /// hold.  Consumed by the decode-loop lowering when it lands.
+    /// hold.  Registered at serve init (uniform family) and launched by
+    /// the host decode loop; awaiting endpoint model binding.
     pub decode_block_kernel: Option<String>,
     pub decode_block_ptx: Option<String>,
     /// Feature 3 (G13/G14): compiled speculative verification kernels.
@@ -238,17 +252,18 @@ pub struct CfiePlan {
     /// epilogue (Leviathan residual + xorshift64* PRNG).  Emitted by
     /// the serve wiring when `speculative` is planned AND the KV plan
     /// selected the static direct-index layout both kernels bake their
-    /// pool strides from.  Consumed by the decode-loop lowering when
-    /// it lands.
+    /// pool strides from.  Registered at serve init (uniform family) and
+    /// launched by the host decode loop; awaiting endpoint model binding.
     pub spec_verify_kernel: Option<String>,
     pub spec_verify_ptx: Option<String>,
     pub spec_reject_kernel: Option<String>,
     pub spec_reject_ptx: Option<String>,
     /// Feature 6 (G11): the initialized `.global` PTX fragment baking
-    /// the grammar's valid-token bitmask into the module image.
-    /// Emitted by the serve wiring when `grammar` is set; the decode
-    /// loop binds its device address to the sampler's
-    /// `grammar_mask_ptr` param when it lands (G16).
+    /// the grammar's valid-token bitmask into the module image.  Emitted
+    /// by the serve wiring when `grammar` is set and spliced into the
+    /// fused-sampler module; the host resolves its device address via
+    /// `cuModuleGetGlobal` at `nsl_cfie_engine_finalize` so the sampler
+    /// reads it directly (no `grammar_mask_ptr` parameter needed).
     pub grammar_mask_ptx: Option<String>,
     /// Feature 5 (G18): per-layer decode-attention kernels with the
     /// KV-quant plan's precision baked into each layer's load path
@@ -286,6 +301,12 @@ pub struct CfiePlan {
     /// serve sets this; the disaggregated path does NOT emit the wiring
     /// and the report must not claim it (`false` for hand-built plans).
     pub runtime_wiring_emitted: bool,
+    /// G22: estimated decode latency + throughput from the explicit
+    /// roofline cost model (`cfie_cost`).  Set by `run_cfie_for_serve`
+    /// (which has the resolved shape + weights precision + GPU spec);
+    /// hand-built plans and `cfie::run` leave it `None` and the report
+    /// simply omits the two estimate lines.
+    pub cost_estimate: Option<CfieCostEstimate>,
 }
 
 impl CfiePlan {
@@ -465,6 +486,29 @@ impl CfiePlan {
             100.0 * self.launch_reduction()
         )
         .unwrap();
+        // G22: estimated latency + throughput from the roofline cost
+        // model.  Present only when the serve wiring computed it (it has
+        // the shape + GPU spec); hand-built plans omit these two lines.
+        // ASCII-only: the paper's microsecond renders as "us", never a
+        // Unicode micro sign.
+        if let Some(est) = self.cost_estimate.as_ref() {
+            writeln!(
+                s,
+                "Estimated decode latency: {:.1}us/token (vs {:.1}us baseline) \
+                 [bandwidth-roofline model @ seq={}]",
+                est.cfie_us_per_token, est.baseline_us_per_token, est.kv_seq
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "Estimated throughput (batch={}): {} tok/s \
+                 [same model; weights amortized across batch]",
+                est.batch,
+                group_thousands(est.throughput_tok_s.round() as u64)
+            )
+            .unwrap();
+            writeln!(s, "  cost-model assumptions: {}", est.assumptions).unwrap();
+        }
         writeln!(s, "Continuous batching: on ({} active slots, ring capacity {})",
                  self.persistent.scheduler.max_active,
                  self.persistent.scheduler.ring_buffer.capacity).unwrap();
@@ -491,6 +535,22 @@ impl CfiePlan {
         writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }
+}
+
+/// Group an integer with ASCII commas every three digits (the paper
+/// prints throughput as `18,400 tok/s`).  ASCII-only by construction.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 pub fn run(input: CfieInput) -> CfiePlan {
@@ -532,6 +592,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
             spec_reject_launch: None,
             quant_attention_launch: None,
             runtime_wiring_emitted: false,
+            cost_estimate: None,
         };
     }
 
@@ -621,6 +682,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
         spec_reject_launch: None,
         quant_attention_launch: None,
         runtime_wiring_emitted: false,
+        cost_estimate: None,
     }
 }
 
