@@ -670,3 +670,199 @@ fn report_file_is_written_when_requested() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// CFIE Cycle 11: endpoint wiring emission
+// ---------------------------------------------------------------------------
+
+/// Compile `src` to an object file and return the set of runtime-function
+/// symbols that are *actually called* — i.e. targeted by at least one
+/// relocation.  Membership proves the compile emitted a real call, not
+/// merely that `declare_runtime_functions` imported the symbol (it imports
+/// every runtime function unconditionally).  Mirrors the relocation-walk
+/// in `csha_gap_a_forward_saves.rs`.
+fn called_runtime_symbols(src: &str) -> std::collections::HashSet<String> {
+    use object::{Object, ObjectSection, ObjectSymbol};
+
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "parse must be clean: {:?}",
+        parsed.diagnostics
+    );
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "input must type-check: {:?}",
+        analysis.diagnostics
+    );
+
+    let obj_bytes = nsl_codegen::compile_module(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        &CompileOptions::default(),
+    )
+    .expect("compile_module must succeed");
+
+    let file = object::File::parse(&*obj_bytes).expect("object::File::parse");
+    let name_by_index: std::collections::HashMap<_, _> = file
+        .symbols()
+        .filter_map(|s| s.name().ok().map(|n| (s.index(), n.to_string())))
+        .collect();
+
+    let mut called = std::collections::HashSet::new();
+    for section in file.sections() {
+        for (_offset, reloc) in section.relocations() {
+            if let object::RelocationTarget::Symbol(idx) = reloc.target() {
+                if let Some(name) = name_by_index.get(&idx) {
+                    called.insert(name.clone());
+                }
+            }
+        }
+    }
+    called
+}
+
+/// A CFIE serve block whose endpoint calls `generate()` must emit the
+/// Cycle-11 model-binding + generation driver calls: `nsl_model_create`
+/// (load the served weights), `nsl_cfie_bind_model` (upload + record the
+/// shape), and `nsl_cfie_generate` (drive the decode loop) — and it must
+/// NOT fall back to the dead M29 `nsl_serve_enqueue` path (the pre-Cycle-11
+/// bug that used the model handle as `prompt_len`).
+#[test]
+fn cfie_serve_generate_emits_the_driver_calls() {
+    // Full CFIE config so the decode path is wired (kernels emitted ->
+    // engine finalize -> the endpoint init + generate() are emitted).
+    let src = r#"
+fn main():
+    serve Inference:
+        max_batch: 64
+        max_seq: 2048
+        kv_layout: "static"
+        kv_quant: "uniform_fp16"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        d_ff: 1408
+        vocab_size: 49152
+        weights: "model.safetensors"
+        tokenizer: "tokenizer.json"
+        prompt: "Hello"
+        max_new_tokens: 16
+        eos_token_id: 2
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            fused: true
+
+        @endpoint
+        fn generate_endpoint(prompt: str) -> str:
+            let n = generate(prompt, prompt, 0)
+            print(n)
+"#;
+    let called = called_runtime_symbols(src);
+
+    for sym in [
+        "nsl_model_create",
+        "nsl_cfie_bind_model",
+        "nsl_cfie_generate",
+        "nsl_tokenizer_load",
+    ] {
+        assert!(
+            called.contains(sym),
+            "CFIE serve generate() must emit a call to {sym}; called runtime symbols: {called:?}"
+        );
+    }
+    // The old broken path must be gone.
+    assert!(
+        !called.contains("nsl_serve_enqueue"),
+        "generate() must NOT enqueue into the dead M29 path (pre-Cycle-11 bug)"
+    );
+}
+
+/// A CFIE serve block WITHOUT a tokenizer still wires model binding +
+/// generation; only `nsl_tokenizer_load` is absent.
+#[test]
+fn cfie_serve_generate_without_tokenizer_still_binds_and_generates() {
+    let src = r#"
+fn main():
+    serve Inference:
+        max_batch: 64
+        max_seq: 2048
+        kv_layout: "static"
+        kv_quant: "uniform_fp16"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        d_ff: 1408
+        vocab_size: 49152
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            fused: true
+
+        @endpoint
+        fn generate_endpoint(prompt: str) -> str:
+            let n = generate(prompt, prompt, 0)
+            print(n)
+"#;
+    let called = called_runtime_symbols(src);
+    assert!(called.contains("nsl_model_create"));
+    assert!(called.contains("nsl_cfie_bind_model"));
+    assert!(called.contains("nsl_cfie_generate"));
+    assert!(
+        !called.contains("nsl_tokenizer_load"),
+        "no tokenizer: key -> no tokenizer load emitted"
+    );
+    assert!(!called.contains("nsl_serve_enqueue"));
+}
+
+/// `generate()` called OUTSIDE a CFIE serve context has no bound model to
+/// drive, so it must refuse at compile time with a clear message — never
+/// silently emit a broken enqueue.
+#[test]
+fn generate_outside_cfie_serve_context_refuses() {
+    let src = r#"
+fn main():
+    let tok = tokenizer_load("t.json")
+    let ids = tokenizer_encode(tok, "hi")
+    let out = generate(0, ids, 0)
+    print(out)
+"#;
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    // Semantics accept `generate` (registered builtin); codegen must refuse.
+    let res = nsl_codegen::compile_module(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        &CompileOptions::default(),
+    );
+    let err = match res {
+        Err(e) => e,
+        Ok(_) => panic!("generate() outside a CFIE serve block must refuse"),
+    };
+    assert!(
+        err.message.contains("CFIE-active serve block"),
+        "refusal must explain the CFIE serve requirement: {}",
+        err.message
+    );
+}

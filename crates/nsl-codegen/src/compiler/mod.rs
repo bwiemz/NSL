@@ -563,6 +563,14 @@ pub struct Compiler<'a> {
     /// block, kept for observability (build report / future `nsl
     /// check` surface).  `None` when no serve block opted into CFIE.
     pub last_cfie_plan: Option<crate::cfie::CfiePlan>,
+    /// CFIE Cycle 11: the `generate()` intrinsic's driver parameters,
+    /// set by `run_cfie_for_serve` while a CFIE-active serve block
+    /// compiles and consulted by the `generate()` rewrite in
+    /// `expr::calls`.  `Some` ONLY inside a CFIE-active monolithic serve
+    /// body; `None` everywhere else, so a `generate()` call outside a
+    /// CFIE serve context refuses cleanly instead of enqueueing into the
+    /// dead M29 path.  Cleared when the serve block finishes compiling.
+    pub cfie_serve_gen: Option<crate::serve::CfieServeGen>,
 
     // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
     /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
@@ -859,6 +867,7 @@ impl<'a> Compiler<'a> {
             cfie_decorator_mode: None,
             cfie_decorator_target: None,
             last_cfie_plan: None,
+            cfie_serve_gen: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,

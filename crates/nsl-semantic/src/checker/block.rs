@@ -178,15 +178,29 @@ impl<'a> TypeChecker<'a> {
             crate::cfie::validate_serve_config(serve, &resolve, &mut self.diagnostics);
         }
         for endpoint in &serve.endpoints {
-            for param in &endpoint.params {
-                if let Some(ref type_ann) = param.type_ann {
-                    self.resolve_type(type_ann);
-                }
-            }
             if let Some(ref ret_type) = endpoint.return_type {
                 self.resolve_type(ret_type);
             }
+            // CFIE Cycle 11: an endpoint body may reference its params
+            // (e.g. `generate(target_model, prompt, params)`), so declare
+            // them as in-scope locals before checking the body — mirrors
+            // the train-block callback-param handling above.  Without
+            // this the body would fail with `undefined variable` on the
+            // first param reference.  Params are declared in a scope that
+            // wraps the body's own block scope so they stay visible.
+            let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+            let prev = self.current_scope;
+            self.current_scope = scope;
+            for param in &endpoint.params {
+                let param_ty = if let Some(ref type_ann) = param.type_ann {
+                    self.resolve_type(type_ann)
+                } else {
+                    Type::Unknown
+                };
+                self.declare_symbol(param.name, param_ty, param.span, false, true);
+            }
             self.check_block(&endpoint.body, ScopeKind::Block);
+            self.current_scope = prev;
         }
         if serve.endpoints.is_empty() {
             self.diagnostics.push(

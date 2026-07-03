@@ -88,6 +88,25 @@ pub struct CfieServeConfig {
     /// Tokenizer vocab path (`.txt` = one token per line, `.json` =
     /// string array) — required to token-project the schema (G12).
     pub grammar_tokenizer: Option<String>,
+    // ── Cycle 11 endpoint-wiring keys ────────────────────────────────
+    /// `weights: "<path.safetensors>"` — the model to serve.  Falls back
+    /// to the `--weights` CLI path when absent (resolved in serve.rs).
+    pub weights_path: Option<String>,
+    /// `tokenizer: "<path.json>"` — optional; when present the demo
+    /// decodes the generated tokens back to text via
+    /// `nsl_tokenizer_load` + the endpoint-body `tokenizer_decode` call.
+    pub tokenizer_path: Option<String>,
+    /// `prompt: "<text>"` — optional demo prompt.  When a tokenizer is
+    /// also configured the prompt is tokenized offline (compile time) so
+    /// the baked token array feeds the runtime `nsl_cfie_generate`
+    /// (whose prompt ABI is a host i64 array, NOT an f64 tokenizer
+    /// tensor — see the Cycle 11 note in serve.rs).
+    pub prompt: Option<String>,
+    /// `max_new_tokens: <int>` — decode budget for the one-shot demo
+    /// (default 64).
+    pub max_new_tokens: Option<i64>,
+    /// `eos_token_id: <int>` — stop token (default -1 = none).
+    pub eos_token_id: Option<i64>,
 }
 
 impl CfieServeConfig {
@@ -163,6 +182,12 @@ pub fn extract(serve: &ServeBlock, resolve: &dyn Fn(Symbol) -> String) -> CfieSe
             "vocab_size" => cfg.vocab_size = entry_int(entry),
             "rope_theta" => cfg.rope_theta = entry_float(entry),
             "norm_eps" => cfg.norm_eps = entry_float(entry),
+            // Cycle 11 endpoint-wiring keys.
+            "weights" => cfg.weights_path = entry_string(entry, resolve),
+            "tokenizer" => cfg.tokenizer_path = entry_string(entry, resolve),
+            "prompt" => cfg.prompt = entry_string(entry, resolve),
+            "max_new_tokens" => cfg.max_new_tokens = entry_int(entry),
+            "eos_token_id" => cfg.eos_token_id = entry_int(entry),
             _ => {}
         }
     }

@@ -821,6 +821,18 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // CFIE Cycle 11: generate(target_model, prompt, params=...) drives
+    // the compiled decode loop inside a CFIE serve endpoint.  Variadic
+    // (the trailing `params` / kwargs are accepted for source
+    // compatibility); returns the generated token COUNT (Int) in v1.
+    def(
+        "generate",
+        Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
     def(
         "cumsum",
         Type::Function {
