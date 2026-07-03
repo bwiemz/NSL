@@ -101,7 +101,6 @@ pub mod backend_amdgpu;
 pub mod backend_metal;
 pub mod backend_ptx;
 pub mod backend_wgsl;
-pub mod deterministic_kernels;
 pub mod gpu_specs;
 pub mod gpu_target;
 pub mod kernel;
@@ -274,9 +273,9 @@ pub mod core {
 /// GPU code generation: device backends and kernel lowering.
 pub mod gpu {
     pub use crate::{
-        backend_amdgpu, backend_metal, backend_ptx, backend_wgsl,
-        deterministic_kernels, gpu_specs, gpu_target, kernel, kernel_ir,
-        kernel_lower, kernel_skeleton, matmul_mma, ptx_metadata, ptxas_validation,
+        backend_amdgpu, backend_metal, backend_ptx, backend_wgsl, gpu_specs,
+        gpu_target, kernel, kernel_ir, kernel_lower, kernel_skeleton,
+        matmul_mma, ptx_metadata, ptxas_validation,
     };
 }
 
