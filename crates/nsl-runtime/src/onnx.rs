@@ -12,9 +12,9 @@ use prost::Message as _;
 use crate::onnx_proto::{
     AttributeProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorProto,
     TensorShapeDimProto, TensorShapeProto, TensorTypeProto, TypeProto, ValueInfoProto,
-    ATTRIBUTE_FLOAT, ATTRIBUTE_INT, ATTRIBUTE_INTS, DOUBLE, FLOAT,
+    ATTRIBUTE_FLOAT, ATTRIBUTE_INT, ATTRIBUTE_INTS, DOUBLE, FLOAT, FLOAT16,
 };
-use crate::tensor::NslTensor;
+use crate::tensor::{NslTensor, DTYPE_CUSTOM_START, DTYPE_F32, DTYPE_F64, DTYPE_FP16};
 use crate::trace::{AttrValue, OpType, TraceGraph};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,32 +73,45 @@ fn make_value_info(name: &str, elem_type: i32, shape: &[i64]) -> ValueInfoProto 
 
 /// Read all tensor data as little-endian bytes.
 /// Returns (raw_bytes, onnx_data_type).
+///
+/// f64/f32 keep their exact ONNX types (DOUBLE/FLOAT). fp16 is emitted natively
+/// as ONNX FLOAT16 — its raw little-endian IEEE-754 half bits are exactly NSL's
+/// in-memory layout. Every other *known* numeric dtype (bf16, i32, u16 token
+/// ids) is upcast losslessly to f32 and emitted as FLOAT so any ONNX consumer
+/// can read it. Custom block-packed dtypes (>= DTYPE_CUSTOM_START) have no ONNX
+/// tensor representation and refuse loudly.
+///
+/// The previous implementation silently returned an EMPTY `raw_data` with a
+/// FLOAT placeholder for every dtype other than f64/f32, corrupting exported
+/// initializers (fp16/bf16/int weights) into zero-length tensors with no error —
+/// a deferral-must-refuse violation.
 unsafe fn tensor_raw_bytes(t: &NslTensor) -> (Vec<u8>, i32) {
     let len = t.len as usize;
     match t.dtype {
-        0 => {
-            // f64 CPU
-            let ptr = t.data as *const f64;
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let bytes: Vec<u8> = slice
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            (bytes, DOUBLE)
+        DTYPE_F64 => {
+            let slice = std::slice::from_raw_parts(t.data as *const f64, len);
+            (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), DOUBLE)
         }
-        1 => {
-            // f32 GPU or CPU
-            let ptr = t.data as *const f32;
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let bytes: Vec<u8> = slice
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
+        DTYPE_F32 => {
+            let slice = std::slice::from_raw_parts(t.data as *const f32, len);
+            (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), FLOAT)
+        }
+        DTYPE_FP16 => {
+            // ONNX FLOAT16 raw_data is the little-endian half bits verbatim.
+            let slice = std::slice::from_raw_parts(t.data as *const u16, len);
+            (slice.iter().flat_map(|v| v.to_le_bytes()).collect(), FLOAT16)
+        }
+        d if d >= DTYPE_CUSTOM_START => panic!(
+            "ONNX export: custom/block-packed dtype {d} has no ONNX tensor \
+             representation; convert the tensor to f32/f16 before export"
+        ),
+        _ => {
+            // Known narrow dtypes (bf16, i32, u16 token ids): upcast losslessly
+            // to f32 element-by-element via read_scalar_as_f64 and emit FLOAT.
+            let bytes: Vec<u8> = (0..len)
+                .flat_map(|i| (t.read_scalar_as_f64(i) as f32).to_le_bytes())
                 .collect();
             (bytes, FLOAT)
-        }
-        _ => {
-            // Unknown dtype — emit empty raw_data with FLOAT placeholder
-            (Vec::new(), FLOAT)
         }
     }
 }
@@ -353,6 +366,70 @@ mod tests {
     use super::*;
     use crate::trace::{AttrValue, OpType, TraceGraph, TraceOp};
     use std::collections::HashMap;
+
+    /// Build a contiguous 1-D CPU NslTensor over `data` bytes for dtype tests.
+    /// The backing buffers are intentionally leaked — the test process reclaims
+    /// them on exit, and `owns_data = 0` keeps `Drop` from freeing borrowed data.
+    unsafe fn raw_tensor(data: Vec<u8>, len: i64, dtype: u16) -> NslTensor {
+        let data_ptr = Box::leak(data.into_boxed_slice()).as_ptr() as *mut std::ffi::c_void;
+        let shape = Box::leak(Box::new([len])).as_mut_ptr();
+        let strides = Box::leak(Box::new([1i64])).as_mut_ptr();
+        NslTensor::new(data_ptr, shape, strides, 1, len, 0, dtype, 0, 0)
+    }
+
+    /// Every supported dtype must serialize to non-empty, correctly-typed ONNX
+    /// bytes — regression for the old silent `(Vec::new(), FLOAT)` fallback that
+    /// zeroed out fp16/bf16/int initializers.
+    #[test]
+    fn tensor_raw_bytes_covers_all_dtypes() {
+        use crate::tensor::{DTYPE_BF16, DTYPE_F32, DTYPE_F64, DTYPE_FP16};
+        unsafe {
+            // f64 -> DOUBLE, exact
+            let t = raw_tensor(1.5f64.to_le_bytes().to_vec(), 1, DTYPE_F64);
+            let (bytes, dt) = tensor_raw_bytes(&t);
+            assert_eq!(dt, DOUBLE);
+            assert_eq!(f64::from_le_bytes(bytes.try_into().unwrap()), 1.5);
+
+            // f32 -> FLOAT, exact
+            let t = raw_tensor(2.5f32.to_le_bytes().to_vec(), 1, DTYPE_F32);
+            let (bytes, dt) = tensor_raw_bytes(&t);
+            assert_eq!(dt, FLOAT);
+            assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 2.5);
+
+            // fp16 -> FLOAT16, raw half bits preserved
+            let h = half::f16::from_f32(3.5);
+            let t = raw_tensor(h.to_bits().to_le_bytes().to_vec(), 1, DTYPE_FP16);
+            let (bytes, dt) = tensor_raw_bytes(&t);
+            assert_eq!(dt, FLOAT16);
+            let bits = u16::from_le_bytes(bytes.try_into().unwrap());
+            assert_eq!(half::f16::from_bits(bits).to_f32(), 3.5);
+
+            // bf16 -> FLOAT (upcast), value preserved, NOT empty
+            let b = half::bf16::from_f32(4.0);
+            let t = raw_tensor(b.to_bits().to_le_bytes().to_vec(), 1, DTYPE_BF16);
+            let (bytes, dt) = tensor_raw_bytes(&t);
+            assert_eq!(dt, FLOAT);
+            assert_eq!(bytes.len(), 4, "bf16 must upcast to 4-byte f32, not be empty");
+            assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 4.0);
+
+            // i32 token dtype (4) -> FLOAT (upcast), value preserved
+            let t = raw_tensor(7i32.to_le_bytes().to_vec(), 1, 4);
+            let (bytes, dt) = tensor_raw_bytes(&t);
+            assert_eq!(dt, FLOAT);
+            assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 7.0);
+        }
+    }
+
+    /// A custom block-packed dtype (>= 256) must refuse loudly rather than
+    /// silently emit empty ONNX data.
+    #[test]
+    #[should_panic(expected = "no ONNX tensor")]
+    fn tensor_raw_bytes_refuses_custom_dtype() {
+        unsafe {
+            let t = raw_tensor(vec![0u8; 4], 1, DTYPE_CUSTOM_START);
+            let _ = tensor_raw_bytes(&t);
+        }
+    }
 
     /// Build a TraceGraph manually: input → Add(input, weight) → Relu → output.
     fn make_test_graph() -> TraceGraph {
