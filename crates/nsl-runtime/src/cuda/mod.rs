@@ -2232,6 +2232,94 @@ pub extern "C" fn nsl_kernel_launch(
     }
 }
 
+/// Launch a user `kernel` block whose arguments are NslTensor handles.
+///
+/// This is the codegen entry point for user kernel calls (e.g.
+/// `vec_add(ga, gb, gc, grid=4, block=256)`). Cranelift lowers each tensor
+/// argument to its NslTensor *handle* (a host pointer to the struct), but
+/// `cuLaunchKernel` needs an array of pointers to the device *data* addresses.
+/// This wrapper reads the handle array, extracts each tensor's `.data` (the
+/// device pointer), and builds the correct kernel-parameter indirection —
+/// unlike [`nsl_kernel_launch`], which takes an already-marshaled parameter
+/// array and is used by hand-written launchers/tests.
+///
+/// `args_ptr` points to an array of `num_args` NslTensor handles (each i64).
+/// Returns the `CUresult` code (0 on success).
+#[no_mangle]
+pub extern "C" fn nsl_kernel_launch_tensors(
+    ptx_ptr: i64,
+    name_ptr: i64,
+    grid_x: i64,
+    grid_y: i64,
+    grid_z: i64,
+    block_x: i64,
+    block_y: i64,
+    block_z: i64,
+    args_ptr: i64,
+    num_args: i64,
+    shared_mem_bytes: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        use crate::tensor::NslTensor;
+        let n = num_args as usize;
+        // from_raw_parts requires a non-null pointer even for len 0.
+        let handles: &[i64] = if n == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(args_ptr as *const i64, n) }
+        };
+
+        // Extract each tensor's device data pointer into a stable Vec, then
+        // build the kernelParams array where each entry points at the u64
+        // device address. Both Vecs must outlive the launch call (cuLaunchKernel
+        // reads the argument values synchronously at launch time).
+        let mut device_ptrs: Vec<u64> = Vec::with_capacity(n);
+        for (i, &handle) in handles.iter().enumerate() {
+            let tensor = unsafe { &*(handle as *const NslTensor) };
+            // Kernel arguments must be GPU-resident. Passing a CPU tensor here
+            // would feed a host pointer to the kernel as a device address and
+            // crash with an opaque CUDA_ERROR_ILLEGAL_ADDRESS — refuse loudly
+            // with an actionable message instead.
+            if tensor.device == 0 {
+                eprintln!(
+                    "nsl: kernel argument {} is a CPU tensor; kernel arguments must be \
+                     moved to the GPU first (e.g. `arg.to(cuda)`).",
+                    i
+                );
+                std::process::abort();
+            }
+            device_ptrs.push(tensor.data as u64);
+        }
+        let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(n);
+        for slot in &device_ptrs {
+            kernel_params.push(slot as *const u64 as *mut c_void);
+        }
+
+        let result = inner::kernel_launch(
+            ptx_ptr as *const u8,
+            name_ptr as *const u8,
+            [grid_x, grid_y, grid_z],
+            [block_x, block_y, block_z],
+            &kernel_params,
+            shared_mem_bytes as u32,
+        );
+        result as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
+        let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
+        eprintln!(
+            "nsl: this program launches a GPU `kernel` block, but the nsl runtime \
+             was built without CUDA support. Rebuild the toolchain with \
+             `--features cuda` (e.g. `cargo build -p nsl-cli --features cuda`) to run \
+             GPU kernels."
+        );
+        std::process::abort();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GPU Embedding Lookup
 // ---------------------------------------------------------------------------

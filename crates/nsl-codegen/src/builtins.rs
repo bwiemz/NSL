@@ -741,6 +741,25 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // User `kernel` block launch: args array holds NslTensor handles; the
+    // runtime extracts each `.data` device pointer and builds the kernelParams.
+    (
+        "nsl_kernel_launch_tensors",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_to_device",
         &[types::I64, types::I64],

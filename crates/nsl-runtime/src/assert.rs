@@ -85,36 +85,24 @@ pub extern "C" fn nsl_assert_close(
         }
     }
 
-    // Element-wise closeness check: |a - b| <= atol + rtol * |b|
-    if a.dtype == 1 && b.dtype == 1 {
-        // f32 path
-        for i in 0..a.len as usize {
-            let va = unsafe { *a.data_f32().add(i) } as f64;
-            let vb = unsafe { *b.data_f32().add(i) } as f64;
-            let diff = (va - vb).abs();
-            let tol = atol + rtol * vb.abs();
-            if diff > tol {
-                eprintln!(
-                    "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
-                    msg, i, va, vb, diff, tol
-                );
-                std::process::abort();
-            }
-        }
-    } else {
-        // f64 path
-        for i in 0..a.len as usize {
-            let va = unsafe { *a.data_f64().add(i) };
-            let vb = unsafe { *b.data_f64().add(i) };
-            let diff = (va - vb).abs();
-            let tol = atol + rtol * vb.abs();
-            if diff > tol {
-                eprintln!(
-                    "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
-                    msg, i, va, vb, diff, tol
-                );
-                std::process::abort();
-            }
+    // Element-wise closeness check: |a - b| <= atol + rtol * |b|.
+    // Read each operand through its own dtype rather than assuming both share
+    // one: the two sides frequently differ (e.g. `zeros`/`full`/`ones` create
+    // f32 CPU tensors, while a `.to(cpu)` transfer upcasts GPU f32 -> CPU f64),
+    // and comparing values must not depend on the dtypes matching. `read_scalar
+    // _as_f64` handles f32/f64/f16/bf16/i32, matching the existing contiguous
+    // flat-index assumption.
+    for i in 0..a.len as usize {
+        let va = a.read_scalar_as_f64(i);
+        let vb = b.read_scalar_as_f64(i);
+        let diff = (va - vb).abs();
+        let tol = atol + rtol * vb.abs();
+        if diff > tol {
+            eprintln!(
+                "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
+                msg, i, va, vb, diff, tol
+            );
+            std::process::abort();
         }
     }
 }
