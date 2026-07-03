@@ -1481,6 +1481,26 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_cfie_kv_pool_alloc", &[types::I64], Some(types::I64)), // bytes
     ("nsl_cfie_engine_finalize", &[], Some(types::I64)),
     ("nsl_cfie_engine_destroy", &[], Some(types::I64)),
+    // --- CFIE Cycle 9: runtime weight binding (production upload FFIs).
+    // Cast host f32 [out][in] row-major -> device f16/f32, persistent
+    // pool, engine-tracked; reset frees them. ---
+    (
+        "nsl_cfie_upload_weight_f16",
+        &[
+            types::I64, // host_f32_ptr
+            types::I64, // n_elems
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_upload_weight_f32",
+        &[
+            types::I64, // host_f32_ptr
+            types::I64, // n_elems
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_weights_reset", &[], Some(types::I64)),
     (
         "nsl_cfie_launch_decode_attn",
         &[
@@ -2567,6 +2587,9 @@ mod tests {
         assert_eq!(arity("nsl_cfie_kv_pool_alloc"), 1);
         assert_eq!(arity("nsl_cfie_engine_finalize"), 0);
         assert_eq!(arity("nsl_cfie_engine_destroy"), 0);
+        assert_eq!(arity("nsl_cfie_upload_weight_f16"), 2);
+        assert_eq!(arity("nsl_cfie_upload_weight_f32"), 2);
+        assert_eq!(arity("nsl_cfie_weights_reset"), 0);
         assert_eq!(arity("nsl_cfie_launch_decode_attn"), 5);
         assert_eq!(arity("nsl_cfie_launch_fused_sample"), 6);
         assert_eq!(arity("nsl_cfie_launch_decode_block"), 14);

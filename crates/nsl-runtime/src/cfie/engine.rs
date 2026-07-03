@@ -83,6 +83,13 @@ struct EngineState {
     /// attach record; `free_managed` only needs the base.
     #[allow(dead_code)]
     pool_bytes: u64,
+    /// Device addresses (as `usize`) of every weight buffer uploaded via
+    /// `nsl_cfie_upload_weight_f16` / `_f32`.  Engine-owned, freed by
+    /// `nsl_cfie_weights_reset` and by `nsl_cfie_engine_destroy` so a
+    /// serve session leaves no device leak.  Non-cuda builds never push
+    /// (the uploads refuse), so the vec is always empty there.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    weight_allocs: Vec<usize>,
 }
 
 static ENGINE: OnceLock<Mutex<EngineState>> = OnceLock::new();
@@ -95,6 +102,7 @@ fn engine() -> &'static Mutex<EngineState> {
             grammar_mask_dev: 0,
             pool_base: 0,
             pool_bytes: 0,
+            weight_allocs: Vec::new(),
         })
     })
 }
@@ -367,6 +375,13 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
         if g.pool_base != 0 {
             crate::cuda::inner::free_managed(g.pool_base as *mut std::ffi::c_void);
         }
+        // Weights are engine-owned device resources, same as the KV pool
+        // and module handles — a serve session must leave no device leak.
+        free_weight_allocs(&mut g);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        g.weight_allocs.clear();
     }
     g.pool_base = 0;
     g.pool_bytes = 0;
@@ -393,6 +408,225 @@ pub extern "C" fn nsl_cfie_kv_pool_base() -> i64 {
         Ok(g) => g.pool_base as i64,
         Err(_) => 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Weight binding (CFIE Cycle 9)
+//
+// PRODUCTION upload primitives: put model weights on the GPU in the
+// EXACT layout `nsl_cfie_decode_step` already consumes.  The caller lays
+// each weight out [out][in] row-major on the host; the upload copies it
+// element-for-element, so the device buffer is f16 (or f32) [out][in]
+// row-major — exactly what the decode-block kernel `ld.global.b16`
+// addressing expects (cfie_persistent_ptx.rs).  This cycle ships the
+// upload/lifecycle primitives + the GPU proof; resolving weights from a
+// loaded NslModel by name is Cycle 10.
+// ---------------------------------------------------------------------------
+
+/// Round-to-nearest-even f32 -> f16 (IEEE 754 half), returned as raw
+/// bits.  `half` is already a nsl-runtime dependency, so delegate to its
+/// audited converter (correct RNE including subnormals, overflow to inf,
+/// and NaN) rather than hand-rolling and risking a rounding-edge bug.
+#[cfg(feature = "cuda")]
+#[inline]
+fn f32_to_f16_bits(x: f32) -> u16 {
+    half::f16::from_f32(x).to_bits()
+}
+
+/// Free every recorded weight allocation and clear the tracking list.
+/// Operates on an already-locked engine guard so `nsl_cfie_weights_reset`
+/// and `nsl_cfie_engine_destroy` share one code path.  Idempotent.
+#[cfg(feature = "cuda")]
+fn free_weight_allocs(g: &mut EngineState) {
+    for ptr in g.weight_allocs.drain(..) {
+        crate::cuda::inner::free_managed(ptr as *mut c_void);
+    }
+}
+
+/// Allocate `bytes` in the PERSISTENT caching-allocator pool (the same
+/// bracket the KV pool uses — per-step transient drains never release
+/// it).  Returns a null pointer only for a zero request (`alloc_managed`
+/// panics on real OOM, matching `nsl_cfie_kv_pool_alloc`).
+#[cfg(feature = "cuda")]
+fn alloc_persistent(bytes: usize) -> *mut c_void {
+    use crate::cuda::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
+    let prev = get_alloc_pool();
+    set_alloc_pool(AllocPool::Persistent);
+    let ptr = crate::cuda::inner::alloc_managed(bytes);
+    set_alloc_pool(prev);
+    ptr
+}
+
+/// Byte count for a weight upload of `n_elems` f32 read from host.
+///
+/// The upload reads `n_elems * size_of::<f32>()` host bytes via
+/// `slice::from_raw_parts`/`memcpy`, which requires that total to be
+/// `<= isize::MAX` — exceeding it is undefined behaviour (a process
+/// abort), NOT a recoverable error.  Both upload FFIs must therefore
+/// guard the HOST read size, not just their (never-larger) device
+/// buffer: the f16 device buffer is `n_elems * 2` and the f32 one is
+/// `n_elems * 4 == host_bytes`, so a single host-bytes guard bounds both.
+/// Returns the host byte count, or `None` to refuse (`n_elems <= 0` or
+/// the read would exceed `isize::MAX`).
+#[cfg(feature = "cuda")]
+fn checked_host_f32_bytes(n_elems: i64) -> Option<usize> {
+    if n_elems <= 0 {
+        return None;
+    }
+    (n_elems as u64)
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .filter(|&b| b <= isize::MAX as u64)
+        .map(|b| b as usize)
+}
+
+/// Upload `n_elems` f32 read from host memory at `host_f32_ptr` to the
+/// GPU as f16, round-to-nearest-even (via `half`).  Allocates
+/// `n_elems * 2` device bytes in the PERSISTENT pool, uploads the f16
+/// bytes, records the allocation for cleanup, and returns the device
+/// pointer as `i64` (> 0).
+///
+/// Layout is preserved verbatim: the caller lays weights out [out][in]
+/// row-major on the host, this copies element-for-element, so the device
+/// buffer is f16 [out][in] row-major — exactly what the decode-block
+/// kernel's `ld.global.b16` addressing expects.
+///
+/// Returns -1 on: non-cuda build, `host_f32_ptr == 0`, `n_elems <= 0`,
+/// host read size (`n_elems * 4`) exceeding `isize::MAX`, or any driver
+/// failure (freeing the partial device allocation first).
+///
+/// # Safety
+/// `host_f32_ptr` must point to at least `n_elems` readable `f32`s.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_upload_weight_f16(host_f32_ptr: i64, n_elems: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        if host_f32_ptr == 0 {
+            return -1;
+        }
+        // Guard the HOST read size (n_elems * 4) against isize::MAX — the
+        // slice below is UB (process abort) past that, so an overflowing
+        // n_elems must refuse, not abort.  Device bytes (f16 = n_elems*2)
+        // are half the host bytes and can't overflow once this passes.
+        let host_bytes = match checked_host_f32_bytes(n_elems) {
+            Some(b) => b,
+            None => return -1,
+        };
+        let dev_bytes = host_bytes / 2; // f16 is 2 B/elem; host f32 is 4 B/elem
+        // Cast host f32 -> f16 bits with round-to-nearest-even.  Read the
+        // host f32s into an owned buffer we control (the caller's memory
+        // may be reclaimed after this call returns).
+        let src = unsafe { std::slice::from_raw_parts(host_f32_ptr as *const f32, n_elems as usize) };
+        let bits: Vec<u16> = src.iter().map(|&x| f32_to_f16_bits(x)).collect();
+
+        let mut g = match engine().lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        let ptr = alloc_persistent(dev_bytes);
+        if ptr.is_null() {
+            return -1;
+        }
+        // htod copy of the f16 bytes.  On a driver failure `memcpy_htod`
+        // panics (house contract, same as the KV pool's memset) — guard
+        // it so the partial allocation is freed before the panic
+        // unwinds, honoring the "free partial alloc first" contract.
+        let copy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::cuda::inner::memcpy_htod(
+                ptr,
+                bits.as_ptr() as *const c_void,
+                dev_bytes,
+            );
+        }));
+        if copy.is_err() {
+            crate::cuda::inner::free_managed(ptr);
+            return -1;
+        }
+        g.weight_allocs.push(ptr as usize);
+        ptr as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (host_f32_ptr, n_elems);
+        eprintln!("CFIE: upload_weight_f16 requires a CUDA-enabled build and GPU — refusing (no upload)");
+        -1
+    }
+}
+
+/// Upload `n_elems` f32 read from host memory at `host_f32_ptr` to the
+/// GPU, KEEPING f32 (`n_elems * 4` device bytes, straight htod copy).
+/// For the RMSNorm gammas (norm1_w, norm2_w, final norm) which the
+/// decode/sample kernels read as f32.  Records the allocation for
+/// cleanup and returns the device pointer as `i64` (> 0).  Same error
+/// contract as `nsl_cfie_upload_weight_f16`: refuses (-1) when the host
+/// read size (`n_elems * 4`) would exceed `isize::MAX`.
+///
+/// # Safety
+/// `host_f32_ptr` must point to at least `n_elems` readable `f32`s.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_upload_weight_f32(host_f32_ptr: i64, n_elems: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        if host_f32_ptr == 0 {
+            return -1;
+        }
+        // f32 device bytes == host read bytes (n_elems * 4); the shared
+        // guard bounds both against isize::MAX so a huge n_elems refuses
+        // (-1) instead of panicking in alloc/memcpy.
+        let dev_bytes = match checked_host_f32_bytes(n_elems) {
+            Some(b) => b,
+            None => return -1,
+        };
+        let mut g = match engine().lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        let ptr = alloc_persistent(dev_bytes);
+        if ptr.is_null() {
+            return -1;
+        }
+        let copy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::cuda::inner::memcpy_htod(
+                ptr,
+                host_f32_ptr as *const c_void,
+                dev_bytes,
+            );
+        }));
+        if copy.is_err() {
+            crate::cuda::inner::free_managed(ptr);
+            return -1;
+        }
+        g.weight_allocs.push(ptr as usize);
+        ptr as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (host_f32_ptr, n_elems);
+        eprintln!("CFIE: upload_weight_f32 requires a CUDA-enabled build and GPU — refusing (no upload)");
+        -1
+    }
+}
+
+/// Free every weight allocation recorded by the two upload FFIs (via
+/// `free_managed`) and clear the tracking list.  Returns 0 always
+/// (idempotent; safe with no CUDA / nothing uploaded).  Does NOT touch
+/// the KV pool or kernel registrations.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_weights_reset() -> i64 {
+    let mut g = match engine().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    #[cfg(feature = "cuda")]
+    {
+        free_weight_allocs(&mut g);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        // No cuda: no device allocations were ever recorded, but keep the
+        // vec cleared for symmetry (always empty here).
+        g.weight_allocs.clear();
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,5 +1498,117 @@ mod tests {
         assert_eq!(register(4, 0), 0);
         assert_eq!(nsl_cfie_engine_destroy(), 0);
         assert_eq!(kernel_count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // CFIE Cycle 9 weight binding
+    // -----------------------------------------------------------------
+
+    /// The f32 -> f16 cast used by `nsl_cfie_upload_weight_f16` delegates
+    /// to `half::f16::from_f32(x).to_bits()`.  Pin its round-to-nearest-
+    /// even behavior against known-correct half bit patterns so a future
+    /// `half` bump (or an accidental swap to a hand-rolled converter)
+    /// cannot silently change the device weights.  This runs on every
+    /// build (the helper itself is cuda-gated; `half` is not).
+    #[test]
+    fn f32_to_f16_cast_is_correct_rne() {
+        let case = |x: f32| half::f16::from_f32(x).to_bits();
+        // Exact representables.
+        assert_eq!(case(1.0), 0x3C00, "1.0");
+        assert_eq!(case(0.5), 0x3800, "0.5");
+        assert_eq!(case(-0.0), 0x8000, "-0.0 keeps the sign bit, mantissa 0");
+        assert_eq!(case(0.0), 0x0000, "+0.0");
+        assert_eq!(case(2.0), 0x4000, "2.0");
+        // A subnormal f16: 2^-24 is the smallest positive subnormal
+        // (bits 0x0001); RNE of exactly 2^-24 lands on it.
+        assert_eq!(
+            case(2f32.powi(-24)),
+            0x0001,
+            "smallest positive f16 subnormal 2^-24"
+        );
+        // Overflow: 70000 > f16 max (65504) rounds to +inf.
+        assert_eq!(case(70000.0), 0x7C00, "overflow to +inf");
+        assert_eq!(case(-70000.0), 0xFC00, "overflow to -inf");
+        // A mid value that is NOT exactly representable: 0.1 -> nearest
+        // half is 0x2E66 (0.0999755859375), the documented RNE result.
+        assert_eq!(case(0.1), 0x2E66, "0.1 rounds to nearest even half");
+        // NaN stays NaN (exponent all ones, non-zero mantissa).
+        let nan = case(f32::NAN);
+        assert_eq!(nan & 0x7C00, 0x7C00, "NaN exponent all ones");
+        assert_ne!(nan & 0x03FF, 0, "NaN mantissa non-zero");
+        // Round-trip sanity: casting the half bits back to f32 is close.
+        assert!((half::f16::from_bits(case(0.1)).to_f32() - 0.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn weights_reset_idempotent_and_zero_with_nothing_uploaded() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        // Never uploaded anything: reset is a no-op returning 0, twice.
+        assert_eq!(nsl_cfie_weights_reset(), 0);
+        assert_eq!(nsl_cfie_weights_reset(), 0);
+        {
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.weight_allocs.is_empty(), "no allocations recorded");
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn uploads_refuse_on_bad_args_and_noncuda() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        // A real host f32 buffer so the ptr is non-null; on non-cuda
+        // builds the upload refuses before touching it, and on cuda
+        // builds the bad-arg guards fire before any device work.
+        let host = [1.0f32, 2.0, 3.0, 4.0];
+        let hp = host.as_ptr() as i64;
+
+        // Bad args: null host ptr, zero and negative n_elems.
+        assert_eq!(nsl_cfie_upload_weight_f16(0, 4), -1, "null host ptr");
+        assert_eq!(nsl_cfie_upload_weight_f16(hp, 0), -1, "zero n_elems");
+        assert_eq!(nsl_cfie_upload_weight_f16(hp, -1), -1, "negative n_elems");
+        assert_eq!(nsl_cfie_upload_weight_f32(0, 4), -1, "null host ptr (f32)");
+        assert_eq!(nsl_cfie_upload_weight_f32(hp, 0), -1, "zero n_elems (f32)");
+        assert_eq!(nsl_cfie_upload_weight_f32(hp, -1), -1, "negative n_elems (f32)");
+
+        // Host read size (n_elems * 4) must fit isize::MAX, else the
+        // internal slice/memcpy is UB (a process ABORT, not a panic).
+        // i64::MAX overflows u64 * 4 outright:
+        assert_eq!(
+            nsl_cfie_upload_weight_f16(hp, i64::MAX),
+            -1,
+            "i64::MAX host-bytes overflow (f16)"
+        );
+        assert_eq!(
+            nsl_cfie_upload_weight_f32(hp, i64::MAX),
+            -1,
+            "i64::MAX host-bytes overflow (f32)"
+        );
+        // The dangerous band: n_elems where n_elems*4 does NOT overflow
+        // u64 but DOES exceed isize::MAX.  The old guard (device bytes vs
+        // usize::MAX) passed this and reached from_raw_parts -> abort; the
+        // host-bytes guard must refuse with -1 without aborting.
+        let band = (isize::MAX as i64) / 4 + 1;
+        assert_eq!(
+            nsl_cfie_upload_weight_f16(hp, band),
+            -1,
+            "host bytes > isize::MAX must refuse, not abort (f16)"
+        );
+        assert_eq!(
+            nsl_cfie_upload_weight_f32(hp, band),
+            -1,
+            "host bytes > isize::MAX must refuse, not abort (f32)"
+        );
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Non-cuda build: even a valid request refuses (no GPU).
+            assert_eq!(nsl_cfie_upload_weight_f16(hp, 4), -1, "no cuda => -1");
+            assert_eq!(nsl_cfie_upload_weight_f32(hp, 4), -1, "no cuda => -1");
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.weight_allocs.is_empty(), "non-cuda never records");
+        }
+        reset_engine();
     }
 }
