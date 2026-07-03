@@ -50,6 +50,49 @@ struct CfieRuntimeInit {
     /// `n_layers * 2 * (max_slots * per_slot_tokens) * n_kv_heads *
     /// head_dim * 2` (f16).
     pool_bytes: Option<i64>,
+    /// Cycle 11: model-binding + generation parameters resolved from the
+    /// serve config + the compile-time model shape.  `Some` only when
+    /// the plan actually wired the decode path (kernels emitted); `None`
+    /// leaves the generation FFIs unemitted so `generate()` refuses.
+    endpoint: Option<CfieEndpointInit>,
+}
+
+/// Cycle 11: everything the monolithic serve path needs to emit the
+/// model-binding + generation-driver calls, resolved at compile time.
+struct CfieEndpointInit {
+    /// Absolute path to the `.safetensors` weights, from the serve
+    /// `weights:` key or (fallback) the `--weights` CLI path.  Empty
+    /// string when neither is set — the emitted `nsl_model_create` then
+    /// receives an empty path and returns a null handle, and the runtime
+    /// `nsl_cfie_bind_model` refuses it cleanly (documented boundary:
+    /// there is no served model without a weights path).
+    weights_path: String,
+    /// Optional tokenizer path for the decode-and-print demo tail.
+    tokenizer_path: Option<String>,
+    /// The prompt token ids, baked at compile time.  When a tokenizer +
+    /// prompt are configured this is the offline-encoded prompt; else a
+    /// tiny sentinel (`[0]`) so the endpoint body still compiles + runs.
+    /// The runtime `nsl_cfie_generate` prompt ABI is a host i64 array,
+    /// so these are baked as raw i64s in .rodata (NOT an f64 tokenizer
+    /// tensor — the tokenizer-encode -> generate bridge would need an
+    /// f64-tensor -> i64-host-array runtime FFI that is out of Cycle-11
+    /// scope; see the deferral note in `emit_cfie_endpoint_init`).
+    prompt_tokens: Vec<i64>,
+    /// Resolved model shape (passed to `nsl_cfie_bind_model`).
+    shape: crate::cfie_serve::ResolvedModelShape,
+    max_new_tokens: i64,
+    eos_token_id: i64,
+}
+
+/// CFIE Cycle 11 side-channel: the `generate()` intrinsic's driver
+/// parameters, published on `Compiler::cfie_serve_gen` while a
+/// CFIE-active serve body compiles.  Presence of this value is exactly
+/// the "CFIE serve context" the `generate()` rewrite tests for.
+pub struct CfieServeGen {
+    pub max_new_tokens: i64,
+    pub eos_token_id: i64,
+    /// Prompt token count baked at serve init (host i64 array length).
+    pub prompt_len: i64,
 }
 
 struct WorkerConfigSpec {
@@ -240,10 +283,16 @@ impl Compiler<'_> {
                     }
                 }
                 // CFIE config keys: consumed by `run_cfie_for_serve`
-                // below — not runtime expressions.
+                // below — not runtime expressions.  The Cycle 11
+                // endpoint-wiring keys (weights/tokenizer/prompt/
+                // max_new_tokens/eos_token_id) are string/int literals
+                // consumed by the CFIE serve-init emission, so they
+                // must be skipped here too or `compile_expr` would treat
+                // e.g. `weights` as a bare variable reference.
                 "kv_layout" | "kv_quant" | "target_gpu" | "n_layers" | "n_kv_heads"
                 | "kv_heads" | "n_heads" | "head_dim" | "d_model" | "d_ff" | "vocab_size"
-                | "rope_theta" | "norm_eps" => {}
+                | "rope_theta" | "norm_eps" | "weights" | "tokenizer" | "prompt"
+                | "max_new_tokens" | "eos_token_id" => {}
                 _ => {
                     self.compile_expr(builder, state, &entry.value)?;
                 }
@@ -296,6 +345,12 @@ impl Compiler<'_> {
                 &[v_max_batch, v_max_seq_len, v_kv_blocks, v_prefill_chunk],
             )?;
 
+            // CFIE Cycle 11: the baked prompt-token host i64 array
+            // pointer, produced by `emit_cfie_endpoint_init` and bound to
+            // the endpoint's first param below.  `None` when CFIE is
+            // inactive or the decode path was not wired.
+            let mut cfie_prompt_ptr: Option<cranelift_codegen::ir::Value> = None;
+
             // CFIE: size the continuous-batching request ring and the
             // KV sequence-slot free-list from the compile-time plan
             // (audit gaps G5/G8 — the runtime FFIs are now reachable
@@ -336,13 +391,55 @@ impl Compiler<'_> {
                     }
                     self.compile_call_by_name(builder, "nsl_cfie_engine_finalize", &[])?;
                 }
+                // CFIE Cycle 11: after the engine is finalized, bind the
+                // served model (nsl_model_create + nsl_cfie_bind_model),
+                // optionally load the tokenizer, bake the prompt token
+                // array, and publish the `generate()` driver params.  The
+                // baked prompt ptr becomes the endpoint's first param.
+                if let Some(ep) = init.endpoint.as_ref() {
+                    let scope =
+                        cfie_label_scope(&self.resolve_sym(serve.name).to_string());
+                    let prompt_ptr = self.emit_cfie_endpoint_init(builder, &scope, ep)?;
+                    self.cfie_serve_gen = Some(CfieServeGen {
+                        max_new_tokens: ep.max_new_tokens,
+                        eos_token_id: ep.eos_token_id,
+                        prompt_len: ep.prompt_tokens.len() as i64,
+                    });
+                    cfie_prompt_ptr = Some(prompt_ptr);
+                }
             }
 
+            // CFIE Cycle 11: bind each endpoint's params as real
+            // function-scope locals so the body can reference them
+            // (mirrors func.rs::compile_fn_def_named param binding).
+            // Since a one-shot serve binary has no caller, the FIRST
+            // param (the prompt) is initialised to the baked prompt-token
+            // host i64 array pointer; any remaining params are bound to a
+            // defined 0 sentinel (DEFERRED: live per-request param
+            // sourcing needs the request loop this v1 does not build).
             for endpoint in &serve.endpoints {
+                for (i, param) in endpoint.params.iter().enumerate() {
+                    let init_val = if i == 0 {
+                        cfie_prompt_ptr
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0))
+                    } else {
+                        builder.ins().iconst(cl_types::I64, 0)
+                    };
+                    let var = state.new_variable();
+                    builder.declare_var(var, cl_types::I64);
+                    builder.def_var(var, init_val);
+                    state.variables.insert(param.name, (var, cl_types::I64));
+                    state.param_symbols.insert(param.name);
+                }
                 for stmt in &endpoint.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
             }
+
+            // CFIE Cycle 11: the serve body is done — the `generate()`
+            // side-channel must not leak into any function compiled
+            // after this serve block.
+            self.cfie_serve_gen = None;
 
             // CFIE Cycle 6: free the pool + clear registrations before
             // the serve runtime tears down (CUmodules may stay loaded —
@@ -416,6 +513,93 @@ impl Compiler<'_> {
             ],
         )?;
         Ok(())
+    }
+
+    /// CFIE Cycle 11: emit the model-binding + tokenizer-load + baked
+    /// prompt-token array, and return the baked prompt host i64 array
+    /// pointer (the endpoint's first param is bound to it).
+    ///
+    /// Emission order (AFTER `nsl_cfie_engine_finalize`):
+    ///   1. `model_handle = nsl_model_create(weights_path_cstr)`.  A null
+    ///      handle (missing/failed weights) is well-formed: the runtime
+    ///      `nsl_cfie_bind_model` refuses a null handle cleanly.
+    ///   2. `nsl_cfie_bind_model(model_handle, n_layers, d_model,
+    ///      n_heads, n_kv_heads, head_dim, d_ff, vocab_size)` with the
+    ///      resolved-shape constants.
+    ///   3. `tok_handle = nsl_tokenizer_load(tokenizer_path_cstr)` when a
+    ///      tokenizer is configured (loaded so the decode-and-print demo
+    ///      tail can resolve it; the handle is currently unused by the
+    ///      body because the i64-token-buffer -> f64-tensor decode bridge
+    ///      is a documented Cycle-11 deferral).
+    ///   4. bake the prompt token ids as a raw host i64 array in .rodata
+    ///      and return its pointer.
+    ///
+    /// Data labels are scoped by serve-block name so two CFIE serve
+    /// blocks in one module do not collide (same-name blocks collide
+    /// loudly via `DuplicateDefinition`, matching the kernel-reg path).
+    fn emit_cfie_endpoint_init(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        scope: &str,
+        ep: &CfieEndpointInit,
+    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+        // 1. model_handle = nsl_model_create(weights_path_cstr)
+        let (wbytes, _wlen) = cfie_nul_terminated(&ep.weights_path);
+        let w_id = embed_cfie_bytes(
+            &mut self.module,
+            &format!("__nsl_cfie_weights_{scope}"),
+            wbytes,
+        )?;
+        let w_gv = self.module.declare_data_in_func(w_id, builder.func);
+        let w_ptr = builder.ins().symbol_value(cl_types::I64, w_gv);
+        let model_handle = self.compile_call_by_name(builder, "nsl_model_create", &[w_ptr])?;
+
+        // 2. nsl_cfie_bind_model(model_handle, shape...)
+        let s = &ep.shape;
+        let v_layers = builder.ins().iconst(cl_types::I64, s.n_layers as i64);
+        let v_dmodel = builder.ins().iconst(cl_types::I64, s.d_model as i64);
+        let v_nheads = builder.ins().iconst(cl_types::I64, s.n_heads as i64);
+        let v_nkv = builder.ins().iconst(cl_types::I64, s.n_kv_heads as i64);
+        let v_hdim = builder.ins().iconst(cl_types::I64, s.head_dim as i64);
+        let v_dff = builder.ins().iconst(cl_types::I64, s.d_ff as i64);
+        let v_vocab = builder.ins().iconst(cl_types::I64, s.vocab_size as i64);
+        self.compile_call_by_name(
+            builder,
+            "nsl_cfie_bind_model",
+            &[
+                model_handle, v_layers, v_dmodel, v_nheads, v_nkv, v_hdim, v_dff, v_vocab,
+            ],
+        )?;
+
+        // 3. optional tokenizer_load
+        if let Some(tok_path) = ep.tokenizer_path.as_ref() {
+            let (tbytes, _tlen) = cfie_nul_terminated(tok_path);
+            let t_id = embed_cfie_bytes(
+                &mut self.module,
+                &format!("__nsl_cfie_tokenizer_{scope}"),
+                tbytes,
+            )?;
+            let t_gv = self.module.declare_data_in_func(t_id, builder.func);
+            let t_ptr = builder.ins().symbol_value(cl_types::I64, t_gv);
+            // Return value (tok handle) intentionally dropped in v1 — see
+            // the decode-bridge deferral note in the method doc.
+            self.compile_call_by_name(builder, "nsl_tokenizer_load", &[t_ptr])?;
+        }
+
+        // 4. bake the prompt token ids as a host i64 array (little-endian
+        // raw bytes) and return its pointer.
+        let mut prompt_bytes: Vec<u8> = Vec::with_capacity(ep.prompt_tokens.len() * 8);
+        for tok in &ep.prompt_tokens {
+            prompt_bytes.extend_from_slice(&tok.to_le_bytes());
+        }
+        let p_id = embed_cfie_bytes(
+            &mut self.module,
+            &format!("__nsl_cfie_prompt_{scope}"),
+            prompt_bytes,
+        )?;
+        let p_gv = self.module.declare_data_in_func(p_id, builder.func);
+        let p_ptr = builder.ins().symbol_value(cl_types::I64, p_gv);
+        Ok(p_ptr)
     }
 
     /// CFIE Tier-A wiring: extract serve-block CFIE config, resolve the
@@ -911,6 +1095,52 @@ impl Compiler<'_> {
             }
         };
 
+        // Cycle 11: the endpoint's generation driver is wired ONLY when
+        // the decode path was actually emitted (kernels registered ->
+        // engine finalize will run -> nsl_cfie_generate can drive
+        // decode_step).  With no kernels the engine never finalizes, so
+        // emitting the binding + generate calls would produce a runtime
+        // that always refuses; instead leave `endpoint = None` so the
+        // `generate()` rewrite refuses at COMPILE time with a clear
+        // message (honest: no half-wired binary).
+        let endpoint = if kernels.is_empty() {
+            None
+        } else {
+            // Weights: serve `weights:` key > `--weights` CLI path (the
+            // loaded WeightMap's source path) > empty (null handle;
+            // bind_model refuses cleanly at runtime).
+            let weights_path = cfg
+                .weights_path
+                .clone()
+                .or_else(|| weights.map(|w| w.source_path().to_string()))
+                .unwrap_or_default();
+            // Baked prompt token ids.  Runtime `nsl_cfie_generate` reads a
+            // host i64 array, so we bake raw i64s.  A configured `prompt:`
+            // is baked as byte-level token ids (the runtime byte-tokenizer
+            // convention), clamped into [0, vocab_size) so the runtime's
+            // per-token range guard passes; absent that, a single [0]
+            // sentinel keeps the body runnable.  NOTE (deferral): a live
+            // HF-tokenizer-encoded prompt would need an f64-tensor ->
+            // i64-host-array runtime bridge that Cycle 11 does not add;
+            // the baked byte-id prompt is the v1 demo path.
+            let vocab = prepared.shape.vocab_size.max(1) as i64;
+            let prompt_tokens: Vec<i64> = match cfg.prompt.as_deref() {
+                Some(p) if !p.is_empty() => p
+                    .bytes()
+                    .map(|b| (b as i64) % vocab)
+                    .collect(),
+                _ => vec![0],
+            };
+            Some(CfieEndpointInit {
+                weights_path,
+                tokenizer_path: cfg.tokenizer_path.clone(),
+                prompt_tokens,
+                shape: prepared.shape.clone(),
+                max_new_tokens: cfg.max_new_tokens.unwrap_or(64).max(1),
+                eos_token_id: cfg.eos_token_id.unwrap_or(-1),
+            })
+        };
+
         let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
         self.last_cfie_plan = Some(plan);
         Ok(Some(CfieRuntimeInit {
@@ -918,6 +1148,7 @@ impl Compiler<'_> {
             kv_slots,
             kernels,
             pool_bytes,
+            endpoint,
         }))
     }
 

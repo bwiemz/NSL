@@ -11,11 +11,14 @@
 //! `nsl_cfie_kv_pool_alloc` / `nsl_cfie_engine_finalize` calls, so the
 //! chosen kernel family is registered with the runtime engine at serve
 //! init.  Per-token launches then go through the host decode loop
-//! (`nsl_cfie_decode_step`).  Still pending: endpoint-driven generation
-//! needs model binding — serve blocks carry no model reference yet, so
-//! the compiled decode loop is exercised by tests/host callers until
-//! that binding lands.  The disaggregated serve path emits none of the
-//! runtime wiring and the report says so (`runtime_wiring_emitted`).
+//! (`nsl_cfie_decode_step`).  Cycle 11 wires the last mile: on the
+//! monolithic path the endpoint's `generate()` compiles to serve-init
+//! model binding (`nsl_model_create` + `nsl_cfie_bind_model`) + the
+//! `nsl_cfie_generate` decode driver, with the served model resolved
+//! from the serve `weights:` key / `--weights` (model defs carry only
+//! compile-time shape metadata, so there is no runtime model value).
+//! The disaggregated serve path emits none of the runtime wiring and the
+//! report says so (`runtime_wiring_emitted`).
 //! Produces a human-readable report matching paper §8's sample output.
 
 use serde::Serialize;
@@ -525,13 +528,34 @@ impl CfiePlan {
             )
             .unwrap();
         }
-        writeln!(
-            s,
-            "Note: endpoint-driven generation still requires model binding — \
-             serve blocks carry no model reference yet, so the compiled \
-             decode loop is driven by tests/host callers until binding lands."
-        )
-        .unwrap();
+        // Cycle 11: the endpoint's `generate()` now compiles to the
+        // model-binding + decode driver (nsl_model_create +
+        // nsl_cfie_bind_model + nsl_cfie_generate), emitted at serve init
+        // whenever the decode path was wired (kernels registered).  The
+        // served model comes from the serve `weights:` key / --weights,
+        // NOT a runtime model value.
+        if regs.is_empty() {
+            writeln!(
+                s,
+                "Note: no decode kernels were emitted this build, so the \
+                 endpoint `generate()` call has no engine to finalize and \
+                 refuses at compile time (add CFIE serve config that wires \
+                 the static decode path)."
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                s,
+                "Note: endpoint `generate()` compiles to serve-init model \
+                 binding (nsl_model_create + nsl_cfie_bind_model) + the \
+                 nsl_cfie_generate decode driver; the served model is bound \
+                 from the serve `weights:` key / --weights at serve init. \
+                 v1 returns the generated-token count; the prompt is baked \
+                 from the `prompt:` key (live per-request prompts + text \
+                 decode need the deferred request loop)."
+            )
+            .unwrap();
+        }
         writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }

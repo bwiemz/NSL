@@ -2360,73 +2360,90 @@ impl Compiler<'_> {
             );
         }
 
-        // M44b: generate(model, tokens, max_tokens=256, temperature=0.7, top_p=0.9, schema=...)
+        // CFIE Cycle 11: generate(target_model, prompt_tokens, params).
+        //
+        // In a CFIE-active serve context (`self.cfie_serve_gen` is set by
+        // the serve-init emission after `nsl_cfie_engine_finalize`), this
+        // drives the GPU-proven decode loop:
+        //   out_ptr = nsl_alloc(max_new_tokens * 8)   // host i64 buffer
+        //   rc = nsl_cfie_generate(prompt_ptr, prompt_len, max_new_tokens,
+        //                          eos_token_id, rng_seed, out_ptr, out_cap)
+        //   return rc                                 // tokens generated
+        //
+        // `target_model` is accepted for source compatibility with the
+        // paper's `generate(model, ...)` syntax, but the SERVED model is
+        // the one bound at serve init from `--weights` / the `weights:`
+        // key (there is no runtime model VALUE to resolve — model defs
+        // are compile-time metadata).  Likewise the sampling params
+        // (temperature/top_k/top_p) are already baked into the fused
+        // sample kernel at plan time; `generate()`'s `params` arg is not
+        // re-plumbed in v1 (documented).
+        //
+        // `prompt_tokens` (the endpoint's first param) was bound at serve
+        // init to the baked prompt HOST i64 ARRAY pointer, so we pass its
+        // value straight through as `prompt_ptr` — the runtime ABI is a
+        // host i64 array, NOT an f64 tokenizer tensor.
+        //
+        // v1 returns the generated token COUNT (i64) so the one-shot demo
+        // can `print(...)` a visible result.  Returning the decoded text
+        // would require an i64-token-buffer -> f64-tensor decode bridge
+        // that Cycle 11 does not add (documented deferral); the buffer at
+        // `out_ptr` holds the raw token ids for a future request loop.
         if func_name == "generate" {
-            if args.len() >= 2 {
-                let model_val = self.compile_expr(builder, state, &args[0].value)?;
-                let tokens_val = self.compile_expr(builder, state, &args[1].value)?;
-                // Extract max_tokens (default 256), temperature (default 0.7), top_p (default 0.9)
-                let max_tokens = builder.ins().iconst(cl_types::I64, 256);
-                let temperature = builder.ins().f64const(0.7);
-                let top_p = builder.ins().f64const(0.9);
-                // Enqueue the request — nsl_serve_enqueue(prompt_ptr, prompt_len, max_tokens, temp, top_p)
-                // tokens_val is used as prompt_ptr; model_val as prompt_len placeholder
-                let request_id = self.compile_call_by_name(
-                    builder,
-                    "nsl_serve_enqueue",
-                    &[tokens_val, model_val, max_tokens, temperature, top_p],
-                )?;
-
-                // M44: Check for schema= kwarg → compile grammar at codegen time → set FSM on request
-                let mut schema_val: Option<String> = None;
-                for arg in args {
-                    if let Some(name_sym) = arg.name {
-                        let name = self.resolve_sym(name_sym).to_string();
-                        if name == "schema" {
-                            if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
-                                schema_val = Some(s.clone());
-                            }
-                        }
-                    }
-                }
-
-                if let Some(ref schema) = schema_val {
-                    // Compile grammar at codegen time; pass start_state=0 (DFA start) to runtime.
-                    // The runtime interprets start_state > 0 as "constrained decoding active".
-                    // We use 1 to distinguish "grammar set" from "no grammar" (0).
-                    let start_state = builder.ins().iconst(cl_types::I64, 1);
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_serve_set_grammar",
-                        &[request_id, start_state],
-                    )?;
-                    eprintln!("[nsl] Constrained decoding active: schema='{}'", schema);
-                } else {
-                    // Check if the current function has a model-level @grammar decorator
-                    let current_fn_name = state.current_function_name.clone().unwrap_or_default();
-                    if let Some(grammar_info) = self.features.grammar_configs.get(&current_fn_name)
-                    {
-                        if !grammar_info.grammar_source.is_empty()
-                            || !grammar_info.start_rule.is_empty()
-                        {
-                            let src = grammar_info.grammar_source.clone();
-                            let start_state = builder.ins().iconst(cl_types::I64, 1);
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_serve_set_grammar",
-                                &[request_id, start_state],
-                            )?;
-                            eprintln!("[nsl] Constrained decoding active via @grammar: '{}'", src);
-                        }
-                    }
-                }
-
-                let _ = model_val; // suppress unused warning — model used as prompt_len placeholder
-                return Ok(request_id);
+            let Some(gen) = self.cfie_serve_gen.as_ref() else {
+                // OUTSIDE a CFIE serve context there is no bound model to
+                // drive.  Refuse cleanly rather than enqueue into the dead
+                // M29 `nsl_serve_enqueue` path (the pre-Cycle-11 bug that
+                // passed the model handle as `prompt_len`).
+                return Err(CodegenError::new(
+                    "generate() is only supported inside a CFIE-active serve \
+                     block (its model is bound at serve init from --weights / \
+                     the serve `weights:` key). Add CFIE serve config (e.g. \
+                     `kv_layout: \"static\"`) or use the runtime serve loop.",
+                ));
+            };
+            if args.len() < 2 {
+                return Err(CodegenError::new(
+                    "generate() requires at least 2 arguments (target_model, prompt)",
+                ));
             }
-            return Err(CodegenError::new(
-                "generate() requires at least 2 arguments (model, tokens)",
-            ));
+            let max_new_tokens = gen.max_new_tokens;
+            let eos_token_id = gen.eos_token_id;
+            let prompt_len = gen.prompt_len;
+
+            // target_model (arg 0) is accepted for source compatibility;
+            // compile it so any side effects hold, but the value is unused
+            // (the served model is the serve-init-bound one).
+            let _model_val = self.compile_expr(builder, state, &args[0].value)?;
+            // prompt (arg 1) resolves to the baked prompt host i64 array
+            // pointer bound at serve init.
+            let prompt_ptr = self.compile_expr(builder, state, &args[1].value)?;
+
+            // Allocate the output host i64 buffer (capacity = max_new_tokens).
+            let out_cap = builder.ins().iconst(cl_types::I64, max_new_tokens);
+            let alloc_bytes = builder.ins().iconst(cl_types::I64, max_new_tokens * 8);
+            let out_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_bytes])?;
+
+            let v_prompt_len = builder.ins().iconst(cl_types::I64, prompt_len);
+            let v_max_new = builder.ins().iconst(cl_types::I64, max_new_tokens);
+            let v_eos = builder.ins().iconst(cl_types::I64, eos_token_id);
+            // Fixed rng seed for the one-shot demo (deterministic output).
+            let v_seed = builder.ins().iconst(cl_types::I64, 0);
+
+            let rc = self.compile_call_by_name(
+                builder,
+                "nsl_cfie_generate",
+                &[
+                    prompt_ptr,
+                    v_prompt_len,
+                    v_max_new,
+                    v_eos,
+                    v_seed,
+                    out_ptr,
+                    out_cap,
+                ],
+            )?;
+            return Ok(rc);
         }
 
         // argmax(tensor, dim=-1)
