@@ -627,8 +627,15 @@ fn run_sgd_wrap_envelope(theta_init: &[f32]) -> Vec<f32> {
     theta
 }
 
-/// Pure-Rust SGD reference with truncating-FP16 momentum (Mode B).
-fn run_sgd_truncate_reference(theta_init: &[f32]) -> Vec<f32> {
+/// Pure-Rust SGD reference with RTE-FP16 momentum (Mode B).
+///
+/// Mirrors the AdamW Mode-B reference (which uses `rtn_fp16`): the runtime
+/// `nsl_tensor_cast_into` quant-store is RTE (`half::f16::from_f32`) post-v7,
+/// so the reference must round the same way. Previously used `trunc_fp16`,
+/// which diverges from the RTE runtime by ~0.5 ULP/step (accumulated to
+/// ~1.8e-3 over N_STEPS) — the `run_negative_control_truncate` path exists
+/// precisely to prove truncation ≠ RTE, so it must NOT be the positive ref.
+fn run_sgd_rte_reference(theta_init: &[f32]) -> Vec<f32> {
     let len = theta_init.len();
     let mut theta = theta_init.to_vec();
     let mut v = vec![0.0_f32; len];
@@ -636,7 +643,7 @@ fn run_sgd_truncate_reference(theta_init: &[f32]) -> Vec<f32> {
         let grad = gradients_for_step(step);
         sgd_step_f32(&mut theta, &mut v, &grad);
         for vi in v.iter_mut() {
-            *vi = trunc_fp16(*vi);
+            *vi = rtn_fp16(*vi);
         }
     }
     theta
@@ -659,7 +666,7 @@ fn run_sgd_fp32_reference(theta_init: &[f32]) -> Vec<f32> {
 /// but exercises the `s1 == s2` branch instead of the multi-state branch.
 ///
 /// Three-way comparison:
-///   - Mode B (cast correctness): wrap-envelope ≡ truncating-Rust SGD (rel < 1e-5)
+///   - Mode B (cast correctness): wrap-envelope ≡ RTE-Rust SGD (rel < 1e-5)
 ///   - Mode A (precision claim):  wrap-envelope ~ FP32-SGD reference   (rel < 5e-2)
 ///   - SGD-specific: the v_state buffer is the SOLE state slot — no v2/s2
 ///     aliasing artifacts (the codegen passes `wrap_s2=false` for SGD;
@@ -669,7 +676,7 @@ fn cpdt_fp16_sgd_fullbuffer_wrap_envelope_validation() {
     let theta_init = initial_params();
 
     let result_wrap     = run_sgd_wrap_envelope(&theta_init);
-    let result_mode_b   = run_sgd_truncate_reference(&theta_init);
+    let result_mode_b   = run_sgd_rte_reference(&theta_init);
     let result_mode_a   = run_sgd_fp32_reference(&theta_init);
 
     let rel_err_b = max_rel_err(&result_wrap, &result_mode_b);
@@ -678,9 +685,9 @@ fn cpdt_fp16_sgd_fullbuffer_wrap_envelope_validation() {
     );
     assert!(
         rel_err_b < 1e-5,
-        "SGD Mode B FAILED: wrap-envelope and truncating-Rust reference diverge by \
+        "SGD Mode B FAILED: wrap-envelope and RTE-Rust reference diverge by \
          {rel_err_b:.2e} (gate: < 1e-5). The S5 cast/cast_into emission does NOT \
-         match pure-Rust truncation for the single-state path."
+         match pure-Rust RTE (half::f16::from_f32) for the single-state path."
     );
 
     let rel_err_a = max_rel_err(&result_wrap, &result_mode_a);
