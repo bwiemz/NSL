@@ -90,6 +90,41 @@ struct EngineState {
     /// (the uploads refuse), so the vec is always empty there.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     weight_allocs: Vec<usize>,
+    /// Bound-model state (CFIE Cycle 10), populated by
+    /// `nsl_cfie_bind_model`.  `None` until a model is bound; cleared by
+    /// `nsl_cfie_generate_reset` and `nsl_cfie_engine_destroy` WITHOUT
+    /// freeing the device weight buffers (those are owned by
+    /// `weight_allocs` / `nsl_cfie_weights_reset`).  Non-cuda builds never
+    /// populate it (bind_model refuses), so it is always `None` there.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    bound_model: Option<BoundModel>,
+}
+
+/// The runtime binding of an `NslModel` to the finalized CFIE engine —
+/// the device weight table `nsl_cfie_generate` drives `decode_step` with,
+/// plus the host-resident token-embedding table the per-step gather
+/// reads.  Assembled by `nsl_cfie_bind_model`; the device pointers here
+/// alias entries in `EngineState::weight_allocs` (the upload FFIs record
+/// them for cleanup), so tearing the binding down only clears these
+/// records — the device buffers are freed by `nsl_cfie_weights_reset`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct BoundModel {
+    /// `n_layers * 9` DEVICE pointers in the exact order
+    /// `nsl_cfie_decode_step` reads each layer record:
+    /// wq, wk, wv, wo, w_gate, w_up, w_down, norm1_w, norm2_w.
+    weight_table: Vec<u64>,
+    /// Final-norm gamma (f32) device pointer -> decode_step `norm_w_ptr`.
+    final_norm_dev: u64,
+    /// LM-head (f16) device pointer -> decode_step `lm_head_ptr`.
+    lm_head_dev: u64,
+    /// Token-embedding table kept on the HOST as f32, laid out
+    /// `[vocab][d_model]` row-major.  The v1 embedding gather memcpys
+    /// row `t` (d_model f32 = d_model*4 bytes) host->device into `x_a`
+    /// before each decode_step — no kernel, no f16 convert (x_a is f32).
+    embed_host: Vec<f32>,
+    n_layers: i64,
+    d_model: i64,
+    vocab_size: i64,
 }
 
 static ENGINE: OnceLock<Mutex<EngineState>> = OnceLock::new();
@@ -103,6 +138,7 @@ fn engine() -> &'static Mutex<EngineState> {
             pool_base: 0,
             pool_bytes: 0,
             weight_allocs: Vec::new(),
+            bound_model: None,
         })
     })
 }
@@ -383,6 +419,9 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
     {
         g.weight_allocs.clear();
     }
+    // Clear the bound-model records too (device buffers already freed
+    // above via free_weight_allocs / weight_allocs.clear()).
+    g.bound_model = None;
     g.pool_base = 0;
     g.pool_bytes = 0;
     if let Ok(mut kv) = kv_slots_global().lock() {
@@ -626,6 +665,552 @@ pub extern "C" fn nsl_cfie_weights_reset() -> i64 {
         // vec cleared for symmetry (always empty here).
         g.weight_allocs.clear();
     }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Model binding + generation driver (CFIE Cycle 10)
+//
+// bind_model resolves an NslModel's host f32 weights BY NAME (HF-Llama
+// convention), uploads each to the device in the layout decode_step
+// consumes (attention/FFN/lm_head as f16, the RMSNorm gammas as f32),
+// keeps the token-embedding table on the HOST as f32, and records the
+// device weight table + shape in engine state.  generate then drives the
+// single decode loop: gather embed row -> x_a, decode_step, sample,
+// prefill-boundary + EOS + capacity handling.
+// ---------------------------------------------------------------------------
+
+/// HF-Llama weight naming convention (documented ABI).  bind_model
+/// resolves EXACTLY these names; a real NslModel using different names is
+/// refused with the expected-vs-missing list rather than guessed at.
+#[cfg(feature = "cuda")]
+mod names {
+    /// Per-layer attention/FFN projections + the two RMSNorm gammas.
+    /// `{i}` is the layer index.
+    pub const WQ: &str = "model.layers.{i}.self_attn.q_proj.weight";
+    pub const WK: &str = "model.layers.{i}.self_attn.k_proj.weight";
+    pub const WV: &str = "model.layers.{i}.self_attn.v_proj.weight";
+    pub const WO: &str = "model.layers.{i}.self_attn.o_proj.weight";
+    pub const W_GATE: &str = "model.layers.{i}.mlp.gate_proj.weight";
+    pub const W_UP: &str = "model.layers.{i}.mlp.up_proj.weight";
+    pub const W_DOWN: &str = "model.layers.{i}.mlp.down_proj.weight";
+    pub const NORM1: &str = "model.layers.{i}.input_layernorm.weight";
+    pub const NORM2: &str = "model.layers.{i}.post_attention_layernorm.weight";
+    /// Model-level: final norm, LM head, token embedding.
+    pub const FINAL_NORM: &str = "model.norm.weight";
+    pub const LM_HEAD: &str = "lm_head.weight";
+    pub const EMBED: &str = "model.embed_tokens.weight";
+
+    /// Substitute the layer index into a `{i}` template name.
+    pub fn layer(name: &str, i: i64) -> String {
+        name.replace("{i}", &i.to_string())
+    }
+}
+
+/// Read a bound weight tensor's host f32 data pointer + element count by
+/// name from an NslModel handle.  Returns `Err(name)` (the resolved
+/// name) when the weight is absent or its `data`/`len` is unusable so the
+/// caller can list the first missing tensor.  The model's loaded weights
+/// are host f32 NslTensors (dtype 1, device 0), matching the upload FFIs'
+/// `host_f32_ptr` contract.
+#[cfg(feature = "cuda")]
+fn resolve_weight(model_handle: i64, name: &str) -> Result<(*const f32, i64), String> {
+    let tptr = crate::c_api::nsl_model_get_weight(
+        model_handle,
+        name.as_ptr() as i64,
+        name.len() as i64,
+    );
+    if tptr == 0 {
+        return Err(name.to_string());
+    }
+    // The tensor lives in this crate; read its fields directly.  Loaded
+    // safetensors weights are contiguous host f32.
+    let t = unsafe { &*(tptr as *const crate::tensor::NslTensor) };
+    if t.data.is_null() || t.len <= 0 {
+        return Err(name.to_string());
+    }
+    Ok((t.data as *const f32, t.len))
+}
+
+/// Resolve a weight, verify its element count equals `expect_elems`, then
+/// upload it to the device via `uploader` (f16 or f32).  On a shape
+/// mismatch or a failed upload the FIRST offending name is returned so
+/// bind_model can refuse with it (deferral-must-refuse: never fabricate a
+/// weight).  Returns the device pointer on success.
+#[cfg(feature = "cuda")]
+fn upload_named(
+    model_handle: i64,
+    name: &str,
+    expect_elems: i64,
+    uploader: extern "C" fn(i64, i64) -> i64,
+) -> Result<u64, String> {
+    let (ptr, len) = resolve_weight(model_handle, name)?;
+    if len != expect_elems {
+        return Err(format!(
+            "{name} (shape mismatch: has {len} elems, expected {expect_elems})"
+        ));
+    }
+    let dev = uploader(ptr as i64, len);
+    if dev <= 0 {
+        return Err(format!("{name} (device upload failed)"));
+    }
+    Ok(dev as u64)
+}
+
+/// Bind a loaded `NslModel` to the finalized CFIE engine: resolve every
+/// weight by the HF-Llama naming convention, upload it in the layout
+/// `nsl_cfie_decode_step` consumes (q/k/v/o + gate/up/down + lm_head as
+/// f16; the RMSNorm gammas + final norm as f32), keep the token-embedding
+/// table host-resident as f32, and record the device weight table +
+/// shape in engine state.  `nsl_cfie_generate` then drives decode_step
+/// over a prompt with this binding.
+///
+/// Weight names (HF-Llama; `{i}` = layer index):
+///   model.layers.{i}.self_attn.{q,k,v,o}_proj.weight  (f16)
+///   model.layers.{i}.mlp.{gate,up,down}_proj.weight    (f16)
+///   model.layers.{i}.input_layernorm.weight            (f32)
+///   model.layers.{i}.post_attention_layernorm.weight   (f32)
+///   model.norm.weight                                  (f32)
+///   lm_head.weight                                     (f16)
+///   model.embed_tokens.weight                          (host f32)
+///
+/// Shapes verified against the passed dims (weights are `[out][in]`
+/// row-major, matching the PyTorch/safetensors `nn.Linear` convention the
+/// decode-block kernel's `ld.global.b16` addressing expects):
+///   q_proj  [n_heads*head_dim][d_model]
+///   k/v_proj [n_kv_heads*head_dim][d_model]
+///   o_proj  [d_model][n_heads*head_dim]
+///   gate/up [d_ff][d_model], down [d_model][d_ff]
+///   norms   [d_model], final norm [d_model]
+///   lm_head [vocab][d_model], embed [vocab][d_model]
+///
+/// Returns 0 on success; -1 (with an eprintln LISTING the first
+/// missing/mis-shaped tensor) on any resolution/shape/upload failure or
+/// on a non-cuda build.  A partial upload IS torn down on failure (the
+/// uploads are engine-tracked, and this refusal clears the whole binding
+/// via `nsl_cfie_weights_reset` so no half-bound state survives).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_cfie_bind_model(
+    model_handle: i64,
+    n_layers: i64,
+    d_model: i64,
+    n_heads: i64,
+    n_kv_heads: i64,
+    head_dim: i64,
+    d_ff: i64,
+    vocab_size: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        if model_handle == 0 {
+            eprintln!("CFIE: bind_model refused — null model handle");
+            return -1;
+        }
+        if n_layers <= 0
+            || d_model <= 0
+            || n_heads <= 0
+            || n_kv_heads <= 0
+            || head_dim <= 0
+            || d_ff <= 0
+            || vocab_size <= 0
+        {
+            eprintln!("CFIE: bind_model refused — non-positive dimension in the model shape");
+            return -1;
+        }
+
+        // Per-weight expected element counts (from the [out][in] shapes).
+        let nhd = n_heads * head_dim; // q/attention width
+        let nkvd = n_kv_heads * head_dim; // k/v width
+        let attn_in = d_model; // projections read the residual stream
+        let wq_elems = nhd * attn_in;
+        let wkv_elems = nkvd * attn_in;
+        let wo_elems = d_model * nhd;
+        let gate_up_elems = d_ff * d_model;
+        let down_elems = d_model * d_ff;
+        let norm_elems = d_model;
+        let lm_head_elems = vocab_size * d_model;
+        let embed_elems = vocab_size * d_model;
+
+        // Assemble the binding into locals first; only on a fully clean
+        // resolve do we commit it to engine state.  On ANY failure we
+        // reset the (partially uploaded) weights so no half-bound state
+        // survives.
+        let bind = || -> Result<BoundModel, String> {
+            let mut weight_table = Vec::with_capacity((n_layers * 9) as usize);
+            for i in 0..n_layers {
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::WQ, i),
+                    wq_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::WK, i),
+                    wkv_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::WV, i),
+                    wkv_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::WO, i),
+                    wo_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::W_GATE, i),
+                    gate_up_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::W_UP, i),
+                    gate_up_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::W_DOWN, i),
+                    down_elems,
+                    nsl_cfie_upload_weight_f16,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::NORM1, i),
+                    norm_elems,
+                    nsl_cfie_upload_weight_f32,
+                )?);
+                weight_table.push(upload_named(
+                    model_handle,
+                    &names::layer(names::NORM2, i),
+                    norm_elems,
+                    nsl_cfie_upload_weight_f32,
+                )?);
+            }
+            let final_norm_dev = upload_named(
+                model_handle,
+                names::FINAL_NORM,
+                norm_elems,
+                nsl_cfie_upload_weight_f32,
+            )?;
+            let lm_head_dev = upload_named(
+                model_handle,
+                names::LM_HEAD,
+                lm_head_elems,
+                nsl_cfie_upload_weight_f16,
+            )?;
+            // Embedding table stays HOST-resident as f32 (v1 gather is a
+            // per-step host->device row memcpy — no upload, no f16
+            // convert).  Resolve + shape-check, then copy into an owned
+            // Vec the engine keeps for the session.
+            let (embed_ptr, embed_len) = resolve_weight(model_handle, names::EMBED)?;
+            if embed_len != embed_elems {
+                return Err(format!(
+                    "{} (shape mismatch: has {embed_len} elems, expected {embed_elems})",
+                    names::EMBED
+                ));
+            }
+            let embed_host =
+                unsafe { std::slice::from_raw_parts(embed_ptr, embed_len as usize) }.to_vec();
+
+            Ok(BoundModel {
+                weight_table,
+                final_norm_dev,
+                lm_head_dev,
+                embed_host,
+                n_layers,
+                d_model,
+                vocab_size,
+            })
+        };
+
+        match bind() {
+            Ok(bm) => {
+                let mut g = match engine().lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        // Lock poisoned after uploads landed — free them
+                        // so the refusal leaves no device leak.
+                        nsl_cfie_weights_reset();
+                        eprintln!("CFIE: bind_model refused — engine lock poisoned");
+                        return -1;
+                    }
+                };
+                // A re-bind replaces any prior binding; the old device
+                // buffers were freed by the caller's weights_reset (Cycle
+                // 11 rebinds via bind_model after weights_reset) or are
+                // superseded here — we only overwrite the records.
+                g.bound_model = Some(bm);
+                0
+            }
+            Err(missing) => {
+                // Deferral-must-refuse: a missing/mis-shaped weight must
+                // refuse, never fabricate.  Free whatever partial uploads
+                // landed so the refusal leaves no device leak, and clear
+                // any stale binding.
+                nsl_cfie_weights_reset();
+                if let Ok(mut g) = engine().lock() {
+                    g.bound_model = None;
+                }
+                eprintln!(
+                    "CFIE: bind_model refused — missing or mis-shaped weight: {missing}"
+                );
+                -1
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            model_handle,
+            n_layers,
+            d_model,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_ff,
+            vocab_size,
+        );
+        eprintln!("CFIE: bind_model requires a CUDA-enabled build and GPU — refusing (no binding)");
+        -1
+    }
+}
+
+/// Drive the CFIE decode loop over `prompt_tokens` + up to
+/// `max_new_tokens` generated tokens, writing the GENERATED token ids to
+/// `out_tokens` (host array of capacity `out_cap` i64).  Requires
+/// `nsl_cfie_bind_model` + `nsl_cfie_engine_finalize` to have run.
+///
+/// The loop (see the ABI): acquire a KV slot; for pos in
+/// 0..(prompt_len + max_new_tokens), gather the embedding row of the
+/// current input token (prompt token while prefilling, else the last
+/// sampled token) into `x_a`, run `nsl_cfie_decode_step`, read the
+/// sampled token, and — from the LAST prefill step onward (`pos >=
+/// prompt_len - 1`, which already produces the first NEW token) — record
+/// it, stopping on EOS or `max_new_tokens`.  Cleanly stops (breaks) on a
+/// `-2` KV-capacity refusal; a real failure (`rc < 0`, `rc != -2`)
+/// releases the slot and returns -1.
+///
+/// grammar_state stays 0 in v1 (the sampler supports a grammar mask when
+/// grammar_states>0, but wiring the per-step DFA transition through
+/// generate is a later cycle — DEFERRED, documented here).
+///
+/// Return value: the TRUE generated-token count (may exceed `out_cap`).
+/// Writes are CLAMPED to `out_cap` (tokens past the capacity are counted
+/// but not written — no buffer overrun); the returned count is the true
+/// number generated so the caller can detect truncation.  Returns -1 on a
+/// bad argument, missing binding/finalize, slot-acquire failure, or a
+/// real decode failure; on a non-cuda build.
+///
+/// # Safety
+/// `prompt_tokens_ptr` must point to `prompt_len` readable i64s;
+/// `out_tokens_ptr` to `out_cap` writable i64s.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_cfie_generate(
+    prompt_tokens_ptr: i64,
+    prompt_len: i64,
+    max_new_tokens: i64,
+    eos_token_id: i64,
+    rng_seed: i64,
+    out_tokens_ptr: i64,
+    out_cap: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        // Argument validation up front (before any device work).
+        if prompt_tokens_ptr == 0
+            || out_tokens_ptr == 0
+            || prompt_len <= 0
+            || out_cap <= 0
+            || max_new_tokens <= 0
+        {
+            eprintln!("CFIE: generate refused — bad argument (null ptr or non-positive length/cap)");
+            return -1;
+        }
+
+        // Snapshot the binding + shape under the engine lock (the device
+        // pointers/host embed are stable for the call; we release the lock
+        // before the decode loop so decode_step's own engine locking is
+        // not re-entrant).
+        let (weight_table, final_norm_dev, lm_head_dev, embed_host, n_layers, d_model, vocab_size) = {
+            let g = match engine().lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    eprintln!("CFIE: generate refused — engine lock poisoned");
+                    return -1;
+                }
+            };
+            match g.bound_model.as_ref() {
+                Some(bm) => (
+                    bm.weight_table.clone(),
+                    bm.final_norm_dev,
+                    bm.lm_head_dev,
+                    bm.embed_host.clone(),
+                    bm.n_layers,
+                    bm.d_model,
+                    bm.vocab_size,
+                ),
+                None => {
+                    eprintln!("CFIE: generate refused — no model bound (call nsl_cfie_bind_model first)");
+                    return -1;
+                }
+            }
+        };
+        // Engine must be finalized (kinds 1 + 2 resolved).  resolved()
+        // checks finalize; probe kind 2 so a not-finalized engine refuses
+        // here rather than deep in the loop.
+        if resolved(KIND_DECODE_BLOCK, 0).is_err() || resolved(KIND_FUSED_SAMPLE, 0).is_err() {
+            eprintln!("CFIE: generate refused — engine not finalized (kinds 1+2 unresolved)");
+            return -1;
+        }
+
+        let d = d_model as usize;
+        // Read the prompt token ids (host i64 array).
+        let prompt =
+            unsafe { std::slice::from_raw_parts(prompt_tokens_ptr as *const i64, prompt_len as usize) };
+        // Output slice (host i64 array of capacity out_cap).
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(out_tokens_ptr as *mut i64, out_cap as usize)
+        };
+
+        // Acquire a fresh KV slot for this sequence.
+        let slot = crate::cfie::ffi::nsl_cfie_kv_slot_acquire();
+        if slot < 0 {
+            eprintln!("CFIE: generate refused — KV slot acquire failed (pool exhausted?)");
+            return -1;
+        }
+
+        // Device scratch: x_a / x_b (f32 [d_model]) + one u32 out-token.
+        // Freed on EVERY exit path below (including early returns).
+        let x_a = crate::cuda::inner::alloc_device(d * 4) as i64;
+        let x_b = crate::cuda::inner::alloc_device(d * 4) as i64;
+        let tok_dev = crate::cuda::inner::alloc_device(4) as i64;
+
+        // Single cleanup closure — release slot + free scratch.  Called on
+        // every return so no device buffer or KV slot leaks.
+        let cleanup = |x_a: i64, x_b: i64, tok_dev: i64, slot: i64| {
+            crate::cuda::inner::free_device(x_a as *mut c_void);
+            crate::cuda::inner::free_device(x_b as *mut c_void);
+            crate::cuda::inner::free_device(tok_dev as *mut c_void);
+            crate::cfie::ffi::nsl_cfie_kv_slot_release(slot);
+        };
+
+        let mut generated: i64 = 0;
+        let mut last_sampled: i64 = 0;
+        let total_steps = prompt_len + max_new_tokens;
+        for pos in 0..total_steps {
+            let input_token = if pos < prompt_len {
+                prompt[pos as usize]
+            } else {
+                last_sampled
+            };
+            // Embedding gather: memcpy the host f32 row `input_token`
+            // (d_model elems) into x_a.  Guard the token id against the
+            // vocab so a bad id refuses rather than reading OOB host mem.
+            if input_token < 0 || input_token >= vocab_size {
+                cleanup(x_a, x_b, tok_dev, slot);
+                eprintln!(
+                    "CFIE: generate refused — input token id {input_token} out of range [0, {vocab_size})"
+                );
+                return -1;
+            }
+            let row_start = input_token as usize * d;
+            crate::cuda::inner::memcpy_htod(
+                x_a as *mut c_void,
+                embed_host[row_start..row_start + d].as_ptr() as *const c_void,
+                d * 4,
+            );
+
+            let rc = nsl_cfie_decode_step(
+                x_a,
+                x_b,
+                weight_table.as_ptr() as i64,
+                n_layers,
+                final_norm_dev as i64,
+                lm_head_dev as i64,
+                slot,
+                pos,
+                rng_seed,
+                0, // grammar_state — DEFERRED (v1 unconstrained sampling)
+                tok_dev,
+            );
+            if rc == -2 {
+                // KV slot capacity reached -> stop cleanly (not a failure).
+                break;
+            }
+            if rc < 0 {
+                // Real decode failure -> release slot + free scratch, -1.
+                cleanup(x_a, x_b, tok_dev, slot);
+                eprintln!("CFIE: generate — decode_step failed with rc {rc}");
+                return -1;
+            }
+
+            // Copy the sampled device u32 -> host.
+            let mut sampled_u32 = [0u32; 1];
+            crate::cuda::inner::memcpy_dtoh(
+                sampled_u32.as_mut_ptr() as *mut c_void,
+                tok_dev as *const c_void,
+                4,
+            );
+            let sampled = sampled_u32[0] as i64;
+
+            // The last prefill step (pos == prompt_len - 1) already
+            // produces the FIRST new token, so recording starts there.
+            if pos >= prompt_len - 1 {
+                if generated < out_cap {
+                    out[generated as usize] = sampled;
+                }
+                generated += 1;
+                if sampled == eos_token_id {
+                    break;
+                }
+                if generated >= max_new_tokens {
+                    break;
+                }
+            }
+            last_sampled = sampled;
+        }
+
+        cleanup(x_a, x_b, tok_dev, slot);
+        generated
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            prompt_tokens_ptr,
+            prompt_len,
+            max_new_tokens,
+            eos_token_id,
+            rng_seed,
+            out_tokens_ptr,
+            out_cap,
+        );
+        eprintln!("CFIE: generate requires a CUDA-enabled build and GPU — refusing (no generation)");
+        -1
+    }
+}
+
+/// Clear the bound-model state (weight table, embed/final_norm/lm_head,
+/// shape) WITHOUT freeing the device weight buffers — those are owned by
+/// `nsl_cfie_weights_reset` / `nsl_cfie_engine_destroy`.  Idempotent;
+/// always returns 0.  Cycle 11 rebinds via `nsl_cfie_bind_model` after a
+/// weights reset; this FFI just drops the table records so a stale
+/// binding cannot drive `nsl_cfie_generate`.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_generate_reset() -> i64 {
+    let mut g = match engine().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    g.bound_model = None;
     0
 }
 
@@ -1609,6 +2194,99 @@ mod tests {
             let g = engine().lock().unwrap_or_else(|e| e.into_inner());
             assert!(g.weight_allocs.is_empty(), "non-cuda never records");
         }
+        reset_engine();
+    }
+
+    // -----------------------------------------------------------------
+    // CFIE Cycle 10 model binding + generation driver
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn generate_reset_is_idempotent_and_zero() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        // No binding yet: reset is a no-op returning 0, twice.
+        assert_eq!(nsl_cfie_generate_reset(), 0);
+        assert_eq!(nsl_cfie_generate_reset(), 0);
+        {
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.bound_model.is_none(), "no binding recorded");
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn bind_model_validates_args_and_refuses_noncuda() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        // Null model handle refuses on every build (guard fires before any
+        // device work / any weight resolution).
+        assert_eq!(
+            nsl_cfie_bind_model(0, 2, 64, 2, 1, 32, 128, 128),
+            -1,
+            "null model handle must refuse"
+        );
+        // A non-null handle with a non-positive dimension refuses on cuda
+        // builds via the shape guard; on non-cuda builds the whole FFI
+        // refuses regardless.  Use a bogus (never-dereferenced on these
+        // paths) handle value.
+        let bogus = 0x1000i64;
+        assert_eq!(
+            nsl_cfie_bind_model(bogus, 0, 64, 2, 1, 32, 128, 128),
+            -1,
+            "non-positive n_layers must refuse"
+        );
+        assert_eq!(
+            nsl_cfie_bind_model(bogus, 2, 0, 2, 1, 32, 128, 128),
+            -1,
+            "non-positive d_model must refuse"
+        );
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Non-cuda: even a fully valid-looking request refuses (no GPU)
+            // BEFORE dereferencing the handle.
+            assert_eq!(
+                nsl_cfie_bind_model(bogus, 2, 64, 2, 1, 32, 128, 128),
+                -1,
+                "no cuda => -1"
+            );
+        }
+        // No binding may have been recorded by any refusal.
+        {
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.bound_model.is_none(), "a refused bind must record nothing");
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn generate_validates_args_and_refuses_before_bind() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        // A real host prompt + output buffer so the ptrs are non-null; the
+        // arg guards / no-binding refusal fire before any device work.
+        let prompt = [1i64, 2, 3];
+        let pp = prompt.as_ptr() as i64;
+        let mut out = [0i64; 4];
+        let op = out.as_mut_ptr() as i64;
+
+        // Bad args refuse (-1): null prompt ptr, null out ptr, non-positive
+        // prompt_len / out_cap / max_new_tokens.
+        assert_eq!(nsl_cfie_generate(0, 3, 4, 99, 7, op, 4), -1, "null prompt ptr");
+        assert_eq!(nsl_cfie_generate(pp, 3, 4, 99, 7, 0, 4), -1, "null out ptr");
+        assert_eq!(nsl_cfie_generate(pp, 0, 4, 99, 7, op, 4), -1, "zero prompt_len");
+        assert_eq!(nsl_cfie_generate(pp, -1, 4, 99, 7, op, 4), -1, "neg prompt_len");
+        assert_eq!(nsl_cfie_generate(pp, 3, 4, 99, 7, op, 0), -1, "zero out_cap");
+        assert_eq!(nsl_cfie_generate(pp, 3, 0, 99, 7, op, 4), -1, "zero max_new_tokens");
+
+        // Valid args but NO model bound (and on cuda, not finalized): must
+        // refuse -1 before touching a KV slot.  On non-cuda the whole FFI
+        // refuses regardless.
+        assert_eq!(
+            nsl_cfie_generate(pp, 3, 4, 99, 7, op, 4),
+            -1,
+            "generate must refuse before bind_model + finalize"
+        );
         reset_engine();
     }
 }
