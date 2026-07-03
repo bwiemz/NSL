@@ -78,13 +78,21 @@ pub fn emit_wire(w: &Wire) -> String {
 }
 
 /// M57.1 wire-array realization (Task W2): module-scope multi-dim wire decl.
-/// Mechanical lowering — emits `wire signed [W-1:0] name [0:dims[0]-1]...;`
-/// (single space after name, no separator between dim brackets).
+///
+/// Emitted as a **packed** multi-dim wire (`wire signed [d0-1:0]...[W-1:0]
+/// name;`) rather than an unpacked array (`wire signed [W-1:0] name
+/// [0:d0-1]...;`). Yosys's built-in Verilog frontend rejects unpacked `wire`
+/// arrays ("syntax error, unexpected '['") but accepts packed multi-dim
+/// wires, and continuous `assign name[i][j] = ...` to their elements
+/// synthesizes cleanly (verified against the `synth -flatten; check`
+/// zero-warnings gate). Packed and unpacked arrays share identical
+/// `name[i][j]` element-access syntax, so no reference-site emitter changes
+/// are needed (see `emit_signal_ref`'s `WireArrayElement` arm).
 pub fn emit_wire_array(wa: &WireArray) -> String {
     let dims_str: String = wa.dims.iter()
-        .map(|d| format!("[0:{}]", d - 1))
+        .map(|d| format!("[{}:0]", d - 1))
         .collect();
-    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, dims_str)
+    format!("wire signed {}[{}:0] {};", dims_str, wa.width - 1, wa.name)
 }
 
 /// M57.1 wire-array realization (Task W4): drives one element of a WireArray.
@@ -113,37 +121,49 @@ pub fn emit_local_param(lp: &LocalParam) -> String {
 /// elide localparam lines (`elide_localparams`) so the bulk of the W matrix
 /// content doesn't dominate the structural-skeleton snapshot.
 pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
+    // Yosys's Verilog frontend rejects BOTH unpacked arrays
+    // (`localparam signed [W-1:0] name [0:d0-1]...`) and multi-dim *packed*
+    // localparams (`localparam signed [d0-1:0][d1-1:0] name` → "unexpected
+    // '['"). Emit the constant table instead as a packed multi-dim *wire*
+    // driven by a single flat constant `assign`: packed wires accept
+    // `name[i][j]` element access (identical to the old unpacked-localparam
+    // refs, so `IndexedLocalParam` sites are unchanged) and Yosys constant-
+    // folds the wire back to a literal during `synth`. Verified clean against
+    // the `synth -flatten; check` zero-warnings gate.
+    //
+    // Packed vectors concatenate MSB-first, so the highest index is emitted
+    // first: for a 2-D `[rows-1:0][cols-1:0][W-1:0]` table, `name[i][j]`
+    // selects `values[i*cols + j]` when the concat runs r=rows-1..0, c=cols-1..0.
     let dims_str: String = lpa.dims.iter()
-        .map(|d| format!(" [0:{}]", d - 1))
+        .map(|d| format!("[{}:0]", d - 1))
         .collect();
-    let values_str = match lpa.dims.len() {
+    let cells: Vec<String> = match lpa.dims.len() {
         2 => {
             let (rows, cols) = (lpa.dims[0], lpa.dims[1]);
             assert_eq!(lpa.values.len(), rows * cols,
                 "LocalParamArray.values len {} != rows({}) * cols({})",
                 lpa.values.len(), rows, cols);
-            let row_strs: Vec<String> = (0..rows).map(|r| {
-                let cells: Vec<String> = (0..cols).map(|c| {
-                    format!("{}'sd{}", lpa.width, lpa.values[r * cols + c])
-                }).collect();
-                format!("'{{{}}}", cells.join(", "))
-            }).collect();
-            format!("'{{{}}}", row_strs.join(", "))
+            let mut v = Vec::with_capacity(rows * cols);
+            for r in (0..rows).rev() {
+                for c in (0..cols).rev() {
+                    v.push(format!("{}'sd{}", lpa.width, lpa.values[r * cols + c]));
+                }
+            }
+            v
         }
         1 => {
             assert_eq!(lpa.values.len(), lpa.dims[0],
                 "LocalParamArray.values len {} != dim {}",
                 lpa.values.len(), lpa.dims[0]);
-            let cells: Vec<String> = lpa.values.iter()
-                .map(|v| format!("{}'sd{}", lpa.width, v))
-                .collect();
-            format!("'{{{}}}", cells.join(", "))
+            (0..lpa.dims[0]).rev()
+                .map(|i| format!("{}'sd{}", lpa.width, lpa.values[i]))
+                .collect()
         }
         n => panic!("emit_local_param_array: rank {} not supported in v1", n),
     };
     format!(
-        "localparam signed [{}:0] {}{} = {};",
-        lpa.width - 1, lpa.name, dims_str, values_str
+        "wire signed {}[{}:0] {};\n    assign {} = {{{}}};",
+        dims_str, lpa.width - 1, lpa.name, lpa.name, cells.join(", ")
     )
 }
 
@@ -559,7 +579,7 @@ mod tests {
         };
         assert_eq!(
             emit_wire_array(&wa),
-            "wire signed [31:0] acc_l1 [0:127][0:784];"
+            "wire signed [127:0][784:0][31:0] acc_l1;"
         );
     }
 
@@ -572,7 +592,35 @@ mod tests {
         };
         assert_eq!(
             emit_wire_array(&wa),
-            "wire signed [31:0] relu_l1 [0:127];"
+            "wire signed [127:0][31:0] relu_l1;"
+        );
+    }
+
+    // Lock in the packed-wire value-to-index mapping: the flat concat must be
+    // MSB-first so `name[i][j]` still selects `values[i*cols + j]` (the fixture
+    // uses all-zero weights, so this ordering is otherwise unexercised).
+    #[test]
+    fn emit_local_param_array_2d_value_ordering() {
+        // row-major values: [[1,2],[3,4]] → W[0][0]=1, W[0][1]=2, W[1][0]=3, W[1][1]=4
+        let lpa = LocalParamArray {
+            name: "W".into(), dims: vec![2, 2], width: 8, values: vec![1, 2, 3, 4],
+        };
+        // packed [1:0][1:0][7:0]; concat MSB-first = W[1][1], W[1][0], W[0][1], W[0][0].
+        assert_eq!(
+            emit_local_param_array(&lpa),
+            "wire signed [1:0][1:0][7:0] W;\n    assign W = {8'sd4, 8'sd3, 8'sd2, 8'sd1};"
+        );
+    }
+
+    #[test]
+    fn emit_local_param_array_1d_value_ordering() {
+        let lpa = LocalParamArray {
+            name: "b".into(), dims: vec![3], width: 32, values: vec![10, 20, 30],
+        };
+        // packed [2:0][31:0]; concat MSB-first = b[2], b[1], b[0].
+        assert_eq!(
+            emit_local_param_array(&lpa),
+            "wire signed [2:0][31:0] b;\n    assign b = {32'sd30, 32'sd20, 32'sd10};"
         );
     }
 
