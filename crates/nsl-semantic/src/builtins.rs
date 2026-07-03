@@ -400,6 +400,27 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         );
     }
 
+    // Element-wise tensor `sign` (Tensor -> Tensor). Its runtime FFI
+    // (`nsl_tensor_sign`), Cranelift signature, and codegen call-dispatch all
+    // already existed; only this semantic registration was missing, which made
+    // the stdlib Lion optimizer (`sign(β₁m+(1-β₁)g)`) fail type-checking.
+    //
+    // It is deliberately typed concretely as Tensor->Tensor (not `Unknown` like
+    // `abs`): a `sign(...)` result typed `Unknown` would make a downstream
+    // `scalar * result` (e.g. Lion's `lr * update`) mis-dispatch to a scalar
+    // multiply, producing an f64 where a tensor pointer is required. Unlike
+    // `abs`, `sign` has no scalar-argument codegen path — the scalar version is
+    // `nsl.math.sign`, which shadows this builtin via codegen's
+    // user-defined-function check when imported (same pattern as `clamp`).
+    def(
+        "sign",
+        Type::Function {
+            params: vec![tensor_ret.clone()],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // tensor_slice(tensor, dim, start, end) -> tensor
     def(
         "tensor_slice",
@@ -1132,4 +1153,45 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The element-wise tensor `sign` builtin must be registered as
+    /// `Tensor -> Tensor`. If it is missing, the stdlib Lion optimizer fails to
+    /// type-check (`undefined variable sign`). If it is registered as `Unknown`
+    /// instead of `Tensor`, a downstream `scalar * sign(...)` (Lion's
+    /// `lr * update`) mis-dispatches to a scalar multiply and fails Cranelift
+    /// verification with "arg has type f64, expected i64". This test guards both.
+    #[test]
+    fn sign_is_registered_as_tensor_to_tensor() {
+        let mut scopes = ScopeMap::new();
+        let mut interner = Interner::new();
+        register_builtins(&mut scopes, &mut interner);
+
+        let sym = Symbol(interner.get_or_intern("sign"));
+        let (_, info) = scopes
+            .lookup(ScopeId::ROOT, sym)
+            .expect("`sign` must be a registered builtin");
+
+        match &info.ty {
+            Type::Function { params, ret, .. } => {
+                assert_eq!(params.len(), 1, "sign takes exactly one argument");
+                assert!(
+                    matches!(params[0], Type::Tensor { .. }),
+                    "sign's parameter must be Tensor (got {:?}); an Unknown param would let \
+                     the result stay untyped and mis-dispatch downstream arithmetic",
+                    params[0]
+                );
+                assert!(
+                    matches!(**ret, Type::Tensor { .. }),
+                    "sign must return Tensor (got {:?}), not Unknown",
+                    ret
+                );
+            }
+            other => panic!("`sign` must be a Function type, got {:?}", other),
+        }
+    }
 }
