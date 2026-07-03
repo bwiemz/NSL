@@ -720,7 +720,7 @@ pub fn cpu_reference(
     let vocab = program.shape.vocab_size as usize;
     let k = program.params.top_k as usize;
     assert!((1..=64).contains(&k), "top_k must be in 1..=64");
-    assert!(dm >= 1 && dm <= 8192, "d_model must be in 1..=8192");
+    assert!((1..=8192).contains(&dm), "d_model must be in 1..=8192");
     assert_eq!(program.shape.vocab_tile, TILE, "vocab_tile must be {TILE}");
     assert_eq!(hidden.len(), dm, "hidden must be [1, d_model]");
     assert_eq!(

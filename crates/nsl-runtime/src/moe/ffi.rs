@@ -473,9 +473,9 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
         }
     };
 
-    let logits_f32 = read_f32(&logits);
-    let tokens_f32 = read_f32(&tokens);
-    let experts_f32 = read_f32(&experts);
+    let logits_f32 = read_f32(logits);
+    let tokens_f32 = read_f32(tokens);
+    let experts_f32 = read_f32(experts);
 
     // Route tokens — same as v1.
     let routing = router::route_topk(
@@ -792,16 +792,16 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
         }
     };
 
-    let logits_f32 = read_f32(&logits);
-    let tokens_f32 = read_f32(&tokens);
-    let experts_up_f32 = read_f32(&experts_up);
-    let experts_down_f32 = read_f32(&experts_down);
+    let logits_f32 = read_f32(logits);
+    let tokens_f32 = read_f32(tokens);
+    let experts_up_f32 = read_f32(experts_up);
+    let experts_down_f32 = read_f32(experts_down);
     // v2.11 — materialize bias buffers (if present) up front so the
     // per-expert hot loop avoids re-reading dtype on each iteration.
-    // NslTensor::from_ptr returns &mut NslTensor, so the closure
-    // takes an explicit reborrow to match read_f32's &NslTensor sig.
-    let up_bias_f32_opt: Option<Vec<f32>> = up_bias_opt.as_ref().map(|t| read_f32(&**t));
-    let down_bias_f32_opt: Option<Vec<f32>> = down_bias_opt.as_ref().map(|t| read_f32(&**t));
+    // `*_bias_opt.as_ref()` yields `&&mut NslTensor`, which deref-coerces
+    // to read_f32's `&NslTensor` parameter at the call site.
+    let up_bias_f32_opt: Option<Vec<f32>> = up_bias_opt.as_ref().map(|t| read_f32(t));
+    let down_bias_f32_opt: Option<Vec<f32>> = down_bias_opt.as_ref().map(|t| read_f32(t));
 
     let routing = router::route_topk(
         &logits_f32, total_tokens, num_experts_us, top_k, capacity_factor,
@@ -868,10 +868,10 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
                 }
                 2 => {
                     // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
-                    // 0.7978845608 = sqrt(2.0 / std::f32::consts::PI), precomputed
-                    // as an f32 constant to avoid bringing the dependency into
-                    // this inner loop.
-                    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+                    // 0.797_884_6 = sqrt(2.0 / std::f32::consts::PI) rounded to
+                    // f32, precomputed as a constant to avoid bringing the
+                    // dependency into this inner loop.
+                    const SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
                     const GELU_CUBIC: f32 = 0.044715_f32;
                     for v in intermediate.iter_mut() {
                         let x = *v;
@@ -1207,24 +1207,22 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
         }
     };
 
-    let logits_f32 = read_f32(&logits);
-    let tokens_f32 = read_f32(&tokens);
-    let experts_gate_f32 = read_f32(&experts_gate);
-    let experts_up_f32 = read_f32(&experts_up);
-    let experts_down_f32 = read_f32(&experts_down);
+    let logits_f32 = read_f32(logits);
+    let tokens_f32 = read_f32(tokens);
+    let experts_gate_f32 = read_f32(experts_gate);
+    let experts_up_f32 = read_f32(experts_up);
+    let experts_down_f32 = read_f32(experts_down);
     // v2.14 bias materialization. Hoisted outside the kernel loops so
     // the bias buffer is materialized once per FFI call, not per
-    // (expert, token) pair. Type annotation pins the closure-reborrow
-    // pattern (NslTensor::from_ptr returns &'static mut so
-    // .as_ref().map(read_f32) hits a &&mut NslTensor vs &NslTensor
-    // mismatch; explicit `|t| read_f32(&**t)` works around the
-    // double-mut-ref).
+    // (expert, token) pair. `*_bias_opt.as_ref()` yields `&&mut NslTensor`
+    // (NslTensor::from_ptr returns `&'static mut`), which deref-coerces to
+    // read_f32's `&NslTensor` parameter at the call site.
     let gate_bias_f32_opt: Option<Vec<f32>> =
-        gate_bias_opt.as_ref().map(|t| read_f32(&**t));
+        gate_bias_opt.as_ref().map(|t| read_f32(t));
     let up_bias_f32_opt: Option<Vec<f32>> =
-        up_bias_opt.as_ref().map(|t| read_f32(&**t));
+        up_bias_opt.as_ref().map(|t| read_f32(t));
     let down_bias_f32_opt: Option<Vec<f32>> =
-        down_bias_opt.as_ref().map(|t| read_f32(&**t));
+        down_bias_opt.as_ref().map(|t| read_f32(t));
 
     let routing = router::route_topk(
         &logits_f32, total_tokens, num_experts_us, top_k, capacity_factor,
@@ -1294,20 +1292,20 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
                     for j in 0..intermediate_dim_us {
                         let g = gate_scratch[j];
                         let s = 1.0_f32 / (1.0_f32 + (-g).exp());
-                        up_scratch[j] = (g * s) * up_scratch[j];
+                        up_scratch[j] *= g * s;
                     }
                 }
                 2 => {
                     // GeGLU = gelu(gate) * up. tanh-approx, matches
                     // torch.gelu(approximate='tanh') and the v3
                     // activation_kind=2 branch.
-                    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+                    const SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
                     const GELU_CUBIC: f32 = 0.044715_f32;
                     for j in 0..intermediate_dim_us {
                         let x = gate_scratch[j];
                         let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
                         let gelu_x = 0.5_f32 * x * (1.0_f32 + inner.tanh());
-                        up_scratch[j] = gelu_x * up_scratch[j];
+                        up_scratch[j] *= gelu_x;
                     }
                 }
                 3 => {
@@ -1315,7 +1313,7 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
                     for j in 0..intermediate_dim_us {
                         let g = gate_scratch[j];
                         let relu_g = if g < 0.0_f32 { 0.0_f32 } else { g };
-                        up_scratch[j] = relu_g * up_scratch[j];
+                        up_scratch[j] *= relu_g;
                     }
                 }
                 _ => unreachable!(

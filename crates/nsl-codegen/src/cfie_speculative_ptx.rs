@@ -860,7 +860,7 @@ pub fn cpu_reference_verify(
     let nkv = cfg.n_kv_heads as usize;
     let hd = cfg.head_dim as usize;
     let sl = seq_len as usize;
-    assert!(nkv >= 1 && nh % nkv == 0);
+    assert!(nkv >= 1 && nh.is_multiple_of(nkv));
     assert_eq!(cfg.mask_bits.len(), nn, "mask_bits must have one row per node");
     assert_eq!(q.len(), nn * nh * hd, "q must be [num_nodes][n_heads][head_dim]");
     assert_eq!(
