@@ -626,6 +626,46 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // Source-AD conv2d backward FFIs: (grad, input, weight, sh, sw, ph, pw) -> grad.
+    (
+        "nsl_conv2d_input_backward",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_conv2d_weight_backward",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_conv2d_bias_backward",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_maxpool2d",
         &[types::I64, types::I64, types::I64, types::I64, types::I64],

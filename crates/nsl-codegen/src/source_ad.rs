@@ -1146,32 +1146,22 @@ impl AdjointGenerator {
             }
 
             // --- Conv/Pool backward ---
-            // Conv2d gradients are REFUSED in source AD (deferral must refuse).
-            // Neither conv arm is reachable today: no extractor emits
-            // `PrimalOp::Conv2d`, so conv models fall back to the tape-based
-            // backward, which implements the correct nested-loop gradients.
-            // These panics exist so that if Conv2d extraction is ever added
-            // without implementing correct source-AD conv gradients, the
-            // compiler fails loudly instead of silently emitting wrong math.
-            AdjointExpr::ConvTransposeInput(_y_bar, _weight, _stride, _padding) => panic!(
-                "[source-ad] Conv2d input gradients are not supported in source AD; \
-                 use the tape AD fallback (do not extract PrimalOp::Conv2d). The \
-                 previous lowering emitted PrimalOp::ConvTranspose2d, whose only \
-                 lowering approximates it with a plain nsl_tensor_conv2d call -- \
-                 not a true transposed convolution -- and would produce incorrect \
-                 input gradients. Implement a real conv_transpose2d (stride \
-                 upsampling + full padding + flipped kernel) before enabling \
-                 Conv2d in source AD."
-            ),
-            AdjointExpr::ConvTransposeWeight(_input, _y_bar) => panic!(
-                "[source-ad] Conv2d weight gradients are not supported in source AD; \
-                 use the tape AD fallback (do not extract PrimalOp::Conv2d). The \
-                 previous transpose+matmul lowering was incorrect for 4D \
-                 convolution -- the weight gradient requires im2col + matmul \
-                 (cross-correlation of the input with grad_output), not \
-                 transpose(input) @ grad. Implement im2col before enabling \
-                 Conv2d in source AD."
-            ),
+            // Conv2d gradients delegate to the runtime `nsl_conv2d_*_backward`
+            // FFIs, which wrap the same verified nested-loop `conv2d_backward`
+            // the tape path uses — so source-AD conv gradients are byte-identical
+            // to the tape gradients. `kind` selects input/weight/bias; inputs are
+            // [grad_output, input, weight]. (This replaced an earlier
+            // transpose+matmul lowering that was wrong for 4D convolution and was
+            // subsequently turned into a hard refusal; it is now implemented.)
+            AdjointExpr::Conv2dBackward(kind, grad, input, weight, stride, padding) => self
+                .emit_op(
+                    PrimalOp::Conv2dBackward {
+                        kind,
+                        stride,
+                        padding,
+                    },
+                    vec![grad, input, weight],
+                ),
             AdjointExpr::MaxPoolBackward(y_bar, indices) => {
                 // MaxPool backward: scatter grad to argmax positions
                 self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices])
@@ -3154,6 +3144,61 @@ impl<'a> WengertExtractor<'a> {
                             .unwrap_or(0);
                         PrimalOp::Gather { dim }
                     }
+                    // Conv2d: conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w).
+                    // Extract square stride/padding as compile-time constants and
+                    // emit PrimalOp::Conv2d with only the tensor inputs
+                    // [input, weight, bias]. Non-constant or non-square stride/
+                    // padding is not representable by the single-valued
+                    // PrimalOp::Conv2d, so it returns None and falls back to tape AD
+                    // (whose conv2d_backward handles the general case).
+                    "conv2d" => {
+                        if args.len() != 7 {
+                            eprintln!(
+                                "[source-ad] conv2d expected 7 args (input, weight, bias, \
+                                 stride_h, stride_w, pad_h, pad_w), got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        let as_const_int = |k: &ExprKind| -> Option<i64> {
+                            match k {
+                                ExprKind::IntLiteral(v) => Some(*v),
+                                ExprKind::UnaryOp {
+                                    op: AstUnaryOp::Neg,
+                                    operand,
+                                } => match &operand.kind {
+                                    ExprKind::IntLiteral(v) => Some(-*v),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        };
+                        let (sh, sw, ph, pw) = match (
+                            as_const_int(&args[3].value.kind),
+                            as_const_int(&args[4].value.kind),
+                            as_const_int(&args[5].value.kind),
+                            as_const_int(&args[6].value.kind),
+                        ) {
+                            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                            _ => return None,
+                        };
+                        if sh != sw || ph != pw || sh < 1 || ph < 0 {
+                            return None;
+                        }
+                        let conv_inputs = vec![input_vars[0], input_vars[1], input_vars[2]];
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::Conv2d {
+                                stride: sh as usize,
+                                padding: ph as usize,
+                            },
+                            inputs: conv_inputs,
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
+                    }
                     // Attention — emit as fused ScaledDotProductAttention.
                     // The backward is handled by FlashAttentionBackwardExtract
                     // which calls nsl_flash_attention_backward (CPU reference path).
@@ -4199,29 +4244,50 @@ mod tests {
         );
     }
 
-    /// Deferral-must-refuse: the `ConvTransposeWeight` arm previously lowered
-    /// Conv2d weight gradients as `transpose(input) @ grad`, which is
-    /// mathematically wrong for 4D convolution (requires im2col + matmul).
-    /// The arm is unreachable from any extractor today (nothing emits
-    /// `PrimalOp::Conv2d`; conv falls back to tape AD), but it must refuse
-    /// loudly rather than silently emit wrong gradients if ever reached.
+    /// Conv2d gradients are now implemented in source AD (the deferral is
+    /// closed). Each `Conv2dBackward` adjoint lowers to exactly one
+    /// `PrimalOp::Conv2dBackward` op carrying the same kind/stride/padding and
+    /// inputs `[grad, input, weight]` — which in turn calls the runtime
+    /// `nsl_conv2d_{input,weight,bias}_backward` FFI wrapping the verified
+    /// `conv2d_backward` shared with the tape path. (Previously both arms
+    /// refused loudly because the old transpose+matmul lowering was wrong for
+    /// 4D convolution.)
     #[test]
-    #[should_panic(expected = "Conv2d weight gradients are not supported in source AD")]
-    fn lower_adjoint_expr_conv_weight_grad_refuses() {
-        let mut gen = AdjointGenerator::new(200);
-        let _ = gen.lower_adjoint_expr(AdjointExpr::ConvTransposeWeight(0, 100));
-    }
-
-    /// Sibling refusal: `ConvTransposeInput` previously emitted
-    /// `PrimalOp::ConvTranspose2d`, whose only lowering (wengert_lower.rs)
-    /// is a documented approximation that calls plain `nsl_tensor_conv2d`
-    /// -- not a transposed convolution -- so the input-gradient arm was
-    /// equally silently-wrong-if-reached and must refuse the same way.
-    #[test]
-    #[should_panic(expected = "Conv2d input gradients are not supported in source AD")]
-    fn lower_adjoint_expr_conv_input_grad_refuses() {
-        let mut gen = AdjointGenerator::new(200);
-        let _ = gen.lower_adjoint_expr(AdjointExpr::ConvTransposeInput(100, 1, 1, 0));
+    fn lower_adjoint_expr_conv_grads_emit_backward_ops() {
+        use crate::wengert::ConvGradKind;
+        for (kind, stride, padding) in [
+            (ConvGradKind::Input, 1usize, 0usize),
+            (ConvGradKind::Weight, 2, 1),
+            (ConvGradKind::Bias, 1, 0),
+        ] {
+            let mut gen = AdjointGenerator::new(200);
+            // grad=100, input=5, weight=6 — distinct for an unambiguous inputs check.
+            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+                kind, 100, 5, 6, stride, padding,
+            ));
+            let ops = &gen.adjoint_ops;
+            assert_eq!(
+                ops.len(),
+                1,
+                "Conv2dBackward must lower to exactly 1 op, got {:?}",
+                ops.iter().map(|o| &o.op).collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                ops[0].op,
+                PrimalOp::Conv2dBackward {
+                    kind,
+                    stride,
+                    padding
+                },
+                "unexpected lowered op for kind {:?}",
+                kind,
+            );
+            assert_eq!(
+                ops[0].inputs,
+                vec![100, 5, 6],
+                "Conv2dBackward inputs must be [grad, input, weight]",
+            );
+        }
     }
 
     /// CPDT Part II activation: the source-AD lowering of `Mul`'s backward
