@@ -178,8 +178,14 @@ unsafe extern "C" fn vtable_get_input_type(
 }
 
 unsafe extern "C" fn vtable_get_input_count(_op: *const OrtCustomOp) -> usize {
-    // v1: hardcode 1 input. Multi-input exports will surface via
-    // `GetVariadicInput*` + `GetInputCharacteristic == VARIADIC` in v2.
+    // One *formal* input slot, declared VARIADIC via
+    // `vtable_get_input_char` below, so ORT accepts any actual input count
+    // >= the variadic min arity (1). This lets multi-arg exports such as
+    // `add(a, b)` register — the kernel reads the real count at compute
+    // time via `KernelContext_GetInputCount` and forwards them all to the
+    // NSL export. (Previously hardcoded non-variadic 1, which made ORT
+    // reject any node with != 1 input: "input size 2 not in range
+    // [min=1, max=1]".)
     1
 }
 
@@ -198,7 +204,11 @@ unsafe extern "C" fn vtable_get_input_char(
     _op: *const OrtCustomOp,
     _idx: usize,
 ) -> OrtCustomOpInputOutputCharacteristic {
-    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_REQUIRED
+    // VARIADIC (not REQUIRED) so a single formal input slot accepts N >= 1
+    // actual inputs of the same type. Required for multi-arg exports like
+    // `add(a, b)`; `GetVariadicInputMinArity`/`Homogeneity` below bound it
+    // (min 1, homogeneous — consistent with v1's f32-only input scope).
+    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_VARIADIC
 }
 
 unsafe extern "C" fn vtable_get_output_char(

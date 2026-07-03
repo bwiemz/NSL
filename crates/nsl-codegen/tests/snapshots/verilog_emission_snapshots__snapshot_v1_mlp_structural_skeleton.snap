@@ -12,10 +12,10 @@ module tiny_mlp(
 );
 
 
-    wire signed [7:0] x_l1_a [0:783];
+    wire signed [783:0][7:0] x_l1_a;
     // (784 per-element assigns elided)
-    wire signed [31:0] acc_l1 [0:127][0:784];
-    wire signed [31:0] relu_l1 [0:127];
+    wire signed [127:0][784:0][31:0] acc_l1;
+    wire signed [127:0][31:0] relu_l1;
     // (128 per-element assigns elided)
     generate for (genvar _gv1 = 0; _gv1 < 128; _gv1++) begin : gen_1
         generate for (genvar _gv2 = 0; _gv2 < 784; _gv2++) begin : gen_2
@@ -33,8 +33,8 @@ module tiny_mlp(
         assign _w4 = ($signed(acc_l1[_gv3][784]) > 0) ? acc_l1[_gv3][784] : '0;
         assign relu_l1[_gv3] = _w4;
     end endgenerate
-    wire signed [63:0] acc_l2 [0:9][0:128];
-    wire signed [63:0] relu_l2 [0:9];
+    wire signed [9:0][128:0][63:0] acc_l2;
+    wire signed [9:0][63:0] relu_l2;
     // (10 per-element assigns elided)
     generate for (genvar _gv4 = 0; _gv4 < 10; _gv4++) begin : gen_4
         generate for (genvar _gv5 = 0; _gv5 < 128; _gv5++) begin : gen_5
