@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/pca_forward_kernel_snapshot.rs
-assertion_line: 64
 expression: ptx
 ---
 .version 8.7
@@ -157,7 +156,6 @@ PCA_LOAD_DONE:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_0:
@@ -183,6 +181,7 @@ V2_LOOP_K_LOAD_0:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_0;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 0)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -362,7 +361,7 @@ V2_LOOP_V_LOAD_0:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_0;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 0)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -461,7 +460,6 @@ V2_LOOP_PV_OVER_K_0:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_1:
@@ -487,6 +485,7 @@ V2_LOOP_K_LOAD_1:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_1;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 1)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -666,7 +665,7 @@ V2_LOOP_V_LOAD_1:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_1;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 1)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -765,7 +764,6 @@ V2_LOOP_PV_OVER_K_1:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_2:
@@ -791,6 +789,7 @@ V2_LOOP_K_LOAD_2:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_2;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 2)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -970,7 +969,7 @@ V2_LOOP_V_LOAD_2:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_2;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 2)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -1069,7 +1068,6 @@ V2_LOOP_PV_OVER_K_2:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_3:
@@ -1095,6 +1093,7 @@ V2_LOOP_K_LOAD_3:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_3;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 3)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -1274,7 +1273,7 @@ V2_LOOP_V_LOAD_3:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_3;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 3)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -1373,7 +1372,6 @@ V2_LOOP_PV_OVER_K_3:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_4:
@@ -1399,6 +1397,7 @@ V2_LOOP_K_LOAD_4:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_4;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 4)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -1578,7 +1577,7 @@ V2_LOOP_V_LOAD_4:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_4;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 4)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -1677,7 +1676,6 @@ V2_LOOP_PV_OVER_K_4:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_5:
@@ -1703,6 +1701,7 @@ V2_LOOP_K_LOAD_5:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_5;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 5)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -1882,7 +1881,7 @@ V2_LOOP_V_LOAD_5:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_5;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 5)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -1981,7 +1980,6 @@ V2_LOOP_PV_OVER_K_5:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_6:
@@ -2007,6 +2005,7 @@ V2_LOOP_K_LOAD_6:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_6;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 6)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -2186,7 +2185,7 @@ V2_LOOP_V_LOAD_6:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_6;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 6)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -2285,7 +2284,6 @@ V2_LOOP_PV_OVER_K_6:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_7:
@@ -2311,6 +2309,7 @@ V2_LOOP_K_LOAD_7:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_7;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 7)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -2490,7 +2489,7 @@ V2_LOOP_V_LOAD_7:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_7;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 7)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -2589,7 +2588,6 @@ V2_LOOP_PV_OVER_K_7:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_8:
@@ -2615,6 +2613,7 @@ V2_LOOP_K_LOAD_8:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_8;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 8)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -2794,7 +2793,7 @@ V2_LOOP_V_LOAD_8:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_8;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 8)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -2893,7 +2892,6 @@ V2_LOOP_PV_OVER_K_8:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_9:
@@ -2919,6 +2917,7 @@ V2_LOOP_K_LOAD_9:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_9;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 9)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -3098,7 +3097,7 @@ V2_LOOP_V_LOAD_9:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_9;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 9)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -3197,7 +3196,6 @@ V2_LOOP_PV_OVER_K_9:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_10:
@@ -3223,6 +3221,7 @@ V2_LOOP_K_LOAD_10:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_10;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 10)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -3402,7 +3401,7 @@ V2_LOOP_V_LOAD_10:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_10;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 10)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -3501,7 +3500,6 @@ V2_LOOP_PV_OVER_K_10:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_11:
@@ -3527,6 +3525,7 @@ V2_LOOP_K_LOAD_11:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_11;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 11)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -3706,7 +3705,7 @@ V2_LOOP_V_LOAD_11:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_11;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 11)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -3805,7 +3804,6 @@ V2_LOOP_PV_OVER_K_11:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_12:
@@ -3831,6 +3829,7 @@ V2_LOOP_K_LOAD_12:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_12;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 12)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -4010,7 +4009,7 @@ V2_LOOP_V_LOAD_12:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_12;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 12)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -4109,7 +4108,6 @@ V2_LOOP_PV_OVER_K_12:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_13:
@@ -4135,6 +4133,7 @@ V2_LOOP_K_LOAD_13:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_13;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 13)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -4314,7 +4313,7 @@ V2_LOOP_V_LOAD_13:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_13;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 13)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -4413,7 +4412,6 @@ V2_LOOP_PV_OVER_K_13:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_14:
@@ -4439,6 +4437,7 @@ V2_LOOP_K_LOAD_14:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_14;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 14)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -4618,7 +4617,7 @@ V2_LOOP_V_LOAD_14:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_14;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 14)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
@@ -4717,7 +4716,6 @@ V2_LOOP_PV_OVER_K_14:
     add.u64 %smem_addr, %smem_addr, %shmem_base;
     st.shared.b16 [%smem_addr], %h0;
     bar.sync 0;  // FENCE: all warps finish Q shmem store
-    // CSHA Tier C save_activations: save_activations=false, no emission
     mov.u64 %k_start, 0;
     mov.u64 %k_max, %rd6;                        // seq_len
 V2_LOOP_KV_START_15:
@@ -4743,6 +4741,7 @@ V2_LOOP_K_LOAD_15:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_K_LOAD_15;
     bar.sync 0;  // FENCE: K tile in shmem
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 2: S = Q*K^T (q_tile_iter = 15)
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
@@ -4922,7 +4921,7 @@ V2_LOOP_V_LOAD_15:
     setp.lt.u64 %p0, %rd59, 2048;
     @%p0 bra V2_LOOP_V_LOAD_15;
     bar.sync 0;  // FENCE: V tile in shmem
-    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C V-save: save_activations=false, no emission
     // Phase 5: O_acc += P * V (q_tile_iter = 15)
     mul.f32 %f48, %f48, %correction;
     mov.u32 %r5, 0;                           // k = 0
