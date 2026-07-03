@@ -3110,7 +3110,7 @@ impl Compiler<'_> {
             let shared_mem = builder.ins().iconst(cl_types::I64, 0);
             self.compile_call_by_name(
                 builder,
-                "nsl_kernel_launch",
+                "nsl_kernel_launch_tensors",
                 &[
                     ptx_ptr,
                     name_ptr,
@@ -3142,12 +3142,16 @@ impl Compiler<'_> {
             let num_args_val = builder.ins().iconst(cl_types::I64, num_args as i64);
             let shared_mem = builder.ins().iconst(cl_types::I64, 0);
 
-            // Call nsl_kernel_launch(ptx_ptr, name_ptr, grid_x, grid_y, grid_z,
-            //                        block_x, block_y, block_z, args_ptr, num_args,
-            //                        shared_mem_bytes)
+            // Call nsl_kernel_launch_tensors(ptx_ptr, name_ptr, grid_x, grid_y,
+            //   grid_z, block_x, block_y, block_z, args_ptr, num_args, shared_mem).
+            // args_ptr is an array of NslTensor handles; the runtime extracts
+            // each `.data` device pointer and builds the kernelParams array.
+            // (Passing the handles straight to `nsl_kernel_launch` made
+            // cuLaunchKernel dereference host struct pointers as device
+            // addresses -> CUDA_ERROR_ILLEGAL_ADDRESS.)
             self.compile_call_by_name(
                 builder,
-                "nsl_kernel_launch",
+                "nsl_kernel_launch_tensors",
                 &[
                     ptx_ptr,
                     name_ptr,
