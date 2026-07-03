@@ -897,6 +897,36 @@ pub(crate) struct RunArgs {
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
 
+        /// WGGO: global-optimization mode ("full", "greedy", "off", or "auto").
+        /// Passing `--wggo` without a value enables full mode. Mirrors
+        /// `nsl build --wggo` so the WGGO mode-table dispatch reaches
+        /// `emit_unified_optim_step_dispatch` end-to-end via `nsl run`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        pub(crate) wggo: Option<String>,
+
+        /// WGGO: print the global-optimization report to stderr
+        #[arg(long)]
+        pub(crate) wggo_report: bool,
+
+        /// WGGO Stage 3: path to a `.nslweights` sidecar for real
+        /// weight-based importance scoring. Without this flag the analyzer
+        /// falls back to uniform head scores.
+        #[arg(long, value_name = "PATH")]
+        pub(crate) wggo_weights: Option<PathBuf>,
+
+        /// WGGO head-importance scoring mode.
+        /// - `auto` (default): gradient scoring when calibration sidecar present, else magnitude.
+        /// - `magnitude`: force magnitude scoring even with calibration data.
+        /// - `grad`: require gradient scoring; errors if no calibration sidecar present.
+        #[arg(long, value_enum, default_value_t = CliWggoImportance::Auto)]
+        pub(crate) wggo_importance: CliWggoImportance,
+
+        /// WGGO Stage 3: fraction of heads the default
+        /// `min_retained_importance` threshold allows to be pruned.
+        /// Clamped to [0.0, 0.9]; default 0.25.
+        #[arg(long, value_name = "F")]
+        pub(crate) wggo_prune_fraction: Option<f64>,
+
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
         #[arg(short = 'w', long)]

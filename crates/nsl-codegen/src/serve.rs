@@ -322,7 +322,7 @@ impl Compiler<'_> {
                 // stderr and every launch FFI refuses cleanly (-1) when
                 // finalize did not succeed.
                 if !init.kernels.is_empty() {
-                    let scope = cfie_label_scope(&self.resolve_sym(serve.name).to_string());
+                    let scope = cfie_label_scope(self.resolve_sym(serve.name));
                     for reg in &init.kernels {
                         self.emit_cfie_register_kernel(builder, &scope, reg)?;
                     }
@@ -620,10 +620,7 @@ impl Compiler<'_> {
                 let supported = s.head_dim >= 1
                     && s.head_dim <= 128
                     && s.n_heads % s.n_kv_heads.max(1) == 0
-                    && num_nodes >= 1
-                    // K+1 <= 33: a node row's mask bits fit one u64
-                    // immediate; wider trees stay plan-level.
-                    && num_nodes <= 33
+                    && (1..=33).contains(&num_nodes)
                     && per_slot >= num_nodes
                     && max_slots >= 1
                     && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64

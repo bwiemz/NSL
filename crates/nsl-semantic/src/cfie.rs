@@ -258,23 +258,22 @@ pub fn validate_serve_config(
                     );
                 }
             }
-            "max_seq" => {
-                if !matches!(expr_as_i64(&entry.value), Some(v) if v >= 1) {
-                    diagnostics.push(
-                        Diagnostic::error("max_seq must be a positive integer".to_string())
-                            .with_label(entry.value.span, "invalid max_seq"),
-                    );
-                }
+            // Guard-collapsed (clippy::collapsible_match): a valid value falls
+            // through to the `_ => {}` no-op arm, identical to the prior
+            // arm-body `if`. Behavior-preserving.
+            "max_seq" if !matches!(expr_as_i64(&entry.value), Some(v) if v >= 1) => {
+                diagnostics.push(
+                    Diagnostic::error("max_seq must be a positive integer".to_string())
+                        .with_label(entry.value.span, "invalid max_seq"),
+                );
             }
-            "target_gpu" => {
-                if expr_as_name(&entry.value, resolve_sym).is_none() {
-                    diagnostics.push(
-                        Diagnostic::error(
-                            "target_gpu must be a GPU name string (e.g. \"h100\")".to_string(),
-                        )
-                        .with_label(entry.value.span, "invalid target_gpu"),
-                    );
-                }
+            "target_gpu" if expr_as_name(&entry.value, resolve_sym).is_none() => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "target_gpu must be a GPU name string (e.g. \"h100\")".to_string(),
+                    )
+                    .with_label(entry.value.span, "invalid target_gpu"),
+                );
             }
             _ => {}
         }

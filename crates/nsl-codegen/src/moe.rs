@@ -525,12 +525,13 @@ pub fn derive_v4_dims(
 /// runtime FFI at `crates/nsl-runtime/src/moe/ffi.rs::nsl_moe_dispatch_full_v3`
 /// branches on these literal integers.
 #[repr(i64)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoeActivation {
     /// No activation (identity) — test-only; production should use
     /// a real nonlinearity.
     Identity = 0,
     /// SiLU = `x * sigmoid(x)`. Mixtral / DeepSeek MoE default.
+    #[default]
     Silu = 1,
     /// GELU (tanh approximation, matches `torch.gelu(approximate='tanh')`).
     Gelu = 2,
@@ -544,6 +545,10 @@ impl MoeActivation {
     /// string itself. Returns None for unknown names — callers must
     /// surface this as a decorator-validation error rather than
     /// silently fall back to a default.
+    // Intentionally returns `Option`, not the `Result` that
+    // `std::str::FromStr` requires, so it cannot implement that trait —
+    // an inherent `from_str` is the clearest name for callers.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "identity" | "none" => Some(Self::Identity),
@@ -552,12 +557,6 @@ impl MoeActivation {
             "relu" => Some(Self::Relu),
             _ => None,
         }
-    }
-}
-
-impl Default for MoeActivation {
-    fn default() -> Self {
-        Self::Silu
     }
 }
 
@@ -718,10 +717,8 @@ pub fn extract_moe_decorator<'a>(
                                         s
                                     ))?;
                                 } else {
-                                    return Err(format!(
-                                        "@moe: activation kwarg must be a string literal \
-                                         (e.g. activation=\"silu\"), got non-string expression"
-                                    ));
+                                    return Err("@moe: activation kwarg must be a string literal \
+                                         (e.g. activation=\"silu\"), got non-string expression".to_string());
                                 }
                             }
                             "weight_prefix" => {
@@ -753,11 +750,9 @@ pub fn extract_moe_decorator<'a>(
                                     validate_weight_prefix(s)?;
                                     weight_prefix = Some(s.clone());
                                 } else {
-                                    return Err(format!(
-                                        "@moe: weight_prefix kwarg must be a string literal \
+                                    return Err("@moe: weight_prefix kwarg must be a string literal \
                                          (e.g. weight_prefix=\"model.layers.0.block_sparse_moe\"), \
-                                         got non-string expression"
-                                    ));
+                                         got non-string expression".to_string());
                                 }
                             }
                             _ => {}
