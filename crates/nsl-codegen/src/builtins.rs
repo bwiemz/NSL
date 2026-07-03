@@ -1597,6 +1597,39 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // --- CFIE Cycle 10: model binding + generation driver. bind_model
+    // resolves an NslModel's host f32 weights by the HF-Llama name
+    // convention, uploads them, and records the device weight table;
+    // generate drives the decode loop over a prompt; generate_reset
+    // clears the binding without freeing the weight buffers. ---
+    (
+        "nsl_cfie_bind_model",
+        &[
+            types::I64, // model_handle (NslModel*)
+            types::I64, // n_layers
+            types::I64, // d_model
+            types::I64, // n_heads
+            types::I64, // n_kv_heads
+            types::I64, // head_dim
+            types::I64, // d_ff
+            types::I64, // vocab_size
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_generate",
+        &[
+            types::I64, // prompt_tokens_ptr (host i64 array)
+            types::I64, // prompt_len
+            types::I64, // max_new_tokens
+            types::I64, // eos_token_id
+            types::I64, // rng_seed
+            types::I64, // out_tokens_ptr (host i64 array)
+            types::I64, // out_cap
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_generate_reset", &[], Some(types::I64)),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",
@@ -2597,5 +2630,8 @@ mod tests {
         assert_eq!(arity("nsl_cfie_launch_spec_reject"), 6);
         assert_eq!(arity("nsl_cfie_launch_quant_attn"), 7);
         assert_eq!(arity("nsl_cfie_decode_step"), 11);
+        assert_eq!(arity("nsl_cfie_bind_model"), 8);
+        assert_eq!(arity("nsl_cfie_generate"), 7);
+        assert_eq!(arity("nsl_cfie_generate_reset"), 0);
     }
 }
