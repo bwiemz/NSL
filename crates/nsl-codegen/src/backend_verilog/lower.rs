@@ -61,7 +61,10 @@ impl VerilogEmitter {
         }
 
         out.push_str("endmodule\n");
-        out
+        // Collapse packed multi-dim arrays → flat 1-D vectors + part-selects so
+        // the output parses on the apt Yosys 0.33 pinned by CI (which rejects
+        // multi-dim packed arrays). See `flatten` module.
+        crate::backend_verilog::flatten::flatten_packed_arrays(&out)
     }
 }
 

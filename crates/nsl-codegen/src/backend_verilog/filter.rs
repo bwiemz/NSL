@@ -39,13 +39,15 @@ pub fn elide_localparams(verilog: &str) -> String {
     let const_concat_assign = Regex::new(
         r"^\s*assign\s+\w+\s*=\s*\{[^{}]*'sd[^{}]*\};\s*$",
     ).unwrap();
-    // M57.1 wire-array mini §3.2: per-element fan-out / bias-seed assigns
-    // (e.g. `assign x_l1_a[7] = x_l1[56 +: 8];` or
-    // `assign acc_l1[7][0] = b1[7];`). Anchored by an integer-only second
-    // bracket so the genvar ripple write `assign acc_l1[_gv1][(_gv2 + 1)]`
-    // is NOT matched.
+    // M57.1 wire-array mini §3.2: per-element fan-out / bias-seed assigns.
+    // After the `flatten` pass these are flat literal part-selects, e.g.
+    // `assign x_l1_a[0 * 8 +: 8] = x_l1[0 +: 8];` or
+    // `assign acc_l1[(7 * 785 + 0) * 32 +: 32] = b1[7 * 32 +: 32];`. The LHS
+    // subscript is a *constant* arithmetic expression (digits/spaces/`*+:()`
+    // only) — the genvar ripple write `assign acc_l1[((_gv1) * 785 ...) ...]`
+    // contains `_gv` identifiers and so is NOT matched (stays visible).
     let element_assign = Regex::new(
-        r"^\s*assign\s+\w+\[\d+\](?:\[\d+\])*\s*=\s*\S.*;\s*$",
+        r"^\s*assign\s+\w+\[[\d\s*+:()]+\]\s*=\s*\S.*;\s*$",
     ).unwrap();
     let mut elements_collapsed = 0usize;
     let mut prev_was_element = false;

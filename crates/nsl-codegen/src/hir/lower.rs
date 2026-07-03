@@ -2149,27 +2149,30 @@ mod tests {
             .lower(&kir, "tiny_mlp_seq").unwrap();
         let v = VerilogEmitter::emit_module(&module);
 
+        // NOTE: `emit_module` runs the `flatten` pass, so array subscripts are
+        // rendered as flat part-selects: `b{i}[o]` → `b{i}[(o) * W +: W]`, and
+        // the RegPlus form `b{i}[(o + 1)]` → `b{i}[((o + 1)) * W +: W]`. The
+        // three-case checks below match those flattened forms; the semantics
+        // (which index each seed uses) are unchanged by flattening.
+        //
         // ── Case (1): phase-entry seeds b1[0] and b2[0] ─────────────────────
         assert!(
-            v.contains("b1[0]"),
-            "layer-1 phase-entry seed b1[0] missing from FSM Verilog",
+            v.contains("b1[(0)"),
+            "layer-1 phase-entry seed b1[(0) ...] missing from FSM Verilog",
         );
         assert!(
-            v.contains("b2[0]"),
-            "layer-2 phase-entry seed b2[0] missing from FSM Verilog",
+            v.contains("b2[(0)"),
+            "layer-2 phase-entry seed b2[(0) ...] missing from FSM Verilog",
         );
 
         // ── Case (2): intra-layer advance b{i}[(o+1)] ───────────────────────
-        // The o register emits as `_rN`; the RegPlus form emits as `[(_rN + 1)]`.
-        // We locate the o-register name from the `o <= ZERO` reset line
-        // (the only line of the form `_rN <= ZERO;` in the reset block where N
-        // is also used as an index in b1/b2 subscripts).
-        //
-        // More practically: scan for `b1[(` and confirm ` + 1)]` follows on the
-        // same line (the full token is `b1[(_rN + 1)]`).
+        // The o register emits as `_rN`; the RegPlus form emits as
+        // `[(_rN + 1)]`, which flatten renders as `b1[((_rN + 1)) * W +: W]`.
+        // Scan for `b1[(` and confirm ` + 1))` follows on the same line (the
+        // flattened token is `b1[((_rN + 1)) * W +: W]`).
         let b1_intra = v.lines().any(|line| {
             if let Some(pos) = line.find("b1[(") {
-                line[pos..].contains(" + 1)]")
+                line[pos..].contains(" + 1))")
             } else {
                 false
             }
@@ -2182,18 +2185,19 @@ mod tests {
         // ── Case (3): no bare `b1[_rN]` or `b2[_rN]` form ──────────────────
         // Locate the o-register id by finding a line `_rN <= _rM;` in the
         // always_ff block where _rM is the o_next wire — but the simplest
-        // proxy is: any line that matches `b1[_r` or `b2[_r` but does NOT
-        // also contain ` + 1)]` is the bug form.
+        // proxy: after flatten the bare bug form `b1[_rN]` renders as
+        // `b1[(_rN) ...]` (single `(` then `_r`), while the correct RegPlus
+        // form is `b1[((_rN + 1)) ...]` (double `(`). So `b1[(_r` matches ONLY
+        // the bug form.
         let bare_b1_bug = v.lines().any(|line| {
-            // Match `b1[_r` (bare reg subscript) but not `b1[(_r` (RegPlus form)
-            line.contains("b1[_r")
+            line.contains("b1[(_r")
         });
         assert!(
             !bare_b1_bug,
             "bare-reg bias index `b1[_rN]` found in FSM Verilog — SQ-5 regression!",
         );
         let bare_b2_bug = v.lines().any(|line| {
-            line.contains("b2[_r")
+            line.contains("b2[(_r")
         });
         assert!(
             !bare_b2_bug,
