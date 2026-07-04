@@ -183,6 +183,7 @@ fn run_fused_backward_config(
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -358,6 +359,22 @@ fn run_fused_backward_config(
     let bwd_ptx = bwd_ptx_str.into_bytes();
     let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
 
+    // Backward dynamic SMEM size: the backward kernel emits `.extern .shared
+    // shmem[]` (dynamic) when its total tile footprint exceeds the 48 KB static
+    // cap (e.g. head_dim=64), and the launch MUST supply that size. Passing 0
+    // (as this forward-derived harness previously did) leaves the dynamic
+    // region 0-byte, so every SMEM tile access is out of bounds — the source
+    // of the hd=64 "catastrophic dV" garbage. Use the exact production sizing
+    // helper (wengert_lower calls the same one), gated on the static cap to
+    // mirror the kernel's own static-vs-`.extern` emit decision.
+    let bwd_smem =
+        nsl_codegen::flash_attention_v2::shared_mem_bytes_v2_backward(&config);
+    let bwd_smem_dyn = if bwd_smem > smem_layout::SMEM_BUDGET_BYTES {
+        bwd_smem as i64
+    } else {
+        0
+    };
+
     let rc_bwd = unsafe {
         nsl_flash_attention_csha_backward(
             q_dev, k_dev, v_dev, out_dev, lse_dev,
@@ -366,7 +383,7 @@ fn run_fused_backward_config(
             0, 0, 0, 0,
             cos_dev, sin_dev,
             0, 0,
-            0,
+            bwd_smem_dyn,
             bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
             block_q as i64, block_kv as i64,
             if causal { 1 } else { 0 },
@@ -384,6 +401,8 @@ fn run_fused_backward_config(
             // Tier B extension — null (no Tier B dispatch for this test).
             0i64, 0i64,
             // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
             0i64,
             // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
             // means legacy per-q-block topology.
@@ -515,6 +534,45 @@ fn t6_3_smoke_single_config() {
     }
 }
 
+/// hd=64 backward at block=32. head_dim=64 with block_q=block_kv=64 exceeds
+/// the 99 KB sm_120 SMEM opt-in cap (181 KB), but block=32 tiles fit (~83 KB).
+/// This is the smallest config that reaches the bug's d-range (d up to 56).
+/// Logs dV/dK/dQ max_abs + worst dV cell; no gate (diagnostic).
+#[test]
+#[ignore]
+fn t6_3_hd64_block32_dv_probe() {
+    if !cuda_available() {
+        eprintln!("[hd64] skipping — no CUDA");
+        return;
+    }
+    let hd = 64usize;
+    for causal in [false, true] {
+        let (gpu, cpu) = match run_fused_backward_config(32, 32, 64, 1, 64, causal, false) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[hd64 block32] causal={causal} LAUNCH FAILED: {e}");
+                continue;
+            }
+        };
+        let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
+        let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
+        let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
+        let (mut wi, mut wmax) = (0usize, 0f32);
+        for (i, (&g, &c)) in gpu.dv.iter().zip(cpu.dv.iter()).enumerate() {
+            let d = (g - c).abs();
+            if d > wmax {
+                wmax = d;
+                wi = i;
+            }
+        }
+        eprintln!(
+            "[hd64 block32] causal={causal} dv={d_dv:.3e} dk={d_dk:.3e} dq={d_dq:.3e} \
+             | worst dv[{wi}]: col={} d={} gpu={:.4e} cpu={:.4e}",
+            wi / hd, wi % hd, gpu.dv[wi], cpu.dv[wi]
+        );
+    }
+}
+
 /// Numerical sweep across (head_dim, causal, rope_q). One line per config
 /// with per-gradient max_abs and PASS/FAIL. Gated by the same three
 /// NUMERICAL_GATE_* consts as the smoke — only enabled gates panic.
@@ -566,6 +624,7 @@ fn t6_3_matrix_sweep_numerical() {
                         active_heads: heads,
                         rmsnorm_eps: 1e-5, d_model: dm,
                         skip_rmsnorm_prologue: false,
+                        static_seq_len: None,
                     }),
                     checkpoint: None,
                 };
