@@ -12,6 +12,7 @@ use crate::tensor::{
     nsl_tensor_mul as tensor_mul,
     nsl_tensor_mul_scalar as tensor_mul_scalar,
     nsl_tensor_neg as tensor_neg,
+    nsl_tensor_retain,
     nsl_tensor_rotate_half as tensor_rotate_half,
     nsl_tensor_select as nsl_tensor_select,
     nsl_tensor_shape as tensor_shape,
@@ -1029,6 +1030,46 @@ fn materialize_conv_output_grad(
          cannot materialize the output gradient."
     );
     std::process::abort();
+}
+
+/// Reify `grad_output` to the conv2d output shape once per node. Exposed so
+/// the source-AD lowering can emit a single materialize call shared by the
+/// input/weight/bias gradients, instead of each of those 3 FFIs redundantly
+/// (and, for a scalar sum-loss gradient, expensively) reifying its own copy.
+/// See `materialize_conv_output_grad` for why this is needed at all.
+///
+/// Unlike the internal helper's other call site (`conv2d_backward_source_ad`,
+/// where the possibly-aliased result is used and discarded within the same
+/// stack frame), this result becomes an independent Wengert value with its
+/// own free-once-at-end-of-function lifecycle. When the shape already
+/// matched, the helper returns `grad_ptr` unchanged with no refcount bump —
+/// fine for a same-frame borrow, but here it would let this var's cleanup and
+/// grad_ptr's own var's cleanup each free the same allocation once, double
+/// freeing it. Retain in that case, mirroring `nsl_tensor_reduce_to_shape`'s
+/// identical identity-path retain.
+#[no_mangle]
+pub extern "C" fn nsl_materialize_conv_output_grad(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
+) -> i64 {
+    let result = materialize_conv_output_grad(
+        grad_ptr,
+        input_ptr,
+        weight_ptr,
+        stride_h as usize,
+        stride_w as usize,
+        pad_h as usize,
+        pad_w as usize,
+    );
+    if result == grad_ptr {
+        nsl_tensor_retain(grad_ptr);
+    }
+    result
 }
 
 /// Run `conv2d_backward` with the gradient materialized to the conv output shape.
