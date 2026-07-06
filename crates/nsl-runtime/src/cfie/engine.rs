@@ -12,10 +12,11 @@
 //! call, which is too slow for a decode loop).
 //!
 //! Kernel kinds: 0=decode_attn, 1=fused_sample, 2=decode_block,
-//! 3=spec_verify, 4=spec_reject, 5=quant_attn.  `layer_idx` is
-//! meaningful ONLY for kind 5 (the quant emitter bakes the layer into
-//! the PTX, so there is one registration per layer); all other kinds
-//! register with layer_idx 0.
+//! 3=spec_verify, 4=spec_reject, 5=quant_attn, 6=draft decode_block,
+//! 7=draft_sample, 8=verify_probs (6-8: CFIE Cycle 13, G15
+//! draft-model-in-binary).  `layer_idx` is meaningful ONLY for kind 5
+//! (the quant emitter bakes the layer into the PTX, so there is one
+//! registration per layer); all other kinds register with layer_idx 0.
 //!
 //! Non-GPU builds are honest refusals: `finalize`/`kv_pool_alloc` print
 //! one clear warning and return -1 — they never pretend success
@@ -39,6 +40,15 @@ pub(crate) const KIND_DECODE_BLOCK: i64 = 2;
 pub(crate) const KIND_SPEC_VERIFY: i64 = 3;
 pub(crate) const KIND_SPEC_REJECT: i64 = 4;
 pub(crate) const KIND_QUANT_ATTN: i64 = 5;
+// CFIE Cycle 13 (G15 draft-model-in-binary) kinds.  Kind 6 is the
+// EXISTING decode-block emitter (cfie_persistent_ptx.rs) instantiated
+// with the DRAFT model's DecodeBlockConfig (draft dims,
+// per_slot_max_tokens = draft pool capacity, max_slots = 1); kinds 7/8
+// are the draft greedy sampler and the verification prob-row writer
+// (cfie_spec_sampler_ptx.rs) — sampler-family kernels, no KV access.
+pub(crate) const KIND_DRAFT_BLOCK: i64 = 6;
+pub(crate) const KIND_DRAFT_SAMPLE: i64 = 7;
+pub(crate) const KIND_VERIFY_PROBS: i64 = 8;
 
 /// One registered kernel: an owned NUL-terminated PTX copy + launch
 /// metadata, plus the driver handles cached at finalize time.
@@ -98,6 +108,28 @@ struct EngineState {
     /// populate it (bind_model refuses), so it is always `None` there.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     bound_model: Option<BoundModel>,
+    /// DRAFT-model binding (CFIE Cycle 13, G15 draft-model-in-binary),
+    /// populated by `nsl_cfie_bind_draft_model` — the same record shape
+    /// as the target binding (the draft is a full HF-Llama model with
+    /// its own dims; only the vocab must match the target's).  Its
+    /// device pointers alias entries in `weight_allocs` (uploaded via
+    /// the same Cycle-9 FFIs), so clearing the binding
+    /// (`nsl_cfie_draft_reset` / `nsl_cfie_engine_destroy`) drops the
+    /// RECORDS only; the buffers are freed by `nsl_cfie_weights_reset`
+    /// / `nsl_cfie_engine_destroy`.
+    draft_model: Option<BoundModel>,
+    /// DRAFT KV pool device base, allocated + zeroed by
+    /// `nsl_cfie_draft_pool_alloc` in the PERSISTENT caching-allocator
+    /// bracket.  This pool is NOT tracked by the target KV slot
+    /// allocator — draft position bookkeeping is host-side in
+    /// `nsl_cfie_speculative_generate`, and kind-6 launches inject this
+    /// base as their `kv_base`.  0 = unallocated.  Freed by
+    /// `nsl_cfie_draft_reset` and `nsl_cfie_engine_destroy`.
+    draft_pool_base: u64,
+    /// Recorded for diagnostics/symmetry with `pool_bytes`; the frees
+    /// only need the base.
+    #[allow(dead_code)]
+    draft_pool_bytes: u64,
 }
 
 /// The runtime binding of an `NslModel` to the finalized CFIE engine —
@@ -139,6 +171,9 @@ fn engine() -> &'static Mutex<EngineState> {
             pool_bytes: 0,
             weight_allocs: Vec::new(),
             bound_model: None,
+            draft_model: None,
+            draft_pool_base: 0,
+            draft_pool_bytes: 0,
         })
     })
 }
@@ -173,7 +208,8 @@ pub extern "C" fn nsl_cfie_register_kernel(
 ) -> i64 {
     match kind {
         KIND_DECODE_ATTN | KIND_FUSED_SAMPLE | KIND_DECODE_BLOCK | KIND_SPEC_VERIFY
-        | KIND_SPEC_REJECT | KIND_QUANT_ATTN => {}
+        | KIND_SPEC_REJECT | KIND_QUANT_ATTN | KIND_DRAFT_BLOCK | KIND_DRAFT_SAMPLE
+        | KIND_VERIFY_PROBS => {}
         _ => return -1,
     }
     if layer_idx < 0 {
@@ -411,6 +447,11 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
         if g.pool_base != 0 {
             crate::cuda::inner::free_managed(g.pool_base as *mut std::ffi::c_void);
         }
+        // The DRAFT KV pool is engine-held (no slot-allocator attach) —
+        // free it here so a serve session leaves no device leak.
+        if g.draft_pool_base != 0 {
+            crate::cuda::inner::free_managed(g.draft_pool_base as *mut std::ffi::c_void);
+        }
         // Weights are engine-owned device resources, same as the KV pool
         // and module handles — a serve session must leave no device leak.
         free_weight_allocs(&mut g);
@@ -420,10 +461,14 @@ pub extern "C" fn nsl_cfie_engine_destroy() -> i64 {
         g.weight_allocs.clear();
     }
     // Clear the bound-model records too (device buffers already freed
-    // above via free_weight_allocs / weight_allocs.clear()).
+    // above via free_weight_allocs / weight_allocs.clear()).  Same for
+    // the draft binding — its device pointers were in weight_allocs.
     g.bound_model = None;
+    g.draft_model = None;
     g.pool_base = 0;
     g.pool_bytes = 0;
+    g.draft_pool_base = 0;
+    g.draft_pool_bytes = 0;
     if let Ok(mut kv) = kv_slots_global().lock() {
         if let Some(a) = kv.as_mut() {
             a.attach_device_buffer(0, 0);
@@ -757,6 +802,134 @@ fn upload_named(
     Ok(dev as u64)
 }
 
+/// Resolve + upload one full HF-Llama model (target OR draft) into a
+/// `BoundModel` record: every weight resolved by name from the
+/// `NslModel` handle, shape-verified against the passed dims, and
+/// uploaded in the layout the decode-block/sampler kernels consume
+/// (q/k/v/o + gate/up/down + lm_head as f16; RMSNorm gammas + final
+/// norm as f32; the token-embedding table kept HOST-resident as f32).
+/// Returns `Err(first offending name)` on any resolution/shape/upload
+/// failure — the CALLER owns cleanup of whatever partial uploads landed
+/// in `weight_allocs` (bind_model resets ALL weights; bind_draft_model
+/// frees only the uploads recorded after its snapshot).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_upload_model(
+    model_handle: i64,
+    n_layers: i64,
+    d_model: i64,
+    n_heads: i64,
+    n_kv_heads: i64,
+    head_dim: i64,
+    d_ff: i64,
+    vocab_size: i64,
+) -> Result<BoundModel, String> {
+    // Per-weight expected element counts (from the [out][in] shapes).
+    let nhd = n_heads * head_dim; // q/attention width
+    let nkvd = n_kv_heads * head_dim; // k/v width
+    let attn_in = d_model; // projections read the residual stream
+    let wq_elems = nhd * attn_in;
+    let wkv_elems = nkvd * attn_in;
+    let wo_elems = d_model * nhd;
+    let gate_up_elems = d_ff * d_model;
+    let down_elems = d_model * d_ff;
+    let norm_elems = d_model;
+    let lm_head_elems = vocab_size * d_model;
+    let embed_elems = vocab_size * d_model;
+
+    let mut weight_table = Vec::with_capacity((n_layers * 9) as usize);
+    for i in 0..n_layers {
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::WQ, i),
+            wq_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::WK, i),
+            wkv_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::WV, i),
+            wkv_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::WO, i),
+            wo_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::W_GATE, i),
+            gate_up_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::W_UP, i),
+            gate_up_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::W_DOWN, i),
+            down_elems,
+            nsl_cfie_upload_weight_f16,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::NORM1, i),
+            norm_elems,
+            nsl_cfie_upload_weight_f32,
+        )?);
+        weight_table.push(upload_named(
+            model_handle,
+            &names::layer(names::NORM2, i),
+            norm_elems,
+            nsl_cfie_upload_weight_f32,
+        )?);
+    }
+    let final_norm_dev = upload_named(
+        model_handle,
+        names::FINAL_NORM,
+        norm_elems,
+        nsl_cfie_upload_weight_f32,
+    )?;
+    let lm_head_dev = upload_named(
+        model_handle,
+        names::LM_HEAD,
+        lm_head_elems,
+        nsl_cfie_upload_weight_f16,
+    )?;
+    // Embedding table stays HOST-resident as f32 (v1 gather is a
+    // per-step host->device row memcpy — no upload, no f16 convert).
+    // Resolve + shape-check, then copy into an owned Vec the engine
+    // keeps for the session.
+    let (embed_ptr, embed_len) = resolve_weight(model_handle, names::EMBED)?;
+    if embed_len != embed_elems {
+        return Err(format!(
+            "{} (shape mismatch: has {embed_len} elems, expected {embed_elems})",
+            names::EMBED
+        ));
+    }
+    let embed_host = unsafe { std::slice::from_raw_parts(embed_ptr, embed_len as usize) }.to_vec();
+
+    Ok(BoundModel {
+        weight_table,
+        final_norm_dev,
+        lm_head_dev,
+        embed_host,
+        n_layers,
+        d_model,
+        vocab_size,
+    })
+}
+
 /// Bind a loaded `NslModel` to the finalized CFIE engine: resolve every
 /// weight by the HF-Llama naming convention, upload it in the layout
 /// `nsl_cfie_decode_step` consumes (q/k/v/o + gate/up/down + lm_head as
@@ -819,126 +992,32 @@ pub extern "C" fn nsl_cfie_bind_model(
             return -1;
         }
 
-        // Per-weight expected element counts (from the [out][in] shapes).
-        let nhd = n_heads * head_dim; // q/attention width
-        let nkvd = n_kv_heads * head_dim; // k/v width
-        let attn_in = d_model; // projections read the residual stream
-        let wq_elems = nhd * attn_in;
-        let wkv_elems = nkvd * attn_in;
-        let wo_elems = d_model * nhd;
-        let gate_up_elems = d_ff * d_model;
-        let down_elems = d_model * d_ff;
-        let norm_elems = d_model;
-        let lm_head_elems = vocab_size * d_model;
-        let embed_elems = vocab_size * d_model;
-
         // Assemble the binding into locals first; only on a fully clean
         // resolve do we commit it to engine state.  On ANY failure we
         // reset the (partially uploaded) weights so no half-bound state
         // survives.
-        let bind = || -> Result<BoundModel, String> {
-            let mut weight_table = Vec::with_capacity((n_layers * 9) as usize);
-            for i in 0..n_layers {
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::WQ, i),
-                    wq_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::WK, i),
-                    wkv_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::WV, i),
-                    wkv_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::WO, i),
-                    wo_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::W_GATE, i),
-                    gate_up_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::W_UP, i),
-                    gate_up_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::W_DOWN, i),
-                    down_elems,
-                    nsl_cfie_upload_weight_f16,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::NORM1, i),
-                    norm_elems,
-                    nsl_cfie_upload_weight_f32,
-                )?);
-                weight_table.push(upload_named(
-                    model_handle,
-                    &names::layer(names::NORM2, i),
-                    norm_elems,
-                    nsl_cfie_upload_weight_f32,
-                )?);
-            }
-            let final_norm_dev = upload_named(
-                model_handle,
-                names::FINAL_NORM,
-                norm_elems,
-                nsl_cfie_upload_weight_f32,
-            )?;
-            let lm_head_dev = upload_named(
-                model_handle,
-                names::LM_HEAD,
-                lm_head_elems,
-                nsl_cfie_upload_weight_f16,
-            )?;
-            // Embedding table stays HOST-resident as f32 (v1 gather is a
-            // per-step host->device row memcpy — no upload, no f16
-            // convert).  Resolve + shape-check, then copy into an owned
-            // Vec the engine keeps for the session.
-            let (embed_ptr, embed_len) = resolve_weight(model_handle, names::EMBED)?;
-            if embed_len != embed_elems {
-                return Err(format!(
-                    "{} (shape mismatch: has {embed_len} elems, expected {embed_elems})",
-                    names::EMBED
-                ));
-            }
-            let embed_host =
-                unsafe { std::slice::from_raw_parts(embed_ptr, embed_len as usize) }.to_vec();
-
-            Ok(BoundModel {
-                weight_table,
-                final_norm_dev,
-                lm_head_dev,
-                embed_host,
-                n_layers,
-                d_model,
-                vocab_size,
-            })
-        };
-
-        match bind() {
+        match resolve_and_upload_model(
+            model_handle,
+            n_layers,
+            d_model,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_ff,
+            vocab_size,
+        ) {
             Ok(bm) => {
                 let mut g = match engine().lock() {
                     Ok(g) => g,
                     Err(_) => {
                         // Lock poisoned after uploads landed — free them
-                        // so the refusal leaves no device leak.
+                        // so the refusal leaves no device leak.  The reset
+                        // frees the DRAFT weights too, so both binding
+                        // records must go (dangling-pointer hazard).
                         nsl_cfie_weights_reset();
+                        let mut g = engine().lock().unwrap_or_else(|e| e.into_inner());
+                        g.bound_model = None;
+                        g.draft_model = None;
                         eprintln!("CFIE: bind_model refused — engine lock poisoned");
                         return -1;
                     }
@@ -954,10 +1033,14 @@ pub extern "C" fn nsl_cfie_bind_model(
                 // Deferral-must-refuse: a missing/mis-shaped weight must
                 // refuse, never fabricate.  Free whatever partial uploads
                 // landed so the refusal leaves no device leak, and clear
-                // any stale binding.
+                // any stale binding.  weights_reset frees EVERY recorded
+                // device weight — including a bound draft model's — so
+                // the draft records must be cleared too or they dangle.
                 nsl_cfie_weights_reset();
-                if let Ok(mut g) = engine().lock() {
+                {
+                    let mut g = engine().lock().unwrap_or_else(|e| e.into_inner());
                     g.bound_model = None;
+                    g.draft_model = None;
                 }
                 eprintln!(
                     "CFIE: bind_model refused — missing or mis-shaped weight: {missing}"
@@ -1211,6 +1294,247 @@ pub extern "C" fn nsl_cfie_generate_reset() -> i64 {
         Err(e) => e.into_inner(),
     };
     g.bound_model = None;
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Draft-model binding + draft KV pool (CFIE Cycle 13, G15)
+//
+// The paper's serve speculative config names a DRAFT model compiled into
+// the SAME binary (same CUDA context, same memory pool).  The engine
+// holds it as a SECOND BoundModel + a SECOND, engine-held KV pool: the
+// draft decode chain (kind 6 — the existing decode-block emitter
+// instantiated with the draft dims, max_slots = 1) injects the draft
+// pool base as kv_base and always runs slot 0; draft position
+// bookkeeping is host-side in `nsl_cfie_speculative_generate` (no slot
+// allocator — appends at an explicit pos, overwriting stale rows by
+// position IS the rollback).
+// ---------------------------------------------------------------------------
+
+/// Free every weight allocation recorded at index >= `start` and
+/// truncate the tracking list back to `start`.  Cleanup path for a
+/// failed DRAFT bind: the target model's uploads (recorded before
+/// `start`) must survive, so the full `free_weight_allocs` /
+/// `nsl_cfie_weights_reset` hammer cannot be used.
+#[cfg(feature = "cuda")]
+fn free_weight_allocs_from(g: &mut EngineState, start: usize) {
+    let start = start.min(g.weight_allocs.len());
+    for ptr in g.weight_allocs.drain(start..) {
+        crate::cuda::inner::free_managed(ptr as *mut c_void);
+    }
+}
+
+/// Bind a loaded `NslModel` as the DRAFT model for speculative decoding:
+/// same resolution + upload as `nsl_cfie_bind_model` (HF-Llama names,
+/// Cycle-9 upload FFIs, refuse-on-missing) into a SEPARATE draft binding
+/// (weight table + final norm + lm_head + host f32 embed).
+///
+/// Refuses (-1, eprintln) when: null handle / non-positive dim; NO
+/// target model is bound yet (speculative decoding verifies against the
+/// target — bind it first); `vocab_size` differs from the target
+/// binding's vocab (rejection sampling compares prob rows over ONE
+/// shared vocab); any weight is missing/mis-shaped (only the DRAFT
+/// uploads recorded by this call are freed — the target binding
+/// survives); non-cuda build.  A re-bind replaces the previous draft
+/// records (the superseded device buffers stay in `weight_allocs` until
+/// `nsl_cfie_weights_reset` / destroy, matching bind_model's re-bind
+/// discipline).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_cfie_bind_draft_model(
+    model_handle: i64,
+    n_layers: i64,
+    d_model: i64,
+    n_heads: i64,
+    n_kv_heads: i64,
+    head_dim: i64,
+    d_ff: i64,
+    vocab_size: i64,
+) -> i64 {
+    // Cross-build guards (pure bookkeeping — meaningful CPU-only tests):
+    // arg validation, target-bound ordering, shared-vocab invariant.
+    if model_handle == 0 {
+        eprintln!("CFIE: bind_draft_model refused — null model handle");
+        return -1;
+    }
+    if n_layers <= 0
+        || d_model <= 0
+        || n_heads <= 0
+        || n_kv_heads <= 0
+        || head_dim <= 0
+        || d_ff <= 0
+        || vocab_size <= 0
+    {
+        eprintln!("CFIE: bind_draft_model refused — non-positive dimension in the model shape");
+        return -1;
+    }
+    {
+        let g = match engine().lock() {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("CFIE: bind_draft_model refused — engine lock poisoned");
+                return -1;
+            }
+        };
+        match g.bound_model.as_ref() {
+            None => {
+                eprintln!(
+                    "CFIE: bind_draft_model refused — no target model bound (call nsl_cfie_bind_model first)"
+                );
+                return -1;
+            }
+            Some(bm) if bm.vocab_size != vocab_size => {
+                eprintln!(
+                    "CFIE: bind_draft_model refused — draft vocab {} != target vocab {} (speculative decoding requires a shared vocab)",
+                    vocab_size, bm.vocab_size
+                );
+                return -1;
+            }
+            Some(_) => {}
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        // Snapshot the upload-tracking length so a failed draft bind can
+        // free ONLY its own partial uploads (the target's stay).
+        let start = match engine().lock() {
+            Ok(g) => g.weight_allocs.len(),
+            Err(_) => {
+                eprintln!("CFIE: bind_draft_model refused — engine lock poisoned");
+                return -1;
+            }
+        };
+        match resolve_and_upload_model(
+            model_handle,
+            n_layers,
+            d_model,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_ff,
+            vocab_size,
+        ) {
+            Ok(bm) => {
+                let mut g = engine().lock().unwrap_or_else(|e| e.into_inner());
+                // Re-verify the ordering invariants under the commit lock
+                // (the target could have been unbound/re-bound between the
+                // guard above and here) — refuse + free our uploads rather
+                // than commit a draft that no longer matches.
+                let target_ok = matches!(
+                    g.bound_model.as_ref(),
+                    Some(t) if t.vocab_size == vocab_size
+                );
+                if !target_ok {
+                    free_weight_allocs_from(&mut g, start);
+                    eprintln!(
+                        "CFIE: bind_draft_model refused — target binding changed during the draft bind"
+                    );
+                    return -1;
+                }
+                g.draft_model = Some(bm);
+                0
+            }
+            Err(missing) => {
+                // Deferral-must-refuse; free ONLY this call's uploads.
+                {
+                    let mut g = engine().lock().unwrap_or_else(|e| e.into_inner());
+                    free_weight_allocs_from(&mut g, start);
+                    g.draft_model = None;
+                }
+                eprintln!(
+                    "CFIE: bind_draft_model refused — missing or mis-shaped weight: {missing}"
+                );
+                -1
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        eprintln!(
+            "CFIE: bind_draft_model requires a CUDA-enabled build and GPU — refusing (no binding)"
+        );
+        -1
+    }
+}
+
+/// Allocate + zero the DRAFT KV pool (persistent caching-allocator
+/// bracket, same as the target pool).  Engine-held: NOT attached to the
+/// target KV slot allocator — kind-6 launches inject this base as their
+/// `kv_base`, and draft position bookkeeping is host-side.  Returns 0
+/// ok; -1 when `bytes <= 0`, a draft pool is already allocated (call
+/// `nsl_cfie_draft_reset` / destroy first), or on a non-cuda build.
+///
+/// SIZING CONTRACT: the registered kind-6 kernel's baked
+/// `per_slot_max_tokens` (which `bytes` must match:
+/// `draft_n_layers * 2 * per_slot * draft_n_kv_heads * draft_head_dim
+/// * 2`) must be >= the TARGET's per-slot token capacity —
+/// `nsl_cfie_speculative_generate`'s capacity probe bounds draft-KV
+/// writes by the TARGET capacity only.  The serve wiring bakes the
+/// same per-slot value into both DecodeBlockConfigs.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_draft_pool_alloc(bytes: i64) -> i64 {
+    if bytes <= 0 {
+        return -1;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let mut g = match engine().lock() {
+            Ok(g) => g,
+            Err(_) => return -1,
+        };
+        if g.draft_pool_base != 0 {
+            return -1; // already allocated — nsl_cfie_draft_reset first
+        }
+        let ptr = alloc_persistent(bytes as usize);
+        if ptr.is_null() {
+            return -1;
+        }
+        crate::cuda::inner::memset_d8(ptr, bytes as usize);
+        g.draft_pool_base = ptr as u64;
+        g.draft_pool_bytes = bytes as u64;
+        0
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        eprintln!("CFIE: draft_pool_alloc requires a CUDA-enabled build and GPU — refusing (no pool allocated)");
+        -1
+    }
+}
+
+/// Test/diagnostic accessor: the DRAFT KV pool device base recorded by
+/// `nsl_cfie_draft_pool_alloc`, or 0 when no draft pool is allocated.
+/// Mirrors `nsl_cfie_kv_pool_base` — GPU parity tests seed draft K/V
+/// rows through it; production launches inject the base internally.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_cfie_draft_pool_base() -> i64 {
+    match engine().lock() {
+        Ok(g) => g.draft_pool_base as i64,
+        Err(_) => 0,
+    }
+}
+
+/// Clear the draft-model binding and free the draft KV pool.
+/// Idempotent; always returns 0.  Does NOT free the draft WEIGHT device
+/// buffers — those live in `weight_allocs` (shared with the target's)
+/// and are freed by `nsl_cfie_weights_reset` / `nsl_cfie_engine_destroy`;
+/// this drops the binding records so a stale draft cannot drive
+/// `nsl_cfie_speculative_generate`.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_draft_reset() -> i64 {
+    let mut g = match engine().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    #[cfg(feature = "cuda")]
+    {
+        if g.draft_pool_base != 0 {
+            crate::cuda::inner::free_managed(g.draft_pool_base as *mut std::ffi::c_void);
+        }
+    }
+    g.draft_pool_base = 0;
+    g.draft_pool_bytes = 0;
+    g.draft_model = None;
     0
 }
 
@@ -1615,6 +1939,201 @@ pub extern "C" fn nsl_cfie_launch_quant_attn(
     }
 }
 
+/// Kind 6 — the DRAFT decode block.  Same 15-param kernel as kind 2
+/// (cfie_persistent_ptx.rs — the emitter is instantiated with the DRAFT
+/// DecodeBlockConfig: draft dims, per_slot_max_tokens = draft pool
+/// capacity, max_slots = 1), but the injection differs: `kv_base` = the
+/// DRAFT pool base (engine-held, `nsl_cfie_draft_pool_alloc`), the nine
+/// weight pointers come from the DRAFT binding's table for `layer_idx`
+/// (engine-held — unlike kind 2 the weights are NOT FFI arguments,
+/// keeping this FFI small), and `slot_idx` is fixed 0 (single draft
+/// sequence).  Returns 0 ok; -1 not-finalized / kind missing / no draft
+/// binding / `layer_idx` out of range / negative pos / draft pool
+/// unallocated; else the positive CUresult.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_launch_draft_block(
+    x_in: i64,
+    x_out: i64,
+    layer_idx: i64,
+    pos: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let meta = match resolved(KIND_DRAFT_BLOCK, 0) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        if pos < 0 {
+            return -1; // would wrap to a huge u32 KV row index
+        }
+        // Snapshot the draft layer record + pool base under one lock.
+        let (rec, kvb) = {
+            let g = match engine().lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
+            let dm = match g.draft_model.as_ref() {
+                Some(dm) => dm,
+                None => return -1,
+            };
+            if layer_idx < 0 || layer_idx >= dm.n_layers {
+                return -1;
+            }
+            if g.draft_pool_base == 0 {
+                return -1; // refuse rather than hand the kernel a null KV region
+            }
+            let base = layer_idx as usize * 9;
+            let rec: [u64; 9] = match dm
+                .weight_table
+                .get(base..base + 9)
+                .and_then(|s| s.try_into().ok())
+            {
+                Some(r) => r,
+                None => return -1, // malformed binding — refuse
+            };
+            (rec, g.draft_pool_base)
+        };
+        let mut xin = x_in as u64;
+        let mut xout = x_out as u64;
+        let mut p_wq = rec[0];
+        let mut p_wk = rec[1];
+        let mut p_wv = rec[2];
+        let mut p_wo = rec[3];
+        let mut p_wg = rec[4];
+        let mut p_wu = rec[5];
+        let mut p_wd = rec[6];
+        let mut p_n1 = rec[7];
+        let mut p_n2 = rec[8];
+        let mut kv = kvb;
+        let mut layer = layer_idx as u32;
+        let mut slot = 0u32; // draft config is max_slots = 1
+        let mut p_pos = pos as u32;
+        let args: [*mut c_void; 15] = [
+            &mut xin as *mut _ as *mut c_void,
+            &mut xout as *mut _ as *mut c_void,
+            &mut p_wq as *mut _ as *mut c_void,
+            &mut p_wk as *mut _ as *mut c_void,
+            &mut p_wv as *mut _ as *mut c_void,
+            &mut p_wo as *mut _ as *mut c_void,
+            &mut p_wg as *mut _ as *mut c_void,
+            &mut p_wu as *mut _ as *mut c_void,
+            &mut p_wd as *mut _ as *mut c_void,
+            &mut p_n1 as *mut _ as *mut c_void,
+            &mut p_n2 as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut layer as *mut _ as *mut c_void,
+            &mut slot as *mut _ as *mut c_void,
+            &mut p_pos as *mut _ as *mut c_void,
+        ];
+        launch(&meta, &args)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (x_in, x_out, layer_idx, pos);
+        -1
+    }
+}
+
+/// Kind 7 — draft greedy sampler.  Kernel params
+/// (cfie_spec_sampler_ptx.rs `nsl_cfie_draft_sample`, 6): hidden.u64,
+/// norm_w.u64 (INJECTED: draft binding's final-norm gamma), lm_head.u64
+/// (INJECTED: draft binding's f16 lm_head), out_token.u64 (st u32
+/// argmax), out_prob.u64 (st f32 = p(argmax)), rng_seed.u64 (ACCEPTED
+/// for ABI symmetry; UNUSED by the kernel — v1 drafting is greedy per
+/// the paper's temperature 0.0).  Sampler-family: no KV access, no pool
+/// needed.  Returns 0 ok; -1 not-finalized / kind missing / no draft
+/// binding; else the positive CUresult.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_launch_draft_sample(
+    hidden_ptr: i64,
+    out_token_ptr: i64,
+    out_prob_ptr: i64,
+    rng_seed: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let meta = match resolved(KIND_DRAFT_SAMPLE, 0) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let (norm, lm) = {
+            let g = match engine().lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
+            match g.draft_model.as_ref() {
+                Some(dm) => (dm.final_norm_dev, dm.lm_head_dev),
+                None => return -1,
+            }
+        };
+        let mut hidden = hidden_ptr as u64;
+        let mut norm_w = norm;
+        let mut lm_head = lm;
+        let mut out_tok = out_token_ptr as u64;
+        let mut out_prob = out_prob_ptr as u64;
+        let mut seed = rng_seed as u64;
+        let args: [*mut c_void; 6] = [
+            &mut hidden as *mut _ as *mut c_void,
+            &mut norm_w as *mut _ as *mut c_void,
+            &mut lm_head as *mut _ as *mut c_void,
+            &mut out_tok as *mut _ as *mut c_void,
+            &mut out_prob as *mut _ as *mut c_void,
+            &mut seed as *mut _ as *mut c_void,
+        ];
+        launch(&meta, &args)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (hidden_ptr, out_token_ptr, out_prob_ptr, rng_seed);
+        -1
+    }
+}
+
+/// Kind 8 — verification prob-row writer.  Kernel params
+/// (cfie_spec_sampler_ptx.rs `nsl_cfie_verify_probs`, 4): hidden.u64,
+/// norm_w.u64 (INJECTED: TARGET binding's final-norm gamma), lm_head.u64
+/// (INJECTED: TARGET binding's f16 lm_head), out_probs.u64 (st f32 x
+/// vocab, the full softmaxed row).  The fused sampler never materializes
+/// probs by design; this kernel exists so the kind-4 rejection kernel
+/// has target rows to compare against.  Returns 0 ok; -1 not-finalized /
+/// kind missing / no target binding; else the positive CUresult.
+#[no_mangle]
+pub extern "C" fn nsl_cfie_launch_verify_probs(hidden_ptr: i64, out_probs_ptr: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let meta = match resolved(KIND_VERIFY_PROBS, 0) {
+            Ok(m) => m,
+            Err(e) => return e,
+        };
+        let (norm, lm) = {
+            let g = match engine().lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
+            match g.bound_model.as_ref() {
+                Some(bm) => (bm.final_norm_dev, bm.lm_head_dev),
+                None => return -1,
+            }
+        };
+        let mut hidden = hidden_ptr as u64;
+        let mut norm_w = norm;
+        let mut lm_head = lm;
+        let mut out_probs = out_probs_ptr as u64;
+        let args: [*mut c_void; 4] = [
+            &mut hidden as *mut _ as *mut c_void,
+            &mut norm_w as *mut _ as *mut c_void,
+            &mut lm_head as *mut _ as *mut c_void,
+            &mut out_probs as *mut _ as *mut c_void,
+        ];
+        launch(&meta, &args)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (hidden_ptr, out_probs_ptr);
+        -1
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host decode loop
 // ---------------------------------------------------------------------------
@@ -1726,6 +2245,817 @@ pub extern "C" fn nsl_cfie_decode_step(
 }
 
 // ---------------------------------------------------------------------------
+// Speculative generation driver (CFIE Cycle 13, G15)
+// ---------------------------------------------------------------------------
+
+/// Byte count for a host read of `n_elems` i64 — same isize::MAX
+/// refusal contract as `checked_host_f32_bytes` (Cycle-9 overflow-guard
+/// pattern) for the prompt/out token arrays.
+#[cfg(feature = "cuda")]
+fn checked_host_i64_bytes(n_elems: i64) -> Option<usize> {
+    if n_elems <= 0 {
+        return None;
+    }
+    (n_elems as u64)
+        .checked_mul(std::mem::size_of::<i64>() as u64)
+        .filter(|&b| b <= isize::MAX as u64)
+        .map(|b| b as usize)
+}
+
+/// Embedding gather: memcpy the host f32 row `token` (`d` elems) into
+/// the device buffer `x_dev`.  The CALLER guards `token` against the
+/// vocab — this indexes `embed_host` directly.
+#[cfg(feature = "cuda")]
+fn gather_embed_row(embed_host: &[f32], d: usize, token: i64, x_dev: i64) {
+    let row_start = token as usize * d;
+    crate::cuda::inner::memcpy_htod(
+        x_dev as *mut c_void,
+        embed_host[row_start..row_start + d].as_ptr() as *const c_void,
+        d * 4,
+    );
+}
+
+/// Run the DRAFT decode-block chain (kind 6, all draft layers) at `pos`,
+/// ping-ponging the hidden state between the two draft buffers exactly
+/// like `nsl_cfie_decode_step` does for the target.  Returns the final
+/// hidden buffer on success, or `Err(rc)` from the failing launch.  No
+/// slot booking: draft position bookkeeping is host-side (the caller's
+/// `draft_pos` counter), and appending at an explicit `pos` overwrites
+/// stale rows by position.
+#[cfg(feature = "cuda")]
+fn draft_chain(x_da: i64, x_db: i64, n_layers: i64, pos: i64) -> Result<i64, i64> {
+    for layer in 0..n_layers {
+        let (x_in, x_out) = if layer % 2 == 0 {
+            (x_da, x_db)
+        } else {
+            (x_db, x_da)
+        };
+        let rc = nsl_cfie_launch_draft_block(x_in, x_out, layer, pos);
+        if rc != 0 {
+            return Err(rc);
+        }
+    }
+    Ok(if n_layers % 2 == 0 { x_da } else { x_db })
+}
+
+/// One VERIFY-position target forward: identical to
+/// `nsl_cfie_decode_step` (advance-first slot booking, kind-2 chain,
+/// same rollback-on-failure discipline) except the terminal kernel is
+/// kind 8 — the full softmaxed prob ROW writer — instead of the fused
+/// sampler.  Return contract mirrors decode_step: 0 ok; -2 capacity
+/// refusal (nothing launched); -3 pos/len mismatch (booking rolled
+/// back); else the failing launch's code (booking rolled back).
+#[cfg(feature = "cuda")]
+fn target_verify_step(
+    x_buf_a: i64,
+    x_buf_b: i64,
+    weight_table: &[u64],
+    n_layers: i64,
+    slot_idx: i64,
+    pos: i64,
+    out_probs_ptr: i64,
+) -> i64 {
+    let new_len = crate::cfie::ffi::nsl_cfie_kv_slot_advance(slot_idx, 1);
+    if new_len < 0 {
+        return -2;
+    }
+    if new_len != pos + 1 {
+        crate::cfie::ffi::nsl_cfie_kv_slot_rollback(slot_idx, 1);
+        return -3;
+    }
+    for layer in 0..n_layers {
+        let base = layer as usize * 9;
+        let rec = &weight_table[base..base + 9];
+        let (x_in, x_out) = if layer % 2 == 0 {
+            (x_buf_a, x_buf_b)
+        } else {
+            (x_buf_b, x_buf_a)
+        };
+        let rc = nsl_cfie_launch_decode_block(
+            x_in,
+            x_out,
+            rec[0] as i64, // wq
+            rec[1] as i64, // wk
+            rec[2] as i64, // wv
+            rec[3] as i64, // wo
+            rec[4] as i64, // w_gate
+            rec[5] as i64, // w_up
+            rec[6] as i64, // w_down
+            rec[7] as i64, // norm1_w
+            rec[8] as i64, // norm2_w
+            layer,
+            slot_idx,
+            pos,
+        );
+        if rc != 0 {
+            crate::cfie::ffi::nsl_cfie_kv_slot_rollback(slot_idx, 1);
+            return rc;
+        }
+    }
+    let final_hidden = if n_layers % 2 == 0 { x_buf_a } else { x_buf_b };
+    let rc = nsl_cfie_launch_verify_probs(final_hidden, out_probs_ptr);
+    if rc != 0 {
+        crate::cfie::ffi::nsl_cfie_kv_slot_rollback(slot_idx, 1);
+        return rc;
+    }
+    0
+}
+
+/// Speculative decode loop (the paper's serve `speculative:` driver):
+/// draft `k_tokens` greedily with the DRAFT model, verify them with one
+/// target forward per position + ONE kind-4 rejection launch, emit the
+/// accepted prefix (+ the residual correction, or a bonus token on
+/// all-accept), and roll both KV sides back to the emitted sequence.
+/// Same conventions as `nsl_cfie_generate`: advance-first target slot
+/// booking, `out_cap`-clamped writes with the TRUE generated count
+/// returned, scratch freed on every path, slot released, vocab-range
+/// guards on every token id used as an input.
+///
+/// Requires: `nsl_cfie_bind_model` + `nsl_cfie_bind_draft_model` +
+/// `nsl_cfie_draft_pool_alloc` + `nsl_cfie_engine_finalize` (kinds
+/// 1/2/4/6/7/8).  `k_tokens` must be 1..=32 and MUST equal the K the
+/// registered kind-4 rejection kernel was compiled for (the serve
+/// wiring passes the same speculative-config value to both).
+///
+/// The loop:
+///   1. Prefill BOTH models over the prompt (target: `decode_step` at
+///      pos 0..prompt_len — byte-identical to `nsl_cfie_generate`'s
+///      prefix, so the first new token, sampled at pos prompt_len-1,
+///      agrees token-for-token; draft: kind-6 chain, outputs discarded).
+///   2. Rounds until max_new/EOS/capacity.  Each round STARTS with a
+///      capacity probe: the draft phase writes K draft-KV rows BEFORE
+///      any verify step books the target slot, and the kind-6 kernel
+///      appends at an explicit pos with NO bounds check (the plane
+///      strides are baked from its per_slot_max_tokens) — so the round
+///      may only start when the TARGET slot can book K more rows
+///      (`kv_slot_advance(slot, K)` probe, rolled straight back).  When
+///      the probe fails, the TAIL of the generation falls back to plain
+///      per-token `decode_step`s — exact parity with
+///      `nsl_cfie_generate` up to capacity (no truncated round, no
+///      draft-KV write past the pool).  Otherwise: draft K tokens (per
+///      token: draft embed gather -> kind-6 all layers -> kind-7 ->
+///      (token, p_draft)); target-verify K positions (embed gather of
+///      the PREVIOUS token -> kind-2 chain appending target KV ->
+///      kind-8 prob row); ONE kind-4 launch -> (accepted, correction).
+///   3. Rejection: emit the accepted prefix + the correction.  The
+///      round appended K KV rows for inputs (last, d0..d[K-2]); the
+///      emitted sequence keeps accepted+1 of them, so
+///      `K - accepted - 1` rows are STALE on BOTH sides —
+///      `nsl_cfie_kv_slot_rollback` for the target, and the draft
+///      position counter rewinds by the same count (the correction
+///      token is fed at the next round boundary, overwriting the first
+///      stale draft row by position — that overwrite IS the draft
+///      rollback).
+///   4. All-accept (0xFFFFFFFF sentinel): emit the K drafts, then one
+///      BONUS token via a plain target `decode_step` (kind-1 fused
+///      sampler — generate's step), drafting d[K-1] through the draft
+///      chain to keep the two KV sides in lock-step.
+///
+/// DETERMINISM CONTRACT (the lossless self-speculation invariant): with
+/// greedy target sampling AND draft == target weights, p_t/p_d == 1 for
+/// every drafted token, the reject kernel accepts all K every round
+/// regardless of seed, and the output equals `nsl_cfie_generate`'s for
+/// the same prompt/seed/max_new EXACTLY — same positions, same embed
+/// gathers, same sampler calls at round boundaries.  The kind-4 seed is
+/// varied per round (`rng_seed + round`, wrapping) so real draft/target
+/// pairs do not replay identical uniforms each round; the invariant is
+/// seed-independent.
+///
+/// SIZING CONTRACT (enforced by the serve wiring, documented here
+/// because the engine cannot verify it): the draft pool must be sized
+/// with per_slot_max_tokens >= the TARGET's per-slot token capacity —
+/// the capacity probe bounds every draft-KV write by the TARGET
+/// capacity, so a smaller draft pool would still overflow.  The serve
+/// wiring bakes the SAME per-slot value into both DecodeBlockConfigs.
+///
+/// SINGLE-FLIGHT: concurrent speculative calls would race on slot 0 of
+/// the single engine-held draft pool (kind-6 launches hardcode slot 0),
+/// so overlapping calls refuse (-1) instead of silently corrupting
+/// draft KV; `nsl_cfie_generate` stays per-slot concurrent.
+///
+/// Returns the TRUE generated-token count (writes clamped to
+/// `out_cap`); EOS anywhere in the emitted tokens stops generation
+/// (truncated after the EOS).  -1 on bad args (incl. `k_tokens`
+/// outside 1..=32), missing target/draft binding, vocab mismatch,
+/// missing finalize/pool, slot-acquire failure, a real launch failure,
+/// or a non-cuda build.  A -2 capacity refusal anywhere stops CLEANLY
+/// with the tokens emitted so far (via the probe + tail fallback the
+/// emitted prefix equals `nsl_cfie_generate`'s output truncated at
+/// capacity under the determinism contract).
+///
+/// # Safety
+/// `prompt_tokens_ptr` must point to `prompt_len` readable i64s;
+/// `out_tokens_ptr` to `out_cap` writable i64s.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_cfie_speculative_generate(
+    prompt_tokens_ptr: i64,
+    prompt_len: i64,
+    max_new_tokens: i64,
+    eos_token_id: i64,
+    rng_seed: i64,
+    k_tokens: i64,
+    out_tokens_ptr: i64,
+    out_cap: i64,
+) -> i64 {
+    // Cross-build guards (pure bookkeeping — CPU-unit-testable): args,
+    // binding order, shared-vocab invariant.
+    if prompt_tokens_ptr == 0
+        || out_tokens_ptr == 0
+        || prompt_len <= 0
+        || out_cap <= 0
+        || max_new_tokens <= 0
+    {
+        eprintln!(
+            "CFIE: speculative_generate refused — bad argument (null ptr or non-positive length/cap)"
+        );
+        return -1;
+    }
+    if !(1..=32).contains(&k_tokens) {
+        eprintln!(
+            "CFIE: speculative_generate refused — k_tokens {k_tokens} outside the frozen 1..=32 range"
+        );
+        return -1;
+    }
+    {
+        let g = match engine().lock() {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("CFIE: speculative_generate refused — engine lock poisoned");
+                return -1;
+            }
+        };
+        let bm = match g.bound_model.as_ref() {
+            Some(bm) => bm,
+            None => {
+                eprintln!(
+                    "CFIE: speculative_generate refused — no model bound (call nsl_cfie_bind_model first)"
+                );
+                return -1;
+            }
+        };
+        match g.draft_model.as_ref() {
+            Some(dm) if dm.vocab_size == bm.vocab_size => {}
+            Some(dm) => {
+                eprintln!(
+                    "CFIE: speculative_generate refused — draft vocab {} != target vocab {} (rebind required)",
+                    dm.vocab_size, bm.vocab_size
+                );
+                return -1;
+            }
+            None => {
+                eprintln!(
+                    "CFIE: speculative_generate refused — no draft model bound (call nsl_cfie_bind_draft_model first)"
+                );
+                return -1;
+            }
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Single-flight guard (see the doc comment): the draft pool is
+        // single-slot, so a second concurrent speculative call would
+        // race the first's draft KV rows.  Released on EVERY exit path
+        // via the drop guard.
+        static SPEC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        struct SpecFlight;
+        impl Drop for SpecFlight {
+            fn drop(&mut self) {
+                SPEC_IN_FLIGHT.store(false, Ordering::Release);
+            }
+        }
+        if SPEC_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+            eprintln!(
+                "CFIE: speculative_generate refused — another speculative call is in flight (single-slot draft KV pool; serialize calls)"
+            );
+            return -1;
+        }
+        let _flight = SpecFlight;
+
+        // Snapshot BOTH bindings under one lock (device pointers/host
+        // embeds are stable for the call; the lock is released before
+        // the loop so the per-launch engine locking is not re-entrant).
+        let (
+            weight_table,
+            final_norm_dev,
+            lm_head_dev,
+            embed_host,
+            n_layers,
+            d_model,
+            vocab_size,
+            draft_embed,
+            draft_n_layers,
+            draft_d_model,
+        ) = {
+            let g = match engine().lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
+            let (bm, dm) = match (g.bound_model.as_ref(), g.draft_model.as_ref()) {
+                (Some(b), Some(d)) => (b, d),
+                _ => return -1, // unbound between the guard and here
+            };
+            (
+                bm.weight_table.clone(),
+                bm.final_norm_dev,
+                bm.lm_head_dev,
+                bm.embed_host.clone(),
+                bm.n_layers,
+                bm.d_model,
+                bm.vocab_size,
+                dm.embed_host.clone(),
+                dm.n_layers,
+                dm.d_model,
+            )
+        };
+        // Every kernel kind the loop drives must be finalized.
+        if resolved(KIND_DECODE_BLOCK, 0).is_err()
+            || resolved(KIND_FUSED_SAMPLE, 0).is_err()
+            || resolved(KIND_DRAFT_BLOCK, 0).is_err()
+            || resolved(KIND_DRAFT_SAMPLE, 0).is_err()
+            || resolved(KIND_VERIFY_PROBS, 0).is_err()
+            || resolved(KIND_SPEC_REJECT, 0).is_err()
+        {
+            eprintln!(
+                "CFIE: speculative_generate refused — engine not finalized (kinds 1/2/4/6/7/8 unresolved)"
+            );
+            return -1;
+        }
+        // The draft KV pool must exist (kind-6 kv_base injection).
+        {
+            let g = match engine().lock() {
+                Ok(g) => g,
+                Err(_) => return -1,
+            };
+            if g.draft_pool_base == 0 {
+                eprintln!(
+                    "CFIE: speculative_generate refused — draft KV pool not allocated (call nsl_cfie_draft_pool_alloc)"
+                );
+                return -1;
+            }
+        }
+        // Host-read overflow guards (Cycle-9 pattern) for the token
+        // arrays, and the [K][vocab] f32 prob-matrix size.
+        if checked_host_i64_bytes(prompt_len).is_none()
+            || checked_host_i64_bytes(out_cap).is_none()
+        {
+            eprintln!("CFIE: speculative_generate refused — token array size overflows");
+            return -1;
+        }
+        let probs_bytes = match (k_tokens as u64)
+            .checked_mul(vocab_size as u64)
+            .and_then(|x| x.checked_mul(4))
+            .filter(|&b| b <= isize::MAX as u64)
+        {
+            Some(b) => b as usize,
+            None => {
+                eprintln!("CFIE: speculative_generate refused — K x vocab prob matrix overflows");
+                return -1;
+            }
+        };
+
+        let d = d_model as usize;
+        let dd = draft_d_model as usize;
+        let k = k_tokens as usize;
+        let prompt = unsafe {
+            std::slice::from_raw_parts(prompt_tokens_ptr as *const i64, prompt_len as usize)
+        };
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(out_tokens_ptr as *mut i64, out_cap as usize)
+        };
+
+        // Acquire a fresh TARGET KV slot; the draft side is slot 0 of
+        // its own single-slot pool.
+        let slot = crate::cfie::ffi::nsl_cfie_kv_slot_acquire();
+        if slot < 0 {
+            eprintln!("CFIE: speculative_generate refused — KV slot acquire failed (pool exhausted?)");
+            return -1;
+        }
+
+        // Device scratch — freed on EVERY exit path via `cleanup`.
+        let x_a = crate::cuda::inner::alloc_device(d * 4) as i64; // target hidden ping
+        let x_b = crate::cuda::inner::alloc_device(d * 4) as i64; // target hidden pong
+        let tok_dev = crate::cuda::inner::alloc_device(4) as i64; // kind-1 sampled u32
+        let x_da = crate::cuda::inner::alloc_device(dd * 4) as i64; // draft hidden ping
+        let x_db = crate::cuda::inner::alloc_device(dd * 4) as i64; // draft hidden pong
+        let d_tokens_dev = crate::cuda::inner::alloc_device(k * 4) as i64; // draft tokens u32[K]
+        let d_probs_dev = crate::cuda::inner::alloc_device(k * 4) as i64; // p_draft f32[K]
+        let t_probs_dev = crate::cuda::inner::alloc_device(probs_bytes) as i64; // target rows f32[K][vocab]
+        let rj_dev = crate::cuda::inner::alloc_device(8) as i64; // accepted u32 + correction u32
+
+        let scratch = [
+            x_a, x_b, tok_dev, x_da, x_db, d_tokens_dev, d_probs_dev, t_probs_dev, rj_dev,
+        ];
+        let cleanup = move || {
+            for p in scratch.iter() {
+                crate::cuda::inner::free_device(*p as *mut c_void);
+            }
+            crate::cfie::ffi::nsl_cfie_kv_slot_release(slot);
+        };
+        // Device u32 -> host readback (NULL-stream ordering serializes
+        // behind the preceding launches, same as generate's readback).
+        let read_u32 = |dev: i64| -> u32 {
+            let mut v = [0u32; 1];
+            crate::cuda::inner::memcpy_dtoh(v.as_mut_ptr() as *mut c_void, dev as *const c_void, 4);
+            v[0]
+        };
+        // Record one emitted token; returns true when generation must
+        // STOP (EOS emitted, or max_new reached).  Same clamp/count/EOS
+        // ordering as nsl_cfie_generate.
+        fn record(
+            tok: i64,
+            out: &mut [i64],
+            generated: &mut i64,
+            out_cap: i64,
+            eos: i64,
+            max_new: i64,
+        ) -> bool {
+            if *generated < out_cap {
+                out[*generated as usize] = tok;
+            }
+            *generated += 1;
+            tok == eos || *generated >= max_new
+        }
+
+        let mut generated: i64 = 0;
+
+        // ---- Phase 1: TARGET prefill — byte-identical to
+        // nsl_cfie_generate's first prompt_len decode_steps, so the
+        // pre-speculation prefix agrees token-for-token.  The sampler
+        // output only matters at the last position (the FIRST new
+        // token, sampled at pos prompt_len-1).
+        for pos in 0..prompt_len {
+            let t = prompt[pos as usize];
+            if t < 0 || t >= vocab_size {
+                cleanup();
+                eprintln!(
+                    "CFIE: speculative_generate refused — prompt token id {t} out of range [0, {vocab_size})"
+                );
+                return -1;
+            }
+            gather_embed_row(&embed_host, d, t, x_a);
+            let rc = nsl_cfie_decode_step(
+                x_a,
+                x_b,
+                weight_table.as_ptr() as i64,
+                n_layers,
+                final_norm_dev as i64,
+                lm_head_dev as i64,
+                slot,
+                pos,
+                rng_seed,
+                0, // grammar_state — DEFERRED, same as generate
+                tok_dev,
+            );
+            if rc == -2 {
+                // Prompt alone filled the slot: 0 new tokens, cleanly.
+                cleanup();
+                return 0;
+            }
+            if rc < 0 {
+                cleanup();
+                eprintln!("CFIE: speculative_generate — prefill decode_step failed with rc {rc}");
+                return -1;
+            }
+        }
+        let t0 = read_u32(tok_dev) as i64;
+        if record(t0, out, &mut generated, out_cap, eos_token_id, max_new_tokens) {
+            cleanup();
+            return generated;
+        }
+
+        // ---- Phase 2: DRAFT prefill — kind-6 chain per prompt token,
+        // outputs discarded (this only appends draft KV).  Prompt ids
+        // were vocab-guarded in phase 1 (shared vocab).
+        for pos in 0..prompt_len {
+            gather_embed_row(&draft_embed, dd, prompt[pos as usize], x_da);
+            if let Err(rc) = draft_chain(x_da, x_db, draft_n_layers, pos) {
+                cleanup();
+                eprintln!("CFIE: speculative_generate — draft prefill launch failed with rc {rc}");
+                return -1;
+            }
+        }
+
+        // Fed-token counters.  target_pos mirrors the slot allocator's
+        // booked length EXACTLY (each verify/decode_step advances 1;
+        // rejection rolls back `stale`); draft_pos is the host-side
+        // equivalent for the single-slot draft pool.  Invariant at every
+        // round boundary: target_pos == draft_pos == (fed tokens), and
+        // the last emitted token has NOT yet been fed to either model.
+        let mut target_pos: i64 = prompt_len;
+        let mut draft_pos: i64 = prompt_len;
+        let mut last = t0;
+        let mut round: i64 = 0;
+
+        'rounds: loop {
+            // ---- Capacity probe (draft-KV OOB guard). ----
+            // The draft phase below writes K draft-KV rows at
+            // draft_pos..draft_pos+K BEFORE any advance-first booking,
+            // and the kind-6 kernel has NO bounds check — so the round
+            // may only start when the TARGET slot (whose booked length
+            // equals draft_pos at every round boundary) can book K more
+            // rows.  Probe by advancing K and rolling straight back
+            // (both pure bookkeeping); with the single-flight guard the
+            // slot is exclusively ours, so a passing probe guarantees
+            // the verify bookings succeed.
+            let probe = crate::cfie::ffi::nsl_cfie_kv_slot_advance(slot, k_tokens);
+            if probe >= 0 {
+                crate::cfie::ffi::nsl_cfie_kv_slot_rollback(slot, k_tokens);
+            } else {
+                // TAIL FALLBACK: fewer than K rows remain.  Finish with
+                // plain per-token decode_steps — exactly what
+                // nsl_cfie_generate runs from this state, so the
+                // determinism contract holds all the way to the -2
+                // capacity stop.  No draft sync needed: speculation
+                // never resumes (capacity only shrinks from here).
+                loop {
+                    if last < 0 || last >= vocab_size {
+                        cleanup();
+                        eprintln!(
+                            "CFIE: speculative_generate refused — tail input token id {last} out of range [0, {vocab_size})"
+                        );
+                        return -1;
+                    }
+                    gather_embed_row(&embed_host, d, last, x_a);
+                    let rc = nsl_cfie_decode_step(
+                        x_a,
+                        x_b,
+                        weight_table.as_ptr() as i64,
+                        n_layers,
+                        final_norm_dev as i64,
+                        lm_head_dev as i64,
+                        slot,
+                        target_pos,
+                        rng_seed,
+                        0,
+                        tok_dev,
+                    );
+                    if rc == -2 {
+                        break 'rounds; // capacity — clean stop
+                    }
+                    if rc < 0 {
+                        cleanup();
+                        eprintln!(
+                            "CFIE: speculative_generate — tail decode_step failed with rc {rc}"
+                        );
+                        return -1;
+                    }
+                    target_pos += 1;
+                    let t = read_u32(tok_dev) as i64;
+                    if t >= vocab_size {
+                        cleanup();
+                        eprintln!(
+                            "CFIE: speculative_generate — sampler produced out-of-vocab token {t} (kernel contract violation)"
+                        );
+                        return -1;
+                    }
+                    if record(t, out, &mut generated, out_cap, eos_token_id, max_new_tokens) {
+                        break 'rounds;
+                    }
+                    last = t;
+                }
+            }
+
+            // ---- Draft K tokens greedily, recording p_draft[j]. ----
+            let mut draft_toks: Vec<i64> = Vec::with_capacity(k);
+            let mut prev = last;
+            for j in 0..k {
+                if prev < 0 || prev >= vocab_size {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate refused — draft input token id {prev} out of range [0, {vocab_size})"
+                    );
+                    return -1;
+                }
+                gather_embed_row(&draft_embed, dd, prev, x_da);
+                let hidden = match draft_chain(x_da, x_db, draft_n_layers, draft_pos) {
+                    Ok(h) => h,
+                    Err(rc) => {
+                        cleanup();
+                        eprintln!(
+                            "CFIE: speculative_generate — draft block launch failed with rc {rc}"
+                        );
+                        return -1;
+                    }
+                };
+                let rc = nsl_cfie_launch_draft_sample(
+                    hidden,
+                    d_tokens_dev + (j as i64) * 4,
+                    d_probs_dev + (j as i64) * 4,
+                    rng_seed, // ABI symmetry — kind 7 is greedy, seed unused
+                );
+                if rc != 0 {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — draft sample launch failed with rc {rc}"
+                    );
+                    return -1;
+                }
+                draft_pos += 1;
+                let dt = read_u32(d_tokens_dev + (j as i64) * 4) as i64;
+                if dt >= vocab_size {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — draft sampler produced out-of-vocab token {dt} (kernel contract violation)"
+                    );
+                    return -1;
+                }
+                draft_toks.push(dt);
+                prev = dt;
+            }
+
+            // ---- Target verify: kind-2 chain + kind-8 prob row per
+            // position.  Row j is the target distribution over the
+            // sequence slot draft_toks[j] occupies, so the INPUT is the
+            // PREVIOUS token (row 0 feeds `last`).  Each step appends
+            // target KV (advance-first, exactly like decode_step).
+            for j in 0..k {
+                let inp = if j == 0 { last } else { draft_toks[j - 1] };
+                // (vocab-guarded when produced, on every build path)
+                gather_embed_row(&embed_host, d, inp, x_a);
+                let rc = target_verify_step(
+                    x_a,
+                    x_b,
+                    &weight_table,
+                    n_layers,
+                    slot,
+                    target_pos,
+                    t_probs_dev + (j as i64) * vocab_size * 4,
+                );
+                if rc == -2 {
+                    // Unreachable given the round-start capacity probe
+                    // + single-flight (K rows were bookable); kept as
+                    // defense-in-depth — a clean stop, never corruption.
+                    break 'rounds;
+                }
+                if rc != 0 {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — verify step failed with rc {rc}"
+                    );
+                    return -1;
+                }
+                target_pos += 1;
+            }
+
+            // ---- ONE kind-4 rejection launch over the K rows.  The
+            // seed varies per round (wrapping) so real draft/target
+            // pairs do not replay identical uniforms; the
+            // self-speculation invariant is seed-independent.
+            let rc = nsl_cfie_launch_spec_reject(
+                t_probs_dev,
+                d_probs_dev,
+                d_tokens_dev,
+                rng_seed.wrapping_add(round),
+                rj_dev,
+                rj_dev + 4,
+            );
+            if rc != 0 {
+                cleanup();
+                eprintln!("CFIE: speculative_generate — reject launch failed with rc {rc}");
+                return -1;
+            }
+            round += 1;
+            let accepted = read_u32(rj_dev) as i64;
+            let correction = read_u32(rj_dev + 4);
+            if accepted > k_tokens {
+                cleanup();
+                eprintln!(
+                    "CFIE: speculative_generate — reject kernel reported {accepted} accepted of {k_tokens} (kernel contract violation)"
+                );
+                return -1;
+            }
+
+            if correction == 0xFFFF_FFFF {
+                // All K accepted (sentinel).  Emit the K drafts, then
+                // ONE bonus token via a plain target step, drafting
+                // d[K-1] through the draft chain to keep both KV sides
+                // in lock-step.
+                if accepted != k_tokens {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — all-accept sentinel with accepted {accepted} != K {k_tokens} (kernel contract violation)"
+                    );
+                    return -1;
+                }
+                for &t in &draft_toks {
+                    if record(t, out, &mut generated, out_cap, eos_token_id, max_new_tokens) {
+                        break 'rounds;
+                    }
+                }
+                let inp = draft_toks[k - 1]; // vocab-guarded at draft time
+                gather_embed_row(&embed_host, d, inp, x_a);
+                let rc = nsl_cfie_decode_step(
+                    x_a,
+                    x_b,
+                    weight_table.as_ptr() as i64,
+                    n_layers,
+                    final_norm_dev as i64,
+                    lm_head_dev as i64,
+                    slot,
+                    target_pos,
+                    rng_seed,
+                    0,
+                    tok_dev,
+                );
+                if rc == -2 {
+                    break 'rounds;
+                }
+                if rc < 0 {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — bonus decode_step failed with rc {rc}"
+                    );
+                    return -1;
+                }
+                target_pos += 1;
+                let bonus = read_u32(tok_dev) as i64;
+                if bonus >= vocab_size {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — sampler produced out-of-vocab token {bonus} (kernel contract violation)"
+                    );
+                    return -1;
+                }
+                // Draft KV sync: feed d[K-1] (chain only — its sample is
+                // never needed; the bonus came from the TARGET sampler).
+                gather_embed_row(&draft_embed, dd, inp, x_da);
+                if let Err(rc) = draft_chain(x_da, x_db, draft_n_layers, draft_pos) {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — draft sync launch failed with rc {rc}"
+                    );
+                    return -1;
+                }
+                draft_pos += 1;
+                if record(bonus, out, &mut generated, out_cap, eos_token_id, max_new_tokens) {
+                    break 'rounds;
+                }
+                last = bonus;
+            } else {
+                // Rejection at index `accepted`: emit the accepted
+                // prefix, then the residual correction sample.
+                if accepted >= k_tokens {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — correction with accepted {accepted} >= K {k_tokens} (kernel contract violation)"
+                    );
+                    return -1;
+                }
+                for &t in &draft_toks[..accepted as usize] {
+                    if record(t, out, &mut generated, out_cap, eos_token_id, max_new_tokens) {
+                        break 'rounds;
+                    }
+                }
+                let corr = correction as i64;
+                if corr >= vocab_size {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — reject kernel produced out-of-vocab correction {corr} (kernel contract violation)"
+                    );
+                    return -1;
+                }
+                // Roll back the STALE rows.  The round appended K rows
+                // for inputs (last, d0..d[K-2]); the emitted sequence
+                // keeps (last, d0..d[accepted-1]) = accepted+1 of them,
+                // so K - accepted - 1 rows are stale on BOTH sides.  The
+                // correction is fed at the next round boundary,
+                // overwriting the first stale draft row by position —
+                // that overwrite IS the draft-side rollback.
+                let stale = k_tokens - accepted - 1;
+                if stale > 0
+                    && crate::cfie::ffi::nsl_cfie_kv_slot_rollback(slot, stale) < 0
+                {
+                    cleanup();
+                    eprintln!(
+                        "CFIE: speculative_generate — KV rollback of {stale} rejected rows failed"
+                    );
+                    return -1;
+                }
+                target_pos -= stale;
+                draft_pos -= stale;
+                if record(corr, out, &mut generated, out_cap, eos_token_id, max_new_tokens) {
+                    break 'rounds;
+                }
+                last = corr;
+            }
+        }
+
+        cleanup();
+        generated
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (eos_token_id, rng_seed);
+        eprintln!(
+            "CFIE: speculative_generate requires a CUDA-enabled build and GPU — refusing (no generation)"
+        );
+        -1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (CPU-only — run without the cuda feature)
 // ---------------------------------------------------------------------------
 
@@ -1780,12 +3110,12 @@ mod tests {
         let _serial = engine_serial_lock();
         reset_engine();
         assert_eq!(register(-1, 0), -1);
-        assert_eq!(register(6, 0), -1);
+        assert_eq!(register(9, 0), -1); // one past the Cycle-13 range
         assert_eq!(register(0, -1), -1); // negative layer index
-        for kind in 0..=5 {
+        for kind in 0..=8 {
             assert_eq!(register(kind, 0), 0, "kind {} must register", kind);
         }
-        assert_eq!(kernel_count(), 6);
+        assert_eq!(kernel_count(), 9);
         reset_engine();
     }
 
@@ -1909,7 +3239,7 @@ mod tests {
         let _serial = engine_serial_lock();
         reset_engine();
         // Register every kind, but never finalize: all launches refuse.
-        for kind in 0..=5 {
+        for kind in 0..=8 {
             assert_eq!(register(kind, 0), 0);
         }
         assert_eq!(nsl_cfie_launch_decode_attn(0x10, 0x20, 0, 0, 1), -1);
@@ -1921,6 +3251,10 @@ mod tests {
         assert_eq!(nsl_cfie_launch_spec_verify(0x10, 0x20, 0, 0, 1), -1);
         assert_eq!(nsl_cfie_launch_spec_reject(1, 2, 3, 4, 5, 6), -1);
         assert_eq!(nsl_cfie_launch_quant_attn(0, 0x10, 0x20, 0, 1, 0, 0), -1);
+        // Cycle-13 draft/verify launches refuse before finalize too.
+        assert_eq!(nsl_cfie_launch_draft_block(0x10, 0x20, 0, 0), -1);
+        assert_eq!(nsl_cfie_launch_draft_sample(0x10, 0x20, 0x30, 7), -1);
+        assert_eq!(nsl_cfie_launch_verify_probs(0x10, 0x20), -1);
         reset_engine();
     }
 
@@ -2287,6 +3621,210 @@ mod tests {
             -1,
             "generate must refuse before bind_model + finalize"
         );
+        reset_engine();
+    }
+
+    // -----------------------------------------------------------------
+    // CFIE Cycle 13 draft binding + speculative generation
+    // -----------------------------------------------------------------
+
+    /// A fake binding record for the CROSS-BUILD guard paths (binding
+    /// order, vocab agreement).  Empty tables/embeds are fine: every
+    /// test that injects one only exercises refusals that fire BEFORE
+    /// any table/embed access (non-cuda refuses outright; cuda refuses
+    /// at the not-finalized check).
+    fn fake_binding(vocab: i64) -> BoundModel {
+        BoundModel {
+            weight_table: Vec::new(),
+            final_norm_dev: 0,
+            lm_head_dev: 0,
+            embed_host: Vec::new(),
+            n_layers: 1,
+            d_model: 8,
+            vocab_size: vocab,
+        }
+    }
+
+    fn inject_fake_target(vocab: i64) {
+        engine()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bound_model = Some(fake_binding(vocab));
+    }
+
+    fn inject_fake_draft(vocab: i64) {
+        engine()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .draft_model = Some(fake_binding(vocab));
+    }
+
+    #[test]
+    fn bind_draft_refuses_bad_args_ordering_and_vocab_mismatch() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        let bogus = 0x1000i64; // never dereferenced on these paths
+        // Null handle / non-positive dims refuse on every build.
+        assert_eq!(nsl_cfie_bind_draft_model(0, 1, 8, 1, 1, 8, 16, 32), -1);
+        assert_eq!(
+            nsl_cfie_bind_draft_model(bogus, 0, 8, 1, 1, 8, 16, 32),
+            -1,
+            "non-positive n_layers"
+        );
+        assert_eq!(
+            nsl_cfie_bind_draft_model(bogus, 1, 8, 1, 1, 8, 16, 0),
+            -1,
+            "non-positive vocab"
+        );
+        // Ordering: no TARGET model bound yet => refuse on every build.
+        assert_eq!(
+            nsl_cfie_bind_draft_model(bogus, 1, 8, 1, 1, 8, 16, 32),
+            -1,
+            "bind_draft before bind_model must refuse"
+        );
+        // Shared-vocab invariant: target vocab 32, draft vocab 64.
+        inject_fake_target(32);
+        assert_eq!(
+            nsl_cfie_bind_draft_model(bogus, 1, 8, 1, 1, 8, 16, 64),
+            -1,
+            "vocab mismatch must refuse"
+        );
+        #[cfg(not(feature = "cuda"))]
+        {
+            // Matching vocab, non-cuda: honest refusal (never touches
+            // the bogus handle).
+            assert_eq!(
+                nsl_cfie_bind_draft_model(bogus, 1, 8, 1, 1, 8, 16, 32),
+                -1,
+                "no cuda => -1"
+            );
+        }
+        // No draft binding may have been recorded by any refusal.
+        {
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.draft_model.is_none(), "a refused draft bind records nothing");
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn draft_pool_alloc_refuses_bad_args_and_double_alloc() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        assert_eq!(nsl_cfie_draft_pool_alloc(0), -1);
+        assert_eq!(nsl_cfie_draft_pool_alloc(-4096), -1);
+        assert_eq!(nsl_cfie_draft_pool_base(), 0, "no pool recorded");
+        #[cfg(not(feature = "cuda"))]
+        {
+            // No GPU: honest refusal for a valid size too.
+            assert_eq!(nsl_cfie_draft_pool_alloc(4096), -1);
+            assert_eq!(nsl_cfie_draft_pool_base(), 0);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            // GPU build: first alloc succeeds, second refuses until
+            // draft_reset (or destroy) releases the pool.
+            assert_eq!(nsl_cfie_draft_pool_alloc(4096), 0);
+            assert_ne!(nsl_cfie_draft_pool_base(), 0);
+            assert_eq!(nsl_cfie_draft_pool_alloc(4096), -1);
+            assert_eq!(nsl_cfie_draft_reset(), 0);
+            assert_eq!(nsl_cfie_draft_pool_base(), 0);
+            assert_eq!(nsl_cfie_draft_pool_alloc(4096), 0);
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn draft_reset_is_idempotent_and_clears_binding() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        // Nothing bound: reset is a no-op returning 0, twice.
+        assert_eq!(nsl_cfie_draft_reset(), 0);
+        assert_eq!(nsl_cfie_draft_reset(), 0);
+        // With a (fake) draft binding: reset clears it, target untouched.
+        inject_fake_target(32);
+        inject_fake_draft(32);
+        assert_eq!(nsl_cfie_draft_reset(), 0);
+        {
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.draft_model.is_none(), "draft binding cleared");
+            assert_eq!(g.draft_pool_base, 0);
+            assert_eq!(g.draft_pool_bytes, 0);
+            assert!(g.bound_model.is_some(), "target binding must survive draft_reset");
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn destroy_clears_draft_state() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        inject_fake_target(32);
+        inject_fake_draft(32);
+        assert_eq!(nsl_cfie_engine_destroy(), 0);
+        {
+            let g = engine().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.bound_model.is_none());
+            assert!(g.draft_model.is_none(), "destroy must clear the draft binding");
+            assert_eq!(g.draft_pool_base, 0);
+            assert_eq!(g.draft_pool_bytes, 0);
+        }
+        reset_engine();
+    }
+
+    #[test]
+    fn speculative_generate_validates_args_and_binding_order() {
+        let _serial = engine_serial_lock();
+        reset_engine();
+        let prompt = [1i64, 2, 3];
+        let pp = prompt.as_ptr() as i64;
+        let mut out = [0i64; 8];
+        let op = out.as_mut_ptr() as i64;
+
+        // Bad args refuse (-1) on every build.
+        assert_eq!(nsl_cfie_speculative_generate(0, 3, 4, 99, 7, 4, op, 8), -1, "null prompt");
+        assert_eq!(nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 4, 0, 8), -1, "null out");
+        assert_eq!(nsl_cfie_speculative_generate(pp, 0, 4, 99, 7, 4, op, 8), -1, "zero prompt_len");
+        assert_eq!(nsl_cfie_speculative_generate(pp, -1, 4, 99, 7, 4, op, 8), -1, "neg prompt_len");
+        assert_eq!(nsl_cfie_speculative_generate(pp, 3, 0, 99, 7, 4, op, 8), -1, "zero max_new");
+        assert_eq!(nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 4, op, 0), -1, "zero out_cap");
+        // k_tokens outside the frozen 1..=32 range refuses.
+        assert_eq!(nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 0, op, 8), -1, "k = 0");
+        assert_eq!(nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, -3, op, 8), -1, "k < 0");
+        assert_eq!(nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 33, op, 8), -1, "k > 32");
+
+        // Binding order: no target model bound.
+        assert_eq!(
+            nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 4, op, 8),
+            -1,
+            "must refuse before bind_model"
+        );
+        // Target bound but NO draft model bound.
+        inject_fake_target(32);
+        assert_eq!(
+            nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 4, op, 8),
+            -1,
+            "must refuse before bind_draft_model"
+        );
+        // Both bound but vocab disagreement (a target re-bind after the
+        // draft bind can cause this) refuses.
+        inject_fake_draft(64);
+        assert_eq!(
+            nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 4, op, 8),
+            -1,
+            "vocab mismatch must refuse"
+        );
+        // Both bound + matching: on non-cuda the FFI refuses (no GPU);
+        // on cuda builds it refuses at the not-finalized check — either
+        // way -1 with no device work and no KV slot touched.
+        inject_fake_draft(32);
+        assert_eq!(
+            nsl_cfie_speculative_generate(pp, 3, 4, 99, 7, 4, op, 8),
+            -1,
+            "must refuse before finalize"
+        );
+        // Nothing was written to the output buffer by any refusal.
+        assert_eq!(out, [0i64; 8]);
         reset_engine();
     }
 }

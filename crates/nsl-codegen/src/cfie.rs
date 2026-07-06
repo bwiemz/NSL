@@ -11,11 +11,19 @@
 //! `nsl_cfie_kv_pool_alloc` / `nsl_cfie_engine_finalize` calls, so the
 //! chosen kernel family is registered with the runtime engine at serve
 //! init.  Per-token launches then go through the host decode loop
-//! (`nsl_cfie_decode_step`).  Still pending: endpoint-driven generation
-//! needs model binding — serve blocks carry no model reference yet, so
-//! the compiled decode loop is exercised by tests/host callers until
-//! that binding lands.  The disaggregated serve path emits none of the
-//! runtime wiring and the report says so (`runtime_wiring_emitted`).
+//! (`nsl_cfie_decode_step`).  Cycle 11 wires the last mile: on the
+//! monolithic path the endpoint's `generate()` compiles to serve-init
+//! model binding (`nsl_model_create` + `nsl_cfie_bind_model`) + the
+//! `nsl_cfie_generate` decode driver, with the served model resolved
+//! from the serve `weights:` key / `--weights` (model defs carry only
+//! compile-time shape metadata, so there is no runtime model value).
+//! Cycle 12 closes the text loop: with `tokenizer:` configured the
+//! `prompt:` text is runtime-encoded (`nsl_tokenizer_encode` ->
+//! `nsl_cfie_tensor_to_tokens`, baked byte-ids as the select fallback)
+//! and the generated ids are decoded and printed as text
+//! (`nsl_cfie_tokens_to_tensor` -> `nsl_tokenizer_decode`).
+//! The disaggregated serve path emits none of the runtime wiring and the
+//! report says so (`runtime_wiring_emitted`).
 //! Produces a human-readable report matching paper §8's sample output.
 
 use serde::Serialize;
@@ -109,8 +117,9 @@ pub fn choose_kernel_family(plan: &CfiePlan) -> CfieKernelFamily {
 /// One `nsl_cfie_register_kernel` call the compiled serve binary makes
 /// at init.  Kinds per the frozen Cycle-6 ABI: 0=decode_attn,
 /// 1=fused_sample, 2=decode_block, 3=spec_verify, 4=spec_reject,
-/// 5=quant_attn.  `layer_idx` is meaningful only for kind 5 (0 for all
-/// other kinds).
+/// 5=quant_attn; Cycle-13 ABI: 6=draft decode_block, 7=draft_sample,
+/// 8=verify_probs.  `layer_idx` is meaningful only for kind 5 (0 for
+/// all other kinds).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfieKernelReg {
     pub kind: u8,
@@ -182,6 +191,30 @@ pub fn kernel_registrations(plan: &CfiePlan) -> Vec<CfieKernelReg> {
             ) {
                 regs.push(reg(4, 0, name, ptx, spec));
             }
+            // Cycle 13 (G15): the draft family registers ONLY alongside
+            // the uniform family — the speculative driver's verify side
+            // is the kind-2 chain, which the quant family excludes.
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.draft_block_kernel.as_ref(),
+                plan.draft_block_ptx.as_ref(),
+                plan.draft_block_launch,
+            ) {
+                regs.push(reg(6, 0, name, ptx, spec));
+            }
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.draft_sample_kernel.as_ref(),
+                plan.draft_sample_ptx.as_ref(),
+                plan.draft_sample_launch,
+            ) {
+                regs.push(reg(7, 0, name, ptx, spec));
+            }
+            if let (Some(name), Some(ptx), Some(spec)) = (
+                plan.verify_probs_kernel.as_ref(),
+                plan.verify_probs_ptx.as_ref(),
+                plan.verify_probs_launch,
+            ) {
+                regs.push(reg(8, 0, name, ptx, spec));
+            }
         }
     }
     if let (Some(name), Some(ptx), Some(spec)) = (
@@ -192,6 +225,34 @@ pub fn kernel_registrations(plan: &CfiePlan) -> Vec<CfieKernelReg> {
         regs.push(reg(1, 0, name, ptx, spec));
     }
     regs
+}
+
+/// CFIE Cycle 13 (G15): everything the serve wiring resolved about the
+/// draft model compiled into the binary — the checkpoint path, the
+/// draft architecture (vocab is the target's; shared-vocab invariant),
+/// the draft KV pool size (`draft_n_layers * 2 * per_slot *
+/// draft_n_kv_heads * draft_head_dim * 2` f16 bytes, with per_slot =
+/// the TARGET per-slot capacity per the engine's sizing contract), and
+/// the speculative K the kind-4 reject kernel was compiled for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfieSpeculativeDraft {
+    pub weights_path: String,
+    pub n_layers: u32,
+    pub d_model: u32,
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+    pub d_ff: u32,
+    /// The shared vocab (== the target's resolved vocab_size).
+    pub vocab_size: u32,
+    /// Draft KV pool bytes for `nsl_cfie_draft_pool_alloc`.
+    pub pool_bytes: i64,
+    /// Speculative K (`speculative.tokens`, clamped 1..=32) — passed to
+    /// `nsl_cfie_speculative_generate` and baked into the kind-4 kernel.
+    pub k_tokens: u32,
+    /// The TARGET model's layer count (for the report's per-round
+    /// launch accounting: the verify side is the kind-2 chain).
+    pub target_n_layers: u32,
 }
 
 /// Driver input.
@@ -258,6 +319,21 @@ pub struct CfiePlan {
     pub spec_verify_ptx: Option<String>,
     pub spec_reject_kernel: Option<String>,
     pub spec_reject_ptx: Option<String>,
+    /// CFIE Cycle 13 (G15 draft-model-in-binary): the DRAFT decode
+    /// block (kind 6 — the `cfie_persistent_ptx` emitter instantiated
+    /// with the draft dims, max_slots = 1, per_slot_max_tokens = the
+    /// TARGET's per-slot capacity per the draft-pool sizing contract),
+    /// the draft greedy sampler (kind 7) and the target prob-row writer
+    /// (kind 8) from `cfie_spec_sampler_ptx`.  Emitted by the serve
+    /// wiring only when `speculative.draft_weights` is configured AND
+    /// the uniform family + spec kernels are wired; the engine's
+    /// `nsl_cfie_speculative_generate` drives them.
+    pub draft_block_kernel: Option<String>,
+    pub draft_block_ptx: Option<String>,
+    pub draft_sample_kernel: Option<String>,
+    pub draft_sample_ptx: Option<String>,
+    pub verify_probs_kernel: Option<String>,
+    pub verify_probs_ptx: Option<String>,
     /// Feature 6 (G11): the initialized `.global` PTX fragment baking
     /// the grammar's valid-token bitmask into the module image.  Emitted
     /// by the serve wiring when `grammar` is set and spliced into the
@@ -296,6 +372,17 @@ pub struct CfiePlan {
     pub spec_verify_launch: Option<CfieLaunchSpec>,
     pub spec_reject_launch: Option<CfieLaunchSpec>,
     pub quant_attention_launch: Option<CfieLaunchSpec>,
+    pub draft_block_launch: Option<CfieLaunchSpec>,
+    pub draft_sample_launch: Option<CfieLaunchSpec>,
+    pub verify_probs_launch: Option<CfieLaunchSpec>,
+    /// Cycle 13 (G15): resolved draft-model wiring info — set by the
+    /// serve wiring exactly when the kind-6/7/8 kernels above are
+    /// emitted.  Drives the serve-init draft binding emission
+    /// (`nsl_model_create(draft) -> nsl_cfie_bind_draft_model ->
+    /// nsl_cfie_draft_pool_alloc`), the `generate()` rewrite to
+    /// `nsl_cfie_speculative_generate`, and the report's truthful
+    /// per-round launch accounting.
+    pub speculative_draft: Option<CfieSpeculativeDraft>,
     /// Whether the compiled binary actually carries the Cycle-6 runtime
     /// wiring (register/pool/finalize/destroy emission).  Monolithic
     /// serve sets this; the disaggregated path does NOT emit the wiring
@@ -385,6 +472,65 @@ impl CfiePlan {
                     "      rejection epilogue: {} emitted ({} bytes PTX, {wiring})",
                     kernel,
                     self.spec_reject_ptx.as_ref().map_or(0, |p| p.len())
+                )
+                .unwrap();
+            }
+            // Cycle 13 (G15): draft-model-in-binary — truthful lines
+            // for the draft kernel family + the speculative driver,
+            // present exactly when the serve wiring emitted them.
+            // These three kernels are driven by the SPECULATIVE loop,
+            // not the plain decode_step loop — say so per line rather
+            // than reusing the shared {wiring} suffix.
+            if let Some(draft) = self.speculative_draft.as_ref() {
+                let spec_wiring = if self.runtime_wiring_emitted {
+                    "registered at serve init; driven by nsl_cfie_speculative_generate"
+                } else {
+                    "runtime wiring NOT emitted on this serve path (report-only)"
+                };
+                if let Some(kernel) = self.draft_block_kernel.as_ref() {
+                    writeln!(
+                        s,
+                        "      draft decode block: {} emitted (kind 6, draft dims {}x{}d, {} bytes PTX, {spec_wiring})",
+                        kernel,
+                        draft.n_layers,
+                        draft.d_model,
+                        self.draft_block_ptx.as_ref().map_or(0, |p| p.len())
+                    )
+                    .unwrap();
+                }
+                if let Some(kernel) = self.draft_sample_kernel.as_ref() {
+                    writeln!(
+                        s,
+                        "      draft greedy sampler: {} emitted (kind 7, {} bytes PTX, {spec_wiring})",
+                        kernel,
+                        self.draft_sample_ptx.as_ref().map_or(0, |p| p.len())
+                    )
+                    .unwrap();
+                }
+                if let Some(kernel) = self.verify_probs_kernel.as_ref() {
+                    writeln!(
+                        s,
+                        "      verify prob-row writer: {} emitted (kind 8, {} bytes PTX, {spec_wiring})",
+                        kernel,
+                        self.verify_probs_ptx.as_ref().map_or(0, |p| p.len())
+                    )
+                    .unwrap();
+                }
+                // Per-round launch accounting for the speculative
+                // driver: K draft steps (draft_n_layers kind-6 + one
+                // kind-7 each) + K verify steps (target n_layers kind-2
+                // + one kind-8 each) + ONE kind-4 reject.  The target
+                // layer count comes from the persistent plan's model.
+                let k = draft.k_tokens as u64;
+                let launches = k * (draft.n_layers as u64 + 1)
+                    + k * (draft.target_n_layers as u64 + 1)
+                    + 1;
+                writeln!(
+                    s,
+                    "      speculative decode driver: nsl_cfie_speculative_generate \
+                     (draft model bound at serve init from '{}'; draft KV pool {} bytes; \
+                     K={}, {} launches per round + 1 bonus step on all-accept)",
+                    draft.weights_path, draft.pool_bytes, draft.k_tokens, launches
                 )
                 .unwrap();
             }
@@ -525,13 +671,48 @@ impl CfiePlan {
             )
             .unwrap();
         }
-        writeln!(
-            s,
-            "Note: endpoint-driven generation still requires model binding — \
-             serve blocks carry no model reference yet, so the compiled \
-             decode loop is driven by tests/host callers until binding lands."
-        )
-        .unwrap();
+        // Cycle 11: the endpoint's `generate()` now compiles to the
+        // model-binding + decode driver (nsl_model_create +
+        // nsl_cfie_bind_model + nsl_cfie_generate), emitted at serve init
+        // whenever the decode path was wired (kernels registered).  The
+        // served model comes from the serve `weights:` key / --weights,
+        // NOT a runtime model value.
+        if regs.is_empty() {
+            writeln!(
+                s,
+                "Note: no decode kernels were emitted this build, so the \
+                 endpoint `generate()` call has no engine to finalize and \
+                 refuses at compile time (add CFIE serve config that wires \
+                 the static decode path)."
+            )
+            .unwrap();
+        } else {
+            // Cycle 13: with a compiled-in draft, generate() drives the
+            // SPECULATIVE loop — the note must name the real driver.
+            let driver = if self.speculative_draft.is_some() {
+                "nsl_cfie_speculative_generate speculative decode driver \
+                 (draft K greedily -> verify -> ONE rejection launch -> \
+                 rollback)"
+            } else {
+                "nsl_cfie_generate decode driver"
+            };
+            writeln!(
+                s,
+                "Note: endpoint `generate()` compiles to serve-init model \
+                 binding (nsl_model_create + nsl_cfie_bind_model) + the \
+                 {driver}; the served model is bound \
+                 from the serve `weights:` key / --weights at serve init. \
+                 generate() returns the generated-token count. With \
+                 `tokenizer:` configured, the `prompt:` text is \
+                 runtime-encoded through that tokenizer (falling back to \
+                 baked byte-level ids if the encode yields nothing) and \
+                 the generated ids are decoded and printed as TEXT; \
+                 without a tokenizer the prompt stays byte-baked and only \
+                 the count is printed (live per-request prompts need the \
+                 deferred request loop)."
+            )
+            .unwrap();
+        }
         writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }
@@ -591,6 +772,16 @@ pub fn run(input: CfieInput) -> CfiePlan {
             spec_verify_launch: None,
             spec_reject_launch: None,
             quant_attention_launch: None,
+            draft_block_kernel: None,
+            draft_block_ptx: None,
+            draft_sample_kernel: None,
+            draft_sample_ptx: None,
+            verify_probs_kernel: None,
+            verify_probs_ptx: None,
+            draft_block_launch: None,
+            draft_sample_launch: None,
+            verify_probs_launch: None,
+            speculative_draft: None,
             runtime_wiring_emitted: false,
             cost_estimate: None,
         };
@@ -681,6 +872,16 @@ pub fn run(input: CfieInput) -> CfiePlan {
         spec_verify_launch: None,
         spec_reject_launch: None,
         quant_attention_launch: None,
+        draft_block_kernel: None,
+        draft_block_ptx: None,
+        draft_sample_kernel: None,
+        draft_sample_ptx: None,
+        verify_probs_kernel: None,
+        verify_probs_ptx: None,
+        draft_block_launch: None,
+        draft_sample_launch: None,
+        verify_probs_launch: None,
+        speculative_draft: None,
         runtime_wiring_emitted: false,
         cost_estimate: None,
     }

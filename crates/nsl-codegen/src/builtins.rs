@@ -1671,6 +1671,93 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     ("nsl_cfie_generate_reset", &[], Some(types::I64)),
+    // --- CFIE Cycle 12: host token-buffer <-> tokenizer-tensor bridge.
+    // tokens_to_tensor turns generate's out-buffer into the 1-D f64
+    // tensor nsl_tokenizer_decode consumes (text output); tensor_to_tokens
+    // turns nsl_tokenizer_encode's tensor into generate's host i64 prompt
+    // array (runtime-encoded prompt). ---
+    (
+        "nsl_cfie_tokens_to_tensor",
+        &[
+            types::I64, // tokens_ptr (host i64 array)
+            types::I64, // count
+        ],
+        Some(types::I64), // NslTensor* (1-D f64), or 0 on bad args
+    ),
+    (
+        "nsl_cfie_tensor_to_tokens",
+        &[
+            types::I64, // tensor_ptr (1-D f64 NslTensor*)
+            types::I64, // out_ptr (host i64 buffer)
+            types::I64, // cap
+        ],
+        Some(types::I64), // FULL token count (> cap = truncated), or -1
+    ),
+    // --- CFIE Cycle 13 (G15 draft-model-in-binary): draft-model binding
+    // + engine-held draft KV pool + speculative decode driver.  The
+    // serve wiring emits bind_draft_model/draft_pool_alloc at serve init
+    // (after the target bind) and speculative_generate from the
+    // endpoint's generate() when the speculative draft is configured;
+    // the launch FFIs are the kind-6/7/8 wrappers the driver uses
+    // internally (registered for ABI completeness + direct testing). ---
+    (
+        "nsl_cfie_bind_draft_model",
+        &[
+            types::I64, // model_handle (NslModel*)
+            types::I64, // n_layers (draft)
+            types::I64, // d_model (draft)
+            types::I64, // n_heads (draft)
+            types::I64, // n_kv_heads (draft)
+            types::I64, // head_dim (draft)
+            types::I64, // d_ff (draft)
+            types::I64, // vocab_size (MUST equal the target binding's)
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_draft_pool_alloc", &[types::I64], Some(types::I64)), // bytes
+    ("nsl_cfie_draft_reset", &[], Some(types::I64)),
+    (
+        "nsl_cfie_launch_draft_block",
+        &[
+            types::I64, // x_in
+            types::I64, // x_out
+            types::I64, // layer_idx (draft weight table is engine-held)
+            types::I64, // pos
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_draft_sample",
+        &[
+            types::I64, // hidden_ptr
+            types::I64, // out_token_ptr (device u32)
+            types::I64, // out_prob_ptr (device f32)
+            types::I64, // rng_seed (accepted-unused; greedy v1)
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_verify_probs",
+        &[
+            types::I64, // hidden_ptr
+            types::I64, // out_probs_ptr (device f32 x vocab)
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_speculative_generate",
+        &[
+            types::I64, // prompt_tokens_ptr (host i64 array)
+            types::I64, // prompt_len
+            types::I64, // max_new_tokens
+            types::I64, // eos_token_id
+            types::I64, // rng_seed
+            types::I64, // k_tokens (MUST match the kind-4 kernel's K)
+            types::I64, // out_tokens_ptr (host i64 array)
+            types::I64, // out_cap
+        ],
+        Some(types::I64),
+    ),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",
@@ -2680,5 +2767,17 @@ mod tests {
         assert_eq!(arity("nsl_cfie_bind_model"), 8);
         assert_eq!(arity("nsl_cfie_generate"), 7);
         assert_eq!(arity("nsl_cfie_generate_reset"), 0);
+        assert_eq!(arity("nsl_cfie_tokens_to_tensor"), 2);
+        assert_eq!(arity("nsl_cfie_tensor_to_tokens"), 3);
+        // CFIE Cycle 13 (G15): draft binding + pool + launch trio +
+        // the speculative decode driver — arity-pinned against the
+        // frozen all-i64 engine ABI.
+        assert_eq!(arity("nsl_cfie_bind_draft_model"), 8);
+        assert_eq!(arity("nsl_cfie_draft_pool_alloc"), 1);
+        assert_eq!(arity("nsl_cfie_draft_reset"), 0);
+        assert_eq!(arity("nsl_cfie_launch_draft_block"), 4);
+        assert_eq!(arity("nsl_cfie_launch_draft_sample"), 4);
+        assert_eq!(arity("nsl_cfie_launch_verify_probs"), 2);
+        assert_eq!(arity("nsl_cfie_speculative_generate"), 8);
     }
 }

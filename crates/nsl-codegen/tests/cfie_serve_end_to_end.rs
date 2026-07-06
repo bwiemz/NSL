@@ -670,3 +670,443 @@ fn report_file_is_written_when_requested() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// CFIE Cycle 11: endpoint wiring emission
+// ---------------------------------------------------------------------------
+
+/// Compile `src` to an object file and return the set of runtime-function
+/// symbols that are *actually called* — i.e. targeted by at least one
+/// relocation.  Membership proves the compile emitted a real call, not
+/// merely that `declare_runtime_functions` imported the symbol (it imports
+/// every runtime function unconditionally).  Mirrors the relocation-walk
+/// in `csha_gap_a_forward_saves.rs`.
+fn called_runtime_symbols(src: &str) -> std::collections::HashSet<String> {
+    use object::{Object, ObjectSection, ObjectSymbol};
+
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "parse must be clean: {:?}",
+        parsed.diagnostics
+    );
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "input must type-check: {:?}",
+        analysis.diagnostics
+    );
+
+    let obj_bytes = nsl_codegen::compile_module(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        &CompileOptions::default(),
+    )
+    .expect("compile_module must succeed");
+
+    let file = object::File::parse(&*obj_bytes).expect("object::File::parse");
+    let name_by_index: std::collections::HashMap<_, _> = file
+        .symbols()
+        .filter_map(|s| s.name().ok().map(|n| (s.index(), n.to_string())))
+        .collect();
+
+    let mut called = std::collections::HashSet::new();
+    for section in file.sections() {
+        for (_offset, reloc) in section.relocations() {
+            if let object::RelocationTarget::Symbol(idx) = reloc.target() {
+                if let Some(name) = name_by_index.get(&idx) {
+                    called.insert(name.clone());
+                }
+            }
+        }
+    }
+    called
+}
+
+/// A CFIE serve block whose endpoint calls `generate()` must emit the
+/// Cycle-11 model-binding + generation driver calls: `nsl_model_create`
+/// (load the served weights), `nsl_cfie_bind_model` (upload + record the
+/// shape), and `nsl_cfie_generate` (drive the decode loop) — and it must
+/// NOT fall back to the dead M29 `nsl_serve_enqueue` path (the pre-Cycle-11
+/// bug that used the model handle as `prompt_len`).
+#[test]
+fn cfie_serve_generate_emits_the_driver_calls() {
+    // Full CFIE config so the decode path is wired (kernels emitted ->
+    // engine finalize -> the endpoint init + generate() are emitted).
+    let src = r#"
+fn main():
+    serve Inference:
+        max_batch: 64
+        max_seq: 2048
+        kv_layout: "static"
+        kv_quant: "uniform_fp16"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        d_ff: 1408
+        vocab_size: 49152
+        weights: "model.safetensors"
+        tokenizer: "tokenizer.json"
+        prompt: "Hello"
+        max_new_tokens: 16
+        eos_token_id: 2
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            fused: true
+
+        @endpoint
+        fn generate_endpoint(prompt: str) -> str:
+            let n = generate(prompt, prompt, 0)
+            print(n)
+"#;
+    let called = called_runtime_symbols(src);
+
+    for sym in [
+        "nsl_model_create",
+        "nsl_cfie_bind_model",
+        "nsl_cfie_generate",
+        "nsl_tokenizer_load",
+        // Cycle 12 — runtime prompt encode (tokenizer + prompt are both
+        // configured, so the serve init encodes the prompt through the
+        // real tokenizer and bridges the tensor to the i64 prompt ABI)...
+        "nsl_tokenizer_encode",
+        "nsl_cfie_tensor_to_tokens",
+        // ...and the decode-and-print text tail on generate()'s output.
+        "nsl_cfie_tokens_to_tensor",
+        "nsl_tokenizer_decode",
+        "nsl_print_str",
+        // Free discipline: the encode tensor, the decode string, and the
+        // bridge tensor are all released.
+        "nsl_tensor_free",
+        "nsl_string_free",
+    ] {
+        assert!(
+            called.contains(sym),
+            "CFIE serve generate() must emit a call to {sym}; called runtime symbols: {called:?}"
+        );
+    }
+    // The old broken path must be gone.
+    assert!(
+        !called.contains("nsl_serve_enqueue"),
+        "generate() must NOT enqueue into the dead M29 path (pre-Cycle-11 bug)"
+    );
+    // Cycle 13: WITHOUT a speculative draft, none of the draft-in-binary
+    // FFIs may be emitted — no behavior change for existing programs.
+    for sym in [
+        "nsl_cfie_bind_draft_model",
+        "nsl_cfie_draft_pool_alloc",
+        "nsl_cfie_speculative_generate",
+    ] {
+        assert!(
+            !called.contains(sym),
+            "no draft_weights -> {sym} must not be emitted; called: {called:?}"
+        );
+    }
+}
+
+/// A CFIE serve block WITHOUT a tokenizer still wires model binding +
+/// generation; only `nsl_tokenizer_load` is absent.
+#[test]
+fn cfie_serve_generate_without_tokenizer_still_binds_and_generates() {
+    let src = r#"
+fn main():
+    serve Inference:
+        max_batch: 64
+        max_seq: 2048
+        kv_layout: "static"
+        kv_quant: "uniform_fp16"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        d_ff: 1408
+        vocab_size: 49152
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            fused: true
+
+        @endpoint
+        fn generate_endpoint(prompt: str) -> str:
+            let n = generate(prompt, prompt, 0)
+            print(n)
+"#;
+    let called = called_runtime_symbols(src);
+    assert!(called.contains("nsl_model_create"));
+    assert!(called.contains("nsl_cfie_bind_model"));
+    assert!(called.contains("nsl_cfie_generate"));
+    assert!(
+        !called.contains("nsl_tokenizer_load"),
+        "no tokenizer: key -> no tokenizer load emitted"
+    );
+    // Cycle 12: with no tokenizer there is no runtime prompt encode and
+    // no text-decode tail — the count-print behavior is preserved and
+    // none of the bridge FFIs are reachable.
+    for sym in [
+        "nsl_tokenizer_encode",
+        "nsl_tokenizer_decode",
+        "nsl_cfie_tensor_to_tokens",
+        "nsl_cfie_tokens_to_tensor",
+    ] {
+        assert!(
+            !called.contains(sym),
+            "no tokenizer: key -> {sym} must not be emitted; called: {called:?}"
+        );
+    }
+    assert!(!called.contains("nsl_serve_enqueue"));
+    // Cycle 13: no draft -> no draft-in-binary FFIs.
+    assert!(!called.contains("nsl_cfie_bind_draft_model"));
+    assert!(!called.contains("nsl_cfie_speculative_generate"));
+}
+
+// ---------------------------------------------------------------------------
+// CFIE Cycle 13 (G15): draft-model-in-binary emission
+// ---------------------------------------------------------------------------
+
+/// Full CFIE config + a speculative draft compiled into the binary.
+/// Uniform family (the kind-2 verify chain requirement), method
+/// "standard" (the linear-K driver), K = 3, a 2-layer half-width draft.
+const CFIE_DRAFT_SERVE_SRC: &str = r#"
+fn main():
+    serve Inference:
+        max_batch: 64
+        max_seq: 2048
+        kv_layout: "static"
+        kv_quant: "uniform_fp16"
+        target_gpu: "h100"
+        n_layers: 8
+        n_kv_heads: 4
+        head_dim: 128
+        d_model: 512
+        d_ff: 1408
+        vocab_size: 49152
+        weights: "model.safetensors"
+        max_new_tokens: 16
+        eos_token_id: 2
+
+        sampling:
+            temperature: 0.7
+            top_k: 50
+            fused: true
+
+        speculative:
+            tokens: 3
+            method: "standard"
+            draft_weights: "draft.safetensors"
+            draft_n_layers: 2
+            draft_d_model: 256
+            draft_n_heads: 2
+            draft_n_kv_heads: 1
+            draft_head_dim: 128
+            draft_d_ff: 704
+
+        @endpoint
+        fn generate_endpoint(prompt: str) -> str:
+            let n = generate(prompt, prompt, 0)
+            print(n)
+"#;
+
+/// The draft fixture populates the kind-6/7/8 kernels + the resolved
+/// draft info on the plan, registers the full uniform family
+/// [0,2,3,4,6,7,8,1], and renders the truthful report lines.
+#[test]
+fn cfie_draft_serve_emits_kind_6_7_8_and_draft_info() {
+    let plan = compile_cfie(CFIE_DRAFT_SERVE_SRC, &CompileOptions::default())
+        .expect("draft fixture must activate CFIE");
+
+    // Resolved draft info: explicit draft_* keys + shared vocab + the
+    // TARGET's per-slot capacity in the pool sizing.
+    let draft = plan
+        .speculative_draft
+        .as_ref()
+        .expect("draft_weights must populate speculative_draft");
+    assert_eq!(draft.weights_path, "draft.safetensors");
+    assert_eq!(
+        (draft.n_layers, draft.d_model, draft.n_heads, draft.n_kv_heads),
+        (2, 256, 2, 1)
+    );
+    assert_eq!((draft.head_dim, draft.d_ff), (128, 704));
+    assert_eq!(draft.vocab_size, 49152, "vocab is the target's (shared)");
+    assert_eq!(draft.k_tokens, 3);
+    assert_eq!(draft.target_n_layers, 8);
+    let per_slot = plan
+        .kv
+        .direct
+        .as_ref()
+        .expect("static layout")
+        .per_sequence_max_tokens as i64;
+    assert_eq!(
+        draft.pool_bytes,
+        2 * 2 * per_slot * 1 * 128 * 2,
+        "draft pool = n_layers * 2 * per_slot(TARGET) * n_kv * hd * 2 (f16)"
+    );
+
+    // Kind 6: the decode-block emitter instantiated with the DRAFT dims.
+    let dblk = plan
+        .draft_block_ptx
+        .as_deref()
+        .expect("draft decode-block PTX on the plan");
+    assert_eq!(plan.draft_block_kernel.as_deref(), Some("nsl_cfie_decode_block"));
+    assert!(dblk.contains(".visible .entry nsl_cfie_decode_block"));
+    assert_ne!(
+        dblk,
+        plan.decode_block_ptx.as_deref().expect("target block PTX"),
+        "draft block bakes DRAFT dims — it must differ from the target block"
+    );
+    // Kinds 7/8: the Cycle-13 sampler family.
+    assert_eq!(
+        plan.draft_sample_kernel.as_deref(),
+        Some("nsl_cfie_draft_sample")
+    );
+    assert!(plan
+        .draft_sample_ptx
+        .as_deref()
+        .expect("kind-7 PTX")
+        .contains(".visible .entry nsl_cfie_draft_sample"));
+    assert_eq!(
+        plan.verify_probs_kernel.as_deref(),
+        Some("nsl_cfie_verify_probs")
+    );
+    assert!(plan
+        .verify_probs_ptx
+        .as_deref()
+        .expect("kind-8 PTX")
+        .contains(".visible .entry nsl_cfie_verify_probs"));
+
+    // Registration list: the uniform family + the draft trio, sampler
+    // last (the Cycle-6 convention).
+    assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Uniform);
+    let regs = kernel_registrations(&plan);
+    assert_eq!(
+        regs.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        vec![0, 2, 3, 4, 6, 7, 8, 1],
+        "uniform family + kinds 6/7/8 when the draft is compiled in"
+    );
+    // Kinds 6/7/8 are single-CTA block-128 launches.
+    for k in [6u8, 7, 8] {
+        let r = regs.iter().find(|r| r.kind == k).unwrap();
+        assert_eq!((r.grid_x, r.block_x, r.smem_dyn), (1, 128, 0));
+    }
+
+    // Report truthing: the [3] section names the draft kernels, the
+    // driver, and the per-round launch accounting
+    // (K*(draft_layers+1) + K*(target_layers+1) + 1 = 3*3 + 3*9 + 1).
+    let report = plan.render_report();
+    assert!(report.contains("draft decode block: nsl_cfie_decode_block emitted (kind 6"));
+    assert!(report.contains("draft greedy sampler: nsl_cfie_draft_sample emitted (kind 7"));
+    assert!(report.contains("verify prob-row writer: nsl_cfie_verify_probs emitted (kind 8"));
+    assert!(report.contains("speculative decode driver: nsl_cfie_speculative_generate"));
+    assert!(report.contains("draft model bound at serve init from 'draft.safetensors'"));
+    assert!(
+        report.contains("K=3, 37 launches per round"),
+        "per-round launch accounting must be truthful: {report}"
+    );
+    assert!(
+        !report.contains("G15"),
+        "the old G15 refusal text must be gone from the report"
+    );
+}
+
+/// The draft fixture's binary emits the Cycle-13 serve-init calls
+/// (draft model_create -> bind_draft -> pool alloc) and generate()
+/// rewrites to the SPECULATIVE driver — the plain driver must be gone.
+#[test]
+fn cfie_draft_serve_emits_bind_draft_pool_and_speculative_generate() {
+    let called = called_runtime_symbols(CFIE_DRAFT_SERVE_SRC);
+    for sym in [
+        "nsl_model_create",
+        "nsl_cfie_bind_model",
+        "nsl_cfie_bind_draft_model",
+        "nsl_cfie_draft_pool_alloc",
+        "nsl_cfie_speculative_generate",
+    ] {
+        assert!(
+            called.contains(sym),
+            "draft serve must emit a call to {sym}; called: {called:?}"
+        );
+    }
+    assert!(
+        !called.contains("nsl_cfie_generate"),
+        "with a compiled-in draft, generate() must drive the speculative \
+         loop INSTEAD of nsl_cfie_generate; called: {called:?}"
+    );
+    assert!(!called.contains("nsl_serve_enqueue"));
+}
+
+/// draft_weights under the QUANT family cannot wire the kind-2 verify
+/// chain — the compile must refuse loudly, never ship a binary whose
+/// generate() refuses at runtime.
+#[test]
+fn cfie_draft_with_quant_family_refuses_at_compile_time() {
+    let src = CFIE_DRAFT_SERVE_SRC.replace("\"uniform_fp16\"", "\"auto\"");
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _) = nsl_lexer::tokenize(&src, nsl_errors::FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(parsed.diagnostics.is_empty());
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    let res = nsl_codegen::debug_compile_and_return_cfie_plan_from_ast(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        &CompileOptions::default(),
+    );
+    let err = match res {
+        Err(e) => e,
+        Ok(_) => panic!("draft_weights + quant family must refuse at compile time"),
+    };
+    assert!(
+        err.message.contains("draft_weights") && err.message.contains("uniform_fp16"),
+        "refusal must name the key and the fix: {}",
+        err.message
+    );
+}
+
+/// `generate()` called OUTSIDE a CFIE serve context has no bound model to
+/// drive, so it must refuse at compile time with a clear message — never
+/// silently emit a broken enqueue.
+#[test]
+fn generate_outside_cfie_serve_context_refuses() {
+    let src = r#"
+fn main():
+    let tok = tokenizer_load("t.json")
+    let ids = tokenizer_encode(tok, "hi")
+    let out = generate(0, ids, 0)
+    print(out)
+"#;
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
+    // Semantics accept `generate` (registered builtin); codegen must refuse.
+    let res = nsl_codegen::compile_module(
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        &CompileOptions::default(),
+    );
+    let err = match res {
+        Err(e) => e,
+        Ok(_) => panic!("generate() outside a CFIE serve block must refuse"),
+    };
+    assert!(
+        err.message.contains("CFIE-active serve block"),
+        "refusal must explain the CFIE serve requirement: {}",
+        err.message
+    );
+}

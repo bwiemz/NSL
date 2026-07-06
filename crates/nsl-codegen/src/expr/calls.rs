@@ -2379,73 +2379,182 @@ impl Compiler<'_> {
             );
         }
 
-        // M44b: generate(model, tokens, max_tokens=256, temperature=0.7, top_p=0.9, schema=...)
+        // CFIE Cycle 11: generate(target_model, prompt_tokens, params).
+        //
+        // In a CFIE-active serve context (`self.cfie_serve_gen` is set by
+        // the serve-init emission after `nsl_cfie_engine_finalize`), this
+        // drives the GPU-proven decode loop:
+        //   out_ptr = nsl_alloc(max_new_tokens * 8)   // host i64 buffer
+        //   rc = nsl_cfie_generate(prompt_ptr, prompt_len, max_new_tokens,
+        //                          eos_token_id, rng_seed, out_ptr, out_cap)
+        //   return rc                                 // tokens generated
+        //
+        // `target_model` is accepted for source compatibility with the
+        // paper's `generate(model, ...)` syntax, but the SERVED model is
+        // the one bound at serve init from `--weights` / the `weights:`
+        // key (there is no runtime model VALUE to resolve — model defs
+        // are compile-time metadata).  Likewise the sampling params
+        // (temperature/top_k/top_p) are already baked into the fused
+        // sample kernel at plan time; `generate()`'s `params` arg is not
+        // re-plumbed in v1 (documented).
+        //
+        // `prompt_tokens` (the endpoint's first param) was bound at serve
+        // init to the prompt HOST i64 ARRAY pointer — Cycle 12: the
+        // runtime-tokenizer-encoded buffer when tokenizer + prompt are
+        // configured (with a runtime select falling back to the baked
+        // ids), else the baked array — so we pass its value straight
+        // through as `prompt_ptr`.  The runtime ABI is a host i64 array,
+        // NOT an f64 tokenizer tensor.
+        //
+        // generate() returns the generated token COUNT (i64) — type
+        // stability with Cycle 11.  Cycle 12 adds the TEXT tail: when a
+        // tokenizer is configured, the emission below ALSO decodes the
+        // out-buffer (nsl_cfie_tokens_to_tensor -> nsl_tokenizer_decode)
+        // and prints the text to stdout.  The tail lives HERE (not in the
+        // endpoint epilogue) because `out_ptr`/`rc` are locals of this
+        // emission — the epilogue would need them re-plumbed through
+        // FuncState for zero benefit (documented decision).
         if func_name == "generate" {
-            if args.len() >= 2 {
-                let model_val = self.compile_expr(builder, state, &args[0].value)?;
-                let tokens_val = self.compile_expr(builder, state, &args[1].value)?;
-                // Extract max_tokens (default 256), temperature (default 0.7), top_p (default 0.9)
-                let max_tokens = builder.ins().iconst(cl_types::I64, 256);
-                let temperature = builder.ins().f64const(0.7);
-                let top_p = builder.ins().f64const(0.9);
-                // Enqueue the request — nsl_serve_enqueue(prompt_ptr, prompt_len, max_tokens, temp, top_p)
-                // tokens_val is used as prompt_ptr; model_val as prompt_len placeholder
-                let request_id = self.compile_call_by_name(
-                    builder,
-                    "nsl_serve_enqueue",
-                    &[tokens_val, model_val, max_tokens, temperature, top_p],
-                )?;
-
-                // M44: Check for schema= kwarg → compile grammar at codegen time → set FSM on request
-                let mut schema_val: Option<String> = None;
-                for arg in args {
-                    if let Some(name_sym) = arg.name {
-                        let name = self.resolve_sym(name_sym).to_string();
-                        if name == "schema" {
-                            if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
-                                schema_val = Some(s.clone());
-                            }
-                        }
-                    }
-                }
-
-                if let Some(ref schema) = schema_val {
-                    // Compile grammar at codegen time; pass start_state=0 (DFA start) to runtime.
-                    // The runtime interprets start_state > 0 as "constrained decoding active".
-                    // We use 1 to distinguish "grammar set" from "no grammar" (0).
-                    let start_state = builder.ins().iconst(cl_types::I64, 1);
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_serve_set_grammar",
-                        &[request_id, start_state],
-                    )?;
-                    eprintln!("[nsl] Constrained decoding active: schema='{}'", schema);
-                } else {
-                    // Check if the current function has a model-level @grammar decorator
-                    let current_fn_name = state.current_function_name.clone().unwrap_or_default();
-                    if let Some(grammar_info) = self.features.grammar_configs.get(&current_fn_name)
-                    {
-                        if !grammar_info.grammar_source.is_empty()
-                            || !grammar_info.start_rule.is_empty()
-                        {
-                            let src = grammar_info.grammar_source.clone();
-                            let start_state = builder.ins().iconst(cl_types::I64, 1);
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_serve_set_grammar",
-                                &[request_id, start_state],
-                            )?;
-                            eprintln!("[nsl] Constrained decoding active via @grammar: '{}'", src);
-                        }
-                    }
-                }
-
-                let _ = model_val; // suppress unused warning — model used as prompt_len placeholder
-                return Ok(request_id);
+            let Some(gen) = self.cfie_serve_gen.as_ref() else {
+                // OUTSIDE a CFIE serve context there is no bound model to
+                // drive.  Refuse cleanly rather than enqueue into the dead
+                // M29 `nsl_serve_enqueue` path (the pre-Cycle-11 bug that
+                // passed the model handle as `prompt_len`).
+                return Err(CodegenError::new(
+                    "generate() is only supported inside a CFIE-active serve \
+                     block (its model is bound at serve init from --weights / \
+                     the serve `weights:` key). Add CFIE serve config (e.g. \
+                     `kv_layout: \"static\"`) or use the runtime serve loop.",
+                ));
+            };
+            if args.len() < 2 {
+                return Err(CodegenError::new(
+                    "generate() requires at least 2 arguments (target_model, prompt)",
+                ));
             }
-            return Err(CodegenError::new(
-                "generate() requires at least 2 arguments (model, tokens)",
-            ));
+            let max_new_tokens = gen.max_new_tokens;
+            let eos_token_id = gen.eos_token_id;
+            let prompt_len = gen.prompt_len;
+            // Cycle 12 wiring (Values are Copy; snapshot before the
+            // mutable-borrow compiles below).
+            let prompt_len_val = gen.prompt_len_val;
+            let tok_handle = gen.tok_handle;
+            // Cycle 13 (G15): Some(k) when a speculative draft model is
+            // compiled into this binary — generate() then drives the
+            // speculative decode loop instead of the plain one.
+            let speculative_k = gen.speculative_k;
+
+            // target_model (arg 0) is accepted for source compatibility;
+            // compile it so any side effects hold, but the value is unused
+            // (the served model is the serve-init-bound one).
+            let _model_val = self.compile_expr(builder, state, &args[0].value)?;
+            // prompt (arg 1) resolves to the baked prompt host i64 array
+            // pointer bound at serve init.
+            let prompt_ptr = self.compile_expr(builder, state, &args[1].value)?;
+
+            // Allocate the output host i64 buffer (capacity = max_new_tokens).
+            let out_cap = builder.ins().iconst(cl_types::I64, max_new_tokens);
+            let alloc_bytes = builder.ins().iconst(cl_types::I64, max_new_tokens * 8);
+            let out_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_bytes])?;
+
+            // Cycle 12: the prompt length is the serve-init-selected
+            // runtime value (tokenizer-encoded count with baked fallback)
+            // when present, else the baked compile-time constant.
+            let v_prompt_len = prompt_len_val
+                .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, prompt_len));
+            let v_max_new = builder.ins().iconst(cl_types::I64, max_new_tokens);
+            let v_eos = builder.ins().iconst(cl_types::I64, eos_token_id);
+            // Fixed rng seed for the one-shot demo (deterministic output).
+            let v_seed = builder.ins().iconst(cl_types::I64, 0);
+
+            // Cycle 13 (G15): with a compiled-in draft model, generate()
+            // drives nsl_cfie_speculative_generate (the paper's
+            // speculative decode loop: draft K greedily -> verify ->
+            // ONE rejection launch -> rollback), k_tokens from the
+            // speculative config — the SAME K the kind-4 reject kernel
+            // was compiled for.  Without a draft the plain driver is
+            // emitted, byte-identical to Cycle 11/12.
+            let rc = if let Some(k) = speculative_k {
+                let v_k = builder.ins().iconst(cl_types::I64, k);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_speculative_generate",
+                    &[
+                        prompt_ptr,
+                        v_prompt_len,
+                        v_max_new,
+                        v_eos,
+                        v_seed,
+                        v_k,
+                        out_ptr,
+                        out_cap,
+                    ],
+                )?
+            } else {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_generate",
+                    &[
+                        prompt_ptr,
+                        v_prompt_len,
+                        v_max_new,
+                        v_eos,
+                        v_seed,
+                        out_ptr,
+                        out_cap,
+                    ],
+                )?
+            };
+
+            // Cycle 12 decode-and-print tail, emitted only when a
+            // tokenizer was loaded at serve init:
+            //   count = min(rc, out_cap)   // rc > cap means truncation;
+            //                              // rc < 0 (failure) flows into
+            //                              // tokens_to_tensor's count<=0
+            //                              // refusal -> tensor 0 -> skip
+            //   t = nsl_cfie_tokens_to_tensor(out_ptr, count)
+            //   if t != 0:
+            //       text = nsl_tokenizer_decode(tok, t); print; free both
+            // The branch is REQUIRED (not a select): decoding a null
+            // tensor would crash, and on a generate refusal the honest
+            // outcome is "no text printed" (the runtime already put the
+            // refusal on stderr).  Block plumbing mirrors the null-guard
+            // precedent in expr/access.rs (state.current_block sync).
+            if let Some(tok) = tok_handle {
+                let rc_over_cap =
+                    builder.ins().icmp(IntCC::SignedGreaterThan, rc, out_cap);
+                let count = builder.ins().select(rc_over_cap, out_cap, rc);
+                let out_tensor = self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_tokens_to_tensor",
+                    &[out_ptr, count],
+                )?;
+                let decode_blk = builder.create_block();
+                let merge_blk = builder.create_block();
+                let t_is_null = builder.ins().icmp_imm(IntCC::Equal, out_tensor, 0);
+                builder.ins().brif(t_is_null, merge_blk, &[], decode_blk, &[]);
+
+                builder.switch_to_block(decode_blk);
+                builder.seal_block(decode_blk);
+                state.current_block = Some(decode_blk);
+                let text = self.compile_call_by_name(
+                    builder,
+                    "nsl_tokenizer_decode",
+                    &[tok, out_tensor],
+                )?;
+                self.compile_call_by_name(builder, "nsl_print_str", &[text])?;
+                // Free the decode string + the bridge tensor on the only
+                // path that created text; the tensor is also freed here
+                // (the null branch never allocated one).
+                self.compile_call_by_name(builder, "nsl_string_free", &[text])?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[out_tensor])?;
+                builder.ins().jump(merge_blk, &[]);
+
+                builder.switch_to_block(merge_blk);
+                builder.seal_block(merge_blk);
+                state.current_block = Some(merge_blk);
+            }
+            return Ok(rc);
         }
 
         // argmax(tensor, dim=-1)

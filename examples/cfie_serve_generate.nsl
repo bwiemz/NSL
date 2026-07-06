@@ -1,0 +1,85 @@
+# CFIE Cycle 12: end-to-end serve/generate example — text in, text out.
+#
+# This is the paper's `serve` + `@endpoint` + `generate(...)` syntax
+# compiling all the way to the GPU-proven CFIE runtime (cycles 1-11):
+# the config below drives the compile-time planner, the serve init emits
+# the model binding (nsl_model_create + nsl_cfie_bind_model) + tokenizer
+# load, and the endpoint's generate() call drives nsl_cfie_generate over
+# the decode loop.  `nsl build examples/cfie_serve_generate.nsl` produces
+# a ONE-SHOT inference binary (there is no network listener — the paper's
+# `nsl build --serve` emits an executable, not a daemon).
+#
+# WHAT RUNS (Cycle 12):
+#   * PROMPT: with `tokenizer:` configured, the `prompt:` text is encoded
+#     AT RUNTIME by the real tokenizer (nsl_tokenizer_encode ->
+#     nsl_cfie_tensor_to_tokens); if the encode yields no tokens the
+#     binary falls back to the compile-time byte-baked ids, so it still
+#     runs.  A missing/corrupt tokenizer FILE fails loudly at load.
+#   * OUTPUT: the generated token ids are decoded back through the same
+#     tokenizer (nsl_cfie_tokens_to_tensor -> nsl_tokenizer_decode) and
+#     the TEXT is printed to stdout, followed by the count from print().
+#     Without a `tokenizer:` key, only the count is printed.
+#
+# HONEST BOUNDARIES:
+#   * The served model is bound at serve init from the `weights:` path
+#     (or the --weights CLI path), NOT from a runtime model value:
+#     `model` definitions are compile-time shape/layer metadata only.
+#     The `target_model` argument to generate() is accepted for source
+#     compatibility with the paper's syntax but is not resolved to a
+#     value.
+#   * `generate()` returns the number of tokens generated (Int) — type
+#     stability with Cycle 11; the decoded text is printed by the
+#     generate() emission itself, not returned as a value.
+#   * The prompt comes from the `prompt:` config key; live per-request
+#     prompts need the (deferred) request loop.
+#   * Sampling params (temperature/top_k/top_p) are baked into the fused
+#     sample kernel at plan time; generate()'s params arg is not
+#     re-plumbed.
+#
+# Running actually generates tokens only on a CUDA-enabled build with a
+# real GPU + a real `model.safetensors` at the `weights:` path; the
+# runtime refuses cleanly otherwise.  COMPILING never needs a GPU.
+
+serve Inference:
+    max_batch: 32
+    max_seq: 2048
+    kv_layout: "static"
+    kv_quant: "uniform_fp16"
+    target_gpu: "h100"
+
+    # Model architecture (drives the compile-time KV/kernel plan and the
+    # nsl_cfie_bind_model shape constants).
+    n_layers: 8
+    n_kv_heads: 4
+    head_dim: 128
+    d_model: 512
+    d_ff: 1408
+    vocab_size: 49152
+
+    # Cycle 11 endpoint-wiring keys.
+    weights: "model.safetensors"
+    tokenizer: "tokenizer.json"
+    prompt: "The capital of France is"
+    max_new_tokens: 32
+    eos_token_id: 2
+
+    sampling:
+        temperature: 0.7
+        top_k: 50
+        top_p: 0.9
+        fused: true
+
+    @endpoint
+    fn complete(prompt: str) -> str:
+        # `generate(target_model, prompt, params)` drives the compiled
+        # decode loop.  arg 0 (`target_model`) is accepted for source
+        # compatibility with the paper's syntax but is IGNORED — the
+        # served model is bound once at serve init from `weights:`, since
+        # `model` definitions are compile-time metadata with no runtime
+        # value.  The literal below just stands in for that arg; arg 1 is
+        # the prompt and arg 2 (`params`) is reserved (sampling is baked
+        # into the fused kernel at plan time).
+        let count = generate("Inference", prompt, 0)
+        # Cycle 12: generate() already decoded + printed the generated
+        # TEXT via the configured tokenizer.  This prints the count too.
+        print(count)
