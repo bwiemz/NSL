@@ -275,6 +275,7 @@ fn run_fused_config_dmodel(
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -606,6 +607,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
             rmsnorm_eps: 1e-5, d_model: 32,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -726,6 +728,18 @@ fn csha_fused_matrix_sweep() {
                 smem_blocked.push(label.clone());
                 results.push((label, f32::NAN, false));
             }
+            // Asymmetric fused tiles (block_q != block_kv) REFUSE at the
+            // runtime multi-tile dispatch (rc=-1) instead of launching
+            // into single-tile garbage: seq = max(bq, bkv) exceeds
+            // min(bq, bkv), and the fused projection pre-passes cover
+            // only a square own-block tile. Pre-refusal these rows FAILED
+            // numerically at 4.7-6.2 abs — the refusal is the honest
+            // contract until asymmetric multi-tile support lands.
+            Err(ref e) if bq != bkv && e.contains("rc=-1") => {
+                eprintln!("[C3] REFUSED (asymmetric multi-tile)  {label}: {e}");
+                smem_blocked.push(label.clone());
+                results.push((label, f32::NAN, false));
+            }
             Err(e) => {
                 eprintln!("[C3] ERROR  {label}: {e}");
                 failures.push(format!("{label}: launch error — {e}"));
@@ -805,6 +819,7 @@ fn run_with_saves(
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -864,7 +879,11 @@ fn run_with_saves(
         nsl_test_cuda_h2d(nw_dev, nw.as_ptr() as i64, nw_bytes);
     }
 
-    let ptx = synthesize_flash_attention_ptx_selected(&config);
+    // Combined module (fused + `_mt_attn` interleaved twin) so the
+    // runtime's two-launch multi-tile dispatch can resolve the twin by
+    // name at seq > block. Single-tile launches use the fused entry only
+    // (byte-identical to the plain synthesis).
+    let ptx = nsl_codegen::flash_attention_v2::synthesize_forward_multi_tile_combined(&config);
     let kernel_name = CString::new(flash_attention_kernel_name_selected(&config)).unwrap();
     let smem_total = shared_mem_bytes_selected(&config);
     let smem_dynamic = if needs_dynamic_smem(&config) { smem_total as i64 } else { 0 };
@@ -1057,34 +1076,33 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     let mut seg_ids = vec![0u16; seq];
     for s in seg_ids.iter_mut().take(seq).skip(64) { *s = 1; }
 
-    let (out_no_save, lse_no_save) = run_with_saves(
+    // Multi-tile + segment_masked is REFUSED by the runtime dispatch:
+    // the two-launch multi-tile chain does not support segmented
+    // launches yet, and the pre-dispatch fused kernel produced silent
+    // garbage at seq > block (single-tile K/V projections + split-S/PV
+    // P clobbering). The old save-flag invariance held only over that
+    // garbage; the honest contract now is a loud rc=-1 on both arms.
+    let err_no_save = run_with_saves(
         block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
     )
-    .expect("launch (save=None, segmented) failed");
+    .expect_err("segmented multi-tile launch must refuse (save=None arm)");
+    assert!(
+        err_no_save.contains("rc=-1"),
+        "expected refusal rc=-1, got: {err_no_save}"
+    );
 
     let saves = unsafe {
         nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
     };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
-
-    let (out_save, lse_save) = run_with_saves(
+    let err_save = run_with_saves(
         block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
     )
-    .expect("launch (save=Some, segmented) failed");
-
+    .expect_err("segmented multi-tile launch must refuse (save=Some arm)");
     unsafe { nsl_csha_free_backward_activations(saves); }
-
-    assert_eq!(
-        out_no_save, out_save,
-        "T1.4 multitile segmented (2-equal) invariant broken: forward O diverged between save-null and save-active"
-    );
-    let lse_bits_eq = lse_no_save
-        .iter()
-        .zip(&lse_save)
-        .all(|(&a, &b)| a.to_bits() == b.to_bits());
     assert!(
-        lse_bits_eq,
-        "T1.4 multitile segmented (2-equal) invariant broken: LSE diverged"
+        err_save.contains("rc=-1"),
+        "expected refusal rc=-1, got: {err_save}"
     );
 }
 
@@ -1105,34 +1123,33 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
         *s = if i < 38 { 0 } else if i < 38 + 64 { 1 } else { 2 };
     }
 
-    let (out_no_save, lse_no_save) = run_with_saves(
+    // Multi-tile + segment_masked is REFUSED by the runtime dispatch:
+    // the two-launch multi-tile chain does not support segmented
+    // launches yet, and the pre-dispatch fused kernel produced silent
+    // garbage at seq > block (single-tile K/V projections + split-S/PV
+    // P clobbering). The old save-flag invariance held only over that
+    // garbage; the honest contract now is a loud rc=-1 on both arms.
+    let err_no_save = run_with_saves(
         block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
     )
-    .expect("launch (save=None, segmented) failed");
+    .expect_err("segmented multi-tile launch must refuse (save=None arm)");
+    assert!(
+        err_no_save.contains("rc=-1"),
+        "expected refusal rc=-1, got: {err_no_save}"
+    );
 
     let saves = unsafe {
         nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
     };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
-
-    let (out_save, lse_save) = run_with_saves(
+    let err_save = run_with_saves(
         block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
     )
-    .expect("launch (save=Some, segmented) failed");
-
+    .expect_err("segmented multi-tile launch must refuse (save=Some arm)");
     unsafe { nsl_csha_free_backward_activations(saves); }
-
-    assert_eq!(
-        out_no_save, out_save,
-        "T1.4 multitile segmented (3-unequal) invariant broken: forward O diverged between save-null and save-active"
-    );
-    let lse_bits_eq = lse_no_save
-        .iter()
-        .zip(&lse_save)
-        .all(|(&a, &b)| a.to_bits() == b.to_bits());
     assert!(
-        lse_bits_eq,
-        "T1.4 multitile segmented (3-unequal) invariant broken: LSE diverged"
+        err_save.contains("rc=-1"),
+        "expected refusal rc=-1, got: {err_save}"
     );
 }
 
@@ -1178,6 +1195,7 @@ fn t4_csha_backward_ffi_smoke() {
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -1269,6 +1287,8 @@ fn t4_csha_backward_ffi_smoke() {
             // Tier B extension — null (no Tier B dispatch for this test).
             0i64, 0i64,
             // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
             0i64,
             // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
             // means legacy per-q-block topology.

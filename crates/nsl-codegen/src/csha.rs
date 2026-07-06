@@ -324,7 +324,15 @@ impl CshaPlan {
                     .map(|h| h.precision.as_str())
                     .collect();
                 if !precisions.is_empty() {
-                    writeln!(s, "  Precisions: {}", precisions.join(", ")).unwrap();
+                    // Report honesty: per-head precision is a specialization
+                    // *analysis* result only — no FP8 per-head kernel is
+                    // actually emitted (unlike causal/sink, which have PTX).
+                    writeln!(
+                        s,
+                        "  Precisions (analysis only; not emitted): {}",
+                        precisions.join(", ")
+                    )
+                    .unwrap();
                 }
             }
             // Kernel specialisation name that downstream passes embed
@@ -337,11 +345,23 @@ impl CshaPlan {
                 writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
             }
             if let Some(pat) = self.patterns.get(&plan.layer) {
+                // Report honesty: the GQA zero-copy strategy is planned by
+                // the pattern analysis but has no backing kernel emission
+                // yet; causal/sink strategies DO drive real PTX.
+                let gqa_suffix = if matches!(
+                    pat.gqa,
+                    crate::csha_patterns::GqaStrategy::ZeroCopyStride { .. }
+                ) {
+                    " (analysis only)"
+                } else {
+                    ""
+                };
                 writeln!(
                     s,
-                    "  Patterns: causal={} gqa={} sink={}",
+                    "  Patterns: causal={} gqa={}{} sink={}",
                     pat.causal_mask.as_str(),
                     pat.gqa.as_str(),
+                    gqa_suffix,
                     pat.sink.as_str(),
                 )
                 .unwrap();

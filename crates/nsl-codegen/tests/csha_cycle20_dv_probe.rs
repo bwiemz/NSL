@@ -1,6 +1,20 @@
 //! CSHA cycle 20 T2 — dV probe integration test.
 //!
-//! **STATUS: XFAIL / IGNORED (HONEST PARTIAL after c20 T2).**
+//! **STATUS: OBSOLETE 2026-07-04 - target bug DISSOLVED.** The
+//! "catastrophic dV" this probe was built to bisect (j=284 garbage)
+//! was a TEST-HARNESS bug: csha_cuda_backward.rs launched the backward
+//! FFI with shared_mem_bytes = 0, so the hd=64 dynamic-SMEM kernel ran
+//! with a 0-byte shmem allocation - every tile access OOB (fixed in
+//! b94ed20f; sanitizer 131 errors -> 0; hd=64 dV now ~1e-3 vs CPU ref).
+//! Production always sized correctly. Retained for slot-layout /
+//! bisection-contract documentation and ABI pinning.
+//!
+//! NOTE the paragraph below claiming "the c19 T1 launcher still
+//! delegates without threading probe_dv_out_ptr" is itself STALE: the
+//! c20 T1-followup landed the launcher refactor (csha_backward_impl
+//! probe_ptrs param; the probe FFI threads Some((ds, dv))).
+//!
+//! **Original status: XFAIL / IGNORED (HONEST PARTIAL after c20 T2).**
 //!
 //! **What LANDED in c20 T2:**
 //!   * PTX-side dV probe emission — new `maybe_emit_dv_probe_store`

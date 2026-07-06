@@ -1378,6 +1378,100 @@ pub fn synthesize_backward_combined(
     Ok(combined)
 }
 
+/// Forward module for CSHA fused-projection configs with a multi-tile
+/// attention twin appended.
+///
+/// The fused-projection forward orchestrator is single-tile by
+/// construction twice over: (1) the K/V pre-passes project only the
+/// CTA's own block rows, and (2) the split S-pass/PV-pass materializes
+/// P per KV tile in SMEM, so a second KV tile clobbers the first's P
+/// before the PV pass reads it. Multi-tile launches therefore need the
+/// classic INTERLEAVED orchestration (the `else` branch: per-tile
+/// S+softmax+PV with k_start-addressed HBM loads).
+///
+/// This synthesizer emits BOTH into one module:
+///   * the fused kernel, byte-identical to
+///     `synthesize_flash_attention_ptx_v2(config)` (used stand-alone or
+///     as "launch A" of the runtime's two-launch multi-tile dispatch —
+///     its per-block projection saves are valid at any seq_len);
+///   * an attention "twin": same config with `fused_rmsnorm=false`,
+///     `fused_projections=false`, `rope_q=false`, `level=1` (dodges the
+///     Tier B.1 pipelined dispatch at `gpu_sm >= 80`), renamed to
+///     `<fused_name>_mt_attn`. The runtime's launch B feeds it the
+///     f32-widened projection saves via q/k/v (classic loads apply no
+///     RMSNorm/projection/RoPE — the inputs are already projected and
+///     rotated) and its else-branch `emit_save_softmax_state` writes the
+///     row_max/row_sum saves the backward needs.
+///
+/// Configs the twin cannot serve (sinks, segment_masked, checkpoint)
+/// return the fused module unchanged — the runtime's multi-tile
+/// dispatch then fails loudly at kernel-name resolution instead of
+/// producing silent garbage.
+///
+/// Output is NUL-terminated like `synthesize_flash_attention_ptx_v2`.
+pub fn synthesize_forward_multi_tile_combined(config: &FlashAttentionConfig) -> Vec<u8> {
+    let fused = synthesize_flash_attention_ptx_v2(config);
+
+    let is_fused_proj = config
+        .csha
+        .as_ref()
+        .is_some_and(|c| c.fused_projections);
+    if !is_fused_proj
+        || config.num_sink_tokens > 0
+        || config.segment_masked
+        || config.checkpoint.is_some()
+        || config.paged
+    {
+        return fused;
+    }
+
+    let mut twin_cfg = config.clone();
+    twin_cfg.rope_q = false;
+    if let Some(c) = twin_cfg.csha.as_mut() {
+        c.fused_rmsnorm = false;
+        c.fused_projections = false;
+        c.level = 1;
+    }
+    let twin = synthesize_flash_attention_ptx_v2(&twin_cfg);
+
+    // Strip trailing NULs so string ops below see clean PTX text.
+    let to_str = |v: &[u8]| -> String {
+        let end = v.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        String::from_utf8_lossy(&v[..end]).into_owned()
+    };
+    let fused_txt = to_str(&fused);
+    let twin_txt = to_str(&twin);
+
+    let fused_name = flash_attention_kernel_name_v2(config);
+    let twin_name = flash_attention_kernel_name_v2(&twin_cfg);
+    let mt_name = format!("{fused_name}_mt_attn");
+    let twin_renamed = twin_txt.replace(&twin_name, &mt_name);
+
+    use crate::flash_attention_v2::tier_b2::backward::strip_module_header;
+    let mut combined = String::new();
+    // Union header: match the fused component's own target choice
+    // (prelude emits sm_80 when gpu_sm >= 80, else sm_75).
+    combined.push_str(".version 8.7\n");
+    if config.gpu_sm >= 80 {
+        combined.push_str(".target sm_80\n");
+    } else {
+        combined.push_str(".target sm_75\n");
+    }
+    combined.push_str(".address_size 64\n\n");
+    // One module-level extern serves any entry that references dynamic
+    // SMEM; entries with static `.shared` decls shadow it locally
+    // (same convention as `synthesize_backward_combined`).
+    combined.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+    combined.push_str(strip_module_header(&fused_txt));
+    combined.push_str("\n\n");
+    combined.push_str(strip_module_header(&twin_renamed));
+    combined.push('\n');
+
+    let mut bytes = combined.into_bytes();
+    bytes.push(0);
+    bytes
+}
+
 /// Tier C backward orchestrator with optional PCA Tier B.2 support.
 ///
 /// When `tier_b` is `None` this produces byte-identical output to

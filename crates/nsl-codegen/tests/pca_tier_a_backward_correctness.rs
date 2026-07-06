@@ -325,6 +325,7 @@ fn pca_backward_config(segment_masked: bool) -> FlashAttentionConfig {
             rmsnorm_eps:                   1e-5,
             d_model:                       32,
             skip_rmsnorm_prologue:         false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     }
@@ -694,6 +695,8 @@ fn launch_pca_backward(
             // Tier B extension — null (not used for Tier A tests)
             0i64, 0i64,
             // doc_starts ptr — null (rope_q=false, no doc-aware positions)
+            0i64,
+            // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
             0i64,
             // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
             // means legacy per-q-block topology (Tier A; not per-doc).
@@ -1709,6 +1712,8 @@ fn launch_pca_backward_ex(
             seg_dev,
             0i64, 0i64,                 // Tier B extension — null
             doc_starts_dev,             // doc_starts ptr
+            // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
+            0i64,
             // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
             // means legacy per-q-block topology (Tier A; not per-doc).
             0i64,

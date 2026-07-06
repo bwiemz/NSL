@@ -1794,17 +1794,19 @@ impl<'a> WengertExtractor<'a> {
     ///     `[V, H]`, and produce wrong forward logits + wrong dW gradients
     ///     with no diagnostic.
     ///
-    ///     Current mitigation: the upstream type system rejects non-2D
-    ///     Matmul inputs in most shape configurations, AND the decorator's
-    ///     `(vocab_size, hidden_size)` shape contract — checked by the
-    ///     caller before emitting the substitution — pins the expected
-    ///     `[V, H]` shape.  A 3-D `W` that happens to satisfy `D * V == V`
-    ///     OR a missing-shape-hint path would slip through.  Structural
-    ///     rank-2 enforcement (walk the producer of `w_var`, consult the
-    ///     shape table for `Param` / `Constant` ops) is tracked as a
-    ///     follow-on — the cheapest pin until then is the negative-test
-    ///     coverage codified in `fused_linear_ce_auto_substitution.rs`
-    ///     (rank-3 W → no substitution).
+    ///     RESOLVED (v10, PR #294): structural rank enforcement now exists
+    ///     for known-rank `W` — the matcher consults the `known_ranks`
+    ///     table (populated via `register_input_with_rank` /
+    ///     `register_param_with_rank` and, for model-field weights,
+    ///     `set_model_field_ranks` + `resolvable_tensor_rank`) and returns
+    ///     `None` when `W`'s declared rank is not exactly 2 (guard at the
+    ///     `known_ranks.get(&w_var)` check below).  Only the
+    ///     unknown/absent-shape-hint path remains conservative-fire; the
+    ///     defensive layers there are the upstream type system, the
+    ///     decorator's `(vocab_size, hidden_size)` shape contract, and the
+    ///     negative-test coverage in
+    ///     `fused_linear_ce_auto_substitution.rs` (rank-3 W → no
+    ///     substitution).
     ///   * No-transpose W layout (`Matmul(x, W)` with W already `[H, V]`)
     ///     is NOT accepted.  Sprint v4-3 deferral: the runtime FFI at
     ///     `crates/nsl-runtime/src/fused_linear_ce.rs` (`w_ptr` doc) and

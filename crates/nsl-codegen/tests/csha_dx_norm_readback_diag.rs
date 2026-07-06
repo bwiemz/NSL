@@ -139,6 +139,7 @@ fn dx_norm_hbm_buffer_is_populated() {
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -308,6 +309,8 @@ fn dx_norm_hbm_buffer_is_populated() {
         // Tier B extension — null (no Tier B dispatch for diag test).
         0i64, 0i64,
         // doc_starts ptr — null (no doc-aware RoPE for diag test).
+        0i64,
+        // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
         0i64,
         // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
         // means legacy per-q-block topology.

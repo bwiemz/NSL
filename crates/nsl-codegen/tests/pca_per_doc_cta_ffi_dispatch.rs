@@ -186,7 +186,8 @@ fn ffi_kernel_name_classifier_recognizes_per_doc_cta_suffix() {
         block_q: 64, block_kv: 64, head_dim: 32,
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
     let kname = per_doc_cta_kernel_name(&cfg);
     assert!(
@@ -271,7 +272,8 @@ fn per_doc_cta_ffi_dispatch_matches_segmented_reference() {
         block_q: 64, block_kv: 64, head_dim: 32,
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
 
     let packing = DatasetPackingConfig {
@@ -465,7 +467,8 @@ fn per_doc_cta_ffi_dispatch_rejects_zero_num_docs() {
         block_q: 64, block_kv: 64, head_dim: 32,
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
     let packing = DatasetPackingConfig {
         enabled: true,

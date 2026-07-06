@@ -518,6 +518,33 @@ fn csha_is_per_doc_cta_kernel(name_ptr: i64) -> bool {
     name_bytes.windows(marker.len()).any(|w| w == marker)
 }
 
+/// Detect a CSHA fused-projection kernel by name. The CSHA name suffix
+/// block (`cshaL<level>_n<0|1>_p<0|1>_o<0|1>_h<heads>`) carries `_p1`
+/// exactly when `fused_projections` was set at synthesis. The search is
+/// anchored AFTER the `cshaL` marker so the leading `flash_attn_p<0|1>`
+/// paged marker can never match.
+///
+/// Fused-projection kernels compute K/V projections only for the CTA's
+/// own block rows (single-tile assumption — see the "Single-tile
+/// assumption" comment in `flash_attention_v2/mod.rs`), so multi-tile
+/// launches must go through the two-launch dispatch or be refused.
+///
+/// Safety: caller guarantees `name_ptr`, when non-zero, points to a
+/// null-terminated C string.
+#[cfg(feature = "cuda")]
+fn csha_is_fused_projection_kernel(name_ptr: i64) -> bool {
+    if name_ptr == 0 {
+        return false;
+    }
+    let name_bytes = unsafe {
+        std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes()
+    };
+    let Some(pos) = name_bytes.windows(5).position(|w| w == b"cshaL") else {
+        return false;
+    };
+    name_bytes[pos..].windows(3).any(|w| w == b"_p1")
+}
+
 /// Tier B.1 per-call x-scratch RAII holder. Drops free the GPU scratch
 /// buffer after `cuCtxSynchronize`, ensuring the kernel reading from
 /// it has completed.
@@ -769,6 +796,29 @@ pub extern "C" fn nsl_flash_attention_csha(
                  kernel name {:?} lacks the `_per_doc_cta` suffix",
                 num_docs_or_zero,
                 csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
+
+        // Multi-tile fused-projection refusal (inference FFI): the `_p1`
+        // kernel is single-tile ("Single-tile assumption" in
+        // flash_attention_v2/mod.rs). The training path
+        // (`nsl_flash_attention_csha_with_saves`) implements the two-launch
+        // multi-tile dispatch using its projection save buffers as staging;
+        // this saves-less entry point has no staging buffers yet, so refuse
+        // loudly rather than launch into silent garbage. Callers needing
+        // multi-tile today can route through the with_saves FFI with
+        // transient q_proj/k_proj/v_proj buffers.
+        if !per_doc_cta
+            && csha_is_fused_projection_kernel(effective_name_ptr)
+            && (seq_len > block_q || seq_len > _block_kv)
+        {
+            eprintln!(
+                "[nsl::flash_attention] nsl_flash_attention_csha: fused-projection kernel {:?} is \
+                 single-tile (seq_len={seq_len} > block_q={block_q}/block_kv={}) — refusing; use \
+                 nsl_flash_attention_csha_with_saves (two-launch multi-tile dispatch) instead",
+                csha_kernel_name_for_diag(effective_name_ptr),
+                _block_kv,
             );
             return -1;
         }
@@ -1137,6 +1187,54 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             return -1;
         }
 
+        // Multi-tile fused-projection dispatch (two-launch): a `_p1` kernel
+        // projects K/V only for the CTA's own block rows ("Single-tile
+        // assumption" in flash_attention_v2/mod.rs), so seq_len beyond one
+        // block would silently produce garbage attention. Launch A (the
+        // normal launch below) still writes VALID projection saves for
+        // every block; a second launch of the same kernel with null
+        // weights/x then takes the classic HBM tile-load path
+        // (k_start-addressed, multi-tile-correct) over the widened
+        // projections. Configurations the chain does not cover refuse
+        // loudly here instead of launching into silent garbage.
+        let is_tier_b1 = {
+            let nb = if effective_name_ptr != 0 {
+                unsafe { std::ffi::CStr::from_ptr(effective_name_ptr as *const i8).to_bytes() }
+            } else {
+                &[][..]
+            };
+            nb.windows(14).any(|w| w == b"_tier_b1_chunk")
+        };
+        let multi_tile_fused = !per_doc_cta
+            && csha_is_fused_projection_kernel(effective_name_ptr)
+            && (seq_len > block_q || seq_len > _block_kv);
+        if multi_tile_fused {
+            if block_q != _block_kv {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: multi-tile fused-projection \
+                     dispatch requires block_q == block_kv (got {block_q} vs {_block_kv}, seq_len={seq_len}); \
+                     asymmetric fused tiles are single-tile only — refusing instead of launching into garbage"
+                );
+                return -1;
+            }
+            if is_tier_b1 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: multi-tile dispatch not \
+                     implemented for Tier B.1 kernels ({:?}, seq_len={seq_len} > block_q={block_q}) — refusing",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                );
+                return -1;
+            }
+            if segment_ids_ptr != 0 || doc_starts_ptr != 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_with_saves: multi-tile fused dispatch \
+                     does not support segment_masked / doc-aware launches yet (seq_len={seq_len} > \
+                     block_q={block_q}) — refusing"
+                );
+                return -1;
+            }
+        }
+
         let grid_x = if per_doc_cta {
             num_docs_or_zero
         } else {
@@ -1227,6 +1325,28 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut rmax = row_max_ptr as u64;
         let mut rsum = row_sum_ptr as u64;
         let mut xraw = x_raw_ptr as u64;
+
+        // Multi-tile dispatch needs the projection saves as staging between
+        // launch A (fused per-block projections) and launch B (interleaved
+        // attention twin). Callers that don't keep saves (inference-style
+        // invocations) get transient f16 staging allocated here and freed
+        // after the chain.
+        let mut mt_staging: [*mut c_void; 3] = [std::ptr::null_mut(); 3];
+        if multi_tile_fused {
+            let f16_bytes = (batch * heads * seq_len * head_dim) as usize * 2;
+            if q_proj == 0 {
+                mt_staging[0] = crate::cuda::inner::alloc_device(f16_bytes);
+                q_proj = mt_staging[0] as u64;
+            }
+            if k_proj == 0 {
+                mt_staging[1] = crate::cuda::inner::alloc_device(f16_bytes);
+                k_proj = mt_staging[1] as u64;
+            }
+            if v_proj == 0 {
+                mt_staging[2] = crate::cuda::inner::alloc_device(f16_bytes);
+                v_proj = mt_staging[2] as u64;
+            }
+        }
         // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order).
         let mut seg_ids = segment_ids_ptr as u64;
         // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order).
@@ -1318,7 +1438,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             }
         }
 
-        let fwd_rc = crate::cuda::inner::kernel_launch(
+        let mut fwd_rc = crate::cuda::inner::kernel_launch(
             effective_ptx_ptr as *const u8,
             effective_name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
@@ -1326,6 +1446,100 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             &args,
             shared_mem_bytes as u32,
         );
+
+        // Multi-tile two-launch, launch B: launch A above ran the fused
+        // kernel per q-block — its projection saves (q_proj/k_proj/v_proj,
+        // f16, post-RoPE) are valid for EVERY block, but its attention
+        // output is single-tile garbage twice over (own-block K/V SMEM
+        // re-read + the split S/PV orchestration clobbers P per KV tile).
+        // Widen the saved projections to f32 scratch and launch the
+        // `_mt_attn` twin entry from the combined module
+        // (`synthesize_forward_multi_tile_combined`): the classic
+        // INTERLEAVED orchestration with k_start-addressed HBM tile
+        // loads, no RMSNorm/projection/RoPE (inputs are pre-projected
+        // and pre-rotated), and else-branch row_max/row_sum saves.
+        // Launch B overwrites out/lse/row_max/row_sum with correct
+        // values; the projection saves survive because their pointers
+        // are nulled for B. If the module lacks the twin (single-kernel
+        // PTX from a caller that has not adopted the combined
+        // synthesizer, or a sinks/segment/checkpoint config), the name
+        // lookup fails and the error surfaces loudly in the rc.
+        if multi_tile_fused && fwd_rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            // Twin entry name: `<fused_name>_mt_attn`, NUL-terminated.
+            let mt_name: Vec<u8> = {
+                let base = unsafe {
+                    std::ffi::CStr::from_ptr(effective_name_ptr as *const i8).to_bytes()
+                };
+                let mut v = Vec::with_capacity(base.len() + 9);
+                v.extend_from_slice(base);
+                v.extend_from_slice(b"_mt_attn\0");
+                v
+            };
+            let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
+            let f32_bytes = qkv_elems * 4;
+            let qf = crate::cuda::inner::alloc_device(f32_bytes);
+            let kf = crate::cuda::inner::alloc_device(f32_bytes);
+            let vf = crate::cuda::inner::alloc_device(f32_bytes);
+            let free_mt = |a: *mut c_void, b: *mut c_void, c: *mut c_void| {
+                if !a.is_null() { crate::cuda::inner::free_device(a); }
+                if !b.is_null() { crate::cuda::inner::free_device(b); }
+                if !c.is_null() { crate::cuda::inner::free_device(c); }
+            };
+            for (src, dst, tag) in [(q_proj, qf, "q_proj"), (k_proj, kf, "k_proj"), (v_proj, vf, "v_proj")] {
+                let rc = csha_fwd_convert_f16_to_f32(src, dst, qkv_elems);
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    eprintln!(
+                        "[nsl::flash_attention] multi-tile dispatch: f16->f32 widening of {tag} failed: {rc:?}"
+                    );
+                    free_mt(qf, kf, vf);
+                    for st in mt_staging {
+                        if !st.is_null() {
+                            crate::cuda::inner::free_device(st);
+                        }
+                    }
+                    return -1;
+                }
+            }
+            // Mutate the launch locals in place — `args` holds pointers to
+            // them, and cuLaunchKernel reads the pointees at call time
+            // (same contract the per-q-block `slens` threading relies on).
+            q = qf as u64;
+            k = kf as u64;
+            v = vf as u64;
+            x = 0;
+            nw = 0;
+            wq = 0;
+            wk = 0;
+            wv = 0;
+            q_proj = 0;
+            k_proj = 0;
+            v_proj = 0;
+            xraw = 0;
+            let _ = std::hint::black_box(&args);
+            // Same shared_mem_bytes as launch A: if the twin declares a
+            // static in-body `.shared` array the dynamic request is
+            // additional-but-unused; if it uses the module extern the
+            // fused size over-provisions it. Both are within the opt-in
+            // cap already validated for launch A.
+            fwd_rc = crate::cuda::inner::kernel_launch(
+                effective_ptx_ptr as *const u8,
+                mt_name.as_ptr(),
+                [grid_x, grid_y, grid_z],
+                [block_x, block_y, block_z],
+                &args,
+                shared_mem_bytes as u32,
+            );
+            // kernel_launch synchronizes before returning (async-error
+            // check), so freeing the widened buffers here is safe.
+            free_mt(qf, kf, vf);
+        }
+        // Transient staging (allocated only when the caller passed null
+        // save pointers on a multi-tile launch) is dead after launch B.
+        for st in mt_staging {
+            if !st.is_null() {
+                crate::cuda::inner::free_device(st);
+            }
+        }
 
         // Immediately after the forward kernel, sync + read back q_proj and
         // row_sum so we can tell whether the save-write path fired.  If the
@@ -1603,10 +1817,15 @@ fn csha_backward_impl(
     // holding the four concatenated Tier B.2 backward entries
     // (`tier_b2_d_prepass`, `tier_b2_dq_kernel`, `tier_b2_dkdv_kernel`,
     // `tier_b2_proj_backward`) and they are launched in sequence, with a
-    // D = rowsum(dO*O) scratch buffer allocated for the intermediate. When 0
-    // (the default for all existing callers, including the wengert lowering
-    // until T7 computes the flag), behavior is byte-identical to the scalar
-    // single-kernel path below. Selection is an explicit flag rather than
+    // D = rowsum(dO*O) scratch buffer allocated for the intermediate. When 0,
+    // behavior is byte-identical to the scalar single-kernel path below.
+    // The wengert lowering COMPUTES this flag (Sprint 1 T7:
+    // compile-time-eligible AND seq_len == block_q, wengert_lower ~2088);
+    // note it is iconst(0) for every config the production training-config
+    // builder currently emits, because kernel.rs pins level=1 /
+    // active_heads=0 which the tier_b2 dispatch eligibility rejects — see
+    // the production-eligibility note in the campaign memory. Selection is
+    // an explicit flag rather than
     // kernel-name-suffix sniffing — the dispatch decision is made in codegen
     // (see `tier_b2_hybrid_backward_eligible`) and threaded here. See spec §7.
     tier_b2_active: i64,
@@ -1741,6 +1960,30 @@ fn csha_backward_impl(
                  provided but kernel name {:?} lacks the `_per_doc_cta` suffix",
                 num_docs_or_zero,
                 csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
+
+        // Multi-tile fused backward refusal: two cross-launch accumulation
+        // gaps make seq_len beyond one block produce silently-wrong weight
+        // and input gradients today — (1) emit_dproj stores dwq/dwk/dwv as
+        // a plain f16 OVERWRITE per q-block launch (each launch clobbers
+        // the previous block's contribution; dk/dv solved this with the
+        // f32-scratch RMW pattern, dW has no scratch yet), and (2) the
+        // in-launch dRMSNorm/dx chain consumes only the launch's PARTIAL
+        // dK/dV SMEM tiles, not the cross-launch totals. Refuse loudly
+        // until the dW scratch + dx post-pass land. The forward multi-tile
+        // path (two-launch dispatch in the forward FFIs) is NOT affected.
+        if !per_doc_cta
+            && csha_is_fused_projection_kernel(effective_name_ptr)
+            && (seq_len > block_q || seq_len > _block_kv)
+        {
+            eprintln!(
+                "[nsl::flash_attention] nsl_flash_attention_csha_backward: multi-tile backward \
+                 (seq_len={seq_len} > block_q={block_q}/block_kv={_block_kv}) is not implemented for \
+                 fused-projection kernels: cross-launch dW accumulation (f16 overwrite, needs f32 \
+                 scratch RMW like dk/dv) and the dx chain's partial dK/dV tiles would produce \
+                 silently-wrong gradients — refusing"
             );
             return -1;
         }
@@ -2448,13 +2691,15 @@ fn csha_tier_b2_backward_launch(
     // slot (`csha_tensor_data_ptr(out_ptr)`); the standalone dQ/dK/dV gates feed
     // `fwd.o`. We source O from the same `out_ptr` slot here.
     //
-    // PARITY-GATE NOTE (T8): the wengert `FusedCshaBackward` lowering currently
-    // passes `null` for `out_ptr` (it does not retain O as an NslTensor handle).
-    // The production forward-save plumbing must thread O into this slot for the
-    // hybrid; this is the single launch-arg the parity gate (T8) must confirm.
-    // If O is null the D pre-pass yields D == 0 and the §8 zero-output guard
-    // FAILS — so a missing O cannot pass vacuously. (Today the branch is dormant
-    // — every caller passes tier_b2_active = 0 — so this is not yet exercised.)
+    // PARITY-GATE NOTE (T8, RESOLVED by Sprint 1 T1.1): the wengert
+    // `FusedCshaBackward` lowering now threads the forward O handle here —
+    // `CshaSavePointers.out` is populated at both forward call sites and
+    // passed in the `out_ptr` slot (wengert_lower ~2137). The tier_b2_active
+    // flag is likewise computed at lowering (~2088), though it is iconst(0)
+    // for the configs the production training-config builder currently
+    // emits (kernel.rs pins level=1 / active_heads=0). If O were null the
+    // D pre-pass would yield D == 0 and the §8 zero-output guard FAILS —
+    // so a missing O cannot pass vacuously.
     let o_for_prepass = csha_tensor_data_ptr(out_ptr);
 
     // D-scratch: D = rowsum(dO * O), f32, shape [batch, heads, seq_len].
@@ -2921,6 +3166,86 @@ const CSHA_BWD_F32_TO_F16_PTX: &str = concat!(
 
 #[cfg(feature = "cuda")]
 const CSHA_BWD_F32_TO_F16_NAME: &str = "nsl_csha_bwd_f32_to_f16\0";
+
+/// f16 -> f32 widening kernel: reads `n_elems` f16 values from `src_ptr`
+/// and writes them as f32 to `dst_ptr`. Used by the multi-tile two-launch
+/// forward dispatch: launch A saves projections as f16 (`q_proj`/`k_proj`/
+/// `v_proj`), while the attention pass's HBM tile loads read f32 sources
+/// (`ld.global.f32` in `emit_k_tile_load` / the q_load wq-null fallback).
+/// Same register discipline as the f32->f16 sibling above.
+#[cfg(feature = "cuda")]
+const CSHA_FWD_F16_TO_F32_PTX: &str = concat!(
+    ".version 8.7\n",
+    ".target sm_75\n",
+    ".address_size 64\n",
+    ".visible .entry nsl_csha_fwd_f16_to_f32(\n",
+    "    .param .u64 src_ptr,\n",
+    "    .param .u64 dst_ptr,\n",
+    "    .param .u64 n_elems\n",
+    ")\n",
+    "{\n",
+    "    .reg .u32 %th, %bd, %bi, %gid, %tmp;\n",
+    "    .reg .u64 %idx, %n, %src, %dst, %addr_src, %addr_dst;\n",
+    "    .reg .f32 %f;\n",
+    "    .reg .b16 %h;\n",
+    "    .reg .pred %p;\n",
+    "    mov.u32 %th, %tid.x;\n",
+    "    mov.u32 %bd, %ntid.x;\n",
+    "    mov.u32 %bi, %ctaid.x;\n",
+    "    mul.lo.u32 %tmp, %bi, %bd;\n",
+    "    add.u32 %gid, %tmp, %th;\n",
+    "    cvt.u64.u32 %idx, %gid;\n",
+    "    ld.param.u64 %src, [src_ptr];\n",
+    "    ld.param.u64 %dst, [dst_ptr];\n",
+    "    ld.param.u64 %n, [n_elems];\n",
+    "    setp.ge.u64 %p, %idx, %n;\n",
+    "    @%p bra F16F32_END;\n",
+    "    shl.b64 %addr_src, %idx, 1;\n",
+    "    add.u64 %addr_src, %src, %addr_src;\n",
+    "    shl.b64 %addr_dst, %idx, 2;\n",
+    "    add.u64 %addr_dst, %dst, %addr_dst;\n",
+    "    ld.global.b16 %h, [%addr_src];\n",
+    "    cvt.f32.f16 %f, %h;\n",
+    "    st.global.f32 [%addr_dst], %f;\n",
+    "F16F32_END:\n",
+    "    ret;\n",
+    "}\n",
+    "\0",
+);
+
+#[cfg(feature = "cuda")]
+const CSHA_FWD_F16_TO_F32_NAME: &str = "nsl_csha_fwd_f16_to_f32\0";
+
+/// Launch the f16->f32 widening kernel. `n_elems` is the element count
+/// (src is f16*2 bytes, dst is f32*4 bytes).
+#[cfg(feature = "cuda")]
+fn csha_fwd_convert_f16_to_f32(
+    src: u64,
+    dst: *mut c_void,
+    n_elems: usize,
+) -> cudarc::driver::sys::CUresult {
+    if n_elems == 0 {
+        return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    }
+    let mut src_ptr = src;
+    let mut dst_ptr = dst as u64;
+    let mut n = n_elems as u64;
+    let args: [*mut c_void; 3] = [
+        &mut src_ptr as *mut _ as *mut c_void,
+        &mut dst_ptr as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void,
+    ];
+    let block: i64 = 128;
+    let grid: i64 = ((n_elems as i64) + block - 1) / block;
+    crate::cuda::inner::kernel_launch(
+        CSHA_FWD_F16_TO_F32_PTX.as_ptr(),
+        CSHA_FWD_F16_TO_F32_NAME.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    )
+}
 
 /// Launch the f32→f16 conversion kernel. `n_elems` is the element count
 /// (src is f32*4 bytes, dst is f16*2 bytes).

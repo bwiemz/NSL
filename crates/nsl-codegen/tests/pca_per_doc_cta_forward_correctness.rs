@@ -420,7 +420,8 @@ fn per_doc_cta_four_short_docs_matches_segmented_reference() {
         block_q: 64, block_kv: 64, head_dim: 32,
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
 
     // Build the plan.

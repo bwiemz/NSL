@@ -930,9 +930,23 @@ impl Compiler<'_> {
                     crate::pca_tier_b::emit_tier_b_variants_for_config(&training_config);
                 let fwd_kernel_name = fwd_emission.base_kernel_name.clone();
 
+                // Multi-tile twin: embed the combined module (fused kernel +
+                // `_mt_attn` interleaved twin) instead of the bare fused PTX
+                // so the runtime's two-launch dispatch can serve
+                // seq_len > block_q at run time (the fused orchestration is
+                // single-tile by construction). For configs the twin cannot
+                // serve (segment_masked / sinks / checkpoint / paged /
+                // non-fused) `synthesize_forward_multi_tile_combined` returns
+                // the fused module unchanged, so this is byte-identical to
+                // the previous `fwd_emission.base_ptx` embedding there.
+                let base_ptx_combined =
+                    crate::flash_attention_v2::synthesize_forward_multi_tile_combined(
+                        &training_config,
+                    );
+                let _ = fwd_emission.base_ptx;
                 let fwd_ptx_id = self.embed_raw_data(
                     &format!("__nsl_flash_ptx_csha_saves_{}", fwd_kernel_name),
-                    fwd_emission.base_ptx,
+                    base_ptx_combined,
                 )?;
                 let mut fwd_name_bytes = fwd_kernel_name.as_bytes().to_vec();
                 fwd_name_bytes.push(0);
