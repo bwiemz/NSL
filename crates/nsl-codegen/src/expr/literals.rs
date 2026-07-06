@@ -216,8 +216,33 @@ impl Compiler<'_> {
         let call = builder.ins().call(new_ref, &[]);
         let result_list = builder.inst_results(call)[0];
 
-        // Only support single generator for now
-        let gen = &generators[0];
+        self.compile_comp_level(builder, state, element, generators, 0, result_list)?;
+        Ok(result_list)
+    }
+
+    /// Lower generator `level` of a (possibly nested) list comprehension as one
+    /// counted loop, recursing for the next generator inside the loop body.
+    ///
+    /// Earlier codegen bound only `generators[0]` and silently ignored the
+    /// rest: `[x*100 for x in [1,2] for y in [10,20,30]]` produced 2 elements
+    /// instead of 6, and any `if` filters on inner generators were dropped
+    /// (elements referencing the inner variable at least failed loudly with
+    /// "undefined variable").
+    ///
+    /// Each inner iterable is compiled *inside* the enclosing loop body, so
+    /// dependent generators (`[y for x in nested for y in x]`) re-evaluate per
+    /// outer iteration. On return, the current block is this level's exit
+    /// block; the caller (or `compile_list_comp`) continues from there.
+    fn compile_comp_level(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        element: &Expr,
+        generators: &[nsl_ast::expr::CompGenerator],
+        level: usize,
+        result_list: Value,
+    ) -> Result<(), CodegenError> {
+        let gen = &generators[level];
         let sym = match &gen.pattern.kind {
             PatternKind::Ident(sym) => *sym,
             _ => {
@@ -261,7 +286,7 @@ impl Compiler<'_> {
         let cond = builder.ins().icmp(IntCC::SignedLessThan, counter, list_len);
         builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 
-        // Body: get element, evaluate conditions, push to result
+        // Body: get element, evaluate this generator's filter conditions
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
@@ -273,42 +298,33 @@ impl Compiler<'_> {
         let elem = builder.inst_results(call)[0];
         builder.def_var(elem_var, elem);
 
-        // Handle filter conditions
-        let push_block = if gen.conditions.is_empty() {
-            body_block // no filter, push directly
+        for cond_expr in &gen.conditions {
+            let cond_val = self.compile_expr(builder, state, cond_expr)?;
+            let next_check = builder.create_block();
+            builder
+                .ins()
+                .brif(cond_val, next_check, &[], increment_block, &[]);
+            builder.switch_to_block(next_check);
+            builder.seal_block(next_check);
+            state.current_block = Some(next_check);
+        }
+
+        if level + 1 < generators.len() {
+            // Inner generator: its whole loop nests inside this body; when it
+            // returns we are in its exit block, which falls through to this
+            // level's increment.
+            self.compile_comp_level(builder, state, element, generators, level + 1, result_list)?;
         } else {
-            let push_bb = builder.create_block();
-            let mut current_block_id = body_block;
-            for cond_expr in &gen.conditions {
-                let cond_val = self.compile_expr(builder, state, cond_expr)?;
-                let next_check = builder.create_block();
-                builder
-                    .ins()
-                    .brif(cond_val, next_check, &[], increment_block, &[]);
-                builder.switch_to_block(next_check);
-                builder.seal_block(next_check);
-                state.current_block = Some(next_check);
-                current_block_id = next_check;
-            }
-            // Jump from last condition check to push block
-            builder.ins().jump(push_bb, &[]);
-            builder.switch_to_block(push_bb);
-            builder.seal_block(push_bb);
-            state.current_block = Some(push_bb);
-            let _ = current_block_id;
-            push_bb
-        };
-
-        // Evaluate element expression and push
-        let elem_val = self.compile_expr(builder, state, element)?;
-        let push_id = self.registry.runtime_fns["nsl_list_push"].0;
-        let push_ref = self.module.declare_func_in_func(push_id, builder.func);
-        builder.ins().call(push_ref, &[result_list, elem_val]);
-
-        let _ = push_block;
+            // Innermost level: evaluate the element expression and push.
+            let elem_val = self.compile_expr(builder, state, element)?;
+            let push_id = self.registry.runtime_fns["nsl_list_push"].0;
+            let push_ref = self.module.declare_func_in_func(push_id, builder.func);
+            builder.ins().call(push_ref, &[result_list, elem_val]);
+        }
         builder.ins().jump(increment_block, &[]);
 
-        // Increment
+        // Increment (predecessors — condition-fail edges and the body-end jump —
+        // are all emitted by now, so sealing on switch stays valid)
         builder.switch_to_block(increment_block);
         builder.seal_block(increment_block);
         state.current_block = Some(increment_block);
@@ -323,7 +339,7 @@ impl Compiler<'_> {
         builder.seal_block(exit_block);
         state.current_block = Some(exit_block);
 
-        Ok(result_list)
+        Ok(())
     }
 
     pub(crate) fn compile_match_expr(
