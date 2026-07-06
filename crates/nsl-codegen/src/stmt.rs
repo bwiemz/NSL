@@ -3583,7 +3583,30 @@ impl Compiler<'_> {
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
-                _ => {} // Eval, Distribute, Stmt — not yet implemented
+                // Bare statements in a train block execute once, pre-training,
+                // in source position — same treatment as Data-section
+                // statements (the semantic checker already declared their
+                // symbols). These were previously silently dropped.
+                TrainSection::Stmt(s) => {
+                    self.compile_stmt(builder, state, s)?;
+                }
+                // Deferral-must-refuse: these sections parse and type-check but
+                // are not executed — silently dropping them meant documented
+                // eval/best-checkpoint logic never ran with no diagnostic.
+                TrainSection::Eval { .. } => {
+                    return Err(CodegenError::new(
+                        "train block `eval:` sections are not yet executed; move \
+                         evaluation logic into an `on_epoch` callback (which \
+                         receives the epoch and loss) so it actually runs",
+                    ));
+                }
+                TrainSection::Distribute(_) => {
+                    return Err(CodegenError::new(
+                        "train block `distribute:` sections are not supported; \
+                         configure distribution via the @pipeline decorator / \
+                         CLI options instead",
+                    ));
+                }
             }
         }
 
@@ -7258,6 +7281,26 @@ impl Compiler<'_> {
                         }
                         self.compile_stmt(builder, state, stmt)?;
                     }
+                }
+                // Same treatment as the standard train path: bare statements
+                // run once pre-training; eval:/distribute: refuse loudly
+                // instead of being silently dropped.
+                TrainSection::Stmt(s) => {
+                    self.compile_stmt(builder, state, s)?;
+                }
+                TrainSection::Eval { .. } => {
+                    return Err(CodegenError::new(
+                        "train block `eval:` sections are not yet executed; move \
+                         evaluation logic into an `on_epoch` callback (which \
+                         receives the epoch and loss) so it actually runs",
+                    ));
+                }
+                TrainSection::Distribute(_) => {
+                    return Err(CodegenError::new(
+                        "train block `distribute:` sections are not supported; \
+                         configure distribution via the @pipeline decorator / \
+                         CLI options instead",
+                    ));
                 }
                 _ => {}
             }
