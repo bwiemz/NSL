@@ -624,6 +624,22 @@ impl Compiler<'_> {
             }
         }
 
+        // A bare member access on a model instance hands out the model's own
+        // field handle (no retain) — e.g. `let alias = m.w`. The binding is a
+        // borrow: freeing it would free the weight itself. Marking it
+        // non-owning makes the step-end cleanup skip it, makes ELTLS rebind
+        // skip the old-value free, and makes assignment-inside-if materialize
+        // a clone first (the established clone-on-mutate discipline).
+        if let ExprKind::MemberAccess { object, .. } = &expr.kind {
+            if matches!(
+                self.node_type(object.id),
+                nsl_semantic::types::Type::Model { .. }
+            ) {
+                state.non_owning_symbols.insert(target_sym);
+                return;
+            }
+        }
+
         state.non_owning_symbols.remove(&target_sym);
     }
 
@@ -6549,6 +6565,11 @@ impl Compiler<'_> {
                 .variables
                 .iter()
                 .filter(|(sym, _)| !vars_before_step.contains(sym))
+                // Borrow aliases (e.g. `let alias = m.w`, DataLoader handles)
+                // don't own their tensor — freeing them here would free the
+                // model weight itself and use-after-free the next step.
+                .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
+                .filter(|(sym, _)| !state.borrowed_batch_symbols.contains(sym))
                 .filter_map(|(sym, (var, _))| {
                     let sem_ty = state.variable_types.get(sym);
                     let is_tensor = sem_ty.map(|t| t.is_tensor()).unwrap_or(false);
