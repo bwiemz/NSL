@@ -147,6 +147,7 @@ fn forward_saves_match_cpu_reference() {
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };

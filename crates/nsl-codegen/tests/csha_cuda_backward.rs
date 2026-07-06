@@ -150,6 +150,13 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
     }
 }
 
+/// Forward-parity max_abs from the most recent harness run (f32 bits).
+/// Written by the fwd-parity diagnostic inside the harness; read by
+/// tests whose backward launch is EXPECTED to refuse (multi-tile) but
+/// which still gate on forward correctness. Tests run --test-threads=1.
+static LAST_FWD_PARITY_MAX_ABS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// Three-way launch harness. Returns (gpu_grads, cpu_grads) so the
 /// caller can compute per-tensor max_abs. Structural guarantees: rc=0
 /// launches, all 7 gradient outputs finite, shapes match CPU reference.
@@ -323,7 +330,10 @@ fn run_fused_backward_config_seq(
     }
 
     // Forward PTX + name.
-    let fwd_ptx = synthesize_flash_attention_ptx_v2(&config);
+    // Combined module: fused kernel + `_mt_attn` interleaved twin. The
+    // runtime's two-launch multi-tile dispatch resolves the twin by name
+    // when seq > block; single-tile launches use the fused entry only.
+    let fwd_ptx = nsl_codegen::flash_attention_v2::synthesize_forward_multi_tile_combined(&config);
     let fwd_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(&config);
     let fwd_smem_dyn = if needs_dynamic_smem(&config) { fwd_smem_total as i64 } else { 0 };
@@ -366,6 +376,46 @@ fn run_fused_backward_config_seq(
         unsafe { nsl_csha_free_backward_activations(saves); }
         free_all(&all_dev);
         return Err(format!("forward rc={rc_fwd}\nJIT log:\n{log}"));
+    }
+
+    // Forward-parity diagnostic (multi-tile localization): per-q-block
+    // max_abs of GPU `out` vs the CPU reference forward. If blocks 1+ are
+    // garbage while block 0 matches, the defect is in the forward
+    // multi-q-block path, not the backward. The overall max is published
+    // through LAST_FWD_PARITY_MAX_ABS so refusal-path tests (backward
+    // refuses at multi-tile) can still gate on forward correctness.
+    {
+        let fwd_qkv_elems = h * seq * hd;
+        let gpu_out: Vec<f32> = {
+            let mut raw = vec![0u16; fwd_qkv_elems];
+            unsafe { nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, out_dev, (fwd_qkv_elems * 2) as i64); }
+            raw.iter().map(|&b| f16_to_f32(b)).collect()
+        };
+        let cpu_out = csha_reference(&inputs, &shape);
+        let bq = block_q as usize;
+        let mut per_block: Vec<f32> = Vec::new();
+        for qb in 0..seq.div_ceil(bq) {
+            let mut m = 0f32;
+            let r0 = qb * bq;
+            let r1 = ((qb + 1) * bq).min(seq);
+            for hh in 0..h {
+                for r in r0..r1 {
+                    for d in 0..hd {
+                        let i = (hh * seq + r) * hd + d;
+                        m = m.max((gpu_out[i] - cpu_out[i]).abs());
+                    }
+                }
+            }
+            per_block.push(m);
+        }
+        let blocks_str: Vec<String> =
+            per_block.iter().map(|m| format!("{m:.2e}")).collect();
+        eprintln!(
+            "  [fwd-parity] seq={seq} bq={bq} per-block out max_abs: [{}]",
+            blocks_str.join(", ")
+        );
+        let overall = per_block.iter().cloned().fold(0f32, f32::max);
+        LAST_FWD_PARITY_MAX_ABS.store(overall.to_bits(), std::sync::atomic::Ordering::SeqCst);
     }
 
     // Backward PTX + name.
@@ -453,36 +503,6 @@ fn run_fused_backward_config_seq(
     let dw_elems = dm * kv_dim;
     let dx_elems = h * seq * hd;
 
-    // Forward-parity diagnostic (multi-tile localization): per-q-block
-    // max_abs of GPU `out` vs the CPU reference forward. If blocks 1+ are
-    // garbage while block 0 matches, the defect is in the forward
-    // multi-q-block path, not the backward.
-    {
-        let gpu_out = read_f16(out_dev, qkv_elems);
-        let cpu_out = csha_reference(&inputs, &shape);
-        let bq = block_q as usize;
-        let mut per_block: Vec<f32> = Vec::new();
-        for qb in 0..seq.div_ceil(bq) {
-            let mut m = 0f32;
-            let r0 = qb * bq;
-            let r1 = ((qb + 1) * bq).min(seq);
-            for hh in 0..h {
-                for r in r0..r1 {
-                    for d in 0..hd {
-                        let i = (hh * seq + r) * hd + d;
-                        m = m.max((gpu_out[i] - cpu_out[i]).abs());
-                    }
-                }
-            }
-            per_block.push(m);
-        }
-        let blocks_str: Vec<String> =
-            per_block.iter().map(|m| format!("{m:.2e}")).collect();
-        eprintln!(
-            "  [fwd-parity] seq={seq} bq={bq} per-block out max_abs: [{}]",
-            blocks_str.join(", ")
-        );
-    }
 
     let gpu_grads = CshaGradients {
         dq: read_f16(dq_dev, qkv_elems),
@@ -621,13 +641,27 @@ fn t6_3_hd64_block32_dv_probe() {
     }
 }
 
-/// Multi-tile parity: seq = 4 blocks (128 rows at block=32), hd ∈ {32, 64},
-/// causal ∈ {0,1}. This is the launch-path class where the cycle-14..17
-/// "Path A RED" numbers (dk max_rel 21.46 etc.) were measured — but through
-/// the checkpoint-recompute harness, whose forward output was ~all-zero
-/// (nonzero≈1 block), so those numbers never reflected the kernel. This
-/// test runs the same class through THIS validated harness. Diagnostic:
-/// logs unconditionally; gates via the same NUMERICAL_GATE consts.
+/// Multi-tile contract: seq = 4 blocks (128 rows at block=32), hd ∈ {32, 64},
+/// causal ∈ {0,1}. Two assertions per config:
+///
+///   1. FORWARD parity holds — the runtime two-launch dispatch (launch A =
+///      fused per-block projections + saves; launch B = same kernel with
+///      null weights, taking the classic k_start-addressed HBM tile loads
+///      over the widened projections) must match the CPU reference in
+///      EVERY q-block. Pre-dispatch, every block diverged by 3-10 abs
+///      (single-tile K/V SMEM re-read — see the "Single-tile assumption"
+///      comment in flash_attention_v2/mod.rs).
+///
+///   2. BACKWARD refuses loudly — cross-launch dW accumulation (f16
+///      overwrite) and the dx chain's partial dK/dV tiles are not yet
+///      implemented for multi-tile, so the FFI must return rc=-1 instead
+///      of producing silently-wrong gradients. This assertion flips when
+///      the dW scratch + dx post-pass land (then this test reverts to
+///      full 7-gradient parity gating).
+///
+/// Historical note: this launch-path class is where the cycle-14..17
+/// "Path A RED" numbers (dk max_rel 21.46 etc.) were measured — through
+/// the checkpoint-recompute harness, downstream of the broken forward.
 #[test]
 #[ignore]
 fn t6_3_multitile_seq128() {
@@ -638,32 +672,35 @@ fn t6_3_multitile_seq128() {
     let mut failures: Vec<String> = Vec::new();
     for hd in [32u32, 64u32] {
         for causal in [false, true] {
-            let (gpu, cpu) =
-                match run_fused_backward_config_seq(32, 32, hd, 1, hd, causal, false, 128) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[multitile] hd={hd} causal={causal} LAUNCH FAILED: {e}");
-                        failures.push(format!("hd={hd} causal={causal}: launch: {e}"));
-                        continue;
+            let fwd_tol = if hd <= 32 { 5e-3f32 } else { 2e-2f32 };
+            match run_fused_backward_config_seq(32, 32, hd, 1, hd, causal, false, 128) {
+                Ok(_) => {
+                    // Backward unexpectedly succeeded — the refusal must not
+                    // silently vanish without this test being re-gated.
+                    failures.push(format!(
+                        "hd={hd} causal={causal}: backward SUCCEEDED but multi-tile backward \
+                         is unimplemented (dW overwrite + partial dK/dV dx chain) — if the \
+                         multi-tile backward landed, re-gate this test on gradient parity"
+                    ));
+                }
+                Err(e) => {
+                    let fwd_max_abs = f32::from_bits(
+                        LAST_FWD_PARITY_MAX_ABS.load(std::sync::atomic::Ordering::SeqCst),
+                    );
+                    eprintln!(
+                        "[multitile] seq=128 hd={hd} causal={} fwd_max_abs={fwd_max_abs:.3e} \
+                         (tol {fwd_tol:.0e}) backward: refused as expected",
+                        causal as u8
+                    );
+                    if !e.starts_with("backward rc=") {
+                        failures.push(format!(
+                            "hd={hd} causal={causal}: expected backward refusal, got: {e}"
+                        ));
                     }
-                };
-            let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
-            let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
-            let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
-            let d_dwq = max_abs_diff(&gpu.dwq, &cpu.dwq);
-            let d_dwk = max_abs_diff(&gpu.dwk, &cpu.dwk);
-            let d_dwv = max_abs_diff(&gpu.dwv, &cpu.dwv);
-            let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
-            eprintln!(
-                "[multitile] seq=128 hd={hd} causal={} dq={d_dq:.3e} dk={d_dk:.3e} \
-                 dv={d_dv:.3e} dwq={d_dwq:.3e} dwk={d_dwk:.3e} dwv={d_dwv:.3e} dx={d_dx:.3e}",
-                causal as u8
-            );
-            let tol = tol_for_head_dim(hd);
-            if NUMERICAL_GATE_DQKV_ENABLED {
-                for (name, d) in [("dq", d_dq), ("dk", d_dk), ("dv", d_dv)] {
-                    if d >= tol {
-                        failures.push(format!("hd={hd} causal={causal}: {name}={d:.3e} > {tol:.1e}"));
+                    if fwd_max_abs >= fwd_tol {
+                        failures.push(format!(
+                            "hd={hd} causal={causal}: forward parity {fwd_max_abs:.3e} > {fwd_tol:.0e}"
+                        ));
                     }
                 }
             }
