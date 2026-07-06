@@ -20,4 +20,17 @@ let p1 = pair[1]
 assert_close(p0, full([4], 5.0), 0.0001, 0.0001)
 assert_close(p1, full([4], 7.0), 0.0001, 0.0001)
 
+# Pass-through: a BORROWED element (the parameter itself) in the tuple. The
+# tuple must retain it — otherwise the caller holds two owned aliases of a
+# refcount-1 tensor and the second free double-frees.
+fn pass_through(x: Tensor) -> (Tensor, Tensor):
+    return (x, x * 2.0)
+
+let t = ones([4])
+let (a0, a1) = pass_through(t)
+assert_close(a0, full([4], 1.0), 0.0001, 0.0001)
+assert_close(a1, full([4], 2.0), 0.0001, 0.0001)
+# The original variable must still be alive and correct after destructuring.
+assert_close(t, full([4], 1.0), 0.0001, 0.0001)
+
 print("tuple-of-tensors-ok")

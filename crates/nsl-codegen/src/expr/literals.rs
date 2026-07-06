@@ -74,15 +74,36 @@ impl Compiler<'_> {
         for elem in elements {
             let val = self.compile_expr(builder, state, elem)?;
             builder.ins().call(push_ref, &[tuple_ptr, val]);
-            // Ownership of tensor elements transfers INTO the tuple. Without
-            // this, the statement/return temporaries sweep freed the element
-            // tensors while the tuple still held their handles — so returning
-            // `(x * 2.0, x * 3.0)` handed the caller a tuple of dangling
-            // pointers ("bad magic 0xDEAD" on first use). Worst case now is a
-            // leak when a locally-built tuple is dropped unused (the accepted
-            // tradeoff elsewhere in this file's ownership model).
+            // The tuple takes its own reference to each tensor element, using
+            // the same ownership discrimination as the return-statement and
+            // assignment transfer sites (stmt.rs):
+            //   - Owned temporaries (e.g. `x * 2.0`) transfer INTO the tuple —
+            //     without this the statement/return temporaries sweep freed
+            //     them while the tuple still held their handles ("bad magic
+            //     0xDEAD" on first use of a returned tuple).
+            //   - Borrowed values (a bare variable/param/weight read) are
+            //     RETAINED: the tuple's reference must be independent, or a
+            //     pass-through like `return (x, x * 2.0)` leaves the caller
+            //     holding two owned aliases of a refcount-1 tensor — a
+            //     double-free once both are swept (worst in train steps).
+            // Worst case now is a leak when a locally-built tuple is dropped
+            // unused (the accepted tradeoff in this ownership model).
             if self.node_type(elem.id).is_tensor() {
-                self.consume_ownership(state, val);
+                use crate::ownership_expr::Ownership;
+                match self.get_ownership(state, val) {
+                    Ownership::Owned => self.consume_ownership(state, val),
+                    Ownership::BorrowedFromVar(_)
+                    | Ownership::BorrowedWeight
+                    | Ownership::TapeHeld => {
+                        let _ =
+                            self.compile_call_by_name(builder, "nsl_tensor_retain", &[val]);
+                    }
+                    Ownership::Unknown => {
+                        let _ =
+                            self.compile_call_by_name(builder, "nsl_tensor_retain", &[val]);
+                        self.note_unknown_fallback(state, val);
+                    }
+                }
             }
         }
         Ok(tuple_ptr)
