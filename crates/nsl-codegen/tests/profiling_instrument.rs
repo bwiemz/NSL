@@ -98,6 +98,7 @@ fn build_from_report_splits_ops_and_eliminated() {
         total_estimated_us: 2.0,
         fusion: None,
         memory_timeline: None,
+        memory_timeline_approximate: None,
         recommendations: vec![],
         wggo_explain: None,
     };
