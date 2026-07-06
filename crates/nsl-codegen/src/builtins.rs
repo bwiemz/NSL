@@ -2288,6 +2288,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // Explicit-sample-rate variant; the 4-arg form assumes 16 kHz.
+    (
+        "nsl_mel_spectrogram_sr",
+        &[types::I64, types::I64, types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
     (
         "nsl_cross_attention",
         &[types::I64, types::I64, types::I64, types::I64],
