@@ -27,6 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::wggo_cfie::{CfieInferConfig, CfieInferenceChoice};
 use crate::wggo_cost::{LayerCostEntry, LayerCostLut};
 
 /// The kind of decision recorded in a [`DecisionTrace`].
@@ -42,6 +43,12 @@ pub enum DecisionKind {
     /// PCA: sequence-packing mode chosen for this layer's attention kernels.
     PcaPacking,
 }
+// NOTE (G20): the CFIE inference decisions deliberately do NOT get a
+// `DecisionKind` variant — external consumers (nsl-cli's decision
+// explainer) match this enum exhaustively, and the G20 surface is the
+// advisory `WggoPlan::cfie_inference` sidecar (each record carries its own
+// human-readable model note).  A variant can be added together with the
+// explainer wiring when the decisions stop being advisory.
 
 /// A human-readable record of one ILP decision, suitable for reporting.
 ///
@@ -272,6 +279,18 @@ pub struct LayerIlpConstraints {
     /// mode (0..=3).  Typical defaults: 0.00, 0.15, 0.25, 0.35 — derived
     /// from the fraction of padded tokens in typical batches.
     pub packing_savings: [f64; 4],
+    /// CFIE inference decision axes (audit gap G20) — **opt-in, default
+    /// `None` = OFF**.  When `Some`, the solver additionally decides
+    /// {fusion level, KV layout, per-layer KV precision, speculative
+    /// on/off} with decode-latency cost terms from
+    /// [`crate::wggo_cfie::decode_us_per_token`], and the static-layout KV
+    /// pool is charged against `memory_budget`.  With the gate off the
+    /// candidate space, costs, and outputs are byte-identical to a build
+    /// without the axes (WGGO precedent: `zero_stage_search`,
+    /// `snap_to_grid`).  The decisions are ADVISORY in this cycle —
+    /// surfaced on `WggoPlan::cfie_inference` + the report, not consumed
+    /// by the CFIE serve planner.
+    pub cfie_infer: Option<CfieInferConfig>,
 }
 
 impl Default for LayerIlpConstraints {
@@ -292,6 +311,7 @@ impl Default for LayerIlpConstraints {
             fase_backward_speedup: 0.10,
             packing_modes_mask: 0b1111,
             packing_savings: [0.00, 0.15, 0.25, 0.35],
+            cfie_infer: None,
         }
     }
 }
@@ -323,10 +343,24 @@ pub fn solve_layer(
     lut: &LayerCostLut,
     constraints: &LayerIlpConstraints,
 ) -> LayerIlpSolution {
+    solve_layer_cfie(lut, constraints).0
+}
+
+/// [`solve_layer`] variant that also returns the CFIE inference choice
+/// (audit gap G20).  `None` unless [`LayerIlpConstraints::cfie_infer`] is
+/// `Some` and a feasible candidate exists.  The choice is deliberately
+/// carried OUTSIDE `LayerDecision`/`LayerIlpSolution` (advisory sidecar,
+/// see `wggo_cfie` module docs) so consumer-owned struct layouts stay
+/// untouched while the gate is advisory.
+pub fn solve_layer_cfie(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> (LayerIlpSolution, Option<CfieInferenceChoice>) {
     let mut state = SolverState {
         best_cost: f64::INFINITY,
         best_decision: None,
         best_entry: None,
+        best_cfie: None,
         nodes: 0,
     };
 
@@ -339,6 +373,11 @@ pub fn solve_layer(
     } else {
         &[false]
     };
+    // CFIE inference axis (G20).  Gate off (`cfie_infer == None`, the
+    // production default) yields the single `None` element: one loop pass,
+    // a 0.0 cost term, and a 0-byte pool — the candidate walk, node count,
+    // and objective are byte-identical to a solver without the axis.
+    let cfie_domain = crate::wggo_cfie::enumerate_choices(constraints.cfie_infer.as_ref());
 
     for &m_bits in precision_domain {
         if !prec_allowed(m_bits, constraints) {
@@ -350,6 +389,7 @@ pub fn solve_layer(
             }
             for &fase in fase_domain {
                 for pack in enumerate_packing_modes(constraints) {
+                  for &cfie in &cfie_domain {
                     for &c in lut.axes_csha_levels.iter().rev() {
                         for &f in lut.axes_ffn_widths.iter().rev() {
                             for &r in &lut.axes_adapter_ranks {
@@ -381,7 +421,26 @@ pub fn solve_layer(
                                     if entry.smem_bytes > constraints.smem_budget {
                                         continue;
                                     }
+                                    // CFIE (G20): decode-latency term + KV-pool
+                                    // memory charge for this candidate's
+                                    // inference choice.  Gate off => (0.0, 0):
+                                    // both the sum and the comparison below are
+                                    // bit-identical to the pre-G20 solver.
+                                    let (cfie_us, cfie_pool) =
+                                        match (cfie, constraints.cfie_infer.as_ref()) {
+                                            (Some(ch), Some(cfg)) => (
+                                                crate::wggo_cfie::decode_us_per_token(
+                                                    ch,
+                                                    cfg,
+                                                    entry.param_bytes,
+                                                    lut.peak_bandwidth_gbs,
+                                                ),
+                                                crate::wggo_cfie::kv_pool_bytes(ch, cfg),
+                                            ),
+                                            _ => (0.0, 0u64),
+                                        };
                                     if ilp_resident_bytes(&entry, lut, m_bits, v_bits)
+                                        .saturating_add(cfie_pool)
                                         > constraints.memory_budget
                                     {
                                         continue;
@@ -395,7 +454,9 @@ pub fn solve_layer(
                                     // `v_bits` / `fase` affect the cost at all —
                                     // without it the ILP's objective is blind to
                                     // its own precision/FASE decisions (paper §2.3
-                                    // optimizer_time term).
+                                    // optimizer_time term).  The CFIE decode term
+                                    // composes the same way (G20): additive, in
+                                    // μs, zero when the gate is off.
                                     let optim_us = crate::wggo_cost::optimizer_us(
                                         entry.param_bytes,
                                         lut.dtype_bytes,
@@ -404,7 +465,8 @@ pub fn solve_layer(
                                         fase,
                                         lut.peak_bandwidth_gbs,
                                     );
-                                    let cand_cost = entry.total_us() + placement_us + optim_us;
+                                    let cand_cost =
+                                        entry.total_us() + placement_us + optim_us + cfie_us;
                                     if cand_cost >= state.best_cost {
                                         continue; // bound prune
                                     }
@@ -422,10 +484,12 @@ pub fn solve_layer(
                                     state.best_cost = cand_cost;
                                     state.best_decision = Some(decision);
                                     state.best_entry = Some(entry);
+                                    state.best_cfie = cfie;
                                 }
                             }
                         }
                     }
+                  }
                 }
             }
         }
@@ -435,27 +499,40 @@ pub fn solve_layer(
         Some(decision) => {
             let entry = state.best_entry.unwrap();
             let decision_trace = build_decision_trace(&decision, &entry, constraints);
+            // Gate off => best_cfie is None => pool is 0 and memory_bytes
+            // is byte-identical to the pre-G20 accounting.
+            let cfie_pool = match (state.best_cfie, constraints.cfie_infer.as_ref()) {
+                (Some(ch), Some(cfg)) => crate::wggo_cfie::kv_pool_bytes(ch, cfg),
+                _ => 0,
+            };
             let memory_bytes =
-                ilp_resident_bytes(&entry, lut, decision.optim_m_bits, decision.optim_v_bits);
-            LayerIlpSolution {
-                decision,
-                cost_us: state.best_cost,
-                memory_bytes,
-                smem_bytes: entry.smem_bytes,
-                nodes_explored: state.nodes,
-                feasible: true,
-                decision_trace,
-            }
+                ilp_resident_bytes(&entry, lut, decision.optim_m_bits, decision.optim_v_bits)
+                    .saturating_add(cfie_pool);
+            (
+                LayerIlpSolution {
+                    decision,
+                    cost_us: state.best_cost,
+                    memory_bytes,
+                    smem_bytes: entry.smem_bytes,
+                    nodes_explored: state.nodes,
+                    feasible: true,
+                    decision_trace,
+                },
+                state.best_cfie,
+            )
         }
-        None => LayerIlpSolution {
-            decision: fallback_decision(constraints),
-            cost_us: f64::INFINITY,
-            memory_bytes: 0,
-            smem_bytes: 0,
-            nodes_explored: state.nodes,
-            feasible: false,
-            decision_trace: Vec::new(),
-        },
+        None => (
+            LayerIlpSolution {
+                decision: fallback_decision(constraints),
+                cost_us: f64::INFINITY,
+                memory_bytes: 0,
+                smem_bytes: 0,
+                nodes_explored: state.nodes,
+                feasible: false,
+                decision_trace: Vec::new(),
+            },
+            None,
+        ),
     }
 }
 
@@ -464,6 +541,19 @@ pub fn solve_layer(
 /// `f64::INFINITY` when the (possibly post-resolution) decision is no longer
 /// representable in the LUT.  Used by greedy mode's cost re-evaluation (G3).
 pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstraints) -> f64 {
+    recost_decision_cfie(lut, d, c, None)
+}
+
+/// [`recost_decision`] extended with the layer's CFIE inference choice
+/// (G20) so a gate-on greedy re-cost stays comparable with `solve_layer`'s
+/// objective (which includes the decode term).  Passing `None` (or a gate
+/// that is off) adds nothing and is bit-identical to [`recost_decision`].
+pub fn recost_decision_cfie(
+    lut: &LayerCostLut,
+    d: &LayerDecision,
+    c: &LayerIlpConstraints,
+    cfie: Option<CfieInferenceChoice>,
+) -> f64 {
     let h_count = (d.active_heads() as u64).max(1);
     let Some(base) = lut.get(h_count, d.ffn_width, d.csha_level, d.adapter_rank) else {
         return f64::INFINITY;
@@ -475,7 +565,7 @@ pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstr
     let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
     // Mirror `solve_layer`'s objective exactly so a re-cost after conflict
     // resolution is comparable: forward+backward + adapter-comm + optimizer.
-    entry.total_us()
+    let mut cost = entry.total_us()
         + placement_cost_us(d.adapter_rank, d.adapter_placement)
         + crate::wggo_cost::optimizer_us(
             entry.param_bytes,
@@ -484,7 +574,16 @@ pub fn recost_decision(lut: &LayerCostLut, d: &LayerDecision, c: &LayerIlpConstr
             d.optim_v_bits,
             d.fase_fused,
             lut.peak_bandwidth_gbs,
-        )
+        );
+    if let (Some(ch), Some(cfg)) = (cfie, c.cfie_infer.as_ref()) {
+        cost += crate::wggo_cfie::decode_us_per_token(
+            ch,
+            cfg,
+            entry.param_bytes,
+            lut.peak_bandwidth_gbs,
+        );
+    }
+    cost
 }
 
 /// Resident memory the ILP charges a candidate layer: the shared
@@ -532,12 +631,30 @@ pub fn solve_all_templated(
     luts: &[LayerCostLut],
     constraints: &[LayerIlpConstraints],
 ) -> (Vec<LayerIlpSolution>, TemplateStats) {
+    let (sols, stats, _cfie) = solve_all_templated_cfie(luts, constraints);
+    (sols, stats)
+}
+
+/// [`solve_all_templated`] variant that also returns the per-layer CFIE
+/// inference choices (G20) — parallel to the solutions vector, all `None`
+/// when the gate is off.  Template reuse replicates the cached choice
+/// alongside the cached solution; the gate config participates in the
+/// template key via [`constraints_eq`].
+pub fn solve_all_templated_cfie(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (
+    Vec<LayerIlpSolution>,
+    TemplateStats,
+    Vec<Option<CfieInferenceChoice>>,
+) {
     assert_eq!(
         luts.len(),
         constraints.len(),
         "luts and constraints must be parallel arrays"
     );
     let mut out: Vec<LayerIlpSolution> = Vec::with_capacity(luts.len());
+    let mut cfie_out: Vec<Option<CfieInferenceChoice>> = Vec::with_capacity(luts.len());
     let mut stats = TemplateStats::default();
     let mut template_idx: Option<usize> = None;
 
@@ -546,21 +663,24 @@ pub fn solve_all_templated(
             .map(|j| lut_eq(&luts[j], lut) && constraints_eq(&constraints[j], c))
             .unwrap_or(false);
         if reuse {
-            let mut s = out[template_idx.unwrap()].clone();
+            let j = template_idx.unwrap();
+            let mut s = out[j].clone();
             // Mark replicated solutions with zero nodes so callers can
             // distinguish fresh solves from cache hits.
             s.nodes_explored = 0;
             out.push(s);
+            cfie_out.push(cfie_out[j]);
             stats.template_hits += 1;
         } else {
-            let sol = solve_layer(lut, c);
+            let (sol, cfie) = solve_layer_cfie(lut, c);
             out.push(sol);
+            cfie_out.push(cfie);
             stats.templates_solved += 1;
             template_idx = Some(i);
         }
     }
 
-    (out, stats)
+    (out, stats, cfie_out)
 }
 
 /// Field-by-field equality for [`LayerCostLut`] (manual to avoid
@@ -615,6 +735,13 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
             .iter()
             .zip(b.packing_savings.iter())
             .all(|(x, y)| x.to_bits() == y.to_bits())
+        // G20: the CFIE gate (and its knobs) are part of the template key —
+        // a gate-on layer must never reuse a gate-off template's solution.
+        && match (a.cfie_infer.as_ref(), b.cfie_infer.as_ref()) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x.key_eq(y),
+            _ => false,
+        }
 }
 
 /// Solve a layer **greedily** — paper §5.3.
@@ -630,6 +757,18 @@ pub fn solve_layer_greedy(
     lut: &LayerCostLut,
     constraints: &LayerIlpConstraints,
 ) -> LayerIlpSolution {
+    solve_layer_greedy_cfie(lut, constraints).0
+}
+
+/// [`solve_layer_greedy`] variant that also returns the CFIE inference
+/// choice (G20).  Greedy picks the locally-cheapest choice whose KV pool
+/// fits the remaining memory headroom (`wggo_cfie::best_choice_fitting`) —
+/// mirroring greedy's per-variable local heuristics; when nothing fits it
+/// refuses to advise (`None`) rather than surfacing an over-budget pool.
+pub fn solve_layer_greedy_cfie(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> (LayerIlpSolution, Option<CfieInferenceChoice>) {
     let mut nodes = 0u64;
 
     // Heads: keep all that satisfy the GQA-group + importance constraint.
@@ -673,15 +812,18 @@ pub fn solve_layer_greedy(
     let packing_mode = enumerate_packing_modes(constraints)[0];
 
     let Some(base) = lut.get(h_count, f, c, r) else {
-        return LayerIlpSolution {
-            decision: fallback_decision(constraints),
-            cost_us: f64::INFINITY,
-            memory_bytes: 0,
-            smem_bytes: 0,
-            nodes_explored: nodes,
-            feasible: false,
-            decision_trace: Vec::new(),
-        };
+        return (
+            LayerIlpSolution {
+                decision: fallback_decision(constraints),
+                cost_us: f64::INFINITY,
+                memory_bytes: 0,
+                smem_bytes: 0,
+                nodes_explored: nodes,
+                feasible: false,
+                decision_trace: Vec::new(),
+            },
+            None,
+        );
     };
     let entry = apply_packing(
         apply_fase(base, fase_fused, constraints.fase_backward_speedup),
@@ -689,51 +831,80 @@ pub fn solve_layer_greedy(
         &constraints.packing_savings,
     );
     let memory_bytes = ilp_resident_bytes(&entry, lut, m_bits, v_bits);
+    // G20 greedy: locally-best CFIE choice that fits the memory headroom
+    // left after the training-resident bytes.  Gate off => (None, 0.0, 0),
+    // leaving every expression below bit-identical to the pre-G20 solver.
+    let (cfie_choice, cfie_us, cfie_pool) = match constraints.cfie_infer.as_ref() {
+        Some(cfg) => {
+            let headroom = constraints.memory_budget.saturating_sub(memory_bytes);
+            match crate::wggo_cfie::best_choice_fitting(
+                cfg,
+                entry.param_bytes,
+                lut.peak_bandwidth_gbs,
+                headroom,
+            ) {
+                Some((ch, us)) => (Some(ch), us, crate::wggo_cfie::kv_pool_bytes(ch, cfg)),
+                None => (None, 0.0, 0),
+            }
+        }
+        None => (None, 0.0, 0),
+    };
+    let memory_bytes = memory_bytes.saturating_add(cfie_pool);
     let feasible = base.feasible
         && entry.smem_bytes <= constraints.smem_budget
         && memory_bytes <= constraints.memory_budget;
 
     if !feasible {
-        return LayerIlpSolution {
-            decision: fallback_decision(constraints),
-            cost_us: f64::INFINITY,
+        return (
+            LayerIlpSolution {
+                decision: fallback_decision(constraints),
+                cost_us: f64::INFINITY,
+                memory_bytes,
+                smem_bytes: entry.smem_bytes,
+                nodes_explored: nodes,
+                feasible: false,
+                decision_trace: Vec::new(),
+            },
+            None,
+        );
+    }
+
+    (
+        LayerIlpSolution {
+            decision: LayerDecision {
+                keep_head,
+                ffn_width: f,
+                csha_level: c,
+                adapter_rank: r,
+                optim_m_bits: m_bits,
+                optim_v_bits: v_bits,
+                fase_fused,
+                packing_mode,
+                adapter_placement: best_placement(r, constraints)
+                    .unwrap_or(AdapterPlacement::None),
+            },
+            cost_us: entry.total_us()
+                + placement_cost_us(
+                    r,
+                    best_placement(r, constraints).unwrap_or(AdapterPlacement::None),
+                )
+                + crate::wggo_cost::optimizer_us(
+                    entry.param_bytes,
+                    lut.dtype_bytes,
+                    m_bits,
+                    v_bits,
+                    fase_fused,
+                    lut.peak_bandwidth_gbs,
+                )
+                + cfie_us,
             memory_bytes,
             smem_bytes: entry.smem_bytes,
             nodes_explored: nodes,
-            feasible: false,
+            feasible: true,
             decision_trace: Vec::new(),
-        };
-    }
-
-    LayerIlpSolution {
-        decision: LayerDecision {
-            keep_head,
-            ffn_width: f,
-            csha_level: c,
-            adapter_rank: r,
-            optim_m_bits: m_bits,
-            optim_v_bits: v_bits,
-            fase_fused,
-            packing_mode,
-            adapter_placement: best_placement(r, constraints)
-                .unwrap_or(AdapterPlacement::None),
         },
-        cost_us: entry.total_us()
-            + placement_cost_us(r, best_placement(r, constraints).unwrap_or(AdapterPlacement::None))
-            + crate::wggo_cost::optimizer_us(
-                entry.param_bytes,
-                lut.dtype_bytes,
-                m_bits,
-                v_bits,
-                fase_fused,
-                lut.peak_bandwidth_gbs,
-            ),
-        memory_bytes,
-        smem_bytes: entry.smem_bytes,
-        nodes_explored: nodes,
-        feasible: true,
-        decision_trace: Vec::new(),
-    }
+        cfie_choice,
+    )
 }
 
 /// Greedy variant of [`solve_all`].
@@ -741,6 +912,16 @@ pub fn solve_all_greedy(
     luts: &[LayerCostLut],
     constraints: &[LayerIlpConstraints],
 ) -> Vec<LayerIlpSolution> {
+    solve_all_greedy_cfie(luts, constraints).0
+}
+
+/// [`solve_all_greedy`] variant that also returns the per-layer CFIE
+/// inference choices (G20) — parallel to the solutions, all `None` when
+/// the gate is off.
+pub fn solve_all_greedy_cfie(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (Vec<LayerIlpSolution>, Vec<Option<CfieInferenceChoice>>) {
     assert_eq!(
         luts.len(),
         constraints.len(),
@@ -748,8 +929,8 @@ pub fn solve_all_greedy(
     );
     luts.iter()
         .zip(constraints.iter())
-        .map(|(lut, c)| solve_layer_greedy(lut, c))
-        .collect()
+        .map(|(lut, c)| solve_layer_greedy_cfie(lut, c))
+        .unzip()
 }
 
 /// Solve all layers in parallel-safe sequential order.
@@ -776,6 +957,9 @@ struct SolverState {
     best_cost: f64,
     best_decision: Option<LayerDecision>,
     best_entry: Option<LayerCostEntry>,
+    /// CFIE inference choice of the incumbent (G20).  Always `None` when
+    /// the `cfie_infer` gate is off.
+    best_cfie: Option<CfieInferenceChoice>,
     nodes: u64,
 }
 

@@ -62,6 +62,8 @@ fn empty_plan() -> WggoPlan {
         weight_analysis: Default::default(),
         estimated_solve_us: 0,
         warnings: Vec::new(),
+        // G20: CFIE inference decisions (advisory sidecar; empty = gate off).
+        cfie_inference: Vec::new(),
     }
 }
 
