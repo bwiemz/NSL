@@ -5474,19 +5474,21 @@ impl Compiler<'_> {
         // 7e1c. Dev Tools Phase 4 Task 4: health-monitor hooks.
         // Emits per-step loss, per-parameter gradient norm, per-parameter
         // weight norm (step 0 + every 100 steps), and a snapshot flush every
-        // 100 steps.  Gated entirely on `health_monitor`; when off the IR is
-        // byte-identical to pre-phase-4.
+        // 100 steps.  Gated on `health_monitor`; when neither it nor
+        // `inspect_enabled` is on the IR is byte-identical to pre-phase-4.
         //
         // TODO(phase4-fase): splice grad-norm emission into the FASE per-layer
         // loop when FASE is active.  Phase 4 Task 4 ships the standard-
         // backward-only path — grads_list is indexed the same whether the
         // primary backward was tape-AD or source-AD.
-        if self.compile_options.health_monitor {
-            use cranelift_codegen::ir::{types as cl_types, MemFlags};
-            let _ = MemFlags::trusted(); // keep import valid across cfgs
 
-            // (a) Record loss: scalarize loss_val and call
-            //     nsl_health_record_loss(loss_scalar, step).
+        // (a) Record loss: scalarize loss_val and call
+        //     nsl_health_record_loss(loss_scalar, step).
+        // Also emitted when only `--inspect` is on: `@inspect` predicates read
+        // `loss` back through nsl_health_get_last_loss, so without this call
+        // the collector would stay empty and `loss` would read 0.0 (the exact
+        // silent-wrong the getter replaced).
+        if self.compile_options.health_monitor || self.compile_options.inspect_enabled {
             let loss_scalar = self.compile_call_by_name(
                 builder,
                 "nsl_tensor_item",
@@ -5498,6 +5500,11 @@ impl Compiler<'_> {
                 "nsl_health_record_loss",
                 &[loss_scalar, step_now],
             )?;
+        }
+
+        if self.compile_options.health_monitor {
+            use cranelift_codegen::ir::{types as cl_types, MemFlags};
+            let _ = MemFlags::trusted(); // keep import valid across cfgs
 
             // Precompute step-gating flags shared by grad/weight/flush hooks.
             let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
@@ -8447,10 +8454,11 @@ impl Compiler<'_> {
     ///     `nsl_inspect_record_stats`.
     ///   * `condition="..."` → predicate-gated `nsl_inspect_dump_full`.
     ///     Predicate AST is lowered via `inspect::predicate::lower_predicate`.
-    ///   * The `loss` identifier in predicates always evaluates to `0.0` —
-    ///     the loss value isn't in scope at @inspect emission time (inspect
-    ///     fires at the let-binding site, typically before the loss compute).
-    ///     TODO(phase-5-fase): thread loss through once it's available.
+    ///   * The `loss` identifier reads the most recent recorded loss at
+    ///     runtime via `nsl_health_get_last_loss` (recorded per step whenever
+    ///     `--inspect` or the health monitor is on). Because @inspect fires at
+    ///     the let-binding site — before the current step's loss compute — the
+    ///     predicate sees the previous completed step's loss (0.0 on step 0).
     ///
     /// All emission gated on `compile_options.inspect_enabled`.  When that
     /// flag is off, this method is never called.
@@ -8626,13 +8634,18 @@ impl Compiler<'_> {
             let get_nan_inf_count_window_ref =
                 self.module.declare_func_in_func(nic_id, builder.func);
 
+            let (lloss_id, _) = match self.registry.runtime_fns.get("nsl_health_get_last_loss") {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_last_loss_ref =
+                self.module.declare_func_in_func(lloss_id, builder.func);
+
             let step_loaded = builder.use_var(step_count_var);
-            // Placeholder for `loss` identifier in predicate — see TODO above.
-            let loss_placeholder = builder.ins().f64const(0.0);
 
             let ctx = crate::inspect::predicate::PredicateLowerCtx {
                 step_val: step_loaded,
-                loss_val: loss_placeholder,
+                get_last_loss_ref,
                 get_loss_ema_ref,
                 get_loss_ema_slope_ref,
                 get_grad_norm_total_ref,

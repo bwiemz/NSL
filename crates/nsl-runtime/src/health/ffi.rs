@@ -95,6 +95,15 @@ pub extern "C" fn nsl_health_set_flush_interval(n: u64) {
     COLLECTOR.lock().unwrap().set_flush_interval(n);
 }
 
+/// Most recent finite loss recorded this run (0.0 before the first record).
+/// Powers the `loss` identifier in `@inspect` predicates — previously that
+/// identifier lowered to a compile-time 0.0 constant, so `condition="loss > x"`
+/// silently never fired.
+#[no_mangle]
+pub extern "C" fn nsl_health_get_last_loss() -> f64 {
+    COLLECTOR.lock().unwrap().last_loss().unwrap_or(0.0)
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_health_get_loss_ema() -> f64 {
     COLLECTOR.lock().unwrap().snapshot().loss_ema.unwrap_or(0.0)

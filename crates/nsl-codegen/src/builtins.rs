@@ -360,6 +360,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I32),
     ),
     ("nsl_inspect_set_dir", &[types::I64, types::I64], None),
+    ("nsl_health_get_last_loss", &[], Some(types::F64)),
     ("nsl_health_get_loss_ema", &[], Some(types::F64)),
     ("nsl_health_get_loss_ema_slope", &[], Some(types::F64)),
     ("nsl_health_get_grad_norm_total", &[], Some(types::F64)),

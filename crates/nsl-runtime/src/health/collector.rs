@@ -72,6 +72,12 @@ impl HealthCollector {
         });
     }
 
+    /// Most recent finite loss recorded via `record_loss` (NaN/Inf are counted
+    /// but never enter the history, so this is the last *usable* loss).
+    pub fn last_loss(&self) -> Option<f64> {
+        self.loss_history.back().copied()
+    }
+
     pub fn record_grad_norm(&mut self, _path: &str, layer_idx: u32, norm: f64) {
         self.grad_norm_per_layer.insert(layer_idx, norm);
     }
