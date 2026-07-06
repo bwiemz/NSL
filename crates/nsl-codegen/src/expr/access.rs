@@ -418,7 +418,44 @@ impl Compiler<'_> {
                 let call = builder.ins().call(fref, &[obj_val, lo, hi, st]);
                 Ok(builder.inst_results(call)[0])
             }
-            _ => Err(CodegenError::new("multi-dim subscript not supported yet")),
+            SubscriptKind::MultiDim(dims) => {
+                // Tensor element read: t[i, j, ...] → nsl_tensor_get(t, [i, j, ...]).
+                // The runtime validates arity against ndim, bounds-checks each
+                // index, and applies strides; it returns the element as F64.
+                let obj_type = self.node_type(object.id).clone();
+                if !obj_type.is_tensor() && !obj_type.is_indeterminate() {
+                    return Err(CodegenError::new(format!(
+                        "multi-dim subscript requires a tensor, got {obj_type:?}"
+                    )));
+                }
+                let indices_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                for dim in dims {
+                    let SubscriptKind::Index(idx_expr) = dim else {
+                        return Err(CodegenError::new(
+                            "mixed index/slice in multi-dim tensor subscript is not \
+                             supported; use tensor_slice for range views",
+                        ));
+                    };
+                    let idx_raw = self.compile_expr(builder, state, idx_expr)?;
+                    // Indices must be I64 for the runtime; coerce float indices.
+                    let idx_val = if matches!(
+                        self.node_type(idx_expr.id),
+                        nsl_semantic::types::Type::Float
+                    ) {
+                        builder.ins().fcvt_to_sint(cl_types::I64, idx_raw)
+                    } else {
+                        idx_raw
+                    };
+                    self.compile_call_by_name(builder, "nsl_list_push", &[indices_list, idx_val])?;
+                }
+                let elem = self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_get",
+                    &[obj_val, indices_list],
+                )?;
+                self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
+                Ok(elem)
+            }
         }
     }
 

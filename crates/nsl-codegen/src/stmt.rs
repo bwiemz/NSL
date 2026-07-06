@@ -1803,6 +1803,72 @@ impl Compiler<'_> {
                         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
                         builder.ins().call(set_ref, &[obj_val, idx_val, final_val]);
                     }
+                    SubscriptKind::MultiDim(dims) => {
+                        // Tensor element write: t[i, j, ...] = v (and compound
+                        // forms) → nsl_tensor_set(t, [i, j, ...], v as f64).
+                        // The runtime validates arity/bounds and applies strides.
+                        if !obj_type.is_tensor() && !obj_type.is_indeterminate() {
+                            return Err(CodegenError::new(format!(
+                                "multi-dim subscript assignment requires a tensor, got {obj_type:?}"
+                            )));
+                        }
+                        let indices_list =
+                            self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        for dim in dims {
+                            let SubscriptKind::Index(idx_expr) = dim else {
+                                return Err(CodegenError::new(
+                                    "mixed index/slice in multi-dim tensor subscript \
+                                     assignment is not supported",
+                                ));
+                            };
+                            let idx_raw = self.compile_expr(builder, state, idx_expr)?;
+                            let idx_val = if matches!(
+                                self.node_type(idx_expr.id),
+                                nsl_semantic::types::Type::Float
+                            ) {
+                                builder.ins().fcvt_to_sint(cl_types::I64, idx_raw)
+                            } else {
+                                idx_raw
+                            };
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_push",
+                                &[indices_list, idx_val],
+                            )?;
+                        }
+                        // nsl_tensor_set takes the value as F64; coerce ints.
+                        let rhs_f64 = if matches!(
+                            self.node_type(value.id),
+                            nsl_semantic::types::Type::Int | nsl_semantic::types::Type::Bool
+                        ) {
+                            builder.ins().fcvt_from_sint(cl_types::F64, new_val)
+                        } else {
+                            new_val
+                        };
+                        let final_val = if matches!(op, AssignOp::Assign) {
+                            rhs_f64
+                        } else {
+                            // Read-modify-write on the element in f64.
+                            let old_val = self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_get",
+                                &[obj_val, indices_list],
+                            )?;
+                            match op {
+                                AssignOp::AddAssign => builder.ins().fadd(old_val, rhs_f64),
+                                AssignOp::SubAssign => builder.ins().fsub(old_val, rhs_f64),
+                                AssignOp::MulAssign => builder.ins().fmul(old_val, rhs_f64),
+                                AssignOp::DivAssign => builder.ins().fdiv(old_val, rhs_f64),
+                                _ => unreachable!(),
+                            }
+                        };
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_set",
+                            &[obj_val, indices_list, final_val],
+                        )?;
+                        self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
+                    }
                     _ => return Err(CodegenError::new("only simple index assignment supported")),
                 }
             }
