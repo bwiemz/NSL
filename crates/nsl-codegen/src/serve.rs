@@ -67,17 +67,24 @@ struct CfieEndpointInit {
     /// `nsl_cfie_bind_model` refuses it cleanly (documented boundary:
     /// there is no served model without a weights path).
     weights_path: String,
-    /// Optional tokenizer path for the decode-and-print demo tail.
+    /// Optional tokenizer path for the runtime prompt-encode + the
+    /// decode-and-print tail (Cycle 12).
     tokenizer_path: Option<String>,
-    /// The prompt token ids, baked at compile time.  When a tokenizer +
-    /// prompt are configured this is the offline-encoded prompt; else a
-    /// tiny sentinel (`[0]`) so the endpoint body still compiles + runs.
-    /// The runtime `nsl_cfie_generate` prompt ABI is a host i64 array,
-    /// so these are baked as raw i64s in .rodata (NOT an f64 tokenizer
-    /// tensor — the tokenizer-encode -> generate bridge would need an
-    /// f64-tensor -> i64-host-array runtime FFI that is out of Cycle-11
-    /// scope; see the deferral note in `emit_cfie_endpoint_init`).
+    /// The FALLBACK prompt token ids, baked at compile time (byte-level
+    /// ids clamped into the vocab; `[0]` sentinel when no `prompt:` is
+    /// configured).  When a tokenizer + prompt are both configured the
+    /// serve init ALSO emits the runtime encode
+    /// (`nsl_tokenizer_encode` -> `nsl_cfie_tensor_to_tokens`) and a
+    /// Cranelift `select` picks the runtime-encoded buffer whenever the
+    /// encode produced tokens (n > 0), falling back to these baked ids
+    /// otherwise — so the binary still runs if the encode comes back
+    /// empty.  The runtime `nsl_cfie_generate` prompt ABI is a host i64
+    /// array, so these are baked as raw i64s in .rodata.
     prompt_tokens: Vec<i64>,
+    /// The raw `prompt:` string for the runtime tokenizer encode
+    /// (Cycle 12).  `None` when no non-empty prompt is configured — the
+    /// baked sentinel is then the only prompt source.
+    prompt_text: Option<String>,
     /// Resolved model shape (passed to `nsl_cfie_bind_model`).
     shape: crate::cfie_serve::ResolvedModelShape,
     max_new_tokens: i64,
@@ -91,8 +98,30 @@ struct CfieEndpointInit {
 pub struct CfieServeGen {
     pub max_new_tokens: i64,
     pub eos_token_id: i64,
-    /// Prompt token count baked at serve init (host i64 array length).
+    /// FALLBACK prompt token count baked at serve init (host i64 array
+    /// length) — used when `prompt_len_val` is `None`.
     pub prompt_len: i64,
+    /// Cycle 12: the RUNTIME prompt length (a Cranelift value selected
+    /// at serve init between the tokenizer-encoded count and the baked
+    /// length).  `Some` exactly when tokenizer + prompt are configured;
+    /// `generate()` then passes this instead of the baked constant.
+    /// Valid because serve init and the endpoint bodies compile into the
+    /// SAME Cranelift function (the init block dominates the bodies).
+    pub prompt_len_val: Option<cranelift_codegen::ir::Value>,
+    /// Cycle 12: the tokenizer handle loaded at serve init.  `Some`
+    /// exactly when `tokenizer:` is configured; `generate()` then emits
+    /// the decode-and-print tail (tokens -> tensor -> text -> stdout).
+    pub tok_handle: Option<cranelift_codegen::ir::Value>,
+}
+
+/// What `emit_cfie_endpoint_init` hands back to `compile_serve_block`:
+/// the (possibly runtime-selected) prompt pointer the endpoint's first
+/// param binds to, the runtime prompt length when the Cycle-12 encode
+/// path was emitted, and the tokenizer handle when one was loaded.
+struct CfieEndpointWiring {
+    prompt_ptr: cranelift_codegen::ir::Value,
+    prompt_len_val: Option<cranelift_codegen::ir::Value>,
+    tok_handle: Option<cranelift_codegen::ir::Value>,
 }
 
 struct WorkerConfigSpec {
@@ -397,15 +426,16 @@ impl Compiler<'_> {
                 // array, and publish the `generate()` driver params.  The
                 // baked prompt ptr becomes the endpoint's first param.
                 if let Some(ep) = init.endpoint.as_ref() {
-                    let scope =
-                        cfie_label_scope(&self.resolve_sym(serve.name).to_string());
-                    let prompt_ptr = self.emit_cfie_endpoint_init(builder, &scope, ep)?;
+                    let scope = cfie_label_scope(self.resolve_sym(serve.name));
+                    let wired = self.emit_cfie_endpoint_init(builder, &scope, ep)?;
                     self.cfie_serve_gen = Some(CfieServeGen {
                         max_new_tokens: ep.max_new_tokens,
                         eos_token_id: ep.eos_token_id,
                         prompt_len: ep.prompt_tokens.len() as i64,
+                        prompt_len_val: wired.prompt_len_val,
+                        tok_handle: wired.tok_handle,
                     });
-                    cfie_prompt_ptr = Some(prompt_ptr);
+                    cfie_prompt_ptr = Some(wired.prompt_ptr);
                 }
             }
 
@@ -515,9 +545,9 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// CFIE Cycle 11: emit the model-binding + tokenizer-load + baked
-    /// prompt-token array, and return the baked prompt host i64 array
-    /// pointer (the endpoint's first param is bound to it).
+    /// CFIE Cycle 11 (+12): emit the model-binding + tokenizer-load +
+    /// prompt wiring, and return the values the endpoint bodies consume
+    /// (prompt pointer/length + tokenizer handle).
     ///
     /// Emission order (AFTER `nsl_cfie_engine_finalize`):
     ///   1. `model_handle = nsl_model_create(weights_path_cstr)`.  A null
@@ -527,12 +557,29 @@ impl Compiler<'_> {
     ///      n_heads, n_kv_heads, head_dim, d_ff, vocab_size)` with the
     ///      resolved-shape constants.
     ///   3. `tok_handle = nsl_tokenizer_load(tokenizer_path_cstr)` when a
-    ///      tokenizer is configured (loaded so the decode-and-print demo
-    ///      tail can resolve it; the handle is currently unused by the
-    ///      body because the i64-token-buffer -> f64-tensor decode bridge
-    ///      is a documented Cycle-11 deferral).
-    ///   4. bake the prompt token ids as a raw host i64 array in .rodata
-    ///      and return its pointer.
+    ///      tokenizer is configured.  Cycle 12: the handle is KEPT — it
+    ///      feeds the runtime prompt encode below and the `generate()`
+    ///      decode-and-print tail (calls.rs).
+    ///   4. bake the FALLBACK prompt token ids as a raw host i64 array
+    ///      in .rodata.
+    ///   5. Cycle 12, when tokenizer + prompt are both configured: emit
+    ///      the RUNTIME prompt encode —
+    ///        enc  = nsl_tokenizer_encode(tok_handle, prompt_text_cstr)
+    ///        n    = nsl_cfie_tensor_to_tokens(enc, prompt_buf, cap)
+    ///        nsl_tensor_free(enc)
+    ///      then a Cranelift `select` on `n > 0` picks
+    ///      `(prompt_buf, min(n, cap))` over the baked `(ptr, len)` — a
+    ///      RUNTIME branch, so the binary still runs when the encode
+    ///      yields nothing.  (A missing/corrupt tokenizer FILE never
+    ///      reaches the select: `nsl_tokenizer_load` aborts with its own
+    ///      clean diagnostic — the runtime's documented load contract.)
+    ///      `cap` is `4 * prompt_bytes + 16`, comfortably above any real
+    ///      tokenizer's token count for the text; if a tokenizer still
+    ///      exceeds it, `min(n, cap)` clamps to the tokens actually
+    ///      written (no overrun, truncated prompt).  `prompt_buf` stays
+    ///      allocated for the process lifetime (the endpoint body may
+    ///      call `generate()` repeatedly; a one-shot serve binary exits
+    ///      right after).
     ///
     /// Data labels are scoped by serve-block name so two CFIE serve
     /// blocks in one module do not collide (same-name blocks collide
@@ -542,7 +589,7 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         scope: &str,
         ep: &CfieEndpointInit,
-    ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+    ) -> Result<CfieEndpointWiring, CodegenError> {
         // 1. model_handle = nsl_model_create(weights_path_cstr)
         let (wbytes, _wlen) = cfie_nul_terminated(&ep.weights_path);
         let w_id = embed_cfie_bytes(
@@ -571,7 +618,9 @@ impl Compiler<'_> {
             ],
         )?;
 
-        // 3. optional tokenizer_load
+        // 3. optional tokenizer_load — Cycle 12 keeps the handle for the
+        // runtime prompt encode + the generate() decode tail.
+        let mut tok_handle: Option<cranelift_codegen::ir::Value> = None;
         if let Some(tok_path) = ep.tokenizer_path.as_ref() {
             let (tbytes, _tlen) = cfie_nul_terminated(tok_path);
             let t_id = embed_cfie_bytes(
@@ -581,13 +630,12 @@ impl Compiler<'_> {
             )?;
             let t_gv = self.module.declare_data_in_func(t_id, builder.func);
             let t_ptr = builder.ins().symbol_value(cl_types::I64, t_gv);
-            // Return value (tok handle) intentionally dropped in v1 — see
-            // the decode-bridge deferral note in the method doc.
-            self.compile_call_by_name(builder, "nsl_tokenizer_load", &[t_ptr])?;
+            tok_handle =
+                Some(self.compile_call_by_name(builder, "nsl_tokenizer_load", &[t_ptr])?);
         }
 
-        // 4. bake the prompt token ids as a host i64 array (little-endian
-        // raw bytes) and return its pointer.
+        // 4. bake the FALLBACK prompt token ids as a host i64 array
+        // (little-endian raw bytes).
         let mut prompt_bytes: Vec<u8> = Vec::with_capacity(ep.prompt_tokens.len() * 8);
         for tok in &ep.prompt_tokens {
             prompt_bytes.extend_from_slice(&tok.to_le_bytes());
@@ -598,8 +646,66 @@ impl Compiler<'_> {
             prompt_bytes,
         )?;
         let p_gv = self.module.declare_data_in_func(p_id, builder.func);
-        let p_ptr = builder.ins().symbol_value(cl_types::I64, p_gv);
-        Ok(p_ptr)
+        let baked_ptr = builder.ins().symbol_value(cl_types::I64, p_gv);
+        let baked_len = builder
+            .ins()
+            .iconst(cl_types::I64, ep.prompt_tokens.len() as i64);
+
+        // 5. Cycle 12: runtime prompt encode + select-fallback, emitted
+        // only when tokenizer + prompt are BOTH configured (without a
+        // prompt there is nothing to encode; without a tokenizer there
+        // is nothing to encode WITH).
+        let (prompt_ptr, prompt_len_val) = match (tok_handle, ep.prompt_text.as_ref()) {
+            (Some(tok), Some(text)) => {
+                let (pbytes, _plen) = cfie_nul_terminated(text);
+                let cap_tokens = 4 * (pbytes.len() as i64 - 1) + 16;
+                let pt_id = embed_cfie_bytes(
+                    &mut self.module,
+                    &format!("__nsl_cfie_prompt_text_{scope}"),
+                    pbytes,
+                )?;
+                let pt_gv = self.module.declare_data_in_func(pt_id, builder.func);
+                let pt_ptr = builder.ins().symbol_value(cl_types::I64, pt_gv);
+
+                // enc = nsl_tokenizer_encode(tok, prompt_text) — a 1-D
+                // f64 tensor of token ids (the runtime tokenizer ABI).
+                let enc =
+                    self.compile_call_by_name(builder, "nsl_tokenizer_encode", &[tok, pt_ptr])?;
+                // prompt_buf = nsl_alloc(cap * 8) host i64 buffer.
+                let v_cap = builder.ins().iconst(cl_types::I64, cap_tokens);
+                let v_cap_bytes = builder.ins().iconst(cl_types::I64, cap_tokens * 8);
+                let prompt_buf =
+                    self.compile_call_by_name(builder, "nsl_alloc", &[v_cap_bytes])?;
+                // n = nsl_cfie_tensor_to_tokens(enc, prompt_buf, cap);
+                // then free the encode tensor — the ids now live in
+                // prompt_buf (free-every-tensor-on-every-path: this is
+                // the only path, no branches between encode and free).
+                let n = self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_tensor_to_tokens",
+                    &[enc, prompt_buf, v_cap],
+                )?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[enc])?;
+
+                // Runtime select: use (prompt_buf, min(n, cap)) when the
+                // encode produced tokens (n > 0), else the baked prompt.
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                let use_rt = builder.ins().icmp(IntCC::SignedGreaterThan, n, zero);
+                let n_over_cap = builder.ins().icmp(IntCC::SignedGreaterThan, n, v_cap);
+                let n_clamped = builder.ins().select(n_over_cap, v_cap, n);
+                let sel_ptr = builder.ins().select(use_rt, prompt_buf, baked_ptr);
+                let sel_len = builder.ins().select(use_rt, n_clamped, baked_len);
+                (sel_ptr, Some(sel_len))
+            }
+            _ => (baked_ptr, None),
+        };
+
+        Ok(CfieEndpointWiring {
+            prompt_ptr,
+            prompt_len_val,
+            tok_handle,
+        })
     }
 
     /// CFIE Tier-A wiring: extract serve-block CFIE config, resolve the
@@ -1114,16 +1220,21 @@ impl Compiler<'_> {
                 .clone()
                 .or_else(|| weights.map(|w| w.source_path().to_string()))
                 .unwrap_or_default();
-            // Baked prompt token ids.  Runtime `nsl_cfie_generate` reads a
-            // host i64 array, so we bake raw i64s.  A configured `prompt:`
-            // is baked as byte-level token ids (the runtime byte-tokenizer
-            // convention), clamped into [0, vocab_size) so the runtime's
-            // per-token range guard passes; absent that, a single [0]
-            // sentinel keeps the body runnable.  NOTE (deferral): a live
-            // HF-tokenizer-encoded prompt would need an f64-tensor ->
-            // i64-host-array runtime bridge that Cycle 11 does not add;
-            // the baked byte-id prompt is the v1 demo path.
+            // FALLBACK prompt token ids.  Runtime `nsl_cfie_generate`
+            // reads a host i64 array, so we bake raw i64s.  A configured
+            // `prompt:` is baked as byte-level token ids (the runtime
+            // byte-tokenizer convention), clamped into [0, vocab_size) so
+            // the runtime's per-token range guard passes; absent that, a
+            // single [0] sentinel keeps the body runnable.  Cycle 12:
+            // when `tokenizer:` is ALSO configured, serve init emits the
+            // runtime tokenizer encode (`nsl_tokenizer_encode` ->
+            // `nsl_cfie_tensor_to_tokens`) and selects it over these
+            // baked ids at runtime whenever it produces tokens.  A
+            // tokenizer id >= vocab_size is NOT clamped on that path —
+            // `nsl_cfie_generate`'s per-token range guard refuses it
+            // loudly (honest refusal beats a silently-wrong prompt).
             let vocab = prepared.shape.vocab_size.max(1) as i64;
+            let prompt_text = cfg.prompt.clone().filter(|p| !p.is_empty());
             let prompt_tokens: Vec<i64> = match cfg.prompt.as_deref() {
                 Some(p) if !p.is_empty() => p
                     .bytes()
@@ -1135,6 +1246,7 @@ impl Compiler<'_> {
                 weights_path,
                 tokenizer_path: cfg.tokenizer_path.clone(),
                 prompt_tokens,
+                prompt_text,
                 shape: prepared.shape.clone(),
                 max_new_tokens: cfg.max_new_tokens.unwrap_or(64).max(1),
                 eos_token_id: cfg.eos_token_id.unwrap_or(-1),

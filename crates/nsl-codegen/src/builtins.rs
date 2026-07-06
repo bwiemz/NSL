@@ -1670,6 +1670,28 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     ("nsl_cfie_generate_reset", &[], Some(types::I64)),
+    // --- CFIE Cycle 12: host token-buffer <-> tokenizer-tensor bridge.
+    // tokens_to_tensor turns generate's out-buffer into the 1-D f64
+    // tensor nsl_tokenizer_decode consumes (text output); tensor_to_tokens
+    // turns nsl_tokenizer_encode's tensor into generate's host i64 prompt
+    // array (runtime-encoded prompt). ---
+    (
+        "nsl_cfie_tokens_to_tensor",
+        &[
+            types::I64, // tokens_ptr (host i64 array)
+            types::I64, // count
+        ],
+        Some(types::I64), // NslTensor* (1-D f64), or 0 on bad args
+    ),
+    (
+        "nsl_cfie_tensor_to_tokens",
+        &[
+            types::I64, // tensor_ptr (1-D f64 NslTensor*)
+            types::I64, // out_ptr (host i64 buffer)
+            types::I64, // cap
+        ],
+        Some(types::I64), // FULL token count (> cap = truncated), or -1
+    ),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",
@@ -2673,5 +2695,7 @@ mod tests {
         assert_eq!(arity("nsl_cfie_bind_model"), 8);
         assert_eq!(arity("nsl_cfie_generate"), 7);
         assert_eq!(arity("nsl_cfie_generate_reset"), 0);
+        assert_eq!(arity("nsl_cfie_tokens_to_tensor"), 2);
+        assert_eq!(arity("nsl_cfie_tensor_to_tokens"), 3);
     }
 }

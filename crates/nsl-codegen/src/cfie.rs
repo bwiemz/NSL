@@ -17,6 +17,11 @@
 //! `nsl_cfie_generate` decode driver, with the served model resolved
 //! from the serve `weights:` key / `--weights` (model defs carry only
 //! compile-time shape metadata, so there is no runtime model value).
+//! Cycle 12 closes the text loop: with `tokenizer:` configured the
+//! `prompt:` text is runtime-encoded (`nsl_tokenizer_encode` ->
+//! `nsl_cfie_tensor_to_tokens`, baked byte-ids as the select fallback)
+//! and the generated ids are decoded and printed as text
+//! (`nsl_cfie_tokens_to_tensor` -> `nsl_tokenizer_decode`).
 //! The disaggregated serve path emits none of the runtime wiring and the
 //! report says so (`runtime_wiring_emitted`).
 //! Produces a human-readable report matching paper §8's sample output.
@@ -550,9 +555,14 @@ impl CfiePlan {
                  binding (nsl_model_create + nsl_cfie_bind_model) + the \
                  nsl_cfie_generate decode driver; the served model is bound \
                  from the serve `weights:` key / --weights at serve init. \
-                 v1 returns the generated-token count; the prompt is baked \
-                 from the `prompt:` key (live per-request prompts + text \
-                 decode need the deferred request loop)."
+                 generate() returns the generated-token count. With \
+                 `tokenizer:` configured, the `prompt:` text is \
+                 runtime-encoded through that tokenizer (falling back to \
+                 baked byte-level ids if the encode yields nothing) and \
+                 the generated ids are decoded and printed as TEXT; \
+                 without a tokenizer the prompt stays byte-baked and only \
+                 the count is printed (live per-request prompts need the \
+                 deferred request loop)."
             )
             .unwrap();
         }

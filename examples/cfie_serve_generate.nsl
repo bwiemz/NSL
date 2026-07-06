@@ -1,33 +1,40 @@
-# CFIE Cycle 11: end-to-end serve/generate example.
+# CFIE Cycle 12: end-to-end serve/generate example — text in, text out.
 #
 # This is the paper's `serve` + `@endpoint` + `generate(...)` syntax
-# compiling all the way to the GPU-proven CFIE runtime (cycles 1-10):
+# compiling all the way to the GPU-proven CFIE runtime (cycles 1-11):
 # the config below drives the compile-time planner, the serve init emits
-# the model binding (nsl_model_create + nsl_cfie_bind_model), and the
-# endpoint's generate() call drives nsl_cfie_generate over the decode
-# loop.  `nsl build examples/cfie_serve_generate.nsl` produces a ONE-SHOT
-# inference binary (there is no network listener — the paper's
+# the model binding (nsl_model_create + nsl_cfie_bind_model) + tokenizer
+# load, and the endpoint's generate() call drives nsl_cfie_generate over
+# the decode loop.  `nsl build examples/cfie_serve_generate.nsl` produces
+# a ONE-SHOT inference binary (there is no network listener — the paper's
 # `nsl build --serve` emits an executable, not a daemon).
 #
-# HONEST BOUNDARIES (Cycle 11 v1):
+# WHAT RUNS (Cycle 12):
+#   * PROMPT: with `tokenizer:` configured, the `prompt:` text is encoded
+#     AT RUNTIME by the real tokenizer (nsl_tokenizer_encode ->
+#     nsl_cfie_tensor_to_tokens); if the encode yields no tokens the
+#     binary falls back to the compile-time byte-baked ids, so it still
+#     runs.  A missing/corrupt tokenizer FILE fails loudly at load.
+#   * OUTPUT: the generated token ids are decoded back through the same
+#     tokenizer (nsl_cfie_tokens_to_tensor -> nsl_tokenizer_decode) and
+#     the TEXT is printed to stdout, followed by the count from print().
+#     Without a `tokenizer:` key, only the count is printed.
+#
+# HONEST BOUNDARIES:
 #   * The served model is bound at serve init from the `weights:` path
 #     (or the --weights CLI path), NOT from a runtime model value:
 #     `model` definitions are compile-time shape/layer metadata only.
 #     The `target_model` argument to generate() is accepted for source
 #     compatibility with the paper's syntax but is not resolved to a
 #     value.
-#   * `generate()` returns the number of tokens generated (Int) in v1.
-#     The generated token ids are written to an internal host buffer.
-#     Decoding them back to text needs an i64-token-buffer -> f64-tensor
-#     bridge that Cycle 11 does not add, so the visible demo prints the
-#     generated-token COUNT.  `tokenizer:` is still loaded at serve init
-#     so a future request loop can decode.
-#   * The prompt is baked at compile time from the `prompt:` string
-#     (byte-level token ids) so the one-shot body runs without a caller;
-#     live per-request prompts need the (deferred) request loop.
+#   * `generate()` returns the number of tokens generated (Int) — type
+#     stability with Cycle 11; the decoded text is printed by the
+#     generate() emission itself, not returned as a value.
+#   * The prompt comes from the `prompt:` config key; live per-request
+#     prompts need the (deferred) request loop.
 #   * Sampling params (temperature/top_k/top_p) are baked into the fused
 #     sample kernel at plan time; generate()'s params arg is not
-#     re-plumbed in v1.
+#     re-plumbed.
 #
 # Running actually generates tokens only on a CUDA-enabled build with a
 # real GPU + a real `model.safetensors` at the `weights:` path; the
@@ -73,5 +80,6 @@ serve Inference:
         # the prompt and arg 2 (`params`) is reserved (sampling is baked
         # into the fused kernel at plan time).
         let count = generate("Inference", prompt, 0)
-        # Visible demo: how many tokens were generated.
+        # Cycle 12: generate() already decoded + printed the generated
+        # TEXT via the configured tokenizer.  This prints the count too.
         print(count)

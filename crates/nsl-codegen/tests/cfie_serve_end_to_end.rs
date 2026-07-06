@@ -778,6 +778,19 @@ fn main():
         "nsl_cfie_bind_model",
         "nsl_cfie_generate",
         "nsl_tokenizer_load",
+        // Cycle 12 — runtime prompt encode (tokenizer + prompt are both
+        // configured, so the serve init encodes the prompt through the
+        // real tokenizer and bridges the tensor to the i64 prompt ABI)...
+        "nsl_tokenizer_encode",
+        "nsl_cfie_tensor_to_tokens",
+        // ...and the decode-and-print text tail on generate()'s output.
+        "nsl_cfie_tokens_to_tensor",
+        "nsl_tokenizer_decode",
+        "nsl_print_str",
+        // Free discipline: the encode tensor, the decode string, and the
+        // bridge tensor are all released.
+        "nsl_tensor_free",
+        "nsl_string_free",
     ] {
         assert!(
             called.contains(sym),
@@ -828,6 +841,20 @@ fn main():
         !called.contains("nsl_tokenizer_load"),
         "no tokenizer: key -> no tokenizer load emitted"
     );
+    // Cycle 12: with no tokenizer there is no runtime prompt encode and
+    // no text-decode tail — the count-print behavior is preserved and
+    // none of the bridge FFIs are reachable.
+    for sym in [
+        "nsl_tokenizer_encode",
+        "nsl_tokenizer_decode",
+        "nsl_cfie_tensor_to_tokens",
+        "nsl_cfie_tokens_to_tensor",
+    ] {
+        assert!(
+            !called.contains(sym),
+            "no tokenizer: key -> {sym} must not be emitted; called: {called:?}"
+        );
+    }
     assert!(!called.contains("nsl_serve_enqueue"));
 }
 

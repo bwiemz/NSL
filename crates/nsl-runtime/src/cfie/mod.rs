@@ -23,6 +23,7 @@
 //!     at `nsl_cfie_engine_finalize` and then launches per token
 //!     through cached handles (`engine.rs`).
 
+pub mod bridge;
 pub mod engine;
 pub mod ffi;
 pub mod kv_slots;

@@ -2380,15 +2380,21 @@ impl Compiler<'_> {
         // re-plumbed in v1 (documented).
         //
         // `prompt_tokens` (the endpoint's first param) was bound at serve
-        // init to the baked prompt HOST i64 ARRAY pointer, so we pass its
-        // value straight through as `prompt_ptr` — the runtime ABI is a
-        // host i64 array, NOT an f64 tokenizer tensor.
+        // init to the prompt HOST i64 ARRAY pointer — Cycle 12: the
+        // runtime-tokenizer-encoded buffer when tokenizer + prompt are
+        // configured (with a runtime select falling back to the baked
+        // ids), else the baked array — so we pass its value straight
+        // through as `prompt_ptr`.  The runtime ABI is a host i64 array,
+        // NOT an f64 tokenizer tensor.
         //
-        // v1 returns the generated token COUNT (i64) so the one-shot demo
-        // can `print(...)` a visible result.  Returning the decoded text
-        // would require an i64-token-buffer -> f64-tensor decode bridge
-        // that Cycle 11 does not add (documented deferral); the buffer at
-        // `out_ptr` holds the raw token ids for a future request loop.
+        // generate() returns the generated token COUNT (i64) — type
+        // stability with Cycle 11.  Cycle 12 adds the TEXT tail: when a
+        // tokenizer is configured, the emission below ALSO decodes the
+        // out-buffer (nsl_cfie_tokens_to_tensor -> nsl_tokenizer_decode)
+        // and prints the text to stdout.  The tail lives HERE (not in the
+        // endpoint epilogue) because `out_ptr`/`rc` are locals of this
+        // emission — the epilogue would need them re-plumbed through
+        // FuncState for zero benefit (documented decision).
         if func_name == "generate" {
             let Some(gen) = self.cfie_serve_gen.as_ref() else {
                 // OUTSIDE a CFIE serve context there is no bound model to
@@ -2410,6 +2416,10 @@ impl Compiler<'_> {
             let max_new_tokens = gen.max_new_tokens;
             let eos_token_id = gen.eos_token_id;
             let prompt_len = gen.prompt_len;
+            // Cycle 12 wiring (Values are Copy; snapshot before the
+            // mutable-borrow compiles below).
+            let prompt_len_val = gen.prompt_len_val;
+            let tok_handle = gen.tok_handle;
 
             // target_model (arg 0) is accepted for source compatibility;
             // compile it so any side effects hold, but the value is unused
@@ -2424,7 +2434,11 @@ impl Compiler<'_> {
             let alloc_bytes = builder.ins().iconst(cl_types::I64, max_new_tokens * 8);
             let out_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_bytes])?;
 
-            let v_prompt_len = builder.ins().iconst(cl_types::I64, prompt_len);
+            // Cycle 12: the prompt length is the serve-init-selected
+            // runtime value (tokenizer-encoded count with baked fallback)
+            // when present, else the baked compile-time constant.
+            let v_prompt_len = prompt_len_val
+                .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, prompt_len));
             let v_max_new = builder.ins().iconst(cl_types::I64, max_new_tokens);
             let v_eos = builder.ins().iconst(cl_types::I64, eos_token_id);
             // Fixed rng seed for the one-shot demo (deterministic output).
@@ -2443,6 +2457,55 @@ impl Compiler<'_> {
                     out_cap,
                 ],
             )?;
+
+            // Cycle 12 decode-and-print tail, emitted only when a
+            // tokenizer was loaded at serve init:
+            //   count = min(rc, out_cap)   // rc > cap means truncation;
+            //                              // rc < 0 (failure) flows into
+            //                              // tokens_to_tensor's count<=0
+            //                              // refusal -> tensor 0 -> skip
+            //   t = nsl_cfie_tokens_to_tensor(out_ptr, count)
+            //   if t != 0:
+            //       text = nsl_tokenizer_decode(tok, t); print; free both
+            // The branch is REQUIRED (not a select): decoding a null
+            // tensor would crash, and on a generate refusal the honest
+            // outcome is "no text printed" (the runtime already put the
+            // refusal on stderr).  Block plumbing mirrors the null-guard
+            // precedent in expr/access.rs (state.current_block sync).
+            if let Some(tok) = tok_handle {
+                let rc_over_cap =
+                    builder.ins().icmp(IntCC::SignedGreaterThan, rc, out_cap);
+                let count = builder.ins().select(rc_over_cap, out_cap, rc);
+                let out_tensor = self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_tokens_to_tensor",
+                    &[out_ptr, count],
+                )?;
+                let decode_blk = builder.create_block();
+                let merge_blk = builder.create_block();
+                let t_is_null = builder.ins().icmp_imm(IntCC::Equal, out_tensor, 0);
+                builder.ins().brif(t_is_null, merge_blk, &[], decode_blk, &[]);
+
+                builder.switch_to_block(decode_blk);
+                builder.seal_block(decode_blk);
+                state.current_block = Some(decode_blk);
+                let text = self.compile_call_by_name(
+                    builder,
+                    "nsl_tokenizer_decode",
+                    &[tok, out_tensor],
+                )?;
+                self.compile_call_by_name(builder, "nsl_print_str", &[text])?;
+                // Free the decode string + the bridge tensor on the only
+                // path that created text; the tensor is also freed here
+                // (the null branch never allocated one).
+                self.compile_call_by_name(builder, "nsl_string_free", &[text])?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[out_tensor])?;
+                builder.ins().jump(merge_blk, &[]);
+
+                builder.switch_to_block(merge_blk);
+                builder.seal_block(merge_blk);
+                state.current_block = Some(merge_blk);
+            }
             return Ok(rc);
         }
 
