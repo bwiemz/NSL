@@ -43,7 +43,7 @@
 
 #[path = "csha_reference.rs"]
 mod csha_reference;
-use csha_reference::{csha_reference_backward, CshaInputs, CshaShape, CshaGradients};
+use csha_reference::{csha_reference, csha_reference_backward, CshaInputs, CshaShape, CshaGradients};
 
 use std::ffi::CString;
 
@@ -158,8 +158,24 @@ fn run_fused_backward_config(
     block_q: u32, block_kv: u32, head_dim: u32, heads: u32, d_model: u32,
     causal: bool, rope_q: bool,
 ) -> Result<(CshaGradients /*gpu_as_f32*/, CshaGradients /*cpu*/), String> {
-    let batch = 1usize;
     let seq = (block_q as usize).max(block_kv as usize);
+    run_fused_backward_config_seq(block_q, block_kv, head_dim, heads, d_model, causal, rope_q, seq)
+}
+
+/// Seq-decoupled variant: `seq` may exceed the block sizes, exercising the
+/// multi-KV-tile / multi-q-block launch path (`q_blocks` outer loop in the
+/// backward FFI + the kernel's `V2_BWD_LOOP_KV` k_start sweep). The
+/// single-tile wrapper above pins `seq = max(block_q, block_kv)`.
+#[allow(clippy::too_many_arguments)]
+fn run_fused_backward_config_seq(
+    block_q: u32, block_kv: u32, head_dim: u32, heads: u32, d_model: u32,
+    causal: bool, rope_q: bool, seq: usize,
+) -> Result<(CshaGradients /*gpu_as_f32*/, CshaGradients /*cpu*/), String> {
+    let batch = 1usize;
+    assert!(
+        seq >= (block_q as usize).max(block_kv as usize),
+        "seq {seq} must cover at least one full block"
+    );
     let hd = head_dim as usize;
     let dm = d_model as usize;
     let h = heads as usize;
@@ -436,6 +452,38 @@ fn run_fused_backward_config(
     let qkv_elems = h * seq * hd;
     let dw_elems = dm * kv_dim;
     let dx_elems = h * seq * hd;
+
+    // Forward-parity diagnostic (multi-tile localization): per-q-block
+    // max_abs of GPU `out` vs the CPU reference forward. If blocks 1+ are
+    // garbage while block 0 matches, the defect is in the forward
+    // multi-q-block path, not the backward.
+    {
+        let gpu_out = read_f16(out_dev, qkv_elems);
+        let cpu_out = csha_reference(&inputs, &shape);
+        let bq = block_q as usize;
+        let mut per_block: Vec<f32> = Vec::new();
+        for qb in 0..seq.div_ceil(bq) {
+            let mut m = 0f32;
+            let r0 = qb * bq;
+            let r1 = ((qb + 1) * bq).min(seq);
+            for hh in 0..h {
+                for r in r0..r1 {
+                    for d in 0..hd {
+                        let i = (hh * seq + r) * hd + d;
+                        m = m.max((gpu_out[i] - cpu_out[i]).abs());
+                    }
+                }
+            }
+            per_block.push(m);
+        }
+        let blocks_str: Vec<String> =
+            per_block.iter().map(|m| format!("{m:.2e}")).collect();
+        eprintln!(
+            "  [fwd-parity] seq={seq} bq={bq} per-block out max_abs: [{}]",
+            blocks_str.join(", ")
+        );
+    }
+
     let gpu_grads = CshaGradients {
         dq: read_f16(dq_dev, qkv_elems),
         dk: read_f16(dk_dev, qkv_elems),
@@ -571,6 +619,57 @@ fn t6_3_hd64_block32_dv_probe() {
             wi / hd, wi % hd, gpu.dv[wi], cpu.dv[wi]
         );
     }
+}
+
+/// Multi-tile parity: seq = 4 blocks (128 rows at block=32), hd ∈ {32, 64},
+/// causal ∈ {0,1}. This is the launch-path class where the cycle-14..17
+/// "Path A RED" numbers (dk max_rel 21.46 etc.) were measured — but through
+/// the checkpoint-recompute harness, whose forward output was ~all-zero
+/// (nonzero≈1 block), so those numbers never reflected the kernel. This
+/// test runs the same class through THIS validated harness. Diagnostic:
+/// logs unconditionally; gates via the same NUMERICAL_GATE consts.
+#[test]
+#[ignore]
+fn t6_3_multitile_seq128() {
+    if !cuda_available() {
+        eprintln!("[multitile] skipping — no CUDA");
+        return;
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for hd in [32u32, 64u32] {
+        for causal in [false, true] {
+            let (gpu, cpu) =
+                match run_fused_backward_config_seq(32, 32, hd, 1, hd, causal, false, 128) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[multitile] hd={hd} causal={causal} LAUNCH FAILED: {e}");
+                        failures.push(format!("hd={hd} causal={causal}: launch: {e}"));
+                        continue;
+                    }
+                };
+            let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
+            let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
+            let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
+            let d_dwq = max_abs_diff(&gpu.dwq, &cpu.dwq);
+            let d_dwk = max_abs_diff(&gpu.dwk, &cpu.dwk);
+            let d_dwv = max_abs_diff(&gpu.dwv, &cpu.dwv);
+            let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
+            eprintln!(
+                "[multitile] seq=128 hd={hd} causal={} dq={d_dq:.3e} dk={d_dk:.3e} \
+                 dv={d_dv:.3e} dwq={d_dwq:.3e} dwk={d_dwk:.3e} dwv={d_dwv:.3e} dx={d_dx:.3e}",
+                causal as u8
+            );
+            let tol = tol_for_head_dim(hd);
+            if NUMERICAL_GATE_DQKV_ENABLED {
+                for (name, d) in [("dq", d_dq), ("dk", d_dk), ("dv", d_dv)] {
+                    if d >= tol {
+                        failures.push(format!("hd={hd} causal={causal}: {name}={d:.3e} > {tol:.1e}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "multitile failures:\n{}", failures.join("\n"));
 }
 
 /// Numerical sweep across (head_dim, causal, rope_q). One line per config

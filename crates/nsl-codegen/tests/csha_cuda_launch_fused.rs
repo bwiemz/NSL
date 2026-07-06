@@ -275,6 +275,7 @@ fn run_fused_config_dmodel(
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -606,6 +607,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
             rmsnorm_eps: 1e-5, d_model: 32,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -805,6 +807,7 @@ fn run_with_saves(
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -1178,6 +1181,7 @@ fn t4_csha_backward_ffi_smoke() {
             // Tier B.1 narrow-and-chunkify pre-pass not used here — keep
             // the in-kernel RMSNorm prologue active (default).
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }),
         checkpoint: None,
     };
@@ -1269,6 +1273,8 @@ fn t4_csha_backward_ffi_smoke() {
             // Tier B extension — null (no Tier B dispatch for this test).
             0i64, 0i64,
             // doc_starts ptr — null (no doc-aware RoPE for this test).
+            0i64,
+            // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
             0i64,
             // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
             // means legacy per-q-block topology.
