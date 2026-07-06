@@ -1817,10 +1817,15 @@ fn csha_backward_impl(
     // holding the four concatenated Tier B.2 backward entries
     // (`tier_b2_d_prepass`, `tier_b2_dq_kernel`, `tier_b2_dkdv_kernel`,
     // `tier_b2_proj_backward`) and they are launched in sequence, with a
-    // D = rowsum(dO*O) scratch buffer allocated for the intermediate. When 0
-    // (the default for all existing callers, including the wengert lowering
-    // until T7 computes the flag), behavior is byte-identical to the scalar
-    // single-kernel path below. Selection is an explicit flag rather than
+    // D = rowsum(dO*O) scratch buffer allocated for the intermediate. When 0,
+    // behavior is byte-identical to the scalar single-kernel path below.
+    // The wengert lowering COMPUTES this flag (Sprint 1 T7:
+    // compile-time-eligible AND seq_len == block_q, wengert_lower ~2088);
+    // note it is iconst(0) for every config the production training-config
+    // builder currently emits, because kernel.rs pins level=1 /
+    // active_heads=0 which the tier_b2 dispatch eligibility rejects — see
+    // the production-eligibility note in the campaign memory. Selection is
+    // an explicit flag rather than
     // kernel-name-suffix sniffing — the dispatch decision is made in codegen
     // (see `tier_b2_hybrid_backward_eligible`) and threaded here. See spec §7.
     tier_b2_active: i64,
@@ -2686,13 +2691,15 @@ fn csha_tier_b2_backward_launch(
     // slot (`csha_tensor_data_ptr(out_ptr)`); the standalone dQ/dK/dV gates feed
     // `fwd.o`. We source O from the same `out_ptr` slot here.
     //
-    // PARITY-GATE NOTE (T8): the wengert `FusedCshaBackward` lowering currently
-    // passes `null` for `out_ptr` (it does not retain O as an NslTensor handle).
-    // The production forward-save plumbing must thread O into this slot for the
-    // hybrid; this is the single launch-arg the parity gate (T8) must confirm.
-    // If O is null the D pre-pass yields D == 0 and the §8 zero-output guard
-    // FAILS — so a missing O cannot pass vacuously. (Today the branch is dormant
-    // — every caller passes tier_b2_active = 0 — so this is not yet exercised.)
+    // PARITY-GATE NOTE (T8, RESOLVED by Sprint 1 T1.1): the wengert
+    // `FusedCshaBackward` lowering now threads the forward O handle here —
+    // `CshaSavePointers.out` is populated at both forward call sites and
+    // passed in the `out_ptr` slot (wengert_lower ~2137). The tier_b2_active
+    // flag is likewise computed at lowering (~2088), though it is iconst(0)
+    // for the configs the production training-config builder currently
+    // emits (kernel.rs pins level=1 / active_heads=0). If O were null the
+    // D pre-pass would yield D == 0 and the §8 zero-output guard FAILS —
+    // so a missing O cannot pass vacuously.
     let o_for_prepass = csha_tensor_data_ptr(out_ptr);
 
     // D-scratch: D = rowsum(dO * O), f32, shape [batch, heads, seq_len].

@@ -107,6 +107,7 @@ extern "C" {
         tier_b_name_ptr: i64,
         doc_starts_ptr: i64,
         tier_b2_active: i64,
+        num_docs_or_zero: i64,
     ) -> i64;
 }
 
@@ -672,6 +673,7 @@ fn run_hybrid_backward_on_gpu(
             0, 0,             // tier_b_ptx_ptr, tier_b_name_ptr (sentinel: both 0)
             0,                // doc_starts_ptr
             1,                // tier_b2_active = 1 — HYBRID BRANCH
+            0,                // num_docs_or_zero — legacy per-q-block topology
         )
     };
 

@@ -520,6 +520,21 @@ fn run_fused_backward_config_seq(
     Ok((gpu_grads, cpu_grads))
 }
 
+/// Worst allclose excess: max over cells of |g-c| - rtol*|c|. A result
+/// < atol means every cell satisfies |g-c| < atol + rtol*|c| (the
+/// standard mixed absolute/relative gate). Used for the dW tensors,
+/// whose cells reach |2..4| where the f16 STORE quantum alone is ~2e-3
+/// — an absolute-only 5e-3 gate mis-fires on value-proportional
+/// quantization noise there (verified diffuse via the [dwk-top] dump:
+/// top excursions scatter across unrelated cells, all at max-magnitude
+/// values, rel err <= 2.6e-3).
+fn worst_allclose_excess(gpu: &[f32], cpu: &[f32], rtol: f32) -> f32 {
+    gpu.iter()
+        .zip(cpu.iter())
+        .map(|(&g, &c)| (g - c).abs() - rtol * c.abs())
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter())
         .map(|(&x, &y)| (x - y).abs())
@@ -575,6 +590,27 @@ fn t6_3_smoke_single_config() {
          dv={d_dv:.3e} dwq={d_dwq:.3e} dwk={d_dwk:.3e} dwv={d_dwv:.3e} dx={d_dx:.3e}"
     );
 
+    // dwk error-shape diagnostic: top-5 |gpu-cpu| cells with values, so a
+    // tolerance excursion can be classified as CONCENTRATED (systematic
+    // defect at specific cells) vs DIFFUSE (f16/approx-op noise near the
+    // gate boundary).
+    {
+        let mut cells: Vec<(usize, f32, f32, f32)> = gpu
+            .dwk
+            .iter()
+            .zip(cpu.dwk.iter())
+            .enumerate()
+            .map(|(i, (&g, &c))| (i, (g - c).abs(), g, c))
+            .collect();
+        cells.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (i, d, g, c) in cells.iter().take(5) {
+            eprintln!(
+                "  [dwk-top] idx={i} p={} j={} |d|={d:.3e} gpu={g:.4} cpu={c:.4}",
+                i / 32, i % 32
+            );
+        }
+    }
+
     let tol = tol_for_head_dim(32);
     if NUMERICAL_GATE_DQKV_ENABLED {
         assert!(d_dq < tol, "dq max_abs {d_dq:.3e} > tol {tol:.1e}");
@@ -582,9 +618,17 @@ fn t6_3_smoke_single_config() {
         assert!(d_dv < tol, "dv max_abs {d_dv:.3e} > tol {tol:.1e}");
     }
     if NUMERICAL_GATE_DW_ENABLED {
-        assert!(d_dwq < tol, "dwq max_abs {d_dwq:.3e} > tol {tol:.1e}");
-        assert!(d_dwk < tol, "dwk max_abs {d_dwk:.3e} > tol {tol:.1e}");
-        assert!(d_dwv < tol, "dwv max_abs {d_dwv:.3e} > tol {tol:.1e}");
+        // dW gates use the mixed atol+rtol form (see worst_allclose_excess):
+        // dW cells reach |2..4| where the f16 store quantum alone is ~2e-3,
+        // so an absolute-only 5e-3 gate mis-fires on value-proportional
+        // quantization noise (diagnosed diffuse via [dwk-top], not a defect).
+        let rtol = 5e-3f32;
+        let e_dwq = worst_allclose_excess(&gpu.dwq, &cpu.dwq, rtol);
+        let e_dwk = worst_allclose_excess(&gpu.dwk, &cpu.dwk, rtol);
+        let e_dwv = worst_allclose_excess(&gpu.dwv, &cpu.dwv, rtol);
+        assert!(e_dwq < tol, "dwq allclose excess {e_dwq:.3e} > atol {tol:.1e} (rtol {rtol:.0e})");
+        assert!(e_dwk < tol, "dwk allclose excess {e_dwk:.3e} > atol {tol:.1e} (rtol {rtol:.0e})");
+        assert!(e_dwv < tol, "dwv allclose excess {e_dwv:.3e} > atol {tol:.1e} (rtol {rtol:.0e})");
     }
     if NUMERICAL_GATE_DX_ENABLED {
         // dx tolerance includes an additional sqrt(D)·ε_f16 factor from the
@@ -813,9 +857,17 @@ fn t6_3_matrix_sweep_numerical() {
                     if dv >= tol { fails.push(format!("dv={dv:.2e}>{tol:.0e}")); }
                 }
                 if NUMERICAL_GATE_DW_ENABLED {
-                    if dwq >= tol { fails.push(format!("dwq={dwq:.2e}>{tol:.0e}")); }
-                    if dwk >= tol { fails.push(format!("dwk={dwk:.2e}>{tol:.0e}")); }
-                    if dwv >= tol { fails.push(format!("dwv={dwv:.2e}>{tol:.0e}")); }
+                    // Mixed atol+rtol gate for dW (see worst_allclose_excess):
+                    // |dW| cells reach 2..4 where the f16 store quantum is
+                    // ~2e-3, so absolute-only mis-fires on value-proportional
+                    // quantization noise.
+                    let rtol = 5e-3f32;
+                    let e_dwq = worst_allclose_excess(&gpu.dwq, &cpu.dwq, rtol);
+                    let e_dwk = worst_allclose_excess(&gpu.dwk, &cpu.dwk, rtol);
+                    let e_dwv = worst_allclose_excess(&gpu.dwv, &cpu.dwv, rtol);
+                    if e_dwq >= tol { fails.push(format!("dwq_excess={e_dwq:.2e}>{tol:.0e}")); }
+                    if e_dwk >= tol { fails.push(format!("dwk_excess={e_dwk:.2e}>{tol:.0e}")); }
+                    if e_dwv >= tol { fails.push(format!("dwv_excess={e_dwv:.2e}>{tol:.0e}")); }
                 }
                 if NUMERICAL_GATE_DX_ENABLED && dx >= dx_tol {
                     fails.push(format!("dx={dx:.2e}>{dx_tol:.0e}"));

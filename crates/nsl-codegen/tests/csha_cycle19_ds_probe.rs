@@ -1,6 +1,17 @@
 //! CSHA cycle 20 T1-followup — dS probe integration test.
 //!
-//! **STATUS: FFI PLUMBING LANDED (GPU-body #[ignore]d as GPU-required).**
+//! **STATUS: OBSOLETE 2026-07-04 - target bug DISSOLVED.** The
+//! "catastrophic dV/dS" investigation this probe was built to bisect
+//! was a TEST-HARNESS bug, not a kernel bug: csha_cuda_backward.rs
+//! launched the backward FFI with shared_mem_bytes = 0, so hd=64
+//! (dynamic-SMEM) kernels ran with a 0-byte shmem allocation and every
+//! tile access was out of bounds (fixed in commit b94ed20f; production
+//! always sized correctly via shared_mem_bytes_v2_backward in
+//! wengert_lower). The probes never executed on GPU. This file is
+//! retained for probe-infra ABI pinning (compile-time signature check
+//! below) and as the historical record of the probe machinery.
+//!
+//! **Original status: FFI PLUMBING LANDED (GPU-body #[ignore]d as GPU-required).**
 //!
 //! **What LANDED (c20 T1 + c20 T1-followup):**
 //!   * PTX-side probe emission — `phases/backward/probe.rs` module with
