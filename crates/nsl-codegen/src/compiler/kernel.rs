@@ -172,7 +172,7 @@ impl Compiler<'_> {
         let kernel_bytes = match target {
             GpuTarget::Cuda => {
                 // Original path: direct AST -> PTX
-                crate::kernel::KernelCompiler::compile(kernel, self.interner)
+                crate::kernel::KernelCompiler::compile(kernel, self.interner)?
             }
             GpuTarget::Fpga => {
                 // M57.1 §3.2: `nsl build --target fpga` parses successfully (parse_target
@@ -183,7 +183,7 @@ impl Compiler<'_> {
             }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
                 // M47b: AST -> KIR -> backend-specific lowerer
-                let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target);
+                let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target)?;
 
                 // Validate that the kernel's required features are supported by the target
                 let missing = target.features().missing(kir.required_features);
@@ -354,7 +354,7 @@ impl Compiler<'_> {
                     kernel,
                     self.interner,
                     constants,
-                )
+                )?
             }
             _ => {
                 // Non-CUDA: constant substitution not yet supported for KIR path.
@@ -448,7 +448,8 @@ impl Compiler<'_> {
         let ptx_generator = |variant: &crate::autotune::Variant| -> Result<String, String> {
             let const_map: HashMap<String, i64> = variant.iter().cloned().collect();
             let ptx_bytes =
-                crate::kernel::KernelCompiler::compile_with_constants(kernel, interner, &const_map);
+                crate::kernel::KernelCompiler::compile_with_constants(kernel, interner, &const_map)
+                    .map_err(|e| e.to_string())?;
             // Convert to string (PTX is null-terminated UTF-8)
             let ptx_str = String::from_utf8_lossy(&ptx_bytes).to_string();
             Ok(ptx_str)

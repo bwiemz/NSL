@@ -7,13 +7,15 @@
 //! batch; Gemini's review insists (correctly) that a production
 //! inference engine must accept new requests mid-stream.
 //!
-//! This module implements the missing piece:
+//! This module PLANS the missing piece (the runtime that executes it
+//! lives in `nsl-runtime::cfie`):
 //!
-//!   * a **lock-free ring buffer** in CPU-pinned memory that the host
-//!     pushes new requests into,
-//!   * a **GPU-side scheduler** that, at the top of every decode
-//!     loop iteration, checks the buffer and integrates any pending
-//!     requests into the active batch,
+//!   * a **request ring buffer** the host pushes new requests into (the
+//!     runtime ships a lock-free SPSC ring, though the shipped consumer
+//!     is still host-side — see `nsl-runtime::cfie`),
+//!   * a **scheduler descriptor** that, at the top of every decode loop
+//!     iteration, is meant to integrate pending requests into the active
+//!     batch (GPU-side on-device dequeue is the intended endpoint),
 //!   * a **feasibility analysis** that decides which CSHA fusion
 //!     level the persistent kernel can sustain on the target GPU.
 
@@ -89,7 +91,8 @@ pub struct PersistentModel {
     pub dtype_bytes: u32,
 }
 
-/// CPU → GPU ring-buffer descriptor (the lock-free request queue).
+/// Host → device ring-buffer descriptor (the request queue; the runtime
+/// ring is a lock-free SPSC structure, popped host-side today).
 #[derive(Debug, Clone, Serialize)]
 pub struct RingBuffer {
     /// Capacity in slots.  Must be a power of two so the GPU-side

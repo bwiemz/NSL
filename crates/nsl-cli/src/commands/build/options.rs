@@ -401,6 +401,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     mode: cpdt_mode,
                     cluster: cpdt_cluster.clone(),
                     report_requested: cpdt_report,
+                    moe_roofline_slack: 0.0,
                     plan_out: cpdt_plan_out.clone(),
                 },
                 // Normal `nsl build` never sets WRGA check-mode overrides;

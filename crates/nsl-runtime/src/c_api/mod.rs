@@ -839,8 +839,22 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
         let raw_data = view.data();
         capi_trace(format!("load_weight name={name} shape={shape:?}"));
 
-        // Convert to f32 (the standard NSL runtime format for loaded weights)
-        let f32_data = convert_weight_to_f32(view.dtype(), raw_data, len as usize);
+        // Convert to f32 (the standard NSL runtime format for loaded weights).
+        // Unsupported dtypes hard-error naming the tensor — the Err propagates
+        // to nsl_model_create, which does set_error + returns 0. Before bailing,
+        // free the tensors already allocated this call: they are not yet owned
+        // by any NslModel, so nothing else would ever reclaim them.
+        let f32_data = match convert_weight_to_f32(view.dtype(), raw_data, len as usize) {
+            Ok(d) => d,
+            Err(e) => {
+                for &ptr in &weight_ptrs {
+                    if ptr != 0 {
+                        crate::tensor::nsl_tensor_free(ptr);
+                    }
+                }
+                return Err(format!("tensor '{name}' in '{path}': {e}"));
+            }
+        };
 
         // Allocate NslTensor
         let data_size = (len as usize) * std::mem::size_of::<f32>();
@@ -875,42 +889,70 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
 }
 
 /// Convert raw weight bytes to f32 based on safetensors dtype.
+///
+/// Refuse-loudly: an unsupported dtype returns `Err` naming the dtype and the
+/// supported list instead of silently producing a zero-filled tensor (which
+/// corrupted model loads — the caller mapped the zeros into model weights).
 #[cfg(feature = "interop")]
-fn convert_weight_to_f32(dtype: safetensors::Dtype, data: &[u8], len: usize) -> Vec<f32> {
+fn convert_weight_to_f32(
+    dtype: safetensors::Dtype,
+    data: &[u8],
+    len: usize,
+) -> Result<Vec<f32>, String> {
     match dtype {
-        safetensors::Dtype::F32 => data
+        safetensors::Dtype::F32 => Ok(data
             .chunks_exact(std::mem::size_of::<f32>())
             .take(len)
             .map(|chunk| {
                 let bytes: [u8; 4] = chunk.try_into().expect("f32 chunks are 4 bytes");
                 f32::from_le_bytes(bytes)
             })
-            .collect(),
-        safetensors::Dtype::F64 => data
+            .collect()),
+        safetensors::Dtype::F64 => Ok(data
             .chunks_exact(std::mem::size_of::<f64>())
             .take(len)
             .map(|chunk| {
                 let bytes: [u8; 8] = chunk.try_into().expect("f64 chunks are 8 bytes");
                 f64::from_le_bytes(bytes) as f32
             })
-            .collect(),
-        safetensors::Dtype::F16 => data
+            .collect()),
+        safetensors::Dtype::F16 => Ok(data
             .chunks_exact(std::mem::size_of::<u16>())
             .take(len)
             .map(|chunk| {
                 let bytes: [u8; 2] = chunk.try_into().expect("f16 chunks are 2 bytes");
                 half::f16::from_bits(u16::from_le_bytes(bytes)).to_f32()
             })
-            .collect(),
-        safetensors::Dtype::BF16 => data
+            .collect()),
+        safetensors::Dtype::BF16 => Ok(data
             .chunks_exact(std::mem::size_of::<u16>())
             .take(len)
             .map(|chunk| {
                 let bytes: [u8; 2] = chunk.try_into().expect("bf16 chunks are 2 bytes");
                 half::bf16::from_bits(u16::from_le_bytes(bytes)).to_f32()
             })
-            .collect(),
-        _ => vec![0.0_f32; len], // unsupported dtype → zeros
+            .collect()),
+        // Integer weights convert to f32 (same semantics as the NSL builtin
+        // safetensors loader — keeps the two loaders' supported sets in sync).
+        safetensors::Dtype::I32 => Ok(data
+            .chunks_exact(std::mem::size_of::<i32>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk.try_into().expect("i32 chunks are 4 bytes");
+                i32::from_le_bytes(bytes) as f32
+            })
+            .collect()),
+        safetensors::Dtype::I64 => Ok(data
+            .chunks_exact(std::mem::size_of::<i64>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 8] = chunk.try_into().expect("i64 chunks are 8 bytes");
+                i64::from_le_bytes(bytes) as f32
+            })
+            .collect()),
+        other => Err(format!(
+            "unsupported dtype {other:?}; supported dtypes: F32, F64, F16, BF16, I32, I64"
+        )),
     }
 }
 
@@ -1400,5 +1442,132 @@ mod tests {
     fn nsl_model_get_weight_ptrs_null_returns_zero() {
         assert_eq!(nsl_model_get_weight_ptrs(0), 0);
         assert_eq!(nsl_model_get_num_weights(0), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Refuse-loudly: unsupported safetensors dtypes must fail the load naming
+    // the tensor — never silently zero-fill model weights. Interop-gated
+    // because `convert_weight_to_f32` / the real `load_safetensors_weights`
+    // only exist with `--features interop`.
+    // -----------------------------------------------------------------------
+
+    /// Write a temp .safetensors with one supported F32 tensor and one
+    /// unsupported U8 tensor; return the temp file handle (unique path).
+    #[cfg(feature = "interop")]
+    fn write_temp_safetensors_with_u8_tensor() -> tempfile::NamedTempFile {
+        use std::io::Write;
+
+        let good_bytes: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let good = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::F32,
+            vec![2],
+            &good_bytes,
+        )
+        .unwrap();
+        let bad_bytes = [1u8, 2, 3, 4];
+        let bad = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::U8,
+            vec![4],
+            &bad_bytes,
+        )
+        .unwrap();
+
+        let mut map = HashMap::new();
+        map.insert("layer.weight".to_string(), good);
+        map.insert("quant.blob".to_string(), bad);
+        let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&serialized).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
+    #[cfg(feature = "interop")]
+    #[test]
+    fn convert_weight_to_f32_unsupported_dtype_errors() {
+        let err = convert_weight_to_f32(safetensors::Dtype::U8, &[1u8, 2, 3], 3).unwrap_err();
+        assert!(err.contains("U8"), "error must name the dtype: {err}");
+        for supported in ["F32", "F64", "F16", "BF16"] {
+            assert!(
+                err.contains(supported),
+                "error must list supported dtype {supported}: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "interop")]
+    #[test]
+    fn load_safetensors_weights_unsupported_dtype_names_tensor() {
+        let tmp = write_temp_safetensors_with_u8_tensor();
+        let path = tmp.path().to_str().unwrap();
+
+        let err = load_safetensors_weights(path).unwrap_err();
+        assert!(err.contains("quant.blob"), "error must name the tensor: {err}");
+        assert!(err.contains("U8"), "error must name the dtype: {err}");
+        for supported in ["F32", "F64", "F16", "BF16"] {
+            assert!(
+                err.contains(supported),
+                "error must list supported dtype {supported}: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "interop")]
+    #[test]
+    fn nsl_model_create_unsupported_dtype_sets_error_and_returns_zero() {
+        let tmp = write_temp_safetensors_with_u8_tensor();
+        let path_c = std::ffi::CString::new(tmp.path().to_str().unwrap()).unwrap();
+
+        nsl_clear_error();
+        let model_ptr = nsl_model_create(path_c.as_ptr() as i64);
+        assert_eq!(model_ptr, 0, "model create must fail for unsupported dtype");
+
+        let err_ptr = nsl_get_last_error();
+        assert_ne!(err_ptr, 0);
+        let err = unsafe {
+            CStr::from_ptr(err_ptr as *const c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(err.contains("quant.blob"), "error must name the tensor: {err}");
+        assert!(err.contains("U8"), "error must name the dtype: {err}");
+        nsl_clear_error();
+    }
+
+    /// I32/I64 checkpoints load via the C-API path (parity with the NSL builtin
+    /// safetensors loader, which already supported them).
+    #[cfg(feature = "interop")]
+    #[test]
+    fn convert_weight_to_f32_supports_i32_i64() {
+        let i32_bytes = (-3i32).to_le_bytes();
+        let i32_out = convert_weight_to_f32(safetensors::Dtype::I32, &i32_bytes, 1).unwrap();
+        assert_eq!(i32_out, vec![-3.0f32]);
+
+        let i64_bytes = 7i64.to_le_bytes();
+        let i64_out = convert_weight_to_f32(safetensors::Dtype::I64, &i64_bytes, 1).unwrap();
+        assert_eq!(i64_out, vec![7.0f32]);
+
+        // The refusal list now advertises I32/I64 too.
+        let err = convert_weight_to_f32(safetensors::Dtype::U8, &[0u8], 1).unwrap_err();
+        for supported in ["F32", "F64", "F16", "BF16", "I32", "I64"] {
+            assert!(err.contains(supported), "error must list {supported}: {err}");
+        }
+    }
+
+    /// The mid-loop refusal frees the tensors allocated for earlier entries
+    /// (they are not yet owned by any NslModel). Calling twice would abort on a
+    /// double-free if the cleanup were wrong, so a clean second failure pins the
+    /// no-leak / no-double-free error path.
+    #[cfg(feature = "interop")]
+    #[test]
+    fn load_safetensors_weights_error_path_is_clean_and_repeatable() {
+        let tmp = write_temp_safetensors_with_u8_tensor();
+        let path = tmp.path().to_str().unwrap();
+
+        for _ in 0..2 {
+            let err = load_safetensors_weights(path).unwrap_err();
+            assert!(err.contains("quant.blob"), "error must name the tensor: {err}");
+        }
     }
 }

@@ -324,6 +324,50 @@ pub fn comm_optim_us(
     (comm_us, optim_us)
 }
 
+/// Communication + optimizer-step latency (μs) for a layer under an explicit
+/// ZeRO **stage** (audit gap #6), where parameters/gradients/optimizer state
+/// carry independent shard factors.
+///
+/// Higher stages move more data over the interconnect but need less HBM for the
+/// optimizer step — the memory/comm trade-off the Level-1 DP weighs. Each tensor
+/// sharded beyond DDP needs one collective proportional to `2·param·(N-1)/N`:
+/// gradient reduce-scatter at stage ≥ 2 and parameter all-gather at stage 3
+/// (full FSDP does both). Optimizer-state sharding adds no collective (the Adam
+/// update is local once the gradient is reduced) but scales its HBM traffic by
+/// `1/shard_optim`. Coarse heuristic, consistent with [`comm_optim_us`] (the
+/// repo has no measured collective-latency oracle); at stage 0 it returns the
+/// same *cost* `(0, 6·param/1)` as the legacy unsharded path. (The *memory*
+/// model differs: [`resident_training_bytes_sharded`] additionally counts
+/// gradient memory, so a staged stage-0 layer is `4·param` where the legacy
+/// [`resident_training_bytes`] is `3·param` — the staged path is the more
+/// physically faithful accounting.)
+///
+/// The heuristic omits DDP's own baseline gradient all-reduce, so stage 0 shows
+/// zero comm; consequently stage 1 (optimizer-state sharding) strictly dominates
+/// stage 0 whenever `num_gpus > 1` — the expected "ZeRO-1 is near-free" property,
+/// not a modeling error.
+pub fn zero_stage_costs(
+    param_bytes: u64,
+    shard_param: u32,
+    shard_grad: u32,
+    shard_optim: u32,
+    interconnect_gbs: f64,
+    gpu: &GpuSpec,
+) -> (f64, f64) {
+    let cluster = shard_param.max(shard_grad).max(shard_optim).max(1);
+    let sharded_collectives = (shard_grad > 1) as u32 + (shard_param > 1) as u32;
+    let comm_us = if cluster <= 1 || sharded_collectives == 0 {
+        0.0
+    } else {
+        let s = cluster as f64;
+        let bytes = 2.0 * param_bytes as f64 * (s - 1.0) / s * sharded_collectives as f64;
+        bytes / (interconnect_gbs.max(1.0) * 1e9) * 1e6
+    };
+    let optim_bytes = 6.0 * param_bytes as f64 / (shard_optim.max(1) as f64);
+    let optim_us = optim_bytes / (gpu.peak_bandwidth_gbs.max(1.0) * 1e9) * 1e6;
+    (comm_us, optim_us)
+}
+
 /// Optimizer-step latency (μs) for one layer — **precision- and FASE-aware**.
 ///
 /// Adam's update is HBM-bandwidth-bound: each step streams the master
@@ -414,6 +458,34 @@ pub fn resident_training_bytes(
 ) -> u64 {
     let sharded = param_bytes.saturating_add(optimizer_state_bytes) / (shard.max(1) as u64);
     sharded.saturating_add(activation_bytes)
+}
+
+/// Per-GPU resident training memory with each ZeRO component sharded
+/// *independently* (audit gap #6): parameters, gradients, and optimizer state
+/// carry their own shard factors, while activations are never sharded.
+///
+/// ```text
+/// param/shard_param + grad/shard_grad + optimizer_state/shard_optim + activation
+/// ```
+///
+/// This is the faithful counterpart to [`resident_training_bytes`] (which shards
+/// `param + optimizer_state` by a single factor and omits gradient memory).
+/// The Level-1 DP drives it from a [`crate::wggo_dp::ZeroStage`] whose nested
+/// chain supplies the three factors, so each stage is a genuinely distinct
+/// memory point.  `shard == 0` is treated as `1`.
+pub fn resident_training_bytes_sharded(
+    param_bytes: u64,
+    grad_bytes: u64,
+    optimizer_state_bytes: u64,
+    activation_bytes: u64,
+    shard_param: u32,
+    shard_grad: u32,
+    shard_optim: u32,
+) -> u64 {
+    let p = param_bytes / (shard_param.max(1) as u64);
+    let g = grad_bytes / (shard_grad.max(1) as u64);
+    let o = optimizer_state_bytes / (shard_optim.max(1) as u64);
+    p.saturating_add(g).saturating_add(o).saturating_add(activation_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +615,29 @@ mod tests {
             let legacy = 3u64 * p / (s as u64) + a;
             assert_eq!(resident_training_bytes(p, 2 * p, a, s), legacy);
         }
+    }
+
+    #[test]
+    fn resident_training_bytes_sharded_shards_each_component() {
+        // param=1000, grad=1000, optim=2000, activation=500, N=4. The ZeRO
+        // stages shard progressively more, so per-GPU memory strictly decreases.
+        let r0 = resident_training_bytes_sharded(1000, 1000, 2000, 500, 1, 1, 1); // stage 0
+        let r1 = resident_training_bytes_sharded(1000, 1000, 2000, 500, 1, 1, 4); // stage 1: optim
+        let r2 = resident_training_bytes_sharded(1000, 1000, 2000, 500, 1, 4, 4); // stage 2: + grad
+        let r3 = resident_training_bytes_sharded(1000, 1000, 2000, 500, 4, 4, 4); // stage 3: + param
+        assert_eq!(r0, 1000 + 1000 + 2000 + 500); // 4500
+        assert_eq!(r1, 1000 + 1000 + 500 + 500); //  3000
+        assert_eq!(r2, 1000 + 250 + 500 + 500); //   2250
+        assert_eq!(r3, 250 + 250 + 500 + 500); //    1500
+        assert!(r0 > r1 && r1 > r2 && r2 > r3, "nested chain ⇒ strictly less memory");
+        // Activations are never sharded.
+        assert_eq!(
+            resident_training_bytes_sharded(1000, 1000, 2000, 900, 4, 4, 4)
+                - resident_training_bytes_sharded(1000, 1000, 2000, 500, 4, 4, 4),
+            400
+        );
+        // shard == 0 is treated as 1 (never divide by zero).
+        assert_eq!(resident_training_bytes_sharded(1000, 1000, 2000, 500, 0, 0, 0), 4500);
     }
 
     #[test]

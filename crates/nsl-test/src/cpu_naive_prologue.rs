@@ -6,6 +6,7 @@
 //! can be cross-checked against an INDEPENDENT bit-for-bit reference of the
 //! same arithmetic order:
 //!
+//! ```text
 //!     x_norm = RMSNorm(x, weight=norm_weight, eps)
 //!     q_proj = x_norm @ W_q
 //!     k_proj = x_norm @ W_k
@@ -13,6 +14,7 @@
 //!     RoPE(q_proj, cos, sin)         (RopeStyle::Adjacent)
 //!     RoPE(k_proj, cos, sin)         (RopeStyle::Adjacent)
 //!     // v_proj is NOT rotated — RoPE is Q/K only.
+//! ```
 //!
 //! Returns `(q_proj, k_proj, v_proj)` all post-RoPE (V is post-pass-through —
 //! no RoPE applied, just the projection), each as row-major `[seq, kv_dim]`
@@ -20,8 +22,10 @@
 //! `emit_rope_pair_sweep` byte-for-byte (RopeStyle::Adjacent, GPT-NeoX layout,
 //! pairs `(x[2k], x[2k+1])` — NOT half-split):
 //!
+//! ```text
 //!     new_x[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
 //!     new_x[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
+//! ```
 //!
 //! See `csha_reference.rs::apply_rope` for the dual-purpose reference in
 //! `nsl-codegen/tests/`; this file is the standalone version that can be

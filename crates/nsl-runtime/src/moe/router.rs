@@ -3,6 +3,14 @@ pub struct CpuRoutingResult {
     pub expert_indices: Vec<i32>,
     pub expert_weights: Vec<f32>,
     pub sorted_token_indices: Vec<i32>,
+    /// Per-sorted-position routing weight. Length == `total_assigned`,
+    /// aligned with `sorted_token_indices`. For each surviving assignment
+    /// `i`, this is the (re-normalized) softmax probability the routed
+    /// token gave the expert it was placed under. Downstream consumers
+    /// pass this directly to `dispatch::gather_tokens` for the
+    /// gating-weight broadcast (sum-of-weights == 1.0 per token when no
+    /// capacity drop occurs).
+    pub sorted_assignment_weights: Vec<f32>,
     pub expert_boundaries: Vec<i32>,
     pub total_assigned: i64,
     pub importance_loss: f32,
@@ -75,11 +83,17 @@ pub fn route_topk(
     let total_assigned = offset as i64;
 
     let mut sorted_token_indices = vec![0i32; total_assigned as usize];
+    let mut sorted_assignment_weights = vec![0.0f32; total_assigned as usize];
     let mut write_pos = vec![0usize; num_experts];
     for (i, assignment) in assignment_to_expert.iter().enumerate() {
         if let Some(expert) = *assignment {
             let pos = expert_boundaries[expert] as usize + write_pos[expert];
             sorted_token_indices[pos] = (i / top_k) as i32;
+            // expert_weights is indexed by the original assignment index `i`
+            // (length total_tokens * top_k). Re-aligning by sorted position
+            // here lets the gather pipeline broadcast gating weights
+            // without re-deriving (token, k-slot) -> assignment-index.
+            sorted_assignment_weights[pos] = expert_weights[i];
             write_pos[expert] += 1;
         }
     }
@@ -96,6 +110,7 @@ pub fn route_topk(
         expert_indices,
         expert_weights,
         sorted_token_indices,
+        sorted_assignment_weights,
         expert_boundaries,
         total_assigned,
         importance_loss,
@@ -158,6 +173,77 @@ mod tests {
         assert!(aux_loss_imb > aux_loss_bal,
             "imbalanced loss ({}) should be greater than balanced loss ({})",
             aux_loss_imb, aux_loss_bal);
+    }
+
+    #[test]
+    fn sorted_assignment_weights_topk1_equals_per_token_softmax() {
+        // top_k=1: each token contributes exactly one assignment with weight 1.0
+        // (single-element softmax always normalizes to 1.0 inside route_topk).
+        let logits: Vec<f32> = vec![
+            1.0, 2.0, 0.5,
+            3.0, 0.1, 0.2,
+            0.1, 0.2, 4.0,
+            0.5, 5.0, 0.3,
+        ];
+        let result = route_topk(&logits, 4, 3, 1, 2.0);
+        assert_eq!(result.sorted_assignment_weights.len(), result.total_assigned as usize);
+        for &w in &result.sorted_assignment_weights {
+            assert!((w - 1.0).abs() < 1e-5, "top_k=1 weight should re-normalize to 1.0, got {}", w);
+        }
+    }
+
+    #[test]
+    fn sorted_assignment_weights_topk2_sum_per_token_equals_one() {
+        // top_k=2: route_topk re-normalizes so the surviving pair sums to 1.0
+        // per token. After sorting by expert, summing the weights for both
+        // assignments of the same original token must still equal 1.0.
+        let logits: Vec<f32> = vec![
+            1.0, 5.0, 3.0, 0.1,
+            4.0, 0.1, 0.2, 3.0,
+            0.1, 0.2, 0.3, 6.0,
+        ];
+        let total_tokens = 3;
+        let result = route_topk(&logits, total_tokens, 4, 2, 2.0);
+        // For each token, accumulate the routing weight from every sorted
+        // position that came from that token. With no capacity drop the sum
+        // must be 1.0 (within softmax precision).
+        let mut per_token_sums = vec![0.0f32; total_tokens];
+        for (pos, &tok) in result.sorted_token_indices.iter().enumerate() {
+            per_token_sums[tok as usize] += result.sorted_assignment_weights[pos];
+        }
+        for (t, &s) in per_token_sums.iter().enumerate() {
+            assert!((s - 1.0).abs() < 1e-5, "token {} weights should sum to 1.0, got {}", t, s);
+        }
+    }
+
+    #[test]
+    fn sorted_assignment_weights_aligned_with_sorted_token_indices() {
+        // Cross-check: sorted_assignment_weights[pos] must equal
+        // expert_weights[original_assignment_index] where the original index
+        // is t * top_k + k (k being which top-k slot landed token t in
+        // sorted_token_indices[pos]'s expert). Verifies the i/top_k mapping
+        // is consistent.
+        let logits: Vec<f32> = vec![
+            1.0, 5.0, 3.0, 0.1,
+            4.0, 0.1, 0.2, 3.0,
+            0.1, 0.2, 0.3, 6.0,
+        ];
+        let result = route_topk(&logits, 3, 4, 2, 2.0);
+        for (pos, &tok) in result.sorted_token_indices.iter().enumerate() {
+            let t = tok as usize;
+            let sorted_w = result.sorted_assignment_weights[pos];
+            // The two candidate weights for this token were stored at
+            // expert_weights[t * 2 + 0..2]. Sorted-weight must match one of
+            // them (we don't know which slot survived if both went to
+            // different experts that may overflow capacity differently).
+            let w0 = result.expert_weights[t * 2];
+            let w1 = result.expert_weights[t * 2 + 1];
+            assert!(
+                (sorted_w - w0).abs() < 1e-6 || (sorted_w - w1).abs() < 1e-6,
+                "sorted weight {} at pos {} (tok {}) must match one of original weights ({}, {})",
+                sorted_w, pos, t, w0, w1
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,9 @@ pub(crate) fn alloc_c_string(s: &str) -> *mut u8 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: convert safetensors dtype bytes → Vec<f32>
 // ─────────────────────────────────────────────────────────────────────────────
-pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32> {
+/// Refuse-loudly: an unsupported dtype returns `Err` naming the dtype and the
+/// supported list instead of silently producing zeros (which corrupted loads).
+pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Result<Vec<f32>, String> {
     match dtype {
         safetensors::Dtype::F32 => {
             // Interpret bytes directly as f32
@@ -33,7 +35,7 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
                 let bytes: [u8; 4] = data[i * 4..(i + 1) * 4].try_into().unwrap();
                 out.push(f32::from_le_bytes(bytes));
             }
-            out
+            Ok(out)
         }
         safetensors::Dtype::F64 => {
             let count = data.len() / 8;
@@ -43,7 +45,7 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
                 let v = f64::from_le_bytes(bytes);
                 out.push(v as f32);
             }
-            out
+            Ok(out)
         }
         safetensors::Dtype::F16 => {
             let count = data.len() / 2;
@@ -53,7 +55,7 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
                 let v = half::f16::from_le_bytes(bytes);
                 out.push(f32::from(v));
             }
-            out
+            Ok(out)
         }
         safetensors::Dtype::BF16 => {
             let count = data.len() / 2;
@@ -63,7 +65,7 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
                 let v = half::bf16::from_le_bytes(bytes);
                 out.push(f32::from(v));
             }
-            out
+            Ok(out)
         }
         safetensors::Dtype::I32 => {
             let count = data.len() / 4;
@@ -73,7 +75,7 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
                 let v = i32::from_le_bytes(bytes);
                 out.push(v as f32);
             }
-            out
+            Ok(out)
         }
         safetensors::Dtype::I64 => {
             let count = data.len() / 8;
@@ -83,12 +85,12 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
                 let v = i64::from_le_bytes(bytes);
                 out.push(v as f32);
             }
-            out
+            Ok(out)
         }
-        other => {
-            eprintln!("[nsl] safetensors_load: unsupported dtype {:?}, treating as zeros", other);
-            Vec::new()
-        }
+        other => Err(format!(
+            "unsupported dtype {:?}; supported dtypes: F32, F64, F16, BF16, I32, I64",
+            other
+        )),
     }
 }
 
@@ -195,13 +197,20 @@ pub extern "C" fn nsl_safetensors_load(path_ptr: i64, path_len: i64, device: i64
             shape_usize.iter().map(|&d| d as i64).product()
         };
 
-        let f32_data = convert_to_f32(view.dtype(), view.data());
-
-        // Pad / handle empty tensors gracefully
-        let f32_data = if f32_data.is_empty() && len > 0 {
-            vec![0f32; len as usize]
-        } else {
-            f32_data
+        // Refuse-loudly: never zero-fill an unsupported dtype (silently corrupt
+        // model loads). Matches the abort convention of the other error paths
+        // above. NOTE: no zero-pad fallback is needed for supported dtypes —
+        // SafeTensors::deserialize validates buffer length against dtype/shape,
+        // so `convert_to_f32` output length always matches `len` on success.
+        let f32_data = match convert_to_f32(view.dtype(), view.data()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "[nsl] safetensors_load: tensor '{}' in '{}': {}",
+                    name, path, e
+                );
+                std::process::abort();
+            }
         };
 
         let nsl_tensor = allocate_f32_tensor(&f32_data, &shape_usize, ndim, len, device as u8);
@@ -497,5 +506,38 @@ mod tests {
         assert_eq!(ta2.len, 3);
         let v = unsafe { *ta2.data_f32().add(0) };
         assert!((v - 1.0f32).abs() < 1e-5, "a[0] should be 1.0, got {v}");
+    }
+
+    // ── test 4 ──────────────────────────────────────────────────────────────
+    // Refuse-loudly: unsupported dtypes must return Err naming the dtype and
+    // the supported list — never silently produce zeros. The FFI wrapper's
+    // abort path is intentionally not exercised in-process (same as the file's
+    // other abort paths); the Result-returning helper carries the contract.
+    #[test]
+    fn test_convert_to_f32_unsupported_dtype_errors() {
+        let err = convert_to_f32(safetensors::Dtype::U8, &[1u8, 2, 3]).unwrap_err();
+        assert!(err.contains("U8"), "error must name the dtype: {err}");
+        for supported in ["F32", "F64", "F16", "BF16", "I32", "I64"] {
+            assert!(
+                err.contains(supported),
+                "error must list supported dtype {supported}: {err}"
+            );
+        }
+
+        let err_bool = convert_to_f32(safetensors::Dtype::BOOL, &[0u8, 1]).unwrap_err();
+        assert!(err_bool.contains("BOOL"), "error must name the dtype: {err_bool}");
+    }
+
+    // ── test 5 ──────────────────────────────────────────────────────────────
+    #[test]
+    fn test_convert_to_f32_supported_dtypes_ok() {
+        let f32_out = convert_to_f32(safetensors::Dtype::F32, &1.5f32.to_le_bytes()).unwrap();
+        assert_eq!(f32_out, vec![1.5f32]);
+
+        let i32_out = convert_to_f32(safetensors::Dtype::I32, &(-3i32).to_le_bytes()).unwrap();
+        assert_eq!(i32_out, vec![-3.0f32]);
+
+        let i64_out = convert_to_f32(safetensors::Dtype::I64, &7i64.to_le_bytes()).unwrap();
+        assert_eq!(i64_out, vec![7.0f32]);
     }
 }

@@ -106,6 +106,39 @@ pub fn emit_mask_global(dfa: &CompiledDfa) -> String {
     p
 }
 
+/// Splice the initialized mask fragment into a sampler module (CFIE
+/// Cycle 6): the fragment is inserted on its own lines immediately
+/// after the `.address_size` directive — the last line of the module
+/// header, before any `.shared` / `.visible .entry` declarations — so
+/// the loaded module carries the mask data and the host can resolve
+/// [`MASK_GLOBAL_NAME`] with `cuModuleGetGlobal` at engine finalize.
+///
+/// Panics when `sampler_ptx` has no `.address_size` line: splicing
+/// module-scope data into a headerless fragment would produce invalid
+/// PTX, and every NSL emitter writes the three-line header.
+pub fn splice_mask_into_module(sampler_ptx: &str, mask_fragment: &str) -> String {
+    assert!(
+        sampler_ptx
+            .lines()
+            .any(|l| l.trim_start().starts_with(".address_size")),
+        "sampler module has no .address_size directive to splice after"
+    );
+    let mut out = String::with_capacity(sampler_ptx.len() + mask_fragment.len() + 1);
+    let mut spliced = false;
+    for line in sampler_ptx.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !spliced && line.trim_start().starts_with(".address_size") {
+            out.push_str(mask_fragment);
+            if !mask_fragment.ends_with('\n') {
+                out.push('\n');
+            }
+            spliced = true;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -230,5 +263,93 @@ mod tests {
             live_transitions: 0,
         };
         let _ = emit_mask_global(&dfa);
+    }
+
+    // ── Cycle 6: splice into a sampler module ────────────────────────
+
+    #[test]
+    fn splice_inserts_fragment_after_address_size_before_entry() {
+        let dfa = sequence_dfa(&[1, 2], 64);
+        let frag = emit_mask_global(&dfa);
+        let module = ".version 8.4\n.target sm_90\n.address_size 64\n\n\
+                      .shared .align 4 .b8 smem[16];\n\n\
+                      .visible .entry k()\n{\n    ret;\n}\n";
+        let out = splice_mask_into_module(module, &frag);
+        let addr = out.find(".address_size 64").unwrap();
+        let mask = out.find("nsl_cfie_grammar_mask").unwrap();
+        let entry = out.find(".visible .entry").unwrap();
+        assert!(addr < mask && mask < entry, "mask must sit in module scope");
+        // The fragment starts on its own line directly after the header.
+        let after_addr = &out[addr..];
+        let line_end = after_addr.find('\n').unwrap();
+        assert!(after_addr[line_end + 1..]
+            .starts_with(".global .align 1 .b8 nsl_cfie_grammar_mask["));
+        // Nothing from the original module is lost or reordered.
+        assert!(out.contains(".shared .align 4 .b8 smem[16];"));
+        assert!(out.ends_with("{\n    ret;\n}\n"));
+        assert!(out.bytes().all(|b| b < 128), "PTX must stay ASCII-only");
+    }
+
+    #[test]
+    fn splice_is_pure_concatenation_of_module_and_fragment() {
+        // Both inputs newline-terminated => output length is exactly
+        // the sum (no dropped or duplicated lines).
+        let dfa = sequence_dfa(&[3], 32);
+        let frag = emit_mask_global(&dfa);
+        let module = ".version 7.0\n.target sm_80\n.address_size 64\n\
+                      .visible .entry k()\n{\n    ret;\n}\n";
+        let out = splice_mask_into_module(module, &frag);
+        assert_eq!(out.len(), module.len() + frag.len());
+    }
+
+    #[test]
+    #[should_panic(expected = ".address_size")]
+    fn splice_refuses_module_without_address_size() {
+        let dfa = sequence_dfa(&[1], 8);
+        let _ = splice_mask_into_module(".version 8.4\n.target sm_90\n", &emit_mask_global(&dfa));
+    }
+
+    // ── ptxas validation (skips silently when no validator present) ──
+
+    #[test]
+    fn ptxas_validates_spliced_sampler_module() {
+        use crate::cfie_fused_sample::{emit_program, LmHeadShape, SamplingParams};
+        use crate::cfie_sample_ptx::{emit as emit_sampler, FusedSampleKernelConfig};
+
+        let dfa = sequence_dfa(&[5, 7, 3], 256);
+        let params = SamplingParams {
+            grammar_masked: true,
+            top_k: 8,
+            ..Default::default()
+        };
+        let shape = LmHeadShape {
+            d_model: 64,
+            vocab_size: 256,
+            vocab_tile: 128,
+            dtype_bytes: 2,
+        };
+        let program = emit_program(params, shape);
+        let cfg = FusedSampleKernelConfig {
+            d_model: 64,
+            vocab_size: 256,
+            vocab_tile: 128,
+            top_k: 8,
+            sm_version: 80,
+            grammar_states: dfa.num_states,
+        };
+        let (sampler, _) = emit_sampler(&program, &cfg);
+        let spliced = splice_mask_into_module(&sampler, &emit_mask_global(&dfa));
+        assert!(spliced.contains("nsl_cfie_grammar_mask["));
+        match crate::ptxas_validation::validate_ptx(&spliced) {
+            Ok(()) => {}
+            Err(msg) if msg.contains("nvcc not available") => {
+                eprintln!(
+                    "[skip] cfie grammar-splice ptxas validation - no validator: {msg}"
+                );
+            }
+            Err(msg) => panic!(
+                "spliced sampler module rejected by ptxas:\n{msg}\n\nEmitted PTX:\n{spliced}"
+            ),
+        }
     }
 }

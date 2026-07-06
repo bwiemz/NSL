@@ -1010,7 +1010,7 @@ pub fn emit_prologue_recompute_from_raw(
         "    {{ // Cycle-14 prologue-recompute reg scope ({namespace_suffix})\n"
     ));
     ptx.push_str("    .reg .u64 %rd_x_raw_ptr;\n");
-    ptx.push_str(&format!("    .reg .pred %p_xraw_null;\n"));
+    ptx.push_str("    .reg .pred %p_xraw_null;\n");
     ptx.push_str(&format!(
         "    .reg .pred %p_row_active{namespace_suffix};\n"
     ));
@@ -1253,9 +1253,7 @@ fn emit_one_recompute_matmul(
                 ));
                 ptx.push_str("    cvt.f32.f16 %f_rc_x, %h_rc_x;\n");
                 // Weight: W[p, j_global] = weight_base + (p*kv_dim + j_global)*2
-                ptx.push_str(&format!(
-                    "    mul.lo.u64 %rd_rc_wo, %rd_rc_jg, 2; // j_global*2 base\n"
-                ));
+                ptx.push_str("    mul.lo.u64 %rd_rc_wo, %rd_rc_jg, 2; // j_global*2 base\n");
                 // Add p*kv_dim*2 (constant per p)
                 ptx.push_str(&format!(
                     "    add.u64 %rd_rc_wo, %rd_rc_wo, {}; // + p*kv_dim*2\n",

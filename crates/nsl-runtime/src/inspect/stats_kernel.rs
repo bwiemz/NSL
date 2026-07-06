@@ -2,9 +2,11 @@
 //!
 //! Writes `[mean, std, min, max, nan_count, inf_count]` into `out_buf`.
 //!
-//! Phase 5 ship-fast: host-side loop over CPU-resident tensors. GPU tensors
-//! currently return an error (rc=3); a follow-up PR will fuse into a single
-//! PTX kernel launched on the inspect stream.
+//! Host-side loop over CPU-resident tensors. GPU-resident tensors are staged
+//! device-to-host (`nsl_tensor_contiguous` -> `nsl_tensor_to_device(_, 0)`)
+//! and then run through the same CPU reduction, so both devices share one
+//! set of NaN/Inf-skipping, sample-std semantics. Without the `cuda` feature
+//! the GPU path refuses (rc=3) with a zeroed buffer.
 
 use crate::tensor::{NslTensor, DTYPE_F32, DTYPE_F64};
 
@@ -16,12 +18,18 @@ pub extern "C" fn nsl_tensor_stats(t: i64, out_buf: *mut f64) -> i32 {
     if out_buf.is_null() {
         return 1;
     }
+    // Zero-fill every slot up front: codegen at `@inspect` sites ignores the
+    // return code, so any error path below must leave zeroed records in the
+    // .stats.bin file rather than uninitialized stack garbage.
+    unsafe {
+        std::ptr::write_bytes(out_buf, 0, 6);
+    }
     if t == 0 {
         return 2;
     }
     let tensor = NslTensor::from_ptr(t);
 
-    match compute_stats(tensor) {
+    match compute_stats(t, tensor) {
         Ok(stats) => {
             unsafe {
                 out_buf.add(0).write(stats[0]); // mean
@@ -37,8 +45,8 @@ pub extern "C" fn nsl_tensor_stats(t: i64, out_buf: *mut f64) -> i32 {
     }
 }
 
-fn compute_stats(t: &NslTensor) -> Result<[f64; 6], &'static str> {
-    let host_data = read_host_f64(t)?;
+fn compute_stats(handle: i64, t: &NslTensor) -> Result<[f64; 6], &'static str> {
+    let host_data = read_host_f64(handle, t)?;
     if host_data.is_empty() {
         return Ok([0.0; 6]);
     }
@@ -98,12 +106,50 @@ fn compute_stats(t: &NslTensor) -> Result<[f64; 6], &'static str> {
 
 /// Read all tensor elements as `f64`, converting from the underlying dtype.
 ///
-/// Supports CPU-resident f64 / f32 tensors. GPU tensors and non-float dtypes
-/// return `Err` for now.
-pub(crate) fn read_host_f64(t: &NslTensor) -> Result<Vec<f64>, &'static str> {
+/// CPU-resident f64 / f32 tensors are read directly. GPU-resident tensors are
+/// staged to the host first (see `read_gpu_f64`); without the `cuda` feature
+/// they refuse with `Err`. Non-float dtypes return `Err`.
+pub(crate) fn read_host_f64(handle: i64, t: &NslTensor) -> Result<Vec<f64>, &'static str> {
     if t.device > 0 {
-        return Err("GPU tensor host-read not implemented (Phase 5 ship-fast)");
+        #[cfg(feature = "cuda")]
+        {
+            return read_gpu_f64(handle);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = handle;
+            return Err("GPU tensor stats require the `cuda` feature (refusing rather than reading device memory)");
+        }
     }
+    read_cpu_f64(t)
+}
+
+/// Stage a GPU-resident tensor to the host and read it as `f64`.
+///
+/// `nsl_tensor_contiguous` and `nsl_tensor_to_device` BOTH return owned refs
+/// (project invariant) that must be released here via `nsl_tensor_free`.
+/// `nsl_tensor_to_device(_, 0)` context-syncs and widens f32 -> f64 (runtime
+/// invariant: CPU=f64, GPU=f32), so `read_cpu_f64` sees a plain CPU tensor.
+#[cfg(feature = "cuda")]
+fn read_gpu_f64(handle: i64) -> Result<Vec<f64>, &'static str> {
+    crate::cuda::inner::ensure_context();
+    let contig = crate::tensor::nsl_tensor_contiguous(handle);
+    if contig == 0 {
+        return Err("nsl_tensor_contiguous failed on GPU tensor for inspect stats");
+    }
+    let host = crate::tensor::nsl_tensor_to_device(contig, 0);
+    if host == 0 {
+        crate::tensor::nsl_tensor_free(contig);
+        return Err("device-to-host staging failed on GPU tensor for inspect stats");
+    }
+    let result = read_cpu_f64(NslTensor::from_ptr(host));
+    crate::tensor::nsl_tensor_free(host);
+    crate::tensor::nsl_tensor_free(contig);
+    result
+}
+
+/// Read a CPU-resident f64 / f32 tensor as `f64`.
+fn read_cpu_f64(t: &NslTensor) -> Result<Vec<f64>, &'static str> {
     if t.data.is_null() {
         return Err("tensor data pointer is null");
     }

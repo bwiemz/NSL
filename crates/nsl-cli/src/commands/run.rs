@@ -45,6 +45,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             cpdt_intra_bw,
             cpdt_inter_bw,
             cpdt_report,
+            wggo,
+            wggo_report,
+            wggo_weights,
+            wggo_importance,
+            wggo_prune_fraction,
             weights,
     } = args;
 
@@ -56,6 +61,41 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     eprintln!(
                         "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
                         m
+                    );
+                    process::exit(1);
+                }
+            }
+
+            // WGGO: validate the same way `nsl build --wggo` does (build's
+            // options.rs) so an unrecognised mode / out-of-range prune fraction
+            // / missing sidecar fails fast rather than silently no-op'ing. The
+            // error strings are kept byte-identical to the build path.
+            if let Some(ref m) = wggo {
+                if nsl_codegen::wggo::WggoMode::parse(m).is_none() {
+                    eprintln!(
+                        "error: --wggo value '{}' is not one of full|greedy|off|auto",
+                        m
+                    );
+                    process::exit(1);
+                }
+            }
+            // wggo_importance is a typed CliWggoImportance enum; clap rejects
+            // unknown values before we get here. The Grad variant requires a
+            // calibration sidecar — enforced downstream at compile time.
+            if let Some(f) = wggo_prune_fraction {
+                if !(0.0..=0.9).contains(&f) {
+                    eprintln!(
+                        "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
+                        f
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = wggo_weights {
+                if !p.exists() {
+                    eprintln!(
+                        "error: --wggo-weights path does not exist: {}",
+                        p.display()
                     );
                     process::exit(1);
                 }
@@ -273,7 +313,18 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 fused_ce_configs: Vec::new(),
                 pca_user_strategies: Vec::new(),
                 wrga_fold_allocations: false,
-                wggo: nsl_codegen::WggoOptions::default(),
+                // S3: thread the `--wggo*` surface through so the WGGO
+                // mode-table dispatch reaches `emit_unified_optim_step_dispatch`
+                // via `nsl run` (previously hardcoded to defaults, which
+                // blocked end-to-end activation of the Part II FP16 optim wrap).
+                // Mirrors `nsl build` (build/options.rs).
+                wggo: nsl_codegen::WggoOptions {
+                    mode: wggo.clone(),
+                    report: wggo_report,
+                    weights: wggo_weights.clone(),
+                    importance: nsl_codegen::WggoImportance::from(wggo_importance),
+                    prune_fraction: wggo_prune_fraction,
+                },
                 cfie: nsl_codegen::CfieOptions::default(),
                 // Phase 4 Task 6: when a train block is detected with --monitor,
                 // the health monitor takes over; disable the Phase 1/2 kernel
@@ -321,6 +372,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     mode: cpdt_mode,
                     cluster: cpdt_cluster.clone(),
                     report_requested: cpdt_report,
+                    moe_roofline_slack: 0.0,
                     plan_out: cpdt_plan_out.clone(),
                 },
                 // `nsl run` never sets WRGA check-mode overrides.

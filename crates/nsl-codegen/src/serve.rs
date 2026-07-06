@@ -2,6 +2,7 @@
 
 use cranelift_codegen::ir::{types as cl_types, InstBuilder};
 use cranelift_frontend::FunctionBuilder;
+use cranelift_module::Module as _;
 
 use nsl_ast::block::ServeBlock;
 
@@ -38,6 +39,17 @@ struct CfieRuntimeInit {
     /// present only when the plan selected a static layout and the
     /// decode-attention kernel was emitted.
     kv_slots: Option<(i64, i64)>,
+    /// Cycle 6: kernel registrations for the compile-time-chosen
+    /// family (`cfie::kernel_registrations` — quant wins whenever the
+    /// per-layer kernels were emitted, else uniform).  Each entry
+    /// becomes one `nsl_cfie_register_kernel` call at serve init.
+    kernels: Vec<crate::cfie::CfieKernelReg>,
+    /// Device KV-pool bytes for `nsl_cfie_kv_pool_alloc` — `Some` only
+    /// when at least one KV-consuming kernel (kind 0/2/3/5) registers.
+    /// Quant family: `cfie_kv_quant_ptx::total_pool_bytes`; uniform:
+    /// `n_layers * 2 * (max_slots * per_slot_tokens) * n_kv_heads *
+    /// head_dim * 2` (f16).
+    pool_bytes: Option<i64>,
 }
 
 struct WorkerConfigSpec {
@@ -47,6 +59,49 @@ struct WorkerConfigSpec {
     speculative_method: i64,
     speculative_tree_width: i64,
     speculative_temperature_bits: i64,
+}
+
+/// Embed raw bytes in .rodata and return the DataId (the
+/// `Compiler::embed_raw_data` pattern, kernel.rs:1609 — duplicated here
+/// because that helper is private to `compiler::kernel`).  Callers own
+/// NUL termination: push the trailing 0 BEFORE calling when the bytes
+/// feed a C-string consumer.
+fn embed_cfie_bytes(
+    module: &mut cranelift_object::ObjectModule,
+    label: &str,
+    bytes: Vec<u8>,
+) -> Result<cranelift_module::DataId, CodegenError> {
+    let data_id = module
+        .declare_data(label, cranelift_module::Linkage::Local, false, false)
+        .map_err(|e| CodegenError::new(format!("failed to declare CFIE data '{label}': {e}")))?;
+    let mut desc = cranelift_module::DataDescription::new();
+    desc.define(bytes.into_boxed_slice());
+    module
+        .define_data(data_id, &desc)
+        .map_err(|e| CodegenError::new(format!("failed to define CFIE data '{label}': {e}")))?;
+    Ok(data_id)
+}
+
+/// NUL-terminate `s` for .rodata embedding and return
+/// `(bytes_with_nul, len_without_nul)`.  The runtime copies
+/// `[ptr, ptr + len)` and appends its OWN terminator, so the registered
+/// length must EXCLUDE the NUL (PR #251 missing-NUL precedent).
+fn cfie_nul_terminated(s: &str) -> (Vec<u8>, i64) {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    let len = (bytes.len() - 1) as i64;
+    (bytes, len)
+}
+
+/// Sanitize a serve-block name into a data-section label fragment so
+/// two CFIE-active serve blocks in one module get distinct labels
+/// (same-name blocks still collide loudly via `DuplicateDefinition`).
+fn cfie_label_scope(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if s.is_empty() { "serve".to_string() } else { s }
 }
 
 impl Compiler<'_> {
@@ -203,16 +258,17 @@ impl Compiler<'_> {
             decode_workers = self.features.decode_workers as i64;
         }
 
+        let is_disaggregated = prefill_workers > 1 || decode_workers > 1;
+
         // ── CFIE Tier-A wiring (audit gap G1) ────────────────────────
         // Extract CFIE config from the serve block, resolve the mode
         // (CLI --cfie > @cfie decorator > implicit via CFIE keys), run
         // the orchestrator, and surface the build report.  The plan
         // drives the report, the request-ring + KV-slot init calls, and
-        // (static layouts) the direct-index decode-attention kernel;
-        // the decode-loop launch path lands with audit gap G16.
-        let cfie_init = self.run_cfie_for_serve(serve)?;
-
-        let is_disaggregated = prefill_workers > 1 || decode_workers > 1;
+        // the Cycle-6 kernel registration/finalize emission — the
+        // report must know the path up front because the disaggregated
+        // branch emits NONE of that runtime wiring.
+        let cfie_init = self.run_cfie_for_serve(serve, is_disaggregated)?;
 
         if is_disaggregated {
             self.compile_disaggregated_serve(
@@ -258,6 +314,28 @@ impl Compiler<'_> {
                         &[v_slots, v_tokens],
                     )?;
                 }
+                // CFIE Cycle 6: register the compiled kernel family,
+                // allocate the device KV pool, and finalize the engine
+                // (one cuModuleLoadData + cuModuleGetFunction per
+                // kernel) before any endpoint body runs.  Return values
+                // are intentionally ignored — the runtime warns on
+                // stderr and every launch FFI refuses cleanly (-1) when
+                // finalize did not succeed.
+                if !init.kernels.is_empty() {
+                    let scope = cfie_label_scope(self.resolve_sym(serve.name));
+                    for reg in &init.kernels {
+                        self.emit_cfie_register_kernel(builder, &scope, reg)?;
+                    }
+                    if let Some(bytes) = init.pool_bytes {
+                        let v_bytes = builder.ins().iconst(cl_types::I64, bytes);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_cfie_kv_pool_alloc",
+                            &[v_bytes],
+                        )?;
+                    }
+                    self.compile_call_by_name(builder, "nsl_cfie_engine_finalize", &[])?;
+                }
             }
 
             for endpoint in &serve.endpoints {
@@ -266,6 +344,12 @@ impl Compiler<'_> {
                 }
             }
 
+            // CFIE Cycle 6: free the pool + clear registrations before
+            // the serve runtime tears down (CUmodules may stay loaded —
+            // module leak-by-design precedent, cuda/mod.rs module_cache).
+            if cfie_init.as_ref().is_some_and(|i| !i.kernels.is_empty()) {
+                self.compile_call_by_name(builder, "nsl_cfie_engine_destroy", &[])?;
+            }
             self.compile_call_by_name(builder, "nsl_serve_destroy", &[])?;
         }
 
@@ -277,6 +361,63 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// CFIE Cycle 6: emit one `nsl_cfie_register_kernel` call.  PTX and
+    /// kernel-name bytes are embedded in .rodata WITH a trailing NUL
+    /// (cuModuleLoadData / cuModuleGetFunction consume C strings — the
+    /// PR #251 missing-NUL precedent); the registered lengths EXCLUDE
+    /// the NUL per the frozen ABI.  Data labels follow the contract,
+    /// scoped by serve-block name so two CFIE-active serve blocks don't
+    /// collide: `__nsl_cfie_{ptx,name}_{scope}_{kind}` (`_l{N}` suffix
+    /// for kind 5).
+    fn emit_cfie_register_kernel(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        label_scope: &str,
+        reg: &crate::cfie::CfieKernelReg,
+    ) -> Result<(), CodegenError> {
+        let suffix = if reg.kind == 5 {
+            format!("{label_scope}_{}_l{}", reg.kind, reg.layer_idx)
+        } else {
+            format!("{label_scope}_{}", reg.kind)
+        };
+
+        let (ptx_bytes, ptx_len) = cfie_nul_terminated(&reg.ptx);
+        let ptx_id = embed_cfie_bytes(
+            &mut self.module,
+            &format!("__nsl_cfie_ptx_{suffix}"),
+            ptx_bytes,
+        )?;
+
+        let (name_bytes, name_len) = cfie_nul_terminated(&reg.name);
+        let name_id = embed_cfie_bytes(
+            &mut self.module,
+            &format!("__nsl_cfie_name_{suffix}"),
+            name_bytes,
+        )?;
+
+        let ptx_gv = self.module.declare_data_in_func(ptx_id, builder.func);
+        let ptx_ptr = builder.ins().symbol_value(cl_types::I64, ptx_gv);
+        let name_gv = self.module.declare_data_in_func(name_id, builder.func);
+        let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
+
+        let v_kind = builder.ins().iconst(cl_types::I64, reg.kind as i64);
+        let v_layer = builder.ins().iconst(cl_types::I64, reg.layer_idx as i64);
+        let v_ptx_len = builder.ins().iconst(cl_types::I64, ptx_len);
+        let v_name_len = builder.ins().iconst(cl_types::I64, name_len);
+        let v_grid = builder.ins().iconst(cl_types::I64, reg.grid_x as i64);
+        let v_block = builder.ins().iconst(cl_types::I64, reg.block_x as i64);
+        let v_smem = builder.ins().iconst(cl_types::I64, reg.smem_dyn as i64);
+        self.compile_call_by_name(
+            builder,
+            "nsl_cfie_register_kernel",
+            &[
+                v_kind, v_layer, ptx_ptr, v_ptx_len, name_ptr, v_name_len, v_grid,
+                v_block, v_smem,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// CFIE Tier-A wiring: extract serve-block CFIE config, resolve the
     /// mode, run the six-pass orchestrator against real inputs (GPU
     /// database + `--weights` WeightMap + serve config keys), print the
@@ -284,9 +425,14 @@ impl Compiler<'_> {
     ///
     /// Returns the runtime-init values the compiled binary must pass to
     /// the `nsl_cfie_*` init FFIs, or `None` when CFIE is not active.
+    ///
+    /// `is_disaggregated`: the disaggregated serve branch emits NONE of
+    /// the CFIE runtime wiring (ring/slots/registration/finalize) — the
+    /// report must say so instead of claiming monolithic wiring.
     fn run_cfie_for_serve(
         &mut self,
         serve: &ServeBlock,
+        is_disaggregated: bool,
     ) -> Result<Option<CfieRuntimeInit>, CodegenError> {
         let interner = self.interner;
         let resolve = |sym: nsl_ast::Symbol| -> String {
@@ -364,6 +510,15 @@ impl Compiler<'_> {
                 && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
             if supported {
                 let (ptx, meta) = crate::cfie_decode_attention::emit(&attn_cfg);
+                plan.decode_attention_launch = Some(crate::cfie::CfieLaunchSpec {
+                    grid_x: if meta.grid_dim_is_n_heads {
+                        prepared.shape.n_heads
+                    } else {
+                        1
+                    },
+                    block_x: meta.block_dim,
+                    smem_dyn_bytes: 0,
+                });
                 plan.decode_attention_kernel = Some(meta.kernel_name);
                 plan.decode_attention_ptx = Some(ptx);
                 kv_slots = Some((max_slots as i64, per_slot as i64));
@@ -422,6 +577,13 @@ impl Compiler<'_> {
                 // CTA; a bigger footprint would fail module load, so
                 // downgrade to plan-level instead of shipping dead PTX.
                 if meta.smem_bytes <= 48 * 1024 {
+                    // Persistent block: ONE CTA runs one layer's decode
+                    // step (grid = 1 by construction, see emitter doc).
+                    plan.decode_block_launch = Some(crate::cfie::CfieLaunchSpec {
+                        grid_x: 1,
+                        block_x: meta.block_dim,
+                        smem_dyn_bytes: 0,
+                    });
                     plan.decode_block_kernel = Some(meta.kernel_name);
                     plan.decode_block_ptx = Some(ptx);
                 }
@@ -458,10 +620,7 @@ impl Compiler<'_> {
                 let supported = s.head_dim >= 1
                     && s.head_dim <= 128
                     && s.n_heads % s.n_kv_heads.max(1) == 0
-                    && num_nodes >= 1
-                    // K+1 <= 33: a node row's mask bits fit one u64
-                    // immediate; wider trees stay plan-level.
-                    && num_nodes <= 33
+                    && (1..=33).contains(&num_nodes)
                     && per_slot >= num_nodes
                     && max_slots >= 1
                     && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64
@@ -487,6 +646,16 @@ impl Compiler<'_> {
                     };
                     let (rptx, rmeta) =
                         crate::cfie_speculative_ptx::emit_rejection_kernel(&reject_cfg);
+                    plan.spec_verify_launch = Some(crate::cfie::CfieLaunchSpec {
+                        grid_x: if vmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
+                        block_x: vmeta.block_dim,
+                        smem_dyn_bytes: 0,
+                    });
+                    plan.spec_reject_launch = Some(crate::cfie::CfieLaunchSpec {
+                        grid_x: if rmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
+                        block_x: rmeta.block_dim,
+                        smem_dyn_bytes: 0,
+                    });
                     plan.spec_verify_kernel = Some(vmeta.kernel_name);
                     plan.spec_verify_ptx = Some(vptx);
                     plan.spec_reject_kernel = Some(rmeta.kernel_name);
@@ -511,6 +680,7 @@ impl Compiler<'_> {
         // mixed-precision pool layout, which differs from the uniform
         // f16 pool the base/block/verify kernels assume — the decode
         // loop picks ONE family per build at integration time.
+        let mut quant_pool_bytes: Option<i64> = None;
         if plan.kv.uses_direct_indexing() && !plan.kv_quant.layers.is_empty() {
             use crate::cfie_kv_quant::KvPrecision;
             let s = &prepared.shape;
@@ -554,26 +724,157 @@ impl Compiler<'_> {
                     sm_version: gpu.sm_version,
                     layer_precisions: precisions,
                 };
-                plan.quant_attention_kernels = crate::cfie_kv_quant_ptx::emit_all(&qcfg)
+                // Mixed-precision pool sizing (Cycle 6): when this
+                // family wins registration, the device pool is sized
+                // by the quant layout, not the uniform-f16 formula.
+                quant_pool_bytes =
+                    Some(crate::cfie_kv_quant_ptx::total_pool_bytes(&qcfg) as i64);
+                let kernels = crate::cfie_kv_quant_ptx::emit_all(&qcfg);
+                if let Some((_, meta0)) = kernels.first() {
+                    // All layer kernels share one launch shape (same
+                    // flash-decode scheme as the base kernel).
+                    plan.quant_attention_launch = Some(crate::cfie::CfieLaunchSpec {
+                        grid_x: if meta0.grid_dim_is_n_heads { s.n_heads } else { 1 },
+                        block_x: meta0.block_dim,
+                        smem_dyn_bytes: 0,
+                    });
+                }
+                plan.quant_attention_kernels = kernels
                     .into_iter()
                     .map(|(ptx, meta)| (meta.kernel_name, ptx))
                     .collect();
             }
         }
 
+        // Feature 2 (F2, Cycle 6): the fused decode-sample kernel —
+        // kernel kind 1, registered in BOTH families; the host decode
+        // loop (nsl_cfie_decode_step) launches it on the final hidden
+        // state.  Preconditions mirror the emitter's asserts, F1-style
+        // (miss => skip + report note, never a build failure): d_model
+        // 1..=8192 (hidden staged in static SMEM), vocab_size a
+        // positive multiple of the 128-wide tile (thread t owns row
+        // tile_base+t), top_k 1..=64 (serial SMEM candidate list).
+        // The plan's sampler program bakes vocab_tile 256 (the
+        // HBM-accounting default from `prepare`); the kernel tile is
+        // fixed at 128, so re-emit the program against the kernel tile
+        // with the SAME params (incl. grammar_masked).
+        let mut fused_sample_note: Option<String> = None;
+        if plan.sampling.is_fused() {
+            let s = &prepared.shape;
+            let top_k = plan.sampling.params.top_k;
+            let supported = s.d_model >= 1
+                && s.d_model <= 8192
+                && s.vocab_size >= 128
+                && s.vocab_size % 128 == 0
+                && (1..=64).contains(&top_k);
+            if supported {
+                let shape128 = crate::cfie_fused_sample::LmHeadShape {
+                    vocab_tile: 128,
+                    ..plan.sampling.shape
+                };
+                let program =
+                    crate::cfie_fused_sample::emit_program(plan.sampling.params, shape128);
+                // DFA state count sizes the grammar hook's comment and
+                // gates its emission; 0 = no grammar hook.
+                let grammar_states =
+                    plan.grammar.as_ref().map(|d| d.num_states).unwrap_or(0);
+                let sample_cfg = crate::cfie_sample_ptx::FusedSampleKernelConfig {
+                    d_model: s.d_model,
+                    vocab_size: s.vocab_size,
+                    vocab_tile: 128,
+                    top_k,
+                    sm_version: gpu.sm_version,
+                    grammar_states,
+                };
+                let (ptx, meta) = crate::cfie_sample_ptx::emit(&program, &sample_cfg);
+                // Splice the baked mask .global into the sampler module
+                // so the host can cuModuleGetGlobal it at finalize.
+                let ptx = match plan.grammar_mask_ptx.as_ref() {
+                    Some(mask) => {
+                        crate::cfie_grammar_ptx::splice_mask_into_module(&ptx, mask)
+                    }
+                    None => ptx,
+                };
+                plan.fused_sample_launch = Some(crate::cfie::CfieLaunchSpec {
+                    grid_x: 1, // single-CTA latency path
+                    block_x: meta.block_dim,
+                    smem_dyn_bytes: 0,
+                });
+                plan.fused_sample_kernel = Some(meta.kernel_name);
+                plan.fused_sample_ptx = Some(ptx);
+            } else {
+                fused_sample_note = Some(format!(
+                    "note: fused-sample kernel skipped (preconditions: d_model {} \
+                     in 1..=8192, vocab_size {} a positive multiple of 128, \
+                     top_k {} in 1..=64)\n",
+                    s.d_model, s.vocab_size, top_k
+                ));
+            }
+        }
+
+        // G22: estimated decode latency + throughput from the explicit
+        // roofline cost model.  Computed here because this is the only
+        // point with the resolved model shape, the weights precision, the
+        // per-layer KV-quant plan, and the GPU spec all in scope.  The
+        // baseline KV footprint is the plan's uniform-FP16 count when the
+        // quant pass ran (Full mode); otherwise a shape-derived fallback.
+        {
+            let s = &prepared.shape;
+            let baseline_kv_stored = if plan.kv_quant.bytes_per_token_uniform_fp16 > 0 {
+                plan.kv_quant.bytes_per_token_uniform_fp16
+            } else {
+                // Uniform FP16 KV per stored token across all layers:
+                // 2 (K+V) * n_kv_heads * head_dim * 2 bytes * n_layers.
+                2 * (s.n_kv_heads as u64) * (s.head_dim as u64) * 2 * (s.n_layers as u64)
+            };
+            let cost_inputs = crate::cfie_cost::CostModelInputs {
+                n_layers: s.n_layers,
+                n_heads: s.n_heads,
+                n_kv_heads: s.n_kv_heads,
+                head_dim: s.head_dim,
+                d_model: s.d_model,
+                d_ff: s.d_ff,
+                vocab_size: s.vocab_size,
+                weight_dtype_bytes: s.dtype_bytes,
+                cfie_launches_per_token: plan.kernel_launches_per_token_cfie,
+                baseline_launches_per_token: plan.kernel_launches_per_token_baseline,
+                kv_quant: &plan.kv_quant,
+                baseline_kv_bytes_per_stored_token: baseline_kv_stored,
+                max_seq: cfg.max_seq.unwrap_or(4096).max(1) as u32,
+                batch: plan.persistent.scheduler.max_active,
+                gpu,
+            };
+            plan.cost_estimate = Some(crate::cfie_cost::estimate(&cost_inputs));
+        }
+
         // Build report: the paper's visible artifact (§8).  Provenance +
         // wiring status keep it honest about what this build actually
         // bakes into the binary.
+        plan.runtime_wiring_emitted = !is_disaggregated;
         let mut report = plan.render_report();
         report.push_str(&format!(
             "Model-shape provenance: {}\n",
             prepared.shape.provenance
         ));
-        report.push_str(
-            "Kernel wiring: plan + request-ring + KV-slot init in this \
-             build; kernel launch paths land with the decode-loop \
-             integration cycle.\n",
-        );
+        if let Some(note) = fused_sample_note {
+            report.push_str(&note);
+        }
+        if is_disaggregated {
+            report.push_str(
+                "Kernel wiring: DISAGGREGATED serve — CFIE runtime wiring \
+                 (request ring, KV slots, kernel registration, engine \
+                 finalize) is NOT emitted on this path; the plan and \
+                 kernels above are report-only for this build \
+                 (monolithic serve gets the wiring).\n",
+            );
+        } else {
+            report.push_str(
+                "Kernel wiring: plan + request-ring + KV-slot init + \
+                 kernel-family registration + engine finalize in this build; \
+                 per-token launches go through the host decode loop \
+                 (nsl_cfie_decode_step).\n",
+            );
+        }
         eprint!("{report}");
         if let Some(path) = self.compile_options.cfie.report_path.clone() {
             if let Err(e) = std::fs::write(&path, &report) {
@@ -584,11 +885,39 @@ impl Compiler<'_> {
             }
         }
 
+        // Cycle 6: registration list for the compile-time-chosen family
+        // + KV pool sizing.  The pool allocates only when a KV-consuming
+        // kernel (kind 0/2/3/5) registers; the quant family sizes it
+        // from the mixed-precision layout, the uniform family from the
+        // f16 formula (both cover ALL layers of the baked pool).
+        let kernels = crate::cfie::kernel_registrations(&plan);
+        let has_kv_consumer = kernels.iter().any(|r| matches!(r.kind, 0 | 2 | 3 | 5));
+        let pool_bytes = if !has_kv_consumer {
+            None
+        } else {
+            match crate::cfie::choose_kernel_family(&plan) {
+                crate::cfie::CfieKernelFamily::Quant => quant_pool_bytes,
+                crate::cfie::CfieKernelFamily::Uniform => {
+                    kv_slots.map(|(slots, per_slot)| {
+                        let s = &prepared.shape;
+                        (s.n_layers as i64)
+                            * 2 // K + V halves
+                            * (slots * per_slot)
+                            * (s.n_kv_heads as i64)
+                            * (s.head_dim as i64)
+                            * 2 // f16 bytes
+                    })
+                }
+            }
+        };
+
         let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
         self.last_cfie_plan = Some(plan);
         Ok(Some(CfieRuntimeInit {
             ring_capacity: capacity,
             kv_slots,
+            kernels,
+            pool_bytes,
         }))
     }
 
@@ -768,5 +1097,30 @@ impl Compiler<'_> {
         state.current_block = Some(merge_block);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cfie_emit_tests {
+    use super::{cfie_label_scope, cfie_nul_terminated};
+
+    // The runtime copies [ptr, ptr + len) and appends its own NUL, so a
+    // regression to len-INCLUDING-NUL would hand the driver an interior
+    // NUL (PR #251 class of bug).  Pin the convention here.
+    #[test]
+    fn nul_terminated_len_excludes_terminator() {
+        let (bytes, len) = cfie_nul_terminated("abc");
+        assert_eq!(bytes, b"abc\0");
+        assert_eq!(len, 3);
+        let (bytes, len) = cfie_nul_terminated("");
+        assert_eq!(bytes, b"\0");
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn label_scope_sanitizes_to_identifier_chars() {
+        assert_eq!(cfie_label_scope("Inference"), "Inference");
+        assert_eq!(cfie_label_scope("My-Serve.2"), "My_Serve_2");
+        assert_eq!(cfie_label_scope(""), "serve");
     }
 }

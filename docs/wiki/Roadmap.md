@@ -160,14 +160,14 @@ Worst-case execution time analysis for robotics/safety-critical deployments; req
 ### M54 -- Bare-metal unikernels (In flight, Phase 10)
 x86_64 boot stub + unikernel runtime + GPU init (M54b shipped v0.9.1); single-binary AI inference with no OS. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M55 -- ZK inference circuits (Planned, Phase 11)
-Zero-knowledge proofs over model inference; verifiable computation for privacy-sensitive deployments. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
+### M55 -- ZK inference circuits (v1 shipped: folding backend)
+Zero-knowledge proofs over model inference; verifiable computation for privacy-sensitive deployments. The folding backend is shipped and wired end-to-end (`nsl build --zk-backend folding` proves + `nsl zk verify`); the `halo2` and `plonky3` backends are refused at compile time (halo2 deprecated/removed, plonky3 prover not yet wired) rather than silently falling back to folding. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
 ### M56 -- Multi-agent shared memory (Planned, Phase 11)
 Safe shared-memory protocol for multi-agent systems; ownership enforced by M38 linear types. Design: [`2026-03-19-m56-multi-agent-design.md`](../superpowers/specs/2026-03-19-m56-multi-agent-design.md).
 
-### M57 -- FPGA/neuromorphic backend (Planned, Phase 13)
-Emit to FPGA HLS or neuromorphic hardware targets via the M47 KIR; dense inference only. Design: [`2026-03-19-m57-fpga-neuromorphic-design.md`](../superpowers/specs/2026-03-19-m57-fpga-neuromorphic-design.md).
+### M57 -- FPGA/neuromorphic backend (v1 shipped: clocked-FSM MLP; parity gated on external tools)
+Emit to FPGA HLS or neuromorphic hardware targets via the M47 KIR; dense inference only. The v1 sequential clocked-FSM emitter for MLPs is shipped (PR #211); Verilator/Yosys synthesis-parity validation is gated on those external tools (not available in the default CI/dev environment). Further scope is paused pending re-scoping. Design: [`2026-03-19-m57-fpga-neuromorphic-design.md`](../superpowers/specs/2026-03-19-m57-fpga-neuromorphic-design.md).
 
 ### M58 -- Elastic fault tolerance (Planned, Phase 12)
 Checkpoint/restore with worker elasticity; re-route around failed nodes mid-training. Design: [`2026-03-19-m58-fault-tolerance-design.md`](../superpowers/specs/2026-03-19-m58-fault-tolerance-design.md).

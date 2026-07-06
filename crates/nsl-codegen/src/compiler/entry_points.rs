@@ -193,6 +193,100 @@ fn load_and_register_weights_if_needed(
     })?;
     let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
 
+    // CPDT Part III v2.7 — HF Mixtral auto-pack.
+    //
+    // Scan the freshly-loaded WeightMap for HF Mixtral per-expert
+    // patterns (`<prefix>.experts.{e}.w{1,2,3}.weight`) and rewrite
+    // each detected block in place into NSL packed convention so the
+    // downstream `derive_v3_dims` / `derive_v4_dims` can resolve them.
+    // Per-block atomicity is provided by v2.6's two-phase commit;
+    // cross-block failures don't roll back successful blocks (a user
+    // with one bad MoE layer still gets every other layer packed).
+    //
+    // The auto-pack is an UNCONDITIONAL post-load pass — a no-op when
+    // no HF patterns are found, so no CLI flag is needed to gate it.
+    // Users with non-HF safetensors (NSL-packed or other MoE
+    // conventions) see no behavior change. Users with HF Mixtral
+    // safetensors get the pack for free.
+    let auto_pack = crate::moe_hf_pack::pack_all_detected_hf_mixtral_blocks(&mut wmap);
+    if !auto_pack.packed.is_empty() {
+        eprintln!(
+            "[nsl] CPDT v2.7: auto-packed {} HF Mixtral MoE block{} into NSL convention",
+            auto_pack.packed.len(),
+            if auto_pack.packed.len() == 1 { "" } else { "s" },
+        );
+        for (block, _) in &auto_pack.packed {
+            eprintln!(
+                "  - {} (num_experts={})",
+                block.hf_prefix, block.num_experts,
+            );
+        }
+    }
+    // CPDT Part III v2.15 — bias auto-pack telemetry. Blocks that
+    // shipped per-expert HF `.w{1,2,3}.bias` keys get their biases
+    // packed into NSL convention alongside the weights. Blocks
+    // without biases produce no entry here (Ok(None) no-op).
+    if !auto_pack.bias_packed.is_empty() {
+        eprintln!(
+            "[nsl] CPDT v2.15: auto-packed v4 biases for {} HF Mixtral MoE block{}",
+            auto_pack.bias_packed.len(),
+            if auto_pack.bias_packed.len() == 1 { "" } else { "s" },
+        );
+        for (block, _) in &auto_pack.bias_packed {
+            eprintln!(
+                "  - {} (num_experts={})",
+                block.hf_prefix, block.num_experts,
+            );
+        }
+    }
+    // v2.7 adversarial-review F2 fix: hard-refuse on any auto-pack
+    // failure. Previously the wrapper only printed failures to stderr
+    // and let the build continue, which created a silent-corruption
+    // hazard for the mixed HF+already-packed case: detection finds
+    // the HF block, packer trips `TargetAlreadyExists` on the stale
+    // pre-existing packed entry, the failure is logged-but-ignored,
+    // and `derive_v4_dims` then succeeds against the STALE shadow
+    // data while the freshly-loaded HF per-expert tensors become
+    // orphans. Per the "deferral must refuse" / "no silent fallback"
+    // invariant carried from v2.3..v2.6, any HF block detected MUST
+    // either pack successfully or surface as a build error.
+    //
+    // v2.15 extends the same refuse-loudly contract to bias-pack
+    // failures: a partial bias bundle would silently drop biases at
+    // the v4 lowering's `detect_v4_biases` (no `.experts.gate.bias`
+    // resolves because the HF `.w1.bias` keys remain unpacked), so
+    // the 5-arg no-bias path runs and produces wrong numerics. Same
+    // surface treatment as weight-pack failures.
+    if !auto_pack.failed.is_empty() || !auto_pack.bias_failed.is_empty() {
+        let mut msg = String::from(
+            "CPDT v2.7/v2.15/v2.16: HF Mixtral auto-pack failed for one or more detected blocks:\n",
+        );
+        use std::fmt::Write as _;
+        for (block, err) in &auto_pack.failed {
+            let _ = writeln!(msg, "  - {} (weights): {}", block.hf_prefix, err);
+        }
+        for (block, err) in &auto_pack.bias_failed {
+            // v2.16-B: BiasesWithoutWeights uses a synthetic block
+            // with num_experts=0. Surface a clearer label so users
+            // know the failure isn't tied to a fully-detected block.
+            let kind = if matches!(err, crate::moe_hf_pack::PackError::BiasesWithoutWeights { .. }) {
+                "biases-without-weights"
+            } else {
+                "biases"
+            };
+            let _ = writeln!(msg, "  - {} ({}): {}", block.hf_prefix, kind, err);
+        }
+        if !auto_pack.packed.is_empty() || !auto_pack.bias_packed.is_empty() {
+            let _ = std::fmt::Write::write_str(
+                &mut msg,
+                "\nNote: other blocks WERE successfully packed in place (per-block \
+                 atomicity preserved). Rebuilding after fixing the failed blocks will \
+                 not double-pack the successful ones.",
+            );
+        }
+        return Err(crate::error::CodegenError::new(msg));
+    }
+
     // Sparsity analysis for sparse codegen / dead-weight elimination.
     if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
         let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
@@ -555,6 +649,22 @@ pub fn compile_returning_plan(
     compiler.collect_models(&ast.stmts)?;
     // M56 Task 17: compute agent struct layouts.
     compiler.collect_agents(&ast.stmts)?;
+    // CPDT Part III: non-WGGO MoE dead-expert prune. Runs here (not under the
+    // WGGO-gated invoke_cpdt_if_enabled) so it's reachable with --cpdt --weights
+    // alone. No-op unless cpdt Full + a @moe config + a loaded WeightMap.
+    // CPDT §6.1 — `@cpdt(...)` train-block decorator (must precede the
+    // mode/cluster-reading passes below so the decorator's source-level
+    // configuration is authoritative when present).
+    let cpdt_decor_outcome = crate::cpdt_decorator::apply_cpdt_decorator_from_ast(
+        ast, interner, &mut compiler,
+    );
+    crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
+    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    // CPDT §4.1 — roofline-derived capacity-factor override. Runs after the
+    // prune pass (so n_live is settled in moe_configs) and before any body
+    // codegen (the moe_dispatch lowering reads MoeInfo.capacity_factor).
+    // Same non-WGGO blocker-sidestep posture as the prune pass.
+    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen.  The pipe-site splice in `try_emit_retention_splice` early-

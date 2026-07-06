@@ -9,6 +9,7 @@ pub mod trig;
 pub mod ad_ops;
 pub mod fbip_flags;
 pub mod precision_cast;
+pub mod int8_blockwise;
 
 // Re-export everything from sub-modules so the public API is unchanged.
 pub use creation::*;
@@ -1461,12 +1462,33 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
 
     #[cfg(feature = "cuda")]
     if tensor.device > 0 {
-        // Round-trip: pull to CPU, scale, push back.
+        // Round-trip: pull to CPU, scale, push back. `nsl_tensor_to_device`
+        // upcasts the GPU f32 buffer to CPU f64, so the scaled CPU result is
+        // f64. Copying f64-sized bytes back into the f32 device buffer would
+        // reinterpret f64 bit patterns as f32 (garbage), so down-convert to
+        // f32 before the HtoD when needed (mirrors nsl_tensor_add_inplace).
         let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
         nsl_tensor_mul_scalar_inplace(cpu_ptr, scalar);
         let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
-        let byte_count = (tensor.len as usize) * tensor.element_size();
-        crate::cuda::inner::memcpy_htod(tensor.data, cpu_tensor.data, byte_count);
+        let len = cpu_tensor.len as usize;
+        let f32_bytes = len * std::mem::size_of::<f32>();
+        if cpu_tensor.dtype == 1 {
+            // CPU f32 → GPU f32: direct copy.
+            crate::cuda::inner::memcpy_htod(tensor.data, cpu_tensor.data, f32_bytes);
+        } else {
+            // CPU f64 → GPU f32: stage the down-conversion in a heap buffer.
+            let staging = checked_alloc(f32_bytes) as *mut f32;
+            let src = cpu_tensor.data as *const f64;
+            for i in 0..len {
+                unsafe { *staging.add(i) = *src.add(i) as f32; }
+            }
+            crate::cuda::inner::memcpy_htod(
+                tensor.data,
+                staging as *const std::ffi::c_void,
+                f32_bytes,
+            );
+            unsafe { checked_free(staging as *mut u8, f32_bytes); }
+        }
         nsl_tensor_free(cpu_ptr);
         return;
     }

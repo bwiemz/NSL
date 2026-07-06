@@ -162,6 +162,17 @@ pub struct HarnessConfig {
     /// Owned compile context used by the real subprocess path to emit the
     /// calibration model object from the user's program.
     pub compile_bundle: Option<Arc<CalibrationCompileBundle>>,
+    /// **Test-only fault injection.** When `Some`, `real_subprocess_entry`
+    /// feeds THIS file to the calibration subprocess as its runtime data
+    /// path (argv[1]) while compile-time shape derivation (`peek_batch_seq`)
+    /// still reads `calibration_data`. Production uses the same file for
+    /// both roles, which makes the wrapper's status-3 per-batch shape check
+    /// unsatisfiable-by-construction; the override is the only way to reach
+    /// that refusal from an e2e test. MUST be `None` in production. The
+    /// cached driver (`run_harness_simulated` / `run_harness_production`)
+    /// hard-rejects `Some` because its cache key is derived from
+    /// `calibration_data` and an override would poison the sidecar cache.
+    pub runtime_data_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +189,26 @@ pub fn run_harness_simulated(
     cfg: &HarnessConfig,
     entry: SubprocessEntry,
 ) -> Result<HarnessOutput, HarnessError> {
+    // Hard guard: `runtime_data_override` is test-only fault injection for
+    // `real_subprocess_entry`. The cache key computed below is derived from
+    // `calibration_data`, so letting an override through would store a
+    // sidecar computed from DIFFERENT data under the un-overridden key
+    // (cache-key desync) and later runs would silently serve poisoned
+    // results from cache. Refuse loudly regardless of harness mode — this
+    // is an API-misuse bug, not a recoverable infrastructure failure.
+    if cfg.runtime_data_override.is_some() {
+        return Err(HarnessError::Infrastructure {
+            reason: "HarnessConfig.runtime_data_override is test-only fault injection \
+                     and must be None when running through the cached harness driver \
+                     (run_harness_simulated / run_harness_production): the sidecar \
+                     cache key is derived from `calibration_data`, so overriding the \
+                     subprocess's runtime data file would poison the cache with results \
+                     computed from different data. Tests that need the override must \
+                     call binary_codegen::real_subprocess_entry directly (it bypasses \
+                     the cache)."
+                .into(),
+        });
+    }
     let ckpt_hashes: Vec<String> = cfg
         .checkpoints
         .iter()
@@ -412,6 +443,7 @@ mod driver_tests {
             mode: HarnessMode::Required,
             projections: vec![],
             compile_bundle: None,
+            runtime_data_override: None,
         };
 
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess)
@@ -452,6 +484,7 @@ mod driver_tests {
             mode: HarnessMode::Required,
             projections: vec![],
             compile_bundle: None,
+            runtime_data_override: None,
         };
         match run_harness_simulated(&registry, &cfg, simulated_infra_error) {
             Err(HarnessError::Infrastructure { reason }) => {
@@ -480,6 +513,7 @@ mod driver_tests {
             mode: HarnessMode::BestEffort,
             projections: vec![],
             compile_bundle: None,
+            runtime_data_override: None,
         };
         let r = run_harness_simulated(&registry, &cfg, simulated_infra_error)
             .expect("best-effort should not error");
@@ -509,6 +543,7 @@ mod driver_tests {
             mode: HarnessMode::BestEffort,
             projections: vec![],
             compile_bundle: None,
+            runtime_data_override: None,
         };
         let err = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap_err();
         match err {
@@ -540,6 +575,7 @@ mod driver_tests {
             mode: HarnessMode::Required,
             projections: vec![],
             compile_bundle: None,
+            runtime_data_override: None,
         };
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
         assert_eq!(r1.outcome_repr, "clean");
@@ -552,6 +588,86 @@ mod driver_tests {
         let _ = fs::remove_file(&ckpt);
         let _ = fs::remove_file(&data);
         let _ = fs::remove_file(crate::calibration::cache::sidecar_path_for(&ckpt));
+    }
+
+    /// `runtime_data_override` is test-only fault injection for
+    /// `real_subprocess_entry`; the cached driver must refuse it up front
+    /// (before hashing anything) so the sidecar cache can never be keyed on
+    /// `calibration_data` while holding results computed from override data.
+    #[test]
+    fn runtime_data_override_rejected_by_cached_driver() {
+        let ckpt = t13_tmp("ckpt-override");
+        fs::write(&ckpt, b"x").unwrap();
+        let data = t13_tmp("data-override.bin");
+        fs::write(&data, [0u8; 8]).unwrap();
+        let override_data = t13_tmp("data-override-injected.bin");
+        fs::write(&override_data, [0u8; 8]).unwrap();
+
+        let registry = HookRegistry::new();
+        let cfg = HarnessConfig {
+            checkpoints: vec![ckpt.clone()],
+            calibration_data: data.clone(),
+            samples: 1,
+            batch_size: 1,
+            timeout_secs: 1,
+            mode: HarnessMode::Required,
+            projections: vec![],
+            compile_bundle: None,
+            runtime_data_override: Some(override_data.clone()),
+        };
+        // The entry seam would succeed — the guard must fire BEFORE it runs.
+        match run_harness_simulated(&registry, &cfg, simulated_would_panic) {
+            Err(HarnessError::Infrastructure { reason }) => {
+                assert!(
+                    reason.contains("runtime_data_override"),
+                    "refusal must name the offending field: {reason}"
+                );
+                assert!(
+                    reason.contains("real_subprocess_entry"),
+                    "refusal must point at the supported alternative: {reason}"
+                );
+            }
+            other => panic!("expected Infrastructure refusal, got {other:?}"),
+        }
+        let _ = fs::remove_file(&ckpt);
+        let _ = fs::remove_file(&data);
+        let _ = fs::remove_file(&override_data);
+    }
+
+    /// Same guard, best-effort mode: API misuse must NOT be softened into a
+    /// fallback sidecar — the refusal fires before the mode dispatch.
+    #[test]
+    fn runtime_data_override_rejected_even_in_best_effort_mode() {
+        let ckpt = t13_tmp("ckpt-override-be");
+        fs::write(&ckpt, b"x").unwrap();
+        let data = t13_tmp("data-override-be.bin");
+        fs::write(&data, [0u8; 8]).unwrap();
+
+        let registry = HookRegistry::new();
+        let cfg = HarnessConfig {
+            checkpoints: vec![ckpt.clone()],
+            calibration_data: data.clone(),
+            samples: 1,
+            batch_size: 1,
+            timeout_secs: 1,
+            mode: HarnessMode::BestEffort,
+            projections: vec![],
+            compile_bundle: None,
+            runtime_data_override: Some(data.clone()),
+        };
+        match run_harness_simulated(&registry, &cfg, simulated_would_panic) {
+            Err(HarnessError::Infrastructure { reason }) => {
+                assert!(
+                    reason.contains("runtime_data_override"),
+                    "refusal must name the offending field: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Infrastructure refusal (not best-effort fallback), got {other:?}"
+            ),
+        }
+        let _ = fs::remove_file(&ckpt);
+        let _ = fs::remove_file(&data);
     }
 
     fn simulated_ok_subprocess(

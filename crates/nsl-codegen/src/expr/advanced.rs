@@ -1611,75 +1611,36 @@ impl Compiler<'_> {
                 let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
                 let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
 
-                // Stash on Compiler so the fused source-AD backward
-                // emission (Gap C/D) can read these when lowering the
-                // chain's output op. Key = layer name (falls back to a
-                // synthetic ordinal-based key when the layer is
-                // unresolved — unlikely in practice but defensive).
-                let layer_key = csha_layer
-                    .clone()
-                    .unwrap_or_else(|| format!("csha_fa_ord_{}", ordinal));
-                // Gap B: copy the backward-PTX DataIds from the flash context
-                // into the per-layer save record so Gap C/D's adjoint emitter
-                // has everything needed to launch `nsl_flash_attention_csha_backward`
-                // from one lookup keyed by layer name.
-                let (bwd_ptx_id, bwd_name_id, bwd_tier_b_ptx_id, bwd_tier_b_name_id) = self
-                    .kernels
-                    .flash_attention_context
-                    .as_ref()
-                    .map(|c| {
-                        (
-                            c.csha_backward_ptx_data_id,
-                            c.csha_backward_name_data_id,
-                            c.csha_backward_tier_b_on_ptx_id,
-                            c.csha_backward_tier_b_on_name_id,
-                        )
-                    })
-                    .unwrap_or((None, None, None, None));
-                // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named locals
-                // BEFORE the save insert so both the save record and the
-                // forward FFI agree on the same Cranelift Values. Forward and
-                // backward must see identical cos/sin — the save record is
-                // the structural channel that closes H1.
+                // NOTE (save-buffer-leak fix, 2026-07-02): this site used to
+                // stash the six save pointers on `Compiler.csha_forward_saves`
+                // for "the fused source-AD backward" to consume.  That stash
+                // was dead code AND a stale-Value landmine:
+                //   * The @train forward+backward pair lowers through
+                //     `wengert_lower.rs` — its `ScaledDotProductAttention`
+                //     arm allocates its OWN save buffers and inserts a
+                //     same-function record that `FusedCshaBackward` consumes
+                //     and `.remove()`s.  This method-body emission runs in a
+                //     DIFFERENT Cranelift function, so a record inserted here
+                //     holds function-local `Value` handles that no other
+                //     function may legally read.
+                //   * Model methods compile AFTER `compile_train_block`
+                //     (functions.rs), so an entry inserted here could never
+                //     be observed by the train block that just compiled — but
+                //     it WOULD be observed (as dangling cross-function
+                //     Values) by any future second train block lowered before
+                //     `clear_csha_per_function_caches()` runs.
+                // The insert has been deleted; the buffers are instead freed
+                // scope-immediately after the forward launch below.
+                //
+                // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named
+                // locals so the forward FFI call below reads stable Values.
                 //
                 // WIRE-HERE: when future work threads a real cos/sin tensor
                 // source (e.g. resolved from a @param input or a wengert-side
                 // synthesis op), REPLACE the two `null` assignments below with
-                // the resolved Cranelift Value handles. The backward FFI in
-                // wengert_lower.rs consumes them from `saves.cos` / `saves.sin`
-                // — once these locals are non-null, backward picks them up
-                // with no further edits.
+                // the resolved Cranelift Value handles.
                 let rope_cos_v = null;
                 let rope_sin_v = null;
-                self.csha_forward_saves.insert(
-                    layer_key,
-                    crate::csha_apply::CshaSavePointers {
-                        q_proj: q_proj_v,
-                        k_proj: k_proj_v,
-                        v_proj: v_proj_v,
-                        row_max: row_max_v,
-                        row_sum: row_sum_v,
-                        x_raw: x_raw_v,
-                        // Sprint 1 T1.1: retain the forward attention
-                        // output handle (already allocated above as
-                        // `out_val` via `nsl_tensor_zeros_like`/`_on`
-                        // and threaded into the with-saves FFI below).
-                        // The Tier B.2 hybrid backward's D pre-pass
-                        // reads O via `csha_tensor_data_ptr(out_ptr)`.
-                        out: out_val,
-                        // Sprint 1 (cycle-2): stash the same null RoPE cos/sin
-                        // Values the forward FFI is handed (below) so the
-                        // Tier B.2 hybrid backward reads identical pointers
-                        // (today both null → both forward and backward skip
-                        // rotation, self-consistent rope-effectively-off).
-                        cos: rope_cos_v,
-                        sin: rope_sin_v,
-                        backward_ptx_data_id: bwd_ptx_id,
-                        backward_name_data_id: bwd_name_id,
-                        backward_tier_b_on_ptx_data_id: bwd_tier_b_ptx_id,
-                        backward_tier_b_on_name_data_id: bwd_tier_b_name_id,
-                    },
-                );
 
                 // Gap B: route the launch to the CSHA-with-saves PTX / name
                 // when they were synthesized at module scan. Without this
@@ -1812,21 +1773,38 @@ impl Compiler<'_> {
                     builder.seal_block(ok_block);
                 }
 
-                // Gap D: the scope-immediate free that was here in Gap A
-                // has MOVED.  Under @train the saves must survive until
-                // the backward kernel runs — the free now fires inside
-                // the `FusedCshaBackward` lowerer in `wengert_lower.rs`
-                // right after `nsl_flash_attention_csha_backward` has
-                // consumed the pointers.  If the backward never runs
-                // (e.g. inference path hitting this branch because
-                // `save_activations_for_backward` was set by mistake)
-                // we leak the 6 device buffers for this call — that's
-                // a small, one-time leak per layer per @train compile
-                // unit; the stash is cleared at end of function body by
-                // Cranelift's scope-local `Value` lifetime anyway, so
-                // the allocation is recovered by the next JIT reset.
-                // TODO: audit non-@train callers once Gap D's adjoint
-                // wiring stabilises.
+                // Scope-immediate free (save-buffer-leak fix, 2026-07-02).
+                //
+                // This emission site is the model-METHOD body — direct
+                // inference calls of an `@flash_attention` method — NOT the
+                // @train step function.  The @train forward+backward pair
+                // lowers through `wengert_lower.rs`, which allocates its own
+                // save buffers and frees them right after
+                // `nsl_flash_attention_csha_backward` consumes the pointers.
+                // No backward can ever consume the buffers allocated above:
+                // `save_activations_for_backward` stays flipped on after
+                // `compile_train_block` returns and methods compile after the
+                // train block, so every post-train direct method call
+                // (validation, generation) lands in this branch.  Before this
+                // fix each such call leaked all 6 device buffers
+                // (~B*H*S*(10*D+8) bytes ≈ 10.6 MB at B=1,H=8,S=2048,D=64)
+                // PER CALL — not "one-time" as the previous comment claimed,
+                // and never "recovered by JIT reset" either (raw
+                // `cuMemAlloc`'d device memory outlives the JIT module).
+                //
+                // Race-safety: `nsl_csha_free_backward_activations_from`
+                // synchronizes the CUDA context before freeing (the forward
+                // launch above is asynchronous and `kernel_launch` does not
+                // sync outside `--cuda-sync`), so the free cannot race the
+                // in-flight kernel.
+                let _ = self.compile_call_by_name(
+                    builder,
+                    "nsl_csha_free_backward_activations_from",
+                    &[
+                        q_proj_v, k_proj_v, v_proj_v,
+                        row_max_v, row_sum_v, x_raw_v,
+                    ],
+                )?;
             } else {
                 // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the
                 // per-step thread-local packing registry. Inference path:

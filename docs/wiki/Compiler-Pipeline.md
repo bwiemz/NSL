@@ -61,9 +61,9 @@ GPU kernels are not a second function-emission backend. PTX text is synthesized 
 
 Two PTX synthesis paths exist:
 
-1. **Portable subset** — `KernelDef` AST nodes are lowered by [`kernel_lower.rs`](../../crates/nsl-codegen/src/kernel_lower.rs) (`lower_kernel_to_ir`) into a backend-agnostic `KernelIR`, then emitted as PTX text bytes by [`backend_ptx.rs`](../../crates/nsl-codegen/src/backend_ptx.rs) (`lower_kir_to_ptx`). This is the M47 portable path for user-authored `kernel` blocks.
+1. **Direct AST → PTX (default CUDA target)** — [`kernel.rs`](../../crates/nsl-codegen/src/kernel.rs) (`KernelCompiler`) translates user-authored `KernelDef` AST nodes directly to PTX strings without going through `KernelIR`. This is the path user `kernel` blocks take on the default `--target cuda` (see the dispatch in [`compiler/kernel.rs`](../../crates/nsl-codegen/src/compiler/kernel.rs) `compile_single_kernel`). Constructs outside its supported subset are refused with a compile error.
 
-2. **Direct AST → PTX (legacy)** — [`kernel.rs`](../../crates/nsl-codegen/src/kernel.rs) handles complex kernel bodies that use NSL features beyond the portable `KernelIR` subset. It translates `KernelDef` AST nodes directly to PTX strings without going through `KernelIR`.
+2. **Portable subset (M47b, non-CUDA targets only)** — for `--target rocm|metal|webgpu`, `KernelDef` AST nodes are lowered by [`kernel_lower.rs`](../../crates/nsl-codegen/src/kernel_lower.rs) (`lower_kernel_to_ir`) into a backend-agnostic `KernelIR`, then emitted by the per-backend lowerers (`backend_amdgpu.rs`, `backend_metal.rs`, `backend_wgsl.rs`; [`backend_ptx.rs`](../../crates/nsl-codegen/src/backend_ptx.rs) exists for KIR→PTX but is not in the CUDA dispatch). Stores and control flow on this path are deferred to M47c and refuse with a compile error; there is no automatic fallback between the two paths.
 
 Subsystem-specific fusions (CSHA, WRGA, FlashAttention-2) have their own templated PTX emitters. Their output also becomes a Cranelift data section. See [Optimization-Passes](Optimization-Passes.md) for the per-subsystem pass structure.
 

@@ -294,15 +294,20 @@ pub(crate) struct CheckArgs {
         #[arg(long)]
         pub(crate) shapes: bool,
 
-        /// M37: Run roofline performance analysis
+        /// M37: Run roofline performance analysis (delegates to the
+        /// `nsl profile` engine with its defaults; use `nsl profile`
+        /// directly for entry-point/dim/JSON control)
         #[arg(long)]
         pub(crate) perf: bool,
 
-        /// M37: Target GPU for performance analysis (e.g., "H100", "A100-PCIe")
+        /// M37: Target GPU for performance analysis (e.g., "H100",
+        /// "A100-PCIe"); requires --perf
         #[arg(long)]
         pub(crate) gpu: Option<String>,
 
-        /// M37: Write Chrome tracing JSON to file
+        /// M37: Write Chrome tracing JSON to file. NOT IMPLEMENTED on
+        /// `nsl check` — refused with an error; use
+        /// `nsl debug <file.nsltrace> --export-chrome <out>` instead
         #[arg(long)]
         pub(crate) trace: Option<String>,
 
@@ -589,7 +594,9 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) zk_circuit: bool,
 
-        /// M55: ZK proving backend: folding (default), halo2, or plonky3
+        /// M55: ZK proving backend. Only "folding" (default) is implemented;
+        /// "halo2" (deprecated, circuit lowering removed) and "plonky3"
+        /// (prover not yet wired into compilation) are refused at build time.
         #[arg(long, default_value = "folding")]
         pub(crate) zk_backend: String,
 
@@ -889,6 +896,36 @@ pub(crate) struct RunArgs {
         /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
+
+        /// WGGO: global-optimization mode ("full", "greedy", "off", or "auto").
+        /// Passing `--wggo` without a value enables full mode. Mirrors
+        /// `nsl build --wggo` so the WGGO mode-table dispatch reaches
+        /// `emit_unified_optim_step_dispatch` end-to-end via `nsl run`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        pub(crate) wggo: Option<String>,
+
+        /// WGGO: print the global-optimization report to stderr
+        #[arg(long)]
+        pub(crate) wggo_report: bool,
+
+        /// WGGO Stage 3: path to a `.nslweights` sidecar for real
+        /// weight-based importance scoring. Without this flag the analyzer
+        /// falls back to uniform head scores.
+        #[arg(long, value_name = "PATH")]
+        pub(crate) wggo_weights: Option<PathBuf>,
+
+        /// WGGO head-importance scoring mode.
+        /// - `auto` (default): gradient scoring when calibration sidecar present, else magnitude.
+        /// - `magnitude`: force magnitude scoring even with calibration data.
+        /// - `grad`: require gradient scoring; errors if no calibration sidecar present.
+        #[arg(long, value_enum, default_value_t = CliWggoImportance::Auto)]
+        pub(crate) wggo_importance: CliWggoImportance,
+
+        /// WGGO Stage 3: fraction of heads the default
+        /// `min_retained_importance` threshold allows to be pruned.
+        /// Clamped to [0.0, 0.9]; default 0.25.
+        #[arg(long, value_name = "F")]
+        pub(crate) wggo_prune_fraction: Option<f64>,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

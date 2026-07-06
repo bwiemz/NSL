@@ -411,7 +411,7 @@ pub fn cpu_reference(
     head_dim: u32,
     seq_len: u32,
 ) -> Vec<f32> {
-    assert!(n_kv_heads >= 1 && n_heads % n_kv_heads == 0);
+    assert!(n_kv_heads >= 1 && n_heads.is_multiple_of(n_kv_heads));
     let (nh, nkv, hd, sl) = (
         n_heads as usize,
         n_kv_heads as usize,

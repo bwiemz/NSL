@@ -24,7 +24,7 @@ Research paper describing NSL's speculative decoding approach: hypothesis genera
 Research document covering the compiler's strategy for fusing multi-head attention with adjacent elementwise and normalization ops. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf).
 
 ### <a id="cfie"></a>CFIE — Compiler-Fused Inference Engine
-NSL's inference-serving orchestration layer: KV plan, fused sampling, speculative decode, persistent KV cache, and grammar-constrained generation all compose into one codegen pass. See [CFIE.pdf](../research/CFIE.pdf); implementation in `crates/nsl-codegen/src/cfie.rs`.
+NSL's inference-serving orchestration layer: KV plan, fused sampling, speculative decode, persistent KV cache, and grammar-constrained generation compose into one codegen pass. Shipped today: compile-time planning + real PTX emission for all five kernel families, plus (on the monolithic serve path) kernel registration with the runtime engine at serve init and a host-side decode loop (`nsl_cfie_decode_step`). Still pending: endpoint-driven generation needs serve-block model binding, so the compiled decode loop is exercised by tests/host callers until that lands. See [CFIE.pdf](../research/CFIE.pdf); implementation in `crates/nsl-codegen/src/cfie.rs` (driver + report) and `crates/nsl-codegen/src/serve.rs` (`run_cfie_for_serve`).
 
 ### <a id="cftp"></a>CFTP — Compiler-Fused Training Pipeline
 Research framework covering NSL's full training pipeline as a compile-time transformation: batching, packing, gradient accumulation, and optimizer dispatch fused into a single low-level loop. See [CFTP.pdf](../research/CFTP.pdf); PCA (§2) and FASE (§1) are the shipped sub-systems.

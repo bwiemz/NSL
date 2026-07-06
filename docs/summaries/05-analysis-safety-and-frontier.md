@@ -141,7 +141,7 @@ Activated via `nsl check --nan-analysis`.
 
 ## Determinism / Reproducibility (M46)
 
-**Files**: `nsl-semantic/src/determinism.rs`, `nsl-codegen/src/deterministic_kernels.rs`, `nsl-runtime/src/deterministic_ops.rs`
+**Files**: `nsl-semantic/src/determinism.rs`, `nsl-codegen/src/wengert_lower.rs` (deterministic op routing), `nsl-runtime/src/deterministic_ops.rs`
 
 ### Semantic Analysis
 - **DeterminismMode**: Off, FunctionLevel, Global
@@ -149,14 +149,13 @@ Activated via `nsl check --nan-analysis`.
 - **Non-determinism categories**: GpuAtomic, ImplicitRng, AlgorithmSelection, External
 - **Function-level marking**: `@deterministic` decorator with compile-time verification
 
-### Kernel Variants
-The codegen can select deterministic variants of GPU kernels:
-- `DeterministicSortReduce`: Sort-based reduction (deterministic but slower)
-- `DeterministicSortAccumulate`: Deterministic accumulation order
-- `DeterministicCublas`: Force deterministic cuBLAS algorithms
-
-### Graph Fingerprinting
-Computes a hash of the computation graph for bitwise reproducibility verification across runs.
+### Deterministic Op Routing (M46b/M46c)
+When `--deterministic` is active, `wengert_lower.rs` routes affected ops to
+bit-reproducible runtime variants in `nsl-runtime/src/deterministic_ops.rs`:
+- `reduce_sum` / `reduce_mean` → `nsl_tensor_reduce_{sum,mean}_deterministic`
+  (fixed ascending-order accumulation; sequential single-thread PTX kernels on GPU)
+- `scatter_add` → `nsl_tensor_scatter_add_deterministic` (output-centric GPU
+  kernel: each output element is owned by exactly one thread — no atomics, no sorting)
 
 ---
 

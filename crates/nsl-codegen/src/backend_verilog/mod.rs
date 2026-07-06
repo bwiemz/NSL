@@ -2,6 +2,7 @@
 //! One fixed Verilog template per HIR node kind; no optimization.
 
 pub mod filter;
+pub mod flatten;
 pub mod lower;
 pub mod templates;
 pub mod yosys;

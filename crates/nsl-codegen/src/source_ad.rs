@@ -745,7 +745,20 @@ impl AdjointGenerator {
 
             // --- Simple pass-through ops (single instruction, mathematically correct) ---
             AdjointExpr::Negate(v) => self.emit_op(PrimalOp::Neg, vec![v]),
-            AdjointExpr::MulElementwise(a, b) => self.emit_op(PrimalOp::Mul, vec![a, b]),
+            AdjointExpr::MulElementwise(grad, other, target) => {
+                // Broadcast-aware backward for elementwise multiply.
+                // The raw product `grad * other` carries the broadcast output
+                // shape; the gradient accumulating into `target` must be
+                // reduced (summed) over any broadcast axes so it matches
+                // target's storage shape. Mirrors the broadcast-correct
+                // sibling arms MatmulTransposeRight, Expand/ReduceToShape,
+                // and the RMSNorm dgamma path.
+                let raw = self.emit_op(PrimalOp::Mul, vec![grad, other]);
+                self.emit_op(
+                    PrimalOp::Passthrough("reduce_to_shape".into()),
+                    vec![raw, target],
+                )
+            }
             AdjointExpr::MatmulTransposeLeft(grad, b) => {
                 // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support)
                 let b_t = self.emit_op(
@@ -1133,21 +1146,22 @@ impl AdjointGenerator {
             }
 
             // --- Conv/Pool backward ---
-            AdjointExpr::ConvTransposeInput(y_bar, weight, stride, padding) => self.emit_op(
-                PrimalOp::ConvTranspose2d { stride, padding },
-                vec![y_bar, weight],
-            ),
-            AdjointExpr::ConvTransposeWeight(input, y_bar) => {
-                // Conv weight gradient requires im2col + matmul (cross-correlation),
-                // not a plain matmul on 4D tensors. The tape-based backward in
-                // backward.rs implements the correct nested loop. For source-AD,
-                // we transpose the input and compute the correlation via matmul
-                // on the flattened spatial dimensions.
-                // TODO(M40c): implement proper im2col + matmul for 4D conv grad.
-                // For now, transpose input and matmul (correct for 2D FC-like convs).
-                let input_t = self.emit_op(PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![input]);
-                self.emit_op(PrimalOp::Matmul, vec![input_t, y_bar])
-            }
+            // Conv2d gradients delegate to the runtime `nsl_conv2d_*_backward`
+            // FFIs, which wrap the same verified nested-loop `conv2d_backward`
+            // the tape path uses — so source-AD conv gradients are byte-identical
+            // to the tape gradients. `kind` selects input/weight/bias; inputs are
+            // [grad_output, input, weight]. (This replaced an earlier
+            // transpose+matmul lowering that was wrong for 4D convolution and was
+            // subsequently turned into a hard refusal; it is now implemented.)
+            AdjointExpr::Conv2dBackward(kind, grad, input, weight, stride, padding) => self
+                .emit_op(
+                    PrimalOp::Conv2dBackward {
+                        kind,
+                        stride,
+                        padding,
+                    },
+                    vec![grad, input, weight],
+                ),
             AdjointExpr::MaxPoolBackward(y_bar, indices) => {
                 // MaxPool backward: scatter grad to argmax positions
                 self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices])
@@ -3130,6 +3144,61 @@ impl<'a> WengertExtractor<'a> {
                             .unwrap_or(0);
                         PrimalOp::Gather { dim }
                     }
+                    // Conv2d: conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w).
+                    // Extract square stride/padding as compile-time constants and
+                    // emit PrimalOp::Conv2d with only the tensor inputs
+                    // [input, weight, bias]. Non-constant or non-square stride/
+                    // padding is not representable by the single-valued
+                    // PrimalOp::Conv2d, so it returns None and falls back to tape AD
+                    // (whose conv2d_backward handles the general case).
+                    "conv2d" => {
+                        if args.len() != 7 {
+                            eprintln!(
+                                "[source-ad] conv2d expected 7 args (input, weight, bias, \
+                                 stride_h, stride_w, pad_h, pad_w), got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        let as_const_int = |k: &ExprKind| -> Option<i64> {
+                            match k {
+                                ExprKind::IntLiteral(v) => Some(*v),
+                                ExprKind::UnaryOp {
+                                    op: AstUnaryOp::Neg,
+                                    operand,
+                                } => match &operand.kind {
+                                    ExprKind::IntLiteral(v) => Some(-*v),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        };
+                        let (sh, sw, ph, pw) = match (
+                            as_const_int(&args[3].value.kind),
+                            as_const_int(&args[4].value.kind),
+                            as_const_int(&args[5].value.kind),
+                            as_const_int(&args[6].value.kind),
+                        ) {
+                            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                            _ => return None,
+                        };
+                        if sh != sw || ph != pw || sh < 1 || ph < 0 {
+                            return None;
+                        }
+                        let conv_inputs = vec![input_vars[0], input_vars[1], input_vars[2]];
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::Conv2d {
+                                stride: sh as usize,
+                                padding: ph as usize,
+                            },
+                            inputs: conv_inputs,
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
+                    }
                     // Attention — emit as fused ScaledDotProductAttention.
                     // The backward is handled by FlashAttentionBackwardExtract
                     // which calls nsl_flash_attention_backward (CPU reference path).
@@ -4128,6 +4197,140 @@ mod tests {
         let _adjoint = gen.generate(&primal);
         assert!(gen.adjoint_of(0).is_some());
         assert!(gen.adjoint_of(1).is_some());
+    }
+
+    /// CPDT Part II activation: directly tests `lower_adjoint_expr` against
+    /// a single `MulElementwise` adjoint, independent of the full
+    /// `AdjointGenerator::generate` flow. Catches a bug class that
+    /// `mul_backward_emits_reduce_to_shape_per_arm` cannot — e.g. accidentally
+    /// swapping `raw` and `target` inside the Mul lowering's emit_op call
+    /// would still produce two ops and a `Passthrough("reduce_to_shape")`
+    /// op, but with the wrong target VarId.
+    #[test]
+    fn lower_adjoint_expr_mul_elementwise_uses_target_as_shape_anchor() {
+        let mut gen = AdjointGenerator::new(200);
+        // grad=100, other=42, target=7 — chosen to be unambiguous in the
+        // result inputs vector.
+        let _ = gen.lower_adjoint_expr(AdjointExpr::MulElementwise(100, 42, 7));
+        let ops = &gen.adjoint_ops;
+        assert_eq!(
+            ops.len(),
+            2,
+            "MulElementwise must lower to exactly 2 ops (Mul + reduce_to_shape), got {} (ops: {:?})",
+            ops.len(),
+            ops.iter().map(|o| &o.op).collect::<Vec<_>>(),
+        );
+        assert!(
+            matches!(ops[0].op, PrimalOp::Mul),
+            "op[0] must be PrimalOp::Mul, got {:?}",
+            ops[0].op,
+        );
+        assert_eq!(
+            ops[0].inputs,
+            vec![100, 42],
+            "Mul inputs must be (grad, other), got {:?}",
+            ops[0].inputs,
+        );
+        let raw_var = ops[0].result;
+        match &ops[1].op {
+            PrimalOp::Passthrough(name) => assert_eq!(name, "reduce_to_shape"),
+            other => panic!("op[1] must be Passthrough(\"reduce_to_shape\"), got {:?}", other),
+        }
+        assert_eq!(
+            ops[1].inputs,
+            vec![raw_var, 7],
+            "reduce_to_shape inputs must be (raw_mul_result, target), got {:?}",
+            ops[1].inputs,
+        );
+    }
+
+    /// Conv2d gradients are now implemented in source AD (the deferral is
+    /// closed). Each `Conv2dBackward` adjoint lowers to exactly one
+    /// `PrimalOp::Conv2dBackward` op carrying the same kind/stride/padding and
+    /// inputs `[grad, input, weight]` — which in turn calls the runtime
+    /// `nsl_conv2d_{input,weight,bias}_backward` FFI wrapping the verified
+    /// `conv2d_backward` shared with the tape path. (Previously both arms
+    /// refused loudly because the old transpose+matmul lowering was wrong for
+    /// 4D convolution.)
+    #[test]
+    fn lower_adjoint_expr_conv_grads_emit_backward_ops() {
+        use crate::wengert::ConvGradKind;
+        for (kind, stride, padding) in [
+            (ConvGradKind::Input, 1usize, 0usize),
+            (ConvGradKind::Weight, 2, 1),
+            (ConvGradKind::Bias, 1, 0),
+        ] {
+            let mut gen = AdjointGenerator::new(200);
+            // grad=100, input=5, weight=6 — distinct for an unambiguous inputs check.
+            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+                kind, 100, 5, 6, stride, padding,
+            ));
+            let ops = &gen.adjoint_ops;
+            assert_eq!(
+                ops.len(),
+                1,
+                "Conv2dBackward must lower to exactly 1 op, got {:?}",
+                ops.iter().map(|o| &o.op).collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                ops[0].op,
+                PrimalOp::Conv2dBackward {
+                    kind,
+                    stride,
+                    padding
+                },
+                "unexpected lowered op for kind {:?}",
+                kind,
+            );
+            assert_eq!(
+                ops[0].inputs,
+                vec![100, 5, 6],
+                "Conv2dBackward inputs must be [grad, input, weight]",
+            );
+        }
+    }
+
+    /// CPDT Part II activation: the source-AD lowering of `Mul`'s backward
+    /// must reduce each grad arm to the shape of the input whose adjoint it
+    /// feeds, otherwise broadcast multiplies (e.g. `h[2,64] * scale[64]`)
+    /// produce mismatched grad shapes and crash at
+    /// `nsl_tensor_add_inplace`. This regression test confirms that BOTH
+    /// arms of `Mul`'s backward emit a `reduce_to_shape` passthrough whose
+    /// second input is the corresponding original primal input — the
+    /// shape-anchor used by `nsl_tensor_reduce_to_shape` at runtime.
+    #[test]
+    fn mul_backward_emits_reduce_to_shape_per_arm() {
+        let primal = WengertList {
+            ops: vec![
+                make_op(0, 0, PrimalOp::Input("a".into()), vec![]),
+                make_op(1, 1, PrimalOp::Input("b".into()), vec![]),
+                make_op(2, 2, PrimalOp::Mul, vec![0, 1]),
+            ],
+            output: 2,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        let mut gen = AdjointGenerator::new(10);
+        let adjoint = gen.generate(&primal);
+        let reduce_ops: Vec<_> = adjoint
+            .ops
+            .iter()
+            .filter(|op| matches!(&op.op, PrimalOp::Passthrough(s) if s == "reduce_to_shape"))
+            .collect();
+        assert_eq!(
+            reduce_ops.len(),
+            2,
+            "expected one reduce_to_shape per Mul backward arm, got {} (ops: {:?})",
+            reduce_ops.len(),
+            adjoint.ops.iter().map(|o| &o.op).collect::<Vec<_>>(),
+        );
+        // Targets are the original Mul inputs, in arm order: 0 then 1.
+        let targets: Vec<VarId> = reduce_ops.iter().map(|op| op.inputs[1]).collect();
+        assert_eq!(
+            targets,
+            vec![0, 1],
+            "reduce_to_shape targets must match the primal inputs whose grads they shape",
+        );
     }
 
     #[test]

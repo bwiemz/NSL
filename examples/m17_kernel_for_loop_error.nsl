@@ -1,0 +1,10 @@
+# Negative test: `for` loops are not supported inside `kernel` blocks.
+# The kernel PTX compiler must refuse loudly instead of silently dropping
+# the loop body (which used to produce wrong numbers at runtime).
+
+kernel bad_loop(a, out):
+    let i = thread_id()
+    for j in range(0, 4):
+        out[i] = a[i]
+
+print("should_not_compile")

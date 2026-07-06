@@ -263,19 +263,39 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         }
         KirOp::Exp(dst, src) => {
             let prefix = var_reg_prefix(ir, *dst, *src);
+            // e^x = 2^(x * log2(e)); ex2.approx computes 2^x, so pre-scale
+            // by log2(e) = 1.4426950408889634 (0f3FB8AA3B). src is read only
+            // by the first instruction, so the sequence is safe when
+            // dst == src.
+            writeln!(
+                ptx,
+                "    mul.f32 {}{}, {}{}, 0f3FB8AA3B;",
+                prefix, dst, prefix, src
+            )
+            .unwrap();
             writeln!(
                 ptx,
                 "    ex2.approx.f32 {}{}, {}{};",
-                prefix, dst, prefix, src
+                prefix, dst, prefix, dst
             )
             .unwrap();
         }
         KirOp::Log(dst, src) => {
             let prefix = var_reg_prefix(ir, *dst, *src);
+            // ln(x) = log2(x) * ln(2); lg2.approx computes log2(x), so
+            // post-scale by ln(2) = 0.6931471805599453 (0f3F317218). src is
+            // read only by the first instruction, so the sequence is safe
+            // when dst == src.
             writeln!(
                 ptx,
                 "    lg2.approx.f32 {}{}, {}{};",
                 prefix, dst, prefix, src
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    mul.f32 {}{}, {}{}, 0f3F317218;",
+                prefix, dst, prefix, dst
             )
             .unwrap();
         }
@@ -297,12 +317,57 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             )
             .unwrap();
         }
-        KirOp::Tanh(dst, _src) => {
-            // PTX has no native tanh; emitted as a sequence, but for KIR we emit a placeholder call
-            let prefix = var_reg_prefix(ir, *dst, *_src);
-            // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) -- simplified as a call stub
-            writeln!(ptx, "    // tanh: not native in PTX, requires expansion").unwrap();
-            writeln!(ptx, "    mov.f32 {}{}, {}{};", prefix, dst, prefix, _src).unwrap();
+        KirOp::Tanh(dst, src) => {
+            let prefix = var_reg_prefix(ir, *dst, *src);
+            // PTX has no native tanh; expand as tanh(x) = 2*sigmoid(2x) - 1
+            // = 2/(1 + exp(-2x)) - 1, with exp via ex2.approx and the base
+            // conversion folded in (-2x * log2(e) = -2x * 0f3FB8AA3B).
+            // Same instruction sequence as the proven "tanh" epilogue in
+            // epilogue_fusion.rs. src is read only by the first instruction,
+            // so the expansion is safe when dst == src.
+            writeln!(
+                ptx,
+                "    add.f32 {}{}, {}{}, {}{};",
+                prefix, dst, prefix, src, prefix, src
+            )
+            .unwrap();
+            writeln!(ptx, "    neg.f32 {}{}, {}{};", prefix, dst, prefix, dst).unwrap();
+            writeln!(
+                ptx,
+                "    mul.f32 {}{}, {}{}, 0f3FB8AA3B;",
+                prefix, dst, prefix, dst
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    ex2.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, dst
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    add.f32 {}{}, {}{}, 0f3F800000;",
+                prefix, dst, prefix, dst
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    rcp.approx.f32 {}{}, {}{};",
+                prefix, dst, prefix, dst
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    add.f32 {}{}, {}{}, {}{};",
+                prefix, dst, prefix, dst, prefix, dst
+            )
+            .unwrap();
+            writeln!(
+                ptx,
+                "    sub.f32 {}{}, {}{}, 0f3F800000;",
+                prefix, dst, prefix, dst
+            )
+            .unwrap();
         }
         KirOp::Pow(dst, base, exp) => {
             let prefix = var_reg_prefix(ir, *dst, *base);
@@ -768,6 +833,135 @@ mod tests {
             "GlobalId(dst=0) uses synthetic temps %r1000 and %r1001; \
              .reg .u32 %r<N> must declare N >= 1002, got {}",
             decl_count
+        );
+    }
+
+    /// Build a trivial kernel with a single unary math op `emit(dst, src)`
+    /// applied to two fresh f32 vars (src = VarId 0, dst = VarId 1) and
+    /// return the emitted PTX text.
+    fn ptx_for_unary_op(name: &str, op: fn(VarId, VarId) -> KirOp) -> String {
+        let mut b = KirBuilder::new(name);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let src = b.new_typed_var(KirType::F32);
+        let dst = b.new_typed_var(KirType::F32);
+        b.emit(op(dst, src));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+
+        let ptx_bytes = lower_kir_to_ptx(&ir);
+        String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]).into_owned()
+    }
+
+    /// KirOp::Exp must compute e^x, not 2^x: ex2.approx computes 2^x, so the
+    /// input must be pre-scaled by log2(e) = 0f3FB8AA3B.
+    #[test]
+    fn test_ptx_exp_applies_base_conversion() {
+        let ptx = ptx_for_unary_op("test_exp", |d, s| KirOp::Exp(d, s));
+
+        let mul = ptx
+            .find("mul.f32 %f1, %f0, 0f3FB8AA3B;")
+            .expect("Exp must pre-multiply the input by log2(e) (0f3FB8AA3B)");
+        let ex2 = ptx
+            .find("ex2.approx.f32 %f1, %f1;")
+            .expect("Exp must apply ex2.approx to the pre-scaled value");
+        assert!(
+            mul < ex2,
+            "log2(e) pre-scale must come before ex2.approx:\n{}",
+            ptx
+        );
+        assert!(
+            !ptx.contains("ex2.approx.f32 %f1, %f0;"),
+            "Exp must not feed the raw input to ex2.approx (that computes 2^x):\n{}",
+            ptx
+        );
+    }
+
+    /// KirOp::Log must compute ln(x), not log2(x): lg2.approx computes
+    /// log2(x), so the result must be post-scaled by ln(2) = 0f3F317218.
+    #[test]
+    fn test_ptx_log_applies_base_conversion() {
+        let ptx = ptx_for_unary_op("test_log", |d, s| KirOp::Log(d, s));
+
+        let lg2 = ptx
+            .find("lg2.approx.f32 %f1, %f0;")
+            .expect("Log must apply lg2.approx to the input");
+        let mul = ptx
+            .find("mul.f32 %f1, %f1, 0f3F317218;")
+            .expect("Log must post-multiply the lg2 result by ln(2) (0f3F317218)");
+        assert!(
+            lg2 < mul,
+            "ln(2) post-scale must come after lg2.approx:\n{}",
+            ptx
+        );
+    }
+
+    /// KirOp::Tanh must emit a real expansion (tanh(x) = 2*sigmoid(2x) - 1,
+    /// mirroring the epilogue_fusion.rs sequence), not the old silent
+    /// identity `mov.f32 dst, src`.
+    #[test]
+    fn test_ptx_tanh_emits_expansion_not_identity() {
+        let ptx = ptx_for_unary_op("test_tanh", |d, s| KirOp::Tanh(d, s));
+
+        assert!(
+            !ptx.contains("mov.f32 %f1, %f0;"),
+            "Tanh must not emit a bare mov identity:\n{}",
+            ptx
+        );
+        let expected = [
+            "add.f32 %f1, %f0, %f0;",       // 2x
+            "neg.f32 %f1, %f1;",            // -2x
+            "mul.f32 %f1, %f1, 0f3FB8AA3B;", // -2x * log2(e)
+            "ex2.approx.f32 %f1, %f1;",     // exp(-2x)
+            "add.f32 %f1, %f1, 0f3F800000;", // 1 + exp(-2x)
+            "rcp.approx.f32 %f1, %f1;",     // sigmoid(2x)
+            "add.f32 %f1, %f1, %f1;",       // 2*sigmoid(2x)
+            "sub.f32 %f1, %f1, 0f3F800000;", // 2*sigmoid(2x) - 1
+        ];
+        let mut cursor = 0;
+        for instr in expected {
+            match ptx[cursor..].find(instr) {
+                Some(pos) => cursor += pos + instr.len(),
+                None => panic!(
+                    "Tanh expansion missing (or out of order): `{}`\nPTX:\n{}",
+                    instr, ptx
+                ),
+            }
+        }
+    }
+
+    /// The unary math expansions read the source register only in their
+    /// first instruction, so they must stay correct when dst == src.
+    #[test]
+    fn test_ptx_unary_math_dst_src_aliasing() {
+        let mut b = KirBuilder::new("test_alias");
+        let entry = b.new_block();
+        b.set_block(entry);
+        let x = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Exp(x, x));
+        b.emit(KirOp::Tanh(x, x));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+
+        let ptx_bytes = lower_kir_to_ptx(&ir);
+        let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]);
+
+        // Exp(x, x): the log2(e) pre-scale reads %f0 before overwriting it.
+        assert!(
+            ptx.contains("mul.f32 %f0, %f0, 0f3FB8AA3B;"),
+            "aliased Exp must pre-scale in-place:\n{}",
+            ptx
+        );
+        // Tanh(x, x): the doubling reads %f0 twice before overwriting it.
+        assert!(
+            ptx.contains("add.f32 %f0, %f0, %f0;"),
+            "aliased Tanh must double in-place:\n{}",
+            ptx
+        );
+        assert!(
+            ptx.contains("sub.f32 %f0, %f0, 0f3F800000;"),
+            "aliased Tanh must complete the 2*sigmoid(2x) - 1 expansion:\n{}",
+            ptx
         );
     }
 }

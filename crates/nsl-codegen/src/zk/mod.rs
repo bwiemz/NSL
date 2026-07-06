@@ -127,12 +127,17 @@ pub fn extract_zk_lookup_decorator<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// compile_zk — top-level orchestrator (placeholder until Task 14)
+// compile_zk — top-level orchestrator
 // ---------------------------------------------------------------------------
 
 /// Top-level ZK compilation orchestrator.
 ///
 /// Compiles a function or model decorated with `@zk_proof` into a [`ZkCompileResult`].
+///
+/// Only the folding backend is wired into compilation. Requests for any other
+/// backend are refused up front with [`backend::ZkError::BackendNotImplemented`]
+/// rather than silently falling back to folding (which would mislabel the
+/// resulting proof as coming from the requested backend).
 ///
 /// For the folding backend (default), this:
 ///   1. Lowers the DAG to per-layer ZkIRs
@@ -151,6 +156,28 @@ pub fn compile_zk(
     type_map: &nsl_semantic::checker::TypeMap,
     interner: &nsl_lexer::Interner,
 ) -> Result<ZkCompileResult, backend::ZkError> {
+    // M55: honest backend refusal. This guard MUST live here (not in
+    // `compile_zk_from_dag`) because the `compile_zk_from_dag(...).ok()` call
+    // below swallows errors — a guard placed there would silently drop the
+    // refusal and still emit stats as if the requested backend had run.
+    match config.backend {
+        backend::ZkBackendType::Folding => {}
+        backend::ZkBackendType::Halo2 => {
+            return Err(backend::ZkError::BackendNotImplemented {
+                backend: "halo2",
+                message: "the Halo2 (PSE fork) backend is deprecated and its circuit \
+                          lowering has been removed; use --zk-backend folding",
+            });
+        }
+        backend::ZkBackendType::Plonky3 => {
+            return Err(backend::ZkError::BackendNotImplemented {
+                backend: "plonky3",
+                message: "the Plonky3 prover exists but is not yet wired into ZK \
+                          compilation; use --zk-backend folding",
+            });
+        }
+    }
+
     let mut dag = ast_to_zkdag(fn_def, type_map, interner)?;
 
     // M55: If a weights file was provided, load weight values and patch the DAG.

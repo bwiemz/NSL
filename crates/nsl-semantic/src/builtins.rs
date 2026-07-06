@@ -400,6 +400,27 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         );
     }
 
+    // Element-wise tensor `sign` (Tensor -> Tensor). Its runtime FFI
+    // (`nsl_tensor_sign`), Cranelift signature, and codegen call-dispatch all
+    // already existed; only this semantic registration was missing, which made
+    // the stdlib Lion optimizer (`sign(β₁m+(1-β₁)g)`) fail type-checking.
+    //
+    // It is deliberately typed concretely as Tensor->Tensor (not `Unknown` like
+    // `abs`): a `sign(...)` result typed `Unknown` would make a downstream
+    // `scalar * result` (e.g. Lion's `lr * update`) mis-dispatch to a scalar
+    // multiply, producing an f64 where a tensor pointer is required. Unlike
+    // `abs`, `sign` has no scalar-argument codegen path — the scalar version is
+    // `nsl.math.sign`, which shadows this builtin via codegen's
+    // user-defined-function check when imported (same pattern as `clamp`).
+    def(
+        "sign",
+        Type::Function {
+            params: vec![tensor_ret.clone()],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // tensor_slice(tensor, dim, start, end) -> tensor
     def(
         "tensor_slice",
@@ -989,6 +1010,43 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // CPDT Part III v2.3: paper-faithful MoE FFN intrinsic
+    // (`moe_dispatch_ffn(tokens, logits, experts_up, experts_down)`).
+    // Opt-in 4-arg variant that lowers to `nsl_moe_dispatch_full_v3`
+    // (up → SiLU → down). Coexists with the 3-arg `moe_dispatch`
+    // (v1/v2 path); users opt into v3 by switching intrinsics.
+    def(
+        "moe_dispatch_ffn",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown, Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
+    // CPDT Part III v2.5+v2.8: Mixtral's gated MoE FFN intrinsic
+    // (`moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up,
+    // experts_down)`). 5-arg opt-in that lowers to
+    // `nsl_moe_dispatch_full_v4`. Gate activation selected by
+    // `@moe(activation="silu"|"gelu"|"relu")` — default silu→SwiGLU,
+    // gelu→GeGLU (v2.8), relu→ReGLU (v2.8). `@moe(activation="identity")`
+    // is refused at codegen (use `moe_dispatch_ffn` v3 for a 2-weight
+    // FFN). Coexists with v2 / v3 source intrinsics.
+    def(
+        "moe_dispatch_swiglu",
+        Type::Function {
+            params: vec![
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+            ],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // M33: Speculative decode step intrinsic
     def(
         "speculative_decode",
@@ -1095,4 +1153,45 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The element-wise tensor `sign` builtin must be registered as
+    /// `Tensor -> Tensor`. If it is missing, the stdlib Lion optimizer fails to
+    /// type-check (`undefined variable sign`). If it is registered as `Unknown`
+    /// instead of `Tensor`, a downstream `scalar * sign(...)` (Lion's
+    /// `lr * update`) mis-dispatches to a scalar multiply and fails Cranelift
+    /// verification with "arg has type f64, expected i64". This test guards both.
+    #[test]
+    fn sign_is_registered_as_tensor_to_tensor() {
+        let mut scopes = ScopeMap::new();
+        let mut interner = Interner::new();
+        register_builtins(&mut scopes, &mut interner);
+
+        let sym = Symbol(interner.get_or_intern("sign"));
+        let (_, info) = scopes
+            .lookup(ScopeId::ROOT, sym)
+            .expect("`sign` must be a registered builtin");
+
+        match &info.ty {
+            Type::Function { params, ret, .. } => {
+                assert_eq!(params.len(), 1, "sign takes exactly one argument");
+                assert!(
+                    matches!(params[0], Type::Tensor { .. }),
+                    "sign's parameter must be Tensor (got {:?}); an Unknown param would let \
+                     the result stay untyped and mis-dispatch downstream arithmetic",
+                    params[0]
+                );
+                assert!(
+                    matches!(**ret, Type::Tensor { .. }),
+                    "sign must return Tensor (got {:?}), not Unknown",
+                    ret
+                );
+            }
+            other => panic!("`sign` must be a Function type, got {:?}", other),
+        }
+    }
 }

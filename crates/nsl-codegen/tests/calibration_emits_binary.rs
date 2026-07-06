@@ -88,6 +88,7 @@ fn real_subprocess_entry_produces_runnable_binary_with_identity_hook() {
         mode: HarnessMode::Required,
         projections: vec![],
         compile_bundle: None,
+        runtime_data_override: None,
     };
 
     let result = real_subprocess_entry(&cfg, &registry);
@@ -134,6 +135,7 @@ fn real_subprocess_entry_accepts_linear_input_activations_hooks() {
         mode: HarnessMode::Required,
         projections,
         compile_bundle: Some(compile_bundle),
+        runtime_data_override: None,
     };
 
     let result = real_subprocess_entry(&cfg, &registry);
@@ -189,6 +191,7 @@ fn real_subprocess_entry_reports_batch_shape_mismatch_for_forward_hooks() {
         mode: HarnessMode::Required,
         projections,
         compile_bundle: Some(compile_bundle),
+        runtime_data_override: None,
     };
 
     let result = real_subprocess_entry(&cfg, &registry);
@@ -233,6 +236,7 @@ fn real_subprocess_entry_with_valid_awq_weights_produces_sidecar() {
         mode: HarnessMode::Required,
         projections,
         compile_bundle: Some(compile_bundle),
+        runtime_data_override: None,
     };
 
     let out = real_subprocess_entry(&cfg, &registry)

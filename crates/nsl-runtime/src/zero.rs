@@ -132,6 +132,13 @@ pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
 /// In single-process mode (world_size=1), this is a no-op since gradients
 /// are already complete.
 ///
+/// NOTE (M43b): this path is currently DEAD in production. `nsl_zero_init`
+/// is registered as a builtin but never emitted by codegen and is absent
+/// from the stdlib, so `ZERO_CTX` is always `None` and this function
+/// returns -1 at the context guard before touching any tensor. Wiring
+/// `nsl_zero_init` emission is M43b-proper work; the body below is kept
+/// correct (CPU and GPU, f64/f32) so that wiring lands on a sound runtime.
+///
 /// `grads_list_ptr`: pointer to an NslList of gradient tensors.
 /// `num_params`: number of gradient tensors in the list.
 /// Returns 0 on success, -1 on error.
@@ -165,6 +172,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
     let list = unsafe { &*list_ptr };
 
     let ws = ctx.world_size as f64;
+    let inv_ws = 1.0 / ws;
     for i in 0..num_params as usize {
         if i >= list.len as usize {
             break;
@@ -175,30 +183,72 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             continue;
         }
         let tensor = unsafe { &*tensor_ptr };
-        let len = tensor.len as usize;
 
-        // CPU-side gradient averaging
-        if tensor.device == 0 {
-            match tensor.dtype {
-                0 => {
-                    // f64
-                    let data = tensor.data as *mut f64;
-                    for j in 0..len {
-                        unsafe { *data.add(j) /= ws; }
-                    }
-                }
-                1 => {
-                    // f32
-                    let data = tensor.data as *mut f32;
-                    let ws32 = ws as f32;
-                    for j in 0..len {
-                        unsafe { *data.add(j) /= ws32; }
-                    }
-                }
-                _ => {} // Other dtypes: skip for now
-            }
+        // Refuse loudly instead of silently skipping: a skipped tensor would
+        // leave one gradient un-averaged and produce silently-wrong training.
+        if tensor.device == 0 && tensor.dtype > 1 {
+            eprintln!(
+                "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} at \
+                 index {}; only f64 (0) and f32 (1) gradients are supported",
+                tensor.dtype, i
+            );
+            return -1;
         }
-        // GPU gradients would use a CUDA kernel for division; skip for now.
+        if tensor.device > 0 && tensor.dtype != 1 {
+            eprintln!(
+                "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
+                 dtype {}; only the canonical GPU f32 (dtype 1) is supported",
+                i, tensor.dtype
+            );
+            return -1;
+        }
+
+        if tensor.device == 0 {
+            // CPU: device-agnostic in-place scale handles both f64 and f32.
+            crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
+            continue;
+        }
+
+        // GPU: round-trip through the CPU with an explicit f64 -> f32
+        // down-convert on the way back (same staged pattern as
+        // nsl_tensor_add_inplace's GPU arm). NOT delegated to
+        // nsl_tensor_mul_scalar_inplace: its GPU arm copies
+        // `len * element_size()` bytes straight from the round-trip CPU
+        // buffer, but `nsl_tensor_to_device(gpu_f32, 0)` upcasts to CPU f64,
+        // so that copy would push raw f64 bytes into the f32 device buffer.
+        #[cfg(feature = "cuda")]
+        {
+            let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_raw, 0);
+            let cpu = unsafe { &*(cpu_ptr as *const NslTensor) };
+            let len = cpu.len as usize;
+            let mut staged = vec![0.0f32; len];
+            if cpu.dtype == 1 {
+                let d = cpu.data as *const f32;
+                for (j, slot) in staged.iter_mut().enumerate() {
+                    *slot = unsafe { *d.add(j) } * inv_ws as f32;
+                }
+            } else {
+                let d = cpu.data as *const f64;
+                for (j, slot) in staged.iter_mut().enumerate() {
+                    *slot = (unsafe { *d.add(j) } * inv_ws) as f32;
+                }
+            }
+            crate::cuda::inner::memcpy_htod(
+                tensor.data,
+                staged.as_ptr() as *const std::ffi::c_void,
+                len * std::mem::size_of::<f32>(),
+            );
+            crate::tensor::nsl_tensor_free(cpu_ptr);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!(
+                "nsl: nsl_zero_reduce_grads: GPU gradient at index {} requires \
+                 the cuda feature",
+                i
+            );
+            return -1;
+        }
     }
 
     0
@@ -251,6 +301,19 @@ pub extern "C" fn nsl_zero_destroy() -> i64 {
 /// Accumulate gradients: dst += src element-wise.
 /// Both `dst_ptr` and `src_ptr` are pointers to NslTensor.
 /// `num_elems` is the number of elements to accumulate (must match tensor lengths).
+///
+/// Matched CPU f64/f64 and f32/f32 pairs take the original inline loops
+/// (byte-identical fast path). CPU dtype mismatches convert element-wise
+/// with proper casts. Any pair with a GPU-resident side — including the
+/// live single-GPU FullBuffer path (GPU accum buffer += tape gradient,
+/// reached by `grad_accumulation > 1` with lion/muon/soap) — migrates
+/// `src` to `dst`'s device via `nsl_tensor_to_device_like` (owned ref,
+/// canonical dtype: CPU=f64, GPU=f32) and delegates to the GPU-safe
+/// `nsl_tensor_add_inplace` round-trip.
+///
+/// Non-f32/f64 dtypes refuse loudly with -1: the previous fallback promoted
+/// both pointers to f64 blindly, which read out of bounds whenever `src`
+/// was narrower than 8 bytes per element.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn nsl_grad_accumulate_add(
@@ -268,43 +331,101 @@ pub extern "C" fn nsl_grad_accumulate_add(
     let src = unsafe { &*src_tensor };
     let n = num_elems as usize;
 
-    // Both tensors must be on CPU for this implementation.
-    if dst.device != 0 || src.device != 0 {
+    if dst.dtype > 1 || src.dtype > 1 {
+        eprintln!(
+            "nsl: nsl_grad_accumulate_add: unsupported gradient dtype pair \
+             (dst={}, src={}); only f64 (0) and f32 (1) are supported",
+            dst.dtype, src.dtype
+        );
         return -1;
     }
 
-    match (dst.dtype, src.dtype) {
-        (0, 0) => {
-            // f64 += f64
-            let d = dst.data as *mut f64;
-            let s = src.data as *const f64;
-            for i in 0..n {
-                unsafe { *d.add(i) += *s.add(i); }
+    if dst.device == 0 && src.device == 0 {
+        match (dst.dtype, src.dtype) {
+            (0, 0) => {
+                // f64 += f64
+                let d = dst.data as *mut f64;
+                let s = src.data as *const f64;
+                for i in 0..n {
+                    unsafe { *d.add(i) += *s.add(i); }
+                }
             }
-        }
-        (1, 1) => {
-            // f32 += f32
-            let d = dst.data as *mut f32;
-            let s = src.data as *const f32;
-            for i in 0..n {
-                unsafe { *d.add(i) += *s.add(i); }
+            (1, 1) => {
+                // f32 += f32
+                let d = dst.data as *mut f32;
+                let s = src.data as *const f32;
+                for i in 0..n {
+                    unsafe { *d.add(i) += *s.add(i); }
+                }
             }
-        }
-        _ => {
-            // Mixed or unsupported dtypes: promote to f64
-            let d = dst.data as *mut f64;
-            let s = src.data as *const f64;
-            for i in 0..n {
-                unsafe { *d.add(i) += *s.add(i); }
+            (0, 1) => {
+                // f64 += f32: element-wise upcast.
+                let d = dst.data as *mut f64;
+                let s = src.data as *const f32;
+                for i in 0..n {
+                    unsafe { *d.add(i) += *s.add(i) as f64; }
+                }
             }
+            (1, 0) => {
+                // f32 += f64: element-wise downcast.
+                let d = dst.data as *mut f32;
+                let s = src.data as *const f64;
+                for i in 0..n {
+                    unsafe { *d.add(i) += *s.add(i) as f32; }
+                }
+            }
+            _ => unreachable!("dtypes > 1 rejected above"),
         }
+        return 0;
     }
+
+    // At least one side is GPU-resident. The delegated nsl_tensor_add_inplace
+    // always adds dst.len elements, so a partial `num_elems < dst.len` request
+    // (honored by the CPU arms above) cannot be expressed here — refuse it
+    // rather than silently over-adding.
+    if n != dst.len as usize {
+        eprintln!(
+            "nsl: nsl_grad_accumulate_add: partial accumulation \
+             (num_elems={} != dst len={}) is not supported on the GPU path; \
+             refusing",
+            n, dst.len
+        );
+        return -1;
+    }
+
+    // Migrate src to dst's device —
+    // nsl_tensor_to_device_like returns an OWNED ref (refcount++ when the
+    // devices already match, a fresh tensor otherwise) that must be freed
+    // exactly once below (FBIP ownership, see stmt_fase.rs accumulate arm).
+    // Migration canonicalizes dtype (CPU=f64, GPU=f32), so the delegated
+    // nsl_tensor_add_inplace sees matching same-device operands and its
+    // GPU arm performs the proven CPU round-trip with f64 -> f32 staging.
+    let migrated = crate::tensor::nsl_tensor_to_device_like(src_ptr, dst_ptr);
+    if migrated == 0 {
+        return -1;
+    }
+    let mig = unsafe { &*(migrated as *const NslTensor) };
+    if mig.dtype != dst.dtype || mig.len != dst.len {
+        eprintln!(
+            "nsl: nsl_grad_accumulate_add: post-migration mismatch \
+             (dst dtype={} len={}, migrated src dtype={} len={}); refusing",
+            dst.dtype, dst.len, mig.dtype, mig.len
+        );
+        crate::tensor::nsl_tensor_free(migrated);
+        return -1;
+    }
+    crate::tensor::nsl_tensor_add_inplace(dst_ptr, migrated);
+    crate::tensor::nsl_tensor_free(migrated);
 
     0
 }
 
 /// Zero out gradient buffer. `grad_ptr` is a pointer to NslTensor.
 /// `num_elems` is the number of elements to zero.
+///
+/// GPU buffers (accumulation buffers are `zeros_like(param)`, so they live
+/// on the param's device) are zeroed with a device memset, mirroring
+/// `nsl_tensor_zero_inplace`. Zeroing is dtype-agnostic byte clearing.
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
@@ -316,10 +437,6 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
     let tensor = unsafe { &*tensor_ptr };
     let n = num_elems as usize;
 
-    if tensor.device != 0 {
-        return -1; // GPU zeroing would use cudaMemset; not implemented here
-    }
-
     let byte_width = match tensor.dtype {
         0 => 8usize, // f64
         1 => 4,      // f32
@@ -327,8 +444,34 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
         4..=6 => 1, // i8/fp8
         _ => 8,      // default to f64 width
     };
-
     let total_bytes = n * byte_width;
+
+    if tensor.device != 0 {
+        // GPU grad buffers are always f32 (`zeros_like(param)` on GPU). The
+        // byte_width table above reflects CPU storage widths — e.g. dtype 4
+        // is 1 byte on CPU but allocated 4 bytes/elem on GPU by
+        // nsl_tensor_to_device — so any non-f32 GPU buffer would be silently
+        // under-zeroed. Refuse instead (mirrors nsl_zero_reduce_grads).
+        if tensor.dtype != 1 {
+            eprintln!(
+                "nsl: nsl_grad_zero: GPU grad buffer must be f32 (dtype 1), \
+                 got dtype {}; refusing",
+                tensor.dtype
+            );
+            return -1;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::inner::memset_d8(tensor.data, total_bytes);
+            return 0;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!("nsl: nsl_grad_zero: GPU tensor requires the cuda feature");
+            return -1;
+        }
+    }
+
     unsafe {
         std::ptr::write_bytes(tensor.data as *mut u8, 0, total_bytes);
     }
@@ -338,6 +481,11 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
 
 /// All-reduce gradients across all DP ranks (legacy API, wraps nsl_zero_reduce_grads).
 /// `grad_ptr` is a single gradient tensor pointer, `num_elems` is element count.
+///
+/// NOTE: never-emitted scaffolding — no codegen path or stdlib function
+/// references this symbol today. It intentionally performs no arithmetic:
+/// a single-process all-reduce is the identity, and real multi-process
+/// NCCL collectives are M43b work (see nsl_zero_reduce_grads).
 /// Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn nsl_grad_all_reduce(_grad_ptr: i64, _num_elems: i64) -> i64 {
@@ -515,6 +663,150 @@ mod tests {
         let src_ptr = &src_tensor as *const NslTensor as i64;
         assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), 0);
         assert_eq!(dst_data, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    /// Build a borrowed (owns_data=0) CPU test tensor over caller-owned
+    /// buffers. Used by the mixed-dtype accumulate tests below.
+    fn borrowed_cpu_tensor(
+        data: *mut c_void,
+        shape: *mut i64,
+        strides: *mut i64,
+        len: i64,
+        dtype: u16,
+    ) -> NslTensor {
+        NslTensor {
+            magic: crate::tensor::TENSOR_MAGIC,
+            data,
+            shape,
+            strides,
+            ndim: 1,
+            len,
+            refcount: std::sync::atomic::AtomicI64::new(1),
+            device: 0,
+            dtype,
+            owns_data: 0,
+            data_owner: 0,
+            slab_managed: 0,
+            tape_id: 0,
+        }
+    }
+
+    /// f64 dst += f32 src. The pre-fix code promoted BOTH pointers to f64,
+    /// reading 8 bytes per element out of the 4-byte-per-element f32 src —
+    /// an out-of-bounds read producing garbage sums. Now converts properly.
+    #[test]
+    fn test_grad_accumulate_add_f64_dst_f32_src_converts() {
+        let mut dst_data = vec![1.0f64, 2.0, 3.0, 4.0];
+        let mut src_data = vec![0.5f32, 1.5, 2.5, 3.5];
+        let mut shape = vec![4i64];
+        let mut strides = vec![1i64];
+
+        let dst_tensor = borrowed_cpu_tensor(
+            dst_data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            0,
+        );
+        let src_tensor = borrowed_cpu_tensor(
+            src_data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            1,
+        );
+
+        let dst_ptr = &dst_tensor as *const NslTensor as i64;
+        let src_ptr = &src_tensor as *const NslTensor as i64;
+        assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), 0);
+        assert_eq!(dst_data, vec![1.5, 3.5, 5.5, 7.5]);
+        // src untouched
+        assert_eq!(src_data, vec![0.5, 1.5, 2.5, 3.5]);
+    }
+
+    /// f32 dst += f64 src (tape-AD gradients are CPU f64; an f32 accum
+    /// buffer must receive a downcast add, not a reinterpretation).
+    #[test]
+    fn test_grad_accumulate_add_f32_dst_f64_src_converts() {
+        let mut dst_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut src_data = vec![10.0f64, 20.0, 30.0, 40.0];
+        let mut shape = vec![4i64];
+        let mut strides = vec![1i64];
+
+        let dst_tensor = borrowed_cpu_tensor(
+            dst_data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            1,
+        );
+        let src_tensor = borrowed_cpu_tensor(
+            src_data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            0,
+        );
+
+        let dst_ptr = &dst_tensor as *const NslTensor as i64;
+        let src_ptr = &src_tensor as *const NslTensor as i64;
+        assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), 0);
+        assert_eq!(dst_data, vec![11.0f32, 22.0, 33.0, 44.0]);
+    }
+
+    /// Non-f32/f64 dtypes must refuse (-1) and leave the buffers untouched
+    /// instead of taking the old unsound promote-to-f64 arm.
+    #[test]
+    fn test_grad_accumulate_add_unsupported_dtype_refuses() {
+        let mut dst_data = vec![0x3C00u16, 0x4000, 0x4200, 0x4400]; // f16 bits
+        let mut src_data = vec![10.0f64, 20.0, 30.0, 40.0];
+        let mut shape = vec![4i64];
+        let mut strides = vec![1i64];
+
+        let dst_tensor = borrowed_cpu_tensor(
+            dst_data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            2, // f16
+        );
+        let src_tensor = borrowed_cpu_tensor(
+            src_data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            0,
+        );
+
+        let dst_ptr = &dst_tensor as *const NslTensor as i64;
+        let src_ptr = &src_tensor as *const NslTensor as i64;
+        assert_eq!(nsl_grad_accumulate_add(dst_ptr, src_ptr, 4), -1);
+        assert_eq!(dst_data, vec![0x3C00, 0x4000, 0x4200, 0x4400]);
+    }
+
+    #[test]
+    fn test_grad_accumulate_add_null_refuses() {
+        assert_eq!(nsl_grad_accumulate_add(0, 0, 4), -1);
+        assert_eq!(nsl_grad_zero(0, 4), -1);
+    }
+
+    #[test]
+    fn test_grad_zero_f32() {
+        let mut data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut shape = vec![4i64];
+        let mut strides = vec![1i64];
+
+        let tensor = borrowed_cpu_tensor(
+            data.as_mut_ptr() as *mut c_void,
+            shape.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            4,
+            1,
+        );
+
+        let tensor_ptr = &tensor as *const NslTensor as i64;
+        assert_eq!(nsl_grad_zero(tensor_ptr, 4), 0);
+        assert_eq!(data, vec![0.0f32, 0.0, 0.0, 0.0]);
     }
 
     #[test]

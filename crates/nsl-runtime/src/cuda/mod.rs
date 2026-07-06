@@ -899,6 +899,137 @@ pub(crate) mod inner {
         // ordered; profiler flush performs single sync at program end
         res
     }
+
+    // ------------------------------------------------------------------
+    // CFIE engine raw-handle helpers (CFIE Cycle 6 decode-loop wiring).
+    //
+    // `kernel_launch` above re-resolves the CUfunction on every call
+    // (cuModuleGetFunction per launch) — acceptable for training-step
+    // kernels, far too slow for a per-token decode loop.  The CFIE
+    // engine resolves each kernel ONCE at finalize time via
+    // `load_module_once` + `get_function`, then launches through
+    // `launch_function_raw`, which does nothing but cuLaunchKernel.
+    //
+    // Handles cross this boundary as `usize`: CUmodule / CUfunction are
+    // opaque driver pointers and not `Send` on their own, so the CFIE
+    // engine stores the casts behind its own global Mutex — the same
+    // pattern CudaState uses for `module_cache`.
+    // ------------------------------------------------------------------
+
+    /// Load a PTX module once, reusing the content-hash module cache
+    /// shared with `kernel_launch` (loading is one-time, so the FNV-1a
+    /// hash cost is fine here; launching must NOT re-hash).  `ptx_nul`
+    /// must be NUL-terminated.  Returns the CUmodule as `usize`, or
+    /// `Err(positive CUresult code)`.
+    pub(crate) fn load_module_once(ptx_nul: &[u8]) -> Result<usize, u32> {
+        debug_assert_eq!(ptx_nul.last(), Some(&0u8), "PTX must be NUL-terminated");
+        let s = state();
+        let mut guard = s.lock().unwrap();
+        unsafe { cuCtxSetCurrent(guard.context); }
+        // FNV-1a over the PTX bytes excluding the trailing NUL — matches
+        // the hash `kernel_launch` computes by scanning to the NUL, so
+        // CFIE modules and kernel_launch modules share one cache entry.
+        let mut h: u64 = 14695981039346656037u64;
+        for &b in &ptx_nul[..ptx_nul.len().saturating_sub(1)] {
+            h ^= b as u64;
+            h = h.wrapping_mul(1099511628211u64);
+        }
+        if let Some(m) = guard.module_cache.get(&h) {
+            return Ok(*m as usize);
+        }
+        let mut module: CUmodule = std::ptr::null_mut();
+        let res = unsafe { cuModuleLoadData(&mut module, ptx_nul.as_ptr() as *const c_void) };
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res as u32);
+        }
+        guard.module_cache.insert(h, module);
+        Ok(module as usize)
+    }
+
+    /// Resolve a kernel entry point in a module returned by
+    /// `load_module_once`.  Returns the CUfunction as `usize`, or
+    /// `Err(positive CUresult code)`.
+    pub(crate) fn get_function(module: usize, name: &std::ffi::CStr) -> Result<usize, u32> {
+        ensure_context();
+        let mut func: CUfunction = std::ptr::null_mut();
+        let res = unsafe { cuModuleGetFunction(&mut func, module as CUmodule, name.as_ptr()) };
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res as u32);
+        }
+        Ok(func as usize)
+    }
+
+    /// Look up a module-scope global (e.g. the CFIE grammar-mask
+    /// table).  Returns `(device_address, size_bytes)` on success, or
+    /// `Err(positive CUresult code)` — the caller distinguishes
+    /// CUDA_ERROR_NOT_FOUND (symbol absent, legal) from real failures.
+    pub(crate) fn module_get_global(
+        module: usize,
+        name: &std::ffi::CStr,
+    ) -> Result<(u64, usize), u32> {
+        ensure_context();
+        let mut dptr: CUdeviceptr = 0;
+        let mut bytes: usize = 0;
+        let res = unsafe {
+            cuModuleGetGlobal_v2(&mut dptr, &mut bytes, module as CUmodule, name.as_ptr())
+        };
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res as u32);
+        }
+        Ok((dptr as u64, bytes))
+    }
+
+    /// Launch an already-resolved CUfunction on the NULL stream — no
+    /// module load, no function lookup, no PTX hashing.  The CFIE
+    /// decode loop calls this once per kernel per token.  Honors
+    /// NSL_CUDA_SYNC=1 like `kernel_launch`, but returns the async
+    /// error code instead of panicking so the engine FFIs can surface
+    /// it per the CFIE ABI.  Returns 0 on success or the positive
+    /// CUresult code.
+    pub(crate) fn launch_function_raw(
+        func: usize,
+        grid: [u32; 3],
+        block: [u32; 3],
+        args: &[*mut c_void],
+        smem_dyn_bytes: u32,
+    ) -> u32 {
+        ensure_context();
+        if smem_dyn_bytes > 0 {
+            // Dynamic-SMEM opt-in for future extern-.shared CFIE kernels
+            // (mirrors kernel_launch).  All current CFIE kernels declare
+            // static .shared in-module and pass 0 here.
+            let res = unsafe {
+                cuFuncSetAttribute(
+                    func as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_dyn_bytes as i32,
+                )
+            };
+            if res != CUresult::CUDA_SUCCESS {
+                return res as u32;
+            }
+        }
+        let mut kernel_args: Vec<*mut c_void> = args.to_vec();
+        let res = unsafe {
+            cuLaunchKernel(
+                func as CUfunction,
+                grid[0], grid[1], grid[2],
+                block[0], block[1], block[2],
+                smem_dyn_bytes, std::ptr::null_mut(),
+                kernel_args.as_mut_ptr(), std::ptr::null_mut(),
+            )
+        };
+        if res != CUresult::CUDA_SUCCESS {
+            return res as u32;
+        }
+        if sync_mode_enabled() {
+            let sync = unsafe { cuCtxSynchronize() };
+            if sync != CUresult::CUDA_SUCCESS {
+                return sync as u32;
+            }
+        }
+        0
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -2097,6 +2228,94 @@ pub extern "C" fn nsl_kernel_launch(
         let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
         let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
+        std::process::abort();
+    }
+}
+
+/// Launch a user `kernel` block whose arguments are NslTensor handles.
+///
+/// This is the codegen entry point for user kernel calls (e.g.
+/// `vec_add(ga, gb, gc, grid=4, block=256)`). Cranelift lowers each tensor
+/// argument to its NslTensor *handle* (a host pointer to the struct), but
+/// `cuLaunchKernel` needs an array of pointers to the device *data* addresses.
+/// This wrapper reads the handle array, extracts each tensor's `.data` (the
+/// device pointer), and builds the correct kernel-parameter indirection —
+/// unlike [`nsl_kernel_launch`], which takes an already-marshaled parameter
+/// array and is used by hand-written launchers/tests.
+///
+/// `args_ptr` points to an array of `num_args` NslTensor handles (each i64).
+/// Returns the `CUresult` code (0 on success).
+#[no_mangle]
+pub extern "C" fn nsl_kernel_launch_tensors(
+    ptx_ptr: i64,
+    name_ptr: i64,
+    grid_x: i64,
+    grid_y: i64,
+    grid_z: i64,
+    block_x: i64,
+    block_y: i64,
+    block_z: i64,
+    args_ptr: i64,
+    num_args: i64,
+    shared_mem_bytes: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        use crate::tensor::NslTensor;
+        let n = num_args as usize;
+        // from_raw_parts requires a non-null pointer even for len 0.
+        let handles: &[i64] = if n == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(args_ptr as *const i64, n) }
+        };
+
+        // Extract each tensor's device data pointer into a stable Vec, then
+        // build the kernelParams array where each entry points at the u64
+        // device address. Both Vecs must outlive the launch call (cuLaunchKernel
+        // reads the argument values synchronously at launch time).
+        let mut device_ptrs: Vec<u64> = Vec::with_capacity(n);
+        for (i, &handle) in handles.iter().enumerate() {
+            let tensor = unsafe { &*(handle as *const NslTensor) };
+            // Kernel arguments must be GPU-resident. Passing a CPU tensor here
+            // would feed a host pointer to the kernel as a device address and
+            // crash with an opaque CUDA_ERROR_ILLEGAL_ADDRESS — refuse loudly
+            // with an actionable message instead.
+            if tensor.device == 0 {
+                eprintln!(
+                    "nsl: kernel argument {} is a CPU tensor; kernel arguments must be \
+                     moved to the GPU first (e.g. `arg.to(cuda)`).",
+                    i
+                );
+                std::process::abort();
+            }
+            device_ptrs.push(tensor.data as u64);
+        }
+        let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(n);
+        for slot in &device_ptrs {
+            kernel_params.push(slot as *const u64 as *mut c_void);
+        }
+
+        let result = inner::kernel_launch(
+            ptx_ptr as *const u8,
+            name_ptr as *const u8,
+            [grid_x, grid_y, grid_z],
+            [block_x, block_y, block_z],
+            &kernel_params,
+            shared_mem_bytes as u32,
+        );
+        result as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
+        let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
+        eprintln!(
+            "nsl: this program launches a GPU `kernel` block, but the nsl runtime \
+             was built without CUDA support. Rebuild the toolchain with \
+             `--features cuda` (e.g. `cargo build -p nsl-cli --features cuda`) to run \
+             GPU kernels."
+        );
         std::process::abort();
     }
 }

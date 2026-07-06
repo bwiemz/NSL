@@ -491,6 +491,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
     ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
+    // CPDT §3.2: INT8 blockwise quantization (the headline 4× memory result)
+    ("nsl_tensor_quant_int8_blockwise", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_dequant_int8_blockwise", &[types::I64], Some(types::I64)),
     // CFTP v6 forward inline-cast wrappers: src_ptr -> new tensor (scope-tracked).
     ("nsl_tensor_to_bf16", &[types::I64], Some(types::I64)),
     ("nsl_tensor_to_fp16", &[types::I64], Some(types::I64)),
@@ -623,6 +626,46 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // Source-AD conv2d backward FFIs: (grad, input, weight, sh, sw, ph, pw) -> grad.
+    (
+        "nsl_conv2d_input_backward",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_conv2d_weight_backward",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_conv2d_bias_backward",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_maxpool2d",
         &[types::I64, types::I64, types::I64, types::I64, types::I64],
@@ -723,6 +766,25 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_cuda_init", &[], Some(types::I64)),
     (
         "nsl_kernel_launch",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    // User `kernel` block launch: args array holds NslTensor handles; the
+    // runtime extracts each `.data` device pointer and builds the kernelParams.
+    (
+        "nsl_kernel_launch_tensors",
         &[
             types::I64,
             types::I64,
@@ -1436,6 +1498,178 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64], // base, bytes
         Some(types::I64),
     ),
+    // --- CFIE Cycle 6: compiled-engine registration/lifecycle + launch
+    // FFIs (frozen ABI).  All params/returns i64; f32 kernel params are
+    // passed as f32::to_bits in the LOW 32 bits.  Kernel kinds:
+    // 0=decode_attn, 1=fused_sample, 2=decode_block, 3=spec_verify,
+    // 4=spec_reject, 5=quant_attn (layer_idx meaningful only for 5). ---
+    (
+        "nsl_cfie_register_kernel",
+        &[
+            types::I64, // kind
+            types::I64, // layer_idx
+            types::I64, // ptx_ptr
+            types::I64, // ptx_len (excludes NUL)
+            types::I64, // name_ptr
+            types::I64, // name_len (excludes NUL)
+            types::I64, // grid_x
+            types::I64, // block_x
+            types::I64, // smem_dyn_bytes
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_kv_pool_alloc", &[types::I64], Some(types::I64)), // bytes
+    ("nsl_cfie_engine_finalize", &[], Some(types::I64)),
+    ("nsl_cfie_engine_destroy", &[], Some(types::I64)),
+    // --- CFIE Cycle 9: runtime weight binding (production upload FFIs).
+    // Cast host f32 [out][in] row-major -> device f16/f32, persistent
+    // pool, engine-tracked; reset frees them. ---
+    (
+        "nsl_cfie_upload_weight_f16",
+        &[
+            types::I64, // host_f32_ptr
+            types::I64, // n_elems
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_upload_weight_f32",
+        &[
+            types::I64, // host_f32_ptr
+            types::I64, // n_elems
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_weights_reset", &[], Some(types::I64)),
+    (
+        "nsl_cfie_launch_decode_attn",
+        &[
+            types::I64, // q_ptr
+            types::I64, // out_ptr
+            types::I64, // layer_idx
+            types::I64, // slot_idx
+            types::I64, // seq_len
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_fused_sample",
+        &[
+            types::I64, // hidden_ptr
+            types::I64, // norm_w_ptr
+            types::I64, // lm_head_ptr
+            types::I64, // out_token_ptr
+            types::I64, // rng_seed
+            types::I64, // grammar_state
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_decode_block",
+        &[
+            types::I64, // x_in
+            types::I64, // x_out
+            types::I64, // wq
+            types::I64, // wk
+            types::I64, // wv
+            types::I64, // wo
+            types::I64, // w_gate
+            types::I64, // w_up
+            types::I64, // w_down
+            types::I64, // norm1_w
+            types::I64, // norm2_w
+            types::I64, // layer_idx
+            types::I64, // slot_idx
+            types::I64, // pos
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_spec_verify",
+        &[
+            types::I64, // q_ptr
+            types::I64, // out_ptr
+            types::I64, // layer_idx
+            types::I64, // slot_idx
+            types::I64, // seq_len
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_spec_reject",
+        &[
+            types::I64, // target_probs_ptr
+            types::I64, // draft_probs_ptr
+            types::I64, // draft_tokens_ptr
+            types::I64, // rng_seed
+            types::I64, // out_accepted_ptr
+            types::I64, // out_correction_token_ptr
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_launch_quant_attn",
+        &[
+            types::I64, // layer_idx (selects the (5, layer) registration)
+            types::I64, // q_ptr
+            types::I64, // out_ptr
+            types::I64, // slot_idx
+            types::I64, // seq_len
+            types::I64, // k_scale_bits (f32 bits, low 32)
+            types::I64, // v_scale_bits (f32 bits, low 32)
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_decode_step",
+        &[
+            types::I64, // x_buf_a
+            types::I64, // x_buf_b
+            types::I64, // layer_weights_ptr (host array: n_layers x 9 device ptrs)
+            types::I64, // n_layers
+            types::I64, // norm_w_ptr (final-norm gamma)
+            types::I64, // lm_head_ptr
+            types::I64, // slot_idx
+            types::I64, // pos
+            types::I64, // rng_seed
+            types::I64, // grammar_state
+            types::I64, // out_token_ptr (device u32)
+        ],
+        Some(types::I64),
+    ),
+    // --- CFIE Cycle 10: model binding + generation driver. bind_model
+    // resolves an NslModel's host f32 weights by the HF-Llama name
+    // convention, uploads them, and records the device weight table;
+    // generate drives the decode loop over a prompt; generate_reset
+    // clears the binding without freeing the weight buffers. ---
+    (
+        "nsl_cfie_bind_model",
+        &[
+            types::I64, // model_handle (NslModel*)
+            types::I64, // n_layers
+            types::I64, // d_model
+            types::I64, // n_heads
+            types::I64, // n_kv_heads
+            types::I64, // head_dim
+            types::I64, // d_ff
+            types::I64, // vocab_size
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_cfie_generate",
+        &[
+            types::I64, // prompt_tokens_ptr (host i64 array)
+            types::I64, // prompt_len
+            types::I64, // max_new_tokens
+            types::I64, // eos_token_id
+            types::I64, // rng_seed
+            types::I64, // out_tokens_ptr (host i64 array)
+            types::I64, // out_cap
+        ],
+        Some(types::I64),
+    ),
+    ("nsl_cfie_generate_reset", &[], Some(types::I64)),
     // --- M41: Disaggregated inference ---
     (
         "nsl_disagg_init",
@@ -1574,6 +1808,83 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // CPDT Part III v1 production-forward (M32 gap closure): same as v1
+    // plus `experts_ptr`, `hidden_dim`, `intermediate_dim` (3 extra i64
+    // args, total 8). Returns NslTensor `[total_tokens, intermediate_dim]`
+    // (note: trailing dim differs from v1's `[total_tokens, hidden_dim]`
+    // identity output). See crates/nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v2",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    // CPDT Part III v2.2 paper-faithful MoE FFN: per-expert kernel is
+    // `up → SiLU → down` instead of v2's single matmul. 10 i64 args:
+    // tokens, logits, experts_up, experts_down, num_experts, top_k,
+    // capacity_factor_bits, hidden_dim, intermediate_dim, activation_kind,
+    // experts_up_bias_ptr, experts_down_bias_ptr (v2.11: bias args are
+    // nullable — pass 0 for no bias).
+    // Returns NslTensor `[total_tokens, hidden_dim]` (back to hidden,
+    // unlike v2's intermediate). See nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v3",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
+    // CPDT Part III v2.5+v2.8 Mixtral gated MoE FFN: per-expert kernel is
+    // `gate_act(gate) * up → down` where gate_act is selected by
+    // gate_activation_kind. 11 i64 args: tokens, logits, experts_gate,
+    // experts_up, experts_down, num_experts, top_k, capacity_factor_bits,
+    // hidden_dim, intermediate_dim, gate_activation_kind (v2.8: 1=SwiGLU,
+    // 2=GeGLU, 3=ReGLU). Output shape matches v3
+    // `[total_tokens, hidden_dim]`. See nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v4",
+        // v2.14: 14 i64 args. Positions 12+13+14 are
+        // experts_{gate,up,down}_bias_ptr (nullable, 0 = no bias).
+        // Codegen always emits iconst(0) for these in the 5-arg
+        // source form; the 8-arg form threads source-supplied bias
+        // expressions through (mirrors v3's 4/6 pattern in v2.12).
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // --- M33: Speculative decoding runtime functions ---
     (
         "nsl_speculative_draft",
@@ -1678,70 +1989,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     // --- M34: Context parallelism (ring attention) ---
-    (
-        "nsl_cp_init",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_sequence_partition",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_ring_attention",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    (
-        "nsl_ring_send_recv",
-        &[types::I64, types::I64, types::I64, types::I64, types::I64],
-        Some(types::I64),
-    ),
-    (
-        "nsl_sequence_gather",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-        Some(types::I64),
-    ),
-    ("nsl_cp_destroy", &[types::I64], Some(types::I64)),
+    // Extern signatures REMOVED across two cycles:
+    //   * CPDT Part III v2.22 unlinked the ring FFI chain from codegen
+    //     (`nsl_cp_init` / `nsl_sequence_partition` / `nsl_ring_attention`
+    //     / `nsl_ring_send_recv` / `nsl_sequence_gather` / `nsl_cp_destroy`)
+    //     and fell `@context_parallel` through to naive attention.
+    //   * M34 v1 (this cycle) deleted the six runtime stubs themselves from
+    //     `crates/nsl-runtime/src/context_parallel/ffi.rs` (they were dead
+    //     symbols with wrong positional layouts) and shipped the
+    //     single-node ring-attention composer
+    //     (`run_ring_attention_full`) verified against `naive_attention`
+    //     on a matrix of shapes and ring sizes. Multi-device distribution
+    //     is deferred until NCCL/IPC lands.
+    // When multi-device distribution lands, a fresh runtime FFI shape gets
+    // designed and the extern table + emission + runtime impl all get
+    // wired together against the new shape.
     // --- M35: FP8 compute ---
     (
         "nsl_fp8_cast",
@@ -2320,6 +2582,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn int8_blockwise_ops_have_signatures() {
+        // CPDT §3.2 — the headline 4× memory result. These signatures must
+        // match the runtime exports in nsl-runtime/src/tensor/int8_blockwise.rs
+        // and the ownership table in ffi_ownership.rs (both produce new owned
+        // tensors).
+        let table: Vec<(&str, &[cranelift_codegen::ir::Type], Option<cranelift_codegen::ir::Type>)> =
+            RUNTIME_FUNCTIONS
+                .iter()
+                .filter(|(n, _, _)| {
+                    *n == "nsl_tensor_quant_int8_blockwise"
+                        || *n == "nsl_tensor_dequant_int8_blockwise"
+                })
+                .map(|(n, p, r)| (*n, *p, *r))
+                .collect();
+        assert_eq!(table.len(), 2, "INT8 blockwise op pair missing");
+        for (name, params, ret) in &table {
+            assert_eq!(*ret, Some(cranelift_codegen::ir::types::I64), "{name} must return i64");
+            assert!(params.iter().all(|t| *t == cranelift_codegen::ir::types::I64),
+                "{name} params must all be I64");
+        }
+    }
+
     /// CFTP v6: forward inline-cast wrapper FFIs are registered with the
     /// correct Cranelift signature ([I64] -> I64). Required so wengert_lower
     /// can emit calls to them from compiled NSL.
@@ -2344,5 +2629,49 @@ mod tests {
                 entry.2
             );
         }
+    }
+
+    /// CFIE Cycle 6: the engine registration/lifecycle + launch FFIs
+    /// are declared with the frozen ABI's arities — all-i64 params,
+    /// i64 return — so `declare_runtime_functions` picks them up and
+    /// the serve emission can `compile_call_by_name` them.
+    #[test]
+    fn cfie_cycle6_engine_ffis_have_frozen_abi_signatures() {
+        use cranelift_codegen::ir::types;
+        let arity = |name: &str| -> usize {
+            let entry = RUNTIME_FUNCTIONS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} missing from RUNTIME_FUNCTIONS"));
+            assert!(
+                entry.1.iter().all(|&t| t == types::I64),
+                "{name}: every param must be I64 (frozen ABI), got {:?}",
+                entry.1
+            );
+            assert_eq!(
+                entry.2,
+                Some(types::I64),
+                "{name}: must return I64, got {:?}",
+                entry.2
+            );
+            entry.1.len()
+        };
+        assert_eq!(arity("nsl_cfie_register_kernel"), 9);
+        assert_eq!(arity("nsl_cfie_kv_pool_alloc"), 1);
+        assert_eq!(arity("nsl_cfie_engine_finalize"), 0);
+        assert_eq!(arity("nsl_cfie_engine_destroy"), 0);
+        assert_eq!(arity("nsl_cfie_upload_weight_f16"), 2);
+        assert_eq!(arity("nsl_cfie_upload_weight_f32"), 2);
+        assert_eq!(arity("nsl_cfie_weights_reset"), 0);
+        assert_eq!(arity("nsl_cfie_launch_decode_attn"), 5);
+        assert_eq!(arity("nsl_cfie_launch_fused_sample"), 6);
+        assert_eq!(arity("nsl_cfie_launch_decode_block"), 14);
+        assert_eq!(arity("nsl_cfie_launch_spec_verify"), 5);
+        assert_eq!(arity("nsl_cfie_launch_spec_reject"), 6);
+        assert_eq!(arity("nsl_cfie_launch_quant_attn"), 7);
+        assert_eq!(arity("nsl_cfie_decode_step"), 11);
+        assert_eq!(arity("nsl_cfie_bind_model"), 8);
+        assert_eq!(arity("nsl_cfie_generate"), 7);
+        assert_eq!(arity("nsl_cfie_generate_reset"), 0);
     }
 }
