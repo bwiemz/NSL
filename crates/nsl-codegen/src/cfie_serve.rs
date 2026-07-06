@@ -58,6 +58,23 @@ pub struct SpeculativeSection {
     pub method: Option<String>,
     pub tree_width: Option<i64>,
     pub temperature: Option<f64>,
+    /// CFIE Cycle 13 (G15): the draft checkpoint compiled into the SAME
+    /// binary (`draft_weights: "<path.safetensors>"`).  When set (and
+    /// the spec kernels are emitted) the serve wiring emits the draft
+    /// decode-block + kind-7/8 sampler registrations, the serve-init
+    /// draft binding, and the `nsl_cfie_speculative_generate` driver.
+    pub draft_weights: Option<String>,
+    /// Draft model architecture keys (vocab is the target's — shared
+    /// vocab is a speculative-decoding invariant).  Any key left unset
+    /// defaults to the TARGET's resolved value; a mismatch against the
+    /// actual draft checkpoint refuses loudly at serve init
+    /// (`nsl_cfie_bind_draft_model` validates every weight's shape).
+    pub draft_n_layers: Option<i64>,
+    pub draft_d_model: Option<i64>,
+    pub draft_n_heads: Option<i64>,
+    pub draft_n_kv_heads: Option<i64>,
+    pub draft_head_dim: Option<i64>,
+    pub draft_d_ff: Option<i64>,
 }
 
 /// Everything CFIE-relevant found in one serve block.
@@ -238,6 +255,14 @@ fn extract_speculative(
             "method" => s.method = entry_string(entry, resolve),
             "tree_width" => s.tree_width = entry_int(entry),
             "temperature" => s.temperature = entry_float(entry),
+            // Cycle 13 (G15): draft-model-in-binary keys.
+            "draft_weights" => s.draft_weights = entry_string(entry, resolve),
+            "draft_n_layers" => s.draft_n_layers = entry_int(entry),
+            "draft_d_model" => s.draft_d_model = entry_int(entry),
+            "draft_n_heads" => s.draft_n_heads = entry_int(entry),
+            "draft_n_kv_heads" => s.draft_n_kv_heads = entry_int(entry),
+            "draft_head_dim" => s.draft_head_dim = entry_int(entry),
+            "draft_d_ff" => s.draft_d_ff = entry_int(entry),
             _ => {}
         }
     }
@@ -557,17 +582,17 @@ pub fn prepare<'a>(
         _ => None,
     };
     if let Some(draft) = cfg.speculative.as_ref().and_then(|s| s.draft_path.as_deref()) {
-        // Accepting a draft-model path that is never loaded would be a
-        // silent failure; refuse until compiled-speculative draft
-        // loading lands (audit gaps G13/G15).  `speculative:` without
-        // `draft` stays a compile-time plan (structure/accounting only)
-        // and is labelled as such in the build report.
+        // The legacy `draft:` key predates the landed G15 path and was
+        // never loaded; keep refusing it, but point at the REAL
+        // mechanism now that draft-in-binary exists (Cycle 13).
         return Err(CodegenError::new(format!(
-            "CFIE compiled speculative: draft model '{draft}' cannot be \
-             loaded yet — draft+verify kernel compilation is not wired \
-             (audit gaps G13/G15). Remove the `draft` key (plan-only \
-             speculative structure) or use the runtime @speculative \
-             decorator path until it lands."
+            "CFIE compiled speculative: the legacy `draft` key is not \
+             loaded ('{draft}').  Draft-model-in-binary landed (G15): \
+             use `draft_weights: \"<path.safetensors>\"` plus the \
+             draft_* shape keys (draft_n_layers/draft_d_model/\
+             draft_n_heads/draft_n_kv_heads/draft_head_dim/draft_d_ff) \
+             in the speculative: section, or remove the `draft` key for \
+             plan-only speculative structure."
         )));
     }
 
@@ -871,6 +896,7 @@ mod tests {
             method: Some("tree".to_string()),
             tree_width: Some(2),
             temperature: Some(0.0),
+            ..Default::default()
         });
         let gpu = find_gpu("H100").unwrap();
         let prepared = prepare(&cfg, CfieMode::Full, gpu, None).unwrap();
@@ -881,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn speculative_draft_path_refuses_loudly() {
+    fn speculative_legacy_draft_key_refuses_and_points_at_draft_weights() {
         let mut cfg = cfg_with(Some("static"));
         cfg.speculative = Some(SpeculativeSection {
             draft_path: Some("draft.nslm".to_string()),
@@ -889,16 +915,38 @@ mod tests {
             method: Some("tree".to_string()),
             tree_width: Some(2),
             temperature: Some(0.0),
+            ..Default::default()
         });
         let gpu = find_gpu("H100").unwrap();
         let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
             Err(e) => e,
-            Ok(_) => panic!("draft path must refuse until G13/G15 land"),
+            Ok(_) => panic!("the legacy draft key is never loaded and must refuse"),
         };
         assert!(
-            err.message.contains("G13"),
-            "refusal must cite the audit gaps: {}",
+            err.message.contains("draft_weights"),
+            "refusal must point at the landed G15 mechanism: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn speculative_draft_weights_key_passes_prepare() {
+        // `draft_weights` (the landed G15 path) is consumed by the
+        // serve wiring, not by prepare() — prepare must NOT refuse it.
+        let mut cfg = cfg_with(Some("static"));
+        cfg.speculative = Some(SpeculativeSection {
+            tokens: Some(3),
+            method: Some("standard".to_string()),
+            draft_weights: Some("draft.safetensors".to_string()),
+            draft_n_layers: Some(2),
+            ..Default::default()
+        });
+        let gpu = find_gpu("H100").unwrap();
+        let prepared =
+            prepare(&cfg, CfieMode::Full, gpu, None).expect("draft_weights must not refuse");
+        assert_eq!(
+            prepared.input.speculative.expect("speculative config").k_tokens,
+            3
         );
     }
 }

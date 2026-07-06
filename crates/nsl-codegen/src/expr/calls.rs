@@ -2420,6 +2420,10 @@ impl Compiler<'_> {
             // mutable-borrow compiles below).
             let prompt_len_val = gen.prompt_len_val;
             let tok_handle = gen.tok_handle;
+            // Cycle 13 (G15): Some(k) when a speculative draft model is
+            // compiled into this binary — generate() then drives the
+            // speculative decode loop instead of the plain one.
+            let speculative_k = gen.speculative_k;
 
             // target_model (arg 0) is accepted for source compatibility;
             // compile it so any side effects hold, but the value is unused
@@ -2444,19 +2448,44 @@ impl Compiler<'_> {
             // Fixed rng seed for the one-shot demo (deterministic output).
             let v_seed = builder.ins().iconst(cl_types::I64, 0);
 
-            let rc = self.compile_call_by_name(
-                builder,
-                "nsl_cfie_generate",
-                &[
-                    prompt_ptr,
-                    v_prompt_len,
-                    v_max_new,
-                    v_eos,
-                    v_seed,
-                    out_ptr,
-                    out_cap,
-                ],
-            )?;
+            // Cycle 13 (G15): with a compiled-in draft model, generate()
+            // drives nsl_cfie_speculative_generate (the paper's
+            // speculative decode loop: draft K greedily -> verify ->
+            // ONE rejection launch -> rollback), k_tokens from the
+            // speculative config — the SAME K the kind-4 reject kernel
+            // was compiled for.  Without a draft the plain driver is
+            // emitted, byte-identical to Cycle 11/12.
+            let rc = if let Some(k) = speculative_k {
+                let v_k = builder.ins().iconst(cl_types::I64, k);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_speculative_generate",
+                    &[
+                        prompt_ptr,
+                        v_prompt_len,
+                        v_max_new,
+                        v_eos,
+                        v_seed,
+                        v_k,
+                        out_ptr,
+                        out_cap,
+                    ],
+                )?
+            } else {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_cfie_generate",
+                    &[
+                        prompt_ptr,
+                        v_prompt_len,
+                        v_max_new,
+                        v_eos,
+                        v_seed,
+                        out_ptr,
+                        out_cap,
+                    ],
+                )?
+            };
 
             // Cycle 12 decode-and-print tail, emitted only when a
             // tokenizer was loaded at serve init:

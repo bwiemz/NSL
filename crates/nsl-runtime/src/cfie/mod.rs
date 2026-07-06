@@ -22,6 +22,13 @@
 //!     CFIE PTX kernels that resolves every CUmodule/CUfunction once
 //!     at `nsl_cfie_engine_finalize` and then launches per token
 //!     through cached handles (`engine.rs`).
+//!   * A **speculative-decode driver** (Cycle 13, G15): a SECOND,
+//!     draft-model binding (`nsl_cfie_bind_draft_model`) + an
+//!     engine-held draft KV pool (`nsl_cfie_draft_pool_alloc`) and
+//!     `nsl_cfie_speculative_generate` — per round: draft K greedily
+//!     (kinds 6+7), target-verify K prob rows (kinds 2+8), ONE kind-4
+//!     rejection launch, then roll both KV sides back to the emitted
+//!     sequence (`engine.rs`).
 
 pub mod bridge;
 pub mod engine;

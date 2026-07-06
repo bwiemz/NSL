@@ -1,0 +1,84 @@
+# CFIE Cycle 13 (G15): speculative serve with a DRAFT MODEL COMPILED
+# INTO THE BINARY — the paper's `speculative:` config driving the real
+# draft/verify/reject decode loop on the GPU.
+#
+# What this adds over examples/cfie_serve_generate.nsl:
+#   * `draft_weights:` names a second (smaller) checkpoint that serve
+#     init loads and binds NEXT TO the target model (same CUDA context,
+#     same process): nsl_model_create(draft) ->
+#     nsl_cfie_bind_draft_model -> nsl_cfie_draft_pool_alloc.
+#   * The compiler emits THREE extra kernels alongside the uniform
+#     family: the draft decode block (kind 6 — the persistent
+#     decode-block emitter instantiated with the draft dims), the draft
+#     greedy sampler (kind 7, argmax + p(chosen) in one flash-softmax
+#     pass), and the target prob-row writer (kind 8, the softmaxed row
+#     the GPU-proven rejection kernel consumes).
+#   * The endpoint's generate() compiles to
+#     nsl_cfie_speculative_generate: per round, draft K tokens greedily
+#     (temperature 0.0 per the paper), verify them with one target
+#     forward per position, run ONE rejection-sampling launch, emit the
+#     accepted prefix (+ correction, or a bonus token on all-accept),
+#     and roll BOTH KV caches back to the emitted sequence.
+#
+# HONEST BOUNDARIES:
+#   * v1 drafting is method "standard" (a linear K-token chain);
+#     tree/medusa/lookahead drafting still refuses with draft_weights.
+#   * The draft shares the target's vocab (rejection sampling compares
+#     prob rows over ONE vocab) — bind refuses on a mismatch.
+#   * draft_* shape keys default to the target's dims when omitted; a
+#     wrong shape refuses loudly at serve init when the checkpoint's
+#     weights are validated.
+#   * LOSSLESS: with draft == target weights the rejection step accepts
+#     every token and the output EXACTLY equals plain generate (the
+#     self-speculation invariant, GPU-proven in
+#     cfie_speculative_generate_gpu_e2e.rs).
+#
+# Running needs a CUDA build + GPU + real checkpoints at both paths;
+# compiling never needs a GPU.
+
+serve Inference:
+    max_batch: 32
+    max_seq: 2048
+    kv_layout: "static"
+    kv_quant: "uniform_fp16"
+    target_gpu: "h100"
+
+    # TARGET model architecture (compile-time plan + bind shapes).
+    n_layers: 8
+    n_kv_heads: 4
+    head_dim: 128
+    d_model: 512
+    d_ff: 1408
+    vocab_size: 49152
+
+    weights: "model.safetensors"
+    tokenizer: "tokenizer.json"
+    prompt: "The capital of France is"
+    max_new_tokens: 32
+    eos_token_id: 2
+
+    sampling:
+        temperature: 0.7
+        top_k: 50
+        top_p: 0.9
+        fused: true
+
+    speculative:
+        tokens: 4
+        method: "standard"
+        # The draft model compiled into this binary (G15).
+        draft_weights: "draft.safetensors"
+        draft_n_layers: 2
+        draft_d_model: 256
+        draft_n_heads: 2
+        draft_n_kv_heads: 1
+        draft_head_dim: 128
+        draft_d_ff: 704
+
+    @endpoint
+    fn complete(prompt: str) -> str:
+        # With draft_weights configured this drives the SPECULATIVE
+        # decode loop (nsl_cfie_speculative_generate, K = tokens);
+        # without it, the plain nsl_cfie_generate — same syntax.
+        let count = generate("Inference", prompt, 0)
+        print(count)

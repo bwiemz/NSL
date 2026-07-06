@@ -423,10 +423,39 @@ fn validate_speculative_section(
                     );
                 }
             }
+            // CFIE Cycle 13 (G15 draft-model-in-binary): a draft model
+            // compiled into the same binary.  `draft_weights` names the
+            // draft checkpoint; the draft_* shape keys mirror the
+            // top-level architecture keys (vocab is the target's).
+            "draft_weights" => {
+                if !matches!(&entry.value.kind, ExprKind::StringLiteral(_)) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "speculative draft_weights must be a .safetensors path string"
+                                .to_string(),
+                        )
+                        .with_label(entry.value.span, "invalid draft_weights"),
+                    );
+                }
+            }
+            "draft_n_layers" | "draft_d_model" | "draft_n_heads" | "draft_n_kv_heads"
+            | "draft_head_dim" | "draft_d_ff" => {
+                if !matches!(expr_as_i64(&entry.value), Some(v) if v >= 1) {
+                    diagnostics.push(
+                        Diagnostic::error(format!(
+                            "speculative {key} must be a positive integer"
+                        ))
+                        .with_label(entry.value.span, "invalid draft shape key"),
+                    );
+                }
+            }
             other => {
                 diagnostics.push(
                     Diagnostic::error(format!(
-                        "unknown speculative key '{other}'; expected draft, tokens, method, tree_width, or temperature"
+                        "unknown speculative key '{other}'; expected draft, tokens, method, \
+                         tree_width, temperature, draft_weights, or a draft_* shape key \
+                         (draft_n_layers, draft_d_model, draft_n_heads, draft_n_kv_heads, \
+                         draft_head_dim, draft_d_ff)"
                     ))
                     .with_label(entry.span, "unknown key"),
                 );

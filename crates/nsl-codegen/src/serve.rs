@@ -89,6 +89,13 @@ struct CfieEndpointInit {
     shape: crate::cfie_serve::ResolvedModelShape,
     max_new_tokens: i64,
     eos_token_id: i64,
+    /// Cycle 13 (G15): the resolved draft-model wiring — `Some` exactly
+    /// when the plan emitted the kind-6/7/8 draft kernels.  Serve init
+    /// then ALSO emits `nsl_model_create(draft) ->
+    /// nsl_cfie_bind_draft_model -> nsl_cfie_draft_pool_alloc` after
+    /// the target binding, and `generate()` rewrites to
+    /// `nsl_cfie_speculative_generate` (k = `k_tokens`).
+    draft: Option<crate::cfie::CfieSpeculativeDraft>,
 }
 
 /// CFIE Cycle 11 side-channel: the `generate()` intrinsic's driver
@@ -112,6 +119,11 @@ pub struct CfieServeGen {
     /// exactly when `tokenizer:` is configured; `generate()` then emits
     /// the decode-and-print tail (tokens -> tensor -> text -> stdout).
     pub tok_handle: Option<cranelift_codegen::ir::Value>,
+    /// Cycle 13 (G15): `Some(k)` exactly when a speculative draft model
+    /// is compiled into the binary — `generate()` then emits
+    /// `nsl_cfie_speculative_generate(..., k, ...)` instead of
+    /// `nsl_cfie_generate`.
+    pub speculative_k: Option<i64>,
 }
 
 /// What `emit_cfie_endpoint_init` hands back to `compile_serve_block`:
@@ -434,6 +446,9 @@ impl Compiler<'_> {
                         prompt_len: ep.prompt_tokens.len() as i64,
                         prompt_len_val: wired.prompt_len_val,
                         tok_handle: wired.tok_handle,
+                        // Cycle 13: a compiled-in draft flips generate()
+                        // to the speculative driver with this K.
+                        speculative_k: ep.draft.as_ref().map(|d| d.k_tokens as i64),
                     });
                     cfie_prompt_ptr = Some(wired.prompt_ptr);
                 }
@@ -617,6 +632,43 @@ impl Compiler<'_> {
                 model_handle, v_layers, v_dmodel, v_nheads, v_nkv, v_hdim, v_dff, v_vocab,
             ],
         )?;
+
+        // 2b. Cycle 13 (G15): draft-model binding + draft KV pool,
+        // emitted AFTER the target bind (nsl_cfie_bind_draft_model
+        // refuses when no target is bound — the emission order IS the
+        // runtime ordering contract).  Return values are intentionally
+        // ignored, matching the target-bind discipline: the runtime
+        // warns on stderr and nsl_cfie_speculative_generate refuses
+        // cleanly when the draft binding is absent.
+        if let Some(dr) = ep.draft.as_ref() {
+            let (dbytes, _dlen) = cfie_nul_terminated(&dr.weights_path);
+            let d_id = embed_cfie_bytes(
+                &mut self.module,
+                &format!("__nsl_cfie_draft_weights_{scope}"),
+                dbytes,
+            )?;
+            let d_gv = self.module.declare_data_in_func(d_id, builder.func);
+            let d_ptr = builder.ins().symbol_value(cl_types::I64, d_gv);
+            let draft_handle =
+                self.compile_call_by_name(builder, "nsl_model_create", &[d_ptr])?;
+            let v_dlayers = builder.ins().iconst(cl_types::I64, dr.n_layers as i64);
+            let v_ddmodel = builder.ins().iconst(cl_types::I64, dr.d_model as i64);
+            let v_dnheads = builder.ins().iconst(cl_types::I64, dr.n_heads as i64);
+            let v_dnkv = builder.ins().iconst(cl_types::I64, dr.n_kv_heads as i64);
+            let v_dhdim = builder.ins().iconst(cl_types::I64, dr.head_dim as i64);
+            let v_ddff = builder.ins().iconst(cl_types::I64, dr.d_ff as i64);
+            let v_dvocab = builder.ins().iconst(cl_types::I64, dr.vocab_size as i64);
+            self.compile_call_by_name(
+                builder,
+                "nsl_cfie_bind_draft_model",
+                &[
+                    draft_handle, v_dlayers, v_ddmodel, v_dnheads, v_dnkv, v_dhdim,
+                    v_ddff, v_dvocab,
+                ],
+            )?;
+            let v_pool = builder.ins().iconst(cl_types::I64, dr.pool_bytes);
+            self.compile_call_by_name(builder, "nsl_cfie_draft_pool_alloc", &[v_pool])?;
+        }
 
         // 3. optional tokenizer_load — Cycle 12 keeps the handle for the
         // runtime prompt encode + the generate() decode tail.
@@ -1102,6 +1154,198 @@ impl Compiler<'_> {
             }
         }
 
+        // CFIE Cycle 13 (G15 draft-model-in-binary): when the
+        // speculative section names `draft_weights`, emit the DRAFT
+        // decode block (kind 6 — the existing cfie_persistent_ptx
+        // emitter with the draft dims, max_slots = 1, per-slot capacity
+        // = the TARGET's per the engine's draft-pool sizing contract)
+        // plus the two sampler-family kernels (kind 7 draft greedy
+        // sampler over the DRAFT head, kind 8 target prob-row writer),
+        // and record the resolved draft info that drives the serve-init
+        // binding + the generate() -> speculative_generate rewrite.
+        // Misconfiguration REFUSES loudly (deferral-must-refuse): a
+        // configured draft that silently failed to wire would produce a
+        // binary whose generate() refuses at runtime with no compile-
+        // time hint.  This block runs after the Feature-3/4/2 emissions
+        // because it requires kinds 1/2/4 wired.
+        if let Some(draft_path) = cfg
+            .speculative
+            .as_ref()
+            .and_then(|sp| sp.draft_weights.clone())
+        {
+            let refuse = |what: &str| {
+                Err(CodegenError::new(format!(
+                    "CFIE speculative draft_weights ('{draft_path}'): {what} — \
+                     the compiled speculative driver \
+                     (nsl_cfie_speculative_generate) cannot be wired. Fix the \
+                     serve config or remove draft_weights."
+                )))
+            };
+            if plan.decode_block_ptx.is_none() {
+                return refuse(
+                    "the persistent decode block (kind 2) was not emitted \
+                     (requires a static KV layout + Level-3 fusion + block \
+                     preconditions); the target verify chain runs on kind 2",
+                );
+            }
+            if plan.fused_sample_ptx.is_none() {
+                return refuse(
+                    "the fused sampler (kind 1) was not emitted (requires \
+                     sampling: fused + vocab_size a positive multiple of 128, \
+                     d_model <= 8192, top_k 1..=64); the driver's prefill/bonus \
+                     steps sample through kind 1",
+                );
+            }
+            if plan.spec_reject_ptx.is_none() || plan.spec_reject_launch.is_none() {
+                return refuse(
+                    "the rejection kernel (kind 4) was not emitted (requires \
+                     a speculative plan + static KV layout + K*vocab within \
+                     u32); the driver's accept/reject step is one kind-4 launch",
+                );
+            }
+            if !plan.quant_attention_kernels.is_empty() {
+                return refuse(
+                    "the QUANT kernel family won registration (kv_quant mixed \
+                     INT8 in), which excludes the kind-2 decode block the \
+                     verify chain needs; use kv_quant: \"uniform_fp16\"",
+                );
+            }
+            let spec_cfg = match plan.speculative.as_ref() {
+                Some(sp) => &sp.config,
+                None => {
+                    return refuse("no speculative plan (mode must plan speculative)");
+                }
+            };
+            if spec_cfg.method != crate::cfie_speculative::DraftMethod::Standard {
+                return refuse(
+                    "the v1 speculative driver drafts a LINEAR K-token chain \
+                     (method \"standard\"); tree/medusa/lookahead drafting is \
+                     not wired into nsl_cfie_speculative_generate",
+                );
+            }
+            let s = &prepared.shape;
+            let sp_sec = cfg.speculative.as_ref().expect("draft_weights implies section");
+            // Draft dims: explicit draft_* keys, defaulting to the
+            // TARGET's resolved values (self-speculation shape).  A
+            // mismatch against the actual checkpoint refuses loudly at
+            // serve init (bind_draft_model validates every shape).
+            let pick = |v: Option<i64>, dflt: u32| -> u32 {
+                match v {
+                    Some(x) if x > 0 => x as u32,
+                    _ => dflt,
+                }
+            };
+            let dn_layers = pick(sp_sec.draft_n_layers, s.n_layers);
+            let dd_model = pick(sp_sec.draft_d_model, s.d_model);
+            let dn_heads = pick(sp_sec.draft_n_heads, s.n_heads);
+            let dn_kv = pick(sp_sec.draft_n_kv_heads, s.n_kv_heads);
+            let dhead = pick(sp_sec.draft_head_dim, s.head_dim);
+            let dd_ff = pick(sp_sec.draft_d_ff, s.d_ff);
+            let per_slot = plan
+                .kv
+                .direct
+                .as_ref()
+                .map(|d| d.per_sequence_max_tokens)
+                .unwrap_or(0);
+            let draft_ok = dhead >= 2
+                && dhead % 2 == 0
+                && dhead <= 128
+                && (1..=8192).contains(&dd_model)
+                && (1..=32768).contains(&dd_ff)
+                && dn_heads % dn_kv.max(1) == 0
+                && dn_heads * dhead <= 8192
+                && per_slot >= 1;
+            if !draft_ok {
+                return refuse(
+                    "the draft dims fail the decode-block emitter \
+                     preconditions (head_dim even in 2..=128, d_model <= 8192, \
+                     d_ff <= 32768, n_heads divisible by n_kv_heads, \
+                     n_heads*head_dim <= 8192, static per-slot capacity >= 1)",
+                );
+            }
+            let draft_blk_cfg = crate::cfie_persistent_ptx::DecodeBlockConfig {
+                d_model: dd_model,
+                head_dim: dhead,
+                n_heads: dn_heads,
+                n_kv_heads: dn_kv,
+                d_ff: dd_ff,
+                // Sizing contract: the draft pool's per-slot capacity
+                // equals the TARGET's, so the driver's capacity probe
+                // (bounded by the target slot) bounds draft writes too.
+                per_slot_max_tokens: per_slot,
+                max_slots: 1,
+                n_layers: dn_layers,
+                rope_theta: cfg.rope_theta.unwrap_or(10_000.0) as f32,
+                eps: cfg.norm_eps.unwrap_or(1e-5) as f32,
+                sm_version: gpu.sm_version,
+            };
+            let (dptx, dmeta) = crate::cfie_persistent_ptx::emit(&draft_blk_cfg);
+            if dmeta.smem_bytes > 48 * 1024 {
+                return refuse(
+                    "the draft decode block's static .shared footprint exceeds \
+                     the 48 KB per-CTA cap (shrink draft d_model/d_ff/head_dim)",
+                );
+            }
+            let sampler7_cfg = crate::cfie_spec_sampler_ptx::SpecSamplerConfig {
+                d_model: dd_model,
+                vocab_size: s.vocab_size, // shared vocab
+                vocab_tile: 128,
+                sm_version: gpu.sm_version,
+            };
+            let (sptx7, smeta7) =
+                crate::cfie_spec_sampler_ptx::emit_draft_sample(&sampler7_cfg);
+            let sampler8_cfg = crate::cfie_spec_sampler_ptx::SpecSamplerConfig {
+                d_model: s.d_model, // TARGET head
+                vocab_size: s.vocab_size,
+                vocab_tile: 128,
+                sm_version: gpu.sm_version,
+            };
+            let (sptx8, smeta8) =
+                crate::cfie_spec_sampler_ptx::emit_verify_probs(&sampler8_cfg);
+
+            plan.draft_block_launch = Some(crate::cfie::CfieLaunchSpec {
+                grid_x: 1,
+                block_x: dmeta.block_dim,
+                smem_dyn_bytes: 0,
+            });
+            plan.draft_block_kernel = Some(dmeta.kernel_name);
+            plan.draft_block_ptx = Some(dptx);
+            plan.draft_sample_launch = Some(crate::cfie::CfieLaunchSpec {
+                grid_x: 1,
+                block_x: smeta7.block_dim,
+                smem_dyn_bytes: 0,
+            });
+            plan.draft_sample_kernel = Some(smeta7.kernel_name);
+            plan.draft_sample_ptx = Some(sptx7);
+            plan.verify_probs_launch = Some(crate::cfie::CfieLaunchSpec {
+                grid_x: 1,
+                block_x: smeta8.block_dim,
+                smem_dyn_bytes: 0,
+            });
+            plan.verify_probs_kernel = Some(smeta8.kernel_name);
+            plan.verify_probs_ptx = Some(sptx8);
+            // Draft KV pool: [n_layers][2][1 * per_slot][n_kv][hd] f16.
+            let pool_bytes = (dn_layers as i64)
+                * 2
+                * (per_slot as i64)
+                * (dn_kv as i64)
+                * (dhead as i64)
+                * 2;
+            plan.speculative_draft = Some(crate::cfie::CfieSpeculativeDraft {
+                weights_path: draft_path,
+                n_layers: dn_layers,
+                d_model: dd_model,
+                n_heads: dn_heads,
+                n_kv_heads: dn_kv,
+                head_dim: dhead,
+                d_ff: dd_ff,
+                vocab_size: s.vocab_size,
+                pool_bytes,
+                k_tokens: spec_cfg.k_tokens,
+                target_n_layers: s.n_layers,
+            });
+        }
+
         // G22: estimated decode latency + throughput from the explicit
         // roofline cost model.  Computed here because this is the only
         // point with the resolved model shape, the weights precision, the
@@ -1250,6 +1494,9 @@ impl Compiler<'_> {
                 shape: prepared.shape.clone(),
                 max_new_tokens: cfg.max_new_tokens.unwrap_or(64).max(1),
                 eos_token_id: cfg.eos_token_id.unwrap_or(-1),
+                // Cycle 13: present exactly when the kind-6/7/8 draft
+                // kernels were emitted above.
+                draft: plan.speculative_draft.clone(),
             })
         };
 
