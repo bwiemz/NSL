@@ -5598,15 +5598,17 @@ impl Compiler<'_> {
                     "nsl_tensor_l2_norm",
                     &[param],
                 )?;
-                // is_init flag: 1 iff step == 0.
+                // is_init flag: 1 iff step == 0. icmp already yields I8 in
+                // current Cranelift (the old b1 type is gone) — a further
+                // uextend to I8 is a same-width extend and fails verification,
+                // which broke every `nsl run --monitor` on a train program.
                 let step_cmp = builder.use_var(step_count_var);
                 let zero_cmp = builder.ins().iconst(cl_types::I64, 0);
-                let is_init_b1 = builder.ins().icmp(
+                let is_init_i8 = builder.ins().icmp(
                     cranelift_codegen::ir::condcodes::IntCC::Equal,
                     step_cmp,
                     zero_cmp,
                 );
-                let is_init_i8 = builder.ins().uextend(cl_types::I8, is_init_b1);
                 self.compile_call_by_name(
                     builder,
                     "nsl_health_record_weight_norm",

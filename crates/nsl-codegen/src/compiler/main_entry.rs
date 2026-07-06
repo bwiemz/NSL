@@ -149,7 +149,10 @@ impl Compiler<'_> {
 
         self.module
             .define_function(main_id, &mut ctx)
-            .map_err(|e| CodegenError::new(format!("failed to define main: {e}")))?;
+            // Debug-format: Display for ModuleError::Compilation(Verifier(..))
+            // is just "Verifier errors", swallowing the per-instruction list
+            // that makes these actionable.
+            .map_err(|e| CodegenError::new(format!("failed to define main: {e:?}")))?;
         Ok(())
     }
 
