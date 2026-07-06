@@ -624,6 +624,22 @@ impl Compiler<'_> {
             }
         }
 
+        // A bare member access on a model instance hands out the model's own
+        // field handle (no retain) — e.g. `let alias = m.w`. The binding is a
+        // borrow: freeing it would free the weight itself. Marking it
+        // non-owning makes the step-end cleanup skip it, makes ELTLS rebind
+        // skip the old-value free, and makes assignment-inside-if materialize
+        // a clone first (the established clone-on-mutate discipline).
+        if let ExprKind::MemberAccess { object, .. } = &expr.kind {
+            if matches!(
+                self.node_type(object.id),
+                nsl_semantic::types::Type::Model { .. }
+            ) {
+                state.non_owning_symbols.insert(target_sym);
+                return;
+            }
+        }
+
         state.non_owning_symbols.remove(&target_sym);
     }
 
@@ -1786,6 +1802,72 @@ impl Compiler<'_> {
                         let set_id = self.registry.runtime_fns[set_fn].0;
                         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
                         builder.ins().call(set_ref, &[obj_val, idx_val, final_val]);
+                    }
+                    SubscriptKind::MultiDim(dims) => {
+                        // Tensor element write: t[i, j, ...] = v (and compound
+                        // forms) → nsl_tensor_set(t, [i, j, ...], v as f64).
+                        // The runtime validates arity/bounds and applies strides.
+                        if !obj_type.is_tensor() && !obj_type.is_indeterminate() {
+                            return Err(CodegenError::new(format!(
+                                "multi-dim subscript assignment requires a tensor, got {obj_type:?}"
+                            )));
+                        }
+                        let indices_list =
+                            self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        for dim in dims {
+                            let SubscriptKind::Index(idx_expr) = dim else {
+                                return Err(CodegenError::new(
+                                    "mixed index/slice in multi-dim tensor subscript \
+                                     assignment is not supported",
+                                ));
+                            };
+                            let idx_raw = self.compile_expr(builder, state, idx_expr)?;
+                            let idx_val = if matches!(
+                                self.node_type(idx_expr.id),
+                                nsl_semantic::types::Type::Float
+                            ) {
+                                builder.ins().fcvt_to_sint(cl_types::I64, idx_raw)
+                            } else {
+                                idx_raw
+                            };
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_push",
+                                &[indices_list, idx_val],
+                            )?;
+                        }
+                        // nsl_tensor_set takes the value as F64; coerce ints.
+                        let rhs_f64 = if matches!(
+                            self.node_type(value.id),
+                            nsl_semantic::types::Type::Int | nsl_semantic::types::Type::Bool
+                        ) {
+                            builder.ins().fcvt_from_sint(cl_types::F64, new_val)
+                        } else {
+                            new_val
+                        };
+                        let final_val = if matches!(op, AssignOp::Assign) {
+                            rhs_f64
+                        } else {
+                            // Read-modify-write on the element in f64.
+                            let old_val = self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_get",
+                                &[obj_val, indices_list],
+                            )?;
+                            match op {
+                                AssignOp::AddAssign => builder.ins().fadd(old_val, rhs_f64),
+                                AssignOp::SubAssign => builder.ins().fsub(old_val, rhs_f64),
+                                AssignOp::MulAssign => builder.ins().fmul(old_val, rhs_f64),
+                                AssignOp::DivAssign => builder.ins().fdiv(old_val, rhs_f64),
+                                _ => unreachable!(),
+                            }
+                        };
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_set",
+                            &[obj_val, indices_list, final_val],
+                        )?;
+                        self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
                     }
                     _ => return Err(CodegenError::new("only simple index assignment supported")),
                 }
@@ -3567,7 +3649,30 @@ impl Compiler<'_> {
                         self.compile_stmt(builder, state, stmt)?;
                     }
                 }
-                _ => {} // Eval, Distribute, Stmt — not yet implemented
+                // Bare statements in a train block execute once, pre-training,
+                // in source position — same treatment as Data-section
+                // statements (the semantic checker already declared their
+                // symbols). These were previously silently dropped.
+                TrainSection::Stmt(s) => {
+                    self.compile_stmt(builder, state, s)?;
+                }
+                // Deferral-must-refuse: these sections parse and type-check but
+                // are not executed — silently dropping them meant documented
+                // eval/best-checkpoint logic never ran with no diagnostic.
+                TrainSection::Eval { .. } => {
+                    return Err(CodegenError::new(
+                        "train block `eval:` sections are not yet executed; move \
+                         evaluation logic into an `on_epoch` callback (which \
+                         receives the epoch and loss) so it actually runs",
+                    ));
+                }
+                TrainSection::Distribute(_) => {
+                    return Err(CodegenError::new(
+                        "train block `distribute:` sections are not supported; \
+                         configure distribution via the @pipeline decorator / \
+                         CLI options instead",
+                    ));
+                }
             }
         }
 
@@ -5474,19 +5579,21 @@ impl Compiler<'_> {
         // 7e1c. Dev Tools Phase 4 Task 4: health-monitor hooks.
         // Emits per-step loss, per-parameter gradient norm, per-parameter
         // weight norm (step 0 + every 100 steps), and a snapshot flush every
-        // 100 steps.  Gated entirely on `health_monitor`; when off the IR is
-        // byte-identical to pre-phase-4.
+        // 100 steps.  Gated on `health_monitor`; when neither it nor
+        // `inspect_enabled` is on the IR is byte-identical to pre-phase-4.
         //
         // TODO(phase4-fase): splice grad-norm emission into the FASE per-layer
         // loop when FASE is active.  Phase 4 Task 4 ships the standard-
         // backward-only path — grads_list is indexed the same whether the
         // primary backward was tape-AD or source-AD.
-        if self.compile_options.health_monitor {
-            use cranelift_codegen::ir::{types as cl_types, MemFlags};
-            let _ = MemFlags::trusted(); // keep import valid across cfgs
 
-            // (a) Record loss: scalarize loss_val and call
-            //     nsl_health_record_loss(loss_scalar, step).
+        // (a) Record loss: scalarize loss_val and call
+        //     nsl_health_record_loss(loss_scalar, step).
+        // Also emitted when only `--inspect` is on: `@inspect` predicates read
+        // `loss` back through nsl_health_get_last_loss, so without this call
+        // the collector would stay empty and `loss` would read 0.0 (the exact
+        // silent-wrong the getter replaced).
+        if self.compile_options.health_monitor || self.compile_options.inspect_enabled {
             let loss_scalar = self.compile_call_by_name(
                 builder,
                 "nsl_tensor_item",
@@ -5498,6 +5605,11 @@ impl Compiler<'_> {
                 "nsl_health_record_loss",
                 &[loss_scalar, step_now],
             )?;
+        }
+
+        if self.compile_options.health_monitor {
+            use cranelift_codegen::ir::{types as cl_types, MemFlags};
+            let _ = MemFlags::trusted(); // keep import valid across cfgs
 
             // Precompute step-gating flags shared by grad/weight/flush hooks.
             let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
@@ -5575,15 +5687,17 @@ impl Compiler<'_> {
                     "nsl_tensor_l2_norm",
                     &[param],
                 )?;
-                // is_init flag: 1 iff step == 0.
+                // is_init flag: 1 iff step == 0. icmp already yields I8 in
+                // current Cranelift (the old b1 type is gone) — a further
+                // uextend to I8 is a same-width extend and fails verification,
+                // which broke every `nsl run --monitor` on a train program.
                 let step_cmp = builder.use_var(step_count_var);
                 let zero_cmp = builder.ins().iconst(cl_types::I64, 0);
-                let is_init_b1 = builder.ins().icmp(
+                let is_init_i8 = builder.ins().icmp(
                     cranelift_codegen::ir::condcodes::IntCC::Equal,
                     step_cmp,
                     zero_cmp,
                 );
-                let is_init_i8 = builder.ins().uextend(cl_types::I8, is_init_b1);
                 self.compile_call_by_name(
                     builder,
                     "nsl_health_record_weight_norm",
@@ -6542,6 +6656,11 @@ impl Compiler<'_> {
                 .variables
                 .iter()
                 .filter(|(sym, _)| !vars_before_step.contains(sym))
+                // Borrow aliases (e.g. `let alias = m.w`, DataLoader handles)
+                // don't own their tensor — freeing them here would free the
+                // model weight itself and use-after-free the next step.
+                .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
+                .filter(|(sym, _)| !state.borrowed_batch_symbols.contains(sym))
                 .filter_map(|(sym, (var, _))| {
                     let sem_ty = state.variable_types.get(sym);
                     let is_tensor = sem_ty.map(|t| t.is_tensor()).unwrap_or(false);
@@ -7228,6 +7347,26 @@ impl Compiler<'_> {
                         }
                         self.compile_stmt(builder, state, stmt)?;
                     }
+                }
+                // Same treatment as the standard train path: bare statements
+                // run once pre-training; eval:/distribute: refuse loudly
+                // instead of being silently dropped.
+                TrainSection::Stmt(s) => {
+                    self.compile_stmt(builder, state, s)?;
+                }
+                TrainSection::Eval { .. } => {
+                    return Err(CodegenError::new(
+                        "train block `eval:` sections are not yet executed; move \
+                         evaluation logic into an `on_epoch` callback (which \
+                         receives the epoch and loss) so it actually runs",
+                    ));
+                }
+                TrainSection::Distribute(_) => {
+                    return Err(CodegenError::new(
+                        "train block `distribute:` sections are not supported; \
+                         configure distribution via the @pipeline decorator / \
+                         CLI options instead",
+                    ));
                 }
                 _ => {}
             }
@@ -8447,10 +8586,11 @@ impl Compiler<'_> {
     ///     `nsl_inspect_record_stats`.
     ///   * `condition="..."` → predicate-gated `nsl_inspect_dump_full`.
     ///     Predicate AST is lowered via `inspect::predicate::lower_predicate`.
-    ///   * The `loss` identifier in predicates always evaluates to `0.0` —
-    ///     the loss value isn't in scope at @inspect emission time (inspect
-    ///     fires at the let-binding site, typically before the loss compute).
-    ///     TODO(phase-5-fase): thread loss through once it's available.
+    ///   * The `loss` identifier reads the most recent recorded loss at
+    ///     runtime via `nsl_health_get_last_loss` (recorded per step whenever
+    ///     `--inspect` or the health monitor is on). Because @inspect fires at
+    ///     the let-binding site — before the current step's loss compute — the
+    ///     predicate sees the previous completed step's loss (0.0 on step 0).
     ///
     /// All emission gated on `compile_options.inspect_enabled`.  When that
     /// flag is off, this method is never called.
@@ -8626,13 +8766,18 @@ impl Compiler<'_> {
             let get_nan_inf_count_window_ref =
                 self.module.declare_func_in_func(nic_id, builder.func);
 
+            let (lloss_id, _) = match self.registry.runtime_fns.get("nsl_health_get_last_loss") {
+                Some(e) => e.clone(),
+                None => return Ok(()),
+            };
+            let get_last_loss_ref =
+                self.module.declare_func_in_func(lloss_id, builder.func);
+
             let step_loaded = builder.use_var(step_count_var);
-            // Placeholder for `loss` identifier in predicate — see TODO above.
-            let loss_placeholder = builder.ins().f64const(0.0);
 
             let ctx = crate::inspect::predicate::PredicateLowerCtx {
                 step_val: step_loaded,
-                loss_val: loss_placeholder,
+                get_last_loss_ref,
                 get_loss_ema_ref,
                 get_loss_ema_slope_ref,
                 get_grad_norm_total_ref,

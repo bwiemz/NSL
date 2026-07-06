@@ -120,6 +120,15 @@ impl<'a> TypeChecker<'a> {
                             },
                         }
                     }
+                    // Multi-dim element read `t[i, j, ...]` lowers to
+                    // nsl_tensor_get, which returns the element as f64 — the
+                    // expression is a Float scalar. Single-index and slice
+                    // subscripts on tensors keep their legacy Unknown typing
+                    // (their codegen paths predate tensor element access).
+                    Type::Tensor { .. } => match index.as_ref() {
+                        nsl_ast::expr::SubscriptKind::MultiDim(_) => Type::Float,
+                        _ => Type::Unknown,
+                    },
                     _ => Type::Unknown,
                 }
             }

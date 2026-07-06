@@ -241,7 +241,9 @@ impl Compiler<'_> {
 
         self.module
             .define_function(main_id, &mut ctx)
-            .map_err(|e| CodegenError::new(format!("failed to define main: {e}")))?;
+            // Debug-format so verifier error lists aren't swallowed (see
+            // compiler/main_entry.rs).
+            .map_err(|e| CodegenError::new(format!("failed to define main: {e:?}")))?;
         Ok(())
     }
 }

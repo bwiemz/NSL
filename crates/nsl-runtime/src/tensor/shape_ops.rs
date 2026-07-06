@@ -843,9 +843,14 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     for &cp in &contiguous_ptrs {
         let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
-        assert_eq!(
-            t.dtype,
-            first.dtype,
+        // f32/f64 CPU inputs may be mixed (creation ops make f32 tensors while
+        // many op results are f64 — the known split CPU dtype model): the
+        // output keeps the FIRST tensor's dtype and mismatched elements are
+        // converted through the f64 scalar accessors in the copy loop below.
+        // Any other dtype pairing still refuses loudly.
+        let f32f64 = |d: u16| d == 0 || d == 1;
+        assert!(
+            t.dtype == first.dtype || (f32f64(t.dtype) && f32f64(first.dtype)),
             "nsl_tensor_cat: dtype mismatch ({} vs {})",
             t.dtype,
             first.dtype,
@@ -896,7 +901,22 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
                     out_offset += idx * o_strides[axis] as usize;
                 }
             }
-            unsafe { copy_preserved_dtype_element(t, flat, data, out_offset) };
+            if t.dtype == out_dtype {
+                unsafe { copy_preserved_dtype_element(t, flat, data, out_offset) };
+            } else {
+                // Mixed f32/f64 input (allowed above): convert into the
+                // output's dtype via the f64 scalar path.
+                let v = t.read_scalar_as_f64(flat);
+                unsafe {
+                    match out_dtype {
+                        0 => *(data as *mut f64).add(out_offset) = v,
+                        1 => *(data as *mut f32).add(out_offset) = v as f32,
+                        other => unreachable!(
+                            "nsl_tensor_cat: mixed-dtype copy only supports f32/f64 (got {other})"
+                        ),
+                    }
+                }
+            }
         }
         cat_offset += sz as usize;
     }

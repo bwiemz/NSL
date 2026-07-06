@@ -188,11 +188,12 @@ use cranelift_frontend::FunctionBuilder;
 pub struct PredicateLowerCtx {
     /// Current train-loop step counter loaded as an I64 value.
     pub step_val: Value,
-    /// Current scalar loss (F64).  When the compiler cannot resolve `loss`
-    /// in scope (e.g. `@inspect` fires before the loss is computed), this is
-    /// a compile-time zero constant — predicates referencing `loss` degrade
-    /// to `false` / `0.0` rather than erroring.
-    pub loss_val: Value,
+    /// Getter for the most recent recorded loss (`nsl_health_get_last_loss`).
+    /// Resolved lazily like the other health getters, so `loss` in a predicate
+    /// reads the real per-step value at runtime. (Previously this was a
+    /// compile-time 0.0 constant, so `condition="loss > x"` silently never
+    /// fired and `loss < x` always fired.)
+    pub get_last_loss_ref: FuncRef,
     pub get_loss_ema_ref: FuncRef,
     pub get_loss_ema_slope_ref: FuncRef,
     pub get_grad_norm_total_ref: FuncRef,
@@ -281,7 +282,10 @@ fn lower_ident_to_value(
         PredicateExpr::FloatLit(f) => (builder.ins().f64const(*f), true),
         PredicateExpr::Ident(s) => match s.as_str() {
             "step" => (ctx.step_val, false),
-            "loss" => (ctx.loss_val, true),
+            "loss" => {
+                let inst = builder.ins().call(ctx.get_last_loss_ref, &[]);
+                (builder.inst_results(inst)[0], true)
+            }
             "loss_ema" => {
                 let inst = builder.ins().call(ctx.get_loss_ema_ref, &[]);
                 (builder.inst_results(inst)[0], true)

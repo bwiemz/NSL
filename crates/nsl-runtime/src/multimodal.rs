@@ -358,9 +358,30 @@ pub extern "C" fn nsl_stft(audio_ptr: i64, n_fft: i64, hop_length: i64) -> i64 {
 
 /// Mel spectrogram: STFT → power spectrum → mel filterbank → log.
 /// Returns [B, n_mels, n_frames] or 0 on error.
+///
+/// Assumes 16 kHz audio — the filterbank frequency grid is built against that
+/// rate. For any other rate use `nsl_mel_spectrogram_sr`, or the mel bins land
+/// at the wrong frequencies (silently, since the output shape is identical).
 #[no_mangle]
 pub extern "C" fn nsl_mel_spectrogram(
     audio_ptr: i64, n_fft: i64, hop_length: i64, n_mels: i64,
+) -> i64 {
+    mel_spectrogram_impl(audio_ptr, n_fft, hop_length, n_mels, 16000.0)
+}
+
+/// Mel spectrogram with an explicit sample rate (Hz). Same output contract as
+/// `nsl_mel_spectrogram`; refuses (returns 0) on a non-positive sample rate,
+/// matching this file's error convention.
+#[no_mangle]
+pub extern "C" fn nsl_mel_spectrogram_sr(
+    audio_ptr: i64, n_fft: i64, hop_length: i64, n_mels: i64, sample_rate: i64,
+) -> i64 {
+    if sample_rate <= 0 { return 0; }
+    mel_spectrogram_impl(audio_ptr, n_fft, hop_length, n_mels, sample_rate as f32)
+}
+
+fn mel_spectrogram_impl(
+    audio_ptr: i64, n_fft: i64, hop_length: i64, n_mels: i64, sr: f32,
 ) -> i64 {
     if audio_ptr == 0 || n_fft <= 0 || hop_length <= 0 || n_mels <= 0 { return 0; }
 
@@ -374,8 +395,7 @@ pub extern "C" fn nsl_mel_spectrogram(
     let nm = n_mels as usize;
     let sd = unsafe { f32_data(st) };
 
-    // Build mel filterbank (simplified triangular)
-    let sr = 16000.0f32; // assumed sample rate
+    // Build mel filterbank (simplified triangular) against the given rate
     let fmin = 0.0f32;
     let fmax = sr / 2.0;
     let mel_min = 2595.0 * (1.0 + fmin / 700.0).log10();
@@ -480,11 +500,64 @@ mod tests {
     fn null_inputs_return_zero() {
         assert_eq!(nsl_patch_embed(0, 0, 16), 0);
         assert_eq!(nsl_mel_spectrogram(0, 1024, 256, 80), 0);
+        assert_eq!(nsl_mel_spectrogram_sr(0, 1024, 256, 80, 16000), 0);
         assert_eq!(nsl_cross_attention(0, 0, 0, 8), 0);
         assert_eq!(nsl_image_resize(0, 224, 224), 0);
         assert_eq!(nsl_image_normalize(0, 0, 0), 0);
         assert_eq!(nsl_stft(0, 1024, 256), 0);
         assert_eq!(nsl_audio_resample(0, 44100, 16000), 0);
+    }
+
+    /// The sample-rate parameter must be live: 16 kHz must reproduce the legacy
+    /// 4-arg output exactly, a different rate must move the mel filterbank (and
+    /// so the values), and a non-positive rate must refuse.
+    #[test]
+    fn mel_spectrogram_sample_rate_is_live() {
+        // 1 batch x 512 samples of a fixed tone so filterbank placement matters.
+        let audio = alloc_f32_tensor(&[1, 512]);
+        assert_ne!(audio, 0);
+        {
+            let at = unsafe { &*(audio as *const NslTensor) };
+            let ad = unsafe { f32_data_mut(audio) };
+            for i in 0..at.len as usize {
+                ad[i] = (i as f32 * 0.7).sin();
+            }
+        }
+
+        let legacy = nsl_mel_spectrogram(audio, 128, 64, 8);
+        let sr16k = nsl_mel_spectrogram_sr(audio, 128, 64, 8, 16000);
+        let sr48k = nsl_mel_spectrogram_sr(audio, 128, 64, 8, 48000);
+        assert_ne!(legacy, 0);
+        assert_ne!(sr16k, 0);
+        assert_ne!(sr48k, 0);
+        assert_eq!(nsl_mel_spectrogram_sr(audio, 128, 64, 8, 0), 0);
+        assert_eq!(nsl_mel_spectrogram_sr(audio, 128, 64, 8, -1), 0);
+
+        let (tl, t16, t48) = unsafe {
+            (
+                &*(legacy as *const NslTensor),
+                &*(sr16k as *const NslTensor),
+                &*(sr48k as *const NslTensor),
+            )
+        };
+        assert_eq!(tl.len, t16.len);
+        assert_eq!(tl.len, t48.len);
+        let (dl, d16, d48) =
+            unsafe { (f32_data(tl), f32_data(t16), f32_data(t48)) };
+        let n = tl.len as usize;
+        assert!(
+            (0..n).all(|i| dl[i] == d16[i]),
+            "sr=16000 must be bit-identical to the legacy 4-arg path"
+        );
+        assert!(
+            (0..n).any(|i| (d16[i] - d48[i]).abs() > 1e-6),
+            "sr=48000 must produce a different filterbank placement than 16000"
+        );
+
+        crate::tensor::nsl_tensor_free(audio);
+        crate::tensor::nsl_tensor_free(legacy);
+        crate::tensor::nsl_tensor_free(sr16k);
+        crate::tensor::nsl_tensor_free(sr48k);
     }
 
     #[test]

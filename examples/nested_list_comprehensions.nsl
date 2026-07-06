@@ -1,0 +1,48 @@
+# Nested list-comprehension verification.
+
+# (a) cross product with element referencing both vars
+let a = [1, 2]
+let b = [10, 20]
+let ab = [x + y for x in a for y in b]
+assert_eq(len(ab), 4)
+assert_eq(ab[0], 11)
+assert_eq(ab[1], 21)
+assert_eq(ab[2], 12)
+assert_eq(ab[3], 22)
+
+# (b) the silent-wrong regression: element ignores the inner var — must still
+# iterate the full cross product (was: 2 elements instead of 6)
+let c = [x * 100 for x in [1, 2] for y in [10, 20, 30]]
+assert_eq(len(c), 6)
+assert_eq(c[0], 100)
+assert_eq(c[3], 200)
+
+# (c) conditions on BOTH generators (inner filters were silently dropped)
+let d = [x * y for x in [1, 2, 3] if x > 1 for y in [1, 2] if y == 2]
+assert_eq(len(d), 2)
+assert_eq(d[0], 4)
+assert_eq(d[1], 6)
+
+# (d) dependent generators: inner iterable references the outer variable
+let nested = [[1, 2], [3]]
+let flat = [y for x in nested for y in x]
+assert_eq(len(flat), 3)
+assert_eq(flat[0], 1)
+assert_eq(flat[1], 2)
+assert_eq(flat[2], 3)
+
+# (e) single-generator regression: unchanged behavior
+let e = [x * x for x in [1, 2, 3, 4] if x > 2]
+assert_eq(len(e), 2)
+assert_eq(e[0], 9)
+assert_eq(e[1], 16)
+
+# (f) triple nesting
+let f = [x + y + z for x in [100] for y in [10, 20] for z in [1, 2]]
+assert_eq(len(f), 4)
+assert_eq(f[0], 111)
+assert_eq(f[1], 112)
+assert_eq(f[2], 121)
+assert_eq(f[3], 122)
+
+print("nested-comp-ok")

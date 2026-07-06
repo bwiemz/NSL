@@ -70,11 +70,15 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
     }
 
     if args.memory {
-        // TODO: replace with real WengertList when source-AD integration is
-        // stable. For Phase 1 we synthesize a minimal plausible plan from the
-        // walker's op list: each op produces an activation of `bytes_written`
-        // bytes, birthed at its program-point index and living for a small
-        // sliding window (2 steps) to approximate activation reuse.
+        // APPROXIMATION, and labeled as such in both the render and the JSON
+        // (`memory_timeline_approximate: true`): each op's activation is given
+        // a fixed 2-step lifetime, so the timeline shows a moving sum of
+        // bytes_written — NOT real activation liveness. In particular, saved-
+        // for-backward activations in training programs accumulate far beyond
+        // this window, so the real peak is typically much higher. Replacing
+        // this with a real WengertList-driven plan (extraction + adjoint +
+        // analyze_saved_tensors + the WRGA planner) is the tracked follow-up;
+        // until then the honest contract is a clearly-labeled estimate.
         use nsl_codegen::wrga_memory::{MemoryPlan, MemoryPlanStats, SlotAssignment};
         const LIFETIME_WINDOW: u32 = 2;
         let n = report.ops.len() as u32;
@@ -105,6 +109,7 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
             },
         );
         report.memory_timeline = Some(tl);
+        report.memory_timeline_approximate = Some(true);
     }
 
     if args.explain_wggo {
@@ -196,6 +201,14 @@ fn render_text(r: &ProfileReport, gpu: &GpuSpec) -> String {
     }
     if let Some(tl) = &r.memory_timeline {
         out.push_str(&nsl_codegen::profiling::memory_timeline::render(tl));
+        if r.memory_timeline_approximate == Some(true) {
+            out.push_str(
+                "\n  NOTE: APPROXIMATE timeline — synthesized from a fixed 2-step\n  \
+                 activation-lifetime heuristic, not real liveness analysis. For\n  \
+                 training programs the true peak (saved-for-backward activations)\n  \
+                 is typically much higher than shown.\n",
+            );
+        }
     }
     if !r.recommendations.is_empty() {
         out.push_str("\nRecommendations:\n");

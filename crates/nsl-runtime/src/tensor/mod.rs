@@ -867,6 +867,14 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let indices = NslList::from_ptr(indices_list);
 
+    if tensor.device > 0 {
+        eprintln!(
+            "nsl: element read on a GPU tensor is not supported; move it to the \
+             CPU first (e.g. `t.to(cpu)`) — reading device memory host-side \
+             would return garbage"
+        );
+        std::process::abort();
+    }
     if indices.len != tensor.ndim {
         eprintln!(
             "nsl: tensor index dimension mismatch (got {}, expected {})",
@@ -897,6 +905,14 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let indices = NslList::from_ptr(indices_list);
 
+    if tensor.device > 0 {
+        eprintln!(
+            "nsl: element write on a GPU tensor is not supported; move it to the \
+             CPU first (e.g. `t.to(cpu)`) — writing device memory host-side \
+             would corrupt it"
+        );
+        std::process::abort();
+    }
     if indices.len != tensor.ndim {
         eprintln!(
             "nsl: tensor index dimension mismatch (got {}, expected {})",

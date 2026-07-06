@@ -95,6 +95,11 @@ pub struct ProfileReport {
     pub total_estimated_us: f64,
     pub fusion: Option<FusionPlan>,
     pub memory_timeline: Option<Vec<MemoryTimelineEntry>>,
+    /// `Some(true)` when the timeline was synthesized from a fixed-lifetime
+    /// heuristic rather than a real activation-liveness (WengertList) plan.
+    /// Consumers must not treat the peak as a real memory bound when set.
+    #[serde(default)]
+    pub memory_timeline_approximate: Option<bool>,
     pub recommendations: Vec<Recommendation>,
     /// Populated by `nsl profile --explain-wggo`. `WggoPlan` is serialize-only,
     /// so this field is skipped on deserialization and defaults to `None`.
