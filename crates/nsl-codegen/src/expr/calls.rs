@@ -199,7 +199,26 @@ impl Compiler<'_> {
                          object — defaulting to tensor dispatch. This may indicate a type inference gap."
                     );
                 }
-                return self.compile_tensor_method_call(builder, state, object, &member_name, args);
+                let result =
+                    self.compile_tensor_method_call(builder, state, object, &member_name, args);
+                if matches!(obj_type, Type::Unknown) {
+                    if let Err(e) = result {
+                        // Generic (untyped) value whose method didn't resolve —
+                        // e.g. `.forward()` on a model passed as an untyped fn
+                        // parameter. Generic model-method dispatch is not yet
+                        // implemented, so refuse with the workaround named
+                        // (deferral-must-refuse) instead of the bare
+                        // "unknown tensor method" the tensor fallback produces.
+                        return Err(CodegenError::new(format!(
+                            "cannot dispatch '.{member_name}()' on a generic (untyped) \
+                             value here ({e}); generic model-method dispatch is not yet \
+                             supported — call the method where the object's concrete \
+                             model type is known (e.g. on the model variable itself), \
+                             or annotate the parameter with a concrete type"
+                        )));
+                    }
+                }
+                return result;
             }
         }
 

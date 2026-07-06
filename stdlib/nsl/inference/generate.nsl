@@ -1,18 +1,32 @@
 # NeuralScript Text Generation Module
-# Autoregressive generation with pre-allocated buffer and no_grad.
+# Autoregressive generation: grows the token sequence one step at a time. Each
+# step runs the model on the current sequence, takes the logits at the last
+# position, samples the next token, and appends it. The `@no_grad` decorator
+# keeps the whole loop off the autodiff tape.
+#
+# Works for 1-D token sequences ([seq]) and batched ones ([batch, seq]): the
+# logits' last position is taken along dim -2 and the sampled token appends
+# along dim -1.
+#
+# The sequence grows by concatenation rather than in-place index-assignment
+# into a pre-allocated buffer: the earlier pre-allocated version never wrote
+# its sampled tokens back (and used the reserved keyword `model` as a param
+# name plus a nonexistent `no_grad:` block, so it did not even compile).
 
 from nsl.inference.sampling import sample_top_k
 
-fn generate(model, prompt: Tensor, max_tokens: int, temperature: float, top_k: int) -> Tensor:
-    let prompt_len = prompt.shape(-1)
-    let total_len = prompt_len + max_tokens
-    let tokens = zeros([1, total_len])
-    # Copy prompt into pre-allocated buffer
-    for i in range(prompt_len):
-        let tok = prompt.select(1, i)
-    no_grad:
-        for i in range(prompt_len, total_len):
-            let logits = model.forward(tokens)
-            let next_logit = logits.select(-2, -1)
-            let next_token = sample_top_k(next_logit, top_k, temperature)
+@no_grad
+fn generate(lm, prompt: Tensor, max_tokens: int, temperature: float, top_k: int) -> Tensor:
+    let tokens = prompt
+    for i in range(max_tokens):
+        let logits = lm.forward(tokens)
+        # Logits at the final position: [.., seq, vocab] -> [.., vocab].
+        let next_logit = logits.select(-2, -1)
+        # Sampled next token id (a 0-d tensor for 1-D sequences).
+        let next_token = sample_top_k(next_logit, top_k, temperature)
+        # Materialize as a length-1 tensor so it concatenates along the
+        # sequence dimension.
+        let next_1d = next_token.reshape([1])
+        let parts = [tokens, next_1d]
+        tokens = tensor_cat(parts, -1)
     return tokens

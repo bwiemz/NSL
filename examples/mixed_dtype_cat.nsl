@@ -1,0 +1,18 @@
+# Regression: tensor_cat with mixed f32/f64 CPU inputs.
+#
+# Creation ops (full/zeros/ones) make f32 CPU tensors while many op results
+# (e.g. gather chains) are f64 — the split CPU dtype model. tensor_cat used to
+# assert "dtype mismatch (0 vs 1)" on any such mix; it now keeps the FIRST
+# input's dtype and converts the rest element-wise.
+
+let a = full([2], 1.5)
+let b = arange(0.0, 3.0)
+let ab = tensor_cat([a, b], -1)
+let expected = tensor_cat([full([2], 1.5), full([1], 0.0), full([1], 1.0), full([1], 2.0)], -1)
+assert_close(ab, expected, 0.0001, 0.0001)
+
+# Reverse order (f64 first) must also work.
+let ba = tensor_cat([b, a], -1)
+assert_close(ba.select(-1, -1), full([1], 1.5).select(-1, -1), 0.0001, 0.0001)
+
+print("mixed-dtype-cat-ok")
