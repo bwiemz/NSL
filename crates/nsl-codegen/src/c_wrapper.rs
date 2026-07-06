@@ -38,12 +38,21 @@ pub fn build_c_abi_wrapper_signature(
     sig.params.push(AbiParam::new(types::I64)); // NslModel*
 
     for param in &export_info.params {
-        let ty = match &param.ty {
-            ExportTypeInfo::Tensor { .. } => types::I64,
-            ExportTypeInfo::Scalar(dt) => cranelift_type_for_scalar(*dt),
-            ExportTypeInfo::Tuple(_) => types::I64,
-        };
-        sig.params.push(AbiParam::new(ty));
+        match &param.ty {
+            ExportTypeInfo::Tensor { .. } => sig.params.push(AbiParam::new(types::I64)),
+            ExportTypeInfo::Scalar(dt) => {
+                sig.params.push(AbiParam::new(cranelift_type_for_scalar(*dt)))
+            }
+            // Two slots, matching the C header's
+            // `const NslTensorDesc* {name}_items, int32_t {name}_count`.
+            // (Safe ABI change: tuple-param wrappers were previously refused
+            // at compile time, so no existing binary links against the old
+            // single-slot shape.)
+            ExportTypeInfo::Tuple(_) => {
+                sig.params.push(AbiParam::new(types::I64));
+                sig.params.push(AbiParam::new(types::I32));
+            }
+        }
     }
 
     match &export_info.return_type {
@@ -157,26 +166,86 @@ pub fn emit_c_abi_wrapper(
         }
 
         // ── Convert tensor inputs; pass scalars through ───────────────────────
+        // `param_cursor` walks the wrapper's C-ABI slots explicitly because a
+        // tuple parameter occupies TWO slots (items ptr + i32 count).
         let mut internal_args: Vec<cranelift_codegen::ir::Value> = leading_args;
         let mut tensor_inputs_to_free: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        let mut lists_to_free: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        let mut param_cursor = 1usize; // params[0] is NslModel*
 
-        for (i, param) in wrapper.export_info.params.iter().enumerate() {
-            let arg_val = params[1 + i];
+        for param in wrapper.export_info.params.iter() {
             match &param.ty {
                 ExportTypeInfo::Tensor { .. } => {
+                    let arg_val = params[param_cursor];
+                    param_cursor += 1;
                     let tensor =
                         call_desc_to_tensor(&mut builder, &mut compiler.module, arg_val)?;
                     internal_args.push(tensor);
                     tensor_inputs_to_free.push(tensor);
                 }
                 ExportTypeInfo::Scalar(_) => {
-                    internal_args.push(arg_val);
+                    internal_args.push(params[param_cursor]);
+                    param_cursor += 1;
                 }
-                ExportTypeInfo::Tuple(_) => {
-                    return Err(CodegenError::new(format!(
-                        "@export tuple input parameter for '{}' is not yet supported",
-                        wrapper.raw_name
-                    )));
+                ExportTypeInfo::Tuple(elems) => {
+                    // v1 scope: every element must be a tensor — the C ABI
+                    // types the items array as NslTensorDesc*.
+                    if elems
+                        .iter()
+                        .any(|e| !matches!(e, ExportTypeInfo::Tensor { .. }))
+                    {
+                        return Err(CodegenError::new(format!(
+                            "@export tuple parameter for '{}' may only contain \
+                             tensors (the C ABI passes an NslTensorDesc array); \
+                             pass scalars as separate parameters",
+                            wrapper.raw_name
+                        )));
+                    }
+                    let items_ptr = params[param_cursor];
+                    let count_val = params[param_cursor + 1];
+                    param_cursor += 2;
+
+                    // Runtime arity guard: the caller's count must match the
+                    // compile-time tuple arity or unpacking would read past
+                    // the caller's array.
+                    let arity_i32 = builder.ins().iconst(cw_types::I32, elems.len() as i64);
+                    let count_err = builder.create_block();
+                    let count_ok = builder.create_block();
+                    let count_bad =
+                        builder
+                            .ins()
+                            .icmp(IntCC::NotEqual, count_val, arity_i32);
+                    builder.ins().brif(count_bad, count_err, &[], count_ok, &[]);
+                    builder.switch_to_block(count_err);
+                    builder.seal_block(count_err);
+                    let msg = format!(
+                        "tuple parameter count mismatch for '{}' (expected {})",
+                        wrapper.raw_name,
+                        elems.len()
+                    );
+                    emit_set_error(&mut builder, &mut compiler.module, &msg)?;
+                    let neg_one = builder.ins().iconst(cw_types::I32, -1);
+                    builder.ins().return_(&[neg_one]);
+                    builder.switch_to_block(count_ok);
+                    builder.seal_block(count_ok);
+
+                    // Unpack each desc into a tensor and collect them into the
+                    // NslList that IS the tuple's runtime representation.
+                    let list = call_nsl_list_new(&mut builder, &mut compiler.module)?;
+                    for k in 0..elems.len() {
+                        let off = (k as i64) * NSL_TENSOR_DESC_SIZE;
+                        let desc_ptr = if off == 0 {
+                            items_ptr
+                        } else {
+                            builder.ins().iadd_imm(items_ptr, off)
+                        };
+                        let tensor =
+                            call_desc_to_tensor(&mut builder, &mut compiler.module, desc_ptr)?;
+                        call_nsl_list_push(&mut builder, &mut compiler.module, list, tensor)?;
+                        tensor_inputs_to_free.push(tensor);
+                    }
+                    internal_args.push(list);
+                    lists_to_free.push(list);
                 }
             }
         }
@@ -195,7 +264,7 @@ pub fn emit_c_abi_wrapper(
         // A proper fix (memcpy + free, or caller-side nsl_desc_free_data) is deferred.
         match &wrapper.export_info.return_type {
             ExportTypeInfo::Tensor { .. } => {
-                let ret_desc_ptr = params[1 + wrapper.export_info.params.len()];
+                let ret_desc_ptr = params[param_cursor];
                 let result_tensor = impl_rets[0];
                 call_tensor_to_desc_ffi(
                     &mut builder,
@@ -205,23 +274,83 @@ pub fn emit_c_abi_wrapper(
                 )?;
             }
             ExportTypeInfo::Scalar(_) => {
-                let ret_ptr = params[1 + wrapper.export_info.params.len()];
+                let ret_ptr = params[param_cursor];
                 let scalar_val = impl_rets[0];
                 builder
                     .ins()
                     .store(MemFlags::trusted(), scalar_val, ret_ptr, 0);
             }
-            ExportTypeInfo::Tuple(_) => {
-                return Err(CodegenError::new(format!(
-                    "@export tuple return for '{}' is not yet supported",
-                    wrapper.raw_name
-                )));
+            ExportTypeInfo::Tuple(elems) => {
+                // v1 scope mirrors tuple params: all elements must be tensors
+                // (the C ABI's __rets is an NslTensorDesc array).
+                if elems
+                    .iter()
+                    .any(|e| !matches!(e, ExportTypeInfo::Tensor { .. }))
+                {
+                    return Err(CodegenError::new(format!(
+                        "@export tuple return for '{}' may only contain tensors \
+                         (the C ABI writes an NslTensorDesc array)",
+                        wrapper.raw_name
+                    )));
+                }
+                let rets_ptr = params[param_cursor];
+                let num_rets_ptr = params[param_cursor + 1];
+                // The impl returns the tuple as one NslList handle.
+                let list = impl_rets[0];
+
+                // Defensive arity guard: a mismatched list would over/under-run
+                // the caller's __rets array.
+                let list_len = call_nsl_list_len(&mut builder, &mut compiler.module, list)?;
+                let arity_i64 = builder.ins().iconst(cw_types::I64, elems.len() as i64);
+                let len_err = builder.create_block();
+                let len_ok = builder.create_block();
+                let len_bad = builder.ins().icmp(IntCC::NotEqual, list_len, arity_i64);
+                builder.ins().brif(len_bad, len_err, &[], len_ok, &[]);
+                builder.switch_to_block(len_err);
+                builder.seal_block(len_err);
+                let msg = format!(
+                    "tuple return arity mismatch for '{}' (expected {})",
+                    wrapper.raw_name,
+                    elems.len()
+                );
+                emit_set_error(&mut builder, &mut compiler.module, &msg)?;
+                let neg_one = builder.ins().iconst(cw_types::I32, -1);
+                builder.ins().return_(&[neg_one]);
+                builder.switch_to_block(len_ok);
+                builder.seal_block(len_ok);
+
+                for k in 0..elems.len() {
+                    let idx = builder.ins().iconst(cw_types::I64, k as i64);
+                    let elem =
+                        call_nsl_list_get(&mut builder, &mut compiler.module, list, idx)?;
+                    let off = (k as i64) * NSL_TENSOR_DESC_SIZE;
+                    let dst = if off == 0 {
+                        rets_ptr
+                    } else {
+                        builder.ins().iadd_imm(rets_ptr, off)
+                    };
+                    // NOTE: like the single-Tensor return above, the element
+                    // NslTensor structs intentionally leak (~80 bytes each) —
+                    // the descs alias their buffers, so freeing here would
+                    // dangle the caller's data pointers.
+                    call_tensor_to_desc_ffi(&mut builder, &mut compiler.module, elem, dst)?;
+                }
+                // Free the list container itself (just the i64 vec, not the
+                // element tensors).
+                call_nsl_list_free(&mut builder, &mut compiler.module, list)?;
+                let arity_out = builder.ins().iconst(cw_types::I32, elems.len() as i64);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), arity_out, num_rets_ptr, 0);
             }
         }
 
         // ── Free wrapper tensor structs ───────────────────────────────────────
         for t in tensor_inputs_to_free {
             call_nsl_tensor_free(&mut builder, &mut compiler.module, t)?;
+        }
+        for l in lists_to_free {
+            call_nsl_list_free(&mut builder, &mut compiler.module, l)?;
         }
 
         let zero_ret = builder.ins().iconst(cw_types::I32, 0);
@@ -513,6 +642,73 @@ fn call_desc_to_tensor<M: Module + ?Sized>(
     Ok(builder.inst_results(call)[0])
 }
 
+/// Call `nsl_list_new() -> i64` — allocates the NslList used as the runtime
+/// representation of a tuple.
+fn call_nsl_list_new<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+    let fid = declare_runtime_fn(module, "nsl_list_new", &[], &[cw_types::I64])?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    let call = builder.ins().call(fref, &[]);
+    Ok(builder.inst_results(call)[0])
+}
+
+/// Call `nsl_list_push(list: i64, value: i64)`.
+fn call_nsl_list_push<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    list: cranelift_codegen::ir::Value,
+    value: cranelift_codegen::ir::Value,
+) -> Result<(), CodegenError> {
+    let fid = declare_runtime_fn(module, "nsl_list_push", &[cw_types::I64, cw_types::I64], &[])?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    builder.ins().call(fref, &[list, value]);
+    Ok(())
+}
+
+/// Call `nsl_list_get(list: i64, index: i64) -> i64`.
+fn call_nsl_list_get<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    list: cranelift_codegen::ir::Value,
+    index: cranelift_codegen::ir::Value,
+) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_list_get",
+        &[cw_types::I64, cw_types::I64],
+        &[cw_types::I64],
+    )?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    let call = builder.ins().call(fref, &[list, index]);
+    Ok(builder.inst_results(call)[0])
+}
+
+/// Call `nsl_list_len(list: i64) -> i64`.
+fn call_nsl_list_len<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    list: cranelift_codegen::ir::Value,
+) -> Result<cranelift_codegen::ir::Value, CodegenError> {
+    let fid = declare_runtime_fn(module, "nsl_list_len", &[cw_types::I64], &[cw_types::I64])?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    let call = builder.ins().call(fref, &[list]);
+    Ok(builder.inst_results(call)[0])
+}
+
+/// Call `nsl_list_free(list: i64)` — frees the i64 vec only, not the values.
+fn call_nsl_list_free<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    list: cranelift_codegen::ir::Value,
+) -> Result<(), CodegenError> {
+    let fid = declare_runtime_fn(module, "nsl_list_free", &[cw_types::I64], &[])?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    builder.ins().call(fref, &[list]);
+    Ok(())
+}
+
 /// Call `nsl_tensor_to_desc_ffi(tensor: i64, desc: i64)` — C-ABI export in nsl-runtime.
 fn call_tensor_to_desc_ffi<M: Module + ?Sized>(
     builder: &mut FunctionBuilder,
@@ -734,6 +930,45 @@ mod tests {
             sig_b.returns.len(),
             "signature return count must not vary by is_model_method"
         );
+    }
+
+    #[test]
+    fn wrapper_signature_for_tuple_param_has_items_and_count() {
+        let info = ExportInfo {
+            symbol_name: "fuse".into(),
+            raw_name: "fuse".into(),
+            params: vec![ExportParamInfo {
+                name: "pair".into(),
+                ty: ExportTypeInfo::Tuple(vec![
+                    ExportTypeInfo::Tensor {
+                        shape: vec!["2".into()],
+                        dtype: ExportDtype::F32,
+                        device: ExportDevice::Cpu,
+                    },
+                    ExportTypeInfo::Tensor {
+                        shape: vec!["2".into()],
+                        dtype: ExportDtype::F32,
+                        device: ExportDevice::Cpu,
+                    },
+                ]),
+            }],
+            return_type: ExportTypeInfo::Tensor {
+                shape: vec!["2".into()],
+                dtype: ExportDtype::F32,
+                device: ExportDevice::Cpu,
+            },
+        };
+        let sig = build_c_abi_wrapper_signature(&info, CallConv::SystemV);
+        // [i64 model, i64 pair_items, i32 pair_count, i64 ret_desc] -> i32
+        // — matches the C header's `const NslTensorDesc* pair_items,
+        // int32_t pair_count` two-arg tuple-param ABI.
+        assert_eq!(sig.params.len(), 4);
+        assert_eq!(sig.params[0].value_type, I64);
+        assert_eq!(sig.params[1].value_type, I64);
+        assert_eq!(sig.params[2].value_type, I32);
+        assert_eq!(sig.params[3].value_type, I64);
+        assert_eq!(sig.returns.len(), 1);
+        assert_eq!(sig.returns[0].value_type, I32);
     }
 
     #[test]

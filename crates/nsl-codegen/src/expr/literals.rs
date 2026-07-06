@@ -74,6 +74,16 @@ impl Compiler<'_> {
         for elem in elements {
             let val = self.compile_expr(builder, state, elem)?;
             builder.ins().call(push_ref, &[tuple_ptr, val]);
+            // Ownership of tensor elements transfers INTO the tuple. Without
+            // this, the statement/return temporaries sweep freed the element
+            // tensors while the tuple still held their handles — so returning
+            // `(x * 2.0, x * 3.0)` handed the caller a tuple of dangling
+            // pointers ("bad magic 0xDEAD" on first use). Worst case now is a
+            // leak when a locally-built tuple is dropped unused (the accepted
+            // tradeoff elsewhere in this file's ownership model).
+            if self.node_type(elem.id).is_tensor() {
+                self.consume_ownership(state, val);
+            }
         }
         Ok(tuple_ptr)
     }

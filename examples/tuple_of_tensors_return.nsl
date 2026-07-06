@@ -1,0 +1,23 @@
+# Regression: returning a tuple of tensors from a function.
+#
+# Tuple construction previously did NOT take ownership of its tensor elements:
+# the statement/return temporaries sweep freed them while the tuple still held
+# their handles, so `let (a, b) = split2(x)` handed back dangling pointers
+# ("bad magic 0xDEAD" on first use).
+
+fn split2(x: Tensor) -> (Tensor, Tensor):
+    return (x * 2.0, x * 3.0)
+
+let x = ones([4])
+let (a, b) = split2(x)
+assert_close(a, full([4], 2.0), 0.0001, 0.0001)
+assert_close(b, full([4], 3.0), 0.0001, 0.0001)
+
+# Locally-built tuple consumed across statements (same ownership shape).
+let pair = (x * 5.0, x * 7.0)
+let p0 = pair[0]
+let p1 = pair[1]
+assert_close(p0, full([4], 5.0), 0.0001, 0.0001)
+assert_close(p1, full([4], 7.0), 0.0001, 0.0001)
+
+print("tuple-of-tensors-ok")
