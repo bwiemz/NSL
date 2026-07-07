@@ -177,7 +177,7 @@ model Block:
         analysis
             .type_map
             .values()
-            .map(|t| std::mem::discriminant(t))
+            .map(std::mem::discriminant)
             .collect::<std::collections::HashSet<_>>()
     );
 }

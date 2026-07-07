@@ -118,6 +118,94 @@ fn speculative_tokens_out_of_range_is_rejected() {
     );
 }
 
+const VALID_CFIE_SERVE_WITH_DRAFT_IN_BINARY: &str = r#"
+serve Inference:
+    max_batch: 32
+    max_seq: 2048
+    kv_layout: "static"
+    kv_quant: "auto"
+    target_gpu: "h100"
+
+    sampling:
+        temperature: 0.7
+        top_k: 50
+        top_p: 0.9
+        fused: true
+
+    speculative:
+        draft: "draft.nslm"
+        tokens: 5
+        method: "tree"
+        tree_width: 2
+        draft_weights: "draft.safetensors"
+        draft_n_layers: 2
+        draft_d_model: 256
+        draft_n_heads: 4
+        draft_n_kv_heads: 4
+        draft_head_dim: 64
+        draft_d_ff: 1024
+
+    grammar:
+        schema: "output_schema.json"
+        tokenizer: "vocab.txt"
+
+    @endpoint
+    fn generate(prompt: str) -> str:
+        let x = 0
+"#;
+
+#[test]
+fn draft_in_binary_config_produces_no_errors() {
+    let errs = analyze_errs(VALID_CFIE_SERVE_WITH_DRAFT_IN_BINARY);
+    assert!(errs.is_empty(), "expected clean analysis, got: {errs:?}");
+}
+
+#[test]
+fn draft_weights_non_string_is_rejected() {
+    let src = VALID_CFIE_SERVE_WITH_DRAFT_IN_BINARY
+        .replace("draft_weights: \"draft.safetensors\"", "draft_weights: 5");
+    let errs = analyze_errs(&src);
+    assert!(
+        errs.iter().any(|m| m.contains("draft_weights")),
+        "expected draft_weights error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn draft_shape_key_zero_is_rejected() {
+    let src = VALID_CFIE_SERVE_WITH_DRAFT_IN_BINARY.replace("draft_n_layers: 2", "draft_n_layers: 0");
+    let errs = analyze_errs(&src);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("draft_n_layers") && m.contains("positive integer")),
+        "expected draft_n_layers error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn draft_shape_key_negative_is_rejected() {
+    let src = VALID_CFIE_SERVE_WITH_DRAFT_IN_BINARY
+        .replace("draft_head_dim: 64", "draft_head_dim: -1");
+    let errs = analyze_errs(&src);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("draft_head_dim") && m.contains("positive integer")),
+        "expected draft_head_dim error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn unknown_speculative_key_names_draft_shape_keys() {
+    let src = VALID_CFIE_SERVE_WITH_DRAFT_IN_BINARY
+        .replace("draft_d_ff: 1024", "draft_dff_typo: 1024");
+    let errs = analyze_errs(&src);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("unknown speculative key") && m.contains("draft_d_ff")),
+        "expected unknown-key error naming draft_* shape keys, got: {errs:?}"
+    );
+}
+
 #[test]
 fn unknown_section_is_rejected() {
     let src = VALID_CFIE_SERVE.replace("sampling:", "samplign:");

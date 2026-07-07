@@ -1056,7 +1056,20 @@ pub struct CompileOptions {
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
+    /// Also controls PIC codegen (`is_pic`), which every object linked into
+    /// the shared library needs — including non-entry modules on the
+    /// multi-file path. See `emit_export_table` for the (distinct) decision
+    /// of which compilation unit emits the `nsl_get_num_exports` /
+    /// `nsl_get_export_name` C ABI, since only one may define them.
     pub shared_lib: bool,
+    /// Whether *this* compilation unit should emit the shared-library
+    /// export-table FFIs (`nsl_get_num_exports` / `nsl_get_export_name`).
+    /// On the single-file shared-lib path this mirrors `shared_lib`. On the
+    /// multi-file path every module needs `shared_lib = true` for PIC, but
+    /// only the entry module's object may define these symbols — every
+    /// other module defining them too causes a "multiple definition"
+    /// linker error when the objects are joined. Defaults to `false`.
+    pub emit_export_table: bool,
     /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
     pub wrga_inputs: Option<WrgaInputs>,
     /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
@@ -1198,6 +1211,7 @@ impl Default for CompileOptions {
             zero_stage: None,
             debug_training: false,
             shared_lib: false,
+            emit_export_table: false,
             wrga_inputs: None,
             fused_ce_configs: Vec::new(),
             pca_user_strategies: Vec::new(),
