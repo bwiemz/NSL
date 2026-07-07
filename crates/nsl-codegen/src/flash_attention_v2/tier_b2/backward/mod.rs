@@ -124,6 +124,52 @@ pub fn synthesize_tier_b2_backward(
         )));
     }
 
+    // Phase 1.4b (pretraining plan): refuse `segment_masked`. The Tier B.2
+    // dq/dkdv kernels declare a `segment_ids_ptr` param but never load it
+    // (dkdv.rs:129-132, dq.rs:96) — a non-null pointer is SILENTLY IGNORED,
+    // producing wrong gradients on packed (segment-masked) sequences, which are
+    // exactly the PCA-packed pretraining inputs. Until the kernels honor the
+    // mask, refuse here so the production caller falls back to the scalar
+    // backward, which DOES apply the segment mask via
+    // phases/backward/ds_compute.rs. The dispatch eligibility predicates gate
+    // the same condition so wengert lowering selects scalar directly.
+    // Lift point: when dq/dkdv call `segment_mask::emit_segment_mask_predicate`.
+    if config.segment_masked {
+        return Err(BackwardSynthError::UnsupportedConfig(
+            "segment_masked is not honored by the Tier B.2 dq/dkdv kernels \
+             (segment_ids_ptr is declared but never loaded); falling back to the \
+             scalar backward, which applies the segment mask"
+                .to_string(),
+        ));
+    }
+
+    // Phase 1.4a (pretraining plan): compile-time SMEM budget refusal using the
+    // REAL launch layout. `tier_b2_dq/dkdv_total_smem_bytes` include the
+    // col-major re-stage bands that the planner's simplified `tier_b2_smem_bytes`
+    // omits, so a config the planner admits (notably head_dim=256, whose dkdv
+    // layout is ~104.5 KB) can still exceed the 99 KB dynamic budget and surface
+    // only as a runtime CUDA_ERROR_INVALID_VALUE. Refuse at synth instead;
+    // production callers fall back to the scalar backward. Mirrors the forward
+    // validator's Err-on-overflow. Gated to the ladder head_dims so an
+    // unsupported head_dim still surfaces as `UnsupportedHeadDim` from the dq
+    // kernel below rather than being masked by this check.
+    if matches!(config.head_dim, 32 | 64 | 128 | 256) {
+        use crate::flash_attention_v2::smem_layout::{
+            tier_b2_dkdv_total_smem_bytes, tier_b2_dq_total_smem_bytes,
+            SMEM_DYNAMIC_BUDGET_BYTES,
+        };
+        let dq_smem = tier_b2_dq_total_smem_bytes(config);
+        let dkdv_smem = tier_b2_dkdv_total_smem_bytes(config);
+        let needed = dq_smem.max(dkdv_smem);
+        if needed > SMEM_DYNAMIC_BUDGET_BYTES {
+            return Err(BackwardSynthError::UnsupportedConfig(format!(
+                "Tier B.2 backward needs {needed} B dynamic SMEM \
+                 (dq={dq_smem}, dkdv={dkdv_smem}) which exceeds the \
+                 {SMEM_DYNAMIC_BUDGET_BYTES} B budget; falling back to the scalar backward"
+            )));
+        }
+    }
+
     let d_prepass_ptx = d_prepass::synthesize_d_prepass(config)?;
     let dq_ptx = dq::synthesize_dq_kernel(config)?;
     let dkdv_ptx = dkdv::synthesize_dkdv_kernel(config)?;
@@ -219,6 +265,55 @@ mod tests {
         for name in ["tier_b2_d_prepass", "tier_b2_dq_kernel", "tier_b2_dkdv_kernel",
                      "tier_b2_proj_backward"] {
             assert!(ptx.contains(name), "missing entry {name}");
+        }
+    }
+
+    // === Phase 1.4 guards (pretraining plan) ===
+
+    #[test]
+    fn phase1_4b_synth_refuses_segment_masked() {
+        // The dq/dkdv kernels declare but never load segment_ids_ptr, so a
+        // segment-masked config must be refused (caller falls back to scalar,
+        // which honors the mask) rather than emit wrong gradients.
+        let mut cfg = smoke_cfg();
+        cfg.segment_masked = true;
+        let err = synthesize_tier_b2_backward(&cfg)
+            .expect_err("segment_masked must be refused");
+        match err {
+            BackwardSynthError::UnsupportedConfig(msg) => {
+                assert!(msg.contains("segment_masked"), "unexpected message: {msg}");
+            }
+            other => panic!("expected UnsupportedConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase1_4a_synth_refuses_hd256_over_smem_budget() {
+        // head_dim=256 passes the planner's simplified SMEM formula, but its
+        // real dkdv layout (~104.5 KB) exceeds the 99 KB dynamic budget. Refuse
+        // at synth; production falls back to the scalar backward.
+        let mut cfg = smoke_cfg();
+        cfg.head_dim = 256;
+        let err = synthesize_tier_b2_backward(&cfg)
+            .expect_err("hd=256 exceeds the SMEM budget and must be refused");
+        match err {
+            BackwardSynthError::UnsupportedConfig(msg) => {
+                assert!(msg.contains("SMEM") && msg.contains("budget"),
+                    "unexpected message: {msg}");
+            }
+            other => panic!("expected UnsupportedConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase1_4a_in_scope_head_dims_still_synth_ok() {
+        // Regression: the SMEM refusal must NOT fire for the in-scope head_dims.
+        for hd in [32i64, 64, 128] {
+            let mut cfg = smoke_cfg();
+            cfg.head_dim = hd;
+            cfg.csha.as_mut().unwrap().d_model = hd as u32;
+            synthesize_tier_b2_backward(&cfg)
+                .unwrap_or_else(|e| panic!("hd={hd} must still synth, got {e:?}"));
         }
     }
 }
