@@ -4479,13 +4479,15 @@ impl Compiler<'_> {
                 extractor.set_output(loss_var_id);
 
                 // WGGO: run the global optimization planner if enabled.  The
-                // planner is pure data-in/data-out and does not mutate the
-                // Wengert list — it produces a report describing the
-                // globally-optimal per-layer decisions that downstream
-                // passes SHOULD honour.  Wiring the decisions back into
-                // codegen is a future step; the planner itself is
-                // independently useful as a diagnostic and is exercised by
-                // the test suite and CLI integration tests.
+                // planner call itself is pure data-in/data-out — it produces a
+                // plan of globally-optimal per-layer decisions.  Several of
+                // those decisions are now lowered downstream: sub-block prune
+                // rewrites the Wengert list below (via `wggo_prune::run`), and
+                // the resulting `WggoOverrides` drive CSHA fusion level, WRGA
+                // adapter placement, FASE fused-step, and the CPDT shard factor.
+                // Some decisions remain advisory/report-only for now (WGGO-side
+                // PCA packing_mode, per-layer optimizer precision, whole-block
+                // prune, and CFIE inference decisions).
                 //
                 let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
                 if let Some(ref mode_str) = self.compile_options.wggo.mode {

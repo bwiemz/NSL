@@ -7,22 +7,24 @@
 //!   head_dim=64  → 2e-2
 //!   head_dim=128 → 4e-2
 //!
-//! # Current status: BLOCKED on Phase 3 HBM addressing
+//! # Current status: real HBM addressing landed; numerical gates enabled
 //!
 //! The T3.3/T3.4/T3.5/T3.6 phase emitters land the reduction SHAPE
 //! (warp butterflies, lane-owns-column fmas, softmax Jacobian, chain-
 //! rule scale factor, null guards, label uniqueness, ptxas-clean
-//! assembly) but use placeholder f32 constants (0f3F800000 == 1.0)
-//! for the Q/K/V/dO/x_norm inner-loop HBM loads. Every commit message
-//! in that phase range documents this boundary explicitly.
+//! assembly). The Phase-3 follow-up that replaced the placeholder f32
+//! constants (0f3F800000 == 1.0) with real Q/K/V/dO/x_norm inner-loop
+//! HBM loads has since landed (see the per-gate notes below: dq/dk/dv
+//! after the V-save/SMEM-tile/dQ-flush fixes; dw after `emit_dproj`
+//! real addressing + x_norm re-materialisation; dx after the
+//! `x_raw_ptr` forward save channel).
 //!
-//! Consequence: the fused backward kernel launches cleanly (T4.2
-//! FFI smoke confirmed rc=0 on RTX 5070 Ti) but the gradients it
-//! produces are the reductions of dummy 1.0 constants, not the real
-//! chain-rule gradients. A numerical comparison against the CPU
-//! reference will diverge by many orders of magnitude until the
-//! placeholder loads are replaced with real addressing — that is
-//! a Phase 3 follow-up task, not a new T6.3 scope.
+//! Consequence: under the smoke scope (heads=1, no RoPE, no causal) the
+//! fused backward produces real chain-rule gradients, and all three
+//! numerical gates below are enabled. This is validated only on real
+//! GPU hardware — the file is `#[cfg(feature = "cuda")]` and its tests
+//! are `#[ignore]`, so the numerical comparison runs manually
+//! (`--features cuda -- --ignored`), not in default CI.
 //!
 //! # What THIS file ships
 //!
@@ -34,10 +36,10 @@
 //!      - fused-backward launch rc=0
 //!      - all 7 gradient outputs readable and finite
 //!      - gradient shapes match expected layouts
-//! 3. The numerical-tolerance assertions are gated by
-//!    `const NUMERICAL_GATE_ENABLED: bool = false` with a BLOCKED
-//!    note pointing at the placeholder-load sites. Flip to true
-//!    when Phase 3 inner loops carry real addressing.
+//! 3. The numerical-tolerance assertions, now that Phase-3 inner loops
+//!    carry real addressing, are enabled via the
+//!    `NUMERICAL_GATE_DQKV_ENABLED` / `NUMERICAL_GATE_DW_ENABLED` /
+//!    `NUMERICAL_GATE_DX_ENABLED` consts (all `true`).
 
 #![cfg(feature = "cuda")]
 
@@ -74,11 +76,11 @@ use nsl_runtime::flash_attention::{
 //   re-materialisation lands (feat/csha-tier-c-diag). Under the smoke
 //   scope (heads=1, no RoPE, no causal) max_abs lands ≤ 5e-3.
 //
-// dx: STILL BLOCKED — not on addressing but on a forward-side issue:
-//   `phases/forward/csha_hooks.rs::emit_prologue` writes x_normed back
-//   into `csha_x_ptr` in place, so the backward has no raw x to feed
-//   the closed-form dx formula. Fix requires a new forward save pointer
-//   (e.g. `x_raw_save`) on the backward activations struct.
+// dx: enabled. The forward-side blocker is resolved — `emit_prologue`
+//   (`phases/forward/csha_hooks.rs`) now saves the pre-RMSNorm raw x to a
+//   dedicated `x_raw_ptr` channel (null-gated per-slice store), and the
+//   backward reads `[x_raw_ptr]` to feed the closed-form dx formula
+//   (`csha_hooks_backward.rs`).
 const NUMERICAL_GATE_DQKV_ENABLED: bool = true;
 const NUMERICAL_GATE_DW_ENABLED:   bool = true;
 const NUMERICAL_GATE_DX_ENABLED:   bool = true;

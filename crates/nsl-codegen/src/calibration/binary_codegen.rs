@@ -2173,9 +2173,11 @@ fn wggo_n_o_heads(target: &crate::calibration::discovery::WggoGradTarget) -> u32
 /// `per_step_backward_symbols`: running-buffer symbol names that backward hooks
 /// need referenced per step (spec §4.5).  Each symbol must already be declared
 /// as an Export global via `finalize_plan` — the scaffolding reuses the
-/// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
-/// keeps the relocation alive so the linker sees a reference even before Task 21
-/// replaces this stub with real per-head dot+abs reduction IR.
+/// `running_data_ids` entry.  When `wggo_targets` is non-empty the scaffolding
+/// emits the real per-head `|g·w|` reduction IR (`emit_per_head_dot_abs_accum`,
+/// Task 3.5).  The `symbol_value` + `stack_store` placeholder is retained only
+/// for the AWQ-only path (`wggo_targets` empty), where it keeps the relocation
+/// alive so the linker still sees a reference.
 pub fn emit_calibration_scaffolding_object(
     observe_plan: &[ObservePlanEntry],
     finalize_plan: &[FinalizePlanEntry],

@@ -4,7 +4,10 @@
 //!
 //!   1. Wengert graph extraction          — `wengert.rs`
 //!   2. Cost-model annotation             — `wggo_cost::build_lut`
-//!   3. Weight-analysis (optional)        — placeholder hook
+//!   3. Weight-analysis (optional)        — `run_weight_analysis` +
+//!                                          `wggo_weight_analysis::apply_to`
+//!                                          (feeds head-importance /
+//!                                          min-retained into the ILP)
 //!   4. Level 1: inter-layer DP           — `wggo_dp::solve`
 //!   5. Level 2: per-layer ILP            — `wggo_ilp::solve_all`
 //!   6. Level 3: kernel generation        — delegated to backend

@@ -12,8 +12,11 @@
 //! loop closes but STILL INSIDE the kv-outer loop (before its back-edge),
 //! so each kv tile's dK/dV is written with the correct in-range kv row.
 //!
-//! This module is a SCAFFOLD (Phase 3a Task 3). The finalize body is a stub;
-//! Tasks 4-8 add S/dP/dS/dV/dK MMA math.
+//! The full backward math is emitted: tile-skip gate, S = Q@K^T, intra-tile
+//! causal mask, P-recompute, dP = dO@V^T, dS = P*(dP-D), P/dS col-major scatter,
+//! Q/dO re-stage, and MMA-3/4 (dV += P^T@dO, dK += dS^T@Q) plus HBM finalize.
+//! Structurally/ptxas-validated; GPU-numerical validation is still pending
+//! (GPU tests are `#[ignore]` + `feature=cuda`).
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md ss4 + ss5.2
 
@@ -1131,8 +1134,9 @@ fn emit_dp_matmul_tiled(
 
 /// Emit the dK/dV inner-loop body: tile-skip gate, S=Q@K^T MMA, P-recompute.
 ///
-/// This is Task 4. The structure mirrors dq.rs::emit_inner_loop_body (top portion
-/// only: S + P-recompute). The dP/dS/scatter/restage/MMA-3/4 are Tasks 5-8.
+/// The structure mirrors dq.rs::emit_inner_loop_body. It emits the tile-skip
+/// gate, S = Q@K^T, P-recompute, dP = dO@V^T, dS = P*(dP-D), P/dS col-major
+/// scatter, Q/dO re-stage, and MMA-3/4 (dV/dK) — the full inner-loop body.
 ///
 /// Key differences vs dq:
 ///   - Labels use the DKDV_ prefix (both kernels concatenate into one PTX module).
@@ -1184,8 +1188,8 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // === Open runtime n-tile streaming loop (DKDV_NTILE_LOOP) ===
     // One iteration per 8-column kv n-tile (bkv/8 iterations at runtime). The body
-    // computes S(tiled) -> P-recompute for this %n_tile.
-    // Tasks 5-8 will add dP/dS/scatter/MMA-3/4 inside the n-tile loop.
+    // computes S(tiled) -> P-recompute -> dP -> dS -> P/dS scatter for this
+    // %n_tile; Q/dO re-stage and MMA-3/4 (dV/dK) run after the loop closes.
     let num_n_tiles = tier_b2_effective_bkv(config) / 8;
     // Idle-warp gate: warps with warp_id >= bq/16 skip the n-tile loop entirely.
     // The n-tile loop is Q-axis work (S/dP/P-scatter/dS-scatter sit on the q-band
