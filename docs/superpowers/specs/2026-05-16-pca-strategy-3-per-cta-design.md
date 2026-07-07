@@ -1,7 +1,12 @@
 # CFTP §4.2 Strategy 3 — Multi-Sequence Per-CTA (Design — Spec-only)
 
 **Date:** 2026-05-16
-**Status:** Spec-only — no implementation in this cycle
+**Status:** IMPLEMENTED (superseding the original "Spec-only" status). The
+per-document CTA forward and backward kernels are emitted by
+`flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`/`_backward`,
+admission is wired via `pca_per_doc::admit`, and the path is enabled end to end
+by `@pca(strategy=per_document)` (see `pca_per_doc.rs` module docs). The design
+sketch below is retained for historical context.
 **Parent:** [CFTP §4.3 RoPE Position Reset](2026-05-16-pca-rope-position-reset-design.md)
 
 ---
@@ -12,7 +17,7 @@ CFTP §4.2's third strategy: when documents are short (avg length ≪ max sequen
 
 ## §2 — Current state
 
-The detector at [`pca_detect.rs:44`](../../../crates/nsl-codegen/src/pca_detect.rs#L44) recognizes when `PerDocumentCta` would be a better strategy than `SegmentId` (Tier A) or `DocumentBoundaryTileSkip` (Tier B). The detector recommendation is plumbed into the planner output but no kernel synthesizer emits the per-document grid layout.
+The detector at [`pca_detect.rs:44`](../../../crates/nsl-codegen/src/pca_detect.rs#L44) recognizes when `PerDocumentCta` would be a better strategy than `SegmentId` (Tier A) or `DocumentBoundaryTileSkip` (Tier B). **Update:** the per-document grid-layout synthesizers now exist (`per_doc_cta::synthesize_per_doc_cta_forward`/`_backward`) and are reached in production when the user requests `@pca(strategy=per_document)`; the detector's recommendation alone does not auto-enable it.
 
 ## §3 — Architecture sketch
 

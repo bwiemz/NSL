@@ -1,10 +1,7 @@
-//! Smoke test: FASE Deferred mode should compile a train block with
-//! grad_accumulation=4 and AdamW once Tasks 8 + 9 land.  Until then this
-//! test is expected to FAIL (test is `#[ignore]`d to keep CI green).
-//!
-//! Flip `#[ignore]` to a plain `#[test]` after Task 9 lands the stmt.rs
-//! dispatch that wires `Compiler::fase_emit_accumulate` into the micro-batch
-//! accumulation loop.
+//! Smoke test: FASE Deferred mode compiles a train block with
+//! grad_accumulation=4 and AdamW. The stmt.rs dispatch that wires
+//! `Compiler::fase_emit_accumulate` into the micro-batch accumulation loop has
+//! landed, so these run as plain `#[test]`s (no `#[ignore]`) in default CI.
 
 use nsl_codegen::CompileOptions;
 use std::path::PathBuf;

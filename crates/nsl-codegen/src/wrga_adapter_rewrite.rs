@@ -623,8 +623,10 @@ pub fn synthesize_ia3_unfused_mul(
 /// `ctx.synth_call_overrides` keyed by the callee's NodeId (same pattern as
 /// `synthesize_lora_fused_call`).
 ///
-/// `kernel_handle` is stubbed at 0 until Task 5.0.c registers the real PTX
-/// kernel and wires the handle through `ctx.fused_kernel_order`.
+/// `kernel_handle` is resolved by looking the kernel's `LoraKernelKey` up in
+/// `ctx.fused_gatedlora_kernel_order` (offset past `ctx.fused_kernel_order` to
+/// avoid colliding with LoRA handles of the same shape); it is `-1` when the
+/// key is not registered.
 pub fn synthesize_gatedlora_fused_call(
     original: Expr,
     lhs: &Expr,
@@ -744,8 +746,9 @@ pub fn synthesize_gatedlora_fused_call(
 /// When `site.fusion_decision == Some(EpilogueFusedGatedLora)` AND
 /// `ctx.target_sm >= 80`, emits a single `Call` to
 /// `nsl_adapter_fused_gatedlora_matmul(x, W, A, B, scale, gate, kernel_handle)`
-/// instead of the AST sigmoid+triple+scale expression.  The kernel
-/// handle is currently stubbed at 0; Task 5.0.c wires real registration.
+/// instead of the AST sigmoid+triple+scale expression.  The kernel handle is
+/// resolved via `ctx.fused_gatedlora_kernel_order` (see
+/// `synthesize_gatedlora_fused_call`), not stubbed.
 pub fn synthesize_gatedlora_adapted(
     original: Expr,
     lhs: &Expr,

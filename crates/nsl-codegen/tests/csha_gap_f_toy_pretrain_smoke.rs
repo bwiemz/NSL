@@ -28,11 +28,13 @@
 //!      method COMPILES successfully under source AD.
 //!   2. `nsl_set_training_mode`, `nsl_optim_sgd__sgd_step` are in the
 //!      relocation set (train block actually compiled).
-//!   3. Source AD fired — `nsl_tensor_reduce_to_shape` reloc is
-//!      present (AD expansion of matmul adjoints).
+//!   3. Source AD fired.  The CSHA-fused source-AD path does NOT emit
+//!      `nsl_tensor_reduce_to_shape` (the fused backward kernel handles
+//!      reshape internally), so source AD is detected via the fused
+//!      backward FFI reloc in item 4 instead.
 //!   4. The CSHA fused-backward FFI `nsl_flash_attention_csha_backward`
-//!      IS emitted from real source.  Pre-Gap-F this was the documented
-//!      blocking gap.
+//!      IS emitted from real source (hard-asserted).  Pre-Gap-F this was
+//!      the documented blocking gap.
 //!   5. `nsl_csha_alloc_backward_activations_into` is also referenced
 //!      (alloc lowering for the save buffer).
 //!
@@ -270,12 +272,10 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
     //       variable name ("m") that doesn't show up in the forward's
     //       name-match space.
     //
-    // Pending those follow-ups, keep the Gap F stretch assertion
-    // (`nsl_flash_attention_csha_backward` reloc) as a skip-with-
-    // diagnostic — H's hard assertions live on the relocations that
-    // H.1 + H.2 directly affect: `nsl_optim_sgd__sgd_step` (H.2),
-    // `nsl_set_training_mode` (train block compiled), and
-    // `nsl_tensor_reduce_to_shape` (source AD ran).
+    // Post Gap H-replay + Gap I.1..I.4, `nsl_flash_attention_csha_backward`
+    // is now hard-asserted below (no longer a skip-with-diagnostic), alongside
+    // H's assertions on `nsl_optim_sgd__sgd_step` (H.2) and
+    // `nsl_set_training_mode` (train block compiled).
     //
     // `stdlib_loader` resolves `nsl.optim.sgd` via `NSL_STDLIB_PATH` or
     // `$CWD/stdlib`.  Cargo runs tests from the workspace root with
@@ -359,22 +359,12 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
 
     // ── Gap F.1 + F.2 load-bearing assertions ──────────────────────
     //
-    // H.1 + H.2 landed but the Tier C backward SMEM validator + Gap
-    // D extract-op dataflow are known-broken past this point (see
-    // toy_pretrain_hd32_compile_emits_fused_backward_ffi header
-    // comment).  `compile_entry` now succeeds end-to-end, so we can
-    // hard-assert:
+    // `compile_entry` succeeds end-to-end, so the following are asserted
+    // above as soon as it returns an object:
     //   - `nsl_optim_sgd__sgd_step` is referenced → H.2 SGD mangling.
     //   - `nsl_set_training_mode` is referenced   → train block fired.
-    //   - `nsl_tensor_reduce_to_shape` is referenced → source AD ran.
-    // (all three already asserted above as soon as compile_entry returns
-    // an object.)
-    //
-    // The Gap F stretch goal — `nsl_flash_attention_csha_backward`
-    // reloc — requires the SMEM + extract-op cascades that are out
-    // of H's scope.  Keep this check as a skip-with-diagnostic so the
-    // rest of the H-level relocation assertions above can still hard-
-    // fail on regressions.
+    // Source AD is confirmed by the fused backward FFI reloc below (the
+    // CSHA-fused path does not emit `nsl_tensor_reduce_to_shape`).
     // ── The load-bearing assertion: fused backward FFI is present ──
     //
     // Post H-replay + Gap I.1..I.4, the fused CSHA backward kernel is

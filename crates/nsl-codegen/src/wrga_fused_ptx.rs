@@ -155,9 +155,8 @@ const MMA_K_U32: u32 = 16; // m16n8k16
 /// or GatedLoRA (FoldKind::PerColumnSigmoid).  Variation points:
 ///   - Param block: PerColumnSigmoid adds `.param .u64 gate_ptr`
 ///   - Fold step: Scalar uses %scale_reg uniform multiply; PerColumnSigmoid
-///     uses per-thread sigmoid(gate) multiply (implemented in Task 4.1;
-///     this task leaves the PerColumnSigmoid fold as a placeholder that
-///     emits the same Scalar math so unit tests compile and run plausibly).
+///     uses per-thread sigmoid(gate) multiply via
+///     `wrga_kernel_helpers::emit_gatedlora_fold` (see the fold match below).
 ///
 /// All other phases (header, SMEM, register pool, indexing, param loads,
 /// output coords, accumulator init, main K-loop, post-loop (x@A)@B MMA,
@@ -486,9 +485,7 @@ fn emit_fused_adapter_kernel_body(
 
     // 9. Scale epi_final, fold into main_accum.
     // Variation point B: Scalar uses %scale_reg uniform multiply;
-    // PerColumnSigmoid placeholder emits the same Scalar math for now —
-    // Task 4.1 replaces it with emit_gatedlora_fold() after the gate-load
-    // helpers from Task Group 2 are in place.
+    // PerColumnSigmoid folds via emit_gatedlora_fold() (per-column sigmoid gate).
     match fold {
         FoldKind::Scalar => {
             // LoRA fold: main_accum += epi_final * scale  (uniform scalar from param)
@@ -720,10 +717,8 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
 /// Uses the shared `emit_fused_adapter_kernel_body` with
 /// `FoldKind::PerColumnSigmoid` to reuse LoRA's proven kernel body plus
 /// gate-load + sigmoid + per-column fold logic from `wrga_kernel_helpers`.
-///
-/// STUB — current body returns an invalid PTX header-only stub for
-/// Task 3.2's red-state test setup.  Task 4.1 replaces this with the real
-/// emission via `emit_fused_adapter_kernel_body(.., FoldKind::PerColumnSigmoid { .. })`.
+/// The full body is emitted (ptxas-validated up to Llama scale by
+/// `tests/wrga_fused_ptx_ptxas.rs`); it is not a header-only stub.
 pub fn synthesize_fused_gatedlora_ptx(config: &FusedGatedLoraConfig) -> String {
     assert!(
         config.rank <= 16,
