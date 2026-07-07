@@ -109,6 +109,21 @@ cargo test -p nsl-codegen --features cuda --test csha_cuda_launch_fused -- --ign
 NSL_SKIP_CUDA_TESTS=1 cargo test --workspace
 ```
 
+### Reproducible harness
+
+The commands above are the raw form. For a **documented, reproducible gate** —
+toolchain preflight, provenance stamping, a curated known-green canary, and a
+PASS/FAIL summary that fails loud (and refuses to run if `NSL_SKIP_CUDA_TESTS`
+is set so a skip cannot masquerade as green) — use the harness:
+
+```powershell
+pwsh tools/gpu-test.ps1 -Canary        # acceptance gate: the known-green canary
+pwsh tools/gpu-test.ps1 -ListCanary    # show the manifest
+```
+
+See [GPU-Test-Harness](GPU-Test-Harness.md) for the full reference, the canary
+set, and the "structural pass ≠ numerical pass" known-blocked list.
+
 ### CI
 
 The CI workflow (`.github/workflows/ci.yml`) runs on a matrix of `ubuntu-latest`, `windows-latest`, `macos-14`, and `macos-latest`. It does **not** provision a CUDA device, so GPU-gated (`#[ignore]`) tests are never triggered in CI. What CI does run:

@@ -1,0 +1,23 @@
+# NSL GPU canary manifest
+# -----------------------
+# The curated set of CUDA tests confirmed green on real hardware. `-Canary`
+# runs exactly these; if they pass, the GPU test harness itself is working.
+#
+# Membership rule: a test belongs here ONLY if it (a) makes a real numerical
+# claim against a CPU reference (not just a launch/rc=0 structural check) and
+# (b) has been observed green on the reference GPU below. Do not add tests
+# whose numerical gate is disabled (e.g. csha_cuda_backward's
+# NUMERICAL_GATE_ENABLED=false) — those are tracked in the harness doc's
+# "known-blocked" list, not here.
+#
+# Reference hardware: NVIDIA GeForce RTX 5070 Ti (sm_120), CUDA 13.2 toolkit.
+#
+# Format (pipe-delimited, one test per line):
+#   package | test_binary | test_fn | note
+#
+# Run:  pwsh tools/gpu-test.ps1 -Canary
+# List: pwsh tools/gpu-test.ps1 -ListCanary
+
+nsl-runtime | tier_b1_prepass_gpu | w_prepass_matches_cpu_reference | CSHA D pre-pass (W): narrow+col-major chunkify, bit-exact vs CPU
+nsl-runtime | tier_b1_prepass_gpu | x_prepass_matches_cpu_reference | CSHA D pre-pass (X): RMSNorm+narrow+chunkify, tol 5e-2 (rsqrt.approx)
+nsl-codegen | csha_cuda_backward | t6_3_smoke_single_config       | CSHA fused backward, smoke scope (heads=1, seq=bq=32, hd=32): 7 grads vs CPU ref within Tier-A tol. NOTE: single-tile only; multi-tile backward is refused (Phase 1.1).
