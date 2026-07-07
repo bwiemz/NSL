@@ -133,6 +133,13 @@ pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: 
     if config.num_sink_tokens > 0 {
         return false;
     }
+    // Phase 1.4b (pretraining plan): the dq/dkdv kernels silently ignore
+    // `segment_ids_ptr`. Force a fallback to the scalar backward (which honors
+    // the segment mask) rather than emit wrong grads on packed sequences.
+    // Mirrors the synth-side refusal in `synthesize_tier_b2_backward`.
+    if config.segment_masked {
+        return false;
+    }
     // Sprint 1 cycle-2: rope_q=true is now safe because forward and backward
     // share cos/sin via the CshaSavePointers channel. The forward call sites
     // (wengert_lower.rs and expr/advanced.rs) hoist the cos/sin Cranelift
@@ -182,6 +189,13 @@ pub fn tier_b2_hybrid_backward_compile_time_eligible(config: &FlashAttentionConf
     if config.num_sink_tokens > 0 {
         return false;
     }
+    // Phase 1.4b (pretraining plan): mirror the runtime predicate — the dq/dkdv
+    // kernels silently ignore `segment_ids_ptr`, so a segment-masked config must
+    // fall back to the scalar backward (which honors the mask). Forcing `false`
+    // here makes wengert lowering emit the scalar branch directly.
+    if config.segment_masked {
+        return false;
+    }
     // Sprint 1 cycle-2: rope_q=true is now safe because forward and backward
     // share cos/sin via the CshaSavePointers channel. See the matching comment
     // in `tier_b2_hybrid_backward_eligible` for the full rationale.
@@ -223,6 +237,24 @@ mod tests {
             result,
             Ok(BackwardTier::TierB2 { bq: 64, bkv: 64, chunk: 4 })
         );
+    }
+
+    #[test]
+    fn hybrid_ineligible_when_segment_masked() {
+        // Phase 1.4b: a segment-masked config that is otherwise hybrid-eligible
+        // must fall back to the scalar backward (which honors the mask).
+        let mut c = cfg(64, 80, 2);
+        c.csha = Some(CshaExtras { level: 2, d_model: 64, active_heads: 1, ..Default::default() });
+        let seq = c.block_q as u32;
+        assert!(tier_b2_hybrid_backward_eligible(&c, seq),
+            "sanity: config must be eligible before enabling segment_masked");
+        assert!(tier_b2_hybrid_backward_compile_time_eligible(&c),
+            "sanity: compile-time predicate eligible before segment_masked");
+        c.segment_masked = true;
+        assert!(!tier_b2_hybrid_backward_eligible(&c, seq),
+            "segment_masked must force scalar fallback");
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c),
+            "compile-time predicate must also refuse segment_masked");
     }
 
     #[test]
@@ -484,6 +516,9 @@ mod tests {
             ("sm75",          hybrid_cfg(64,  1,  64, false, 75, 2)),
             ("level1",        hybrid_cfg(64,  1,  64, false, 80, 1)),
             ("hd96",          hybrid_cfg(96,  1,  96, false, 80, 2)),
+            // Phase 1.4b: segment_masked must preserve the decomposition invariant
+            // (both predicates false → full == compile_time && seq==block_q holds).
+            ("segmasked",     { let mut c = hybrid_cfg(64, 1, 64, false, 80, 2); c.segment_masked = true; c }),
         ];
         for (label, c) in &configs {
             for seq in [32u32, 64, 128] {
