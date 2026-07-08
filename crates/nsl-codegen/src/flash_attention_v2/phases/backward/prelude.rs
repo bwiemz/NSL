@@ -138,6 +138,17 @@ pub fn emit(
         // saturates at f16 max (65504) like the prior f16-HBM design.
         (".param .u64", "dk_scratch_ptr"),
         (".param .u64", "dv_scratch_ptr"),
+        // Phase 1.1 (pretraining): dW f32 scratch pointers. Same serialized
+        // ld/add/st f32 RMW pattern as dk/dv above, so dwq/dwk/dwv accumulate
+        // correctly across the serial per-q-block launches instead of the prior
+        // f16 OVERWRITE (which clobbered all but the last q-block's partial).
+        // A host-side conversion writes f32 scratch → f16 dwq/dwk/dwv once all
+        // q-block launches complete. Kept immediately after dk/dv scratch (and
+        // before the conditional segment/doc/probe trailing params) so the FFI
+        // args array stays in positional lockstep.
+        (".param .u64", "dwq_scratch_ptr"),
+        (".param .u64", "dwk_scratch_ptr"),
+        (".param .u64", "dwv_scratch_ptr"),
     ];
     // PCA Tier A: segment_ids pointer — trailing, only when segment_masked.
     // Kept at the END so the rest of the param layout stays byte-stable
@@ -275,6 +286,8 @@ pub fn emit(
     // complete. Avoids the f16-HBM saturation-to-inf that broke the
     // prior cvt.rn.f16.f32 ld-add-st design.
     ptx.push_str("    .reg .u64 %rd_bwd_dk_scratch, %rd_bwd_dv_scratch;\n");
+    // Phase 1.1 (pretraining): dW f32 scratch pointers (mirror dk/dv scratch).
+    ptx.push_str("    .reg .u64 %rd_bwd_dwq_scratch, %rd_bwd_dwk_scratch, %rd_bwd_dwv_scratch;\n");
 
     // SMEM-base pointer + warp_row (shared with forward contract so
     // backward phase emitters can use the same addressing helpers).
@@ -423,6 +436,9 @@ pub fn emit(
     ptx.push_str("    ld.param.u64 %rd_bwd_dxn, [dx_norm_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dk_scratch, [dk_scratch_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dv_scratch, [dv_scratch_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_bwd_dwq_scratch, [dwq_scratch_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_bwd_dwk_scratch, [dwk_scratch_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_bwd_dwv_scratch, [dwv_scratch_ptr];\n");
     ptx.push_str("    ld.param.u64 %q_launch_base, [seq_lens_ptr];\n");
 
     // CSHA cycle 20 T1 — probe pointer + gate registers. Feature-gated

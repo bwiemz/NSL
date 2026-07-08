@@ -499,20 +499,24 @@ pub fn synthesize_per_doc_cta_backward(
     // standard tail is `probe_dv_out_ptr\n)` instead of `dv_scratch_ptr\n)`.
     // Both match paths keep the segment_ids + doc_starts insertion
     // between the last standard param and the closing paren.
+    // Phase 1.1 (pretraining): the standard backward prelude now ends the param
+    // list with the three dW f32-scratch pointers (dwq/dwk/dwv_scratch_ptr)
+    // right after dk/dv scratch, so the non-probe tail is `dwv_scratch_ptr\n)`
+    // (was `dv_scratch_ptr\n)` before the dW-scratch params landed). The probe
+    // slots still trail everything, so the probe tail is unchanged.
     #[cfg(not(feature = "csha_cycle19_probe"))]
-    let std_tail = "    .param .u64 dv_scratch_ptr\n)";
+    let std_tail = "    .param .u64 dwv_scratch_ptr\n)";
     #[cfg(not(feature = "csha_cycle19_probe"))]
-    let new_tail = "    .param .u64 dv_scratch_ptr,\n    .param .u64 _segment_ids_placeholder,\n    .param .u64 doc_starts_ptr\n)";
+    let new_tail = "    .param .u64 dwv_scratch_ptr,\n    .param .u64 _segment_ids_placeholder,\n    .param .u64 doc_starts_ptr\n)";
     #[cfg(feature = "csha_cycle19_probe")]
     let std_tail = "    .param .u64 probe_dv_out_ptr\n)";
     #[cfg(feature = "csha_cycle19_probe")]
     let new_tail = "    .param .u64 probe_dv_out_ptr,\n    .param .u64 _segment_ids_placeholder,\n    .param .u64 doc_starts_ptr\n)";
     if !ptx.contains(std_tail) {
-        return Err(
+        return Err(format!(
             "per-doc backward synth: expected standard backward param-list tail \
-             `.param .u64 dv_scratch_ptr\\n)` not found"
-                .to_string(),
-        );
+             `{std_tail}` not found"
+        ));
     }
     ptx = ptx.replacen(std_tail, new_tail, 1);
 

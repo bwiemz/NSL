@@ -56,6 +56,9 @@ expression: ptx
     .param .u64 dx_norm_ptr,
     .param .u64 dk_scratch_ptr,
     .param .u64 dv_scratch_ptr,
+    .param .u64 dwq_scratch_ptr,
+    .param .u64 dwk_scratch_ptr,
+    .param .u64 dwv_scratch_ptr,
     .param .u64 segment_ids_ptr
 )
 {
@@ -96,6 +99,7 @@ expression: ptx
     .reg .u64 %rd_bwd_dwq, %rd_bwd_dwk, %rd_bwd_dwv, %rd_bwd_dx;
     .reg .u64 %rd_bwd_dxn;
     .reg .u64 %rd_bwd_dk_scratch, %rd_bwd_dv_scratch;
+    .reg .u64 %rd_bwd_dwq_scratch, %rd_bwd_dwk_scratch, %rd_bwd_dwv_scratch;
     .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;
     .reg .u64 %warp_row;
     .reg .u64 %rd_seg_global, %seg_base;
@@ -137,6 +141,9 @@ expression: ptx
     ld.param.u64 %rd_bwd_dxn, [dx_norm_ptr];
     ld.param.u64 %rd_bwd_dk_scratch, [dk_scratch_ptr];
     ld.param.u64 %rd_bwd_dv_scratch, [dv_scratch_ptr];
+    ld.param.u64 %rd_bwd_dwq_scratch, [dwq_scratch_ptr];
+    ld.param.u64 %rd_bwd_dwk_scratch, [dwk_scratch_ptr];
+    ld.param.u64 %rd_bwd_dwv_scratch, [dwv_scratch_ptr];
     ld.param.u64 %q_launch_base, [seq_lens_ptr];
     mov.u32 %tid_x, %tid.x;
     shr.u32 %warp_id, %tid_x, 5;
@@ -4929,16 +4936,16 @@ V2_BWD_STORE_DV_SKIP_0:
     bar.sync 0;
     // Tier C dRoPE: rope_q=false, no emission
     // Phase 4 dK store (q_tile_iter=0): post-inverse-RoPE dK SMEM->HBM
-    // -- DK store via [dk_ptr] (coop SMEM->HBM, full tile, f16) --
-    setp.eq.u64 %p0, %rd_bwd_dk, 0;
+    // -- DK f32-scratch RMW via [dk_scratch_ptr] (coop SMEM->HBM) --
+    setp.eq.u64 %p0, %rd_bwd_dk_scratch, 0;
     @%p0 bra V2_BWD_STORE_DK_SKIP_0;
     mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;
     add.u64 %rd_dk_base, %rd_dk_base, %head_idx;
     mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;
     add.u64 %rd_dk_base, %rd_dk_base, %k_start;
     mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;
-    shl.b64 %rd_dk_base, %rd_dk_base, 1;  // * 2 bytes (f16)
-    add.u64 %rd_dk_base, %rd_bwd_dk, %rd_dk_base;
+    shl.b64 %rd_dk_base, %rd_dk_base, 2;  // * 4 bytes (f32)
+    add.u64 %rd_dk_base, %rd_bwd_dk_scratch, %rd_dk_base;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
     div.u64 %rd42, %rd_dk_idx, %rd7;
@@ -4949,10 +4956,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 128;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -4964,10 +4972,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 256;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -4979,10 +4988,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 384;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -4994,10 +5004,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 512;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -5009,10 +5020,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 640;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -5024,10 +5036,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 768;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -5039,10 +5052,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
     cvt.u64.u32 %rd_dk_idx, %tid_x;
     add.u64 %rd_dk_idx, %rd_dk_idx, 896;
     setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
@@ -5054,10 +5068,11 @@ V2_BWD_STORE_DV_SKIP_0:
     add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
     add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
     @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
     add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
 V2_BWD_STORE_DK_SKIP_0:
     add.u64 %k_start, %k_start, 32;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -5623,13 +5638,14 @@ V2_BWD_DPROJ_WQ_LOOP_0:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_0_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 128;
@@ -5927,13 +5943,14 @@ V2_BWD_DPROJ_WQ_CELL_0_0_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_1_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 256;
@@ -6231,13 +6248,14 @@ V2_BWD_DPROJ_WQ_CELL_0_1_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_2_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 384;
@@ -6535,13 +6553,14 @@ V2_BWD_DPROJ_WQ_CELL_0_2_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_3_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 512;
@@ -6839,13 +6858,14 @@ V2_BWD_DPROJ_WQ_CELL_0_3_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_4_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 640;
@@ -7143,13 +7163,14 @@ V2_BWD_DPROJ_WQ_CELL_0_4_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_5_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 768;
@@ -7447,13 +7468,14 @@ V2_BWD_DPROJ_WQ_CELL_0_5_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_6_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 896;
@@ -7751,13 +7773,14 @@ V2_BWD_DPROJ_WQ_CELL_0_6_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwq, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwq_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WQ_CELL_0_7_SKIP:
 V2_BWD_DPROJ_WQ_SKIP_0:
 V2_BWD_DPROJ_WK_LOOP_0:
@@ -8061,13 +8084,14 @@ V2_BWD_DPROJ_WK_LOOP_0:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_0_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 128;
@@ -8365,13 +8389,14 @@ V2_BWD_DPROJ_WK_CELL_0_0_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_1_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 256;
@@ -8669,13 +8694,14 @@ V2_BWD_DPROJ_WK_CELL_0_1_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_2_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 384;
@@ -8973,13 +8999,14 @@ V2_BWD_DPROJ_WK_CELL_0_2_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_3_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 512;
@@ -9277,13 +9304,14 @@ V2_BWD_DPROJ_WK_CELL_0_3_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_4_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 640;
@@ -9581,13 +9609,14 @@ V2_BWD_DPROJ_WK_CELL_0_4_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_5_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 768;
@@ -9885,13 +9914,14 @@ V2_BWD_DPROJ_WK_CELL_0_5_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_6_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 896;
@@ -10189,13 +10219,14 @@ V2_BWD_DPROJ_WK_CELL_0_6_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwk, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwk_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WK_CELL_0_7_SKIP:
 V2_BWD_DPROJ_WK_SKIP_0:
 V2_BWD_DPROJ_WV_LOOP_0:
@@ -10499,13 +10530,14 @@ V2_BWD_DPROJ_WV_LOOP_0:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_0_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 128;
@@ -10803,13 +10835,14 @@ V2_BWD_DPROJ_WV_CELL_0_0_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_1_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 256;
@@ -11107,13 +11140,14 @@ V2_BWD_DPROJ_WV_CELL_0_1_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_2_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 384;
@@ -11411,13 +11445,14 @@ V2_BWD_DPROJ_WV_CELL_0_2_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_3_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 512;
@@ -11715,13 +11750,14 @@ V2_BWD_DPROJ_WV_CELL_0_3_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_4_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 640;
@@ -12019,13 +12055,14 @@ V2_BWD_DPROJ_WV_CELL_0_4_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_5_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 768;
@@ -12323,13 +12360,14 @@ V2_BWD_DPROJ_WV_CELL_0_5_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_6_SKIP:
     cvt.u64.u32 %rd_c0, %tid_x;
     add.u64 %rd_c0, %rd_c0, 896;
@@ -12627,13 +12665,14 @@ V2_BWD_DPROJ_WV_CELL_0_6_SKIP:
     ld.shared.f32 %f_dy, [%rd_c4];
     fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;
     mul.lo.u64 %rd_c3, %head_idx, 32;
-    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local
+    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j
     mul.lo.u64 %rd_c4, %rd_c1, 32;
-    add.u64 %rd_c4, %rd_c4, %rd_c3;
-    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)
-    add.u64 %rd_c4, %rd_bwd_dwv, %rd_c4;
-    cvt.rn.f16.f32 %h_tmp, %f_dw;
-    st.global.b16 [%rd_c4], %h_tmp;
+    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j
+    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)
+    add.u64 %rd_c4, %rd_bwd_dwv_scratch, %rd_c4;
+    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial
+    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial
+    st.global.f32 [%rd_c4], %f_dw;
 V2_BWD_DPROJ_WV_CELL_0_7_SKIP:
 V2_BWD_DPROJ_WV_SKIP_0:
     bar.sync 0;  // dproj stores + dY reads complete

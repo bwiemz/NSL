@@ -698,16 +698,21 @@ fn t6_3_hd64_block32_dv_probe() {
 ///      (single-tile K/V SMEM re-read — see the "Single-tile assumption"
 ///      comment in flash_attention_v2/mod.rs).
 ///
-///   2. BACKWARD refuses loudly — cross-launch dW accumulation (f16
-///      overwrite) and the dx chain's partial dK/dV tiles are not yet
-///      implemented for multi-tile, so the FFI must return rc=-1 instead
-///      of producing silently-wrong gradients. This assertion flips when
-///      the dW scratch + dx post-pass land (then this test reverts to
-///      full 7-gradient parity gating).
+///   2. BACKWARD parity holds for all 7 gradients (PR2b). Multi-tile is now
+///      correct at batch=1, heads=1 via the dK f32-scratch RMW
+///      (emit_store_dk_only) + the {dWk,dWv,dx,dx_norm} post-pass
+///      (csha_bwd_multitile_postpass) that recomputes those gradients from the
+///      cross-launch dK/dV/dQ totals. This replaces the prior assert-refusal.
 ///
 /// Historical note: this launch-path class is where the cycle-14..17
 /// "Path A RED" numbers (dk max_rel 21.46 etc.) were measured — through
 /// the checkpoint-recompute harness, downstream of the broken forward.
+///
+/// Tolerances carry a seq-scaling factor over the smoke gate: dK/dV RMW-
+/// accumulate over 4× the q-block launches (more f16-drain round-off), the
+/// post-pass reads dQ from f16 `d_q` (one extra quantization the in-kernel f32
+/// SMEM path avoids), and dW sums over 4× rows. Every per-gradient excess is
+/// logged so an excursion can be classified concentrated-vs-diffuse.
 #[test]
 #[ignore]
 fn t6_3_multitile_seq128() {
@@ -715,39 +720,76 @@ fn t6_3_multitile_seq128() {
         eprintln!("[multitile] skipping — no CUDA");
         return;
     }
+    let rtol = 5e-3f32;
     let mut failures: Vec<String> = Vec::new();
     for hd in [32u32, 64u32] {
         for causal in [false, true] {
             let fwd_tol = if hd <= 32 { 5e-3f32 } else { 2e-2f32 };
+            // Seq-scaled tolerances (see the fn doc). base = single-tile tier.
+            let base = tol_for_head_dim(hd);
+            let qkv_tol = base * 2.0; // dk/dv accumulate over q-block launches
+            let dw_atol = base * 2.0; // dW sums x_norm^T·dY over 4× rows
+            let dx_tol = (base * 8.0).max(1.5e-2);
             match run_fused_backward_config_seq(32, 32, hd, 1, hd, causal, false, 128) {
-                Ok(_) => {
-                    // Backward unexpectedly succeeded — the refusal must not
-                    // silently vanish without this test being re-gated.
-                    failures.push(format!(
-                        "hd={hd} causal={causal}: backward SUCCEEDED but multi-tile backward \
-                         is unimplemented (dW overwrite + partial dK/dV dx chain) — if the \
-                         multi-tile backward landed, re-gate this test on gradient parity"
-                    ));
-                }
-                Err(e) => {
+                Ok((gpu, cpu)) => {
                     let fwd_max_abs = f32::from_bits(
                         LAST_FWD_PARITY_MAX_ABS.load(std::sync::atomic::Ordering::SeqCst),
                     );
-                    eprintln!(
-                        "[multitile] seq=128 hd={hd} causal={} fwd_max_abs={fwd_max_abs:.3e} \
-                         (tol {fwd_tol:.0e}) backward: refused as expected",
-                        causal as u8
-                    );
-                    if !e.starts_with("backward rc=") {
-                        failures.push(format!(
-                            "hd={hd} causal={causal}: expected backward refusal, got: {e}"
-                        ));
-                    }
                     if fwd_max_abs >= fwd_tol {
                         failures.push(format!(
                             "hd={hd} causal={causal}: forward parity {fwd_max_abs:.3e} > {fwd_tol:.0e}"
                         ));
                     }
+                    // Finiteness + shape.
+                    for (name, g, c) in [
+                        ("dq", &gpu.dq, &cpu.dq), ("dk", &gpu.dk, &cpu.dk),
+                        ("dv", &gpu.dv, &cpu.dv), ("dwq", &gpu.dwq, &cpu.dwq),
+                        ("dwk", &gpu.dwk, &cpu.dwk), ("dwv", &gpu.dwv, &cpu.dwv),
+                        ("dx", &gpu.dx, &cpu.dx),
+                    ] {
+                        if g.len() != c.len() {
+                            failures.push(format!(
+                                "hd={hd} causal={causal} {name}: len {} != {}", g.len(), c.len()
+                            ));
+                        }
+                        if let Some((i, v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            failures.push(format!("hd={hd} causal={causal} {name}[{i}]={v} not finite"));
+                        }
+                    }
+                    // dq/dk/dv: absolute gate (seq-scaled).
+                    let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
+                    let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
+                    let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
+                    // dw: mixed atol+rtol gate (seq-scaled atol).
+                    let e_dwq = worst_allclose_excess(&gpu.dwq, &cpu.dwq, rtol);
+                    let e_dwk = worst_allclose_excess(&gpu.dwk, &cpu.dwk, rtol);
+                    let e_dwv = worst_allclose_excess(&gpu.dwv, &cpu.dwv, rtol);
+                    // dx: absolute gate (extra reduction + f16-dQ headroom).
+                    let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
+                    eprintln!(
+                        "[multitile] seq=128 hd={hd} causal={} fwd={fwd_max_abs:.3e} | \
+                         dq={d_dq:.3e} dk={d_dk:.3e} dv={d_dv:.3e} \
+                         dwq={e_dwq:.3e} dwk={e_dwk:.3e} dwv={e_dwv:.3e} dx={d_dx:.3e} \
+                         (qkv_tol={qkv_tol:.1e} dw_atol={dw_atol:.1e} dx_tol={dx_tol:.1e})",
+                        causal as u8
+                    );
+                    for (name, val, tol) in [
+                        ("dq", d_dq, qkv_tol), ("dk", d_dk, qkv_tol), ("dv", d_dv, qkv_tol),
+                        ("dwq", e_dwq, dw_atol), ("dwk", e_dwk, dw_atol), ("dwv", e_dwv, dw_atol),
+                        ("dx", d_dx, dx_tol),
+                    ] {
+                        if !(val < tol) {
+                            failures.push(format!(
+                                "hd={hd} causal={causal} {name}: {val:.3e} >= tol {tol:.1e}"
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    failures.push(format!(
+                        "hd={hd} causal={causal}: multi-tile backward launch failed (expected \
+                         success after PR2b): {e}"
+                    ));
                 }
             }
         }

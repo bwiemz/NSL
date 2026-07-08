@@ -1964,28 +1964,45 @@ fn csha_backward_impl(
             return -1;
         }
 
-        // Multi-tile fused backward refusal: two cross-launch accumulation
-        // gaps make seq_len beyond one block produce silently-wrong weight
-        // and input gradients today — (1) emit_dproj stores dwq/dwk/dwv as
-        // a plain f16 OVERWRITE per q-block launch (each launch clobbers
-        // the previous block's contribution; dk/dv solved this with the
-        // f32-scratch RMW pattern, dW has no scratch yet), and (2) the
-        // in-launch dRMSNorm/dx chain consumes only the launch's PARTIAL
-        // dK/dV SMEM tiles, not the cross-launch totals. Refuse loudly
-        // until the dW scratch + dx post-pass land. The forward multi-tile
-        // path (two-launch dispatch in the forward FFIs) is NOT affected.
+        // Multi-tile fused backward (Phase 1.1 / PR2b). At multi-tile (seq_len >
+        // block_q OR > block_kv) the fused backward now produces correct
+        // gradients at batch=1, heads=1 via two mechanisms working together:
+        //   1. dK RMWs into f32 scratch (emit_store_dk_only), mirroring dV, so
+        //      d_k and dk_scratch hold the cross-launch dK total (was an f16
+        //      overwrite that kept only the last-attending q-block).
+        //   2. A post-pass (csha_bwd_multitile_postpass, run after the q-block
+        //      loop below) recomputes dWk/dWv/dx/dx_norm from the fully
+        //      accumulated dK/dV/dQ totals, overwriting the in-kernel per-block
+        //      partials. dWq is already correct via its own f32 scratch.
+        // heads>1 (cross-head dx_norm accumulation + per-head x_raw layout) and
+        // batch>1 (x_raw addressing lacks a batch term) remain unimplemented and
+        // are refused. NSL_CSHA_MULTITILE_DW_VALIDATION=1 forces the launch
+        // through for isolated heads>1/batch>1 experimentation (gradients not
+        // guaranteed correct in that mode). The forward path is unaffected.
         if !per_doc_cta
             && csha_is_fused_projection_kernel(effective_name_ptr)
             && (seq_len > block_q || seq_len > _block_kv)
         {
-            eprintln!(
-                "[nsl::flash_attention] nsl_flash_attention_csha_backward: multi-tile backward \
-                 (seq_len={seq_len} > block_q={block_q}/block_kv={_block_kv}) is not implemented for \
-                 fused-projection kernels: cross-launch dW accumulation (f16 overwrite, needs f32 \
-                 scratch RMW like dk/dv) and the dx chain's partial dK/dV tiles would produce \
-                 silently-wrong gradients — refusing"
-            );
-            return -1;
+            let supported = batch == 1 && heads == 1;
+            if !supported {
+                let validation_only = std::env::var_os("NSL_CSHA_MULTITILE_DW_VALIDATION")
+                    .map(|v| v != "0" && v != "")
+                    .unwrap_or(false);
+                if !validation_only {
+                    eprintln!(
+                        "[nsl::flash_attention] nsl_flash_attention_csha_backward: multi-tile backward \
+                         (seq_len={seq_len} > block_q={block_q}/block_kv={_block_kv}) is implemented only \
+                         for batch=1, heads=1 (got batch={batch}, heads={heads}): heads>1 needs cross-head \
+                         dx_norm accumulation + per-head x_raw layout, batch>1 needs x_raw batch addressing \
+                         — refusing"
+                    );
+                    return -1;
+                }
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_backward: MULTI-TILE VALIDATION MODE \
+                     (batch={batch}, heads={heads}) — gradients NOT guaranteed correct for heads>1/batch>1"
+                );
+            }
         }
         let q_blocks = (seq_len + block_q - 1) / block_q;
         let grid_x = if per_doc_cta { num_docs_or_zero } else { 1i64 };
@@ -2099,6 +2116,45 @@ fn csha_backward_impl(
         let mut dk_scratch = dk_scratch_raw as u64;
         let mut dv_scratch = dv_scratch_raw as u64;
 
+        // Phase 1.1 (pretraining): f32 scratch for dW (dwq/dwk/dwv), same
+        // serialized-RMW pattern as dK/dV above. emit_dproj now accumulates
+        // each q-block's partial into these f32 buffers (grid_x=1, serial
+        // launches → no atomics), and the conversion below writes f32 scratch →
+        // f16 dwq/dwk/dwv. Shape is [d_model, kv_dim] with
+        // kv_dim = max(active_heads,1)*head_dim, matching emit_dproj's cell
+        // layout. Single-tile (one launch, zero-init scratch) stays identical to
+        // the old f16 overwrite.
+        let dw_kv_dim = active_heads.max(1) * head_dim;
+        let dw_elems = (d_model * dw_kv_dim) as usize;
+        let dw_scratch_bytes = dw_elems * 4; // f32
+        let dwq_scratch_raw = if d_wq != 0 {
+            crate::cuda::inner::alloc_device(dw_scratch_bytes)
+        } else {
+            std::ptr::null_mut()
+        };
+        let dwk_scratch_raw = if d_wk != 0 {
+            crate::cuda::inner::alloc_device(dw_scratch_bytes)
+        } else {
+            std::ptr::null_mut()
+        };
+        let dwv_scratch_raw = if d_wv != 0 {
+            crate::cuda::inner::alloc_device(dw_scratch_bytes)
+        } else {
+            std::ptr::null_mut()
+        };
+        if !dwq_scratch_raw.is_null() {
+            crate::cuda::inner::memset_d8(dwq_scratch_raw, dw_scratch_bytes);
+        }
+        if !dwk_scratch_raw.is_null() {
+            crate::cuda::inner::memset_d8(dwk_scratch_raw, dw_scratch_bytes);
+        }
+        if !dwv_scratch_raw.is_null() {
+            crate::cuda::inner::memset_d8(dwv_scratch_raw, dw_scratch_bytes);
+        }
+        let mut dwq_scratch = dwq_scratch_raw as u64;
+        let mut dwk_scratch = dwk_scratch_raw as u64;
+        let mut dwv_scratch = dwv_scratch_raw as u64;
+
         // CSHA cycle 20 T1 (+T1-followup) — probe pointer trailing slots.
         // Under the `csha_cycle19_probe` feature the backward PTX prelude
         // declares two additional `.param .u64 probe_{ds,dv}_out_ptr`
@@ -2124,7 +2180,7 @@ fn csha_backward_impl(
         let _ = probe_ptrs;
 
         #[cfg(feature = "csha_cycle19_probe")]
-        let args: [*mut c_void; 51] = [
+        let args: [*mut c_void; 54] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -2174,6 +2230,11 @@ fn csha_backward_impl(
             // Option A: f32 scratch for dK/dV accumulation.
             &mut dk_scratch as *mut _ as *mut c_void,
             &mut dv_scratch as *mut _ as *mut c_void,
+            // Phase 1.1: dW f32 scratch — positional lockstep with the PTX param
+            // list (right after dk/dv scratch, before segment/doc/probe trailing).
+            &mut dwq_scratch as *mut _ as *mut c_void,
+            &mut dwk_scratch as *mut _ as *mut c_void,
+            &mut dwv_scratch as *mut _ as *mut c_void,
             // PCA Tier A Task 4B: segment_ids trailing slot.
             &mut seg_ids as *mut _ as *mut c_void,
             // PCA §4.3: doc_starts trailing slot.
@@ -2190,9 +2251,9 @@ fn csha_backward_impl(
         #[cfg(feature = "csha_cycle19_probe")]
         let _ = (&probe_ds_slot, &probe_dv_slot);
 
-        // Non-probe cfg: byte-identical 49-slot args array.
+        // Non-probe cfg: 52-slot args array (49 base + 3 dW scratch, Phase 1.1).
         #[cfg(not(feature = "csha_cycle19_probe"))]
-        let args: [*mut c_void; 49] = [
+        let args: [*mut c_void; 52] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -2240,6 +2301,11 @@ fn csha_backward_impl(
             &mut d_xn as *mut _ as *mut c_void,
             &mut dk_scratch as *mut _ as *mut c_void,
             &mut dv_scratch as *mut _ as *mut c_void,
+            // Phase 1.1: dW f32 scratch — positional lockstep with the PTX param
+            // list (right after dk/dv scratch, before segment/doc trailing).
+            &mut dwq_scratch as *mut _ as *mut c_void,
+            &mut dwk_scratch as *mut _ as *mut c_void,
+            &mut dwv_scratch as *mut _ as *mut c_void,
             &mut seg_ids as *mut _ as *mut c_void,
             &mut doc_starts as *mut _ as *mut c_void,
         ];
@@ -2320,12 +2386,7 @@ fn csha_backward_impl(
             dump_first_nonfinite_scratch("dv_scratch", dv_scratch_raw);
         }
 
-        // Convert f32 scratch -> f16 output for dV only.
-        // Cycle-16 G16-1 fix: dK is now written as f16 directly by the kernel
-        // (emit_store_dk_only Phase 4). The dk_scratch buffer is allocated and
-        // passed to the kernel (param slot stays; register loaded but unused),
-        // but we must NOT run the f32->f16 conversion for dK -- it would
-        // overwrite the correct f16 dK the kernel already wrote to dk_ptr.
+        // Drain dV f32 scratch -> f16 d_v.
         if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
             && !dv_scratch_raw.is_null() && d_v != 0
         {
@@ -2337,11 +2398,116 @@ fn csha_backward_impl(
             }
         }
 
+        // Phase 1.1 (PR2b): drain dK f32 scratch -> f16 d_k. dK now accumulates
+        // in f32 scratch via emit_store_dk_only's in-loop RMW (was an f16
+        // overwrite that was correct only at single-tile). Byte-identical at
+        // single-tile (zero-init scratch, one RMW, one cvt.rn.f16.f32); correct
+        // across q-block launches at multi-tile. Done BEFORE the post-pass reads
+        // dk_scratch (drain does not mutate the f32 scratch).
+        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            && !dk_scratch_raw.is_null() && d_k != 0
+        {
+            let c_rc = csha_bwd_convert_f32_to_f16(
+                dk_scratch_raw, d_k as *mut c_void, qkv_elems,
+            );
+            if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                rc = c_rc;
+            }
+        }
+
+        // Phase 1.1 (PR2b): multi-tile post-pass. Recompute dWk/dWv/dx/dx_norm
+        // from the now-complete dK/dV totals (dk_scratch/dv_scratch) + dQ total
+        // (d_q) + x_raw, overwriting the in-kernel per-q-block PARTIAL results.
+        // Only at multi-tile (single-tile in-kernel values are already correct
+        // and byte-identical) and only for the supported regime (batch=1,
+        // heads=1). Runs BEFORE the dk/dv scratch is freed.
+        // Gate: multi-tile AND the supported regime (batch=1, heads=1) AND the
+        // fused-projection, non-per-doc kernel class the post-pass applies to.
+        // The per-doc CTA path uses csha=None (no fused projections, x_raw_ptr=0,
+        // no dWk/dWv/dx outputs), so it must NOT engage the post-pass — otherwise
+        // a legitimate per-doc backward at batch=1/heads=1/multi-tile would take
+        // the null-input branch and print a spurious "gradients WRONG" diagnostic.
+        // Mirrors the refusal gate above.
+        let multitile = seq_len > block_q || seq_len > _block_kv;
+        let run_postpass = multitile
+            && batch == 1
+            && heads == 1
+            && !per_doc_cta
+            && csha_is_fused_projection_kernel(effective_name_ptr);
+        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && run_postpass {
+            // The post-pass needs a dx_norm staging buffer whenever it computes
+            // dx (Phase B writes dx_norm then reloads it for the closed-form dx).
+            // dx_ptr and dx_norm_ptr are independently nullable per the FFI
+            // contract, so when the caller wants dx but not dx_norm, allocate a
+            // throwaway dx_norm buffer so dx is still recomputed from the totals
+            // (the in-kernel per-block dx is wrong at multi-tile). If neither is
+            // requested, pass 0 and the kernel skips Phase B entirely.
+            let mut temp_dxn_raw: *mut c_void = std::ptr::null_mut();
+            let dxn_for_pp = if d_xn != 0 {
+                d_xn
+            } else if d_x != 0 {
+                let dxn_bytes = (seq_len * d_model * 4) as usize;
+                temp_dxn_raw = crate::cuda::inner::alloc_device(dxn_bytes);
+                temp_dxn_raw as u64
+            } else {
+                0
+            };
+            if xraw != 0
+                && d_q != 0
+                && !dk_scratch_raw.is_null()
+                && !dv_scratch_raw.is_null()
+            {
+                let pp_rc = csha_bwd_multitile_postpass(
+                    dk_scratch, dv_scratch, d_q, xraw, nw, wq, wk, wv,
+                    d_wk, d_wv, d_x, dxn_for_pp, seq_len, d_model as u32, head_dim, eps,
+                );
+                if pp_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    rc = pp_rc;
+                }
+            } else {
+                eprintln!(
+                    "[nsl::flash_attention] multi-tile backward post-pass skipped: a required input \
+                     buffer is null (xraw={xraw:#x}, d_q={d_q:#x}) — dWk/dWv/dx will be WRONG"
+                );
+            }
+            if !temp_dxn_raw.is_null() {
+                crate::cuda::inner::free_device(temp_dxn_raw);
+            }
+        }
+
         if !dk_scratch_raw.is_null() {
             crate::cuda::inner::free_device(dk_scratch_raw);
         }
         if !dv_scratch_raw.is_null() {
             crate::cuda::inner::free_device(dv_scratch_raw);
+        }
+
+        // Phase 1.1: drain dW f32 scratch -> f16. dWq is correct at both single-
+        // and multi-tile (dQ_proj is complete per q-block launch). dWk/dWv are
+        // correct ONLY at single-tile; at multi-tile they hold per-q-block
+        // PARTIALS and the post-pass above already wrote the correct d_wk/d_wv,
+        // so we must NOT overwrite them with the scratch drain — drain dWq only.
+        let dw_drain: &[(*mut c_void, u64)] = if run_postpass {
+            &[(dwq_scratch_raw, d_wq)]
+        } else {
+            &[
+                (dwq_scratch_raw, d_wq),
+                (dwk_scratch_raw, d_wk),
+                (dwv_scratch_raw, d_wv),
+            ]
+        };
+        for &(scratch_raw, out) in dw_drain {
+            if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && !scratch_raw.is_null() {
+                let c_rc = csha_bwd_convert_f32_to_f16(scratch_raw, out as *mut c_void, dw_elems);
+                if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    rc = c_rc;
+                }
+            }
+        }
+        for scratch_raw in [dwq_scratch_raw, dwk_scratch_raw, dwv_scratch_raw] {
+            if !scratch_raw.is_null() {
+                crate::cuda::inner::free_device(scratch_raw);
+            }
         }
 
         // NSL_CSHA_DUMP_GRADS=1 diagnostic — zero-cost when unset. Reads back
@@ -3273,6 +3439,382 @@ fn csha_bwd_convert_f32_to_f16(
         CSHA_BWD_F32_TO_F16_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
+        &args,
+        0,
+    )
+}
+
+// ── Phase 1.1 (pretraining): multi-tile backward post-pass ──────────────────
+//
+// At multi-tile (seq_len > block_q OR > block_kv) the in-kernel emit_dproj /
+// emit_drmsnorm compute dWk/dWv and dx/dx_norm from each q-block launch's
+// PARTIAL dK/dV SMEM tiles, which are wrong: those gradients need the
+// cross-launch dK/dV TOTALS. After the host q-block loop, the totals ARE
+// available: dk_scratch / dv_scratch (f32, accumulated by the in-loop RMW
+// stores) hold dK_proj_total / dV_proj_total, and d_q (f16, disjoint
+// per-launch writes) holds dQ_proj_total. This post-pass recomputes the four
+// affected gradients from those totals and OVERWRITES the partial in-kernel
+// results.
+//
+// Correctness scope: batch=1, heads=1 (the multi-tile regime the caller
+// admits — heads>1 needs cross-head dx_norm accumulation + per-head x_raw
+// layout, batch>1 needs an x_raw batch term; both are refused upstream). The
+// math mirrors emit_xnorm_recompute / emit_dproj / emit_drmsnorm exactly:
+//
+//   inv_rms[s]   = rsqrt(mean_p(x_raw[s,p]^2) + eps)
+//   x_norm(s,p)  = x_raw[s,p] * inv_rms[s] * norm_weight[p]
+//   dWk[p,j]     = sum_s x_norm(s,p) * dk_scratch[s,j]     (= x_norm^T @ dK)
+//   dWv[p,j]     = sum_s x_norm(s,p) * dv_scratch[s,j]
+//   dx_norm[s,p] = sum_j dQ[s,j]*Wq[p,j] + dK[s,j]*Wk[p,j] + dV[s,j]*Wv[p,j]
+//   g_d          = dx_norm[s,p] * norm_weight[p]
+//   s_grad       = sum_p g_d * x_raw[s,p]
+//   dx[s,p]      = g_d*inv_rms[s] - x_raw[s,p]*s_grad*inv_rms[s]^3/d_model
+//
+// One CTA (grid=(1,1,1)), 128 threads, serial inner loops (correctness-first;
+// perf is Tier B.2's job). inv_rms[s] is cached in static shared memory
+// (pp_smem[16384] = 4096 f32 rows → seq_len <= 4096; the launcher refuses
+// larger). All buffer layouts match the in-kernel emitters byte-for-byte at
+// batch=1/heads=1: x_raw/dx/dx_norm [seq, d_model] f32; dQ/dK/dV [seq,
+// head_dim] (dQ f16, dK/dV f32 scratch); Wq/Wk/Wv/dWk/dWv [d_model, head_dim]
+// f16; norm_weight [d_model] f32.
+#[cfg(feature = "cuda")]
+const CSHA_BWD_MULTITILE_POSTPASS_PTX: &str = concat!(
+r#".version 8.7
+.target sm_75
+.address_size 64
+.visible .entry nsl_csha_bwd_multitile_postpass(
+    .param .u64 dk_scratch_ptr,
+    .param .u64 dv_scratch_ptr,
+    .param .u64 dq_ptr,
+    .param .u64 x_raw_ptr,
+    .param .u64 nw_ptr,
+    .param .u64 wq_ptr,
+    .param .u64 wk_ptr,
+    .param .u64 wv_ptr,
+    .param .u64 dwk_ptr,
+    .param .u64 dwv_ptr,
+    .param .u64 dx_ptr,
+    .param .u64 dxn_ptr,
+    .param .u32 seq_len,
+    .param .u32 d_model,
+    .param .u32 head_dim,
+    .param .f32 eps
+)
+{
+    .shared .align 4 .b8 pp_smem[16384];
+    .reg .u32 %th, %s, %pi, %jj, %cell, %ncells, %tmp, %tmp2, %saddr, %sbase, %widx, %wrow, %pcol, %dm, %hd, %seq;
+    .reg .u64 %dkp, %dvp, %dqp, %xrp, %nwp, %wqp, %wkp, %wvp, %dwkp, %dwvp, %dxp, %dxnp;
+    .reg .u64 %off, %off2, %a, %xrow, %qrow, %krow, %vrow, %dxnrow, %dxrow;
+    .reg .f32 %acc, %mean, %eps, %dmf, %invr, %acck, %accv, %xn, %xv, %nwv, %dkv, %dvv, %dxnf, %sgrad, %gd, %t, %invdm, %one, %pre, %term1, %term2, %dxv, %dqv, %wqv, %wkv, %wvv;
+    .reg .b16 %h;
+    .reg .pred %p, %pg;
+
+    mov.u32 %th, %tid.x;
+    ld.param.u64 %dkp,  [dk_scratch_ptr];
+    ld.param.u64 %dvp,  [dv_scratch_ptr];
+    ld.param.u64 %dqp,  [dq_ptr];
+    ld.param.u64 %xrp,  [x_raw_ptr];
+    ld.param.u64 %nwp,  [nw_ptr];
+    ld.param.u64 %wqp,  [wq_ptr];
+    ld.param.u64 %wkp,  [wk_ptr];
+    ld.param.u64 %wvp,  [wv_ptr];
+    ld.param.u64 %dwkp, [dwk_ptr];
+    ld.param.u64 %dwvp, [dwv_ptr];
+    ld.param.u64 %dxp,  [dx_ptr];
+    ld.param.u64 %dxnp, [dxn_ptr];
+    ld.param.u32 %seq,  [seq_len];
+    ld.param.u32 %dm,   [d_model];
+    ld.param.u32 %hd,   [head_dim];
+    ld.param.f32 %eps,  [eps];
+    mov.u32 %sbase, pp_smem;
+    cvt.rn.f32.u32 %dmf, %dm;
+    mov.f32 %one, 0f3F800000;
+    div.rn.f32 %invdm, %one, %dmf;
+
+    // Phase 0: inv_rms[s] -> shared
+    mov.u32 %s, %th;
+PP_IRMS:
+    setp.ge.u32 %p, %s, %seq;
+    @%p bra PP_IRMS_DONE;
+    mul.lo.u32 %tmp, %s, %dm;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 2;
+    add.u64 %xrow, %xrp, %off;
+    mov.f32 %acc, 0f00000000;
+    mov.u32 %pi, 0;
+PP_IRMS_SUM:
+    setp.ge.u32 %p, %pi, %dm;
+    @%p bra PP_IRMS_SUM_DONE;
+    cvt.u64.u32 %off, %pi;
+    shl.b64 %off, %off, 2;
+    add.u64 %a, %xrow, %off;
+    ld.global.f32 %xv, [%a];
+    fma.rn.f32 %acc, %xv, %xv, %acc;
+    add.u32 %pi, %pi, 1;
+    bra PP_IRMS_SUM;
+PP_IRMS_SUM_DONE:
+    mul.f32 %mean, %acc, %invdm;
+    add.f32 %mean, %mean, %eps;
+    rsqrt.approx.f32 %invr, %mean;
+    mul.lo.u32 %saddr, %s, 4;
+    add.u32 %saddr, %sbase, %saddr;
+    st.shared.f32 [%saddr], %invr;
+    add.u32 %s, %s, 128;
+    bra PP_IRMS;
+PP_IRMS_DONE:
+    bar.sync 0;
+
+    // Phase A: dWk[p,j], dWv[p,j] = sum_s x_norm(s,p) * d{K,V}[s,j]
+    mul.lo.u32 %ncells, %dm, %hd;
+    mov.u32 %cell, %th;
+PP_A:
+    setp.ge.u32 %p, %cell, %ncells;
+    @%p bra PP_A_DONE;
+    div.u32 %pcol, %cell, %hd;
+    rem.u32 %jj, %cell, %hd;
+    mov.f32 %acck, 0f00000000;
+    mov.f32 %accv, 0f00000000;
+    cvt.u64.u32 %off, %pcol;
+    shl.b64 %off, %off, 2;
+    add.u64 %a, %nwp, %off;
+    ld.global.f32 %nwv, [%a];
+    mov.u32 %s, 0;
+PP_A_S:
+    setp.ge.u32 %p, %s, %seq;
+    @%p bra PP_A_S_DONE;
+    mul.lo.u32 %tmp, %s, %dm;
+    add.u32 %tmp, %tmp, %pcol;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 2;
+    add.u64 %a, %xrp, %off;
+    ld.global.f32 %xv, [%a];
+    mul.lo.u32 %saddr, %s, 4;
+    add.u32 %saddr, %sbase, %saddr;
+    ld.shared.f32 %invr, [%saddr];
+    mul.f32 %xn, %xv, %invr;
+    mul.f32 %xn, %xn, %nwv;
+    mul.lo.u32 %tmp2, %s, %hd;
+    add.u32 %tmp2, %tmp2, %jj;
+    cvt.u64.u32 %off2, %tmp2;
+    shl.b64 %off2, %off2, 2;
+    add.u64 %a, %dkp, %off2;
+    ld.global.f32 %dkv, [%a];
+    add.u64 %a, %dvp, %off2;
+    ld.global.f32 %dvv, [%a];
+    fma.rn.f32 %acck, %xn, %dkv, %acck;
+    fma.rn.f32 %accv, %xn, %dvv, %accv;
+    add.u32 %s, %s, 1;
+    bra PP_A_S;
+PP_A_S_DONE:
+    mul.lo.u32 %widx, %pcol, %hd;
+    add.u32 %widx, %widx, %jj;
+    cvt.u64.u32 %off, %widx;
+    shl.b64 %off, %off, 1;
+    setp.eq.u64 %pg, %dwkp, 0;
+    @%pg bra PP_A_SKIP_WK;
+    add.u64 %a, %dwkp, %off;
+    cvt.rn.f16.f32 %h, %acck;
+    st.global.b16 [%a], %h;
+PP_A_SKIP_WK:
+    setp.eq.u64 %pg, %dwvp, 0;
+    @%pg bra PP_A_SKIP_WV;
+    add.u64 %a, %dwvp, %off;
+    cvt.rn.f16.f32 %h, %accv;
+    st.global.b16 [%a], %h;
+PP_A_SKIP_WV:
+    add.u32 %cell, %cell, 128;
+    bra PP_A;
+PP_A_DONE:
+
+    // Phase B: dx_norm[s,p], dx[s,p] (one thread per row)
+    setp.eq.u64 %pg, %dxnp, 0;
+    @%pg bra PP_B_DONE;
+    mov.u32 %s, %th;
+PP_B:
+    setp.ge.u32 %p, %s, %seq;
+    @%p bra PP_B_DONE;
+    mul.lo.u32 %saddr, %s, 4;
+    add.u32 %saddr, %sbase, %saddr;
+    ld.shared.f32 %invr, [%saddr];
+    mul.lo.u32 %tmp, %s, %dm;
+    cvt.u64.u32 %off, %tmp;
+    shl.b64 %off, %off, 2;
+    add.u64 %xrow, %xrp, %off;
+    add.u64 %dxnrow, %dxnp, %off;
+    add.u64 %dxrow, %dxp, %off;
+    mul.lo.u32 %tmp2, %s, %hd;
+    cvt.u64.u32 %off2, %tmp2;
+    shl.b64 %off2, %off2, 1;
+    add.u64 %qrow, %dqp, %off2;
+    cvt.u64.u32 %off2, %tmp2;
+    shl.b64 %off2, %off2, 2;
+    add.u64 %krow, %dkp, %off2;
+    add.u64 %vrow, %dvp, %off2;
+    mov.f32 %sgrad, 0f00000000;
+    mov.u32 %pi, 0;
+PP_B_P1:
+    setp.ge.u32 %p, %pi, %dm;
+    @%p bra PP_B_P1_DONE;
+    mul.lo.u32 %wrow, %pi, %hd;
+    mov.f32 %dxnf, 0f00000000;
+    mov.u32 %jj, 0;
+PP_B_J:
+    setp.ge.u32 %p, %jj, %hd;
+    @%p bra PP_B_J_DONE;
+    cvt.u64.u32 %off, %jj;
+    shl.b64 %off, %off, 1;
+    add.u64 %a, %qrow, %off;
+    ld.global.b16 %h, [%a];
+    cvt.f32.f16 %dqv, %h;
+    cvt.u64.u32 %off, %jj;
+    shl.b64 %off, %off, 2;
+    add.u64 %a, %krow, %off;
+    ld.global.f32 %dkv, [%a];
+    add.u64 %a, %vrow, %off;
+    ld.global.f32 %dvv, [%a];
+    add.u32 %widx, %wrow, %jj;
+    cvt.u64.u32 %off, %widx;
+    shl.b64 %off, %off, 1;
+    add.u64 %a, %wqp, %off;
+    ld.global.b16 %h, [%a];
+    cvt.f32.f16 %wqv, %h;
+    add.u64 %a, %wkp, %off;
+    ld.global.b16 %h, [%a];
+    cvt.f32.f16 %wkv, %h;
+    add.u64 %a, %wvp, %off;
+    ld.global.b16 %h, [%a];
+    cvt.f32.f16 %wvv, %h;
+    fma.rn.f32 %dxnf, %dqv, %wqv, %dxnf;
+    fma.rn.f32 %dxnf, %dkv, %wkv, %dxnf;
+    fma.rn.f32 %dxnf, %dvv, %wvv, %dxnf;
+    add.u32 %jj, %jj, 1;
+    bra PP_B_J;
+PP_B_J_DONE:
+    cvt.u64.u32 %off, %pi;
+    shl.b64 %off, %off, 2;
+    add.u64 %a, %dxnrow, %off;
+    st.global.f32 [%a], %dxnf;
+    add.u64 %a, %nwp, %off;
+    ld.global.f32 %nwv, [%a];
+    mul.f32 %gd, %dxnf, %nwv;
+    add.u64 %a, %xrow, %off;
+    ld.global.f32 %xv, [%a];
+    fma.rn.f32 %sgrad, %gd, %xv, %sgrad;
+    add.u32 %pi, %pi, 1;
+    bra PP_B_P1;
+PP_B_P1_DONE:
+    mul.f32 %t, %invr, %invr;
+    mul.f32 %t, %t, %invr;
+    mul.f32 %t, %t, %invdm;
+    mul.f32 %pre, %sgrad, %t;
+    mov.u32 %pi, 0;
+PP_B_P2:
+    setp.ge.u32 %p, %pi, %dm;
+    @%p bra PP_B_P2_DONE;
+    cvt.u64.u32 %off, %pi;
+    shl.b64 %off, %off, 2;
+    add.u64 %a, %dxnrow, %off;
+    ld.global.f32 %dxnf, [%a];
+    add.u64 %a, %nwp, %off;
+    ld.global.f32 %nwv, [%a];
+    mul.f32 %gd, %dxnf, %nwv;
+    mul.f32 %term1, %gd, %invr;
+    add.u64 %a, %xrow, %off;
+    ld.global.f32 %xv, [%a];
+    mul.f32 %term2, %xv, %pre;
+    sub.f32 %dxv, %term1, %term2;
+    setp.eq.u64 %pg, %dxp, 0;
+    @%pg bra PP_B_P2_SKIPST;
+    add.u64 %a, %dxrow, %off;
+    st.global.f32 [%a], %dxv;
+PP_B_P2_SKIPST:
+    add.u32 %pi, %pi, 1;
+    bra PP_B_P2;
+PP_B_P2_DONE:
+    add.u32 %s, %s, 128;
+    bra PP_B;
+PP_B_DONE:
+    ret;
+}
+"#,
+"\0");
+
+#[cfg(feature = "cuda")]
+const CSHA_BWD_MULTITILE_POSTPASS_NAME: &str = "nsl_csha_bwd_multitile_postpass\0";
+
+/// Launch the multi-tile backward post-pass (see the PTX const above).
+/// Single CTA, 128 threads. `inv_rms` is cached in 16 KB static shared, so
+/// `seq_len` must be <= 4096 (larger returns `CUDA_ERROR_INVALID_VALUE` and the
+/// caller surfaces a backward failure). All pointers are raw device u64.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn csha_bwd_multitile_postpass(
+    dk_scratch: u64,
+    dv_scratch: u64,
+    dq: u64,
+    x_raw: u64,
+    norm_weight: u64,
+    wq: u64,
+    wk: u64,
+    wv: u64,
+    dwk: u64,
+    dwv: u64,
+    dx: u64,
+    dxn: u64,
+    seq_len: i64,
+    d_model: u32,
+    head_dim: i64,
+    eps: f32,
+) -> cudarc::driver::sys::CUresult {
+    if seq_len <= 0 || d_model == 0 || head_dim <= 0 {
+        return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    }
+    if seq_len > 4096 {
+        eprintln!(
+            "[nsl::flash_attention] multi-tile backward post-pass: seq_len={seq_len} > 4096 \
+             (static inv_rms shared cap) — refusing"
+        );
+        return cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE;
+    }
+    let mut a_dk = dk_scratch;
+    let mut a_dv = dv_scratch;
+    let mut a_dq = dq;
+    let mut a_xr = x_raw;
+    let mut a_nw = norm_weight;
+    let mut a_wq = wq;
+    let mut a_wk = wk;
+    let mut a_wv = wv;
+    let mut a_dwk = dwk;
+    let mut a_dwv = dwv;
+    let mut a_dx = dx;
+    let mut a_dxn = dxn;
+    let mut a_seq = seq_len as u32;
+    let mut a_dm = d_model;
+    let mut a_hd = head_dim as u32;
+    let mut a_eps = eps;
+    let args: [*mut c_void; 16] = [
+        &mut a_dk as *mut _ as *mut c_void,
+        &mut a_dv as *mut _ as *mut c_void,
+        &mut a_dq as *mut _ as *mut c_void,
+        &mut a_xr as *mut _ as *mut c_void,
+        &mut a_nw as *mut _ as *mut c_void,
+        &mut a_wq as *mut _ as *mut c_void,
+        &mut a_wk as *mut _ as *mut c_void,
+        &mut a_wv as *mut _ as *mut c_void,
+        &mut a_dwk as *mut _ as *mut c_void,
+        &mut a_dwv as *mut _ as *mut c_void,
+        &mut a_dx as *mut _ as *mut c_void,
+        &mut a_dxn as *mut _ as *mut c_void,
+        &mut a_seq as *mut _ as *mut c_void,
+        &mut a_dm as *mut _ as *mut c_void,
+        &mut a_hd as *mut _ as *mut c_void,
+        &mut a_eps as *mut _ as *mut c_void,
+    ];
+    crate::cuda::inner::kernel_launch(
+        CSHA_BWD_MULTITILE_POSTPASS_PTX.as_ptr(),
+        CSHA_BWD_MULTITILE_POSTPASS_NAME.as_ptr(),
+        [1, 1, 1],
+        [128, 1, 1],
         &args,
         0,
     )
@@ -4650,6 +5192,28 @@ mod tests {
         assert_ne!(r.row_sum, 0, "row_sum alloc failed");
         assert_ne!(r.x_raw, 0, "x_raw alloc failed");
         unsafe { nsl_csha_free_backward_activations(r); }
+    }
+
+    /// The multi-tile backward post-pass PTX must be ASCII-only and
+    /// NUL-terminated. The driver JIT (`cuModuleLoadData`, C-string contract)
+    /// rejects any non-ASCII byte with `CUDA_ERROR_INVALID_PTX` — a box-drawing
+    /// char in a PTX comment cost a debug cycle here, and offline `ptxas` under
+    /// a UTF-8 locale does NOT reproduce it, so a static guard is the only
+    /// reliable catch. Mirrors the precision-cast kernels' ASCII assertion.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn multitile_postpass_ptx_is_ascii_and_nul_terminated() {
+        let ptx = CSHA_BWD_MULTITILE_POSTPASS_PTX;
+        assert!(ptx.ends_with('\0'), "post-pass PTX must be NUL-terminated");
+        for (i, b) in ptx.bytes().enumerate() {
+            assert!(
+                b.is_ascii(),
+                "post-pass PTX byte {i} = {b:#x} is non-ASCII (driver JIT trips \
+                 CUDA_ERROR_INVALID_PTX). Context: {:?}",
+                &ptx[i.saturating_sub(24)..(i + 1).min(ptx.len())]
+            );
+        }
+        assert!(CSHA_BWD_MULTITILE_POSTPASS_NAME.ends_with('\0'));
     }
 
     /// Leak regression for the alloc/free pairing bug (2026-07-02):
