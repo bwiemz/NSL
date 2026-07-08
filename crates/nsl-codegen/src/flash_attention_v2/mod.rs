@@ -1432,7 +1432,6 @@ pub fn synthesize_forward_multi_tile_combined(config: &FlashAttentionConfig) -> 
         || config.segment_masked
         || config.checkpoint.is_some()
         || config.paged
-        || config.rope_q
     {
         return fused;
     }

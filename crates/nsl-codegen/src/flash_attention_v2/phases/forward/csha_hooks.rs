@@ -1565,7 +1565,20 @@ fn emit_rope_pair_sweep(
     // of the tile-local row, so packed-batch positions wrap back to 0 at
     // each document boundary. SMEM addressing further below still uses
     // %r_rope_row.
-    let cs_row_reg = if reset_active { effective_pos_reg } else { "%r_rope_row" };
+    // Phase 1.1 multi-tile RoPE fix: index cos/sin by the GLOBAL row
+    // (q_start + tile-local row), not the tile-local row. At multi-tile each
+    // launch-A CTA rotates its own block starting at q_start (Q and K share
+    // q_start in the fused path — the K pre-pass writes K rows at q_start +
+    // warp_row), so cos/sin[tile_local] mis-rotates every block past position 0.
+    // Byte-identical numerically at single-tile (q_start=0). The RoPE-reset
+    // (segment_masked) path keeps its document-relative effective_pos.
+    let cs_row_reg = if reset_active {
+        effective_pos_reg
+    } else {
+        ptx.push_str("    cvt.u32.u64 %r_rope_cs_row, %q_start;\n");
+        ptx.push_str("    add.u32 %r_rope_cs_row, %r_rope_cs_row, %r_rope_row;\n");
+        "%r_rope_cs_row"
+    };
     ptx.push_str(&format!(
         "    mul.lo.u32 %r_rope_cs_off, {cs_row_reg}, {half_dim};\n"
     ));

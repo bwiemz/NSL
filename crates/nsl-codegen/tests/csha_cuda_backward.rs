@@ -797,39 +797,84 @@ fn t6_3_multitile_seq128() {
     assert!(failures.is_empty(), "multitile failures:\n{}", failures.join("\n"));
 }
 
-/// DIAGNOSTIC (PR3 root-cause): isolate rope_q at multi-tile. Same driver /
-/// gpu_sm=75 / level-2 config as the green `t6_3_multitile_seq128`, flipping
-/// ONLY rope_q. If rope_q=false is green and rope_q=true is red, the multi-tile
-/// backward bug is rope-specific (forward-rope or backward-dRoPE indexing).
-/// Non-asserting — logs per-grad max_abs.
+/// Phase 1.3 (PR3): rope_q=TRUE multi-tile parity gate. Companion to the
+/// rope_q=false `t6_3_multitile_seq128` — locks in the forward RoPE multi-tile
+/// fix (cos/sin indexed by global q_start+row, not tile-local row). Before the
+/// fix, forward parity was 4.5-9.8 (garbage) and all grads were O(1) wrong; the
+/// isolation that found it (rope_q the sole variable) is preserved in the doc.
+///
+/// Tolerances: same seq-scaled grad tiers as the rope-off gate, plus a rope-
+/// aware forward tolerance (RoPE's extra f16 math ~doubles forward round-off:
+/// hd64 fwd ~2.6e-2 vs 1.2e-2 rope-off).
 #[test]
 #[ignore]
-fn t6_3_multitile_rope_diag() {
+fn t6_3_multitile_seq128_rope() {
     if !cuda_available() {
-        eprintln!("[rope-diag] skipping — no CUDA");
+        eprintln!("[multitile-rope] skipping — no CUDA");
         return;
     }
-    for rope_q in [false, true] {
-        for hd in [32u32, 64u32] {
-            match run_fused_backward_config_seq(32, 32, hd, 1, hd, true, rope_q, 128) {
+    let rtol = 5e-3f32;
+    let mut failures: Vec<String> = Vec::new();
+    for hd in [32u32, 64u32] {
+        for causal in [false, true] {
+            let fwd_tol = if hd <= 32 { 1e-2f32 } else { 4e-2f32 }; // rope-aware
+            let base = tol_for_head_dim(hd);
+            let qkv_tol = base * 2.0;
+            let dw_atol = base * 2.0;
+            let dx_tol = (base * 8.0).max(1.5e-2);
+            match run_fused_backward_config_seq(32, 32, hd, 1, hd, causal, true, 128) {
                 Ok((gpu, cpu)) => {
-                    let fwd = f32::from_bits(
+                    let fwd_max_abs = f32::from_bits(
                         LAST_FWD_PARITY_MAX_ABS.load(std::sync::atomic::Ordering::SeqCst),
                     );
+                    if fwd_max_abs >= fwd_tol {
+                        failures.push(format!(
+                            "hd={hd} causal={causal} rope: forward parity {fwd_max_abs:.3e} > {fwd_tol:.0e}"
+                        ));
+                    }
+                    for (name, g, c) in [
+                        ("dq", &gpu.dq, &cpu.dq), ("dk", &gpu.dk, &cpu.dk),
+                        ("dv", &gpu.dv, &cpu.dv), ("dwq", &gpu.dwq, &cpu.dwq),
+                        ("dwk", &gpu.dwk, &cpu.dwk), ("dwv", &gpu.dwv, &cpu.dwv),
+                        ("dx", &gpu.dx, &cpu.dx),
+                    ] {
+                        if g.len() != c.len() {
+                            failures.push(format!("hd={hd} causal={causal} rope {name}: len {} != {}", g.len(), c.len()));
+                        }
+                        if let Some((i, v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            failures.push(format!("hd={hd} causal={causal} rope {name}[{i}]={v} not finite"));
+                        }
+                    }
                     let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
                     let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
                     let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
+                    let e_dwq = worst_allclose_excess(&gpu.dwq, &cpu.dwq, rtol);
+                    let e_dwk = worst_allclose_excess(&gpu.dwk, &cpu.dwk, rtol);
+                    let e_dwv = worst_allclose_excess(&gpu.dwv, &cpu.dwv, rtol);
                     let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
                     eprintln!(
-                        "[rope-diag] rope_q={} hd={hd} seq=128 causal=1: FWD={fwd:.3e} | dq={d_dq:.3e} \
-                         dk={d_dk:.3e} dv={d_dv:.3e} dx={d_dx:.3e}",
-                        rope_q as u8
+                        "[multitile-rope] seq=128 hd={hd} causal={} fwd={fwd_max_abs:.3e} | \
+                         dq={d_dq:.3e} dk={d_dk:.3e} dv={d_dv:.3e} \
+                         dwq={e_dwq:.3e} dwk={e_dwk:.3e} dwv={e_dwv:.3e} dx={d_dx:.3e}",
+                        causal as u8
                     );
+                    for (name, val, tol) in [
+                        ("dq", d_dq, qkv_tol), ("dk", d_dk, qkv_tol), ("dv", d_dv, qkv_tol),
+                        ("dwq", e_dwq, dw_atol), ("dwk", e_dwk, dw_atol), ("dwv", e_dwv, dw_atol),
+                        ("dx", d_dx, dx_tol),
+                    ] {
+                        if !(val < tol) {
+                            failures.push(format!("hd={hd} causal={causal} rope {name}: {val:.3e} >= tol {tol:.1e}"));
+                        }
+                    }
                 }
-                Err(e) => eprintln!("[rope-diag] rope_q={} hd={hd}: launch err: {e}", rope_q as u8),
+                Err(e) => {
+                    failures.push(format!("hd={hd} causal={causal} rope: launch failed: {e}"));
+                }
             }
         }
     }
+    assert!(failures.is_empty(), "multitile rope failures:\n{}", failures.join("\n"));
 }
 
 /// Numerical sweep across (head_dim, causal, rope_q). One line per config
