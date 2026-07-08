@@ -1403,10 +1403,21 @@ pub fn synthesize_backward_combined(
 ///     rotated) and its else-branch `emit_save_softmax_state` writes the
 ///     row_max/row_sum saves the backward needs.
 ///
-/// Configs the twin cannot serve (sinks, segment_masked, checkpoint)
-/// return the fused module unchanged — the runtime's multi-tile
+/// Configs the twin cannot serve (sinks, segment_masked, checkpoint,
+/// rope_q) return the fused module unchanged — the runtime's multi-tile
 /// dispatch then fails loudly at kernel-name resolution instead of
 /// producing silent garbage.
+///
+/// Phase 1.1 SAFETY (2026-07-08): `rope_q=true` is refused here. RoPE is
+/// applied in launch A (the fused per-tile kernel) via `emit_rope_pair_sweep`,
+/// which indexes cos/sin by the TILE-LOCAL row under a single-tile assumption
+/// (see forward/csha_hooks.rs:1519-1524). At multi-tile every tile past
+/// position 0 is mis-rotated, so the saved rotated projections are wrong and
+/// the whole forward is garbage (GPU-verified: forward parity 4.5-9.8 at
+/// rope_q=true multi-tile vs 3e-3 at rope_q=false). Refuse (no twin -> runtime
+/// rc=500) until the launch-A rope epilogue is reworked to use GLOBAL tile
+/// positions (q_start for Q, k_start for K). Single-tile rope is unaffected
+/// (it uses the fused entry directly, never the twin).
 ///
 /// Output is NUL-terminated like `synthesize_flash_attention_ptx_v2`.
 pub fn synthesize_forward_multi_tile_combined(config: &FlashAttentionConfig) -> Vec<u8> {
@@ -1421,6 +1432,7 @@ pub fn synthesize_forward_multi_tile_combined(config: &FlashAttentionConfig) -> 
         || config.segment_masked
         || config.checkpoint.is_some()
         || config.paged
+        || config.rope_q
     {
         return fused;
     }

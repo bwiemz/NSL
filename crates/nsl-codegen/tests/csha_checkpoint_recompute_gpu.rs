@@ -431,8 +431,25 @@ fn forward_launch_and_saves(
     }
 
     // ── Forward PTX synth + launch ─────────────────────────────────────────
-    let fwd_ptx = synthesize_flash_attention_ptx_v2(config);
-    let fwd_name = CString::new(flash_attention_kernel_name_v2(config)).unwrap();
+    // Combined module: fused kernel + `_mt_attn` interleaved twin. These
+    // configs are multi-tile (S >> block_q), so the runtime's two-launch
+    // dispatch inside nsl_flash_attention_csha_with_saves resolves the twin by
+    // name — a single-tile-only `synthesize_flash_attention_ptx_v2` module
+    // lacks the twin and faults with rc=500 (CUDA_ERROR_NOT_FOUND).
+    //
+    // The checkpoint carrier is a backward-only concern. `flash_attention_
+    // kernel_name_v2` encodes it into the entry name, so synthesizing the
+    // forward from the checkpoint config would name the entry with a checkpoint
+    // suffix the runtime's lookup key (also checkpoint-suffixed) matches — but
+    // the multi-tile TWIN is emitted without that suffix, so the two-launch
+    // dispatch's twin lookup misses and returns rc=500. Strip checkpoint for
+    // the forward (name + PTX both), matching the sister csha_cuda_backward
+    // harness which uses a checkpoint-free forward config.
+    let mut fwd_config = config.clone();
+    fwd_config.checkpoint = None;
+    let fwd_ptx =
+        nsl_codegen::flash_attention_v2::synthesize_forward_multi_tile_combined(&fwd_config);
+    let fwd_name = CString::new(flash_attention_kernel_name_v2(&fwd_config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(config);
     let fwd_smem_dyn = if smem_layout::needs_dynamic_smem(config) {
         fwd_smem_total as i64

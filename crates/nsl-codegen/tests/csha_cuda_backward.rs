@@ -797,6 +797,41 @@ fn t6_3_multitile_seq128() {
     assert!(failures.is_empty(), "multitile failures:\n{}", failures.join("\n"));
 }
 
+/// DIAGNOSTIC (PR3 root-cause): isolate rope_q at multi-tile. Same driver /
+/// gpu_sm=75 / level-2 config as the green `t6_3_multitile_seq128`, flipping
+/// ONLY rope_q. If rope_q=false is green and rope_q=true is red, the multi-tile
+/// backward bug is rope-specific (forward-rope or backward-dRoPE indexing).
+/// Non-asserting — logs per-grad max_abs.
+#[test]
+#[ignore]
+fn t6_3_multitile_rope_diag() {
+    if !cuda_available() {
+        eprintln!("[rope-diag] skipping — no CUDA");
+        return;
+    }
+    for rope_q in [false, true] {
+        for hd in [32u32, 64u32] {
+            match run_fused_backward_config_seq(32, 32, hd, 1, hd, true, rope_q, 128) {
+                Ok((gpu, cpu)) => {
+                    let fwd = f32::from_bits(
+                        LAST_FWD_PARITY_MAX_ABS.load(std::sync::atomic::Ordering::SeqCst),
+                    );
+                    let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
+                    let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
+                    let d_dv = max_abs_diff(&gpu.dv, &cpu.dv);
+                    let d_dx = max_abs_diff(&gpu.dx, &cpu.dx);
+                    eprintln!(
+                        "[rope-diag] rope_q={} hd={hd} seq=128 causal=1: FWD={fwd:.3e} | dq={d_dq:.3e} \
+                         dk={d_dk:.3e} dv={d_dv:.3e} dx={d_dx:.3e}",
+                        rope_q as u8
+                    );
+                }
+                Err(e) => eprintln!("[rope-diag] rope_q={} hd={hd}: launch err: {e}", rope_q as u8),
+            }
+        }
+    }
+}
+
 /// Numerical sweep across (head_dim, causal, rope_q). One line per config
 /// with per-gradient max_abs and PASS/FAIL. Gated by the same three
 /// NUMERICAL_GATE_* consts as the smoke — only enabled gates panic.
