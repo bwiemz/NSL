@@ -468,10 +468,10 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
         return;
     }
 
-    for (label, ptr_name, ptr_reg, dy_off) in [
-        ("WQ", "csha_wq_ptr", "%rd_bwd_dwq", backward_dq_offset(config)),
-        ("WK", "csha_wk_ptr", "%rd_bwd_dwk", backward_dk_offset(config)),
-        ("WV", "csha_wv_ptr", "%rd_bwd_dwv", backward_dv_offset(config)),
+    for (label, ptr_name, ptr_reg, scratch_reg, dy_off) in [
+        ("WQ", "csha_wq_ptr", "%rd_bwd_dwq", "%rd_bwd_dwq_scratch", backward_dq_offset(config)),
+        ("WK", "csha_wk_ptr", "%rd_bwd_dwk", "%rd_bwd_dwk_scratch", backward_dk_offset(config)),
+        ("WV", "csha_wv_ptr", "%rd_bwd_dwv", "%rd_bwd_dwv_scratch", backward_dv_offset(config)),
     ] {
         ptx.push_str(&format!("V2_BWD_DPROJ_{label}_LOOP_{q_tile_iter}:\n"));
         // Null-guard per weight pointer (matches forward fused-proj).
@@ -535,23 +535,32 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 ptx.push_str("    fma.rn.f32 %f_dw, %f_xn, %f_dy, %f_dw;\n");
             }
 
-            // HBM store: dW[p, head_idx*head_dim + j_local] as f16
-            //   flat_j = head_idx*head_dim + j_local
-            //   byte_off = (p*kv_dim + flat_j) * 2
+            // Phase 1.1: f32 scratch RMW instead of the prior f16 OVERWRITE.
+            //   flat_j   = head_idx*head_dim + j_local
+            //   elem_idx = p*kv_dim + flat_j   (f32 scratch, *4 bytes)
+            //   scratch[elem_idx] += %f_dw     (serialized ld/add/st, NO atomics:
+            //   the fused backward launches grid_x=1 (one CTA) and iterates
+            //   q-blocks SERIALLY on one stream — see the per-q-block launch loop
+            //   in nsl_flash_attention_csha_backward — so each cell has exactly
+            //   one writer per launch and launches are ordered). A host-side
+            //   conversion writes f32 scratch -> f16 dwq/dwk/dwv after the loop.
+            //   Single-tile (seq==block_q, one launch) is byte-identical to the
+            //   old path: scratch is zero-init so the RMW reduces to 0 + partial.
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd_c3, %head_idx, {};\n", head_dim
             ));
-            ptx.push_str("    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local\n");
+            ptx.push_str("    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local -> flat_j\n");
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd_c4, %rd_c1, {};\n", kv_dim
             ));
-            ptx.push_str("    add.u64 %rd_c4, %rd_c4, %rd_c3;\n");
-            ptx.push_str("    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)\n");
+            ptx.push_str("    add.u64 %rd_c4, %rd_c4, %rd_c3;  // p*kv_dim + flat_j\n");
+            ptx.push_str("    shl.b64 %rd_c4, %rd_c4, 2;  // *4 bytes (f32 scratch)\n");
             ptx.push_str(&format!(
-                "    add.u64 %rd_c4, {ptr_reg}, %rd_c4;\n"
+                "    add.u64 %rd_c4, {scratch_reg}, %rd_c4;\n"
             ));
-            ptx.push_str("    cvt.rn.f16.f32 %h_tmp, %f_dw;\n");
-            ptx.push_str("    st.global.b16 [%rd_c4], %h_tmp;\n");
+            ptx.push_str("    ld.global.f32 %f_xn, [%rd_c4];  // prior accumulated partial\n");
+            ptx.push_str("    add.f32 %f_dw, %f_dw, %f_xn;    // += this q-block's partial\n");
+            ptx.push_str("    st.global.f32 [%rd_c4], %f_dw;\n");
 
             ptx.push_str(&format!(
                 "V2_BWD_DPROJ_{label}_CELL_{q_tile_iter}_{k}_SKIP:\n"

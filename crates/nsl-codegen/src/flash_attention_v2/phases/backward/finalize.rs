@@ -88,8 +88,19 @@ pub fn emit_store_dk_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
     ptx.push_str(&format!(
         "    // Phase 4 dK store (q_tile_iter={q_tile_iter}): post-inverse-RoPE dK SMEM->HBM\n"
     ));
-    ptx.push_str("    // -- DK store via [dk_ptr] (coop SMEM->HBM, full tile, f16) --\n");
-    ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dk, 0;\n");
+    // Phase 1.1 (pretraining): dK now RMWs into f32 scratch (dk_scratch_ptr),
+    // mirroring dV in emit_store_kv_only, instead of overwriting the f16 dk
+    // output. The prior f16 OVERWRITE was correct only at single-tile: at
+    // multi-tile (seq > block_kv OR > block_q) EVERY q-block launch that
+    // attends a k-row writes that k-row's dK, and an overwrite keeps only the
+    // last-attending q-block's contribution. The f32-scratch RMW accumulates
+    // across q-block launches (deterministic, grid_x=1 serial launches → no
+    // atomics), and a host-side drain writes scratch -> f16 dk after the loop.
+    // This runs AFTER emit_drope_branch(K) (post-inverse-RoPE, defect-3 safe)
+    // and stays byte-identical at single-tile (zero-init scratch, one RMW,
+    // then cvt.rn.f16.f32 == the old direct cvt.rn.f16.f32 overwrite).
+    ptx.push_str("    // -- DK f32-scratch RMW via [dk_scratch_ptr] (coop SMEM->HBM) --\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dk_scratch, 0;\n");
     ptx.push_str(&format!(
         "    @%p0 bra V2_BWD_STORE_DK_SKIP_{q_tile_iter};\n"
     ));
@@ -98,8 +109,9 @@ pub fn emit_store_dk_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
     ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;\n");
     ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %k_start;\n");
     ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd_dk_base, %rd_dk_base, 1;  // * 2 bytes (f16)\n");
-    ptx.push_str("    add.u64 %rd_dk_base, %rd_bwd_dk, %rd_dk_base;\n");
+    // f32 scratch: 4 bytes per element, byte stride = elem * 4.
+    ptx.push_str("    shl.b64 %rd_dk_base, %rd_dk_base, 2;  // * 4 bytes (f32)\n");
+    ptx.push_str("    add.u64 %rd_dk_base, %rd_bwd_dk_scratch, %rd_dk_base;\n");
     for k in 0..dk_cells_per_thread {
         let thread_cell = k * 128;
         ptx.push_str("    cvt.u64.u32 %rd_dk_idx, %tid_x;\n");
@@ -115,16 +127,19 @@ pub fn emit_store_dk_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
         ptx.push_str("    add.u64 %rd43, %rd42, %k_start;\n");
         ptx.push_str("    setp.lt.u64 %p0, %rd43, %rd6;\n");
         ptx.push_str("    and.pred %p_dk, %p_dk, %p0;\n");
+        // SMEM f32 load (this q-block's post-inverse-RoPE dK contribution).
         ptx.push_str("    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;\n");
         ptx.push_str(&format!(
             "    add.u64 %rd_dk_smem, %rd_dk_smem, {dk_smem_off};\n"
         ));
         ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
         ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
-        ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;\n");
+        // HBM f32 scratch RMW: load, add, store — all in f32.
+        ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;\n");
         ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
-        ptx.push_str("    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;\n");
-        ptx.push_str("    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;\n");
+        ptx.push_str("    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];\n");
+        ptx.push_str("    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;\n");
+        ptx.push_str("    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;\n");
     }
     ptx.push_str(&format!("V2_BWD_STORE_DK_SKIP_{q_tile_iter}:\n"));
 }

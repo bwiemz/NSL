@@ -447,10 +447,18 @@ fn launch_per_doc_cta_backward(
     let mut d_x: u64 = 0; let mut d_xn: u64 = 0;
     let mut dk_scratch = dk_scratch_dev as u64;
     let mut dv_scratch = dv_scratch_dev as u64;
+    // Phase 1.1 (pretraining): the backward prelude now carries three dW
+    // f32-scratch params (dwq/dwk/dwv_scratch_ptr) after dk/dv scratch. This
+    // test nulls the dW outputs (d_wq/d_wk/d_wv = 0), so emit_dproj null-guards
+    // on the (null) dW output pointer and never dereferences these scratch
+    // slots — passing 0 is safe. They must still occupy their param positions.
+    let mut dwq_scratch: u64 = 0;
+    let mut dwk_scratch: u64 = 0;
+    let mut dwv_scratch: u64 = 0;
     let mut seg_placeholder: u64 = 0;
     let mut doc_starts = doc_starts_dev as u64;
 
-    let args: [*mut c_void; 49] = [
+    let args: [*mut c_void; 52] = [
         &mut q as *mut _ as *mut c_void,         // 0  q_ptr
         &mut k as *mut _ as *mut c_void,         // 1  k_ptr
         &mut v as *mut _ as *mut c_void,         // 2  v_ptr
@@ -498,8 +506,11 @@ fn launch_per_doc_cta_backward(
         &mut d_xn as *mut _ as *mut c_void,      // 44 dx_norm_ptr
         &mut dk_scratch as *mut _ as *mut c_void,// 45 dk_scratch_ptr
         &mut dv_scratch as *mut _ as *mut c_void,// 46 dv_scratch_ptr
-        &mut seg_placeholder as *mut _ as *mut c_void, // 47 _segment_ids_placeholder
-        &mut doc_starts as *mut _ as *mut c_void,// 48 doc_starts_ptr
+        &mut dwq_scratch as *mut _ as *mut c_void,// 47 dwq_scratch_ptr
+        &mut dwk_scratch as *mut _ as *mut c_void,// 48 dwk_scratch_ptr
+        &mut dwv_scratch as *mut _ as *mut c_void,// 49 dwv_scratch_ptr
+        &mut seg_placeholder as *mut _ as *mut c_void, // 50 _segment_ids_placeholder
+        &mut doc_starts as *mut _ as *mut c_void,// 51 doc_starts_ptr
     ];
 
     let grid_y = (batch * heads) as i64;
@@ -510,7 +521,7 @@ fn launch_per_doc_cta_backward(
             bwd_name.as_ptr() as i64,
             num_docs, grid_y, 1i64,
             128i64, 1i64, 1i64,
-            args.as_ptr() as i64, 49i64,
+            args.as_ptr() as i64, 52i64,
             bwd_smem,
         )
     };
