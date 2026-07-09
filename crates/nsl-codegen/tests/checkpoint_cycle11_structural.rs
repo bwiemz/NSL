@@ -157,62 +157,35 @@ fn g3c_kv_smem_writes_before_ds_compute() {
 }
 
 #[test]
-fn g3c_rope_k_write_between_projection_and_ds_compute() {
-    // Cycle-12 extension to G3c: when rope_q=true, the backward
-    // kv-recompute path MUST lift the forward `emit_rope_k_epilogue`
-    // emission into the backward (step 5 of `emit_kv_recompute`). The
-    // characteristic emission is the rope-K loop label
-    // (`V2_CSHA_ROPE_K_LOOP_0`) or the fused-skip label
-    // (`V2_CSHA_ROPE_K_FUSED_SKIP`) — both appear when
-    // rope_q + fused_projections are set.
+fn g3c_rope_k_write_ordering_now_refused_pending_path_b_fix() {
+    // Formerly `g3c_rope_k_write_between_projection_and_ds_compute`: a
+    // cycle-12 structural probe asserting the RoPE-K rotation emission
+    // (V2_CSHA_ROPE_K_LOOP_0 / V2_CSHA_ROPE_K_FUSED_SKIP) is lifted into
+    // `emit_kv_recompute` between the K projection matmul and the first
+    // ds_compute consumer.
     //
-    // Ordering invariant we extend over base G3c:
-    //   1. K projection matmul (V2_RECOMPUTE_K_MATMUL_MAIN) precedes
-    //   2. RoPE-K rotation emission (V2_CSHA_ROPE_K_*) precedes
-    //   3. KV recompute completion barrier (V2_KV_RECOMPUTE_DONE_MAIN)
-    //      precedes
-    //   4. first ds_compute consumer (V2_BWD_DS_*).
+    // Phase 1.3 (commit 8f774ad) found that checkpoint + rope_q backward
+    // (Path B) — the exact composition `build_bypass_config_with_rope()`
+    // builds — has "a known GROSS numerical error ... never-GPU-validated
+    // ... tracked for follow-up", and `validate_checkpoint_eligibility`'s
+    // R7 was generalized to refuse it unconditionally (not just under
+    // segment_masked) rather than let it silently compile to wrong
+    // gradients. `bypass_r0_for_testing()` only bypasses the retired R0
+    // gate, not R7, so this config is now refused at every production
+    // entry point — including this test's `synthesize_backward_with_tier`
+    // call — by design (the R7/R3/etc. cascade must fire everywhere).
     //
-    // Catches the cycle-11 RoPE-K gap that the cycle-12 R3 augmentation
-    // closes structurally — if `emit_rope_k_epilogue` is not invoked
-    // from `emit_kv_recompute`, downstream ds_compute reads
-    // un-rotated K and gradients diverge silently.
+    // This test now locks in that refusal. The original structural
+    // ordering probe (K matmul -> RoPE-K -> recompute-done -> ds_compute)
+    // is valuable again once Path B's kv-recompute math is fixed and
+    // GPU-validated — re-derive it from this commit's history at that
+    // point instead of bypassing R7 here.
     let cfg = build_bypass_config_with_rope();
-    let ptx = synthesize_backward_with_tier(&cfg)
-        .expect("G3c rope: bypass-active rope_q backward synthesis must succeed");
-
-    let k_matmul_pos = ptx
-        .find("V2_RECOMPUTE_K_MATMUL_MAIN:")
-        .expect("G3c rope: V2_RECOMPUTE_K_MATMUL_MAIN label missing");
-    // The rope-K emitter writes the LOOP label inside the rotation body.
-    let rope_k_pos = ptx
-        .find("V2_CSHA_ROPE_K_LOOP_0")
-        .or_else(|| ptx.find("V2_CSHA_ROPE_K_FUSED_SKIP"))
-        .expect(
-            "G3c rope: emit_rope_k_epilogue did not emit RoPE-K marker inside \
-             emit_kv_recompute — cycle-11 RoPE-K gap NOT closed",
-        );
-    let recompute_done_pos = ptx
-        .find("V2_KV_RECOMPUTE_DONE_MAIN")
-        .expect("G3c rope: KV recompute DONE label missing");
-    let first_ds_pos = ptx
-        .find("V2_BWD_DS_")
-        .expect("G3c rope: ds_compute label V2_BWD_DS_* missing");
-
+    let err = synthesize_backward_with_tier(&cfg)
+        .expect_err("G3c rope: checkpoint+rope_q (Path B) must be refused, not synthesized");
     assert!(
-        k_matmul_pos < rope_k_pos,
-        "G3c rope: K projection matmul @ {} did not precede rope-K rotation @ {}",
-        k_matmul_pos, rope_k_pos
-    );
-    assert!(
-        rope_k_pos < recompute_done_pos,
-        "G3c rope: rope-K rotation @ {} did not precede recompute DONE @ {}",
-        rope_k_pos, recompute_done_pos
-    );
-    assert!(
-        recompute_done_pos < first_ds_pos,
-        "G3c rope: recompute DONE @ {} did not precede first V2_BWD_DS_ @ {}",
-        recompute_done_pos, first_ds_pos
+        err.contains("rope_q=true") && err.contains("checkpoint"),
+        "G3c rope: refusal message missing expected substrings: {err}"
     );
 }
 

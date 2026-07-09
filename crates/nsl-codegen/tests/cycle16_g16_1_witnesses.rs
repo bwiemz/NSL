@@ -38,41 +38,34 @@ fn build_cycle16_g16_1_cfg() -> FlashAttentionConfig {
     }
 }
 
-/// G16-1a: K-tile dRoPE cs_row uses `add.u64 %rd35, %rd33, %k_start`
-/// (cycle-16 defect-2 fix). The prior `mov.u64 %rd35, %rd33` applied the
-/// wrong cos/sin slice to K tiles starting past position 0.
+/// G16-1a/1b formerly asserted on PTX text reachable only by synthesizing
+/// checkpoint + rope_q (Path B) end-to-end. That composition is now
+/// refused unconditionally by `validate_checkpoint_eligibility`'s R7 (see
+/// checkpoint_v1_integration.rs / cycle15_backward_prelude_rope.rs for the
+/// full rationale: Path B's kv-recompute math has a documented "GROSS
+/// numerical error" that was never fixed, and 8f774ad only unblocked its
+/// *compilation*, not its correctness). Both now lock in the refusal
+/// instead of asserting on unreachable PTX text; re-derive the original
+/// register/label assertions once Path B is fixed and R7 is narrowed.
 #[test]
-fn t_cycle16_g16_1a_dk_k_start_offset_in_drope() {
+fn t_cycle16_g16_1a_checkpoint_rope_q_now_refused_pending_path_b_fix() {
     let cfg = build_cycle16_g16_1_cfg();
-    let ptx = synthesize_backward_with_tier_b(&cfg, None).unwrap();
+    let err = synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err("G16-1a: checkpoint+rope_q (Path B) must be refused, not synthesized");
     assert!(
-        ptx.contains("add.u64 %rd35, %rd33, %k_start"),
-        "G16-1a: K-tile dRoPE must use add.u64 %rd35, %rd33, %k_start \
-         (cycle-16 defect-2 fix; prior: mov.u64 %rd35, %rd33)"
-    );
-    // Verify the Q-tile counterpart is also present (pre-existing, unchanged).
-    assert!(
-        ptx.contains("add.u64 %rd35, %rd33, %q_start"),
-        "G16-1a: Q-tile dRoPE must still use add.u64 %rd35, %rd33, %q_start"
+        err.contains("rope_q=true") && err.contains("checkpoint"),
+        "G16-1a: refusal message missing expected substrings: {err}"
     );
 }
 
-/// G16-1b: Phase 4 dK store is present in synthesized PTX.
-/// emit_store_dk_only is wired in mod.rs after emit_drmsnorm. Its PTX comment
-/// "Phase 4 dK store" serves as the structural witness.
 #[test]
-fn t_cycle16_g16_1b_phase4_dk_store_present() {
+fn t_cycle16_g16_1b_checkpoint_rope_q_now_refused_pending_path_b_fix() {
     let cfg = build_cycle16_g16_1_cfg();
-    let ptx = synthesize_backward_with_tier_b(&cfg, None).unwrap();
+    let err = synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err("G16-1b: checkpoint+rope_q (Path B) must be refused, not synthesized");
     assert!(
-        ptx.contains("Phase 4 dK store"),
-        "G16-1b: Phase 4 dK store comment must appear in PTX (emit_store_dk_only \
-         wired in mod.rs after emit_drmsnorm)"
-    );
-    // Also verify the skip label (null-guard) is emitted.
-    assert!(
-        ptx.contains("V2_BWD_STORE_DK_SKIP_0:"),
-        "G16-1b: V2_BWD_STORE_DK_SKIP_0 label must be present (emit_store_dk_only)"
+        err.contains("rope_q=true") && err.contains("checkpoint"),
+        "G16-1b: refusal message missing expected substrings: {err}"
     );
 }
 
