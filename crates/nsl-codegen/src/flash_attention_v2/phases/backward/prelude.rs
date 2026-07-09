@@ -313,6 +313,11 @@ pub fn emit(
         ptx.push_str("    .reg .u32 %r_rope_tid, %r_rope_pair_idx;\n");
         ptx.push_str("    .reg .u32 %r_rope_row, %r_rope_dim_pair;\n");
         ptx.push_str("    .reg .u32 %r_rope_cs_off, %r_rope_smem_row_off;\n");
+        // Phase 1.3: global cos/sin row (q_start + tile-local row) — mirrors the
+        // forward prelude addition so emit_kv_recompute's rope epilogue (which
+        // calls the forward emit_rope_pair_sweep) has the register declared under
+        // the checkpoint backward path.
+        ptx.push_str("    .reg .u32 %r_rope_cs_row;\n");
         ptx.push_str("    .reg .u32 %r_rope_x0_col, %r_rope_x0_off, %r_rope_x1_off;\n");
         // Predicate registers for null-guard and loop exit.
         ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
