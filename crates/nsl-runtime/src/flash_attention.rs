@@ -4549,6 +4549,55 @@ fn compute_logsumexp_gqa(
     lse
 }
 
+/// Budget-aware backward tile-size selector — the runtime mirror of codegen's
+/// `nsl_codegen::flash_attention::backward_select_blocks`.
+///
+/// The Phase-2 backward keeps six resident SMEM tiles (Q, K, V, dO, dK-local,
+/// dV-local) plus the S and dP (MMA) tiles. At `block_q = block_kv = 64` that
+/// footprint is ~134 KB at head_dim=64 and ~230 KB at head_dim=128 — far past the
+/// 99 KB (`101376`-byte) `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` cap on sm_80..sm_120,
+/// so those launches fail the opt-in guard and fall back to the (correct but slow)
+/// CPU backward. Shrinking the tiles for large head_dims brings the footprint back
+/// under the cap so the GPU kernel runs.
+///
+/// Constraints baked into the table:
+///   * **Symmetric only** (`block_q == block_kv`). The GPU block-size sweep
+///     (`diag_block_size_sweep`) found that asymmetric tiles produce a WRONG dV
+///     gradient under a *causal* mask (both the MMA and scalar paths, dV magnitude
+///     unchanged → a masking/tile-alignment bug, not a scale bug), while symmetric
+///     tiles are correct in every mode. Until that causal-asymmetric dV bug is
+///     fixed, the selector never emits `block_q != block_kv`.
+///   * MMA needs full 32-lane warps, so an MMA-eligible `block_q` is a multiple of
+///     32 (enforced codegen-side in `backward_uses_mma`); a `block_q < 32` routes to
+///     the scalar path, which is warp-count-agnostic.
+///   * The runtime always requests the MMA-inclusive SMEM maximum (it cannot tell
+///     scalar from MMA PTX apart — see the Phase-2 launch comment), so each entry
+///     must fit the MMA-inclusive layout under 99 KB.
+///
+/// This MUST stay identical to the codegen copy; the codegen test
+/// `select_backward_blocks_matches_codegen` pins both to the same table.
+#[cfg(feature = "cuda")]
+pub fn select_backward_blocks(head_dim: i64) -> (i64, i64) {
+    match head_dim {
+        // ≤32: the classic 64/64 tile fits (88.6 KB at hd=32). MMA. Unchanged.
+        hd if hd <= 32 => (64, 64),
+        // 64: 32/32 → 59 KB MMA-inclusive, 1 warp. MMA path (block_q=32 % 32 == 0).
+        // Verified GPU-correct causal + non-causal (coder-rl runs here, tensor cores).
+        64 => (32, 32),
+        // 128: 16/16 → 52 KB. block_q=16 is sub-warp, so this deliberately routes to
+        // the SCALAR path (correct for any thread count). No symmetric MMA-eligible
+        // tile fits hd128 under 99 KB (32/32 is 107 KB), so hd128 runs on the scalar
+        // GPU kernel — slower than tensor cores but far faster than the CPU fallback.
+        // Verified GPU-correct causal + non-causal (coder7b runs here).
+        128 => (16, 16),
+        // >128 (e.g. 256): no symmetric tile both fits 99 KB and stays MMA-eligible.
+        // Keep 64/64 so the launch cleanly overflows the opt-in guard and the runtime
+        // falls back to the CPU backward (loud, correct). A future layout redesign
+        // (fewer resident tiles) could lift this.
+        _ => (64, 64),
+    }
+}
+
 /// GPU PTX backward dispatch: launches Phase 1 (D-correction) and Phase 2 (dQ/dK/dV)
 /// kernels entirely on GPU. No host-device transfer needed.
 ///
@@ -4561,6 +4610,14 @@ fn flash_attention_backward_gpu(
     scale: f32,
     b: usize, h: usize, s: usize, d: usize,
     is_causal: bool,
+    // Backward tile sizes. MUST equal the values the caller used to synthesize the
+    // Phase-2 PTX (they are baked into the kernel name via
+    // `flash_attention_bwd_main_kernel_name` AND into the SMEM offsets in the PTX
+    // body), because this function derives the launch grid, block dims, and the
+    // dynamic-SMEM request from them. In production both sides call
+    // `select_backward_blocks(head_dim)` so they agree; the test FFI passes explicit
+    // values that match the test's codegen config.
+    block_q: i64, block_kv: i64,
     phase1_ptx_ptr: i64, phase1_name_ptr: i64,
     phase2_ptx_ptr: i64, phase2_name_ptr: i64,
 ) -> i64 {
@@ -4577,10 +4634,6 @@ fn flash_attention_backward_gpu(
     let out_t = NslTensor::from_ptr(out_ptr);
 
     let total_qkv = b * h * s * d;
-
-    // Block sizes must match compile-time PTX constants
-    let block_q: i64 = 64;
-    let block_kv: i64 = 64;
 
     // ── Allocate D correction vector [b*h*s] on GPU ──
     let d_buf = inner::alloc_managed(b * h * s * 4);
@@ -4820,6 +4873,43 @@ fn flash_attention_backward_gpu(
     list
 }
 
+/// Test-only GPU backward probe with **explicit** block sizes — a thin wrapper over
+/// `flash_attention_backward_gpu` that bypasses the production `select_backward_blocks`
+/// table and does NOT fall back to CPU. Returns the `[dQ, dK, dV]` GPU list on a
+/// successful launch, or `0` if the GPU kernel could not run (invalid PTX or the
+/// dynamic-SMEM request exceeded the device opt-in cap for this `block_q`/`block_kv`).
+///
+/// The caller MUST synthesize the Phase-1/Phase-2 PTX with the *same* `block_q`/
+/// `block_kv` so the kernel names and SMEM offsets baked into the PTX match the grid
+/// and dynamic-SMEM request this function derives from them. Used by the block-size
+/// parity sweep in `flash_attention_backward_gpu.rs` to classify each candidate
+/// (block_q, block_kv, head_dim) config as GPU-correct / GPU-wrong / GPU-unavailable
+/// before a config is promoted into `select_backward_blocks`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn nsl_test_flash_attention_backward_blocks(
+    block_q: i64, block_kv: i64,
+    dout_ptr: i64,
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    out_ptr: i64, logsumexp_ptr: i64,
+    scale_bits: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    causal: i64,
+    phase1_ptx_ptr: i64, phase1_name_ptr: i64,
+    phase2_ptx_ptr: i64, phase2_name_ptr: i64,
+) -> i64 {
+    let scale = f32::from_bits(scale_bits as u32);
+    flash_attention_backward_gpu(
+        dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
+        scale,
+        batch as usize, heads as usize, seq_len as usize, head_dim as usize,
+        causal != 0,
+        block_q, block_kv,
+        phase1_ptx_ptr, phase1_name_ptr,
+        phase2_ptx_ptr, phase2_name_ptr,
+    )
+}
+
 ///
 /// Allocates dQ, dK, dV tensors, runs the CPU backward, and returns them
 /// as a tuple of three tensor pointers packed into an NslList.
@@ -4904,9 +4994,16 @@ pub extern "C" fn nsl_flash_attention_backward(
         };
 
         if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h {
+            // Budget-aware backward tile sizes. Must match the sizes codegen used to
+            // synthesize the Phase-2 PTX; both sides derive them from head_dim via
+            // the same `select_backward_blocks` table (codegen's copy lives in
+            // nsl-codegen; this is the runtime mirror — kept identical by
+            // `select_backward_blocks_matches_codegen` in the codegen tests).
+            let (block_q, block_kv) = select_backward_blocks(head_dim);
             let gpu_result = flash_attention_backward_gpu(
                 dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
                 scale, b, h, s, d, is_causal,
+                block_q, block_kv,
                 phase1_ptx_ptr, phase1_name_ptr,
                 phase2_ptx_ptr, phase2_name_ptr,
             );

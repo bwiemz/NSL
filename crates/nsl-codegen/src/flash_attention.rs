@@ -153,13 +153,62 @@ pub fn validate_mma_tile_sizes(
 /// silently truncate the `k_iters`/`n_tiles`/`m_tiles` counts and drop the tail —
 /// a silent-wrong gradient, not a launch failure the runtime could catch — so we
 /// fall back to the scalar q-loop (correct for any head_dim) instead of emitting
-/// MMA PTX. Production block sizes are 64 and real head_dims are multiples of 16,
-/// so this only guards against a future off-grid config.
+/// MMA PTX.
+///
+/// `block_q` must additionally be a multiple of **32** (a full warp): the CTA runs
+/// `block_q` threads and every warp redundantly evaluates the MMA output tile (the
+/// per-warp `atom.add` accumulate is gated to warp 0 — see the PR #325 fix). A
+/// sub-warp `block_q` (e.g. 16) launches a partial warp, so `mma.sync`'s missing
+/// lanes yield NaN/garbage — the GPU sweep (`diag_block_size_sweep`) confirms
+/// `block_q=16` MMA produces NaN. `select_backward_blocks` uses `block_q=16` for
+/// hd128 *precisely* to route it here to the (warp-count-agnostic) scalar path.
 fn backward_uses_mma(config: &FlashAttentionBackwardConfig) -> bool {
     use_mma_path(config.gpu_sm)
-        && config.block_q % MMA_M as i64 == 0
+        && config.block_q % 32 == 0
         && config.block_kv % MMA_M as i64 == 0
         && config.head_dim % MMA_K as i64 == 0
+}
+
+/// Budget-aware backward tile-size selector, keyed by `head_dim`.
+///
+/// The Phase-2 backward keeps six resident SMEM tiles (Q, K, V, dO, dK-local,
+/// dV-local) plus S and (on the MMA path) dP. At `block_q = block_kv = 64` that
+/// footprint is ~134 KB at head_dim=64 and ~230 KB at head_dim=128 — well past the
+/// 99 KB (`101376`-byte) `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` cap shared by sm_80
+/// through sm_120, so those launches fail the opt-in guard and the runtime falls
+/// back to the (correct but slow) CPU backward. This picks smaller tiles for the
+/// large head_dims so the footprint fits and the GPU kernel actually runs.
+///
+/// **Symmetric only** (`block_q == block_kv`): the GPU sweep found asymmetric tiles
+/// give a wrong dV under a causal mask (both MMA and scalar). **MMA needs full
+/// 32-lane warps**, so a `block_q < 32` deliberately routes to the scalar path (see
+/// `backward_uses_mma`). Every entry must fit the *MMA-inclusive* SMEM layout under
+/// 99 KB because the runtime always requests that maximum (it cannot distinguish the
+/// scalar and MMA PTX it is handed).
+///
+/// The runtime keeps a byte-identical copy at
+/// `nsl_runtime::flash_attention::select_backward_blocks` (it cannot depend on
+/// nsl-codegen); `select_backward_blocks_matches_codegen` in the GPU tests pins the
+/// two together. Both sides must agree because the block sizes are baked into the
+/// Phase-2 kernel name (`flash_attention_bwd_main_kernel_name`) and its SMEM offsets
+/// on the codegen side, and into the launch grid + dynamic-SMEM request on the
+/// runtime side.
+pub fn backward_select_blocks(head_dim: i64) -> (i64, i64) {
+    match head_dim {
+        // ≤32: the classic 64/64 tile fits (88.6 KB at hd=32). MMA. Unchanged.
+        hd if hd <= 32 => (64, 64),
+        // 64: 32/32 → 59 KB, 1 warp. MMA (block_q=32 % 32 == 0). GPU-verified correct
+        // causal + non-causal (coder-rl head_dim; runs on tensor cores).
+        64 => (32, 32),
+        // 128: 16/16 → 52 KB. block_q=16 is sub-warp → SCALAR path (correct for any
+        // thread count). No symmetric MMA-eligible tile fits hd128 under 99 KB
+        // (32/32 = 107 KB), so hd128 uses the scalar GPU kernel — slower than tensor
+        // cores but far faster than CPU. GPU-verified correct (coder7b head_dim).
+        128 => (16, 16),
+        // >128: no symmetric tile both fits 99 KB and stays MMA-eligible. Keep 64/64
+        // so the launch cleanly overflows the opt-in guard → loud CPU fallback.
+        _ => (64, 64),
+    }
 }
 
 /// RoPE interleaving style.
