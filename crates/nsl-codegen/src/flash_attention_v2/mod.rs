@@ -1167,15 +1167,37 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
         );
     }
 
-    // ── R7: PCA packing with rope_q=true under @checkpoint ───────
-    if config.segment_masked && config.rope_q {
-        return Err(
+    // ── R7 (Phase 1.3 generalized): rope_q=true under @checkpoint ─
+    // Originally this only refused segment_masked && rope_q (the PCA
+    // packing / RoPE-Q write-back index collision below). Commit 8f774ad
+    // then unblocked *compilation* of the general checkpoint kv-recompute
+    // + rope_q backward (Path B, segment_masked or not) by declaring the
+    // missing %r_rope_cs_row register, but explicitly left Path B's
+    // numerics broken ("GROSS numerical error ... never-GPU-validated
+    // ... tracked for follow-up"). Nothing refused the segment_masked=
+    // false case, so checkpoint policy="full" + rope_q=true — a common
+    // RoPE + gradient-checkpointing training combo — reached the
+    // kv-recompute emitter: for RopeStyle::Adjacent that's silently wrong
+    // gradients, for RopeStyle::HalfSplit it's an uncaught panic in
+    // `emit_rope_k_epilogue` ("only implements RopeStyle::Adjacent").
+    // Refuse both cases until Path B's kv-recompute math is fixed and
+    // GPU-validated.
+    if config.rope_q {
+        return Err(if config.segment_masked {
             "PCA packing with rope_q=true under @checkpoint deferred to v4: \
              the segment-aware causal mask shares index machinery with the \
              RoPE-Q write-back path; safe composition requires the v4 \
              rotated-Q SMEM-staging refactor"
-                .to_string(),
-        );
+                .to_string()
+        } else {
+            "checkpoint policy=\"full\" + rope_q=true composition refused: \
+             the kv-recompute backward (Path B) has a known GROSS numerical \
+             error at multi-tile (RopeStyle::Adjacent) and an unimplemented \
+             path (RopeStyle::HalfSplit) that is not yet fixed or \
+             GPU-validated (tracked for follow-up); disable @checkpoint or \
+             rope_q until Path B's kv-recompute math is corrected"
+                .to_string()
+        });
     }
 
     // ── R9: @paged_kv model + @checkpoint fn composition ─────────
@@ -1403,21 +1425,25 @@ pub fn synthesize_backward_combined(
 ///     rotated) and its else-branch `emit_save_softmax_state` writes the
 ///     row_max/row_sum saves the backward needs.
 ///
-/// Configs the twin cannot serve (sinks, segment_masked, checkpoint,
-/// rope_q) return the fused module unchanged — the runtime's multi-tile
-/// dispatch then fails loudly at kernel-name resolution instead of
-/// producing silent garbage.
+/// Configs the twin cannot serve (sinks, segment_masked, checkpoint) return
+/// the fused module unchanged — the runtime's multi-tile dispatch then
+/// fails loudly at kernel-name resolution instead of producing silent
+/// garbage.
 ///
-/// Phase 1.1 SAFETY (2026-07-08): `rope_q=true` is refused here. RoPE is
-/// applied in launch A (the fused per-tile kernel) via `emit_rope_pair_sweep`,
-/// which indexes cos/sin by the TILE-LOCAL row under a single-tile assumption
-/// (see forward/csha_hooks.rs:1519-1524). At multi-tile every tile past
-/// position 0 is mis-rotated, so the saved rotated projections are wrong and
-/// the whole forward is garbage (GPU-verified: forward parity 4.5-9.8 at
-/// rope_q=true multi-tile vs 3e-3 at rope_q=false). Refuse (no twin -> runtime
-/// rc=500) until the launch-A rope epilogue is reworked to use GLOBAL tile
-/// positions (q_start for Q, k_start for K). Single-tile rope is unaffected
-/// (it uses the fused entry directly, never the twin).
+/// Phase 1.3 (2026-07-08, pt2): `rope_q=true` is NO LONGER refused here.
+/// Launch A's `emit_rope_pair_sweep` used to index cos/sin by the
+/// TILE-LOCAL row under a single-tile assumption (see
+/// forward/csha_hooks.rs:1519-1524), which mis-rotated every tile past
+/// position 0 at multi-tile (GPU-verified: forward parity 4.5-9.8 at
+/// rope_q=true multi-tile vs 3e-3 at rope_q=false). Commit fed9ba3 fixed
+/// this by indexing by the GLOBAL row (`q_start + tile_local_row`), so
+/// rope_q=true multi-tile forward is now correct (parity 4.4e-3 hd32 /
+/// 2.65e-2 hd64) and the twin builds normally for it. NOTE: this is
+/// forward-only — the separate `@checkpoint(policy="full")` + rope_q
+/// backward composition (Path B) is still refused, unconditionally, by
+/// `validate_checkpoint_eligibility`'s R7 (this function already bails
+/// out above when `config.checkpoint.is_some()`, so the two refusals
+/// don't overlap).
 ///
 /// Output is NUL-terminated like `synthesize_flash_attention_ptx_v2`.
 pub fn synthesize_forward_multi_tile_combined(config: &FlashAttentionConfig) -> Vec<u8> {
