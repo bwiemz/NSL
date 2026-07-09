@@ -4622,13 +4622,37 @@ fn flash_attention_backward_gpu(
             grid, block, &args, 0,
         );
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            eprintln!("[flash-bwd] Phase 1 kernel launch failed: {:?}", res);
+            // Do NOT proceed to return zero-initialized gradients — that would
+            // silently corrupt training. Free scratch and signal failure (0) so
+            // the caller falls back to the correct CPU backward. See the return-0
+            // contract in `nsl_flash_attention_backward`.
+            eprintln!(
+                "[flash-bwd] Phase 1 (D-correction) kernel launch FAILED: {:?} — \
+                 refusing to return zero gradients; caller will fall back to CPU. \
+                 (This means the GPU backward PTX is invalid/unlaunchable for this config.)",
+                res
+            );
+            inner::free_managed(d_buf);
+            inner::free_managed(dq_data);
+            inner::free_managed(dk_data);
+            inner::free_managed(dv_data);
+            return 0;
         }
     }
 
     // ── Phase 2: Main backward (dQ/dK/dV) ──
     // Grid: (b*h, ceil(s/block_kv), 1), Block: (block_q, 1, 1)
-    // Shared memory: compute inline (matches backward_shared_mem_bytes)
+    // Shared memory: this must mirror codegen's `backward_shared_mem_bytes`
+    // (nsl-codegen/src/flash_attention.rs). We can't call that function directly
+    // — the crate dependency runs codegen -> runtime, not the reverse — and this
+    // FFI does not receive `gpu_sm`, so the runtime cannot tell whether the PTX it
+    // was handed is the scalar or the MMA variant. The MMA variant reserves an
+    // extra `dp_tile` (same size as the S tile) that the scalar variant does not.
+    // We therefore always request the MMA-inclusive MAXIMUM: over-allocating
+    // dynamic shared for the scalar path is harmless (the kernel simply uses less
+    // of its window), whereas UNDER-allocating for the MMA path is undefined
+    // behavior (the kernel would index past its dynamic-shared window at run time
+    // with no launch-time error). Keep this in sync with `backward_shared_mem_bytes`.
     {
         let pad: i64 = 4;
         let hd_padded = d as i64 + pad;
@@ -4637,6 +4661,7 @@ fn flash_attention_backward_gpu(
             + tile_bytes(block_q, hd_padded) * 2           // Q, dO tiles
             + tile_bytes(block_kv, hd_padded) * 2          // dK, dV accumulators
             + tile_bytes(block_q, block_kv)                // S tile
+            + tile_bytes(block_q, block_kv)                // dP tile (MMA path only; over-allocated for scalar)
             + block_q * 4                                  // D vector
             + block_q * 4                                  // L (logsumexp) vector
         ) as u32;
@@ -4710,11 +4735,48 @@ fn flash_attention_backward_gpu(
             grid, block, &args, shmem,
         );
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            eprintln!("[flash-bwd] Phase 2 kernel launch failed: {:?}", res);
+            // As with Phase 1: never return zero gradients on a launch failure.
+            // Free everything and signal failure (0) so the caller uses the CPU
+            // backward. Common causes: MMA path PTX not yet valid (sm>=80), or the
+            // dynamic shared request exceeds the device opt-in cap for this head_dim.
+            eprintln!(
+                "[flash-bwd] Phase 2 (dQ/dK/dV) kernel launch FAILED: {:?} — \
+                 refusing to return zero gradients; caller will fall back to CPU. \
+                 (shmem request = {} bytes; check MMA-path PTX validity and the \
+                 device MAX_SHARED_MEMORY_PER_BLOCK_OPTIN cap.)",
+                res, shmem
+            );
+            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            inner::free_managed(lse_data);
+            inner::free_managed(d_buf);
+            inner::free_managed(dq_data);
+            inner::free_managed(dk_data);
+            inner::free_managed(dv_data);
+            return 0;
         }
 
-        // Sync after all kernels
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        // Sync after all kernels and check for ASYNCHRONOUS execution faults.
+        // `kernel_launch` only surfaces synchronous enqueue errors (invalid PTX,
+        // bad launch config, shared-mem cap); an illegal shared/global access that
+        // occurs DURING execution surfaces only here (and only in the default,
+        // non-CUDA_SYNC_MODE config `kernel_launch` does not itself check). Route a
+        // faulted sync through the same free-and-return-0 path so the caller falls
+        // back to the correct CPU backward rather than returning corrupt gradients.
+        let sync_rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+        if sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            eprintln!(
+                "[flash-bwd] backward kernels reported an ASYNCHRONOUS execution fault \
+                 on cuCtxSynchronize: {:?} — refusing to return possibly-corrupt \
+                 gradients; caller will fall back to CPU.",
+                sync_rc
+            );
+            inner::free_managed(lse_data);
+            inner::free_managed(d_buf);
+            inner::free_managed(dq_data);
+            inner::free_managed(dk_data);
+            inner::free_managed(dv_data);
+            return 0;
+        }
 
         // Free logsumexp scratch buffer
         inner::free_managed(lse_data);
@@ -4842,11 +4904,24 @@ pub extern "C" fn nsl_flash_attention_backward(
         };
 
         if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h {
-            return flash_attention_backward_gpu(
+            let gpu_result = flash_attention_backward_gpu(
                 dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
                 scale, b, h, s, d, is_causal,
                 phase1_ptx_ptr, phase1_name_ptr,
                 phase2_ptx_ptr, phase2_name_ptr,
+            );
+            if gpu_result != 0 {
+                return gpu_result;
+            }
+            // gpu_result == 0: a kernel launch failed (invalid/unlaunchable PTX for
+            // this config). flash_attention_backward_gpu already logged loudly and
+            // returned NO gradients rather than silently-wrong zeros. Fall through to
+            // the CPU reference below, which computes correct gradients (slower).
+            eprintln!(
+                "[flash-bwd] GPU backward unavailable for this config \
+                 (batch={b}, heads={h}, seq={s}, head_dim={d}) — falling back to the \
+                 CPU reference backward (correct but slow). Fix the GPU PTX to restore \
+                 GPU-speed gradients."
             );
         }
 
