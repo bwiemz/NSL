@@ -362,6 +362,50 @@ fn assert_parity(tag: &str, gpu: &Grads, cpu: &Grads, tol: f32) {
     assert!(failures.is_empty(), "{tag}: {}", failures.join("; "));
 }
 
+/// TEMP localization diagnostic (not a gate): run the MMA path (sm=80) across
+/// minimal shapes and print per-grad max_abs_diff + magnitudes + first samples,
+/// to pinpoint whether the numerical bug is in the core single-tile/single-head
+/// MMA, the multi-tile q-loop accumulation, or the heads mapping.
+#[test]
+#[ignore = "diagnostic: localizes MMA backward numerical bug"]
+fn diag_mma_localize() {
+    if !cuda_available() {
+        return;
+    }
+    let shapes = [
+        (1usize, 1usize, 64usize, 16usize, "core_h1_s64_hd16"),
+        (1, 1, 64, 32, "core_h1_s64_hd32"),
+        (1, 1, 128, 32, "multitile_h1_s128_hd32"),
+        (1, 2, 64, 32, "heads_h2_s64_hd32"),
+        (1, 4, 128, 32, "full_h4_s128_hd32"),
+    ];
+    for (b, h, s, d, tag) in shapes {
+        let (gpu, cpu) = run(b, h, s, d, false, 80);
+        eprintln!("── [{tag}]  b{b} h{h} s{s} hd{d} ──");
+        for (name, g, c) in [
+            ("dq", &gpu.dq, &cpu.dq),
+            ("dk", &gpu.dk, &cpu.dk),
+            ("dv", &gpu.dv, &cpu.dv),
+        ] {
+            let m = max_abs_diff(g, c);
+            eprintln!(
+                "   {name}: max_abs_diff={m:.4e}  |gpu|={:.4e} |ref|={:.4e}  finite={}",
+                max_abs(g),
+                max_abs(c),
+                all_finite(g),
+            );
+            eprintln!(
+                "        gpu[0..6]={:?}",
+                g.iter().take(6).map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "        ref[0..6]={:?}",
+                c.iter().take(6).map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 // ── Baseline: single-tile heads=1, scalar path (harness sanity) ─────────────
 
 /// If this fails, the harness/oracle is wrong (not a multi-tile/heads bug):
@@ -420,20 +464,89 @@ fn plain_bwd_multitile_batch2_heads4_hd16_scalar() {
     }
 }
 
-// ── Documented remaining gaps (NOT yet fixed) ───────────────────────────────
+// ── MMA-path (sm_80+ tensor-core) heads>1 + multi-tile parity ───────────────
 //
-// These assert the CURRENT (broken) state so the gaps stay visible and flip to a
-// failing test — prompting an update — once the underlying kernel work lands.
-// They deliberately avoid numeric-parity assertions: the runtime now falls back
-// to the correct CPU backward on a GPU launch failure (the silent-failure guard),
-// which would make a parity assertion pass WITHOUT exercising the GPU kernel.
+// The GPU MMA backward (`flash_attn_bwd_main` on sm>=80 — the path the RTX 5070
+// Ti / sm_120 takes) is now numerically correct: its m16n8k16 fragment loaders
+// and C stores follow the hardware lane layout (row=laneid/4, col=2*(laneid%4)),
+// and the per-warp `atom.add` accumulate (dV/dK/dQ) is gated to warp 0 — the CTA
+// is block_q=64 threads = 2 warps, each of which independently computes the full
+// MMA tile, so an unguarded atom.add over-counts by the warp count (an exact 2×).
+// These mirror the scalar tests but at gpu_sm=80 so they exercise the tensor-core
+// kernel. The non-triviality guard in `assert_parity` still catches a silent CPU
+// fallback (which would match but never touch the GPU kernel), and the eprintln'd
+// |gpu| vs |ref| makes any fallback visible.
 
-/// Bug #2: the sm_80+ MMA backward path still emits invalid PTX (the MMA q-tile
-/// loop feeds a `.u32 %bwd_mma_addr` into `add.s64`). When fixed, the JIT log
-/// goes clean and this test fails — flip it to assert GPU-path numeric parity.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn mma_backward_phase2_ptx_not_yet_valid() {
+fn mma_bwd_singletile_heads1_hd16() {
+    if !cuda_available() {
+        return;
+    }
+    let (gpu, cpu) = run(1, 1, 64, 16, false, 80);
+    assert_parity("mma_singletile_h1_hd16", &gpu, &cpu, tol_for(16));
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn mma_bwd_multitile_heads4_hd16() {
+    if !cuda_available() {
+        return;
+    }
+    for causal in [false, true] {
+        let (gpu, cpu) = run(1, 4, 128, 16, causal, 80);
+        assert_parity(
+            &format!("mma_multitile_h4_hd16_c{}", causal as u8),
+            &gpu,
+            &cpu,
+            tol_for(16),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn mma_bwd_multitile_heads4_hd32() {
+    if !cuda_available() {
+        return;
+    }
+    for causal in [false, true] {
+        let (gpu, cpu) = run(1, 4, 128, 32, causal, 80);
+        assert_parity(
+            &format!("mma_multitile_h4_hd32_c{}", causal as u8),
+            &gpu,
+            &cpu,
+            tol_for(32),
+        );
+    }
+}
+
+/// batch>1 + heads>1 + multi-tile on the MMA path: exercises grid_x = batch*heads.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn mma_bwd_multitile_batch2_heads4_hd16() {
+    if !cuda_available() {
+        return;
+    }
+    for causal in [false, true] {
+        let (gpu, cpu) = run(2, 4, 128, 16, causal, 80);
+        assert_parity(
+            &format!("mma_multitile_b2_h4_hd16_c{}", causal as u8),
+            &gpu,
+            &cpu,
+            tol_for(16),
+        );
+    }
+}
+
+/// Regression guard: the sm_80+ MMA backward Phase 2 PTX must JIT cleanly. It
+/// previously failed ptxas ("Arguments mismatch for instruction 'add'") because
+/// the MMA tile loaders fed a `.u32` offset into `add.s64`; the u32→u64 widening
+/// restored validity. If this regresses, the runtime silently falls back to the
+/// CPU backward (correct but slow) — this catches it at the PTX level instead.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn mma_backward_phase2_ptx_is_valid() {
     if !cuda_available() {
         return;
     }
@@ -448,28 +561,25 @@ fn mma_backward_phase2_ptx_not_yet_valid() {
     let (_ptx1, ptx2) = synthesize_flash_attention_backward_ptx(&cfg);
     let log = read_jit_log(ptx2.as_ptr() as i64);
     assert!(
-        log.contains("error") || log.contains("mismatch"),
-        "MMA backward Phase 2 PTX is unexpectedly JIT-clean — bug #2 may be fixed. \
-         Flip this test to assert GPU-path numeric parity (run(1,4,128,32,_,80)). JIT log: {log}"
+        !(log.contains("error") || log.contains("mismatch")),
+        "MMA backward Phase 2 PTX failed to JIT (regressed): {log}"
     );
 }
 
-/// Silent-failure guard: an MMA config whose GPU kernel fails to launch must NOT
-/// return zero gradients — the runtime falls back to the correct CPU backward.
-/// This asserts numeric parity for an sm_80 (MMA) config: parity holds ONLY
-/// because the fallback produced correct grads (the non-triviality check in
-/// `assert_parity` would fire on the pre-guard zero-return behavior). When the MMA
-/// path is fixed, this test still passes (now via the real GPU kernel).
+/// Silent-failure guard: an MMA config whose kernel genuinely cannot launch must
+/// NOT return zero gradients — the runtime must fall back to the correct CPU
+/// backward. head_dim=64 exceeds the shared-memory opt-in cap at block=64 (see
+/// `plain_bwd_shared_budget_ceiling_is_hd32`), so its GPU launch fails; the
+/// fallback must still produce correct grads (zeros would fail the non-triviality
+/// check in `assert_parity`).
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn mma_config_falls_back_to_correct_grads_not_zeros() {
+fn mma_hd64_falls_back_to_correct_grads_not_zeros() {
     if !cuda_available() {
         return;
     }
-    // gpu_sm=80 selects the (currently invalid) MMA PTX -> launch fails -> CPU
-    // fallback. Correct grads come back; zeros would fail the non-triviality guard.
-    let (gpu, cpu) = run(1, 4, 128, 32, false, 80);
-    assert_parity("mma_fallback_h4_hd32", &gpu, &cpu, tol_for(32));
+    let (gpu, cpu) = run(1, 1, 64, 64, false, 80);
+    assert_parity("mma_hd64_fallback", &gpu, &cpu, tol_for(64));
 }
 
 /// head_dim >= 64 exceeds the resident-tile shared-memory budget at the runtime's
