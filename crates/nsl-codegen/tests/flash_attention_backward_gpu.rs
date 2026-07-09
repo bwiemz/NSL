@@ -29,8 +29,11 @@
 //! `out`; the GPU auto-recomputes logsumexp from q/k (standard logsumexp, matches
 //! the oracle's within tolerance). Compare dQ/dK/dV.
 //!
-//! block_q = block_kv = 64 are hardcoded by the runtime launcher, so "multi-tile"
-//! means seq_len > 64; these tests use seq_len = 128 (2 tiles).
+//! Backward tile sizes are budget-selected per head_dim (`select_backward_blocks`),
+//! not fixed at 64: hd<=32 -> 64/64 (MMA), hd64 -> 32/32 (MMA), hd128 -> 16/16
+//! (scalar). "Multi-tile" therefore means seq_len > block_q; these tests use
+//! seq_len = 128, which is >= 2 tiles for every selected block_q (2 at bq=64, up to
+//! 8 at bq=16). `run()` mirrors production by keying its block sizes off the selector.
 //!
 //! # Running
 //!
@@ -44,12 +47,15 @@
 use std::ffi::CString;
 
 use nsl_codegen::flash_attention::{
-    backward_shared_mem_bytes, flash_attention_bwd_d_kernel_name,
+    backward_select_blocks, backward_shared_mem_bytes, flash_attention_bwd_d_kernel_name,
     flash_attention_bwd_main_kernel_name, synthesize_flash_attention_backward_ptx,
     FlashAttentionBackwardConfig,
 };
 
-use nsl_runtime::flash_attention::{flash_attention_backward_cpu, nsl_flash_attention_backward};
+use nsl_runtime::flash_attention::{
+    flash_attention_backward_cpu, nsl_flash_attention_backward,
+    nsl_test_flash_attention_backward_blocks, select_backward_blocks,
+};
 use nsl_runtime::list::{nsl_list_free, nsl_list_get, nsl_list_new, nsl_list_push};
 use nsl_runtime::tensor::{nsl_tensor_data_ptr, nsl_tensor_zeros_on};
 use nsl_runtime::{nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d, nsl_test_cuda_jit_log};
@@ -258,9 +264,14 @@ fn run(
     );
 
     // ── GPU (system under test) ──
+    // Match the production path: block sizes are budget-selected per head_dim, and
+    // the production FFI (`nsl_flash_attention_backward`) independently derives the
+    // same via `select_backward_blocks`, so the PTX we synthesize here and the grid/
+    // SMEM the runtime computes agree (both keyed off head_dim).
+    let (sel_bq, sel_bkv) = select_backward_blocks(d as i64);
     let cfg = FlashAttentionBackwardConfig {
-        block_q: 64,
-        block_kv: 64,
+        block_q: sel_bq,
+        block_kv: sel_bkv,
         head_dim: d as i64,
         causal,
         gpu_sm,
@@ -310,6 +321,166 @@ fn run(
         Grads { dq: dq_g, dk: dk_g, dv: dv_g },
         Grads { dq: dq_c, dk: dk_c, dv: dv_c },
     )
+}
+
+/// Direct GPU backward probe at **explicit** `(block_q, block_kv)` via the test FFI
+/// `nsl_test_flash_attention_backward_blocks` — synthesizes the Phase-1/2 PTX with
+/// the same block sizes and does NOT fall back to CPU. Returns:
+///   * `Some(Grads)` — the GPU kernel launched and produced gradients, or
+///   * `None`        — the GPU launch failed (invalid PTX or SMEM request over the
+///                     device opt-in cap), i.e. this config would fall back to CPU.
+///
+/// This is the discovery instrument for the block-size sweep: it classifies each
+/// candidate as GPU-correct / GPU-wrong (compare the returned grads to the oracle)
+/// / GPU-unavailable (`None`) without the production `select_backward_blocks` table
+/// getting in the way.
+#[allow(clippy::too_many_arguments)]
+fn gpu_probe(
+    b: usize,
+    h: usize,
+    s: usize,
+    d: usize,
+    causal: bool,
+    gpu_sm: u32,
+    block_q: i64,
+    block_kv: i64,
+) -> (Option<Grads>, Grads) {
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let total = b * h * s * d;
+
+    let q = det_seq(1, total);
+    let k = det_seq(2, total);
+    let v = det_seq(3, total);
+    let dout = det_seq(4, total);
+
+    let (out, lse) = naive_forward(&q, &k, &v, b, h, s, d, scale, causal);
+
+    let mut dq_c = vec![0.0f32; total];
+    let mut dk_c = vec![0.0f32; total];
+    let mut dv_c = vec![0.0f32; total];
+    flash_attention_backward_cpu(
+        &q, &k, &v, &out, &lse, &dout, &mut dq_c, &mut dk_c, &mut dv_c, b, h, s, d, scale, causal,
+    );
+
+    let cfg = FlashAttentionBackwardConfig {
+        block_q,
+        block_kv,
+        head_dim: d as i64,
+        causal,
+        gpu_sm,
+        segment_masked: false,
+    };
+    let (ptx1, ptx2) = synthesize_flash_attention_backward_ptx(&cfg);
+    let name1 = CString::new(flash_attention_bwd_d_kernel_name(&cfg)).unwrap();
+    let name2 = CString::new(flash_attention_bwd_main_kernel_name(&cfg)).unwrap();
+
+    let shape = [b as i64, h as i64, s as i64, d as i64];
+    let q_t = gpu_tensor(&q, &shape);
+    let k_t = gpu_tensor(&k, &shape);
+    let v_t = gpu_tensor(&v, &shape);
+    let out_t = gpu_tensor(&out, &shape);
+    let dout_t = gpu_tensor(&dout, &shape);
+
+    let grads_list = nsl_test_flash_attention_backward_blocks(
+        block_q,
+        block_kv,
+        dout_t,
+        q_t,
+        k_t,
+        v_t,
+        out_t,
+        0, // logsumexp_ptr = 0 -> runtime auto-computes
+        scale.to_bits() as i64,
+        b as i64,
+        h as i64,
+        s as i64,
+        d as i64,
+        causal as i64,
+        ptx1.as_ptr() as i64,
+        name1.as_ptr() as i64,
+        ptx2.as_ptr() as i64,
+        name2.as_ptr() as i64,
+    );
+
+    let _ = (&ptx1, &ptx2, &name1, &name2);
+
+    let gpu = if grads_list == 0 {
+        None
+    } else {
+        Some(Grads {
+            dq: read_gpu(nsl_list_get(grads_list, 0), total),
+            dk: read_gpu(nsl_list_get(grads_list, 1), total),
+            dv: read_gpu(nsl_list_get(grads_list, 2), total),
+        })
+    };
+    (gpu, Grads { dq: dq_c, dk: dk_c, dv: dv_c })
+}
+
+/// EMPIRICAL block-size sweep (diagnostic, not a gate). For each candidate
+/// `(gpu_sm, block_q, block_kv, head_dim)` it runs the GPU backward at those exact
+/// tiles and classifies the result vs the CPU oracle: `OK` (within tol), `WRONG`
+/// (with the observed max ratio, e.g. an exact 2× = redundant-warp bug), or
+/// `UNAVAIL` (launch failed / over the SMEM opt-in cap → CPU fallback). This is
+/// what decides which tiles `select_backward_blocks` may use for hd64/hd128.
+#[test]
+#[ignore = "diagnostic: sweeps backward block sizes for correctness"]
+fn diag_block_size_sweep() {
+    if !cuda_available() {
+        return;
+    }
+    // (gpu_sm, block_q, block_kv, head_dim, note)
+    let candidates = [
+        // ── head_dim = 64 ──
+        (80u32, 64i64, 64i64, 64usize, "MMA sym 64/64 (expect UNAVAIL: ~134KB)"),
+        (80, 64, 32, 64, "MMA asym 64/32 (~84.5KB)"),
+        (80, 32, 32, 64, "MMA sym 32/32, 1 warp (~59KB)"),
+        (75, 64, 32, 64, "scalar asym 64/32"),
+        (75, 32, 32, 64, "scalar sym 32/32"),
+        // ── head_dim = 128 ──
+        (80, 32, 16, 128, "MMA asym 32/16 (~70KB) <- key hd128 MMA candidate"),
+        (80, 32, 32, 128, "MMA sym 32/32 (expect UNAVAIL: ~107KB)"),
+        (80, 16, 16, 128, "MMA sub-warp 16/16 (expect WRONG: <32 lanes)"),
+        (75, 32, 16, 128, "scalar asym 32/16"),
+        (75, 16, 16, 128, "scalar sym 16/16 (~52KB)"),
+    ];
+    let (b, h, s) = (1usize, 2usize, 128usize);
+    for causal in [false, true] {
+        eprintln!("\n══════ causal={causal}  (b={b} h={h} s={s}) ══════");
+        for (gpu_sm, bq, bkv, hd, note) in candidates {
+            let (gpu, cpu) = gpu_probe(b, h, s, hd, causal, gpu_sm, bq, bkv);
+            let path = if gpu_sm >= 80 { "MMA " } else { "scal" };
+            match gpu {
+                None => eprintln!(
+                    "  sm{gpu_sm} {path} q{bq:<2} kv{bkv:<2} hd{hd:<3} -> UNAVAIL (CPU fallback)   | {note}"
+                ),
+                Some(g) => {
+                    let tol = tol_for(hd);
+                    let mut verdict = "OK   ";
+                    let mut detail = String::new();
+                    for (name, gg, cc) in [
+                        ("dq", &g.dq, &cpu.dq),
+                        ("dk", &g.dk, &cpu.dk),
+                        ("dv", &g.dv, &cpu.dv),
+                    ] {
+                        let m = max_abs_diff(gg, cc);
+                        let rmag = max_abs(cc);
+                        let gmag = max_abs(gg);
+                        let ratio = if rmag > 1e-6 { gmag / rmag } else { 0.0 };
+                        if !all_finite(gg) {
+                            verdict = "WRONG";
+                            detail.push_str(&format!(" {name}=NaN"));
+                        } else if m > tol {
+                            verdict = "WRONG";
+                            detail.push_str(&format!(" {name}(d={m:.2e},ratio={ratio:.3})"));
+                        }
+                    }
+                    eprintln!(
+                        "  sm{gpu_sm} {path} q{bq:<2} kv{bkv:<2} hd{hd:<3} -> {verdict}{detail:<40} | {note}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Tolerance per head_dim: MMA uses tf32 for the matmuls, so error scales with
@@ -566,44 +737,107 @@ fn mma_backward_phase2_ptx_is_valid() {
     );
 }
 
-/// Silent-failure guard: an MMA config whose kernel genuinely cannot launch must
-/// NOT return zero gradients — the runtime must fall back to the correct CPU
-/// backward. head_dim=64 exceeds the shared-memory opt-in cap at block=64 (see
-/// `plain_bwd_shared_budget_ceiling_is_hd32`), so its GPU launch fails; the
-/// fallback must still produce correct grads (zeros would fail the non-triviality
-/// check in `assert_parity`).
+// ── Block-size/shared-budget redesign: hd64/hd128 now run on GPU ────────────────
+//
+// Before the `select_backward_blocks` selector the backward used a fixed 64/64 tile,
+// whose resident-tile SMEM footprint (~118 KB at hd64, ~230 KB at hd128) blew past
+// the 99 KB opt-in cap on every sm_80..sm_120 device, so hd64/hd128 ALWAYS fell back
+// to the (correct but slow) CPU backward. The selector shrinks the tiles per head_dim
+// so the footprint fits and the GPU kernel launches. These gates use `gpu_probe` (the
+// no-fallback test FFI): a `Some` result PROVES the GPU kernel ran — a CPU fallback
+// would return `None`, so a fallback can't masquerade as a pass here.
+
+/// head_dim=64 now runs on the **MMA (tensor-core)** GPU path. `select_backward_blocks(64)`
+/// = (32,32): symmetric (dodges the asymmetric-causal dV bug), block_q=32 = one full
+/// warp (MMA-eligible), ~59 KB MMA-inclusive < 99 KB cap. This is the coder-rl head_dim.
+/// Exercises heads>1, batch>1, multi-tile (seq=128 > block_q=32), causal + non-causal.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn mma_hd64_falls_back_to_correct_grads_not_zeros() {
+fn mma_hd64_runs_on_gpu_not_cpu_fallback() {
     if !cuda_available() {
         return;
     }
-    let (gpu, cpu) = run(1, 1, 64, 64, false, 80);
-    assert_parity("mma_hd64_fallback", &gpu, &cpu, tol_for(64));
+    let (bq, bkv) = select_backward_blocks(64);
+    assert_eq!((bq, bkv), (32, 32), "selector regressed for hd64");
+    for causal in [false, true] {
+        let (gpu, cpu) = gpu_probe(2, 4, 128, 64, causal, 80, bq, bkv);
+        let gpu = gpu.expect(
+            "hd64 must LAUNCH on the GPU (32/32 fits the 99 KB opt-in cap); \
+             `None` means it fell back to CPU — the redesign regressed",
+        );
+        assert_parity(&format!("mma_hd64_gpu_c{}", causal as u8), &gpu, &cpu, tol_for(64));
+    }
 }
 
-/// head_dim >= 64 exceeds the resident-tile shared-memory budget at the runtime's
-/// fixed block_q=block_kv=64 (hd64 needs ~118.5 KB > the sm_120 99 KB opt-in cap),
-/// so the GPU kernel cannot launch and the runtime falls back to CPU. This host
-/// assertion documents the ceiling; lifting it needs a block-size/layout redesign.
+/// head_dim=128 now runs on the **scalar** GPU path. `select_backward_blocks(128)` =
+/// (16,16): symmetric, but block_q=16 is sub-warp so `backward_uses_mma` is false and
+/// codegen emits the (warp-count-agnostic, dimension-robust) scalar kernel — even at
+/// sm_80+, because no symmetric MMA-eligible tile fits hd128 under 99 KB. ~52 KB. This
+/// is the coder7b head_dim: scalar-on-GPU is slower than tensor cores but far faster
+/// than the previous CPU fallback. Exercises heads>1, multi-tile, causal + non-causal.
 #[test]
-fn plain_bwd_shared_budget_ceiling_is_hd32() {
-    let mk = |hd: i64| FlashAttentionBackwardConfig {
-        block_q: 64,
-        block_kv: 64,
-        head_dim: hd,
-        causal: false,
-        gpu_sm: 80,
-        segment_masked: false,
+#[ignore = "requires CUDA GPU"]
+fn scalar_hd128_runs_on_gpu_not_cpu_fallback() {
+    if !cuda_available() {
+        return;
+    }
+    let (bq, bkv) = select_backward_blocks(128);
+    assert_eq!((bq, bkv), (16, 16), "selector regressed for hd128");
+    for causal in [false, true] {
+        let (gpu, cpu) = gpu_probe(1, 2, 128, 128, causal, 80, bq, bkv);
+        let gpu = gpu.expect(
+            "hd128 must LAUNCH on the GPU (16/16 scalar fits the cap); \
+             `None` means it fell back to CPU — the redesign regressed",
+        );
+        assert_parity(&format!("scalar_hd128_gpu_c{}", causal as u8), &gpu, &cpu, tol_for(128));
+    }
+}
+
+/// The runtime's `select_backward_blocks` mirror MUST equal codegen's authoritative
+/// `backward_select_blocks` for every head_dim. They are baked into the Phase-2 kernel
+/// name (codegen) and the launch grid + dynamic-SMEM request (runtime); if they ever
+/// disagree, the runtime would launch a kernel whose tile geometry differs from the
+/// grid/SMEM it set up — silent corruption. Host-only (no GPU needed).
+#[test]
+fn select_backward_blocks_matches_codegen() {
+    for hd in [8i64, 16, 32, 48, 64, 96, 128, 256] {
+        assert_eq!(
+            select_backward_blocks(hd),
+            nsl_codegen::flash_attention::backward_select_blocks(hd),
+            "runtime/codegen backward block-size selectors disagree at head_dim={hd}",
+        );
+    }
+}
+
+/// The whole point of the redesign: after selection, EVERY production head_dim's
+/// backward fits the 99 KB opt-in cap under the MMA-INCLUSIVE layout the runtime always
+/// requests (it can't tell scalar vs MMA PTX apart), so the GPU kernel launches instead
+/// of falling back to CPU. Also pins the symmetric-only invariant (asymmetric tiles have
+/// the causal dV bug). Host-only. Replaces the old `plain_bwd_shared_budget_ceiling_is_hd32`,
+/// whose ceiling this work lifts.
+#[test]
+fn selector_keeps_every_head_dim_within_opt_in_budget() {
+    // sm_80..sm_120 MAX_SHARED_MEMORY_PER_BLOCK_OPTIN.
+    const OPTIN_CAP: i64 = 99 * 1024; // 101376
+    // MMA-inclusive SMEM — mirrors the runtime's Phase-2 request formula exactly
+    // (K,V + Q,dO + dK,dV tiles, each padded head_dim; S + dP; D + L vectors).
+    let mma_inclusive = |bq: i64, bkv: i64, hd: i64| -> i64 {
+        let hdp = hd + 4; // BWD_PAD
+        let tb = |r: i64, c: i64| r * c * 4;
+        tb(bkv, hdp) * 2 + tb(bq, hdp) * 2 + tb(bkv, hdp) * 2 + tb(bq, bkv) * 2 + bq * 4 * 2
     };
-    // sm_120 (RTX 5070 Ti) MAX_SHARED_MEMORY_PER_BLOCK_OPTIN.
-    const OPTIN_CAP: u32 = 99 * 1024;
-    assert!(
-        backward_shared_mem_bytes(&mk(32)) <= OPTIN_CAP,
-        "head_dim=32 must fit the opt-in cap"
-    );
-    assert!(
-        backward_shared_mem_bytes(&mk(64)) > OPTIN_CAP,
-        "head_dim=64 is expected to exceed the opt-in cap (block-size redesign needed)"
-    );
+    for hd in [16i64, 32, 64, 128] {
+        let (bq, bkv) = select_backward_blocks(hd);
+        assert_eq!(bq, bkv, "selector must stay symmetric at hd{hd} (asymmetric = causal dV bug)");
+        let smem = mma_inclusive(bq, bkv, hd);
+        assert!(
+            smem <= OPTIN_CAP,
+            "hd{hd} at {bq}/{bkv} needs {smem} B > {OPTIN_CAP} B opt-in cap — would fall back to CPU",
+        );
+    }
+    // hd=32 keeps the classic 64/64 tile (unchanged, byte-identical PTX for the common case).
+    assert_eq!(select_backward_blocks(32), (64, 64));
+    // hd>128 has no fitting symmetric MMA-eligible tile: documented CPU fallback (64/64 overflows).
+    assert_eq!(select_backward_blocks(256), (64, 64));
+    assert!(mma_inclusive(64, 64, 256) > OPTIN_CAP, "hd256 is the documented CPU-fallback case");
 }

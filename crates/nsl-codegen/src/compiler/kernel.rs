@@ -1559,10 +1559,16 @@ impl Compiler<'_> {
                     ))
                 })?;
 
-            // Embed backward PTX alongside forward
+            // Embed backward PTX alongside forward.
+            // Backward tiles are budget-selected per head_dim (decoupled from the
+            // forward's tiles) so hd64/hd128 fit the 99 KB SMEM opt-in cap and run on
+            // GPU rather than falling back to CPU. The runtime mirrors this via
+            // `select_backward_blocks(head_dim)`; the two must stay in agreement.
+            let (bwd_block_q, bwd_block_kv) =
+                crate::flash_attention::backward_select_blocks(config.head_dim);
             let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
-                block_q: config.block_q,
-                block_kv: config.block_kv,
+                block_q: bwd_block_q,
+                block_kv: bwd_block_kv,
                 head_dim: config.head_dim,
                 causal: config.causal,
                 gpu_sm: config.gpu_sm,
@@ -1746,10 +1752,16 @@ impl Compiler<'_> {
                 _ => (None, None),
             };
 
-            // Embed backward PTX alongside forward
+            // Embed backward PTX alongside forward.
+            // Backward tiles are budget-selected per head_dim (decoupled from the
+            // forward's tiles) so hd64/hd128 fit the 99 KB SMEM opt-in cap and run on
+            // GPU rather than falling back to CPU. The runtime mirrors this via
+            // `select_backward_blocks(head_dim)`; the two must stay in agreement.
+            let (bwd_block_q, bwd_block_kv) =
+                crate::flash_attention::backward_select_blocks(config.head_dim);
             let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
-                block_q: config.block_q,
-                block_kv: config.block_kv,
+                block_q: bwd_block_q,
+                block_kv: bwd_block_kv,
                 head_dim: config.head_dim,
                 causal: config.causal,
                 gpu_sm: config.gpu_sm,
