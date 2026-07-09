@@ -3386,6 +3386,18 @@ const BWD_PAD: i64 = 4;
 fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
     let kernel_name = flash_attention_bwd_main_kernel_name(config);
 
+    // Dynamic shared memory, declared at MODULE scope (before the entry).
+    // `backward_shared_mem_bytes` exceeds the 48 KB static-shared cap for all but
+    // the smallest head_dim (e.g. 70.5 KB at head_dim=32), so a fixed-size static
+    // `.shared` array inside the function fails at launch with
+    // CUDA_ERROR_INVALID_VALUE. A dynamic `.extern .shared` window (sized per
+    // launch) is required; PTX requires it at module scope, mirroring the v2
+    // emitter (flash_attention_v2/mod.rs). The runtime launcher computes the same
+    // size via its own copy of the layout formula and passes it as the dynamic
+    // shared request; `kernel_launch` opts in via
+    // cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) for any non-zero request.
+    ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+
     // Entry point
     ptx.push_str(&format!(".visible .entry {} (\n", kernel_name));
     ptx.push_str("    .param .u64 param_dout,\n");
@@ -3402,13 +3414,6 @@ fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    .param .u64 param_head_dim\n");
     ptx.push_str(")\n");
     ptx.push_str("{\n");
-
-    // Shared memory
-    let shmem_bytes = backward_shared_mem_bytes(config);
-    ptx.push_str(&format!(
-        "    .shared .align 16 .b8 shmem[{}];\n\n",
-        shmem_bytes
-    ));
 
     emit_bwd_main_registers(ptx, config);
     if use_mma_path(config.gpu_sm) {
@@ -3449,7 +3454,17 @@ fn emit_bwd_main_registers(ptx: &mut String, _config: &FlashAttentionBackwardCon
     ptx.push_str("    .reg .f32 %f_d_val;\n");
     ptx.push_str("    .reg .f32 %f_l_val;\n");
     ptx.push_str("    .reg .f32 %f_tmp;\n");
-    ptx.push_str("    .reg .f32 %f_discard;  // sink for atom.shared.add.f32 return value\n\n");
+    ptx.push_str("    .reg .f32 %f_discard;  // sink for atom.shared.add.f32 return value\n");
+    // SMEM addressing prolog — the emit_smem_store / emit_smem_load / emit_smem_atom
+    // helpers (used throughout both the scalar and MMA q-tile loops) address shared
+    // memory as `add.s64 %smem_addr, %shmem_base, <offset>` + `st/ld/atom.shared
+    // [%smem_addr]`. Without these declarations and the generic-address init the
+    // whole Phase 2 kernel is invalid PTX (undeclared %smem_addr/%shmem_base). The
+    // `.shared shmem[...]` array is declared by `emit_flash_attention_bwd_main`
+    // before this function runs, so `cvta.shared.u64 %shmem_base, shmem` resolves.
+    ptx.push_str("    .reg .u64 %smem_addr;\n");
+    ptx.push_str("    .reg .u64 %shmem_base;\n");
+    ptx.push_str("    cvta.shared.u64 %shmem_base, shmem;\n\n");
 }
 
 /// Load kernel parameters into registers.
@@ -6584,18 +6599,24 @@ mod tests {
     fn test_bwd_main_shared_mem_size() {
         let cfg = bwd_config(false);
         let shmem = backward_shared_mem_bytes(&cfg);
-        // block_q=64, block_kv=64, head_dim=64, pad=4, hd_padded=68
-        // K: 64*68*4=17408, V: same, Q: 64*68*4=17408, dO: same
-        // dK: 17408, dV: 17408
-        // S_tile: 64*64*4=16384, D: 64*4=256, L: 64*4=256
-        // Total: 6*17408 + 16384 + 256 + 256 = 104448 + 16896 = 121344
-        // ... just check it's a reasonable size
+        // `backward_shared_mem_bytes` is the authoritative layout size the runtime
+        // passes as the DYNAMIC shared request (the runtime keeps its own matching
+        // copy of this formula). For head_dim=64, pad=4, hd_padded=68:
+        //   6*17408 (K,V,Q,dO,dK,dV) + 16384 (S) + 256 (D) + 256 (L) = 121344 bytes.
+        // That exceeds the 48 KB static cap (and the 99 KB opt-in for hd>=64), so
+        // Phase 2 declares a module-scope DYNAMIC `.extern .shared` window rather
+        // than a fixed-size static array (a static array > 48 KB fails to launch
+        // with CUDA_ERROR_INVALID_VALUE). See emit_flash_attention_bwd_main.
         assert!(shmem > 0, "shmem must be > 0");
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
         assert!(
-            ptx.contains(&format!("shmem[{}]", shmem)),
-            "shared memory declaration matches computed size"
+            ptx.contains(".extern .shared .align 16 .b8 shmem[]"),
+            "Phase 2 must declare dynamic (module-scope) shared memory `.extern .shared ... shmem[]`"
+        );
+        assert!(
+            !ptx.contains(&format!("shmem[{}]", shmem)),
+            "Phase 2 must NOT declare a fixed-size static shared array (exceeds the static cap)"
         );
     }
 
