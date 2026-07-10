@@ -508,7 +508,7 @@ pub fn emit_fp8_matmul_ptx_wgmma(k: usize) -> String {
     // Store (simplified — each warp group thread stores its accumulators)
     writeln!(ptx, "    // Store output").unwrap();
     for r in 0..32 {
-        writeln!(ptx, "    // acc{r} → output[...]").unwrap();
+        writeln!(ptx, "    // acc{r} -> output[...]").unwrap();
     }
 
     writeln!(ptx, "    ret;").unwrap();

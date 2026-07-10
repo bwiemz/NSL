@@ -661,7 +661,7 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     // for the full rationale + invariant #19. IA³ shares the same runtime
     // K-loop structure but without adapter A/B staging or epilogue MMA.
     let (n, k) = (config.n, config.k);
-    ptx.push_str("    // ==== Runtime PTX K-loop (IA³) ====\n");
+    ptx.push_str("    // ==== Runtime PTX K-loop (IA3) ====\n");
     ptx.push_str("    mov.u32 %k_iter, 0;\n");
     ptx.push_str("k_loop_start:\n");
     ptx.push_str("    cvt.u64.u32 %rd_k_iter, %k_iter;\n");

@@ -260,7 +260,7 @@ fn csha_l2_rope_ptx_assembles_on_sm120() {
 /// target's SM, not the old hardcoded `80`.
 ///
 /// `emit_ptx_header` (v1) maps SM versions to three discrete PTX targets:
-///   * `gpu_sm < 80`  → `.target sm_52`  (scalar path)
+///   * `gpu_sm < 80`  → `.target sm_70`  (scalar path)
 ///   * `gpu_sm >= 80` → `.target sm_80`  (MMA path)
 ///   * `gpu_sm >= 90` → `.target sm_90`  (Hopper / Blackwell)
 ///

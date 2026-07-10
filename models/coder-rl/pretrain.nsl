@@ -1,0 +1,81 @@
+# models/coder-rl/pretrain.nsl
+# ============================================================================
+# NSL-Coder-RL — Phase 0: From-scratch pretraining (roadmap 4.1)
+# ============================================================================
+# The production pretraining composition, end to end, with ZERO external files:
+#
+#   * stdlib GQA transformer (model.nsl: RMSNorm + GroupedQueryAttention with
+#     6Q/3KV heads, head_dim=64, SwiGLU, weight-tied LM head, ~10.1M params).
+#     Under `--source-ad` the SDPA core lowers to the fused flash-attention
+#     kernels; the backward dispatches through `select_backward_blocks` and
+#     runs the sm_80+ MMA (tensor-core) path on hd64 (PRs #324/#325/#326/#328).
+#   * FASE Deferred optimizer path: `grad_accumulation > 1` + AdamW under
+#     `--source-ad` activates the deferred consume-per-param hook (exact
+#     windowed AdamW: v = beta2*v + (1-beta2)*(mean g)^2).
+#   * Two-phase gradient clipping: `grad_clip` + accumulation exercises the
+#     global-norm Phase A/B split.
+#
+# Honest composition note (roadmap 4.1): `@pca(strategy=per_document)` packed
+# per-document CTA kernels attach ONLY to the CSHA `@flash_attention`
+# model-method path (admission in `maybe_synthesize_csha_training_ptx`), not
+# to the stdlib GQA SDPA op this model trains through. Composing packing with
+# THIS model therefore isn't possible today; the WGGO consumption layer
+# (`[pca] wggo-override-*` verdicts) makes that visible instead of silent.
+# See `examples/csha_toy_pretrain_hd32.nsl` for the CSHA-path composition.
+#
+# Run (from repo root; --source-ad is MANDATORY — tape AD lowers SDPA naively
+# and leaves GPU params frozen, so a tape run would silently not train):
+#
+#   nsl run --source-ad models/coder-rl/pretrain.nsl
+#
+# The corpus is synthetic constant tokens, so loss must fall from the uniform
+# baseline (~ln 4096 = 8.32) toward 0 as the model memorizes — that visible
+# collapse is the 4.2 smoke signal. Swap `full(...)` for the real corpus
+# (`load_mmap("models/coder-rl/data/sft_tokens.bin", 3)`, built by
+# models/coder-rl/data/prepare_sft.py) for a real run.
+
+from model import NSLCoderRL
+from nsl.nn.losses import cross_entropy
+
+# ─── Knobs ───
+# DataLoader/train arguments must be compile-time literals (a `const` does not
+# propagate into DataLoader kwargs), so the shape lives inline below:
+#   tokens 524288 | batch_size=4 | seq_len=1024 | grad_accumulation=4 | epochs=1
+#   = 128 micro-batches = 32 optimizer steps.
+# The 4.2/4.3 e2e harness rewrites the literals via exact-string replacement —
+# keep each knob's spelling unique in this file.
+
+print("================================================================")
+print("  NSL-Coder-RL — Phase 0: pretraining (FASE Deferred + GQA SDPA)")
+print("  10.1M params | 6 layers | D=384 | GQA 6Q/3KV | head_dim=64")
+print("================================================================")
+
+let m = NSLCoderRL()
+m.to(cuda)
+print("Model created and transferred to GPU")
+
+# Synthetic corpus: constant tokens. DataLoader synthesizes next-token labels
+# when none are passed (same pattern as coder1b's FASE demo).
+let tokens = full([524288], 1.0)
+let loader = DataLoader(tokens, batch_size=4, seq_len=1024, shuffle=false, drop_last=true)
+
+print("Uniform CE baseline (~ln 4096):")
+print(8.31776616671934)
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            # One bare float per micro-step — the 4.2 harness parses these.
+            print(loss.item())
+
+print("LOSS_STREAM_END")
+model_save(m, "models/coder-rl/checkpoints/coder_rl_pretrain.nslm")
+print("Pretraining checkpoint: models/coder-rl/checkpoints/coder_rl_pretrain.nslm")

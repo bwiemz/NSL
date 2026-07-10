@@ -647,7 +647,7 @@ pub fn emit_ia3_tile_bases(ptx: &mut String) {
 /// already predicates on n_real per column); γ OOB loads on tail columns only
 /// produce garbage values that are never written to y.
 pub fn emit_ia3_load_gamma(ptx: &mut String) {
-    ptx.push_str("    // Load per-thread γ slice (2 cols per thread)\n");
+    ptx.push_str("    // Load per-thread gamma slice (2 cols per thread)\n");
     // col_base_in_tile = (tid % 4) * 2
     ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
     ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
@@ -678,7 +678,7 @@ pub fn emit_ia3_load_gamma(ptx: &mut String) {
 /// Must be called AFTER emit_ia3_load_gamma (uses %gamma0/%gamma1) and
 /// BEFORE emit_ia3_store_output.
 pub fn emit_ia3_gamma_multiply(ptx: &mut String) {
-    ptx.push_str("    // Broadcast-multiply main_accum by γ (per-thread 2-col)\n");
+    ptx.push_str("    // Broadcast-multiply main_accum by gamma (per-thread 2-col)\n");
     // First D-fragment half (rows 0 and 8 of the tile):
     ptx.push_str("    mul.f32 %main_accum0, %main_accum0, %gamma0;\n");
     ptx.push_str("    mul.f32 %main_accum1, %main_accum1, %gamma1;\n");

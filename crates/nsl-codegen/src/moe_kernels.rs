@@ -17,7 +17,7 @@
 pub fn gen_moe_token_sort_histogram_ptx() -> Vec<u8> {
     let ptx = r#"
 .version 7.0
-.target sm_52
+.target sm_70
 .address_size 64
 
 .visible .entry moe_token_sort_histogram(
@@ -106,7 +106,7 @@ HIST_DONE:
 pub fn gen_moe_scatter_ptx() -> Vec<u8> {
     let ptx = r#"
 .version 7.0
-.target sm_52
+.target sm_70
 .address_size 64
 
 .visible .entry moe_scatter(
@@ -205,7 +205,7 @@ pub fn gen_expert_batched_gemm_ptx_tiled(tile_size: usize) -> Vec<u8> {
     let mut ptx = String::with_capacity(8192);
 
     writeln!(ptx, ".version 7.0").unwrap();
-    writeln!(ptx, ".target sm_52").unwrap();
+    writeln!(ptx, ".target sm_70").unwrap();
     writeln!(ptx, ".address_size 64").unwrap();
     writeln!(ptx).unwrap();
 
@@ -424,7 +424,7 @@ pub fn gen_expert_batched_gemm_ptx() -> Vec<u8> {
 pub fn gen_moe_gather_ptx() -> Vec<u8> {
     let ptx = r#"
 .version 7.0
-.target sm_52
+.target sm_70
 .address_size 64
 
 .visible .entry moe_gather(
@@ -605,7 +605,7 @@ mod tests {
             ptx.contains("boundaries_ptr"),
             "expert boundaries parameter"
         );
-        assert!(ptx.contains(".target sm_52"), "scalar targets sm_52");
+        assert!(ptx.contains(".target sm_70"), "scalar targets sm_52");
         assert!(
             !ptx.contains("mma.sync.aligned"),
             "scalar should NOT have MMA"

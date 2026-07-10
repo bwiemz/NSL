@@ -1715,13 +1715,21 @@ fn lower_single_op(
                     (v1, v2, v3, v4)
                 };
 
+                // Tier-B sentinel pair (planner spec §4): the plain (non-CSHA)
+                // SDPA backward has no Tier-B-on variant, so pass the disabled
+                // sentinel — via the construction helper, per the discipline
+                // documented on `nsl_flash_attention_backward` (inline 0,0
+                // literals are what let the pre-fix 16-arg call rot silently).
+                let [tier_b_ptx, tier_b_name] =
+                    crate::pca_tier_b::tier_b_disabled_sentinel(builder);
                 let list = call(
                     compiler,
                     builder,
                     "nsl_flash_attention_backward",
                     &[dout, q, k, v, fwd_out, lse_null,
                       scale_bits, batch, heads, seq_len, head_dim,
-                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name],
+                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name,
+                      tier_b_ptx, tier_b_name],
                 )?;
                 compiler.flash_attn_bwd_cache.insert(fwd_out, list);
                 list

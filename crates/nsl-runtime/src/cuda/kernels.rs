@@ -9,7 +9,7 @@
 
 pub(crate) const ADD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_add_f32(\n\
@@ -44,7 +44,7 @@ DONE: ret;\n\
 
 pub(crate) const SUB_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sub_f32(\n\
@@ -79,7 +79,7 @@ DONE: ret;\n\
 
 pub(crate) const MUL_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_mul_f32(\n\
@@ -114,7 +114,7 @@ DONE: ret;\n\
 
 pub(crate) const DIV_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_div_f32(\n\
@@ -149,7 +149,7 @@ DONE: ret;\n\
 
 pub(crate) const ROTATE_HALF_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_rotate_half_f32(\n\
@@ -198,7 +198,7 @@ DONE: ret;\n\
 
 pub(crate) const NEG_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_neg_f32(\n\
@@ -230,7 +230,7 @@ DONE: ret;\n\
 
 pub(crate) const RELU_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_relu_f32(\n\
@@ -265,7 +265,7 @@ DONE: ret;\n\
 
 pub(crate) const MUL_SCALAR_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_mul_scalar_f32(\n\
@@ -307,7 +307,7 @@ DONE: ret;\n\
 
 pub(crate) const ADD_SCALAR_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_add_scalar_f32(\n\
@@ -343,7 +343,7 @@ DONE: ret;\n\
 /// exp(x) = 2^(x * log2(e))  using ex2.approx
 pub(crate) const EXP_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_exp_f32(\n\
@@ -377,7 +377,7 @@ DONE: ret;\n\
 /// ln(x) = log2(x) * ln(2)  using lg2.approx
 pub(crate) const LOG_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_log_f32(\n\
@@ -410,7 +410,7 @@ DONE: ret;\n\
 
 pub(crate) const SQRT_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sqrt_f32(\n\
@@ -442,7 +442,7 @@ DONE: ret;\n\
 
 pub(crate) const ABS_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_abs_f32(\n\
@@ -475,7 +475,7 @@ DONE: ret;\n\
 /// sign(x): 1.0 if x>0, -1.0 if x<0, 0.0 if x==0
 pub(crate) const SIGN_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sign_f32(\n\
@@ -515,7 +515,7 @@ DONE: ret;\n\
 /// sigmoid(x) = 1 / (1 + exp(-x))
 pub(crate) const SIGMOID_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sigmoid_f32(\n\
@@ -554,7 +554,7 @@ DONE: ret;\n\
 /// relu_backward: out[i] = input[i] > 0 ? grad[i] : 0
 pub(crate) const RELU_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_relu_backward_f32(\n\
@@ -593,7 +593,7 @@ DONE: ret;\n\
 /// saved[i] is the sigmoid output
 pub(crate) const SIGMOID_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sigmoid_backward_f32(\n\
@@ -632,7 +632,7 @@ DONE: ret;\n\
 /// saved[i] is the tanh output
 pub(crate) const TANH_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_tanh_backward_f32(\n\
@@ -673,7 +673,7 @@ DONE: ret;\n\
 /// out[i] = grad[i] * 0.5 * (1 + tanh(k) + x * sech2 * (0.107032*x + 0.797885))
 pub(crate) const GELU_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_gelu_backward_f32(\n\
@@ -730,7 +730,7 @@ DONE: ret;\n\
 /// silu_backward: sig = 1/(1+exp(-x)); out[i] = grad[i] * (sig + x*sig*(1-sig))
 pub(crate) const SILU_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_silu_backward_f32(\n\
@@ -775,7 +775,7 @@ DONE: ret;\n\
 /// clamp_backward: out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0
 pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_clamp_backward_f32(\n\
@@ -817,7 +817,7 @@ DONE: ret;\n\
 /// sin(x) using sin.approx.f32
 pub(crate) const SIN_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_sin_f32(\n\
@@ -850,7 +850,7 @@ DONE: ret;\n\
 /// cos(x) using cos.approx.f32
 pub(crate) const COS_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_cos_f32(\n\
@@ -884,7 +884,7 @@ DONE: ret;\n\
 /// sigmoid(1.702*x) = 1 / (1 + exp(-1.702*x))
 pub(crate) const GELU_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_gelu_f32(\n\
@@ -923,7 +923,7 @@ DONE: ret;\n\
 /// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
 pub(crate) const SILU_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_silu_f32(\n\
@@ -961,7 +961,7 @@ DONE: ret;\n\
 /// clamp(x, lo, hi): max(lo, min(x, hi))
 pub(crate) const CLAMP_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_clamp_f32(\n\
@@ -997,7 +997,7 @@ DONE: ret;\n\
 /// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
 pub(crate) const TANH_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_tanh_f32(\n\

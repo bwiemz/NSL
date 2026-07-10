@@ -142,3 +142,67 @@ fn helpers_actually_fired() {
          This suggests the SMEM addressing helpers were not called."
     );
 }
+
+/// PTX must be pure ASCII. ptxas on CUDA >= 13 hard-rejects non-ASCII bytes
+/// anywhere in the module — including comments — with "Unexpected non-ASCII
+/// character" / CUDA_ERROR_INVALID_PTX. CUDA 12 tolerated them, which let
+/// em-dashes and arrows live in emitter comment strings for months: the plain
+/// SDPA forward silently returned zeros on CUDA 13.3 (launch rc ignored by
+/// call sites) and GPU pretraining walked its loss UP to the uniform plateau.
+/// Lints every synthesizable variant: the full forward config matrix, the
+/// multi-tile combined module, and the backward phase pair at every
+/// selector-reachable tile shape.
+#[test]
+fn all_ptx_is_pure_ascii() {
+    use nsl_codegen::flash_attention::{
+        backward_select_blocks, synthesize_flash_attention_backward_ptx,
+        FlashAttentionBackwardConfig,
+    };
+    let mut checked = 0usize;
+    let mut check = |label: String, bytes: &[u8]| {
+        if let Some(pos) = bytes.iter().position(|&b| b >= 0x80) {
+            let line = bytes[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+            let ctx_start = bytes[..pos].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            let ctx_end = bytes[pos..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| pos + i);
+            panic!(
+                "{label}: non-ASCII byte 0x{:02x} at PTX line {line}: {:?} — \
+                 ptxas (CUDA >= 13) rejects this with CUDA_ERROR_INVALID_PTX",
+                bytes[pos],
+                String::from_utf8_lossy(&bytes[ctx_start..ctx_end]),
+            );
+        }
+        checked += 1;
+    };
+
+    for (i, cfg) in configs_to_lint().iter().enumerate() {
+        check(format!("forward config #{i}"), &synthesize_flash_attention_ptx(cfg));
+        // The combined (multi-tile twin) module only composes on the plain
+        // path; CSHA-extras configs assert on unsupported rope styles inside
+        // the v2 emitter (pre-existing refusal, not a lint concern).
+        if cfg.csha.is_none() {
+            check(
+                format!("forward combined config #{i}"),
+                &nsl_codegen::flash_attention_v2::synthesize_forward_multi_tile_combined(cfg),
+            );
+        }
+    }
+    for hd in [16i64, 32, 64, 128] {
+        let (bq, bkv) = backward_select_blocks(hd);
+        for causal in [false, true] {
+            for gpu_sm in [75u32, 80] {
+                let cfg = FlashAttentionBackwardConfig {
+                    block_q: bq,
+                    block_kv: bkv,
+                    head_dim: hd,
+                    causal,
+                    gpu_sm,
+                    segment_masked: false,
+                };
+                let (p1, p2) = synthesize_flash_attention_backward_ptx(&cfg);
+                check(format!("bwd p1 hd{hd} c{} sm{gpu_sm}", causal as u8), &p1);
+                check(format!("bwd p2 hd{hd} c{} sm{gpu_sm}", causal as u8), &p2);
+            }
+        }
+    }
+    assert!(checked > 20, "lint must actually cover the matrix (got {checked})");
+}
