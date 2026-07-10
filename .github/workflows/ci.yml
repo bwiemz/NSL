@@ -263,3 +263,94 @@ jobs:
 
       - name: Run nsl-test lib unit tests
         run: cargo test -p nsl-test --lib
+
+  # The `cuda` feature gates the entire crates/nsl-runtime/src/cuda module. No
+  # other job builds it, so until this existed that code -- roughly 25 tests, 59
+  # hand-written PTX modules, and the GPU caching allocator -- was never even
+  # compiled in CI. Three latent bugs lived there for months as a result.
+  #
+  # No GPU is required. The CUDA toolkit supplies ptxas (which assembles PTX
+  # without a device) and a libcuda stub to link against. The tests selected
+  # below deliberately touch no CUDA API: the allocator tests drive a mock
+  # driver, and the PTX gate only shells out to ptxas.
+  cuda-feature:
+    name: CUDA feature — compile + GPU-free tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install CUDA toolkit (nvcc, ptxas, cudart stubs, cuBLAS)
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          # cudarc's `cuda-version-from-build-system` feature shells out to
+          # `nvcc --version`, so nvcc must be present even though nothing here
+          # compiles CUDA C. Any version cudarc knows about will do.
+          cuda: '12.6.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cuda-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Show toolkit
+        run: |
+          echo "CUDA_PATH=$CUDA_PATH"
+          nvcc --version
+          ptxas --version
+
+      # cudarc links -lcuda and -lcublas. On a driverless runner libcuda.so comes
+      # from the toolkit's stubs directory; cudarc's build script already adds
+      # lib64/stubs to the rustc link search path, but the linker and the loader
+      # each need it too.
+      - name: Export stub library paths
+        run: |
+          echo "LIBRARY_PATH=$CUDA_PATH/lib64/stubs:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$CUDA_PATH/lib64/stubs:$CUDA_PATH/lib64:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+
+      # Compile-coverage for the whole feature. This alone catches any change
+      # that breaks the cuda module, which nothing else in CI does.
+      - name: Build workspace with --features cuda
+        run: cargo build --workspace --features cuda
+
+      # Assembles all 59 hand-written PTX modules with ptxas. Needs no GPU.
+      # Would have caught the invalid `.reg .f32 %f<3>` in BIAS_ADD_F32_PTX.
+      - name: PTX assembly gate
+        run: |
+          cargo test -p nsl-runtime --features cuda --lib -- \
+            --exact cuda::tests::all_handwritten_ptx_assembles_with_ptxas --nocapture
+
+      # Pure logic over a mock driver; no CUDA calls. Would have caught the
+      # small-pool free-list bug.
+      - name: GPU caching allocator tests
+        run: cargo test -p nsl-runtime --features cuda --lib -- cuda::caching_allocator
+
+      # These live in nsl-codegen and need only ptxas, not the cuda feature.
+      # They silently no-op on a runner without a toolkit, which is exactly how
+      # the NUL-terminator bug survived.
+      - name: PTX emitter ptxas validation
+        run: |
+          cargo test -p nsl-codegen --test csha_ptx_ptxas_validation
+          cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas
+          cargo test -p nsl-codegen --test fused_linear_ce_fp16_ptxas
+          cargo test -p nsl-codegen --test fused_linear_ce_large_vocab_ptxas
+
+      # Guard the blind spot itself: assert ptxas was actually found, so these
+      # gates can never silently degrade to no-ops on a misconfigured runner.
+      - name: Assert the ptxas gates did not skip
+        run: |
+          out=$(cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas -- --nocapture 2>&1)
+          echo "$out" | grep -q "ptxas accepted" \
+            || (echo "::error::ptxas gate skipped -- toolkit not visible to the tests" && exit 1)
