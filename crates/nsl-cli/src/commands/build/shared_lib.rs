@@ -390,13 +390,21 @@ fn run_build_shared_multi(
                 }
             }
         } else {
+            // Only the entry module's object may define the export-table
+            // FFIs (`nsl_get_num_exports` / `nsl_get_export_name`); this
+            // module still needs `shared_lib` (PIC) since its object is
+            // linked into the same shared library. See
+            // `CompileOptions::emit_export_table` for why the two are
+            // separate flags.
+            let mut import_options = options.clone();
+            import_options.emit_export_table = false;
             match nsl_codegen::compile_module(
                 &mod_data.ast,
                 &interner,
                 &mod_data.type_map,
                 &mod_data.module_prefix,
                 dump_ir,
-                options,
+                &import_options,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => {

@@ -311,6 +311,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
                 shared_lib: false,
+                emit_export_table: false,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
                 pca_user_strategies: Vec::new(),
