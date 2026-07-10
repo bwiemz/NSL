@@ -144,8 +144,18 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    // The codegen emits two symbols per @export:
+    //   - `<name>`              : typed C-ABI wrapper, (model_ptr, desc0, ..., ret_desc) -> i32
+    //   - `<name>__nsl_dispatch`: packed-array bridge, (model_ptr, in_descs, n_in, out_descs, n_out) -> i64
+    // The kernel must call the `__nsl_dispatch` variant because that matches
+    // the `ExportFnPtr` ABI used by `nsl_ort_kernel_compute`. Calling the
+    // plain `<name>` C wrapper with the dispatch ABI is UB (wrong arg count
+    // and wrong return type), and causes ORT to silently return None outputs.
+    let base_bytes = (*entry).name_cstr.as_bytes(); // without NUL
+    let mut dispatch_bytes = Vec::with_capacity(base_bytes.len() + b"__nsl_dispatch".len() + 1);
+    dispatch_bytes.extend_from_slice(base_bytes);
+    dispatch_bytes.extend_from_slice(b"__nsl_dispatch\0");
+    let raw_fn = resolve_self_symbol(dispatch_bytes.as_ptr() as *const c_char);
     if raw_fn == 0 {
         // Symbol not found. Return null kernel; ORT treats this as a
         // create-kernel failure. (No status-returning variant in V1 —
