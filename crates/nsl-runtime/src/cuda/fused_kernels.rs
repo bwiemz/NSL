@@ -124,6 +124,10 @@ DONE: ret;\n\
 // Grid:  (ceil(rows*cols / 256), 1, 1)
 // Block: (256, 1, 1)
 // Params: in ptr, bias ptr, out ptr, total (rows*cols, u64), cols (u64)
+//
+// `.reg .f32 %f<4>` is deliberate: `%f<N>` declares %f0..%f(N-1) and the body
+// uses %f3 for the sum. This read `%f<3>` until 2026-07, so ptxas rejected the
+// module with `Unknown symbol '%f3'` and every GPU bias_add launch failed.
 // ---------------------------------------------------------------------------
 pub(crate) const BIAS_ADD_F32_PTX: &str = "\
 .version 7.0\n\
@@ -136,7 +140,7 @@ pub(crate) const BIAS_ADD_F32_PTX: &str = "\
 ) {\n\
     .reg .u64 %rd<10>;\n\
     .reg .u32 %r<4>;\n\
-    .reg .f32 %f<3>;\n\
+    .reg .f32 %f<4>;\n\
     .reg .pred %p1;\n\
     ld.param.u64 %rd1, [inp];\n\
     ld.param.u64 %rd2, [bias];\n\
@@ -2818,3 +2822,44 @@ DQFP8_STORE:\n\
     st.global.f32 [%rd6], %f1;\n\
 DQFP8_DONE: ret;\n\
 }\0";
+
+/// Every hand-written PTX module in this file, paired with its constant name.
+///
+/// Consumed by the `ptxas` gate in `super::tests`, which assembles each one.
+/// These modules only ever reach `cuModuleLoadData` at runtime, so a syntax error
+/// in them is invisible until a kernel launch fails on a real GPU.
+#[cfg(test)]
+pub(crate) const ALL_PTX: &[(&str, &str)] = &[
+    ("EMBEDDING_F32_PTX", EMBEDDING_F32_PTX),
+    ("EMBEDDING_I32IDX_PTX", EMBEDDING_I32IDX_PTX),
+    ("BIAS_ADD_F32_PTX", BIAS_ADD_F32_PTX),
+    ("SOFTMAX_F32_PTX", SOFTMAX_F32_PTX),
+    ("LOG_SOFTMAX_F32_PTX", LOG_SOFTMAX_F32_PTX),
+    ("SUM_DIM_F32_PTX", SUM_DIM_F32_PTX),
+    ("MAX_DIM_F32_PTX", MAX_DIM_F32_PTX),
+    ("GLOBAL_SUM_F32_PTX", GLOBAL_SUM_F32_PTX),
+    ("LAYERNORM_F32_PTX", LAYERNORM_F32_PTX),
+    ("RMSNORM_F32_PTX", RMSNORM_F32_PTX),
+    ("SCATTER_ADD_F32_PTX", SCATTER_ADD_F32_PTX),
+    ("GATHER_F32_PTX", GATHER_F32_PTX),
+    ("GATHER_I32IDX_PTX", GATHER_I32IDX_PTX),
+    ("CONV2D_F32_PTX", CONV2D_F32_PTX),
+    ("MAXPOOL2D_F32_PTX", MAXPOOL2D_F32_PTX),
+    ("DROPOUT_F32_PTX", DROPOUT_F32_PTX),
+    ("BMM_F32_PTX", BMM_F32_PTX),
+    ("GPU_SLICE_F32_PTX", GPU_SLICE_F32_PTX),
+    ("STRIDED_COPY_F32_PTX", STRIDED_COPY_F32_PTX),
+    ("CSR_SPMM_F32_PTX", CSR_SPMM_F32_PTX),
+    ("COO_SPMM_F32_PTX", COO_SPMM_F32_PTX),
+    ("BSR_SPMM_F32_PTX", BSR_SPMM_F32_PTX),
+    ("CSR_SPMV_F32_PTX", CSR_SPMV_F32_PTX),
+    ("COO_SPMV_F32_PTX", COO_SPMV_F32_PTX),
+    ("DET_GLOBAL_SUM_F32_PTX", DET_GLOBAL_SUM_F32_PTX),
+    ("DET_SUM_DIM_F32_PTX", DET_SUM_DIM_F32_PTX),
+    ("DET_SCATTER_ADD_F32_PTX", DET_SCATTER_ADD_F32_PTX),
+    ("TENSOR_STATS_F32_PTX", TENSOR_STATS_F32_PTX),
+    ("DEQUANT_INT8_PER_HEAD_F32_PTX", DEQUANT_INT8_PER_HEAD_F32_PTX),
+    ("DEQUANT_INT8_PER_TOKEN_F32_PTX", DEQUANT_INT8_PER_TOKEN_F32_PTX),
+    ("DEQUANT_INT4_PER_GROUP_F32_PTX", DEQUANT_INT4_PER_GROUP_F32_PTX),
+    ("DEQUANT_FP8_E4M3_F32_PTX", DEQUANT_FP8_E4M3_F32_PTX),
+];

@@ -1033,3 +1033,40 @@ pub(crate) const TANH_F32_PTX: &str = "\
     st.global.f32 [%rd6], %fs1;\n\
 DONE: ret;\n\
 }\0";
+
+
+/// Every hand-written PTX module in this file, paired with its constant name.
+///
+/// Consumed by the `ptxas` gate in `super::tests`, which assembles each one.
+/// These modules are only ever fed to `cuModuleLoadData` at runtime, so a syntax
+/// error in them is invisible until a kernel launch fails on a real GPU.
+#[cfg(test)]
+pub(crate) const ALL_PTX: &[(&str, &str)] = &[
+    ("ADD_F32_PTX", ADD_F32_PTX),
+    ("SUB_F32_PTX", SUB_F32_PTX),
+    ("MUL_F32_PTX", MUL_F32_PTX),
+    ("DIV_F32_PTX", DIV_F32_PTX),
+    ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
+    ("NEG_F32_PTX", NEG_F32_PTX),
+    ("RELU_F32_PTX", RELU_F32_PTX),
+    ("MUL_SCALAR_F32_PTX", MUL_SCALAR_F32_PTX),
+    ("ADD_SCALAR_F32_PTX", ADD_SCALAR_F32_PTX),
+    ("EXP_F32_PTX", EXP_F32_PTX),
+    ("LOG_F32_PTX", LOG_F32_PTX),
+    ("SQRT_F32_PTX", SQRT_F32_PTX),
+    ("ABS_F32_PTX", ABS_F32_PTX),
+    ("SIGN_F32_PTX", SIGN_F32_PTX),
+    ("SIGMOID_F32_PTX", SIGMOID_F32_PTX),
+    ("RELU_BACKWARD_F32_PTX", RELU_BACKWARD_F32_PTX),
+    ("SIGMOID_BACKWARD_F32_PTX", SIGMOID_BACKWARD_F32_PTX),
+    ("TANH_BACKWARD_F32_PTX", TANH_BACKWARD_F32_PTX),
+    ("GELU_BACKWARD_F32_PTX", GELU_BACKWARD_F32_PTX),
+    ("SILU_BACKWARD_F32_PTX", SILU_BACKWARD_F32_PTX),
+    ("CLAMP_BACKWARD_F32_PTX", CLAMP_BACKWARD_F32_PTX),
+    ("SIN_F32_PTX", SIN_F32_PTX),
+    ("COS_F32_PTX", COS_F32_PTX),
+    ("GELU_F32_PTX", GELU_F32_PTX),
+    ("SILU_F32_PTX", SILU_F32_PTX),
+    ("CLAMP_F32_PTX", CLAMP_F32_PTX),
+    ("TANH_F32_PTX", TANH_F32_PTX),
+];

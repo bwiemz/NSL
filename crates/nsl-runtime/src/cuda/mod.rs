@@ -4612,6 +4612,98 @@ mod tests {
     use super::*;
     use crate::tensor::{DTYPE_F32, NslTensor};
 
+    /// Locate `ptxas` under `$CUDA_PATH`/`$CUDA_HOME`, else on PATH.
+    fn find_ptxas() -> Option<std::path::PathBuf> {
+        for root in ["CUDA_PATH", "CUDA_HOME"] {
+            if let Ok(p) = std::env::var(root) {
+                let cand = std::path::Path::new(&p).join("bin").join("ptxas");
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|d| d.join("ptxas"))
+            .find(|c| c.is_file())
+    }
+
+    /// Lowest real SASS architecture CUDA 13's `ptxas` still generates code for.
+    ///
+    /// A module's `.target sm_XY` names a *virtual* ISA floor, not a real GPU.
+    /// `ptxas` compiles `.target sm_52` for any newer `--gpu-name` just fine; what
+    /// CUDA 13 removed is SASS generation for pre-Turing *real* architectures, so
+    /// `--gpu-name sm_52` and `--gpu-name sm_70` are rejected. Assemble each module
+    /// for the newest of (its declared target, this floor).
+    const MIN_PTXAS_GPU_ARCH: u32 = 75;
+
+    /// Assemble every hand-written PTX module in `kernels.rs` and `fused_kernels.rs`.
+    ///
+    /// These modules are only ever handed to `cuModuleLoadData`, so a syntax error
+    /// in one stays invisible until a kernel launch fails on a real GPU. `ptxas`
+    /// needs no GPU, only the CUDA toolkit, so this gate runs anywhere the
+    /// toolkit is installed.
+    #[test]
+    fn all_handwritten_ptx_assembles_with_ptxas() {
+        let Some(ptxas) = find_ptxas() else {
+            eprintln!("ptxas not found (no CUDA toolkit); skipping PTX assembly gate");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nsl_ptx_gate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mut failures = Vec::new();
+        let modules = super::kernels::ALL_PTX
+            .iter()
+            .chain(super::fused_kernels::ALL_PTX.iter());
+
+        for (name, ptx) in modules {
+            // These constants carry a trailing NUL for `cuModuleLoadData`. ptxas
+            // reads an embedded NUL as a premature EOF, so strip it before writing.
+            let src = ptx.strip_suffix('\0').unwrap_or(ptx);
+            assert!(
+                !src.contains('\0'),
+                "{name}: NUL byte inside the PTX body, not just at the end"
+            );
+
+            let target = src
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(".target "))
+                .unwrap_or_else(|| panic!("{name}: PTX has no .target directive"))
+                .trim();
+            let declared: u32 = target
+                .strip_prefix("sm_")
+                .and_then(|n| n.trim_end_matches('a').parse().ok())
+                .unwrap_or_else(|| panic!("{name}: unparsable .target `{target}`"));
+            let gpu_arch = format!("sm_{}", declared.max(MIN_PTXAS_GPU_ARCH));
+
+            let in_path = dir.join(format!("{name}.ptx"));
+            std::fs::write(&in_path, src).expect("write ptx");
+            let out = std::process::Command::new(&ptxas)
+                .args(["--gpu-name", &gpu_arch, "-o"])
+                .arg(dir.join(format!("{name}.cubin")))
+                .arg(&in_path)
+                .output()
+                .expect("run ptxas");
+
+            if !out.status.success() {
+                failures.push(format!(
+                    "{name} (.target {target}, --gpu-name {gpu_arch}):\n{}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            failures.is_empty(),
+            "ptxas rejected {} hand-written PTX module(s):\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+
+
     const VEC_ADD_PTX: &str = "\
 .version 7.0
 .target sm_52
@@ -4660,18 +4752,21 @@ DONE:
         let n: usize = 1024;
         let size_bytes = n * std::mem::size_of::<f32>();
 
-        // Allocate unified memory
+        // Despite the name, `alloc_managed` does NOT return unified memory: it
+        // routes through the caching allocator, which calls `cuMemAlloc_v2`.
+        // `cuMemAllocManaged` is never called anywhere in the runtime. These are
+        // plain device pointers, so the host must stage through memcpy. An
+        // earlier version of this test built a `&mut [f32]` over `a` and wrote
+        // through it, which segfaulted and aborted the entire test binary --
+        // masking every cuda test ordered after it.
         let a = inner::alloc_managed(size_bytes);
         let b = inner::alloc_managed(size_bytes);
         let c = inner::alloc_managed(size_bytes);
 
-        // Fill a and b on CPU (unified memory allows this)
-        let a_slice = unsafe { std::slice::from_raw_parts_mut(a as *mut f32, n) };
-        let b_slice = unsafe { std::slice::from_raw_parts_mut(b as *mut f32, n) };
-        for i in 0..n {
-            a_slice[i] = i as f32;
-            b_slice[i] = (i * 2) as f32;
-        }
+        let a_host: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let b_host: Vec<f32> = (0..n).map(|i| (i * 2) as f32).collect();
+        inner::memcpy_htod(a, a_host.as_ptr() as *const c_void, size_bytes);
+        inner::memcpy_htod(b, b_host.as_ptr() as *const c_void, size_bytes);
 
         // Launch kernel
         let n_val = n as u64;
@@ -4705,11 +4800,12 @@ DONE:
             assert_eq!(sync as u32, 0, "sync failed");
         }
 
-        // Verify results on CPU (unified memory)
-        let c_slice = unsafe { std::slice::from_raw_parts(c as *const f32, n) };
+        // Copy results back to the host before reading them.
+        let mut c_host = vec![0.0f32; n];
+        inner::memcpy_dtoh(c_host.as_mut_ptr() as *mut c_void, c, size_bytes);
         for i in 0..n {
             let expected = (i + i * 2) as f32;
-            assert_eq!(c_slice[i], expected, "mismatch at index {}", i);
+            assert_eq!(c_host[i], expected, "mismatch at index {}", i);
         }
 
         // Cleanup
