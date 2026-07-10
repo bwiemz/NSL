@@ -6,10 +6,10 @@ Two tests live here:
   for the ``nslpy.onnxrt.make_onnx_node`` helper. Only requires the ``onnx``
   package; runs on every CI lane that has the package installed.
 
-* ``test_session_load_and_run_calls_nsl_add`` — full ORT round-trip. Builds a
-  shared library from a one-line NSL source, loads it through ORT, and runs a
-  1-node graph. Gated on ``NSL_TEST_ONNX_RT=1`` AND ``onnxruntime`` installed
-  because:
+* ``test_session_load_and_run_calls_nsl_scale2`` — full ORT round-trip. Builds
+  a shared library from a one-line NSL source (``scale2(a) -> a * 2.0``),
+  loads it through ORT, and runs a 1-node graph. Gated on
+  ``NSL_TEST_ONNX_RT=1`` AND ``onnxruntime`` installed because:
 
     1. ``onnxruntime`` is a 100+ MB wheel we don't want to pull on every CI
        lane;
@@ -113,8 +113,8 @@ def test_make_onnx_node_produces_valid_proto():
         "produced .so/.dll exports RegisterCustomOps"
     ),
 )
-def test_session_load_and_run_calls_nsl_add():
-    """End-to-end: NSL @export add() invoked through ORT InferenceSession."""
+def test_session_load_and_run_calls_nsl_scale2():
+    """End-to-end: NSL @export scale2() invoked through ORT InferenceSession."""
     import numpy as np
     import onnxruntime as ort
     from onnx import helper, TensorProto
@@ -129,14 +129,13 @@ def test_session_load_and_run_calls_nsl_add():
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        src = tmp / "add.nsl"
+        src = tmp / "scale2.nsl"
         src.write_text(
             "@export\n"
-            "fn add(a: Tensor<[4], f32>, b: Tensor<[4], f32>)"
-            " -> Tensor<[4], f32>:\n"
-            "    return a + b\n"
+            "fn scale2(a: Tensor<[4], f32>) -> Tensor<[4], f32>:\n"
+            "    return a * 2.0\n"
         )
-        lib = tmp / f"add.{_lib_ext()}"
+        lib = tmp / f"scale2.{_lib_ext()}"
 
         env = os.environ.copy()
         stdlib = WORKSPACE / "stdlib"
@@ -163,16 +162,15 @@ def test_session_load_and_run_calls_nsl_add():
         sess_opts = ort.SessionOptions()
         register_nsl_provider(sess_opts, str(lib))
 
-        node = make_onnx_node("add", inputs=["a", "b"], outputs=["c"])
+        node = make_onnx_node("scale2", inputs=["a"], outputs=["b"])
         graph = helper.make_graph(
             nodes=[node],
             name="t",
             inputs=[
                 helper.make_tensor_value_info("a", TensorProto.FLOAT, [4]),
-                helper.make_tensor_value_info("b", TensorProto.FLOAT, [4]),
             ],
             outputs=[
-                helper.make_tensor_value_info("c", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("b", TensorProto.FLOAT, [4]),
             ],
         )
         model = helper.make_model(
@@ -183,17 +181,14 @@ def test_session_load_and_run_calls_nsl_add():
         # packages default make_model() to a higher ir_version (e.g. 13),
         # which ORT rejects with "Unsupported model IR version". Pin it
         # explicitly so this test is independent of the installed onnx version.
-        model.ir_version = 10
+        model.ir_version = 8
 
         sess = ort.InferenceSession(model.SerializeToString(), sess_opts)
         out = sess.run(
-            ["c"],
-            {
-                "a": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
-                "b": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
-            },
+            ["b"],
+            {"a": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)},
         )
-        assert out[0].tolist() == [11.0, 22.0, 33.0, 44.0]
+        assert out[0].tolist() == [2.0, 4.0, 6.0, 8.0]
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation helper

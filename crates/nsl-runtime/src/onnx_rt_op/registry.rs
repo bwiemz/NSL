@@ -14,18 +14,26 @@
 //!
 //! ## Symbol resolution
 //!
-//! Each vtable's `CreateKernel` resolves the export by name *from this same
-//! `.so`/`.dll`* via:
-//! - Unix: `dlsym(RTLD_DEFAULT, name)`.
+//! The dispatch symbol for each export is resolved **once** at
+//! `RegisterCustomOps` time and cached in `PerExportVtable::cached_dispatch_fn`.
+//! This avoids a repeated dlsym on every session creation and is the point at
+//! which the RTLD_LOCAL workaround matters most (see `resolve_self_symbol`).
+//!
+//! Platform-specific handle acquisition:
+//! - macOS: `dlsym(RTLD_SELF, name)` — searches only the calling library,
+//!   works even under RTLD_LOCAL.
+//! - Linux: `dladdr(&resolve_self_symbol, &info)` to get our `.so` path,
+//!   then `dlopen(path, RTLD_NOLOAD)` to retrieve the existing handle,
+//!   then `dlsym(handle, name)`.
 //! - Windows: `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &resolve_export_via_self_dlsym, &out)`
 //!   then `GetProcAddress(out, name)`.
 //!
 //! Spec A's `nsl_model_lookup_function` requires a model handle, which the
 //! ORT kernel doesn't have — ORT loads the `.so` via
 //! `register_custom_ops_library` without ever calling `nsl_model_create`.
-//! v1 is therefore restricted to stateless exports (`model_ptr = 0`); exports
-//! that read weights would need M62c's session-config plumbing to receive a
-//! handle.
+//! v1 is therefore restricted to stateless exports; `model_ptr` is set to the
+//! sentinel `1` (non-zero, never dereferenced) so the codegen-emitted null
+//! check passes. Exports that read weights need M62c's session-config plumbing.
 
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
@@ -46,10 +54,15 @@ struct PerExportVtable {
     vtable: OrtCustomOp,
     /// Backing storage for `vtable.GetName`'s returned pointer.
     name_cstr: CString,
+    /// Dispatch fn resolved once at `RegisterCustomOps` time. `0` means the
+    /// symbol was not found; `CreateKernel`/`CreateKernelV2` return null in
+    /// that case so ORT rejects the op rather than calling an invalid pointer.
+    cached_dispatch_fn: usize,
 }
 
-// SAFETY: `PerExportVtable` contains only read-only function pointers and a
-// `CString`. Once constructed and pushed into `VTABLES` it is never mutated.
+// SAFETY: `PerExportVtable` contains only read-only function pointers, a
+// `CString`, and a `usize`. Once constructed and pushed into `VTABLES` it is
+// never mutated.
 unsafe impl Send for PerExportVtable {}
 unsafe impl Sync for PerExportVtable {}
 
@@ -63,8 +76,8 @@ static VTABLES: OnceLock<Mutex<Vec<Box<PerExportVtable>>>> = OnceLock::new();
 ///
 /// Returns a pointer to a heap-allocated vtable owned by `VTABLES`. The
 /// pointer remains valid until process exit. `idx` is currently unused
-/// (each kernel-create call dlsym's the export by name); kept in the
-/// signature so a future revision can index a direct dispatch table.
+/// (each kernel-create call uses the cached fn ptr); kept in the signature
+/// so a future revision can index a direct dispatch table.
 pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCustomOp {
     let _ = idx;
 
@@ -74,6 +87,19 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
     // codegen-emitted storage living forever (in case future codegen
     // changes that contract).
     let name_cstr = unsafe { CStr::from_ptr(name) }.to_owned();
+
+    // Eagerly resolve the dispatch symbol once at registration time.
+    // We look up `<name>__nsl_dispatch`, NOT `<name>`: the typed `<name>`
+    // symbol takes individual tensor-desc pointers plus an output desc as
+    // separate params, while ExportFnPtr expects the packed-array ABI
+    // (model_ptr, inputs_ptr, n_inputs, outputs_ptr, n_outputs). Calling the
+    // typed wrapper as ExportFnPtr misroutes `n_inputs=1` as the output-desc
+    // pointer, writing into address 0x1 → SIGABRT. See exports.rs L145.
+    let dispatch_cname = {
+        let s = format!("{}__nsl_dispatch", name_cstr.to_string_lossy());
+        CString::new(s).unwrap_or_else(|_| name_cstr.clone())
+    };
+    let cached_dispatch_fn = unsafe { resolve_self_symbol(dispatch_cname.as_ptr()) };
 
     let entry = Box::new(PerExportVtable {
         vtable: OrtCustomOp {
@@ -94,12 +120,11 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             GetVariadicInputHomogeneity: vtable_get_variadic_hom,
             GetVariadicOutputMinArity: vtable_get_variadic_min,
             GetVariadicOutputHomogeneity: vtable_get_variadic_hom,
-            // Post-V1 callbacks — Spec C registers V1 only. These slots
-            // must be populated (ORT 1.16+ reads them unconditionally),
-            // but the v2 paths are never invoked because we set the v1
-            // KernelCompute slot above.
-            CreateKernelV2: vtable_create_kernel_v2_unused,
-            KernelComputeV2: vtable_kernel_compute_v2_unused,
+            // ORT 1.16+ calls V2 callbacks when their slots are non-null,
+            // taking priority over V1. Wire real implementations here so
+            // kernel state is created and compute actually runs.
+            CreateKernelV2: vtable_create_kernel_v2,
+            KernelComputeV2: vtable_kernel_compute_v2,
             InferOutputShapeFn: vtable_infer_output_shape_unused,
             GetStartVersion: vtable_get_start_version,
             GetEndVersion: vtable_get_end_version,
@@ -109,6 +134,7 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             ReleaseAliasMap: vtable_release_alias_map,
         },
         name_cstr,
+        cached_dispatch_fn,
     });
 
     // The Box's heap allocation address is what we return; pushing the Box
@@ -144,21 +170,26 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    let raw_fn = (*entry).cached_dispatch_fn;
     if raw_fn == 0 {
-        // Symbol not found. Return null kernel; ORT treats this as a
-        // create-kernel failure. (No status-returning variant in V1 —
-        // M62c migrates to CreateKernelV2 for proper error reporting.)
+        // Symbol not found at registration time — return null kernel so ORT
+        // rejects this op. (No status-returning variant in V1 — M62c migrates
+        // to CreateKernelV2 for proper error reporting.)
         return std::ptr::null_mut();
     }
-    // SAFETY: dlsym/GetProcAddress returned a non-null pointer to a symbol
-    // codegen emitted with the `ExportFnPtr` signature.
+    // SAFETY: `cached_dispatch_fn` was set by `resolve_self_symbol` to a
+    // non-null pointer to a symbol codegen emitted with the `ExportFnPtr`
+    // signature.
     let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
-        model_ptr: 0, // v1: stateless exports only.
+        // Non-zero sentinel for stateless exports: the codegen-emitted typed
+        // wrapper null-checks model_ptr and returns -1 when it is zero. For
+        // @export functions that are not model methods, model_ptr is never
+        // dereferenced — the null check is the only consumer. Use 1 so the
+        // check passes without providing a real model handle.
+        model_ptr: 1,
     });
     Box::into_raw(state) as *mut c_void
 }
@@ -234,27 +265,51 @@ unsafe extern "C" fn vtable_get_variadic_hom(_op: *const OrtCustomOp) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// V2 / 1.16+ vtable functions — populated with safe stubs.
-//
-// Spec C v1 uses the V1 KernelCompute path. ORT 1.22 still reads these slots
-// during op registration even if it never invokes them through this op, so
-// they must contain valid function pointers.
+// V2 vtable functions — ORT 1.16+ calls these when they are non-null,
+// taking priority over V1 CreateKernel/KernelCompute.
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn vtable_create_kernel_v2_unused(
-    _op: *const OrtCustomOp,
-    _api: *const OrtApi,
+/// V2 CreateKernel — mirrors V1 but reports errors via the return status
+/// and writes the kernel state pointer through `kernel_out`.
+unsafe extern "C" fn vtable_create_kernel_v2(
+    op: *const OrtCustomOp,
+    api: *const OrtApi,
     _info: *const OrtKernelInfo,
-    _kernel_out: *mut *mut c_void,
+    kernel_out: *mut *mut c_void,
 ) -> *mut OrtStatus {
-    // Should never be called — Spec C registers via V1 CreateKernel.
+    let entry = op as *const PerExportVtable;
+    let raw_fn = (*entry).cached_dispatch_fn;
+    if raw_fn == 0 {
+        // Dispatch symbol not found — zero out *kernel_out so ORT sees a
+        // null kernel (not uninitialized stack garbage) and return an error
+        // status so ORT rejects this op cleanly.
+        if !kernel_out.is_null() {
+            *kernel_out = std::ptr::null_mut();
+        }
+        let msg = c"NSL: __nsl_dispatch symbol not found in shared library".as_ptr();
+        return ((*api).CreateStatus)(OrtErrorCode::ORT_INVALID_ARGUMENT, msg);
+    }
+    let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
+    let state = Box::new(NslOrtKernelState {
+        api,
+        fn_ptr,
+        // Non-zero sentinel for stateless exports: see vtable_create_kernel
+        // above for the full rationale. model_ptr=1 bypasses the null check
+        // in the codegen-emitted typed wrapper without being a real model ptr.
+        model_ptr: 1,
+    });
+    *kernel_out = Box::into_raw(state) as *mut c_void;
     std::ptr::null_mut()
 }
 
-unsafe extern "C" fn vtable_kernel_compute_v2_unused(
-    _op_kernel: *mut c_void,
-    _context: *mut OrtKernelContext,
+/// V2 KernelCompute — delegates to the shared `nsl_ort_kernel_compute` body.
+unsafe extern "C" fn vtable_kernel_compute_v2(
+    op_kernel: *mut c_void,
+    context: *mut OrtKernelContext,
 ) -> *mut OrtStatus {
+    if !op_kernel.is_null() {
+        nsl_ort_kernel_compute(op_kernel, context);
+    }
     std::ptr::null_mut()
 }
 
@@ -313,30 +368,69 @@ unsafe extern "C" fn vtable_release_alias_map(
 ///    `nsl_get_num_exports` / `nsl_get_export_name` enumeration FFIs at
 ///    runtime. They may not exist in test binaries; we handle absence by
 ///    returning success with no domain.
-/// 2. Per-export `CreateKernel` looks up the export's NSL function
-///    pointer by name. The codegen-emitted symbol lives in the same .so
-///    as this code, so the same self-dlsym pattern works.
+/// 2. `make_custom_op_for_export` eagerly resolves each export's dispatch
+///    fn at registration time and caches it in `cached_dispatch_fn`.
 ///
-/// **Unix:** `dlsym(RTLD_DEFAULT, name)` — searches the process's loaded
-/// symbol table including this `.so`.
+/// **macOS:** `dlsym(RTLD_SELF, name)` — searches only the calling library's
+/// symbol table. Works even when ORT loaded us with `RTLD_LOCAL` (unlike
+/// `RTLD_DEFAULT`, which searches only the global scope).
+///
+/// **Linux:** `dladdr(&resolve_self_symbol, &info)` to find our `.so` path,
+/// `dlopen(path, RTLD_NOLOAD)` to retrieve the existing in-process handle
+/// without re-executing init, then `dlsym(handle, name)`. `RTLD_DEFAULT`
+/// would miss `RTLD_LOCAL` symbols; the explicit handle bypasses that limit.
 ///
 /// **Windows:** `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &this_fn, &out)`
-/// finds the module containing this function (i.e., our own DLL), then
-/// `GetProcAddress(out, name)`. Mirrors the canonical pattern in
-/// `c_api/mod.rs::nsl_dl_path_for_fn_addr`. We pass our own function's
-/// address as the lookup anchor so the call works equally well from a
-/// `.dll`, `.exe`, or test binary.
+/// finds our DLL, then `GetProcAddress(out, name)`.
 pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     {
         extern "C" {
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
         }
-        // RTLD_DEFAULT is a sentinel: NULL on Linux/macOS (POSIX). It tells
-        // dlsym to search the whole process symbol space, which includes
-        // this .so via the normal global symbol scope.
-        const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
-        let p = dlsym(RTLD_DEFAULT, name_ptr);
+        // RTLD_SELF (-3) searches only the calling library — works even when
+        // ORT loaded us with RTLD_LOCAL.
+        const RTLD_SELF: *mut c_void = (-3isize) as *mut c_void;
+        let p = dlsym(RTLD_SELF, name_ptr);
+        p as usize
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        extern "C" {
+            fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+            fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
+        }
+        #[repr(C)]
+        struct DlInfo {
+            dli_fname: *const c_char,
+            dli_fbase: *mut c_void,
+            dli_sname: *const c_char,
+            dli_saddr: *mut c_void,
+        }
+        // RTLD_DEFAULT misses RTLD_LOCAL symbols on Linux. Workaround:
+        // 1. dladdr on our own address → get the path of our .so.
+        // 2. dlopen(path, RTLD_NOLOAD) → get the existing in-process handle
+        //    without re-executing initializers or changing refcount.
+        // 3. dlsym(handle, sym) finds RTLD_LOCAL symbols in our .so.
+        let mut info = DlInfo {
+            dli_fname: std::ptr::null(),
+            dli_fbase: std::ptr::null_mut(),
+            dli_sname: std::ptr::null(),
+            dli_saddr: std::ptr::null_mut(),
+        };
+        let ok = dladdr(resolve_self_symbol as *const c_void, &mut info);
+        if ok == 0 || info.dli_fname.is_null() {
+            return 0;
+        }
+        // RTLD_LAZY=1, RTLD_NOLOAD=4 (glibc / musl).
+        const RTLD_LAZY: i32 = 1;
+        const RTLD_NOLOAD: i32 = 4;
+        let handle = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY);
+        if handle.is_null() {
+            return 0;
+        }
+        let p = dlsym(handle, name_ptr);
         p as usize
     }
     #[cfg(windows)]

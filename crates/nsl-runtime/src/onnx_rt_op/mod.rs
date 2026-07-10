@@ -65,7 +65,8 @@ pub unsafe extern "C" fn RegisterCustomOps(
     // artifacts where `--features onnx-rt-op` is enabled alongside an
     // `@export`-bearing NSL module. We resolve them at runtime via the
     // same self-dlsym pattern the registry uses for individual exports:
-    // - Unix: `dlsym(RTLD_DEFAULT, ...)`
+    // - macOS: `dlsym(RTLD_SELF, ...)` — searches only the calling library.
+    // - Linux: `dladdr + dlopen(RTLD_NOLOAD) + dlsym` — bypasses RTLD_LOCAL.
     // - Windows: `GetModuleHandleExW(FROM_ADDRESS) + GetProcAddress`.
     //
     // If either symbol is missing (the common case for `cargo test` /
