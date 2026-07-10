@@ -844,6 +844,12 @@ impl Compiler<'_> {
                     &crate::pca_detect::PcaDetectConfig::default(),
                     2,
                 );
+                // The user wrote `@pca(strategy=per_document)` explicitly —
+                // don't let the statistics-only auto-detect heuristic
+                // silently downgrade that opt-in. See
+                // `apply_user_strategy_override`'s doc comment.
+                let detection =
+                    crate::pca_detect::apply_user_strategy_override(detection, true);
                 let admit_cfg = crate::pca_per_doc::PerDocAdmitConfig {
                     enable_per_doc_cta: true,
                     ..crate::pca_per_doc::PerDocAdmitConfig::default()
@@ -863,15 +869,18 @@ impl Compiler<'_> {
                     }
                     Err(reason) => {
                         eprintln!(
-                            "[pca-per-doc] refused: {:?} — falling through to Tier A",
-                            reason
+                            "warning: @pca(strategy=per_document) was requested but could not \
+                             be honored ({reason:?}) — falling through to the segment_id_masked \
+                             Tier A kernel"
                         );
                         None
                     }
                 }
             } else {
                 eprintln!(
-                    "[pca-per-doc] refused: train block's dataset packing config could not be resolved — falling through to Tier A"
+                    "warning: @pca(strategy=per_document) was requested but the train block's \
+                     dataset packing config could not be resolved — falling through to the \
+                     segment_id_masked Tier A kernel"
                 );
                 None
             }

@@ -182,3 +182,83 @@ fn from_semantic_str_explicitly_handles_auto_not_via_fallback() {
         PcaUserStrategy::Auto
     ));
 }
+
+/// Regression: `@pca(strategy=per_document)` must not be silently
+/// downgraded to the segment_id_masked Tier A path just because the
+/// dataset's mean-doc-length/max-seq ratio and σ/μ fall outside the
+/// auto-detect heuristic's thresholds. This is the exact admission
+/// sequence `compiler/kernel.rs`'s per-doc-CTA planner runs: `detect()`
+/// then `apply_user_strategy_override()` then `admit()`.
+#[test]
+fn explicit_per_document_request_is_admitted_even_when_auto_detect_disagrees() {
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use nsl_codegen::pca_detect::{apply_user_strategy_override, detect, DatasetPackingConfig, PcaDetectConfig, PcaStrategy};
+    use nsl_codegen::pca_per_doc::{admit, PerDocAdmitConfig};
+
+    // mean_doc_len/max_seq = 300/1024 ≈ 0.29, above the default 0.25
+    // per_doc_threshold — auto-detect alone picks SegmentIdMasked, but the
+    // docs are still short enough (well under block_q=32... actually not,
+    // so use a block_q that comfortably covers this fixture's docs).
+    let packing_cfg = DatasetPackingConfig {
+        enabled: true,
+        max_sequence_length: 1024,
+        mean_doc_length: Some(300),
+        doc_length_stddev: Some(20),
+        separator_token_id: Some(2),
+    };
+    let training_config = FlashAttentionConfig {
+        block_q: 512,
+        block_kv: 512,
+        head_dim: 32,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        num_sink_tokens: 0,
+        gpu_sm: 75,
+        segment_masked: true,
+        checkpoint: None,
+        csha: Some(CshaExtras {
+            level: 1,
+            save_activations_for_backward: true,
+            ..Default::default()
+        }),
+    };
+    let admit_cfg = PerDocAdmitConfig {
+        enable_per_doc_cta: true,
+        ..PerDocAdmitConfig::default()
+    };
+
+    let auto_detection = detect(&packing_cfg, &PcaDetectConfig::default(), 2);
+    assert_eq!(
+        auto_detection.strategy,
+        PcaStrategy::SegmentIdMasked,
+        "fixture must exercise the disagreement case: auto-detect alone should pick \
+         segment_id_masked for this dataset"
+    );
+
+    // Without the fix: admit() sees the un-overridden auto-detect result and
+    // refuses with WrongStrategy, silently discarding the user's explicit
+    // `@pca(strategy=per_document)` request.
+    let without_override =
+        admit(&auto_detection, &training_config, &packing_cfg, &admit_cfg);
+    assert!(
+        without_override.is_err(),
+        "sanity: this fixture's auto-detect disagreement must actually reject admission \
+         pre-fix, otherwise this test doesn't exercise the bug"
+    );
+
+    // With the fix: the user's explicit request overrides the strategy
+    // label, and every other structural gate still passes, so per-doc CTA
+    // is correctly admitted.
+    let overridden = apply_user_strategy_override(auto_detection, true);
+    let plan = admit(&overridden, &training_config, &packing_cfg, &admit_cfg);
+    assert!(
+        plan.is_ok(),
+        "explicit @pca(strategy=per_document) must be honored once auto-detect's \
+         strategy label is overridden, but admit() still refused: {:?}",
+        plan.err()
+    );
+}
