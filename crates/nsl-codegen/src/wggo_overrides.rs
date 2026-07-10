@@ -88,6 +88,19 @@ pub enum OverrideRejectReason {
     PruneWholeBlockUnsupported,
     /// Prune refusal — spec §3.7. Two prune decisions in the same plan conflict.
     PruneConflictingDecisions,
+    // PCA packing (errata E2 / audit gap #4):
+    /// WGGO requested packing (`packing_mode > 0`) but the module synthesized
+    /// no segment-masked attention kernels — the source has no packed
+    /// `dataset` (and/or no `@flash_attention` train context), and segment
+    /// masking cannot be synthesized from nothing (dataset packing is
+    /// authorial, like `@pca` — see the meta-flag refusal doctrine).
+    PackingRequiresPackedDataset { mode: u8 },
+    /// WGGO requested `packing_mode = 0` (skip packing) but the dataset IS
+    /// packed and masked kernels were synthesized. Segment masking is a
+    /// correctness requirement for packed data — unmasked attention leaks
+    /// across document boundaries — so the plan's preference is refused and
+    /// the masked kernels keep dispatching.
+    PackingMaskingMandatoryForPackedDataset,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -233,6 +246,122 @@ pub fn collect_prune_diagnostics(
 pub fn whole_block_prune_not_implemented_reason() -> &'static str {
     // Stable string preserved from PR #102; see spec §5.5.
     "ir_rewrite_not_implemented"
+}
+
+// ─── PCA packing_mode consumption (errata E2 / audit gap #4) ────────────────
+
+/// Human name for a WGGO `packing_mode` value (the joint-ILP PCA decision,
+/// `wggo_ilp::LayerDecision::packing_mode`). Single source of truth shared by
+/// the `--wggo-report` renderer and the `[pca]` consumption diagnostics.
+pub fn packing_mode_name(mode: u8) -> &'static str {
+    match mode {
+        0 => "none",
+        1 => "segment_id",
+        2 => "tile_skip",
+        3 => "multi_seq",
+        _ => "invalid",
+    }
+}
+
+/// What packed-attention kernels the module-scan emitter actually synthesized
+/// for the train block's flash-attention config — the ground truth the WGGO
+/// packing decision is validated against. Derived in `stmt.rs` from
+/// `FlashAttentionCompileContext`: masked kernels exist iff the training
+/// config had `segment_masked=true` (dataset packing detection); when masked,
+/// per-doc CTA *replaced* the Tier-B pair iff the Tier-B-on data IDs are None.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackingKernelState {
+    /// No segment-masked attention kernels in the module (dataset not packed,
+    /// or no `@flash_attention` train context at all).
+    NoMaskedKernels,
+    /// Base + Tier-B-on masked variant pair emitted; the runtime gate picks
+    /// the masked variant when segment IDs are present.
+    TierBMasked,
+    /// Per-document CTA kernels admitted (user `@pca(strategy=per_document)`);
+    /// they replace the Tier-B pair as the training forward.
+    PerDocCta,
+}
+
+/// One `[pca]` consumption verdict for a layer's WGGO packing decision.
+#[derive(Debug, Clone)]
+pub struct PackingDiagnostic {
+    pub layer_index: u32,
+    pub layer_name: String,
+    /// The plan's requested packing mode (see `packing_mode_name`).
+    pub mode: u8,
+    pub verdict: PackingVerdict,
+}
+
+#[derive(Debug, Clone)]
+pub enum PackingVerdict {
+    /// The plan's packing request and the synthesized kernels agree; `kernel`
+    /// names what actually dispatches.
+    Consumed { kernel: &'static str },
+    /// The plan's request cannot be honored; masked-kernel reality wins.
+    Rejected(OverrideRejectReason),
+}
+
+/// Validate the plan's per-layer `packing_mode` against the kernels the module
+/// actually synthesized, yielding one diagnostic per layer that has anything
+/// to say (silent when plan and kernels trivially agree: `mode == 0` with no
+/// masked kernels).
+///
+/// Semantics (v1 — consumption/validation layer):
+///   * `mode > 0` with masked kernels present → **consumed**: the decision and
+///     the emitted kernels agree (Tier-B masked or per-doc CTA).
+///   * `mode > 0` with NO masked kernels → **rejected**
+///     [`OverrideRejectReason::PackingRequiresPackedDataset`]: WGGO wants
+///     packing but the source has no packed `dataset` (segment masking cannot
+///     be synthesized from nothing — the decorator/dataset are authorial).
+///   * `mode == 0` with masked kernels present → **rejected**
+///     [`OverrideRejectReason::PackingMaskingMandatoryForPackedDataset`]:
+///     segment masking is a *correctness* requirement for packed data
+///     (unmasked attention leaks across document boundaries), so the plan's
+///     preference to skip packing cannot be honored by dispatching unmasked
+///     kernels. The layer still pays the (small) masking cost; the ILP's
+///     savings estimate for this layer was optimistic.
+///
+/// The kernel-granularity caveat: attention-kernel synthesis is per train
+/// block today, not per layer, so all layers validate against the same
+/// `PackingKernelState`. True per-layer packing dispatch needs per-layer
+/// kernel variants — that, plus letting a WGGO decision *flip the per-doc
+/// admission itself*, requires hoisting WGGO planning ahead of
+/// `compile_flash_attention_kernels` (the module-scan emitter runs before
+/// `compile_main`, so `wggo_overrides` is `None` at admission time). That
+/// ordering restructure is the tracked follow-up; this validation layer is
+/// the same first increment the `[prune]` diagnostics established.
+pub fn collect_packing_diagnostics(
+    applied: &crate::wggo_apply::AppliedPlan,
+    state: PackingKernelState,
+) -> Vec<PackingDiagnostic> {
+    applied
+        .layers
+        .iter()
+        .filter_map(|l| {
+            let verdict = match (l.packing_mode, state) {
+                // Agreement, nothing to report: no packing wanted, none exists.
+                (0, PackingKernelState::NoMaskedKernels) => return None,
+                (0, _) => PackingVerdict::Rejected(
+                    OverrideRejectReason::PackingMaskingMandatoryForPackedDataset,
+                ),
+                (m, PackingKernelState::NoMaskedKernels) => PackingVerdict::Rejected(
+                    OverrideRejectReason::PackingRequiresPackedDataset { mode: m },
+                ),
+                (_, PackingKernelState::TierBMasked) => PackingVerdict::Consumed {
+                    kernel: "segment-masked Tier-B attention",
+                },
+                (_, PackingKernelState::PerDocCta) => PackingVerdict::Consumed {
+                    kernel: "per-document CTA attention",
+                },
+            };
+            Some(PackingDiagnostic {
+                layer_index: l.layer_index,
+                layer_name: l.layer_name.clone(),
+                mode: l.packing_mode,
+                verdict,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -474,6 +603,93 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].layer_index, 5);
         assert_eq!(diags[0].layer_name, "h.5");
+    }
+
+    // ─── PCA packing consumption (errata E2 / audit gap #4) ────────────────
+
+    #[test]
+    fn packing_mode_names_are_stable() {
+        // Part of the externally-observable `--wggo-report` "PCA=" column and
+        // the `[pca] ... packing_mode=<S>` stderr format — pin the literals.
+        assert_eq!(packing_mode_name(0), "none");
+        assert_eq!(packing_mode_name(1), "segment_id");
+        assert_eq!(packing_mode_name(2), "tile_skip");
+        assert_eq!(packing_mode_name(3), "multi_seq");
+        assert_eq!(packing_mode_name(200), "invalid");
+    }
+
+    fn plan_with_packing(modes: &[u8]) -> AppliedPlan {
+        let mut layers = Vec::new();
+        for (i, &m) in modes.iter().enumerate() {
+            let mut l = layer(&format!("blocks.{i}"), i as u32, CoarseDecision::KeepFull);
+            l.packing_mode = m;
+            layers.push(l);
+        }
+        AppliedPlan { layers, total_us: 1.0, peak_memory_bytes: 0 }
+    }
+
+    #[test]
+    fn packing_consumed_when_plan_and_masked_kernels_agree() {
+        let plan = plan_with_packing(&[1, 3]);
+        for (state, kernel) in [
+            (PackingKernelState::TierBMasked, "segment-masked Tier-B attention"),
+            (PackingKernelState::PerDocCta, "per-document CTA attention"),
+        ] {
+            let diags = collect_packing_diagnostics(&plan, state);
+            assert_eq!(diags.len(), 2, "one verdict per packing layer at {state:?}");
+            for d in &diags {
+                match &d.verdict {
+                    PackingVerdict::Consumed { kernel: k } => assert_eq!(*k, kernel),
+                    other => panic!("expected Consumed at {state:?}, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packing_rejected_when_source_has_no_packed_dataset() {
+        // WGGO wants packing but the module has no masked kernels: authorial
+        // inputs (packed dataset / @pca) cannot be synthesized from a plan.
+        let plan = plan_with_packing(&[2]);
+        let diags =
+            collect_packing_diagnostics(&plan, PackingKernelState::NoMaskedKernels);
+        assert_eq!(diags.len(), 1);
+        match &diags[0].verdict {
+            PackingVerdict::Rejected(OverrideRejectReason::PackingRequiresPackedDataset {
+                mode,
+            }) => assert_eq!(*mode, 2),
+            other => panic!("expected PackingRequiresPackedDataset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packing_mode_zero_is_refused_when_dataset_is_packed() {
+        // Correctness invariant: masked kernels cannot be turned off by a plan
+        // preference — unmasked attention on packed data leaks across document
+        // boundaries. The plan's mode=0 is rejected, masking stays.
+        let plan = plan_with_packing(&[0]);
+        for state in [PackingKernelState::TierBMasked, PackingKernelState::PerDocCta] {
+            let diags = collect_packing_diagnostics(&plan, state);
+            assert_eq!(diags.len(), 1, "at {state:?}");
+            assert!(
+                matches!(
+                    diags[0].verdict,
+                    PackingVerdict::Rejected(
+                        OverrideRejectReason::PackingMaskingMandatoryForPackedDataset
+                    )
+                ),
+                "at {state:?}: {:?}",
+                diags[0].verdict
+            );
+        }
+    }
+
+    #[test]
+    fn packing_silent_when_no_packing_wanted_and_none_exists() {
+        // mode=0 + no masked kernels = trivial agreement; no diagnostic noise.
+        let plan = plan_with_packing(&[0, 0, 0]);
+        assert!(collect_packing_diagnostics(&plan, PackingKernelState::NoMaskedKernels)
+            .is_empty());
     }
 
     fn overrides_with_layers(layers: &[(&str, u32)]) -> WggoOverrides {
