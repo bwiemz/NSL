@@ -178,13 +178,9 @@ impl WggoPlan {
                 layer.optim_m_bits,
                 layer.optim_v_bits,
                 if layer.fase_fused { "fused" } else { "deferred" },
-                match layer.packing_mode {
-                    0 => "none",
-                    1 => "segment_id",
-                    2 => "tile_skip",
-                    3 => "multi_seq",
-                    _ => "?",
-                }
+                // Shared with the [pca] consumption diagnostics — one naming
+                // authority for packing modes (errata E2 wiring).
+                crate::wggo_overrides::packing_mode_name(layer.packing_mode)
             )
             .unwrap();
         }

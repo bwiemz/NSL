@@ -1241,13 +1241,9 @@ fn build_decision_trace(
     };
 
     // ---------- PCA (sequence packing) ----------
-    let pca_mode = match decision.packing_mode {
-        0 => "none",
-        1 => "segment_id",
-        2 => "tile_skip",
-        3 => "multi_seq",
-        _ => "unknown",
-    };
+    // Single naming authority shared with the report renderer and the [pca]
+    // consumption verdicts (errata E2 wiring).
+    let pca_mode = crate::wggo_overrides::packing_mode_name(decision.packing_mode);
     let pca_trace = DecisionTrace {
         kind: DecisionKind::PcaPacking,
         chosen: format!("Packing mode {} ({})", decision.packing_mode, pca_mode),

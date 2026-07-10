@@ -4563,6 +4563,95 @@ impl Compiler<'_> {
                                     reason_str,
                                 );
                             }
+                            // PCA packing consumption (errata E2 / audit gap #4):
+                            // validate the plan's per-layer packing_mode against
+                            // the attention kernels the module-scan emitter
+                            // actually synthesized (it ran before compile_main,
+                            // so the plan could not influence admission — the
+                            // ordering restructure that would let it is the
+                            // tracked follow-up). One `[pca] layer:N
+                            // wggo-override-consumed/rejected` line per layer,
+                            // matching the CSHA/WRGA/CPDT/FASE/prune pattern.
+                            {
+                                use crate::wggo_overrides::{
+                                    packing_mode_name, PackingKernelState, PackingVerdict,
+                                };
+                                let state = match self
+                                    .kernels
+                                    .flash_attention_context
+                                    .as_ref()
+                                    .and_then(|c| c.csha_training_config.as_ref())
+                                {
+                                    Some(cfg) if cfg.segment_masked => {
+                                        // Per-doc CTA replaces the Tier-B pair at
+                                        // emission (compiler/kernel.rs fork), so
+                                        // masked + no Tier-B IDs ⇔ per-doc active.
+                                        if self
+                                            .kernels
+                                            .flash_attention_context
+                                            .as_ref()
+                                            .is_some_and(|c| {
+                                                c.csha_with_saves_tier_b_on_ptx_id.is_some()
+                                            })
+                                        {
+                                            PackingKernelState::TierBMasked
+                                        } else {
+                                            PackingKernelState::PerDocCta
+                                        }
+                                    }
+                                    _ => PackingKernelState::NoMaskedKernels,
+                                };
+                                for diag in crate::wggo_overrides::collect_packing_diagnostics(
+                                    &plan.applied,
+                                    state,
+                                ) {
+                                    match &diag.verdict {
+                                        PackingVerdict::Consumed { kernel } => eprintln!(
+                                            "[pca] layer:{} name={} wggo-override-consumed \
+                                             packing_mode={} -> {}",
+                                            diag.layer_index,
+                                            diag.layer_name,
+                                            packing_mode_name(diag.mode),
+                                            kernel,
+                                        ),
+                                        PackingVerdict::Rejected(reason) => {
+                                            // Space-free snake_case token, like every
+                                            // other consumer's reason string (the
+                                            // decision explainer splits on whitespace;
+                                            // `{:?}` of a struct variant would inject
+                                            // `{ mode: N }` tokens). The requested
+                                            // mode already rides in `requested=`.
+                                            let reason_token = match reason {
+                                                crate::wggo_overrides::OverrideRejectReason::PackingRequiresPackedDataset { .. } =>
+                                                    "packing_requires_packed_dataset",
+                                                crate::wggo_overrides::OverrideRejectReason::PackingMaskingMandatoryForPackedDataset =>
+                                                    "packing_masking_mandatory_for_packed_dataset",
+                                                other => {
+                                                    debug_assert!(
+                                                        false,
+                                                        "non-packing reject reason in packing verdict: {other:?}"
+                                                    );
+                                                    "unexpected_packing_reject_reason"
+                                                }
+                                            };
+                                            eprintln!(
+                                                "[pca] layer:{} name={} wggo-override-rejected \
+                                                 requested={} applied={} reason={}",
+                                                diag.layer_index,
+                                                diag.layer_name,
+                                                packing_mode_name(diag.mode),
+                                                match state {
+                                                    PackingKernelState::NoMaskedKernels => "unmasked",
+                                                    PackingKernelState::TierBMasked =>
+                                                        "segment_masked",
+                                                    PackingKernelState::PerDocCta => "per_doc_cta",
+                                                },
+                                                reason_token,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             // Stash for all downstream consumers (CSHA, WRGA, ...).
                             self.wggo_overrides = Some(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),
