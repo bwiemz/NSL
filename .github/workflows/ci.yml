@@ -285,13 +285,18 @@ jobs:
           toolchain: 1.95.0
 
       - name: Install CUDA toolkit (nvcc, ptxas, cudart stubs, cuBLAS)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          # cudarc's `cuda-version-from-build-system` feature shells out to
+          # Must be >= 13.2. cuda/mod.rs constructs a CUmemLocation with the
+          # `__bindgen_anon_1` field, and cudarc only emits
+          # `CUmemLocation_st__bindgen_ty_1` under its cuda-13020 / cuda-13030
+          # features. Building against 12.x fails with E0560 / E0422.
+          #
+          # cudarc's `cuda-version-from-build-system` feature also shells out to
           # `nvcc --version`, so nvcc must be present even though nothing here
-          # compiles CUDA C. Any version cudarc knows about will do.
-          cuda: '12.6.2'
+          # compiles CUDA C.
+          cuda: '13.2.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
@@ -310,6 +315,8 @@ jobs:
           echo "CUDA_PATH=$CUDA_PATH"
           nvcc --version
           ptxas --version
+          echo "--- libcuda stubs ---"
+          find "$CUDA_PATH" -name 'libcuda.so*' -o -name 'libcublas.so*' | head
 
       # cudarc links -lcuda and -lcublas. On a driverless runner libcuda.so comes
       # from the toolkit's stubs directory; cudarc's build script already adds
@@ -317,8 +324,12 @@ jobs:
       # each need it too.
       - name: Export stub library paths
         run: |
-          echo "LIBRARY_PATH=$CUDA_PATH/lib64/stubs:${LIBRARY_PATH:-}" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$CUDA_PATH/lib64/stubs:$CUDA_PATH/lib64:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          # CUDA 12 puts stubs in lib64/stubs; CUDA 13 uses
+          # targets/x86_64-linux/lib/stubs. Export both so this survives a bump.
+          STUBS="$CUDA_PATH/lib64/stubs:$CUDA_PATH/targets/x86_64-linux/lib/stubs"
+          LIBS="$CUDA_PATH/lib64:$CUDA_PATH/targets/x86_64-linux/lib"
+          echo "LIBRARY_PATH=$STUBS:$LIBS:${LIBRARY_PATH:-}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$STUBS:$LIBS:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
 
       # Compile-coverage for the whole feature. This alone catches any change
       # that breaks the cuda module, which nothing else in CI does.
