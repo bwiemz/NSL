@@ -1532,15 +1532,21 @@ impl<'a> Compiler<'a> {
     /// `declare_user_functions_with_linkage`. See `crate::c_wrapper`.
     ///
     /// Also emits the runtime export-table FFIs (`nsl_get_num_exports` and
-    /// `nsl_get_export_name`) — but only when producing a single shared
-    /// library (`compile_options.shared_lib == true`). For multi-object
-    /// `nsl run` builds, every object would otherwise carry its own copy
-    /// of those two `Linkage::Export` symbols and the MSVC linker emits
-    /// LNK2005 (already-defined) when it joins the objects. Multi-object
-    /// builds do not consume the export-table FFIs (they're only reached
-    /// via dlsym on a loaded shared lib), so suppressing them is safe.
-    /// Empty-export shared libs still emit the table (returns 0/NULL),
-    /// preserving uniform runtime probing.
+    /// `nsl_get_export_name`) — but only for the compilation unit that owns
+    /// them (`compile_options.emit_export_table == true`). Every object
+    /// linked into a shared library needs `shared_lib` (PIC) set, but only
+    /// one object may define these two `Linkage::Export` symbols: on the
+    /// multi-file shared-lib path every non-entry module also has
+    /// `shared_lib == true` (for PIC), so gating on `shared_lib` alone made
+    /// every module emit its own copy, and the linker rejected the object
+    /// set as already-defined (GNU ld "multiple definition", MSVC LNK2005)
+    /// once a build imported more than one module. `emit_export_table` is
+    /// the independent, single-owner decision; only the entry module (or
+    /// the sole module on the single-file path) sets it. Non-owning
+    /// multi-object builds do not consume the export-table FFIs (they're
+    /// only reached via dlsym on a loaded shared lib), so suppressing them
+    /// there is safe. Empty-export shared libs still emit the table
+    /// (returns 0/NULL), preserving uniform runtime probing.
     pub fn emit_export_wrappers(&mut self) -> Result<(), CodegenError> {
         // Clone to side-step borrow of `self.features` during emission, which
         // itself calls `&mut self.module`.
@@ -1556,7 +1562,7 @@ impl<'a> Compiler<'a> {
             crate::c_wrapper::emit_c_abi_dispatch_wrapper(self, wrapper)?;
         }
 
-        if self.compile_options.shared_lib {
+        if self.compile_options.emit_export_table {
             let exports = self.features.export_functions.clone();
             crate::c_export_table::emit_export_table(self, &exports)?;
         }

@@ -459,10 +459,17 @@ pub fn validate_adapter_decorator(
 ///
 /// Cross-module imports are accepted on trust: if the adapter symbol is bound
 /// somewhere in scope (via `from foo.peft import GatedLoRA`) but no matching
-/// `ModelDef` is in this file's `stmts`, the post-pass skips the model-shape
-/// checks rather than emitting a false "undeclared adapter" error.  The
-/// codegen integration cycle (which has the full multi-file analysis) will
-/// produce the deeper contract check.
+/// declaration of *any* kind is in this file's `stmts`, the post-pass skips
+/// the model-shape checks rather than emitting a false "undeclared adapter"
+/// error.  The codegen integration cycle (which has the full multi-file
+/// analysis) will produce the deeper contract check.
+///
+/// That trust only extends to symbols this file genuinely can't see the
+/// definition of.  A same-file declaration of the wrong kind (`struct`,
+/// `fn`, `enum`, `trait`, `agent`) is not a cross-module import — this pass
+/// has full access to its shape and must reject it outright, since only a
+/// `model` can satisfy the adapter contract (`struct` in particular can
+/// never declare a `forward` method at all).
 ///
 /// Sub-passes only inspect surface signature shape — the heavy contract
 /// check (forward takes a single `Tensor` arg and returns a `Tensor`) is
@@ -486,9 +493,33 @@ pub fn validate_wrga_custom_adapters(
             _ => None,
         });
         let Some(model) = model else {
+            // Same-file declaration of the wrong kind: not a cross-module
+            // import, so we can see its shape directly and it definitively
+            // fails the adapter contract (only `model` can have a `forward`
+            // method or WRGA-placeable `Tensor` field).
+            let wrong_kind = module.stmts.iter().find_map(|s| match &s.kind {
+                StmtKind::StructDef(d) if d.name == adapter_sym => Some("struct"),
+                StmtKind::FnDef(d) if d.name == adapter_sym => Some("fn"),
+                StmtKind::EnumDef(d) if d.name == adapter_sym => Some("enum"),
+                StmtKind::TraitDef(d) if d.name == adapter_sym => Some("trait"),
+                StmtKind::AgentDef(d) if d.name == adapter_sym => Some("agent"),
+                _ => None,
+            });
+            if let Some(kind) = wrong_kind {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "@wrga: custom adapter '{adapter_name}' is a `{kind}`, not a `model` \
+                         (WRGA paper §8.2 requires `adapter={adapter_name}` to name a `model \
+                         {adapter_name}(...)` with a `Tensor` field and a `forward` method — a \
+                         `{kind}` cannot satisfy the adapter contract)"
+                    ))
+                    .with_label(cfg.block.span, "wrong declaration kind"),
+                );
+                continue;
+            }
             // Fallback: an imported adapter (`from foo.peft import GatedLoRA`)
             // is bound in the module's root scope but never appears in
-            // `module.stmts` as a `ModelDef`.  Trust the import — the deeper
+            // `module.stmts` at all.  Trust the import — the deeper
             // contract check happens at codegen.
             if scopes.lookup(crate::scope::ScopeId::ROOT, adapter_sym).is_some() {
                 continue;

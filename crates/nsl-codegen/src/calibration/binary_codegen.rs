@@ -4542,10 +4542,13 @@ mod grad_arena_emission {
         let obj_bytes = compiler.finalize().expect("finalize");
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
-        // Find the __nsl_calib_grad_arena symbol.
+        // Find the __nsl_calib_grad_arena symbol.  On macOS (Mach-O) Cranelift
+        // prepends an extra '_' to the declared symbol name, so the raw object
+        // symbol is `___nsl_calib_grad_arena`; strip_host_symbol_prefix removes
+        // the platform prefix before comparing, matching the production checks.
         let sym = obj
             .symbols()
-            .find(|s| s.name() == Ok("__nsl_calib_grad_arena"))
+            .find(|s| s.name().map(strip_host_symbol_prefix) == Ok("__nsl_calib_grad_arena"))
             .expect("__nsl_calib_grad_arena must be exported");
 
         assert!(

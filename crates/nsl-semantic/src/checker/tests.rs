@@ -1249,14 +1249,13 @@ model Toy:
     );
 }
 
-/// Regression: an adapter symbol that is in-scope as a non-model
-/// declaration (mimicking the `from foo.peft import GatedLoRA` case where
-/// the imported name lives in the root scope but never appears as a local
-/// `ModelDef`) must NOT trigger the "undeclared adapter" error.  The
-/// post-pass falls back to a scope lookup and trusts the import — the
-/// deeper contract check lands at codegen.
+/// A same-file `struct` named as `adapter=` is not a cross-module import: the
+/// post-pass can see its full shape, and a `struct` can never declare a
+/// `forward` method, so it can never satisfy the §8.2 adapter contract. It must
+/// be rejected outright rather than trusted via the import fallback. (Before
+/// this fix the struct fell into the cross-module trust path and was accepted.)
 #[test]
-fn wrga_decorator_custom_adapter_in_scope_via_non_model_is_accepted() {
+fn wrga_decorator_custom_adapter_naming_a_same_file_struct_is_rejected() {
     let src = r#"
 struct GatedLoRA:
     placeholder: int
@@ -1269,17 +1268,40 @@ model Toy:
         return x @ self.w
 "#;
     let res = analyze_source(src);
-    let undeclared_errors: Vec<_> = res
+    let wrong_kind_errors: Vec<_> = res
         .diagnostics
         .iter()
         .filter(|d| matches!(d.level, nsl_errors::Level::Error))
-        .filter(|d| format!("{:?}", d).contains("undeclared adapter"))
+        .filter(|d| format!("{:?}", d).contains("is a `struct`, not a `model`"))
         .collect();
     assert!(
-        undeclared_errors.is_empty(),
-        "post-pass must accept an in-scope (but non-ModelDef) adapter symbol; \
-         got undeclared-adapter errors: {:?}",
-        undeclared_errors,
+        !wrong_kind_errors.is_empty(),
+        "post-pass must reject a same-file struct named as `adapter=`; \
+         got diagnostics: {:?}",
+        res.diagnostics,
+    );
+}
+
+/// A genuinely external adapter symbol — one that is in scope (e.g. a builtin,
+/// standing in for `from foo.peft import GatedLoRA`) but has no declaration of
+/// any kind in this file's `stmts` — must NOT trigger an error. The post-pass
+/// falls back to a scope lookup and trusts the import; the deeper contract
+/// check lands at codegen.
+#[test]
+fn wrga_decorator_custom_adapter_in_scope_via_non_local_symbol_is_accepted() {
+    let src = r#"
+@wrga(mode=auto, adapter=print)
+model Toy:
+    w: Tensor = zeros([4, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "no semantic errors expected for an in-scope external adapter symbol, got: {:?}",
+        res.diagnostics,
     );
 }
 
