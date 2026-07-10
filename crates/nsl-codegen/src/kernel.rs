@@ -284,7 +284,7 @@ impl KernelCompiler {
 
         // PTX header
         kc.emit(".version 7.0\n");
-        kc.emit(".target sm_52\n");
+        kc.emit(".target sm_70\n");
         kc.emit(".address_size 64\n\n");
 
         // Entry point signature

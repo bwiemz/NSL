@@ -1290,6 +1290,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     // FlashAttention-2 backward (M27 backward pass)
     // Returns NslList [dQ, dK, dV]. When logsumexp_ptr == 0, auto-computes lse.
+    //
+    // The trailing Tier-B sentinel pair (planner spec §4) was added to the
+    // runtime FFI but this declaration and the wengert_lower call site were
+    // never extended — Cranelift emitted 16-arg calls against the 18-param C
+    // function, so the runtime read undefined stack/registers for the pair
+    // and `assert_tier_b_sentinels` aborted the process at the FIRST plain-
+    // SDPA training backward (found by the roadmap-4.2 pretrain e2e; no prior
+    // test ran the compiler-EMITTED call — GPU parity tests build FFI args by
+    // hand). Keep this in lock-step with `nsl_flash_attention_backward` in
+    // nsl-runtime/src/flash_attention.rs.
     (
         "nsl_flash_attention_backward",
         &[
@@ -1304,6 +1314,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // phase1_name_ptr
             types::I64, // phase2_ptx_ptr
             types::I64, // phase2_name_ptr
+            types::I64, // tier_b_ptx_ptr (planner spec §4 sentinel pair;
+            types::I64, // tier_b_name_ptr  both 0 = no Tier-B-on variant)
         ],
         Some(types::I64),
     ),

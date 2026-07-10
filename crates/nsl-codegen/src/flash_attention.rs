@@ -983,7 +983,7 @@ fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
     let block_q = config.block_q;
     let head_dim = config.head_dim;
 
-    ptx.push_str("    // ── CSHA A.2.2: RMSNorm prologue ──────────────────────────\n");
+    ptx.push_str("    // -- CSHA A.2.2: RMSNorm prologue --------------------------\n");
     ptx.push_str(&format!(
         "    // fused_rmsnorm=1, block_q={}, head_dim={}\n",
         block_q, head_dim
@@ -995,7 +995,7 @@ fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
     // generous `%rd<64>`, `%f<128>`, `%p<16>` pools declared in
     // `emit_register_declarations`, so the indices here don't need new
     // `.reg` lines.
-    ptx.push_str("    // (no new .reg lines — all indices fall within the pools declared above)\n");
+    ptx.push_str("    // (no new .reg lines -- all indices fall within the pools declared above)\n");
 
     ptx.push_str("    ld.param.u64 %rd50, [csha_x_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd51, [csha_norm_weight_ptr];\n");
@@ -1083,7 +1083,7 @@ fn emit_csha_rmsnorm_prologue(ptx: &mut String, config: &FlashAttentionConfig) {
 
     ptx.push_str("CSHA_PROLOGUE_END:\n");
     ptx.push_str("    bar.sync 0;                       // Q tile (from prologue OR Q load) consistent across warps\n");
-    ptx.push_str("    // ── end CSHA prologue ───────────────────────────────────────\n");
+    ptx.push_str("    // -- end CSHA prologue ---------------------------------------\n");
 }
 
 /// CSHA A.4 — active_heads early-exit guard.
@@ -1115,7 +1115,7 @@ fn emit_csha_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig)
         return;
     }
 
-    ptx.push_str("    // ── CSHA A.4: active_heads guard ─────────────────────────\n");
+    ptx.push_str("    // -- CSHA A.4: active_heads guard -------------------------\n");
     ptx.push_str(&format!(
         "    // active_heads={} (weight-informed kernel specialisation)\n",
         csha.active_heads
@@ -1125,7 +1125,7 @@ fn emit_csha_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig)
         csha.active_heads
     ));
     ptx.push_str("    @%p9 ret;                         // dead head: exit CTA cleanly\n");
-    ptx.push_str("    // ── end CSHA active_heads guard ─────────────────────────────\n");
+    ptx.push_str("    // -- end CSHA active_heads guard -----------------------------\n");
 }
 
 /// CSHA A.2.3 — matmul projection emitter.
@@ -1166,7 +1166,7 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
     let head_dim = config.head_dim;
     let d_model = csha.d_model.max(head_dim as u32);
 
-    ptx.push_str("    // ── CSHA A.2.3: matmul projection (x_norm @ Wq/Wk/Wv) ────\n");
+    ptx.push_str("    // -- CSHA A.2.3: matmul projection (x_norm @ Wq/Wk/Wv) ----\n");
     ptx.push_str(&format!(
         "    // fused_projections=1, block_q={}, head_dim={}, d_model={}\n",
         block_q, head_dim, d_model
@@ -1288,7 +1288,7 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
         d_regs: &[String; 4],
     ) {
         ptx.push_str(&format!(
-            "    // --- {} projection: x_norm @ W{} ({}×{} × {} MMA) ---\n",
+            "    // --- {} projection: x_norm @ W{} ({}x{} x {} MMA) ---\n",
             proj_tag,
             proj_tag.to_ascii_lowercase(),
             m_tiles,
@@ -1490,7 +1490,7 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
 
     ptx.push_str("CSHA_PROJECTION_END:\n");
     ptx.push_str("    bar.sync 0;                       // Q/K/V SMEM tiles consistent\n");
-    ptx.push_str("    // ── end CSHA projection ─────────────────────────────────────\n");
+    ptx.push_str("    // -- end CSHA projection -------------------------------------\n");
 }
 
 /// CSHA A.2.4 — RoPE epilogue emitter.
@@ -1533,7 +1533,7 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
     };
     let block_q = config.block_q;
 
-    ptx.push_str("    // ── CSHA A.2.4: RoPE epilogue ────────────────────────────\n");
+    ptx.push_str("    // -- CSHA A.2.4: RoPE epilogue ----------------------------\n");
     ptx.push_str(&format!(
         "    // rope_q=1, rope_style={:?}, head_dim={}, stride={}\n",
         config.rope_style, head_dim, stride_val
@@ -1572,7 +1572,7 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // --- Q rotation sweep ---
     ptx.push_str(&format!(
-        "    // --- Q rotation sweep: {} row pairs × {} col pairs per row ---\n",
+        "    // --- Q rotation sweep: {} row pairs x {} col pairs per row ---\n",
         block_q,
         head_dim / 2,
     ));
@@ -1643,7 +1643,7 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
     // --- K rotation sweep ---
     ptx.push_str("CSHA_ROPE_K_START:\n");
     ptx.push_str(&format!(
-        "    // --- K rotation sweep: {} row pairs × {} col pairs per row ---\n",
+        "    // --- K rotation sweep: {} row pairs x {} col pairs per row ---\n",
         block_q,
         head_dim / 2,
     ));
@@ -1708,7 +1708,7 @@ fn emit_csha_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
 
 
     ptx.push_str("CSHA_ROPE_EPILOGUE_END:\n");
-    ptx.push_str("    // ── end CSHA RoPE epilogue ─────────────────────────────────\n");
+    ptx.push_str("    // -- end CSHA RoPE epilogue ---------------------------------\n");
 }
 
 fn emit_q_tile_load(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -1868,7 +1868,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
 
     if config.causal {
         ptx.push_str("    // Causal: k_max = min(seq_len, q_start + block_q)\n");
-        ptx.push_str("    // Zero-divergence — loop naturally terminates at diagonal\n");
+        ptx.push_str("    // Zero-divergence -- loop naturally terminates at diagonal\n");
     } else {
         ptx.push_str("    // Non-causal: k_max = seq_len\n");
     }
@@ -2050,7 +2050,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         // M33: Tree-structured causal mask.
         // Node query_idx attends to node key_idx iff key_idx is an ancestor of query_idx.
         // Ancestor check: dfs_enter[key] <= dfs_enter[query] AND dfs_exit[key] >= dfs_exit[query]
-        ptx.push_str("    // M33: Tree mask — ancestor check via DFS timestamps\n");
+        ptx.push_str("    // M33: Tree mask -- ancestor check via DFS timestamps\n");
         ptx.push_str("    cvt.u64.u32 %rd43, %r5;           // k_col as u64\n");
         ptx.push_str("    add.u64 %rd43, %k_start, %rd43;   // key_idx = k_start + k_col\n");
         ptx.push_str("    cvt.u64.u32 %rd44, %r4;           // q_row as u64\n");
@@ -2073,9 +2073,9 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    ld.global.u32 %dfs_q_exit, [%rd48];\n");
         // Check: is key an ancestor of query?
         // ancestor iff dfs_enter[key] <= dfs_enter[query] AND dfs_exit[key] >= dfs_exit[query]
-        ptx.push_str("    setp.gt.u32 %p1, %dfs_k_enter, %dfs_q_enter;  // key enters AFTER query → not ancestor\n");
-        ptx.push_str("    setp.lt.u32 %p_ancestor, %dfs_k_exit, %dfs_q_exit;  // key exits BEFORE query → not ancestor\n");
-        ptx.push_str("    or.pred %p1, %p1, %p_ancestor;    // either condition → mask out\n");
+        ptx.push_str("    setp.gt.u32 %p1, %dfs_k_enter, %dfs_q_enter;  // key enters AFTER query -> not ancestor\n");
+        ptx.push_str("    setp.lt.u32 %p_ancestor, %dfs_k_exit, %dfs_q_exit;  // key exits BEFORE query -> not ancestor\n");
+        ptx.push_str("    or.pred %p1, %p1, %p_ancestor;    // either condition -> mask out\n");
         ptx.push_str(&format!("    @%p1 mov.f32 %f0, {};     // -inf for non-ancestor positions\n", f32_bits(F32_NEG_INF)));
     } else if config.causal {
         ptx.push_str("    // Partial causal mask on diagonal tile: S[i][j] = -inf where k_start+j > q_start+i\n");
@@ -2104,7 +2104,7 @@ fn emit_kv_tile_loop(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    bar.sync 0;  // FENCE 2: all warps done reading K before SRAM overwrite\n");
 
     // ── Phase 3: Online softmax ────────────────────────────────────
-    ptx.push_str("    // Phase 3: Online softmax — S→P in-place in registers\n");
+    ptx.push_str("    // Phase 3: Online softmax -- S->P in-place in registers\n");
 
     // Find local max across this thread's S values
     ptx.push_str("    // Local max from this thread's S values\n");
@@ -2379,7 +2379,7 @@ fn emit_output_store(ptx: &mut String, config: &FlashAttentionConfig) {
     // Each thread stores its num_oacc elements
     let num_oacc = (config.block_q * config.head_dim / 128) as usize;
     ptx.push_str(&format!(
-        "    // Convert {} O_acc registers f32→f16, store to global\n",
+        "    // Convert {} O_acc registers f32->f16, store to global\n",
         num_oacc
     ));
 
@@ -2388,13 +2388,13 @@ fn emit_output_store(ptx: &mut String, config: &FlashAttentionConfig) {
         // Compute the global element index for this O_acc register
         // elem_idx = tid_x + i * 128
         ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %h{}, %f{};              // f32 → f16\n",
+            "    cvt.rn.f16.f32 %h{}, %f{};              // f32 -> f16\n",
             h_reg,
             64 + i
         ));
         // Byte offset = (tid_x + i * 128) * 2
         ptx.push_str(&format!(
-            "    // elem {} → global offset = (tid_x + {}) * 2\n",
+            "    // elem {} -> global offset = (tid_x + {}) * 2\n",
             i,
             i * 128
         ));
@@ -2448,7 +2448,7 @@ fn emit_rope_cache_write_entry(ptx: &mut String, head_dim: i64, rope_style: Rope
     ptx.push_str(&format!("    // RoPE style: {}\n", stride_comment));
 
     ptx.push_str("    // 1. Load K element pair from k_projected into registers\n");
-    ptx.push_str("    // 2. Load cos[pos], sin[pos] from frequency table → registers\n");
+    ptx.push_str("    // 2. Load cos[pos], sin[pos] from frequency table -> registers\n");
     ptx.push_str(
         "    // 3. Apply RoPE: k_rot_a = k_a*cos - k_b*sin; k_rot_b = k_a*sin + k_b*cos\n",
     );
@@ -2849,7 +2849,7 @@ fn emit_smem_swizzle_store(ptx: &mut String) {
     ptx.push_str("    // Output: %smem_swiz_off (swizzled byte offset)\n");
     ptx.push_str("    shr.u32 %smem_bank, %smem_linear_off, 2;    // bank = offset / 4\n");
     ptx.push_str("    and.b32 %smem_bank, %smem_bank, 31;         // bank = bank % 32\n");
-    ptx.push_str("    shr.u32 %smem_row_bits, %smem_linear_off, 7; // row ≈ offset / 128\n");
+    ptx.push_str("    shr.u32 %smem_row_bits, %smem_linear_off, 7; // row ~= offset / 128\n");
     ptx.push_str("    and.b32 %smem_row_bits, %smem_row_bits, 7;  // row % 8\n");
     ptx.push_str("    and.b32 %smem_bank_lo, %smem_bank, 7;       // bank % 8\n");
     ptx.push_str("    xor.b32 %smem_swiz, %smem_row_bits, %smem_bank_lo;  // XOR\n");
@@ -3249,7 +3249,7 @@ fn emit_wgmma_registers(ptx: &mut String, block_kv: usize, head_dim: usize) {
 #[allow(dead_code)]
 fn emit_mma_temp_registers(ptx: &mut String) {
     ptx.push_str("    // MMA temporary registers\n");
-    ptx.push_str("    .reg .f16 %mma_h0, %mma_h1;       // f32→f16 conversion temps\n");
+    ptx.push_str("    .reg .f16 %mma_h0, %mma_h1;       // f32->f16 conversion temps\n");
     ptx.push_str("    .reg .u32 %mma_a_row, %mma_b_row;  // fragment row indices\n");
     ptx.push_str("    .reg .u32 %mma_addr;                // shared memory address temp\n");
     ptx.push_str("    .reg .u32 %mma_laneid;              // warp lane ID\n");

@@ -1857,7 +1857,7 @@ SC_DONE: ret;\n\
 /// row_ptrs: u32[M+1], col_indices: u32[nnz], values: f32[nnz], B: f32[K,N], C: f32[M,N]
 pub(crate) const CSR_SPMM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_csr_spmm_f32(\n\
@@ -1948,7 +1948,7 @@ SP_DONE: ret;\n\
 /// COO SpMM kernel: row_indices[nnz], col_indices[nnz], values[nnz], B[K,N], C[M,N], N, nnz
 pub(crate) const COO_SPMM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_coo_spmm_f32(\n\
@@ -2030,7 +2030,7 @@ COO_DONE: ret;\n\
 /// B[K,N], C[M,N], N, block_rows, block_cols, nblk_rows
 pub(crate) const BSR_SPMM_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_bsr_spmm_f32(\n\
@@ -2146,7 +2146,7 @@ BSR_DONE: ret;\n\
 /// CSR SpMV kernel: row_ptrs[M+1], col_indices[nnz], values[nnz], x[K], y[M], M
 pub(crate) const CSR_SPMV_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_csr_spmv_f32(\n\
@@ -2219,7 +2219,7 @@ SPMV_DONE: ret;\n\
 /// COO SpMV kernel: row_indices[nnz], col_indices[nnz], values[nnz], x[K], y[M], nnz
 pub(crate) const COO_SPMV_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_coo_spmv_f32(\n\
@@ -2601,7 +2601,7 @@ TS_DONE: ret;\n\
 //         head_stride (block_size * head_dim)
 pub(crate) const DEQUANT_INT8_PER_HEAD_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_dequant_int8_per_head_f32(\n\
@@ -2649,7 +2649,7 @@ DQ8H_DONE: ret;\n\
 // Params: inp, out, scales, n, head_dim
 pub(crate) const DEQUANT_INT8_PER_TOKEN_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_dequant_int8_per_token_f32(\n\
@@ -2700,7 +2700,7 @@ DQ8T_DONE: ret;\n\
 //         n (total elements), group_size
 pub(crate) const DEQUANT_INT4_PER_GROUP_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_dequant_int4_per_group_f32(\n\
@@ -2763,7 +2763,7 @@ DQ4G_DONE: ret;\n\
 // Params: inp (u8*), out (f32*), n
 pub(crate) const DEQUANT_FP8_E4M3_F32_PTX: &str = "\
 .version 7.0\n\
-.target sm_52\n\
+.target sm_70\n\
 .address_size 64\n\
 \n\
 .visible .entry nsl_dequant_fp8_e4m3_f32(\n\

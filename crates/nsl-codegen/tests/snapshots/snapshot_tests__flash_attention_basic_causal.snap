@@ -186,7 +186,7 @@ LOOP_Q_LOAD:
     mov.u64 %k_start, 0;
     // === Main K/V tile loop ===
     // Causal: k_max = min(seq_len, q_start + block_q)
-    // Zero-divergence — loop naturally terminates at diagonal
+    // Zero-divergence -- loop naturally terminates at diagonal
     setp.ge.u64 %p0, %k_start, %k_max;
     @%p0 bra LOOP_KV_END;
 LOOP_KV_START:
@@ -324,7 +324,7 @@ LOOP_HD:
     setp.lt.u32 %p0, %r1, %r2;
     @%p0 bra LOOP_S_OUTER;
     bar.sync 0;  // FENCE 2: all warps done reading K before SRAM overwrite
-    // Phase 3: Online softmax — S→P in-place in registers
+    // Phase 3: Online softmax -- S->P in-place in registers
     // Local max from this thread's S values
     mov.f32 %f0, 0fFF800000;               // f_local_max = -inf
     max.f32 %f0, %f0, %f3;              // max with S[0]
@@ -925,450 +925,450 @@ SKIP_LSE_STORE:
     mul.lo.u64 %rd51, %rd51, %rd7;         // * head_dim
     shl.b64 %rd51, %rd51, 1;               // * 2 (sizeof f16)
     add.u64 %rd51, %rd3, %rd51;            // out_base = out_ptr + offset
-    // Convert 64 O_acc registers f32→f16, store to global
-    cvt.rn.f16.f32 %h0, %f64;              // f32 → f16
-    // elem 0 → global offset = (tid_x + 0) * 2
+    // Convert 64 O_acc registers f32->f16, store to global
+    cvt.rn.f16.f32 %h0, %f64;              // f32 -> f16
+    // elem 0 -> global offset = (tid_x + 0) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 0;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h0;
-    cvt.rn.f16.f32 %h1, %f65;              // f32 → f16
-    // elem 1 → global offset = (tid_x + 128) * 2
+    cvt.rn.f16.f32 %h1, %f65;              // f32 -> f16
+    // elem 1 -> global offset = (tid_x + 128) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 128;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h1;
-    cvt.rn.f16.f32 %h2, %f66;              // f32 → f16
-    // elem 2 → global offset = (tid_x + 256) * 2
+    cvt.rn.f16.f32 %h2, %f66;              // f32 -> f16
+    // elem 2 -> global offset = (tid_x + 256) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 256;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h2;
-    cvt.rn.f16.f32 %h3, %f67;              // f32 → f16
-    // elem 3 → global offset = (tid_x + 384) * 2
+    cvt.rn.f16.f32 %h3, %f67;              // f32 -> f16
+    // elem 3 -> global offset = (tid_x + 384) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 384;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h3;
-    cvt.rn.f16.f32 %h4, %f68;              // f32 → f16
-    // elem 4 → global offset = (tid_x + 512) * 2
+    cvt.rn.f16.f32 %h4, %f68;              // f32 -> f16
+    // elem 4 -> global offset = (tid_x + 512) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 512;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h4;
-    cvt.rn.f16.f32 %h5, %f69;              // f32 → f16
-    // elem 5 → global offset = (tid_x + 640) * 2
+    cvt.rn.f16.f32 %h5, %f69;              // f32 -> f16
+    // elem 5 -> global offset = (tid_x + 640) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 640;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h5;
-    cvt.rn.f16.f32 %h6, %f70;              // f32 → f16
-    // elem 6 → global offset = (tid_x + 768) * 2
+    cvt.rn.f16.f32 %h6, %f70;              // f32 -> f16
+    // elem 6 -> global offset = (tid_x + 768) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 768;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h6;
-    cvt.rn.f16.f32 %h7, %f71;              // f32 → f16
-    // elem 7 → global offset = (tid_x + 896) * 2
+    cvt.rn.f16.f32 %h7, %f71;              // f32 -> f16
+    // elem 7 -> global offset = (tid_x + 896) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 896;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h7;
-    cvt.rn.f16.f32 %h8, %f72;              // f32 → f16
-    // elem 8 → global offset = (tid_x + 1024) * 2
+    cvt.rn.f16.f32 %h8, %f72;              // f32 -> f16
+    // elem 8 -> global offset = (tid_x + 1024) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1024;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h8;
-    cvt.rn.f16.f32 %h9, %f73;              // f32 → f16
-    // elem 9 → global offset = (tid_x + 1152) * 2
+    cvt.rn.f16.f32 %h9, %f73;              // f32 -> f16
+    // elem 9 -> global offset = (tid_x + 1152) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1152;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h9;
-    cvt.rn.f16.f32 %h10, %f74;              // f32 → f16
-    // elem 10 → global offset = (tid_x + 1280) * 2
+    cvt.rn.f16.f32 %h10, %f74;              // f32 -> f16
+    // elem 10 -> global offset = (tid_x + 1280) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1280;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h10;
-    cvt.rn.f16.f32 %h11, %f75;              // f32 → f16
-    // elem 11 → global offset = (tid_x + 1408) * 2
+    cvt.rn.f16.f32 %h11, %f75;              // f32 -> f16
+    // elem 11 -> global offset = (tid_x + 1408) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1408;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h11;
-    cvt.rn.f16.f32 %h12, %f76;              // f32 → f16
-    // elem 12 → global offset = (tid_x + 1536) * 2
+    cvt.rn.f16.f32 %h12, %f76;              // f32 -> f16
+    // elem 12 -> global offset = (tid_x + 1536) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1536;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h12;
-    cvt.rn.f16.f32 %h13, %f77;              // f32 → f16
-    // elem 13 → global offset = (tid_x + 1664) * 2
+    cvt.rn.f16.f32 %h13, %f77;              // f32 -> f16
+    // elem 13 -> global offset = (tid_x + 1664) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1664;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h13;
-    cvt.rn.f16.f32 %h14, %f78;              // f32 → f16
-    // elem 14 → global offset = (tid_x + 1792) * 2
+    cvt.rn.f16.f32 %h14, %f78;              // f32 -> f16
+    // elem 14 -> global offset = (tid_x + 1792) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1792;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h14;
-    cvt.rn.f16.f32 %h15, %f79;              // f32 → f16
-    // elem 15 → global offset = (tid_x + 1920) * 2
+    cvt.rn.f16.f32 %h15, %f79;              // f32 -> f16
+    // elem 15 -> global offset = (tid_x + 1920) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 1920;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h15;
-    cvt.rn.f16.f32 %h16, %f80;              // f32 → f16
-    // elem 16 → global offset = (tid_x + 2048) * 2
+    cvt.rn.f16.f32 %h16, %f80;              // f32 -> f16
+    // elem 16 -> global offset = (tid_x + 2048) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2048;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h16;
-    cvt.rn.f16.f32 %h17, %f81;              // f32 → f16
-    // elem 17 → global offset = (tid_x + 2176) * 2
+    cvt.rn.f16.f32 %h17, %f81;              // f32 -> f16
+    // elem 17 -> global offset = (tid_x + 2176) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2176;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h17;
-    cvt.rn.f16.f32 %h18, %f82;              // f32 → f16
-    // elem 18 → global offset = (tid_x + 2304) * 2
+    cvt.rn.f16.f32 %h18, %f82;              // f32 -> f16
+    // elem 18 -> global offset = (tid_x + 2304) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2304;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h18;
-    cvt.rn.f16.f32 %h19, %f83;              // f32 → f16
-    // elem 19 → global offset = (tid_x + 2432) * 2
+    cvt.rn.f16.f32 %h19, %f83;              // f32 -> f16
+    // elem 19 -> global offset = (tid_x + 2432) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2432;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h19;
-    cvt.rn.f16.f32 %h20, %f84;              // f32 → f16
-    // elem 20 → global offset = (tid_x + 2560) * 2
+    cvt.rn.f16.f32 %h20, %f84;              // f32 -> f16
+    // elem 20 -> global offset = (tid_x + 2560) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2560;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h20;
-    cvt.rn.f16.f32 %h21, %f85;              // f32 → f16
-    // elem 21 → global offset = (tid_x + 2688) * 2
+    cvt.rn.f16.f32 %h21, %f85;              // f32 -> f16
+    // elem 21 -> global offset = (tid_x + 2688) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2688;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h21;
-    cvt.rn.f16.f32 %h22, %f86;              // f32 → f16
-    // elem 22 → global offset = (tid_x + 2816) * 2
+    cvt.rn.f16.f32 %h22, %f86;              // f32 -> f16
+    // elem 22 -> global offset = (tid_x + 2816) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2816;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h22;
-    cvt.rn.f16.f32 %h23, %f87;              // f32 → f16
-    // elem 23 → global offset = (tid_x + 2944) * 2
+    cvt.rn.f16.f32 %h23, %f87;              // f32 -> f16
+    // elem 23 -> global offset = (tid_x + 2944) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 2944;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h23;
-    cvt.rn.f16.f32 %h24, %f88;              // f32 → f16
-    // elem 24 → global offset = (tid_x + 3072) * 2
+    cvt.rn.f16.f32 %h24, %f88;              // f32 -> f16
+    // elem 24 -> global offset = (tid_x + 3072) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3072;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h24;
-    cvt.rn.f16.f32 %h25, %f89;              // f32 → f16
-    // elem 25 → global offset = (tid_x + 3200) * 2
+    cvt.rn.f16.f32 %h25, %f89;              // f32 -> f16
+    // elem 25 -> global offset = (tid_x + 3200) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3200;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h25;
-    cvt.rn.f16.f32 %h26, %f90;              // f32 → f16
-    // elem 26 → global offset = (tid_x + 3328) * 2
+    cvt.rn.f16.f32 %h26, %f90;              // f32 -> f16
+    // elem 26 -> global offset = (tid_x + 3328) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3328;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h26;
-    cvt.rn.f16.f32 %h27, %f91;              // f32 → f16
-    // elem 27 → global offset = (tid_x + 3456) * 2
+    cvt.rn.f16.f32 %h27, %f91;              // f32 -> f16
+    // elem 27 -> global offset = (tid_x + 3456) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3456;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h27;
-    cvt.rn.f16.f32 %h28, %f92;              // f32 → f16
-    // elem 28 → global offset = (tid_x + 3584) * 2
+    cvt.rn.f16.f32 %h28, %f92;              // f32 -> f16
+    // elem 28 -> global offset = (tid_x + 3584) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3584;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h28;
-    cvt.rn.f16.f32 %h29, %f93;              // f32 → f16
-    // elem 29 → global offset = (tid_x + 3712) * 2
+    cvt.rn.f16.f32 %h29, %f93;              // f32 -> f16
+    // elem 29 -> global offset = (tid_x + 3712) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3712;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h29;
-    cvt.rn.f16.f32 %h30, %f94;              // f32 → f16
-    // elem 30 → global offset = (tid_x + 3840) * 2
+    cvt.rn.f16.f32 %h30, %f94;              // f32 -> f16
+    // elem 30 -> global offset = (tid_x + 3840) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3840;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h30;
-    cvt.rn.f16.f32 %h31, %f95;              // f32 → f16
-    // elem 31 → global offset = (tid_x + 3968) * 2
+    cvt.rn.f16.f32 %h31, %f95;              // f32 -> f16
+    // elem 31 -> global offset = (tid_x + 3968) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 3968;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h31;
-    cvt.rn.f16.f32 %h0, %f96;              // f32 → f16
-    // elem 32 → global offset = (tid_x + 4096) * 2
+    cvt.rn.f16.f32 %h0, %f96;              // f32 -> f16
+    // elem 32 -> global offset = (tid_x + 4096) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4096;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h0;
-    cvt.rn.f16.f32 %h1, %f97;              // f32 → f16
-    // elem 33 → global offset = (tid_x + 4224) * 2
+    cvt.rn.f16.f32 %h1, %f97;              // f32 -> f16
+    // elem 33 -> global offset = (tid_x + 4224) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4224;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h1;
-    cvt.rn.f16.f32 %h2, %f98;              // f32 → f16
-    // elem 34 → global offset = (tid_x + 4352) * 2
+    cvt.rn.f16.f32 %h2, %f98;              // f32 -> f16
+    // elem 34 -> global offset = (tid_x + 4352) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4352;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h2;
-    cvt.rn.f16.f32 %h3, %f99;              // f32 → f16
-    // elem 35 → global offset = (tid_x + 4480) * 2
+    cvt.rn.f16.f32 %h3, %f99;              // f32 -> f16
+    // elem 35 -> global offset = (tid_x + 4480) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4480;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h3;
-    cvt.rn.f16.f32 %h4, %f100;              // f32 → f16
-    // elem 36 → global offset = (tid_x + 4608) * 2
+    cvt.rn.f16.f32 %h4, %f100;              // f32 -> f16
+    // elem 36 -> global offset = (tid_x + 4608) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4608;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h4;
-    cvt.rn.f16.f32 %h5, %f101;              // f32 → f16
-    // elem 37 → global offset = (tid_x + 4736) * 2
+    cvt.rn.f16.f32 %h5, %f101;              // f32 -> f16
+    // elem 37 -> global offset = (tid_x + 4736) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4736;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h5;
-    cvt.rn.f16.f32 %h6, %f102;              // f32 → f16
-    // elem 38 → global offset = (tid_x + 4864) * 2
+    cvt.rn.f16.f32 %h6, %f102;              // f32 -> f16
+    // elem 38 -> global offset = (tid_x + 4864) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4864;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h6;
-    cvt.rn.f16.f32 %h7, %f103;              // f32 → f16
-    // elem 39 → global offset = (tid_x + 4992) * 2
+    cvt.rn.f16.f32 %h7, %f103;              // f32 -> f16
+    // elem 39 -> global offset = (tid_x + 4992) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 4992;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h7;
-    cvt.rn.f16.f32 %h8, %f104;              // f32 → f16
-    // elem 40 → global offset = (tid_x + 5120) * 2
+    cvt.rn.f16.f32 %h8, %f104;              // f32 -> f16
+    // elem 40 -> global offset = (tid_x + 5120) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5120;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h8;
-    cvt.rn.f16.f32 %h9, %f105;              // f32 → f16
-    // elem 41 → global offset = (tid_x + 5248) * 2
+    cvt.rn.f16.f32 %h9, %f105;              // f32 -> f16
+    // elem 41 -> global offset = (tid_x + 5248) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5248;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h9;
-    cvt.rn.f16.f32 %h10, %f106;              // f32 → f16
-    // elem 42 → global offset = (tid_x + 5376) * 2
+    cvt.rn.f16.f32 %h10, %f106;              // f32 -> f16
+    // elem 42 -> global offset = (tid_x + 5376) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5376;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h10;
-    cvt.rn.f16.f32 %h11, %f107;              // f32 → f16
-    // elem 43 → global offset = (tid_x + 5504) * 2
+    cvt.rn.f16.f32 %h11, %f107;              // f32 -> f16
+    // elem 43 -> global offset = (tid_x + 5504) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5504;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h11;
-    cvt.rn.f16.f32 %h12, %f108;              // f32 → f16
-    // elem 44 → global offset = (tid_x + 5632) * 2
+    cvt.rn.f16.f32 %h12, %f108;              // f32 -> f16
+    // elem 44 -> global offset = (tid_x + 5632) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5632;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h12;
-    cvt.rn.f16.f32 %h13, %f109;              // f32 → f16
-    // elem 45 → global offset = (tid_x + 5760) * 2
+    cvt.rn.f16.f32 %h13, %f109;              // f32 -> f16
+    // elem 45 -> global offset = (tid_x + 5760) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5760;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h13;
-    cvt.rn.f16.f32 %h14, %f110;              // f32 → f16
-    // elem 46 → global offset = (tid_x + 5888) * 2
+    cvt.rn.f16.f32 %h14, %f110;              // f32 -> f16
+    // elem 46 -> global offset = (tid_x + 5888) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 5888;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h14;
-    cvt.rn.f16.f32 %h15, %f111;              // f32 → f16
-    // elem 47 → global offset = (tid_x + 6016) * 2
+    cvt.rn.f16.f32 %h15, %f111;              // f32 -> f16
+    // elem 47 -> global offset = (tid_x + 6016) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6016;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h15;
-    cvt.rn.f16.f32 %h16, %f112;              // f32 → f16
-    // elem 48 → global offset = (tid_x + 6144) * 2
+    cvt.rn.f16.f32 %h16, %f112;              // f32 -> f16
+    // elem 48 -> global offset = (tid_x + 6144) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6144;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h16;
-    cvt.rn.f16.f32 %h17, %f113;              // f32 → f16
-    // elem 49 → global offset = (tid_x + 6272) * 2
+    cvt.rn.f16.f32 %h17, %f113;              // f32 -> f16
+    // elem 49 -> global offset = (tid_x + 6272) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6272;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h17;
-    cvt.rn.f16.f32 %h18, %f114;              // f32 → f16
-    // elem 50 → global offset = (tid_x + 6400) * 2
+    cvt.rn.f16.f32 %h18, %f114;              // f32 -> f16
+    // elem 50 -> global offset = (tid_x + 6400) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6400;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h18;
-    cvt.rn.f16.f32 %h19, %f115;              // f32 → f16
-    // elem 51 → global offset = (tid_x + 6528) * 2
+    cvt.rn.f16.f32 %h19, %f115;              // f32 -> f16
+    // elem 51 -> global offset = (tid_x + 6528) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6528;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h19;
-    cvt.rn.f16.f32 %h20, %f116;              // f32 → f16
-    // elem 52 → global offset = (tid_x + 6656) * 2
+    cvt.rn.f16.f32 %h20, %f116;              // f32 -> f16
+    // elem 52 -> global offset = (tid_x + 6656) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6656;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h20;
-    cvt.rn.f16.f32 %h21, %f117;              // f32 → f16
-    // elem 53 → global offset = (tid_x + 6784) * 2
+    cvt.rn.f16.f32 %h21, %f117;              // f32 -> f16
+    // elem 53 -> global offset = (tid_x + 6784) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6784;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h21;
-    cvt.rn.f16.f32 %h22, %f118;              // f32 → f16
-    // elem 54 → global offset = (tid_x + 6912) * 2
+    cvt.rn.f16.f32 %h22, %f118;              // f32 -> f16
+    // elem 54 -> global offset = (tid_x + 6912) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 6912;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h22;
-    cvt.rn.f16.f32 %h23, %f119;              // f32 → f16
-    // elem 55 → global offset = (tid_x + 7040) * 2
+    cvt.rn.f16.f32 %h23, %f119;              // f32 -> f16
+    // elem 55 -> global offset = (tid_x + 7040) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7040;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h23;
-    cvt.rn.f16.f32 %h24, %f120;              // f32 → f16
-    // elem 56 → global offset = (tid_x + 7168) * 2
+    cvt.rn.f16.f32 %h24, %f120;              // f32 -> f16
+    // elem 56 -> global offset = (tid_x + 7168) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7168;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h24;
-    cvt.rn.f16.f32 %h25, %f121;              // f32 → f16
-    // elem 57 → global offset = (tid_x + 7296) * 2
+    cvt.rn.f16.f32 %h25, %f121;              // f32 -> f16
+    // elem 57 -> global offset = (tid_x + 7296) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7296;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h25;
-    cvt.rn.f16.f32 %h26, %f122;              // f32 → f16
-    // elem 58 → global offset = (tid_x + 7424) * 2
+    cvt.rn.f16.f32 %h26, %f122;              // f32 -> f16
+    // elem 58 -> global offset = (tid_x + 7424) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7424;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h26;
-    cvt.rn.f16.f32 %h27, %f123;              // f32 → f16
-    // elem 59 → global offset = (tid_x + 7552) * 2
+    cvt.rn.f16.f32 %h27, %f123;              // f32 -> f16
+    // elem 59 -> global offset = (tid_x + 7552) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7552;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h27;
-    cvt.rn.f16.f32 %h28, %f124;              // f32 → f16
-    // elem 60 → global offset = (tid_x + 7680) * 2
+    cvt.rn.f16.f32 %h28, %f124;              // f32 -> f16
+    // elem 60 -> global offset = (tid_x + 7680) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7680;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h28;
-    cvt.rn.f16.f32 %h29, %f125;              // f32 → f16
-    // elem 61 → global offset = (tid_x + 7808) * 2
+    cvt.rn.f16.f32 %h29, %f125;              // f32 -> f16
+    // elem 61 -> global offset = (tid_x + 7808) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7808;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h29;
-    cvt.rn.f16.f32 %h30, %f126;              // f32 → f16
-    // elem 62 → global offset = (tid_x + 7936) * 2
+    cvt.rn.f16.f32 %h30, %f126;              // f32 -> f16
+    // elem 62 -> global offset = (tid_x + 7936) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 7936;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)
     add.u64 %rd52, %rd51, %rd52;          // out_base + offset
     st.global.b16 [%rd52], %h30;
-    cvt.rn.f16.f32 %h31, %f127;              // f32 → f16
-    // elem 63 → global offset = (tid_x + 8064) * 2
+    cvt.rn.f16.f32 %h31, %f127;              // f32 -> f16
+    // elem 63 -> global offset = (tid_x + 8064) * 2
     cvt.u64.u32 %rd52, %tid_x;
     add.u64 %rd52, %rd52, 8064;              // + i * 128
     shl.b64 %rd52, %rd52, 1;              // * 2 (f16)

@@ -266,14 +266,32 @@ pub extern "C" fn nsl_flash_attention(
             if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!("[nsl] Using FlashAttention-2 (Ampere mma.sync)");
             }
-            crate::cuda::inner::kernel_launch(
+            let rc = crate::cuda::inner::kernel_launch(
                 effective_ptx_ptr as *const u8,
                 effective_name_ptr as *const u8,
                 [grid_x, grid_y, grid_z],
                 [block_x, block_y, block_z],
                 &args,
                 shared_mem_bytes as u32,
-            ) as i64
+            ) as i64;
+            if rc != 0 {
+                // NEVER fail silently: the Cranelift call sites ignore this
+                // return code, so without this line a failed launch leaves
+                // `out` all-zeros and training continues on garbage — the
+                // forward twin of the #324 silent-zero-gradients bug. (Found
+                // by the 4.2 pretrain e2e: ptxas 13.3 rejected non-ASCII PTX
+                // comments with CUDA_ERROR_INVALID_PTX=218, the forward
+                // "succeeded" with zero attention output, and the loss
+                // climbed to the uniform plateau.)
+                eprintln!(
+                    "[flash-fwd] FlashAttention forward kernel launch FAILED \
+                     (CUDA error {rc}) — the attention output buffer is \
+                     UNWRITTEN (zeros) and training/inference results are \
+                     invalid. Check the PTX with nsl_test_cuda_jit_log. \
+                     Refusing to continue silently."
+                );
+            }
+            rc
         };
 
         // Record tape op for backward pass if recording

@@ -4614,7 +4614,7 @@ mod tests {
 
     const VEC_ADD_PTX: &str = "\
 .version 7.0
-.target sm_52
+.target sm_70
 .address_size 64
 
 .visible .entry vec_add(
