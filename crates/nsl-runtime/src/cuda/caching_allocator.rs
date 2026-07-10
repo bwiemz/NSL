@@ -306,7 +306,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         // Possibly split
         let remainder = block.size - rounded;
         if remainder >= Self::min_split_size(small) {
-            self.split_block(block_ptr, rounded, small);
+            self.split_block(block_ptr, rounded);
         }
 
         // Mark allocated
@@ -387,7 +387,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let rounded = Self::round_size(size_bytes);
         let remainder = segment_size - rounded;
         if remainder >= Self::min_split_size(small) {
-            self.split_block(block, rounded, small);
+            self.split_block(block, rounded);
         }
 
         let blk = unsafe { &mut *block };
@@ -411,10 +411,11 @@ impl<D: DriverAlloc> CachingAllocator<D> {
     }
 
     /// Split a block: shrink `block` to `new_size` and create a free remainder.
-    fn split_block(&mut self, block_ptr: *mut Block, new_size: usize, small: bool) {
+    fn split_block(&mut self, block_ptr: *mut Block, new_size: usize) {
         let block = unsafe { &mut *block_ptr };
         let remainder_size = block.size - new_size;
         let remainder_ptr = unsafe { (block.ptr as *mut u8).add(new_size) as *mut c_void };
+        let segment_idx = block.segment_idx;
 
         let remainder = Box::into_raw(Box::new(Block {
             ptr: remainder_ptr,
@@ -436,8 +437,16 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         block.next = remainder;
         block.size = new_size;
 
-        // Track the remainder block — use remainder's actual size to choose pool
-        let remainder_small = Self::is_small(remainder_size);
+        // File the remainder in its owning segment's free-list. Choosing by the
+        // remainder's own size would strand it: the remainder of a 2 MB small
+        // segment exceeds SMALL_THRESHOLD, so it would land in `large_free`,
+        // where a small request (which only searches `small_free`) never looks.
+        //
+        // This makes free-list placement depend on `Block::segment_idx` being
+        // accurate. `drain_all` keeps it so by rewriting every block's index
+        // after its `swap_remove` calls; any future segment renumbering must do
+        // the same or blocks will be filed into the wrong pool.
+        let remainder_small = self.segments[segment_idx].is_small;
         self.all_blocks.insert(remainder_ptr as usize, remainder);
         self.free_set_mut(remainder_small).insert(FreeBlockKey {
             size: remainder_size,
@@ -469,6 +478,8 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         let seg = &mut self.segments[block.segment_idx];
         seg.allocated_count -= 1;
+        // Every block reachable from this one via prev/next lives in the same
+        // segment, so one pool flag governs all the free-list edits below.
         let small = seg.is_small;
 
         self.total_allocated -= old_size;
@@ -489,12 +500,14 @@ impl<D: DriverAlloc> CachingAllocator<D> {
                 let next_next = next_block.next;
                 let next_ptr_addr = next_block.ptr as usize;
 
-                // Remove next from free-list (use next's size to find correct pool)
-                let next_small = Self::is_small(next_size);
-                self.free_set_mut(next_small).remove(&FreeBlockKey {
+                // Remove next from its segment's free-list. Bind the result
+                // before asserting: debug_assert! does not evaluate its argument
+                // in release builds, which would skip the removal entirely.
+                let removed = self.free_set_mut(small).remove(&FreeBlockKey {
                     size: next_size,
                     ptr: next_ptr_addr,
                 });
+                debug_assert!(removed, "next block absent from its segment's free-list");
                 self.stats.num_free_blocks -= 1;
 
                 let block = unsafe { &mut *block_ptr };
@@ -517,12 +530,12 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         if !prev.is_null() {
             let prev_block = unsafe { &*prev };
             if !prev_block.allocated {
-                // Remove prev from free-list (use prev's size to find correct pool)
-                let prev_small = Self::is_small(prev_block.size);
-                self.free_set_mut(prev_small).remove(&FreeBlockKey {
+                // Remove prev from its segment's free-list
+                let removed = self.free_set_mut(small).remove(&FreeBlockKey {
                     size: prev_block.size,
                     ptr: prev_block.ptr as usize,
                 });
+                debug_assert!(removed, "prev block absent from its segment's free-list");
                 self.stats.num_free_blocks -= 1;
 
                 // Merge block into prev
@@ -542,9 +555,8 @@ impl<D: DriverAlloc> CachingAllocator<D> {
                 unsafe { drop(Box::from_raw(block_ptr)); }
                 self.stats.num_coalesces += 1;
 
-                // Insert prev (the coalesced block) into free-list
-                let merged_small = Self::is_small(merged_size);
-                self.free_set_mut(merged_small).insert(FreeBlockKey {
+                // Insert prev (the coalesced block) into its segment's free-list
+                self.free_set_mut(small).insert(FreeBlockKey {
                     size: merged_size,
                     ptr: prev_block.ptr as usize,
                 });
@@ -556,8 +568,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         // No prev-coalesce: insert the (possibly next-coalesced) block into free-list
         let block = unsafe { &*block_ptr };
-        let block_small = Self::is_small(block.size);
-        self.free_set_mut(block_small).insert(FreeBlockKey {
+        self.free_set_mut(small).insert(FreeBlockKey {
             size: block.size,
             ptr: block.ptr as usize,
         });
@@ -587,6 +598,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             let seg_blocks_head = self.segments[idx].blocks_head;
             let seg_base_ptr = self.segments[idx].base_ptr;
             let seg_total_size = self.segments[idx].total_size;
+            let seg_is_small = self.segments[idx].is_small;
 
             // Walk the block list and remove all blocks from free-set + all_blocks
             let mut bptr = seg_blocks_head;
@@ -597,11 +609,11 @@ impl<D: DriverAlloc> CachingAllocator<D> {
                 let blk_ptr = block.ptr as usize;
 
                 // Remove from free-list (all blocks in a fully-free segment must be free)
-                let blk_small = Self::is_small(blk_size);
-                self.free_set_mut(blk_small).remove(&FreeBlockKey {
+                let removed = self.free_set_mut(seg_is_small).remove(&FreeBlockKey {
                     size: blk_size,
                     ptr: blk_ptr,
                 });
+                debug_assert!(removed, "block in a fully-free segment absent from its free-list");
                 self.stats.num_free_blocks = self.stats.num_free_blocks.saturating_sub(1);
                 self.all_blocks.remove(&blk_ptr);
 
@@ -917,19 +929,46 @@ mod tests {
     #[test]
     fn test_best_fit() {
         let mut a = make_alloc();
-        // Allocate and free blocks of different sizes
-        let p_small = a.alloc_with_grow(512).unwrap();
+        // Carve [guard][victim] pairs out of one 2 MB segment. The guards stay
+        // allocated so the victims are never adjacent to each other; without
+        // them all three victims coalesce back into a single 2 MB block on free
+        // and best-fit selection is unobservable.
+        let _g0 = a.alloc_with_grow(512).unwrap();
+        let p_small = a.alloc_from_cache(512).unwrap();
+        let _g1 = a.alloc_from_cache(512).unwrap();
         let p_med = a.alloc_from_cache(2048).unwrap();
+        let _g2 = a.alloc_from_cache(512).unwrap();
         let p_large = a.alloc_from_cache(8192).unwrap();
+        let _g3 = a.alloc_from_cache(512).unwrap();
 
         a.free_block(p_small);
         a.free_block(p_med);
         a.free_block(p_large);
 
-        // Request for 1024 should pick the 2048 block (best fit), not the 8192
+        // Free blocks are now 512, 2048, 8192 (plus the segment's large tail).
+        // A 1024 request must pick the 2048 block: 512 is too small, and 8192
+        // and the tail are larger than necessary.
         let p = a.alloc_from_cache(1024).unwrap();
-        // The returned pointer should be the 2048 block (smallest that fits)
         assert_eq!(p, p_med, "best-fit should choose the smallest sufficient block");
+    }
+
+    /// Regression: the remainder left over from carving a small allocation out
+    /// of a 2 MB small segment is itself larger than SMALL_THRESHOLD. It must be
+    /// filed in the small pool (its segment's pool) rather than the large pool
+    /// (its own size), or no small request can ever reuse it and every small
+    /// alloc grows a fresh segment.
+    #[test]
+    fn test_small_segment_remainder_stays_in_small_pool() {
+        let mut a = make_alloc();
+        let _p = a.alloc_with_grow(1024).unwrap();
+
+        let remainder = SMALL_SEGMENT_SIZE - 1024;
+        assert!(
+            !CachingAllocator::<MockDriver>::is_small(remainder),
+            "precondition: the remainder is larger than SMALL_THRESHOLD",
+        );
+        assert_eq!(a.small_free.len(), 1, "remainder belongs to the small pool");
+        assert!(a.large_free.is_empty(), "remainder must not land in the large pool");
     }
 
     #[test]
@@ -962,17 +1001,33 @@ mod tests {
         let mut a = make_alloc();
         a.memory_limit = 4 << 20; // 4 MB limit
 
-        // First alloc: 2MB segment
+        // Each alloc_with_grow reserves a fresh SMALL_SEGMENT_SIZE (2 MB) segment.
         let p1 = a.alloc_with_grow(512);
         assert!(p1.is_some());
 
-        // Second alloc: would need another 2MB segment, still within 4MB
-        let p2 = a.alloc_with_grow(2 << 20);
+        // Second segment: 4 MB reserved, exactly at the limit.
+        let p2 = a.alloc_with_grow(512);
         assert!(p2.is_some());
 
-        // Third alloc: would exceed 4MB limit
-        let p3 = a.alloc_with_grow(2 << 20);
+        // Third would reserve 6 MB.
+        let p3 = a.alloc_with_grow(512);
         assert!(p3.is_none(), "should fail when memory limit exceeded");
+    }
+
+    /// A large request grows a whole LARGE_SEGMENT_SIZE (20 MB) segment even when
+    /// the request is far smaller, so a modest memory limit rejects it outright.
+    #[test]
+    fn test_memory_limit_large_pool_growth_is_coarse() {
+        let mut a = make_alloc();
+        a.memory_limit = 4 << 20; // 4 MB limit
+
+        // 2 MB is a large request; growth reserves 20 MB, which exceeds the limit.
+        assert!(a.alloc_with_grow(2 << 20).is_none());
+
+        // Raising the limit past LARGE_SEGMENT_SIZE lets the same request through.
+        a.memory_limit = LARGE_SEGMENT_SIZE;
+        assert!(a.alloc_with_grow(2 << 20).is_some());
+        assert_eq!(a.total_reserved, LARGE_SEGMENT_SIZE);
     }
 
     #[test]
@@ -1031,9 +1086,10 @@ mod tests {
     #[test]
     fn test_repeated_alloc_free_no_growth() {
         let mut a = make_alloc();
-        // Simulate training loop: same-sized allocs repeated
+        // Simulate training loop: same-sized allocs repeated. Cache first, then
+        // grow on a miss — the order the runtime uses in cuda::mod::alloc.
         for _ in 0..100 {
-            let p = a.alloc_with_grow(4096).or_else(|| a.alloc_from_cache(4096)).unwrap();
+            let p = a.alloc_from_cache(4096).or_else(|| a.alloc_with_grow(4096)).unwrap();
             a.free_block(p);
         }
         // Should only have 1 driver allocation (the initial segment)
