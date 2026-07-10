@@ -89,9 +89,17 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
     let name_cstr = unsafe { CStr::from_ptr(name) }.to_owned();
 
     // Eagerly resolve the dispatch symbol once at registration time.
-    // Cached in `cached_dispatch_fn`; `CreateKernel`/`CreateKernelV2` read
-    // it directly rather than calling `resolve_self_symbol` again.
-    let cached_dispatch_fn = unsafe { resolve_self_symbol(name_cstr.as_ptr()) };
+    // We look up `<name>__nsl_dispatch`, NOT `<name>`: the typed `<name>`
+    // symbol takes individual tensor-desc pointers plus an output desc as
+    // separate params, while ExportFnPtr expects the packed-array ABI
+    // (model_ptr, inputs_ptr, n_inputs, outputs_ptr, n_outputs). Calling the
+    // typed wrapper as ExportFnPtr misroutes `n_inputs=1` as the output-desc
+    // pointer, writing into address 0x1 → SIGABRT. See exports.rs L145.
+    let dispatch_cname = {
+        let s = format!("{}__nsl_dispatch", name_cstr.to_string_lossy());
+        CString::new(s).unwrap_or_else(|_| name_cstr.clone())
+    };
+    let cached_dispatch_fn = unsafe { resolve_self_symbol(dispatch_cname.as_ptr()) };
 
     let entry = Box::new(PerExportVtable {
         vtable: OrtCustomOp {
@@ -272,8 +280,14 @@ unsafe extern "C" fn vtable_create_kernel_v2(
     let entry = op as *const PerExportVtable;
     let raw_fn = (*entry).cached_dispatch_fn;
     if raw_fn == 0 {
-        // Symbol not found — leave *kernel_out null so ORT rejects the op.
-        return std::ptr::null_mut();
+        // Dispatch symbol not found — zero out *kernel_out so ORT sees a
+        // null kernel (not uninitialized stack garbage) and return an error
+        // status so ORT rejects this op cleanly.
+        if !kernel_out.is_null() {
+            *kernel_out = std::ptr::null_mut();
+        }
+        let msg = c"NSL: __nsl_dispatch symbol not found in shared library".as_ptr();
+        return ((*api).CreateStatus)(OrtErrorCode::ORT_INVALID_ARGUMENT, msg);
     }
     let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
     let state = Box::new(NslOrtKernelState {
