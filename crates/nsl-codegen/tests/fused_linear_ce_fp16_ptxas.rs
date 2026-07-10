@@ -48,7 +48,15 @@ fn assemble_ptx(
     let pid = std::process::id();
     let in_path = std::env::temp_dir().join(format!("nsl_ptxas_fp16_in_{pid}_{tag}.ptx"));
     let out_path = std::env::temp_dir().join(format!("nsl_ptxas_fp16_out_{pid}_{tag}.cubin"));
-    std::fs::write(&in_path, ptx_bytes)
+    // `synthesize_*_ptx` returns NUL-terminated bytes, because that is what
+    // `cuModuleLoadData` expects. ptxas reads an embedded NUL as a premature end
+    // of file and fails with `Unexpected EOF encountered on line N`, so hand it
+    // only the text before the terminator.
+    let text_end = ptx_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(ptx_bytes.len());
+    std::fs::write(&in_path, &ptx_bytes[..text_end])
         .map_err(|e| format!("failed to write PTX temp file: {e}"))?;
 
     let mut child = Command::new(ptxas_path)
