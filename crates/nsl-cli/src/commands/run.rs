@@ -275,7 +275,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
                 autotune_fresh: false,
-                world_size: devices as usize,
+                // Clamp like `nsl build` (build/options.rs) — `--devices 0` must not
+                // produce world_size=0 (WGGO ZeRO/TP math assumes >= 1 rank).
+                world_size: (devices as usize).max(1),
                 fusion_report: false,
                 vram_budget: None,
                 memory_report: false,
