@@ -4561,12 +4561,10 @@ fn compute_logsumexp_gqa(
 /// under the cap so the GPU kernel runs.
 ///
 /// Constraints baked into the table:
-///   * **Symmetric only** (`block_q == block_kv`). The GPU block-size sweep
-///     (`diag_block_size_sweep`) found that asymmetric tiles produce a WRONG dV
-///     gradient under a *causal* mask (both the MMA and scalar paths, dV magnitude
-///     unchanged → a masking/tile-alignment bug, not a scale bug), while symmetric
-///     tiles are correct in every mode. Until that causal-asymmetric dV bug is
-///     fixed, the selector never emits `block_q != block_kv`.
+///   * Asymmetric tiles (`block_q != block_kv`) are allowed: codegen's causal
+///     q-loop start is tile-ratio-aware (`emit_bwd_causal_q_loop_start` floors
+///     `j*block_kv/block_q`), which fixed the historical asymmetric-causal
+///     wrong-dV bug the sweep (`diag_block_size_sweep`) originally exposed.
 ///   * MMA needs full 32-lane warps, so an MMA-eligible `block_q` is a multiple of
 ///     32 (enforced codegen-side in `backward_uses_mma`); a `block_q < 32` routes to
 ///     the scalar path, which is warp-count-agnostic.
@@ -4584,16 +4582,15 @@ pub fn select_backward_blocks(head_dim: i64) -> (i64, i64) {
         // 64: 32/32 → 59 KB MMA-inclusive, 1 warp. MMA path (block_q=32 % 32 == 0).
         // Verified GPU-correct causal + non-causal (coder-rl runs here, tensor cores).
         64 => (32, 32),
-        // 128: 16/16 → 52 KB. block_q=16 is sub-warp, so this deliberately routes to
-        // the SCALAR path (correct for any thread count). No symmetric MMA-eligible
-        // tile fits hd128 under 99 KB (32/32 is 107 KB), so hd128 runs on the scalar
-        // GPU kernel — slower than tensor cores but far faster than the CPU fallback.
-        // Verified GPU-correct causal + non-causal (coder7b runs here).
-        128 => (16, 16),
-        // >128 (e.g. 256): no symmetric tile both fits 99 KB and stays MMA-eligible.
-        // Keep 64/64 so the launch cleanly overflows the opt-in guard and the runtime
-        // falls back to the CPU backward (loud, correct). A future layout redesign
-        // (fewer resident tiles) could lift this.
+        // 128: 32/16 → 70 KB. block_q=32 is one full warp → MMA (tensor cores).
+        // Asymmetric is safe now that the causal q-loop start floors the tile ratio;
+        // GPU-verified correct causal + non-causal (coder7b head_dim). Previously
+        // 16/16 scalar (sub-warp block_q forced the scalar path).
+        128 => (32, 16),
+        // >128 (e.g. 256): nothing fits 99 KB even asymmetric (hd256 at 16/16 is
+        // ~102 KB). Keep 64/64 so the launch cleanly overflows the opt-in guard and
+        // the runtime falls back to the CPU backward (loud, correct). A future layout
+        // redesign (fewer resident tiles) could lift this.
         _ => (64, 64),
     }
 }
@@ -4623,6 +4620,29 @@ fn flash_attention_backward_gpu(
 ) -> i64 {
     use crate::cuda::inner;
     use std::ffi::c_void;
+
+    // ── Ragged-seq guard ──
+    // The Phase-2 main backward kernel has NO seq_len tail guards: it iterates
+    // num_q_tiles = ceil(s/block_q) and grid_y = ceil(s/block_kv), and a partial
+    // final tile computes PHANTOM rows/cols past seq_len. Phantom q-rows are not
+    // even causally masked (global_i >= s > every global_j), read the NEXT
+    // batch-head's Q/dO/D/L (or past the allocation for the last one), pollute
+    // valid dV/dK rows, and atomicAdd garbage dQ into the neighbor batch-head —
+    // silent gradient corruption, not a launch error. Until the emitter grows
+    // per-row bounds (zero-filling phantom SMEM rows), refuse loudly and let the
+    // caller take the correct CPU backward. Production pretraining seqs
+    // (1024/2048/4096) are multiples of every selector tile size, so this gate
+    // only redirects genuinely-unsupported ragged shapes.
+    if s % (block_q.max(1) as usize) != 0 || s % (block_kv.max(1) as usize) != 0 {
+        eprintln!(
+            "[flash-bwd] seq_len={s} is not a multiple of the backward tile sizes \
+             (block_q={block_q}, block_kv={block_kv}) — the GPU Phase-2 kernel has no \
+             ragged-tail guards and would corrupt gradients. Falling back to the \
+             correct CPU backward (slower). Pad/pack sequences to a multiple of \
+             {block_q} to train this shape on GPU."
+        );
+        return 0;
+    }
 
     // Sync before reading tensor data pointers
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
