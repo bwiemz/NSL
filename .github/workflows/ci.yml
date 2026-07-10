@@ -331,6 +331,20 @@ jobs:
           echo "LIBRARY_PATH=$STUBS:$LIBS:${LIBRARY_PATH:-}" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$STUBS:$LIBS:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
 
+      # Linking finds `libcuda.so` in the stubs directory, but at run time the
+      # loader resolves the SONAME `libcuda.so.1`, which the toolkit does not
+      # ship. Nothing in this job calls into the driver -- the allocator tests
+      # drive a mock and the PTX gate only shells out to ptxas -- so the stub is
+      # sufficient. It just has to exist under the name the loader looks for.
+      - name: Expose libcuda.so.1 to the loader
+        run: |
+          STUB=$(find "$CUDA_PATH" -path '*stubs*' -name 'libcuda.so' | head -1)
+          if [ -z "$STUB" ]; then echo "::error::no libcuda.so stub in $CUDA_PATH"; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/cuda-stubs"
+          ln -sf "$STUB" "$RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "linked $STUB -> $RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+
       # Compile-coverage for the whole feature. This alone catches any change
       # that breaks the cuda module, which nothing else in CI does.
       - name: Build workspace with --features cuda
