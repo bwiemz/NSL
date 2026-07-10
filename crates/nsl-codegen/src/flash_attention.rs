@@ -160,8 +160,10 @@ pub fn validate_mma_tile_sizes(
 /// per-warp `atom.add` accumulate is gated to warp 0 — see the PR #325 fix). A
 /// sub-warp `block_q` (e.g. 16) launches a partial warp, so `mma.sync`'s missing
 /// lanes yield NaN/garbage — the GPU sweep (`diag_block_size_sweep`) confirms
-/// `block_q=16` MMA produces NaN. `select_backward_blocks` uses `block_q=16` for
-/// hd128 *precisely* to route it here to the (warp-count-agnostic) scalar path.
+/// `block_q=16` MMA produces NaN. Any sub-warp `block_q` therefore routes here to
+/// the (warp-count-agnostic) scalar path. Every current `backward_select_blocks`
+/// entry (64/64, 32/32, 32/16) is MMA-eligible; hd128 runs tensor cores at 32/16
+/// since the causal floor-start fix made asymmetric tiles safe.
 fn backward_uses_mma(config: &FlashAttentionBackwardConfig) -> bool {
     use_mma_path(config.gpu_sm)
         && config.block_q % 32 == 0
@@ -179,12 +181,14 @@ fn backward_uses_mma(config: &FlashAttentionBackwardConfig) -> bool {
 /// back to the (correct but slow) CPU backward. This picks smaller tiles for the
 /// large head_dims so the footprint fits and the GPU kernel actually runs.
 ///
-/// **Symmetric only** (`block_q == block_kv`): the GPU sweep found asymmetric tiles
-/// give a wrong dV under a causal mask (both MMA and scalar). **MMA needs full
-/// 32-lane warps**, so a `block_q < 32` deliberately routes to the scalar path (see
-/// `backward_uses_mma`). Every entry must fit the *MMA-inclusive* SMEM layout under
-/// 99 KB because the runtime always requests that maximum (it cannot distinguish the
-/// scalar and MMA PTX it is handed).
+/// Asymmetric tiles (`block_q != block_kv`) are allowed: the causal q-loop start is
+/// tile-ratio-aware (`emit_bwd_causal_q_loop_start` floors `j*block_kv/block_q`), which
+/// fixed the historical "wrong dV under a causal mask at asymmetric tiles" bug (the old
+/// start `i_block = j_block` assumed equal tile sizes and skipped live q-tiles).
+/// **MMA needs full 32-lane warps**, so a `block_q < 32` deliberately routes to the
+/// scalar path (see `backward_uses_mma`). Every entry must fit the *MMA-inclusive* SMEM
+/// layout under 99 KB because the runtime always requests that maximum (it cannot
+/// distinguish the scalar and MMA PTX it is handed).
 ///
 /// The runtime keeps a byte-identical copy at
 /// `nsl_runtime::flash_attention::select_backward_blocks` (it cannot depend on
@@ -200,14 +204,49 @@ pub fn backward_select_blocks(head_dim: i64) -> (i64, i64) {
         // 64: 32/32 → 59 KB, 1 warp. MMA (block_q=32 % 32 == 0). GPU-verified correct
         // causal + non-causal (coder-rl head_dim; runs on tensor cores).
         64 => (32, 32),
-        // 128: 16/16 → 52 KB. block_q=16 is sub-warp → SCALAR path (correct for any
-        // thread count). No symmetric MMA-eligible tile fits hd128 under 99 KB
-        // (32/32 = 107 KB), so hd128 uses the scalar GPU kernel — slower than tensor
-        // cores but far faster than CPU. GPU-verified correct (coder7b head_dim).
-        128 => (16, 16),
-        // >128: no symmetric tile both fits 99 KB and stays MMA-eligible. Keep 64/64
-        // so the launch cleanly overflows the opt-in guard → loud CPU fallback.
+        // 128: 32/16 → 70 KB. block_q=32 is one full warp → MMA (tensor cores).
+        // Asymmetric is safe now that the causal q-loop start floors the tile ratio;
+        // GPU-verified correct causal + non-causal (coder7b head_dim). Previously
+        // 16/16 scalar (sub-warp block_q forced the scalar path).
+        128 => (32, 16),
+        // >128: nothing fits 99 KB even asymmetric (hd256 at 16/16 is ~102 KB). Keep
+        // 64/64 so the launch cleanly overflows the opt-in guard → loud CPU fallback.
         _ => (64, 64),
+    }
+}
+
+/// Emit the initial `i_block` (q-tile index) for the backward main kernel's inner
+/// Q-tile loop into `%rd24`, given `%rd13` = `j_block` (this CTA's kv-tile index).
+///
+/// Causal: the first q-tile that can attend kv-tile `j` is
+/// `floor(j * block_kv / block_q)` — every earlier q-tile ends before `kv_start`,
+/// so all its positions are masked. The historical form `i_block = j_block`
+/// implicitly assumed `block_q == block_kv`; with asymmetric tiles it started the
+/// loop too LATE and silently skipped live (q-tile, kv-tile) pairs — dropping
+/// dV/dK contributions for the skipped q-rows (and their dQ) — the
+/// "asymmetric-causal wrong-dV" bug `diag_block_size_sweep` exposed on both the
+/// MMA and scalar paths. Flooring may start on a partially-masked tile; that is
+/// numerically exact because the in-tile mask is element-level on absolute
+/// positions (`global_i < global_j` → P = 0), so masked elements contribute
+/// nothing to any gradient. Non-causal starts at 0.
+fn emit_bwd_causal_q_loop_start(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    if !config.causal {
+        ptx.push_str("    mov.u64 %rd24, 0;  // i_block = 0 (non-causal)\n");
+    } else if config.block_q == config.block_kv {
+        // Equal tiles: floor(j*bkv/bq) == j. Keep the historical emission
+        // byte-identical so symmetric configs (hd<=32 production) don't churn.
+        ptx.push_str("    mov.u64 %rd24, %rd13;  // i_block = j_block (causal)\n");
+    } else {
+        // General floor(j_block * block_kv / block_q); one mul+div per CTA launch,
+        // cost is negligible. Works for any tile sizes (no power-of-two assumption).
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd24, %rd13, {};  // j_block * block_kv\n",
+            config.block_kv
+        ));
+        ptx.push_str(&format!(
+            "    div.u64 %rd24, %rd24, {};  // i_block = j_block*block_kv/block_q (causal floor start)\n",
+            config.block_q
+        ));
     }
 }
 
@@ -3784,12 +3823,8 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
 
     ptx.push_str("    // === Inner Q-tile loop ===\n");
 
-    // i_block loop: for causal, start at j_block; otherwise start at 0
-    if config.causal {
-        ptx.push_str("    mov.u64 %rd24, %rd13;  // i_block = j_block (causal)\n");
-    } else {
-        ptx.push_str("    mov.u64 %rd24, 0;  // i_block = 0 (non-causal)\n");
-    }
+    // i_block loop start: causal-aware floor start (see emit_bwd_causal_q_loop_start).
+    emit_bwd_causal_q_loop_start(ptx, config);
 
     ptx.push_str("BWD_MAIN_Q_LOOP:\n");
     ptx.push_str("    setp.ge.u64 %p0, %rd24, %rd17;  // i_block >= num_q_tiles?\n");
@@ -4350,12 +4385,8 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
 
     ptx.push_str("    // === Inner Q-tile loop (full MMA path for all matmuls) ===\n");
 
-    // i_block loop: for causal, start at j_block; otherwise start at 0
-    if config.causal {
-        ptx.push_str("    mov.u64 %rd24, %rd13;  // i_block = j_block (causal)\n");
-    } else {
-        ptx.push_str("    mov.u64 %rd24, 0;  // i_block = 0 (non-causal)\n");
-    }
+    // i_block loop start: causal-aware floor start (see emit_bwd_causal_q_loop_start).
+    emit_bwd_causal_q_loop_start(ptx, config);
 
     ptx.push_str("BWD_MAIN_Q_LOOP:\n");
     ptx.push_str("    setp.ge.u64 %p0, %rd24, %rd17;  // i_block >= num_q_tiles?\n");
@@ -6718,6 +6749,40 @@ mod tests {
             ptx.contains("force P = 0 for masked"),
             "masked P zeroing"
         );
+    }
+
+    /// Asymmetric tiles must emit the tile-ratio-aware causal floor start, not the
+    /// symmetric shortcut. `i_block = j_block` at `block_q != block_kv` starts the
+    /// q-loop too late and silently drops dV/dK contributions (the asymmetric-causal
+    /// wrong-dV bug) — this pins the floor(j*block_kv/block_q) emission on BOTH the
+    /// scalar and MMA q-loops.
+    #[test]
+    fn test_bwd_main_causal_start_asymmetric_floors_tile_ratio() {
+        for gpu_sm in [75u32, 80] {
+            let cfg = FlashAttentionBackwardConfig {
+                block_q: 32,
+                block_kv: 16,
+                head_dim: 128,
+                causal: true,
+                gpu_sm,
+                segment_masked: false,
+            };
+            let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+            let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+            assert!(
+                ptx.contains("causal floor start"),
+                "sm{gpu_sm}: asymmetric causal must emit the floor start"
+            );
+            assert!(
+                !ptx.contains("i_block = j_block (causal)"),
+                "sm{gpu_sm}: asymmetric causal must NOT emit the symmetric shortcut"
+            );
+            // floor(j * 16 / 32): the emitted mul/div constants must be the tile sizes.
+            assert!(
+                ptx.contains("mul.lo.u64 %rd24, %rd13, 16") && ptx.contains("div.u64 %rd24, %rd24, 32"),
+                "sm{gpu_sm}: floor start must compute j_block*block_kv/block_q"
+            );
+        }
     }
 
     #[test]

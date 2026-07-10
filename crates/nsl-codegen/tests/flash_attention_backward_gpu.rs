@@ -30,10 +30,11 @@
 //! the oracle's within tolerance). Compare dQ/dK/dV.
 //!
 //! Backward tile sizes are budget-selected per head_dim (`select_backward_blocks`),
-//! not fixed at 64: hd<=32 -> 64/64 (MMA), hd64 -> 32/32 (MMA), hd128 -> 16/16
-//! (scalar). "Multi-tile" therefore means seq_len > block_q; these tests use
-//! seq_len = 128, which is >= 2 tiles for every selected block_q (2 at bq=64, up to
-//! 8 at bq=16). `run()` mirrors production by keying its block sizes off the selector.
+//! not fixed at 64: hd<=32 -> 64/64 (MMA), hd64 -> 32/32 (MMA), hd128 -> 32/16
+//! (MMA; asymmetric tiles are safe since the causal q-loop floor-start fix).
+//! "Multi-tile" therefore means seq_len > block_q; these tests use seq_len = 128,
+//! which is >= 2 tiles for every selected block_q. `run()` mirrors production by
+//! keying its block sizes off the selector.
 //!
 //! # Running
 //!
@@ -437,9 +438,9 @@ fn diag_block_size_sweep() {
         (75, 64, 32, 64, "scalar asym 64/32"),
         (75, 32, 32, 64, "scalar sym 32/32"),
         // ── head_dim = 128 ──
-        (80, 32, 16, 128, "MMA asym 32/16 (~70KB) <- key hd128 MMA candidate"),
+        (80, 32, 16, 128, "MMA asym 32/16 (~70KB) <- PRODUCTION hd128 tiles (causal fixed by floor start)"),
         (80, 32, 32, 128, "MMA sym 32/32 (expect UNAVAIL: ~107KB)"),
-        (80, 16, 16, 128, "MMA sub-warp 16/16 (expect WRONG: <32 lanes)"),
+        (80, 16, 16, 128, "sub-warp 16/16 at sm80: backward_uses_mma's block_q%32 gate routes to scalar (raw sub-warp MMA was NaN)"),
         (75, 32, 16, 128, "scalar asym 32/16"),
         (75, 16, 16, 128, "scalar sym 16/16 (~52KB)"),
     ];
@@ -769,27 +770,120 @@ fn mma_hd64_runs_on_gpu_not_cpu_fallback() {
     }
 }
 
-/// head_dim=128 now runs on the **scalar** GPU path. `select_backward_blocks(128)` =
-/// (16,16): symmetric, but block_q=16 is sub-warp so `backward_uses_mma` is false and
-/// codegen emits the (warp-count-agnostic, dimension-robust) scalar kernel — even at
-/// sm_80+, because no symmetric MMA-eligible tile fits hd128 under 99 KB. ~52 KB. This
-/// is the coder7b head_dim: scalar-on-GPU is slower than tensor cores but far faster
-/// than the previous CPU fallback. Exercises heads>1, multi-tile, causal + non-causal.
+/// head_dim=128 now runs on the **MMA (tensor-core)** GPU path.
+/// `select_backward_blocks(128)` = (32,16): asymmetric — safe since the causal
+/// q-loop start floors the tile ratio (`emit_bwd_causal_q_loop_start`) — with
+/// block_q=32 = one full warp (MMA-eligible) at ~70 KB MMA-inclusive < 99 KB cap.
+/// This is the coder7b head_dim, upgraded from the earlier 16/16 scalar tiles.
+/// Exercises heads>1, multi-tile, causal + non-causal.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn scalar_hd128_runs_on_gpu_not_cpu_fallback() {
+fn mma_hd128_runs_on_gpu_not_cpu_fallback() {
     if !cuda_available() {
         return;
     }
     let (bq, bkv) = select_backward_blocks(128);
-    assert_eq!((bq, bkv), (16, 16), "selector regressed for hd128");
+    assert_eq!((bq, bkv), (32, 16), "selector regressed for hd128");
     for causal in [false, true] {
         let (gpu, cpu) = gpu_probe(1, 2, 128, 128, causal, 80, bq, bkv);
         let gpu = gpu.expect(
-            "hd128 must LAUNCH on the GPU (16/16 scalar fits the cap); \
+            "hd128 must LAUNCH on the GPU (32/16 MMA fits the cap); \
              `None` means it fell back to CPU — the redesign regressed",
         );
-        assert_parity(&format!("scalar_hd128_gpu_c{}", causal as u8), &gpu, &cpu, tol_for(128));
+        assert_parity(&format!("mma_hd128_gpu_c{}", causal as u8), &gpu, &cpu, tol_for(128));
+    }
+}
+
+// ── Asymmetric-causal regression gates (the floor-start fix) ────────────────────
+//
+// The causal q-loop start used to be `i_block = j_block`, which assumes
+// block_q == block_kv; at asymmetric tiles it skipped live q-tiles and produced
+// wrong dV/dK under a causal mask (found by `diag_block_size_sweep`, both paths).
+// `emit_bwd_causal_q_loop_start` now floors `j*block_kv/block_q`. These gates pin
+// the fix on BOTH code paths at both production and non-production tile shapes —
+// via `gpu_probe`, so a CPU fallback cannot masquerade as a pass.
+
+/// Asymmetric 64/32 at hd64, causal, on both the MMA (sm80) and scalar (sm75)
+/// paths. 64/32 is not what the selector picks for hd64 (32/32), but it is the
+/// exact shape the sweep first caught the bug at — the strongest regression pin.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn asymmetric_causal_hd64_64_32_grads_correct_both_paths() {
+    if !cuda_available() {
+        return;
+    }
+    for (gpu_sm, path) in [(80u32, "mma"), (75, "scalar")] {
+        for causal in [false, true] {
+            let (gpu, cpu) = gpu_probe(1, 2, 128, 64, causal, gpu_sm, 64, 32);
+            let gpu = gpu.expect("64/32 hd64 fits the cap; launch must succeed");
+            assert_parity(
+                &format!("asym_hd64_64_32_{path}_c{}", causal as u8),
+                &gpu,
+                &cpu,
+                tol_for(64),
+            );
+        }
+    }
+}
+
+/// Asymmetric 32/16 at hd128 on the scalar path (sm75) — the selector's hd128 tiles
+/// but exercising the scalar q-loop's floor start (the MMA variant is covered by
+/// `mma_hd128_runs_on_gpu_not_cpu_fallback`).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn asymmetric_causal_hd128_32_16_scalar_grads_correct() {
+    if !cuda_available() {
+        return;
+    }
+    for causal in [false, true] {
+        let (gpu, cpu) = gpu_probe(1, 2, 128, 128, causal, 75, 32, 16);
+        let gpu = gpu.expect("32/16 hd128 scalar fits the cap; launch must succeed");
+        assert_parity(
+            &format!("asym_hd128_32_16_scalar_c{}", causal as u8),
+            &gpu,
+            &cpu,
+            tol_for(128),
+        );
+    }
+}
+
+/// Ragged-seq guard: the Phase-2 backward kernel has NO seq_len tail bounds —
+/// a partial final q-tile computes phantom rows past seq_len that are NOT
+/// causally masked (global_i >= s > every global_j), read the next batch-head's
+/// Q/dO/D/L, pollute valid dV/dK rows, and atomicAdd garbage dQ into the
+/// neighbor batch-head. The runtime therefore REFUSES the GPU launch for any
+/// seq_len not a multiple of both tile sizes and falls back to the correct CPU
+/// backward (adversarial-review finding on the hd128 32/16 selector change:
+/// seq % 16 == 0 && seq % 32 != 0, e.g. 2000, was exact at the old 16/16 tiles
+/// but gains a phantom half-tile at 32/16).
+///
+/// seq=80 (80 % 16 == 0, 80 % 32 == 16) is the cheap stand-in for that class:
+/// the probe must refuse (None => loud CPU-fallback path), and the production
+/// FFI must still return CORRECT gradients (via CPU), never silently-corrupt
+/// GPU output. b=2/h=2 makes cross-batch-head corruption detectable if the
+/// guard ever regresses and the kernel launches anyway.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn ragged_seq_refuses_gpu_and_falls_back_correct() {
+    if !cuda_available() {
+        return;
+    }
+    for causal in [false, true] {
+        // Probe at the production hd128 tiles: must refuse (not launch).
+        let (gpu, _cpu) = gpu_probe(2, 2, 80, 128, causal, 80, 32, 16);
+        assert!(
+            gpu.is_none(),
+            "ragged seq=80 must REFUSE the GPU backward at 32/16 tiles (c{})",
+            causal as u8
+        );
+        // Production path: falls back to CPU and stays correct.
+        let (grads, oracle) = run(1, 2, 80, 128, causal, 80);
+        assert_parity(
+            &format!("ragged_s80_hd128_cpu_fallback_c{}", causal as u8),
+            &grads,
+            &oracle,
+            tol_for(128),
+        );
     }
 }
 
@@ -812,9 +906,9 @@ fn select_backward_blocks_matches_codegen() {
 /// The whole point of the redesign: after selection, EVERY production head_dim's
 /// backward fits the 99 KB opt-in cap under the MMA-INCLUSIVE layout the runtime always
 /// requests (it can't tell scalar vs MMA PTX apart), so the GPU kernel launches instead
-/// of falling back to CPU. Also pins the symmetric-only invariant (asymmetric tiles have
-/// the causal dV bug). Host-only. Replaces the old `plain_bwd_shared_budget_ceiling_is_hd32`,
-/// whose ceiling this work lifts.
+/// of falling back to CPU. Also pins the MMA-eligibility of the tensor-core entries
+/// (hd64 and hd128 must stay on tensor cores). Host-only. Replaces the old
+/// `plain_bwd_shared_budget_ceiling_is_hd32`, whose ceiling this work lifts.
 #[test]
 fn selector_keeps_every_head_dim_within_opt_in_budget() {
     // sm_80..sm_120 MAX_SHARED_MEMORY_PER_BLOCK_OPTIN.
@@ -828,16 +922,27 @@ fn selector_keeps_every_head_dim_within_opt_in_budget() {
     };
     for hd in [16i64, 32, 64, 128] {
         let (bq, bkv) = select_backward_blocks(hd);
-        assert_eq!(bq, bkv, "selector must stay symmetric at hd{hd} (asymmetric = causal dV bug)");
         let smem = mma_inclusive(bq, bkv, hd);
         assert!(
             smem <= OPTIN_CAP,
             "hd{hd} at {bq}/{bkv} needs {smem} B > {OPTIN_CAP} B opt-in cap — would fall back to CPU",
         );
+        // Tensor-core eligibility for the real model head_dims (mirrors
+        // `backward_uses_mma`): block_q a full warp multiple, block_kv on the
+        // MMA_M=16 grid. hd64 = coder-rl, hd128 = coder7b — neither may silently
+        // drop to the scalar path via a selector change.
+        if hd == 64 || hd == 128 {
+            assert!(
+                bq % 32 == 0 && bkv % 16 == 0,
+                "hd{hd} at {bq}/{bkv} lost MMA eligibility — tensor-core regression"
+            );
+        }
     }
     // hd=32 keeps the classic 64/64 tile (unchanged, byte-identical PTX for the common case).
     assert_eq!(select_backward_blocks(32), (64, 64));
-    // hd>128 has no fitting symmetric MMA-eligible tile: documented CPU fallback (64/64 overflows).
+    // hd128 uses asymmetric 32/16 (allowed since the causal floor-start fix).
+    assert_eq!(select_backward_blocks(128), (32, 16));
+    // hd>128 has no fitting tile even asymmetric: documented CPU fallback (64/64 overflows).
     assert_eq!(select_backward_blocks(256), (64, 64));
     assert!(mma_inclusive(64, 64, 256) > OPTIN_CAP, "hd256 is the documented CPU-fallback case");
 }
