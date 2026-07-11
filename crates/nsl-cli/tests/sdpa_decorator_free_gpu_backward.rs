@@ -210,6 +210,49 @@ fn variant_table_embedded_for_decorator_free_train() {
     }
 }
 
+/// Gate 2b: non-CUDA targets must compile (no `parse_gpu_sm_from_target`
+/// panic — review finding on the first cut of the table) and must carry no
+/// variant PTX: the classic backward is CUDA-only, so rocm/metal/webgpu
+/// keep the pre-table null-pointer → CPU-backward lowering.
+#[test]
+fn non_cuda_target_compiles_without_variant_table() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src_path = tmp.path().join("rocm_attn.nsl");
+    fs::write(&src_path, DECORATOR_FREE_SRC).expect("write source");
+
+    let mut cmd = Command::cargo_bin("nsl").expect("locate nsl binary");
+    cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .current_dir(tmp.path())
+        .arg("build")
+        .arg(&src_path)
+        .arg("--source-ad")
+        .arg("--target")
+        .arg("rocm")
+        .arg("--emit-obj");
+    let output = cmd.output().expect("spawn nsl build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "[sdpa-bwd-table] decorator-free SDPA train compile PANICKED/failed \
+         for --target rocm — the variant table must refuse quietly on \
+         non-CUDA targets, not abort the compiler.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid compile target"),
+        "[sdpa-bwd-table] parse_gpu_sm_from_target panic text leaked:\n{stderr}"
+    );
+    let entry_obj = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Wrote ").map(str::to_string))
+        .find(|p| p.contains("rocm_attn"))
+        .expect("entry object Wrote line");
+    let obj = fs::read(&entry_obj).expect("read object");
+    assert!(
+        !contains_bytes(&obj, "flash_attn_bwd_main"),
+        "[sdpa-bwd-table] a non-CUDA target embedded CUDA backward PTX"
+    );
+}
+
 /// Gate 2: laziness — no attention, no table.
 #[test]
 fn variant_table_not_embedded_without_sdpa() {

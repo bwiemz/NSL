@@ -1845,6 +1845,19 @@ impl Compiler<'_> {
         if let Some(table) = self.kernels.sdpa_bwd_variants.get(&causal) {
             return Ok(table.clone());
         }
+        // The classic backward PTX is CUDA-only, and `parse_gpu_sm_from_target`
+        // PANICS on anything but "cuda"/"sm_<N>". The decorated path only
+        // reaches it behind an @flash_attention decorator, but this lazy path
+        // fires for EVERY decorator-free SDPA train compile — including
+        // `--target rocm|metal|webgpu|fpga`, which compiled fine before the
+        // variant table existed (null pointers → CPU backward). Keep exactly
+        // that behavior for non-CUDA targets: an empty table lowers to null
+        // pointers, no panic.
+        let target = self.compile_options.target.as_str();
+        if target != "cuda" && !target.starts_with("sm_") {
+            self.kernels.sdpa_bwd_variants.insert(causal, Vec::new());
+            return Ok(Vec::new());
+        }
         let gpu_sm = parse_gpu_sm_from_target(&self.compile_options.target);
         let c = i64::from(causal);
         let mut table = Vec::with_capacity(SDPA_BWD_VARIANT_HEAD_DIMS.len());
