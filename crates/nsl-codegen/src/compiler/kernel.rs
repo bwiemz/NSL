@@ -520,6 +520,38 @@ impl Compiler<'_> {
     /// Walk function definitions for `@flash_attention` decorator, synthesize PTX,
     /// embed it in .rodata, and store the `FlashAttentionCompileContext`.
     pub fn compile_flash_attention_kernels(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        // WGGO-before-kernel-synthesis: solve the per-train-block plans NOW,
+        // before any kernel decision, so `maybe_synthesize_csha_training_ptx`
+        // (per-doc admission, packing fork) can consume them and the train
+        // blocks can reuse them ahead of FASE recipe selection. This is the
+        // single choke point every entry point funnels through, which is what
+        // makes the ordering guarantee structural rather than per-call-site.
+        //
+        // Exception (documented follow-up, #134 ordering invariant): when
+        // calibrated importance scoring is in play, the calibration harness
+        // fires AFTER this point (compile_and_calibrate wrapper), so a plan
+        // solved here would silently degrade importance=Auto to magnitude and
+        // break importance=Grad. Refuse the pre-pass in that configuration —
+        // planning then stays in-place exactly as before this restructure.
+        let calibrated_importance = self.compile_options.calibration_data.is_some()
+            && !matches!(
+                self.compile_options.wggo.importance,
+                crate::WggoImportance::Magnitude
+            );
+        if calibrated_importance {
+            // Note only when planning would otherwise happen: `--wggo off`
+            // arrives as Some("off"), so `mode.is_some()` is NOT "enabled"
+            // (review finding — the off mode must stay chatter-free).
+            if crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
+                eprintln!(
+                    "[wggo] pre-pass deferred: calibrated importance scoring fires after \
+                     kernel synthesis; planning stays in-place (kernel admission unplanned)"
+                );
+            }
+        } else {
+            self.wggo_preplans = crate::wggo_prepass::run(self, stmts);
+        }
+
         for stmt in stmts {
             let decorators = match &stmt.kind {
                 StmtKind::Decorated { decorators, stmt } => {
@@ -830,7 +862,29 @@ impl Compiler<'_> {
         // FFI dispatcher (`nsl_flash_attention_csha_with_saves` /
         // `nsl_flash_attention_csha_backward`) already detects to walk
         // `doc_starts` and override `grid_x = num_docs`.
-        let per_doc_plan = if self
+        // WGGO-before-kernels: the pre-pass makes the plan visible HERE, at
+        // kernel-synthesis time, so a packing preference can finally flip an
+        // admission decision instead of only being validated after the fact
+        // (PR #334's deliberate deferral). Semantics: @pca(per_document)
+        // AUTHORIZES the per-doc CTA lowering; when the first train block's
+        // plan unambiguously prefers segment_id packing (every layer with a
+        // nonzero packing_mode chose mode 1), honor that preference and keep
+        // the segment-masked Tier-B pair — the post-hoc [pca] verdict layer
+        // then reports wggo-override-consumed against the kernels that were
+        // actually built. Mixed, zero, or absent preferences change nothing:
+        // masking itself is a correctness requirement for packed data and is
+        // never plan-negotiable.
+        // Consult the FIRST train block's plan specifically (not merely the
+        // first block that HAPPENED to plan): kernel synthesis serves the
+        // whole module, and when the first block's extraction failed there
+        // is no plan entitled to govern it — a later block's preference must
+        // not flip admission on the wrong evidence (review finding).
+        let plan_prefers_segment_id = self
+            .wggo_preplans
+            .iter()
+            .find(|p| p.is_first_train_block)
+            .is_some_and(|pre| crate::wggo_prepass::plan_prefers_segment_id(&pre.overrides));
+        let per_doc_authorized = self
             .pca_user_strategies
             .iter()
             .any(|s| s.is_per_document())
@@ -838,8 +892,14 @@ impl Compiler<'_> {
             && !training_config
                 .csha
                 .as_ref()
-                .is_some_and(|c| c.fused_projections)
-        {
+                .is_some_and(|c| c.fused_projections);
+        let per_doc_plan = if per_doc_authorized && plan_prefers_segment_id {
+            eprintln!(
+                "[pca-per-doc] deferred to plan preference: wggo packing_mode=segment_id \
+                 prefers the segment-masked Tier-B kernels — skipping per-doc CTA admission"
+            );
+            None
+        } else if per_doc_authorized {
             if let Some(packing_cfg) =
                 crate::pca_activation::resolve_packing_config_for_stmts(stmts, self.interner)
             {

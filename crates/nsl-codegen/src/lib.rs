@@ -230,6 +230,7 @@ pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
 pub mod wggo_ilp;
 pub mod wggo_overrides;
+pub mod wggo_prepass;
 pub mod wggo_prune;
 pub mod wggo_schedule;
 pub mod wggo_shape;
@@ -1398,8 +1399,8 @@ pub fn compile_and_calibrate(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
         compiler.compile_kernels(&parsed.module.stmts)?;
-        compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
         crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
         compiler.compile_user_functions(&parsed.module.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&parsed.module.stmts)?;

@@ -599,9 +599,9 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     // Swallow the result intentionally.  The splice runs BEFORE
     // `compile_call_by_name` inside `ExprKind::Pipe` lowering, so the counter
     // is valid even if a later pipe target's function-call lookup fails — a
@@ -685,7 +685,6 @@ pub fn compile_returning_plan(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     // B.2.1 Task 5.5: pre-populate adapter_sites + last_wrga_plan from the
     // user-facing @adapter decorators BEFORE model methods (e.g. `forward`)
     // are compiled. Without this, the Task 3 LoRA AST rewrite never fires
@@ -697,6 +696,7 @@ pub fn compile_returning_plan(
     // call is visible in the code path source-AD traverses during train
     // blocks. Mirrors the rewrite inside `compile_user_functions`.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     // M56 Task 17: compile agent method bodies.
     compiler.compile_agent_methods(&ast.stmts)?;
@@ -860,11 +860,11 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        compiler.compile_flash_attention_kernels(&ast.stmts)?;
         crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
         compiler.compile_user_functions(&ast.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&ast.stmts)?;
@@ -1036,11 +1036,11 @@ fn compile_standalone_best_effort_plan(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        compiler.compile_flash_attention_kernels(&ast.stmts)?;
         crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
         compiler.compile_user_functions(&ast.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&ast.stmts)?;
@@ -1295,11 +1295,11 @@ pub fn compile_module_with_imports_best_effort_plans(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        compiler.compile_flash_attention_kernels(&ast.stmts)?;
         crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+        compiler.compile_flash_attention_kernels(&ast.stmts)?;
         compiler.compile_user_functions(&ast.stmts)?;
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&ast.stmts)?;
@@ -1448,11 +1448,11 @@ pub fn compile_entry_returning_plan(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
     // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
     // so source-AD's inline expansion sees the fused FFI call.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
     // M56 Task 17: compile agent method bodies.
     compiler.compile_agent_methods(&ast.stmts)?;

@@ -792,10 +792,23 @@ pub struct Compiler<'a> {
     pub grad_arena_layout: Option<crate::calibration::retention::GradArenaLayout>,
 
     // ── WGGO override side-channel (Task 3) ─────────────────────
-    /// Per-layer WGGO decisions for consumer passes.  Populated in the
-    /// diagnostics section of `compile_quant_block` when `--wggo` is on;
-    /// read by CSHA, WRGA, and (future) FASE/Prune/Sharding consumers.
+    /// Per-layer WGGO decisions for consumer passes. Set per train block in
+    /// `compile_train_block` (from that block's pre-plan when one exists,
+    /// explicitly `None` otherwise — never a previous block's leftovers) and
+    /// re-stashed after in-place planning; read by FASE, CSHA, WRGA, and the
+    /// packing validators.
     pub(crate) wggo_overrides: Option<crate::wggo_overrides::WggoOverrides>,
+
+    // ── WGGO pre-main plans (WGGO-before-kernel-synthesis restructure) ──
+    /// Per-train-block plans solved BEFORE `compile_flash_attention_kernels`
+    /// by `wggo_prepass::run`, keyed by train-block stmt NodeId. The
+    /// admission gate reads the FIRST entry (kernel synthesis is
+    /// module-scoped); `compile_train_block` consumes its own block's entry
+    /// after a graph-fingerprint check and falls back to in-place planning
+    /// on mismatch. Empty when WGGO or source AD is off, or when the
+    /// pre-pass could not extract — behavior then matches the pre-restructure
+    /// pipeline exactly.
+    pub(crate) wggo_preplans: Vec<crate::wggo_prepass::WggoPrePlan>,
 
     // ── M62 Task 4: @export self-field weight-index map ─────────────────────
     /// Maps each `MemberAccess` `NodeId` (for `self.<field>` in @export model
@@ -983,6 +996,7 @@ impl<'a> Compiler<'a> {
             retention_splices_emitted: 0,
             grad_arena_layout: None,
             wggo_overrides: None,
+            wggo_preplans: Vec::new(),
             weight_index_map: options.weight_index_map.clone(),
         })
     }
