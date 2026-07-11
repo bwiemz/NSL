@@ -1422,6 +1422,16 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    // The kernels index flat row-major; a zero-copy view (transpose/expand)
+    // would be read as if contiguous — same stride-blindness class as the
+    // tied-embedding matmul bug. Materialize first (on-device strided copy;
+    // owned ref, freed after), mirroring gpu_elementwise_binary's guard.
+    if !a.is_contiguous() {
+        let a_c = crate::tensor::nsl_tensor_contiguous(a_ptr);
+        let result = gpu_elementwise_unary(a_c, ptx, kernel_name);
+        crate::tensor::nsl_tensor_free(a_c);
+        return result;
+    }
     let n = a.len as usize;
     let out_data = match inner::try_alloc_managed(n * 4) {
         Some(ptr) => ptr,
@@ -1863,6 +1873,15 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     use crate::tensor::NslTensor;
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    // Flat row-major kernel — materialize strided views first (see
+    // gpu_elementwise_unary; same stride-blindness class as the
+    // tied-embedding matmul bug).
+    if !a.is_contiguous() {
+        let a_c = crate::tensor::nsl_tensor_contiguous(a_ptr);
+        let result = gpu_scalar_op(a_c, scalar, ptx, kernel_name);
+        crate::tensor::nsl_tensor_free(a_c);
+        return result;
+    }
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);
     let shape = NslTensor::copy_shape(a.shape, a.ndim);

@@ -128,7 +128,7 @@ fn mean(xs: &[f64]) -> f64 {
 /// = 32 optimizer steps at ACCUM=4; constant tokens collapse fast, so the
 /// signal is unambiguous within a couple of minutes of GPU time.
 #[test]
-#[ignore = "requires CUDA GPU; CURRENTLY FAILS: tied-embedding forward/backward is wrong on GPU (embedding_lookup + embed.transpose reuse — see PR body minimal repro); this test is the acceptance gate for that fix"]
+#[ignore = "requires CUDA GPU (runs a real training loop)"]
 fn pretrain_loss_decreases_on_gpu() {
     if !gpu_present() {
         eprintln!("skipping: no NVIDIA driver");
@@ -251,7 +251,7 @@ mod nslm {
 /// (32 optimizer steps of per-batch grads). Constant data makes the window
 /// mean equal the per-batch gradient, so the checkpoints must match.
 #[test]
-#[ignore = "requires CUDA GPU; blocked on the same tied-embedding GPU bug as pretrain_loss_decreases_on_gpu"]
+#[ignore = "requires CUDA GPU (runs two real training loops)"]
 fn fase_deferred_matches_plain_adamw_checkpoint() {
     if !gpu_present() {
         eprintln!("skipping: no NVIDIA driver");
