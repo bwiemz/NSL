@@ -47,6 +47,7 @@ pub(crate) fn run_build_standalone(
     options.wrga_inputs =
         Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the standalone build path.

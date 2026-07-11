@@ -551,6 +551,21 @@ pub struct Compiler<'a> {
     /// fixed-arity slot record for the v1 three-output backward.
     pub fused_ce_bwd_cache: HashMap<Value, [Value; 3]>,
 
+    // ── CPKD fused KL-CE side-channels ────────────────────────────────
+    /// Forward-saved per-row LSE buffers `[lse_s1, lse_sT, lse_tT]` keyed
+    /// by the scalar-loss Cranelift Value. Populated by
+    /// `lower_fused_kl_ce_forward`; consumed + evicted by the first
+    /// backward extract (mirrors `fused_ce_fwd_lse`).
+    pub fused_kl_ce_fwd_saves: HashMap<Value, [Value; 3]>,
+    /// Backward `[dx_s, dW_s, dbias_s]` shared across the three extract
+    /// components; last component (2) evicts (mirrors
+    /// `fused_ce_bwd_cache`).
+    pub fused_kl_ce_bwd_cache: HashMap<Value, [Value; 3]>,
+    /// Build-report facts collected while lowering the most recent distill
+    /// block (trainable/frozen counts, fused KL-CE status); rendered to
+    /// stderr by `compile_distill_block` after a successful lowering.
+    pub last_cpkd_plan: Option<crate::cpkd::CpkdPlan>,
+
     // ── WRGA side-channel (Milestone A) ─────────────────────────────
     /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.
     /// Consumed inside `compile_train_step_with_source_ad` when a `@train` block
@@ -592,6 +607,11 @@ pub struct Compiler<'a> {
     /// train-block lowering.
     pub fused_ce_configs: Vec<crate::FusedCeDecoratorConfig>,
 
+    /// CPKD: `@fused_kl_ce(...)` decorator configs, forwarded from
+    /// `CompileOptions.fused_kl_ce_configs`. Looked up per distill block
+    /// by `distill_block_stmt_id` in `compile_distill_block`.
+    pub fused_kl_ce_configs: Vec<crate::FusedKlCeDecoratorConfig>,
+
     /// CFTP v10 (item 3): the fused-CE decorator config for the train block
     /// currently being lowered, if any.  Set by `compile_train_block` /
     /// `compile_train_block_pipelined` via
@@ -603,6 +623,17 @@ pub struct Compiler<'a> {
     /// so a second `@fused_lm_ce` on a different train block no longer
     /// leaks the first block's dtype hint.
     pub active_fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
+
+    // ── CPKD side-channel ─────────────────────────────────────────────
+    /// The distill block currently being lowered, if any.  Installed by
+    /// `compile_distill_block` around its delegation into
+    /// `compile_train_block` (same install/restore discipline as
+    /// `active_fused_ce_config`).  Inside `compile_train_block_inner` it:
+    /// seeds `model_sym`/`epochs` (distill has `student=` instead of
+    /// `model=`), registers the teacher as a frozen model instance on the
+    /// Wengert extractor (I-11), forbids the tape fallback (F-06 guard),
+    /// and resolves frozen teacher-field Input leaves to Cranelift values.
+    pub active_distill_context: Option<crate::cpkd::DistillContext>,
 
     // ── CFTP §4.3 G2 Strategy 3 side-channel (Item 4) ────────────────
     /// `@pca(strategy=...)` strategies for this compile, forwarded from
@@ -886,6 +917,9 @@ impl<'a> Compiler<'a> {
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),
             fused_ce_bwd_cache: HashMap::new(),
+            fused_kl_ce_fwd_saves: HashMap::new(),
+            fused_kl_ce_bwd_cache: HashMap::new(),
+            last_cpkd_plan: None,
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
             cfie_decorator_mode: None,
@@ -893,7 +927,9 @@ impl<'a> Compiler<'a> {
             last_cfie_plan: None,
             cfie_serve_gen: None,
             fused_ce_configs: options.fused_ce_configs.clone(),
+            fused_kl_ce_configs: options.fused_kl_ce_configs.clone(),
             active_fused_ce_config: None,
+            active_distill_context: None,
             pca_user_strategies: options.pca_user_strategies.clone(),
             cpdt_mode: options.cpdt.mode,
             cpdt_cluster: options.cpdt.cluster.clone(),
@@ -1017,6 +1053,10 @@ impl<'a> Compiler<'a> {
     pub fn clear_csha_per_function_caches(&mut self) {
         self.csha_fused_bwd_cache.clear();
         self.csha_forward_saves.clear();
+        // CPKD: the fused KL-CE caches are keyed by Cranelift Values,
+        // which alias across functions — same hygiene as the CSHA caches.
+        self.fused_kl_ce_fwd_saves.clear();
+        self.fused_kl_ce_bwd_cache.clear();
     }
 
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the

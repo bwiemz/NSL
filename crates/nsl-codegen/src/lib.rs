@@ -199,6 +199,10 @@ pub mod cfie_serve;
 pub mod cfie_spec_sampler_ptx;
 pub mod cfie_speculative;
 pub mod cfie_speculative_ptx;
+pub mod cpkd;
+pub mod cpkd_fused_loss;
+pub mod cpkd_spectral;
+pub mod cpkd_student;
 pub mod csha;
 pub mod csha_apply;
 pub mod csha_boundary;
@@ -218,6 +222,7 @@ pub mod unikernel_boot;
 pub mod wggo;
 pub mod wggo_apply;
 pub mod wggo_cfie;
+pub mod wggo_cpkd;
 pub mod wggo_conflicts;
 pub mod wggo_cost;
 pub mod wggo_dp;
@@ -739,6 +744,34 @@ pub struct FusedCeDecoratorConfig {
     pub train_block_stmt_id: nsl_ast::NodeId,
 }
 
+/// CPKD: codegen-side mirror of `nsl_semantic::cpkd::FusedKlCeConfig` —
+/// the `@fused_kl_ce(...)` decorator on a `distill` block.
+///
+/// Same opt-in contract as `FusedCeDecoratorConfig`: the fused KL-CE op
+/// only fires when `enabled = true` AND all five shape hints are present;
+/// otherwise `fused_kl_ce(...)` calls fall through to the stdlib
+/// composite (which forces tape AD — refused inside distill blocks, so
+/// in practice an incomplete decorator is a loud compile error there).
+///
+/// v1 is f32-only: there is deliberately no dtype hint field (the
+/// fp16/bf16 emitters are a documented deferral).
+#[derive(Debug, Clone)]
+pub struct FusedKlCeDecoratorConfig {
+    pub enabled: bool,
+    pub vocab_size: Option<u32>,
+    /// Student hidden dim (`hidden_size =` in the decorator, matching the
+    /// @fused_lm_ce naming for the trainable side).
+    pub student_hidden: Option<u32>,
+    /// Teacher hidden dim (`teacher_hidden =`).
+    pub teacher_hidden: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub seq_len: Option<u32>,
+    pub vocab_tile: Option<u32>,
+    /// AST NodeId of the `distill` block Stmt this decorator belongs to
+    /// (per-block dispatch, mirroring CFTP v10 item 3).
+    pub distill_block_stmt_id: nsl_ast::NodeId,
+}
+
 /// Codegen-side mirror of `nsl_semantic::cftp::FusedCeDtypeHint`.
 ///
 /// Maps to the runtime FFI `dtype_tag: i64` sentinel:
@@ -1077,6 +1110,9 @@ pub struct CompileOptions {
     /// the first `enabled = true` entry to gate the fused linear-CE
     /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
     pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
+    /// CPKD: `@fused_kl_ce(...)` decorator configs, one per decorated
+    /// distill block. Empty when no decorator is present.
+    pub fused_kl_ce_configs: Vec<FusedKlCeDecoratorConfig>,
     /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca(strategy=...)` strategies
     /// forwarded from nsl-semantic. Empty when no `@pca` decorator is
     /// present. The CSHA training-PTX synthesis site consults this list
@@ -1214,6 +1250,7 @@ impl Default for CompileOptions {
             emit_export_table: false,
             wrga_inputs: None,
             fused_ce_configs: Vec::new(),
+            fused_kl_ce_configs: Vec::new(),
             pca_user_strategies: Vec::new(),
             wrga_fold_allocations: false,
             wggo: WggoOptions::default(),

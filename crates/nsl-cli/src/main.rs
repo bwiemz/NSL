@@ -22,10 +22,12 @@ use crate::args::Cli;
 /// back to the Phase 1/2 kernel-timing profile path (non-train program).
 /// Train blocks in NSL are a top-level construct, so a flat scan suffices.
 pub(crate) fn has_train_block(module: &nsl_ast::Module) -> bool {
-    module
-        .stmts
-        .iter()
-        .any(|s| matches!(s.kind, nsl_ast::stmt::StmtKind::TrainBlock(_)))
+    module.stmts.iter().any(|s| {
+        matches!(
+            s.kind,
+            nsl_ast::stmt::StmtKind::TrainBlock(_) | nsl_ast::stmt::StmtKind::DistillBlock(_)
+        )
+    })
 }
 
 

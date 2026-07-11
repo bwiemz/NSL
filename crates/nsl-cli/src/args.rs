@@ -382,6 +382,19 @@ pub(crate) struct CheckArgs {
         #[arg(long)]
         pub(crate) cep_out: Option<PathBuf>,
 
+        /// CPKD Innovation 5: design a student architecture under a parameter
+        /// budget via the CEP search oracle and print the teacher->student
+        /// layer mapping. Budget accepts a raw integer or K/M/B suffix (e.g.
+        /// "125M", "1.1B", "350000000"). Requires @search axes on the model.
+        /// Uses `--weights` (if given) for teacher layer importance; without
+        /// weights the mapping degenerates to the first k layers.
+        #[arg(long, value_name = "PARAMS")]
+        pub(crate) cpkd_design_student: Option<String>,
+        /// CPKD: target GPU for student design (e.g. "H100-SXM", "RTX-4090");
+        /// defaults to H100-SXM. Requires --cpkd-design-student.
+        #[arg(long, value_name = "GPU")]
+        pub(crate) cpkd_target: Option<String>,
+
         /// WRGA paper §8.3: emit the WRGA compilation report without running
         /// codegen output. Pass without value (or `-`) for stdout; provide a
         /// path to write to a file. Sister of `nsl build --wrga-report` but

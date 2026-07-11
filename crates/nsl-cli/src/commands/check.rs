@@ -158,6 +158,8 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
             cep_profile,
             cep_target,
             cep_out,
+            cpkd_design_student,
+            cpkd_target,
             wrga_analyze,
             wrga_target,
             wrga_compare,
@@ -168,6 +170,22 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
 
             if cep_search && cep_profile {
                 eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
+                std::process::exit(1);
+            }
+            // CPKD Innovation 5: `--cpkd-design-student` is its own early-exit
+            // mode; overlapping it with the CEP modes would silently pick
+            // whichever dispatch runs first, so refuse instead.
+            if cpkd_design_student.is_some() && (cep_search || cep_profile) {
+                eprintln!(
+                    "error: --cpkd-design-student is mutually exclusive with --cep-search/--cep-profile"
+                );
+                std::process::exit(1);
+            }
+            // `--cpkd-target` only selects the GPU for the student-design
+            // report; alone it would do nothing, so refuse (same doctrine as
+            // `--gpu requires --perf` below).
+            if cpkd_target.is_some() && cpkd_design_student.is_none() {
+                eprintln!("error: --cpkd-target requires --cpkd-design-student");
                 std::process::exit(1);
             }
             // M37: `--trace` on `nsl check` was parsed-but-dormant for a long
@@ -379,6 +397,17 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     cep_emit_source: None,
                 };
                 std::process::exit(crate::commands::cep::run_cep_profile(&file, weights.as_deref(), &ov));
+            }
+            // CPKD Innovation 5: CEP-guided student design under a parameter
+            // budget. Same dispatch shape as `--cep-search`: early-exit,
+            // report to stdout, exit code 0/1.
+            if let Some(ref budget) = cpkd_design_student {
+                std::process::exit(crate::commands::cpkd_design::run_cpkd_design(
+                    &file,
+                    budget,
+                    cpkd_target.as_deref(),
+                    weights.as_deref(),
+                ));
             }
             if shapes {
                 let src = match std::fs::read_to_string(&file) {

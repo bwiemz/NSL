@@ -38,6 +38,20 @@ pub struct CallbackDef {
     pub span: Span,
 }
 
+/// CPKD distillation block: `distill(teacher=t, student=s, epochs=N):`.
+///
+/// Sections reuse [`TrainSection`] (optimizer/data/step behave identically to
+/// `train`); the distill-specific `loss:` section is a flat key=value list
+/// (alpha, temperature, feature_layers, feature_weight, attn_transfer) kept
+/// outside `sections` because `train` has no loss section.
+#[derive(Debug, Clone, Serialize)]
+pub struct DistillBlock {
+    pub config: Vec<Arg>,
+    pub sections: Vec<TrainSection>,
+    pub loss: Vec<Arg>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GradBlock {
     pub outputs: Option<crate::pattern::Pattern>,

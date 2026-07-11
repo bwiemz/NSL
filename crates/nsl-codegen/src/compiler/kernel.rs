@@ -53,6 +53,10 @@ fn stmts_contain_train_block(stmts: &[Stmt]) -> bool {
 fn contains_train_block_stmt(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::TrainBlock(_) => true,
+        // CPKD: a distill block is a training loop over the student — the
+        // CSHA training-PTX synthesis (with-saves forward + fused backward)
+        // must fire for it exactly as for `train`.
+        StmtKind::DistillBlock(_) => true,
         StmtKind::Decorated { stmt: inner, .. } => contains_train_block_stmt(inner),
         _ => false,
     }

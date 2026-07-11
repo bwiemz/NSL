@@ -150,6 +150,46 @@ pub(crate) fn analysis_to_fused_ce_configs(
         .collect()
 }
 
+/// CPKD: bridge `@fused_kl_ce(...)` configs from `AnalysisResult` into
+/// the codegen-side `FusedKlCeDecoratorConfig` newtype. Mirrors
+/// `analysis_to_fused_ce_configs`.
+pub(crate) fn analysis_to_fused_kl_ce_configs(
+    a: &nsl_semantic::AnalysisResult,
+) -> Vec<nsl_codegen::FusedKlCeDecoratorConfig> {
+    a.fused_kl_ce_configs
+        .iter()
+        .map(|c| nsl_codegen::FusedKlCeDecoratorConfig {
+            enabled: c.enabled,
+            vocab_size: c.vocab_size,
+            student_hidden: c.hidden_size,
+            teacher_hidden: c.teacher_hidden,
+            batch_size: c.batch_size,
+            seq_len: c.seq_len,
+            vocab_tile: c.vocab_tile,
+            distill_block_stmt_id: c.distill_block_stmt_id,
+        })
+        .collect()
+}
+
+/// Mirror of `analysis_to_fused_kl_ce_configs` for the multi-file path.
+pub(crate) fn module_data_to_fused_kl_ce_configs(
+    m: &crate::loader::ModuleData,
+) -> Vec<nsl_codegen::FusedKlCeDecoratorConfig> {
+    m.fused_kl_ce_configs
+        .iter()
+        .map(|c| nsl_codegen::FusedKlCeDecoratorConfig {
+            enabled: c.enabled,
+            vocab_size: c.vocab_size,
+            student_hidden: c.hidden_size,
+            teacher_hidden: c.teacher_hidden,
+            batch_size: c.batch_size,
+            seq_len: c.seq_len,
+            vocab_tile: c.vocab_tile,
+            distill_block_stmt_id: c.distill_block_stmt_id,
+        })
+        .collect()
+}
+
 /// CFTP §4.3 G2 Strategy 3 (Item 4): bridge `@pca(strategy=...)` configs
 /// from `AnalysisResult` into the codegen-side `PcaUserStrategy` enum.
 /// Mirrors `analysis_to_fused_ce_configs` — keeps nsl-codegen free of a

@@ -229,6 +229,34 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
                 }
             }
         }
+        StmtKind::DistillBlock(distill) => {
+            use crate::block::TrainSection;
+            for section in &distill.sections {
+                match section {
+                    TrainSection::Data(stmts) => {
+                        for s in stmts {
+                            v.visit_stmt(s);
+                        }
+                    }
+                    TrainSection::Optimizer(e)
+                    | TrainSection::Scheduler(e)
+                    | TrainSection::Distribute(e) => {
+                        v.visit_expr(e);
+                    }
+                    TrainSection::Step { body, .. } | TrainSection::Eval { body, .. } => {
+                        v.visit_block(body);
+                    }
+                    TrainSection::Callbacks(cbs) => {
+                        for cb in cbs {
+                            v.visit_block(&cb.body);
+                        }
+                    }
+                    TrainSection::Stmt(s) => {
+                        v.visit_stmt(s);
+                    }
+                }
+            }
+        }
         StmtKind::GradBlock(g) => {
             if let Some(pat) = &g.outputs {
                 v.visit_pattern(pat);

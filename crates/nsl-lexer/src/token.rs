@@ -60,6 +60,7 @@ pub enum TokenKind {
     Dataset,
     Datatype,
     Serve,
+    Distill,
 
     // === Keywords: Module system ===
     Import,
@@ -199,6 +200,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Kernel => write!(f, "kernel"),
             TokenKind::Datatype => write!(f, "datatype"),
             TokenKind::Serve => write!(f, "serve"),
+            TokenKind::Distill => write!(f, "distill"),
             TokenKind::Import => write!(f, "import"),
             TokenKind::From => write!(f, "from"),
             TokenKind::As => write!(f, "as"),

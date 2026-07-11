@@ -73,42 +73,60 @@ fn discover_optimizer_modules(entry: &Module, interner: &nsl_lexer::Interner) ->
         interner: &nsl_lexer::Interner,
         modules: &mut Vec<String>,
     ) {
-        for stmt in stmts {
-            match &stmt.kind {
-                StmtKind::TrainBlock(train) => {
-                    for section in &train.sections {
-                        match section {
-                            TrainSection::Optimizer(expr) => {
-                                if let ExprKind::Call { callee, .. } = &expr.kind {
-                                    if let ExprKind::Ident(sym) = &callee.kind {
-                                        let name =
-                                            interner.resolve(sym.0).unwrap_or("").to_lowercase();
-                                        let module = match name.as_str() {
-                                            "sgd" => Some("nsl.optim.sgd"),
-                                            "adam" => Some("nsl.optim.adam"),
-                                            "adamw" => Some("nsl.optim.adamw"),
-                                            "lion" => Some("nsl.optim.lion"),
-                                            "muon" => Some("nsl.optim.muon"),
-                                            "soap" => Some("nsl.optim.soap"),
-                                            _ => None,
-                                        };
-                                        if let Some(m) = module {
-                                            if !modules.iter().any(|x: &String| x == m) {
-                                                modules.push(m.to_string());
-                                            }
-                                        }
+        fn walk_sections(
+            sections: &[TrainSection],
+            interner: &nsl_lexer::Interner,
+            modules: &mut Vec<String>,
+        ) {
+            for section in sections {
+                match section {
+                    TrainSection::Optimizer(expr) => {
+                        if let ExprKind::Call { callee, .. } = &expr.kind {
+                            if let ExprKind::Ident(sym) = &callee.kind {
+                                let name = interner.resolve(sym.0).unwrap_or("").to_lowercase();
+                                let module = match name.as_str() {
+                                    "sgd" => Some("nsl.optim.sgd"),
+                                    "adam" => Some("nsl.optim.adam"),
+                                    "adamw" => Some("nsl.optim.adamw"),
+                                    "lion" => Some("nsl.optim.lion"),
+                                    "muon" => Some("nsl.optim.muon"),
+                                    "soap" => Some("nsl.optim.soap"),
+                                    _ => None,
+                                };
+                                if let Some(m) = module {
+                                    if !modules.iter().any(|x: &String| x == m) {
+                                        modules.push(m.to_string());
                                     }
                                 }
                             }
-                            TrainSection::Scheduler(_) => {
-                                let m = "nsl.optim.schedulers".to_string();
-                                if !modules.iter().any(|x| x == &m) {
-                                    modules.push(m);
-                                }
-                            }
-                            _ => {}
                         }
                     }
+                    TrainSection::Scheduler(_) => {
+                        let m = "nsl.optim.schedulers".to_string();
+                        if !modules.iter().any(|x| x == &m) {
+                            modules.push(m);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for stmt in stmts {
+            // Unwrap decorator wrappers (@fused_lm_ce train / @fused_kl_ce
+            // distill) so decorated blocks still get their optimizer modules.
+            let mut inner = stmt;
+            while let StmtKind::Decorated { stmt: wrapped, .. } = &inner.kind {
+                inner = wrapped;
+            }
+            match &inner.kind {
+                StmtKind::TrainBlock(train) => {
+                    walk_sections(&train.sections, interner, modules);
+                }
+                // CPKD: distill blocks share the optimizer/scheduler section
+                // shapes, so they need the same stdlib optimizer modules.
+                StmtKind::DistillBlock(distill) => {
+                    walk_sections(&distill.sections, interner, modules);
                 }
                 StmtKind::FnDef(fn_def) => {
                     walk(&fn_def.body.stmts, interner, modules);

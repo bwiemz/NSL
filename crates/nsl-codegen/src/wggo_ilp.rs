@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wggo_cfie::{CfieInferConfig, CfieInferenceChoice};
 use crate::wggo_cost::{LayerCostEntry, LayerCostLut};
+use crate::wggo_cpkd::{CpkdChoice, CpkdConfig};
 
 /// The kind of decision recorded in a [`DecisionTrace`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +292,18 @@ pub struct LayerIlpConstraints {
     /// surfaced on `WggoPlan::cfie_inference` + the report, not consumed
     /// by the CFIE serve planner.
     pub cfie_infer: Option<CfieInferConfig>,
+    /// CPKD distillation decision axes — **opt-in, default `None` = OFF**.
+    /// When `Some`, the solver additionally decides {feature_match,
+    /// attn_transfer, teacher_stream} per layer with the additive
+    /// distill-overhead cost term from
+    /// [`crate::wggo_cpkd::choice_cost_us`], and the distill buffers
+    /// ([`crate::wggo_cpkd::choice_bytes`]) are charged against
+    /// `memory_budget` exactly where the CFIE KV pool is.  With the gate
+    /// off the candidate space, costs, and outputs are byte-identical to a
+    /// build without the axes.  The decisions are ADVISORY in v1 —
+    /// surfaced on `WggoPlan::cpkd_distill` + the report's "[cpkd]"
+    /// section, not consumed by the distill lowering.
+    pub cpkd: Option<CpkdConfig>,
 }
 
 impl Default for LayerIlpConstraints {
@@ -312,6 +325,7 @@ impl Default for LayerIlpConstraints {
             packing_modes_mask: 0b1111,
             packing_savings: [0.00, 0.15, 0.25, 0.35],
             cfie_infer: None,
+            cpkd: None,
         }
     }
 }
@@ -356,11 +370,30 @@ pub fn solve_layer_cfie(
     lut: &LayerCostLut,
     constraints: &LayerIlpConstraints,
 ) -> (LayerIlpSolution, Option<CfieInferenceChoice>) {
+    let (sol, cfie, _cpkd) = solve_layer_cpkd(lut, constraints);
+    (sol, cfie)
+}
+
+/// [`solve_layer_cfie`] variant that also returns the CPKD distillation
+/// choice (CPKD v1).  `None` unless [`LayerIlpConstraints::cpkd`] is
+/// `Some` and a feasible candidate exists.  Like the CFIE choice, it is
+/// carried OUTSIDE `LayerDecision`/`LayerIlpSolution` (advisory sidecar,
+/// see `wggo_cpkd` module docs) so consumer-owned struct layouts stay
+/// untouched while the gate is advisory.
+pub fn solve_layer_cpkd(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> (
+    LayerIlpSolution,
+    Option<CfieInferenceChoice>,
+    Option<CpkdChoice>,
+) {
     let mut state = SolverState {
         best_cost: f64::INFINITY,
         best_decision: None,
         best_entry: None,
         best_cfie: None,
+        best_cpkd: None,
         nodes: 0,
     };
 
@@ -378,6 +411,12 @@ pub fn solve_layer_cfie(
     // a 0.0 cost term, and a 0-byte pool — the candidate walk, node count,
     // and objective are byte-identical to a solver without the axis.
     let cfie_domain = crate::wggo_cfie::enumerate_choices(constraints.cfie_infer.as_ref());
+    // CPKD distillation axis (v1).  Same gate-off contract as the CFIE
+    // axis: `cpkd == None` (the production default) yields the single
+    // `None` element — one loop pass, a 0.0 cost term, and a 0-byte
+    // charge, keeping the candidate walk, node count, and objective
+    // byte-identical to a solver without the axis.
+    let cpkd_domain = crate::wggo_cpkd::enumerate_choices(constraints.cpkd.as_ref());
 
     for &m_bits in precision_domain {
         if !prec_allowed(m_bits, constraints) {
@@ -390,6 +429,7 @@ pub fn solve_layer_cfie(
             for &fase in fase_domain {
                 for pack in enumerate_packing_modes(constraints) {
                   for &cfie in &cfie_domain {
+                   for &cpkd in &cpkd_domain {
                     for &c in lut.axes_csha_levels.iter().rev() {
                         for &f in lut.axes_ffn_widths.iter().rev() {
                             for &r in &lut.axes_adapter_ranks {
@@ -439,8 +479,23 @@ pub fn solve_layer_cfie(
                                             ),
                                             _ => (0.0, 0u64),
                                         };
+                                    // CPKD (v1): distillation-overhead term +
+                                    // feature/attn buffer memory charge for this
+                                    // candidate's distill choice.  Gate off =>
+                                    // (0.0, 0): both the sum and the comparison
+                                    // below are bit-identical to the pre-CPKD
+                                    // solver.
+                                    let (cpkd_us, cpkd_bytes) =
+                                        match (cpkd, constraints.cpkd.as_ref()) {
+                                            (Some(ch), Some(cfg)) => (
+                                                crate::wggo_cpkd::choice_cost_us(ch, cfg),
+                                                crate::wggo_cpkd::choice_bytes(ch, cfg),
+                                            ),
+                                            _ => (0.0, 0u64),
+                                        };
                                     if ilp_resident_bytes(&entry, lut, m_bits, v_bits)
                                         .saturating_add(cfie_pool)
+                                        .saturating_add(cpkd_bytes)
                                         > constraints.memory_budget
                                     {
                                         continue;
@@ -456,7 +511,8 @@ pub fn solve_layer_cfie(
                                     // its own precision/FASE decisions (paper §2.3
                                     // optimizer_time term).  The CFIE decode term
                                     // composes the same way (G20): additive, in
-                                    // μs, zero when the gate is off.
+                                    // μs, zero when the gate is off — as does the
+                                    // CPKD distill-overhead term (v1).
                                     let optim_us = crate::wggo_cost::optimizer_us(
                                         entry.param_bytes,
                                         lut.dtype_bytes,
@@ -465,8 +521,11 @@ pub fn solve_layer_cfie(
                                         fase,
                                         lut.peak_bandwidth_gbs,
                                     );
-                                    let cand_cost =
-                                        entry.total_us() + placement_us + optim_us + cfie_us;
+                                    let cand_cost = entry.total_us()
+                                        + placement_us
+                                        + optim_us
+                                        + cfie_us
+                                        + cpkd_us;
                                     if cand_cost >= state.best_cost {
                                         continue; // bound prune
                                     }
@@ -485,10 +544,12 @@ pub fn solve_layer_cfie(
                                     state.best_decision = Some(decision);
                                     state.best_entry = Some(entry);
                                     state.best_cfie = cfie;
+                                    state.best_cpkd = cpkd;
                                 }
                             }
                         }
                     }
+                   }
                   }
                 }
             }
@@ -505,9 +566,16 @@ pub fn solve_layer_cfie(
                 (Some(ch), Some(cfg)) => crate::wggo_cfie::kv_pool_bytes(ch, cfg),
                 _ => 0,
             };
+            // Same gate-off contract for CPKD: best_cpkd is None => a
+            // 0-byte charge and byte-identical accounting.
+            let cpkd_bytes = match (state.best_cpkd, constraints.cpkd.as_ref()) {
+                (Some(ch), Some(cfg)) => crate::wggo_cpkd::choice_bytes(ch, cfg),
+                _ => 0,
+            };
             let memory_bytes =
                 ilp_resident_bytes(&entry, lut, decision.optim_m_bits, decision.optim_v_bits)
-                    .saturating_add(cfie_pool);
+                    .saturating_add(cfie_pool)
+                    .saturating_add(cpkd_bytes);
             (
                 LayerIlpSolution {
                     decision,
@@ -519,6 +587,7 @@ pub fn solve_layer_cfie(
                     decision_trace,
                 },
                 state.best_cfie,
+                state.best_cpkd,
             )
         }
         None => (
@@ -531,6 +600,7 @@ pub fn solve_layer_cfie(
                 feasible: false,
                 decision_trace: Vec::new(),
             },
+            None,
             None,
         ),
     }
@@ -553,6 +623,21 @@ pub fn recost_decision_cfie(
     d: &LayerDecision,
     c: &LayerIlpConstraints,
     cfie: Option<CfieInferenceChoice>,
+) -> f64 {
+    recost_decision_cpkd(lut, d, c, cfie, None)
+}
+
+/// [`recost_decision_cfie`] extended with the layer's CPKD distillation
+/// choice (v1) so a gate-on greedy re-cost stays comparable with
+/// `solve_layer`'s objective (which includes the distill-overhead term).
+/// Passing `None` (or a gate that is off) adds nothing and is
+/// bit-identical to [`recost_decision_cfie`].
+pub fn recost_decision_cpkd(
+    lut: &LayerCostLut,
+    d: &LayerDecision,
+    c: &LayerIlpConstraints,
+    cfie: Option<CfieInferenceChoice>,
+    cpkd: Option<CpkdChoice>,
 ) -> f64 {
     let h_count = (d.active_heads() as u64).max(1);
     let Some(base) = lut.get(h_count, d.ffn_width, d.csha_level, d.adapter_rank) else {
@@ -582,6 +667,9 @@ pub fn recost_decision_cfie(
             entry.param_bytes,
             lut.peak_bandwidth_gbs,
         );
+    }
+    if let (Some(ch), Some(cfg)) = (cpkd, c.cpkd.as_ref()) {
+        cost += crate::wggo_cpkd::choice_cost_us(ch, cfg);
     }
     cost
 }
@@ -648,6 +736,24 @@ pub fn solve_all_templated_cfie(
     TemplateStats,
     Vec<Option<CfieInferenceChoice>>,
 ) {
+    let (sols, stats, cfie, _cpkd) = solve_all_templated_cpkd(luts, constraints);
+    (sols, stats, cfie)
+}
+
+/// [`solve_all_templated_cfie`] variant that also returns the per-layer
+/// CPKD distillation choices (v1) — parallel to the solutions vector, all
+/// `None` when the gate is off.  Template reuse replicates the cached
+/// choice alongside the cached solution; the gate config participates in
+/// the template key via [`constraints_eq`].
+pub fn solve_all_templated_cpkd(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (
+    Vec<LayerIlpSolution>,
+    TemplateStats,
+    Vec<Option<CfieInferenceChoice>>,
+    Vec<Option<CpkdChoice>>,
+) {
     assert_eq!(
         luts.len(),
         constraints.len(),
@@ -655,6 +761,7 @@ pub fn solve_all_templated_cfie(
     );
     let mut out: Vec<LayerIlpSolution> = Vec::with_capacity(luts.len());
     let mut cfie_out: Vec<Option<CfieInferenceChoice>> = Vec::with_capacity(luts.len());
+    let mut cpkd_out: Vec<Option<CpkdChoice>> = Vec::with_capacity(luts.len());
     let mut stats = TemplateStats::default();
     let mut template_idx: Option<usize> = None;
 
@@ -670,17 +777,19 @@ pub fn solve_all_templated_cfie(
             s.nodes_explored = 0;
             out.push(s);
             cfie_out.push(cfie_out[j]);
+            cpkd_out.push(cpkd_out[j]);
             stats.template_hits += 1;
         } else {
-            let (sol, cfie) = solve_layer_cfie(lut, c);
+            let (sol, cfie, cpkd) = solve_layer_cpkd(lut, c);
             out.push(sol);
             cfie_out.push(cfie);
+            cpkd_out.push(cpkd);
             stats.templates_solved += 1;
             template_idx = Some(i);
         }
     }
 
-    (out, stats, cfie_out)
+    (out, stats, cfie_out, cpkd_out)
 }
 
 /// Field-by-field equality for [`LayerCostLut`] (manual to avoid
@@ -742,6 +851,14 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
             (Some(x), Some(y)) => x.key_eq(y),
             _ => false,
         }
+        // CPKD (v1): the distillation gate (and its knobs) join the
+        // template key for the same reason — forgetting this would
+        // silently reuse gate-off template solutions for gate-on layers.
+        && match (a.cpkd.as_ref(), b.cpkd.as_ref()) {
+            (None, None) => true,
+            (Some(x), Some(y)) => x.key_eq(y),
+            _ => false,
+        }
 }
 
 /// Solve a layer **greedily** — paper §5.3.
@@ -769,6 +886,24 @@ pub fn solve_layer_greedy_cfie(
     lut: &LayerCostLut,
     constraints: &LayerIlpConstraints,
 ) -> (LayerIlpSolution, Option<CfieInferenceChoice>) {
+    let (sol, cfie, _cpkd) = solve_layer_greedy_cpkd(lut, constraints);
+    (sol, cfie)
+}
+
+/// [`solve_layer_greedy_cfie`] variant that also returns the CPKD
+/// distillation choice (v1).  Greedy picks the locally-cheapest choice
+/// whose distill buffers fit the memory headroom left after the
+/// training-resident bytes and the CFIE KV pool
+/// (`wggo_cpkd::best_choice_fitting`) — mirroring greedy's per-variable
+/// local heuristics.
+pub fn solve_layer_greedy_cpkd(
+    lut: &LayerCostLut,
+    constraints: &LayerIlpConstraints,
+) -> (
+    LayerIlpSolution,
+    Option<CfieInferenceChoice>,
+    Option<CpkdChoice>,
+) {
     let mut nodes = 0u64;
 
     // Heads: keep all that satisfy the GQA-group + importance constraint.
@@ -823,6 +958,7 @@ pub fn solve_layer_greedy_cfie(
                 decision_trace: Vec::new(),
             },
             None,
+            None,
         );
     };
     let entry = apply_packing(
@@ -850,6 +986,21 @@ pub fn solve_layer_greedy_cfie(
         None => (None, 0.0, 0),
     };
     let memory_bytes = memory_bytes.saturating_add(cfie_pool);
+    // CPKD greedy (v1): locally-best distillation choice fitting the
+    // memory headroom left after the training-resident bytes and the CFIE
+    // pool.  Gate off => (None, 0.0, 0), leaving every expression below
+    // bit-identical to the pre-CPKD solver.
+    let (cpkd_choice, cpkd_us, cpkd_bytes) = match constraints.cpkd.as_ref() {
+        Some(cfg) => {
+            let headroom = constraints.memory_budget.saturating_sub(memory_bytes);
+            match crate::wggo_cpkd::best_choice_fitting(cfg, headroom) {
+                Some((ch, us)) => (Some(ch), us, crate::wggo_cpkd::choice_bytes(ch, cfg)),
+                None => (None, 0.0, 0),
+            }
+        }
+        None => (None, 0.0, 0),
+    };
+    let memory_bytes = memory_bytes.saturating_add(cpkd_bytes);
     let feasible = base.feasible
         && entry.smem_bytes <= constraints.smem_budget
         && memory_bytes <= constraints.memory_budget;
@@ -865,6 +1016,7 @@ pub fn solve_layer_greedy_cfie(
                 feasible: false,
                 decision_trace: Vec::new(),
             },
+            None,
             None,
         );
     }
@@ -896,7 +1048,8 @@ pub fn solve_layer_greedy_cfie(
                     fase_fused,
                     lut.peak_bandwidth_gbs,
                 )
-                + cfie_us,
+                + cfie_us
+                + cpkd_us,
             memory_bytes,
             smem_bytes: entry.smem_bytes,
             nodes_explored: nodes,
@@ -904,6 +1057,7 @@ pub fn solve_layer_greedy_cfie(
             decision_trace: Vec::new(),
         },
         cfie_choice,
+        cpkd_choice,
     )
 }
 
@@ -922,15 +1076,36 @@ pub fn solve_all_greedy_cfie(
     luts: &[LayerCostLut],
     constraints: &[LayerIlpConstraints],
 ) -> (Vec<LayerIlpSolution>, Vec<Option<CfieInferenceChoice>>) {
+    let (sols, cfie, _cpkd) = solve_all_greedy_cpkd(luts, constraints);
+    (sols, cfie)
+}
+
+/// [`solve_all_greedy_cfie`] variant that also returns the per-layer CPKD
+/// distillation choices (v1) — parallel to the solutions, all `None` when
+/// the gate is off.
+pub fn solve_all_greedy_cpkd(
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+) -> (
+    Vec<LayerIlpSolution>,
+    Vec<Option<CfieInferenceChoice>>,
+    Vec<Option<CpkdChoice>>,
+) {
     assert_eq!(
         luts.len(),
         constraints.len(),
         "luts and constraints must be parallel arrays"
     );
-    luts.iter()
-        .zip(constraints.iter())
-        .map(|(lut, c)| solve_layer_greedy_cfie(lut, c))
-        .unzip()
+    let mut sols = Vec::with_capacity(luts.len());
+    let mut cfie_out = Vec::with_capacity(luts.len());
+    let mut cpkd_out = Vec::with_capacity(luts.len());
+    for (lut, c) in luts.iter().zip(constraints.iter()) {
+        let (sol, cfie, cpkd) = solve_layer_greedy_cpkd(lut, c);
+        sols.push(sol);
+        cfie_out.push(cfie);
+        cpkd_out.push(cpkd);
+    }
+    (sols, cfie_out, cpkd_out)
 }
 
 /// Solve all layers in parallel-safe sequential order.
@@ -960,6 +1135,9 @@ struct SolverState {
     /// CFIE inference choice of the incumbent (G20).  Always `None` when
     /// the `cfie_infer` gate is off.
     best_cfie: Option<CfieInferenceChoice>,
+    /// CPKD distillation choice of the incumbent (v1).  Always `None`
+    /// when the `cpkd` gate is off.
+    best_cpkd: Option<CpkdChoice>,
     nodes: u64,
 }
 
@@ -1934,5 +2112,266 @@ mod tests {
         }
         // 2^2 - 1 = 3 non-empty subsets of 2 groups.
         assert_eq!(configs.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // CPKD distillation axis (v1) — gate-off byte-identity, gate-on
+    // decisions, memory binding, template key, greedy/full/recost parity.
+    // -----------------------------------------------------------------------
+
+    /// Single-entry LUT (one point on every base axis) so CPKD tests face a
+    /// unique, deterministic base decision — the wggo_cfie integration-test
+    /// fixture pattern.
+    fn cpkd_pinned_lut() -> LayerCostLut {
+        let axes = LutAxes {
+            head_counts: vec![4],
+            ffn_widths: vec![1024],
+            csha_levels: vec![0],
+            adapter_ranks: vec![0],
+        };
+        build_lut(&shape(), h100(), &axes)
+    }
+
+    /// One head config (num_heads=4, gqa_group=4 => a single all-kept
+    /// group), one packing mode, FASE off — the CPKD axis (plus optimizer
+    /// precision) is the only thing that varies.
+    fn cpkd_pinned_constraints() -> LayerIlpConstraints {
+        LayerIlpConstraints {
+            num_heads: 4,
+            gqa_group: 4,
+            packing_modes_mask: 0b0001,
+            allow_fase: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cpkd_gate_off_solution_identical_and_choice_none() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints::default(); // cpkd: None — production default
+        let (sol, cfie, cpkd) = solve_layer_cpkd(&lut, &c);
+        assert!(sol.feasible);
+        assert!(cfie.is_none());
+        assert!(cpkd.is_none(), "gate off must never produce a choice");
+        // The legacy entry point returns the identical solution: same
+        // decision, bit-identical cost, same memory and node count.
+        let legacy = solve_layer(&lut, &c);
+        assert_eq!(legacy.decision, sol.decision);
+        assert_eq!(legacy.cost_us.to_bits(), sol.cost_us.to_bits());
+        assert_eq!(legacy.memory_bytes, sol.memory_bytes);
+        assert_eq!(legacy.nodes_explored, sol.nodes_explored);
+        // Serialized solution is byte-free of any CPKD key: the choice
+        // travels in a sidecar; LayerIlpSolution's layout is untouched.
+        let json = serde_json::to_string(&sol).unwrap();
+        assert!(
+            !json.to_lowercase().contains("cpkd"),
+            "gate-off solution JSON must not mention cpkd: {json}"
+        );
+    }
+
+    #[test]
+    fn cpkd_favorable_feature_cost_flips_feature_match_on() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let off = solve_layer(&lut, &LayerIlpConstraints::default());
+        let mut c = LayerIlpConstraints::default();
+        c.cpkd = Some(CpkdConfig {
+            // A favorable (negative) net charge — e.g. the fused KL-CE
+            // kernel replacing a separate CE loss pass.
+            feature_cost_us: -15.0,
+            ..Default::default()
+        });
+        let (sol, _, choice) = solve_layer_cpkd(&lut, &c);
+        assert!(sol.feasible);
+        let ch = choice.expect("gate on must populate the choice");
+        assert!(ch.feature_match);
+        assert!(!ch.attn_transfer, "deferred axis stays off by default");
+        assert!(!ch.teacher_stream, "deferred axis stays off by default");
+        // The objective composes additively: base + (-15.0); the constant
+        // per-choice delta cannot move the base argmin.
+        assert!(
+            ((off.cost_us - 15.0) - sol.cost_us).abs() < 1e-9,
+            "off={} on={}",
+            off.cost_us,
+            sol.cost_us
+        );
+        // And the winner's memory accounting charges the feature buffer.
+        assert_eq!(sol.memory_bytes, off.memory_bytes + 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cpkd_default_costs_advise_all_off_but_still_populate() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let off = solve_layer(&lut, &LayerIlpConstraints::default());
+        let mut c = LayerIlpConstraints::default();
+        c.cpkd = Some(CpkdConfig::default()); // all-positive charges
+        let (sol, _, choice) = solve_layer_cpkd(&lut, &c);
+        assert!(sol.feasible);
+        // Conservative all-off wins on strict `<` improvement, but the
+        // advisory choice is still populated (the axis was decided).
+        let ch = choice.expect("gate on must populate the choice");
+        assert!(!ch.feature_match && !ch.attn_transfer && !ch.teacher_stream);
+        // All-off charges nothing: cost, memory, and decision match the
+        // gate-off run.
+        assert_eq!(sol.cost_us.to_bits(), off.cost_us.to_bits());
+        assert_eq!(sol.memory_bytes, off.memory_bytes);
+        assert_eq!(sol.decision, off.decision);
+    }
+
+    #[test]
+    fn cpkd_tiny_feature_budget_forces_feature_off() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.cpkd = Some(CpkdConfig {
+            feature_cost_us: -15.0,   // favorable — would be chosen...
+            feature_memory_budget: 1, // ...but the buffer can never fit
+            ..Default::default()
+        });
+        let (sol, _, choice) = solve_layer_cpkd(&lut, &c);
+        assert!(sol.feasible);
+        assert!(!choice.expect("gate on populates").feature_match);
+    }
+
+    #[test]
+    fn cpkd_resident_memory_charge_binds_against_the_ilp_budget() {
+        // Single-entry LUT + pinned constraints so the base decision is
+        // unique and the resident bytes are deterministic.
+        let lut = cpkd_pinned_lut();
+        let base = solve_layer(&lut, &cpkd_pinned_constraints());
+        assert!(base.feasible);
+        let fav = CpkdConfig {
+            feature_cost_us: -15.0,
+            ..Default::default()
+        };
+        let feature_bytes = fav.feature_bytes_per_layer;
+
+        // Budget admits resident + feature buffer exactly: chosen ON, and
+        // the winner's accounting includes the buffer.
+        let mut roomy = cpkd_pinned_constraints();
+        roomy.cpkd = Some(fav.clone());
+        roomy.memory_budget = base.memory_bytes + feature_bytes;
+        let (sol_on, _, ch_on) = solve_layer_cpkd(&lut, &roomy);
+        assert!(sol_on.feasible);
+        assert!(ch_on.unwrap().feature_match);
+        assert_eq!(sol_on.memory_bytes, base.memory_bytes + feature_bytes);
+
+        // One byte less: the feature-on candidate fails the resident
+        // admission check, so despite the favorable cost the solver falls
+        // back to feature-off — the memory constraint binds.
+        let mut tight = cpkd_pinned_constraints();
+        tight.cpkd = Some(fav);
+        tight.memory_budget = base.memory_bytes + feature_bytes - 1;
+        let (sol_off, _, ch_off) = solve_layer_cpkd(&lut, &tight);
+        assert!(
+            sol_off.feasible,
+            "the layer itself still fits without the buffer"
+        );
+        assert!(!ch_off.unwrap().feature_match);
+        assert_eq!(sol_off.memory_bytes, base.memory_bytes);
+    }
+
+    #[test]
+    fn cpkd_template_cache_never_shares_across_gate_states() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c_off = LayerIlpConstraints::default();
+        let mut c_on = LayerIlpConstraints::default();
+        c_on.cpkd = Some(CpkdConfig::default());
+        // Gate-off vs gate-on: two distinct templates (recon risk 6 —
+        // forgetting the constraints_eq entry would silently reuse the
+        // gate-off solution here).
+        let (sols, stats, _cfie, cpkd) =
+            solve_all_templated_cpkd(&[lut.clone(), lut.clone()], &[c_off, c_on.clone()]);
+        assert_eq!(stats.templates_solved, 2);
+        assert_eq!(stats.template_hits, 0);
+        assert!(cpkd[0].is_none());
+        assert!(cpkd[1].is_some());
+        assert!(sols.iter().all(|s| s.feasible));
+
+        // Two configs differing only in a cpkd knob are distinct templates.
+        let mut c_on2 = LayerIlpConstraints::default();
+        c_on2.cpkd = Some(CpkdConfig {
+            feature_cost_us: -15.0,
+            ..Default::default()
+        });
+        let (_, stats2, _, _) =
+            solve_all_templated_cpkd(&[lut.clone(), lut.clone()], &[c_on.clone(), c_on2]);
+        assert_eq!(stats2.templates_solved, 2);
+        assert_eq!(stats2.template_hits, 0);
+
+        // Identical gate-on layers DO share one template, replicating the
+        // cached choice.
+        let (_, stats3, _, cpkd3) =
+            solve_all_templated_cpkd(&[lut.clone(), lut], &[c_on.clone(), c_on]);
+        assert_eq!(stats3.templates_solved, 1);
+        assert_eq!(stats3.template_hits, 1);
+        assert_eq!(cpkd3[0], cpkd3[1]);
+    }
+
+    #[test]
+    fn cpkd_greedy_and_full_agree_on_a_trivial_layer() {
+        // Single-entry LUT: the base axes are pinned, so both solvers face
+        // only the precision + CPKD choices and share one objective.
+        let lut = cpkd_pinned_lut();
+        let mut c = cpkd_pinned_constraints();
+        c.cpkd = Some(CpkdConfig {
+            feature_cost_us: -15.0,
+            ..Default::default()
+        });
+        let (full, _, full_ch) = solve_layer_cpkd(&lut, &c);
+        let (greedy, _, greedy_ch) = solve_layer_greedy_cpkd(&lut, &c);
+        assert!(full.feasible && greedy.feasible);
+        assert_eq!(full_ch, greedy_ch);
+        assert!(full_ch.unwrap().feature_match);
+        assert_eq!(full.decision, greedy.decision);
+        assert!(
+            (full.cost_us - greedy.cost_us).abs() < 1e-9,
+            "full={} greedy={}",
+            full.cost_us,
+            greedy.cost_us
+        );
+        assert_eq!(full.memory_bytes, greedy.memory_bytes);
+    }
+
+    #[test]
+    fn cpkd_greedy_refuses_feature_when_headroom_is_gone() {
+        // Headroom below the 2 MiB feature buffer: greedy must advise the
+        // all-off choice rather than an over-budget buffer.
+        let lut = cpkd_pinned_lut();
+        let base = solve_layer_greedy(&lut, &cpkd_pinned_constraints());
+        assert!(base.feasible);
+        let mut c = cpkd_pinned_constraints();
+        c.cpkd = Some(CpkdConfig {
+            feature_cost_us: -15.0,
+            ..Default::default()
+        });
+        c.memory_budget = base.memory_bytes + 1024; // < feature_bytes_per_layer
+        let (sol, _, ch) = solve_layer_greedy_cpkd(&lut, &c);
+        assert!(sol.feasible);
+        assert!(!ch.expect("gate on populates").feature_match);
+        assert_eq!(sol.memory_bytes, base.memory_bytes);
+    }
+
+    #[test]
+    fn cpkd_recost_matches_the_solver_objective_exactly() {
+        // Greedy G3 escalation compares solver costs with re-costed
+        // decisions, so recost_decision_cpkd must mirror
+        // solve_layer_cpkd's objective exactly.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let mut c = LayerIlpConstraints::default();
+        c.cpkd = Some(CpkdConfig {
+            feature_cost_us: -15.0,
+            ..Default::default()
+        });
+        let (sol, cfie, cpkd) = solve_layer_cpkd(&lut, &c);
+        assert!(sol.feasible);
+        let recost = recost_decision_cpkd(&lut, &sol.decision, &c, cfie, cpkd);
+        assert!(
+            (recost - sol.cost_us).abs() < 1e-9,
+            "recost={recost} cost={}",
+            sol.cost_us
+        );
+        // The legacy wrappers (no cpkd choice) recover the gate-off
+        // objective: exactly the distill term apart.
+        let base = recost_decision(&lut, &sol.decision, &LayerIlpConstraints::default());
+        assert!(((base - 15.0) - recost).abs() < 1e-9);
     }
 }

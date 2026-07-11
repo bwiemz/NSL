@@ -120,6 +120,150 @@ pub fn parse_train_block_stmt(p: &mut Parser) -> Stmt {
     }
 }
 
+/// CPKD: `distill(teacher=t, student=s, epochs=N):` block.
+///
+/// Sections mirror `train` (data/optimizer/scheduler/step/eval/callbacks are
+/// contextual identifiers reusing [`TrainSection`]); the distill-specific
+/// `loss:` section is an indented list of `key = value` entries collected
+/// into `DistillBlock.loss`.
+pub fn parse_distill_block_stmt(p: &mut Parser) -> Stmt {
+    let start = p.current_span();
+    p.advance(); // consume 'distill'
+
+    let config = if p.at(&TokenKind::LeftParen) {
+        p.advance();
+        let args = parse_args(p);
+        p.expect(&TokenKind::RightParen);
+        args
+    } else {
+        Vec::new()
+    };
+
+    p.expect(&TokenKind::Colon);
+    p.skip_newlines();
+    p.expect(&TokenKind::Indent);
+    p.skip_newlines();
+
+    let mut sections = Vec::new();
+    let mut loss = Vec::new();
+
+    while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+        p.skip_newlines();
+        if p.at(&TokenKind::Dedent) || p.at(&TokenKind::Eof) {
+            break;
+        }
+
+        if let TokenKind::Ident(sym) = p.peek().clone() {
+            let name = p.interner.resolve(sym).unwrap_or("").to_string();
+
+            match name.as_str() {
+                "data" if matches!(p.peek_at(1), &TokenKind::Colon) => {
+                    p.advance(); // data
+                    p.advance(); // :
+                    let block = p.parse_block();
+                    sections.push(TrainSection::Data(block.stmts));
+                    continue;
+                }
+                "optimizer" if matches!(p.peek_at(1), &TokenKind::Colon) => {
+                    p.advance(); // optimizer
+                    p.advance(); // :
+                    let expr = parse_expr(p);
+                    p.expect_end_of_stmt();
+                    sections.push(TrainSection::Optimizer(expr));
+                    continue;
+                }
+                "scheduler" if matches!(p.peek_at(1), &TokenKind::Colon) => {
+                    p.advance(); // scheduler
+                    p.advance(); // :
+                    let expr = parse_expr(p);
+                    p.expect_end_of_stmt();
+                    sections.push(TrainSection::Scheduler(expr));
+                    continue;
+                }
+                "loss" if matches!(p.peek_at(1), &TokenKind::Colon) => {
+                    p.advance(); // loss
+                    p.advance(); // :
+                    loss.extend(parse_distill_loss_entries(p));
+                    continue;
+                }
+                "step" if matches!(p.peek_at(1), &TokenKind::LeftParen) => {
+                    p.advance(); // step
+                    p.advance(); // (
+                    let (param, _) = p.expect_ident();
+                    p.expect(&TokenKind::RightParen);
+                    p.expect(&TokenKind::Colon);
+                    let body = p.parse_block();
+                    sections.push(TrainSection::Step { param, body });
+                    continue;
+                }
+                "eval" if matches!(p.peek_at(1), &TokenKind::LeftParen) => {
+                    p.advance(); // eval
+                    p.advance(); // (
+                    let (param, _) = p.expect_ident();
+                    p.expect(&TokenKind::RightParen);
+                    p.expect(&TokenKind::Colon);
+                    let body = p.parse_block();
+                    sections.push(TrainSection::Eval { param, body });
+                    continue;
+                }
+                "callbacks" if matches!(p.peek_at(1), &TokenKind::Colon) => {
+                    p.advance(); // callbacks
+                    p.advance(); // :
+                    let callbacks = parse_callbacks(p);
+                    sections.push(TrainSection::Callbacks(callbacks));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let stmt = crate::stmt::parse_stmt(p);
+        sections.push(TrainSection::Stmt(Box::new(stmt)));
+    }
+
+    p.eat(&TokenKind::Dedent);
+
+    let span = start.merge(p.prev_span());
+    Stmt {
+        kind: StmtKind::DistillBlock(DistillBlock {
+            config,
+            sections,
+            loss,
+            span,
+        }),
+        span,
+        id: p.next_node_id(),
+    }
+}
+
+/// Indented `key = value` entries under a distill `loss:` header.
+fn parse_distill_loss_entries(p: &mut Parser) -> Vec<nsl_ast::expr::Arg> {
+    use nsl_ast::expr::Arg;
+
+    let mut entries = Vec::new();
+    p.skip_newlines();
+    if !p.eat(&TokenKind::Indent) {
+        return entries;
+    }
+    p.skip_newlines();
+    while !p.at(&TokenKind::Dedent) && !p.at(&TokenKind::Eof) {
+        let entry_start = p.current_span();
+        let (name, _) = p.expect_ident();
+        p.expect(&TokenKind::Eq);
+        let value = parse_expr(p);
+        p.expect_end_of_stmt();
+        let span = entry_start.merge(p.prev_span());
+        entries.push(Arg {
+            name: Some(name),
+            value,
+            span,
+        });
+        p.skip_newlines();
+    }
+    p.eat(&TokenKind::Dedent);
+    entries
+}
+
 fn parse_callbacks(p: &mut Parser) -> Vec<CallbackDef> {
     p.skip_newlines();
     p.expect(&TokenKind::Indent);

@@ -108,6 +108,16 @@ fn scan_stmt_for_weight_ref(stmt: &Stmt, interner: &Interner) -> Option<PathBuf>
         StmtKind::FnDef(f) => scan_fn_def_for_weight_ref(f, interner),
         StmtKind::ModelDef(m) => scan_model_def_for_weight_ref(m, interner),
         StmtKind::TrainBlock(tb) => scan_train_block_for_weight_ref(tb, interner),
+        // CPKD: distill blocks can also reference load_safetensors in their
+        // config/sections (e.g. teacher weight loading in data: or step()).
+        StmtKind::DistillBlock(db) => {
+            for arg in db.config.iter().chain(db.loss.iter()) {
+                if let Some(p) = scan_expr_for_weight_ref(&arg.value, interner) {
+                    return Some(p);
+                }
+            }
+            scan_train_sections_for_weight_ref(&db.sections, interner)
+        }
         StmtKind::Decorated { decorators, stmt } => {
             for d in decorators {
                 if let Some(args) = &d.args {
@@ -163,7 +173,14 @@ fn scan_train_block_for_weight_ref(tb: &TrainBlock, interner: &Interner) -> Opti
             return Some(p);
         }
     }
-    for section in &tb.sections {
+    scan_train_sections_for_weight_ref(&tb.sections, interner)
+}
+
+fn scan_train_sections_for_weight_ref(
+    sections: &[TrainSection],
+    interner: &Interner,
+) -> Option<PathBuf> {
+    for section in sections {
         match section {
             TrainSection::Data(stmts) => {
                 for s in stmts {

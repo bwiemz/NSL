@@ -103,6 +103,9 @@ pub enum StmtKind {
     /// train(config): ...
     TrainBlock(TrainBlock),
 
+    /// distill(teacher=t, student=s, epochs=N): ... (CPKD)
+    DistillBlock(DistillBlock),
+
     /// grad(targets): ...
     GradBlock(GradBlock),
 

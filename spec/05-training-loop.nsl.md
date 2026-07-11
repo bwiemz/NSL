@@ -376,3 +376,55 @@ The compiler can optimize the `train` block holistically:
 3. **Parameter groups**: Per-parameter optimizer settings (different LR for different layers)
    use a filter pattern syntax. This is less flexible than PyTorch's arbitrary param groups
    but covers 95% of use cases with far less code.
+
+## Knowledge Distillation: the `distill` Block (CPKD v1)
+
+CPKD (Compiler-Planned Knowledge Distillation) treats distillation as a joint
+compilation problem. The `distill` block compiles a training loop over the
+STUDENT while the TEACHER is structurally frozen: every teacher weight the
+step body touches registers as a no-grad input on the Wengert list, so the
+teacher backward is physically absent from the compiled step — no teacher
+gradient buffers exist (composition-paper invariant I-11 / failure mode F-06).
+
+```nsl
+let teacher = Teacher()      # both must be model instances bound before the block
+let student = Student()
+
+@fused_kl_ce(enabled = true, vocab_size = 4096, hidden_size = 128,
+             teacher_hidden = 256, batch_size = 2, seq_len = 32)
+distill(teacher = teacher, student = student, epochs = 3):
+    optimizer: AdamW(lr = 1e-4)
+    loss:
+        alpha = 0.5           # hard-label CE weight; KL gets (1 - alpha)
+        temperature = 2.0     # KL temperature (Hinton T^2 scaling)
+        feature_weight = 0.1  # advisory metadata for user feature losses
+        feature_layers = "auto"
+        attn_transfer = false # `true` is refused (deferred in v1)
+    step(batch):
+        let t_h = teacher.encode(x)
+        let s_h = student.encode(x)
+        let loss = fused_kl_ce(s_h, student.head_w, student.head_b,
+                               t_h, teacher.head_w, teacher.head_b,
+                               targets, 0.5, 2.0)
+```
+
+Semantics and constraints (v1):
+
+- `teacher=` / `student=` must be distinct, already-bound model instances.
+  Separately-compiled teachers (`@export` binaries) are deferred.
+- `distill` requires source AD (`--source-ad`). The tape fallback is REFUSED:
+  a tape would record teacher ops and allocate teacher gradient buffers.
+- `optimizer:` / `scheduler:` / `data:` / `step()` / `callbacks:` behave
+  exactly as in `train`. `distribute:` is refused (CPDT composition deferred).
+- `fused_kl_ce(x_s, W_s, b_s, x_t, W_t, b_t, targets, alpha, T)` computes
+  `alpha*CE(student, targets) + (1-alpha)*T^2*KL(softmax(t/T) || softmax(s/T))`
+  in ONE kernel without materializing either `[rows, vocab]` logit tensor in
+  HBM. Requires the `@fused_kl_ce` decorator with all shape hints; otherwise
+  the stdlib composite runs (tape-only, so refused inside `distill`).
+  `alpha`/`temperature` must be numeric literals and must agree with the
+  `loss:` section when it sets them. v1 limits: f32 only, `vocab_size <= 8192`.
+- Every `distill` compile prints a Distillation Build Report (stderr) stating
+  what fired and what is advisory: teacher scheduling is sequential in v1
+  (two-stream overlap advisory), spectral logit compression is advisory
+  (`nsl check --cpkd-design-student` reports the effective vocabulary rank
+  and searches student architectures under a parameter budget).

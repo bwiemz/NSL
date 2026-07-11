@@ -121,6 +121,11 @@ pub use fused_linear_ce::{
     nsl_fused_linear_ce_backward,
 };
 
+// CPKD fused KL-CE FFIs exposed for the GPU numerical validation test
+// (`nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs`).
+#[doc(hidden)]
+pub use fused_kl_ce::{nsl_fused_kl_ce_backward, nsl_fused_kl_ce_forward};
+
 // CSHA Tier B.1 pre-pass PTX kernels (exposed for the GPU validation
 // tests in `tests/tier_b1_prepass_gpu.rs`; the orchestration FFI uses
 // them internally via `cuda::tier_b1_prepass::launch_*`).
@@ -222,6 +227,9 @@ pub mod fused_adapter;
 
 // G3: Fused linear + cross-entropy kernel (separator-skip v1)
 pub mod fused_linear_ce;
+
+// CPKD: fused KL-CE distillation loss (teacher+student LM heads + KL + CE in one kernel)
+pub mod fused_kl_ce;
 
 // M54: Unikernel runtime (bare-metal deployment)
 pub mod unikernel;

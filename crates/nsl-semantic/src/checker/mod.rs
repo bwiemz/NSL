@@ -83,6 +83,8 @@ pub struct TypeChecker<'a> {
     /// composite cross_entropy path with the fused linear-CE kernel; v1
     /// only collects + plumbs).
     pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
+    /// CPKD: validated @fused_kl_ce configs (distill-block-only).
+    pub fused_kl_ce_configs: Vec<crate::cpkd::FusedKlCeConfig>,
     /// CFTP §4.3 G2 Strategy 3: `@pca(...)` configs captured during
     /// semantic analysis (one per decorated `train` / `dataset` block).
     /// Consumed by codegen at `maybe_synthesize_csha_training_ptx` to
@@ -118,6 +120,7 @@ impl<'a> TypeChecker<'a> {
             csha_configs: Vec::new(),
             cpdt_decorator_span: None,
             fused_ce_configs: Vec::new(),
+            fused_kl_ce_configs: Vec::new(),
             pca_configs: Vec::new(),
             linear_types_enabled: false,
             agent_decl_spans: Vec::new(),

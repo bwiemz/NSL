@@ -396,6 +396,66 @@ pub enum PrimalOp {
         vocab_tile: u32,
         ignore_index: i64,
     },
+    /// CPKD: fused KL-CE distillation loss.
+    ///
+    /// Inputs (7): `[x_s, W_s, bias_s, x_t, W_t, bias_t, targets]` —
+    /// student hidden/LM-head/bias, teacher hidden/LM-head/bias (frozen
+    /// Input leaves under a distill block), and integer targets. Result =
+    /// scalar mean loss (masked over `ignore_index`, same convention as
+    /// `FusedLinearCe`).
+    ///
+    /// `alpha`/`temperature` are compile-time constants baked into the op
+    /// (the source call site must pass numeric literals in v1; the
+    /// extractor cross-checks them against the distill block's `loss:`
+    /// section and refuses on divergence).
+    ///
+    /// Backward dispatches via `FusedKlCeBackwardExtract`; ONLY the three
+    /// student inputs receive adjoints — the teacher inputs get none by
+    /// rule construction (composition-paper invariant I-11: teacher
+    /// backward structurally absent).
+    FusedKlCe {
+        vocab_size: u32,
+        student_hidden: u32,
+        teacher_hidden: u32,
+        batch_size: u32,
+        seq_len: u32,
+        vocab_tile: u32,
+        ignore_index: i64,
+        /// f64 bits of alpha (PrimalOp must be Eq-able/hashable in some
+        /// contexts; storing bits keeps the enum free of raw f64).
+        alpha_bits: u64,
+        /// f64 bits of temperature.
+        temperature_bits: u64,
+    },
+    /// CPKD: fused KL-CE backward extract.
+    ///
+    /// Component mapping (STUDENT gradients only — I-11):
+    ///   - 0 = dx_s    (gradient w.r.t. student hidden)
+    ///   - 1 = dW_s    (gradient w.r.t. student LM head)
+    ///   - 2 = dbias_s (gradient w.r.t. student bias)
+    ///
+    /// Inputs:
+    ///   inputs[0]    = output_bar (upstream scalar gradient seed)
+    ///   inputs[1..7] = x_s, W_s, bias_s, x_t, W_t, bias_t
+    ///   inputs[7]    = targets
+    ///   inputs[8]    = fwd_result (the FusedKlCe op's result VarId — cache key)
+    ///
+    /// The first-lowered component launches `nsl_fused_kl_ce_backward`
+    /// (which fills all three grads) and caches `[dx_s, dW_s, dbias_s]`
+    /// in `compiler.fused_kl_ce_bwd_cache` keyed by `fwd_result`; the
+    /// remaining components read the cache; the last one evicts.
+    FusedKlCeBackwardExtract {
+        component: u8,
+        vocab_size: u32,
+        student_hidden: u32,
+        teacher_hidden: u32,
+        batch_size: u32,
+        seq_len: u32,
+        vocab_tile: u32,
+        ignore_index: i64,
+        alpha_bits: u64,
+        temperature_bits: u64,
+    },
     // Regularization
     Dropout {
         p: f64,
