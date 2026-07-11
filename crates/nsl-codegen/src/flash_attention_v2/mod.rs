@@ -1706,9 +1706,12 @@ pub fn synthesize_backward_with_tier_b(
     // enclosing fn, the kv_load emitters (which expect K/V to be already
     // resident in HBM) are replaced with `emit_kv_recompute`, which
     // re-derives K/V into `%k_smem_base`/`%v_smem_base` from saved
-    // x_raw_ptr + W_k/W_v projection weights. R0 still guards production
-    // (lifted only via the cfg-gated `bypass_r0_for_testing()` seam);
-    // this fork is reached only when R0 is bypassed under test.
+    // x_raw_ptr + W_k/W_v projection weights. PRODUCTION-REACHABLE since
+    // cycle 12 retired the R0 catch-all (the old "reached only when R0 is
+    // bypassed under test" claim was stale) — eligibility is enforced by
+    // the specific R3..R12 refusals in validate_checkpoint_eligibility,
+    // and Path-B numerics remain GPU-unvalidated (see the deferral note on
+    // csha_hooks_backward::emit_kv_recompute).
     if config.checkpoint.is_some() {
         phases::backward::csha_hooks_backward::emit_kv_recompute(&mut ptx, config, "MAIN");
     } else {
