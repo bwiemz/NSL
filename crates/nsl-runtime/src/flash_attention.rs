@@ -5031,6 +5031,26 @@ pub extern "C" fn nsl_flash_attention_backward(
             h
         };
 
+        // NSL_FLASH_DEBUG=1 narrates the backward dispatch decision. The GPU
+        // path is silent on success and the CPU fallbacks are silent by
+        // design (the tape-AD path always passes null PTX), which made the
+        // decorator-free phase1_ptx=0 wiring gap invisible for a whole
+        // campaign — this gives tests and users a positive observable.
+        let flash_debug = std::env::var("NSL_FLASH_DEBUG").ok().as_deref() == Some("1");
+        if flash_debug && dout_t.device > 0 {
+            if phase1_ptx_ptr == 0 {
+                eprintln!(
+                    "[flash-bwd] no backward PTX provided (phase1_ptx=0) — CPU reference \
+                     backward (batch={b}, heads={h}, seq={s}, head_dim={d})"
+                );
+            } else if kv_h != h {
+                eprintln!(
+                    "[flash-bwd] GQA layout (kv_heads={kv_h} != heads={h}) — the classic \
+                     GPU backward kernel is MHA-only; CPU reference backward"
+                );
+            }
+        }
+
         if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h {
             // Budget-aware backward tile sizes. Must match the sizes codegen used to
             // synthesize the Phase-2 PTX; both sides derive them from head_dim via
@@ -5046,6 +5066,13 @@ pub extern "C" fn nsl_flash_attention_backward(
                 phase2_ptx_ptr, phase2_name_ptr,
             );
             if gpu_result != 0 {
+                if flash_debug {
+                    eprintln!(
+                        "[flash-bwd] GPU backward dispatched \
+                         (batch={b}, heads={h}, seq={s}, head_dim={d}, causal={is_causal}, \
+                         blocks=({block_q},{block_kv}))"
+                    );
+                }
                 return gpu_result;
             }
             // gpu_result == 0: a kernel launch failed (invalid/unlaunchable PTX for
