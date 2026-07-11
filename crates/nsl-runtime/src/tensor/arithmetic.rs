@@ -911,7 +911,20 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         if a.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let result = crate::cuda::gpu_matmul_f32(a_ptr, b_ptr);
+                // The GPU matmul kernels index flat row-major and never read
+                // strides, so a zero-copy view (transpose/expand) as either
+                // operand computes a silently-WRONG product — found via the
+                // tied-embedding pretrain repro `emb @ embed.transpose(0,1)`
+                // (PR #335: GPU loss climbed to the uniform plateau while CPU
+                // descended; the CPU path below always had these guards).
+                // `nsl_tensor_contiguous` is a native on-device strided copy
+                // for GPU views and a refcount bump when already contiguous;
+                // it always returns an owned ref, freed right after the kernel.
+                let a_c = nsl_tensor_contiguous(a_ptr);
+                let b_c = nsl_tensor_contiguous(b_ptr);
+                let result = crate::cuda::gpu_matmul_f32(a_c, b_c);
+                nsl_tensor_free(a_c);
+                nsl_tensor_free(b_c);
                 // FBIP-3: matmul always allocates fresh output; honor relinquish flags
                 // by freeing A/B here. No in-place optimization because matmul output
                 // shape differs from input in general ([M,K] @ [K,N] -> [M,N]).

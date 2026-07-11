@@ -94,13 +94,45 @@ pub extern "C" fn nsl_model_save(
         let byte_count = (tensor.len as usize) * tensor.element_size();
 
         if tensor.device > 0 {
-            // GPU tensor: copy to CPU staging buffer before writing
+            // GPU tensor: copy to CPU staging buffer before writing.
+            //
+            // CRITICAL dtype trap: `nsl_tensor_to_device(_, 0)` follows the
+            // runtime convention CPU=f64 / GPU=f32 and CONVERTS the staged
+            // buffer to f64 (len*8 bytes). The header above was built from
+            // the GPU tensor (dtype "f32", nbytes = len*4), so writing
+            // `byte_count` raw bytes from the f64 staging buffer serialized
+            // interleaved f64 halves as "f32" data — every checkpoint saved
+            // from a GPU-resident model was garbage (found by the roadmap-4.3
+            // FASE-parity gate: |max| ~ 3.7e19 in freshly-initialized
+            // weights). Downcast the staging buffer element-wise so the bytes
+            // match the declared dtype; fall through to a raw write only when
+            // the staging preserved the dtype.
             let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_ptr, 0);
             let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
-            let data_slice = unsafe {
-                std::slice::from_raw_parts(cpu_tensor.data as *const u8, byte_count)
-            };
-            write_or_abort(&mut file, data_slice, "write tensor data (GPU→CPU)");
+            if cpu_tensor.dtype == tensor.dtype {
+                let data_slice = unsafe {
+                    std::slice::from_raw_parts(cpu_tensor.data as *const u8, byte_count)
+                };
+                write_or_abort(&mut file, data_slice, "write tensor data (GPU->CPU)");
+            } else if tensor.dtype == 1 && cpu_tensor.dtype == 0 {
+                // GPU f32 declared in the header; staging is f64 — downcast.
+                let n = tensor.len as usize;
+                let src = unsafe {
+                    std::slice::from_raw_parts(cpu_tensor.data as *const f64, n)
+                };
+                let mut buf = Vec::with_capacity(n * 4);
+                for v in src {
+                    buf.extend_from_slice(&(*v as f32).to_le_bytes());
+                }
+                write_or_abort(&mut file, &buf, "write tensor data (GPU f32 via f64 staging)");
+            } else {
+                eprintln!(
+                    "nsl: model_save: unsupported dtype transition in GPU staging \
+                     (device dtype {} -> staged dtype {}) for tensor #{}",
+                    tensor.dtype, cpu_tensor.dtype, i
+                );
+                std::process::abort();
+            }
             crate::tensor::nsl_tensor_free(cpu_ptr);
         } else {
             let data_slice = unsafe {
@@ -179,6 +211,56 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
                  weights may be mismatched",
                 saved_param_count, tensors.len
             );
+        }
+    }
+
+    // In-order dtype guard (same lightweight no-JSON-parser style as the
+    // count check above): this loader walks the data section by the LIVE
+    // tensor's element size and raw-copies bytes, so a dtype mismatch
+    // between a file entry and the destination tensor (e.g. a CPU-saved
+    // f64 checkpoint loaded into a GPU-resident f32 model, or vice versa)
+    // would silently reinterpret bytes AND misalign every subsequent
+    // tensor. Refuse loudly instead — found while fixing the model_save
+    // GPU-staging dtype bug (f64 staging serialized under an f32 header).
+    let file_dtypes: Vec<&[u8]> = {
+        let header_bytes = &data[16..16 + header_size];
+        let needle: &[u8] = b"\"dtype\":\"";
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + needle.len() <= header_bytes.len() {
+            if &header_bytes[pos..pos + needle.len()] == needle {
+                let start = pos + needle.len();
+                if let Some(end) = header_bytes[start..].iter().position(|&b| b == b'"') {
+                    out.push(&header_bytes[start..start + end]);
+                    pos = start + end;
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+        out
+    };
+
+    // Pre-pass: validate EVERY entry's dtype before copying ANY bytes, so a
+    // mismatch can never leave the model partially overwritten (tensors
+    // 0..i-1 already mutated when the guard fires at i).
+    for i in 0..tensors.len as usize {
+        let tensor_ptr = unsafe { *tensors.data.add(i) };
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if let Some(file_dtype) = file_dtypes.get(i) {
+            let live_dtype: &[u8] = if tensor.dtype == 1 { b"f32" } else { b"f64" };
+            if *file_dtype != live_dtype {
+                eprintln!(
+                    "nsl: model_load: dtype mismatch for tensor #{}: file has {}, \
+                     model expects {} — raw byte copy would corrupt this tensor and \
+                     misalign all subsequent ones. Re-save the checkpoint from a \
+                     model on the same device convention (CPU=f64, GPU=f32).",
+                    i,
+                    String::from_utf8_lossy(file_dtype),
+                    String::from_utf8_lossy(live_dtype),
+                );
+                std::process::abort();
+            }
         }
     }
 
