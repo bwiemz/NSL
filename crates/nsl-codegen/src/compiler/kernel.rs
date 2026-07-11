@@ -535,7 +535,10 @@ impl Compiler<'_> {
                 crate::WggoImportance::Magnitude
             );
         if calibrated_importance {
-            if self.compile_options.wggo.mode.is_some() {
+            // Note only when planning would otherwise happen: `--wggo off`
+            // arrives as Some("off"), so `mode.is_some()` is NOT "enabled"
+            // (review finding — the off mode must stay chatter-free).
+            if crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
                 eprintln!(
                     "[wggo] pre-pass deferred: calibrated importance scoring fires after \
                      kernel synthesis; planning stays in-place (kernel admission unplanned)"
@@ -867,9 +870,15 @@ impl Compiler<'_> {
         // actually built. Mixed, zero, or absent preferences change nothing:
         // masking itself is a correctness requirement for packed data and is
         // never plan-negotiable.
+        // Consult the FIRST train block's plan specifically (not merely the
+        // first block that HAPPENED to plan): kernel synthesis serves the
+        // whole module, and when the first block's extraction failed there
+        // is no plan entitled to govern it — a later block's preference must
+        // not flip admission on the wrong evidence (review finding).
         let plan_prefers_segment_id = self
             .wggo_preplans
-            .first()
+            .iter()
+            .find(|p| p.is_first_train_block)
             .is_some_and(|pre| crate::wggo_prepass::plan_prefers_segment_id(&pre.overrides));
         let per_doc_authorized = self
             .pca_user_strategies

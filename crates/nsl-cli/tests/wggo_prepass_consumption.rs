@@ -154,6 +154,102 @@ fn preplan_consumed_per_block_two_blocks() {
     assert_eq!(summaries, 2, "expected two summaries:\n{stderr}");
 }
 
+/// Review-finding regression: a top-level `for` loop before the train block.
+/// The in-place path registers the loop variable as a FuncState variable and
+/// registration EAGERLY emits an `Input` leaf per registered symbol — the
+/// pre-pass prefix walk doesn't mirror loop vars, so before the fingerprint
+/// learned to ignore unreferenced Input leaves this shape was a GUARANTEED
+/// false `graph_fingerprint_mismatch` on a semantically identical graph.
+const FOR_LOOP_BLOCK: &str = r#"from nsl.nn.losses import mse_loss
+
+model TinyMlp:
+    w: Tensor = ones([16, 16])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = TinyMlp()
+let x = ones([4, 16])
+let y = zeros([4, 16])
+
+for i in range(3):
+    print(i)
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let out = m.forward(x)
+        let loss = mse_loss(out, y)
+"#;
+
+#[test]
+fn preplan_consumed_with_top_level_for_loop() {
+    let stderr = run_nsl(FOR_LOOP_BLOCK, "forloop", Some("greedy"));
+    assert!(
+        stderr.contains("[wggo] consumed pre-solved plan (graph fingerprint match)"),
+        "top-level for-loop registration noise rejected the pre-plan again — \
+         the unreferenced-Input-leaf filter regressed:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("wggo-preplan-rejected"),
+        "false fingerprint rejection:\n{stderr}"
+    );
+}
+
+/// Review-finding regression: the step param shadowing a top-level `let` of
+/// the same name (same interned Symbol). The pre-pass used to register it
+/// twice — a duplicate Input leaf and a guaranteed rejection.
+#[test]
+fn preplan_consumed_when_step_param_shadows_top_level_let() {
+    let program = ONE_BLOCK.replace(
+        "let y = zeros([4, 16])",
+        "let y = zeros([4, 16])\nlet batch = ones([1])",
+    );
+    let stderr = run_nsl(&program, "shadow", Some("greedy"));
+    assert!(
+        stderr.contains("[wggo] consumed pre-solved plan (graph fingerprint match)"),
+        "step-param shadow double-registration rejected the pre-plan:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("wggo-preplan-rejected"),
+        "false fingerprint rejection:\n{stderr}"
+    );
+}
+
+/// Review-finding regression: `--wggo off` + `--calibration-data` must not
+/// print the "pre-pass deferred" note — off means chatter-free, and nothing
+/// is being deferred when nothing would ever plan.
+#[test]
+fn wggo_off_with_calibration_data_is_chatter_free() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_wggo_prepass_offcal_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, ONE_BLOCK).unwrap();
+    let calib = tmp.join("calib.bin");
+    std::fs::write(&calib, [0u8; 128]).unwrap();
+
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .args(["-p", "nsl-cli", "--", "build", "--source-ad", "--wggo", "off"])
+        .arg("--calibration-data")
+        .arg(&calib)
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .output()
+        .expect("spawn nsl build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Exit status deliberately not asserted (the dummy calibration corpus
+    // may fail the harness in either direction); the pin is the chatter.
+    assert!(
+        !stderr.contains("pre-pass deferred"),
+        "--wggo off must not print the calibrated-importance deferral note:\n{stderr}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
 /// Without --wggo the pre-pass must not run at all — no plan lines, no
 /// pre-pass chatter, byte-identical to the pre-restructure pipeline.
 #[test]

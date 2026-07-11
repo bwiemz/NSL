@@ -58,6 +58,23 @@ pub struct WggoPrePlan {
     /// consumer must re-fingerprint its own extraction and reject on
     /// mismatch (`wggo-preplan-rejected reason=graph_fingerprint_mismatch`).
     pub graph_fingerprint: u64,
+    /// True iff this is the FIRST train block in document order — the one
+    /// whose plan may govern module-scoped kernel admission. When the first
+    /// block fails to plan, NO pre-plan carries this flag: the admission
+    /// gate must not fall through to a later block's preferences (kernel
+    /// synthesis serves the whole module; attributing it to whichever block
+    /// happened to plan first would flip admission on the wrong evidence).
+    pub is_first_train_block: bool,
+}
+
+/// The exact off-mode interpretation `run` (and the in-place planner) use.
+/// Callers printing pre-pass diagnostics must gate on this too — `--wggo
+/// off` arrives as `Some("off")`, so `mode.is_some()` is NOT "wggo enabled".
+pub fn wggo_mode_enabled(options: &crate::CompileOptions) -> bool {
+    matches!(
+        options.wggo.mode.as_deref(),
+        Some(m) if m != "off" && m != "disable" && m != "disabled"
+    )
 }
 
 /// Structural fingerprint of a Wengert list: op count plus per-op
@@ -82,21 +99,63 @@ pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
 
-    // Pass 1: leaf ops (Input/Param). Their EMISSION ORDER follows symbol
-    // registration order — which on the in-place path is `state.variables`
-    // HashMap iteration, i.e. nondeterministic — so leaves are hashed as a
-    // name-sorted set and their canonical VarIds derive from that sorted
-    // position, not from op order.
+    // Registration noise filter: `register_input_with_rank` EAGERLY pushes
+    // one `Input` op per registered symbol — referenced or not — and the
+    // in-place path registers every `FuncState` variable (for-loop counters,
+    // tuple binds, anything main compiled so far) while the pre-pass mirrors
+    // only the top-level declarations. An Input leaf nobody reads is pure
+    // registration residue, so it must not participate in the fingerprint:
+    // otherwise a `for i in range(3): ...` before the train block rejects
+    // every pre-plan for a semantically identical graph. A missed symbol the
+    // step body actually READS fails the pre-pass extraction instead — the
+    // honest no-preplan fallback.
+    let referenced: std::collections::HashSet<crate::wengert::VarId> = list
+        .ops
+        .iter()
+        .flat_map(|op| op.inputs.iter().copied())
+        .collect();
+    // NOTE deliberately NO `list.output` exemption here: the pre-pass
+    // extraction never sets `output` (it stays the default VarId 0 — the
+    // extractor only assigns it on `Return` statements, and the in-place
+    // flow fills it post-extraction), so an output exemption would exempt
+    // whichever symbol RANDOMLY got VarId 0 from registration order — the
+    // exact nondeterministic mismatch this filter exists to prevent. A
+    // train step's real output is a computed loss (never a bare leaf), so
+    // the exemption bought nothing.
+    let is_dead_leaf = |op: &crate::wengert::WengertOp| {
+        matches!(
+            &op.op,
+            crate::wengert::PrimalOp::Input(_) | crate::wengert::PrimalOp::Param(_)
+        ) && !referenced.contains(&op.result)
+    };
+
+    // Pass 1: REFERENCED leaf ops (Input/Param). Their EMISSION ORDER follows
+    // symbol registration order — which on the in-place path is
+    // `state.variables` HashMap iteration, i.e. nondeterministic — so leaves
+    // are hashed as a name-sorted set and their canonical VarIds derive from
+    // that sorted position, not from op order.
     let mut leaves: Vec<(&str, crate::wengert::VarId)> = Vec::new();
+    let mut hashed_ops: u64 = 0;
     for op in &list.ops {
+        if is_dead_leaf(op) {
+            continue;
+        }
         match &op.op {
             crate::wengert::PrimalOp::Input(name) | crate::wengert::PrimalOp::Param(name) => {
                 leaves.push((name.as_str(), op.result));
+                hashed_ops += 1;
             }
-            _ => {}
+            _ => hashed_ops += 1,
         }
     }
     leaves.sort_by(|a, b| a.0.cmp(b.0));
+    if std::env::var("NSL_WGGO_PREPASS_DEBUG").is_ok() {
+        eprintln!(
+            "[wggo-prepass-debug] stream: hashed_ops={hashed_ops} output={:?} leaves={:?}",
+            list.output,
+            leaves.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+        );
+    }
     let mut canon: HashMap<crate::wengert::VarId, u64> = HashMap::new();
     let mut next: u64 = 0;
     for (name, var) in &leaves {
@@ -110,7 +169,7 @@ pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
 
     // Pass 2: non-leaf ops in list order, with canonically-renumbered
     // result/input VarIds (leaves resolve to their name-derived ids).
-    list.ops.len().hash(&mut h);
+    hashed_ops.hash(&mut h);
     for op in &list.ops {
         if matches!(
             &op.op,
@@ -134,7 +193,11 @@ pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
         rid.hash(&mut h);
         std::mem::discriminant(&op.op).hash(&mut h);
     }
-    h.finish()
+    let fp = h.finish();
+    if std::env::var("NSL_WGGO_PREPASS_DEBUG").is_ok() {
+        eprintln!("[wggo-prepass-debug] fingerprint={fp:016x}");
+    }
+    fp
 }
 
 /// Module-level packing-preference aggregation for the admission gate.
@@ -180,11 +243,7 @@ pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Vec<WggoPrePlan> {
     if !compiler.features.source_ad_enabled {
         return Vec::new();
     }
-    let wggo_on = matches!(
-        compiler.compile_options.wggo.mode.as_deref(),
-        Some(m) if m != "off" && m != "disable" && m != "disabled"
-    );
-    if !wggo_on {
+    if !wggo_mode_enabled(&compiler.compile_options) {
         return Vec::new();
     }
 
@@ -194,7 +253,8 @@ pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Vec<WggoPrePlan> {
     // exactly the declarations that precede it (main's sequential scope).
     let mut prefix_types: HashMap<nsl_ast::Symbol, nsl_semantic::types::Type> = HashMap::new();
     let mut preplans = Vec::new();
-    walk_stmts(compiler, stmts, &mut prefix_types, &mut preplans);
+    let mut train_blocks_seen = 0usize;
+    walk_stmts(compiler, stmts, &mut prefix_types, &mut train_blocks_seen, &mut preplans);
     preplans
 }
 
@@ -202,6 +262,7 @@ fn walk_stmts(
     compiler: &mut Compiler,
     stmts: &[Stmt],
     prefix_types: &mut HashMap<nsl_ast::Symbol, nsl_semantic::types::Type>,
+    train_blocks_seen: &mut usize,
     out: &mut Vec<WggoPrePlan>,
 ) {
     for stmt in stmts {
@@ -214,14 +275,25 @@ fn walk_stmts(
                 }
             }
             StmtKind::TrainBlock(train) => {
-                if let Some(preplan) = plan_train_block(compiler, train, stmt.id, prefix_types) {
+                let is_first = *train_blocks_seen == 0;
+                *train_blocks_seen += 1;
+                if let Some(mut preplan) =
+                    plan_train_block(compiler, train, stmt.id, prefix_types)
+                {
+                    preplan.is_first_train_block = is_first;
                     out.push(preplan);
                 }
             }
             StmtKind::Decorated { stmt: inner, .. } => {
                 // Train blocks often sit inside test/bench decorators — same
                 // recursion `stmts_contain_train_block` uses.
-                walk_stmts(compiler, std::slice::from_ref(inner), prefix_types, out);
+                walk_stmts(
+                    compiler,
+                    std::slice::from_ref(inner),
+                    prefix_types,
+                    train_blocks_seen,
+                    out,
+                );
             }
             _ => {}
         }
@@ -277,6 +349,35 @@ mod tests {
             9,
         );
         assert_eq!(fingerprint_wengert(&a), fingerprint_wengert(&b));
+    }
+
+    /// Registration is EAGER (one Input op per registered symbol, referenced
+    /// or not) and the in-place path registers every FuncState variable —
+    /// unreferenced leaves are pure registration residue and must not affect
+    /// the fingerprint.
+    #[test]
+    fn fingerprint_ignores_unreferenced_input_leaves() {
+        let clean = list(
+            vec![
+                op(0, 0, PrimalOp::Input("x".into()), vec![]),
+                op(1, 1, PrimalOp::Param("m.w".into()), vec![]),
+                op(2, 2, PrimalOp::Matmul, vec![0, 1]),
+            ],
+            2,
+        );
+        // Same graph plus two dead registrations (a for-loop counter and a
+        // duplicate step-param leaf).
+        let noisy = list(
+            vec![
+                op(0, 0, PrimalOp::Input("i".into()), vec![]),
+                op(1, 1, PrimalOp::Input("x".into()), vec![]),
+                op(2, 2, PrimalOp::Param("m.w".into()), vec![]),
+                op(3, 3, PrimalOp::Input("batch".into()), vec![]),
+                op(4, 4, PrimalOp::Matmul, vec![1, 2]),
+            ],
+            4,
+        );
+        assert_eq!(fingerprint_wengert(&clean), fingerprint_wengert(&noisy));
     }
 
     #[test]
@@ -402,8 +503,13 @@ fn plan_train_block(
         // The in-place path registers the step parameter as a FuncState
         // variable before extraction, which surfaces as an `Input(batch)`
         // leaf in the extracted graph — mirror it or every fingerprint
-        // comparison fails by exactly that one op.
-        extractor.register_input_with_rank(step_param_sym, None);
+        // comparison fails by exactly that one op. Guarded: when the step
+        // param shadows a top-level declaration the two are the SAME
+        // Symbol, and the in-place path holds one `state.variables` entry
+        // per key — double registration here would emit a duplicate leaf.
+        if !prefix_types.contains_key(&step_param_sym) {
+            extractor.register_input_with_rank(step_param_sym, None);
+        }
 
         if !extractor.extract_stmts(&step_body.stmts) {
             // Source-AD extraction failed here; the in-place path may still
@@ -432,8 +538,74 @@ fn plan_train_block(
             plan,
             overrides,
             graph_fingerprint,
+            // Stamped by walk_stmts, which tracks document order across
+            // failed extractions too.
+            is_first_train_block: false,
         })
     })();
     compiler.restore_active_fused_ce_config(saved_fused_ce);
     result
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use crate::wengert::{PrimalOp, VarId, WengertList, WengertOp};
+
+    fn op(id: u64, result: u64, op: PrimalOp, inputs: Vec<u64>) -> WengertOp {
+        WengertOp {
+            id: id as crate::wengert::OpId,
+            result: result as VarId,
+            op,
+            inputs: inputs.into_iter().map(|v| v as VarId).collect(),
+            saved_for_backward: false,
+            checkpointed: false,
+        }
+    }
+
+    fn list(ops: Vec<WengertOp>, output: u64) -> WengertList {
+        WengertList {
+            ops,
+            output: output as VarId,
+            var_names: std::collections::HashMap::new(),
+            var_types: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Exact op lists dumped from two flaky prepass extractions of the same
+    /// two-block fixture (runs a and c) — must fingerprint identically.
+    #[test]
+    fn dumped_isomorphic_lists_fingerprint_equal() {
+        let bad = list(
+            vec![
+                op(0, 0, PrimalOp::Input("m2".into()), vec![]),
+                op(1, 1, PrimalOp::Input("x2".into()), vec![]),
+                op(2, 2, PrimalOp::Input("y2".into()), vec![]),
+                op(3, 3, PrimalOp::Input("x".into()), vec![]),
+                op(4, 4, PrimalOp::Input("y".into()), vec![]),
+                op(5, 5, PrimalOp::Input("m".into()), vec![]),
+                op(6, 6, PrimalOp::Input("batch".into()), vec![]),
+                op(7, 7, PrimalOp::Param("m2.w2".into()), vec![]),
+                op(8, 8, PrimalOp::Matmul, vec![1, 7]),
+                op(9, 9, PrimalOp::MSELoss, vec![8, 2]),
+            ],
+            9,
+        );
+        let good = list(
+            vec![
+                op(0, 0, PrimalOp::Input("y2".into()), vec![]),
+                op(1, 1, PrimalOp::Input("x".into()), vec![]),
+                op(2, 2, PrimalOp::Input("y".into()), vec![]),
+                op(3, 3, PrimalOp::Input("m".into()), vec![]),
+                op(4, 4, PrimalOp::Input("m2".into()), vec![]),
+                op(5, 5, PrimalOp::Input("x2".into()), vec![]),
+                op(6, 6, PrimalOp::Input("batch".into()), vec![]),
+                op(7, 7, PrimalOp::Param("m2.w2".into()), vec![]),
+                op(8, 8, PrimalOp::Matmul, vec![5, 7]),
+                op(9, 9, PrimalOp::MSELoss, vec![8, 0]),
+            ],
+            9,
+        );
+        assert_eq!(fingerprint_wengert(&bad), fingerprint_wengert(&good));
+    }
 }
