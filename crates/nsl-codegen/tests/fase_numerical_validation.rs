@@ -243,7 +243,8 @@ fn adamw_fase_deferred_reference(
         for j in 0..2 {
             // m = β₁·m + (1-β₁)·m_partial
             m_state[j] = beta1 * m_state[j] + (1.0 - beta1) * m_partial[j];
-            // v = β₂·v + (1-β₂)·m_partial²  (FASE approximation)
+            // v = β₂·v + (1-β₂)·m_partial²  (exact standard windowed AdamW:
+            // m_partial is the window-mean gradient)
             v_state[j] =
                 beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
             // Bias correction
@@ -504,4 +505,119 @@ fn adamw_fase_deferred_source_ad_pipeline_equivalence() {
             diff / scale
         );
     }
+}
+
+// ─── v_t semantics discrimination (roadmap 2.1, rescoped) ───────────────────
+
+/// Dual-reference AdamW for the `fase_vt_discrimination.nsl` fixture, where
+/// micro-batch k (globally 0-based) sees `x = 1.25^k * ones(4,2)`, `y = 0`,
+/// and params freeze within each accumulation window (Deferred semantics).
+///
+/// Returns `(theta_standard, theta_option_b)`:
+///   standard:  v = β₂·v + (1-β₂)·(mean g)²   — exact windowed AdamW
+///   option_b:  v = β₂·v + (1-β₂)·mean(g²)    — the CFTP §2.3 approximation
+/// `m` uses the window-mean gradient in both.
+#[allow(clippy::too_many_arguments)]
+fn adamw_vt_dual_references(
+    w_init: &[f32; 2],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    windows: u32,
+    accum: u32,
+    x_growth: f32,
+) -> ([f32; 2], [f32; 2]) {
+    // Gradient of mean((c·(w0+w1))²) over 4 rows w.r.t. each w_j is
+    // 2·c²·(w0+w1) (identical for both components at this fixture's shapes).
+    let run = |option_b: bool| -> [f32; 2] {
+        let mut w = *w_init;
+        let mut m = [0.0_f32; 2];
+        let mut v = [0.0_f32; 2];
+        let mut c = 1.0_f32;
+        for step in 1..=windows {
+            let mut mean_g = [0.0_f32; 2];
+            let mut mean_g2 = [0.0_f32; 2];
+            for _k in 0..accum {
+                let s = w[0] + w[1]; // params frozen within the window
+                for j in 0..2 {
+                    let g = 2.0 * c * c * s;
+                    mean_g[j] += g / accum as f32;
+                    mean_g2[j] += (g * g) / accum as f32;
+                }
+                c *= x_growth;
+            }
+            for j in 0..2 {
+                m[j] = beta1 * m[j] + (1.0 - beta1) * mean_g[j];
+                let v_inc = if option_b {
+                    mean_g2[j]
+                } else {
+                    mean_g[j] * mean_g[j]
+                };
+                v[j] = beta2 * v[j] + (1.0 - beta2) * v_inc;
+                let bc1 = 1.0 - beta1.powi(step as i32);
+                let bc2 = 1.0 - beta2.powi(step as i32);
+                let m_hat = m[j] / bc1;
+                let v_hat = v[j] / bc2;
+                w[j] -= lr * (m_hat / (v_hat.sqrt() + eps));
+            }
+        }
+        w
+    };
+    (run(false), run(true))
+}
+
+/// Pins WHICH second-moment formula the compiled FASE Deferred path emits.
+///
+/// Every other fixture uses constant micro-batches, where (mean g)² ==
+/// mean(g²) and the two candidate formulas are indistinguishable — the
+/// docs/pseudocode claimed the CFTP "Option B" approximation while the
+/// emitted `SquaredAccumulate` over `MPartial` computes the EXACT standard
+/// windowed AdamW. With intra-window gradient variation this test separates
+/// the trajectories (Jensen strict inequality) and asserts the compiled
+/// result matches the standard formula and NOT Option B.
+#[test]
+fn adamw_deferred_vt_is_exact_windowed_not_option_b() {
+    let tmp = TempDir::new().expect("tempdir");
+    nsl_run(&fixture("fase_vt_discrimination.nsl"), tmp.path());
+
+    let checkpoint = tmp.path().join("vt_disc_out.nslm");
+    assert!(checkpoint.exists(), "expected checkpoint at {:?}", checkpoint);
+    let tensors = read_nslm(&checkpoint).expect("read nslm");
+    let w_compiled = tensors
+        .get("w")
+        .or_else(|| tensors.get("m.w"))
+        .expect("w tensor not in checkpoint");
+    assert_eq!(w_compiled.len(), 2);
+
+    let (w_std, w_ob) = adamw_vt_dual_references(
+        &[1.0, 1.0],
+        0.001,
+        0.9,
+        0.999,
+        1e-8,
+        /*windows=*/ 2,
+        /*accum=*/ 4,
+        /*x_growth=*/ 1.25,
+    );
+
+    // Vacuity guard: if the fixture's x-mutation didn't take effect, the
+    // gradients are constant per window and the references coincide — the
+    // test would prove nothing. Fail loudly instead of passing vacuously.
+    let ref_sep = (w_std[0] - w_ob[0]).abs().max((w_std[1] - w_ob[1]).abs());
+    assert!(
+        ref_sep > 1e-6,
+        "reference trajectories did not separate (sep={ref_sep:.3e}) — the \
+         fixture's per-micro-batch gradient variation is not reaching the \
+         step body; discrimination is vacuous"
+    );
+
+    let d_std = (w_compiled[0] - w_std[0]).abs().max((w_compiled[1] - w_std[1]).abs());
+    let d_ob = (w_compiled[0] - w_ob[0]).abs().max((w_compiled[1] - w_ob[1]).abs());
+    assert!(
+        d_std < 1e-5 && d_ob > 10.0 * d_std.max(1e-7),
+        "compiled θ does not discriminate to the standard formula: \
+         |θ-standard|={d_std:.3e}, |θ-option_b|={d_ob:.3e}, ref_sep={ref_sep:.3e} \
+         (compiled={w_compiled:?}, standard={w_std:?}, option_b={w_ob:?})"
+    );
 }

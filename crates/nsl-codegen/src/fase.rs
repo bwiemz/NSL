@@ -49,8 +49,14 @@ pub enum FaseMode {
     /// Accumulation count is 1 — no rewrite needed.
     Passthrough,
     /// First-moment accumulator only (no separate gradient buffer).
-    /// Available for AdamW/Adam and approximates their v_t via per-step
-    /// squared-gradient averaging.
+    /// Available for AdamW/Adam. The emitted second-moment update is the
+    /// EXACT standard grad-accumulation AdamW — `SquaredAccumulate` squares
+    /// the accumulated window-mean gradient (`v += (1-β₂)·(mean g)²`), NOT
+    /// the CFTP §2.3 "Option B" per-step squared-gradient average
+    /// (`mean(g²)`). Pinned by `adamw_deferred_vt_is_exact_windowed_not_
+    /// option_b` in fase_numerical_validation.rs (constant-micro-batch
+    /// fixtures cannot tell the two apart; that test's fixture varies
+    /// gradients within the window).
     Deferred,
     /// Full-gradient-buffer fallback.  Used when the optimizer's update
     /// rule can't be expressed as an incremental accumulator update (e.g.
@@ -79,9 +85,12 @@ pub struct FaseConfig {
     pub weight_decay: f64,
     /// SGD momentum.
     pub momentum: f64,
-    /// Whether AdamW's v_t is allowed to use the per-micro-batch average
-    /// approximation described in Section 3.2 of the CFTP paper.  Default
-    /// `true`; set to `false` to force FullBuffer mode.
+    /// Planner CONSENT flag: whether the caller would accept a v_t
+    /// approximation in exchange for Deferred mode's memory savings.
+    /// `false` forces FullBuffer mode for AdamW/Adam. NOTE: the shipped
+    /// Deferred emission is in fact the EXACT windowed-AdamW formula
+    /// (see `FaseMode::Deferred`); this flag gates eligibility, it does
+    /// not select an approximate formula.
     pub allow_v_approx: bool,
 }
 
@@ -126,8 +135,11 @@ pub struct UpdateRecipe {
     pub optimizer: FaseOptimizer,
     /// `1 / N` scaled into the accumulator per micro-batch.
     pub accum_scale: f64,
-    /// Whether the second moment uses the batch-variance-aware
-    /// approximation (per-step squared-gradient average).
+    /// Historical name — carries the planner's `allow_v_approx` consent
+    /// through to reporting. The emitted math NEVER consults this flag:
+    /// `emit_adamw` always produces the exact windowed-AdamW
+    /// `v = β₂·v + (1-β₂)·(mean g)²` (see `FaseMode::Deferred` and the
+    /// discrimination test in fase_numerical_validation.rs).
     pub v_uses_approx: bool,
     /// Cached constants we fold into the generated code.
     pub one_minus_beta1: f64,
