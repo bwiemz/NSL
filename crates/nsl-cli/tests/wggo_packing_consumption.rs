@@ -30,7 +30,11 @@ fn run_wggo(source: &str, tag: &str) -> String {
     let corpus = tmp.join("tokens.bin");
     std::fs::write(&corpus, [0u8; 128]).unwrap();
     let fixture = tmp.join("prog.nsl");
-    std::fs::write(&fixture, source.replace("{CORPUS}", &corpus.display().to_string())).unwrap();
+    // Forward slashes: the corpus path lands inside an NSL string literal, and on
+    // Windows `display()` emits backslashes that the NSL lexer reads as escape
+    // sequences (`\U`, `\A`, ...). Forward slashes are valid on Windows too.
+    let corpus_path = corpus.to_string_lossy().replace('\\', "/");
+    std::fs::write(&fixture, source.replace("{CORPUS}", &corpus_path)).unwrap();
 
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
