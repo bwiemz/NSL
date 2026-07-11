@@ -21,6 +21,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             disable_fusion,
             tape_ad,
             source_ad,
+            pretrain_optimized,
             debug_training,
             trace_ops,
             deterministic,
@@ -52,6 +53,17 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             wggo_prune_fraction,
             weights,
     } = args;
+
+    // Meta-flag expansion (roadmap 3.3) — see the twin call in build/options.rs.
+    let mut wggo = wggo;
+    let mut csha = csha;
+    let mut source_ad = source_ad;
+    crate::meta_flags::expand_pretrain_optimized(
+        pretrain_optimized,
+        &mut wggo,
+        &mut csha,
+        &mut source_ad,
+    );
 
             // CSHA: validate the same way `nsl build --csha` does so an
             // unrecognised mode fails fast rather than silently disabling

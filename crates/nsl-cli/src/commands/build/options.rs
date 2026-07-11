@@ -30,6 +30,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             disable_fusion,
             tape_ad: _tape_ad,
             source_ad: _source_ad,
+            pretrain_optimized,
             debug_training,
             nan_analysis,
             distribute: _distribute,
@@ -85,6 +86,20 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             cep_emit_weights,
             cep_emit_source,
     } = args;
+
+    // Meta-flag expansion (roadmap 3.3): must run BEFORE mode-string
+    // validation below so bundle-filled values take the same validation
+    // path as hand-written flags. Shared helper with `nsl run` so the two
+    // dispatchers cannot drift.
+    let mut wggo = wggo;
+    let mut csha = csha;
+    let mut _source_ad = _source_ad;
+    crate::meta_flags::expand_pretrain_optimized(
+        pretrain_optimized,
+        &mut wggo,
+        &mut csha,
+        &mut _source_ad,
+    );
 
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.

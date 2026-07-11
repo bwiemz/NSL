@@ -4,6 +4,7 @@ mod commands;
 mod debug;
 mod formatter;
 mod loader;
+mod meta_flags;
 mod pipeline;
 mod mangling;
 mod resolver;
