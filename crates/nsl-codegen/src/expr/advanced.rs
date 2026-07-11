@@ -588,6 +588,7 @@ impl Compiler<'_> {
             | StmtKind::Import(_)
             | StmtKind::FromImport(_)
             | StmtKind::TrainBlock(_)
+            | StmtKind::DistillBlock(_)
             | StmtKind::GradBlock(_)
             | StmtKind::QuantBlock(_)
             | StmtKind::KernelDef(_)

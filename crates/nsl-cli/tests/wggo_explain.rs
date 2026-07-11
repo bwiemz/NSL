@@ -64,6 +64,8 @@ fn empty_plan() -> WggoPlan {
         warnings: Vec::new(),
         // G20: CFIE inference decisions (advisory sidecar; empty = gate off).
         cfie_inference: Vec::new(),
+        // CPKD v1: distillation decisions (advisory sidecar; empty = gate off).
+        cpkd_distill: Vec::new(),
     }
 }
 

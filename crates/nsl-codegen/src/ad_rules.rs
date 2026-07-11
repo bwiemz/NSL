@@ -217,6 +217,30 @@ pub enum AdjointExpr {
         vocab_tile: u32,
         ignore_index: i64,
     },
+    /// CPKD: fused KL-CE distillation backward — STUDENT components only
+    /// (0 = dx_s, 1 = dW_s, 2 = dbias_s). The teacher inputs receive NO
+    /// adjoints by construction (composition-paper invariant I-11); the
+    /// rule simply never emits them.
+    ///
+    /// Lowers to `PrimalOp::FusedKlCeBackwardExtract` sharing one backward
+    /// FFI launch across the three components via
+    /// `Compiler.fused_kl_ce_bwd_cache` (mirrors `FusedLinearCeBackward`).
+    FusedKlCeBackward {
+        grad: VarId,
+        /// Forward inputs in op order: [x_s, W_s, bias_s, x_t, W_t, bias_t, targets].
+        fwd_inputs: [VarId; 7],
+        fwd_result: VarId,
+        component: u8,
+        vocab_size: u32,
+        student_hidden: u32,
+        teacher_hidden: u32,
+        batch_size: u32,
+        seq_len: u32,
+        vocab_tile: u32,
+        ignore_index: i64,
+        alpha_bits: u64,
+        temperature_bits: u64,
+    },
     /// RoPE backward: rotate grad by negative angle. args: (grad, dim)
     RoPEBackward(VarId, usize),
     /// rotate_half backward: -rotate_half(grad).
@@ -681,6 +705,53 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                     },
                 },
             ]
+        }
+        // CPKD: fused KL-CE distillation loss. Adjoints ONLY for the three
+        // STUDENT inputs (x_s, W_s, bias_s = inputs[0..3]); the teacher
+        // inputs (x_t, W_t, bias_t = inputs[3..6]) and targets get none —
+        // zero-grad by omission enforces invariant I-11 at the rule level
+        // (the teacher backward is never generated, not merely skipped).
+        PrimalOp::FusedKlCe {
+            vocab_size,
+            student_hidden,
+            teacher_hidden,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+            alpha_bits,
+            temperature_bits,
+        } => {
+            let fwd_inputs: [VarId; 7] = [
+                op.inputs[0],
+                op.inputs[1],
+                op.inputs[2],
+                op.inputs[3],
+                op.inputs[4],
+                op.inputs[5],
+                op.inputs[6],
+            ];
+            let fwd_result = op.result;
+            (0u8..3u8)
+                .map(|component| InputAdjoint {
+                    input_var: fwd_inputs[component as usize],
+                    expr: AdjointExpr::FusedKlCeBackward {
+                        grad: output_bar,
+                        fwd_inputs,
+                        fwd_result,
+                        component,
+                        vocab_size: *vocab_size,
+                        student_hidden: *student_hidden,
+                        teacher_hidden: *teacher_hidden,
+                        batch_size: *batch_size,
+                        seq_len: *seq_len,
+                        vocab_tile: *vocab_tile,
+                        ignore_index: *ignore_index,
+                        alpha_bits: *alpha_bits,
+                        temperature_bits: *temperature_bits,
+                    },
+                })
+                .collect()
         }
         PrimalOp::MSELoss => {
             let pred = op.inputs[0];

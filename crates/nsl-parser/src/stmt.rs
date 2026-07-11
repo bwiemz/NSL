@@ -34,6 +34,7 @@ pub fn parse_stmt(p: &mut Parser) -> Stmt {
         TokenKind::Import => crate::decl::parse_import_stmt(p),
         TokenKind::From => crate::decl::parse_from_import_stmt(p),
         TokenKind::Train => crate::block::parse_train_block_stmt(p),
+        TokenKind::Distill => crate::block::parse_distill_block_stmt(p),
         TokenKind::Grad => crate::block::parse_grad_block_stmt(p),
         TokenKind::Quant => crate::block::parse_quant_block_stmt(p),
         TokenKind::Kernel => crate::block::parse_kernel_def_stmt(p),

@@ -1377,6 +1377,48 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // CPKD: fused KL-CE distillation loss (forward + backward).
+    //
+    // ABI LOCK-STEP: these declarations, the call sites in
+    // wengert_lower.rs (lower_fused_kl_ce_forward / _backward_extract),
+    // and the runtime extern "C" fns in
+    // crates/nsl-runtime/src/fused_kl_ce.rs must agree on arg count and
+    // order BY HAND — there is no compile-time cross-check (see the
+    // 16-vs-18-arg Tier-B lesson above nsl_flash_attention_backward).
+    // Forward = 20 args; backward = 23 args.
+    (
+        "nsl_fused_kl_ce_forward",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // kname_ptr
+            types::I64, types::I64, types::I64, // x_s, W_s, bias_s (raw device ptrs)
+            types::I64, types::I64, types::I64, // x_t, W_t, bias_t
+            types::I64, // targets
+            types::I64, // loss_out
+            types::I64, types::I64, types::I64, // lse_s1_out, lse_st_out, lse_tt_out
+            types::I64, types::I64, types::I64, types::I64, // rows, v, hs, ht
+            types::I64, types::I64, // alpha_bits, temp_bits (f32 bits in i64)
+            types::I64, // smem_bytes
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_fused_kl_ce_backward",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // kname_ptr
+            types::I64, // grad_output_bits (f32 bits in i64)
+            types::I64, types::I64, types::I64, // x_s, W_s, bias_s
+            types::I64, types::I64, types::I64, // x_t, W_t, bias_t
+            types::I64, // targets
+            types::I64, types::I64, types::I64, // lse_s1, lse_st, lse_tt
+            types::I64, types::I64, types::I64, // dxs_out, dws_out, dbs_out (student only — I-11)
+            types::I64, types::I64, types::I64, types::I64, // rows, v, hs, ht
+            types::I64, types::I64, // alpha_bits, temp_bits
+            types::I64, // num_valid
+        ],
+        Some(types::I64),
+    ),
     // M42b: Quantized FlashAttention (KV-cache in INT8/FP8)
     (
         "nsl_flash_attention_quantized",

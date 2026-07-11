@@ -1,0 +1,47 @@
+# CPKD — distill block with the fused KL-CE loss (@fused_kl_ce decorator).
+#
+# Exercises the full Phase-B chain: decorator validation -> per-block
+# config dispatch -> source-AD recognition of fused_kl_ce(...) as a single
+# PrimalOp::FusedKlCe -> 3 student-only backward extracts (I-11: teacher
+# head/bias are frozen Input leaves, dead-grad-eliminated) -> PTX
+# synthesis + embedding -> FFI call emission.
+#
+# Shapes: V=256, HS=32, HT=64, rows = 2*8 = 16. Asymmetric teacher/student
+# hidden dims on purpose (the kernel supports HS != HT).
+
+from nsl.nn.losses import fused_kl_ce
+
+model Teacher:
+    enc: Tensor = randn([64, 32])
+    head_w: Tensor = randn([256, 64])
+    head_b: Tensor = zeros([256])
+
+    fn encode(self, x: Tensor) -> Tensor:
+        return x @ self.enc.transpose(0, 1)
+
+model Student:
+    enc: Tensor = randn([32, 32])
+    head_w: Tensor = randn([256, 32])
+    head_b: Tensor = zeros([256])
+
+    fn encode(self, x: Tensor) -> Tensor:
+        return x @ self.enc.transpose(0, 1)
+
+let teacher = Teacher()
+let student = Student()
+let x = randn([16, 32])
+let targets = zeros([16])
+
+@fused_kl_ce(enabled = true, vocab_size = 256, hidden_size = 32, teacher_hidden = 64, batch_size = 2, seq_len = 8, vocab_tile = 128)
+distill(teacher = teacher, student = student, epochs = 1):
+    optimizer: AdamW(lr = 0.001)
+    loss:
+        alpha = 0.5
+        temperature = 2.0
+    step(batch):
+        let t_h = teacher.encode(x)
+        let s_h = student.encode(x)
+        let loss = fused_kl_ce(s_h, student.head_w, student.head_b, t_h, teacher.head_w, teacher.head_b, targets, 0.5, 2.0)
+    callbacks:
+        on_step(step, loss):
+            print(loss)

@@ -1,0 +1,43 @@
+# CPKD v1 — basic distill-block fixture.
+#
+# Teacher and student are two independent model instances; the distill
+# block trains ONLY the student (teacher fields register as frozen Input
+# leaves on the Wengert list — invariant I-11).  The step body uses the
+# composite KD-proxy loss (hard CE + logit-matching MSE) built entirely
+# from source-AD-recognized primitives so this fixture exercises Phase A
+# (frontend + frozen-teacher lowering) without the fused KL-CE kernel.
+#
+# Shapes are tiny on purpose: V=64, H=32, rows=16 (2-D data — the CPU
+# cross_entropy gather path requires flattened [rows, V] logits).
+
+from nsl.nn.losses import cross_entropy, mse_loss
+
+model Teacher:
+    w: Tensor = randn([64, 32])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w.transpose(0, 1)
+
+model Student:
+    w: Tensor = randn([64, 32])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w.transpose(0, 1)
+
+let teacher = Teacher()
+let student = Student()
+let x = randn([16, 32])
+let targets = zeros([16])
+
+distill(teacher = teacher, student = student, epochs = 1):
+    optimizer: AdamW(lr = 0.001)
+    loss:
+        alpha = 0.5
+        temperature = 2.0
+    step(batch):
+        let t_logits = teacher.forward(x)
+        let s_logits = student.forward(x)
+        let loss = cross_entropy(s_logits, targets) + mse_loss(s_logits, t_logits)
+    callbacks:
+        on_step(step, loss):
+            print(loss)

@@ -139,6 +139,7 @@ impl<'a> Parser<'a> {
             TokenKind::Model => Some("model"),
             TokenKind::Quant => Some("quant"),
             TokenKind::Train => Some("train"),
+            TokenKind::Distill => Some("distill"),
             TokenKind::Grad => Some("grad"),
             TokenKind::Kernel => Some("kernel"),
             TokenKind::Tokenizer => Some("tokenizer"),

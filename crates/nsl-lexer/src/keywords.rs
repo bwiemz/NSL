@@ -38,6 +38,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "dataset" => Some(TokenKind::Dataset),
         "datatype" => Some(TokenKind::Datatype),
         "serve" => Some(TokenKind::Serve),
+        "distill" => Some(TokenKind::Distill),
 
         // Module system
         "import" => Some(TokenKind::Import),

@@ -43,6 +43,7 @@ pub struct ModuleData {
     /// nsl-semantic (Sprint 2 — collection only; lowering-site
     /// substitution deferred to Sprint 2.5).
     pub fused_ce_configs: Vec<nsl_semantic::cftp::FusedCeConfig>,
+    pub fused_kl_ce_configs: Vec<nsl_semantic::cpkd::FusedKlCeConfig>,
     /// CFTP §4.3 G2 Strategy 3 (Item 4): `@pca` decorator configs
     /// captured by nsl-semantic. Routed into the compiler so the CSHA
     /// training-PTX synthesis site can flip
@@ -147,8 +148,21 @@ fn inject_train_block_imports(
     let mut synthetic_stmts = Vec::new();
 
     for stmt in stmts {
-        if let StmtKind::TrainBlock(train) = &stmt.kind {
-            for section in &train.sections {
+        // CPKD: distill blocks share TrainSection, so the same optimizer /
+        // scheduler auto-imports apply. Decorated blocks (@fused_lm_ce on
+        // train, @fused_kl_ce on distill) hide the block one level down —
+        // unwrap decorator wrappers before matching.
+        let mut inner: &Stmt = stmt;
+        while let StmtKind::Decorated { stmt: wrapped, .. } = &inner.kind {
+            inner = wrapped;
+        }
+        let sections: &[nsl_ast::block::TrainSection] = match &inner.kind {
+            StmtKind::TrainBlock(train) => &train.sections,
+            StmtKind::DistillBlock(distill) => &distill.sections,
+            _ => continue,
+        };
+        {
+            for section in sections {
                 if let nsl_ast::block::TrainSection::Scheduler(expr) = section {
                     // Auto-import nsl.optim.schedulers when a scheduler section is present
                     if let ExprKind::Call { .. } = &expr.kind {
@@ -432,6 +446,7 @@ pub fn load_all_modules(
             adapter_configs: analysis.adapter_configs,
             weight_index_map: analysis.weight_index_map,
             fused_ce_configs: analysis.fused_ce_configs,
+            fused_kl_ce_configs: analysis.fused_kl_ce_configs,
             // Sprint 2 (paper §6.2): forward per-model @csha decorator configs
             // so disable=/level=/target= overrides reach the codegen-side
             // CompileOptions.csha_configs map (pipeline::analysis_to_csha_configs

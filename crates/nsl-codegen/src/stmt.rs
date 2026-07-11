@@ -1423,6 +1423,13 @@ impl Compiler<'_> {
                 self.compile_train_block(builder, state, train, stmt.id)?;
             }
 
+            StmtKind::DistillBlock(distill) => {
+                // CPKD: distillation training loop with a structurally
+                // frozen teacher (I-11); delegates into the train-block
+                // lowering with an `active_distill_context` installed.
+                self.compile_distill_block(builder, state, distill, stmt.id)?;
+            }
+
             StmtKind::StructDef(_)
             | StmtKind::ModelDef(_)
             | StmtKind::EnumDef(_)
@@ -3434,6 +3441,170 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// CPKD: lower a `distill(teacher=t, student=s, epochs=N):` block.
+    ///
+    /// v1 strategy: distillation IS a training loop over the student, so we
+    /// delegate to `compile_train_block` with (a) a synthetic `TrainBlock`
+    /// carrying the distill sections and (b) an `active_distill_context`
+    /// installed on the compiler.  Inside `compile_train_block_inner` the
+    /// context: seeds `model_sym = student` / `epochs`, registers the
+    /// teacher instance for method inlining with its fields FROZEN on the
+    /// Wengert extractor (I-11: teacher fields become Input leaves → no
+    /// adjoints → teacher backward structurally absent), forbids the tape
+    /// fallback (F-06: a tape would record teacher ops and allocate teacher
+    /// grad buffers), and resolves teacher-field Input leaves to Cranelift
+    /// values via `load_source_ad_named_param`.
+    fn compile_distill_block(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        distill: &nsl_ast::block::DistillBlock,
+        distill_block_stmt_id: nsl_ast::NodeId,
+    ) -> Result<(), CodegenError> {
+        // Deferred compositions refuse loudly rather than degrade.
+        if self.features.pipeline_config.is_some() {
+            return Err(CodegenError::new(
+                "distill blocks do not support pipeline-parallel training in CPKD v1 \
+                 (remove the pipeline configuration or use a train block)",
+            ));
+        }
+        if !self.features.source_ad_enabled {
+            return Err(CodegenError::new(
+                "distill blocks require source AD (build with --source-ad): the \
+                 teacher-freeze guarantee (I-11) is enforced structurally on the \
+                 Wengert list; tape AD would record teacher ops and allocate \
+                 teacher gradient buffers (F-06)",
+            ));
+        }
+
+        // ── Extract distill config (semantic layer already validated) ──
+        let mut teacher_sym: Option<nsl_ast::Symbol> = None;
+        let mut student_sym: Option<nsl_ast::Symbol> = None;
+        let mut epochs: i64 = 1;
+        for arg in &distill.config {
+            if let Some(name_sym) = arg.name {
+                match self.resolve_sym(name_sym) {
+                    "teacher" => {
+                        if let ExprKind::Ident(sym) = &arg.value.kind {
+                            teacher_sym = Some(*sym);
+                        }
+                    }
+                    "student" => {
+                        if let ExprKind::Ident(sym) = &arg.value.kind {
+                            student_sym = Some(*sym);
+                        }
+                    }
+                    "epochs" => {
+                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                            epochs = *n;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let teacher_sym = teacher_sym.ok_or_else(|| {
+            CodegenError::new("distill block requires 'teacher=<model ident>'")
+        })?;
+        let student_sym = student_sym.ok_or_else(|| {
+            CodegenError::new("distill block requires 'student=<model ident>'")
+        })?;
+
+        // ── Parse loss: section into DistillLossConfig ──────────────────
+        let mut loss_cfg = crate::cpkd::DistillLossConfig::default();
+        let mut loss_alpha_explicit: Option<f64> = None;
+        let mut loss_temperature_explicit: Option<f64> = None;
+        for entry in &distill.loss {
+            let Some(name_sym) = entry.name else { continue };
+            let key = self.resolve_sym(name_sym).to_string();
+            let as_f64 = |e: &nsl_ast::expr::Expr| -> Option<f64> {
+                match e.kind {
+                    ExprKind::FloatLiteral(v) => Some(v),
+                    ExprKind::IntLiteral(v) => Some(v as f64),
+                    _ => None,
+                }
+            };
+            match key.as_str() {
+                "alpha" => {
+                    if let Some(v) = as_f64(&entry.value) {
+                        loss_cfg.alpha = v;
+                        loss_alpha_explicit = Some(v);
+                    }
+                }
+                "temperature" => {
+                    if let Some(v) = as_f64(&entry.value) {
+                        loss_cfg.temperature = v;
+                        loss_temperature_explicit = Some(v);
+                    }
+                }
+                "feature_weight" => {
+                    if let Some(v) = as_f64(&entry.value) {
+                        loss_cfg.feature_weight = v;
+                    }
+                }
+                "feature_layers" => match &entry.value.kind {
+                    ExprKind::StringLiteral(s) if s == "auto" => {
+                        loss_cfg.feature_layers = crate::cpkd::FeatureLayers::Auto;
+                    }
+                    ExprKind::ListLiteral(items) => {
+                        let mut layers = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let ExprKind::IntLiteral(n) = item.kind {
+                                layers.push(n);
+                            }
+                        }
+                        loss_cfg.feature_layers =
+                            crate::cpkd::FeatureLayers::Explicit(layers);
+                    }
+                    _ => {}
+                },
+                // attn_transfer=true was refused at the semantic layer;
+                // false is the only value that reaches codegen and it is
+                // the default (no state to record).
+                "attn_transfer" => {}
+                _ => {}
+            }
+        }
+
+        // ── Synthetic TrainBlock: empty config (the context seeds
+        //    model/epochs), shared sections. ─────────────────────────────
+        let synthetic = nsl_ast::block::TrainBlock {
+            config: Vec::new(),
+            sections: distill.sections.clone(),
+            span: distill.span,
+        };
+
+        // Per-block @fused_kl_ce dispatch (mirrors CFTP v10 item 3's
+        // per-train-block @fused_lm_ce lookup by stmt id).
+        let fused_kl_ce = self
+            .fused_kl_ce_configs
+            .iter()
+            .find(|c| c.distill_block_stmt_id == distill_block_stmt_id)
+            .cloned();
+
+        let saved_context = self.active_distill_context.replace(crate::cpkd::DistillContext {
+            teacher_sym,
+            student_sym,
+            epochs,
+            loss: loss_cfg,
+            fused_kl_ce,
+            loss_alpha_explicit,
+            loss_temperature_explicit,
+        });
+        let result = self.compile_train_block(builder, state, &synthetic, distill_block_stmt_id);
+        self.active_distill_context = saved_context;
+
+        // Render the Distillation Build Report (facts collected during the
+        // source-AD extraction inside the inner lowering). Stderr, CFIE
+        // convention for in-codegen build reports.
+        if result.is_ok() {
+            if let Some(plan) = self.last_cpkd_plan.take() {
+                eprint!("{}", plan.render_report());
+            }
+        }
+        result
+    }
+
     fn compile_train_block(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -3527,6 +3698,14 @@ impl Compiler<'_> {
                     _ => {} // ignore unknown config for forward compat
                 }
             }
+        }
+
+        // CPKD: a distill block delegates here with an empty config — the
+        // student plays the `model=` role and epochs come from the distill
+        // header. (`compile_distill_block` installed the context.)
+        if let Some(distill) = &self.active_distill_context {
+            model_sym = Some(distill.student_sym);
+            epochs = distill.epochs;
         }
 
         let model_sym = model_sym.ok_or_else(|| {
@@ -4330,9 +4509,23 @@ impl Compiler<'_> {
             // hints — see `feedback_deferral_must_refuse` and the semantic
             // checker's pre-v10 refusal note.
             let fused_ce_cfg = self.active_fused_ce_config.clone();
+            // CPKD: thread the @fused_kl_ce config + loss-section constants
+            // from the active distill context (None for plain train blocks).
+            let (fused_kl_ce_cfg, distill_alpha, distill_temp) = match &self.active_distill_context
+            {
+                Some(d) => (
+                    d.fused_kl_ce.clone(),
+                    // Only EXPLICIT loss-section values participate in the
+                    // call-site literal cross-check; defaults must not veto.
+                    d.loss_alpha_explicit,
+                    d.loss_temperature_explicit,
+                ),
+                None => (None, None, None),
+            };
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
                 .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone())
-                .with_fused_ce_config(fused_ce_cfg);
+                .with_fused_ce_config(fused_ce_cfg)
+                .with_fused_kl_ce_config(fused_kl_ce_cfg, distill_alpha, distill_temp);
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
@@ -4352,6 +4545,29 @@ impl Compiler<'_> {
 
             // Register the model variable as a model instance so method calls get inlined
             extractor.register_model_instance(model_sym, &model_type_name);
+
+            // CPKD: register the frozen teacher instance.  Method calls on
+            // it inline exactly like the student's, but every model field it
+            // touches registers as a `PrimalOp::Input` leaf (I-11) — no
+            // adjoints, no optimizer participation, teacher backward
+            // structurally absent from the compiled step.
+            if let Some(distill) = self.active_distill_context.clone() {
+                let teacher_type_name = self
+                    .resolve_source_ad_model_type_name(state, distill.teacher_sym)
+                    .ok_or_else(|| {
+                        CodegenError::new(format!(
+                            "distill teacher '{}' has no resolvable model type \
+                             (must be a model instance bound before the distill block)",
+                            self.resolve_sym(distill.teacher_sym)
+                        ))
+                    })?;
+                extractor
+                    .register_model_instance(distill.teacher_sym, &teacher_type_name);
+                let teacher_root = self.resolve_sym(distill.teacher_sym).to_string();
+                extractor.set_frozen_model_roots(
+                    std::iter::once(teacher_root).collect(),
+                );
+            }
 
             // Pre-register outer variables visible in the step body as inputs.
             //
@@ -4373,6 +4589,21 @@ impl Compiler<'_> {
             let extraction_ok = extractor.extract_stmts(&step_body.stmts);
 
             if !extraction_ok {
+                // CPKD: the tape records EVERY op on the thread-local tape —
+                // including the teacher forward — and its backward allocates
+                // gradient buffers for each recorded op.  That is the
+                // concrete F-06 failure path (teacher grad memory blow-up),
+                // so a distill block must never fall back silently.
+                if self.active_distill_context.is_some() {
+                    return Err(CodegenError::new(
+                        "distill step body could not be extracted for source AD; \
+                         tape fallback is refused for distillation (I-11/F-06: \
+                         the tape would record teacher ops and allocate teacher \
+                         gradient buffers). Restrict the step body to \
+                         source-AD-supported operations",
+                    ));
+                }
+
                 // Source AD extraction failed — fall back to tape
                 eprintln!("[nsl] source AD extraction failed, falling back to tape-based AD");
 
@@ -4459,6 +4690,63 @@ impl Compiler<'_> {
                         // lowerer will use the null placeholder, which is acceptable
                         // for Passthrough ops that don't need the actual tensor value.
                     }
+                }
+
+                // CPKD: resolve frozen teacher-field Input leaves.  Their
+                // compound names are rooted at the teacher instance variable
+                // (e.g. "teacher.blocks.0.attn.wq"), so the generic
+                // any-root resolver applies.  Unresolvable teacher fields
+                // fail loudly downstream: wengert_lower hard-errors on any
+                // unresolved Input leaf (unlike Params, which degrade to a
+                // null placeholder).
+                for (compound_name, vid) in extractor.frozen_input_var_ids() {
+                    if primal_vars.contains_key(vid) {
+                        continue;
+                    }
+                    if let Some(val) =
+                        self.load_source_ad_named_param(builder, state, compound_name)
+                    {
+                        primal_vars.insert(*vid, val);
+                    }
+                }
+
+                // CPKD: collect the Distillation Build Report facts while the
+                // extractor is in scope. Rendered by `compile_distill_block`.
+                if let Some(distill) = self.active_distill_context.clone() {
+                    let fused_op = extractor.wengert_list().ops.iter().find_map(|op| {
+                        if let crate::wengert::PrimalOp::FusedKlCe {
+                            vocab_size,
+                            student_hidden,
+                            teacher_hidden,
+                            batch_size,
+                            seq_len,
+                            ..
+                        } = &op.op
+                        {
+                            Some((
+                                *vocab_size,
+                                *student_hidden,
+                                *teacher_hidden,
+                                batch_size * seq_len,
+                            ))
+                        } else {
+                            None
+                        }
+                    });
+                    let logit_bytes_eliminated = fused_op
+                        .map(|(v, _, _, rows)| 2 * (v as u64) * (rows as u64) * 4)
+                        .unwrap_or(0);
+                    self.last_cpkd_plan = Some(crate::cpkd::CpkdPlan {
+                        teacher_name: self.resolve_sym(distill.teacher_sym).to_string(),
+                        student_name: self.resolve_sym(distill.student_sym).to_string(),
+                        epochs: distill.epochs,
+                        loss: distill.loss.clone(),
+                        trainable_params: extractor.named_param_var_ids().len(),
+                        frozen_teacher_inputs: extractor.frozen_input_var_ids().len(),
+                        fused_kl_ce_fired: fused_op.is_some(),
+                        fused_shape: fused_op,
+                        logit_bytes_eliminated,
+                    });
                 }
 
                 // 4. Find the loss symbol's VarId and set it as the Wengert

@@ -3,6 +3,7 @@ pub mod builtins;
 pub mod cep;
 pub mod cfie;
 pub mod cftp;
+pub mod cpkd;
 pub mod csha;
 pub mod checker;
 pub mod cpdt;
@@ -101,6 +102,11 @@ pub struct AnalysisResult {
     /// the lowering-site auto-substitution of composite cross_entropy → the
     /// fused linear-CE kernel).
     pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
+    /// CPKD: validated `@fused_kl_ce(...)` decorator configs, one per
+    /// decorated `distill` block. Codegen plumbs these via
+    /// `CompileOptions.fused_kl_ce_configs` (same bridge pattern as
+    /// `fused_ce_configs`).
+    pub fused_kl_ce_configs: Vec<crate::cpkd::FusedKlCeConfig>,
     /// CFTP §4.3 G2 Strategy 3 (Item 4): validated `@pca(...)` configurations.
     /// One entry per decorator occurrence. Codegen reads these at the
     /// CSHA training-PTX synthesis site so that
@@ -151,6 +157,7 @@ pub fn analyze_with_imports(
     let checkpoint_policies = checker.effect_checker.checkpoint_policies().clone();
     let paged_kv_models = checker.effect_checker.paged_kv_models().clone();
     let fused_ce_configs = checker.fused_ce_configs;
+    let fused_kl_ce_configs = checker.fused_kl_ce_configs;
     let pca_configs = checker.pca_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
@@ -247,6 +254,7 @@ pub fn analyze_with_imports(
         checkpoint_policies,
         paged_kv_models,
         fused_ce_configs,
+        fused_kl_ce_configs,
         pca_configs,
     }
 }

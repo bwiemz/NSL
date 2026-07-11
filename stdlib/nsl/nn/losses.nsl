@@ -51,3 +51,45 @@ fn fused_linear_ce(x: Tensor, W: Tensor, bias: Tensor, targets: Tensor) -> Tenso
     let W_t = W.transpose(0, 1)
     let logits = x @ W_t + bias
     return cross_entropy(logits, targets)
+
+# CPKD: fused KL-CE knowledge-distillation loss.
+#
+#   loss = alpha * CE(student_logits, targets)
+#        + (1 - alpha) * T^2 * KL(softmax(teacher/T) || softmax(student/T))
+#
+# Composite reference path: available everywhere (tape AD). Inside a
+# `distill` block decorated with `@fused_kl_ce(enabled = true, ...)`,
+# source-AD recognises this call and short-circuits to the fused GPU
+# kernel (nsl_fused_kl_ce_forward / _backward) that never materializes
+# either [rows, V] logit tensor in HBM. alpha/temperature must be numeric
+# literals at the call site in v1 (compile-time kernel constants).
+#
+# Input shape contract (matches the v1 fused kernel's FFI):
+#   x_s:     [rows, HS]  f32   student hidden states
+#   W_s:     [V,    HS]  f32   student LM head (row-major)
+#   bias_s:  [V]         f32
+#   x_t:     [rows, HT]  f32   teacher hidden states (frozen)
+#   W_t:     [V,    HT]  f32   teacher LM head (frozen)
+#   bias_t:  [V]         f32
+#   targets: [rows]      i64   (-100 = ignore_index)
+#
+# Returns: scalar loss tensor (mean over valid positions).
+fn fused_kl_ce(x_s: Tensor, W_s: Tensor, bias_s: Tensor, x_t: Tensor, W_t: Tensor, bias_t: Tensor, targets: Tensor, alpha: float, temperature: float) -> Tensor:
+    let s_logits = x_s @ W_s.transpose(0, 1) + bias_s
+    let t_logits = x_t @ W_t.transpose(0, 1) + bias_t
+    # Hard-label CE at temperature 1.
+    let ce = cross_entropy(s_logits, targets)
+    # Temperature-scaled distributions.
+    let s_scaled = s_logits / temperature
+    let t_scaled = t_logits / temperature
+    let log_p_s = log_softmax(s_scaled, 1)
+    let log_p_t = log_softmax(t_scaled, 1)
+    let p_t = softmax(t_scaled, 1)
+    # Per-row KL(p_t || p_s), masked mean over valid rows.
+    let kl_elem = p_t * (log_p_t - log_p_s)
+    # keepdim is an integer flag at the FFI boundary (0 = collapse the dim).
+    let kl_rows = sum(kl_elem, 1, 0)
+    let valid_mask = clamp(targets + 1.0, 0.0, 1.0)
+    let num_valid = sum(valid_mask) + 0.00000001
+    let kl = sum(kl_rows * valid_mask) / num_valid
+    return alpha * ce + (1.0 - alpha) * temperature * temperature * kl

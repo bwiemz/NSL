@@ -153,6 +153,306 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// CPKD distill block (`distill(teacher=t, student=s, epochs=N):`).
+    ///
+    /// Mirrors `check_train_block` for the shared sections; adds:
+    /// - config validation: `teacher`/`student` are required Idents bound to
+    ///   model-typed variables (I-11: the teacher is structurally frozen at
+    ///   codegen, so it must be a distinct, resolvable model instance);
+    /// - `loss:` key validation (literal-only in v1);
+    /// - loud refusals for deferred features (attn_transfer, distribute).
+    pub(crate) fn check_distill_block(&mut self, distill: &nsl_ast::block::DistillBlock) {
+        use nsl_ast::expr::ExprKind;
+
+        let mut has_teacher = false;
+        let mut has_student = false;
+        let mut teacher_sym: Option<Symbol> = None;
+        let mut student_sym: Option<Symbol> = None;
+
+        for arg in &distill.config {
+            let key = arg
+                .name
+                .map(|s| self.resolve_name(s))
+                .unwrap_or_default();
+            match key.as_str() {
+                "teacher" | "student" => {
+                    if let ExprKind::Ident(sym) = arg.value.kind {
+                        if key == "teacher" {
+                            has_teacher = true;
+                            teacher_sym = Some(sym);
+                        } else {
+                            has_student = true;
+                            student_sym = Some(sym);
+                        }
+                        self.check_expr(&arg.value);
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "distill '{key}' must be a plain model variable in v1 \
+                                 (separately-compiled teachers are deferred)"
+                            ))
+                            .with_label(arg.span, "expected a model variable"),
+                        );
+                    }
+                }
+                "epochs" => {
+                    self.check_expr(&arg.value);
+                }
+                other => {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("unknown distill config key '{other}'"))
+                            .with_label(arg.span, "expected teacher=, student=, or epochs="),
+                    );
+                }
+            }
+        }
+
+        if !has_teacher || !has_student {
+            self.diagnostics.push(
+                Diagnostic::error("distill block requires both teacher= and student=")
+                    .with_label(distill.span, "missing teacher/student config"),
+            );
+        }
+
+        // Both endpoints must be model-typed variables.
+        for (label, sym) in [("teacher", teacher_sym), ("student", student_sym)] {
+            let Some(sym) = sym else { continue };
+            let ty = self
+                .scopes
+                .lookup(self.current_scope, sym)
+                .map(|(_, info)| info.ty.clone());
+            match ty {
+                Some(Type::Model { .. }) | Some(Type::Error) | Some(Type::Unknown) | None => {}
+                Some(_) => {
+                    let name = self
+                        .interner
+                        .resolve(sym.0)
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "distill {label} '{name}' is not a model instance"
+                        ))
+                        .with_label(distill.span, "expected a model-typed variable"),
+                    );
+                }
+            }
+        }
+        if let (Some(t), Some(s)) = (teacher_sym, student_sym) {
+            if t == s {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "distill teacher and student must be distinct model instances",
+                    )
+                    .with_label(distill.span, "teacher == student"),
+                );
+            }
+        }
+
+        // loss: section — literal-only key=value entries in v1.
+        const LOSS_KEYS: &[&str] = &[
+            "alpha",
+            "temperature",
+            "feature_layers",
+            "feature_weight",
+            "attn_transfer",
+        ];
+        let mut seen_loss_keys: HashSet<String> = HashSet::new();
+        for entry in &distill.loss {
+            let key = entry
+                .name
+                .map(|s| self.resolve_name(s))
+                .unwrap_or_default();
+            if !LOSS_KEYS.contains(&key.as_str()) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("unknown distill loss key '{key}'"))
+                        .with_label(entry.span, "unknown loss config key"),
+                );
+                continue;
+            }
+            if !seen_loss_keys.insert(key.clone()) {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("duplicate distill loss key '{key}'"))
+                        .with_label(entry.span, "already specified"),
+                );
+                continue;
+            }
+            match key.as_str() {
+                "alpha" => match entry.value.kind {
+                    ExprKind::FloatLiteral(v) if (0.0..=1.0).contains(&v) => {}
+                    ExprKind::IntLiteral(v) if v == 0 || v == 1 => {}
+                    _ => self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill loss alpha must be a literal in [0.0, 1.0] in v1",
+                        )
+                        .with_label(entry.value.span, "expected float literal in [0, 1]"),
+                    ),
+                },
+                "temperature" => match entry.value.kind {
+                    ExprKind::FloatLiteral(v) if v > 0.0 => {}
+                    ExprKind::IntLiteral(v) if v > 0 => {}
+                    _ => self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill loss temperature must be a positive literal in v1",
+                        )
+                        .with_label(entry.value.span, "expected positive numeric literal"),
+                    ),
+                },
+                "feature_weight" => match entry.value.kind {
+                    ExprKind::FloatLiteral(v) if v >= 0.0 => {}
+                    ExprKind::IntLiteral(v) if v >= 0 => {}
+                    _ => self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill loss feature_weight must be a non-negative literal in v1",
+                        )
+                        .with_label(entry.value.span, "expected non-negative numeric literal"),
+                    ),
+                },
+                "feature_layers" => match &entry.value.kind {
+                    ExprKind::StringLiteral(s) if s == "auto" => {}
+                    ExprKind::ListLiteral(items)
+                        if items
+                            .iter()
+                            .all(|e| matches!(e.kind, ExprKind::IntLiteral(_))) => {}
+                    _ => self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill loss feature_layers must be \"auto\" or a list of \
+                             integer literals in v1",
+                        )
+                        .with_label(entry.value.span, "expected \"auto\" or [int, ...]"),
+                    ),
+                },
+                "attn_transfer" => match entry.value.kind {
+                    ExprKind::BoolLiteral(false) => {}
+                    ExprKind::BoolLiteral(true) => self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill attention transfer is not implemented in CPKD v1: \
+                             fused attention kernels never materialize post-softmax \
+                             attention weights in HBM (set attn_transfer = false)",
+                        )
+                        .with_label(entry.value.span, "deferred feature"),
+                    ),
+                    _ => self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill loss attn_transfer must be a bool literal",
+                        )
+                        .with_label(entry.value.span, "expected true or false"),
+                    ),
+                },
+                _ => unreachable!("key membership checked above"),
+            }
+        }
+
+        // Shared sections — identical semantics to train, except distribute:
+        // (CPDT composition with distillation) is deferred in v1.
+        let mut has_step = false;
+        for section in &distill.sections {
+            match section {
+                TrainSection::Data(stmts) => {
+                    for stmt in stmts {
+                        if let StmtKind::Assign {
+                            target,
+                            value,
+                            op: nsl_ast::operator::AssignOp::Assign,
+                        } = &stmt.kind
+                        {
+                            if let nsl_ast::expr::ExprKind::Ident(name_sym) = target.kind {
+                                let name = self.resolve_name(name_sym);
+                                if DATA_SECTION_KEYS.contains(&name.as_str()) {
+                                    self.check_expr(value);
+                                } else {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(format!(
+                                            "unknown data-section key '{name}'"
+                                        ))
+                                        .with_label(target.span, "unknown data-section key"),
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        self.check_stmt(stmt);
+                    }
+                }
+                TrainSection::Optimizer(expr) => {
+                    self.check_expr(expr);
+                }
+                TrainSection::Scheduler(_expr) => {
+                    // Same as train: codegen auto-injects base_lr/step args.
+                }
+                TrainSection::Step { param, body } | TrainSection::Eval { param, body } => {
+                    if matches!(section, TrainSection::Step { .. }) {
+                        has_step = true;
+                    }
+                    use crate::types::{DType, Device, Shape};
+                    let batch_type = Type::Dict(
+                        Box::new(Type::Str),
+                        Box::new(Type::Tensor {
+                            shape: Shape::unknown(),
+                            dtype: DType::Unknown,
+                            device: Device::Unknown,
+                        }),
+                    );
+                    let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+                    let prev = self.current_scope;
+                    self.current_scope = scope;
+                    self.declare_symbol(*param, batch_type, body.span, false, true);
+                    for s in &body.stmts {
+                        self.check_stmt(s);
+                    }
+                    self.current_scope = prev;
+                }
+                TrainSection::Callbacks(callbacks) => {
+                    for cb in callbacks {
+                        let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Block);
+                        let prev = self.current_scope;
+                        self.current_scope = scope;
+                        for param in &cb.params {
+                            let param_ty = if let Some(type_ann) = &param.type_ann {
+                                self.resolve_type(type_ann)
+                            } else {
+                                let pname = self.resolve_name(param.name);
+                                match pname.as_str() {
+                                    "step" | "epoch" => Type::Int,
+                                    "loss" => Type::Tensor {
+                                        shape: crate::types::Shape::unknown(),
+                                        dtype: crate::types::DType::F64,
+                                        device: crate::types::Device::Cpu,
+                                    },
+                                    _ => Type::Unknown,
+                                }
+                            };
+                            self.declare_symbol(param.name, param_ty, param.span, false, true);
+                        }
+                        for s in &cb.body.stmts {
+                            self.check_stmt(s);
+                        }
+                        self.current_scope = prev;
+                    }
+                }
+                TrainSection::Distribute(_) => {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "distill does not support a distribute: section in v1 \
+                             (CPDT + distillation composition is deferred)",
+                        )
+                        .with_label(distill.span, "deferred feature"),
+                    );
+                }
+                TrainSection::Stmt(stmt) => {
+                    self.check_stmt(stmt);
+                }
+            }
+        }
+
+        if !has_step {
+            self.diagnostics.push(
+                Diagnostic::warning("distill block missing 'step' section")
+                    .with_label(distill.span, "expected a step(batch): section"),
+            );
+        }
+    }
+
     pub(crate) fn check_serve_block(&mut self, serve: &nsl_ast::block::ServeBlock) {
         for entry in &serve.config {
             if let Some(ref type_ann) = entry.type_ann {

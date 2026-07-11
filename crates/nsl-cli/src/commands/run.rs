@@ -326,6 +326,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 emit_export_table: false,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
+                fused_kl_ce_configs: Vec::new(),
                 pca_user_strategies: Vec::new(),
                 wrga_fold_allocations: false,
                 // S3: thread the `--wggo*` surface through so the WGGO

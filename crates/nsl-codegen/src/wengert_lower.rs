@@ -1474,6 +1474,63 @@ fn lower_single_op(
             *vocab_tile,
             *ignore_index,
         ),
+        // CPKD: fused KL-CE distillation loss (forward).
+        PrimalOp::FusedKlCe {
+            vocab_size,
+            student_hidden,
+            teacher_hidden,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+            alpha_bits,
+            temperature_bits,
+        } => lower_fused_kl_ce_forward(
+            compiler,
+            builder,
+            &inputs,
+            &FusedKlCeLowerParams {
+                vocab_size: *vocab_size,
+                student_hidden: *student_hidden,
+                teacher_hidden: *teacher_hidden,
+                batch_size: *batch_size,
+                seq_len: *seq_len,
+                vocab_tile: *vocab_tile,
+                ignore_index: *ignore_index,
+                alpha: f64::from_bits(*alpha_bits),
+                temperature: f64::from_bits(*temperature_bits),
+            },
+        ),
+        // CPKD: fused KL-CE backward extract (student components only —
+        // I-11: no teacher gradients exist anywhere in this path).
+        PrimalOp::FusedKlCeBackwardExtract {
+            component,
+            vocab_size,
+            student_hidden,
+            teacher_hidden,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+            alpha_bits,
+            temperature_bits,
+        } => lower_fused_kl_ce_backward_extract(
+            compiler,
+            builder,
+            &inputs,
+            *component,
+            &FusedKlCeLowerParams {
+                vocab_size: *vocab_size,
+                student_hidden: *student_hidden,
+                teacher_hidden: *teacher_hidden,
+                batch_size: *batch_size,
+                seq_len: *seq_len,
+                vocab_tile: *vocab_tile,
+                ignore_index: *ignore_index,
+                alpha: f64::from_bits(*alpha_bits),
+                temperature: f64::from_bits(*temperature_bits),
+            },
+        ),
         PrimalOp::L1Loss => {
             // l1_loss(pred, target) = mean(|pred - target|)
             // ELTLS (FBIP-3): nsl_tensor_sub takes a flags byte.
@@ -3358,6 +3415,353 @@ fn lower_fused_linear_ce_backward_extract(
         // last-component boundary so the cache stays bounded across
         // many FusedLinearCe ops in one compile.
         compiler.fused_ce_fwd_casts.remove(&fwd_result_key);
+    }
+    Ok(result)
+}
+
+// ─── CPKD fused KL-CE lowering ──────────────────────────────────────────────
+
+/// Shape + loss-constant bundle threaded from the `FusedKlCe` /
+/// `FusedKlCeBackwardExtract` PrimalOps into the two lowering fns (nine
+/// scalar params would trip clippy::too_many_arguments and invite
+/// positional-swap bugs).
+pub(crate) struct FusedKlCeLowerParams {
+    pub vocab_size: u32,
+    pub student_hidden: u32,
+    pub teacher_hidden: u32,
+    pub batch_size: u32,
+    pub seq_len: u32,
+    pub vocab_tile: u32,
+    pub ignore_index: i64,
+    pub alpha: f64,
+    pub temperature: f64,
+}
+
+impl FusedKlCeLowerParams {
+    fn build_cfg(&self) -> Result<crate::cpkd_fused_loss::FusedKlCeConfig, CodegenError> {
+        let cfg = crate::cpkd_fused_loss::FusedKlCeConfig {
+            vocab_size: self.vocab_size,
+            student_hidden: self.student_hidden,
+            teacher_hidden: self.teacher_hidden,
+            batch_size: self.batch_size,
+            seq_len: self.seq_len,
+            vocab_tile: self.vocab_tile,
+            gpu_sm: 80, // f32 emitters target sm_80+; see cpkd_fused_loss::ptx_header
+            ignore_index: self.ignore_index,
+        };
+        cfg.validate().map_err(CodegenError::new)?;
+        Ok(cfg)
+    }
+
+    /// Pack an f64 loss constant as f32 bits in an i64 immediate (the FFI
+    /// contract: `f32::from_bits(bits as u32)`).
+    fn f32_bits_const(builder: &mut FunctionBuilder, v: f64) -> Value {
+        builder
+            .ins()
+            .iconst(cl_types::I64, (v as f32).to_bits() as i64)
+    }
+}
+
+/// CPKD forward: one FFI launch producing per-row losses + the three saved
+/// LSE buffers, then the same masked-mean reduction as the composite CE
+/// (and fused linear-CE) lowerings so the scalar is dual-path compatible.
+///
+/// inputs = [x_s, W_s, bias_s, x_t, W_t, bias_t, targets] (7).
+fn lower_fused_kl_ce_forward(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    inputs: &[Value],
+    p: &FusedKlCeLowerParams,
+) -> Result<Value, CodegenError> {
+    let cfg = p.build_cfg()?;
+    let rows = (p.batch_size as i64) * (p.seq_len as i64);
+    if inputs.len() < 7 {
+        return Err(CodegenError::new(
+            "FusedKlCe: expected 7 lowered inputs (x_s, W_s, bias_s, x_t, W_t, bias_t, targets)",
+        ));
+    }
+    let (xs_t, ws_t, bs_t) = (inputs[0], inputs[1], inputs[2]);
+    let (xt_t, wt_t, bt_t) = (inputs[3], inputs[4], inputs[5]);
+    let targets_t = inputs[6];
+
+    // Per-row outputs + the three LSE save buffers (backward inputs).
+    let loss_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+    let lse_s1_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+    let lse_st_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+    let lse_tt_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+
+    // v1 is f32-only: no precision casts (the tape stores f32 on GPU).
+    let xs_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xs_t])?;
+    let ws_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[ws_t])?;
+    let bs_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bs_t])?;
+    let xt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xt_t])?;
+    let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
+    let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
+    let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+    let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
+    let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1_out])?;
+    let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st_out])?;
+    let lse_tt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_tt_out])?;
+
+    // Synthesise + embed the forward PTX.
+    let fwd_ptx_bytes = crate::cpkd_fused_loss::synthesize_fused_kl_ce_ptx(&cfg);
+    let kname = cfg.kernel_name();
+    let tag = format!(
+        "klce_v{}_hs{}_ht{}",
+        p.vocab_size, p.student_hidden, p.teacher_hidden
+    );
+    let (ptx_ptr, name_ptr) =
+        embed_fused_ce_data(compiler, builder, &tag, &fwd_ptx_bytes, &kname)?;
+
+    let rows_val = builder.ins().iconst(cl_types::I64, rows);
+    let v_val = builder.ins().iconst(cl_types::I64, p.vocab_size as i64);
+    let hs_val = builder.ins().iconst(cl_types::I64, p.student_hidden as i64);
+    let ht_val = builder.ins().iconst(cl_types::I64, p.teacher_hidden as i64);
+    let alpha_bits = FusedKlCeLowerParams::f32_bits_const(builder, p.alpha);
+    let temp_bits = FusedKlCeLowerParams::f32_bits_const(builder, p.temperature);
+    let smem_val = builder
+        .ins()
+        .iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
+
+    // ABI lock-step: 20 args — must match builtins.rs declaration and the
+    // runtime extern "C" fn (crates/nsl-runtime/src/fused_kl_ce.rs).
+    let _rc = call(
+        compiler,
+        builder,
+        "nsl_fused_kl_ce_forward",
+        &[
+            ptx_ptr, name_ptr, xs_ptr, ws_ptr, bs_ptr, xt_ptr, wt_ptr, bt_ptr, tgt_ptr,
+            loss_ptr, lse_s1_ptr, lse_st_ptr, lse_tt_ptr, rows_val, v_val, hs_val, ht_val,
+            alpha_bits, temp_bits, smem_val,
+        ],
+    )?;
+
+    // Masked-mean reduction — identical to the fused linear-CE forward so
+    // the scalar is bit-compatible with a composite dual path.
+    let one_f = builder.ins().f64const(1.0);
+    let zero_f = builder.ins().f64const(0.0);
+    let eps_f = builder.ins().f64const(1e-8);
+    let addsc_flags = builder.ins().iconst(cl_types::I8, 0);
+    let targets_plus_one = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_scalar",
+        &[targets_t, one_f, addsc_flags],
+    )?;
+    let valid_mask = call(
+        compiler,
+        builder,
+        "nsl_tensor_clamp",
+        &[targets_plus_one, zero_f, one_f],
+    )?;
+    let mul_flags = builder.ins().iconst(cl_types::I8, 0);
+    let masked_loss = call(
+        compiler,
+        builder,
+        "nsl_tensor_mul",
+        &[loss_out, valid_mask, mul_flags],
+    )?;
+    let num_valid = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+    let addsc_flags2 = builder.ins().iconst(cl_types::I8, 0);
+    let num_valid_eps = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_scalar",
+        &[num_valid, eps_f, addsc_flags2],
+    )?;
+    let total = call(compiler, builder, "nsl_tensor_sum", &[masked_loss])?;
+    let div_flags = builder.ins().iconst(cl_types::I8, 0);
+    let result = call(
+        compiler,
+        builder,
+        "nsl_tensor_div",
+        &[total, num_valid_eps, div_flags],
+    )?;
+    for tmp in [
+        targets_plus_one,
+        valid_mask,
+        masked_loss,
+        num_valid,
+        num_valid_eps,
+        total,
+        loss_out,
+    ] {
+        free_tensor_value(compiler, builder, tmp)?;
+    }
+
+    // Save the three LSE buffers for the backward extract, keyed by the
+    // scalar-result Value. First backward extract consumes + evicts.
+    compiler
+        .fused_kl_ce_fwd_saves
+        .insert(result, [lse_s1_out, lse_st_out, lse_tt_out]);
+    Ok(result)
+}
+
+/// CPKD backward extract: first component launches
+/// `nsl_fused_kl_ce_backward` (fills all three student grads), caches
+/// `[dx_s, dW_s, dbias_s]`; the others read the cache; component 2
+/// evicts. inputs = [grad, x_s, W_s, bias_s, x_t, W_t, bias_t, targets,
+/// fwd_result] (9).
+fn lower_fused_kl_ce_backward_extract(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    inputs: &[Value],
+    component: u8,
+    p: &FusedKlCeLowerParams,
+) -> Result<Value, CodegenError> {
+    if component > 2 {
+        return Err(CodegenError::new(format!(
+            "FusedKlCeBackwardExtract: component {component} out of range 0..=2"
+        )));
+    }
+    if inputs.len() < 9 {
+        return Err(CodegenError::new(
+            "FusedKlCeBackwardExtract: expected 9 lowered inputs",
+        ));
+    }
+    let output_bar = inputs[0];
+    let (xs_t, ws_t, bs_t) = (inputs[1], inputs[2], inputs[3]);
+    let (xt_t, wt_t, bt_t) = (inputs[4], inputs[5], inputs[6]);
+    let targets_t = inputs[7];
+    let fwd_result_key = inputs[8];
+
+    let slot = if let Some(&cached) = compiler.fused_kl_ce_bwd_cache.get(&fwd_result_key) {
+        cached
+    } else {
+        let cfg = p.build_cfg()?;
+        let rows = (p.batch_size as i64) * (p.seq_len as i64);
+
+        // Student gradient outputs (zero-filled by alloc; the kernel
+        // accumulates via red.global.add). NO teacher gradient buffers
+        // exist on this path (I-11).
+        let dxs_out =
+            alloc_gpu_f32_tensor(compiler, builder, &[rows, p.student_hidden as i64])?;
+        let dws_out = alloc_gpu_f32_tensor(
+            compiler,
+            builder,
+            &[p.vocab_size as i64, p.student_hidden as i64],
+        )?;
+        let dbs_out = alloc_gpu_f32_tensor(compiler, builder, &[p.vocab_size as i64])?;
+
+        // Saved LSE buffers from the forward; consume + evict.
+        let [lse_s1, lse_st, lse_tt] = compiler
+            .fused_kl_ce_fwd_saves
+            .remove(&fwd_result_key)
+            .ok_or_else(|| {
+                CodegenError::new(
+                    "FusedKlCeBackwardExtract: no saved LSE buffers for fwd_result — \
+                     forward must run before backward (compiler.fused_kl_ce_fwd_saves \
+                     is populated in lower_fused_kl_ce_forward)",
+                )
+            })?;
+
+        let xs_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xs_t])?;
+        let ws_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[ws_t])?;
+        let bs_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bs_t])?;
+        let xt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xt_t])?;
+        let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
+        let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
+        let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+        let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1])?;
+        let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st])?;
+        let lse_tt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_tt])?;
+        let dxs_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dxs_out])?;
+        let dws_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dws_out])?;
+        let dbs_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dbs_out])?;
+
+        // Backward PTX synthesis + embed.
+        let bwd_ptx_bytes = crate::cpkd_fused_loss::synthesize_fused_kl_ce_backward_ptx(&cfg);
+        let bwd_kname = cfg.bwd_kernel_name();
+        let tag = format!(
+            "klce_bwd_v{}_hs{}_ht{}",
+            p.vocab_size, p.student_hidden, p.teacher_hidden
+        );
+        let (bwd_ptx_ptr, bwd_name_ptr) =
+            embed_fused_ce_data(compiler, builder, &tag, &bwd_ptx_bytes, &bwd_kname)?;
+
+        // Upstream scalar grad → f32 bits in i64 (same packing as the
+        // fused linear-CE backward).
+        let grad_f64 = call(compiler, builder, "nsl_tensor_item", &[output_bar])?;
+        let grad_f32 = builder.ins().fdemote(cl_types::F32, grad_f64);
+        let grad_bits_i32 = builder.ins().bitcast(
+            cl_types::I32,
+            cranelift_codegen::ir::MemFlags::new(),
+            grad_f32,
+        );
+        let grad_bits = builder.ins().sextend(cl_types::I64, grad_bits_i32);
+
+        // num_valid = count(targets != ignore_index).
+        let one_f = builder.ins().f64const(1.0);
+        let zero_f = builder.ins().f64const(0.0);
+        let addsc_flags_b = builder.ins().iconst(cl_types::I8, 0);
+        let targets_plus_one = call(
+            compiler,
+            builder,
+            "nsl_tensor_add_scalar",
+            &[targets_t, one_f, addsc_flags_b],
+        )?;
+        let valid_mask = call(
+            compiler,
+            builder,
+            "nsl_tensor_clamp",
+            &[targets_plus_one, zero_f, one_f],
+        )?;
+        let num_valid_t = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+        let num_valid_f64 = call(compiler, builder, "nsl_tensor_item", &[num_valid_t])?;
+        let num_valid = builder.ins().fcvt_to_sint(cl_types::I64, num_valid_f64);
+
+        let rows_val = builder.ins().iconst(cl_types::I64, rows);
+        let v_val = builder.ins().iconst(cl_types::I64, p.vocab_size as i64);
+        let hs_val = builder.ins().iconst(cl_types::I64, p.student_hidden as i64);
+        let ht_val = builder.ins().iconst(cl_types::I64, p.teacher_hidden as i64);
+        let alpha_bits = FusedKlCeLowerParams::f32_bits_const(builder, p.alpha);
+        let temp_bits = FusedKlCeLowerParams::f32_bits_const(builder, p.temperature);
+
+        // ABI lock-step: 23 args — must match builtins.rs and the runtime.
+        let _rc = call(
+            compiler,
+            builder,
+            "nsl_fused_kl_ce_backward",
+            &[
+                bwd_ptx_ptr,
+                bwd_name_ptr,
+                grad_bits,
+                xs_ptr,
+                ws_ptr,
+                bs_ptr,
+                xt_ptr,
+                wt_ptr,
+                bt_ptr,
+                tgt_ptr,
+                lse_s1_ptr,
+                lse_st_ptr,
+                lse_tt_ptr,
+                dxs_ptr,
+                dws_ptr,
+                dbs_ptr,
+                rows_val,
+                v_val,
+                hs_val,
+                ht_val,
+                alpha_bits,
+                temp_bits,
+                num_valid,
+            ],
+        )?;
+
+        // The FFI cuCtxSynchronizes, so the LSE buffers are consumed.
+        for tmp in [targets_plus_one, valid_mask, num_valid_t, lse_s1, lse_st, lse_tt] {
+            free_tensor_value(compiler, builder, tmp)?;
+        }
+
+        let slot = [dxs_out, dws_out, dbs_out];
+        compiler.fused_kl_ce_bwd_cache.insert(fwd_result_key, slot);
+        slot
+    };
+
+    let result = slot[component as usize];
+    if component == 2 {
+        compiler.fused_kl_ce_bwd_cache.remove(&fwd_result_key);
     }
     Ok(result)
 }

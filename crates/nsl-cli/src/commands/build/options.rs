@@ -377,6 +377,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 emit_export_table: shared_lib,
                 wrga_inputs: None,
                 fused_ce_configs: Vec::new(),
+                fused_kl_ce_configs: Vec::new(),
                 pca_user_strategies: Vec::new(),
                 wrga_fold_allocations,
                 wggo: nsl_codegen::WggoOptions {

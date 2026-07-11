@@ -30,10 +30,13 @@ use crate::wggo_dp::{
 use crate::wggo_graph::{build as build_graph, LayerRole, OptGraph};
 use crate::wggo_shape::LayerShapeInfo;
 use crate::wggo_cfie::{surface_from_plan, CfieInferenceChoice, CfieLayerInference};
+use crate::wggo_cpkd::{
+    surface_from_plan as cpkd_surface_from_plan, CpkdChoice, CpkdLayerDistill,
+};
 use crate::wggo_ilp::{
-    recost_decision_cfie, solve_all_greedy_cfie as ilp_solve_all_greedy_cfie,
-    solve_all_templated_cfie as ilp_solve_all_templated_cfie,
-    solve_layer_cfie as ilp_solve_layer_cfie, LayerIlpConstraints, LayerIlpSolution,
+    recost_decision_cpkd, solve_all_greedy_cpkd as ilp_solve_all_greedy_cpkd,
+    solve_all_templated_cpkd as ilp_solve_all_templated_cpkd,
+    solve_layer_cpkd as ilp_solve_layer_cpkd, LayerIlpConstraints, LayerIlpSolution,
     TemplateStats,
 };
 use crate::wggo_schedule::{build_schedule, CommSchedule};
@@ -135,6 +138,14 @@ pub struct WggoPlan {
     /// the report IS the deliverable this cycle.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cfie_inference: Vec<CfieLayerInference>,
+    /// CPKD distillation decisions (v1) — ADVISORY, report-only.
+    /// Populated only when the opt-in `LayerIlpConstraints::cpkd` gate is
+    /// on for at least one non-pruned layer; empty (and skipped in
+    /// serialization) otherwise, keeping gate-off plans byte-identical.
+    /// Not yet consumed by the distill lowering — surfacing here + in the
+    /// report's "[cpkd]" section IS the deliverable this cycle.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cpkd_distill: Vec<CpkdLayerDistill>,
 }
 
 impl WggoPlan {
@@ -215,6 +226,41 @@ impl WggoPlan {
                 for d in self.cfie_inference.iter().skip(1) {
                     if d.note != first.note {
                         writeln!(s, "  Cost model ({}): {}", d.layer_name, d.note).unwrap();
+                    }
+                }
+            }
+        }
+        // CPKD distillation decisions (v1) — printed only when the opt-in
+        // gate produced choices, so gate-off reports stay byte-identical.
+        if !self.cpkd_distill.is_empty() {
+            writeln!(s).unwrap();
+            writeln!(s, "[cpkd] Distillation decisions (advisory):").unwrap();
+            writeln!(
+                s,
+                "[cpkd]   Report-only in v1: not consumed by the distill lowering; \
+                 attn transfer + teacher-stream overlap are deferred features."
+            )
+            .unwrap();
+            for d in &self.cpkd_distill {
+                writeln!(
+                    s,
+                    "[cpkd]   {}: feature_match={}, attn_transfer={}, teacher_stream={}",
+                    d.layer_name,
+                    if d.choice.feature_match { "on" } else { "off" },
+                    if d.choice.attn_transfer { "on" } else { "off" },
+                    if d.choice.teacher_stream { "on" } else { "off" },
+                )
+                .unwrap();
+            }
+            // Each record carries the model + constants it was priced with
+            // (wggo_cpkd::model_note); configs are per-layer, so print the
+            // first and flag any layer whose note differs.
+            if let Some(first) = self.cpkd_distill.first() {
+                writeln!(s, "[cpkd]   Cost model: {}", first.note).unwrap();
+                for d in self.cpkd_distill.iter().skip(1) {
+                    if d.note != first.note {
+                        writeln!(s, "[cpkd]   Cost model ({}): {}", d.layer_name, d.note)
+                            .unwrap();
                     }
                 }
             }
@@ -325,14 +371,16 @@ fn splice_resolved(per_layer: &mut [LayerIlpSolution], resolved: &[LayerDecision
 }
 
 /// Total re-costed step time across all layers (G3 cost re-evaluation).
-/// `cfie_choices` keeps a gate-on re-cost comparable with the solver's
-/// objective (which includes the G20 decode term); with the gate off every
-/// entry is `None` and the sum is bit-identical to the pre-G20 re-cost.
+/// `cfie_choices` / `cpkd_choices` keep a gate-on re-cost comparable with
+/// the solver's objective (which includes the G20 decode term and the CPKD
+/// distill term); with the gates off every entry is `None` and the sum is
+/// bit-identical to the pre-G20 re-cost.
 fn recost_total(
     luts: &[LayerCostLut],
     per_layer: &[LayerIlpSolution],
     constraints: &[LayerIlpConstraints],
     cfie_choices: &[Option<CfieInferenceChoice>],
+    cpkd_choices: &[Option<CpkdChoice>],
 ) -> f64 {
     per_layer
         .iter()
@@ -341,11 +389,12 @@ fn recost_total(
             let lut = luts.get(i).or_else(|| luts.first());
             let cons = constraints.get(i).or_else(|| constraints.first());
             match (lut, cons) {
-                (Some(lut), Some(cons)) => recost_decision_cfie(
+                (Some(lut), Some(cons)) => recost_decision_cpkd(
                     lut,
                     &sol.decision,
                     cons,
                     cfie_choices.get(i).copied().flatten(),
+                    cpkd_choices.get(i).copied().flatten(),
                 ),
                 _ => 0.0,
             }
@@ -408,6 +457,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             warnings: shape_warns,
             // The §2.4 refusal must not advertise decisions of any kind.
             cfie_inference: Vec::new(),
+            cpkd_distill: Vec::new(),
         };
     }
 
@@ -439,9 +489,10 @@ pub fn run(input: WggoInput) -> WggoPlan {
             input.scorer.as_deref(),
         );
         weight_analysis.apply_to(&mut ilp_defaults);
-        let (per_layer, template_stats, cfie_choices) =
-            ilp_solve_all_templated_cfie(&luts, &ilp_defaults);
+        let (per_layer, template_stats, cfie_choices, cpkd_choices) =
+            ilp_solve_all_templated_cpkd(&luts, &ilp_defaults);
         let cfie_inference = surface_from_plan(&inter, &cfie_choices, &ilp_defaults);
+        let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_defaults);
         let applied = apply(&inter, &per_layer);
         let schedule = build_schedule(&inter, &applied);
         return WggoPlan {
@@ -458,6 +509,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
             estimated_solve_us: t0.elapsed().as_micros() as u64,
             warnings: Vec::new(),
             cfie_inference,
+            cpkd_distill,
         };
     }
 
@@ -515,13 +567,14 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // correct path: it keeps the conflict detector live in production (G8) and
     // surfaces a visible resolution in the report, instead of silently
     // disabling the option before it can ever conflict.
-    let (mut per_layer, mut template_stats, mut cfie_choices) = match effective_mode {
-        WggoMode::Greedy => {
-            let (sols, choices) = ilp_solve_all_greedy_cfie(&luts, &ilp_constraints);
-            (sols, TemplateStats::default(), choices)
-        }
-        _ => ilp_solve_all_templated_cfie(&luts, &ilp_constraints),
-    };
+    let (mut per_layer, mut template_stats, mut cfie_choices, mut cpkd_choices) =
+        match effective_mode {
+            WggoMode::Greedy => {
+                let (sols, cfie, cpkd) = ilp_solve_all_greedy_cpkd(&luts, &ilp_constraints);
+                (sols, TemplateStats::default(), cfie, cpkd)
+            }
+            _ => ilp_solve_all_templated_cpkd(&luts, &ilp_constraints),
+        };
 
     // G4 degradation ladder, rung 1: if the full branch-and-bound ILP could not
     // make a single layer feasible, fall back to the greedy solver before
@@ -532,9 +585,10 @@ pub fn run(input: WggoInput) -> WggoPlan {
     {
         warnings.push("full ILP found no feasible layer; degraded full -> greedy".to_string());
         effective_mode = WggoMode::Greedy;
-        let (sols, choices) = ilp_solve_all_greedy_cfie(&luts, &ilp_constraints);
+        let (sols, cfie, cpkd) = ilp_solve_all_greedy_cpkd(&luts, &ilp_constraints);
         per_layer = sols;
-        cfie_choices = choices;
+        cfie_choices = cfie;
+        cpkd_choices = cpkd;
         template_stats = TemplateStats::default();
     }
 
@@ -561,7 +615,13 @@ pub fn run(input: WggoInput) -> WggoPlan {
         // a change, so spending the full branch-and-bound on just those layers
         // recovers quality without the cost of a full-model ILP.
         if effective_mode == WggoMode::Greedy && !resolutions.is_empty() {
-            let cost_after = recost_total(&luts, &per_layer, &ilp_constraints, &cfie_choices);
+            let cost_after = recost_total(
+                &luts,
+                &per_layer,
+                &ilp_constraints,
+                &cfie_choices,
+                &cpkd_choices,
+            );
             if cost_after > cost_before * (1.0 + GREEDY_RECOST_THRESHOLD) {
                 let conflicting: std::collections::HashSet<u32> =
                     resolutions.iter().filter_map(|r| r.layer()).collect();
@@ -572,10 +632,13 @@ pub fn run(input: WggoInput) -> WggoPlan {
                         if let (Some(lut), Some(cons)) =
                             (luts.get(i).or_else(|| luts.first()), ilp_constraints.get(i).or_else(|| ilp_constraints.first()))
                         {
-                            let (sol, choice) = ilp_solve_layer_cfie(lut, cons);
+                            let (sol, cfie_choice, cpkd_choice) = ilp_solve_layer_cpkd(lut, cons);
                             per_layer[i] = sol;
                             if let Some(slot) = cfie_choices.get_mut(i) {
-                                *slot = choice;
+                                *slot = cfie_choice;
+                            }
+                            if let Some(slot) = cpkd_choices.get_mut(i) {
+                                *slot = cpkd_choice;
                             }
                         }
                     }
@@ -598,6 +661,8 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // G20 advisory surface: chosen CFIE inference decisions per non-pruned
     // layer.  Empty (gate off) keeps the plan byte-identical to today.
     let cfie_inference = surface_from_plan(&inter, &cfie_choices, &ilp_constraints);
+    // CPKD advisory surface (v1): same contract as the CFIE sidecar.
+    let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_constraints);
 
     WggoPlan {
         mode: effective_mode,
@@ -613,6 +678,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         estimated_solve_us: t0.elapsed().as_micros() as u64,
         warnings,
         cfie_inference,
+        cpkd_distill,
     }
 }
 
@@ -1790,5 +1856,69 @@ mod tests {
         let plan = run_on_wengert(&w, "H100", "full", 8).expect("plan");
         assert_eq!(plan.mode, WggoMode::Full);
         assert!(!plan.inter_layer.layers.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CPKD distillation sidecar (v1) — driver surface.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cpkd_gate_off_plan_and_report_are_free_of_cpkd() {
+        // Production default (no explicit constraints => cpkd: None): the
+        // plan sidecar is empty, the report has no "[cpkd]" section, and
+        // the serialized plan skips the empty vec entirely.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(plan.cpkd_distill.is_empty());
+        let rep = plan.render_report();
+        assert!(
+            !rep.contains("[cpkd]"),
+            "gate-off report must not contain the advisory section"
+        );
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(
+            !json.contains("cpkd_distill"),
+            "gate-off plan JSON must skip the empty advisory vec"
+        );
+    }
+
+    #[test]
+    fn cpkd_gate_on_populates_plan_sidecar_and_report() {
+        use crate::wggo_cpkd::CpkdConfig;
+        let w = two_block_wengert();
+        let n = build_graph(&w).layers.len();
+        let mut cons = LayerIlpConstraints::default();
+        cons.cpkd = Some(CpkdConfig {
+            // Favorable net charge so feature matching is advised on.
+            feature_cost_us: -15.0,
+            ..Default::default()
+        });
+        let mut inp = toy_input(&w);
+        inp.ilp_constraints = vec![cons; n];
+        let plan = run(inp);
+
+        assert!(
+            !plan.cpkd_distill.is_empty(),
+            "gate on must surface advisory decisions on the plan"
+        );
+        for d in &plan.cpkd_distill {
+            assert!(d.choice.feature_match);
+            assert!(!d.choice.attn_transfer, "deferred axis stays off");
+            assert!(!d.choice.teacher_stream, "deferred axis stays off");
+            assert!(!d.layer_name.is_empty());
+            assert!(d.note.contains("distill_us/step/layer"));
+            assert!(d.note.contains("ADVISORY"));
+        }
+
+        let rep = plan.render_report();
+        assert!(rep.contains("[cpkd] Distillation decisions (advisory):"));
+        assert!(rep.contains("Report-only in v1"));
+        assert!(rep.contains("feature_match=on"));
+        assert!(rep.contains("attn_transfer=off"));
+        assert!(rep.contains("[cpkd]   Cost model: distill_us/step/layer"));
+
+        // Serialized plan carries the advisory vec when (and only when) on.
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(json.contains("cpkd_distill"));
     }
 }

@@ -583,6 +583,48 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // CPKD: @fused_kl_ce attaches only to a `distill`
+                        // block (mirrors the @fused_lm_ce/train gating above,
+                        // including the same-block-duplicate refusal).
+                        if dname == "fused_kl_ce" {
+                            if !matches!(&stmt.kind, StmtKind::DistillBlock(_)) {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@fused_kl_ce may only be applied to a `distill` block"
+                                            .to_string(),
+                                    )
+                                    .with_label(deco.span, "invalid @fused_kl_ce target"),
+                                );
+                            } else if self
+                                .fused_kl_ce_configs
+                                .iter()
+                                .any(|c| c.distill_block_stmt_id == stmt.id)
+                            {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@fused_kl_ce: at most one decorator per `distill` \
+                                         block (this distill block already has one)."
+                                            .to_string(),
+                                    )
+                                    .with_label(deco.span, "duplicate @fused_kl_ce decorator"),
+                                );
+                            } else {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
+                                };
+                                if let Some(mut cfg) =
+                                    crate::cpkd::validate_fused_kl_ce_decorator(
+                                        deco,
+                                        &resolve,
+                                        &mut self.diagnostics,
+                                    )
+                                {
+                                    cfg.distill_block_stmt_id = stmt.id;
+                                    self.fused_kl_ce_configs.push(cfg);
+                                }
+                            }
+                        }
+
                         // WRGA: @wrga / @freeze / @adapter decorator validation.
                         // Validated configs are captured so codegen's
                         // `wrga::run` driver can consume them later.
@@ -1256,6 +1298,7 @@ impl<'a> TypeChecker<'a> {
             }
             // ML blocks: walk children for name resolution but defer validation
             StmtKind::TrainBlock(train) => self.check_train_block(train),
+            StmtKind::DistillBlock(distill) => self.check_distill_block(distill),
             StmtKind::GradBlock(grad) => {
                 self.check_expr(&grad.targets);
                 self.check_block(&grad.body, ScopeKind::Block);

@@ -47,6 +47,7 @@ fn run_build_shared_single(
     options.wrga_inputs =
         Some(crate::pipeline::analysis_to_wrga_inputs(&analysis, &options.wrga_check));
     options.fused_ce_configs = crate::pipeline::analysis_to_fused_ce_configs(&analysis);
+    options.fused_kl_ce_configs = crate::pipeline::analysis_to_fused_kl_ce_configs(&analysis);
     options.pca_user_strategies = crate::pipeline::analysis_to_pca_user_strategies(&analysis);
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the shared-library path.
@@ -351,6 +352,7 @@ fn run_build_shared_multi(
                 &entry_options.wrga_check,
             ));
             entry_options.fused_ce_configs = crate::pipeline::module_data_to_fused_ce_configs(mod_data);
+            entry_options.fused_kl_ce_configs = crate::pipeline::module_data_to_fused_kl_ce_configs(mod_data);
             entry_options.pca_user_strategies = crate::pipeline::module_data_to_pca_user_strategies(mod_data);
             // Sprint 2 (paper §6.2): forward entry-module @csha decorator
             // configs so per-model disable/level/target overrides take

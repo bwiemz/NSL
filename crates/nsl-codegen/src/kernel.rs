@@ -45,6 +45,7 @@ pub(crate) fn stmt_kind_name(kind: &StmtKind) -> &'static str {
         StmtKind::Import(_) => "import statement",
         StmtKind::FromImport(_) => "from-import statement",
         StmtKind::TrainBlock(_) => "train block",
+        StmtKind::DistillBlock(_) => "distill block",
         StmtKind::GradBlock(_) => "grad block",
         StmtKind::QuantBlock(_) => "quant block",
         StmtKind::KernelDef(_) => "nested kernel definition",

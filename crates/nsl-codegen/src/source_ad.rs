@@ -1260,6 +1260,46 @@ impl AdjointGenerator {
                 vec![grad, x, w, bias, targets, fwd_result],
             ),
 
+            // CPKD: fused KL-CE backward extract. Lowers to a
+            // `FusedKlCeBackwardExtract` op with the inputs the wengert
+            // lowerer expects:
+            //   [grad, x_s, W_s, bias_s, x_t, W_t, bias_t, targets, fwd_result]
+            AdjointExpr::FusedKlCeBackward {
+                grad,
+                fwd_inputs,
+                fwd_result,
+                component,
+                vocab_size,
+                student_hidden,
+                teacher_hidden,
+                batch_size,
+                seq_len,
+                vocab_tile,
+                ignore_index,
+                alpha_bits,
+                temperature_bits,
+            } => {
+                let mut inputs = Vec::with_capacity(9);
+                inputs.push(grad);
+                inputs.extend_from_slice(&fwd_inputs);
+                inputs.push(fwd_result);
+                self.emit_op(
+                    PrimalOp::FusedKlCeBackwardExtract {
+                        component,
+                        vocab_size,
+                        student_hidden,
+                        teacher_hidden,
+                        batch_size,
+                        seq_len,
+                        vocab_tile,
+                        ignore_index,
+                        alpha_bits,
+                        temperature_bits,
+                    },
+                    inputs,
+                )
+            }
+
             // --- RoPE backward: apply inverse rotation (rotate by -θ) ---
             // RoPE(x, θ) = R(θ)·x, so d/dx = R(θ)^T = R(-θ).
             // Negating the input is WRONG (that's reflection, not inverse rotation).
@@ -1544,6 +1584,16 @@ pub struct WengertExtractor<'a> {
     /// composite path is used (preserving v1's safety + the composite-
     /// fallback regression invariant required by Sprint 4 spec).
     fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
+    /// CPKD: the active `@fused_kl_ce(...)` config for this distill block
+    /// plus the `loss:` section's alpha/temperature for cross-checking the
+    /// call-site literals (None outside distill blocks — the builtin arm
+    /// then falls through to the stdlib composite, which forces tape AD
+    /// and is refused by the distill lowering).
+    fused_kl_ce_config: Option<crate::FusedKlCeDecoratorConfig>,
+    /// CPKD: (alpha, temperature) from the distill `loss:` section, used
+    /// only to refuse a divergent call-site literal (loud consistency
+    /// check between the report surface and the kernel constants).
+    distill_loss_alpha_temp: (Option<f64>, Option<f64>),
     /// CFTP v10 (item 5): known tensor rank per VarId, when the frontend
     /// could derive it (from an annotated function-parameter type or a
     /// rank-preserving op).  Populated by `register_input_with_rank` /
@@ -1571,6 +1621,22 @@ pub struct WengertExtractor<'a> {
     /// anything else?" check is exact (no false negatives from
     /// substitution-time scans that haven't yet seen later uses).
     pending_fused_lce_prunes: Vec<FusedLceMatch>,
+    /// CPKD (I-11): variable roots whose model fields are FROZEN — the
+    /// distill block's teacher instance.  A model-field access whose
+    /// compound name is rooted at one of these (e.g. `teacher.wq`,
+    /// `teacher.blocks.0.attn.wk`) registers as a `PrimalOp::Input`
+    /// leaf instead of a `Param`.  No adjoint is ever generated for an
+    /// Input, so the teacher's backward is structurally absent from the
+    /// tape (composition-paper invariant I-11 / failure mode F-06: no
+    /// teacher gradient buffers, no teacher weight drift).
+    frozen_model_roots: HashSet<String>,
+    /// CPKD: compound names + VarIds of frozen model-field Input leaves
+    /// (parallel to `named_param_vars` but explicitly non-trainable).
+    /// The distill lowering resolves these to Cranelift values via
+    /// `load_source_ad_named_param` so the teacher forward can read its
+    /// weights; they are never handed to the optimizer or gradient
+    /// collection.
+    frozen_input_vars: Vec<(String, VarId)>,
 }
 
 /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1):
@@ -1624,6 +1690,10 @@ impl<'a> WengertExtractor<'a> {
             fused_ce_config: None,
             known_ranks: HashMap::new(),
             pending_fused_lce_prunes: Vec::new(),
+            fused_kl_ce_config: None,
+            distill_loss_alpha_temp: (None, None),
+            frozen_model_roots: HashSet::new(),
+            frozen_input_vars: Vec::new(),
         }
     }
 
@@ -1726,6 +1796,20 @@ impl<'a> WengertExtractor<'a> {
         cfg: Option<crate::FusedCeDecoratorConfig>,
     ) -> Self {
         self.fused_ce_config = cfg;
+        self
+    }
+
+    /// CPKD: install the active `@fused_kl_ce` decorator config plus the
+    /// distill `loss:` section's (alpha, temperature) for the call-site
+    /// literal cross-check.
+    pub fn with_fused_kl_ce_config(
+        mut self,
+        cfg: Option<crate::FusedKlCeDecoratorConfig>,
+        loss_alpha: Option<f64>,
+        loss_temperature: Option<f64>,
+    ) -> Self {
+        self.fused_kl_ce_config = cfg;
+        self.distill_loss_alpha_temp = (loss_alpha, loss_temperature);
         self
     }
 
@@ -2182,6 +2266,31 @@ impl<'a> WengertExtractor<'a> {
         self.self_context = ctx;
     }
 
+    /// CPKD (I-11): mark variable roots (e.g. the distill teacher instance
+    /// name) whose model fields must register as non-trainable `Input`
+    /// leaves.  Must be called BEFORE `extract_stmts` — freezing is applied
+    /// at field-registration time, not retroactively.
+    pub fn set_frozen_model_roots(&mut self, roots: HashSet<String>) {
+        self.frozen_model_roots = roots;
+    }
+
+    /// CPKD: compound-name/VarId pairs for frozen model-field Input leaves
+    /// (teacher weights).  The distill lowering resolves each to a Cranelift
+    /// value; they never reach the optimizer.
+    pub fn frozen_input_var_ids(&self) -> &[(String, VarId)] {
+        &self.frozen_input_vars
+    }
+
+    /// CPKD: true when a model-field compound name (`teacher.wq`,
+    /// `teacher.blocks.0.attn.wk`) is rooted at a frozen model instance.
+    fn is_frozen_compound(&self, compound: &str) -> bool {
+        if self.frozen_model_roots.is_empty() {
+            return false;
+        }
+        let root = compound.split('.').next().unwrap_or("");
+        self.frozen_model_roots.contains(root)
+    }
+
     /// Get named parameter VarIds with their compound names.
     /// Returns (compound_name, VarId) pairs for gradient collection.
     pub fn named_param_var_ids(&self) -> &[(String, VarId)] {
@@ -2442,8 +2551,6 @@ impl<'a> WengertExtractor<'a> {
                     }
 
                     if is_model_param {
-                        self.param_symbols.insert(*member);
-                        self.named_param_vars.push((compound.clone(), var));
                         // CFTP v10 (item 5): populate `known_ranks` when
                         // the enclosing model recorded a declared rank
                         // for this field (via `collection.rs`).  Without
@@ -2462,14 +2569,32 @@ impl<'a> WengertExtractor<'a> {
                                 self.known_ranks.insert(var, r);
                             }
                         }
-                        self.push_op(WengertOp {
-                            id: self.list.ops.len() as u32,
-                            result: var,
-                            op: PrimalOp::Param(compound),
-                            inputs: vec![],
-                            saved_for_backward: false,
-                            checkpointed: false,
-                        });
+                        if self.is_frozen_compound(&compound) {
+                            // CPKD (I-11): frozen (teacher) model field —
+                            // register as an Input leaf.  Inputs receive no
+                            // adjoint, so the teacher backward is
+                            // structurally absent (F-06 guard).
+                            self.frozen_input_vars.push((compound.clone(), var));
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result: var,
+                                op: PrimalOp::Input(compound),
+                                inputs: vec![],
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                        } else {
+                            self.param_symbols.insert(*member);
+                            self.named_param_vars.push((compound.clone(), var));
+                            self.push_op(WengertOp {
+                                id: self.list.ops.len() as u32,
+                                result: var,
+                                op: PrimalOp::Param(compound),
+                                inputs: vec![],
+                                saved_for_backward: false,
+                                checkpointed: false,
+                            });
+                        }
                     } else {
                         // Data access (e.g., batch.input_ids) — emit a dict_get op
                         // that depends on the object value, not a disconnected leaf.
@@ -2559,12 +2684,11 @@ impl<'a> WengertExtractor<'a> {
                                 if let Some(vid) = existing {
                                     Some(vid)
                                 } else {
-                                    // Register as a Param leaf.
+                                    // Register as a Param leaf (or a frozen
+                                    // Input leaf for CPKD teacher fields).
                                     let var = self.alloc_var();
                                     self.symbol_to_var.insert(*sym, var);
                                     self.list.var_names.insert(var, compound.clone());
-                                    self.param_symbols.insert(*sym);
-                                    self.named_param_vars.push((compound.clone(), var));
                                     // CFTP v10 (item 5): mirror the
                                     // MemberAccess-site rank plumbing so
                                     // pipe-RHS model-field accesses
@@ -2585,14 +2709,32 @@ impl<'a> WengertExtractor<'a> {
                                             self.known_ranks.insert(var, r);
                                         }
                                     }
-                                    self.push_op(WengertOp {
-                                        id: self.list.ops.len() as u32,
-                                        result: var,
-                                        op: PrimalOp::Param(compound),
-                                        inputs: vec![],
-                                        saved_for_backward: false,
-                                        checkpointed: false,
-                                    });
+                                    if self.is_frozen_compound(&compound) {
+                                        // CPKD (I-11): teacher field via
+                                        // pipe — Input leaf, no adjoint.
+                                        self.frozen_input_vars
+                                            .push((compound.clone(), var));
+                                        self.push_op(WengertOp {
+                                            id: self.list.ops.len() as u32,
+                                            result: var,
+                                            op: PrimalOp::Input(compound),
+                                            inputs: vec![],
+                                            saved_for_backward: false,
+                                            checkpointed: false,
+                                        });
+                                    } else {
+                                        self.param_symbols.insert(*sym);
+                                        self.named_param_vars
+                                            .push((compound.clone(), var));
+                                        self.push_op(WengertOp {
+                                            id: self.list.ops.len() as u32,
+                                            result: var,
+                                            op: PrimalOp::Param(compound),
+                                            inputs: vec![],
+                                            saved_for_backward: false,
+                                            checkpointed: false,
+                                        });
+                                    }
                                     Some(var)
                                 }
                             } else {
@@ -2950,6 +3092,122 @@ impl<'a> WengertExtractor<'a> {
                     // decorators.  This honours the Sprint 4 regression
                     // invariant: a program without `@fused_lm_ce` always emits
                     // the composite.
+                    // CPKD: user-facing `fused_kl_ce(x_s, W_s, b_s, x_t, W_t,
+                    // b_t, targets, alpha, temperature)`. Recognised as a
+                    // single PrimalOp::FusedKlCe when the enclosing distill
+                    // block carries `@fused_kl_ce(enabled=true)` with all
+                    // five shape hints. alpha/temperature must be numeric
+                    // LITERALS in v1 (they bake into the op as compile-time
+                    // constants) and must agree with the distill `loss:`
+                    // section when it specifies them.
+                    "fused_kl_ce" => {
+                        if args.len() != 9 {
+                            eprintln!(
+                                "[source-ad] fused_kl_ce expected 9 args (x_s, W_s, bias_s, \
+                                 x_t, W_t, bias_t, targets, alpha, temperature), got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        let lit_f64 = |e: &nsl_ast::expr::Expr| -> Option<f64> {
+                            match e.kind {
+                                ExprKind::FloatLiteral(v) => Some(v),
+                                ExprKind::IntLiteral(v) => Some(v as f64),
+                                _ => None,
+                            }
+                        };
+                        let (Some(alpha), Some(temperature)) =
+                            (lit_f64(&args[7].value), lit_f64(&args[8].value))
+                        else {
+                            eprintln!(
+                                "[source-ad] fused_kl_ce: alpha and temperature must be \
+                                 numeric literals in v1 (compile-time kernel constants)"
+                            );
+                            return None;
+                        };
+                        // Consistency with the distill loss: section — a
+                        // divergent literal would make the build report lie.
+                        let (loss_alpha, loss_temp) = self.distill_loss_alpha_temp;
+                        if let Some(la) = loss_alpha {
+                            if (la - alpha).abs() > 1e-12 {
+                                eprintln!(
+                                    "[source-ad] fused_kl_ce: call-site alpha {alpha} \
+                                     != distill loss: section alpha {la}"
+                                );
+                                return None;
+                            }
+                        }
+                        if let Some(lt) = loss_temp {
+                            if (lt - temperature).abs() > 1e-12 {
+                                eprintln!(
+                                    "[source-ad] fused_kl_ce: call-site temperature \
+                                     {temperature} != distill loss: section temperature {lt}"
+                                );
+                                return None;
+                            }
+                        }
+                        if let Some(cfg) = self.fused_kl_ce_config.as_ref() {
+                            if cfg.enabled {
+                                if let (Some(v), Some(hs), Some(ht), Some(b), Some(s)) = (
+                                    cfg.vocab_size,
+                                    cfg.student_hidden,
+                                    cfg.teacher_hidden,
+                                    cfg.batch_size,
+                                    cfg.seq_len,
+                                ) {
+                                    let vt = cfg.vocab_tile.unwrap_or(
+                                        crate::cpkd_fused_loss::FusedKlCeConfig::default()
+                                            .vocab_tile,
+                                    );
+                                    let seven: Vec<VarId> =
+                                        input_vars[0..7].to_vec();
+                                    self.push_op(WengertOp {
+                                        id: self.list.ops.len() as u32,
+                                        result,
+                                        op: PrimalOp::FusedKlCe {
+                                            vocab_size: v,
+                                            student_hidden: hs,
+                                            teacher_hidden: ht,
+                                            batch_size: b,
+                                            seq_len: s,
+                                            vocab_tile: vt,
+                                            ignore_index: -100,
+                                            alpha_bits: alpha.to_bits(),
+                                            temperature_bits: temperature.to_bits(),
+                                        },
+                                        inputs: seven,
+                                        saved_for_backward: false,
+                                        checkpointed: false,
+                                    });
+                                    return Some(result);
+                                }
+                            }
+                        }
+                        // Fall through: composite expansion via the stdlib
+                        // `fused_kl_ce` body (tape AD — refused inside
+                        // distill blocks, so an incomplete/missing decorator
+                        // there surfaces as a loud compile error). Name the
+                        // exact precondition so the refusal is actionable
+                        // rather than a bare "extraction failed".
+                        match self.fused_kl_ce_config.as_ref() {
+                            None => eprintln!(
+                                "[source-ad] fused_kl_ce called without an active \
+                                 @fused_kl_ce decorator config; add \
+                                 @fused_kl_ce(enabled=true, vocab_size=, hidden_size=, \
+                                 teacher_hidden=, batch_size=, seq_len=) to the distill block"
+                            ),
+                            Some(cfg) if !cfg.enabled => eprintln!(
+                                "[source-ad] fused_kl_ce: @fused_kl_ce is present but \
+                                 enabled=false; set enabled=true to activate the fused kernel"
+                            ),
+                            Some(_) => eprintln!(
+                                "[source-ad] fused_kl_ce: @fused_kl_ce is enabled but one of \
+                                 the shape hints (vocab_size, hidden_size, teacher_hidden, \
+                                 batch_size, seq_len) is missing"
+                            ),
+                        }
+                        return None;
+                    }
                     "fused_linear_ce" => {
                         if args.len() != 4 {
                             eprintln!(
