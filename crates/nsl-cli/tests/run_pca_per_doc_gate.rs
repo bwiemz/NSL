@@ -93,7 +93,11 @@ train(model = m, epochs = 1):
         let out = m.forward(x)
         let loss = mse_loss(out, x)
 "#,
-        corpus = corpus.display()
+        // Embed the path into an NSL string literal with forward slashes. On
+        // Windows `Path::display()` yields backslashes, which the NSL lexer reads
+        // as escape sequences, corrupting the `source = "..."` path so the run
+        // never reaches the admission gate. Forward slashes are valid on Windows.
+        corpus = corpus.to_string_lossy().replace('\\', "/")
     );
     let fixture = tmp.join("pca_gate.nsl");
     std::fs::write(&fixture, source).unwrap();
