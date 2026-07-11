@@ -510,6 +510,13 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
+        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto`
+        /// so one invocation runs WGGO planning and applies CSHA + FASE per the
+        /// plan. Explicit flags win (only unset values are filled); conflicts
+        /// with `--tape-ad` (the planning stack lives in the source-AD path).
+        #[arg(long, conflicts_with = "tape_ad")]
+        pub(crate) pretrain_optimized: bool,
+
         /// Debug training: disable fusion + FBIP, emit gradient checksums
         #[arg(long)]
         pub(crate) debug_training: bool,
@@ -792,6 +799,13 @@ pub(crate) struct RunArgs {
         /// Use compile-time source-to-source AD instead of runtime tape AD
         #[arg(long)]
         pub(crate) source_ad: bool,
+
+        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto`
+        /// so one invocation runs WGGO planning and applies CSHA + FASE per the
+        /// plan. Explicit flags win (only unset values are filled); conflicts
+        /// with `--tape-ad` (the planning stack lives in the source-AD path).
+        #[arg(long, conflicts_with = "tape_ad")]
+        pub(crate) pretrain_optimized: bool,
 
         /// Debug training: disable fusion + FBIP, emit gradient checksums
         #[arg(long)]
