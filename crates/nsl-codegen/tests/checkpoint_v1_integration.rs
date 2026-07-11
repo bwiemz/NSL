@@ -146,6 +146,34 @@ fn g2_r7_pca_packing_with_rope_q_refuses() {
 }
 
 #[test]
+fn g2_r7_plain_rope_q_without_segment_masked_refuses() {
+    // R7 (Phase 1.3 generalized): rope_q=true + checkpoint composition
+    // must refuse even when segment_masked=false. Commit 8f774ad
+    // unblocked *compilation* of this combination (declared the missing
+    // %r_rope_cs_row register for the checkpoint kv-recompute backward)
+    // but explicitly left the numerics broken ("Path B's remaining GROSS
+    // numerical error ... never-GPU-validated ... tracked for
+    // follow-up"). Regression guard: without this refusal, checkpoint +
+    // RoPE (a common training combo) silently compiles and runs to wrong
+    // gradients instead of refusing.
+    let mut cfg = base_fusible();
+    cfg.rope_q = true;
+    assert!(
+        !cfg.segment_masked,
+        "test scaffolding bug: segment_masked must stay false so this \
+         exercises the plain rope_q case, not the original segment_masked \
+         && rope_q predicate"
+    );
+    let err = synthesize_backward_with_tier(&cfg).expect_err(
+        "R7: plain rope_q under @checkpoint must refuse even without segment_masked",
+    );
+    assert!(
+        err.contains("rope_q=true") && err.contains("checkpoint"),
+        "R7 missing expected substring: {err}"
+    );
+}
+
+#[test]
 fn g2_r9_paged_kv_collision_refuses() {
     // R9: `paged_kv_collision = true` flag on the carrier signals the
     // enclosing fn was also `@paged_kv`-decorated.

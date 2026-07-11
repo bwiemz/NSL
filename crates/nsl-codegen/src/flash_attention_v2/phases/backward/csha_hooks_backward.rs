@@ -1308,9 +1308,15 @@ fn emit_one_recompute_matmul(
 /// matching the dispatch fork in `mod.rs:934-935`); it must be unique
 /// within the emitted PTX text section.
 ///
-/// Production callers reach this only via the test-only R0 bypass set
-/// by `CheckpointExtras::bypass_r0_for_testing()` (cycle-11 Task 1).
-/// R0 stays in production until cycle-12 GPU validation lifts it.
+/// PRODUCTION-REACHABLE since cycle 12: the unconditional R0 catch-all was
+/// retired ("R0 narrowed to R3/R11/R12", see mod.rs cycle-12 §1 notes), so
+/// `@checkpoint(policy="full")` configs inside the eligible set dispatch
+/// here in real builds — the old "test-only R0 bypass" claim was stale.
+/// What keeps WRONG numerics out of production today is the specific
+/// refusal set (R3/R7/R8.1/R9/R10/R11/R12), including the generalized R7
+/// that refuses any `rope_q` under @checkpoint; the non-rope Path-B
+/// numerics remain unvalidated on GPU (four #[ignore]d oracles in
+/// csha_checkpoint_recompute_gpu.rs).
 pub fn emit_kv_recompute(
     ptx: &mut String,
     config: &FlashAttentionConfig,
@@ -1337,13 +1343,17 @@ pub fn emit_kv_recompute(
     // below. Sub-blocks (`{ ... }`) give us scope without conflict with
     // the outer kernel's register pool.
     //
-    // KNOWN-INCOMPLETE per cycle 14: emit_rope_k_epilogue (step 5) reuses
-    // registers declared by the forward prelude (%rd_rope_cos, %rd_rope_sin,
-    // %p_rope_skip, %r_rope_*, %rd_rope_*, %h_rope_pair, ...). The forward
-    // prelude pre-declares them; the backward prelude does not. Cycle 15
-    // adds either a full backward-side rope register block in
-    // phases/backward/prelude.rs or factors the rope decls into a shared
-    // helper. This sub-block declares only what step 1 needs.
+    // HISTORY (stale "KNOWN-INCOMPLETE" note removed): the backward-prelude
+    // rope registers this block once lacked (%rd_rope_cos/%rd_rope_sin/
+    // %p_rope_skip/%r_rope_*/%h_rope_pair, plus %r_rope_cs_row) were declared
+    // by the cycle-15 cross-prelude fix and 8f774ada, merged via PR #323 —
+    // the register gap is CLOSED. What remains OPEN is the Path-B
+    // kv-recompute NUMERICS: 8f774ada's own message records a "GROSS
+    // numerical error (kv_recompute math at multi-tile) ... never-GPU-
+    // validated", and the four csha_checkpoint_recompute_gpu.rs oracles are
+    // still #[ignore]d. Until one green GPU pass lands, the generalized R7
+    // refusal in validate_checkpoint_eligibility keeps rope_q + @checkpoint
+    // out of production. This sub-block declares only what step 1 needs.
     ptx.push_str("    { // Cycle-14 kv_recompute null-guard reg scope\n");
     ptx.push_str("    .reg .u64 %rd_kvr_xraw;\n");
     ptx.push_str("    .reg .pred %p_kvr_xraw_null;\n");
