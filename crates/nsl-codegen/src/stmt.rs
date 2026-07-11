@@ -40,7 +40,7 @@ fn is_trainable_param_leaf_name(param_name: &str) -> bool {
 /// rank check runs only when the frontend gave us a rank ≥ 1 to check.
 /// A `Borrow(Tensor)` is unwrapped so annotated `&Tensor<[V,H]>`
 /// parameters (common for `W` in NSL step signatures) participate too.
-fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
+pub(crate) fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
     let inner = match ty {
         Type::Borrow(inner) => inner.as_ref(),
         other => other,
@@ -3463,7 +3463,22 @@ impl Compiler<'_> {
         // reentry loses the slot.
         let saved_active_fused_ce =
             self.set_active_fused_ce_config_for_train_block(train_block_stmt_id);
-        let result = self.compile_train_block_inner(builder, state, train);
+        // WGGO-before-kernels: install THIS block's pre-plan overrides — or
+        // explicitly `None`, never a previous block's leftovers (the pre-
+        // restructure stale-leak) — BEFORE the body compiles. FASE recipe
+        // selection and the per-param mode table read `self.wggo_overrides`
+        // well before the in-place planning site in the same function; the
+        // pre-pass is what finally lets them see the plan they were written
+        // to consume. The offer is validated against the codegen-time
+        // extraction at the planning site (graph-fingerprint check) and
+        // replaced by an in-place solve on mismatch.
+        self.wggo_overrides = self
+            .wggo_preplans
+            .iter()
+            .find(|p| p.train_block_stmt_id == train_block_stmt_id)
+            .map(|p| p.overrides.clone());
+        let result =
+            self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
         self.restore_active_fused_ce_config(saved_active_fused_ce);
         result
     }
@@ -3477,6 +3492,7 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
         train: &nsl_ast::block::TrainBlock,
+        train_block_stmt_id: nsl_ast::NodeId,
     ) -> Result<(), CodegenError> {
 
         let saved_variables = state.variables.clone();
@@ -4510,15 +4526,83 @@ impl Compiler<'_> {
                         // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
                         // calibrate wrapper).
                         let weights_path = self.compile_options.wggo.weights.as_deref();
-                        let plan = crate::wggo::run_on_wengert_with_weights(
-                            extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
-                            self.compile_options.world_size,
-                            weights_path,
-                            analysis_config,
-                            Some(&self.compile_options),
-                        );
+                        // WGGO-before-kernels: consume this block's pre-plan
+                        // when its graph fingerprint matches the extraction
+                        // we just did (the list codegen actually lowers, and
+                        // that wggo_prune may rewrite — indices must refer to
+                        // THIS graph). On mismatch, reject loudly and solve
+                        // in place; if the fresh plan then disagrees with the
+                        // pre-plan on any FASE-relevant decision, warn — the
+                        // per-param mode table was already emitted from the
+                        // pre-plan's overrides earlier in this function.
+                        let preplan = self
+                            .wggo_preplans
+                            .iter()
+                            .find(|p| p.train_block_stmt_id == train_block_stmt_id);
+                        let reused_plan = preplan.and_then(|pre| {
+                            let fp = crate::wggo_prepass::fingerprint_wengert(
+                                extractor.wengert_list(),
+                            );
+                            if fp == pre.graph_fingerprint {
+                                // Additive observability line (tests key off
+                                // it); the [wggo] summary itself still prints
+                                // below, identically to the in-place path.
+                                eprintln!(
+                                    "[wggo] consumed pre-solved plan \
+                                     (graph fingerprint match)"
+                                );
+                                Some(pre.plan.clone())
+                            } else {
+                                eprintln!(
+                                    "[wggo] wggo-preplan-rejected \
+                                     reason=graph_fingerprint_mismatch — replanning in place"
+                                );
+                                None
+                            }
+                        });
+                        let preplan_was_rejected =
+                            preplan.is_some() && reused_plan.is_none();
+                        let plan = match reused_plan {
+                            Some(plan) => Some(plan),
+                            None => crate::wggo::run_on_wengert_with_weights(
+                                extractor.wengert_list(),
+                                &self.compile_options.target,
+                                mode_str,
+                                self.compile_options.world_size,
+                                weights_path,
+                                analysis_config,
+                                Some(&self.compile_options),
+                            ),
+                        };
+                        if preplan_was_rejected {
+                            if let (Some(pre), Some(fresh)) = (preplan, plan.as_ref()) {
+                                let fresh_overrides =
+                                    crate::wggo_overrides::WggoOverrides::from_applied(
+                                        &fresh.applied,
+                                    );
+                                let fase_diverged = pre.overrides.per_layer.len()
+                                    != fresh_overrides.per_layer.len()
+                                    || pre
+                                        .overrides
+                                        .per_layer
+                                        .iter()
+                                        .zip(fresh_overrides.per_layer.iter())
+                                        .any(|(a, b)| {
+                                            a.layer_name != b.layer_name
+                                                || a.fase_fused != b.fase_fused
+                                        });
+                                if fase_diverged {
+                                    eprintln!(
+                                        "[wggo] WARNING: the FASE per-param mode table was \
+                                         built from the rejected pre-plan and the in-place \
+                                         plan disagrees on fase_fused — per-param FASE \
+                                         modes for this train block may not match the \
+                                         final plan (rerun with --wggo off to rule the \
+                                         table out when debugging)"
+                                    );
+                                }
+                            }
+                        }
                         if let Some(plan) = plan {
                             if self.compile_options.wggo.report {
                                 eprintln!("{}", plan.render_report());
