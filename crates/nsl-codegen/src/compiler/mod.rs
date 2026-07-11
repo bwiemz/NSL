@@ -281,6 +281,27 @@ impl MemoryPlanState {
 pub struct GpuKernelState {
     pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
     pub flash_attention_context: Option<FlashAttentionCompileContext>,
+    /// Decorator-free SDPA backward variant table, keyed by the op's static
+    /// `causal` flag. Populated lazily by `ensure_sdpa_bwd_variant_table`
+    /// the first time a `FlashAttentionBackwardExtract` lowers without a
+    /// decorated backward context, so programs that never take the SDPA
+    /// backward carry no extra .rodata.
+    pub sdpa_bwd_variants: HashMap<bool, Vec<SdpaBwdVariant>>,
+}
+
+/// One per-head_dim entry of the decorator-free SDPA backward variant table:
+/// the two backward-phase PTX modules plus their entry-name strings, embedded
+/// in .rodata. The phase-2 PTX body bakes head_dim into its shared-memory
+/// strides and MMA tile counts, so an entry is only correct for tensors whose
+/// runtime head_dim equals `head_dim` — the lowering selects on that equality
+/// and falls back to null pointers (CPU backward) for any other dim.
+#[derive(Clone, Copy)]
+pub struct SdpaBwdVariant {
+    pub head_dim: i64,
+    pub phase1_ptx: DataId,
+    pub phase1_name: DataId,
+    pub phase2_ptx: DataId,
+    pub phase2_name: DataId,
 }
 
 impl GpuKernelState {
@@ -288,6 +309,7 @@ impl GpuKernelState {
         Self {
             kernel_ptx_data: HashMap::new(),
             flash_attention_context: None,
+            sdpa_bwd_variants: HashMap::new(),
         }
     }
 }

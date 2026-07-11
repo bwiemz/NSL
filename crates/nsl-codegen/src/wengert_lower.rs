@@ -9,7 +9,7 @@ use crate::wengert::{
     type_for_op, CompareKind, ConvGradKind, PrimalOp, VarId, WengertList, WengertOp, WengertType,
 };
 use crate::CodegenError;
-use cranelift_codegen::ir::{types as cl_types, InstBuilder, Value};
+use cranelift_codegen::ir::{condcodes::IntCC, types as cl_types, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 use std::collections::HashMap;
@@ -1745,31 +1745,57 @@ fn lower_single_op(
 
                 let causal_val = builder.ins().iconst(cl_types::I64, if *causal { 1 } else { 0 });
 
-                // Load backward PTX data pointers from .rodata (if available)
-                let (p1_ptx, p1_name, p2_ptx, p2_name) = {
-                    let ctx = compiler.kernels.flash_attention_context.as_ref();
-                    let p1_did = ctx.and_then(|c| c.bwd_phase1_data_id);
-                    let p1_name_did = ctx.and_then(|c| c.bwd_phase1_name_data_id);
-                    let p2_did = ctx.and_then(|c| c.bwd_phase2_data_id);
-                    let p2_name_did = ctx.and_then(|c| c.bwd_phase2_name_data_id);
-
-                    let load_data_ptr = |did: Option<cranelift_module::DataId>,
-                                         builder: &mut FunctionBuilder,
-                                         module: &mut cranelift_object::ObjectModule|
-                                         -> Value {
-                        if let Some(id) = did {
-                            let gv = module.declare_data_in_func(id, builder.func);
-                            builder.ins().symbol_value(cl_types::I64, gv)
-                        } else {
-                            builder.ins().iconst(cl_types::I64, 0)
+                // Load backward PTX data pointers from .rodata.
+                //
+                // Decorated programs carry a single backward pair (specialized
+                // for the decorator's head_dim) in flash_attention_context.
+                // Decorator-free programs — every plain stdlib model — used to
+                // get four null pointers here, which silently routed the whole
+                // attention backward through the CPU reference (the PR #335
+                // wiring gap). They now get the per-head_dim variant table:
+                // the op's `causal` is static, head_dim is only known at
+                // runtime, so we embed one backward pair per supported
+                // head_dim and select with an equality chain on the runtime
+                // head_dim value. Unmatched dims select null and keep the
+                // CPU fallback.
+                let ctx_bwd = compiler.kernels.flash_attention_context.as_ref().and_then(|c| {
+                    Some((
+                        c.bwd_phase1_data_id?,
+                        c.bwd_phase1_name_data_id?,
+                        c.bwd_phase2_data_id?,
+                        c.bwd_phase2_name_data_id?,
+                    ))
+                });
+                let (p1_ptx, p1_name, p2_ptx, p2_name) = if let Some(ids) = ctx_bwd {
+                    let mut ptrs = Vec::with_capacity(4);
+                    for id in [ids.0, ids.1, ids.2, ids.3] {
+                        let gv = compiler.module.declare_data_in_func(id, builder.func);
+                        ptrs.push(builder.ins().symbol_value(cl_types::I64, gv));
+                    }
+                    (ptrs[0], ptrs[1], ptrs[2], ptrs[3])
+                } else {
+                    let variants = compiler.ensure_sdpa_bwd_variant_table(*causal)?;
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    let mut sel = [zero; 4];
+                    for variant in &variants {
+                        let is_hd = builder.ins().icmp_imm(
+                            IntCC::Equal,
+                            head_dim,
+                            variant.head_dim,
+                        );
+                        let ids = [
+                            variant.phase1_ptx,
+                            variant.phase1_name,
+                            variant.phase2_ptx,
+                            variant.phase2_name,
+                        ];
+                        for (slot, id) in sel.iter_mut().zip(ids) {
+                            let gv = compiler.module.declare_data_in_func(id, builder.func);
+                            let addr = builder.ins().symbol_value(cl_types::I64, gv);
+                            *slot = builder.ins().select(is_hd, addr, *slot);
                         }
-                    };
-
-                    let v1 = load_data_ptr(p1_did, builder, &mut compiler.module);
-                    let v2 = load_data_ptr(p1_name_did, builder, &mut compiler.module);
-                    let v3 = load_data_ptr(p2_did, builder, &mut compiler.module);
-                    let v4 = load_data_ptr(p2_name_did, builder, &mut compiler.module);
-                    (v1, v2, v3, v4)
+                    }
+                    (sel[0], sel[1], sel[2], sel[3])
                 };
 
                 // Tier-B sentinel pair (planner spec §4): the plain (non-CSHA)

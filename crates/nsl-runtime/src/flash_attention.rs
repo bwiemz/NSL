@@ -4613,6 +4613,29 @@ pub fn select_backward_blocks(head_dim: i64) -> (i64, i64) {
     }
 }
 
+/// One-shot stderr diagnostics for per-step backward fallbacks.
+///
+/// Since the decorator-free backward variant table landed, the refusal paths
+/// (ragged seq_len, unavailable config) run once per attention op per
+/// TRAINING STEP for shapes the GPU kernel can't serve — unconditional
+/// printing floods stderr with hundreds of thousands of identical lines per
+/// run where one line carries all the information. Keyed by message content,
+/// so distinct shapes/configs each still print once. Hard launch FAILURES
+/// stay unconditional — those are rare and individually meaningful.
+#[cfg(feature = "cuda")]
+fn flash_bwd_warn_once(msg: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let first = seen
+        .lock()
+        .map(|mut s| s.insert(msg.to_string()))
+        .unwrap_or(true);
+    if first {
+        eprintln!("{msg}");
+    }
+}
+
 /// GPU PTX backward dispatch: launches Phase 1 (D-correction) and Phase 2 (dQ/dK/dV)
 /// kernels entirely on GPU. No host-device transfer needed.
 ///
@@ -4652,13 +4675,13 @@ fn flash_attention_backward_gpu(
     // (1024/2048/4096) are multiples of every selector tile size, so this gate
     // only redirects genuinely-unsupported ragged shapes.
     if s % (block_q.max(1) as usize) != 0 || s % (block_kv.max(1) as usize) != 0 {
-        eprintln!(
+        flash_bwd_warn_once(&format!(
             "[flash-bwd] seq_len={s} is not a multiple of the backward tile sizes \
              (block_q={block_q}, block_kv={block_kv}) — the GPU Phase-2 kernel has no \
              ragged-tail guards and would corrupt gradients. Falling back to the \
              correct CPU backward (slower). Pad/pack sequences to a multiple of \
              {block_q} to train this shape on GPU."
-        );
+        ));
         return 0;
     }
 
@@ -5031,7 +5054,43 @@ pub extern "C" fn nsl_flash_attention_backward(
             h
         };
 
-        if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h {
+        // NSL_FLASH_DEBUG=1 narrates the backward dispatch decision. The GPU
+        // path is silent on success and the CPU fallbacks are silent by
+        // design (the tape-AD path always passes null PTX), which made the
+        // decorator-free phase1_ptx=0 wiring gap invisible for a whole
+        // campaign — this gives tests and users a positive observable.
+        let flash_debug = std::env::var("NSL_FLASH_DEBUG").ok().as_deref() == Some("1");
+
+        // NSL_FLASH_BWD_CPU=1 forces the deterministic CPU reference backward
+        // even when backward PTX is available. The GPU phase-2 kernel
+        // accumulates dK/dV with float atomicAdd, so its rounding depends on
+        // scheduling order: two training runs of the SAME program produce
+        // slightly different gradients. Anything that compares checkpoints
+        // across runs (the FASE-vs-plain-AdamW parity gate, M46-style
+        // determinism audits, bisections) needs this knob until a
+        // deterministic-reduction backward variant exists.
+        let force_cpu_bwd = std::env::var("NSL_FLASH_BWD_CPU").ok().as_deref() == Some("1");
+        if force_cpu_bwd && flash_debug && dout_t.device > 0 {
+            eprintln!(
+                "[flash-bwd] NSL_FLASH_BWD_CPU=1 — deterministic CPU reference backward forced"
+            );
+        }
+
+        if flash_debug && dout_t.device > 0 && !force_cpu_bwd {
+            if phase1_ptx_ptr == 0 {
+                eprintln!(
+                    "[flash-bwd] no backward PTX provided (phase1_ptx=0) — CPU reference \
+                     backward (batch={b}, heads={h}, seq={s}, head_dim={d})"
+                );
+            } else if kv_h != h {
+                eprintln!(
+                    "[flash-bwd] GQA layout (kv_heads={kv_h} != heads={h}) — the classic \
+                     GPU backward kernel is MHA-only; CPU reference backward"
+                );
+            }
+        }
+
+        if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h && !force_cpu_bwd {
             // Budget-aware backward tile sizes. Must match the sizes codegen used to
             // synthesize the Phase-2 PTX; both sides derive them from head_dim via
             // the same `select_backward_blocks` table (codegen's copy lives in
@@ -5046,18 +5105,29 @@ pub extern "C" fn nsl_flash_attention_backward(
                 phase2_ptx_ptr, phase2_name_ptr,
             );
             if gpu_result != 0 {
+                if flash_debug {
+                    eprintln!(
+                        "[flash-bwd] GPU backward dispatched \
+                         (batch={b}, heads={h}, seq={s}, head_dim={d}, causal={is_causal}, \
+                         blocks=({block_q},{block_kv}))"
+                    );
+                }
                 return gpu_result;
             }
-            // gpu_result == 0: a kernel launch failed (invalid/unlaunchable PTX for
-            // this config). flash_attention_backward_gpu already logged loudly and
-            // returned NO gradients rather than silently-wrong zeros. Fall through to
-            // the CPU reference below, which computes correct gradients (slower).
-            eprintln!(
+            // gpu_result == 0: the launcher refused this config (ragged seq)
+            // or a kernel launch failed. flash_attention_backward_gpu already
+            // logged the specific cause and returned NO gradients rather than
+            // silently-wrong zeros. Fall through to the CPU reference below,
+            // which computes correct gradients (slower). Once per distinct
+            // config: since the variant table made decorator-free models hit
+            // this path, an unconditional print here would repeat identically
+            // every attention op of every step.
+            flash_bwd_warn_once(&format!(
                 "[flash-bwd] GPU backward unavailable for this config \
                  (batch={b}, heads={h}, seq={s}, head_dim={d}) — falling back to the \
-                 CPU reference backward (correct but slow). Fix the GPU PTX to restore \
-                 GPU-speed gradients."
-            );
+                 CPU reference backward (correct but slow); an earlier [flash-bwd] \
+                 line names the cause (ragged-seq refusal or launch failure)."
+            ));
         }
 
         if dout_t.device > 0 {

@@ -6,7 +6,7 @@ use nsl_ast::decl::{Decorator, ModelMember};
 use nsl_ast::expr::ExprKind;
 use nsl_ast::stmt::{Stmt, StmtKind};
 
-use super::{Compiler, FlashAttentionCompileContext};
+use super::{Compiler, FlashAttentionCompileContext, SdpaBwdVariant};
 use crate::error::CodegenError;
 
 /// M57.1 §3.2: v1-permanent redirect error message for `nsl build --target fpga`
@@ -1825,6 +1825,87 @@ impl Compiler<'_> {
                 csha_backward_tier_b_on_name_id: None,
             }))
         }
+    }
+
+    /// Backward variant table for decorator-free SDPA (per-head_dim, PR #335
+    /// wiring gap). Lazily synthesizes and embeds the classic two-phase
+    /// backward PTX for each supported head_dim under the op's static
+    /// `causal` flag, so `wengert_lower` can select the matching variant on
+    /// the RUNTIME head_dim value. Emission is a pure function of
+    /// (blocks, head_dim, causal, gpu_sm); blocks come from the same
+    /// `backward_select_blocks` table the runtime re-derives from head_dim,
+    /// which is what makes compile-time synthesis + runtime selection agree.
+    ///
+    /// head_dims not in the table (and GQA ops, gated runtime-side on
+    /// kv_h == h) select null pointers and keep today's CPU fallback.
+    /// hd=256 is omitted on purpose: its (64,64) tiles deliberately overflow
+    /// the 99 KB SMEM opt-in cap, so a variant could never launch.
+    pub(crate) fn ensure_sdpa_bwd_variant_table(
+        &mut self,
+        causal: bool,
+    ) -> Result<Vec<SdpaBwdVariant>, CodegenError> {
+        const SDPA_BWD_VARIANT_HEAD_DIMS: &[i64] = &[32, 64, 128];
+
+        if let Some(table) = self.kernels.sdpa_bwd_variants.get(&causal) {
+            return Ok(table.clone());
+        }
+        // The classic backward PTX is CUDA-only, and `parse_gpu_sm_from_target`
+        // PANICS on anything but "cuda"/"sm_<N>". The decorated path only
+        // reaches it behind an @flash_attention decorator, but this lazy path
+        // fires for EVERY decorator-free SDPA train compile — including
+        // `--target rocm|metal|webgpu|fpga`, which compiled fine before the
+        // variant table existed (null pointers → CPU backward). Keep exactly
+        // that behavior for non-CUDA targets: an empty table lowers to null
+        // pointers, no panic.
+        let target = self.compile_options.target.as_str();
+        if target != "cuda" && !target.starts_with("sm_") {
+            self.kernels.sdpa_bwd_variants.insert(causal, Vec::new());
+            return Ok(Vec::new());
+        }
+        let gpu_sm = parse_gpu_sm_from_target(&self.compile_options.target);
+        let c = i64::from(causal);
+        let mut table = Vec::with_capacity(SDPA_BWD_VARIANT_HEAD_DIMS.len());
+        for &head_dim in SDPA_BWD_VARIANT_HEAD_DIMS {
+            let (block_q, block_kv) = crate::flash_attention::backward_select_blocks(head_dim);
+            let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
+                block_q,
+                block_kv,
+                head_dim,
+                causal,
+                gpu_sm,
+                segment_masked: false,
+            };
+            let (p1, p2) =
+                crate::flash_attention::synthesize_flash_attention_backward_ptx(&bwd_config);
+            let phase1_ptx =
+                self.embed_raw_data(&format!("__nsl_sdpa_bwd_p1_c{c}_hd{head_dim}"), p1)?;
+            let phase2_ptx =
+                self.embed_raw_data(&format!("__nsl_sdpa_bwd_p2_c{c}_hd{head_dim}"), p2)?;
+
+            let mut p1_name =
+                crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config)
+                    .into_bytes();
+            p1_name.push(0);
+            let phase1_name = self
+                .embed_raw_data(&format!("__nsl_sdpa_bwd_p1_name_c{c}_hd{head_dim}"), p1_name)?;
+
+            let mut p2_name =
+                crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config)
+                    .into_bytes();
+            p2_name.push(0);
+            let phase2_name = self
+                .embed_raw_data(&format!("__nsl_sdpa_bwd_p2_name_c{c}_hd{head_dim}"), p2_name)?;
+
+            table.push(SdpaBwdVariant {
+                head_dim,
+                phase1_ptx,
+                phase1_name,
+                phase2_ptx,
+                phase2_name,
+            });
+        }
+        self.kernels.sdpa_bwd_variants.insert(causal, table.clone());
+        Ok(table)
     }
 
     /// Embed raw bytes in .rodata and return the DataId.

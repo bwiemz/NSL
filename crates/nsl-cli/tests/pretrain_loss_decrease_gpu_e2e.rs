@@ -73,6 +73,10 @@ struct RunOutput {
 }
 
 fn run_program(source: &str, tag: &str) -> RunOutput {
+    run_program_with_env(source, tag, &[])
+}
+
+fn run_program_with_env(source: &str, tag: &str, extra_env: &[(&str, &str)]) -> RunOutput {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_pretrain_e2e_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -82,15 +86,17 @@ fn run_program(source: &str, tag: &str) -> RunOutput {
     // copy the model next to the scaled program.
     std::fs::copy(root.join("models/coder-rl/model.nsl"), tmp.join("model.nsl")).unwrap();
 
-    let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "--features", "cuda", "--manifest-path"])
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args(["run", "-q", "--features", "cuda", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
         .args(["-p", "nsl-cli", "--", "run", "--source-ad"])
         .arg(&prog)
         .current_dir(&tmp)
-        .env("NSL_STDLIB_PATH", root.join("stdlib"))
-        .output()
-        .expect("failed to spawn nsl run");
+        .env("NSL_STDLIB_PATH", root.join("stdlib"));
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to spawn nsl run");
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -261,9 +267,18 @@ fn fase_deferred_matches_plain_adamw_checkpoint() {
     let ckpt_fase = std::env::temp_dir().join(format!("pretrain_43_fase_{pid}.nslm"));
     let ckpt_plain = std::env::temp_dir().join(format!("pretrain_43_plain_{pid}.nslm"));
 
-    let fase = run_program(&downscaled_program(&ckpt_fase, 4, 65536), "fase43");
+    // Force the deterministic CPU attention backward in BOTH runs. Since the
+    // decorator-free backward variant table landed, the GPU phase-2 kernel
+    // serves these models — and its float-atomicAdd dK/dV accumulation is
+    // scheduling-order nondeterministic, so the two runs would receive
+    // slightly different attention gradients and drift past the 5e-3 gate
+    // (measured 5.999e-3) for reasons unrelated to what this test pins:
+    // FASE-deferred vs per-step AdamW OPTIMIZER equivalence. 4.2 keeps the
+    // GPU backward in its path; this gate isolates the optimizer semantics.
+    let det = &[("NSL_FLASH_BWD_CPU", "1")][..];
+    let fase = run_program_with_env(&downscaled_program(&ckpt_fase, 4, 65536), "fase43", det);
     assert!(fase.success, "FASE run failed:\n{}", fase.stderr);
-    let plain = run_program(&downscaled_program(&ckpt_plain, 1, 16384), "plain43");
+    let plain = run_program_with_env(&downscaled_program(&ckpt_plain, 1, 16384), "plain43", det);
     assert!(plain.success, "plain run failed:\n{}", plain.stderr);
 
     let a = nslm::read(&ckpt_fase);
