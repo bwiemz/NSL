@@ -239,10 +239,15 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
     UpdateProgram {
         optimizer: recipe.optimizer,
         ops,
-        pseudocode: format!(
-            "m=β₁·m+(1-β₁)·m_partial; v{}=β₂·v+(1-β₂)·m_partial²; m̂=m·bc1_inv; v̂=v·bc2_inv; θ -= lr·(m̂/(√v̂+ε) + wd·θ)",
-            if recipe.v_uses_approx { "≈" } else { "=" }
-        ),
+        // The "≈" marker previously printed when `v_uses_approx` was set
+        // implied the emitted v-update approximates AdamW. It does not:
+        // m_partial holds the accumulated window-MEAN gradient, so
+        // `SquaredAccumulate` computes v = β₂·v + (1-β₂)·(mean g)² — the
+        // exact standard grad-accumulation AdamW (pinned by the
+        // discrimination test in fase_numerical_validation.rs). Always "=".
+        pseudocode:
+            "m=β₁·m+(1-β₁)·m_partial; v=β₂·v+(1-β₂)·m_partial²; m̂=m·bc1_inv; v̂=v·bc2_inv; θ -= lr·(m̂/(√v̂+ε) + wd·θ)"
+                .to_string(),
     }
 }
 
@@ -511,12 +516,13 @@ mod tests {
 
     #[test]
     fn jensen_fence_fase_v_exceeds_standard_v_for_nonconstant_gradients() {
-        // The FASE paper's Option B approximates v using mean(g²) rather than
-        // mean(g)².  Jensen's inequality (mean(g²) ≥ mean(g)²) guarantees
-        // v_fase ≥ v_standard element-wise, with strict inequality when the
-        // per-micro-batch gradients vary.  This test fences the approximation
-        // against future "fixes" that would silently implement the standard
-        // formula.
+        // The CFTP paper's Option B WOULD approximate v using mean(g²)
+        // rather than (mean g)²; Jensen's inequality (mean(g²) ≥ mean(g)²)
+        // separates the two whenever per-micro-batch gradients vary. The
+        // SHIPPED emission implements the standard (mean g)² formula — this
+        // lemma is what gives the program-level discrimination test in
+        // fase_numerical_validation.rs its power (with constant micro-
+        // batches the formulas coincide and nothing can be discriminated).
         //
         // Closed-form per-parameter v-update for one accumulation window:
         //

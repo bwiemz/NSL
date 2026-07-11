@@ -1,0 +1,41 @@
+# v_t-semantics discrimination fixture (roadmap 2.1, rescoped).
+#
+# Every other FASE fixture uses CONSTANT micro-batches, where the standard
+# windowed-AdamW second moment v = beta2*v + (1-beta2)*(mean g)^2 and the
+# CFTP paper's "Option B" approximation v = beta2*v + (1-beta2)*mean(g^2)
+# coincide exactly (mean of equal values squared == mean of their squares) —
+# so no existing test could tell which formula the compiler emits.
+#
+# This fixture makes the per-micro-batch gradients differ WITHIN each
+# accumulation window: the on_step callback rescales x by 1.25 after every
+# micro-step, so window k sees four distinct gradient magnitudes. Jensen's
+# inequality then strictly separates the two candidate v-trajectories, and
+# the companion test (`fase_numerical_validation.rs::
+# adamw_deferred_vt_is_exact_windowed_not_option_b`) asserts the saved
+# parameters match exactly one of the two references.
+#
+# 8 epochs x 1 step/epoch at grad_accumulation=4 = 2 optimizer windows.
+
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 8, grad_accumulation = 4):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            x = x * 1.25
+
+model_save(m, "vt_disc_out.nslm")
