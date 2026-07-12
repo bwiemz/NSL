@@ -65,6 +65,16 @@ pub struct WggoPrePlan {
     /// synthesis serves the whole module; attributing it to whichever block
     /// happened to plan first would flip admission on the wrong evidence).
     pub is_first_train_block: bool,
+    /// True iff the extracted training-step graph contains an attention op
+    /// (`ScaledDotProductAttention` or a flash-attention backward extract).
+    /// A plan is solved for ANY train block — an MLP's matmuls yield one too —
+    /// so consumers whose decision is attention-specific (e.g. the
+    /// decorator-free CSHA/PCA plan-reachability verdict) must gate on this
+    /// rather than on plan existence. Robust across imports: the extracted
+    /// graph inlines the model's forward (and any stdlib GQA layer it calls)
+    /// down to the SDPA op, so it fires for real GQA models whose attention
+    /// lives in an imported layer, not just direct SDPA callers.
+    pub contains_attention: bool,
 }
 
 /// The exact off-mode interpretation `run` (and the in-place planner) use.
@@ -632,6 +642,13 @@ fn plan_train_block(
             Some(&compiler.compile_options),
         )?;
         let overrides = crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied);
+        let contains_attention = extractor.wengert_list().ops.iter().any(|op| {
+            matches!(
+                op.op,
+                crate::wengert::PrimalOp::ScaledDotProductAttention { .. }
+                    | crate::wengert::PrimalOp::FlashAttentionBackwardExtract { .. }
+            )
+        });
         let graph_fingerprint = fingerprint_wengert(extractor.wengert_list());
         Some(WggoPrePlan {
             train_block_stmt_id,
@@ -641,6 +658,7 @@ fn plan_train_block(
             // Stamped by walk_stmts, which tracks document order across
             // failed extractions too.
             is_first_train_block: false,
+            contains_attention,
         })
     })();
     compiler.restore_active_fused_ce_config(saved_fused_ce);
