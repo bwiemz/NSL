@@ -1400,11 +1400,6 @@ pub fn compile_and_calibrate(
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
         compiler.compile_kernels(&parsed.module.stmts)?;
         crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
-        compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
-        compiler.compile_user_functions(&parsed.module.stmts)?;
-        // M56 Task 17: compile agent method bodies.
-        compiler.compile_agent_methods(&parsed.module.stmts)?;
-        compiler.compile_batched_functions(&vmap_results)?;
         // #134 (c-i) wrapper-level firing — spec §4.1 + §8.1 commit 3.
         // Previously: compile_train_block fired the calibration harness as a
         // side-effect inside compile_main, coupling calibration to the
@@ -1415,17 +1410,24 @@ pub fn compile_and_calibrate(
         // same commit. real_subprocess_entry is invoked directly — same
         // canonical path that AWQ + WGGO end-to-end tests already use.
         //
-        // ORDERING INVARIANT (preserved from the deleted stmt.rs block):
-        // Calibration must fire BEFORE compile_main because compile_main
-        // triggers compile_train_block's WGGO pass, which reads
-        // compile_options.calibration_sidecar via build_scorer. Firing after
-        // compile_main would leave the sidecar None at WGGO's read site,
-        // silently degrading wggo_importance=Auto to magnitude scoring and
-        // breaking wggo_importance=Grad outright. Spec §4.1's "after
-        // compile_main returns" wording was over-specified — the architectural
-        // goal "calibration runs around the compiled code" (§4.3) is equally
-        // satisfied by firing before compile_main, with the WGGO ordering
-        // invariant preserved.
+        // ORDERING INVARIANT: calibration must fire BEFORE
+        // compile_flash_attention_kernels (and therefore before compile_main).
+        // TWO WGGO passes read compile_options.calibration_sidecar via
+        // build_scorer: (1) the WGGO pre-pass inside
+        // compile_flash_attention_kernels (the WGGO-before-kernels restructure)
+        // and (2) compile_train_block's in-place WGGO pass under compile_main.
+        // Firing calibration after either read site leaves the sidecar None
+        // there, silently degrading wggo_importance=Auto to magnitude scoring
+        // and breaking wggo_importance=Grad outright — and would score the
+        // pre-pass and the in-place planner with DIFFERENT importance, so the
+        // pre-plan's graph fingerprint would never match and it would be
+        // rejected. Firing here (right after wrga_prescan, before any kernel
+        // synthesis) keeps both read sites consistent. discover_awq_projections
+        // reads only collect_models-era state, which wrga_prescan has already
+        // finalized, so nothing the harness needs is produced by the synthesis
+        // calls now sequenced below it. Spec §4.1's "after compile_main
+        // returns" wording was over-specified; the architectural goal
+        // "calibration runs around the compiled code" (§4.3) is preserved.
         if let Some(data_path) = compiler.compile_options.calibration_data.clone() {
             let mut registry = crate::calibration::registry::HookRegistry::new();
             let awq_projections = compiler.discover_awq_projections().unwrap_or_default();
@@ -1508,6 +1510,11 @@ pub fn compile_and_calibrate(
                 }
             }
         }
+        compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
+        compiler.compile_user_functions(&parsed.module.stmts)?;
+        // M56 Task 17: compile agent method bodies.
+        compiler.compile_agent_methods(&parsed.module.stmts)?;
+        compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_main(&parsed.module.stmts)?;
         compiler.compile_pending_lambdas()?;
         compiler.emit_retention_arena()?;
