@@ -23,9 +23,14 @@ fn runtime_function_signatures_agree_with_extern_impls() {
     // Guard against a silently-empty parse (a path/parser regression) making
     // this test vacuously green.
     let total = report.verified + report.via_macro + report.mismatches.len();
+    // Truncation floor: the table has ~558 entries. A floor well above any
+    // plausible short-parse (a `balanced` early-terminate silently dropping the
+    // tail) is the backstop against a vacuous pass; bump it if the table shrinks
+    // legitimately below this.
     assert!(
-        total > 400,
-        "expected to parse >400 declared runtime functions, got {total} — parser/path regression?"
+        total > 540,
+        "expected to parse >540 declared runtime functions, got {total} — parser/path regression \
+         or a truncated table parse?"
     );
 
     if !report.mismatches.is_empty() {

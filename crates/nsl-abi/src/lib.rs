@@ -123,6 +123,28 @@ fn strip_line_comment(line: &str) -> &str {
     }
 }
 
+/// Remove `/* ... */` block comments, replacing each with a single space to
+/// preserve token separation. UTF-8 safe (slices only at `find` boundaries).
+/// Used only on the `RUNTIME_FUNCTIONS` table text, which contains no string
+/// literals embedding `/*`, so this cannot corrupt a real signature.
+fn strip_block_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Return the substring enclosed by the balanced delimiter pair starting at the
 /// `open` character found at or after `from`. `open`/`close` are e.g. `('(',
 /// ')')` or `('[', ']')`. Returns `(inner, index_after_close)`.
@@ -153,10 +175,18 @@ fn split_top_level(list: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut cur = String::new();
+    let mut prev = '\0';
     for c in list.chars() {
         match c {
             '(' | '[' | '<' => {
                 depth += 1;
+                cur.push(c);
+            }
+            // The `>` in a `->` return arrow (e.g. a `fn(i64) -> i64` param
+            // type) is NOT a generic/bracket close — do not let it drive depth
+            // negative, or every following top-level comma would be missed and
+            // arity would collapse.
+            '>' if prev == '-' => {
                 cur.push(c);
             }
             ')' | ']' | '>' => {
@@ -171,6 +201,7 @@ fn split_top_level(list: &str) -> Vec<String> {
             }
             _ => cur.push(c),
         }
+        prev = c;
     }
     if !cur.trim().is_empty() {
         out.push(cur.trim().to_string());
@@ -182,10 +213,13 @@ fn split_top_level(list: &str) -> Vec<String> {
 /// out of the text of `builtins.rs`.
 pub fn parse_runtime_functions_table(src_raw: &str) -> Vec<FnSig> {
     let mut out = Vec::new();
-    // Strip `// line comments` first: the table's `&[...]` blocks carry inline
-    // comments like `// q, k, v, out` whose COMMAS would otherwise be counted
-    // as extra parameters by `split_top_level`.
-    let src: String = src_raw
+    // Strip comments first: the table's `&[...]` blocks carry inline comments
+    // like `// q, k, v, out` whose COMMAS would otherwise be counted as extra
+    // parameters by `split_top_level`. Block comments are stripped too as
+    // defense in depth — a stray `]`/`)` inside one could otherwise truncate
+    // `balanced` and silently drop the tail of the table.
+    let no_block = strip_block_comments(src_raw);
+    let src: String = no_block
         .lines()
         .map(strip_line_comment)
         .collect::<Vec<_>>()
@@ -424,22 +458,41 @@ fn compare(declared: &FnSig, impls: &[FnSig]) -> Option<Mismatch> {
             ),
         });
     }
-    // Accept if ANY variant is compatible.
-    if impls.iter().any(|im| sigs_compatible(declared, im)) {
+    // EVERY variant must agree, not just one. The checker cannot see
+    // `#[cfg(...)]`, so a symbol with several textual `extern "C" fn`
+    // definitions — e.g. an interop stub gated `#[cfg(not(feature="interop"))]`
+    // plus the real impl gated `#[cfg(feature="interop")]` — has exactly ONE of
+    // them linked per build config, while the codegen emits a single call with
+    // the table's signature. For that call to be correct in EVERY config, all
+    // variants must match the table; flag if ANY variant disagrees.
+    let bad: Vec<&FnSig> = impls
+        .iter()
+        .filter(|im| !sigs_compatible(declared, im))
+        .collect();
+    if bad.is_empty() {
         return None;
     }
-    // None matched — describe the disagreement against the first variant.
-    let im = &impls[0];
+    let im = bad[0];
+    let variant_note = if impls.len() > 1 {
+        format!(
+            " ({} of {} same-name (cfg?) variants disagree)",
+            bad.len(),
+            impls.len()
+        )
+    } else {
+        String::new()
+    };
     if im.params.len() != declared.params.len() {
         return Some(Mismatch {
             name: declared.name.clone(),
             kind: MismatchKind::ArityMismatch,
             detail: format!(
-                "declared {} param(s) in {} but impl in {} has {}",
+                "declared {} param(s) in {} but impl in {} has {}{}",
                 declared.params.len(),
                 declared.source,
                 im.source,
-                im.params.len()
+                im.params.len(),
+                variant_note,
             ),
         });
     }
@@ -447,18 +500,28 @@ fn compare(declared: &FnSig, impls: &[FnSig]) -> Option<Mismatch> {
         name: declared.name.clone(),
         kind: MismatchKind::TypeMismatch,
         detail: format!(
-            "type disagreement (impl {}): declared {:?} ret {:?} vs impl {:?} ret {:?}",
-            im.source, declared.params, declared.ret, im.params, im.ret
+            "type disagreement (impl {}): declared {:?} ret {:?} vs impl {:?} ret {:?}{}",
+            im.source, declared.params, declared.ret, im.params, im.ret, variant_note,
         ),
     })
 }
 
-/// Two positions are compatible if both are `Known` and equal, or if either is
-/// `Unknown` (unmodeled type — treated as a wildcard so we never false-positive
-/// on a type this validator does not yet understand).
+/// Two positions are compatible if:
+/// - both are `Known` and equal;
+/// - both are `Unknown` and spelled identically; or
+/// - exactly one is `Unknown` — treated as a wildcard so we never false-positive
+///   on a type this validator does not model yet.
+///
+/// The single-`Unknown` wildcard is a deliberate blind spot: an unmodeled
+/// runtime type (e.g. a struct passed/returned *by value*, which is an sret ABI
+/// hazard) matched against a modeled `types::X` is accepted. The table side is
+/// fully modeled today (only `I64/F64/I8/I32`), so this only relaxes checking
+/// when the RUNTIME side uses an exotic type; extend [`abi_from_rust`] to
+/// tighten it as the surface grows.
 fn types_compatible(a: &ParsedType, b: &ParsedType) -> bool {
     match (a, b) {
         (ParsedType::Known(x), ParsedType::Known(y)) => x == y,
+        (ParsedType::Unknown(x), ParsedType::Unknown(y)) => x == y,
         _ => true,
     }
 }
@@ -715,6 +778,56 @@ mod tests {
         assert_eq!(kinds.get("arity"), Some(&&MismatchKind::ArityMismatch));
         assert_eq!(kinds.get("typ"), Some(&&MismatchKind::TypeMismatch));
         assert_eq!(kinds.get("gone"), Some(&&MismatchKind::MissingImpl));
+    }
+
+    #[test]
+    fn every_same_name_variant_must_agree_not_just_one() {
+        // Models a cfg-split symbol: an interop stub (3 params) plus the real
+        // impl (4 params), table declares 4. Accepting because ONE variant
+        // matches would miss that the default-build stub drifted (Finding 1).
+        let declared = vec![FnSig {
+            name: "nsl_x".into(),
+            params: vec![ParsedType::Known(AbiScalar::Int(64)); 4],
+            ret: Some(ParsedType::Known(AbiScalar::Int(64))),
+            source: "table".into(),
+        }];
+        let impls = vec![
+            FnSig {
+                name: "nsl_x".into(),
+                params: vec![ParsedType::Known(AbiScalar::Int(64)); 4],
+                ret: Some(ParsedType::Known(AbiScalar::Int(64))),
+                source: "real.rs".into(),
+            },
+            FnSig {
+                name: "nsl_x".into(),
+                params: vec![ParsedType::Known(AbiScalar::Int(64)); 3],
+                ret: Some(ParsedType::Known(AbiScalar::Int(64))),
+                source: "stub.rs".into(),
+            },
+        ];
+        let report = cross_check(&declared, &impls, &[]);
+        assert_eq!(report.verified, 0, "must NOT pass when a variant disagrees");
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].kind, MismatchKind::ArityMismatch);
+    }
+
+    #[test]
+    fn fn_pointer_param_does_not_collapse_arity() {
+        // A `-> i64` return arrow inside a fn-pointer param must not drive the
+        // top-level comma splitter's depth negative (Finding 2).
+        let src = r#"
+        pub extern "C" fn nsl_cb(cb: extern "C" fn(i64) -> i64, tensor: i64, n: i64) -> i64 {
+            0
+        }
+        "#;
+        let sigs = parse_externs_in_file(src, "t.rs");
+        assert_eq!(sigs.len(), 1, "only the outer fn is an extern def");
+        assert_eq!(
+            sigs[0].params.len(),
+            3,
+            "fn-pointer param must not collapse the comma split, got {:?}",
+            sigs[0].params
+        );
     }
 
     #[test]
