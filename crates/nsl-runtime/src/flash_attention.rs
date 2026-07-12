@@ -4780,35 +4780,64 @@ fn flash_attention_backward_gpu(
             + block_q * 4                                  // L (logsumexp) vector
         ) as u32;
 
-        // Compute logsumexp on GPU: reuse D buffer area as scratch for lse
-        // For now, pass the logsumexp pointer if available, otherwise auto-compute
-        // The Phase 2 kernel expects lse_data; we need to compute it.
-        // Since _logsumexp_ptr might be 0, we compute lse on CPU and upload.
+        // Compute logsumexp DEVICE-RESIDENT from Q and K. Q/K are already on
+        // the GPU and the dispatch gate guarantees kv_heads == h (MHA), so a
+        // per-row kernel writes lse without any host transfer. This replaces
+        // the previous Q+K device->host copy + O(b*h*s^2*d) CPU score recompute
+        // + host->device copy that ran on EVERY backward call — a severe
+        // hot-path regression once the decorator-free backward started
+        // dispatching here (PR #347). `_logsumexp_ptr` stays unused: the
+        // decomposed decorator-free forward saves no lse buffer, so the caller
+        // passes 0 (wengert_lower.rs); recomputing on-device is correct and
+        // cheap, and its ex2/lg2 approximations match how the backward kernel
+        // itself recomputes P = exp(score - lse).
         let lse_data = {
             let total_lse = b * h * s;
             let lse_gpu = inner::alloc_managed(total_lse * 4);
 
-            // Read Q and K to CPU to compute logsumexp
-            let total_qkv_bytes = total_qkv * 4;
-            let mut q_cpu = vec![0.0f32; total_qkv];
-            let mut k_cpu = vec![0.0f32; total_qkv];
-            inner::memcpy_dtoh(
-                q_cpu.as_mut_ptr() as *mut c_void,
-                q_t.data as *const c_void,
-                total_qkv_bytes,
+            let mut q_arg = q_t.data as u64;
+            let mut k_arg = k_t.data as u64;
+            let mut lse_arg = lse_gpu as u64;
+            let mut total_arg = total_lse as u64;
+            let mut seq_arg = s as u64;
+            let mut hd_arg = d as u64;
+            let mut scale_arg = scale;
+            let mut causal_arg = if is_causal { 1u64 } else { 0u64 };
+            let lse_args: [*mut c_void; 8] = [
+                &mut q_arg as *mut _ as *mut c_void,
+                &mut k_arg as *mut _ as *mut c_void,
+                &mut lse_arg as *mut _ as *mut c_void,
+                &mut total_arg as *mut _ as *mut c_void,
+                &mut seq_arg as *mut _ as *mut c_void,
+                &mut hd_arg as *mut _ as *mut c_void,
+                &mut scale_arg as *mut _ as *mut c_void,
+                &mut causal_arg as *mut _ as *mut c_void,
+            ];
+            let lse_block = 256i64;
+            let lse_grid = [(total_lse as i64 + lse_block - 1) / lse_block, 1, 1];
+            let lse_res = inner::kernel_launch(
+                crate::cuda::fused_kernels::FLASH_LSE_F32_PTX.as_ptr(),
+                b"nsl_flash_lse_f32\0".as_ptr(),
+                lse_grid,
+                [lse_block, 1, 1],
+                &lse_args,
+                0,
             );
-            inner::memcpy_dtoh(
-                k_cpu.as_mut_ptr() as *mut c_void,
-                k_t.data as *const c_void,
-                total_qkv_bytes,
-            );
-
-            let lse_cpu = compute_logsumexp_gqa(&q_cpu, &k_cpu, b, h, h, s, d, scale, is_causal);
-            inner::memcpy_htod(
-                lse_gpu,
-                lse_cpu.as_ptr() as *const c_void,
-                total_lse * 4,
-            );
+            if lse_res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                // Never return zero gradients on a launch failure — free scratch
+                // and signal 0 so the caller takes the correct CPU backward.
+                eprintln!(
+                    "[flash-bwd] logsumexp kernel launch FAILED: {:?} — refusing to \
+                     return zero gradients; caller will fall back to CPU.",
+                    lse_res
+                );
+                inner::free_managed(lse_gpu);
+                inner::free_managed(d_buf);
+                inner::free_managed(dq_data);
+                inner::free_managed(dk_data);
+                inner::free_managed(dv_data);
+                return 0;
+            }
             lse_gpu
         };
 
@@ -5472,6 +5501,109 @@ mod tests {
         assert_ne!(r.row_sum, 0, "row_sum alloc failed");
         assert_ne!(r.x_raw, 0, "x_raw alloc failed");
         unsafe { nsl_csha_free_backward_activations(r); }
+    }
+
+    /// The device-resident logsumexp kernel (`FLASH_LSE_F32_PTX`) must match
+    /// the CPU reference `compute_logsumexp_gqa` within GPU transcendental
+    /// tolerance. It replaced the per-call Q/K host round-trip + CPU score
+    /// recompute in the flash backward, so a drift here would perturb every
+    /// decorator-free GPU backward's `P = exp(score - lse)`. Checked in both
+    /// causal modes at kv_heads == h (the only shape the GPU backward
+    /// dispatches).
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    #[cfg(feature = "cuda")]
+    fn flash_lse_gpu_matches_cpu_reference() {
+        use crate::cuda::inner;
+        use std::ffi::c_void;
+
+        // `inner::alloc_managed` / `kernel_launch` establish the thread's CUDA
+        // context on first use, so no explicit init is needed here.
+
+        let b = 2usize;
+        let h = 2usize;
+        let s = 24usize;
+        let d = 16usize;
+        let n = b * h * s * d;
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        // Deterministic pseudo-random Q, K in [-1, 1) (LCG).
+        let mut lcg: u32 = 0x2545_F491;
+        let mut nextf = || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((lcg >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        };
+        let q: Vec<f32> = (0..n).map(|_| nextf()).collect();
+        let k: Vec<f32> = (0..n).map(|_| nextf()).collect();
+
+        for &causal in &[false, true] {
+            let reference = compute_logsumexp_gqa(&q, &k, b, h, h, s, d, scale, causal);
+
+            let bytes = n * 4;
+            let total_lse = b * h * s;
+            let q_dev = inner::alloc_managed(bytes);
+            let k_dev = inner::alloc_managed(bytes);
+            let lse_dev = inner::alloc_managed(total_lse * 4);
+            inner::memcpy_htod(q_dev, q.as_ptr() as *const c_void, bytes);
+            inner::memcpy_htod(k_dev, k.as_ptr() as *const c_void, bytes);
+
+            let mut q_arg = q_dev as u64;
+            let mut k_arg = k_dev as u64;
+            let mut lse_arg = lse_dev as u64;
+            let mut total_arg = total_lse as u64;
+            let mut seq_arg = s as u64;
+            let mut hd_arg = d as u64;
+            let mut scale_arg = scale;
+            let mut causal_arg: u64 = causal.into();
+            let args: [*mut c_void; 8] = [
+                &mut q_arg as *mut _ as *mut c_void,
+                &mut k_arg as *mut _ as *mut c_void,
+                &mut lse_arg as *mut _ as *mut c_void,
+                &mut total_arg as *mut _ as *mut c_void,
+                &mut seq_arg as *mut _ as *mut c_void,
+                &mut hd_arg as *mut _ as *mut c_void,
+                &mut scale_arg as *mut _ as *mut c_void,
+                &mut causal_arg as *mut _ as *mut c_void,
+            ];
+            let block = 256i64;
+            let grid = [(total_lse as i64 + block - 1) / block, 1, 1];
+            let res = inner::kernel_launch(
+                crate::cuda::fused_kernels::FLASH_LSE_F32_PTX.as_ptr(),
+                b"nsl_flash_lse_f32\0".as_ptr(),
+                grid,
+                [block, 1, 1],
+                &args,
+                0,
+            );
+            assert_eq!(
+                res,
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                "lse kernel launch failed (causal={causal})"
+            );
+            unsafe {
+                cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            let mut got = vec![0.0f32; total_lse];
+            inner::memcpy_dtoh(
+                got.as_mut_ptr() as *mut c_void,
+                lse_dev as *const c_void,
+                total_lse * 4,
+            );
+            inner::free_managed(q_dev);
+            inner::free_managed(k_dev);
+            inner::free_managed(lse_dev);
+
+            for (i, (&g, &r)) in got.iter().zip(reference.iter()).enumerate() {
+                let diff = (g - r).abs();
+                let tol = 1e-3 * (1.0 + r.abs());
+                assert!(
+                    diff <= tol,
+                    "lse mismatch (causal={causal}) at {i}: gpu={g}, cpu={r}, \
+                     diff={diff}, tol={tol}"
+                );
+            }
+        }
     }
 
     /// The multi-tile backward post-pass PTX must be ASCII-only and
