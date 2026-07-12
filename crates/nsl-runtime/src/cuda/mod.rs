@@ -3716,10 +3716,19 @@ pub(crate) fn gpu_maxpool2d_f32(
     assert_eq!(result as u32, 0, "GPU maxpool2d kernel failed: {:?}", result);
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
-    // Read argmax indices back to CPU (needed for backward tape)
-    let argmax_vec: Vec<u64> = unsafe {
-        std::slice::from_raw_parts(argmax_data as *const u64, total as usize).to_vec()
-    };
+    // Read argmax indices back to CPU (needed for the backward tape).
+    // `argmax_data` is a DEVICE pointer — `alloc_managed` routes through the
+    // caching allocator's `cuMemAlloc`, NOT `cuMemAllocManaged`, so it is not
+    // host-accessible (see its doc-comment). Dereferencing it on the host with
+    // `from_raw_parts` SIGSEGVs on a discrete GPU and aborts the whole process
+    // — the exact bug already fixed in `test_vec_add_kernel_launch`. Stage it
+    // through `memcpy_dtoh` instead.
+    let mut argmax_vec: Vec<u64> = vec![0u64; total as usize];
+    inner::memcpy_dtoh(
+        argmax_vec.as_mut_ptr() as *mut std::ffi::c_void,
+        argmax_data as *const std::ffi::c_void,
+        total as usize * std::mem::size_of::<u64>(),
+    );
     // Free GPU argmax buffer
     inner::free_managed(argmax_data);
 
@@ -4720,6 +4729,87 @@ mod tests {
             "ptxas rejected {} hand-written PTX module(s):\n\n{}",
             failures.len(),
             failures.join("\n\n")
+        );
+    }
+
+    /// Every hand-written PTX string handed to the driver JIT must be pure
+    /// ASCII.
+    ///
+    /// The CUDA driver's JIT (`cuModuleLoadData`, the runtime loader for these
+    /// modules) rejects a non-ASCII byte ANYWHERE in the source -- including
+    /// inside a comment -- with CUDA_ERROR_INVALID_PTX. Offline `ptxas` under a
+    /// UTF-8 locale accepts the same bytes, so the companion assembly gate
+    /// (`all_handwritten_ptx_assembles_with_ptxas`) cannot catch this: a stray
+    /// em-dash / arrow / times sign in a comment ships a kernel that silently
+    /// fails to load on a real GPU (the launch returns an error the call site
+    /// may swallow, or asserts). Two such em-dashes -- in MAXPOOL2D_F32_PTX and
+    /// COO_SPMM_F32_PTX -- shipped invalid for exactly this reason.
+    ///
+    /// Coverage: the two registered kernel tables (`kernels::ALL_PTX` +
+    /// `fused_kernels::ALL_PTX`), plus the runtime-loaded PTX in the `cuda::`
+    /// submodules that those tables omit -- the tier-B1 prepass kernels (which
+    /// had NO ASCII guard before this), the precision-cast kernels (also
+    /// covered by their own `embedded_ptx_strings_are_ascii`), and the shared
+    /// Hopper header assembled via `push_str`. PTX defined outside `cuda::` --
+    /// the CSHA kernels in `flash_attention.rs` -- is out of this gate's
+    /// module reach and is guarded by that file's own tests
+    /// (`multitile_postpass_ptx_is_ascii_and_nul_terminated` and
+    /// `csha_cast_ptx_is_ascii_and_nul_terminated`).
+    #[test]
+    fn all_handwritten_ptx_is_pure_ascii() {
+        // Runtime-loaded PTX that lives outside the two ALL_PTX tables. Header
+        // fragments (HOPPER_PTX_HEADER) are checked here too: they are not
+        // standalone-loadable so the ptxas gate skips them, but a non-ASCII
+        // byte in a header would break every kernel that concatenates it.
+        let extra: [(&str, &str); 7] = [
+            (
+                "CSHA_TIER_B1_PREPASS_X_PTX",
+                super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_X_PTX,
+            ),
+            (
+                "CSHA_TIER_B1_PREPASS_W_PTX",
+                super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_W_PTX,
+            ),
+            (
+                "PTX_F32_TO_BF16",
+                super::precision_cast_kernels::PTX_F32_TO_BF16,
+            ),
+            (
+                "PTX_BF16_TO_F32",
+                super::precision_cast_kernels::PTX_BF16_TO_F32,
+            ),
+            (
+                "PTX_F32_TO_FP16",
+                super::precision_cast_kernels::PTX_F32_TO_FP16,
+            ),
+            (
+                "PTX_FP16_TO_F32",
+                super::precision_cast_kernels::PTX_FP16_TO_F32,
+            ),
+            ("HOPPER_PTX_HEADER", super::kernels_hopper::HOPPER_PTX_HEADER),
+        ];
+        let modules = super::kernels::ALL_PTX
+            .iter()
+            .chain(super::fused_kernels::ALL_PTX.iter())
+            .chain(extra.iter());
+        let mut failures = Vec::new();
+        for (name, ptx) in modules {
+            for (i, line) in ptx.lines().enumerate() {
+                if !line.is_ascii() {
+                    let bad: Vec<char> = line.chars().filter(|c| !c.is_ascii()).collect();
+                    failures.push(format!(
+                        "{name}: non-ASCII on PTX line {} {bad:?} -- driver JIT rejects this \
+                         as CUDA_ERROR_INVALID_PTX (offline ptxas does not). Line: {line:?}",
+                        i + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} hand-written PTX module(s) contain non-ASCII bytes:\n\n{}",
+            failures.len(),
+            failures.join("\n")
         );
     }
 
