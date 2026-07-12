@@ -1444,6 +1444,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // ptx_ptr, name_ptr
             types::I64,
             types::I64, // block_q, block_kv
+            // PCA Tier B planner spec §4 — the runtime
+            // `nsl_flash_attention_quantized` takes the SAME 2 trailing Tier-B
+            // sentinel slots as `nsl_flash_attention` and reads them via
+            // `assert_tier_b_sentinels`. They were missing here (declared 21 vs
+            // the runtime's 23) — a latent ABI drift: no call site emits this
+            // today, but any future caller would push 21 args and the runtime
+            // would read 2 slots of stack garbage. Caught by the nsl-abi
+            // signature-agreement gate.
+            types::I64, // tier_b_ptx_ptr  (disabled sentinel 0)
+            types::I64, // tier_b_name_ptr (disabled sentinel 0)
         ],
         Some(types::I64),
     ),

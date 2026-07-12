@@ -1,0 +1,13 @@
+[package]
+name = "nsl-abi"
+description = "Machine-checkable source of truth for the NSL runtime C-ABI: validates that the codegen's declared runtime-function signatures agree with the runtime's extern \"C\" implementations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Intentionally dependency-free: the validator parses the codegen + runtime
+# source text directly (no build-time coupling to those crates), so it can run
+# as a fast, standalone gate without pulling the whole compiler into its build.
+[dependencies]
