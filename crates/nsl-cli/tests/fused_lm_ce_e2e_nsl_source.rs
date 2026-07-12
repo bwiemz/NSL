@@ -197,10 +197,20 @@ fn nsl_run_produces_finite_loss() {
     cmd.arg("run").arg(&fixture);
     let output = cmd.assert().success().get_output().stdout.clone();
     let stdout = String::from_utf8(output).expect("stdout must be valid UTF-8");
-    let loss: f64 = stdout
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("expected a bare finite loss on stdout, got {stdout:?}: {e}"));
+    // On Windows, `nsl run`'s in-process link step shells out to MSVC
+    // `link.exe`, which prints its own "Creating library ... and object
+    // ..." line to stdout ahead of the fixture's `print(loss)` output --
+    // Linux/macOS toolchains don't emit that noise. The loss is always the
+    // last line the fixture itself prints, so parse the last non-empty
+    // line rather than assuming stdout is the bare float alone.
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("expected non-empty stdout, got {stdout:?}"));
+    let loss: f64 = last_line.trim().parse().unwrap_or_else(|e| {
+        panic!("expected a bare finite loss on the last stdout line, got {stdout:?}: {e}")
+    });
     assert!(
         loss.is_finite(),
         "train step loss must be finite, got {loss}"
