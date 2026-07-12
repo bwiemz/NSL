@@ -379,3 +379,16 @@ jobs:
           out=$(cargo test -p nsl-codegen --test fused_linear_ce_bf16_ptxas -- --nocapture 2>&1)
           echo "$out" | grep -q "ptxas accepted" \
             || (echo "::error::ptxas gate skipped -- toolkit not visible to the tests" && exit 1)
+
+  # Cheap, build-free gate: the version string lives in root Cargo.toml
+  # ([workspace.package].version); every hand-duplicated copy (spec header,
+  # README install snippet) must agree, and the CLI crate must inherit rather
+  # than hardcode. Catches the "bumped Cargo but left the spec/README stale"
+  # drift called out in the metadata-cleanup pass.
+  version-agreement:
+    name: Version agreement (Cargo == spec / README / CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version strings agree with Cargo [workspace.package].version
+        run: ./scripts/check-version-agreement.sh
