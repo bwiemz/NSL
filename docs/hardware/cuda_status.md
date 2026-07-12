@@ -37,11 +37,24 @@ Validated silicon: **NVIDIA RTX 5070 Ti, sm_120** (2026-05-20).
 
 These are tracked honestly so users don't over-trust the backend:
 
-- **dQ / dK-dV backward kernels are structural scaffolds, not yet data-mobile.**
-  As of the v0.9.0 line, the dQ-kernel emitter ships cp.async loads, HBM address
-  derivation, SMEM scatter, and loop back-edges as PTX comments rather than
-  emitted instructions. A launched dQ kernel would read uninitialized SMEM.
-  GPU validation of dQ is gated on the "Phase 2.5" data-mobility work.
+- **dK / dV backward numerics are not yet GPU-confirmed** (dQ is). The Tier B.2
+  backward emitters (dQ, dK/dV, projection) are data-mobile as of the Phase 3
+  work: they emit real `cp.async` loads, HBM address derivation, SMEM scatter,
+  and loop back-edges — the earlier PTX-comment "scaffold" stage is done, so the
+  old "a launched dQ kernel reads uninitialized SMEM" caveat no longer holds.
+  Concretely: **dQ** is GPU-validated for full tiles at `head_dim ∈ {32,64,128}`
+  against the CPU-naive reference (see `flash_attention_v2/tier_b2/backward/dq.rs`
+  module doc). **dK/dV** are structurally + `ptxas`-validated and launchable, but
+  their GPU-numerical parity tests are still `#[cfg(feature = "cuda")]` +
+  `#[ignore]` (manual GPU-box runs) — treat dK/dV numerics as unconfirmed on
+  silicon until those are lifted (`dkdv.rs` module doc).
+- **The full 7-gradient hybrid backward** (`d_prepass → dq → dkdv → proj`,
+  dispatched through `nsl_flash_attention_csha_backward`) is synthesized and
+  wired; its all-gradient parity gate,
+  `crates/nsl-codegen/tests/tier_b2_full_backward_cpu_reference.rs`, is a manual
+  GPU gate (`cuda` + `#[ignore]`) that pins a narrow config (`head_dim ∈ {64,128}`,
+  heads=1, seq=block_q, batch=1, causal, sm_80). No broader golden-on-silicon run
+  is recorded in-repo beyond the D pre-pass (sm_120) and dQ.
 - sm_80/sm_90 (A100/H100-class) are **targeted and roofline-modeled** but the
   golden-validation rows are not yet recorded on this repo's hardware.
 - Multi-GPU / NCCL collectives live in the **Experimental** distributed
@@ -64,7 +77,9 @@ Representative tests (search the tree for the current set):
 
 | Test | Oracle | Status |
 |------|--------|--------|
-| `crates/nsl-codegen/tests/tier_b2_dq_kernel_cpu_reference.rs` | D pre-pass + dQ reference | CPU half in CI; GPU half `#[ignore]`+cuda |
+| `crates/nsl-codegen/tests/tier_b2_full_backward_cpu_reference.rs` | independent f64 backward, all 7 grads | Phase-3 hybrid gate; GPU-only (`cuda`+`#[ignore]`), narrow config |
+| `crates/nsl-codegen/tests/tier_b2_dq_kernel_cpu_reference.rs` | D pre-pass + dQ reference | cuda-gated; GPU parity `#[ignore]` (dQ GPU-validated hd 32/64/128) |
+| `crates/nsl-codegen/tests/tier_b2_dkdv_kernel_cpu_reference.rs` | dK/dV CPU reference | CPU analytic case in CI; GPU parity `#[ignore]`+cuda (numerics pending) |
 | `crates/nsl-test/.../diagnostic_mode` (`compute_d_for_test`) | CSHA backward D | CPU oracle reusable as a bisection probe |
 | FlashAttention-v2 D pre-pass (this doc, "Numerical contract") | rowsum(dO·O) | GPU-validated **bit-exact** on sm_120 |
 | `crates/nsl-codegen/tests/ptx_metadata_public_api.rs` | declared regs / SMEM / target SM parsed from PTX text | CI (no GPU; static analysis) |

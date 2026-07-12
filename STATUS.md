@@ -10,7 +10,7 @@ expectation. Beta features work but may change. Experimental features are
 research vehicles: they may change shape, regress, or be removed between
 releases, and they are not part of the green-build contract.
 
-Last reviewed against: `main` @ v0.9.0 line (2026-06).
+Last reviewed against: `main` @ v0.9.0 line (2026-07).
 If you change a subsystem's maturity, update this file in the same PR.
 
 ---
@@ -93,6 +93,8 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 - **CFIE** — fused inference engine (speculative, grammar, KV planning).
 - **CSHA** — compiler-specialized hardware attention (FlashAttention-v2 tiers).
 - **CPDT** — compiler-planned distributed training (ZeRO, expert/precision tiers).
+- **CPKD** — compiler-planned knowledge distillation (distill block, frozen
+  teacher, fused KL-CE GPU kernel).
 - **FASE** — quantization-aware optimizer/codegen.
 - **ZK** — zero-knowledge proof generation/verification (`nsl build --zk`).
 - **FPGA / Verilog** — HDL backend (Yosys/Verilator nightly job). See
