@@ -37,6 +37,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             cuda_sync,
             gpu_mem_report,
             monitor,
+            health_interval,
             inspect,
             csha,
             csha_report,
@@ -64,6 +65,24 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
         &mut csha,
         &mut source_ad,
     );
+
+    // Dev Tools paper completion (PDF section 4.3): --health-interval
+    // validation. The value reaches codegen via
+    // CompileOptions.health_flush_interval and is only emitted when the
+    // health monitor is active (stmt.rs guards on health_monitor), so
+    // without --monitor the flag is inert -- warn instead of silently
+    // accepting it.
+    if let Some(n) = health_interval {
+        if n == 0 {
+            eprintln!("error: --health-interval must be >= 1");
+            process::exit(1);
+        }
+        if !monitor {
+            eprintln!(
+                "warning: --health-interval has no effect without --monitor"
+            );
+        }
+    }
 
             // CSHA: validate the same way `nsl build --csha` does so an
             // unrecognised mode fails fast rather than silently disabling
@@ -236,6 +255,14 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             };
 
             if monitor && !detected_train_block {
+                // --monitor without a train block falls back to the
+                // kernel-timing path, where the health monitor (and thus
+                // its flush interval) is inactive.
+                if health_interval.is_some() {
+                    eprintln!(
+                        "warning: --health-interval has no effect without a train block"
+                    );
+                }
                 let profile_args = nsl_cli::profile::ProfileArgs {
                     file: file.clone(),
                     target: gpu.clone().unwrap_or_else(|| "h100".to_string()),
@@ -248,6 +275,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     entry: "auto".into(),
                     json: true,
                     explain_wggo: false,
+                    html: None,
                 };
                 let report_json = match nsl_cli::profile::run_profile(&profile_args) {
                     Ok(s) => s,
@@ -364,7 +392,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     None
                 },
                 health_monitor: detected_train_block,
-                health_flush_interval: None,
+                // Dev Tools paper completion: user-tunable flush interval
+                // (steps). None keeps the runtime default of 100; consumed
+                // in stmt.rs only when health_monitor is on.
+                health_flush_interval: health_interval,
                 inspect_enabled: inspect,
                 csha: nsl_codegen::CshaOptions {
                     mode: csha.clone(),
@@ -623,35 +654,137 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     std::process::exit(1);
                 }
             } else {
-                crate::commands::build::run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, gpu_mem_report, &compile_opts);
-                // Phase 4 Task 6: after the child process exits, load and
-                // render the health snapshot written by the runtime flush
-                // hook.  Only runs when `--monitor` + train-block detection
-                // enabled the health monitor upstream.
-                if monitor && detected_train_block {
-                    let health_path = file.with_extension("nsl-health.json");
-                    match std::fs::read_to_string(&health_path) {
-                        Ok(s) => match serde_json::from_str::<
-                            nsl_runtime::health::collector::HealthSnapshot,
-                        >(&s)
-                        {
-                            Ok(snap) => {
-                                let mut renderer =
-                                    nsl_cli::health_monitor::HealthRenderer::new();
-                                renderer.render(&snap);
+                // Dev Tools paper completion (PDF section 4.3): the paper
+                // shows a LIVE-updating health monitor, so the monitor+train
+                // path needs code both before the training child launches
+                // (spawn the poller thread) and after it exits (stop, join,
+                // final repaint). `run_run` never returns -- it forwards the
+                // child's exit code via process::exit -- so that lifecycle
+                // cannot be wrapped around a run_run call. Instead we reuse
+                // run_run's two building blocks directly: `build_to_temp`
+                // (build + CPDT report) and `execute_temp_build` (run + merge
+                // + cleanup, returning the exit code), spawning the poller
+                // BETWEEN them. Every other invocation still goes through
+                // `run_run` unchanged, and no poller is spawned when
+                // --monitor is off.
+                let monitor_exit_code: Option<i32> = if monitor && detected_train_block {
+                    let build = crate::commands::build::build_to_temp(&file, &compile_opts);
+
+                    // The training runtime flushes the snapshot to
+                    // "<source-path>.nsl-health.json" (appended, not
+                    // with_extension -- see stmt.rs, which formats
+                    // profile_source_file_name + ".nsl-health.json").
+                    let health_path = std::path::PathBuf::from(
+                        format!("{}.nsl-health.json", file.display()),
+                    );
+
+                    // Live monitor: spawn the poller BEFORE the training
+                    // child launches. It repaints the shared renderer in
+                    // place every time the runtime rewrites the snapshot
+                    // (every flush interval). last_mtime is seeded from any
+                    // stale snapshot left by a previous run so only writes
+                    // made by THIS run are painted live.
+                    let renderer = std::sync::Arc::new(std::sync::Mutex::new(
+                        nsl_cli::health_monitor::HealthRenderer::new(),
+                    ));
+                    let stop = std::sync::Arc::new(
+                        std::sync::atomic::AtomicBool::new(false),
+                    );
+                    // Seed the mtime in the parent, before either the poller
+                    // thread or the child exists, so a first flush landing
+                    // between thread spawn and its first poll is still seen
+                    // as a change.
+                    let initial_mtime: Option<std::time::SystemTime> =
+                        std::fs::metadata(&health_path)
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                    let poller = {
+                        let renderer = std::sync::Arc::clone(&renderer);
+                        let stop = std::sync::Arc::clone(&stop);
+                        let path = health_path.clone();
+                        std::thread::spawn(move || {
+                            let mut last_mtime = initial_mtime;
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                if let Some(snap) =
+                                    nsl_cli::health_monitor::poll_health_file(
+                                        &path,
+                                        &mut last_mtime,
+                                    )
+                                {
+                                    if let Ok(mut r) = renderer.lock() {
+                                        r.render(&snap);
+                                    }
+                                }
+                                std::thread::sleep(
+                                    std::time::Duration::from_millis(250),
+                                );
                             }
-                            Err(e) => eprintln!(
-                                "warning: health snapshot at {} failed to parse: {}",
-                                health_path.display(),
-                                e
-                            ),
-                        },
-                        Err(_) => eprintln!(
+                        })
+                    };
+
+                    // Execute the compiled program via the SAME helper
+                    // run_run uses (env-var forwarding, profile merge, and
+                    // cleanup all live there), returning the exit code
+                    // instead of exiting so we can stop the poller first.
+                    let code = crate::commands::build::execute_temp_build(
+                        &build,
+                        &args,
+                        profile_memory,
+                        profile_kernels,
+                        profile,
+                        cuda_sync,
+                        gpu_mem_report,
+                    );
+
+                    // Stop the poller, join it, THEN repaint the final
+                    // snapshot with the SAME renderer instance so the last
+                    // frame overwrites the live one in place instead of
+                    // appending a duplicate block.
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = poller.join();
+                    // Only render a snapshot THIS run's runtime wrote: a
+                    // file whose mtime still equals the pre-run seed is a
+                    // stale leftover from a previous run (the child died
+                    // before its first flush) and must not be painted as
+                    // this run's final state.
+                    if !nsl_cli::health_monitor::health_file_changed_since(
+                        &health_path,
+                        initial_mtime,
+                    ) {
+                        eprintln!(
                             "warning: no health snapshot at {} — train step may not have reached first flush",
                             health_path.display()
-                        ),
+                        );
+                    } else {
+                        match std::fs::read_to_string(&health_path) {
+                            Ok(s) => match serde_json::from_str::<
+                                nsl_runtime::health::collector::HealthSnapshot,
+                            >(&s)
+                            {
+                                Ok(snap) => {
+                                    let mut r = renderer
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    r.render(&snap);
+                                }
+                                Err(e) => eprintln!(
+                                    "warning: health snapshot at {} failed to parse: {}",
+                                    health_path.display(),
+                                    e
+                                ),
+                            },
+                            Err(_) => eprintln!(
+                                "warning: no health snapshot at {} — train step may not have reached first flush",
+                                health_path.display()
+                            ),
+                        }
                     }
-                }
+
+                    Some(code)
+                } else {
+                    crate::commands::build::run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, gpu_mem_report, &compile_opts);
+                    None
+                };
                 // Phase 5 Task 8: summarize @inspect dumps written by the
                 // runtime hook to `.nsl-inspect/`.
                 if inspect {
@@ -682,6 +815,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                             );
                         }
                     }
+                }
+                // Forward the training child's exit code (mirrors the
+                // process::exit at the end of run_run). Deferred to after
+                // the inspect summary so `--monitor --inspect` still prints.
+                if let Some(code) = monitor_exit_code {
+                    process::exit(code);
                 }
             }
 }

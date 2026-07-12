@@ -628,7 +628,46 @@ pub fn compile_returning_plan(
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
+    compile_returning_plan_impl(ast, interner, type_map, dump_ir, options, None)
+}
+
+/// Dev-tools paper completion: run the full pipeline while capturing real
+/// train-block artifacts (WengertList, per-var size hints, fusion plan) for
+/// `nsl profile`'s real path.
+///
+/// Returns the captures ALONGSIDE the compile result rather than inside it:
+/// minimal profile-driven compiles routinely fail AFTER extraction (e.g. on
+/// unresolved optimizer stdlib symbols — the `nsl check --csha-report` path
+/// documents the same failure mode), and the captures are exactly what the
+/// caller wants in that case. `(None, Ok(..))` means the module compiled
+/// but had no source-AD train block to capture.
+pub fn compile_with_profile_captures(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    options: &crate::CompileOptions,
+) -> (
+    Option<crate::profiling::captures::ProfileCaptures>,
+    Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError>,
+) {
+    let slot: crate::profiling::captures::ProfileCaptureSlot =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let result =
+        compile_returning_plan_impl(ast, interner, type_map, false, options, Some(slot.clone()));
+    let captures = slot.borrow_mut().take();
+    (captures, result)
+}
+
+fn compile_returning_plan_impl(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    dump_ir: bool,
+    options: &crate::CompileOptions,
+    capture_slot: Option<crate::profiling::captures::ProfileCaptureSlot>,
+) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
+    compiler.profile_capture_slot = capture_slot;
     install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
 
     // M52: load weights if --weights was provided.

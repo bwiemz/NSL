@@ -1637,6 +1637,13 @@ pub struct WengertExtractor<'a> {
     /// weights; they are never handed to the optimizer or gradient
     /// collection.
     frozen_input_vars: Vec<(String, VarId)>,
+    /// Dev-tools profile capture: producing AST node per result VarId,
+    /// recorded by the `extract_expr` wrapper. `entry().or_insert` keeps
+    /// the INNERMOST (producing) expression when an outer expression
+    /// passes a var through unchanged (e.g. an ident reference). Used by
+    /// `profiling::captures::size_hints_from_var_nodes` to resolve
+    /// concrete typed shapes into byte sizes; never read by lowering.
+    var_nodes: HashMap<VarId, nsl_ast::NodeId>,
 }
 
 /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1):
@@ -1694,6 +1701,7 @@ impl<'a> WengertExtractor<'a> {
             distill_loss_alpha_temp: (None, None),
             frozen_model_roots: HashSet::new(),
             frozen_input_vars: Vec::new(),
+            var_nodes: HashMap::new(),
         }
     }
 
@@ -2395,9 +2403,33 @@ impl<'a> WengertExtractor<'a> {
         }
     }
 
+    /// Dev-tools profile capture: read-only view of the producing AST node
+    /// per result VarId (see the `var_nodes` field doc).
+    pub fn var_nodes(&self) -> &HashMap<VarId, nsl_ast::NodeId> {
+        &self.var_nodes
+    }
+
     /// Extract an expression into a WengertOp, returning its VarId.
     /// Returns None if the expression contains dynamic control flow.
+    ///
+    /// Thin wrapper over `extract_expr_inner` that additionally attributes
+    /// each result VarId to the AST expression that produced it. `or_insert`
+    /// keeps the first (innermost/producing) attribution when outer
+    /// expressions return an already-mapped var unchanged. Recursive
+    /// extraction calls go through this wrapper, so every subexpression is
+    /// attributed.
     fn extract_expr(&mut self, expr: &nsl_ast::expr::Expr) -> Option<VarId> {
+        let result = self.extract_expr_inner(expr);
+        if let Some(var) = result {
+            self.var_nodes.entry(var).or_insert(expr.id);
+        }
+        result
+    }
+
+    /// Core expression extraction (formerly `extract_expr`; the attribution
+    /// wrapper above now owns that name). Returns None on dynamic control
+    /// flow.
+    fn extract_expr_inner(&mut self, expr: &nsl_ast::expr::Expr) -> Option<VarId> {
         match &expr.kind {
             ExprKind::Ident(sym) => self.symbol_to_var.get(sym).copied(),
 

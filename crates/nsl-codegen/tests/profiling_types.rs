@@ -13,6 +13,10 @@ fn empty_report_round_trips_json() {
         fusion: None,
         memory_timeline: None,
         memory_timeline_approximate: None,
+        memory_what_if: None,
+        memory_peak_bytes: None,
+        memory_unsized_vars: None,
+        memory_total_vars: None,
         recommendations: vec![],
         wggo_explain: None,
     };

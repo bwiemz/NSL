@@ -26,7 +26,7 @@ mod zk;
 
 pub(crate) use normal::{run_build, run_build_inner};
 pub(crate) use options::dispatch;
-pub(crate) use run::run_run;
+pub(crate) use run::{build_to_temp, execute_temp_build, run_run};
 pub(crate) use shared_lib::run_build_shared;
 pub(crate) use standalone::run_build_standalone;
 pub(crate) use wrga_check::{run_check_wrga_analyze, run_check_wrga_compare};

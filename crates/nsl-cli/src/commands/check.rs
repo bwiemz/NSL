@@ -453,6 +453,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     entry: "auto".to_string(),
                     json: false,
                     explain_wggo: false,
+                    html: None,
                 };
                 match nsl_cli::profile::run_profile(&profile_args) {
                     Ok(report) => println!("{report}"),

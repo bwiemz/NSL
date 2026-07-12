@@ -381,7 +381,8 @@ pub use compiler::{
     compile_entry_returning_plan, compile_module_with_imports_returning_plan,
     compile_returning_plan, compile_returning_splice_count_for_tests,
     compile_standalone, compile_standalone_returning_plan,
-    compile_test, compile_with_zk_info, compile_with_zk_info_returning_plan,
+    compile_test, compile_with_profile_captures, compile_with_zk_info,
+    compile_with_zk_info_returning_plan,
     StandaloneConfig,
 };
 
