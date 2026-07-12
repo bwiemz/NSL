@@ -1437,7 +1437,7 @@ MP_KX:\n\
     mul.lo.u64 %rd16, %rd20, %rd5;\n\
     add.u64 %rd16, %rd16, %rd19;\n\
     mul.lo.u64 %rd16, %rd16, %rd6;\n\
-    // ih was computed above but we used %rd16 — recompute\n\
+    // ih was computed above but we used %rd16 -- recompute\n\
     mul.lo.u64 %rd18, %rd17, %rd10;\n\
     add.u64 %rd18, %rd18, %rd22;\n\
     sub.u64 %rd18, %rd18, %rd11;\n\
@@ -1993,7 +1993,7 @@ pub(crate) const COO_SPMM_F32_PTX: &str = "\
     ld.global.s64 %rd10, [%rd9];    // row\n\
     add.u64 %rd9, %rd2, %rd8;\n\
     ld.global.s64 %rd11, [%rd9];    // col (= k in A)\n\
-    // Load values[thread_id] (f32 — we store values as f32 on GPU)\n\
+    // Load values[thread_id] (f32 -- we store values as f32 on GPU)\n\
     shl.b64 %rd8, %rd0, 2;         // * 4 (f32)\n\
     add.u64 %rd9, %rd3, %rd8;\n\
     ld.global.f32 %f1, [%rd9];     // val = A[row, col]\n\

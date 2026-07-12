@@ -5496,6 +5496,40 @@ mod tests {
         assert!(CSHA_BWD_MULTITILE_POSTPASS_NAME.ends_with('\0'));
     }
 
+    /// Companion guard for the f16<->f32 CSHA cast kernels — also hand-written,
+    /// module-private PTX loaded via `cuModuleLoadData` at runtime, and so
+    /// subject to the same driver-JIT hazard: a non-ASCII byte anywhere (even a
+    /// comment) trips `CUDA_ERROR_INVALID_PTX`, and offline `ptxas` under a
+    /// UTF-8 locale does not reproduce it. Without this, these two consts were
+    /// the last runtime PTX in the crate not covered by any ASCII gate.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn csha_cast_ptx_is_ascii_and_nul_terminated() {
+        for (tag, ptx, name) in [
+            (
+                "CSHA_BWD_F32_TO_F16",
+                CSHA_BWD_F32_TO_F16_PTX,
+                CSHA_BWD_F32_TO_F16_NAME,
+            ),
+            (
+                "CSHA_FWD_F16_TO_F32",
+                CSHA_FWD_F16_TO_F32_PTX,
+                CSHA_FWD_F16_TO_F32_NAME,
+            ),
+        ] {
+            assert!(ptx.ends_with('\0'), "{tag} PTX must be NUL-terminated");
+            for (i, b) in ptx.bytes().enumerate() {
+                assert!(
+                    b.is_ascii(),
+                    "{tag} PTX byte {i} = {b:#x} is non-ASCII (driver JIT trips \
+                     CUDA_ERROR_INVALID_PTX). Context: {:?}",
+                    &ptx[i.saturating_sub(24)..(i + 1).min(ptx.len())]
+                );
+            }
+            assert!(name.ends_with('\0'), "{tag} name must be NUL-terminated");
+        }
+    }
+
     /// Leak regression for the alloc/free pairing bug (2026-07-02):
     /// the six save buffers come from `inner::alloc_device` (raw
     /// `cuMemAlloc`, never registered in `CUDA_ALLOC_SET`), but
