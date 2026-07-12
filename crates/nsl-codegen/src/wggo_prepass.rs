@@ -77,6 +77,32 @@ pub fn wggo_mode_enabled(options: &crate::CompileOptions) -> bool {
     )
 }
 
+/// True iff the WGGO pre-pass must be DEFERRED because calibrated importance
+/// scoring was requested but its calibration sidecar is not yet available.
+///
+/// The pre-pass scorer (`build_scorer`) needs the calibration sidecar to
+/// honour `importance != Magnitude`: without it `importance=Grad` errors (the
+/// plan is silently dropped) and `importance=Auto` degrades to magnitude
+/// scoring. Either way the pre-pass would score with a DIFFERENT importance
+/// than the in-place planner, which runs later (in `compile_main`) once the
+/// sidecar exists — so the pre-plan's graph fingerprint would never match and
+/// it would be rejected. While the sidecar is absent we therefore refuse the
+/// pre-pass and let planning stay in-place.
+///
+/// Once the calibration harness is sequenced ahead of
+/// `compile_flash_attention_kernels` (the `compile_and_calibrate` wrapper does
+/// this) the sidecar is populated before the pre-pass runs, this returns
+/// `false`, and the pre-pass plans under the same calibrated scorer the
+/// in-place planner uses — so the two agree and the pre-plan is consumed.
+/// Entry points that never fire the harness leave the sidecar `None`, so this
+/// keeps returning `true` there and the pre-pass stays deferred, exactly as
+/// before the WGGO-before-kernels restructure.
+pub fn wggo_prepass_deferred_pending_sidecar(options: &crate::CompileOptions) -> bool {
+    options.calibration_data.is_some()
+        && !matches!(options.wggo.importance, crate::WggoImportance::Magnitude)
+        && options.calibration_sidecar.is_none()
+}
+
 /// Structural fingerprint of a Wengert list: op count plus per-op
 /// (canonically-renumbered result/input VarIds, op-kind discriminant) plus
 /// the Param/Input leaf names the plan's layer matching keys off.
@@ -323,6 +349,80 @@ mod tests {
             var_names: std::collections::HashMap::new(),
             var_types: std::collections::HashMap::new(),
         }
+    }
+
+    /// Gate for the calibrated-importance WGGO deferral (calibration-harness
+    /// hoist). The pre-pass must be deferred only while the sidecar it needs
+    /// is still absent; once the harness has produced a sidecar the pre-pass
+    /// plans under the same calibrated scorer the in-place planner uses. The
+    /// old proxy (`calibration_data.is_some() && importance != Magnitude`) had
+    /// no sidecar term, so hoisting the harness alone would have been a silent
+    /// no-op — this pins the sidecar term that makes the hoist effective.
+    #[test]
+    fn prepass_deferral_tracks_sidecar_presence() {
+        use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
+        use crate::{CompileOptions, WggoImportance, WggoOptions};
+
+        // Sidecar has no Default derive (byte_map_b64 serde helper), so build
+        // a minimal empty one — the gate only checks presence, not contents.
+        let empty_sidecar = || Sidecar {
+            version: SIDECAR_VERSION,
+            checkpoint_sha256: String::new(),
+            calibration_data_sha256: String::new(),
+            hook_set_sha256: String::new(),
+            cache_key_digest: String::new(),
+            num_samples_used: 0,
+            hooks: std::collections::BTreeMap::new(),
+            wggo_head_gradients: None,
+        };
+
+        let opts = |imp: WggoImportance, calib: bool, sidecar: Option<Sidecar>| CompileOptions {
+            calibration_data: calib.then(|| std::path::PathBuf::from("calib.safetensors")),
+            calibration_sidecar: sidecar,
+            wggo: WggoOptions {
+                importance: imp,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Calibrated importance requested, sidecar not yet produced -> defer.
+        assert!(wggo_prepass_deferred_pending_sidecar(&opts(
+            WggoImportance::Grad,
+            true,
+            None
+        )));
+        assert!(wggo_prepass_deferred_pending_sidecar(&opts(
+            WggoImportance::Auto,
+            true,
+            None
+        )));
+
+        // Sidecar present (harness hoisted ahead of the pre-pass) -> plan.
+        assert!(!wggo_prepass_deferred_pending_sidecar(&opts(
+            WggoImportance::Grad,
+            true,
+            Some(empty_sidecar())
+        )));
+        assert!(!wggo_prepass_deferred_pending_sidecar(&opts(
+            WggoImportance::Auto,
+            true,
+            Some(empty_sidecar())
+        )));
+
+        // Magnitude scoring never needs the sidecar -> plan regardless.
+        assert!(!wggo_prepass_deferred_pending_sidecar(&opts(
+            WggoImportance::Magnitude,
+            true,
+            None
+        )));
+
+        // No calibration data at all -> the gate is inert -> plan.
+        assert!(!wggo_prepass_deferred_pending_sidecar(&opts(
+            WggoImportance::Grad,
+            false,
+            None
+        )));
     }
 
     /// The load-bearing property: leaf emission order follows symbol

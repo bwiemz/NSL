@@ -527,25 +527,27 @@ impl Compiler<'_> {
         // single choke point every entry point funnels through, which is what
         // makes the ordering guarantee structural rather than per-call-site.
         //
-        // Exception (documented follow-up, #134 ordering invariant): when
-        // calibrated importance scoring is in play, the calibration harness
-        // fires AFTER this point (compile_and_calibrate wrapper), so a plan
-        // solved here would silently degrade importance=Auto to magnitude and
-        // break importance=Grad. Refuse the pre-pass in that configuration —
-        // planning then stays in-place exactly as before this restructure.
-        let calibrated_importance = self.compile_options.calibration_data.is_some()
-            && !matches!(
-                self.compile_options.wggo.importance,
-                crate::WggoImportance::Magnitude
-            );
-        if calibrated_importance {
+        // Calibrated importance exception: a plan solved here needs the
+        // calibration sidecar to score with `importance != Magnitude`. The
+        // `compile_and_calibrate` wrapper now fires the calibration harness
+        // ahead of this call, so the sidecar is present and the pre-pass plans
+        // under the same calibrated scorer the in-place planner uses. But any
+        // entry point that never runs the harness leaves the sidecar `None`;
+        // there `wggo_prepass_deferred_pending_sidecar` returns true and we
+        // defer, keeping planning in-place exactly as before this restructure
+        // (planning under a degraded scorer would diverge from the in-place
+        // planner and its pre-plan would be fingerprint-rejected anyway).
+        let deferred =
+            crate::wggo_prepass::wggo_prepass_deferred_pending_sidecar(&self.compile_options);
+        if deferred {
             // Note only when planning would otherwise happen: `--wggo off`
             // arrives as Some("off"), so `mode.is_some()` is NOT "enabled"
             // (review finding — the off mode must stay chatter-free).
             if crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
                 eprintln!(
-                    "[wggo] pre-pass deferred: calibrated importance scoring fires after \
-                     kernel synthesis; planning stays in-place (kernel admission unplanned)"
+                    "[wggo] pre-pass deferred: calibrated importance scoring requested but \
+                     its calibration sidecar is not yet available; planning stays in-place \
+                     (kernel admission unplanned)"
                 );
             }
         } else {
