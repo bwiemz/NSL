@@ -33,8 +33,8 @@ pub use entry_points::{
     compile_module_with_imports_returning_plan,
     compile_entry_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
-    compile_standalone_returning_plan, compile_test, compile_with_zk_info,
-    compile_with_zk_info_returning_plan,
+    compile_standalone_returning_plan, compile_test, compile_with_profile_captures,
+    compile_with_zk_info, compile_with_zk_info_returning_plan,
 };
 
 // §5.7 debug helper seam: exposed so lib.rs can forward it as a public
@@ -697,6 +697,13 @@ pub struct Compiler<'a> {
     pub fusion_plan_for_profile: Option<crate::wrga_fusion::FusionPlan>,
     pub source_text: String,
     pub source_file_name: String,
+    /// Dev-tools paper completion: shared out-slot for real train-block
+    /// artifacts (`nsl profile` real path). Installed only by
+    /// `compile_with_profile_captures`; the train-block stash site in
+    /// `stmt.rs` writes it. `Rc<RefCell<..>>` so the snapshot survives
+    /// downstream codegen errors (minimal compiles often fail after
+    /// extraction on unresolved optimizer stdlib symbols).
+    pub profile_capture_slot: Option<crate::profiling::captures::ProfileCaptureSlot>,
 
     // ── Dev Tools Phase 5: @inspect decorator state ─────────────────────
     pub inspect_train_step_var: Option<cranelift_frontend::Variable>,
@@ -975,6 +982,7 @@ impl<'a> Compiler<'a> {
             prediction_map: HashMap::new(),
             manifest_builder: None,
             fusion_plan_for_profile: None,
+            profile_capture_slot: None,
             source_text: String::new(),
             source_file_name: String::new(),
             inspect_train_step_var: None,

@@ -22,6 +22,7 @@ fn sample_args() -> ProfileArgs {
         entry: "auto".into(),
         json: false,
         explain_wggo: false,
+        html: None,
     }
 }
 

@@ -100,6 +100,22 @@ pub struct ProfileReport {
     /// Consumers must not treat the peak as a real memory bound when set.
     #[serde(default)]
     pub memory_timeline_approximate: Option<bool>,
+    /// Paper section 3.2 what-if lines ("With FASE: peak drops to ..."),
+    /// populated only on the real-liveness timeline path.
+    #[serde(default)]
+    pub memory_what_if: Option<Vec<crate::profiling::real_timeline::WhatIfPeak>>,
+    /// Peak of the real-liveness timeline in bytes (real path only).
+    #[serde(default)]
+    pub memory_peak_bytes: Option<u64>,
+    /// Real-liveness timeline honesty counts: vars with / without a concrete
+    /// compile-time byte size. When `memory_unsized_vars > 0` the MB figures
+    /// are a lower bound (some vars had no concrete shape). Both `None` on
+    /// the approximate/synthetic path. Consumed by every renderer (text,
+    /// HTML, JSON) so the lower-bound caveat is never dropped.
+    #[serde(default)]
+    pub memory_unsized_vars: Option<usize>,
+    #[serde(default)]
+    pub memory_total_vars: Option<usize>,
     pub recommendations: Vec<Recommendation>,
     /// Populated by `nsl profile --explain-wggo`. `WggoPlan` is serialize-only,
     /// so this field is skipped on deserialization and defaults to `None`.

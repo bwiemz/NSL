@@ -638,6 +638,10 @@ fn build_report(ctx: WalkCtx<'_>, entry: EntryKind) -> ProfileReport {
         fusion: None,
         memory_timeline: None,
         memory_timeline_approximate: None,
+        memory_what_if: None,
+        memory_peak_bytes: None,
+        memory_unsized_vars: None,
+        memory_total_vars: None,
         recommendations,
         wggo_explain: None,
     }

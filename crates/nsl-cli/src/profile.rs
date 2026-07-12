@@ -26,6 +26,8 @@ pub struct ProfileArgs {
     pub json: bool,
     /// Run WGGO `Full` mode and attach/append the decision explanation.
     pub explain_wggo: bool,
+    /// Write a self-contained HTML report (inline-SVG roofline) here.
+    pub html: Option<PathBuf>,
 }
 
 pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
@@ -65,20 +67,65 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         &args.dtype,
     )?;
 
+    // Dev-tools paper completion: run a real capture compile when a real
+    // WengertList materially improves the requested output (--explain-wggo
+    // explains the USER'S model instead of a synthetic one; --memory gets a
+    // real-liveness timeline with what-if lines). The capture survives
+    // downstream codegen errors, so a minimal single-file profile compile
+    // that fails late (e.g. on optimizer stdlib symbols) still yields the
+    // extracted list. Programs without a source-AD train block fall back to
+    // the labeled synthetic/approximate paths below.
+    let captures = if args.explain_wggo || args.memory {
+        try_capture_real(&input, &args.target)
+    } else {
+        None
+    };
+    let real_wengert = captures
+        .as_ref()
+        .and_then(|c| c.train_wengert.clone())
+        .filter(|w| !w.ops.is_empty());
+
     if args.fusion {
-        report.fusion = Some(nsl_codegen::wrga_fusion::build_fusion_plan(&[], None));
+        // Prefer the fusion plan the capture compile actually produced;
+        // fall back to the (empty) placeholder plan otherwise.
+        report.fusion = Some(
+            captures
+                .as_ref()
+                .and_then(|c| c.fusion.clone())
+                .unwrap_or_else(|| nsl_codegen::wrga_fusion::build_fusion_plan(&[], None)),
+        );
     }
 
+    // Pre-rendered real-liveness timeline (render_text uses it in place of
+    // the approximate renderer when the real path succeeded).
+    let mut real_timeline_text: Option<String> = None;
     if args.memory {
-        // APPROXIMATION, and labeled as such in both the render and the JSON
-        // (`memory_timeline_approximate: true`): each op's activation is given
-        // a fixed 2-step lifetime, so the timeline shows a moving sum of
-        // bytes_written — NOT real activation liveness. In particular, saved-
-        // for-backward activations in training programs accumulate far beyond
-        // this window, so the real peak is typically much higher. Replacing
-        // this with a real WengertList-driven plan (extraction + adjoint +
-        // analyze_saved_tensors + the WRGA planner) is the tracked follow-up;
-        // until then the honest contract is a clearly-labeled estimate.
+        if let (Some(c), Some(w)) = (&captures, &real_wengert) {
+            if let Some(rt) =
+                nsl_codegen::profiling::real_timeline::build_training_timeline(
+                    w,
+                    &c.var_size_hints,
+                )
+            {
+                report.memory_timeline = Some(rt.entries.clone());
+                report.memory_timeline_approximate = Some(false);
+                report.memory_what_if = Some(rt.what_if.clone());
+                report.memory_peak_bytes = Some(rt.peak_bytes);
+                report.memory_unsized_vars = Some(rt.unsized_vars);
+                report.memory_total_vars = Some(rt.sized_vars + rt.unsized_vars);
+                real_timeline_text =
+                    Some(nsl_codegen::profiling::real_timeline::render(&rt, 48));
+            }
+        }
+    }
+
+    if args.memory && real_timeline_text.is_none() {
+        // APPROXIMATION fallback, and labeled as such in both the render and
+        // the JSON (`memory_timeline_approximate: true`): each op's
+        // activation is given a fixed 2-step lifetime, so the timeline shows
+        // a moving sum of bytes_written — NOT real activation liveness. Used
+        // when the program has no source-AD train block to extract (the real
+        // path above handles the training case).
         use nsl_codegen::wrga_memory::{MemoryPlan, MemoryPlanStats, SlotAssignment};
         const LIFETIME_WINDOW: u32 = 2;
         let n = report.ops.len() as u32;
@@ -112,14 +159,28 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         report.memory_timeline_approximate = Some(true);
     }
 
+    // Dev-tools paper completion (paper section 3.1 "Roofline Plot:
+    // [generated as SVG/HTML in build output]"): write the self-contained
+    // HTML report when requested. The report is complete at this point for
+    // HTML purposes (ops, fusion, timeline, recommendations).
+    if let Some(html_path) = &args.html {
+        let html = crate::profile_render::render_html(&report, gpu);
+        std::fs::write(html_path, html).map_err(|e| {
+            format!("could not write HTML report '{}': {}", html_path.display(), e)
+        })?;
+        eprintln!("[nsl] HTML profile report written to {}", html_path.display());
+    }
+
     if args.explain_wggo {
-        // Phase 3 Task 4: the CLI profile path doesn't yet carry a real
-        // source-AD WengertList, so we synthesize a minimal two-block
-        // attention-shaped list. This is sufficient for the decision-trace
-        // renderer (Task 3) to produce a complete per-layer explanation.
-        // When Phase-4 source-AD lands in `nsl profile`, replace with the
-        // real wengert extraction.
-        let wengert = synth_two_block_wengert();
+        // Dev-tools paper completion: explain the USER'S model when a real
+        // source-AD WengertList was captured; the synthetic two-block
+        // attention list remains only as the labeled fallback for programs
+        // without a train block.
+        let used_real = real_wengert.is_some();
+        let wengert = match &real_wengert {
+            Some(w) => w.clone(),
+            None => synth_two_block_wengert(),
+        };
         let plan = nsl_codegen::wggo::run_on_wengert(
             &wengert,
             &args.target,
@@ -131,10 +192,15 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
             report.wggo_explain = Some(plan);
         } else {
             let explain = crate::wggo_explain::render_explain(&plan);
-            // Defer to render_text below; stash via a helper string.
-            let text = render_text(&report, gpu);
+            let text = render_text(&report, gpu, real_timeline_text.as_deref());
             let mut out = text;
             out.push('\n');
+            if !used_real {
+                out.push_str(
+                    "note: no source-AD train block captured from this program — the \
+                     explanation below covers a SYNTHETIC two-block attention model.\n",
+                );
+            }
             out.push_str(&explain);
             return Ok(out);
         }
@@ -144,12 +210,67 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
     }
 
-    Ok(render_text(&report, gpu))
+    Ok(render_text(&report, gpu, real_timeline_text.as_deref()))
+}
+
+/// Attempt the real capture compile for `nsl profile`'s real path. Returns
+/// `None` (with a stderr note) when the module has no source-AD train block
+/// or the pipeline errored before extraction.
+///
+/// The CompileOptions are enriched with the SAME decorator bridges the real
+/// build paths apply (standalone.rs / shared_lib.rs / zk.rs): without them a
+/// `@checkpoint`/`@lora`/`@wrga`/`@csha` program would extract a list the
+/// production compile never lowers (unpruned, non-checkpoint-aware), and we
+/// would then label an inaccurate timeline "real". Populating `wrga_inputs`
+/// also makes the captured `fusion` plan non-empty (the profile fusion
+/// summary reflects the real WRGA plan instead of an empty placeholder).
+fn try_capture_real(
+    input: &crate::shape_debug::ShapeDebugInput,
+    target: &str,
+) -> Option<nsl_codegen::profiling::captures::ProfileCaptures> {
+    let analysis = &input.analysis;
+    let mut options = nsl_codegen::CompileOptions {
+        source_ad: true,
+        target: target.to_string(),
+        ..Default::default()
+    };
+    options.wrga_inputs = Some(crate::analysis_bridges::analysis_to_wrga_inputs(
+        analysis,
+        &options.wrga_check,
+    ));
+    options.fused_ce_configs = crate::analysis_bridges::analysis_to_fused_ce_configs(analysis);
+    options.fused_kl_ce_configs = crate::analysis_bridges::analysis_to_fused_kl_ce_configs(analysis);
+    options.pca_user_strategies = crate::analysis_bridges::analysis_to_pca_user_strategies(analysis);
+    options.csha_configs = crate::analysis_bridges::analysis_to_csha_configs(analysis);
+    options.checkpoint_policies = crate::analysis_bridges::analysis_to_checkpoint_policies(analysis);
+    options.weight_index_map = analysis.weight_index_map.clone();
+    let (captures, result) = nsl_codegen::compile_with_profile_captures(
+        &input.module,
+        &input.interner,
+        &input.analysis.type_map,
+        &options,
+    );
+    if captures.is_none() {
+        match &result {
+            Err(e) => eprintln!(
+                "note: real train-block extraction unavailable ({}); using the \
+                 labeled synthetic/approximate profile paths",
+                e.message
+            ),
+            Ok(_) => eprintln!(
+                "note: no source-AD train block in this program; using the \
+                 labeled synthetic/approximate profile paths"
+            ),
+        }
+    }
+    captures
 }
 
 /// Synthesize a two-block attention Wengert list suitable for WGGO
 /// driver input. Mirrors the test fixture used by Task 2's decision-trace
-/// tests. Used only by `--explain-wggo` until real AD extraction is wired.
+/// tests. FALLBACK ONLY: `--explain-wggo` uses the real captured train-block
+/// WengertList when the program has one (and says so in the output when it
+/// does not).
 fn synth_two_block_wengert() -> nsl_codegen::wengert::WengertList {
     use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
     use std::collections::HashMap;
@@ -176,7 +297,7 @@ fn synth_two_block_wengert() -> nsl_codegen::wengert::WengertList {
     }
 }
 
-fn render_text(r: &ProfileReport, gpu: &GpuSpec) -> String {
+fn render_text(r: &ProfileReport, gpu: &GpuSpec, real_timeline_text: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "=== NSL Predictive Profile ===\nTarget: {} ({:.0} TFLOPS fp16, {:.2} TB/s HBM)\nDtype: {}\n\n",
@@ -192,6 +313,17 @@ fn render_text(r: &ProfileReport, gpu: &GpuSpec) -> String {
     ));
     if let Some(fp) = &r.fusion {
         out.push_str("\nFusion summary:\n");
+        if fp.decisions.is_empty() {
+            // Refuse-loudly rather than print a bare header: the fusion plan
+            // is only populated from a real WRGA compile, which runs on the
+            // capture path (--memory / --explain-wggo). Say so instead of
+            // implying "no fusion opportunities exist".
+            out.push_str(
+                "  (no fusion decisions captured — the fusion plan is populated only\n  \
+                 from a real compile; re-run with --memory or --explain-wggo, or with\n  \
+                 @wrga/@adapter decorators present, to see WRGA fusion decisions)\n",
+            );
+        }
         for d in &fp.decisions {
             out.push_str(&format!(
                 "  {} → {:?}  ({} extra HBM bytes)  — {}\n",
@@ -199,7 +331,11 @@ fn render_text(r: &ProfileReport, gpu: &GpuSpec) -> String {
             ));
         }
     }
-    if let Some(tl) = &r.memory_timeline {
+    if let Some(rt_text) = real_timeline_text {
+        // Real-liveness path: the pre-rendered timeline already carries the
+        // phase markers, peak, what-if lines, and honesty notes.
+        out.push_str(rt_text);
+    } else if let Some(tl) = &r.memory_timeline {
         out.push_str(&nsl_codegen::profiling::memory_timeline::render(tl));
         if r.memory_timeline_approximate == Some(true) {
             out.push_str(

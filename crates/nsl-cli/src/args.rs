@@ -165,6 +165,11 @@ pub(crate) enum Cli {
         /// Run WGGO Full mode and append/attach the decision explanation
         #[arg(long)]
         explain_wggo: bool,
+
+        /// Write a self-contained HTML report (inline-SVG roofline plot,
+        /// per-op table, memory timeline) to this path
+        #[arg(long)]
+        html: Option<PathBuf>,
     },
 
     /// Train a BPE tokenizer from source files
@@ -881,6 +886,10 @@ pub(crate) struct RunArgs {
         /// Render predicted-vs-actual kernel timings instead of running the program
         #[arg(long)]
         pub(crate) monitor: bool,
+
+        /// Health-monitor flush interval in steps (default 100; requires --monitor)
+        #[arg(long, value_name = "N")]
+        pub(crate) health_interval: Option<u64>,
 
         /// Activate @inspect hooks: dump tensor stats/contents to .nsl-inspect/
         #[arg(long)]

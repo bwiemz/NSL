@@ -103,6 +103,7 @@ fn main_inner() {
             entry,
             json,
             explain_wggo,
+            html,
         } => {
             let args = nsl_cli::profile::ProfileArgs {
                 file,
@@ -116,6 +117,7 @@ fn main_inner() {
                 entry,
                 json,
                 explain_wggo,
+                html,
             };
             match nsl_cli::profile::run_profile(&args) {
                 Ok(s) => println!("{s}"),

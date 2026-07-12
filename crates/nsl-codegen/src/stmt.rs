@@ -5481,6 +5481,24 @@ impl Compiler<'_> {
                     None => extractor.wengert_list().clone(),
                 };
 
+                // Dev-tools paper completion: snapshot the REAL train-block
+                // artifacts for `nsl profile`'s real path. The slot is
+                // installed only by `compile_with_profile_captures` (None in
+                // normal builds), and lives OUTSIDE the compiler so the
+                // snapshot survives downstream codegen errors (e.g.
+                // unresolved optimizer stdlib symbols on minimal compiles).
+                if let Some(slot) = self.profile_capture_slot.clone() {
+                    let size_hints = crate::profiling::captures::size_hints_from_var_nodes(
+                        extractor.var_nodes(),
+                        self.type_map,
+                    );
+                    *slot.borrow_mut() = Some(crate::profiling::captures::ProfileCaptures {
+                        train_wengert: Some(effective_primal.clone()),
+                        var_size_hints: size_hints,
+                        fusion: wrga_plan.as_ref().map(|p| p.fusion.clone()),
+                    });
+                }
+
                 // WRGA B.1 Task 4: feed MemoryPlan.assignments to the real
                 // memory planner as coalescing hints.  Conservative: only
                 // merges pairs that pass size + liveness-disjoint checks.
