@@ -1,0 +1,33 @@
+# PCA Stage B backward differential, masked side: a ZERO additive mask makes
+# scaled_dot_product_attention_masked mathematically identical to plain
+# non-causal SDPA — but the backward runs through the DECOMPOSED adjoint
+# chain (transpose/matmul/mul/add/softmax/matmul) instead of the fused
+# FlashAttentionBackwardExtract path. Trained weights must match the plain
+# fixture's (pca_plain_sdpa_noncausal_train.nsl) to tight tolerance,
+# cross-validating the decomposed gradients against the flash reference.
+
+from nsl.nn.losses import mse_loss
+
+model Attn:
+    wq: Tensor = ones([2, 2])
+    wk: Tensor = ones([2, 2]) * 0.5
+    wv: Tensor = ones([2, 2]) * 0.25
+
+    fn forward(self, x: Tensor, mask: Tensor) -> Tensor:
+        let q = (x @ self.wq).reshape([1, 1, 4, 2])
+        let k = (x @ self.wk).reshape([1, 1, 4, 2])
+        let v = (x @ self.wv).reshape([1, 1, 4, 2])
+        return scaled_dot_product_attention_masked(q, k, v, 0.7071, mask)
+
+let m = Attn()
+let x = arange(8).reshape([4, 2]) * 0.1
+let y = zeros([1, 1, 4, 2])
+let mask = zeros([4, 4])
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let out = m.forward(x, mask)
+        let loss = mse_loss(out, y)
+
+model_save(m, "masked_sdpa_out.nslm")

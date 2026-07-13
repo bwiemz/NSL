@@ -1,0 +1,36 @@
+# PCA Stage B forward oracle: packed masked attention must equal per-doc
+# attention. One sequence of 4 rows packs two 2-row documents; the additive
+# block-diagonal mask (0 within a doc, -1e9 across docs) must make the
+# packed output row-for-row identical to running each document separately
+# (non-causal within docs — the mask alone carries the structure here).
+#
+# Prints a single scalar: sum((packed - concat(per-doc))^2). The harness
+# asserts it is ~0.
+
+let base = arange(8)
+let q = base.reshape([4, 2])
+let k = q * 0.5
+let v = q * 0.25
+let scale = 0.7071
+
+let z = zeros([2, 2])
+let ninf = full([2, 2], -1000000000.0)
+let row_top = tensor_cat([z, ninf], 1)
+let row_bot = tensor_cat([ninf, z], 1)
+let mask = tensor_cat([row_top, row_bot], 0)
+
+let packed = scaled_dot_product_attention_masked(q, k, v, scale, mask)
+
+let qa = arange(4).reshape([2, 2])
+let qb = qa + full([2, 2], 4.0)
+let ka = qa * 0.5
+let kb = qb * 0.5
+let va = qa * 0.25
+let vb = qb * 0.25
+let outa = scaled_dot_product_attention(qa, ka, va, scale, false)
+let outb = scaled_dot_product_attention(qb, kb, vb, scale, false)
+let sep = tensor_cat([outa, outb], 0)
+
+let d = packed - sep
+let dd = d * d
+print(sum(dd))

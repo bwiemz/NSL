@@ -1185,6 +1185,63 @@ impl Compiler<'_> {
             let seq_len_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len_val]);
         }
+        // PCA Stage B: scaled_dot_product_attention_masked(Q, K, V, scale, mask)
+        // Additive-mask attention for packed sequences. Always the naive
+        // path: softmax((Q @ K.T) * scale + mask) @ V. The mask REPLACES
+        // the causal mask (a packed block-diagonal mask already encodes
+        // within-doc causality), and the fused flash FFI has no mask slot —
+        // so a @flash_attention context deliberately does NOT divert this
+        // call (warned below); masked flash kernels are the Stage C work.
+        if func_name == "scaled_dot_product_attention_masked"
+            && !self.registry.functions.contains_key(&func_name)
+        {
+            if args.len() != 5 {
+                return Err(CodegenError::new(
+                    "scaled_dot_product_attention_masked() requires exactly 5 arguments \
+                     (Q, K, V, scale, mask)",
+                ));
+            }
+            if self.kernels.flash_attention_context.is_some() {
+                eprintln!(
+                    "[nsl] note: scaled_dot_product_attention_masked ignores the \
+                     @flash_attention context — the fused kernel has no additive-mask \
+                     slot; using the naive masked path (masked flash kernels are \
+                     planned work)."
+                );
+            }
+            let q_val = self.compile_expr(builder, state, &args[0].value)?;
+            let k_val = self.compile_expr(builder, state, &args[1].value)?;
+            let v_val = self.compile_expr(builder, state, &args[2].value)?;
+            let scale_val = self.compile_expr(builder, state, &args[3].value)?;
+            let mask_val = self.compile_expr(builder, state, &args[4].value)?;
+
+            let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
+            let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
+            let k_t = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_transpose",
+                &[k_val, dim_m2, dim_m1],
+            )?;
+            let flags0 = builder.ins().iconst(cl_types::I8, 0);
+            let scores =
+                self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t, flags0])?;
+            let scaled = self.compile_traced_call(
+                builder,
+                "nsl_tensor_mul_scalar",
+                &[scores, scale_val, flags0],
+            )?;
+            let masked =
+                self.compile_traced_call(builder, "nsl_tensor_add", &[scaled, mask_val, flags0])?;
+            let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
+            let attn =
+                self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
+            return self.compile_traced_call(
+                builder,
+                "nsl_tensor_matmul",
+                &[attn, v_val, flags0],
+            );
+        }
+
         // M27: scaled_dot_product_attention(Q, K, V, scale, causal=false)
         // Naive path: softmax((Q @ K.T) * scale [+ causal_mask]) @ V
         // Flash path: PTX dispatch via nsl_flash_attention when @flash_attention decorator is present
