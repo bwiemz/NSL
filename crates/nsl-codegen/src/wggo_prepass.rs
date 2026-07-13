@@ -275,6 +275,52 @@ fn primal_op_tag(op: &crate::wengert::PrimalOp) -> String {
 /// No-op (returns empty) unless source AD and a WGGO mode are both enabled —
 /// mirroring the exact gating of the in-place planner so behavior without
 /// this pass's preconditions is byte-identical to before.
+/// Whether any statement (recursively — the AST visitor descends into
+/// model method bodies declared in this module) calls
+/// `scaled_dot_product_attention_masked`, the Stage-B packed-attention
+/// entry point. Together with `pca_activation::detect_packing_for_stmts`,
+/// this is the "module can lower a packing decision" signal that gates the
+/// plan's packing axes.
+pub fn stmts_contain_masked_sdpa(
+    stmts: &[nsl_ast::stmt::Stmt],
+    interner: &nsl_lexer::Interner,
+) -> bool {
+    use nsl_ast::expr::{Expr, ExprKind};
+    use nsl_ast::visitor::{walk_expr, walk_stmt, Visitor};
+
+    struct Finder<'a> {
+        interner: &'a nsl_lexer::Interner,
+        found: bool,
+    }
+    impl Visitor for Finder<'_> {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if self.found {
+                return;
+            }
+            if let ExprKind::Call { callee, .. } = &expr.kind {
+                if let ExprKind::Ident(sym) = &callee.kind {
+                    if self.interner.resolve(sym.0)
+                        == Some("scaled_dot_product_attention_masked")
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut f = Finder { interner, found: false };
+    for st in stmts {
+        if f.found {
+            break;
+        }
+        walk_stmt(&mut f, st);
+    }
+    f.found
+}
+
 pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Vec<WggoPrePlan> {
     if !compiler.features.source_ad_enabled {
         return Vec::new();
@@ -642,6 +688,7 @@ fn plan_train_block(
             compiler.compile_options.wggo.weights.as_deref(),
             analysis_config,
             Some(&compiler.compile_options),
+            compiler.features.packing_supported_in_module,
         )?;
         let overrides = crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied);
         let contains_attention = extractor.wengert_list().ops.iter().any(|op| {

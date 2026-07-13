@@ -397,6 +397,13 @@ pub struct FeatureConfigs {
     pub vmap_configs: HashMap<String, crate::vmap::VmapConfig>,
     /// M40: Source-to-source AD enabled (default true; --tape-ad forces tape-only)
     pub source_ad_enabled: bool,
+    /// PCA: whether this module can LOWER a packing decision — a packed
+    /// dataset (DataLoader packing=true / @pca flow) or a
+    /// scaled_dot_product_attention_masked call exists in the source.
+    /// Computed once during kernel synthesis (before the WGGO pre-pass and
+    /// train-block compilation); gates the plan's packing axes so the
+    /// solver never "chooses" packing it cannot apply.
+    pub packing_supported_in_module: bool,
 
     // ── Weight Intelligence (M52) ────────────────────────────────────
     /// M52: Loaded weight map (populated when --weights is passed)
@@ -446,6 +453,7 @@ impl FeatureConfigs {
             ownership_info: options.ownership_info.clone(),
             vmap_configs: HashMap::new(),
             source_ad_enabled: options.source_ad,
+            packing_supported_in_module: false,
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,

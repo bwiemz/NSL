@@ -106,6 +106,14 @@ pub struct WggoInput<'a> {
     /// When `None` (the default), the Phase 1 magnitude path is used
     /// exclusively, preserving backward compatibility.
     pub scorer: Option<Box<dyn GradientScorer>>,
+    /// Whether the compiled module can actually LOWER a packing decision:
+    /// a packed dataset (DataLoader packing=true / @pca flow) or a masked
+    /// attention call exists. When false, the default per-layer constraints
+    /// restrict `packing_modes_mask` to mode 0 and zero the savings —
+    /// otherwise the cost-only objective always "chooses" the highest
+    /// packing mode from hardcoded fictional savings on programs with no
+    /// packed data at all, and the plan reports packing it can never apply.
+    pub packing_supported: bool,
     /// Cached Stage-3 report (sidecar hit). When `Some`, the analyzer is
     /// skipped and THIS report drives `apply_to` BEFORE the ILP solves —
     /// splicing it in after the solve (the old behavior) meant a cache hit
@@ -483,7 +491,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         let inter =
             dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-            default_constraints_for(&graph)
+            default_constraints_for(&graph, input.packing_supported)
         } else {
             input.ilp_constraints
         };
@@ -555,7 +563,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
     let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-        default_constraints_for(&graph)
+        default_constraints_for(&graph, input.packing_supported)
     } else {
         input.ilp_constraints
     };
@@ -773,12 +781,28 @@ fn role_sensitivity_floor(role: LayerRole) -> f64 {
 
 /// Per-layer default ILP constraints with the [`role_sensitivity_floor`]
 /// applied (used when the caller supplies no explicit `ilp_constraints`).
-fn default_constraints_for(graph: &OptGraph) -> Vec<LayerIlpConstraints> {
+fn default_constraints_for(graph: &OptGraph, packing_supported: bool) -> Vec<LayerIlpConstraints> {
+    // Packing honesty: only mode 1 (segment_id) has any lowering today
+    // (the @pca/CSHA admission fork and the Stage-B masked path), so even
+    // a packing-capable module exposes {none, segment_id} — tile_skip and
+    // multi_seq unlock when their kernels exist. A module with no packed
+    // dataset and no masked-attention call exposes mode 0 only, with
+    // zeroed savings: the modeled savings are estimates, and advertising
+    // them for unlowerable modes made the solver "choose" packing it
+    // could never apply (then reject it downstream with
+    // packing_requires_packed_dataset noise).
+    let (mask, savings) = if packing_supported {
+        (0b0011, [0.0, 0.15, 0.0, 0.0])
+    } else {
+        (0b0001, [0.0; 4])
+    };
     graph
         .layers
         .iter()
         .map(|l| LayerIlpConstraints {
             sensitivity: role_sensitivity_floor(l.role),
+            packing_modes_mask: mask,
+            packing_savings: savings,
             ..Default::default()
         })
         .collect()
@@ -938,6 +962,7 @@ pub fn run_on_wengert(
         mode,
         target,
         wengert,
+        packing_supported: true,
         // Reasonable defaults for a small transformer layer; used only to
         // size the LUT — the graph drives which layers are present.
         layer_shape: LayerShape {
@@ -978,6 +1003,7 @@ pub fn run_on_wengert_with_weights(
     weights_path: Option<&std::path::Path>,
     analysis_config: AnalysisConfig,
     compile_options: Option<&crate::CompileOptions>,
+    packing_supported: bool,
 ) -> Option<WggoPlan> {
     use crate::wggo_gradient_scorer::build_scorer;
     use std::sync::Arc;
@@ -1064,6 +1090,7 @@ pub fn run_on_wengert_with_weights(
         weights: weights_ref,
         analysis_config,
         scorer,
+        packing_supported,
         cached_analysis: cached_report.clone(),
     };
     let mut plan = run(input);
@@ -1146,6 +1173,7 @@ mod tests {
             analysis_config: AnalysisConfig::default(),
             scorer: None,
             cached_analysis: None,
+            packing_supported: true,
         }
     }
 
@@ -1366,8 +1394,13 @@ mod tests {
         let greedy = run(inp_greedy);
         let full_nodes: u64 = full.per_layer.iter().map(|s| s.nodes_explored).sum();
         let greedy_nodes: u64 = greedy.per_layer.iter().map(|s| s.nodes_explored).sum();
+        // Margin note: the evidence gates (uninformed => keep-all heads,
+        // full FFN, 32-bit moments, packing mode 0/1 only) legitimately
+        // shrank the full solver's default search space from ~10^5 nodes
+        // to a few hundred, so the historical 100x margin is stale; 10x
+        // still cleanly separates sum-of-domains from product-of-domains.
         assert!(
-            greedy_nodes * 100 < full_nodes,
+            greedy_nodes * 10 < full_nodes,
             "greedy_nodes={greedy_nodes} full_nodes={full_nodes}"
         );
     }
@@ -1385,6 +1418,7 @@ mod tests {
             Some(std::path::Path::new("/nonexistent/path.nslweights")),
             crate::wggo_weight_analysis::AnalysisConfig::default(),
             None,
+            true,
         )
         .expect("plan");
         // Every layer should be counted as without_weights since the
@@ -1628,6 +1662,7 @@ mod tests {
             Some(missing),
             AnalysisConfig::default(),
             None,
+            true,
         )
         .expect("plan is still produced via uniform-importance fallback");
         assert!(
@@ -1876,6 +1911,7 @@ mod tests {
             None, // no weight file needed; scorer uses sidecar
             crate::wggo_weight_analysis::AnalysisConfig::default(),
             Some(&opts),
+            true,
         )
         .expect("plan");
 
@@ -1980,4 +2016,44 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         assert!(json.contains("cpkd_distill"));
     }
+
+    #[test]
+    fn unpacked_module_constrains_packing_to_mode_zero() {
+        // packing_supported=false (no packed dataset, no masked attention):
+        // the plan must not "choose" packing it can never lower — every
+        // layer decision carries packing_mode 0 and the ILP saw zero
+        // modeled savings.
+        let w = two_block_wengert();
+        let mut inp = toy_input(&w);
+        inp.packing_supported = false;
+        let plan = run(inp);
+        for sol in &plan.per_layer {
+            assert_eq!(
+                sol.decision.packing_mode, 0,
+                "unpacked module must plan packing_mode=0 everywhere"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_module_can_choose_segment_id_but_not_unlowerable_modes() {
+        // packing_supported=true exposes {none, segment_id} only: tile_skip
+        // and multi_seq have no kernels, and advertising their fictional
+        // savings made the solver pick modes that were then rejected
+        // downstream with packing_requires_packed_dataset noise.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w)); // packing_supported: true in the fixture
+        for sol in &plan.per_layer {
+            assert!(
+                sol.decision.packing_mode <= 1,
+                "only mode 0/1 are lowerable; got {}",
+                sol.decision.packing_mode
+            );
+        }
+        assert!(
+            plan.per_layer.iter().any(|s| s.decision.packing_mode == 1),
+            "with modeled segment_id savings the cost-only solver should pick mode 1 somewhere"
+        );
+    }
+
 }
