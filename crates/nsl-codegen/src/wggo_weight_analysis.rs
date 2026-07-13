@@ -105,6 +105,7 @@ impl WeightAnalysisReport {
             // caller set explicitly.
             if imp.has_signal {
                 c.sensitivity_informed = true;
+                c.importance_informed = true;
             }
         }
     }

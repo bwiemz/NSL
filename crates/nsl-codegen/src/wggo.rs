@@ -666,6 +666,39 @@ pub fn run(input: WggoInput) -> WggoPlan {
         resolutions
     };
 
+    // CEP honesty advisories: structural decisions the plan carries that
+    // downstream codegen does not (or only partially) lowers. These fire
+    // only when the decision was actually taken (which requires an
+    // informed importance signal — evidence-free plans are pinned to
+    // keep-all/full-width by `importance_informed`).
+    {
+        let pruned_layers = per_layer
+            .iter()
+            .filter(|s| s.decision.keep_head.iter().any(|k| !k))
+            .count();
+        if pruned_layers > 0 {
+            warnings.push(format!(
+                "[cep] {pruned_layers} layer(s) plan pruned attention heads; \
+                 head pruning is lowered ONLY through the CSHA fused dispatch \
+                 (active_heads guard + launch-grid clamp) — on other attention \
+                 paths the decision is report-only"
+            ));
+        }
+        let max_ffn = per_layer.iter().map(|s| s.decision.ffn_width).max().unwrap_or(0);
+        let thinned_layers = per_layer
+            .iter()
+            .filter(|s| s.decision.ffn_width < max_ffn)
+            .count();
+        if thinned_layers > 0 {
+            warnings.push(format!(
+                "[cep] {thinned_layers} layer(s) plan a thinned FFN width; \
+                 ffn_width has NO codegen consumer (dropped at the \
+                 PerLayerOverride boundary) — layers run at full width and \
+                 the decision is report-only"
+            ));
+        }
+    }
+
     // 8. Apply + communication schedule.  (The §2.4 shape-compatibility
     // precondition was checked up front; a violation would have forced Off
     // above, so reaching here means the plan is shape-compatible.)

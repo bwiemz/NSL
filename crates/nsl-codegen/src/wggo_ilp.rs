@@ -264,6 +264,15 @@ pub struct LayerIlpConstraints {
     /// Role-based floors (`role_sensitivity_floor`) still apply on top
     /// when informed.
     pub sensitivity_informed: bool,
+    /// Whether `head_importance` / `min_retained_importance` are backed by
+    /// a REAL weight signal. When false, the full solver restricts the
+    /// structural axes to identity: keep-all heads and full FFN width.
+    /// Without this, the cost-only objective prunes floor(prune_fraction*H)
+    /// heads of a RANDOM-INIT model — uniform importance scores make the
+    /// retention floor satisfiable by ANY 75% subset, so the minimizer
+    /// happily drops heads on zero evidence (and thins FFN against a
+    /// hardcoded axis set decoupled from the model's real width).
+    pub importance_informed: bool,
     pub high_prec_threshold: f64,
     pub critical_prec_threshold: f64,
     /// Per-head importance scores (higher = more important).  Pruning
@@ -329,6 +338,7 @@ impl Default for LayerIlpConstraints {
             gqa_group: 1,
             sensitivity: 0.0,
             sensitivity_informed: false,
+            importance_informed: false,
             high_prec_threshold: 0.5,
             critical_prec_threshold: 0.9,
             head_importance: Vec::new(),
@@ -445,6 +455,12 @@ pub fn solve_layer_cpkd(
                    for &cpkd in &cpkd_domain {
                     for &c in lut.axes_csha_levels.iter().rev() {
                         for &f in lut.axes_ffn_widths.iter().rev() {
+                            // No importance evidence -> no structural
+                            // thinning: full FFN width only (see
+                            // `importance_informed`).
+                            if !constraints.importance_informed && Some(&f) != lut.axes_ffn_widths.iter().max() {
+                                continue;
+                            }
                             for &r in &lut.axes_adapter_ranks {
                                 // Adapter placement is a real decision: pick the
                                 // smallest placement whose comm cost fits the
@@ -454,7 +470,13 @@ pub fn solve_layer_cpkd(
                                     continue;
                                 };
                                 let placement_us = placement_cost_us(r, placement);
-                                for heads_config in enumerate_head_configs(constraints) {
+                                let head_domain = if constraints.importance_informed {
+                                    enumerate_head_configs(constraints)
+                                } else {
+                                    // Keep-all is the only evidence-free option.
+                                    vec![vec![true; constraints.num_heads as usize]]
+                                };
+                                for heads_config in head_domain {
                                     state.nodes += 1;
                                     let h_count =
                                         heads_config.iter().filter(|b| **b).count() as u64;
@@ -843,6 +865,7 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
         && a.gqa_group == b.gqa_group
         && a.sensitivity.to_bits() == b.sensitivity.to_bits()
         && a.sensitivity_informed == b.sensitivity_informed
+        && a.importance_informed == b.importance_informed
         && a.high_prec_threshold.to_bits() == b.high_prec_threshold.to_bits()
         && a.critical_prec_threshold.to_bits() == b.critical_prec_threshold.to_bits()
         && a.head_importance.len() == b.head_importance.len()
@@ -2410,4 +2433,56 @@ mod tests {
         let base = recost_decision(&lut, &sol.decision, &LayerIlpConstraints::default());
         assert!(((base - 15.0) - recost).abs() < 1e-9);
     }
+
+    #[test]
+    fn uninformed_importance_forces_keep_all_heads_and_full_ffn() {
+        // No weight/calibration evidence -> no structural thinning. With
+        // uniform (Null-provider) importance the retention floor is
+        // satisfiable by any 75% subset, so without this gate the cost-only
+        // objective drops floor(0.25*H) heads of a random-init model.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints {
+            num_heads: 8,
+            gqa_group: 1,
+            head_importance: vec![1.0; 8],
+            min_retained_importance: 6.0, // top-75% floor: any 6 heads satisfy
+            ..Default::default()
+        };
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert!(
+            sol.decision.keep_head.iter().all(|k| *k),
+            "uninformed solve must keep all heads, got {:?}",
+            sol.decision.keep_head
+        );
+        assert_eq!(
+            sol.decision.ffn_width,
+            *lut.axes_ffn_widths.iter().max().unwrap(),
+            "uninformed solve must keep full FFN width"
+        );
+    }
+
+    #[test]
+    fn informed_importance_allows_head_pruning() {
+        // Same constraints WITH evidence: the solver may (and, being
+        // cost-only, will) drop heads down to the retention floor.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints {
+            num_heads: 8,
+            gqa_group: 1,
+            head_importance: vec![1.0; 8],
+            min_retained_importance: 6.0,
+            importance_informed: true,
+            ..Default::default()
+        };
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        let kept = sol.decision.keep_head.iter().filter(|k| **k).count();
+        assert!(
+            kept < 8,
+            "informed low-importance solve should prune below 8 heads (kept {kept})"
+        );
+        assert!(kept >= 6, "retention floor must hold (kept {kept})");
+    }
+
 }
