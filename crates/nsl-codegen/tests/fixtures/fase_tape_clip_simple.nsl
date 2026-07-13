@@ -1,0 +1,31 @@
+# Single-weight model for tape-AD (non-hook) two-phase-clip coverage.
+#
+# No `blocks.N` field: WGGO buckets the lone param into its synthetic
+# "other" layer, so a --wggo run still builds a per-param mode table but
+# every param falls back to the global (Deferred) byte — a uniform-Deferred
+# table on the TAPE path. That reaches the unified dispatch's Phase A with
+# fase_hook_active=false, where the final micro-batch's accumulation must
+# be fused in (the standard accumulation loop is skipped on the stepping
+# batch).
+#
+# 8 epochs = 4 windows (accumulation=2); grad_clip = 0.01 fires every window.
+
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 8, grad_accumulation = 2, grad_clip = 0.01):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "tape_clip_out.nslm")

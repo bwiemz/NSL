@@ -1,0 +1,38 @@
+# Two-block MLP driven by Lion (global-FullBuffer FASE plan), no clipping.
+# Drive with --source-ad (see fase_mixed_clip_blocks.nsl header for why).
+#
+# Used by the mixed-mode differential tests to pin that the unified
+# per-param dispatch's FullBuffer arm zeroes its accumulation buffer after
+# the stdlib step: 4 optimizer windows on the same data must produce
+# exactly the same weights as the monolithic (no-WGGO) FullBuffer path,
+# whose post-optimizer cleanup loop has always zeroed the buffers. Without
+# the zero, windows 2-4 step with gradients accumulated ACROSS windows.
+
+from nsl.nn.losses import mse_loss
+
+model Blk:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = ones([2, 2])
+let y = zeros([2, 2])
+
+train(model = m, epochs = 8, grad_accumulation = 2):
+    optimizer: Lion(lr = 0.001, beta1 = 0.9, beta2 = 0.99)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "lion_fullbuffer_out.nslm")

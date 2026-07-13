@@ -249,12 +249,24 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         ),
     };
 
+    // Two-phase clip requires the Deferred accumulation convention: Phase A
+    // reads the window-mean gradient out of m_partial and Phase B applies
+    // the clip factor before the fused step. A FullBuffer-global plan
+    // (Lion/Unknown/allow_v_approx=false) has no m_partial convention to
+    // norm over, and its optimizer step is the stdlib per-param call — so
+    // it keeps the legacy pre-FASE clipping (per-micro-batch
+    // nsl_clip_grad_norm on grads_list) with the FULL standard accumulation
+    // loop. Tagging it FinalTwoPhase used to make stmt.rs skip the standard
+    // accumulation on the stepping micro-batch while no Phase A existed to
+    // recover it — silently dropping the final micro-batch's gradients.
+    let two_phase = cfg.grad_clip.is_some() && mode == FaseMode::Deferred;
+
     // Build the per-micro-batch phase sequence.
     let mut phases = Vec::with_capacity(accumulation as usize);
     for i in 0..accumulation {
         if i < accumulation - 1 {
             phases.push(BackwardPhase::AccumulateOnly);
-        } else if cfg.grad_clip.is_some() {
+        } else if two_phase {
             phases.push(BackwardPhase::FinalTwoPhase);
         } else {
             phases.push(BackwardPhase::FinalFused);
@@ -266,7 +278,7 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         accumulation,
         backward_phases: phases,
         recipe: make_recipe(cfg, accumulation, v_approx),
-        two_phase_clip: cfg.grad_clip.is_some(),
+        two_phase_clip: two_phase,
         rationale,
         per_layer_mode: None,
         override_diagnostics: Vec::new(),
@@ -285,6 +297,14 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
 ///   `per_layer_mode` stays `None`; no diagnostics.
 /// - Deferred global → overrides feasible either way; `per_layer_mode` is
 ///   `Some(vec![Deferred | FullBuffer, ...])` mapped from the input.
+///   This includes two-phase clip (`grad_clip` set): per-layer modes are
+///   honored. The clip machinery keeps a uniform norm convention by using
+///   scaled (window-mean) accumulation for FullBuffer params whenever
+///   `two_phase_clip` is active, and Phase B applies the shared clip
+///   factor in both dispatch arms (see stmt.rs 7e3 and
+///   `emit_unified_optim_step_dispatch`). Historically mixed modes were
+///   clamped to uniform Deferred here because those two pieces were
+///   missing.
 /// - FullBuffer global (Lion/Unknown/allow_v_approx=false) → `Deferred`
 ///   requests clamp to `FullBuffer` with a `FaseModeInfeasible` diagnostic.
 ///   `FullBuffer` requests apply verbatim.
@@ -295,38 +315,6 @@ pub fn plan_with_overrides(
     let mut p = plan(cfg);
 
     if wggo_fused_per_layer.is_empty() || p.mode == FaseMode::Passthrough {
-        return p;
-    }
-
-    // FASE Codegen Phase 3: Two-phase-clip + mixed mode → clamp to uniform
-    // Deferred. Phase A's global ||m_partial||² norm requires uniform
-    // accumulation convention; preserving per-layer FullBuffer overrides
-    // here would silently produce an incorrect clip factor.
-    let two_phase_clip_active = cfg.grad_clip.is_some() && cfg.accumulation > 1;
-    let global_is_deferred = p.mode == FaseMode::Deferred;
-    let has_any_false = wggo_fused_per_layer.iter().any(|&b| !b);
-
-    if two_phase_clip_active && global_is_deferred && has_any_false {
-        let threshold = cfg.grad_clip.expect("grad_clip checked above");
-        let clamped_modes = vec![FaseMode::Deferred; wggo_fused_per_layer.len()];
-        let diagnostics: Vec<crate::wggo_overrides::OverrideDiagnostic> = wggo_fused_per_layer
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &fused)| {
-                if fused { return None; }
-                Some(crate::wggo_overrides::OverrideDiagnostic {
-                    layer_index: i as u32,
-                    layer_name: format!("layer_{i}"),
-                    requested: "FullBuffer".into(),
-                    applied: "Deferred".into(),
-                    reason: crate::wggo_overrides::OverrideRejectReason::TwoPhaseClipConflict {
-                        grad_clip_threshold: threshold,
-                    },
-                })
-            })
-            .collect();
-        p.per_layer_mode = Some(clamped_modes);
-        p.override_diagnostics = diagnostics;
         return p;
     }
 
@@ -687,7 +675,12 @@ mod tests {
     }
 
     #[test]
-    fn two_phase_clip_with_mixed_modes_clamps_all_to_deferred() {
+    fn two_phase_clip_with_mixed_modes_preserves_modes() {
+        // WGGO's per-layer fase_fused is honored under grad_clip: the
+        // two-phase machinery normalizes on the window-mean convention for
+        // both modes, so there is nothing to clamp. (This is the real
+        // coder-rl pretrain shape: AdamW + grad_accumulation>1 +
+        // grad_clip=1.0 + WGGO overrides.)
         let cfg = FaseConfig {
             optimizer: FaseOptimizer::AdamW,
             accumulation: 4,
@@ -696,23 +689,40 @@ mod tests {
         };
         let p = plan_with_overrides(&cfg, &[true, false, true, false]);
         assert_eq!(p.mode, FaseMode::Deferred);
+        assert!(p.two_phase_clip);
         assert_eq!(
             p.per_layer_mode,
-            Some(vec![FaseMode::Deferred, FaseMode::Deferred, FaseMode::Deferred, FaseMode::Deferred])
+            Some(vec![
+                FaseMode::Deferred,
+                FaseMode::FullBuffer,
+                FaseMode::Deferred,
+                FaseMode::FullBuffer,
+            ])
         );
-        assert_eq!(p.override_diagnostics.len(), 2);
-        let layer_indices: Vec<u32> = p.override_diagnostics.iter().map(|d| d.layer_index).collect();
-        assert_eq!(layer_indices, vec![1, 3]);
-        for d in &p.override_diagnostics {
-            assert_eq!(d.requested, "FullBuffer");
-            assert_eq!(d.applied, "Deferred");
-            assert!(matches!(
-                d.reason,
-                crate::wggo_overrides::OverrideRejectReason::TwoPhaseClipConflict {
-                    grad_clip_threshold: t,
-                } if (t - 1.0).abs() < 1e-12
-            ));
-        }
+        assert!(p.override_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fullbuffer_global_plan_with_clip_is_not_two_phase() {
+        // A FullBuffer-global plan (Lion) with grad_clip keeps the legacy
+        // per-micro-batch clip + full standard accumulation. Tagging it
+        // two-phase used to skip the standard accumulation loop on the
+        // stepping micro-batch with no Phase A to recover it — the final
+        // micro-batch's gradients were silently dropped.
+        let cfg = FaseConfig {
+            optimizer: FaseOptimizer::Lion,
+            accumulation: 4,
+            grad_clip: Some(1.0),
+            ..Default::default()
+        };
+        let p = plan(&cfg);
+        assert_eq!(p.mode, FaseMode::FullBuffer);
+        assert!(!p.two_phase_clip);
+        assert!(!p.backward_phases.contains(&BackwardPhase::FinalTwoPhase));
+        assert_eq!(
+            p.backward_phases.last().copied(),
+            Some(BackwardPhase::FinalFused)
+        );
     }
 
     #[test]
@@ -746,7 +756,9 @@ mod tests {
     }
 
     #[test]
-    fn two_phase_clip_diagnostic_carries_threshold() {
+    fn two_phase_clip_fullbuffer_request_is_honored_without_diagnostics() {
+        // Previously produced a TwoPhaseClipConflict clamp diagnostic; the
+        // mixed-mode two-phase machinery makes the request feasible.
         let cfg = FaseConfig {
             optimizer: FaseOptimizer::AdamW,
             accumulation: 4,
@@ -754,12 +766,8 @@ mod tests {
             ..Default::default()
         };
         let p = plan_with_overrides(&cfg, &[false]);
-        assert_eq!(p.override_diagnostics.len(), 1);
-        assert!(matches!(
-            p.override_diagnostics[0].reason,
-            crate::wggo_overrides::OverrideRejectReason::TwoPhaseClipConflict {
-                grad_clip_threshold: t,
-            } if (t - 2.5).abs() < 1e-12
-        ));
+        assert!(p.two_phase_clip);
+        assert_eq!(p.per_layer_mode, Some(vec![FaseMode::FullBuffer]));
+        assert!(p.override_diagnostics.is_empty());
     }
 }

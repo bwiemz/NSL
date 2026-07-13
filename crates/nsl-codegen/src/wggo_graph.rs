@@ -93,8 +93,22 @@ impl OptGraph {
 /// Everything else is bucketed under a synthetic `other` layer.
 pub fn layer_prefix(name: &str) -> Option<String> {
     for pat in ["blocks.", "layers.", "h."] {
-        if let Some(rest) = name.strip_prefix(pat) {
-            // Everything up to (and including) the next dot.
+        // Accept the pattern at the start of the name OR at a dot
+        // boundary: Wengert `Param` names from the train-block path carry
+        // the model-variable prefix (e.g. "m.blocks.0.w"), and the strict
+        // start-anchored match used to bucket EVERY such param into the
+        // synthetic "other" layer — collapsing real models to a
+        // single-layer WGGO plan. The returned prefix is bare
+        // ("blocks.0"), which is what every downstream matcher
+        // (fase_codegen_table, wggo_prune, overrides) compares against
+        // after stripping the model variable.
+        let start = if name.starts_with(pat) {
+            Some(0)
+        } else {
+            name.find(&format!(".{pat}")).map(|i| i + 1)
+        };
+        if let Some(s) = start {
+            let rest = &name[s + pat.len()..];
             if let Some(end) = rest.find('.') {
                 return Some(format!("{}{}", pat, &rest[..end]));
             }
@@ -302,6 +316,27 @@ mod tests {
         );
         assert_eq!(layer_prefix("h.3.mlp.fc"), Some("h.3".to_string()));
         assert_eq!(layer_prefix("embedding.weight"), None);
+    }
+
+    #[test]
+    fn layer_prefix_strips_model_variable_prefix() {
+        // Train-block Wengert Param names carry the model variable
+        // ("m.blocks.0.w"); the returned prefix must be bare so downstream
+        // matchers (which strip the model variable) find it.
+        assert_eq!(
+            layer_prefix("m.blocks.0.w"),
+            Some("blocks.0".to_string())
+        );
+        assert_eq!(
+            layer_prefix("model.layers.11.ffn.w_up"),
+            Some("layers.11".to_string())
+        );
+        assert_eq!(layer_prefix("net.h.2.attn.wq"), Some("h.2".to_string()));
+        // Dot boundary required: "superblocks." must not match "blocks.".
+        assert_eq!(layer_prefix("m.superblocks.0.w"), None);
+        // Model-var-prefixed but layerless names still land in "other".
+        assert_eq!(layer_prefix("m.w"), None);
+        assert_eq!(layer_prefix("m.embed"), None);
     }
 
     #[test]

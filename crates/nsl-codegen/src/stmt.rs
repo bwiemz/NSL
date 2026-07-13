@@ -3881,8 +3881,8 @@ impl Compiler<'_> {
             step_body.ok_or_else(|| CodegenError::new("train block requires a step section"))?;
 
         // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
-        // (Lion, Unknown, or grad_clip set) fall through to the existing
-        // accum-buffer path below.  Deferred routes through stmt_fase.
+        // (Lion, Unknown) fall through to the existing accum-buffer path
+        // below.  Deferred routes through stmt_fase.
         let fase_cfg = crate::fase::FaseConfig {
             accumulation: grad_accumulation_steps.max(1) as u32,
             optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
@@ -3897,7 +3897,33 @@ impl Compiler<'_> {
         };
         let fase_plan = match self.wggo_overrides.as_ref() {
             Some(o) => {
-                let fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
+                let mut fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
+                // Diagnostic knob: NSL_FASE_FUSED_OVERRIDE="1,0,..." replaces
+                // the plan's per-layer fase_fused pattern (layer order = the
+                // WGGO override order). Used by the mixed-mode differential
+                // tests to pin a deterministic mode table; the layer registry
+                // (names → params) still comes from the real WGGO overrides.
+                if let Ok(spec) = std::env::var("NSL_FASE_FUSED_OVERRIDE") {
+                    let forced: Vec<bool> = spec
+                        .split(',')
+                        .map(|t| matches!(t.trim(), "1" | "true"))
+                        .collect();
+                    if forced.len() == fused.len() {
+                        eprintln!(
+                            "[fase] NSL_FASE_FUSED_OVERRIDE applied: {spec} \
+                             (replacing plan fase_fused for {} layers)",
+                            fused.len()
+                        );
+                        fused = forced;
+                    } else {
+                        eprintln!(
+                            "[fase] NSL_FASE_FUSED_OVERRIDE ignored: {} entries for {} \
+                             WGGO layers",
+                            forced.len(),
+                            fused.len()
+                        );
+                    }
+                }
                 crate::fase::plan_with_overrides(&fase_cfg, &fused)
             }
             None => crate::fase::plan(&fase_cfg),
@@ -3913,9 +3939,6 @@ impl Compiler<'_> {
                     global_mode,
                 } => format!("{:?}_optimizer_global_mode_{:?}", optimizer, global_mode)
                     .to_lowercase(),
-                crate::wggo_overrides::OverrideRejectReason::TwoPhaseClipConflict {
-                    grad_clip_threshold,
-                } => format!("two_phase_clip_threshold_{grad_clip_threshold}"),
                 other => format!("{:?}", other),
             };
             eprintln!(
@@ -3923,15 +3946,15 @@ impl Compiler<'_> {
                 diag.layer_index, diag.requested, diag.applied, reason_str
             );
         }
-        // FASE Codegen Phase 2 (mostly) shipped: the accumulation loop
-        // `ga_body` below now dispatches per-param via a `.rodata` mode
-        // table built from WGGO's per-layer decisions (see
-        // `mode_table_base` allocation below + `emit_fase_mode_branch`
-        // in stmt_fase.rs). Phase A two-phase-clip is Deferred-only by
-        // construction; the optimizer step retains the global boolean
-        // dispatch — its outer-scope structure (separate fused vs
-        // stdlib emission paths) requires a deeper refactor that is
-        // tracked as a follow-up.
+        // FASE Codegen Phase 2+3 shipped: the accumulation loop `ga_body`
+        // below dispatches per-param via a `.rodata` mode table built from
+        // WGGO's per-layer decisions (see `mode_table_base` allocation below
+        // + `emit_fase_mode_branch` in stmt_fase.rs), and the optimizer step
+        // dispatches per-param through `emit_unified_optim_step_dispatch`.
+        // Two-phase clip honors mixed tables: under `two_phase_clip` the
+        // FullBuffer accumulation arm switches to the scaled window-mean
+        // convention so Phase A's global ||m_partial||² norm is uniform, and
+        // Phase B applies the shared clip factor in both dispatch arms.
         // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
@@ -6309,16 +6332,32 @@ impl Compiler<'_> {
                 )?;
                 builder.ins().jump(ga_join, &[]);
 
-                // FullBuffer path
+                // FullBuffer path. Under two-phase clip the FullBuffer arm
+                // uses the SAME scaled window-mean convention as Deferred
+                // (accum += (1/N)·g): Phase A's global ||accum||² norm then
+                // holds uniformly across a mixed mode table, and the stdlib
+                // optimizer step consumes the clipped window-mean gradient —
+                // the same effective gradient the Deferred arm steps with.
+                // Without clipping, the historical raw-sum convention is
+                // preserved byte-identically.
                 builder.switch_to_block(ga_fullbuf);
                 builder.seal_block(ga_fullbuf);
-                let n_elems =
-                    self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_grad_accumulate_add",
-                    &[accum_buf, grad, n_elems],
-                )?;
+                if fase_plan.two_phase_clip {
+                    self.fase_emit_accumulate(
+                        builder,
+                        accum_buf,
+                        grad,
+                        fase_plan.recipe.accum_scale,
+                    )?;
+                } else {
+                    let n_elems =
+                        self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_grad_accumulate_add",
+                        &[accum_buf, grad, n_elems],
+                    )?;
+                }
                 builder.ins().jump(ga_join, &[]);
 
                 // Join — single tensor_free regardless of path
@@ -6491,6 +6530,12 @@ impl Compiler<'_> {
                 num_state_buffers,
                 accum_list,
                 opt_grads,
+                // Final micro-batch grads for the non-hook two-phase Phase A
+                // fused accumulate (the standard accumulation loop was
+                // skipped on the stepping batch). Null sentinel under the
+                // source-AD hook — pass None so it is never read.
+                if fase_hook_active { None } else { Some(grads_list) },
+                fase_hook_active,
                 step_count_var,
                 &fase_plan,
                 optimizer_name.as_str(),
@@ -6572,11 +6617,11 @@ impl Compiler<'_> {
 
                     let pa_mpart =
                         self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
-                    // FASE Codegen Phase 2: Phase A (two-phase-clip accumulation) runs
-                    // only when the global FASE plan is Deferred + grad_clip is set.
-                    // Per spec §2, per-layer FullBuffer overrides on this path are inert
-                    // (the path's existence already implies global Deferred). No mode-
-                    // table dispatch needed here.
+                    // Monolithic Phase A: this branch only runs when NO mode
+                    // table exists (no WGGO overrides), so every param is
+                    // globally Deferred — no mode dispatch needed. Mixed
+                    // tables take the emit_unified_optim_step_dispatch path,
+                    // whose Phase A mirrors this fused accumulate.
                     //
                     // When FASE hook is active, accumulation already happened
                     // during adjoint lowering — skip the grads_list read + accumulate.
@@ -6811,6 +6856,7 @@ impl Compiler<'_> {
                 eps_const,
                 step_count_var,
                 false,
+                None,
             )?;
 
             let one_opt = builder.ins().iconst(cl_types::I64, 1);
