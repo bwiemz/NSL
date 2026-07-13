@@ -1,0 +1,46 @@
+# Two-block MLP for the mixed-mode two-phase-clip differential tests.
+#
+# Array field `blocks: [Blk; 2]` produces params `blocks.0.w` / `blocks.1.w`,
+# which WGGO buckets into layers `blocks.0` / `blocks.1` — so a WGGO run
+# yields a 2-entry per-layer override vector that NSL_FASE_FUSED_OVERRIDE
+# can pin deterministically (e.g. "1,0" = blocks.0 Deferred, blocks.1
+# FullBuffer).
+#
+# Forward iterates blocks with `for block in self.blocks:` — the shape the
+# source-AD extractor supports (the `self.blocks[0].forward(x)` indexing
+# form falls back to tape AD, and tape training through array-block fields
+# currently aborts in the runtime). Drive this fixture with --source-ad.
+#
+# 8 epochs x 1 step = 8 micro-batches, 4 optimizer windows (accumulation=2).
+# grad_clip = 0.01 is small enough that the window clip fires every window.
+# weight_decay = 0 so the Deferred recipe vs stdlib adamw_step comparison
+# has no decoupled-decay term.
+
+from nsl.nn.losses import mse_loss
+
+model Blk:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = ones([2, 2])
+let y = zeros([2, 2])
+
+train(model = m, epochs = 8, grad_accumulation = 2, grad_clip = 0.01):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "mixed_clip_out.nslm")

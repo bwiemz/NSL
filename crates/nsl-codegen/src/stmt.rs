@@ -3881,8 +3881,8 @@ impl Compiler<'_> {
             step_body.ok_or_else(|| CodegenError::new("train block requires a step section"))?;
 
         // FASE: plan the backward rewrite.  Passthrough (N=1) and FullBuffer
-        // (Lion, Unknown, or grad_clip set) fall through to the existing
-        // accum-buffer path below.  Deferred routes through stmt_fase.
+        // (Lion, Unknown) fall through to the existing accum-buffer path
+        // below.  Deferred routes through stmt_fase.
         let fase_cfg = crate::fase::FaseConfig {
             accumulation: grad_accumulation_steps.max(1) as u32,
             optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
@@ -3897,7 +3897,52 @@ impl Compiler<'_> {
         };
         let fase_plan = match self.wggo_overrides.as_ref() {
             Some(o) => {
-                let fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
+                let mut fused: Vec<bool> = o.per_layer.iter().map(|p| p.fase_fused).collect();
+                // Diagnostic knob: NSL_FASE_FUSED_OVERRIDE="1,0,..." replaces
+                // the plan's per-layer fase_fused pattern (layer order = the
+                // WGGO override order). Used by the mixed-mode differential
+                // tests to pin a deterministic mode table; the layer registry
+                // (names → params) still comes from the real WGGO overrides.
+                if let Ok(spec) = std::env::var("NSL_FASE_FUSED_OVERRIDE") {
+                    // Strict parse: only 0/1/true/false are meaningful. Any
+                    // other token (including an empty-but-set variable, or
+                    // "True"/"yes") rejects the WHOLE spec with a warning —
+                    // silently mapping unrecognized tokens to FullBuffer
+                    // would flip production mode tables on a typo'd or
+                    // stray exported variable.
+                    let forced: Option<Vec<bool>> = spec
+                        .split(',')
+                        .map(|t| match t.trim() {
+                            "1" | "true" => Some(true),
+                            "0" | "false" => Some(false),
+                            _ => None,
+                        })
+                        .collect();
+                    match forced {
+                        Some(forced) if forced.len() == fused.len() => {
+                            eprintln!(
+                                "[fase] NSL_FASE_FUSED_OVERRIDE applied: {spec} \
+                                 (replacing plan fase_fused for {} layers)",
+                                fused.len()
+                            );
+                            fused = forced;
+                        }
+                        Some(forced) => {
+                            eprintln!(
+                                "[fase] NSL_FASE_FUSED_OVERRIDE ignored: {} entries \
+                                 for {} WGGO layers",
+                                forced.len(),
+                                fused.len()
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[fase] NSL_FASE_FUSED_OVERRIDE ignored: \
+                                 unrecognized token in '{spec}' (only 0/1/true/false)"
+                            );
+                        }
+                    }
+                }
                 crate::fase::plan_with_overrides(&fase_cfg, &fused)
             }
             None => crate::fase::plan(&fase_cfg),
@@ -3913,9 +3958,6 @@ impl Compiler<'_> {
                     global_mode,
                 } => format!("{:?}_optimizer_global_mode_{:?}", optimizer, global_mode)
                     .to_lowercase(),
-                crate::wggo_overrides::OverrideRejectReason::TwoPhaseClipConflict {
-                    grad_clip_threshold,
-                } => format!("two_phase_clip_threshold_{grad_clip_threshold}"),
                 other => format!("{:?}", other),
             };
             eprintln!(
@@ -3923,15 +3965,16 @@ impl Compiler<'_> {
                 diag.layer_index, diag.requested, diag.applied, reason_str
             );
         }
-        // FASE Codegen Phase 2 (mostly) shipped: the accumulation loop
-        // `ga_body` below now dispatches per-param via a `.rodata` mode
-        // table built from WGGO's per-layer decisions (see
-        // `mode_table_base` allocation below + `emit_fase_mode_branch`
-        // in stmt_fase.rs). Phase A two-phase-clip is Deferred-only by
-        // construction; the optimizer step retains the global boolean
-        // dispatch — its outer-scope structure (separate fused vs
-        // stdlib emission paths) requires a deeper refactor that is
-        // tracked as a follow-up.
+        // FASE Codegen Phase 2+3 shipped: the accumulation loop `ga_body`
+        // below dispatches per-param via a `.rodata` mode table built from
+        // WGGO's per-layer decisions (see `mode_table_base` allocation below
+        // + `emit_fase_mode_branch` in stmt_fase.rs), and the optimizer step
+        // dispatches per-param through `emit_unified_optim_step_dispatch`.
+        // Two-phase clip honors mixed tables on the source-AD hook path
+        // (the only one where a mode table exists): the hook accumulates
+        // every param with the scaled window-mean convention, so Phase A's
+        // global norm is uniform across modes, and Phase B applies the
+        // shared clip factor in both dispatch arms.
         // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
@@ -6309,7 +6352,15 @@ impl Compiler<'_> {
                 )?;
                 builder.ins().jump(ga_join, &[]);
 
-                // FullBuffer path
+                // FullBuffer path: historical raw-sum convention. Note the
+                // two-phase-clip case never reaches this loop: two_phase_clip
+                // implies a Deferred-global plan, which under source AD (the
+                // only path where a mode table exists) activates the FASE
+                // hook — and the hook skips this whole loop, accumulating
+                // every param (both modes) with the scaled window-mean
+                // convention in fase_cb. That uniform convention is what
+                // makes the dispatch's Phase A norm valid for mixed tables;
+                // the dispatch refuses two_phase_clip without the hook.
                 builder.switch_to_block(ga_fullbuf);
                 builder.seal_block(ga_fullbuf);
                 let n_elems =
@@ -6491,6 +6542,7 @@ impl Compiler<'_> {
                 num_state_buffers,
                 accum_list,
                 opt_grads,
+                fase_hook_active,
                 step_count_var,
                 &fase_plan,
                 optimizer_name.as_str(),
@@ -6572,11 +6624,11 @@ impl Compiler<'_> {
 
                     let pa_mpart =
                         self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
-                    // FASE Codegen Phase 2: Phase A (two-phase-clip accumulation) runs
-                    // only when the global FASE plan is Deferred + grad_clip is set.
-                    // Per spec §2, per-layer FullBuffer overrides on this path are inert
-                    // (the path's existence already implies global Deferred). No mode-
-                    // table dispatch needed here.
+                    // Monolithic Phase A: this branch only runs when NO mode
+                    // table exists (no WGGO overrides), so every param is
+                    // globally Deferred — no mode dispatch needed. Mixed
+                    // tables take the emit_unified_optim_step_dispatch path,
+                    // whose Phase A mirrors this fused accumulate.
                     //
                     // When FASE hook is active, accumulation already happened
                     // during adjoint lowering — skip the grads_list read + accumulate.
@@ -6811,6 +6863,7 @@ impl Compiler<'_> {
                 eps_const,
                 step_count_var,
                 false,
+                None,
             )?;
 
             let one_opt = builder.ins().iconst(cl_types::I64, 1);

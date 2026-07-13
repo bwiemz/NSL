@@ -206,9 +206,13 @@ pub struct LayerDecision {
     pub optim_m_bits: u8,
     /// Optimizer `v` precision (bits).
     pub optim_v_bits: u8,
-    /// Whether FASE fuses the optimizer step into the backward pass for
-    /// this layer.  When `true`, gradient buffers are not materialised in
-    /// HBM and the backward kernel writes parameter updates directly.
+    /// Whether FASE runs this layer's params in Deferred mode (`true` →
+    /// `FaseMode::Deferred`: only the m_partial window-mean accumulator is
+    /// materialised, no separate gradient buffer, and the optimizer update
+    /// runs as the fused per-param epilogue after the final micro-batch;
+    /// `false` → `FaseMode::FullBuffer`: a raw gradient buffer survives and
+    /// the stdlib optimizer step consumes it). Honored per-layer by the
+    /// codegen mode table under both clipped and unclipped training.
     pub fase_fused: bool,
     /// PCA sequence-packing mode for attention kernels on this layer.
     ///   0 = none, 1 = segment_id, 2 = tile_skip, 3 = multi_seq.

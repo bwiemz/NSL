@@ -225,11 +225,14 @@ impl Compiler<'_> {
                     }
                 }
 
-                // ── SquaredAccumulate: dst = src + scale * operand² ─────────
-                // dst and src are always the same register (e.g. V = V + …).
-                // Strategy: compute sq=operand², scaled_sq=scale*sq, then
-                // add_inplace(dst, scaled_sq).  No copy needed when dst==src.
-                UpdateOp::SquaredAccumulate { dst, src, operand, scale } => {
+                // ── SquaredAccumulate: dst = src_scale·src + scale·operand² ──
+                // dst and src are always the same register (e.g. V = β₂·V + …).
+                // Strategy: compute sq=operand², scaled_sq=scale*sq, decay dst
+                // in place by src_scale, then add_inplace(dst, scaled_sq).
+                // The decay step is the β₂ EMA damping of the second moment —
+                // omitting it (the historical behavior) computed
+                // v += (1-β₂)·g², an un-damped running sum.
+                UpdateOp::SquaredAccumulate { dst, src, src_scale, operand, scale } => {
                     let operand_ptr = if *operand == Register::Tmp {
                         tmp_val.ok_or_else(|| crate::error::CodegenError::new(
                             "SquaredAccumulate: Tmp operand read before first write"
@@ -265,6 +268,17 @@ impl Compiler<'_> {
                     } else {
                         resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
                     };
+                    // Decay the accumulator (dst *= src_scale) before adding
+                    // the new squared term. Skip emission entirely for the
+                    // neutral factor so non-EMA programs stay byte-identical.
+                    if *src_scale != 1.0 {
+                        let decay_val = builder.ins().f64const(*src_scale);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_mul_scalar_inplace",
+                            &[dst_ptr, decay_val],
+                        )?;
+                    }
                     self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dst_ptr, scaled_sq])?;
                     // FBIP relinq contract: when mul_scalar reuses the input
                     // buffer in-place, it bumps refcount so the input ptr is
@@ -634,6 +648,17 @@ impl Compiler<'_> {
         // (SGD/Lion/Muon) alias s2 to s1, and double-casting that alias
         // would corrupt the buffer on cast_into-back.
         wrap_precision: bool,
+        // Bias-correction step index override (f64). The legacy monolithic
+        // FullBuffer path passes `None`: t = step_count+1, i.e. the
+        // MICRO-batch counter — under grad accumulation it jumps by N
+        // between optimizer steps (historical semantic, preserved).
+        // The unified per-param dispatch passes `Some(window_t)` — the
+        // window counter (step_count+1)/N — so a FullBuffer-mode param's
+        // Adam/AdamW/SOAP bias correction advances at the same rate as the
+        // Deferred arm's `nsl_bias_correction_inv(β, opt_step)`. Without
+        // this, a mixed mode table would step its two arms with different
+        // effective bias corrections even given identical gradients.
+        t_override: Option<cranelift_codegen::ir::Value>,
     ) -> Result<(), crate::error::CodegenError> {
         // CPDT FP16/INT8 wrap envelope (S5). theta and grad are NOT wrapped
         // — params stay in their natural dtype (FP32 by default); CPDT §3.2
@@ -669,10 +694,14 @@ impl Compiler<'_> {
                 )?;
             }
             "adam" | "adamw" => {
-                let t_val = builder.use_var(step_count_var);
-                let one = builder.ins().iconst(cl_types::I64, 1);
-                let t_plus_one = builder.ins().iadd(t_val, one);
-                let t_float = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one);
+                let t_float = if let Some(t) = t_override {
+                    t
+                } else {
+                    let t_val = builder.use_var(step_count_var);
+                    let one = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_one = builder.ins().iadd(t_val, one);
+                    builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one)
+                };
                 self.compile_call_by_name(
                     builder,
                     opt_fn,
@@ -703,10 +732,14 @@ impl Compiler<'_> {
                 )?;
             }
             "soap" => {
-                let t_val_s = builder.use_var(step_count_var);
-                let one_s = builder.ins().iconst(cl_types::I64, 1);
-                let t_plus_s = builder.ins().iadd(t_val_s, one_s);
-                let t_float_s = builder.ins().fcvt_from_sint(cl_types::F64, t_plus_s);
+                let t_float_s = if let Some(t) = t_override {
+                    t
+                } else {
+                    let t_val_s = builder.use_var(step_count_var);
+                    let one_s = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_s = builder.ins().iadd(t_val_s, one_s);
+                    builder.ins().fcvt_from_sint(cl_types::F64, t_plus_s)
+                };
                 self.compile_call_by_name(
                     builder,
                     opt_fn,
@@ -753,13 +786,21 @@ impl Compiler<'_> {
     /// Emit a single unified optimizer-step loop with per-param runtime
     /// dispatch on the FASE mode table. Used when `mode_table_base.is_some()`.
     ///
-    /// Per spec §6, when `two_phase_clip` is active every mode is clamped
-    /// to Deferred upstream (in `plan_with_overrides`). So when this helper
-    /// is called with `fase_plan.two_phase_clip == true`, the runtime
-    /// branch inside the loop still works — modes[i] is Deferred for every
-    /// i, meaning the FullBuffer branch is effectively dead code at
-    /// runtime. This keeps the helper structure uniform regardless of
-    /// clip state.
+    /// Mixed mode tables are honored under `two_phase_clip`: on the (only
+    /// reachable) source-AD hook path, `fase_cb` accumulates EVERY param's
+    /// gradient with the scaled window-mean convention during adjoint
+    /// lowering, so Phase A's global ||accum||² norm is uniform, and both
+    /// dispatch arms apply the shared clip factor to their param's
+    /// accumulated gradient before stepping.
+    ///
+    /// Two-phase clip REQUIRES the hook: a mode table only exists when the
+    /// WGGO pre-pass ran, which is gated on source AD, and two_phase_clip
+    /// implies a Deferred-global plan, which under source AD activates the
+    /// hook. A hypothetical future non-hook mode-table path would have no
+    /// emission that accumulates the final micro-batch (the standard
+    /// accumulation loop is skipped on the stepping batch), so this helper
+    /// REFUSES that combination at compile time rather than emitting
+    /// silently-wrong IR.
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn emit_unified_optim_step_dispatch(
         &mut self,
@@ -773,6 +814,10 @@ impl Compiler<'_> {
         num_state_buffers: usize,
         accum_list: Option<cranelift_codegen::ir::Value>,
         opt_grads: cranelift_codegen::ir::Value,
+        // True when the source-AD FASE hook already accumulated every
+        // param's gradient during adjoint lowering. Required by the
+        // two-phase-clip path (see the refusal above Phase A).
+        fase_hook_active: bool,
         step_count_var: cranelift_frontend::Variable,
         fase_plan: &crate::fase::FasePlan,
         optimizer_name: &str,
@@ -803,6 +848,19 @@ impl Compiler<'_> {
         let grad_accum_const =
             builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
         let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
+        // Window-step index as f64 for the FullBuffer arm's stdlib
+        // Adam/AdamW/SOAP bias correction — the same counter the Deferred
+        // arm feeds nsl_bias_correction_inv, so a MIXED table's two arms
+        // advance their bias corrections in lockstep. Only meaningful when
+        // a Deferred arm exists to stay in lockstep WITH: for a
+        // FullBuffer-GLOBAL plan (Lion/Unknown/SOAP) the historical
+        // micro-batch-t semantic is preserved (t_override = None), matching
+        // the monolithic no-mode-table path bit-for-bit.
+        let fullbuf_t_override = if fase_plan.mode == crate::fase::FaseMode::Deferred {
+            Some(builder.ins().fcvt_from_sint(cl_types::F64, opt_step))
+        } else {
+            None
+        };
         let beta1_for_bc = builder.ins().f64const(fase_plan.recipe.beta1);
         let beta2_for_bc = builder.ins().f64const(fase_plan.recipe.beta2);
         let bc1_inv = self.compile_call_by_name(
@@ -823,6 +881,23 @@ impl Compiler<'_> {
                     "two_phase_clip requires accum_list to be Some".to_string(),
                 ));
             };
+            // Refusal (see the method doc): without the source-AD hook, the
+            // final micro-batch's gradients were never accumulated (the
+            // standard accumulation loop is skipped on the stepping batch)
+            // and no emission path here recovers them — Phase A would norm
+            // and step on a window that silently dropped its last
+            // micro-batch. Unreachable today (mode table ⇒ WGGO pre-pass ⇒
+            // source AD; two_phase_clip ⇒ Deferred global ⇒ hook), but a
+            // future non-hook mode-table path must implement the fused
+            // accumulate before lifting this.
+            if !fase_hook_active {
+                return Err(crate::error::CodegenError::new(
+                    "FASE mode-table two-phase clip requires the source-AD \
+                     FASE hook (fase_hook_active); the tape path has no \
+                     emission that accumulates the final micro-batch"
+                        .to_string(),
+                ));
+            }
 
             let pa_tot_var = state.new_variable();
             builder.declare_var(pa_tot_var, cl_types::F64);
@@ -847,6 +922,10 @@ impl Compiler<'_> {
 
             let pa_mpart =
                 self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+            // Hook path: every param's window-mean gradient (including the
+            // final micro-batch's contribution) was already accumulated
+            // into accum[i] by fase_cb during adjoint lowering — Phase A
+            // only sums the norm here.
             let pa_sq =
                 self.compile_call_by_name(builder, "nsl_tensor_sum_sq", &[pa_mpart])?;
             let pa_tot_cur = builder.use_var(pa_tot_var);
@@ -913,9 +992,16 @@ impl Compiler<'_> {
         );
 
         // ── Deferred path: m_partial-driven fused step ──
+        // Only emit the fused-recipe body when the GLOBAL plan is Deferred:
+        // a FullBuffer-global plan (Lion/Unknown/allow_v_approx=false) has a
+        // G-referencing update recipe that `fase_emit_final_step` rejects at
+        // compile time, and its mode table can never contain a Deferred
+        // byte (`plan_with_overrides` clamps Deferred requests to FullBuffer
+        // with FaseModeInfeasible) — the arm is structurally dead at
+        // runtime, so emit it empty.
         builder.switch_to_block(deferred_blk);
         builder.seal_block(deferred_blk);
-        if let Some(accum) = accum_list {
+        if let (Some(accum), crate::fase::FaseMode::Deferred) = (accum_list, fase_plan.mode) {
             let m_partial =
                 self.compile_call_by_name(builder, "nsl_list_get", &[accum, opt_i])?;
             if let Some(cf) = clip_factor {
@@ -953,6 +1039,18 @@ impl Compiler<'_> {
         builder.seal_block(fullbuf_blk);
         let grad =
             self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, opt_i])?;
+        // Two-phase clip: apply the shared clip factor to this param's
+        // accumulated (window-mean) gradient before the stdlib step — the
+        // exact mirror of the Deferred arm's m_partial scaling. Without
+        // this, a FullBuffer-mode param under a mixed table would step
+        // with the UNCLIPPED gradient.
+        if let Some(cf) = clip_factor {
+            self.compile_call_by_name(
+                builder,
+                "nsl_tensor_mul_scalar_inplace",
+                &[grad, cf],
+            )?;
+        }
         // S5: CPDT FP16/INT8 wrap envelope is THREADED through the FullBuffer
         // sub-arm. Pre-S5 this arm hardcoded `wrap_precision=false`, so a
         // mixed mode table that routed any FP16-tier param through here
@@ -979,7 +1077,17 @@ impl Compiler<'_> {
             eps_const,
             step_count_var,
             cpdt_precision_dtypes.is_some(),
+            fullbuf_t_override,
         )?;
+        // The Deferred arm's fase_emit_final_step zeroes m_partial via its
+        // recipe epilogue; the stdlib call does not. Zero this param's
+        // accumulation buffer so the next window starts fresh — without
+        // this, FullBuffer-mode params under a mode table accumulated
+        // gradients ACROSS windows (the monolithic path's post-optimizer
+        // cleanup loop never runs on the unified-dispatch path).
+        if accum_list.is_some() {
+            self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[grad])?;
+        }
         builder.ins().jump(iter_join, &[]);
 
         // ── Join + loop tail ──

@@ -75,10 +75,17 @@ pub enum UpdateOp {
     },
     /// Elementwise square: `dst = src * src`.
     Square { dst: Register, src: Register },
-    /// `dst = src + scale * squared(operand)` — fused square-accumulate.
+    /// `dst = src_scale * src + scale * squared(operand)` — fused
+    /// square-accumulate with source decay. The decay factor is what makes
+    /// the second-moment update `v = β₂·v + (1-β₂)·g²` an EMA; it was
+    /// historically missing from both this op's contract and the Cranelift
+    /// emitter (`v += (1-β₂)·g²`), silently un-damping v by
+    /// `(1-β₂)·Σv_hist` every window — a ~2.5e-4 relative per-window update
+    /// error against textbook windowed AdamW.
     SquaredAccumulate {
         dst: Register,
         src: Register,
+        src_scale: f64,
         operand: Register,
         scale: f64,
     },
@@ -202,6 +209,7 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
         UpdateOp::SquaredAccumulate {
             dst: Register::V,
             src: Register::V,
+            src_scale: recipe.beta2,
             operand: Register::MPartial,
             scale: recipe.one_minus_beta2,
         },
@@ -505,12 +513,16 @@ mod tests {
         assert!((b_scale - 0.1).abs() < 1e-12, "b_scale must be one_minus_beta1, no extra 1/N");
 
         // Op 1: v = β₂·v + (1-β₂)·m_partial²
-        let UpdateOp::SquaredAccumulate { dst, src, operand, scale } = &prog.ops[1] else {
+        let UpdateOp::SquaredAccumulate { dst, src, src_scale, operand, scale } = &prog.ops[1] else {
             panic!("op 1 should be SquaredAccumulate");
         };
         assert_eq!(*dst, Register::V);
         assert_eq!(*src, Register::V);
         assert_eq!(*operand, Register::MPartial);
+        assert!(
+            (src_scale - 0.999).abs() < 1e-12,
+            "src_scale must be beta2 — the EMA decay of the second moment"
+        );
         assert!((scale - 0.001).abs() < 1e-12);
     }
 

@@ -1,0 +1,30 @@
+# Single-weight model for the tape-path premise test.
+#
+# WGGO's plan is only consumed by a train block when a Wengert list exists
+# (source AD): a `--wggo` run WITHOUT `--source-ad` produces NO overrides
+# and NO per-param FASE mode table, so it must be bit-identical to the
+# plain run. The premise test pins exactly that (and trips if tape-path
+# consumption ever appears, at which point the dispatch's two-phase
+# non-hook refusal becomes reachable and needs a real emission path).
+#
+# 8 epochs = 4 windows (accumulation=2); grad_clip = 0.01 fires every window.
+
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model = m, epochs = 8, grad_accumulation = 2, grad_clip = 0.01):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "tape_clip_out.nslm")

@@ -527,10 +527,20 @@ pub fn run(input: CshaInput) -> CshaPlan {
 
             let layer_idx = out.len() as u32;
 
-            // (1) HEADS FIRST — look up override for this layer.
+            // (1) HEADS FIRST — look up override for this layer BY NAME.
+            // The chain key and WGGO's layer registry both derive from
+            // wggo_graph::layer_prefix ("blocks.N"), so name equality is
+            // the correct join. Positional lookup (`o.find(layer_idx)`)
+            // mis-paired them: CSHA's index counts attention-only boundary
+            // chains in lexicographic key order, while WGGO's layer_index
+            // is execution order over ALL buckets — 'other' (embeddings)
+            // takes index 0 in any real model, shifting every block by one,
+            // and 'blocks.10' sorts before 'blocks.2'. (Inert while every
+            // model collapsed to a single 'other' layer; live now that
+            // layer_prefix handles model-var-prefixed param names.)
             let layer_override = input
                 .wggo_overrides
-                .and_then(|o| o.find(layer_idx));
+                .and_then(|o| o.find_by_layer_containing(&key));
 
             // Use overridden head count when available; fall back to the
             // global n_heads.  The head count feeds into roofline_tile_config
@@ -610,8 +620,12 @@ pub fn run(input: CshaInput) -> CshaPlan {
     // heads, we force n_active_heads=4 (= 4 pruned) so downstream consumers
     // see the WGGO-sanctioned count rather than the weight-analysis result.
     if let Some(overrides) = input.wggo_overrides {
-        for (idx, layer_spec) in specialization.layers.iter_mut().enumerate() {
-            if let Some(ov) = overrides.find(idx as u32) {
+        for layer_spec in specialization.layers.iter_mut() {
+            // Name-based join (LayerSpec.layer carries the same
+            // layer_prefix-derived key as WGGO's registry); the previous
+            // positional `find(idx)` paired spec layers with the wrong
+            // WGGO layers once multi-layer registries became real.
+            if let Some(ov) = overrides.find_by_layer_containing(&layer_spec.layer) {
                 // Only clamp: WGGO can reduce active heads, not add phantom ones.
                 if ov.active_heads < layer_spec.n_active_heads {
                     layer_spec.n_active_heads = ov.active_heads;
