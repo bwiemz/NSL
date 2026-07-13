@@ -2485,4 +2485,34 @@ mod tests {
         assert!(kept >= 6, "retention floor must hold (kept {kept})");
     }
 
+
+    #[test]
+    fn adapter_mandate_axis_yields_nonzero_rank_with_placement() {
+        // Paper @wrga(mode=auto) / errata E3: when adapters are mandated
+        // (rank 0 removed from the axis — the wiring driven by
+        // @wrga/@adapter decorators), the solver must pick a grid rank and
+        // a comm-feasible placement instead of pricing adapters out.
+        let lut = build_lut(
+            &shape(),
+            h100(),
+            &LutAxes {
+                adapter_ranks: vec![2, 4, 8, 16],
+                ..Default::default()
+            },
+        );
+        let constraints = LayerIlpConstraints::default();
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert!(
+            sol.decision.adapter_rank >= 2,
+            "mandated adapters must yield rank >= 2, got {}",
+            sol.decision.adapter_rank
+        );
+        assert_ne!(
+            sol.decision.adapter_placement,
+            AdapterPlacement::None,
+            "a nonzero rank needs a placement"
+        );
+    }
+
 }

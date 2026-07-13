@@ -364,7 +364,12 @@ pub(crate) fn invoke_wrga_if_enabled(
         hybrid_layers,
         wengert: list,
         loss_output: list.output,
-        weights: None,
+        // M52 weights (--weights safetensors) feed WRGA's spectral rank
+        // allocator directly: `run_spectral` consumes &WeightMap, and with
+        // None it silently fell back to the roofline suggested_rank clamp —
+        // `allocate_ranks` (the actual paper allocator) never ran in the
+        // build path. Same field wggo_prune dereferences further down.
+        weights: compiler.features.weight_map.as_ref(),
         target: target_override,
         budget_params,
         r_min: 2,
