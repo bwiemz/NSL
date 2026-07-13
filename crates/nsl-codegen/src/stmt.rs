@@ -3904,24 +3904,43 @@ impl Compiler<'_> {
                 // tests to pin a deterministic mode table; the layer registry
                 // (names → params) still comes from the real WGGO overrides.
                 if let Ok(spec) = std::env::var("NSL_FASE_FUSED_OVERRIDE") {
-                    let forced: Vec<bool> = spec
+                    // Strict parse: only 0/1/true/false are meaningful. Any
+                    // other token (including an empty-but-set variable, or
+                    // "True"/"yes") rejects the WHOLE spec with a warning —
+                    // silently mapping unrecognized tokens to FullBuffer
+                    // would flip production mode tables on a typo'd or
+                    // stray exported variable.
+                    let forced: Option<Vec<bool>> = spec
                         .split(',')
-                        .map(|t| matches!(t.trim(), "1" | "true"))
+                        .map(|t| match t.trim() {
+                            "1" | "true" => Some(true),
+                            "0" | "false" => Some(false),
+                            _ => None,
+                        })
                         .collect();
-                    if forced.len() == fused.len() {
-                        eprintln!(
-                            "[fase] NSL_FASE_FUSED_OVERRIDE applied: {spec} \
-                             (replacing plan fase_fused for {} layers)",
-                            fused.len()
-                        );
-                        fused = forced;
-                    } else {
-                        eprintln!(
-                            "[fase] NSL_FASE_FUSED_OVERRIDE ignored: {} entries for {} \
-                             WGGO layers",
-                            forced.len(),
-                            fused.len()
-                        );
+                    match forced {
+                        Some(forced) if forced.len() == fused.len() => {
+                            eprintln!(
+                                "[fase] NSL_FASE_FUSED_OVERRIDE applied: {spec} \
+                                 (replacing plan fase_fused for {} layers)",
+                                fused.len()
+                            );
+                            fused = forced;
+                        }
+                        Some(forced) => {
+                            eprintln!(
+                                "[fase] NSL_FASE_FUSED_OVERRIDE ignored: {} entries \
+                                 for {} WGGO layers",
+                                forced.len(),
+                                fused.len()
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[fase] NSL_FASE_FUSED_OVERRIDE ignored: \
+                                 unrecognized token in '{spec}' (only 0/1/true/false)"
+                            );
+                        }
                     }
                 }
                 crate::fase::plan_with_overrides(&fase_cfg, &fused)
@@ -3951,10 +3970,11 @@ impl Compiler<'_> {
         // WGGO's per-layer decisions (see `mode_table_base` allocation below
         // + `emit_fase_mode_branch` in stmt_fase.rs), and the optimizer step
         // dispatches per-param through `emit_unified_optim_step_dispatch`.
-        // Two-phase clip honors mixed tables: under `two_phase_clip` the
-        // FullBuffer accumulation arm switches to the scaled window-mean
-        // convention so Phase A's global ||m_partial||² norm is uniform, and
-        // Phase B applies the shared clip factor in both dispatch arms.
+        // Two-phase clip honors mixed tables on the source-AD hook path
+        // (the only one where a mode table exists): the hook accumulates
+        // every param with the scaled window-mean convention, so Phase A's
+        // global norm is uniform across modes, and Phase B applies the
+        // shared clip factor in both dispatch arms.
         // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
@@ -6332,32 +6352,24 @@ impl Compiler<'_> {
                 )?;
                 builder.ins().jump(ga_join, &[]);
 
-                // FullBuffer path. Under two-phase clip the FullBuffer arm
-                // uses the SAME scaled window-mean convention as Deferred
-                // (accum += (1/N)·g): Phase A's global ||accum||² norm then
-                // holds uniformly across a mixed mode table, and the stdlib
-                // optimizer step consumes the clipped window-mean gradient —
-                // the same effective gradient the Deferred arm steps with.
-                // Without clipping, the historical raw-sum convention is
-                // preserved byte-identically.
+                // FullBuffer path: historical raw-sum convention. Note the
+                // two-phase-clip case never reaches this loop: two_phase_clip
+                // implies a Deferred-global plan, which under source AD (the
+                // only path where a mode table exists) activates the FASE
+                // hook — and the hook skips this whole loop, accumulating
+                // every param (both modes) with the scaled window-mean
+                // convention in fase_cb. That uniform convention is what
+                // makes the dispatch's Phase A norm valid for mixed tables;
+                // the dispatch refuses two_phase_clip without the hook.
                 builder.switch_to_block(ga_fullbuf);
                 builder.seal_block(ga_fullbuf);
-                if fase_plan.two_phase_clip {
-                    self.fase_emit_accumulate(
-                        builder,
-                        accum_buf,
-                        grad,
-                        fase_plan.recipe.accum_scale,
-                    )?;
-                } else {
-                    let n_elems =
-                        self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_grad_accumulate_add",
-                        &[accum_buf, grad, n_elems],
-                    )?;
-                }
+                let n_elems =
+                    self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_grad_accumulate_add",
+                    &[accum_buf, grad, n_elems],
+                )?;
                 builder.ins().jump(ga_join, &[]);
 
                 // Join — single tensor_free regardless of path
@@ -6530,11 +6542,6 @@ impl Compiler<'_> {
                 num_state_buffers,
                 accum_list,
                 opt_grads,
-                // Final micro-batch grads for the non-hook two-phase Phase A
-                // fused accumulate (the standard accumulation loop was
-                // skipped on the stepping batch). Null sentinel under the
-                // source-AD hook — pass None so it is never read.
-                if fase_hook_active { None } else { Some(grads_list) },
                 fase_hook_active,
                 step_count_var,
                 &fase_plan,

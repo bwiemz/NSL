@@ -1,12 +1,11 @@
-# Single-weight model for tape-AD (non-hook) two-phase-clip coverage.
+# Single-weight model for the tape-path premise test.
 #
-# No `blocks.N` field: WGGO buckets the lone param into its synthetic
-# "other" layer, so a --wggo run still builds a per-param mode table but
-# every param falls back to the global (Deferred) byte — a uniform-Deferred
-# table on the TAPE path. That reaches the unified dispatch's Phase A with
-# fase_hook_active=false, where the final micro-batch's accumulation must
-# be fused in (the standard accumulation loop is skipped on the stepping
-# batch).
+# WGGO's plan is only consumed by a train block when a Wengert list exists
+# (source AD): a `--wggo` run WITHOUT `--source-ad` produces NO overrides
+# and NO per-param FASE mode table, so it must be bit-identical to the
+# plain run. The premise test pins exactly that (and trips if tape-path
+# consumption ever appears, at which point the dispatch's two-phase
+# non-hook refusal becomes reachable and needs a real emission path).
 #
 # 8 epochs = 4 windows (accumulation=2); grad_clip = 0.01 fires every window.
 

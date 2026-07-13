@@ -786,12 +786,21 @@ impl Compiler<'_> {
     /// Emit a single unified optimizer-step loop with per-param runtime
     /// dispatch on the FASE mode table. Used when `mode_table_base.is_some()`.
     ///
-    /// Mixed mode tables are honored under `two_phase_clip`: the
-    /// accumulation loop upstream uses the scaled window-mean convention
-    /// for BOTH modes when clipping is active (stmt.rs `ga_fullbuf` arm),
-    /// so Phase A's global ||accum||² norm is uniform, and both dispatch
-    /// arms apply the shared clip factor to their param's accumulated
-    /// gradient before stepping.
+    /// Mixed mode tables are honored under `two_phase_clip`: on the (only
+    /// reachable) source-AD hook path, `fase_cb` accumulates EVERY param's
+    /// gradient with the scaled window-mean convention during adjoint
+    /// lowering, so Phase A's global ||accum||² norm is uniform, and both
+    /// dispatch arms apply the shared clip factor to their param's
+    /// accumulated gradient before stepping.
+    ///
+    /// Two-phase clip REQUIRES the hook: a mode table only exists when the
+    /// WGGO pre-pass ran, which is gated on source AD, and two_phase_clip
+    /// implies a Deferred-global plan, which under source AD activates the
+    /// hook. A hypothetical future non-hook mode-table path would have no
+    /// emission that accumulates the final micro-batch (the standard
+    /// accumulation loop is skipped on the stepping batch), so this helper
+    /// REFUSES that combination at compile time rather than emitting
+    /// silently-wrong IR.
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn emit_unified_optim_step_dispatch(
         &mut self,
@@ -805,16 +814,9 @@ impl Compiler<'_> {
         num_state_buffers: usize,
         accum_list: Option<cranelift_codegen::ir::Value>,
         opt_grads: cranelift_codegen::ir::Value,
-        // Per-micro-batch gradient list. Only read when `two_phase_clip`
-        // is active AND `fase_hook_active` is false: on that path the
-        // standard accumulation loop was skipped for the stepping
-        // micro-batch (stmt.rs 7e3), so Phase A must fuse the final
-        // accumulate here (mirroring the monolithic Deferred Phase A) and
-        // free the per-batch grads + list wrapper it consumed.
-        grads_list: Option<cranelift_codegen::ir::Value>,
         // True when the source-AD FASE hook already accumulated every
-        // param's gradient during adjoint lowering (grads_list is a null
-        // sentinel in that case).
+        // param's gradient during adjoint lowering. Required by the
+        // two-phase-clip path (see the refusal above Phase A).
         fase_hook_active: bool,
         step_count_var: cranelift_frontend::Variable,
         fase_plan: &crate::fase::FasePlan,
@@ -848,9 +850,17 @@ impl Compiler<'_> {
         let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
         // Window-step index as f64 for the FullBuffer arm's stdlib
         // Adam/AdamW/SOAP bias correction — the same counter the Deferred
-        // arm feeds nsl_bias_correction_inv, so a mixed table's two arms
-        // advance their bias corrections in lockstep.
-        let opt_step_f = builder.ins().fcvt_from_sint(cl_types::F64, opt_step);
+        // arm feeds nsl_bias_correction_inv, so a MIXED table's two arms
+        // advance their bias corrections in lockstep. Only meaningful when
+        // a Deferred arm exists to stay in lockstep WITH: for a
+        // FullBuffer-GLOBAL plan (Lion/Unknown/SOAP) the historical
+        // micro-batch-t semantic is preserved (t_override = None), matching
+        // the monolithic no-mode-table path bit-for-bit.
+        let fullbuf_t_override = if fase_plan.mode == crate::fase::FaseMode::Deferred {
+            Some(builder.ins().fcvt_from_sint(cl_types::F64, opt_step))
+        } else {
+            None
+        };
         let beta1_for_bc = builder.ins().f64const(fase_plan.recipe.beta1);
         let beta2_for_bc = builder.ins().f64const(fase_plan.recipe.beta2);
         let bc1_inv = self.compile_call_by_name(
@@ -871,6 +881,23 @@ impl Compiler<'_> {
                     "two_phase_clip requires accum_list to be Some".to_string(),
                 ));
             };
+            // Refusal (see the method doc): without the source-AD hook, the
+            // final micro-batch's gradients were never accumulated (the
+            // standard accumulation loop is skipped on the stepping batch)
+            // and no emission path here recovers them — Phase A would norm
+            // and step on a window that silently dropped its last
+            // micro-batch. Unreachable today (mode table ⇒ WGGO pre-pass ⇒
+            // source AD; two_phase_clip ⇒ Deferred global ⇒ hook), but a
+            // future non-hook mode-table path must implement the fused
+            // accumulate before lifting this.
+            if !fase_hook_active {
+                return Err(crate::error::CodegenError::new(
+                    "FASE mode-table two-phase clip requires the source-AD \
+                     FASE hook (fase_hook_active); the tape path has no \
+                     emission that accumulates the final micro-batch"
+                        .to_string(),
+                ));
+            }
 
             let pa_tot_var = state.new_variable();
             builder.declare_var(pa_tot_var, cl_types::F64);
@@ -895,29 +922,10 @@ impl Compiler<'_> {
 
             let pa_mpart =
                 self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
-            // Non-hook path: the standard accumulation loop was skipped for
-            // this (stepping) micro-batch, so fuse its accumulation here —
-            // scaled window-mean for EVERY param regardless of mode (the
-            // FullBuffer arm switched to the scaled convention under
-            // two-phase clip in stmt.rs's ga_fullbuf). When the source-AD
-            // hook is active, accumulation already happened during adjoint
-            // lowering and grads_list is a null sentinel — skip.
-            if !fase_hook_active {
-                let Some(grads) = grads_list else {
-                    return Err(crate::error::CodegenError::new(
-                        "two_phase_clip without FASE hook requires grads_list".to_string(),
-                    ));
-                };
-                let pa_grad =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[grads, pa_i])?;
-                self.fase_emit_accumulate(
-                    builder,
-                    pa_mpart,
-                    pa_grad,
-                    fase_plan.recipe.accum_scale,
-                )?;
-                self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
-            }
+            // Hook path: every param's window-mean gradient (including the
+            // final micro-batch's contribution) was already accumulated
+            // into accum[i] by fase_cb during adjoint lowering — Phase A
+            // only sums the norm here.
             let pa_sq =
                 self.compile_call_by_name(builder, "nsl_tensor_sum_sq", &[pa_mpart])?;
             let pa_tot_cur = builder.use_var(pa_tot_var);
@@ -929,13 +937,6 @@ impl Compiler<'_> {
             builder.switch_to_block(pa_exit);
             builder.seal_block(pa_hdr);
             builder.seal_block(pa_exit);
-
-            // Free the grads_list wrapper consumed above (non-hook only).
-            if !fase_hook_active {
-                if let Some(grads) = grads_list {
-                    self.compile_call_by_name(builder, "nsl_list_free", &[grads])?;
-                }
-            }
 
             let total_sq = builder.use_var(pa_tot_var);
             let norm = builder.ins().sqrt(total_sq);
@@ -1076,7 +1077,7 @@ impl Compiler<'_> {
             eps_const,
             step_count_var,
             cpdt_precision_dtypes.is_some(),
-            Some(opt_step_f),
+            fullbuf_t_override,
         )?;
         // The Deferred arm's fase_emit_final_step zeroes m_partial via its
         // recipe epilogue; the stdlib call does not. Zero this param's

@@ -1,0 +1,42 @@
+# Two-block MLP driven by SOAP (global-FullBuffer FASE plan: soap parses to
+# FaseOptimizer::Unknown), no clipping. Drive with --source-ad.
+#
+# SOAP is the discriminating FullBuffer-global optimizer: unlike Lion
+# (sign-only, magnitude-invariant) its update magnitude depends on both the
+# accumulated gradient magnitude AND the bias-correction step index t. The
+# mode-table run must match the monolithic run bit-for-bit, which pins:
+#  - the dispatch FullBuffer arm zeroing its accumulation buffer after the
+#    stdlib step (without it, windows 2-4 step with cross-window gradient
+#    sums and SOAP's magnitude-sensitive update diverges), and
+#  - the historical micro-batch-t bias correction for FullBuffer-GLOBAL
+#    tables (the window-t override is reserved for mixed Deferred-global
+#    tables that need lockstep with the Deferred arm).
+
+from nsl.nn.losses import mse_loss
+
+model Blk:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = ones([2, 2])
+let y = zeros([2, 2])
+
+train(model = m, epochs = 8, grad_accumulation = 2):
+    optimizer: SOAP(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+model_save(m, "soap_fullbuffer_out.nslm")

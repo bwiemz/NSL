@@ -4,18 +4,18 @@
 //! whenever `grad_clip` was set. These tests pin the machinery that made
 //! honoring mixed modes possible:
 //!
-//! 1. The unified per-param dispatch's Phase A fuses the final
-//!    micro-batch's accumulation on the non-hook (tape-AD) path — the
-//!    standard accumulation loop is skipped on the stepping batch, and the
-//!    monolithic Deferred Phase A was previously the only place that
-//!    recovered it.
-//! 2. Under `two_phase_clip` the FullBuffer accumulation arm uses the same
-//!    scaled window-mean convention as Deferred, so the global norm is
-//!    uniform, and both dispatch arms apply the shared clip factor.
+//! 1. On the source-AD hook path (the only one where a mode table exists),
+//!    `fase_cb` accumulates EVERY param with the scaled window-mean
+//!    convention, so Phase A's global norm is uniform across a mixed
+//!    table; the dispatch REFUSES two-phase clip without the hook.
+//! 2. Both dispatch arms apply the shared clip factor to their param's
+//!    accumulated gradient before stepping.
 //! 3. The FullBuffer arm zeroes its accumulation buffer after the stdlib
 //!    step (the Deferred arm's recipe epilogue already zeroed m_partial).
-//! 4. The FullBuffer arm's Adam/AdamW bias correction uses the window
-//!    counter (same as the Deferred arm), not the micro-batch counter.
+//! 4. Bias-correction t: mixed Deferred-global tables feed the FullBuffer
+//!    arm the window counter (lockstep with the Deferred arm);
+//!    FullBuffer-GLOBAL tables keep the historical micro-batch counter
+//!    (bit-compatible with the monolithic path).
 //!
 //! Strategy: run the same fixture with and without a WGGO mode table (the
 //! table is pinned via the NSL_FASE_FUSED_OVERRIDE diagnostic knob) and
@@ -26,11 +26,10 @@
 //! Path notes: every mode-table run uses --source-ad. WGGO's plan is only
 //! consumed by the train block when a Wengert list exists (source AD), so
 //! `--wggo` without `--source-ad` produces NO overrides and NO mode table
-//! (verified empirically) — the tape path cannot reach the unified
-//! dispatch today. (Tape training through array-block fields also aborts
-//! in the runtime — pre-existing, unrelated.) The dispatch helper's
-//! non-hook Phase A branch is therefore defensive: reachable only if a
-//! future path hands it a mode table with fase_hook_active=false.
+//! (pinned by the tape premise test below). Tape training through
+//! array-block fields also aborts in the runtime — pre-existing,
+//! unrelated — so the blocks fixtures iterate with
+//! `for block in self.blocks:` and run under --source-ad.
 
 mod common {
     include!("common/mod.rs");
@@ -145,17 +144,27 @@ fn assert_override_applied(stderr: &str) {
 fn tape_wggo_produces_no_mode_table_and_is_behavior_neutral() {
     let (oracle, _) =
         run_fixture("fase_tape_clip_simple.nsl", "tape_clip_out.nslm", &[], None);
+    // Set the override knob on the tape run as a POSITIVE tripwire: the
+    // knob only prints (applied OR ignored) when WGGO overrides actually
+    // materialized for the train block. Its total silence proves no mode
+    // table existed, independent of the consumption log message's wording.
     let (mtb, stderr) = run_fixture(
         "fase_tape_clip_simple.nsl",
         "tape_clip_out.nslm",
         &["--wggo", "greedy"],
-        None,
+        Some("1"),
+    );
+    assert!(
+        !stderr.contains("NSL_FASE_FUSED_OVERRIDE"),
+        "the fused-override knob fired on the tape path — WGGO overrides \
+         (and thus mode tables) are now reachable without source AD; the \
+         dispatch's two-phase non-hook refusal will reject clipped configs \
+         until a tape-path fused accumulate exists, and this suite needs \
+         real tape-path differentials:\n{stderr}"
     );
     assert!(
         !stderr.contains("consumed pre-solved plan"),
-        "tape path unexpectedly consumed a WGGO plan — mode tables are now \
-         reachable without source AD; extend this suite with tape-path \
-         differentials:\n{stderr}"
+        "tape path unexpectedly consumed a WGGO plan:\n{stderr}"
     );
     assert_eq!(
         tensor(&oracle, "w"),
@@ -261,9 +270,11 @@ fn mixed_table_under_clip_emits_no_clamp_diagnostics() {
 }
 
 /// Lion (global-FullBuffer plan) with a mode table must reproduce the
-/// monolithic FullBuffer path exactly across multiple windows. This pins
-/// fix (3): without the FullBuffer arm zeroing its accumulation buffer,
-/// windows 2-4 step with gradients accumulated across windows.
+/// monolithic FullBuffer path exactly. NOTE: Lion's sign-only update is
+/// magnitude-invariant, so with this fixture's constant-sign gradients it
+/// canNOT detect cross-window buffer contamination — it covers the lion
+/// dispatch-arm shape and t-insensitivity only. The zeroing fix is pinned
+/// by the SOAP test below (magnitude-sensitive).
 #[test]
 fn mode_table_fullbuffer_lion_matches_monolithic() {
     let (oracle, _) = run_fixture(
@@ -283,8 +294,49 @@ fn mode_table_fullbuffer_lion_matches_monolithic() {
         assert_eq!(
             tensor(&oracle, name),
             tensor(&mtb, name),
-            "{name} diverged between monolithic and mode-table FullBuffer \
-             (accumulation buffer not zeroed between windows?)"
+            "{name} diverged between monolithic and mode-table FullBuffer"
         );
     }
+}
+
+/// SOAP (global-FullBuffer plan: soap → FaseOptimizer::Unknown) with a
+/// mode table must reproduce the monolithic FullBuffer path bit-for-bit
+/// across 4 windows. SOAP's update is magnitude- AND t-sensitive, so this
+/// pins BOTH:
+///  - fix (3): the dispatch FullBuffer arm zeroing its accumulation buffer
+///    after the stdlib step (without it, windows 2-4 step with cross-window
+///    gradient sums → magnitude divergence), and
+///  - the t semantics: FullBuffer-GLOBAL tables keep the historical
+///    micro-batch-t bias correction (window-t is reserved for mixed
+///    Deferred-global tables; forcing it here diverged from monolithic by
+///    ~8e-4 over 4 windows).
+#[test]
+fn mode_table_fullbuffer_soap_matches_monolithic() {
+    let (oracle, _) = run_fixture(
+        "fase_fullbuffer_soap_blocks.nsl",
+        "soap_fullbuffer_out.nslm",
+        &["--source-ad"],
+        None,
+    );
+    let (mtb, stderr) = run_fixture(
+        "fase_fullbuffer_soap_blocks.nsl",
+        "soap_fullbuffer_out.nslm",
+        &["--source-ad", "--wggo", "greedy"],
+        Some("0,0,0"),
+    );
+    assert_override_applied(&stderr);
+    for name in ["blocks[0].w", "blocks[1].w"] {
+        assert_eq!(
+            tensor(&oracle, name),
+            tensor(&mtb, name),
+            "{name} diverged between monolithic and mode-table SOAP \
+             (buffer zeroing or t-override regression in the FullBuffer arm)"
+        );
+    }
+    // Multi-window training must actually move the weights (guards against
+    // a vacuous pass where the optimizer never stepped).
+    assert!(
+        tensor(&mtb, "blocks[1].w").iter().any(|v| (v - 1.0).abs() > 1e-6),
+        "SOAP mode-table run never moved blocks[1].w from init"
+    );
 }

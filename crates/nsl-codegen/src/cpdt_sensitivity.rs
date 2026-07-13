@@ -404,8 +404,19 @@ pub fn validate(wm: &WeightMap, applied: &AppliedPlan) -> Result<(), ValidationE
             continue;
         }
         checked += 1;
+        // WGGO layer names are BARE ("blocks.N") while weight-file keys may
+        // carry container prefixes ("m.blocks.N.w", "model.transformer.
+        // blocks.N.w" — the compiler's own Wengert Param names are
+        // model-var-prefixed). Accept the layer name at the start OR at a
+        // dot boundary. Before layer_prefix handled prefixed names, every
+        // model collapsed into 'other' and this loop checked zero layers —
+        // the anchored match was never exercised and would have hard-
+        // aborted compiles for prefixed checkpoints.
         let prefix = format!("{}.", layer.layer_name);
-        let has_match = wm.entries().any(|(name, _)| name.starts_with(&prefix));
+        let dotted = format!(".{prefix}");
+        let has_match = wm
+            .entries()
+            .any(|(name, _)| name.starts_with(&prefix) || name.contains(&dotted));
         if !has_match {
             missing.push(layer.layer_name.clone());
         }

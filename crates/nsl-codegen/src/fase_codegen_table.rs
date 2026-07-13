@@ -59,8 +59,18 @@ pub fn build_param_mode_table(
 
     let mut modes = Vec::with_capacity(param_paths.len());
     for path in param_paths {
+        // Derive the param's layer with the SAME function WGGO's graph
+        // builder used to bucket it (`wggo_graph::layer_prefix` handles
+        // arbitrary nesting above the blocks container, e.g.
+        // "m.encoder.blocks.0.w" → "blocks.0"), then match by layer-name
+        // equality. The legacy strip-model-var + containing lookup remains
+        // as a fallback for layer registries whose names aren't canonical
+        // blocks.N prefixes.
         let bare = path.strip_prefix(&prefix).unwrap_or(path.as_str());
-        let m = match o.find_by_layer_containing(bare) {
+        let layer = crate::wggo_graph::layer_prefix(path)
+            .and_then(|lp| o.per_layer.iter().find(|l| l.layer_name == lp))
+            .or_else(|| o.find_by_layer_containing(bare));
+        let m = match layer {
             Some(layer) => {
                 let layer_idx = layer.layer_index as usize;
                 per_layer
@@ -181,6 +191,25 @@ mod tests {
         assert_eq!(ParamMode::from(FaseMode::Passthrough) as u8, 0);
         assert_eq!(ParamMode::from(FaseMode::Deferred)    as u8, 1);
         assert_eq!(ParamMode::from(FaseMode::FullBuffer)  as u8, 2);
+    }
+
+    #[test]
+    fn nested_container_paths_match_their_layer() {
+        // Params whose blocks container sits BELOW another field
+        // ("m.encoder.blocks.N.w") bucket into WGGO layer "blocks.N" via
+        // layer_prefix; the table lookup must find the same layer even
+        // though stripping only the model variable leaves
+        // "encoder.blocks.N.w", which the starts_with-anchored containing
+        // lookup misses.
+        let mut p = deferred_plan();
+        p.per_layer_mode = Some(vec![FaseMode::Deferred, FaseMode::FullBuffer]);
+        let paths: Vec<String> = vec![
+            "m.encoder.blocks.0.w".into(),
+            "m.encoder.blocks.1.w".into(),
+        ];
+        let o = make_overrides(&["blocks.0", "blocks.1"]);
+        let modes = build_param_mode_table(&paths, "m", &p, Some(&o)).unwrap();
+        assert_eq!(modes, vec![1, 2]);
     }
 
     #[test]
