@@ -1071,7 +1071,7 @@ pub fn run_on_wengert_with_weights(
             None
         };
 
-    let input = WggoInput {
+    let mut input = WggoInput {
         mode,
         target,
         wengert,
@@ -1093,6 +1093,25 @@ pub fn run_on_wengert_with_weights(
         packing_supported,
         cached_analysis: cached_report.clone(),
     };
+    // WRGA budget semantics (paper §7.1 @wrga(mode=auto): errata E3's
+    // two-level split): when the user opted into adapters via
+    // @wrga/@adapter decorators, adapters are MANDATED — rank 0 stops
+    // being a feasible per-layer choice, and the ILP picks the grid rank
+    // + comm-feasible placement per layer; WRGA's spectral allocator then
+    // distributes the user's budget_params across the layer's matrices.
+    // Without this, the cost-only objective always chose rank 0 (adapters
+    // are pure modeled cost) and the paper's mode=auto could never
+    // materialize.
+    if compile_options.is_some_and(|o| {
+        o.wrga_inputs
+            .as_ref()
+            .is_some_and(|w| !w.wrga.is_empty() || !w.adapter.is_empty())
+    }) {
+        input.lut_axes.adapter_ranks.retain(|&r| r != 0);
+        if input.lut_axes.adapter_ranks.is_empty() {
+            input.lut_axes.adapter_ranks = vec![2, 4, 8, 16];
+        }
+    }
     let mut plan = run(input);
 
     // Surface the weights-load failure (if any) in the report itself, not
