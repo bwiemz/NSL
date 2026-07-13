@@ -358,7 +358,7 @@ impl<'a> WalkCtx<'a> {
         note: &str,
     ) {
         let ai = arithmetic_intensity(flops, bytes_read, bytes_written);
-        let classification = classify_op(ai, self.gpu.crossover_fp16);
+        let classification = classify_op(ai, self.gpu.crossover(self.dtype_bytes as usize));
         let loc = format_loc(expr.span, note);
         let estimated_time_us = estimate_time_us(flops, bytes_read, bytes_written, self.gpu, self.dtype);
         self.ops.push(OpCost {

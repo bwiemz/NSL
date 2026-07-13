@@ -83,6 +83,46 @@ fn memory_flag_appends_timeline() {
     assert!(out.contains("NSL Predictive Profile"));
 }
 
+/// Regression: `push_op` used to classify every op against the FP16
+/// crossover point (`gpu.crossover_fp16`) regardless of `--dtype`, so an
+/// fp32/fp8 profiling run would mislabel a compute-bound op as memory-bound
+/// (H100-SXM: crossover_fp32=20.0 but crossover_fp16=295.2 — an op with
+/// arithmetic intensity ~114 sits well past the fp32 ridge but far short of
+/// the fp16 one). `push_op` must consult `gpu.crossover(dtype_bytes)`, the
+/// same dtype-aware accessor `peak_tflops`/`estimate_time_us` already use.
+#[test]
+fn fp32_profile_classifies_matmul_by_the_fp32_crossover() {
+    let args = ProfileArgs {
+        dtype: "fp32".into(),
+        json: true,
+        ..sample_args()
+    };
+    let out = run_profile(&args).expect("profile should succeed");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("must be valid JSON");
+    let ops = v["ops"].as_array().expect("ops should be an array");
+    let matmuls: Vec<&serde_json::Value> = ops
+        .iter()
+        .filter(|o| o["name"].as_str() == Some("matmul") && o["flops"].as_u64().unwrap_or(0) > 0)
+        .collect();
+    assert!(!matmuls.is_empty(), "fixture should contain resolved matmul ops: {out}");
+    for op in &matmuls {
+        let ai = op["arithmetic_intensity"].as_f64().unwrap_or(0.0);
+        assert!(
+            ai > 20.0,
+            "test assumption broken: matmul AI={ai} should exceed H100's fp32 \
+             crossover (20.0) for this fixture's shapes"
+        );
+        assert_eq!(
+            op["classification"].as_str(),
+            Some("ComputeBound"),
+            "matmul with AI={ai} (> fp32 crossover 20.0, < fp16 crossover 295.2) must be \
+             ComputeBound under --dtype fp32 — got {:?}. If this is MemoryBound, \
+             classify_op is being called with the fp16 crossover regardless of --dtype:\n{out}",
+            op["classification"]
+        );
+    }
+}
+
 #[test]
 fn bad_gpu_errors_with_available_list() {
     let args = ProfileArgs {
