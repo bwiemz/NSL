@@ -595,6 +595,11 @@ impl Compiler<'_> {
                 return Ok(());
             }
         }
+        // Reaching here means the decorator scan built no `@flash_attention`
+        // context (every decorated path returns early above), i.e. this is the
+        // decorator-free attention path. Surface whether a WGGO plan is being
+        // dropped for it.
+        self.report_decorator_free_plan_reachability(stmts);
         Ok(())
     }
 
@@ -707,6 +712,75 @@ impl Compiler<'_> {
     /// forward inference PTX still works, and the Gap A save-pointer
     /// allocation continues to run (just into a kernel that ignores
     /// them).  Non-regression is preserved.
+    /// Surface the WGGO plan's (non-)reachability on the decorator-free
+    /// attention training path.
+    ///
+    /// `maybe_synthesize_csha_training_ptx` — home of the @pca/WGGO packing
+    /// admission fork — only runs when a `@flash_attention` context was built.
+    /// The stdlib GQA models real pretraining uses call the plain
+    /// `scaled_dot_product_attention` builtin with no decorator, so that
+    /// synthesis (and the admission fork that consumes the plan's per-layer
+    /// packing decisions) never fires and the attention op lowers through the
+    /// decomposed/plain-flash path instead. WGGO still SOLVES a plan for the
+    /// train block and the `--wggo` report renders it — which is misleading,
+    /// because on this path only the per-layer FASE overrides actually reach
+    /// codegen. Emit a one-time verdict so the plan's non-application is
+    /// visible rather than silent.
+    ///
+    /// Behaviour-neutral: this only prints. It deliberately does NOT build a
+    /// `flash_attention_context` for the plain op — that field gates the
+    /// forward FFI dispatch and (via its optional backward DataIds) the
+    /// decorator-free backward's per-head_dim variant-table path (PR #347), so
+    /// populating it here would change dispatch, not just diagnostics. Wiring
+    /// the packing decision into the plain SDPA dispatch is a later stage; see
+    /// the WGGO-pretraining-orchestration design.
+    fn report_decorator_free_plan_reachability(&self, stmts: &[Stmt]) {
+        // Chatter-free unless WGGO is actually enabled (`--wggo off` arrives as
+        // Some("off"), so `mode.is_some()` is not "enabled").
+        if !crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
+            return;
+        }
+        // A decorator built a context => the admission fork ran normally; nothing
+        // is being dropped, so there is nothing to report.
+        if self.kernels.flash_attention_context.is_some() {
+            return;
+        }
+        if !stmts_contain_train_block(stmts) {
+            return;
+        }
+        // Only report when a plan was actually solved for the governing (first)
+        // train block: if extraction failed there is no plan being dropped.
+        let Some(pre) = self
+            .wggo_preplans
+            .iter()
+            .find(|p| p.is_first_train_block)
+        else {
+            return;
+        };
+        // A plan is solved for ANY train block (an MLP's matmuls yield one too),
+        // but this verdict is specifically about attention-only CSHA/PCA
+        // decisions — so it must fire ONLY when the training graph actually
+        // computes attention. `contains_attention` is derived from the
+        // extracted (inlined) graph, so it holds for real GQA models whose SDPA
+        // lives in an imported stdlib layer, not just direct SDPA callers.
+        if !pre.contains_attention {
+            return;
+        }
+        let packing_detected =
+            crate::pca_activation::detect_packing_for_stmts(stmts, self.interner);
+        let plan_prefers_segment_id =
+            crate::wggo_prepass::plan_prefers_segment_id(&pre.overrides);
+        eprintln!(
+            "[wggo] plan-reachability: this train block lowers attention through the \
+             decorator-free `scaled_dot_product_attention` path (no @flash_attention \
+             context), so the WGGO plan's per-layer CSHA/PCA packing decisions are NOT \
+             applied here (layers_planned={}, packing_detected={packing_detected}, \
+             plan_prefers_segment_id={plan_prefers_segment_id}); only per-layer FASE \
+             overrides reach codegen on this path.",
+            pre.overrides.per_layer.len(),
+        );
+    }
+
     fn maybe_synthesize_csha_training_ptx(
         &mut self,
         stmts: &[Stmt],
