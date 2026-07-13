@@ -4991,6 +4991,7 @@ impl Compiler<'_> {
                                 weights_path,
                                 analysis_config,
                                 Some(&self.compile_options),
+                                self.features.packing_supported_in_module,
                             ),
                         };
                         if preplan_was_rejected {

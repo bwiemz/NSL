@@ -163,6 +163,7 @@ fn driver_input<'a>(
         analysis_config: AnalysisConfig::default(),
         scorer: None,
         cached_analysis: None,
+        packing_supported: true,
     }
 }
 
