@@ -331,6 +331,21 @@ fn walk_stmts(
                     out,
                 );
             }
+            // A train block can sit inside a `for` loop (e.g. an ensemble
+            // trained via `for m in models: train(model=m): ...`) or a
+            // `while`/`while let` loop. `train_blocks_seen` must advance
+            // past it in document order even when `plan_train_block` can't
+            // resolve a plan for it (e.g. a for-loop-bound model var, whose
+            // type is only known once `compile_for_model_array` runs during
+            // actual codegen) — otherwise a LATER top-level train block
+            // wrongly inherits `is_first_train_block`, corrupting the
+            // "first train block governs admission" invariant every
+            // consumer in kernel.rs relies on.
+            StmtKind::For { body, .. }
+            | StmtKind::While { body, .. }
+            | StmtKind::WhileLet { body, .. } => {
+                walk_stmts(compiler, &body.stmts, prefix_types, train_blocks_seen, out);
+            }
             _ => {}
         }
     }
