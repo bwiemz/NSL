@@ -321,6 +321,22 @@ pub fn stmts_contain_masked_sdpa(
     f.found
 }
 
+/// Companion to [`stmts_contain_masked_sdpa`] for model method bodies —
+/// covers models declared in IMPORTED modules (e.g. the stdlib GQA's
+/// `forward_masked`), whose statements are not part of the entry module's
+/// stmt list but are registered in `Compiler.models.model_method_bodies`.
+pub fn fn_bodies_contain_masked_sdpa<'a>(
+    bodies: impl Iterator<Item = &'a nsl_ast::decl::FnDef>,
+    interner: &nsl_lexer::Interner,
+) -> bool {
+    for def in bodies {
+        if stmts_contain_masked_sdpa(&def.body.stmts, interner) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn run(compiler: &mut Compiler, stmts: &[Stmt]) -> Vec<WggoPrePlan> {
     if !compiler.features.source_ad_enabled {
         return Vec::new();

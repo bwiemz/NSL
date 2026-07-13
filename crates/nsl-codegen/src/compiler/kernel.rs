@@ -556,7 +556,14 @@ impl Compiler<'_> {
             // compilation) so both planning entry points see it.
             self.features.packing_supported_in_module =
                 crate::pca_activation::detect_packing_for_stmts(stmts, self.interner)
-                    || crate::wggo_prepass::stmts_contain_masked_sdpa(stmts, self.interner);
+                    || crate::wggo_prepass::stmts_contain_masked_sdpa(stmts, self.interner)
+                    || crate::wggo_prepass::fn_bodies_contain_masked_sdpa(
+                        self.models
+                            .model_method_bodies
+                            .values()
+                            .flat_map(|m| m.values()),
+                        self.interner,
+                    );
             self.wggo_preplans = crate::wggo_prepass::run(self, stmts);
         }
 

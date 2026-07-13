@@ -5108,6 +5108,15 @@ impl Compiler<'_> {
                                             PackingKernelState::PerDocCta
                                         }
                                     }
+                                    // No fused masked kernels — but a model
+                                    // that consumes the packed mask at the
+                                    // source level (Stage B masked SDPA)
+                                    // honors the plan's segment_id preference
+                                    // itself; only report a rejection when
+                                    // NEITHER channel exists.
+                                    _ if self.features.packing_supported_in_module => {
+                                        PackingKernelState::SourceMasked
+                                    }
                                     _ => PackingKernelState::NoMaskedKernels,
                                 };
                                 for diag in crate::wggo_overrides::collect_packing_diagnostics(
@@ -5151,6 +5160,8 @@ impl Compiler<'_> {
                                                 packing_mode_name(diag.mode),
                                                 match state {
                                                     PackingKernelState::NoMaskedKernels => "unmasked",
+                                                    PackingKernelState::SourceMasked =>
+                                                        "source_masked",
                                                     PackingKernelState::TierBMasked =>
                                                         "segment_masked",
                                                     PackingKernelState::PerDocCta => "per_doc_cta",
