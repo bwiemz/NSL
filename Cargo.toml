@@ -10,6 +10,7 @@ members = [
     "crates/nsl-runtime",
     "crates/nsl-cli",
     "crates/nsl-test",
+    "crates/nsl-abi",
 ]
 
 [workspace.package]

@@ -48,6 +48,26 @@ on either the Rust or the generated-header side is caught:
 
 If either test fails, you are making a **major** ABI change.
 
+## Internal codegen ↔ runtime signature agreement
+
+Distinct from the host-facing contract above: the codegen emits calls to the
+runtime's `extern "C"` functions from a table of Cranelift signatures in
+`crates/nsl-codegen/src/builtins.rs::RUNTIME_FUNCTIONS`. That table and the
+runtime `extern "C" fn` implementations are linked by **symbol name only** — the
+Rust compiler never checks that their arities and types agree, so a drift (a
+parameter added on one side, an `f64` where the table says `I64`, a removed
+impl) compiles cleanly and only surfaces as a stack-corrupting call at runtime.
+
+The `nsl-abi` crate closes this gap: `nsl-abi/tests/signature_agreement.rs`
+parses both surfaces and fails if any of the ~550 declared signatures disagrees
+with its implementation (arity, register-class-level types, and presence of a
+return value). It runs in the ordinary `cargo test --workspace` gate. When you
+add or change a runtime function, update the `RUNTIME_FUNCTIONS` entry and the
+`extern "C" fn` together; the gate reports any divergence with a precise
+per-symbol diff. (It caught one on introduction: `nsl_flash_attention_quantized`
+was declared with 21 params while the runtime read 23, missing the two Tier-B
+sentinel slots.)
+
 ## FFI safety contract (every exported symbol)
 
 These rules hold for **all** `extern "C"` functions in `nsl-runtime::c_api`.
@@ -71,5 +91,7 @@ add it to the generated header if host-facing, and decide whether it is a
 
 - `crates/nsl-runtime/ARCHITECTURE.md` — runtime internals and the FFI safety
   contract at the source level.
+- `crates/nsl-abi/` — validates that the codegen's `RUNTIME_FUNCTIONS` table
+  agrees with the runtime `extern "C"` implementations (internal signature gate).
 - `crates/nsl-codegen/src/c_header.rs` — the generated-header emitter.
 - [`STATUS.md`](../../STATUS.md), [`SECURITY.md`](../../SECURITY.md).
