@@ -871,6 +871,52 @@ impl Compiler<'_> {
                 static_seq_len: None,
             }
         };
+
+        // WGGO plan consultation (Path A). The training-PTX synthesis is
+        // module-scoped while the plan is per-layer, so the consultation is
+        // conservative: the plan's requested_csha_level is READ and answered
+        // honestly rather than blindly applied.
+        //   - Level1 requests align with the synthesis preset — confirmed
+        //     with a one-line note (previously the plan was ignored outright
+        //     and the hardcoded preset happened to coincide).
+        //   - Level2/Level3 requests are REFUSED with a diagnostic: on
+        //     sm>=80 they divert the with-saves forward to the Tier B.1
+        //     pipelined emitter, which emits NO save_activations — honoring
+        //     the plan would silently drop the backward's saved activations
+        //     (the cycle-11 silent-garbage failure mode). Lift only when
+        //     Tier B.1 gains an activation-save channel.
+        //   - Reduced active_heads stays unapplied on this path regardless
+        //     of the plan: the fused backward's dRMSNorm dx_norm writes are
+        //     non-atomic and assume heads=1 (csha_hooks_backward), and the
+        //     plan-level [cep] advisory already reports pruned heads as
+        //     CSHA-dispatch-only. CshaExtras.active_heads=0 (= all) is the
+        //     only safe training value today.
+        if let Some(pre) = self.wggo_preplans.iter().find(|p| p.is_first_train_block) {
+            use crate::cfie_persistent::FusionLevel;
+            let mut over_level1 = 0usize;
+            let mut level1 = 0usize;
+            for l in &pre.overrides.per_layer {
+                match l.requested_csha_level {
+                    Some(FusionLevel::Level2) | Some(FusionLevel::Level3) => over_level1 += 1,
+                    Some(FusionLevel::Level1) => level1 += 1,
+                    _ => {}
+                }
+            }
+            if over_level1 > 0 {
+                eprintln!(
+                    "[csha] wggo-override-rejected: {over_level1} layer(s) requested \
+                     csha level>=2 for the training path; the Tier B.1 forward emits \
+                     no activation saves, so honoring it would corrupt the backward — \
+                     clamped to level 1 (with-saves synthesis)"
+                );
+            }
+            if level1 > 0 {
+                eprintln!(
+                    "[csha] plan-aligned: {level1} layer(s) requested csha level 1; \
+                     training-PTX synthesis honors it (with-saves forward + fused backward)"
+                );
+            }
+        }
         // Tier C's backward emitter (ds_compute/dqdk_accum/dv_accum)
         // currently hard-asserts `block_kv=32` (T3.3–T3.5 landed with
         // that single tile width; T3.6+ is planned to generalise).
