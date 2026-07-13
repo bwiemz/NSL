@@ -256,6 +256,14 @@ pub struct LayerIlpConstraints {
     /// Numerical sensitivity in [0, 1].  `high_prec_threshold` forces m/v
     /// to be ≥ 16 bits; `critical_prec_threshold` forces ≥ 32 bits.
     pub sensitivity: f64,
+    /// Whether `sensitivity` is backed by a REAL signal (weight analysis
+    /// with an actual provider, or calibration). When false, sub-32-bit
+    /// optimizer-moment precision is forbidden outright: the objective is
+    /// cost-only, so without evidence the solver would always quantize —
+    /// the moment-precision analog of pruning heads on uniform importance.
+    /// Role-based floors (`role_sensitivity_floor`) still apply on top
+    /// when informed.
+    pub sensitivity_informed: bool,
     pub high_prec_threshold: f64,
     pub critical_prec_threshold: f64,
     /// Per-head importance scores (higher = more important).  Pruning
@@ -320,6 +328,7 @@ impl Default for LayerIlpConstraints {
             adapter_comm_budget: f64::MAX,
             gqa_group: 1,
             sensitivity: 0.0,
+            sensitivity_informed: false,
             high_prec_threshold: 0.5,
             critical_prec_threshold: 0.9,
             head_importance: Vec::new(),
@@ -833,6 +842,7 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
         && a.adapter_comm_budget.to_bits() == b.adapter_comm_budget.to_bits()
         && a.gqa_group == b.gqa_group
         && a.sensitivity.to_bits() == b.sensitivity.to_bits()
+        && a.sensitivity_informed == b.sensitivity_informed
         && a.high_prec_threshold.to_bits() == b.high_prec_threshold.to_bits()
         && a.critical_prec_threshold.to_bits() == b.critical_prec_threshold.to_bits()
         && a.head_importance.len() == b.head_importance.len()
@@ -1158,6 +1168,10 @@ fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
 }
 
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
+    // No evidence → no quantization. See `sensitivity_informed`.
+    if !c.sensitivity_informed && bits < 32 {
+        return false;
+    }
     if c.sensitivity >= c.critical_prec_threshold && bits < 32 {
         return false;
     }
@@ -1777,17 +1791,35 @@ mod tests {
     }
 
     #[test]
-    fn low_sensitivity_picks_low_optimizer_precision() {
+    fn low_sensitivity_picks_low_optimizer_precision_when_informed() {
         // Gap #2: with the optimizer-cost term in the objective, a layer with
-        // no numerical-sensitivity floor now prefers the cheapest (lowest-bit)
-        // moments.  Before the fix the ILP always returned 32/32 because the
-        // objective was independent of precision.
+        // no numerical-sensitivity floor prefers the cheapest (lowest-bit)
+        // moments — but only when the sensitivity value is backed by a real
+        // signal (weight analysis / calibration).
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
-        let constraints = LayerIlpConstraints::default(); // sensitivity = 0
+        let constraints = LayerIlpConstraints {
+            sensitivity_informed: true, // evidence present, sensitivity = 0
+            ..Default::default()
+        };
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
         assert_eq!(sol.decision.optim_m_bits, 8);
         assert_eq!(sol.decision.optim_v_bits, 8);
+    }
+
+    #[test]
+    fn uninformed_sensitivity_forbids_sub_32_bit_moments() {
+        // No weight/calibration evidence -> no quantization, regardless of
+        // how cheap the cost model says low-bit moments are. The
+        // moment-precision analog of not pruning heads on uniform
+        // importance: the objective is cost-only, so without this gate the
+        // solver would ALWAYS quantize a from-scratch pretrain.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let constraints = LayerIlpConstraints::default(); // uninformed
+        let sol = solve_layer(&lut, &constraints);
+        assert!(sol.feasible);
+        assert_eq!(sol.decision.optim_m_bits, 32);
+        assert_eq!(sol.decision.optim_v_bits, 32);
     }
 
     #[test]

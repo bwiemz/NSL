@@ -912,6 +912,8 @@ mod override_tests {
                     fase_fused: false,
                     packing_mode: 0,
                     shard_factor: 0,
+                    optim_m_bits: 32,
+                    optim_v_bits: 32,
                 })
                 .collect(),
         }

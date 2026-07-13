@@ -49,6 +49,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             cpdt_report,
             wggo,
             wggo_report,
+            wggo_moment_precision,
             wggo_weights,
             wggo_importance,
             wggo_prune_fraction,
@@ -365,6 +366,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 wggo: nsl_codegen::WggoOptions {
                     mode: wggo.clone(),
                     report: wggo_report,
+                    moment_precision: wggo_moment_precision,
                     weights: wggo_weights.clone(),
                     importance: nsl_codegen::WggoImportance::from(wggo_importance),
                     prune_fraction: wggo_prune_fraction,

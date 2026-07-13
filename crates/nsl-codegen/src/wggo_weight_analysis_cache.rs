@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::wggo_weight_analysis::{LayerImportance, WeightAnalysisReport};
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_SUFFIX: &str = ".wggo-importance.json";
 
 /// Serialised payload written to disk.  Version tag lets us invalidate
@@ -143,6 +143,7 @@ mod tests {
             per_layer: vec![LayerImportance {
                 head_scores: vec![1.0, 2.0, 3.0, 4.0],
                 default_min_retained: 9.0,
+                has_signal: true,
             }],
             layers_without_weights: 0,
         }

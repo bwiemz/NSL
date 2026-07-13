@@ -1222,6 +1222,8 @@ mod tests {
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: 0,
+                optim_m_bits: 32,
+                optim_v_bits: 32,
             }],
         };
         let input = WrgaInput {
@@ -1306,6 +1308,8 @@ mod tests {
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: 0,
+                optim_m_bits: 32,
+                optim_v_bits: 32,
             }],
         };
         let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over), false);
@@ -1671,6 +1675,8 @@ mod tests {
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: 0,
+                optim_m_bits: 32,
+                optim_v_bits: 32,
             }],
         }
     }
@@ -1934,6 +1940,8 @@ mod tests {
                     fase_fused: false,
                     packing_mode: 0,
                     shard_factor: 0,
+                    optim_m_bits: 32,
+                    optim_v_bits: 32,
                 },
                 crate::wggo_overrides::PerLayerOverride {
                     layer_index: 1,
@@ -1945,6 +1953,8 @@ mod tests {
                     fase_fused: false,
                     packing_mode: 0,
                     shard_factor: 0,
+                    optim_m_bits: 32,
+                    optim_v_bits: 32,
                 },
             ],
         };

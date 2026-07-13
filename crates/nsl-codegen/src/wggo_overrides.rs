@@ -127,6 +127,14 @@ pub struct PerLayerOverride {
     /// single global recommendation via `WggoOverrides::min_shard_factor`.
     /// `0` is the uninitialized sentinel — meaning "no recommendation."
     pub shard_factor: u32,
+    /// CPDT/FASE: optimizer first-moment storage precision in bits
+    /// (32 / 16 / 8). Consumed by the train-block dtype-list builder in
+    /// stmt.rs; 8 clamps to FP16 storage in v1 (the same ladder step as
+    /// `cpdt_precision_exec::clamp_int8_to_fp16`). Solver-side, sub-32
+    /// bits require an informed sensitivity signal (`prec_allowed`).
+    pub optim_m_bits: u8,
+    /// CPDT/FASE: optimizer second-moment storage precision in bits.
+    pub optim_v_bits: u8,
 }
 
 impl WggoOverrides {
@@ -146,6 +154,8 @@ impl WggoOverrides {
                     fase_fused: l.fase_fused,
                     packing_mode: l.packing_mode,
                     shard_factor: l.shard_factor,
+                    optim_m_bits: l.optim_m_bits,
+                    optim_v_bits: l.optim_v_bits,
                 })
                 .collect(),
         }
@@ -694,6 +704,8 @@ mod tests {
                     fase_fused: false,
                     packing_mode: 0,
                     shard_factor: 0,
+                    optim_m_bits: 32,
+                    optim_v_bits: 32,
                 })
                 .collect(),
         }
@@ -739,6 +751,8 @@ mod tests {
                 fase_fused: false,
                 packing_mode: 0,
                 shard_factor: s,
+                optim_m_bits: 32,
+                optim_v_bits: 32,
             }).collect(),
         }
     }

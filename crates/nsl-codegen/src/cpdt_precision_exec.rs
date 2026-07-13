@@ -69,6 +69,61 @@ pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u
     (m, v)
 }
 
+
+/// Build (m_dtype_codes, v_dtype_codes) from WGGO's per-layer moment-bit
+/// decisions. Returns `None` when no layer carries a sub-32-bit decision
+/// (the caller falls through to the CPDT PrecisionPlan path / plain FP32).
+///
+/// Params are joined to layers with the SAME `wggo_graph::layer_prefix`
+/// the graph builder used to bucket them (handles the model-variable
+/// prefix and arbitrary container nesting); unmatched params stay F32.
+/// Sub-32 bits map to FP16 storage in v1 — the same ladder step as
+/// [`clamp_int8_to_fp16`].
+pub fn build_dtype_lists_from_overrides(
+    overrides: &crate::wggo_overrides::WggoOverrides,
+    param_paths: &[String],
+) -> Option<(Vec<u16>, Vec<u16>)> {
+    let any_sub32 = overrides
+        .per_layer
+        .iter()
+        .any(|l| l.optim_m_bits < 32 || l.optim_v_bits < 32);
+    if !any_sub32 {
+        return None;
+    }
+    let map_bits = |b: u8| -> u16 {
+        if b < 32 {
+            DTYPE_FP16
+        } else {
+            DTYPE_F32
+        }
+    };
+    let mut m = Vec::with_capacity(param_paths.len());
+    let mut v = Vec::with_capacity(param_paths.len());
+    for path in param_paths {
+        let layer = crate::wggo_graph::layer_prefix(path)
+            .and_then(|lp| overrides.per_layer.iter().find(|l| l.layer_name == lp));
+        match layer {
+            Some(l) => {
+                m.push(map_bits(l.optim_m_bits));
+                v.push(map_bits(l.optim_v_bits));
+            }
+            None => {
+                m.push(DTYPE_F32);
+                v.push(DTYPE_F32);
+            }
+        }
+    }
+    // The Some/None boundary is decided AFTER the join: a plan whose only
+    // sub-32 layers cannot be joined to any param (e.g. the synthetic
+    // 'other' bucket, whose params have no layer_prefix) must NOT claim
+    // activation — returning Some(all-F32) here would both lie in the
+    // activation diagnostic and preempt an active per-param CPDT plan.
+    if m.iter().all(|&c| c == DTYPE_F32) && v.iter().all(|&c| c == DTYPE_F32) {
+        return None;
+    }
+    Some((m, v))
+}
+
 /// True when v1 precision-adaptive optimizer execution should activate.
 ///
 /// Five conditions are required (design doc §6): CPDT Full mode, a non-empty
@@ -195,4 +250,62 @@ mod tests {
         assert!(!precision_active(true, false, true, true, true)); // empty plan
         assert!(!precision_active(true, true, false, true, true)); // no weights
     }
+
+    fn override_layer(idx: u32, name: &str, m_bits: u8, v_bits: u8) -> crate::wggo_overrides::PerLayerOverride {
+        crate::wggo_overrides::PerLayerOverride {
+            layer_index: idx,
+            layer_name: name.into(),
+            active_heads: 8,
+            requested_csha_level: None,
+            adapter_rank: 0,
+            adapter_placement: crate::wggo_ilp::AdapterPlacement::None,
+            fase_fused: true,
+            packing_mode: 0,
+            shard_factor: 0,
+            optim_m_bits: m_bits,
+            optim_v_bits: v_bits,
+        }
+    }
+
+    #[test]
+    fn overrides_all_32_bits_yield_none() {
+        let o = crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![override_layer(0, "blocks.0", 32, 32)],
+        };
+        assert!(build_dtype_lists_from_overrides(&o, &["m.blocks.0.w".into()]).is_none());
+    }
+
+    #[test]
+    fn overrides_sub32_bits_map_params_by_layer_prefix() {
+        // blocks.0 keeps FP32 moments; blocks.1 gets FP16 (8-bit clamps to
+        // FP16 in v1). Nested container ("m.encoder.blocks.1.w") and
+        // model-var-prefixed paths both join; the unmatched embedding
+        // param stays F32.
+        let o = crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![
+                override_layer(0, "blocks.0", 32, 32),
+                override_layer(1, "blocks.1", 8, 16),
+            ],
+        };
+        let paths: Vec<String> = vec![
+            "m.blocks.0.w".into(),
+            "m.encoder.blocks.1.w".into(),
+            "m.embed".into(),
+        ];
+        let (m, v) = build_dtype_lists_from_overrides(&o, &paths).unwrap();
+        assert_eq!(m, vec![DTYPE_F32, DTYPE_FP16, DTYPE_F32]);
+        assert_eq!(v, vec![DTYPE_F32, DTYPE_FP16, DTYPE_F32]);
+    }
+
+    #[test]
+    fn overrides_mixed_m_v_bits_are_independent() {
+        let o = crate::wggo_overrides::WggoOverrides {
+            per_layer: vec![override_layer(0, "blocks.0", 32, 16)],
+        };
+        let (m, v) =
+            build_dtype_lists_from_overrides(&o, &["m.blocks.0.w".into()]).unwrap();
+        assert_eq!(m, vec![DTYPE_F32]);
+        assert_eq!(v, vec![DTYPE_FP16]);
+    }
+
 }
