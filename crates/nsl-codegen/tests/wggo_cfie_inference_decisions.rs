@@ -87,6 +87,11 @@ fn tiny_constraints() -> LayerIlpConstraints {
         gqa_group: 4,
         packing_modes_mask: 0b0001,
         allow_fase: false,
+        // The memory arithmetic below assumes the solver's 8-bit Adam
+        // moments ("sensitivity = 0"), i.e. an INFORMED zero-sensitivity
+        // layer. Uninformed layers are pinned to 32-bit moments since the
+        // optim-bit lowering landed.
+        sensitivity_informed: true,
         ..Default::default()
     }
 }
@@ -157,6 +162,7 @@ fn driver_input<'a>(
         weights: None,
         analysis_config: AnalysisConfig::default(),
         scorer: None,
+        cached_analysis: None,
     }
 }
 

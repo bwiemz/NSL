@@ -70,6 +70,15 @@ pub struct LayerImportance {
     /// `num_heads × (1 - default_prune_fraction)` scores.  Callers may
     /// override via `LayerIlpConstraints::min_retained_importance`.
     pub default_min_retained: f64,
+    /// Whether the analyzer had a REAL weight signal for this layer
+    /// (any nonzero raw score). False under NullWeightProvider or a
+    /// checkpoint missing this layer. Gates sub-32-bit optimizer-moment
+    /// recommendations: quantizing moments on zero signal would be a
+    /// cost-only choice with no sensitivity evidence behind it.
+    /// `serde(default)`: pre-existing sidecar caches lack the field and
+    /// deserialize to `false` — conservative (no quantization enabled).
+    #[serde(default)]
+    pub has_signal: bool,
 }
 
 /// Aggregate report from [`analyze`].
@@ -90,6 +99,12 @@ impl WeightAnalysisReport {
             c.head_importance = imp.head_scores.clone();
             if c.min_retained_importance == 0.0 {
                 c.min_retained_importance = imp.default_min_retained;
+            }
+            // Sub-32-bit moment precision requires evidence; see
+            // `prec_allowed`. Only ever ENABLE — never clear a flag a
+            // caller set explicitly.
+            if imp.has_signal {
+                c.sensitivity_informed = true;
             }
         }
     }
@@ -133,6 +148,7 @@ pub fn analyze(
         report.per_layer.push(LayerImportance {
             head_scores,
             default_min_retained,
+            has_signal: any_signal,
         });
     }
     report

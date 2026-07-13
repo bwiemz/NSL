@@ -4081,6 +4081,29 @@ impl Compiler<'_> {
                 //   defense-in-depth for any future refactor that
                 //   reintroduces a non-wrapping optimizer arm.
                 let wrapped_path_active = true;
+
+                // WGGO-plan moment bits take precedence when the plan
+                // actually decided sub-32 storage for any layer: per the
+                // paper, the Level-2 ILP chooses p_m/p_v (gated by an
+                // informed sensitivity signal via `prec_allowed` — a plan
+                // with no weight/calibration evidence carries 32/32 and
+                // lands in the None arm here). Params are joined to layers
+                // with the same `layer_prefix` the graph builder used;
+                // unmatched params stay F32. Requires the Deferred plan
+                // (both dispatch arms wrap m/v in the dequant→step→quant
+                // envelope). 8-bit clamps to FP16 storage in v1, the same
+                // ladder step as `clamp_int8_to_fp16`.
+                let wggo_bits: Option<(Vec<u16>, Vec<u16>)> = if fase_deferred {
+                    self.wggo_overrides.as_ref().and_then(|o| {
+                        crate::cpdt_precision_exec::build_dtype_lists_from_overrides(
+                            o,
+                            &param_paths,
+                        )
+                    })
+                } else {
+                    None
+                };
+
                 let plan = self.cpdt_plan.as_ref();
                 let active = plan
                     .map(|p| {
@@ -4093,7 +4116,7 @@ impl Compiler<'_> {
                         )
                     })
                     .unwrap_or(false);
-                if active {
+                let cpdt_lists = if active {
                     let plan = plan.unwrap();
                     Some(crate::cpdt_precision_exec::build_dtype_lists(
                         &plan.precision,
@@ -4101,6 +4124,71 @@ impl Compiler<'_> {
                     ))
                 } else {
                     None
+                };
+
+                // Arbitration:
+                // - WGGO's plan bits lower ONLY behind the explicit opt-in
+                //   (--wggo-moment-precision): reduced-precision moments
+                //   change training numerics, and the v1 cast envelope is
+                //   CPU-only (nsl_tensor_cast aborts loudly on GPU
+                //   tensors). Without the opt-in the decision stays
+                //   advisory with a not-lowered notice.
+                // - When both sources are live, merge CONSERVATIVELY per
+                //   param: F32 wins. CPDT's PrecisionPlan carries per-param
+                //   tiers (calibrated critical params pinned to F32) that a
+                //   layer-uniform WGGO decision must not override; and a
+                //   CPDT FP16 tier the WGGO layer kept at 32 bits is
+                //   likewise deferred to the more conservative choice.
+                match (wggo_bits, cpdt_lists) {
+                    (Some(_), _) | (_, Some(_))
+                        if !self.compile_options.wggo.moment_precision
+                            && self.wggo_overrides.is_some() =>
+                    {
+                        // WGGO ran but the lowering is not opted in: keep
+                        // FP32 moments and say so (covers both the plan-bits
+                        // and the CPDT-plan source — under WGGO the plan is
+                        // the arbiter).
+                        eprintln!(
+                            "[cpdt] optimizer-moment precision NOT lowered: plan \
+                             carries reduced-precision m/v decisions but \
+                             --wggo-moment-precision was not passed (opt-in; \
+                             v1 cast envelope is CPU-only). Moments stay FP32."
+                        );
+                        None
+                    }
+                    (Some((wm, wv)), Some((cm, cv))) => {
+                        let f32c = crate::cpdt_precision_exec::DTYPE_F32;
+                        let merge = |a: &[u16], b: &[u16]| -> Vec<u16> {
+                            a.iter()
+                                .zip(b)
+                                .map(|(&x, &y)| if x == f32c || y == f32c { f32c } else { x })
+                                .collect()
+                        };
+                        let m = merge(&wm, &cm);
+                        let v = merge(&wv, &cv);
+                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != f32c).count();
+                        eprintln!(
+                            "[cpdt] WGGO optimizer-moment precision active \
+                             (merged with the CPDT per-param plan, F32 wins): \
+                             {sub32} moment buffer(s) in FP16 storage. NOTE: \
+                             nsl_tensor_cast is CPU-only in v1 — GPU training \
+                             with reduced moments aborts loudly at the first cast."
+                        );
+                        Some((m, v))
+                    }
+                    (Some((m, v)), None) => {
+                        let f32c = crate::cpdt_precision_exec::DTYPE_F32;
+                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != f32c).count();
+                        eprintln!(
+                            "[cpdt] WGGO optimizer-moment precision active: {sub32} \
+                             moment buffer(s) in FP16 storage (8-bit clamps to FP16 \
+                             in v1). NOTE: nsl_tensor_cast is CPU-only in v1 — GPU \
+                             training with reduced moments aborts loudly at the \
+                             first cast."
+                        );
+                        Some((m, v))
+                    }
+                    (None, cpdt) => cpdt,
                 }
             };
             if let Some((m_codes, v_codes)) = dtype_data {

@@ -106,6 +106,13 @@ pub struct WggoInput<'a> {
     /// When `None` (the default), the Phase 1 magnitude path is used
     /// exclusively, preserving backward compatibility.
     pub scorer: Option<Box<dyn GradientScorer>>,
+    /// Cached Stage-3 report (sidecar hit). When `Some`, the analyzer is
+    /// skipped and THIS report drives `apply_to` BEFORE the ILP solves —
+    /// splicing it in after the solve (the old behavior) meant a cache hit
+    /// solved with NullWeightProvider constraints: identical consecutive
+    /// compiles produced different optimizer-state allocations (informed
+    /// on miss, uninformed on hit).
+    pub cached_analysis: Option<WeightAnalysisReport>,
 }
 
 /// Aggregate plan emitted by the driver.
@@ -480,14 +487,17 @@ pub fn run(input: WggoInput) -> WggoPlan {
         } else {
             input.ilp_constraints
         };
-        let weight_analysis = run_weight_analysis(
-            &graph,
-            &input.layer_shape,
-            &ilp_defaults,
-            input.weights,
-            &input.analysis_config,
-            input.scorer.as_deref(),
-        );
+        let weight_analysis = match input.cached_analysis {
+            Some(ref cached) => cached.clone(),
+            None => run_weight_analysis(
+                &graph,
+                &input.layer_shape,
+                &ilp_defaults,
+                input.weights,
+                &input.analysis_config,
+                input.scorer.as_deref(),
+            ),
+        };
         weight_analysis.apply_to(&mut ilp_defaults);
         let (per_layer, template_stats, cfie_choices, cpkd_choices) =
             ilp_solve_all_templated_cpkd(&luts, &ilp_defaults);
@@ -552,14 +562,17 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // Stage 3: weight analysis — overwrites head_importance and (when
     // the caller left it zero) min_retained_importance on each layer's
     // constraints, before the ILP runs.
-    let weight_analysis = run_weight_analysis(
-        &graph,
-        &input.layer_shape,
-        &ilp_constraints,
-        input.weights,
-        &input.analysis_config,
-        input.scorer.as_deref(),
-    );
+    let weight_analysis = match input.cached_analysis {
+        Some(ref cached) => cached.clone(),
+        None => run_weight_analysis(
+            &graph,
+            &input.layer_shape,
+            &ilp_constraints,
+            input.weights,
+            &input.analysis_config,
+            input.scorer.as_deref(),
+        ),
+    };
     weight_analysis.apply_to(&mut ilp_constraints);
     // NOTE: FASE is intentionally *not* pre-pruned on sharded layers here.
     // Letting the ILP pick a fused optimizer step and then resolving the
@@ -819,6 +832,14 @@ fn run_weight_analysis(
     if let Some(sc) = scorer {
         for (layer, imp) in graph.layers.iter().zip(report.per_layer.iter_mut()) {
             let has_real_gradient_for_layer = sc.has_gradient_data_for_layer(&layer.name);
+            // Calibrated gradient evidence is a REAL signal for the
+            // informed gates (the field docs promise 'weight analysis with
+            // an actual provider, or calibration') — without this, users
+            // with measured gradients but no --wggo-weights stayed
+            // uninformed and quantization was silently impossible.
+            if has_real_gradient_for_layer {
+                imp.has_signal = true;
+            }
             let from_scorer = sc.score_layer(&layer.name, layer_shape);
             let (new_scores, source) = match from_scorer {
                 Some(hi) => {
@@ -901,6 +922,7 @@ pub fn run_on_wengert(
         weights: None,
         analysis_config: AnalysisConfig::default(),
         scorer: None,
+        cached_analysis: None,
     };
     Some(run(input))
 }
@@ -1009,6 +1031,7 @@ pub fn run_on_wengert_with_weights(
         weights: weights_ref,
         analysis_config,
         scorer,
+        cached_analysis: cached_report.clone(),
     };
     let mut plan = run(input);
 
@@ -1019,14 +1042,14 @@ pub fn run_on_wengert_with_weights(
         plan.warnings.insert(0, msg);
     }
 
-    // Overwrite with cached report when it was a hit — saves both the
-    // checkpoint load and the analyzer's per-layer L2 reductions.
-    if let Some(cached) = cached_report {
-        plan.weight_analysis = cached;
-    } else if let Some(p) = weights_path {
+    // Cache-hit reports were passed into run() via `cached_analysis`
+    // (pre-solve), so the plan already carries them.
+    if cached_report.is_none() {
+        if let Some(p) = weights_path {
         // Cache miss — persist the freshly-computed report alongside
         // the checkpoint.  Failures are silent; the cache is advisory.
         let _ = crate::wggo_weight_analysis_cache::store(p, &plan.weight_analysis);
+        }
     }
 
     Some(plan)
@@ -1089,6 +1112,7 @@ mod tests {
             weights: None,
             analysis_config: AnalysisConfig::default(),
             scorer: None,
+            cached_analysis: None,
         }
     }
 
@@ -1154,27 +1178,29 @@ mod tests {
     }
 
     #[test]
-    fn run_applies_role_sensitivity_floor_to_optimizer_precision() {
-        // End-to-end: the now-precision-aware ILP must NOT advise 8-bit Adam
-        // moments for the fragile catch-all `Other` bucket (embeddings/norms/
-        // head/input land here), while the transformer blocks may use 8-bit.
+    fn run_without_weight_signal_keeps_full_precision_moments() {
+        // End-to-end: `optim_m/v_bits` is now LOWERED to real optimizer-state
+        // allocation (PerLayerOverride → stmt.rs dtype lists), so a plan built
+        // with NO weight/calibration evidence must not quantize anything —
+        // the toy input has no weight provider, every layer is
+        // sensitivity-uninformed, and `prec_allowed` forbids sub-32 bits.
+        // (Role floors — Other ≥16-bit, embeddings/head 32-bit, blocks
+        // low-bit-allowed — still shape decisions once a real signal sets
+        // `sensitivity_informed`; pinned at the ILP level by
+        // `low_sensitivity_picks_low_optimizer_precision_when_informed`.)
         let w = two_block_wengert();
         let plan = run(toy_input(&w));
         for layer in &plan.applied.layers {
-            if layer.layer_name.starts_with("blocks.") {
-                assert_eq!(
-                    layer.optim_m_bits, 8,
-                    "block {} should allow low-bit moments",
-                    layer.layer_name
-                );
-            } else {
-                assert!(
-                    layer.optim_m_bits >= 16,
-                    "fragile layer {} must keep >=16-bit moments, got {}",
-                    layer.layer_name,
-                    layer.optim_m_bits
-                );
-            }
+            assert_eq!(
+                layer.optim_m_bits, 32,
+                "layer {} must keep 32-bit m without evidence, got {}",
+                layer.layer_name, layer.optim_m_bits
+            );
+            assert_eq!(
+                layer.optim_v_bits, 32,
+                "layer {} must keep 32-bit v without evidence, got {}",
+                layer.layer_name, layer.optim_v_bits
+            );
         }
     }
 

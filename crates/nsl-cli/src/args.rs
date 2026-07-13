@@ -656,6 +656,12 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) wggo_report: bool,
 
+        /// WGGO: lower the plan's optimizer-moment precision decisions
+        /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
+        /// training numerics; v1 cast envelope is CPU-only.
+        #[arg(long)]
+        pub(crate) wggo_moment_precision: bool,
+
         /// WGGO Stage 3: path to a `.nslweights` sidecar for real
         /// weight-based importance scoring.  Without this flag the
         /// analyzer falls back to uniform head scores.
@@ -943,6 +949,12 @@ pub(crate) struct RunArgs {
         /// WGGO: print the global-optimization report to stderr
         #[arg(long)]
         pub(crate) wggo_report: bool,
+
+        /// WGGO: lower the plan's optimizer-moment precision decisions
+        /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
+        /// training numerics; v1 cast envelope is CPU-only.
+        #[arg(long)]
+        pub(crate) wggo_moment_precision: bool,
 
         /// WGGO Stage 3: path to a `.nslweights` sidecar for real
         /// weight-based importance scoring. Without this flag the analyzer
