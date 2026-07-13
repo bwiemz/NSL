@@ -958,7 +958,15 @@ pub fn solve_layer_greedy_cpkd(
     // FFN: largest available width.
     let f = *lut.axes_ffn_widths.iter().max().unwrap_or(&1024);
 
-    // CSHA: highest level whose smem fits.
+    // Adapter rank: greedy takes the smallest ON THE AXIS — 0 normally,
+    // or the smallest mandated rank when @wrga/@adapter removed 0 from
+    // the axis (the E3 two-level split).
+    let r = *lut.axes_adapter_ranks.iter().min().unwrap_or(&0);
+
+    // CSHA: highest level whose smem fits. Probe the LUT at the rank the
+    // greedy solution will actually use — a hardcoded rank-0 probe missed
+    // EVERY entry under the adapter mandate (0 off the axis), silently
+    // collapsing csha_level to 0 for the whole plan.
     let c = lut
         .axes_csha_levels
         .iter()
@@ -966,14 +974,11 @@ pub fn solve_layer_greedy_cpkd(
         .rev()
         .find(|&lvl| {
             nodes += 1;
-            lut.get(h_count, f, lvl, 0)
+            lut.get(h_count, f, lvl, r)
                 .map(|e| e.feasible && e.smem_bytes <= constraints.smem_budget)
                 .unwrap_or(false)
         })
         .unwrap_or(0);
-
-    // Adapter rank: greedy keeps it at 0 (no LoRA unless explicitly asked).
-    let r = *lut.axes_adapter_ranks.iter().min().unwrap_or(&0);
 
     // Precision: lowest precision allowed by sensitivity (cheapest).
     let m_bits = pick_precision_low(constraints);
@@ -2513,6 +2518,33 @@ mod tests {
             AdapterPlacement::None,
             "a nonzero rank needs a placement"
         );
+    }
+
+
+    #[test]
+    fn greedy_adapter_mandate_keeps_csha_probe_alive() {
+        // Regression: the greedy CSHA-level scan probed the LUT at the
+        // hardcoded rank 0; with the adapter mandate (0 removed from the
+        // axis) every probe missed and csha_level silently collapsed to 0
+        // while the layer still reported feasible.
+        let lut = build_lut(
+            &shape(),
+            h100(),
+            &LutAxes {
+                adapter_ranks: vec![2, 4, 8, 16],
+                ..Default::default()
+            },
+        );
+        let baseline = solve_layer_greedy(&build_lut(&shape(), h100(), &LutAxes::default()), &LayerIlpConstraints::default());
+        let mandated = solve_layer_greedy(&lut, &LayerIlpConstraints::default());
+        assert!(mandated.feasible);
+        assert_eq!(
+            mandated.decision.csha_level, baseline.decision.csha_level,
+            "mandating adapters must not change the greedy CSHA level \
+             (baseline {}, mandated {})",
+            baseline.decision.csha_level, mandated.decision.csha_level
+        );
+        assert!(mandated.decision.adapter_rank >= 2);
     }
 
 }

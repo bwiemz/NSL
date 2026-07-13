@@ -287,6 +287,12 @@ pub enum PackingKernelState {
     /// Per-document CTA kernels admitted (user `@pca(strategy=per_document)`);
     /// they replace the Tier-B pair as the training forward.
     PerDocCta,
+    /// The model consumes the packed mask at the SOURCE level via
+    /// `scaled_dot_product_attention_masked` (PCA Stage B): segment masking
+    /// is exact through the decomposed path, no fused masked kernels
+    /// required. The plan's segment_id preference is honored by the model
+    /// itself.
+    SourceMasked,
 }
 
 /// One `[pca]` consumption verdict for a layer's WGGO packing decision.
@@ -354,6 +360,9 @@ pub fn collect_packing_diagnostics(
                 (m, PackingKernelState::NoMaskedKernels) => PackingVerdict::Rejected(
                     OverrideRejectReason::PackingRequiresPackedDataset { mode: m },
                 ),
+                (_, PackingKernelState::SourceMasked) => PackingVerdict::Consumed {
+                    kernel: "masked SDPA (Stage B decomposed path)",
+                },
                 (_, PackingKernelState::TierBMasked) => PackingVerdict::Consumed {
                     kernel: "segment-masked Tier-B attention",
                 },
