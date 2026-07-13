@@ -496,6 +496,27 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // PCA Stage B: masked attention for packed sequences.
+    // scaled_dot_product_attention_masked(Q, K, V, scale, mask) -> tensor
+    // `mask` is an ADDITIVE attention mask (0 = attend, -inf/-1e9 = blocked),
+    // broadcast-added to the scaled scores BEFORE softmax. It REPLACES the
+    // causal mask: a packed block-diagonal mask already encodes within-doc
+    // causality, and stacking both would be redundant.
+    def(
+        "scaled_dot_product_attention_masked",
+        Type::Function {
+            params: vec![
+                tensor_ret.clone(),  // Q
+                tensor_ret.clone(),  // K
+                tensor_ret.clone(),  // V
+                Type::Float,         // scale
+                tensor_ret.clone(),  // additive mask
+            ],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // Tokenizer functions (M15)
     def(
         "byte_tokenizer_new",
