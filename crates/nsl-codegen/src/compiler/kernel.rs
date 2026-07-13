@@ -537,6 +537,23 @@ impl Compiler<'_> {
         // defer, keeping planning in-place exactly as before this restructure
         // (planning under a degraded scorer would diverge from the in-place
         // planner and its pre-plan would be fingerprint-rejected anyway).
+        // Packing honesty signal for the plan's constraint defaults —
+        // computed BEFORE the pre-pass deferral gate (it is AST-only and
+        // independent of the calibration sidecar): the in-place planning
+        // fallback reads it even when the pre-pass defers, so computing it
+        // only on the non-deferred arm made a calibration-deferred build
+        // plan packing_mode=0 for a genuinely packed module (review
+        // finding).
+        self.features.packing_supported_in_module =
+            crate::pca_activation::detect_packing_for_stmts(stmts, self.interner)
+                || crate::wggo_prepass::stmts_contain_masked_sdpa(stmts, self.interner)
+                || crate::wggo_prepass::fn_bodies_contain_masked_sdpa(
+                    self.models
+                        .model_method_bodies
+                        .values()
+                        .flat_map(|m| m.values()),
+                    self.interner,
+                );
         let deferred =
             crate::wggo_prepass::wggo_prepass_deferred_pending_sidecar(&self.compile_options);
         if deferred {
@@ -551,19 +568,6 @@ impl Compiler<'_> {
                 );
             }
         } else {
-            // Packing honesty signal for the plan's constraint defaults —
-            // computed here (before the pre-pass and before train-block
-            // compilation) so both planning entry points see it.
-            self.features.packing_supported_in_module =
-                crate::pca_activation::detect_packing_for_stmts(stmts, self.interner)
-                    || crate::wggo_prepass::stmts_contain_masked_sdpa(stmts, self.interner)
-                    || crate::wggo_prepass::fn_bodies_contain_masked_sdpa(
-                        self.models
-                            .model_method_bodies
-                            .values()
-                            .flat_map(|m| m.values()),
-                        self.interner,
-                    );
             self.wggo_preplans = crate::wggo_prepass::run(self, stmts);
         }
 
@@ -902,11 +906,13 @@ impl Compiler<'_> {
             use crate::cfie_persistent::FusionLevel;
             let mut over_level1 = 0usize;
             let mut level1 = 0usize;
+            let mut level0 = 0usize;
             for l in &pre.overrides.per_layer {
                 match l.requested_csha_level {
                     Some(FusionLevel::Level2) | Some(FusionLevel::Level3) => over_level1 += 1,
                     Some(FusionLevel::Level1) => level1 += 1,
-                    _ => {}
+                    Some(FusionLevel::None) => level0 += 1,
+                    None => {}
                 }
             }
             if over_level1 > 0 {
@@ -921,6 +927,15 @@ impl Compiler<'_> {
                 eprintln!(
                     "[csha] plan-aligned: {level1} layer(s) requested csha level 1; \
                      training-PTX synthesis honors it (with-saves forward + fused backward)"
+                );
+            }
+            if level0 > 0 {
+                eprintln!(
+                    "[csha] wggo-override-rejected: {level0} layer(s) requested csha \
+                     level 0 (no fusion), but training-PTX synthesis is gated by the \
+                     @flash_attention/@csha decorators, not the plan — level-1 \
+                     with-saves kernels are still synthesized (plan cannot veto a \
+                     user decorator; remove the decorator to disable CSHA)"
                 );
             }
         }

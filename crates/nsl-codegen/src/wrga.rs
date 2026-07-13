@@ -970,7 +970,45 @@ fn run_spectral(
         .map(|p| p.name.as_str())
         .collect();
     let mut spectral = analyse_weight_map(wm, input.r_max.max(8), 5, 8, input.seed);
-    spectral.retain(|s| active_names.iter().any(|n| s.name == *n));
+    // Join weight-map keys to placement names TOLERANTLY: placements carry
+    // Wengert Param compounds rooted at the train-block model variable
+    // ("m.blocks.0.attn.wq") while checkpoint keys are typically bare
+    // ("blocks.0.attn.wq") or model-class-rooted — exact equality never
+    // matched a real checkpoint, leaving the spectral set empty (review
+    // finding). Accept equality or a dot-boundary suffix relation in
+    // either direction.
+    let dot_suffix_match = |a: &str, b: &str| -> bool {
+        a == b
+            || a.strip_suffix(b)
+                .is_some_and(|rest| rest.ends_with('.'))
+            || b.strip_suffix(a)
+                .is_some_and(|rest| rest.ends_with('.'))
+    };
+    spectral.retain(|sp| active_names.iter().any(|n| dot_suffix_match(n, &sp.name)));
+    if spectral.is_empty() && !active_names.is_empty() {
+        // No key overlap at all (e.g. an HF-convention checkpoint whose
+        // projection names share no suffix with the model's field names):
+        // fall back to the weightless roofline allocation rather than
+        // returning an EMPTY rank plan — empty is strictly worse than the
+        // pre-threading behavior (adapter totals report 0, fusion
+        // rank_overrides vanish).
+        eprintln!(
+            "[wrga] weights present but no checkpoint key matches any adapter \
+             placement name — falling back to roofline suggested ranks \
+             (spectral allocation needs key-compatible names)"
+        );
+        let ranks: Vec<RankAllocation> = placements
+            .iter()
+            .filter(|p| !matches!(p.adapter, crate::wrga_roofline::AdapterKind::Skip))
+            .map(|p| RankAllocation {
+                name: p.name.clone(),
+                rank: p.suggested_rank.max(input.r_min).min(input.r_max),
+                effective_rank: 0.0,
+                adapter_params: p.suggested_rank * 1024,
+            })
+            .collect();
+        return (Vec::new(), ranks, Vec::new());
+    }
 
     // Cross-reference: per-site roofline slack as the allocator weight.
     let mut slack = HashMap::new();
