@@ -5114,6 +5114,16 @@ impl Compiler<'_> {
                                     // honors the plan's segment_id preference
                                     // itself; only report a rejection when
                                     // NEITHER channel exists.
+                                    // PCA Stage C: the packed builtin on a
+                                    // CUDA target upgrades the consumption
+                                    // channel to the fused segment-masked
+                                    // family (decline path = Stage B chain).
+                                    _ if self.features.packed_sdpa_in_module
+                                        && (self.compile_options.target == "cuda"
+                                            || self.compile_options.target.starts_with("sm_")) =>
+                                    {
+                                        PackingKernelState::FusedSegmentMasked
+                                    }
                                     _ if self.features.packing_supported_in_module => {
                                         PackingKernelState::SourceMasked
                                     }
@@ -5162,6 +5172,8 @@ impl Compiler<'_> {
                                                     PackingKernelState::NoMaskedKernels => "unmasked",
                                                     PackingKernelState::SourceMasked =>
                                                         "source_masked",
+                                                    PackingKernelState::FusedSegmentMasked =>
+                                                        "fused_segment_masked",
                                                     PackingKernelState::TierBMasked =>
                                                         "segment_masked",
                                                     PackingKernelState::PerDocCta => "per_doc_cta",
