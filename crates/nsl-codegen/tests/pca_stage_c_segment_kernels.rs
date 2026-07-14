@@ -163,6 +163,55 @@ fn plain_backward_has_no_segment_artifacts() {
 }
 
 #[test]
+fn fwd_table_name_matches_ptx_entry() {
+    // CUDA_ERROR_NOT_FOUND regression (benchmark discovery): the variant
+    // table embeds (base_ptx, base_kernel_name) from
+    // emit_tier_b_variants_for_config — the name MUST appear as the PTX
+    // .entry for every table config, or runtime launches fail loudly and
+    // decline to the decomposed path.
+    for &hd in FWD_TABLE_HEAD_DIMS {
+        for segment_masked in [false, true] {
+            let Some((bq, bkv)) = admitted_fwd_tiles(hd, segment_masked) else {
+                continue;
+            };
+            let cfg = fwd_config(hd, bq, bkv, segment_masked);
+            let emission = nsl_codegen::pca_tier_b::emit_tier_b_variants_for_config(&cfg);
+            let ptx = ptx_str(&emission.base_ptx).to_string();
+            let name = emission.base_kernel_name.clone();
+            assert!(
+                ptx.contains(&format!(".visible .entry {name}")),
+                "hd={hd} segmask={segment_masked} tiles={bq}x{bkv}: kernel name                  '{name}' not found in its own PTX; entries present: {:?}",
+                ptx.lines()
+                    .filter(|l| l.contains(".visible .entry"))
+                    .collect::<Vec<_>>()
+            );
+            // The Tier-B tile-skip pair fires at runtime for seq in
+            // [128, 16384] with a segment pointer — its name must match
+            // its PTX too (this is the pair the benchmark's seq=1024
+            // launch actually selects; the base-only check missed it).
+            // NOTE: the variant table stores the BASE kernel name for the
+            // Tier-B pair, because the v2 prelude names EVERY kernel with
+            // the base v2 name — the emission helper's `_tier_b_max{N}`
+            // suffixed name is a codegen-cache key that never exists as a
+            // PTX entry (pre-existing inconsistency, dead in production
+            // until Stage C; the benchmark's seq=1024 launch surfaced it
+            // as CUDA_ERROR_NOT_FOUND).
+            if let Some(tb_ptx) = &emission.tier_b_on_ptx {
+                let tbs = ptx_str(tb_ptx).to_string();
+                assert!(
+                    tbs.contains(&format!(".visible .entry {name}")),
+                    "hd={hd} segmask={segment_masked}: base kernel name \
+                     '{name}' not found in the TIER-B PTX; entries present: {:?}",
+                    tbs.lines()
+                        .filter(|l| l.contains(".visible .entry"))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fwd_table_configs_admit_and_declare_segment_param() {
     for &hd in FWD_TABLE_HEAD_DIMS {
         for segment_masked in [false, true] {

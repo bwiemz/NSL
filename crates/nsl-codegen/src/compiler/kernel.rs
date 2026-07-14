@@ -2229,17 +2229,36 @@ impl Compiler<'_> {
 
             let emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&config);
             let mut diags = Vec::<String>::new();
-            let smem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+            let mut smem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
                 &config, &mut diags,
             ) as i64;
             for d in diags {
                 eprintln!("warning: {d}");
+            }
+            if emission.tier_b_on_ptx.is_some() {
+                // Tier-B-on kernels build their per-tile segment range table
+                // in the DYNAMIC shmem window at `tier_b_range_table_offset`
+                // (base + seg arena), i.e. BEYOND the base kernel's request —
+                // an under-sized launch is an in-kernel ILLEGAL_ADDRESS
+                // (benchmark discovery). One smem value serves both launches,
+                // so size for the worst admissible seq (the runtime gate caps
+                // at TIER_B_MAX_BAKED_SEQ_LEN); the base kernel simply gets a
+                // slightly larger window than it needs.
+                let tb = crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                    &config,
+                    crate::flash_attention_v2::smem_layout::Direction::Forward,
+                ) + crate::pca_tilerange::tier_b_range_table_bytes(
+                    &config,
+                    crate::pca_tier_b::TIER_B_MAX_BAKED_SEQ_LEN,
+                );
+                smem_bytes = smem_bytes.max(tb as i64);
             }
 
             let base_ptx = self.embed_raw_data(
                 &format!("__nsl_sdpa_fwd_c{c}_s{sm}_hd{head_dim}"),
                 emission.base_ptx,
             )?;
+            let base_kernel_name = emission.base_kernel_name.clone();
             let mut base_name_bytes = emission.base_kernel_name.into_bytes();
             base_name_bytes.push(0);
             let base_name = self.embed_raw_data(
@@ -2247,14 +2266,37 @@ impl Compiler<'_> {
                 base_name_bytes,
             )?;
 
+            // DEFERRED (loud): Tier-B tile-skip promotion is DISABLED for
+            // the Stage C table. As its first-ever production launcher we
+            // found (a) the emission helper's tier-b kernel NAME never
+            // exists as a PTX entry (worked around below by storing the
+            // base name), (b) an under-sized dynamic-SMEM launch
+            // ILLEGAL_ADDRESSes (fixed above), and (c) the kernel's OUTPUT
+            // DEVIATES numerically at s=1024/hd=64 (first-step loss shifts
+            // ~1e-2 while the base segment-masked kernel matches the
+            // decomposed oracle to ~7e-6). Until the Tier-B kernel passes a
+            // packed-shape parity gate, the runtime uses the base
+            // segment-masked kernel (fused, element-masked, no tile skip) —
+            // correctness first; the tile-skip perf increment is follow-up
+            // work. Flip `PROMOTE_TIER_B` once validated.
+            const PROMOTE_TIER_B: bool = false;
             let (tier_b_ptx, tier_b_name) =
                 match (emission.tier_b_on_ptx, emission.tier_b_on_kernel_name) {
-                    (Some(on_ptx), Some(on_name)) => {
+                    (Some(on_ptx), Some(_on_name)) if PROMOTE_TIER_B => {
                         let tb_ptx = self.embed_raw_data(
                             &format!("__nsl_sdpa_fwd_tb_c{c}_s{sm}_hd{head_dim}"),
                             on_ptx,
                         )?;
-                        let mut tb_name_bytes = on_name.into_bytes();
+                        // The v2 prelude names EVERY kernel with the base v2
+                        // name — `emission.tier_b_on_kernel_name`'s
+                        // `_tier_b_max{N}` suffix is a codegen-cache key that
+                        // does NOT exist as a PTX entry (pre-existing helper
+                        // inconsistency; the Tier-B-on path was dead in
+                        // production until Stage C, so cuModuleGetFunction
+                        // never saw it). Store the name that is actually IN
+                        // the PTX; the runtime distinguishes the two modules
+                        // by PTX pointer, not by entry name.
+                        let mut tb_name_bytes = base_kernel_name.clone().into_bytes();
                         tb_name_bytes.push(0);
                         let tb_name = self.embed_raw_data(
                             &format!("__nsl_sdpa_fwd_tb_name_c{c}_s{sm}_hd{head_dim}"),

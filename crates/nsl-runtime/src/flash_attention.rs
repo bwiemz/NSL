@@ -628,12 +628,23 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             return 0;
         }
 
+        // Decline-reason debug (NSL_SDPA_FUSED_DEBUG=1): the decline
+        // protocol is silent by design, which makes shape-dependent
+        // declines invisible in production runs — this narrates them.
+        macro_rules! decline {
+            ($reason:expr) => {{
+                if std::env::var("NSL_SDPA_FUSED_DEBUG").is_ok() {
+                    eprintln!("[sdpa-fused-debug] decline: {}", $reason);
+                }
+                return 0;
+            }};
+        }
         // ── Decline checks: host-only struct reads, no driver calls ──
         if ptx_ptr == 0 || name_ptr == 0 || q_ptr == 0 || k_ptr == 0 || v_ptr == 0 {
-            return 0;
+            decline!("null ptx/name/tensor (head_dim matched no variant?)");
         }
         if block_q <= 0 || block_kv <= 0 {
-            return 0;
+            decline!("non-positive block dims");
         }
         let q_t = NslTensor::from_ptr(q_ptr);
         let k_t = NslTensor::from_ptr(k_ptr);
@@ -641,7 +652,10 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         let wrong_layout =
             |t: &NslTensor| t.device != 1 || t.dtype != 1 || t.ndim != 4;
         if wrong_layout(q_t) || wrong_layout(k_t) || wrong_layout(v_t) {
-            return 0;
+            decline!(format!(
+                "layout: q(dev={},dt={},nd={}) k(dev={},dt={},nd={}) v(dev={},dt={},nd={})",
+                q_t.device, q_t.dtype, q_t.ndim, k_t.device, k_t.dtype, k_t.ndim,
+                v_t.device, v_t.dtype, v_t.ndim));
         }
         // Stride guard: the v2 kernel reads raw device pointers
         // stride-blind. A transpose/reshape VIEW here would compute
@@ -651,7 +665,11 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             || !is_canonical_row_major(k_t)
             || !is_canonical_row_major(v_t)
         {
-            return 0;
+            decline!(format!(
+                "non-canonical strides: q={} k={} v={}",
+                is_canonical_row_major(q_t),
+                is_canonical_row_major(k_t),
+                is_canonical_row_major(v_t)));
         }
         let (b, h, s, d) = unsafe {
             (
@@ -662,7 +680,7 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             )
         };
         if b <= 0 || h <= 0 || s <= 0 || d <= 0 {
-            return 0;
+            decline!("non-positive dims");
         }
         // K/V must agree with Q in [batch, seq, head_dim] and carry the
         // SAME head count — the plain fused kernel indexes K/V by the
@@ -677,11 +695,11 @@ pub extern "C" fn nsl_sdpa_fused_forward(
                 || *t.shape.add(3) != d
         };
         if kv_mismatch(k_t) || kv_mismatch(v_t) {
-            return 0;
+            decline!("k/v shape mismatch with q (GQA must be pre-expanded)");
         }
         // Ragged shapes: the v2 kernel has no seq_len tail guards.
         if s % block_q != 0 || s % block_kv != 0 {
-            return 0;
+            decline!(format!("ragged seq: s={s} block_q={block_q} block_kv={block_kv}"));
         }
 
         // ── Driver work starts here (thread-local context invariant) ──
@@ -837,17 +855,45 @@ pub extern "C" fn nsl_sdpa_fused_forward(
 
         // Grid/block identical to `nsl_flash_attention`: one CTA per
         // q-tile per (batch, head); 4 warps per CTA.
-        let grid = [s / block_q, b * h, 1];
+        // Launch PER BATCH ROW with pre-indexed pointers. The v2 segment
+        // staging documents its contract as "the launch wrapper passes a
+        // pre-indexed pointer (this batch sample's row); the kernel does
+        // NOT add a batch_idx offset" (forward/prelude.rs Task-3C NOTE) —
+        // a single [B,S]-base launch therefore stages ROW 0's segment ids
+        // for every CTA and silently mis-masks rows 1..B (benchmark
+        // discovery: first-step loss shifted 1e-2 at batch=4 while
+        // batch=1 matched the decomposed oracle to 5e-6). Per-row
+        // launches keep every pointer consistent with batch_idx==0
+        // in-kernel; the extra launch overhead is negligible next to the
+        // kernel itself.
+        let grid = [s / block_q, h, 1];
         let block = [128i64, 1, 1];
-
-        let rc = inner::kernel_launch(
-            effective_ptx_ptr as *const u8,
-            effective_name_ptr as *const u8,
-            grid,
-            block,
-            &args,
-            shared_mem_bytes as u32,
-        );
+        let row_qkv = (h * s * d) as u64 * 4; // f32 bytes per batch row
+        let row_lse = (h * s) as u64 * 4;
+        let row_seg = s as u64 * 2; // u16 bytes
+        let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+        for bi in 0..b as u64 {
+            q = q_t.data as u64 + bi * row_qkv;
+            k = k_t.data as u64 + bi * row_qkv;
+            v = v_t.data as u64 + bi * row_qkv;
+            out = out_f16 as u64 + bi * (h * s * d) as u64 * 2; // f16 staging
+            lse = lse_data as u64 + bi * row_lse;
+            bb = 1;
+            if !seg_dev.is_null() {
+                seg_arg = seg_dev as u64 + bi * row_seg;
+            }
+            rc = inner::kernel_launch(
+                effective_ptx_ptr as *const u8,
+                effective_name_ptr as *const u8,
+                grid,
+                block,
+                &args,
+                shared_mem_bytes as u32,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                break;
+            }
+        }
 
         // Widen the f16 staging output into the final f32 tensor. Same
         // stream as the forward launch, so in-stream ordering guarantees
