@@ -554,6 +554,14 @@ impl Compiler<'_> {
                         .flat_map(|m| m.values()),
                     self.interner,
                 );
+        // PCA Stage C note: `packed_sdpa_in_module` is deliberately NOT set
+        // here. An AST scan over model method bodies would over-claim — the
+        // stdlib GQA model always CARRIES forward_packed, so every GQA module
+        // would report the fused consumption channel even when only
+        // forward_masked is called. The flag is instead derived from the
+        // EXTRACTED training graph (actually-reached ops) in
+        // `wggo_prepass::build_preplan`, which is also the only context where
+        // the verdict that consumes it can fire.
         let deferred =
             crate::wggo_prepass::wggo_prepass_deferred_pending_sidecar(&self.compile_options);
         if deferred {
@@ -787,15 +795,34 @@ impl Compiler<'_> {
             crate::pca_activation::detect_packing_for_stmts(stmts, self.interner);
         let plan_prefers_segment_id =
             crate::wggo_prepass::plan_prefers_segment_id(&pre.overrides);
-        eprintln!(
-            "[wggo] plan-reachability: this train block lowers attention through the \
-             decorator-free `scaled_dot_product_attention` path (no @flash_attention \
-             context), so the WGGO plan's per-layer CSHA/PCA packing decisions are NOT \
-             applied here (layers_planned={}, packing_detected={packing_detected}, \
-             plan_prefers_segment_id={plan_prefers_segment_id}); only per-layer FASE \
-             overrides reach codegen on this path.",
-            pre.overrides.per_layer.len(),
-        );
+        // PCA Stage C changed what this verdict must claim: the decorator-free
+        // forward now carries a fused dispatch (plain flash forward with LSE
+        // saves; segment-masked family for the packed builtin), so packing IS
+        // applied on this path when the module uses
+        // `scaled_dot_product_attention_packed`. CSHA fusion levels remain
+        // decorator-gated (unchanged).
+        if self.features.packed_sdpa_in_module {
+            eprintln!(
+                "[wggo] plan-reachability: decorator-free attention with the PACKED \
+                 builtin — the plan's segment_id packing decision lowers through the \
+                 Stage-C fused segment-masked kernel family; CSHA fusion levels remain \
+                 decorator-gated (layers_planned={}, packing_detected={packing_detected}, \
+                 plan_prefers_segment_id={plan_prefers_segment_id}).",
+                pre.overrides.per_layer.len(),
+            );
+        } else {
+            eprintln!(
+                "[wggo] plan-reachability: this train block lowers attention through the \
+                 decorator-free `scaled_dot_product_attention` path (no @flash_attention \
+                 context) — the fused plain forward applies, but the plan's per-layer \
+                 CSHA/PCA packing decisions are NOT lowered here (packing needs the \
+                 packed builtin, e.g. GQA forward_packed; CSHA needs the decorator) \
+                 (layers_planned={}, packing_detected={packing_detected}, \
+                 plan_prefers_segment_id={plan_prefers_segment_id}); per-layer FASE \
+                 overrides reach codegen on this path.",
+                pre.overrides.per_layer.len(),
+            );
+        }
     }
 
     fn maybe_synthesize_csha_training_ptx(
@@ -2053,10 +2080,11 @@ impl Compiler<'_> {
     pub(crate) fn ensure_sdpa_bwd_variant_table(
         &mut self,
         causal: bool,
+        segment_masked: bool,
     ) -> Result<Vec<SdpaBwdVariant>, CodegenError> {
         const SDPA_BWD_VARIANT_HEAD_DIMS: &[i64] = &[32, 64, 128];
 
-        if let Some(table) = self.kernels.sdpa_bwd_variants.get(&causal) {
+        if let Some(table) = self.kernels.sdpa_bwd_variants.get(&(causal, segment_masked)) {
             return Ok(table.clone());
         }
         // The classic backward PTX is CUDA-only, and `parse_gpu_sm_from_target`
@@ -2069,11 +2097,14 @@ impl Compiler<'_> {
         // pointers, no panic.
         let target = self.compile_options.target.as_str();
         if target != "cuda" && !target.starts_with("sm_") {
-            self.kernels.sdpa_bwd_variants.insert(causal, Vec::new());
+            self.kernels
+                .sdpa_bwd_variants
+                .insert((causal, segment_masked), Vec::new());
             return Ok(Vec::new());
         }
         let gpu_sm = parse_gpu_sm_from_target(&self.compile_options.target);
         let c = i64::from(causal);
+        let sm = i64::from(segment_masked);
         let mut table = Vec::with_capacity(SDPA_BWD_VARIANT_HEAD_DIMS.len());
         for &head_dim in SDPA_BWD_VARIANT_HEAD_DIMS {
             let (block_q, block_kv) = crate::flash_attention::backward_select_blocks(head_dim);
@@ -2083,28 +2114,32 @@ impl Compiler<'_> {
                 head_dim,
                 causal,
                 gpu_sm,
-                segment_masked: false,
+                segment_masked,
             };
             let (p1, p2) =
                 crate::flash_attention::synthesize_flash_attention_backward_ptx(&bwd_config);
             let phase1_ptx =
-                self.embed_raw_data(&format!("__nsl_sdpa_bwd_p1_c{c}_hd{head_dim}"), p1)?;
+                self.embed_raw_data(&format!("__nsl_sdpa_bwd_p1_c{c}_s{sm}_hd{head_dim}"), p1)?;
             let phase2_ptx =
-                self.embed_raw_data(&format!("__nsl_sdpa_bwd_p2_c{c}_hd{head_dim}"), p2)?;
+                self.embed_raw_data(&format!("__nsl_sdpa_bwd_p2_c{c}_s{sm}_hd{head_dim}"), p2)?;
 
             let mut p1_name =
                 crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config)
                     .into_bytes();
             p1_name.push(0);
-            let phase1_name = self
-                .embed_raw_data(&format!("__nsl_sdpa_bwd_p1_name_c{c}_hd{head_dim}"), p1_name)?;
+            let phase1_name = self.embed_raw_data(
+                &format!("__nsl_sdpa_bwd_p1_name_c{c}_s{sm}_hd{head_dim}"),
+                p1_name,
+            )?;
 
             let mut p2_name =
                 crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config)
                     .into_bytes();
             p2_name.push(0);
-            let phase2_name = self
-                .embed_raw_data(&format!("__nsl_sdpa_bwd_p2_name_c{c}_hd{head_dim}"), p2_name)?;
+            let phase2_name = self.embed_raw_data(
+                &format!("__nsl_sdpa_bwd_p2_name_c{c}_s{sm}_hd{head_dim}"),
+                p2_name,
+            )?;
 
             table.push(SdpaBwdVariant {
                 head_dim,
@@ -2114,7 +2149,136 @@ impl Compiler<'_> {
                 phase2_name,
             });
         }
-        self.kernels.sdpa_bwd_variants.insert(causal, table.clone());
+        self.kernels
+            .sdpa_bwd_variants
+            .insert((causal, segment_masked), table.clone());
+        Ok(table)
+    }
+
+    /// PCA Stage C: fused-forward variant table for decorator-free SDPA.
+    ///
+    /// Synthesizes the v2 scalar forward (csha: None — the same emitter
+    /// family every decorated plain model launches) per supported head_dim,
+    /// under the op's static `(causal, segment_masked)`, and embeds
+    /// PTX + entry-name bytes in .rodata. Tile sizes are probed against the
+    /// v2 scalar matrix per head_dim, largest-first, so each entry uses the
+    /// biggest admissible tiles; head_dims with no admissible tiling are
+    /// skipped (runtime head_dim then matches nothing → null PTX → the
+    /// lowering's decomposed fallback, exactly like the backward table).
+    ///
+    /// For `segment_masked` tables, `emit_tier_b_variants_for_config` also
+    /// returns the Tier-B tile-skip variant (the codegen gate is
+    /// `should_emit_tier_b_at_codegen == segment_masked`); its pair is
+    /// embedded alongside so the runtime's 4-condition gate can promote the
+    /// launch to the skipping kernel.
+    pub(crate) fn ensure_sdpa_fwd_variant_table(
+        &mut self,
+        causal: bool,
+        segment_masked: bool,
+    ) -> Result<Vec<super::SdpaFwdVariant>, CodegenError> {
+        const SDPA_FWD_VARIANT_HEAD_DIMS: &[i64] = &[32, 64, 128];
+        // Largest-first tile probe order. (64,64) is the decorated-path
+        // default; smaller tiles admit larger head_dims within the v2
+        // scalar matrix / SMEM budget.
+        const TILE_CANDIDATES: &[(i64, i64)] = &[(64, 64), (32, 32), (32, 16), (16, 16)];
+
+        if let Some(table) = self.kernels.sdpa_fwd_variants.get(&(causal, segment_masked)) {
+            return Ok(table.clone());
+        }
+        let target = self.compile_options.target.as_str();
+        if target != "cuda" && !target.starts_with("sm_") {
+            self.kernels
+                .sdpa_fwd_variants
+                .insert((causal, segment_masked), Vec::new());
+            return Ok(Vec::new());
+        }
+        let gpu_sm = parse_gpu_sm_from_target(&self.compile_options.target);
+        let c = i64::from(causal);
+        let sm = i64::from(segment_masked);
+        let mut table = Vec::with_capacity(SDPA_FWD_VARIANT_HEAD_DIMS.len());
+        for &head_dim in SDPA_FWD_VARIANT_HEAD_DIMS {
+            let mut admitted = None;
+            for &(bq, bkv) in TILE_CANDIDATES {
+                let config = crate::flash_attention::FlashAttentionConfig {
+                    block_q: bq,
+                    block_kv: bkv,
+                    head_dim,
+                    causal,
+                    paged: false,
+                    rope_q: false,
+                    rope_style: crate::flash_attention::RopeStyle::HalfSplit,
+                    gqa_group_size: 1,
+                    tree_mask: false,
+                    num_sink_tokens: 0,
+                    gpu_sm,
+                    segment_masked,
+                    csha: None,
+                    checkpoint: None,
+                };
+                if crate::flash_attention_v2::smem_layout::validate_scalar_v2_config(
+                    &config,
+                    crate::flash_attention_v2::smem_layout::Direction::Forward,
+                )
+                .is_ok()
+                {
+                    admitted = Some(config);
+                    break;
+                }
+            }
+            let Some(config) = admitted else { continue };
+
+            let emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&config);
+            let mut diags = Vec::<String>::new();
+            let smem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+                &config, &mut diags,
+            ) as i64;
+            for d in diags {
+                eprintln!("warning: {d}");
+            }
+
+            let base_ptx = self.embed_raw_data(
+                &format!("__nsl_sdpa_fwd_c{c}_s{sm}_hd{head_dim}"),
+                emission.base_ptx,
+            )?;
+            let mut base_name_bytes = emission.base_kernel_name.into_bytes();
+            base_name_bytes.push(0);
+            let base_name = self.embed_raw_data(
+                &format!("__nsl_sdpa_fwd_name_c{c}_s{sm}_hd{head_dim}"),
+                base_name_bytes,
+            )?;
+
+            let (tier_b_ptx, tier_b_name) =
+                match (emission.tier_b_on_ptx, emission.tier_b_on_kernel_name) {
+                    (Some(on_ptx), Some(on_name)) => {
+                        let tb_ptx = self.embed_raw_data(
+                            &format!("__nsl_sdpa_fwd_tb_c{c}_s{sm}_hd{head_dim}"),
+                            on_ptx,
+                        )?;
+                        let mut tb_name_bytes = on_name.into_bytes();
+                        tb_name_bytes.push(0);
+                        let tb_name = self.embed_raw_data(
+                            &format!("__nsl_sdpa_fwd_tb_name_c{c}_s{sm}_hd{head_dim}"),
+                            tb_name_bytes,
+                        )?;
+                        (Some(tb_ptx), Some(tb_name))
+                    }
+                    _ => (None, None),
+                };
+
+            table.push(super::SdpaFwdVariant {
+                head_dim,
+                block_q: config.block_q,
+                block_kv: config.block_kv,
+                smem_bytes,
+                base_ptx,
+                base_name,
+                tier_b_ptx,
+                tier_b_name,
+            });
+        }
+        self.kernels
+            .sdpa_fwd_variants
+            .insert((causal, segment_masked), table.clone());
         Ok(table)
     }
 
