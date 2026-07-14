@@ -1709,6 +1709,9 @@ pub(crate) fn run_backward_core(
                         0, 0, 0, 0, // no PTX pointers — tape-based path uses CPU fallback
                         // Tier B extension (planner spec §4): disabled sentinel.
                         0, 0,
+                        // PCA Stage C: no segment mask on the tape path (the
+                        // fused packed-SDPA channel is source-AD-only).
+                        0,
                     );
 
                     // Eagerly free saved Q, K, V and intermediates
