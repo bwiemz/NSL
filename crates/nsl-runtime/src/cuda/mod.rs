@@ -76,6 +76,16 @@ pub(crate) mod inner {
         }
     }
 
+    /// Non-panicking probe: has the process-wide CUDA state already been
+    /// initialized (by some prior tensor op)? Diagnostics-only callers
+    /// (e.g. the NSL_PHASE_TIMING device sync) must NOT force-initialize
+    /// CUDA — `state()`'s lazy init asserts on cuInit failure, which would
+    /// abort a pure-CPU run of a cuda-featured binary on a GPU-less
+    /// machine from inside an instrumentation path.
+    pub(crate) fn context_initialized() -> bool {
+        CUDA_STATE.get().is_some()
+    }
+
     fn state() -> &'static Mutex<CudaState> {
         CUDA_STATE.get_or_init(|| {
             unsafe {
@@ -152,33 +162,6 @@ pub(crate) mod inner {
             );
         }
         (major * 10 + minor) as u32
-    }
-
-    /// Query the marketing name of device 0 (e.g. "NVIDIA GeForce RTX 5070
-    /// Ti"), with the vendor/brand prefixes stripped so the result matches
-    /// the `nsl-codegen` GPU-database naming ("RTX 5070 Ti" → find_gpu's
-    /// normalizer turns spaces into dashes). Returns `None` if the driver
-    /// gives back an unreadable string.
-    pub(crate) fn device_name_stripped() -> Option<String> {
-        let s = state();
-        let guard = s.lock().unwrap();
-        let mut buf = [0i8; 128];
-        let rc = unsafe { cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, guard.device) };
-        if rc != CUresult::CUDA_SUCCESS {
-            return None;
-        }
-        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-        let mut name = cstr.to_str().ok()?.trim().to_string();
-        for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
-            if let Some(rest) = name.strip_prefix(prefix) {
-                name = rest.to_string();
-            }
-        }
-        if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        }
     }
 
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2239,21 +2222,43 @@ pub extern "C" fn nsl_cuda_init() -> i64 {
 /// probed at COMPILE time, where an abort would kill the compiler.
 #[cfg(feature = "cuda")]
 pub fn cuda_device_name() -> Option<String> {
-    // Probe cuInit/device-count directly: `inner::state()` asserts on
-    // failure, which is correct for the runtime paths but not here.
+    // Fully self-contained probe (review finding): `inner::state()` /
+    // `device_name_stripped()` route through the asserting lazy init
+    // (cuDevicePrimaryCtxRetain can fail even when cuInit succeeded —
+    // exclusive-mode devices, ECC-pending, OOM), and a panic here fires
+    // at COMPILE time inside the CSHA planner. Every driver call below is
+    // rc-checked; no context is created or retained (cuDeviceGetName
+    // needs only a device ordinal).
+    use cudarc::driver::sys::*;
     unsafe {
-        if cudarc::driver::sys::cuInit(0) != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        if cuInit(0) != CUresult::CUDA_SUCCESS {
             return None;
         }
         let mut count: i32 = 0;
-        if cudarc::driver::sys::cuDeviceGetCount(&mut count)
-            != cudarc::driver::sys::CUresult::CUDA_SUCCESS
-            || count == 0
-        {
+        if cuDeviceGetCount(&mut count) != CUresult::CUDA_SUCCESS || count == 0 {
             return None;
         }
+        let mut device: CUdevice = 0;
+        if cuDeviceGet(&mut device, 0) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut buf = [0i8; 128];
+        if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
+        let mut name = cstr.to_str().ok()?.trim().to_string();
+        for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                name = rest.to_string();
+            }
+        }
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
-    inner::device_name_stripped()
 }
 
 /// Non-cuda build: no device to name.

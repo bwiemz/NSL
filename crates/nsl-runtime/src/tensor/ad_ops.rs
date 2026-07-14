@@ -1759,13 +1759,17 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
         let migrated = super::nsl_tensor_to_device(grad_ptr, target.device as i64);
         if migrated != 0 && migrated != grad_ptr {
             let out = nsl_tensor_reduce_to_shape(migrated, target_ptr);
-            // `to_device` returns a published tensor; if the recursive call
-            // returned the migrated pointer itself (identity reduce), its
-            // retain keeps it alive for the caller — otherwise drop our
-            // reference now that the reduce consumed it.
-            if out != migrated {
-                super::nsl_tensor_free(migrated);
-            }
+            // `to_device` returned a FRESH published tensor (rc=1) whose
+            // creation reference WE own. Drop it unconditionally (review
+            // finding): on the identity path the recursive call's retain is
+            // the CALLER's reference (rc 1+1-1 = 1 transferred); on the
+            // non-identity path the reduce allocated a new output and our
+            // reference is the last one (rc 1-1 = 0, freed here). The
+            // previous `if out != migrated` guard skipped the free exactly
+            // when the identity path ALSO needed it — stranding same-shape
+            // migrated grads at rc=2 (peak-memory regression under a scope;
+            // a permanent leak without one).
+            super::nsl_tensor_free(migrated);
             return out;
         }
     }

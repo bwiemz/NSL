@@ -487,15 +487,21 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
     static DETECTED: std::sync::OnceLock<Option<&'static GpuSpec>> = std::sync::OnceLock::new();
     let detected = *DETECTED.get_or_init(|| {
         let name = nsl_runtime::cuda_device_name()?;
-        let spec = find_gpu(&name);
+        // EXACT match only for auto-detected names (review finding):
+        // find_gpu's prefix fallback would silently hand a plain
+        // "RTX 5070" the RTX-5070-Ti's spec ("RTX-5070-TI" starts with
+        // "RTX-5070"). Detected names are full marketing strings — either
+        // the database has that exact card or we fall back loudly.
+        let normalized = name.to_uppercase().replace(' ', "-");
+        let spec = find_gpu(&name).filter(|s| s.name.to_uppercase() == normalized);
         match spec {
             Some(s) => eprintln!(
                 "[csha] gpu spec: {} (auto-detected from local device \"{name}\")",
                 s.name
             ),
             None => eprintln!(
-                "[csha] gpu spec: local device \"{name}\" not in the GPU database — \
-                 falling back to {} (add a GpuSpec entry for honest smem budgets)",
+                "[csha] gpu spec: local device \"{name}\" has no exact GPU-database \
+                 entry — falling back to {} (add a GpuSpec entry for honest smem budgets)",
                 default_gpu().name
             ),
         }

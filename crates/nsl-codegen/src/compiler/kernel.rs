@@ -2272,8 +2272,11 @@ impl Compiler<'_> {
             // PTX (launch-count-proven via `nsl_sdpa_fused_launch_count`)
             // against the base segment-masked kernel across single-doc /
             // tile-aligned / mid-tile / high-density patterns at
-            // s∈{1024,4096} and b=4/h=8 — BITWISE-identical outputs and
-            // LSE everywhere, which is what correct tile-skip predicts (a
+            // s∈{1024,4096} and b=4/h=8. The gate's ENFORCED contract is
+            // max-abs parity within TB_VS_BASE_TOL = 5e-4 (~one f16 ulp at
+            // the fixture's |out| <= 0.5 — the outputs are f16-staged); the
+            // promotion run in fact observed exact 0.0 differences on every
+            // pattern, which is what correct tile-skip predicts (a
             // fully-masked KV tile is an exact no-op in the online
             // softmax: its -1e9 mass rescales to +0.0 once any visible
             // tile follows, and the causal diagonal guarantees one). The

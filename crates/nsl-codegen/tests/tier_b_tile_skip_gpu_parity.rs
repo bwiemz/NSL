@@ -30,6 +30,11 @@
 //!
 //! Requires an NVIDIA GPU + driver; `#[ignore]` by default. Run with:
 //!   cargo test -p nsl-codegen --features cuda --test tier_b_tile_skip_gpu_parity --release -- --ignored --nocapture
+//!
+//! The launch-count proof is serialized through an in-process mutex (see
+//! `assert_tier_b_matches_base`), so the exact-delta counter assertion
+//! holds even under libtest's default parallel scheduling — but
+//! `--test-threads=1` remains the repo-wide GPU-gate convention.
 
 #![cfg(feature = "cuda")]
 
@@ -282,14 +287,25 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
 
 /// Tolerance for tier-b vs base: both outputs pass through the kernel's
 /// f16 output staging, so exact-math-equal paths may still differ by one
-/// f16 ulp after widening. Skip patterns additionally reorder the online
-/// softmax's running max/sum updates (a skipped fully-masked tile no
-/// longer contributes its -1e9 row_max update), which perturbs at the
-/// ~1e-6 level pre-quantization. 2e-3 catches the observed 1e-2 bug with
-/// a 5x margin while tolerating f16 rounding.
-const TB_VS_BASE_TOL: f32 = 2e-3;
+/// f16 ulp after widening; with the test's bounded inputs (|out| <= ~0.5)
+/// one ulp is <= ~4.9e-4. Skip patterns additionally reorder the online
+/// softmax's running max/sum updates at the ~1e-6 level pre-quantization.
+/// 5e-4 is therefore ~one-ulp tight (the 2026-07-14 promotion run in fact
+/// observed max_abs == 0.0 exactly on every pattern) while the original
+/// deferral bug sat at ~1e-2 — 20x above this gate.
+const TB_VS_BASE_TOL: f32 = 5e-4;
+
+/// Serializes the (base run, counter snapshot, tier-b run, counter check)
+/// window: the launch counter is process-global, so a sibling test's
+/// tier-b launch inside the window would make the exact-delta assertion
+/// spuriously fail — or, worse, vouch for a run whose own dispatch fell
+/// back to base (the very bug the counter proves absent).
+static LAUNCH_PROOF_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn assert_tier_b_matches_base(name: &str, b: usize, h: usize, s: usize, seg: &[u16]) {
+    let _serial = LAUNCH_PROOF_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let base = run_variant(b, h, s, seg, false);
     // Launch-count proof: the Tier-B call below must increment the
     // Tier-B counter (variant 1), or the comparison is vacuous — a

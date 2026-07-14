@@ -49,17 +49,25 @@ pub extern "C" fn nsl_clock() -> f64 {
     epoch.elapsed().as_secs_f64()
 }
 
-/// Synchronize the CUDA device (no-op on CPU builds). Emitted by the
-/// NSL_PHASE_TIMING train-block instrumentation before each phase-boundary
-/// `nsl_clock()` read: most runtime ops already end with a
-/// `cuCtxSynchronize`, but a few same-stream kernels deliberately skip it,
-/// so an explicit sync pins the wall-clock delta to completed GPU work.
+/// Synchronize the CUDA device. Emitted by the NSL_PHASE_TIMING
+/// train-block instrumentation before each phase-boundary `nsl_clock()`
+/// read: most runtime ops already end with a `cuCtxSynchronize`, but a few
+/// same-stream kernels deliberately skip it, so an explicit sync pins the
+/// wall-clock delta to completed GPU work.
+///
+/// No-op unless a CUDA context ALREADY exists (review finding): this is a
+/// diagnostics-only path, and force-initializing CUDA here would abort a
+/// pure-CPU run of a cuda-featured binary on a GPU-less machine (the lazy
+/// state init asserts on cuInit failure). On real GPU runs the first
+/// tensor op initialized the context long before the first timed step.
 #[no_mangle]
 pub extern "C" fn nsl_cuda_device_synchronize() {
     #[cfg(feature = "cuda")]
     {
-        crate::cuda::inner::ensure_context();
-        unsafe { crate::cuda::inner::cu_ctx_synchronize() };
+        if crate::cuda::inner::context_initialized() {
+            crate::cuda::inner::ensure_context();
+            unsafe { crate::cuda::inner::cu_ctx_synchronize() };
+        }
     }
 }
 
