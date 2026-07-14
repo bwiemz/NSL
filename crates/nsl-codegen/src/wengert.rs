@@ -191,6 +191,17 @@ pub enum PrimalOp {
         stride: usize,
         padding: usize,
     },
+    /// Reify `grad_output` to the conv2d output shape `[N, C_out, H_out, W_out]`
+    /// (broadcasting a scalar sum-loss gradient, or copying a same-count
+    /// differently-laid-out one). Emitted once per `Conv2d` node so its 2-3
+    /// sibling `Conv2dBackward` gradients (input/weight/bias) share a single
+    /// materialized tensor instead of each reifying (and, for a scalar loss,
+    /// allocating) their own copy. Inputs are `[grad_output, input, weight]`.
+    /// Lowers to `nsl_materialize_conv_output_grad`.
+    MaterializeConvOutputGrad {
+        stride: usize,
+        padding: usize,
+    },
     /// Repeat (upsample) tensor elements by kernel factor — used in AvgPool backward.
     Repeat {
         kernel: usize,

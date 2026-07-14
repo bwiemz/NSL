@@ -1263,6 +1263,20 @@ fn lower_single_op(
                 &[inputs[0], inputs[1], inputs[2], sh, sw, ph, pw],
             )
         }
+        PrimalOp::MaterializeConvOutputGrad { stride, padding } => {
+            // inputs = [grad_output, input, weight]. See PrimalOp docs: this
+            // reifies grad_output once so sibling Conv2dBackward ops share it.
+            let sh = builder.ins().iconst(cl_types::I64, *stride as i64);
+            let sw = builder.ins().iconst(cl_types::I64, *stride as i64);
+            let ph = builder.ins().iconst(cl_types::I64, *padding as i64);
+            let pw = builder.ins().iconst(cl_types::I64, *padding as i64);
+            call(
+                compiler,
+                builder,
+                "nsl_materialize_conv_output_grad",
+                &[inputs[0], inputs[1], inputs[2], sh, sw, ph, pw],
+            )
+        }
 
         // === Pooling (2 ops) ===
         PrimalOp::MaxPool2d { kernel, stride } => {

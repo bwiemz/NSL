@@ -83,6 +83,26 @@ pub struct CshaFusedBackwardEvent {
     pub dgamma_emitted: bool,
 }
 
+/// Memoization key for `MaterializeConvOutputGrad`. Two sibling gradients
+/// (input/weight/bias) of ONE `Conv2d` node may share a reified `grad_output`
+/// only when every input to the materialize op matches: the same `grad` VarId
+/// (identical contents) reified against the same output geometry — which is a
+/// function of `input`/`weight` shapes plus `stride`/`padding`. This is exactly
+/// the materialize op's own identity `(grad, input, weight, stride, padding)`,
+/// so the cache is CSE scoped to that op: it shares among siblings (identical
+/// keys) but keeps DISTINCT `Conv2d` nodes separate even when they happen to
+/// share one upstream `grad` VarId (e.g. a broadcast scalar sum-loss seed feeding
+/// two convs of different geometry) — where reusing the first node's differently
+/// shaped materialized tensor would be silently wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ConvGradMaterializeKey {
+    grad: VarId,
+    input: VarId,
+    weight: VarId,
+    stride: usize,
+    padding: usize,
+}
+
 /// Generates the backward (adjoint) Wengert list from a forward (primal) list.
 pub struct AdjointGenerator {
     adjoint_ops: Vec<WengertOp>,
@@ -98,6 +118,16 @@ pub struct AdjointGenerator {
     /// gate caused the dispatcher to actually take the fused path). See
     /// [`CshaFusedBackwardEvent`].
     csha_fused_events: Vec<CshaFusedBackwardEvent>,
+    /// Conv2d's 2-3 gradient adjoints (input/weight/bias) all reify the same
+    /// `grad_output` to the conv output shape. Memoizes the reified VarId by the
+    /// materialize op's full identity ([`ConvGradMaterializeKey`]) so only the
+    /// first sibling emits the `MaterializeConvOutputGrad` op; the rest reuse it.
+    /// Without this, each sibling reifies (and, for a scalar sum-loss gradient,
+    /// allocates) its own copy — up to 3x the necessary allocations per conv2d
+    /// node per step. Keying on the full geometry (not `grad` alone) keeps two
+    /// different-geometry conv nodes that share an upstream `grad` VarId from
+    /// colliding on a mismatched output shape.
+    conv_grad_materialize_cache: HashMap<ConvGradMaterializeKey, VarId>,
 }
 
 impl AdjointGenerator {
@@ -110,6 +140,7 @@ impl AdjointGenerator {
             csha_claims: None,
             csha_diagnostics: Vec::new(),
             csha_fused_events: Vec::new(),
+            conv_grad_materialize_cache: HashMap::new(),
         }
     }
 
@@ -1153,15 +1184,43 @@ impl AdjointGenerator {
             // [grad_output, input, weight]. (This replaced an earlier
             // transpose+matmul lowering that was wrong for 4D convolution and was
             // subsequently turned into a hard refusal; it is now implemented.)
-            AdjointExpr::Conv2dBackward(kind, grad, input, weight, stride, padding) => self
-                .emit_op(
+            //
+            // Conv2d's 2-3 gradients (input/weight/bias) all reify the same
+            // `grad` to the conv output shape (e.g. broadcasting a scalar
+            // sum-loss gradient). Emit that reification once per (grad, input,
+            // weight, stride, padding) tuple and have every sibling gradient
+            // consume the shared result, instead of each independently reifying
+            // (and, for a scalar gradient, allocating) its own copy. The full
+            // tuple — not `grad` alone — is the key so two different-geometry
+            // conv nodes sharing one upstream `grad` VarId each get their own
+            // correctly shaped materialize, never a collided one.
+            AdjointExpr::Conv2dBackward(kind, grad, input, weight, stride, padding) => {
+                let key = ConvGradMaterializeKey {
+                    grad,
+                    input,
+                    weight,
+                    stride,
+                    padding,
+                };
+                let materialized_grad = if let Some(&v) = self.conv_grad_materialize_cache.get(&key) {
+                    v
+                } else {
+                    let v = self.emit_op(
+                        PrimalOp::MaterializeConvOutputGrad { stride, padding },
+                        vec![grad, input, weight],
+                    );
+                    self.conv_grad_materialize_cache.insert(key, v);
+                    v
+                };
+                self.emit_op(
                     PrimalOp::Conv2dBackward {
                         kind,
                         stride,
                         padding,
                     },
-                    vec![grad, input, weight],
-                ),
+                    vec![materialized_grad, input, weight],
+                )
+            }
             AdjointExpr::MaxPoolBackward(y_bar, indices) => {
                 // MaxPool backward: scatter grad to argmax positions
                 self.emit_op(PrimalOp::ScatterAdd { dim: 0 }, vec![y_bar, indices])
@@ -4632,13 +4691,13 @@ mod tests {
     }
 
     /// Conv2d gradients are now implemented in source AD (the deferral is
-    /// closed). Each `Conv2dBackward` adjoint lowers to exactly one
-    /// `PrimalOp::Conv2dBackward` op carrying the same kind/stride/padding and
-    /// inputs `[grad, input, weight]` — which in turn calls the runtime
-    /// `nsl_conv2d_{input,weight,bias}_backward` FFI wrapping the verified
-    /// `conv2d_backward` shared with the tape path. (Previously both arms
-    /// refused loudly because the old transpose+matmul lowering was wrong for
-    /// 4D convolution.)
+    /// closed). Each `Conv2dBackward` adjoint lowers to a `MaterializeConvOutputGrad`
+    /// op (reifying `grad` to the conv output shape) feeding a
+    /// `PrimalOp::Conv2dBackward` op carrying the same kind/stride/padding —
+    /// which in turn calls the runtime `nsl_conv2d_{input,weight,bias}_backward`
+    /// FFI wrapping the verified `conv2d_backward` shared with the tape path.
+    /// (Previously both arms refused loudly because the old transpose+matmul
+    /// lowering was wrong for 4D convolution.)
     #[test]
     fn lower_adjoint_expr_conv_grads_emit_backward_ops() {
         use crate::wengert::ConvGradKind;
@@ -4655,12 +4714,24 @@ mod tests {
             let ops = &gen.adjoint_ops;
             assert_eq!(
                 ops.len(),
-                1,
-                "Conv2dBackward must lower to exactly 1 op, got {:?}",
+                2,
+                "Conv2dBackward must lower to exactly 2 ops (materialize + backward), got {:?}",
                 ops.iter().map(|o| &o.op).collect::<Vec<_>>(),
             );
             assert_eq!(
                 ops[0].op,
+                PrimalOp::MaterializeConvOutputGrad { stride, padding },
+                "unexpected materialize op for kind {:?}",
+                kind,
+            );
+            assert_eq!(
+                ops[0].inputs,
+                vec![100, 5, 6],
+                "MaterializeConvOutputGrad inputs must be [grad, input, weight]",
+            );
+            let materialized = ops[0].result;
+            assert_eq!(
+                ops[1].op,
                 PrimalOp::Conv2dBackward {
                     kind,
                     stride,
@@ -4670,11 +4741,176 @@ mod tests {
                 kind,
             );
             assert_eq!(
-                ops[0].inputs,
-                vec![100, 5, 6],
-                "Conv2dBackward inputs must be [grad, input, weight]",
+                ops[1].inputs,
+                vec![materialized, 5, 6],
+                "Conv2dBackward inputs must be [materialized_grad, input, weight]",
             );
         }
+    }
+
+    /// Regression for the hidden-allocation invariant: Conv2d's 2-3 sibling
+    /// gradients (input/weight/bias) must share ONE `MaterializeConvOutputGrad`
+    /// call for a given `grad` VarId, not one each. Before this memoization,
+    /// a scalar sum-loss gradient (the common case — see
+    /// `conv2d_source_ad_grad_e2e`) was reified — and allocated — up to 3x per
+    /// conv2d node per backward step, a silent violation of the "no dynamic
+    /// allocation on the backward hot path" invariant.
+    #[test]
+    fn conv2d_backward_siblings_share_one_materialize_call() {
+        use crate::wengert::ConvGradKind;
+        let mut gen = AdjointGenerator::new(200);
+        // Same grad=100/input=5/weight=6 for all three sibling gradients,
+        // as apply_ad_rule produces for one Conv2d node with a bias.
+        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+            ConvGradKind::Input,
+            100,
+            5,
+            6,
+            1,
+            0,
+        ));
+        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+            ConvGradKind::Weight,
+            100,
+            5,
+            6,
+            1,
+            0,
+        ));
+        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+            ConvGradKind::Bias,
+            100,
+            5,
+            6,
+            1,
+            0,
+        ));
+
+        let materialize_ops: Vec<_> = gen
+            .adjoint_ops
+            .iter()
+            .filter(|op| matches!(op.op, PrimalOp::MaterializeConvOutputGrad { .. }))
+            .collect();
+        assert_eq!(
+            materialize_ops.len(),
+            1,
+            "expected exactly 1 MaterializeConvOutputGrad shared by all 3 sibling \
+             gradients, got {}: {:?}",
+            materialize_ops.len(),
+            materialize_ops,
+        );
+        let materialized = materialize_ops[0].result;
+
+        let backward_ops: Vec<_> = gen
+            .adjoint_ops
+            .iter()
+            .filter(|op| matches!(op.op, PrimalOp::Conv2dBackward { .. }))
+            .collect();
+        assert_eq!(backward_ops.len(), 3, "expected 3 Conv2dBackward ops (input/weight/bias)");
+        for op in backward_ops {
+            assert_eq!(
+                op.inputs[0], materialized,
+                "every sibling Conv2dBackward must consume the shared materialized grad, got {:?}",
+                op,
+            );
+        }
+    }
+
+    /// Regression for the cache-collision hazard: the memoization key is the
+    /// materialize op's FULL identity `(grad, input, weight, stride, padding)`,
+    /// not `grad` alone. Two DIFFERENT-geometry `Conv2d` nodes that share one
+    /// upstream `grad` VarId (as a broadcast scalar sum-loss seed does when it
+    /// feeds two convs) must each reify their own correctly shaped grad — the
+    /// conv output shape differs by node, so reusing node A's materialized
+    /// tensor for node B would be a silent shape/gradient miscompile. Keyed on
+    /// `grad` alone, node B would reuse node A's op; keyed on the full tuple,
+    /// it does not.
+    #[test]
+    fn conv2d_backward_distinct_geometry_shared_grad_does_not_collide() {
+        use crate::wengert::ConvGradKind;
+        let mut gen = AdjointGenerator::new(300);
+        // Node A: grad=100, input=5, weight=6. Node B: SAME grad=100, but
+        // input=7, weight=8 (a differently shaped conv). Emit both siblings of
+        // each node so the intra-node sharing path is also exercised.
+        for kind in [ConvGradKind::Input, ConvGradKind::Weight] {
+            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(kind, 100, 5, 6, 1, 0));
+        }
+        for kind in [ConvGradKind::Input, ConvGradKind::Weight] {
+            let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(kind, 100, 7, 8, 1, 0));
+        }
+
+        let materialize_ops: Vec<_> = gen
+            .adjoint_ops
+            .iter()
+            .filter(|op| matches!(op.op, PrimalOp::MaterializeConvOutputGrad { .. }))
+            .collect();
+        assert_eq!(
+            materialize_ops.len(),
+            2,
+            "two different-geometry conv nodes sharing grad=100 must each emit \
+             their own MaterializeConvOutputGrad (no collision), got {}: {:?}",
+            materialize_ops.len(),
+            materialize_ops,
+        );
+        // The two materializations reify grad=100 against each node's own
+        // input/weight — the inputs must differ, proving they are not aliased.
+        assert_eq!(materialize_ops[0].inputs, vec![100, 5, 6]);
+        assert_eq!(materialize_ops[1].inputs, vec![100, 7, 8]);
+        let mat_a = materialize_ops[0].result;
+        let mat_b = materialize_ops[1].result;
+        assert_ne!(mat_a, mat_b, "materialized grads must be distinct VarIds");
+
+        // Node A's Conv2dBackward ops consume mat_a; node B's consume mat_b.
+        let bwd_inputs: Vec<u32> = gen
+            .adjoint_ops
+            .iter()
+            .filter(|op| matches!(op.op, PrimalOp::Conv2dBackward { .. }))
+            .map(|op| op.inputs[0])
+            .collect();
+        assert_eq!(
+            bwd_inputs,
+            vec![mat_a, mat_a, mat_b, mat_b],
+            "each node's backward ops must consume that node's own materialized grad",
+        );
+    }
+
+    /// The materialize key includes `stride`/`padding`, not just the tensor
+    /// VarIds: two convs over the SAME `grad`/`input`/`weight` but with
+    /// different stride (e.g. dilated vs plain) produce different output
+    /// shapes, so they must not share a materialized grad either.
+    #[test]
+    fn conv2d_backward_materialize_key_includes_stride_padding() {
+        use crate::wengert::ConvGradKind;
+        let mut gen = AdjointGenerator::new(400);
+        // Identical grad/input/weight VarIds; stride 1 vs 2.
+        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+            ConvGradKind::Input,
+            100,
+            5,
+            6,
+            1,
+            0,
+        ));
+        let _ = gen.lower_adjoint_expr(AdjointExpr::Conv2dBackward(
+            ConvGradKind::Input,
+            100,
+            5,
+            6,
+            2,
+            0,
+        ));
+        let materialize_ops: Vec<_> = gen
+            .adjoint_ops
+            .iter()
+            .filter(|op| matches!(op.op, PrimalOp::MaterializeConvOutputGrad { .. }))
+            .collect();
+        assert_eq!(
+            materialize_ops.len(),
+            2,
+            "differing stride must NOT collide in the materialize cache, got {}: {:?}",
+            materialize_ops.len(),
+            materialize_ops,
+        );
     }
 
     /// CPDT Part II activation: the source-AD lowering of `Mul`'s backward

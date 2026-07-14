@@ -667,6 +667,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // Reify grad_output to the conv2d output shape once per node, shared by
+    // the 3 FFIs above: (grad, input, weight, sh, sw, ph, pw) -> grad.
+    (
+        "nsl_materialize_conv_output_grad",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_maxpool2d",
         &[types::I64, types::I64, types::I64, types::I64, types::I64],
