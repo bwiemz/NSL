@@ -1229,6 +1229,23 @@ impl AdjointGenerator {
                 vec![y_bar, q, k, v, fwd_out],
             ),
 
+            // PCA Stage C: packed (segment-masked) attention backward — same
+            // extract pattern with the segment tensor threaded as a sixth
+            // input so the lowering can reach the `_segmask` variant table
+            // and the 19-arg backward FFI.
+            AdjointExpr::AttentionBackwardQPacked(y_bar, q, k, v, fwd_out, seg) => self.emit_op(
+                PrimalOp::FlashAttentionBackwardExtractPacked { component: 0 },
+                vec![y_bar, q, k, v, fwd_out, seg],
+            ),
+            AdjointExpr::AttentionBackwardKPacked(y_bar, q, k, v, fwd_out, seg) => self.emit_op(
+                PrimalOp::FlashAttentionBackwardExtractPacked { component: 1 },
+                vec![y_bar, q, k, v, fwd_out, seg],
+            ),
+            AdjointExpr::AttentionBackwardVPacked(y_bar, q, k, v, fwd_out, seg) => self.emit_op(
+                PrimalOp::FlashAttentionBackwardExtractPacked { component: 2 },
+                vec![y_bar, q, k, v, fwd_out, seg],
+            ),
+
             // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.
             // Lowers to a `FusedLinearCeBackwardExtract` op with the inputs
             // the wengert lowerer expects:
@@ -3605,6 +3622,25 @@ impl<'a> WengertExtractor<'a> {
                             checkpointed: false,
                         });
                         return Some(out);
+                    }
+                    // PCA Stage C: PACKED attention — a single fused op
+                    // (unlike the masked builtin above, which decomposes).
+                    // The lowering dispatches to the fused segment-masked
+                    // flash kernel on GPU and falls back to the decomposed
+                    // additive-mask chain at RUNTIME (CPU tensors, unmatched
+                    // head_dim, launch failure). Backward is the `_segmask`
+                    // FlashAttentionBackwardExtractPacked family. See the
+                    // PrimalOp doc for the mask ≡ causal-within-segment
+                    // contract.
+                    "scaled_dot_product_attention_packed" => {
+                        if input_vars.len() < 6 {
+                            eprintln!(
+                                "[source-ad] scaled_dot_product_attention_packed \
+                                 requires 6 args (q, k, v, scale, mask, segment_ids)"
+                            );
+                            return None;
+                        }
+                        PrimalOp::ScaledDotProductAttentionPacked
                     }
                     // Transpose (default: swap last two dims)
                     "transpose" => {

@@ -63,7 +63,10 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_inputs: true,
             needs_output: false,
         },
-        ScaledDotProductAttention { .. } | FlashAttentionBackwardExtract { .. } => {
+        ScaledDotProductAttention { .. }
+        | ScaledDotProductAttentionPacked
+        | FlashAttentionBackwardExtract { .. }
+        | FlashAttentionBackwardExtractPacked { .. } => {
             SaveRequirements { needs_inputs: true, needs_output: true }
         }
         CrossEntropyLoss | MSELoss | L1Loss => SaveRequirements {

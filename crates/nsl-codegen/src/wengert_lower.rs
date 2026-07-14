@@ -224,6 +224,135 @@ fn free_tensor_if_owned(
     Ok(())
 }
 
+/// PCA Stage C: emit the fused-forward runtime dispatch for a decorator-free
+/// SDPA op (plain or packed).
+///
+/// Emits the per-head_dim variant select (equality chain on the runtime
+/// head_dim, mirroring the backward table's pattern), the
+/// `nsl_sdpa_fused_forward` call, and the decline branch:
+///
+/// ```text
+///   list = nsl_sdpa_fused_forward(...)
+///   brif list != 0 -> fused_block, decomp_block
+///   fused_block:  out = list[0]; lse = list[1]; free list; jump join(out, lse)
+///   decomp_block: <caller emits the decomposed chain>; jump join(out, 0)
+///   join(out, lse): ...
+/// ```
+///
+/// Returns `Ok(None)` when the variant table is empty (non-CUDA target) —
+/// the caller then lowers the decomposed chain in the CURRENT block with no
+/// branching, exactly as before Stage C. Otherwise returns
+/// `Ok(Some((join_block, out_param, lse_param)))` with the builder
+/// positioned at the START of the decline block: the caller emits its
+/// decomposed chain there, jumps to `join_block` with
+/// `[decomposed_result, iconst 0]`, seals `join_block`, switches to it, and
+/// uses the two params as (result, lse).
+#[allow(clippy::too_many_arguments)]
+fn emit_sdpa_fused_dispatch(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    q: Value,
+    k: Value,
+    v: Value,
+    scale_bits: Value,
+    causal: bool,
+    segment_ids: Option<Value>,
+) -> Result<Option<(cranelift_codegen::ir::Block, Value, Value)>, CodegenError> {
+    let segment_masked = segment_ids.is_some();
+    let variants = compiler.ensure_sdpa_fwd_variant_table(causal, segment_masked)?;
+    if variants.is_empty() {
+        return Ok(None);
+    }
+
+    // Runtime head_dim from Q ([b, h, s, d]).
+    let dim3 = builder.ins().iconst(cl_types::I64, 3);
+    let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
+
+    // Variant select: equality chain on head_dim. Unmatched dims leave all
+    // selectors zero → the FFI declines → decomposed fallback.
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let mut sel_base_ptx = zero;
+    let mut sel_base_name = zero;
+    let mut sel_tb_ptx = zero;
+    let mut sel_tb_name = zero;
+    let mut sel_bq = zero;
+    let mut sel_bkv = zero;
+    let mut sel_smem = zero;
+    for variant in &variants {
+        let is_hd = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, head_dim, variant.head_dim);
+        let base_ptx_gv = compiler
+            .module
+            .declare_data_in_func(variant.base_ptx, builder.func);
+        let base_ptx_addr = builder.ins().symbol_value(cl_types::I64, base_ptx_gv);
+        sel_base_ptx = builder.ins().select(is_hd, base_ptx_addr, sel_base_ptx);
+        let base_name_gv = compiler
+            .module
+            .declare_data_in_func(variant.base_name, builder.func);
+        let base_name_addr = builder.ins().symbol_value(cl_types::I64, base_name_gv);
+        sel_base_name = builder.ins().select(is_hd, base_name_addr, sel_base_name);
+        // Tier-B pair: present only on segment_masked tables. The sentinel
+        // discipline (both-zero or both-nonzero) is preserved per variant.
+        if let (Some(tb_ptx), Some(tb_name)) = (variant.tier_b_ptx, variant.tier_b_name) {
+            let tb_ptx_gv = compiler.module.declare_data_in_func(tb_ptx, builder.func);
+            let tb_ptx_addr = builder.ins().symbol_value(cl_types::I64, tb_ptx_gv);
+            sel_tb_ptx = builder.ins().select(is_hd, tb_ptx_addr, sel_tb_ptx);
+            let tb_name_gv = compiler.module.declare_data_in_func(tb_name, builder.func);
+            let tb_name_addr = builder.ins().symbol_value(cl_types::I64, tb_name_gv);
+            sel_tb_name = builder.ins().select(is_hd, tb_name_addr, sel_tb_name);
+        }
+        let bq = builder.ins().iconst(cl_types::I64, variant.block_q);
+        sel_bq = builder.ins().select(is_hd, bq, sel_bq);
+        let bkv = builder.ins().iconst(cl_types::I64, variant.block_kv);
+        sel_bkv = builder.ins().select(is_hd, bkv, sel_bkv);
+        let smem = builder.ins().iconst(cl_types::I64, variant.smem_bytes);
+        sel_smem = builder.ins().select(is_hd, smem, sel_smem);
+    }
+
+    let causal_val = builder.ins().iconst(cl_types::I64, i64::from(causal));
+    let seg_val = segment_ids.unwrap_or(zero);
+
+    // 13-arg fused-forward FFI. Returns NslList* [out, lse] or 0 (decline).
+    let list = call(
+        compiler,
+        builder,
+        "nsl_sdpa_fused_forward",
+        &[
+            q, k, v, scale_bits, causal_val, seg_val, sel_base_ptx, sel_base_name, sel_tb_ptx,
+            sel_tb_name, sel_bq, sel_bkv, sel_smem,
+        ],
+    )?;
+
+    let fused_block = builder.create_block();
+    let decomp_block = builder.create_block();
+    let join_block = builder.create_block();
+    let out_param = builder.append_block_param(join_block, cl_types::I64);
+    let lse_param = builder.append_block_param(join_block, cl_types::I64);
+
+    let took_fused = builder.ins().icmp_imm(IntCC::NotEqual, list, 0);
+    builder
+        .ins()
+        .brif(took_fused, fused_block, &[], decomp_block, &[]);
+
+    // Fused: unpack [out, lse] and free the (element-preserving) list.
+    builder.switch_to_block(fused_block);
+    builder.seal_block(fused_block);
+    let idx0 = builder.ins().iconst(cl_types::I64, 0);
+    let fused_out = call(compiler, builder, "nsl_list_get", &[list, idx0])?;
+    let idx1 = builder.ins().iconst(cl_types::I64, 1);
+    let fused_lse = call(compiler, builder, "nsl_list_get", &[list, idx1])?;
+    let _ = call(compiler, builder, "nsl_list_free", &[list])?;
+    builder.ins().jump(join_block, &[fused_out, fused_lse]);
+
+    // Decline: the caller emits the decomposed chain here, then jumps to
+    // join_block with [decomposed_result, 0] and seals it.
+    builder.switch_to_block(decomp_block);
+    builder.seal_block(decomp_block);
+
+    Ok(Some((join_block, out_param, lse_param)))
+}
+
 /// Promote an Integer (i64) to a scalar Tensor if needed for mixed-type arithmetic.
 fn promote_to_tensor(
     compiler: &mut Compiler,
@@ -1627,6 +1756,30 @@ fn lower_single_op(
                 )
             };
 
+            // Scale item hoisted ahead of the fused dispatch: both the fused
+            // FFI (as f32 bits) and the decomposed chain (as f64) consume it.
+            let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
+            free_tensor_if_owned(compiler, builder, scale, free_scale)?;
+
+            // PCA Stage C: fused-forward dispatch (the forward analog of
+            // PR #347's backward variant table). Decorator-free compiles
+            // only — a decorated module's SDPA is owned by the
+            // @flash_attention context machinery (and the decorator-free
+            // backward keys its variant-table path off context==None, so
+            // the forward must fork on exactly the same condition).
+            let fused = if compiler.kernels.flash_attention_context.is_none() {
+                let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
+                let scale_bits_i32 = builder.ins().bitcast(
+                    cl_types::I32,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    scale_f32,
+                );
+                let scale_bits = builder.ins().uextend(cl_types::I64, scale_bits_i32);
+                emit_sdpa_fused_dispatch(compiler, builder, q, k, v, scale_bits, *causal, None)?
+            } else {
+                None
+            };
+
             // K_T = transpose(K, -2, -1)
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
@@ -1641,7 +1794,6 @@ fn lower_single_op(
             let attn_flags0_qk = builder.ins().iconst(cl_types::I8, 0);
             let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t, attn_flags0_qk])?;
             // scaled = scores * scale
-            let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
             let wl_flags0_mulsc = builder.ins().iconst(cl_types::I8, 0);
             let scaled = call(
                 compiler,
@@ -1649,7 +1801,6 @@ fn lower_single_op(
                 "nsl_tensor_mul_scalar",
                 &[scores, scale_item, wl_flags0_mulsc],
             )?;
-            free_tensor_if_owned(compiler, builder, scale, free_scale)?;
 
             // Apply causal mask if needed
             let masked = if *causal {
@@ -1679,13 +1830,6 @@ fn lower_single_op(
             free_tensor_value(compiler, builder, masked)?;
             free_tensor_value(compiler, builder, attn_weights)?;
 
-            // Store the forward output in the side-channel for the backward.
-            // The logsumexp is NOT pre-computed here; the backward runtime
-            // auto-computes it when logsumexp_ptr == 0.
-            // We store (result, null) where null signals "no pre-computed lse".
-            let null_lse = builder.ins().iconst(cl_types::I64, 0);
-            compiler.flash_attn_aux.insert(result, (result, null_lse));
-
             // NOTE: save-buffer allocation for claimed chains is handled
             // above by option 3a's `emit_fused_forward_under_claim` —
             // that path emits `nsl_flash_attention_csha_with_saves`
@@ -1698,6 +1842,225 @@ fn lower_single_op(
             // buffers (the backward consumer for them is the classic
             // `FlashAttentionBackwardExtract` / `nsl_flash_attention_backward`
             // path, not `FusedCshaBackward`).  So no save-alloc here.
+
+            match fused {
+                Some((join_block, out_param, lse_param)) => {
+                    // Close the decline block and merge with the fused edge.
+                    // The side-channel stores the join's (out, lse): the lse
+                    // is the fused kernel's saved logsumexp, or runtime 0
+                    // when the decomposed fallback ran (backward then
+                    // recomputes it, exactly as before Stage C).
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.ins().jump(join_block, &[result, zero]);
+                    builder.seal_block(join_block);
+                    builder.switch_to_block(join_block);
+                    compiler
+                        .flash_attn_aux
+                        .insert(out_param, (out_param, lse_param));
+                    Ok(out_param)
+                }
+                None => {
+                    // Non-CUDA target or decorated module: single-path
+                    // decomposition, (result, null-lse) side-channel as
+                    // before.
+                    let null_lse = builder.ins().iconst(cl_types::I64, 0);
+                    compiler.flash_attn_aux.insert(result, (result, null_lse));
+                    Ok(result)
+                }
+            }
+        }
+        PrimalOp::ScaledDotProductAttentionPacked => {
+            // PCA Stage C: packed-sequence attention.
+            //   inputs: [q, k, v, scale, mask, segment_ids]
+            // Fused path: segment-masked v2 flash kernel (causal-within-doc
+            // derived from segment_ids in-kernel; saves LSE for backward;
+            // Tier-B tile-skip variant when the runtime gate admits it).
+            // Decline path: the Stage-B decomposed additive-mask chain —
+            // numerically identical because exp((s - 1e9) - lse)
+            // underflows to +0.0 (see the PrimalOp contract).
+            //
+            // No CSHA-claim consultation here: claims target the plain
+            // `ScaledDotProductAttention` op only, and the CSHA fused
+            // family has no packed-mask semantics.
+            let q = inputs[0];
+            let k = inputs[1];
+            let v = inputs[2];
+            let mask = inputs[4];
+            let seg = inputs[5];
+
+            let scale_ty = op
+                .inputs
+                .get(3)
+                .and_then(|vid| var_types.get(vid).copied())
+                .unwrap_or(WengertType::Tensor);
+            let (scale, free_scale) = promote_to_tensor(compiler, builder, inputs[3], scale_ty)?;
+            let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
+            free_tensor_if_owned(compiler, builder, scale, free_scale)?;
+
+            let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
+            let scale_bits_i32 = builder.ins().bitcast(
+                cl_types::I32,
+                cranelift_codegen::ir::MemFlags::new(),
+                scale_f32,
+            );
+            let scale_bits = builder.ins().uextend(cl_types::I64, scale_bits_i32);
+
+            // Packed masks are causal-within-document by contract, so the
+            // fused kernel is always built causal=true.
+            let fused = emit_sdpa_fused_dispatch(
+                compiler, builder, q, k, v, scale_bits, true, Some(seg),
+            )?;
+
+            // Decomposed fallback: softmax((Q @ K.T) * scale + mask) @ V.
+            let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
+            let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
+            let k_t = call(
+                compiler,
+                builder,
+                "nsl_tensor_transpose",
+                &[k, dim_m2, dim_m1],
+            )?;
+            let flags0_qk = builder.ins().iconst(cl_types::I8, 0);
+            let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t, flags0_qk])?;
+            let flags0_mulsc = builder.ins().iconst(cl_types::I8, 0);
+            let scaled = call(
+                compiler,
+                builder,
+                "nsl_tensor_mul_scalar",
+                &[scores, scale_item, flags0_mulsc],
+            )?;
+            // masked = scaled + mask (additive [b,1,s,s] broadcast over
+            // heads; REPLACES causal — the packed mask already encodes
+            // within-doc causality).
+            let flags0_add = builder.ins().iconst(cl_types::I8, 0);
+            let masked = call(compiler, builder, "nsl_tensor_add", &[scaled, mask, flags0_add])?;
+            let attn = call(compiler, builder, "nsl_tensor_softmax", &[masked, dim_m1])?;
+            let flags0_av = builder.ins().iconst(cl_types::I8, 0);
+            let result = call(compiler, builder, "nsl_tensor_matmul", &[attn, v, flags0_av])?;
+            free_tensor_value(compiler, builder, k_t)?;
+            free_tensor_value(compiler, builder, scores)?;
+            free_tensor_value(compiler, builder, scaled)?;
+            free_tensor_value(compiler, builder, masked)?;
+            free_tensor_value(compiler, builder, attn)?;
+
+            match fused {
+                Some((join_block, out_param, lse_param)) => {
+                    let zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.ins().jump(join_block, &[result, zero]);
+                    builder.seal_block(join_block);
+                    builder.switch_to_block(join_block);
+                    compiler
+                        .flash_attn_aux
+                        .insert(out_param, (out_param, lse_param));
+                    Ok(out_param)
+                }
+                None => {
+                    let null_lse = builder.ins().iconst(cl_types::I64, 0);
+                    compiler.flash_attn_aux.insert(result, (result, null_lse));
+                    Ok(result)
+                }
+            }
+        }
+        PrimalOp::FlashAttentionBackwardExtractPacked { component } => {
+            // PCA Stage C: segment-masked attention backward.
+            //   inputs: [dout, q, k, v, fwd_out, segment_ids]
+            // Identical structure to FlashAttentionBackwardExtract below,
+            // with three differences: the `_segmask` variant table
+            // (causal=true, segment_masked=true), the saved LSE from the
+            // fused forward's side-channel (runtime 0 when the decomposed
+            // fallback ran — the runtime then refuses the GPU phase-2 and
+            // takes the segment-aware CPU reference), and the segment
+            // tensor as the 19th FFI argument.
+            let dout = inputs[0];
+            let q = inputs[1];
+            let k = inputs[2];
+            let v = inputs[3];
+            let fwd_out = inputs[4];
+            let seg = inputs[5];
+
+            let list_val = if let Some(&cached) = compiler.flash_attn_bwd_cache.get(&fwd_out) {
+                cached
+            } else {
+                // Scale from Q's head_dim: 1/sqrt(hd) — same derivation
+                // (and same stdlib-default-scale assumption) as the plain
+                // extract arm below.
+                let dim3 = builder.ins().iconst(cl_types::I64, 3);
+                let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
+                let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, head_dim);
+                let hd_sqrt = builder.ins().sqrt(hd_f64);
+                let one_f64 = builder.ins().f64const(1.0);
+                let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
+                let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
+                let scale_bits_i32 = builder.ins().bitcast(
+                    cl_types::I32,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    scale_f32,
+                );
+                let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
+
+                let dim0 = builder.ins().iconst(cl_types::I64, 0);
+                let dim1 = builder.ins().iconst(cl_types::I64, 1);
+                let dim2 = builder.ins().iconst(cl_types::I64, 2);
+                let batch = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim0])?;
+                let heads = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim1])?;
+                let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim2])?;
+
+                // Saved LSE from the fused forward (join-block param), or 0
+                // when the forward decomposed at compile time. This is a
+                // RUNTIME value: 0 exactly when the fused launch declined.
+                let lse = compiler
+                    .flash_attn_aux
+                    .get(&fwd_out)
+                    .map(|&(_, l)| l)
+                    .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+
+                let causal_val = builder.ins().iconst(cl_types::I64, 1);
+
+                let variants = compiler.ensure_sdpa_bwd_variant_table(true, true)?;
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                let mut sel = [zero; 4];
+                for variant in &variants {
+                    let is_hd = builder.ins().icmp_imm(
+                        IntCC::Equal,
+                        head_dim,
+                        variant.head_dim,
+                    );
+                    let ids = [
+                        variant.phase1_ptx,
+                        variant.phase1_name,
+                        variant.phase2_ptx,
+                        variant.phase2_name,
+                    ];
+                    for (slot, id) in sel.iter_mut().zip(ids) {
+                        let gv = compiler.module.declare_data_in_func(id, builder.func);
+                        let addr = builder.ins().symbol_value(cl_types::I64, gv);
+                        *slot = builder.ins().select(is_hd, addr, *slot);
+                    }
+                }
+                let (p1_ptx, p1_name, p2_ptx, p2_name) = (sel[0], sel[1], sel[2], sel[3]);
+
+                let [tier_b_ptx, tier_b_name] =
+                    crate::pca_tier_b::tier_b_disabled_sentinel(builder);
+                let list = call(
+                    compiler,
+                    builder,
+                    "nsl_flash_attention_backward",
+                    &[dout, q, k, v, fwd_out, lse,
+                      scale_bits, batch, heads, seq_len, head_dim,
+                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name,
+                      tier_b_ptx, tier_b_name, seg],
+                )?;
+                compiler.flash_attn_bwd_cache.insert(fwd_out, list);
+                list
+            };
+
+            let idx = builder.ins().iconst(cl_types::I64, *component as i64);
+            let result = call(compiler, builder, "nsl_list_get", &[list_val, idx])?;
+
+            if *component == 2 {
+                let _ = call(compiler, builder, "nsl_list_free", &[list_val])?;
+                compiler.flash_attn_bwd_cache.remove(&fwd_out);
+            }
 
             Ok(result)
         }
@@ -1740,8 +2103,16 @@ fn lower_single_op(
                 let heads = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim1])?;
                 let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim2])?;
 
-                // Logsumexp: pass 0 to signal "auto-compute in the runtime"
-                let lse_null = builder.ins().iconst(cl_types::I64, 0);
+                // Logsumexp: the fused forward (PCA Stage C dispatch) saves
+                // it in the side-channel as a runtime value — 0 exactly when
+                // the decomposed fallback ran, which tells the runtime to
+                // recompute it (device-resident FLASH_LSE, PR #354), i.e.
+                // the pre-Stage-C behavior.
+                let lse_null = compiler
+                    .flash_attn_aux
+                    .get(&fwd_out)
+                    .map(|&(_, l)| l)
+                    .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
 
                 let causal_val = builder.ins().iconst(cl_types::I64, if *causal { 1 } else { 0 });
 
@@ -1774,7 +2145,7 @@ fn lower_single_op(
                     }
                     (ptrs[0], ptrs[1], ptrs[2], ptrs[3])
                 } else {
-                    let variants = compiler.ensure_sdpa_bwd_variant_table(*causal)?;
+                    let variants = compiler.ensure_sdpa_bwd_variant_table(*causal, false)?;
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let mut sel = [zero; 4];
                     for variant in &variants {
@@ -1805,6 +2176,9 @@ fn lower_single_op(
                 // literals are what let the pre-fix 16-arg call rot silently).
                 let [tier_b_ptx, tier_b_name] =
                     crate::pca_tier_b::tier_b_disabled_sentinel(builder);
+                // 19th arg (PCA Stage C): segment tensor — always 0 on the
+                // plain (non-packed) path.
+                let seg_none = builder.ins().iconst(cl_types::I64, 0);
                 let list = call(
                     compiler,
                     builder,
@@ -1812,7 +2186,7 @@ fn lower_single_op(
                     &[dout, q, k, v, fwd_out, lse_null,
                       scale_bits, batch, heads, seq_len, head_dim,
                       causal_val, p1_ptx, p1_name, p2_ptx, p2_name,
-                      tier_b_ptx, tier_b_name],
+                      tier_b_ptx, tier_b_name, seg_none],
                 )?;
                 compiler.flash_attn_bwd_cache.insert(fwd_out, list);
                 list
@@ -3944,6 +4318,8 @@ mod tests {
                 causal: false,
                 component: 0,
             },
+            PrimalOp::ScaledDotProductAttentionPacked,
+            PrimalOp::FlashAttentionBackwardExtractPacked { component: 0 },
             PrimalOp::CshaFusedBackwardExtract { component: 0 },
             PrimalOp::FusedCshaBackward {
                 layer: "blocks.0".into(),
@@ -3975,10 +4351,10 @@ mod tests {
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 55 variants total (including markers) — bumped by CFTP §4.4 G3
-        // (Sprint 4) FusedLinearCe + FusedLinearCeBackwardExtract on top of
-        // Gap D's FusedCshaBackward.
-        assert_eq!(ops.len(), 55);
+        // 57 variants total (including markers) — bumped by PCA Stage C's
+        // ScaledDotProductAttentionPacked + FlashAttentionBackwardExtractPacked
+        // on top of CFTP §4.4 G3's FusedLinearCe pair.
+        assert_eq!(ops.len(), 57);
     }
 
     #[test]

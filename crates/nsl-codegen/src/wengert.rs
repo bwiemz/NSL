@@ -208,6 +208,34 @@ pub enum PrimalOp {
         causal: bool,
         component: u8,
     },
+    /// PCA Stage C: packed-sequence attention — causal WITHIN each document,
+    /// fully blocked across documents (`softmax((QK^T)*scale + mask) @ V`).
+    ///
+    /// inputs: `[q, k, v, scale, mask, segment_ids]`.
+    ///
+    /// CONTRACT: `mask` must be the DataLoader's canonical packed mask
+    /// (additive `[b, 1, s, s]`, 0 = attend / -1e9 = blocked, encoding
+    /// causal-within-`segment_ids`). The fused GPU lowering derives masking
+    /// from `segment_ids` + in-kernel causality and IGNORES `mask`; the
+    /// decomposed fallback applies `mask` additively. The two agree exactly
+    /// because `exp((s - 1e9) - lse)` underflows to +0.0 — but only when
+    /// the mask really is causal-within-segment. Arbitrary masks belong to
+    /// `scaled_dot_product_attention_masked` (always decomposed).
+    ///
+    /// `mask` and `segment_ids` are non-differentiable inputs: no adjoint
+    /// is produced for either (Stage B's decomposed form produced — and
+    /// discarded — a mask adjoint; this op never materialises one).
+    ScaledDotProductAttentionPacked,
+    /// PCA Stage C: extract one component (0=dQ, 1=dK, 2=dV) from the
+    /// segment-masked FlashAttention backward (`_segmask` phase-2 kernels,
+    /// 19-arg `nsl_flash_attention_backward` with the segment tensor).
+    ///
+    /// inputs: `[dout, q, k, v, fwd_out, segment_ids]`. Causality is
+    /// implied (packed masks are causal-within-document by contract), so
+    /// no `causal` field: the variant table is always built causal=true.
+    FlashAttentionBackwardExtractPacked {
+        component: u8,
+    },
     /// Gap C (extended by Gap I.5 Option A): extract one component from the
     /// fused CSHA backward kernel.
     ///

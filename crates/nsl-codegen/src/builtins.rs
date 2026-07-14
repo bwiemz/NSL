@@ -1316,6 +1316,31 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // phase2_name_ptr
             types::I64, // tier_b_ptx_ptr (planner spec §4 sentinel pair;
             types::I64, // tier_b_name_ptr  both 0 = no Tier-B-on variant)
+            types::I64, // segment_ids (PCA Stage C: NslTensor* [b,s], 0 = plain)
+        ],
+        Some(types::I64),
+    ),
+    // PCA Stage C: plain fused SDPA forward with saves. Launches the v2
+    // scalar forward (csha: None) selected by the wengert lowering's
+    // per-head_dim variant table; returns an NslList* [out, lse] or 0 to
+    // DECLINE (caller's decomposed fallback runs). segment_ids != 0 selects
+    // the segment-masked kernel family (packed attention); the Tier-B pair
+    // is the tile-skip variant behind the runtime gate. Keep in lock-step
+    // with `nsl_sdpa_fused_forward` in nsl-runtime/src/flash_attention.rs.
+    (
+        "nsl_sdpa_fused_forward",
+        &[
+            types::I64, types::I64, types::I64, // q, k, v (NslTensor*)
+            types::I64, // scale_bits (f32 as i64)
+            types::I64, // causal
+            types::I64, // segment_ids (NslTensor* [b,s] or 0)
+            types::I64, // ptx_ptr (base kernel; 0 = decline)
+            types::I64, // name_ptr
+            types::I64, // tier_b_ptx_ptr (sentinel pair, both 0 = none)
+            types::I64, // tier_b_name_ptr
+            types::I64, // block_q
+            types::I64, // block_kv
+            types::I64, // shared_mem_bytes
         ],
         Some(types::I64),
     ),
