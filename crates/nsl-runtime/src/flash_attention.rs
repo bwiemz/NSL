@@ -562,6 +562,11 @@ fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
 /// PTX variant at codegen time; the runtime accepts it for call-site
 /// symmetry and diagnostics only.
 ///
+/// Output dtype: the v2 kernel STORES its output as f16 (and its
+/// logsumexp as f32). The kernel writes an internal f16 staging buffer,
+/// and the runtime widens on-device (`csha_fwd_convert_f16_to_f32`) into
+/// the f32 tensor this FFI returns — callers always see f32.
+///
 /// Tier-B sentinel discipline matches the other `nsl_flash_attention*`
 /// entries (planner spec §4): the pair must agree, and Tier-B-on can only
 /// fire on the segment path (the runtime gate requires a non-null device
@@ -681,10 +686,24 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         // Output + logsumexp buffers, zeroed (mirrors the backward's
         // alloc_managed discipline; ownership passes to the returned
         // tensors on success, freed on the loud launch-failure path).
+        //
+        // Output dtype: the v2 forward epilogue stores its result as
+        // **f16** (`cvt.rn.f16.f32` + `st.global.b16` in
+        // flash_attention_v2/phases/forward/finalize.rs) while the
+        // decomposed graph consumes f32. The kernel therefore writes into
+        // an f16 STAGING buffer and `csha_fwd_convert_f16_to_f32` widens
+        // into the final f32 tensor after the launch. Wrapping the raw
+        // kernel output as f32 was the Stage-C parity bug: f16 bit pairs
+        // reinterpreted as f32 are ~0, the attention output collapses,
+        // and the first-step loss lands at ~ln(vocab) instead of the
+        // decomposed value. logsumexp is stored f32 by the kernel — no
+        // staging needed.
         let total_out = (b * h * s * d) as usize;
         let total_lse = (b * h * s) as usize;
         let out_data = inner::alloc_managed(total_out * 4);
         inner::memset_d8(out_data, total_out * 4);
+        let out_f16 = inner::alloc_managed(total_out * 2);
+        inner::memset_d8(out_f16, total_out * 2);
         let lse_data = inner::alloc_managed(total_lse * 4);
         inner::memset_d8(lse_data, total_lse * 4);
 
@@ -714,7 +733,9 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         let mut q = q_t.data as u64;
         let mut k = k_t.data as u64;
         let mut v = v_t.data as u64;
-        let mut out = out_data as u64;
+        // Kernel writes f16 — point it at the staging buffer, NOT the
+        // final f32 tensor (see the output-dtype comment above).
+        let mut out = out_f16 as u64;
         let mut sc = f32::from_bits(scale_bits as u32);
         let mut bb = b as u64;
         let mut hh = h as u64;
@@ -812,21 +833,24 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             shared_mem_bytes as u32,
         );
 
-        // Segment path only: synchronize so the staged segment buffer can
-        // be freed (the kernel reads segment ids from global memory while
-        // running) — and, as a bonus, surface asynchronous execution
-        // faults. The unmasked path mirrors `nsl_flash_attention`: no
-        // post-launch sync on the hot path — in-stream ordering protects
-        // every downstream consumer, and NSL_CUDA_SYNC (honored inside
-        // `kernel_launch`) remains the debug knob for async-fault
-        // isolation.
-        let sync_rc = if !seg_dev.is_null() {
-            unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+        // Widen the f16 staging output into the final f32 tensor. Same
+        // stream as the forward launch, so in-stream ordering guarantees
+        // the conversion sees the completed forward — no intermediate
+        // sync needed.
+        let conv_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            csha_fwd_convert_f16_to_f32(out_f16 as u64, out_data, total_out)
         } else {
-            cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            rc
         };
 
+        // Synchronize before freeing the in-flight scratch buffers (the
+        // f16 staging output on every call; the staged segment ids on the
+        // packed path) — and surface asynchronous execution faults while
+        // at it.
+        let sync_rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+
         if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            || conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
             || sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
         {
             // The one LOUD decline: an unwritten output buffer must never
@@ -835,21 +859,25 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             // every attention op of every step on an unlaunchable config.
             flash_bwd_warn_once(&format!(
                 "[sdpa-fused] fused SDPA forward kernel launch FAILED \
-                 (launch rc {:?}, sync rc {:?}; b={b}, h={h}, s={s}, d={d}, \
-                 segmented={}) — declining so the caller falls back to the \
-                 decomposed SDPA graph (correct, slower). Check the PTX \
-                 with nsl_test_cuda_jit_log.",
+                 (launch rc {:?}, f16-widen rc {:?}, sync rc {:?}; b={b}, \
+                 h={h}, s={s}, d={d}, segmented={}) — declining so the \
+                 caller falls back to the decomposed SDPA graph (correct, \
+                 slower). Check the PTX with nsl_test_cuda_jit_log.",
                 rc,
+                conv_rc,
                 sync_rc,
                 !seg_dev.is_null(),
             ));
+            inner::free_managed(out_f16);
             inner::free_managed(seg_dev);
             inner::free_managed(out_data);
             inner::free_managed(lse_data);
             return 0;
         }
 
-        // Kernel finished — the staged segment ids are dead.
+        // Kernels finished — the f16 staging output and the staged
+        // segment ids are dead.
+        inner::free_managed(out_f16);
         inner::free_managed(seg_dev);
 
         // Once-per-process launch marker (see "Observability" above).

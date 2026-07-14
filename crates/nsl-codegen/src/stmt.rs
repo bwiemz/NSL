@@ -4485,6 +4485,19 @@ impl Compiler<'_> {
         // from unified memory page faults.
         if has_dataloader.is_some() {
             let batch_val = builder.use_var(step_param_var);
+            // PCA Stage C GPU fix: align packed-batch mask/segment tensors to
+            // the params' device BEFORE anything consumes them. Without this,
+            // a GPU model adding the HOST attention_mask drags the whole
+            // attention chain onto the CPU (f64), and FASE later aborts
+            // accumulating a CPU-f64 grad into a GPU-f32 m_partial. Runtime
+            // no-ops on CPU models / unpacked batches. Runs BEFORE the
+            // packing-registry stash below so the registry sees post-move
+            // data pointers.
+            self.compile_call_by_name(
+                builder,
+                "nsl_packed_batch_align_device",
+                &[batch_val, param_list],
+            )?;
             // Prefetch input_ids and labels from the batch dict
             let k_ids = self.compile_string_literal(builder, "input_ids")?;
             let k_lbl = self.compile_string_literal(builder, "labels")?;

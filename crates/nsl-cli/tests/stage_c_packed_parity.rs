@@ -102,7 +102,13 @@ fn run_program(source: &str, tag: &str, cuda: bool, extra_env: &[(&str, &str)], 
             "LOSS_STREAM_BEGIN" => in_stream = true,
             "LOSS_STREAM_END" => in_stream = false,
             t if in_stream => {
-                if let Ok(v) = t.parse::<f64>() {
+                // CPU losses print as bare floats; GPU losses print as
+                // `tensor([X])` (device-resident scalar repr).
+                let inner = t
+                    .strip_prefix("tensor([")
+                    .and_then(|s| s.strip_suffix("])"))
+                    .unwrap_or(t);
+                if let Ok(v) = inner.parse::<f64>() {
                     losses.push(v);
                 }
             }

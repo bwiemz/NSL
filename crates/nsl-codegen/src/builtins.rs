@@ -1344,6 +1344,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // PCA Stage C: align packed-batch mask/segment tensors to the params'
+    // device at step start (train-block batch prep). No-op for CPU models
+    // and unpacked batches. Keep in lock-step with
+    // `nsl_packed_batch_align_device` in nsl-runtime/src/packing.rs.
+    (
+        "nsl_packed_batch_align_device",
+        &[
+            types::I64, // batch dict (NslDict*)
+            types::I64, // param list (NslList*) — device reference
+        ],
+        Some(types::I64),
+    ),
     // CFTP §4.4 G3 (Sprint 4): fused linear-CE FFI signatures.
     // Sprint v3-2 added trailing `dtype_tag` (0=F32 sentinel preserves
     // pre-v3-2 ABI; 1=F16). Sprint v4-1 extended the sentinel space
