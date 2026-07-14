@@ -4144,34 +4144,31 @@ impl Compiler<'_> {
                 //   layer-uniform WGGO decision must not override; and a
                 //   CPDT FP16 tier the WGGO layer kept at 32 bits is
                 //   likewise deferred to the more conservative choice.
-                match (wggo_bits, cpdt_lists) {
-                    (Some(_), _) | (_, Some(_))
-                        if !self.compile_options.wggo.moment_precision
-                            && self.wggo_overrides.is_some() =>
-                    {
-                        // WGGO ran but the lowering is not opted in: keep
-                        // FP32 moments and say so (covers both the plan-bits
-                        // and the CPDT-plan source — under WGGO the plan is
-                        // the arbiter).
+                // - When WGGO made NO moment-bit decision for this block at
+                //   all (it may still be active for unrelated reasons —
+                //   structural pruning, CSHA fusion, packing), an
+                //   independent CPDT PrecisionPlan is not gated on the
+                //   opt-in flag: there is nothing for it to arbitrate
+                //   against. See `arbitrate_moment_precision`.
+                use crate::cpdt_precision_exec::{
+                    arbitrate_moment_precision, MomentPrecisionArbitration as MPA, DTYPE_F32,
+                };
+                match arbitrate_moment_precision(
+                    wggo_bits,
+                    cpdt_lists,
+                    self.compile_options.wggo.moment_precision,
+                ) {
+                    MPA::NotLoweredNoOptIn => {
                         eprintln!(
-                            "[cpdt] optimizer-moment precision NOT lowered: plan \
-                             carries reduced-precision m/v decisions but \
+                            "[cpdt] optimizer-moment precision NOT lowered: WGGO's \
+                             plan carries reduced-precision m/v decisions but \
                              --wggo-moment-precision was not passed (opt-in; \
                              v1 cast envelope is CPU-only). Moments stay FP32."
                         );
                         None
                     }
-                    (Some((wm, wv)), Some((cm, cv))) => {
-                        let f32c = crate::cpdt_precision_exec::DTYPE_F32;
-                        let merge = |a: &[u16], b: &[u16]| -> Vec<u16> {
-                            a.iter()
-                                .zip(b)
-                                .map(|(&x, &y)| if x == f32c || y == f32c { f32c } else { x })
-                                .collect()
-                        };
-                        let m = merge(&wm, &cm);
-                        let v = merge(&wv, &cv);
-                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != f32c).count();
+                    MPA::Merged(m, v) => {
+                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
                         eprintln!(
                             "[cpdt] WGGO optimizer-moment precision active \
                              (merged with the CPDT per-param plan, F32 wins): \
@@ -4181,9 +4178,8 @@ impl Compiler<'_> {
                         );
                         Some((m, v))
                     }
-                    (Some((m, v)), None) => {
-                        let f32c = crate::cpdt_precision_exec::DTYPE_F32;
-                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != f32c).count();
+                    MPA::WggoOnly(m, v) => {
+                        let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
                         eprintln!(
                             "[cpdt] WGGO optimizer-moment precision active: {sub32} \
                              moment buffer(s) in FP16 storage (8-bit clamps to FP16 \
@@ -4193,7 +4189,8 @@ impl Compiler<'_> {
                         );
                         Some((m, v))
                     }
-                    (None, cpdt) => cpdt,
+                    MPA::CpdtOnly(m, v) => Some((m, v)),
+                    MPA::Inactive => None,
                 }
             };
             if let Some((m_codes, v_codes)) = dtype_data {

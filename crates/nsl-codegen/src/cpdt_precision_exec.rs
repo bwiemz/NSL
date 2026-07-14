@@ -175,6 +175,65 @@ pub fn precision_active(
         && wrapped_path_active
 }
 
+/// Outcome of arbitrating WGGO's per-layer moment-bit decision against
+/// CPDT's per-param `PrecisionPlan` for the optimizer-state (m/v) dtype
+/// lists. Kept distinct (rather than collapsing straight to
+/// `Option<(Vec<u16>, Vec<u16>)>`) so the caller can emit a diagnostic
+/// that names which source(s) actually decided.
+pub enum MomentPrecisionArbitration {
+    /// WGGO decided sub-32-bit moments for this block but
+    /// `--wggo-moment-precision` was not passed: stay conservative and
+    /// drop BOTH sources (CPDT's plan included) rather than let CPDT
+    /// silently diverge from WGGO's stated decision.
+    NotLoweredNoOptIn,
+    /// Both sources are live and opted in: merged conservatively (F32
+    /// wins per param).
+    Merged(Vec<u16>, Vec<u16>),
+    /// Only WGGO decided (opted in).
+    WggoOnly(Vec<u16>, Vec<u16>),
+    /// Only CPDT decided. Independent of WGGO — applies unconditionally,
+    /// including when WGGO ran on this block for an unrelated reason
+    /// (e.g. structural pruning, CSHA fusion) and made no moment-bit
+    /// decision of its own.
+    CpdtOnly(Vec<u16>, Vec<u16>),
+    /// Neither source decided anything; moments stay FP32.
+    Inactive,
+}
+
+/// Arbitrate WGGO's per-layer moment-bit decision (`wggo_bits`, `None`
+/// unless WGGO itself chose sub-32-bit moments for this train block)
+/// against CPDT's per-param `PrecisionPlan` (`cpdt_lists`).
+///
+/// `wggo_bits.is_some()` is the correct gate for the opt-in requirement —
+/// NOT "WGGO ran on this block at all". WGGO can be active for entirely
+/// unrelated reasons (head pruning, CSHA fusion, packing) without ever
+/// deciding anything about optimizer-moment precision; in that case
+/// `wggo_bits` is `None` and an independent CPDT plan must not be
+/// silently discarded just because WGGO happened to run.
+pub fn arbitrate_moment_precision(
+    wggo_bits: Option<(Vec<u16>, Vec<u16>)>,
+    cpdt_lists: Option<(Vec<u16>, Vec<u16>)>,
+    wggo_moment_precision_opt_in: bool,
+) -> MomentPrecisionArbitration {
+    match (wggo_bits, cpdt_lists) {
+        (Some(_), _) if !wggo_moment_precision_opt_in => {
+            MomentPrecisionArbitration::NotLoweredNoOptIn
+        }
+        (Some((wm, wv)), Some((cm, cv))) => {
+            let merge = |a: &[u16], b: &[u16]| -> Vec<u16> {
+                a.iter()
+                    .zip(b)
+                    .map(|(&x, &y)| if x == DTYPE_F32 || y == DTYPE_F32 { DTYPE_F32 } else { x })
+                    .collect()
+            };
+            MomentPrecisionArbitration::Merged(merge(&wm, &cm), merge(&wv, &cv))
+        }
+        (Some((m, v)), None) => MomentPrecisionArbitration::WggoOnly(m, v),
+        (None, Some((m, v))) => MomentPrecisionArbitration::CpdtOnly(m, v),
+        (None, None) => MomentPrecisionArbitration::Inactive,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,4 +367,82 @@ mod tests {
         assert_eq!(v, vec![DTYPE_FP16]);
     }
 
+    fn dl(codes: &[u16]) -> Vec<u16> {
+        codes.to_vec()
+    }
+
+    #[test]
+    fn arbitration_cpdt_only_applies_even_when_wggo_bits_absent() {
+        // Regression: WGGO can be active on a train block for reasons that
+        // have nothing to do with moment precision (structural pruning,
+        // CSHA fusion, packing), in which case `wggo_bits` is None. An
+        // independent CPDT PrecisionPlan must still apply, regardless of
+        // the --wggo-moment-precision opt-in, exactly as it did before
+        // WGGO plans existed.
+        let cpdt = Some((dl(&[DTYPE_FP16, DTYPE_F32]), dl(&[DTYPE_FP16, DTYPE_F32])));
+        for opt_in in [false, true] {
+            match arbitrate_moment_precision(None, cpdt.clone(), opt_in) {
+                MomentPrecisionArbitration::CpdtOnly(m, v) => {
+                    assert_eq!(m, vec![DTYPE_FP16, DTYPE_F32]);
+                    assert_eq!(v, vec![DTYPE_FP16, DTYPE_F32]);
+                }
+                _ => panic!(
+                    "expected CpdtOnly regardless of opt_in={opt_in}, got a different variant (discriminant only, no Debug)"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn arbitration_wggo_decision_without_opt_in_drops_both_sources() {
+        let wggo = Some((dl(&[DTYPE_FP16]), dl(&[DTYPE_FP16])));
+        let cpdt = Some((dl(&[DTYPE_FP16]), dl(&[DTYPE_FP16])));
+        assert!(matches!(
+            arbitrate_moment_precision(wggo, cpdt, false),
+            MomentPrecisionArbitration::NotLoweredNoOptIn
+        ));
+    }
+
+    #[test]
+    fn arbitration_wggo_only_requires_opt_in() {
+        let wggo = Some((dl(&[DTYPE_FP16]), dl(&[DTYPE_F32])));
+        assert!(matches!(
+            arbitrate_moment_precision(wggo.clone(), None, false),
+            MomentPrecisionArbitration::NotLoweredNoOptIn
+        ));
+        match arbitrate_moment_precision(wggo, None, true) {
+            MomentPrecisionArbitration::WggoOnly(m, v) => {
+                assert_eq!(m, vec![DTYPE_FP16]);
+                assert_eq!(v, vec![DTYPE_F32]);
+            }
+            _ => panic!("expected WggoOnly when opted in"),
+        }
+    }
+
+    #[test]
+    fn arbitration_merge_prefers_f32_conservatively() {
+        // param 0: WGGO says FP16, CPDT says F32 -> merged F32 (conservative).
+        // param 1: both say FP16 -> merged FP16.
+        let wggo = Some((dl(&[DTYPE_FP16, DTYPE_FP16]), dl(&[DTYPE_FP16, DTYPE_FP16])));
+        let cpdt = Some((dl(&[DTYPE_F32, DTYPE_FP16]), dl(&[DTYPE_F32, DTYPE_FP16])));
+        match arbitrate_moment_precision(wggo, cpdt, true) {
+            MomentPrecisionArbitration::Merged(m, v) => {
+                assert_eq!(m, vec![DTYPE_F32, DTYPE_FP16]);
+                assert_eq!(v, vec![DTYPE_F32, DTYPE_FP16]);
+            }
+            _ => panic!("expected Merged"),
+        }
+    }
+
+    #[test]
+    fn arbitration_neither_source_is_inactive() {
+        assert!(matches!(
+            arbitrate_moment_precision(None, None, true),
+            MomentPrecisionArbitration::Inactive
+        ));
+        assert!(matches!(
+            arbitrate_moment_precision(None, None, false),
+            MomentPrecisionArbitration::Inactive
+        ));
+    }
 }
