@@ -400,6 +400,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     // Timing and allocation tracking
     ("nsl_clock", &[], Some(types::F64)),
+    // NSL_PHASE_TIMING train-block instrumentation (deferral-closure
+    // 2026-07-14): device sync + per-phase wall-clock report lines.
+    ("nsl_cuda_device_synchronize", &[], None),
+    ("nsl_phase_fwd_bwd_report", &[types::F64, types::F64], None),
+    ("nsl_phase_optim_report", &[types::F64], None),
     ("nsl_alloc_reset", &[], Some(types::I64)),
     ("nsl_alloc_count", &[], Some(types::I64)),
     ("nsl_alloc_bytes", &[], Some(types::I64)),

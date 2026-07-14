@@ -138,6 +138,10 @@ pub use cuda::tier_b1_prepass::{
 #[cfg(feature = "test-hooks")]
 pub use cuda::test_detect_sm_version;
 
+// Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
+// machines / non-cuda builds — non-panicking by design).
+pub use cuda::cuda_device_name;
+
 pub mod autodiff;
 pub mod checkpoint;
 pub mod inspect;

@@ -73,20 +73,23 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
 
     # PACKED variant (PCA Stage C): same contract as forward_masked below,
     # plus segment_ids ([batch, seq] — the DataLoader's per-token document
-    # ids). On CUDA the attention lowers to the fused segment-masked flash
-    # kernel family (per-document tile skipping; LSE saved for the fused
-    # backward); on CPU / unsupported head_dims it falls back to the exact
-    # decomposed additive-mask path at runtime.
+    # ids) and position_ids ([batch, seq] — the DataLoader's per-token
+    # position WITHIN its document). On CUDA the attention lowers to the
+    # fused segment-masked flash kernel family (per-document tile skipping;
+    # LSE saved for the fused backward); on CPU / unsupported head_dims it
+    # falls back to the exact decomposed additive-mask path at runtime.
     #
     # REQUIREMENT: `mask` must be the DataLoader's canonical packed mask
     # (causal-within-document, derived from these same segment_ids) — that
     # is what makes the fused and fallback paths numerically identical.
     # For arbitrary masks use forward_masked.
     #
-    # v1 note: RoPE positions run CONTINUOUSLY across the packed sequence
-    # (same as forward_masked; per-document position reset is the @pca
-    # doc_starts machinery). Attention isolation is exact regardless.
-    fn forward_packed(self, x: Tensor, mask: Tensor, segment_ids: Tensor, training: bool) -> Tensor:
+    # RoPE positions RESET at each document boundary (deferral-closure
+    # 2026-07-14): rotary embeddings use position_ids, so every packed
+    # document sees positions 0..doc_len exactly as it would unpacked.
+    # (The former v1 limitation — positions running continuously across
+    # the packed row — applied through PR #368.)
+    fn forward_packed(self, x: Tensor, mask: Tensor, segment_ids: Tensor, position_ids: Tensor, training: bool) -> Tensor:
         let s = x.shape
         let batch = s[0]
         let seq_len = s[1]
@@ -104,8 +107,8 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let k4 = k.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
         let v4 = v.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
 
-        let q_rope = self.rope.forward(q4, seq_len)
-        let k_rope = self.rope.forward(k4, seq_len)
+        let q_rope = self.rope.forward_with_positions(q4, position_ids)
+        let k_rope = self.rope.forward_with_positions(k4, position_ids)
 
         let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
         let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])

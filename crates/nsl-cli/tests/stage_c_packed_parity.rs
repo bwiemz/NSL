@@ -43,12 +43,25 @@ fn fixture_src() -> String {
 }
 
 /// Rewrite fixture markers by exact match; every replace asserts it fired.
-fn program(masked_form: bool, gpu: bool, save_path: &Path) -> String {
+///
+/// `continuous_pos` swaps the DataLoader's per-document position_ids for a
+/// continuous 0..seq arange — `forward_with_positions` with continuous
+/// positions is bitwise-identical rope to `forward()`/`forward_masked`'s
+/// internal arange, which is what makes the packed==masked differential
+/// like-for-like now that packed training resets RoPE positions per
+/// document by default.
+fn program(masked_form: bool, gpu: bool, continuous_pos: bool, save_path: &Path) -> String {
     let mut src = fixture_src();
     if masked_form {
-        let from = "self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, training)";
+        let from = "self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, pos, training)";
         let to = "self.attn.forward_masked(rmsnorm(h, self.norm_a, 0.00001), mask, training)";
         assert!(src.contains(from), "packed call marker not found — resync fixture");
+        src = src.replace(from, to);
+    }
+    if continuous_pos {
+        let from = "batch.position_ids  # POSITION_SOURCE";
+        let to = "arange(0.0, 64.0).reshape([1, 64]).expand([2, 64]).contiguous()";
+        assert!(src.contains(from), "position-source marker not found — resync fixture");
         src = src.replace(from, to);
     }
     if gpu {
@@ -173,9 +186,13 @@ fn packed_matches_masked_on_cpu() {
     let save_packed = tmp.join(format!("stage_c_cpu_packed_{pid}.nslm"));
     let save_masked = tmp.join(format!("stage_c_cpu_masked_{pid}.nslm"));
 
-    let packed = run_program(&program(false, false, &save_packed), "cpu_packed", false, &[], &[]);
+    // Continuous positions on BOTH sides: forward_masked applies continuous
+    // arange rope internally, so the packed side must match it to isolate
+    // the attention-builtin differential from the (intentional) per-document
+    // position reset. Reset consumption is proven separately below.
+    let packed = run_program(&program(false, false, true, &save_packed), "cpu_packed", false, &[], &[]);
     assert_trains(&packed, "cpu packed");
-    let masked = run_program(&program(true, false, &save_masked), "cpu_masked", false, &[], &[]);
+    let masked = run_program(&program(true, false, true, &save_masked), "cpu_masked", false, &[], &[]);
     assert_trains(&masked, "cpu masked");
 
     let (max_diff, worst) = checkpoint_max_diff(&save_packed, &save_masked);
@@ -185,6 +202,34 @@ fn packed_matches_masked_on_cpu() {
     );
     let _ = std::fs::remove_file(&save_packed);
     let _ = std::fs::remove_file(&save_masked);
+}
+
+/// CPU: per-document RoPE position reset is CONSUMED. Training with the
+/// DataLoader's reset position_ids vs continuous positions must produce
+/// materially different checkpoints on multi-document rows (the fixture
+/// packs 8 docs per row, so most tokens' rotary phases change). A vacuous
+/// pass here would mean forward_with_positions silently ignores its
+/// argument — the position-space analog of the Tier-B launch-count proof.
+#[test]
+fn position_reset_changes_packed_training_on_cpu() {
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let save_reset = tmp.join(format!("stage_c_cpu_reset_{pid}.nslm"));
+    let save_cont = tmp.join(format!("stage_c_cpu_cont_{pid}.nslm"));
+
+    let reset = run_program(&program(false, false, false, &save_reset), "cpu_reset", false, &[], &[]);
+    assert_trains(&reset, "cpu reset-positions");
+    let cont = run_program(&program(false, false, true, &save_cont), "cpu_cont", false, &[], &[]);
+    assert_trains(&cont, "cpu continuous-positions");
+
+    let (max_diff, worst) = checkpoint_max_diff(&save_reset, &save_cont);
+    assert!(
+        max_diff > 1e-6,
+        "reset vs continuous positions produced IDENTICAL checkpoints \
+         (max_diff={max_diff:.3e} at {worst}) — position_ids are not being consumed"
+    );
+    let _ = std::fs::remove_file(&save_reset);
+    let _ = std::fs::remove_file(&save_cont);
 }
 
 #[cfg(feature = "cuda")]
@@ -212,7 +257,7 @@ fn packed_fused_matches_decomposed_on_gpu() {
     let save_fused = tmp.join(format!("stage_c_gpu_fused_{pid}.nslm"));
     let save_plain = tmp.join(format!("stage_c_gpu_decomp_{pid}.nslm"));
 
-    let fused = run_program(&program(false, true, &save_fused), "gpu_fused", true, &[], &[]);
+    let fused = run_program(&program(false, true, false, &save_fused), "gpu_fused", true, &[], &[]);
     assert_trains(&fused, "gpu fused");
     assert!(
         fused.stderr.contains("sdpa fused forward: launched"),
@@ -221,7 +266,7 @@ fn packed_fused_matches_decomposed_on_gpu() {
     );
 
     let plain = run_program(
-        &program(false, true, &save_plain),
+        &program(false, true, false, &save_plain),
         "gpu_decomp",
         true,
         &[("NSL_SDPA_FUSED_DISABLE", "1")],
@@ -262,7 +307,7 @@ fn wggo_reports_fused_consumption_on_gpu() {
     let tmp = std::env::temp_dir();
     let save = tmp.join(format!("stage_c_gpu_wggo_{}.nslm", std::process::id()));
     let r = run_program(
-        &program(false, true, &save),
+        &program(false, true, false, &save),
         "gpu_wggo",
         true,
         &[],

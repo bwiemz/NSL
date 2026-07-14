@@ -32,3 +32,38 @@ model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
 
         # Apply rotation: x * cos + rotate_half(x) * sin
         return x * cos_4d + rotate_half(x) * sin_4d
+
+    # Packed-sequence variant: positions come from an explicit [batch, seq]
+    # tensor instead of arange(seq_len), so packed batches can reset the
+    # rotary position to 0 at each document start (the DataLoader emits
+    # `position_ids` = index-within-document alongside `segment_ids`).
+    #
+    # Grad structure is IDENTICAL to forward(): position_ids is a
+    # non-differentiable leaf exactly as arange's output is, and the
+    # cos/sin chain reuses the same cat/cos/sin/mul ops — no new AD rules.
+    fn forward_with_positions(self, x: Tensor, position_ids: Tensor) -> Tensor:
+        # x: [batch, heads, seq, head_dim]; position_ids: [batch, seq]
+        let s = x.shape
+        let batch = s[0]
+        let seq_len = s[2]
+        let half_d = int(self._half_dim.item())
+        let d = int(self._dim.item())
+
+        # Per-row outer product: freqs[b, seq, dim/2] = pos[b, :, None] * inv_freq[None, :]
+        # (rank-3 @ rank-2 batched matmul — same idiom as the GQA projections).
+        let p3 = position_ids.reshape([batch, seq_len, 1])
+        let inv2 = self.inv_freq.reshape([1, half_d])
+        let freqs = p3 @ inv2
+
+        # Duplicate for full head_dim: [batch, seq, dim]
+        let tensors = [freqs, freqs]
+        let emb = tensor_cat(tensors, 2)
+
+        let cos_emb = tensor_cos(emb)
+        let sin_emb = tensor_sin(emb)
+
+        # Per-row tables broadcast over heads: [batch, 1, seq, dim]
+        let cos_4d = cos_emb.reshape([batch, 1, seq_len, d])
+        let sin_4d = sin_emb.reshape([batch, 1, seq_len, d])
+
+        return x * cos_4d + rotate_half(x) * sin_4d

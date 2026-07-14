@@ -1734,6 +1734,42 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
     let grad = NslTensor::from_ptr(grad_ptr);
     let target = NslTensor::from_ptr(target_ptr);
 
+    // Device alignment (deferral-closure 2026-07-14): the reduce's output
+    // is a parameter gradient — it is consumed where the parameter lives.
+    // When a host-resident grad meets a GPU-resident target (the rmsnorm
+    // gamma-chain signature: binary adjoint ops follow their LEFT
+    // operand's device, so one CPU-f64 upstream adjoint drags the whole
+    // chain to host), migrate the grad to the target's device HERE so the
+    // reduction itself runs on-device and downstream accumulation never
+    // needs `nsl_tensor_add_inplace`'s reconciling front door (a per-step
+    // f64 round-trip). Warn once — an upstream producer emitting host
+    // grads on a GPU run is still a perf smell worth surfacing.
+    if grad.device != target.device && target.device > 0 {
+        static REDUCE_ALIGN_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !REDUCE_ALIGN_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[nsl] reduce_to_shape: migrating a host-resident gradient \
+                 (ndim={}) to the target parameter's device {} before \
+                 reducing (once-per-process note; an adjoint op upstream is \
+                 producing CPU gradients on a GPU run)",
+                grad.ndim, target.device
+            );
+        }
+        let migrated = super::nsl_tensor_to_device(grad_ptr, target.device as i64);
+        if migrated != 0 && migrated != grad_ptr {
+            let out = nsl_tensor_reduce_to_shape(migrated, target_ptr);
+            // `to_device` returns a published tensor; if the recursive call
+            // returned the migrated pointer itself (identity reduce), its
+            // retain keeps it alive for the caller — otherwise drop our
+            // reference now that the reduce consumed it.
+            if out != migrated {
+                super::nsl_tensor_free(migrated);
+            }
+            return out;
+        }
+    }
+
     let g_ndim = grad.ndim as usize;
     let t_ndim = target.ndim as usize;
 

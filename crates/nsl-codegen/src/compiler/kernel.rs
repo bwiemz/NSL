@@ -2266,20 +2266,26 @@ impl Compiler<'_> {
                 base_name_bytes,
             )?;
 
-            // DEFERRED (loud): Tier-B tile-skip promotion is DISABLED for
-            // the Stage C table. As its first-ever production launcher we
-            // found (a) the emission helper's tier-b kernel NAME never
-            // exists as a PTX entry (worked around below by storing the
-            // base name), (b) an under-sized dynamic-SMEM launch
-            // ILLEGAL_ADDRESSes (fixed above), and (c) the kernel's OUTPUT
-            // DEVIATES numerically at s=1024/hd=64 (first-step loss shifts
-            // ~1e-2 while the base segment-masked kernel matches the
-            // decomposed oracle to ~7e-6). Until the Tier-B kernel passes a
-            // packed-shape parity gate, the runtime uses the base
-            // segment-masked kernel (fused, element-masked, no tile skip) —
-            // correctness first; the tile-skip perf increment is follow-up
-            // work. Flip `PROMOTE_TIER_B` once validated.
-            const PROMOTE_TIER_B: bool = false;
+            // PROMOTED (2026-07-14): Tier-B tile-skip passed the
+            // packed-shape parity gate demanded by the original Stage-C
+            // deferral. `tier_b_tile_skip_gpu_parity.rs` drives the Tier-B
+            // PTX (launch-count-proven via `nsl_sdpa_fused_launch_count`)
+            // against the base segment-masked kernel across single-doc /
+            // tile-aligned / mid-tile / high-density patterns at
+            // s∈{1024,4096} and b=4/h=8 — BITWISE-identical outputs and
+            // LSE everywhere, which is what correct tile-skip predicts (a
+            // fully-masked KV tile is an exact no-op in the online
+            // softmax: its -1e9 mass rescales to +0.0 once any visible
+            // tile follows, and the causal diagonal guarantees one). The
+            // benchmark-era "~1e-2 deviation" that motivated the deferral
+            // was an artifact of the then-live per-batch segment-staging
+            // bug, not a Tier-B defect. Historical launcher discoveries
+            // (still true): (a) the emission helper's tier-b kernel NAME
+            // never exists as a PTX entry (the table stores the base
+            // name), (b) the dynamic-SMEM launch must cover the range
+            // table (sized above). Operational escape hatch:
+            // NSL_SDPA_TIER_B_DISABLE=1 forces the base kernel at runtime.
+            const PROMOTE_TIER_B: bool = true;
             let (tier_b_ptx, tier_b_name) =
                 match (emission.tier_b_on_ptx, emission.tier_b_on_kernel_name) {
                     (Some(on_ptx), Some(_on_name)) if PROMOTE_TIER_B => {

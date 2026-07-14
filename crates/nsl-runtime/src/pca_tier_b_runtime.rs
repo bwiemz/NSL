@@ -55,12 +55,22 @@ const _: () = assert!(
 /// Conditions 3 and 4 together gate the seq_len range to `[FLOOR, MAX_BAKED]` —
 /// below the floor, skip-check overhead exceeds skip-payoff; above MAX_BAKED, the
 /// Tier-B-on PTX's SMEM allocation can't handle the table size.
+///
+/// Operational kill switch: `NSL_SDPA_TIER_B_DISABLE=1` forces the base
+/// segment-masked kernel even when all four conditions hold (mirrors
+/// `NSL_SDPA_FUSED_DISABLE` one level up; read once per process — this
+/// gate sits on the per-attention-op hot path).
 pub fn should_dispatch_tier_b_at_runtime(
     tier_b_ptx_ptr: i64,
     segment_ids_ptr: i64,
     seq_len: u32,
 ) -> bool {
-    tier_b_ptx_ptr != 0
+    static TIER_B_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disabled = *TIER_B_DISABLED.get_or_init(|| {
+        std::env::var("NSL_SDPA_TIER_B_DISABLE").ok().as_deref() == Some("1")
+    });
+    !disabled
+        && tier_b_ptx_ptr != 0
         && segment_ids_ptr != 0
         && (TIER_B_SEQ_LEN_FLOOR..=TIER_B_MAX_BAKED_SEQ_LEN).contains(&seq_len)
 }

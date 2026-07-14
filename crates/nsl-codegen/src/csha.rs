@@ -471,10 +471,43 @@ fn downgrade_until_feasible(
     FusionLevel::Boundary
 }
 
+/// Resolve the GpuSpec for CSHA planning: named target first, then the
+/// LOCAL device (via the driver, when the target is a generic word like
+/// "gpu"/"cuda" that names no database entry), then the database default.
+///
+/// Deferral-closure 2026-07-14: the generic targets previously fell
+/// straight to `default_gpu()` (A100-SXM, 180KB smem budget) — on an RTX
+/// 5070 Ti every "smem_..._exceeds_180kb" negotiation message cited a
+/// budget for hardware that wasn't there. The detection result (or its
+/// absence) is printed once per process so plan reports are attributable.
+fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
+    if let Some(gpu) = find_gpu(target) {
+        return gpu;
+    }
+    static DETECTED: std::sync::OnceLock<Option<&'static GpuSpec>> = std::sync::OnceLock::new();
+    let detected = *DETECTED.get_or_init(|| {
+        let name = nsl_runtime::cuda_device_name()?;
+        let spec = find_gpu(&name);
+        match spec {
+            Some(s) => eprintln!(
+                "[csha] gpu spec: {} (auto-detected from local device \"{name}\")",
+                s.name
+            ),
+            None => eprintln!(
+                "[csha] gpu spec: local device \"{name}\" not in the GPU database — \
+                 falling back to {} (add a GpuSpec entry for honest smem budgets)",
+                default_gpu().name
+            ),
+        }
+        spec
+    });
+    detected.unwrap_or_else(default_gpu)
+}
+
 /// Run the CSHA driver.
 pub fn run(input: CshaInput) -> CshaPlan {
     let t0 = std::time::Instant::now();
-    let gpu: &'static GpuSpec = find_gpu(input.target).unwrap_or_else(default_gpu);
+    let gpu: &'static GpuSpec = resolve_gpu_spec(input.target);
 
     // Off mode: produce an empty plan so callers can uniformly serialize
     // the result.

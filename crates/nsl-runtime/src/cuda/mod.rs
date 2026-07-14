@@ -154,6 +154,33 @@ pub(crate) mod inner {
         (major * 10 + minor) as u32
     }
 
+    /// Query the marketing name of device 0 (e.g. "NVIDIA GeForce RTX 5070
+    /// Ti"), with the vendor/brand prefixes stripped so the result matches
+    /// the `nsl-codegen` GPU-database naming ("RTX 5070 Ti" → find_gpu's
+    /// normalizer turns spaces into dashes). Returns `None` if the driver
+    /// gives back an unreadable string.
+    pub(crate) fn device_name_stripped() -> Option<String> {
+        let s = state();
+        let guard = s.lock().unwrap();
+        let mut buf = [0i8; 128];
+        let rc = unsafe { cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, guard.device) };
+        if rc != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        let mut name = cstr.to_str().ok()?.trim().to_string();
+        for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                name = rest.to_string();
+            }
+        }
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
     static ALLOC_COUNT_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     // ------------------------------------------------------------------
@@ -2202,6 +2229,37 @@ pub extern "C" fn nsl_cuda_init() -> i64 {
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }
+}
+
+/// Marketing name of CUDA device 0 with the vendor/brand prefixes stripped
+/// (e.g. "RTX 5070 Ti"), for `nsl-codegen`'s GPU-database lookup
+/// (`gpu_specs::find_gpu` normalizes spaces to dashes). Non-panicking by
+/// design: compiling on a GPU-less machine (or without the cuda feature)
+/// returns `None` and the caller falls back to its default spec — this is
+/// probed at COMPILE time, where an abort would kill the compiler.
+#[cfg(feature = "cuda")]
+pub fn cuda_device_name() -> Option<String> {
+    // Probe cuInit/device-count directly: `inner::state()` asserts on
+    // failure, which is correct for the runtime paths but not here.
+    unsafe {
+        if cudarc::driver::sys::cuInit(0) != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut count: i32 = 0;
+        if cudarc::driver::sys::cuDeviceGetCount(&mut count)
+            != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            || count == 0
+        {
+            return None;
+        }
+    }
+    inner::device_name_stripped()
+}
+
+/// Non-cuda build: no device to name.
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_device_name() -> Option<String> {
+    None
 }
 
 /// Launch a PTX kernel. All params are i64 for Cranelift ABI compatibility.

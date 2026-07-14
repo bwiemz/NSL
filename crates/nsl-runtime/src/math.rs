@@ -49,6 +49,34 @@ pub extern "C" fn nsl_clock() -> f64 {
     epoch.elapsed().as_secs_f64()
 }
 
+/// Synchronize the CUDA device (no-op on CPU builds). Emitted by the
+/// NSL_PHASE_TIMING train-block instrumentation before each phase-boundary
+/// `nsl_clock()` read: most runtime ops already end with a
+/// `cuCtxSynchronize`, but a few same-stream kernels deliberately skip it,
+/// so an explicit sync pins the wall-clock delta to completed GPU work.
+#[no_mangle]
+pub extern "C" fn nsl_cuda_device_synchronize() {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::inner::ensure_context();
+        unsafe { crate::cuda::inner::cu_ctx_synchronize() };
+    }
+}
+
+/// NSL_PHASE_TIMING: one line per micro-batch with the forward(+loss) and
+/// backward wall-clock seconds. Machine-parseable prefix `[phase]`.
+#[no_mangle]
+pub extern "C" fn nsl_phase_fwd_bwd_report(fwd_s: f64, bwd_s: f64) {
+    println!("[phase] fwd={fwd_s:.6} bwd={bwd_s:.6}");
+}
+
+/// NSL_PHASE_TIMING: one line per OPTIMIZER step (accumulation boundaries
+/// only) with the optimizer wall-clock seconds.
+#[no_mangle]
+pub extern "C" fn nsl_phase_optim_report(opt_s: f64) {
+    println!("[phase] opt={opt_s:.6}");
+}
+
 // ---------------------------------------------------------------------------
 // Allocation tracking (for benchmarking memory pressure)
 // ---------------------------------------------------------------------------
