@@ -136,7 +136,21 @@ pub(crate) fn invoke_cpdt_if_enabled(
     };
 
     let overrides = WggoOverrides::from_applied(applied_plan);
-    let model = ModelSize::from_applied_plan(applied_plan);
+    let mut model = ModelSize::from_applied_plan(applied_plan);
+    // Cost-model audit finding 3: tell the ZeRO evaluator whether
+    // @checkpoint(policy=...) activation checkpointing is active for this
+    // compile (non-empty checkpoint_policies map). Without it the evaluator
+    // charges the full sequential live-set (sum of per-layer activations);
+    // with it, a documented checkpoint-aware estimate.
+    //
+    // Granularity caveat: checkpoint_policies is per-FUNCTION while this
+    // flag is per-MODEL — a single checkpointed helper flips the whole
+    // model to the sqrt-style estimate, under-charging any layers that are
+    // NOT actually checkpointed. The estimate is clamped to the
+    // no-checkpoint sum so the optimism is bounded; a per-layer coverage
+    // blend needs a layer->function map that AppliedPlan does not carry.
+    model.activation_checkpointing =
+        !compiler.compile_options.checkpoint_policies.is_empty();
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
     // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
@@ -4135,9 +4149,14 @@ impl Compiler<'_> {
                 // - WGGO's plan bits lower ONLY behind the explicit opt-in
                 //   (--wggo-moment-precision): reduced-precision moments
                 //   change training numerics, and the v1 cast envelope is
-                //   CPU-only (nsl_tensor_cast aborts loudly on GPU
-                //   tensors). Without the opt-in the decision stays
-                //   advisory with a not-lowered notice.
+                //   CPU-only. GPU-resident params are refused loudly at
+                //   train-block setup (nsl_tensor_zeros_like_dtype rejects
+                //   GPU templates when the moment buffers are allocated —
+                //   a compile-time CodegenError is not possible because the
+                //   device is a runtime property: `m.to(cuda)` transfers at
+                //   run time and the compiler has no static device signal
+                //   here). Without the opt-in the decision stays advisory
+                //   with a not-lowered notice.
                 // - When both sources are live, merge CONSERVATIVELY per
                 //   param: F32 wins. CPDT's PrecisionPlan carries per-param
                 //   tiers (calibrated critical params pinned to F32) that a
@@ -4176,8 +4195,9 @@ impl Compiler<'_> {
                             "[cpdt] WGGO optimizer-moment precision active \
                              (merged with the CPDT per-param plan, F32 wins): \
                              {sub32} moment buffer(s) in FP16 storage. NOTE: \
-                             nsl_tensor_cast is CPU-only in v1 — GPU training \
-                             with reduced moments aborts loudly at the first cast."
+                             the cast envelope is CPU-only in v1 — GPU-resident \
+                             training refuses loudly at train-block setup \
+                             (optimizer-state allocation)."
                         );
                         Some((m, v))
                     }
@@ -4187,9 +4207,9 @@ impl Compiler<'_> {
                         eprintln!(
                             "[cpdt] WGGO optimizer-moment precision active: {sub32} \
                              moment buffer(s) in FP16 storage (8-bit clamps to FP16 \
-                             in v1). NOTE: nsl_tensor_cast is CPU-only in v1 — GPU \
-                             training with reduced moments aborts loudly at the \
-                             first cast."
+                             in v1). NOTE: the cast envelope is CPU-only in v1 — \
+                             GPU-resident training refuses loudly at train-block \
+                             setup (optimizer-state allocation)."
                         );
                         Some((m, v))
                     }
