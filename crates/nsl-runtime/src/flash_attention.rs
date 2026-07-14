@@ -451,6 +451,22 @@ fn segment_ids_host_u16(
     {
         return None;
     }
+    // PCA Stage C (review finding): the fused kernels' per-doc tile SKIP
+    // assumes segment ids are non-decreasing along each row (the DataLoader
+    // packer guarantees it; hand-built ids might not). A violation would
+    // silently skip live tiles — decline to the mask-driven decomposed
+    // path instead, which is correct for arbitrary segment layouts.
+    let row = seq_len;
+    if row > 0 {
+        for chunk in host_f32.chunks(row) {
+            if chunk.windows(2).any(|w| w[1] < w[0]) {
+                flash_bwd_warn_once(
+                    "[nsl] segment_ids not non-decreasing within a row -                      declining fused packed kernels (decomposed path is exact)",
+                );
+                return None;
+            }
+        }
+    }
     Some(host_f32.iter().map(|&x| x as u16).collect())
 }
 

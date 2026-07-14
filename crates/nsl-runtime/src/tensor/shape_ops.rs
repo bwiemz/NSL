@@ -114,6 +114,25 @@ pub extern "C" fn nsl_tensor_assert_dim_bound(tensor_ptr: i64, dim_index: i64, u
     actual
 }
 
+/// PCA Stage C: non-aborting shape probe. Returns `shape[dim]`, or 0 when
+/// `dim` is out of range (negative dims resolve from the back, like
+/// `nsl_tensor_shape_dim`, which ABORTS on out-of-range — this variant
+/// exists so speculative dispatch code can probe rank-agnostically; a 0
+/// head_dim simply matches no fused variant and the decomposed path runs).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_dim_or_zero(tensor_ptr: i64, dim: i64) -> i64 {
+    if tensor_ptr == 0 {
+        return 0;
+    }
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let nd = t.ndim;
+    let d = if dim < 0 { nd + dim } else { dim };
+    if d < 0 || d >= nd {
+        return 0;
+    }
+    unsafe { *t.shape.add(d as usize) }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_ndim(tensor_ptr: i64) -> i64 {
     NslTensor::from_ptr(tensor_ptr).ndim

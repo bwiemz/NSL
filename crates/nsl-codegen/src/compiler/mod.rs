@@ -562,6 +562,12 @@ pub struct Compiler<'a> {
     /// so only the first component (dQ) triggers the backward call and dK/dV
     /// extract from the cached list.
     pub flash_attn_bwd_cache: HashMap<Value, Value>,
+    /// PCA Stage C: per-function Values that the SDPA fused dispatch owns
+    /// beyond op results — currently the saved-LSE tensors returned by
+    /// `nsl_sdpa_fused_forward` (the backward only BORROWS them). Drained
+    /// into `owned_values` at the end of `compile_wengert_ops` so the
+    /// step's cleanup frees them (free(0) is a no-op for declined runs).
+    pub sdpa_extra_owned: Vec<Value>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
     /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
@@ -1003,6 +1009,7 @@ impl<'a> Compiler<'a> {
             fase_table_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
+            sdpa_extra_owned: Vec::new(),
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),
@@ -1149,6 +1156,14 @@ impl<'a> Compiler<'a> {
         // which alias across functions — same hygiene as the CSHA caches.
         self.fused_kl_ce_fwd_saves.clear();
         self.fused_kl_ce_bwd_cache.clear();
+        // PCA Stage C (review finding): these two are Value-keyed as well.
+        // A dead-eliminated dV extract leaves a stale flash_attn_bwd_cache
+        // entry whose Value index can collide in the NEXT function's DFG
+        // (Values restart at v0 per function) — same hazard class the CSHA
+        // caches above document.
+        self.flash_attn_bwd_cache.clear();
+        self.flash_attn_aux.clear();
+        self.sdpa_extra_owned.clear();
     }
 
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the

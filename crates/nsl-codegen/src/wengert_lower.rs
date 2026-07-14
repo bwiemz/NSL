@@ -160,6 +160,12 @@ pub fn compile_wengert_ops(
         }
         var_types.insert(op.result, result_type);
     }
+    // PCA Stage C: adopt the fused-SDPA extras (saved-LSE tensors) into the
+    // step's owned set so cleanup frees them. VarId u32::MAX is a sentinel
+    // no real op produces (it never appears in hook_freed_input_vars).
+    for v in compiler.sdpa_extra_owned.drain(..) {
+        owned_values.push((u32::MAX, v, WengertType::Tensor));
+    }
     Ok(LoweredWengert {
         var_map,
         owned_values,
@@ -264,9 +270,14 @@ fn emit_sdpa_fused_dispatch(
         return Ok(None);
     }
 
-    // Runtime head_dim from Q ([b, h, s, d]).
+    // Runtime head_dim from Q ([b, h, s, d]) — via the non-aborting probe:
+    // `nsl_tensor_shape_dim` process-aborts on out-of-range dims, and this
+    // dispatch is emitted for EVERY decorator-free SDPA on CUDA targets,
+    // including rank<4 attention that used to lower decomposed just fine.
+    // Out-of-range returns 0, which matches no variant, so the FFI declines
+    // and the decomposed fallback runs (review finding).
     let dim3 = builder.ins().iconst(cl_types::I64, 3);
-    let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
+    let head_dim = call(compiler, builder, "nsl_tensor_dim_or_zero", &[q, dim3])?;
 
     // Variant select: equality chain on head_dim. Unmatched dims leave all
     // selectors zero → the FFI declines → decomposed fallback.
@@ -1857,6 +1868,11 @@ fn lower_single_op(
                     compiler
                         .flash_attn_aux
                         .insert(out_param, (out_param, lse_param));
+                    // The saved LSE is OWNED by this step (the backward only
+                    // borrows it; forward-only runs never consume it). Freed
+                    // by the step cleanup via the extra-owned drain — a
+                    // runtime 0 (decline) is a free() no-op.
+                    compiler.sdpa_extra_owned.push(lse_param);
                     Ok(out_param)
                 }
                 None => {
@@ -1952,6 +1968,11 @@ fn lower_single_op(
                     compiler
                         .flash_attn_aux
                         .insert(out_param, (out_param, lse_param));
+                    // The saved LSE is OWNED by this step (the backward only
+                    // borrows it; forward-only runs never consume it). Freed
+                    // by the step cleanup via the extra-owned drain — a
+                    // runtime 0 (decline) is a free() no-op.
+                    compiler.sdpa_extra_owned.push(lse_param);
                     Ok(out_param)
                 }
                 None => {
@@ -1981,22 +2002,29 @@ fn lower_single_op(
             let list_val = if let Some(&cached) = compiler.flash_attn_bwd_cache.get(&fwd_out) {
                 cached
             } else {
-                // Scale from Q's head_dim: 1/sqrt(hd) — same derivation
-                // (and same stdlib-default-scale assumption) as the plain
-                // extract arm below.
-                let dim3 = builder.ins().iconst(cl_types::I64, 3);
-                let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
-                let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, head_dim);
-                let hd_sqrt = builder.ins().sqrt(hd_f64);
-                let one_f64 = builder.ins().f64const(1.0);
-                let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
-                let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
+                // The op's ACTUAL scale, threaded through as the 7th
+                // extract input (review finding: the plain arm's 1/sqrt(hd)
+                // re-derivation silently mis-scales dQ/dK for non-default
+                // scales — the packed op does not inherit that limitation).
+                // The adjoint context may or may not carry a var_types
+                // entry for the scale VarId — drive the conversion off the
+                // Cranelift VALUE TYPE instead (the decorated call site's
+                // scale_bits idiom): F64 = scalar, I64 = tensor pointer.
+                let scale_in = inputs[6];
+                let scale_item = if builder.func.dfg.value_type(scale_in) == cl_types::F64 {
+                    scale_in
+                } else {
+                    call(compiler, builder, "nsl_tensor_item", &[scale_in])?
+                };
+                let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
                 let scale_bits_i32 = builder.ins().bitcast(
                     cl_types::I32,
                     cranelift_codegen::ir::MemFlags::new(),
                     scale_f32,
                 );
-                let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
+                let scale_bits = builder.ins().uextend(cl_types::I64, scale_bits_i32);
+                let dim3 = builder.ins().iconst(cl_types::I64, 3);
+                let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
 
                 let dim0 = builder.ins().iconst(cl_types::I64, 0);
                 let dim1 = builder.ins().iconst(cl_types::I64, 1);

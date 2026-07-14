@@ -371,7 +371,7 @@ pub fn collect_packing_diagnostics(
                     kernel: "masked SDPA (Stage B decomposed path)",
                 },
                 (_, PackingKernelState::FusedSegmentMasked) => PackingVerdict::Consumed {
-                    kernel: "fused segment-masked flash kernel (Stage C plain family)",
+                    kernel: "fused segment-masked flash kernel (Stage C plain family; decomposed fallback when the runtime declines)",
                 },
                 (_, PackingKernelState::TierBMasked) => PackingVerdict::Consumed {
                     kernel: "segment-masked Tier-B attention",

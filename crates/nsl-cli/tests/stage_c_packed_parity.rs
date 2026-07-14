@@ -271,7 +271,7 @@ fn wggo_reports_fused_consumption_on_gpu() {
     assert_trains(&r, "gpu wggo");
     assert!(
         r.stderr
-            .contains("fused segment-masked flash kernel (Stage C plain family)"),
+            .contains("fused segment-masked flash kernel (Stage C plain family"),
         "plan consumption must report the Stage-C fused channel:\n{}",
         r.stderr
     );

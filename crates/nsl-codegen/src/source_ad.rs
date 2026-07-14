@@ -1233,17 +1233,17 @@ impl AdjointGenerator {
             // extract pattern with the segment tensor threaded as a sixth
             // input so the lowering can reach the `_segmask` variant table
             // and the 19-arg backward FFI.
-            AdjointExpr::AttentionBackwardQPacked(y_bar, q, k, v, fwd_out, seg) => self.emit_op(
+            AdjointExpr::AttentionBackwardQPacked(y_bar, q, k, v, fwd_out, seg, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtractPacked { component: 0 },
-                vec![y_bar, q, k, v, fwd_out, seg],
+                vec![y_bar, q, k, v, fwd_out, seg, scale],
             ),
-            AdjointExpr::AttentionBackwardKPacked(y_bar, q, k, v, fwd_out, seg) => self.emit_op(
+            AdjointExpr::AttentionBackwardKPacked(y_bar, q, k, v, fwd_out, seg, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtractPacked { component: 1 },
-                vec![y_bar, q, k, v, fwd_out, seg],
+                vec![y_bar, q, k, v, fwd_out, seg, scale],
             ),
-            AdjointExpr::AttentionBackwardVPacked(y_bar, q, k, v, fwd_out, seg) => self.emit_op(
+            AdjointExpr::AttentionBackwardVPacked(y_bar, q, k, v, fwd_out, seg, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtractPacked { component: 2 },
-                vec![y_bar, q, k, v, fwd_out, seg],
+                vec![y_bar, q, k, v, fwd_out, seg, scale],
             ),
 
             // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.

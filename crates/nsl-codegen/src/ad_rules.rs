@@ -191,11 +191,11 @@ pub enum AdjointExpr {
     /// PCA Stage C: packed (segment-masked) attention backward —
     /// (output_bar, q, k, v, fwd_out, segment_ids). Causal-within-segment
     /// by contract, so no causal flag.
-    AttentionBackwardQPacked(VarId, VarId, VarId, VarId, VarId, VarId),
+    AttentionBackwardQPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
     /// See [`AdjointExpr::AttentionBackwardQPacked`].
-    AttentionBackwardKPacked(VarId, VarId, VarId, VarId, VarId, VarId),
+    AttentionBackwardKPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
     /// See [`AdjointExpr::AttentionBackwardQPacked`].
-    AttentionBackwardVPacked(VarId, VarId, VarId, VarId, VarId, VarId),
+    AttentionBackwardVPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
     /// Attention backward for K: args: (grad, Q, K, V, fwd_result, causal)
     AttentionBackwardK(VarId, VarId, VarId, VarId, VarId, bool),
     /// Attention backward for V: args: (grad, Q, K, V, fwd_result, causal)
@@ -809,25 +809,26 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             let q = op.inputs[0];
             let k = op.inputs[1];
             let v = op.inputs[2];
+            let scale = op.inputs[3];
             let seg = op.inputs[5];
             let fwd_result = op.result;
             vec![
                 InputAdjoint {
                     input_var: q,
                     expr: AdjointExpr::AttentionBackwardQPacked(
-                        output_bar, q, k, v, fwd_result, seg,
+                        output_bar, q, k, v, fwd_result, seg, scale,
                     ),
                 },
                 InputAdjoint {
                     input_var: k,
                     expr: AdjointExpr::AttentionBackwardKPacked(
-                        output_bar, q, k, v, fwd_result, seg,
+                        output_bar, q, k, v, fwd_result, seg, scale,
                     ),
                 },
                 InputAdjoint {
                     input_var: v,
                     expr: AdjointExpr::AttentionBackwardVPacked(
-                        output_bar, q, k, v, fwd_result, seg,
+                        output_bar, q, k, v, fwd_result, seg, scale,
                     ),
                 },
             ]
