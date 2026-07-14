@@ -791,6 +791,7 @@ fn cpu_reference_from_forward_saves(
         &mut dq, &mut dk, &mut dv,
         batch, heads, heads, seq_len, head_dim,
         scale, true, 1,
+        None, // segment ids (PCA Stage C: unmasked oracle)
     );
 
     Some((
