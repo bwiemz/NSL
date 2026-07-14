@@ -454,8 +454,9 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     }
 }
 
-/// Allocate a new zero-filled tensor with the same shape/device as
-/// `template_ptr` but the given `dtype` (v1: F32=1 or FP16=2). Mirrors
+/// Allocate a new zero-filled tensor with the same shape as `template_ptr`
+/// but the given `dtype` (v1: F32=1 or FP16=2). CPU-only: the template must
+/// be device=0 (GPU templates are refused loudly — see below). Mirrors
 /// `nsl_tensor_zeros_like`'s allocation/ownership; the result is a persistent
 /// optimizer-state buffer (same lifecycle as the FP32 zeros_like output).
 ///
@@ -476,10 +477,53 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
 /// and device are needed from the template, not its data, so a GPU template
 /// whose shape is host-readable in principle could be supported, but parity
 /// with the existing CPU-only creation helpers is the v1 constraint).
+/// A GPU template is REFUSED loudly (see [`refuse_gpu_moment_template`]):
+/// pre-audit this function silently allocated HOST memory but stamped the
+/// result `device = template.device`, producing a device=1 tensor backed by
+/// a host pointer — and GPU training with reduced-precision moments then
+/// aborted much later, mid-step, inside `nsl_tensor_cast` with a generic
+/// message. Refusing here fires at train-block SETUP (moment allocation),
+/// before any forward/backward compute is spent.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
     let t = unsafe { &*(template_ptr as *const NslTensor) };
+    refuse_gpu_moment_template(t.device);
     let dtype = dtype as u16;
+    zeros_like_dtype_body(t, dtype)
+}
+
+/// Deferral-must-refuse guard for reduced-precision optimizer-moment storage
+/// on GPU-resident parameters.
+///
+/// The v1 dequant→step→quant envelope (FASE's optimizer wrapper) routes
+/// through `nsl_tensor_cast` / `nsl_tensor_cast_into`, which are CPU-only.
+/// The training device is a RUNTIME property in NSL (`m.to(cuda)` transfers
+/// tensors at run time; the compiler has no static device signal at the
+/// train block), so a compile-time `CodegenError` cannot be device-precise —
+/// this setup-time check is the earliest point where the device is knowable.
+/// It fires when the optimizer-state buffers are allocated, i.e. before the
+/// first forward pass, rather than mid-step at the first cast.
+///
+/// Plain Rust fn (not `extern "C"`) so the refusal itself is unit-testable
+/// with `#[should_panic]`. In production the panic unwinds to the
+/// `extern "C"` wrapper's boundary, where Rust's abort-on-unwind shim turns
+/// it into a process abort AFTER the message is printed — the same loud
+/// panic-equals-abort convention every other guard in this module relies on
+/// (see the crate-level FFI note in `lib.rs`).
+fn refuse_gpu_moment_template(device: u8) {
+    assert_eq!(
+        device, 0,
+        "[cpdt] reduced-precision optimizer moments are CPU-only in v1: \
+         nsl_tensor_zeros_like_dtype got a GPU-resident parameter \
+         (device={device}). The dequant->step->quant envelope routes through \
+         nsl_tensor_cast, which has no GPU path yet (GPU cast for optimizer \
+         moments is not yet implemented). Drop --wggo-moment-precision (or \
+         the CPDT FP16 moment tiers) to keep FP32 moments on GPU, or train \
+         on CPU.",
+    );
+}
+
+fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
     let elem_size: usize = match dtype {
         DTYPE_F32 => 4,
         DTYPE_FP16 => 2,
@@ -500,7 +544,7 @@ pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> 
 
     let tensor = Box::new(NslTensor::new(
         data, shape, strides, ndim, len,
-        t.device, // preserve template's device
+        t.device, // always 0: refuse_gpu_moment_template rejected GPU templates
         dtype,
         1, // owns_data
         0, // data_owner
@@ -992,6 +1036,22 @@ mod tests {
         let qmant = qnan_bits & 0x7F;
         assert_eq!(qexp, 0xFF);
         assert_ne!(qmant, 0);
+    }
+
+    /// Cost-model audit finding 2: GPU-resident templates must be refused at
+    /// optimizer-state allocation (train-block setup), not mid-step at the
+    /// first cast. The guard is a plain Rust fn precisely so this refusal is
+    /// testable — the `extern "C"` wrapper cannot use `#[should_panic]`
+    /// (panic-on-unwind across the FFI boundary aborts the test runner).
+    #[test]
+    #[should_panic(expected = "[cpdt] reduced-precision optimizer moments are CPU-only")]
+    fn zeros_like_dtype_guard_refuses_gpu_template() {
+        refuse_gpu_moment_template(1);
+    }
+
+    #[test]
+    fn zeros_like_dtype_guard_accepts_cpu_template() {
+        refuse_gpu_moment_template(0); // must not panic
     }
 
     /// CFTP v6 Finding 2 (HIGH): the contiguity guard precondition is a

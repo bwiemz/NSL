@@ -882,8 +882,10 @@ pub struct WggoOptions {
     /// Lower the plan's optim_m/v_bits decisions to real optimizer-state
     /// storage dtypes (opt-in: reduced-precision moments change training
     /// numerics, and the v1 dequant→step→quant envelope is CPU-only —
-    /// nsl_tensor_cast aborts loudly on GPU tensors). When false, sub-32
-    /// plan bits stay advisory and a not-lowered notice is printed.
+    /// GPU-resident training is refused loudly at train-block setup, when
+    /// `nsl_tensor_zeros_like_dtype` allocates the moment buffers). When
+    /// false, sub-32 plan bits stay advisory and a not-lowered notice is
+    /// printed.
     pub moment_precision: bool,
 }
 

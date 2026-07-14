@@ -209,12 +209,27 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         }
         Some(rec) => {
             // Gate 2: most aggressive feasible tuple at-or-below rec.
-            let preferred = zero_search
+            // Within the winning s_p tier, take the FIRST candidate in
+            // `ranked` order — `ranked` is sorted best-first by the
+            // deterministic `cpdt_zero::rank_cmp` chain, so the first hit
+            // carries the best (s_g, s_os) combination of that tier.
+            // (`max_by_key` here would return the LAST max-s_p element,
+            // i.e. the tier's worst-ranked evaluation — with the audit's
+            // memory tie-break that deterministically picked the
+            // highest-memory combo.)
+            let max_sp = zero_search
                 .ranked
                 .iter()
                 .filter(|e| e.feasible && e.config.s_p <= rec)
-                .max_by_key(|e| e.config.s_p)
-                .cloned();
+                .map(|e| e.config.s_p)
+                .max();
+            let preferred = max_sp.and_then(|sp| {
+                zero_search
+                    .ranked
+                    .iter()
+                    .find(|e| e.feasible && e.config.s_p == sp)
+                    .cloned()
+            });
 
             match preferred {
                 Some(t) => {
@@ -321,18 +336,23 @@ mod override_tests {
     /// Build a `CpdtInput` with adjustable world_size, WGGO recommendation,
     /// and memory pressure.
     ///
-    /// Model: 8 layers × 6 MB params = 48 MB total, optim_multiplier=8.0,
-    ///        peak activation = 2 MB (single layer max).
+    /// Model: 8 layers × 6 MB params = 48 MB total, optim_multiplier=2.0
+    ///        (fp32 AdamW m+v on param BYTES), retained activations =
+    ///        Σ per-layer = 16 MB (no checkpointing → concurrent live set).
     ///
-    /// Per-GPU memory formula: params/s_p + params/s_g + params*8/s_os + 2 MB.
-    ///   DDP (s_p=1, s_g=1, s_os=1): 48+48+384+2 = 482 MB.
-    ///   Best s_p=2 tuple (s_p=2,s_g=8,s_os=8): 24+6+48+2   =  80 MB.
-    ///   Best s_p=4 tuple (s_p=4,s_g=4,s_os=8): 12+12+48+2  =  74 MB.
+    /// Per-GPU memory formula: params/s_p + params/s_g + params*2/s_os + 16 MB.
+    ///   DDP (s_p=1, s_g=1, s_os=1): 48+48+96+16 = 208 MB.
+    ///   Best s_p=2 tuple (s_p=2,s_g=8,s_os=8): 24+6+12+16 = 58 MB.
+    ///   Best s_p=4 tuple (s_p=4,s_g=8,s_os=8): 12+6+12+16 = 46 MB.
+    ///
+    /// (Arithmetic deliberately re-derived for the cost-model audit: the old
+    /// numbers encoded the 8.0 multiplier-on-bytes bug and max-single-layer
+    /// activation accounting.)
     ///
     /// memory_pressure "low"  → 80 GB budget (all tuples fit).
-    /// memory_pressure "high" → 75 MB budget (only s_p ≥ 4 tuples fit):
-    ///    80 MB (best s_p=2 tuple) > 75 MB → infeasible
-    ///    74 MB (best s_p=4 tuple) ≤ 75 MB → feasible
+    /// memory_pressure "high" → 50 MB budget (only s_p ≥ 4 tuples fit):
+    ///    58 MB (best s_p=2 tuple) > 50 MB → infeasible
+    ///    46 MB (best s_p=4 tuple) ≤ 50 MB → feasible
     fn cpdt_input_with(
         world_size: u32,
         recommended: Option<u32>,
@@ -340,7 +360,7 @@ mod override_tests {
     ) -> CpdtInput<'static> {
         let memory_budget_bytes = match memory_pressure {
             "low" => 80u64 * 1024 * 1024 * 1024, // 80 GB — all tuples feasible
-            "high" => 75_000_000u64,              // 75 MB — only s_p ≥ 4 feasible
+            "high" => 50_000_000u64,              // 50 MB — only s_p ≥ 4 feasible
             other => panic!("unknown memory_pressure: {other}"),
         };
         CpdtInput {
@@ -350,6 +370,7 @@ mod override_tests {
                 per_layer_activation_bytes: vec![2_000_000; 8],
                 optim_state_multiplier: crate::cpdt_zero::ADAMW_FP32_OPTIM_MULTIPLIER,
                 per_layer_compute_us: vec![10.0; 8],
+                activation_checkpointing: false,
             },
             cluster: ClusterSpec {
                 num_gpus: world_size,
@@ -407,8 +428,10 @@ mod override_tests {
 
     #[test]
     fn wggo_recommendation_overridden_by_memory_when_more_sharding_required() {
-        // world_size=8, rec=2, budget=100 MB.
-        // All tuples with s_p ≤ 2 are infeasible (best costs 112 MB).
+        // world_size=8, rec=2, budget=50 MB ("high").
+        // All tuples with s_p ≤ 2 are infeasible (best s_p=2 tuple costs
+        // 58 MB; see cpdt_input_with's arithmetic — deliberately re-derived
+        // for the cost-model audit).
         // Planner falls back to default → picks s_p ≥ 4.
         // Since applied s_p > 2 = rec, ShardFactorOverriddenByMemory is emitted.
         let input = cpdt_input_with(8, Some(2), "high");
@@ -453,6 +476,25 @@ mod override_tests {
             plan.override_diagnostics.is_empty(),
             "table-gap downgrade must be silent (no diagnostic); got {:?}",
             plan.override_diagnostics
+        );
+    }
+
+    #[test]
+    fn gate2_picks_best_ranked_tuple_within_max_sp_tier() {
+        // Cost-model audit review fix: within the max-s_p tier Gate 2 must
+        // take the FIRST candidate in ranked (best-first) order, not the
+        // last (`max_by_key` returned the tier's worst-ranked evaluation).
+        // Huge compute hides all comm → every candidate ties on step time →
+        // rank order inside the s_p=4 tier is decided by memory:
+        //   (4,8,8) 46 MB < (4,4,8) 64 MB < (4,4,4) 88 MB.
+        let mut input = cpdt_input_with(8, Some(4), "low");
+        input.model.per_layer_compute_us = vec![1_000_000.0; 8];
+        let plan = run(input);
+        let cfg = plan.zero.as_ref().expect("zero eval").config;
+        assert_eq!(
+            (cfg.s_p, cfg.s_g, cfg.s_os),
+            (4, 8, 8),
+            "Gate 2 must apply the best-ranked (s_g, s_os) combo of the tier"
         );
     }
 
@@ -516,6 +558,7 @@ mod tests {
             per_layer_activation_bytes: vec![2_000_000; 8],
             optim_state_multiplier: crate::cpdt_zero::ADAMW_FP32_OPTIM_MULTIPLIER,
             per_layer_compute_us: vec![10.0; 8],
+            activation_checkpointing: false,
         }
     }
 
