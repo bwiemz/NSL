@@ -23,23 +23,31 @@
 //!     `@fused_lm_ce may only be applied to a `train` block`.  A silent
 //!     decorator-target-loosen regression would flip this.
 //!
-//! Subprocess-running `nsl run` on the fp16 fixture documents the
-//! load-bearing TRAIN-LOOP BITROT that prevents the full GPU loss-print
-//! the orchestrator originally targeted:
-//!
-//!   * `codegen error: undefined function 'nsl_optim_sgd__sgd_step'`
-//!
-//! This refusal fires from `crates/nsl-codegen/src/stmt.rs` during train-
-//! block lowering — after the `@fused_lm_ce` semantic gate and after
-//! wengert auto-substitution.  It is unrelated to the v7 GPU PTX cast
-//! kernel and would block ANY train block, decorator-bearing or not.
-//! v3-3 / project_cftp_v3_substitution.md tracks the optimizer-step FFI
-//! registration as an open architectural follow-on.
+//! Subprocess-running `nsl run` on the fp16 fixture used to document the
+//! load-bearing TRAIN-LOOP BITROT that prevented the full loss-print the
+//! orchestrator originally targeted (`codegen error: undefined function
+//! 'nsl_optim_sgd__sgd_step'`, fired from `crates/nsl-codegen/src/stmt.rs`
+//! during train-block lowering). That FFI registration bitrot is now
+//! fixed as a side effect of the CPKD `discover_optimizer_modules` stdlib-
+//! loader refactor (it now loads `nsl.optim.*` modules for plain `train`
+//! blocks, not just `distill` blocks) — `nsl run` on the fp16 fixture
+//! compiles, links, and executes to completion, printing a finite CPU
+//! loss. Fixing that surfaced a second, independent bug the bitrot had
+//! been masking: `x`/`targets` in the fp16/bf16 fixtures were unflattened
+//! `[B, S, H]` / `[B, S]` tensors, and the naive composite fallback path
+//! (`bias_add` + `cross_entropy`, taken whenever `@fused_lm_ce` doesn't
+//! substitute a fused kernel call) requires flattened `[rows, H]` /
+//! `[rows]` input — see `cpkd_distill_basic.nsl`. A raw 3D `x` made
+//! `nsl_tensor_bias_add` (`crates/nsl-runtime/src/tensor/mod.rs`)
+//! `std::process::abort()` the whole process with "bias_add requires 2D
+//! tensor (got 3D)" the moment execution reached it. Fixtures now use
+//! `x = randn([64, 128])` / `targets = zeros([64])` (rows = B*S = 64).
 //!
 //! ## Why this is the right scope today
 //!
-//! The numerical contract the orchestrator wants ("rel_err <= 5e-3 for
-//! fp16, <= 2e-2 for bf16") is ALREADY pinned at GPU level in
+//! The strict numerical contract the orchestrator wants ("rel_err <= 5e-3
+//! for fp16, <= 2e-2 for bf16") is pinned at GPU level (CUDA-gated,
+//! unavailable in this environment) in
 //!
 //!   * `crates/nsl-codegen/tests/fused_lm_ce_e2e_fp16_activation.rs`
 //!     Phase 2 (`fp16_decorator_e2e_loss_matches_cpu_f64_reference`)
@@ -49,22 +57,19 @@
 //! Those Phase-2 tests drive the SAME FFI (`nsl_fused_linear_ce_forward`)
 //! the wengert-lowered train block would dispatch to, with the SAME
 //! dtype_tag sentinels (1 for fp16, 2 for bf16), the SAME B/S/V/H shape,
-//! and the SAME CPU f64 reference helper.  The compile-side path from
-//! NSL source through `compile_wengert_ops` is pinned by the same files'
-//! Phase 1 IR proofs.
+//! and the SAME CPU f64 reference helper — that is still the authoritative
+//! numerical contract. `nsl_run_produces_finite_loss` below is a coarser
+//! sanity check on the true `nsl run` user-facing path (parse → semantic
+//! → wengert lower → link → execute → stdout), not a replacement for it:
+//! it only asserts the process exits 0 and prints a finite loss.
 //!
-//! Once `nsl_optim_sgd__sgd_step` FFI is registered, the existing fp16/
-//! bf16 fixtures here become drop-in inputs for the full GPU loss-print
-//! comparison — no fixture rewrites required.
+//! ## What this test does NOT cover
 //!
-//! ## What this test does NOT cover (deferral)
-//!
-//! Actual `nsl run` execution → stdout-loss capture → CPU f64 compare.
-//! Deferred until train-block optimizer FFI bitrot is fixed.  The
-//! `nsl_run_documents_train_loop_bitrot` test guards this deferral with
-//! a stderr substring check so an unexpected FIX to the train-block path
-//! flips a CI signal — that is the trigger to extend this file with the
-//! orchestrator's loss-print numerical compare.
+//! A hard numerical pin of the `nsl run` stdout loss against the CPU f64
+//! reference. Wiring that up (matching this fixture's B/S/V/H/dtype_tag
+//! against `common::fused_lce_cpu_f64`) is a reasonable follow-on now that
+//! the train-loop bitrot is gone, but is left to the GPU-gated Phase-2
+//! tests above, which already own that contract on the fused-kernel path.
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -172,32 +177,42 @@ fn nsl_check_refuses_non_train_block_target() {
     ));
 }
 
-/// `nsl run` on the fp16 fixture MUST currently bottom out in the
-/// optimizer-step FFI bitrot (`nsl_optim_sgd__sgd_step` undefined).
-/// This test DOCUMENTS the deferral the v7 sprint inherits and arms a
-/// CI signal: if the train-block optimizer-FFI registration is ever
-/// fixed, this test will flip from passing to failing — and that is the
-/// trigger to extend this file with the orchestrator's true `nsl run`
-/// loss-print numerical compare (parse stdout → compare against the
-/// CPU f64 reference in `crates/nsl-codegen/tests/common/
-/// fused_lce_cpu_f64.rs`).
-///
-/// CFTP v3-3 `project_cftp_v3_substitution.md` tracks the optimizer-
-/// step FFI registration as an open architectural follow-on.  Until
-/// that lands, the IR + GPU numerical contracts are pinned via
-///   * `crates/nsl-codegen/tests/fused_lm_ce_e2e_fp16_activation.rs`
-///   * `crates/nsl-codegen/tests/fused_lm_ce_e2e_bf16_activation.rs`
-/// (decorator → wengert lower → 3× precision_cast → fused_linear_ce
-/// FFI with the right dtype_tag → CUDA-gated GPU loss vs CPU f64).
+/// `nsl run` on the fp16 fixture now runs the full user-facing path to
+/// completion: the `nsl_optim_sgd__sgd_step` FFI bitrot this test used to
+/// pin is fixed (CPKD's `discover_optimizer_modules` stdlib-loader
+/// refactor loads `nsl.optim.*` for plain `train` blocks too), and the
+/// fixture's `x`/`targets` are flattened to `[rows, H]` / `[rows]` so the
+/// composite `bias_add` + `cross_entropy` fallback no longer aborts on a
+/// 3D tensor (see the module doc comment for both root causes). This test
+/// is a coarse sanity check, not the numerical contract — see
+/// `fused_lm_ce_e2e_fp16_activation.rs` Phase 2 for the CUDA-gated
+/// rel_err pin against the CPU f64 reference.
 #[test]
-fn nsl_run_documents_train_loop_bitrot() {
+fn nsl_run_produces_finite_loss() {
     let fixture = fixture_path("fused_lm_ce_e2e_fp16.nsl");
     assert!(fixture.exists(), "fp16 fixture missing: {}", fixture.display());
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", stdlib_path());
     cmd.arg("run").arg(&fixture);
-    cmd.assert().failure().stderr(predicate::str::contains(
-        "nsl_optim_sgd__sgd_step",
-    )).stderr(predicate::str::contains("undefined function"));
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).expect("stdout must be valid UTF-8");
+    // On Windows, `nsl run`'s in-process link step shells out to MSVC
+    // `link.exe`, which prints its own "Creating library ... and object
+    // ..." line to stdout ahead of the fixture's `print(loss)` output --
+    // Linux/macOS toolchains don't emit that noise. The loss is always the
+    // last line the fixture itself prints, so parse the last non-empty
+    // line rather than assuming stdout is the bare float alone.
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("expected non-empty stdout, got {stdout:?}"));
+    let loss: f64 = last_line.trim().parse().unwrap_or_else(|e| {
+        panic!("expected a bare finite loss on the last stdout line, got {stdout:?}: {e}")
+    });
+    assert!(
+        loss.is_finite(),
+        "train step loss must be finite, got {loss}"
+    );
 }

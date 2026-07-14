@@ -1,6 +1,7 @@
 # CFTP v7 — end-to-end fixture for `@fused_lm_ce(dtype = "bf16")`.
 # Mirror of `fused_lm_ce_e2e_fp16.nsl` with the dtype hint flipped to
-# bf16 — see that file's docstring for the train-block bitrot status.
+# bf16 — see that file's docstring for the train-block bitrot status
+# and why `x`/`targets` are pre-flattened to [rows, H] / [rows].
 
 from nsl.nn.losses import cross_entropy
 
@@ -12,8 +13,8 @@ model LM:
         return bias_add(x @ self.w.transpose(0, 1), self.bias)
 
 let m = LM()
-let x = randn([2, 32, 128])
-let targets = zeros([2, 32])
+let x = randn([64, 128])
+let targets = zeros([64])
 
 @fused_lm_ce(enabled = true, dtype = "bf16", vocab_size = 4096, hidden_size = 128, batch_size = 2, seq_len = 32, vocab_tile = 1024)
 train(model = m, epochs = 1):

@@ -19,6 +19,14 @@
 # the optimizer-runtime registration is fixed, this fixture is already
 # the right shape to drive the full GPU end-to-end loss compare.
 #
+# `x`/`targets` are pre-flattened to [rows, H] / [rows] (rows = B*S) --
+# `forward`'s naive composite path (`bias_add` + `cross_entropy`) runs
+# whenever `@fused_lm_ce` doesn't substitute a fused kernel call, and
+# both `nsl_tensor_bias_add` and the stdlib `cross_entropy` gather path
+# require 2D/1D flattened input (see `cpkd_distill_basic.nsl`); a raw
+# [B, S, H] `x` aborts the process in `nsl_tensor_bias_add` with
+# "bias_add requires 2D tensor (got 3D)" the moment execution reaches it.
+#
 # Shape parameters here match the v5/v6 numerical-pin orchestrator
 # config (V=4096, H=128, B=2, S=32, vocab_tile=1024) so the same CPU f64
 # reference in `crates/nsl-codegen/tests/common/fused_lce_cpu_f64.rs`
@@ -34,8 +42,8 @@ model LM:
         return bias_add(x @ self.w.transpose(0, 1), self.bias)
 
 let m = LM()
-let x = randn([2, 32, 128])
-let targets = zeros([2, 32])
+let x = randn([64, 128])
+let targets = zeros([64])
 
 @fused_lm_ce(enabled = true, dtype = "fp16", vocab_size = 4096, hidden_size = 128, batch_size = 2, seq_len = 32, vocab_tile = 1024)
 train(model = m, epochs = 1):
