@@ -194,3 +194,84 @@ fn decorated_flash_attention_has_no_reachability_verdict() {
         "the decorated path runs the admission fork; no reachability verdict is expected:\n{stderr}"
     );
 }
+
+/// Regression: a plain-MLP train block sits inside a top-level `for` loop
+/// (an ensemble-style "retrain this model N times" shape), textually BEFORE
+/// a second, decorator-free attention train block. The MLP block is the true
+/// document-order-first train block, but `wggo_prepass::walk_stmts` used to
+/// only recurse into `VarDecl`/`TrainBlock`/`Decorated` — never `For` (or
+/// `While`/`WhileLet`) bodies — so it never counted the loop-nested block.
+/// That left `train_blocks_seen == 0` when the walker reached the attention
+/// block, which then wrongly inherited `is_first_train_block = true` and
+/// printed a plan-reachability verdict describing ITS OWN plan as if it were
+/// the governing first block — exactly the "wrong evidence" failure mode
+/// `kernel.rs`'s admission fork comments warn against.
+///
+/// With the walker correctly recursing into the loop body, the MLP block is
+/// now the one marked first (and has no attention, so nothing to report),
+/// and the attention block is correctly excluded from the first-block-only
+/// verdict — so no `plan-reachability` line should appear at all.
+const FOR_LOOP_THEN_ATTENTION: &str = r#"from nsl.nn.losses import mse_loss
+
+model TinyMlp:
+    w: Tensor = ones([16, 16])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model TinyAttn:
+    w_norm: Tensor = ones([64])
+    wq: Tensor = ones([64, 64])
+    wk: Tensor = ones([64, 64])
+    wv: Tensor = ones([64, 64])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let x_norm = rmsnorm(x, self.w_norm, 0.00001)
+        let q = x_norm @ self.wq
+        let k = x_norm @ self.wk
+        let v = x_norm @ self.wv
+        let scale = 1.0 / sqrt(64.0)
+        return scaled_dot_product_attention(q, k, v, scale)
+
+let m = TinyMlp()
+let x = ones([4, 16])
+let y = zeros([4, 16])
+
+for i in range(1):
+    train(model = m, epochs = 1):
+        optimizer: SGD(lr = 0.001)
+        step(batch):
+            let out = m.forward(x)
+            let loss = mse_loss(out, y)
+
+let m2 = TinyAttn()
+let x2 = ones([1, 1, 64, 64])
+let y2 = zeros([1, 1, 64, 64])
+
+train(model = m2, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let out = m2.forward(x2)
+        let loss = mse_loss(out, y2)
+"#;
+
+#[test]
+fn for_loop_nested_train_block_is_still_first_in_document_order() {
+    let stderr = build_stderr(FOR_LOOP_THEN_ATTENTION, "forloop_first", Some("greedy"));
+    assert!(
+        !stderr.contains("plan-reachability"),
+        "the for-loop-nested MLP block is the true first train block (no attention, \
+         nothing to report there); the second, attention-bearing block must not be \
+         wrongly treated as first just because the walker skipped the loop body:\n{stderr}"
+    );
+    // Both blocks must still plan and consume normally — this is a
+    // mis-attribution regression, not a "stop planning" regression.
+    let consumed = stderr
+        .matches("[wggo] consumed pre-solved plan (graph fingerprint match)")
+        .count();
+    assert_eq!(
+        consumed, 2,
+        "expected both train blocks (loop-nested and top-level) to consume their own \
+         pre-plan, got {consumed}:\n{stderr}"
+    );
+}
