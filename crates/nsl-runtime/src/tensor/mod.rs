@@ -1365,6 +1365,105 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
     let dst = NslTensor::from_ptr(dst_ptr);
+    {
+        // PCA Stage C hardening: reconcile a mismatched src instead of
+        // aborting. Legitimate gradients can arrive as transpose VIEWS
+        // (non-contiguous) or as CPU-f64 chains on a GPU run (any adjoint
+        // op that only has a CPU lowering) — the non-inplace binary ops
+        // already reconcile exactly like this. The warn-once keeps the
+        // perf smell visible: a converted src on every step means some
+        // producer op should grow a device kernel.
+        let src_probe = NslTensor::from_ptr(src_ptr);
+        if src_probe.device != dst.device
+            || src_probe.dtype != dst.dtype
+            || !src_probe.is_contiguous()
+        {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nsl] add_inplace: reconciling src (device {} -> {}, dtype {} -> {}, contiguous={}) —                      repeated reconciliation is a perf smell (CPU-lowered producer on a GPU run?)",
+                    src_probe.device, dst.device, src_probe.dtype, dst.dtype,
+                    src_probe.is_contiguous()
+                );
+            }
+            let contig = if src_probe.is_contiguous() {
+                src_ptr
+            } else {
+                nsl_tensor_contiguous(src_ptr)
+            };
+            // Dtype first: `to_device_like` converts dtype only as part of a
+            // CPU<->GPU transfer; a same-device dtype gap (CPU f64 grad into
+            // a CPU f32 buffer read back from the GPU) needs an explicit
+            // cast. nsl_tensor_cast is CPU-only, which is exactly the only
+            // case where a dtype gap can exist (GPU tensors are always f32).
+            let contig_probe = NslTensor::from_ptr(contig);
+            let casted = if contig_probe.dtype == 0 && dst.dtype == 1 && contig_probe.device == 0 {
+                // f64 host grad into an f32 buffer: plain downcast copy.
+                // (nsl_tensor_cast is the CPDT F32/FP16/BF16 tool and
+                // rejects f64 sources.)
+                let shape: Vec<i64> = (0..contig_probe.ndim as usize)
+                    .map(|i| unsafe { *contig_probe.shape.add(i) })
+                    .collect();
+                let out_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&shape, 1);
+                if out_ptr != 0 {
+                    let out_t = NslTensor::from_ptr(out_ptr);
+                    let n = contig_probe.len as usize;
+                    let src_f64 = contig_probe.data as *const f64;
+                    let dst_f32 = out_t.data as *mut f32;
+                    for i in 0..n {
+                        unsafe { *dst_f32.add(i) = *src_f64.add(i) as f32 };
+                    }
+                }
+                out_ptr
+            } else if contig_probe.dtype == 1 && dst.dtype == 0 && contig_probe.device == 0 {
+                // f32 host src into an f64 buffer: plain upcast copy
+                // (nsl_tensor_cast has no f64 TARGET either).
+                let shape: Vec<i64> = (0..contig_probe.ndim as usize)
+                    .map(|i| unsafe { *contig_probe.shape.add(i) })
+                    .collect();
+                let out_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&shape, 0);
+                if out_ptr != 0 {
+                    let out_t = NslTensor::from_ptr(out_ptr);
+                    let n = contig_probe.len as usize;
+                    let src_f32 = contig_probe.data as *const f32;
+                    let dst_f64 = out_t.data as *mut f64;
+                    for i in 0..n {
+                        unsafe { *dst_f64.add(i) = f64::from(*src_f32.add(i)) };
+                    }
+                }
+                out_ptr
+            } else if contig_probe.dtype != dst.dtype && contig_probe.device == 0 {
+                crate::tensor::precision_cast::nsl_tensor_cast(contig, dst.dtype as i64)
+            } else {
+                contig
+            };
+            if casted != contig && contig != src_ptr {
+                nsl_tensor_free(contig);
+            }
+            let migrated = nsl_tensor_to_device_like(casted, dst_ptr);
+            if migrated != 0 && migrated != src_ptr {
+                nsl_tensor_add_inplace(dst_ptr, migrated);
+                // Refcount balance (review finding): when `to_device_like`
+                // is a same-placement no-op it returns `casted` itself with
+                // an EXTRA refcount — so freeing `migrated` and `casted`
+                // independently is correct in BOTH cases: distinct pointers
+                // get one free each; an aliased pointer gets its rc dropped
+                // twice (bump + original ownership).
+                nsl_tensor_free(migrated);
+                if casted != src_ptr {
+                    nsl_tensor_free(casted);
+                }
+                return;
+            }
+            // Migration failed (returned 0 or the raw src): drop the temp
+            // and fall through to the strict asserts, which will report the
+            // residual mismatch loudly.
+            if casted != src_ptr {
+                nsl_tensor_free(casted);
+            }
+        }
+    }
     let src = NslTensor::from_ptr(src_ptr);
     debug_assert!(dst.is_contiguous(), "add_inplace requires contiguous dst");
     debug_assert!(src.is_contiguous(), "add_inplace requires contiguous src");
@@ -1377,6 +1476,16 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_add_inplace: dst len {} != src len {}",
         dst.len, src.len
     );
+    if dst.dtype != src.dtype && std::env::var("NSL_ALIGN_DEBUG").is_ok() {
+        let shp = |t: &NslTensor| (0..t.ndim as usize)
+            .map(|i| unsafe { *t.shape.add(i) }.to_string())
+            .collect::<Vec<_>>()
+            .join("x");
+        eprintln!(
+            "[align-debug] add_inplace mismatch: dst dev={} dtype={} shape={} | src dev={} dtype={} shape={} contig={}",
+            dst.device, dst.dtype, shp(dst), src.device, src.dtype, shp(src), src.is_contiguous()
+        );
+    }
     assert_eq!(
         dst.dtype, src.dtype,
         "nsl_tensor_add_inplace: dtype mismatch (dst={}, src={})",

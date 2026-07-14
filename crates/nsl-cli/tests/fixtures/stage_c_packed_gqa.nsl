@@ -1,0 +1,75 @@
+# PCA Stage C parity fixture: packed GQA pretraining, fused vs decomposed.
+#
+# A miniature GQA transformer trained on a packed token stream, sized so the
+# fused segment-masked flash kernel is ELIGIBLE on GPU:
+#   - head_dim = 32 (in the fused variant table {32, 64, 128}),
+#   - seq_len = 64 (divisible by every candidate tile size),
+#   - DataLoader(packing=true) provides attention_mask + segment_ids.
+#
+# The attention call is `forward_packed` (Stage C). The parity harness
+# rewrites two markers by exact string match:
+#   - "forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, training)"
+#     -> the forward_masked form, for the CPU packed==masked differential;
+#   - "# GPU_PLACEMENT" -> "m.to(cuda)" for the GPU runs;
+#   - the model_save path.
+
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_a: Tensor = ones([64])
+    norm_f: Tensor = ones([64])
+    attn: GroupedQueryAttention = GroupedQueryAttention(64, 2, 1, 32, 0.0)
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor, mask: Tensor, seg: Tensor, training: bool) -> Tensor:
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, training)
+        let h1 = h + a
+        let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h1 + f
+
+model PackedLM:
+    embed: Tensor = randn([64, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+
+    fn forward_train(self, input_ids: Tensor, mask: Tensor, seg: Tensor, training: bool) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h, mask, seg, training)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = PackedLM()
+# GPU_PLACEMENT
+
+# Token stream with real document boundaries: tokens cycle 1..7 with a 0
+# (the pack separator) every 8 positions -> every 64-token window packs 8
+# documents; the block-diagonal mask and segment ids have real structure.
+let unit = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let tokens = unit.reshape([1, 8]).expand([256, 8]).contiguous().reshape([2048])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true, packing=true, pack_separator=0)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2, grad_clip=1.0):
+    optimizer: AdamW(lr=0.002, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, batch.attention_mask, batch.segment_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+model_save(m, "STAGE_C_SAVE_PATH")

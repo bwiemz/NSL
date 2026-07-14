@@ -1,0 +1,84 @@
+# WGGO all-six-subsystems pretraining benchmark (PCA Stage C campaign).
+#
+# A 16M-param GQA transformer trained on a PACKED token stream on the GPU,
+# driven by --pretrain-optimized (source AD + WGGO greedy + CSHA auto):
+#   - PCA:  DataLoader(packing=true) + forward_packed -> the plan's
+#           segment_id decision lowers to the fused segment-masked flash
+#           family (Tier-B tile skip at seq 1024).
+#   - FASE: grad_accumulation=4 + grad_clip=1.0 -> Deferred windowed AdamW
+#           with two-phase clip.
+#   - CSHA: consulted per layer (decorator-free path: level advisories).
+#   - WRGA: no @wrga decorators -> the plan must hold adapter rank 0.
+#   - CEP:  random-init weights -> evidence gates must keep all heads.
+#   - CPDT: single-GPU ZeRO/precision evaluation (moment-precision opt-in
+#           NOT set: the GPU cast refusal is by design).
+#
+# Geometry: d_model=512, 8 Q heads / 2 KV heads, head_dim=64 (in the fused
+# variant table), 6 blocks, FFN 2048, vocab 4096, seq 1024, batch 4.
+# Every 192-token window ends in a pack separator -> ~5 docs per sequence.
+#
+# Emits one loss line and one bare-float clock() line per optimizer step
+# between the stream markers; the driver pairs them up.
+
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_a: Tensor = ones([512])
+    norm_f: Tensor = ones([512])
+    attn: GroupedQueryAttention = GroupedQueryAttention(512, 8, 2, 64, 0.0)
+    w_up: Tensor = randn([512, 2048]) * 0.02
+    w_down: Tensor = randn([2048, 512]) * 0.02
+
+    fn forward(self, h: Tensor, mask: Tensor, seg: Tensor, training: bool) -> Tensor:
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, training)
+        let h1 = h + a
+        let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h1 + f
+
+model PackedLM:
+    embed: Tensor = randn([4096, 512]) * 0.02
+    blocks: [Blk; 6] = Blk()
+    norm_out: Tensor = ones([512])
+
+    fn forward_train(self, input_ids: Tensor, mask: Tensor, seg: Tensor, training: bool) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 512])
+        for block in self.blocks:
+            h = block.forward(h, mask, seg, training)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        # Weight-tied LM head
+        return hn @ self.embed.transpose(0, 1)
+
+let m = PackedLM()
+m.to(cuda)
+
+# Packed corpus: tokens cycle 1..191 with a separator (0) every 192
+# positions -> real document boundaries every 192 tokens. 192 x 2731 =
+# 524352 tokens -> 128 batches of 4x1024 -> 32 optimizer steps at accum=4.
+let unit = tensor_cat([arange(191) + full([191], 1.0), zeros([1])], 0)
+let tokens = unit.reshape([1, 192]).expand([2731, 192]).contiguous().reshape([524352])
+let loader = DataLoader(tokens, batch_size=4, seq_len=1024, shuffle=false, drop_last=true, packing=true, pack_separator=0)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0):
+    optimizer: AdamW(lr=0.001, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, batch.attention_mask, batch.segment_ids, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+            print(clock())
+
+print("LOSS_STREAM_END")
+
+model_save(m, "BENCH_SAVE_PATH")

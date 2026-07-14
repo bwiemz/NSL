@@ -188,6 +188,14 @@ pub enum AdjointExpr {
     // Attention backward — per-component (Q, K, V) for correct causal masking
     /// Attention backward for Q: args: (grad, Q, K, V, fwd_result, causal)
     AttentionBackwardQ(VarId, VarId, VarId, VarId, VarId, bool),
+    /// PCA Stage C: packed (segment-masked) attention backward —
+    /// (output_bar, q, k, v, fwd_out, segment_ids). Causal-within-segment
+    /// by contract, so no causal flag.
+    AttentionBackwardQPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
+    /// See [`AdjointExpr::AttentionBackwardQPacked`].
+    AttentionBackwardKPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
+    /// See [`AdjointExpr::AttentionBackwardQPacked`].
+    AttentionBackwardVPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
     /// Attention backward for K: args: (grad, Q, K, V, fwd_result, causal)
     AttentionBackwardK(VarId, VarId, VarId, VarId, VarId, bool),
     /// Attention backward for V: args: (grad, Q, K, V, fwd_result, causal)
@@ -793,6 +801,38 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 },
             ]
         }
+        // PCA Stage C: packed attention. Q/K/V get fused-backward extracts;
+        // scale, mask and segment_ids are non-differentiable (the Stage B
+        // decomposed form produced a discarded mask adjoint — this op never
+        // materialises one).
+        PrimalOp::ScaledDotProductAttentionPacked => {
+            let q = op.inputs[0];
+            let k = op.inputs[1];
+            let v = op.inputs[2];
+            let scale = op.inputs[3];
+            let seg = op.inputs[5];
+            let fwd_result = op.result;
+            vec![
+                InputAdjoint {
+                    input_var: q,
+                    expr: AdjointExpr::AttentionBackwardQPacked(
+                        output_bar, q, k, v, fwd_result, seg, scale,
+                    ),
+                },
+                InputAdjoint {
+                    input_var: k,
+                    expr: AdjointExpr::AttentionBackwardKPacked(
+                        output_bar, q, k, v, fwd_result, seg, scale,
+                    ),
+                },
+                InputAdjoint {
+                    input_var: v,
+                    expr: AdjointExpr::AttentionBackwardVPacked(
+                        output_bar, q, k, v, fwd_result, seg, scale,
+                    ),
+                },
+            ]
+        }
         PrimalOp::RoPE { dim } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::RoPEBackward(output_bar, *dim),
@@ -917,6 +957,7 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::MSELoss
         | PrimalOp::L1Loss
         | PrimalOp::ScaledDotProductAttention { .. }
+        | PrimalOp::ScaledDotProductAttentionPacked
         | PrimalOp::Select => SavedRequirement::Inputs,
 
         // Save output — gradient depends on forward output values

@@ -71,6 +71,61 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let out = attn_flat @ self.wo
         return dropout(out, dp, training)
 
+    # PACKED variant (PCA Stage C): same contract as forward_masked below,
+    # plus segment_ids ([batch, seq] — the DataLoader's per-token document
+    # ids). On CUDA the attention lowers to the fused segment-masked flash
+    # kernel family (per-document tile skipping; LSE saved for the fused
+    # backward); on CPU / unsupported head_dims it falls back to the exact
+    # decomposed additive-mask path at runtime.
+    #
+    # REQUIREMENT: `mask` must be the DataLoader's canonical packed mask
+    # (causal-within-document, derived from these same segment_ids) — that
+    # is what makes the fused and fallback paths numerically identical.
+    # For arbitrary masks use forward_masked.
+    #
+    # v1 note: RoPE positions run CONTINUOUSLY across the packed sequence
+    # (same as forward_masked; per-document position reset is the @pca
+    # doc_starts machinery). Attention isolation is exact regardless.
+    fn forward_packed(self, x: Tensor, mask: Tensor, segment_ids: Tensor, training: bool) -> Tensor:
+        let s = x.shape
+        let batch = s[0]
+        let seq_len = s[1]
+        let nh = int(self._n_heads.item())
+        let nkv = int(self._n_kv_heads.item())
+        let hd = int(self._head_dim.item())
+        let n_rep = int(self._n_rep.item())
+        let dp = self._dropout_p.item()
+
+        let q = x @ self.wq
+        let k = x @ self.wk
+        let v = x @ self.wv
+
+        let q4 = q.reshape([batch, seq_len, nh, hd]).transpose(1, 2)
+        let k4 = k.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
+        let v4 = v.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
+
+        let q_rope = self.rope.forward(q4, seq_len)
+        let k_rope = self.rope.forward(k4, seq_len)
+
+        let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
+        let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+        let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
+        let v_exp = v5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+
+        # Broadcast the [batch, seq, seq] packed mask over heads. Consumed
+        # by the decomposed FALLBACK only — the fused kernel derives its
+        # masking from segment_ids directly.
+        let mask4 = mask.reshape([batch, 1, seq_len, seq_len])
+
+        let scale = 1.0 / sqrt(float(hd))
+        let attn_out = scaled_dot_product_attention_packed(q_rope, k_exp, v_exp, scale, mask4, segment_ids)
+
+        let attn_t = attn_out.transpose(1, 2)
+        let attn_flat = attn_t.reshape([batch, seq_len, nh * hd])
+
+        let out = attn_flat @ self.wo
+        return dropout(out, dp, training)
+
     # Packed-sequence variant (PCA Stage B): identical to forward() but the
     # attention consumes an ADDITIVE mask (0 = attend, -1e9 = blocked) that
     # REPLACES the causal mask. Feed the DataLoader's packed

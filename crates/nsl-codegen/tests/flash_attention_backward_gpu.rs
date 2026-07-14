@@ -308,6 +308,7 @@ fn run(
         name2.as_ptr() as i64,
         0, // tier_b_ptx_ptr
         0, // tier_b_name_ptr
+        0, // segment_ids (PCA Stage C: plain path)
     );
 
     assert!(grads_list != 0, "backward FFI returned null list");

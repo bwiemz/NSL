@@ -229,6 +229,81 @@ pub fn backward_select_blocks(head_dim: i64) -> (i64, i64) {
 /// numerically exact because the in-tile mask is element-level on absolute
 /// positions (`global_i < global_j` → P = 0), so masked elements contribute
 /// nothing to any gradient. Non-causal starts at 0.
+/// PCA Stage C: monotone segment break for the backward inner q-tile loop.
+///
+/// Emitted (segment-masked variant only) right after `%rd25 = q_start` at the
+/// top of `BWD_MAIN_Q_LOOP`, before any tile loads or `bar.sync`. Packed
+/// sequences carry non-decreasing segment ids, so once a q tile STARTS past
+/// this KV tile's last segment (`seg[q_start] > seg[kv_end]`, the latter
+/// preloaded into `%r_seg_kend` by the index prologue), every remaining q
+/// tile is entirely cross-document — all its P entries are masked to zero
+/// and it contributes nothing to dQ/dK/dV — so the loop can break, not just
+/// skip. The branch is block-uniform (all operands are CTA-uniform), so
+/// jumping over the body's `bar.sync`s is safe.
+/// PCA Stage C: load `seg[global_i]` once per q row (hoisted out of the nj
+/// loop — the row's segment id is nj-invariant). Emitted right after
+/// `%rd31 = global_i` in both backward bodies. `%rd26` is free at both call
+/// sites (its last use is the D/L shmem addressing above).
+fn emit_bwd_segment_load_seg_i(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    if !config.segment_masked {
+        return;
+    }
+    ptx.push_str("    // PCA Stage C: seg[global_i] (row-invariant, hoisted)\n");
+    ptx.push_str("    add.u64 %rd26, %rd31, %rd_segrow;\n");
+    ptx.push_str("    shl.b64 %rd26, %rd26, 1;           // *2 (u16)\n");
+    ptx.push_str("    add.u64 %rd26, %rd26, %rd_seg;\n");
+    ptx.push_str("    ld.global.u16 %r_seg_i, [%rd26];\n\n");
+}
+
+/// PCA Stage C: per-(mi,nj) segment predicate — `S = -inf` when the pair
+/// crosses a document boundary, folded in exactly like the causal arm so
+/// `P = exp(S - L)` underflows to zero. `recompute_gj` covers the MMA body,
+/// where `%rd33 = global_j` is otherwise only computed under `causal`.
+/// `tmp` must be a free u64 scratch register at the call site.
+fn emit_bwd_segment_mask_pre_exp(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    recompute_gj: bool,
+    tmp: &str,
+) {
+    if !config.segment_masked {
+        return;
+    }
+    ptx.push_str("    // PCA Stage C: segment mask -- S = -inf when seg[i] != seg[j]\n");
+    if recompute_gj {
+        ptx.push_str("    add.u64 %rd33, %rd14, %rd32;  // global_j = kv_start + nj\n");
+    }
+    ptx.push_str(&format!("    add.u64 {tmp}, %rd33, %rd_segrow;\n"));
+    ptx.push_str(&format!("    shl.b64 {tmp}, {tmp}, 1;           // *2 (u16)\n"));
+    ptx.push_str(&format!("    add.u64 {tmp}, {tmp}, %rd_seg;\n"));
+    ptx.push_str(&format!("    ld.global.u16 %r_seg_j, [{tmp}];\n"));
+    ptx.push_str("    setp.ne.u32 %p_seg, %r_seg_i, %r_seg_j;\n");
+    ptx.push_str("    @%p_seg mov.f32 %f_s, 0fFF800000;  // -inf -> exp = 0\n");
+}
+
+/// PCA Stage C: force `P = 0` for cross-document pairs after the `ex2`
+/// (mirrors the causal belt-and-braces store; also neutralises the
+/// `-inf - (-inf) = NaN` case for rows whose LSE is `-inf`).
+fn emit_bwd_segment_mask_post_exp(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    if !config.segment_masked {
+        return;
+    }
+    ptx.push_str("    @%p_seg mov.f32 %f_p, 0f00000000;  // force P = 0 cross-doc\n");
+}
+
+fn emit_bwd_segment_qtile_break(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    if !config.segment_masked {
+        return;
+    }
+    ptx.push_str("    // PCA Stage C: break once q tiles start past this KV tile's docs\n");
+    ptx.push_str("    add.u64 %rd18, %rd25, %rd_segrow;  // segrow + q_start\n");
+    ptx.push_str("    shl.b64 %rd18, %rd18, 1;           // *2 (u16)\n");
+    ptx.push_str("    add.u64 %rd18, %rd18, %rd_seg;\n");
+    ptx.push_str("    ld.global.u16 %r_seg_i, [%rd18];   // seg[q_start]\n");
+    ptx.push_str("    setp.gt.u32 %p_seg_break, %r_seg_i, %r_seg_kend;\n");
+    ptx.push_str("    @%p_seg_break bra BWD_MAIN_Q_LOOP_END;\n\n");
+}
+
 fn emit_bwd_causal_q_loop_start(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
     if !config.causal {
         ptx.push_str("    mov.u64 %rd24, 0;  // i_block = 0 (non-causal)\n");
@@ -3339,16 +3414,30 @@ impl FlashAttentionBackwardConfig {
 }
 
 /// Kernel name for the Phase 1 D-correction vector kernel.
+///
+/// The D vector (`D[i] = sum_d dO[i,d]*O[i,d]`) is mask-independent, so the
+/// segment-masked variant shares the phase-1 kernel with the plain one — no
+/// `_segmask` suffix here on purpose.
 pub fn flash_attention_bwd_d_kernel_name(config: &FlashAttentionBackwardConfig) -> String {
     format!("flash_attn_bwd_d_c{}_q{}", config.causal as u8, config.block_q)
 }
 
 /// Kernel name for the Phase 2 main backward kernel (dQ/dK/dV).
+///
+/// PCA Stage C: `_segmask` differentiates the segment-masked variant (14
+/// params, reads `param_segment_ids`/`param_heads`) from the plain 12-param
+/// kernel so the two never collide in the runtime PTX cache and the launch
+/// arg-count always matches the entry signature.
 pub fn flash_attention_bwd_main_kernel_name(config: &FlashAttentionBackwardConfig) -> String {
-    format!(
+    let base = format!(
         "flash_attn_bwd_main_c{}_q{}_kv{}",
         config.causal as u8, config.block_q, config.block_kv
-    )
+    );
+    if config.segment_masked {
+        format!("{base}_segmask")
+    } else {
+        base
+    }
 }
 
 /// Compute shared memory bytes needed by the Phase 2 backward kernel.
@@ -3533,7 +3622,19 @@ fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwa
     ptx.push_str("    .param .u64 param_lse,\n");
     ptx.push_str("    .param .f32 param_scale,\n");
     ptx.push_str("    .param .u64 param_seq_len,\n");
-    ptx.push_str("    .param .u64 param_head_dim\n");
+    if config.segment_masked {
+        // PCA Stage C: segment-masked variant appends two params at the END
+        // so the plain 12-param signature stays byte-identical (SASS
+        // baselines). `param_heads` exists because the kernel's blockIdx.x
+        // is a fused batch*head index and segment_ids is per-batch-row
+        // ([B, S] u16) — recovering batch_idx needs the head count, which
+        // the plain param list never carried.
+        ptx.push_str("    .param .u64 param_head_dim,\n");
+        ptx.push_str("    .param .u64 param_segment_ids,\n");
+        ptx.push_str("    .param .u64 param_heads\n");
+    } else {
+        ptx.push_str("    .param .u64 param_head_dim\n");
+    }
     ptx.push_str(")\n");
     ptx.push_str("{\n");
 
@@ -3557,7 +3658,15 @@ fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwa
 }
 
 /// Register declarations for the backward main kernel.
-fn emit_bwd_main_registers(ptx: &mut String, _config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    if config.segment_masked {
+        // PCA Stage C: segment-mask registers. Declared first (and only for
+        // the segment variant) so the plain kernel's register block stays
+        // byte-identical.
+        ptx.push_str("    .reg .u64 %rd_seg, %rd_segrow;\n");
+        ptx.push_str("    .reg .u32 %r_seg_i, %r_seg_j, %r_seg_kend;\n");
+        ptx.push_str("    .reg .pred %p_seg, %p_seg_break;\n");
+    }
     ptx.push_str("    // === Register declarations ===\n");
     ptx.push_str("    .reg .u32 %r<32>;\n");
     ptx.push_str("    .reg .u64 %rd<64>;\n");
@@ -3590,7 +3699,7 @@ fn emit_bwd_main_registers(ptx: &mut String, _config: &FlashAttentionBackwardCon
 }
 
 /// Load kernel parameters into registers.
-fn emit_bwd_main_param_loads(ptx: &mut String, _config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_main_param_loads(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
     ptx.push_str("    // === Parameter loads ===\n");
     ptx.push_str("    ld.param.u64 %rd0, [param_dout];\n");
     ptx.push_str("    ld.param.u64 %rd1, [param_q];\n");
@@ -3604,6 +3713,12 @@ fn emit_bwd_main_param_loads(ptx: &mut String, _config: &FlashAttentionBackwardC
     ptx.push_str("    ld.param.f32 %scale, [param_scale];\n");
     ptx.push_str("    ld.param.u64 %rd9, [param_seq_len];\n");
     ptx.push_str("    ld.param.u64 %rd10, [param_head_dim];\n\n");
+    if config.segment_masked {
+        // PCA Stage C: base pointer of the [B, S] u16 segment-id buffer and
+        // the head count (to recover batch_idx from the fused bh block index).
+        ptx.push_str("    ld.param.u64 %rd_seg, [param_segment_ids];\n");
+        ptx.push_str("    ld.param.u64 %rd_segrow, [param_heads];\n\n");
+    }
 }
 
 /// Compute thread/block indices and the base pointers for this thread-block's
@@ -3630,6 +3745,29 @@ fn emit_bwd_main_index_computation(ptx: &mut String, config: &FlashAttentionBack
 
     // bh_seq_offset = bh * seq_len  (element offset into [B*nh, S])
     ptx.push_str("    mul.lo.u64 %rd16, %rd12, %rd9;    // bh * seq_len => bh_seq_offset\n\n");
+
+    if config.segment_masked {
+        // PCA Stage C: %rd_segrow currently holds `heads` (see param loads).
+        // Convert it in place to the batch's row offset into the [B, S] u16
+        // segment-id buffer: segrow = (bh / heads) * seq_len.
+        ptx.push_str("    // segment row base: (bh / heads) * seq_len\n");
+        ptx.push_str("    div.u64 %rd_segrow, %rd12, %rd_segrow;  // batch_idx = bh / heads\n");
+        ptx.push_str("    mul.lo.u64 %rd_segrow, %rd_segrow, %rd9;  // * seq_len\n");
+        // Preload this KV tile's LAST row segment id once — the q-tile loop
+        // uses it for the monotone break test (segment ids are non-decreasing
+        // along a packed sequence, so once a q tile starts past this segment
+        // every later q tile does too).
+        ptx.push_str(&format!(
+            "    add.u64 %rd18, %rd14, {};  // kv_start + block_kv\n",
+            config.block_kv
+        ));
+        ptx.push_str("    min.u64 %rd18, %rd18, %rd9;   // clamp to seq_len\n");
+        ptx.push_str("    sub.u64 %rd18, %rd18, 1;      // kv tile last row\n");
+        ptx.push_str("    add.u64 %rd18, %rd18, %rd_segrow;\n");
+        ptx.push_str("    shl.b64 %rd18, %rd18, 1;      // *2 (u16)\n");
+        ptx.push_str("    add.u64 %rd18, %rd18, %rd_seg;\n");
+        ptx.push_str("    ld.global.u16 %r_seg_kend, [%rd18];\n\n");
+    }
 
     // num_q_tiles = ceil(seq_len / block_q)
     ptx.push_str(&format!(
@@ -3835,6 +3973,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "    mul.lo.u64 %rd25, %rd24, {};  // q_start = i_block * block_q\n",
         config.block_q
     ));
+    emit_bwd_segment_qtile_break(ptx, config);
 
     // Load Q[i_block] into shmem[q_shmem_offset..]
     ptx.push_str(&format!(
@@ -3992,6 +4131,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
 
     // global_i = q_start + mi
     ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
+    emit_bwd_segment_load_seg_i(ptx, config);
 
     // Inner loop over nj (KV positions in tile)
     ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
@@ -4046,6 +4186,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
         ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // set S = -inf so exp = 0\n");
     }
+    emit_bwd_segment_mask_pre_exp(ptx, config, false, "%rd36");
     ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;  // S - L\n");
     ptx.push_str("    mul.f32 %f_tmp, %f_tmp, %log2e;   // * log2(e)\n");
     ptx.push_str("    ex2.approx.f32 %f_p, %f_tmp;      // P = exp(S - L)\n");
@@ -4053,6 +4194,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         // Ensure exactly zero for masked positions (exp(-inf) should be 0 but be safe)
         ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
     }
+    emit_bwd_segment_mask_post_exp(ptx, config);
     ptx.push('\n');
 
     // Store S[mi][nj] = P (actually store P, the attention weight) into S_tile in shmem
@@ -4397,6 +4539,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         "    mul.lo.u64 %rd25, %rd24, {};  // q_start = i_block * block_q\n",
         config.block_q
     ));
+    emit_bwd_segment_qtile_break(ptx, config);
 
     // Load Q[i_block] into shmem[q_shmem_offset..]
     ptx.push_str(&format!(
@@ -4635,6 +4778,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
 
     // global_i = q_start + mi
     ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
+    emit_bwd_segment_load_seg_i(ptx, config);
 
     ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
     ptx.push_str("BWD_MAIN_MMA_P_NJ:\n");
@@ -4663,6 +4807,9 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         ptx.push_str("    setp.lt.u64 %p3, %rd31, %rd33;  // global_i < global_j?\n");
         ptx.push_str("    @%p3 mov.f32 %f_s, 0fFF800000;  // -inf\n");
     }
+    // Segment mask (recomputes %rd33 — the causal arm above only sets it
+    // when `causal`, and the segment variant must not depend on that).
+    emit_bwd_segment_mask_pre_exp(ptx, config, true, "%rd27");
 
     // P = exp(S - L)
     ptx.push_str("    sub.f32 %f_tmp, %f_s, %f_l_val;\n");
@@ -4671,6 +4818,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
     if config.causal {
         ptx.push_str("    @%p3 mov.f32 %f_p, 0f00000000;  // force P = 0 for masked\n");
     }
+    emit_bwd_segment_mask_post_exp(ptx, config);
 
     // Overwrite S_tile with P
     emit_smem_store(ptx, "f32", "%rd35", "%f_p");

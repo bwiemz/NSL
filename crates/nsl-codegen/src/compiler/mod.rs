@@ -282,11 +282,21 @@ pub struct GpuKernelState {
     pub kernel_ptx_data: HashMap<String, (DataId, DataId)>,
     pub flash_attention_context: Option<FlashAttentionCompileContext>,
     /// Decorator-free SDPA backward variant table, keyed by the op's static
-    /// `causal` flag. Populated lazily by `ensure_sdpa_bwd_variant_table`
-    /// the first time a `FlashAttentionBackwardExtract` lowers without a
-    /// decorated backward context, so programs that never take the SDPA
-    /// backward carry no extra .rodata.
-    pub sdpa_bwd_variants: HashMap<bool, Vec<SdpaBwdVariant>>,
+    /// `(causal, segment_masked)` pair. Populated lazily by
+    /// `ensure_sdpa_bwd_variant_table` the first time a
+    /// `FlashAttentionBackwardExtract` lowers without a decorated backward
+    /// context, so programs that never take the SDPA backward carry no
+    /// extra .rodata. The `segment_masked=true` tables carry `_segmask`
+    /// phase-2 kernels (PCA Stage C packed attention).
+    pub sdpa_bwd_variants: HashMap<(bool, bool), Vec<SdpaBwdVariant>>,
+    /// Decorator-free SDPA fused-FORWARD variant table (PCA Stage C), keyed
+    /// by `(causal, segment_masked)`. Each entry is a v2 scalar forward
+    /// kernel (csha: None) specialised per head_dim, plus the Tier-B-on
+    /// tile-skip variant when `segment_masked`. Populated lazily by
+    /// `ensure_sdpa_fwd_variant_table` from the decorator-free SDPA forward
+    /// lowering; the runtime dispatch declines to the decomposed path when
+    /// the head_dim matches no entry.
+    pub sdpa_fwd_variants: HashMap<(bool, bool), Vec<SdpaFwdVariant>>,
 }
 
 /// One per-head_dim entry of the decorator-free SDPA backward variant table:
@@ -304,12 +314,34 @@ pub struct SdpaBwdVariant {
     pub phase2_name: DataId,
 }
 
+/// One per-head_dim entry of the decorator-free SDPA fused-FORWARD variant
+/// table (PCA Stage C). `base_*` is the v2 scalar forward (csha: None; the
+/// same emitter family the decorated plain path launches). `tier_b_*` is the
+/// Tier-B tile-skip variant — `Some` only for `segment_masked` tables (the
+/// codegen gate `should_emit_tier_b_at_codegen` == segment_masked); the
+/// runtime picks it via `should_dispatch_tier_b_at_runtime`. `block_q`,
+/// `block_kv` and `smem_bytes` are launch parameters the lowering must pass
+/// to `nsl_sdpa_fused_forward` (the kernel bakes tile geometry into its body,
+/// so these must be the synthesis-time values, never recomputed).
+#[derive(Clone, Copy)]
+pub struct SdpaFwdVariant {
+    pub head_dim: i64,
+    pub block_q: i64,
+    pub block_kv: i64,
+    pub smem_bytes: i64,
+    pub base_ptx: DataId,
+    pub base_name: DataId,
+    pub tier_b_ptx: Option<DataId>,
+    pub tier_b_name: Option<DataId>,
+}
+
 impl GpuKernelState {
     fn new() -> Self {
         Self {
             kernel_ptx_data: HashMap::new(),
             flash_attention_context: None,
             sdpa_bwd_variants: HashMap::new(),
+            sdpa_fwd_variants: HashMap::new(),
         }
     }
 }
@@ -404,6 +436,13 @@ pub struct FeatureConfigs {
     /// train-block compilation); gates the plan's packing axes so the
     /// solver never "chooses" packing it cannot apply.
     pub packing_supported_in_module: bool,
+    /// PCA Stage C: the EXTRACTED training graph reaches the PACKED
+    /// attention builtin (set by `wggo_prepass::build_preplan`, not an AST
+    /// scan — the stdlib GQA model always carries `forward_packed` as a
+    /// method, which must not claim the channel when uncalled). Upgrades
+    /// the plan's segment_id consumption verdict to the fused kernel
+    /// family on CUDA.
+    pub packed_sdpa_in_module: bool,
 
     // ── Weight Intelligence (M52) ────────────────────────────────────
     /// M52: Loaded weight map (populated when --weights is passed)
@@ -454,6 +493,7 @@ impl FeatureConfigs {
             vmap_configs: HashMap::new(),
             source_ad_enabled: options.source_ad,
             packing_supported_in_module: false,
+            packed_sdpa_in_module: false,
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,
@@ -522,6 +562,12 @@ pub struct Compiler<'a> {
     /// so only the first component (dQ) triggers the backward call and dK/dV
     /// extract from the cached list.
     pub flash_attn_bwd_cache: HashMap<Value, Value>,
+    /// PCA Stage C: per-function Values that the SDPA fused dispatch owns
+    /// beyond op results — currently the saved-LSE tensors returned by
+    /// `nsl_sdpa_fused_forward` (the backward only BORROWS them). Drained
+    /// into `owned_values` at the end of `compile_wengert_ops` so the
+    /// step's cleanup frees them (free(0) is a no-op for declined runs).
+    pub sdpa_extra_owned: Vec<Value>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
     /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
@@ -963,6 +1009,7 @@ impl<'a> Compiler<'a> {
             fase_table_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
+            sdpa_extra_owned: Vec::new(),
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),
@@ -1109,6 +1156,14 @@ impl<'a> Compiler<'a> {
         // which alias across functions — same hygiene as the CSHA caches.
         self.fused_kl_ce_fwd_saves.clear();
         self.fused_kl_ce_bwd_cache.clear();
+        // PCA Stage C (review finding): these two are Value-keyed as well.
+        // A dead-eliminated dV extract leaves a stale flash_attn_bwd_cache
+        // entry whose Value index can collide in the NEXT function's DFG
+        // (Values restart at v0 per function) — same hazard class the CSHA
+        // caches above document.
+        self.flash_attn_bwd_cache.clear();
+        self.flash_attn_aux.clear();
+        self.sdpa_extra_owned.clear();
     }
 
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the

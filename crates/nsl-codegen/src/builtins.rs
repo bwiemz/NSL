@@ -204,6 +204,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     ("nsl_tensor_ndim", &[types::I64], Some(types::I64)),
+    // PCA Stage C: non-aborting shape probe (0 for out-of-range dims).
+    ("nsl_tensor_dim_or_zero", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_len", &[types::I64], Some(types::I64)),
     ("nsl_tensor_get_dtype", &[types::I64], Some(types::I64)),
     (
@@ -1331,6 +1333,43 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // phase2_name_ptr
             types::I64, // tier_b_ptx_ptr (planner spec §4 sentinel pair;
             types::I64, // tier_b_name_ptr  both 0 = no Tier-B-on variant)
+            types::I64, // segment_ids (PCA Stage C: NslTensor* [b,s], 0 = plain)
+        ],
+        Some(types::I64),
+    ),
+    // PCA Stage C: plain fused SDPA forward with saves. Launches the v2
+    // scalar forward (csha: None) selected by the wengert lowering's
+    // per-head_dim variant table; returns an NslList* [out, lse] or 0 to
+    // DECLINE (caller's decomposed fallback runs). segment_ids != 0 selects
+    // the segment-masked kernel family (packed attention); the Tier-B pair
+    // is the tile-skip variant behind the runtime gate. Keep in lock-step
+    // with `nsl_sdpa_fused_forward` in nsl-runtime/src/flash_attention.rs.
+    (
+        "nsl_sdpa_fused_forward",
+        &[
+            types::I64, types::I64, types::I64, // q, k, v (NslTensor*)
+            types::I64, // scale_bits (f32 as i64)
+            types::I64, // causal
+            types::I64, // segment_ids (NslTensor* [b,s] or 0)
+            types::I64, // ptx_ptr (base kernel; 0 = decline)
+            types::I64, // name_ptr
+            types::I64, // tier_b_ptx_ptr (sentinel pair, both 0 = none)
+            types::I64, // tier_b_name_ptr
+            types::I64, // block_q
+            types::I64, // block_kv
+            types::I64, // shared_mem_bytes
+        ],
+        Some(types::I64),
+    ),
+    // PCA Stage C: align packed-batch mask/segment tensors to the params'
+    // device at step start (train-block batch prep). No-op for CPU models
+    // and unpacked batches. Keep in lock-step with
+    // `nsl_packed_batch_align_device` in nsl-runtime/src/packing.rs.
+    (
+        "nsl_packed_batch_align_device",
+        &[
+            types::I64, // batch dict (NslDict*)
+            types::I64, // param list (NslList*) — device reference
         ],
         Some(types::I64),
     ),

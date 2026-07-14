@@ -293,6 +293,13 @@ pub enum PackingKernelState {
     /// required. The plan's segment_id preference is honored by the model
     /// itself.
     SourceMasked,
+    /// PCA Stage C: the model calls `scaled_dot_product_attention_packed`
+    /// on a CUDA target — the plan's segment_id decision lowers to the
+    /// fused segment-masked flash kernel family (plain v2 forward with
+    /// per-doc tile skip behind the Tier-B runtime gate + `_segmask`
+    /// two-phase backward), with the Stage-B decomposed chain as the
+    /// runtime decline fallback.
+    FusedSegmentMasked,
 }
 
 /// One `[pca]` consumption verdict for a layer's WGGO packing decision.
@@ -362,6 +369,9 @@ pub fn collect_packing_diagnostics(
                 ),
                 (_, PackingKernelState::SourceMasked) => PackingVerdict::Consumed {
                     kernel: "masked SDPA (Stage B decomposed path)",
+                },
+                (_, PackingKernelState::FusedSegmentMasked) => PackingVerdict::Consumed {
+                    kernel: "fused segment-masked flash kernel (Stage C plain family; decomposed fallback when the runtime declines)",
                 },
                 (_, PackingKernelState::TierBMasked) => PackingVerdict::Consumed {
                     kernel: "segment-masked Tier-B attention",

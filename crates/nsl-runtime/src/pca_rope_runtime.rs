@@ -34,6 +34,12 @@ thread_local! {
 /// Set the thread-local packing metadata. Called by the train block at
 /// each step body (after `batch["input_ids"]` prefetch).
 ///
+/// Residency (PCA Stage C): batch prep calls
+/// `nsl_packed_batch_align_device` BEFORE this stash, so on GPU runs the
+/// data pointers extracted from the batch dict are DEVICE pointers (the
+/// dict's `attention_mask`/`segment_ids` tensors have already been moved
+/// to the GPU); on CPU runs they remain host pointers.
+///
 /// Pass `(0, 0)` to clear / disable. Must be called every step to
 /// prevent stale state from leaking across steps (the train block
 /// codegen handles this by always calling set, both in the has-packing

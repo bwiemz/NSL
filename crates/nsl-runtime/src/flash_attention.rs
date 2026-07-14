@@ -18,6 +18,13 @@ use crate::autodiff;
 #[cfg(feature = "cuda")]
 static FA_VARIANT_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// One-time log guard: prints the first successful `nsl_sdpa_fused_forward`
+/// launch. Parity harnesses need launch-level PROOF the fused path fired —
+/// the decline protocol is silent by design, so the absence of decline
+/// diagnostics proves nothing.
+#[cfg(feature = "cuda")]
+static SDPA_FUSED_LAUNCH_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Launch FlashAttention-3 (Hopper wgmma) kernel.
 /// Returns 0 on success, -1 if the launch failed (caller should fall back to FA2).
 #[cfg(feature = "cuda")]
@@ -330,6 +337,637 @@ pub extern "C" fn nsl_flash_attention(
         let _ = (effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] FlashAttention requires CUDA. Use naive path (no @flash_attention decorator).");
         -1
+    }
+}
+
+// ── PCA Stage C: plain fused segment-masked SDPA ──────────────────────────
+
+/// Canonical row-major (contiguity) check for the FlashAttention FFI
+/// dispatch gates.
+///
+/// The GPU kernels (forward v2, backward phase-1/phase-2) and the CPU
+/// reference's fast read path consume raw base pointers STRIDE-BLIND: a
+/// `reshape(..).transpose(..)` view fed to them is silently interpreted as
+/// `[b, h, s, d]`-contiguous and produces smoothly-wrong (~1e-4-scale)
+/// results instead of an error — the #344 failure mode. Every stride-blind
+/// consumer must therefore gate on this predicate (decline / fall back)
+/// or gather through the strides.
+///
+/// Unlike `NslTensor::is_contiguous`, dims of extent <= 1 are treated as
+/// trivially contiguous: their stride is never used to address more than
+/// one element, so any value is layout-equivalent to the canonical one.
+fn is_canonical_row_major(t: &NslTensor) -> bool {
+    if t.ndim <= 1 {
+        return true;
+    }
+    let ndim = t.ndim as usize;
+    let mut expected = 1i64;
+    for dd in (0..ndim).rev() {
+        let (dim, stride) = unsafe { (*t.shape.add(dd), *t.strides.add(dd)) };
+        if dim > 1 && stride != expected {
+            return false;
+        }
+        expected *= dim.max(1);
+    }
+    true
+}
+
+/// Read a `[batch, seq]` segment-id tensor into a host `Vec<u16>`.
+///
+/// PCA Stage C staging helper shared by `nsl_sdpa_fused_forward` and the
+/// segment-masked backward in `flash_attention_backward_gpu`. The packing
+/// stdlib materialises segment ids as small integers stored in float
+/// tensors (f32 per packing.rs; CPU-side tensors may carry the runtime's
+/// default f64), while the v2 kernels consume `[B, S]` **u16** entries —
+/// so the runtime narrows host-side before staging.
+///
+/// Device-resident inputs are copied back with `memcpy_dtoh` first (the
+/// inner helpers establish the thread's CUDA context themselves).
+///
+/// Returns `None` when the tensor is null, not rank-2, shape-mismatched
+/// against `[batch, seq]`, not row-major contiguous, has a dtype that is
+/// neither f32 nor f64, or carries ids outside the exactly-representable
+/// u16 range (negative / > 65535 / non-integral — a saturating `as u16`
+/// narrowing would silently mask DIFFERENT pairs than the CPU reference's
+/// raw-f32 comparison). Callers treat `None` as a silent decline (forward)
+/// or a CPU-reference fallback (backward).
+#[cfg(feature = "cuda")]
+fn segment_ids_host_u16(
+    segment_ids_ptr: i64,
+    batch: usize,
+    seq_len: usize,
+) -> Option<Vec<u16>> {
+    if segment_ids_ptr == 0 {
+        return None;
+    }
+    let t = NslTensor::from_ptr(segment_ids_ptr);
+    if t.ndim != 2 {
+        return None;
+    }
+    let (sb, ss) = unsafe { (*t.shape.add(0), *t.shape.add(1)) };
+    if sb != batch as i64 || ss != seq_len as i64 {
+        return None;
+    }
+    // Stride-blind reads were the #344 failure mode: refuse views.
+    if !is_canonical_row_major(t) {
+        return None;
+    }
+    let n = batch * seq_len;
+    let host_f32: Vec<f32> = if t.device > 0 {
+        match t.dtype {
+            1 => {
+                let mut buf = vec![0.0f32; n];
+                crate::cuda::inner::memcpy_dtoh(
+                    buf.as_mut_ptr() as *mut c_void,
+                    t.data as *const c_void,
+                    n * 4,
+                );
+                buf
+            }
+            0 => {
+                let mut buf = vec![0.0f64; n];
+                crate::cuda::inner::memcpy_dtoh(
+                    buf.as_mut_ptr() as *mut c_void,
+                    t.data as *const c_void,
+                    n * 8,
+                );
+                buf.iter().map(|&x| x as f32).collect()
+            }
+            _ => return None,
+        }
+    } else {
+        match t.dtype {
+            1 => (0..n).map(|i| unsafe { *t.data_f32().add(i) }).collect(),
+            0 => (0..n).map(|i| unsafe { *t.data_f64().add(i) as f32 }).collect(),
+            _ => return None,
+        }
+    };
+    // Every id must be an exact small integer so the u16 narrowing is
+    // lossless and the GPU kernel masks the SAME pairs as the CPU
+    // reference (which compares the raw floats).
+    if host_f32
+        .iter()
+        .any(|&x| !(0.0..=65535.0).contains(&x) || x.fract() != 0.0)
+    {
+        return None;
+    }
+    // PCA Stage C (review finding): the fused kernels' per-doc tile SKIP
+    // assumes segment ids are non-decreasing along each row (the DataLoader
+    // packer guarantees it; hand-built ids might not). A violation would
+    // silently skip live tiles — decline to the mask-driven decomposed
+    // path instead, which is correct for arbitrary segment layouts.
+    let row = seq_len;
+    if row > 0 {
+        for chunk in host_f32.chunks(row) {
+            if chunk.windows(2).any(|w| w[1] < w[0]) {
+                flash_bwd_warn_once(
+                    "[nsl] segment_ids not non-decreasing within a row -                      declining fused packed kernels (decomposed path is exact)",
+                );
+                return None;
+            }
+        }
+    }
+    Some(host_f32.iter().map(|&x| x as u16).collect())
+}
+
+/// Stage host segment ids into a device u16 buffer (`alloc_managed` +
+/// `memcpy_htod`). The caller owns the returned buffer and MUST release it
+/// via `inner::free_managed` only after a `cuCtxSynchronize` that covers
+/// every kernel launch reading it — the kernels read segment ids from
+/// global memory while running. Never null for a non-empty slice
+/// (`alloc_managed` panics on OOM rather than returning null).
+#[cfg(feature = "cuda")]
+fn stage_segment_ids_device(seg_host: &[u16]) -> *mut c_void {
+    let bytes = seg_host.len() * 2;
+    let dev = crate::cuda::inner::alloc_managed(bytes);
+    if !dev.is_null() {
+        crate::cuda::inner::memcpy_htod(dev, seg_host.as_ptr() as *const c_void, bytes);
+    }
+    dev
+}
+
+/// Wrap a device buffer in a freshly allocated GPU `NslTensor` (device=1,
+/// dtype=f32, refcount=1). Ownership of `data` passes to the tensor.
+/// Shared by `flash_attention_backward_gpu` ([dq, dk, dv]) and
+/// `nsl_sdpa_fused_forward` ([out, lse]).
+#[cfg(feature = "cuda")]
+fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
+    let ndim = shape.len() as i64;
+    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
+    for (i, &s) in shape.iter().enumerate() {
+        unsafe { *shape_ptr.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape_ptr, ndim);
+    let t = Box::new(NslTensor::new(
+        data,
+        shape_ptr,
+        strides,
+        ndim,
+        total as i64,
+        1, // device = GPU
+        1, // dtype = f32
+        1, // refcount
+        0, // flags
+    ));
+    Box::into_raw(t) as i64
+}
+
+/// PCA Stage C: plain fused (decorator-free) SDPA forward with optional
+/// segment masking for packed-sequence batches.
+///
+/// Called by the wengert_lower decorator-free SDPA dispatch: when the
+/// pattern matcher recognises a plain `softmax(Q K^T * scale [+ mask]) V`
+/// composition, codegen synthesises the v2 FA-2 forward PTX (and, for
+/// packed batches, its `segment_masked` variant) and emits a call here
+/// instead of lowering the decomposed matmul+softmax chain. This entry is
+/// source-AD-only: it records NO tape op (the tape path never reaches it)
+/// and returns the saved logsumexp so the segment-aware backward can skip
+/// the segment-blind FLASH_LSE recompute.
+///
+/// Returns an `NslList*` `[out, lse]` on success:
+///   out — `[b, h, s, d]` f32 GPU tensor (attention output)
+///   lse — `[b, h, s]`    f32 GPU tensor (per-row logsumexp)
+///
+/// # Decline protocol (return 0)
+///
+/// `0` means "decline": the caller keeps the decomposed SDPA graph, which
+/// is always correct. Declines are SILENT and side-effect-free by design —
+/// they are a normal per-op dispatch outcome, not an error:
+///   * non-CUDA build, or `ptx_ptr`/`name_ptr` == 0
+///   * q/k/v null, not GPU-resident (`device != 1`), not f32, or not rank-4
+///   * q/k/v not canonical row-major (the kernel is stride-blind; a
+///     transpose/reshape view would compute smoothly-wrong attention —
+///     callers must materialize `.contiguous()` inputs to use this path)
+///   * k/v disagreeing with q in `[batch, seq, head_dim]`, or carrying a
+///     different head count (GQA callers must pre-expand KV before
+///     dispatching here)
+///   * `seq_len` not a multiple of `block_q`/`block_kv` (the v2 kernel has
+///     no ragged-tail guards)
+///   * segment path: segment tensor missing / rank != 2 / shape mismatch
+///     against `[b, s]` / non-contiguous / ids not exact u16-range ints
+///
+/// Two intentionally NON-silent cases:
+///   * kernel-launch failure — the output buffer would stay unwritten, so
+///     silence would reproduce the #324-style silent-zeros failure mode.
+///     We print once (keyed by message content) and still return 0 so the
+///     caller recovers via decomposition.
+///   * `NSL_SDPA_FUSED_DISABLE=1` — operational kill switch. Every call
+///     declines immediately (before any allocation) with a once-per-process
+///     stderr note. Parity harnesses use it to compare fused-vs-decomposed
+///     on the same fixture; it is also the production escape hatch if the
+///     fused path misbehaves. The env var is read once per process
+///     (OnceLock) — this FFI sits on the per-step hot path.
+///
+/// # Observability
+///
+/// The FIRST successful launch prints a once-per-process stderr marker
+/// (`[nsl] sdpa fused forward: launched (...)`) with the segment-mask
+/// flag, head_dim, tile sizes, and whether the Tier-B tile-skip variant
+/// was selected — launch-level proof for parity tests that the fused path
+/// actually fired (silent declines are indistinguishable from success
+/// otherwise).
+///
+/// # Kernel ABI
+///
+/// Marshals the v2 forward param layout: 36 base params (the 21 classic
+/// FA-2 slots + 9 CSHA extras + 6 Tier-C save slots, all nulled except
+/// `param_logsumexp`), plus a 37th `segment_ids` device pointer passed
+/// ONLY when launching a segment-masked kernel — the unmasked kernel does
+/// not declare the 37th param, and the codegen dispatch guarantees the
+/// (kernel variant, segment pointer) pairing. `causal` is baked into the
+/// PTX variant at codegen time; the runtime accepts it for call-site
+/// symmetry and diagnostics only.
+///
+/// Output dtype: the v2 kernel STORES its output as f16 (and its
+/// logsumexp as f32). The kernel writes an internal f16 staging buffer,
+/// and the runtime widens on-device (`csha_fwd_convert_f16_to_f32`) into
+/// the f32 tensor this FFI returns — callers always see f32.
+///
+/// Tier-B sentinel discipline matches the other `nsl_flash_attention*`
+/// entries (planner spec §4): the pair must agree, and Tier-B-on can only
+/// fire on the segment path (the runtime gate requires a non-null device
+/// segment pointer).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_sdpa_fused_forward(
+    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    scale_bits: i64,
+    causal: i64,
+    segment_ids_ptr: i64,
+    ptx_ptr: i64, name_ptr: i64,
+    tier_b_ptx_ptr: i64, tier_b_name_ptr: i64,
+    block_q: i64, block_kv: i64,
+    shared_mem_bytes: i64,
+) -> i64 {
+    use crate::pca_tier_b_runtime::assert_tier_b_sentinels;
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    assert_tier_b_sentinels(
+        "nsl_sdpa_fused_forward",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+
+    #[cfg(feature = "cuda")]
+    {
+        use crate::cuda::inner;
+        use crate::pca_tier_b_runtime::should_dispatch_tier_b_at_runtime;
+
+        // Baked into the PTX variant at codegen time (see doc comment).
+        let _ = causal;
+
+        // ── Operational kill switch (see doc comment) ──
+        static SDPA_FUSED_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let disabled = *SDPA_FUSED_DISABLED.get_or_init(|| {
+            std::env::var("NSL_SDPA_FUSED_DISABLE").ok().as_deref() == Some("1")
+        });
+        if disabled {
+            flash_bwd_warn_once(
+                "[nsl] sdpa fused forward disabled via NSL_SDPA_FUSED_DISABLE",
+            );
+            return 0;
+        }
+
+        // Decline-reason debug (NSL_SDPA_FUSED_DEBUG=1): the decline
+        // protocol is silent by design, which makes shape-dependent
+        // declines invisible in production runs — this narrates them.
+        macro_rules! decline {
+            ($reason:expr) => {{
+                if std::env::var("NSL_SDPA_FUSED_DEBUG").is_ok() {
+                    eprintln!("[sdpa-fused-debug] decline: {}", $reason);
+                }
+                return 0;
+            }};
+        }
+        // ── Decline checks: host-only struct reads, no driver calls ──
+        if ptx_ptr == 0 || name_ptr == 0 || q_ptr == 0 || k_ptr == 0 || v_ptr == 0 {
+            decline!("null ptx/name/tensor (head_dim matched no variant?)");
+        }
+        if block_q <= 0 || block_kv <= 0 {
+            decline!("non-positive block dims");
+        }
+        let q_t = NslTensor::from_ptr(q_ptr);
+        let k_t = NslTensor::from_ptr(k_ptr);
+        let v_t = NslTensor::from_ptr(v_ptr);
+        let wrong_layout =
+            |t: &NslTensor| t.device != 1 || t.dtype != 1 || t.ndim != 4;
+        if wrong_layout(q_t) || wrong_layout(k_t) || wrong_layout(v_t) {
+            decline!(format!(
+                "layout: q(dev={},dt={},nd={}) k(dev={},dt={},nd={}) v(dev={},dt={},nd={})",
+                q_t.device, q_t.dtype, q_t.ndim, k_t.device, k_t.dtype, k_t.ndim,
+                v_t.device, v_t.dtype, v_t.ndim));
+        }
+        // Stride guard: the v2 kernel reads raw device pointers
+        // stride-blind. A transpose/reshape VIEW here would compute
+        // smoothly-wrong attention (no error) — decline instead; the
+        // decomposed fallback is stride-correct.
+        if !is_canonical_row_major(q_t)
+            || !is_canonical_row_major(k_t)
+            || !is_canonical_row_major(v_t)
+        {
+            decline!(format!(
+                "non-canonical strides: q={} k={} v={}",
+                is_canonical_row_major(q_t),
+                is_canonical_row_major(k_t),
+                is_canonical_row_major(v_t)));
+        }
+        let (b, h, s, d) = unsafe {
+            (
+                *q_t.shape.add(0),
+                *q_t.shape.add(1),
+                *q_t.shape.add(2),
+                *q_t.shape.add(3),
+            )
+        };
+        if b <= 0 || h <= 0 || s <= 0 || d <= 0 {
+            decline!("non-positive dims");
+        }
+        // K/V must agree with Q in [batch, seq, head_dim] and carry the
+        // SAME head count — the plain fused kernel indexes K/V by the
+        // fused batch*head block id, so GQA callers must pre-expand KV
+        // first. (Q's own head_dim vs the PTX variant is NOT re-checked:
+        // the caller selected the variant. K/V agreement with Q is a
+        // separate matter — a mismatch would read out of bounds.)
+        let kv_mismatch = |t: &NslTensor| unsafe {
+            *t.shape.add(0) != b
+                || *t.shape.add(1) != h
+                || *t.shape.add(2) != s
+                || *t.shape.add(3) != d
+        };
+        if kv_mismatch(k_t) || kv_mismatch(v_t) {
+            decline!("k/v shape mismatch with q (GQA must be pre-expanded)");
+        }
+        // Ragged shapes: the v2 kernel has no seq_len tail guards.
+        if s % block_q != 0 || s % block_kv != 0 {
+            decline!(format!("ragged seq: s={s} block_q={block_q} block_kv={block_kv}"));
+        }
+
+        // ── Driver work starts here (thread-local context invariant) ──
+        inner::ensure_context();
+
+        // Segment staging input: [b, s] host-float ids -> Vec<u16>. A
+        // validation failure inside the helper is still a silent decline —
+        // nothing has been allocated yet.
+        let seg_host = if segment_ids_ptr != 0 {
+            match segment_ids_host_u16(segment_ids_ptr, b as usize, s as usize) {
+                Some(host) => Some(host),
+                None => return 0,
+            }
+        } else {
+            None
+        };
+
+        // Output + logsumexp buffers, zeroed (mirrors the backward's
+        // alloc_managed discipline; ownership passes to the returned
+        // tensors on success, freed on the loud launch-failure path).
+        //
+        // Output dtype: the v2 forward epilogue stores its result as
+        // **f16** (`cvt.rn.f16.f32` + `st.global.b16` in
+        // flash_attention_v2/phases/forward/finalize.rs) while the
+        // decomposed graph consumes f32. The kernel therefore writes into
+        // an f16 STAGING buffer and `csha_fwd_convert_f16_to_f32` widens
+        // into the final f32 tensor after the launch. Wrapping the raw
+        // kernel output as f32 was the Stage-C parity bug: f16 bit pairs
+        // reinterpreted as f32 are ~0, the attention output collapses,
+        // and the first-step loss lands at ~ln(vocab) instead of the
+        // decomposed value. logsumexp is stored f32 by the kernel — no
+        // staging needed.
+        let total_out = (b * h * s * d) as usize;
+        let total_lse = (b * h * s) as usize;
+        let out_data = inner::alloc_managed(total_out * 4);
+        inner::memset_d8(out_data, total_out * 4);
+        let out_f16 = inner::alloc_managed(total_out * 2);
+        inner::memset_d8(out_f16, total_out * 2);
+        let lse_data = inner::alloc_managed(total_lse * 4);
+        inner::memset_d8(lse_data, total_lse * 4);
+
+        let seg_dev: *mut c_void = match &seg_host {
+            Some(host) => stage_segment_ids_device(host),
+            None => std::ptr::null_mut(),
+        };
+
+        // Tier-B dispatch (planner spec §6.3): the runtime gate needs the
+        // DEVICE segment pointer, so Tier-B-on only fires on the
+        // segment-masked path.
+        let tier_b_selected = should_dispatch_tier_b_at_runtime(
+            tier_b_ptx_ptr,
+            seg_dev as i64,
+            s as u32,
+        );
+        let (effective_ptx_ptr, effective_name_ptr) = if tier_b_selected {
+            (tier_b_ptx_ptr, tier_b_name_ptr)
+        } else {
+            (ptx_ptr, name_ptr)
+        };
+
+        // ── Marshal the v2 forward param layout: 36 base [+ 1 segment] ──
+        // Widths matter — the launch wrapper reads sizeof(param_type)
+        // bytes at each slot: everything u64 except scale/csha_eps (.f32)
+        // and csha_active_heads/csha_d_model (.u32).
+        let mut q = q_t.data as u64;
+        let mut k = k_t.data as u64;
+        let mut v = v_t.data as u64;
+        // Kernel writes f16 — point it at the staging buffer, NOT the
+        // final f32 tensor (see the output-dtype comment above).
+        let mut out = out_f16 as u64;
+        let mut sc = f32::from_bits(scale_bits as u32);
+        let mut bb = b as u64;
+        let mut hh = h as u64;
+        let mut sl = s as u64;
+        let mut hd = d as u64;
+        let mut bt: u64 = 0; // block_table
+        let mut kp: u64 = 0; // k_pool
+        let mut vp: u64 = 0; // v_pool
+        let mut bs: u64 = 0; // block_size
+        let mut cos: u64 = 0;
+        let mut sin: u64 = 0;
+        let mut sids: u64 = 0; // seq_ids
+        let mut slens: u64 = 0; // seq_lens
+        let mut dfs_enter: u64 = 0;
+        let mut dfs_exit: u64 = 0;
+        let mut num_tree_nodes: u64 = 0;
+        let mut lse = lse_data as u64;
+        // CSHA extras — all disabled on the plain fused path.
+        let mut csha_x: u64 = 0;
+        let mut csha_nw: u64 = 0;
+        let mut csha_wq: u64 = 0;
+        let mut csha_wk: u64 = 0;
+        let mut csha_wv: u64 = 0;
+        let mut csha_wo: u64 = 0;
+        let mut csha_eps: f32 = 0.0;
+        let mut csha_ah: u32 = 0;
+        let mut csha_dm: u32 = 0;
+        // Tier-C activation-save slots — null (the backward consumes the
+        // returned lse instead of forward-saved projections).
+        let mut q_proj: u64 = 0;
+        let mut k_proj: u64 = 0;
+        let mut v_proj: u64 = 0;
+        let mut rmax: u64 = 0;
+        let mut rsum: u64 = 0;
+        let mut xraw: u64 = 0;
+        // 37th param: segment_ids device pointer — pushed ONLY when
+        // launching the segment-masked kernel (which alone declares it).
+        // NEVER marshal 37 args for an unmasked kernel or 36 for a masked
+        // one: cuLaunchKernel arg counts must match the entry signature.
+        let mut seg_arg = seg_dev as u64;
+
+        let mut args: Vec<*mut c_void> = vec![
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bb as *mut _ as *mut c_void,
+            &mut hh as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut sids as *mut _ as *mut c_void,
+            &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
+            &mut csha_x as *mut _ as *mut c_void,
+            &mut csha_nw as *mut _ as *mut c_void,
+            &mut csha_wq as *mut _ as *mut c_void,
+            &mut csha_wk as *mut _ as *mut c_void,
+            &mut csha_wv as *mut _ as *mut c_void,
+            &mut csha_wo as *mut _ as *mut c_void,
+            &mut csha_eps as *mut _ as *mut c_void,
+            &mut csha_ah as *mut _ as *mut c_void,
+            &mut csha_dm as *mut _ as *mut c_void,
+            &mut q_proj as *mut _ as *mut c_void,
+            &mut k_proj as *mut _ as *mut c_void,
+            &mut v_proj as *mut _ as *mut c_void,
+            &mut rmax as *mut _ as *mut c_void,
+            &mut rsum as *mut _ as *mut c_void,
+            &mut xraw as *mut _ as *mut c_void,
+        ];
+        if !seg_dev.is_null() {
+            args.push(&mut seg_arg as *mut _ as *mut c_void);
+        }
+
+        // Grid/block identical to `nsl_flash_attention`: one CTA per
+        // q-tile per (batch, head); 4 warps per CTA.
+        // Launch PER BATCH ROW with pre-indexed pointers. The v2 segment
+        // staging documents its contract as "the launch wrapper passes a
+        // pre-indexed pointer (this batch sample's row); the kernel does
+        // NOT add a batch_idx offset" (forward/prelude.rs Task-3C NOTE) —
+        // a single [B,S]-base launch therefore stages ROW 0's segment ids
+        // for every CTA and silently mis-masks rows 1..B (benchmark
+        // discovery: first-step loss shifted 1e-2 at batch=4 while
+        // batch=1 matched the decomposed oracle to 5e-6). Per-row
+        // launches keep every pointer consistent with batch_idx==0
+        // in-kernel; the extra launch overhead is negligible next to the
+        // kernel itself.
+        let grid = [s / block_q, h, 1];
+        let block = [128i64, 1, 1];
+        let row_qkv = (h * s * d) as u64 * 4; // f32 bytes per batch row
+        let row_lse = (h * s) as u64 * 4;
+        let row_seg = s as u64 * 2; // u16 bytes
+        let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+        for bi in 0..b as u64 {
+            q = q_t.data as u64 + bi * row_qkv;
+            k = k_t.data as u64 + bi * row_qkv;
+            v = v_t.data as u64 + bi * row_qkv;
+            out = out_f16 as u64 + bi * (h * s * d) as u64 * 2; // f16 staging
+            lse = lse_data as u64 + bi * row_lse;
+            bb = 1;
+            if !seg_dev.is_null() {
+                seg_arg = seg_dev as u64 + bi * row_seg;
+            }
+            rc = inner::kernel_launch(
+                effective_ptx_ptr as *const u8,
+                effective_name_ptr as *const u8,
+                grid,
+                block,
+                &args,
+                shared_mem_bytes as u32,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                break;
+            }
+        }
+
+        // Widen the f16 staging output into the final f32 tensor. Same
+        // stream as the forward launch, so in-stream ordering guarantees
+        // the conversion sees the completed forward — no intermediate
+        // sync needed.
+        let conv_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            csha_fwd_convert_f16_to_f32(out_f16 as u64, out_data, total_out)
+        } else {
+            rc
+        };
+
+        // Synchronize before freeing the in-flight scratch buffers (the
+        // f16 staging output on every call; the staged segment ids on the
+        // packed path) — and surface asynchronous execution faults while
+        // at it.
+        let sync_rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            || conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            || sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+        {
+            // The one LOUD decline: an unwritten output buffer must never
+            // flow onward silently (the #324 silent-zeros failure mode).
+            // Once per distinct message — this would otherwise repeat for
+            // every attention op of every step on an unlaunchable config.
+            flash_bwd_warn_once(&format!(
+                "[sdpa-fused] fused SDPA forward kernel launch FAILED \
+                 (launch rc {:?}, f16-widen rc {:?}, sync rc {:?}; b={b}, \
+                 h={h}, s={s}, d={d}, segmented={}) — declining so the \
+                 caller falls back to the decomposed SDPA graph (correct, \
+                 slower). Check the PTX with nsl_test_cuda_jit_log.",
+                rc,
+                conv_rc,
+                sync_rc,
+                !seg_dev.is_null(),
+            ));
+            inner::free_managed(out_f16);
+            inner::free_managed(seg_dev);
+            inner::free_managed(out_data);
+            inner::free_managed(lse_data);
+            return 0;
+        }
+
+        // Kernels finished — the f16 staging output and the staged
+        // segment ids are dead.
+        inner::free_managed(out_f16);
+        inner::free_managed(seg_dev);
+
+        // Once-per-process launch marker (see "Observability" above).
+        if !SDPA_FUSED_LAUNCH_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[nsl] sdpa fused forward: launched (segmask={}, head_dim={d}, \
+                 tiles={block_q}x{block_kv}, tier_b={})",
+                if seg_dev.is_null() { 0 } else { 1 },
+                if tier_b_selected { 1 } else { 0 },
+            );
+        }
+
+        // Hand out/lse ownership to the caller as NslList [out, lse].
+        // No tape recording: this is a source-AD-only channel.
+        let out_ptr = make_gpu_tensor(out_data, &[b, h, s, d], total_out);
+        let lse_ptr = make_gpu_tensor(lse_data, &[b, h, s], total_lse);
+        let list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(list, out_ptr);
+        crate::list::nsl_list_push(list, lse_ptr);
+        list
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        // Silent decline: the caller keeps the decomposed SDPA graph,
+        // which is correct on CPU.
+        let _ = (q_ptr, k_ptr, v_ptr, scale_bits, causal, segment_ids_ptr);
+        let _ = (ptx_ptr, name_ptr, block_q, block_kv, shared_mem_bytes);
+        0
     }
 }
 
@@ -4413,6 +5051,16 @@ pub fn flash_attention_backward_cpu(
 /// Each group of `gqa_groups` Q heads shares one KV head.
 /// dQ has shape [batch, heads, seq, head_dim].
 /// dK, dV have shape [batch, kv_heads, seq, head_dim].
+///
+/// PCA Stage C: `seg` optionally carries per-position segment ids for a
+/// packed batch (`[batch * seq_len]`, row-major, one row per batch entry).
+/// When `Some`, a position pair (i, j) is masked out iff
+/// `seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j]` — on top of the
+/// causal `j > i` skip. Predicate masking is bit-for-bit identical to the
+/// Stage-B additive mask semantics: exp((s - 1e9) - lse) underflows to
+/// exactly 0.0 for every cross-segment pair. The `logsumexp` passed in must
+/// be segment-aware too (forward-saved, or `compute_logsumexp_gqa` with the
+/// same `seg`).
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_backward_cpu_gqa(
     q: &[f32], k: &[f32], v: &[f32],
@@ -4420,6 +5068,7 @@ pub fn flash_attention_backward_cpu_gqa(
     dq: &mut [f32], dk: &mut [f32], dv: &mut [f32],
     batch: usize, heads: usize, kv_heads: usize, seq_len: usize, head_dim: usize,
     scale: f32, causal: bool, gqa_groups: usize,
+    seg: Option<&[f32]>,
 ) {
     // Q/dQ/out/dout strides: [batch, heads, seq_len, head_dim]
     let q_bh_stride = heads * seq_len * head_dim;
@@ -4457,6 +5106,13 @@ pub fn flash_attention_backward_cpu_gqa(
 
                 let j_max = if causal { i + 1 } else { seq_len };
                 for j in 0..j_max {
+                    // PCA Stage C: cross-segment pairs contribute nothing
+                    // (see the seg contract in the doc comment).
+                    if let Some(seg) = seg {
+                        if seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j] {
+                            continue;
+                        }
+                    }
                     let kj = kv_base + j * s_stride;
                     let vj = kv_base + j * s_stride;
 
@@ -4505,11 +5161,17 @@ pub fn flash_attention_backward_cpu_gqa(
 ///
 /// Q has `heads` heads, K has `kv_heads` heads. Each Q head group maps to one KV head.
 /// lse[b,h,i] = log(sum_j(exp(Q[b,h,i,:] . K[b,h//gqa_groups,j,:] * scale)))
+///
+/// PCA Stage C: `seg` optionally carries `[batch * seq_len]` segment ids
+/// (same contract as `flash_attention_backward_cpu_gqa`); cross-segment
+/// key positions j are excluded from row i's normalizer. The diagonal
+/// j == i is always in-segment, so every row keeps at least one term.
 #[allow(clippy::too_many_arguments)]
 fn compute_logsumexp_gqa(
     q: &[f32], k: &[f32],
     batch: usize, heads: usize, kv_heads: usize, seq_len: usize, head_dim: usize,
     scale: f32, causal: bool,
+    seg: Option<&[f32]>,
 ) -> Vec<f32> {
     let q_bh_stride = heads * seq_len * head_dim;
     let q_h_stride = seq_len * head_dim;
@@ -4537,6 +5199,13 @@ fn compute_logsumexp_gqa(
                 // Numerically stable logsumexp: max + log(sum(exp(x - max)))
                 let mut max_val = f32::NEG_INFINITY;
                 for j in 0..j_max {
+                    // PCA Stage C: cross-segment keys are outside row i's
+                    // softmax support.
+                    if let Some(seg) = seg {
+                        if seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j] {
+                            continue;
+                        }
+                    }
                     let k_row = k_base_bh + j * s_stride;
                     let mut dot = 0.0f32;
                     for d_idx in 0..head_dim {
@@ -4550,6 +5219,11 @@ fn compute_logsumexp_gqa(
 
                 let mut sum_exp = 0.0f32;
                 for j in 0..j_max {
+                    if let Some(seg) = seg {
+                        if seg[b_idx * seq_len + i] != seg[b_idx * seq_len + j] {
+                            continue;
+                        }
+                    }
                     let k_row = k_base_bh + j * s_stride;
                     let mut dot = 0.0f32;
                     for d_idx in 0..head_dim {
@@ -4644,7 +5318,7 @@ fn flash_bwd_warn_once(msg: &str) {
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_backward_gpu(
     dout_ptr: i64, q_ptr: i64, k_ptr: i64, v_ptr: i64,
-    out_ptr: i64, _logsumexp_ptr: i64,
+    out_ptr: i64, logsumexp_ptr: i64,
     scale: f32,
     b: usize, h: usize, s: usize, d: usize,
     is_causal: bool,
@@ -4658,6 +5332,11 @@ fn flash_attention_backward_gpu(
     block_q: i64, block_kv: i64,
     phase1_ptx_ptr: i64, phase1_name_ptr: i64,
     phase2_ptx_ptr: i64, phase2_name_ptr: i64,
+    // PCA Stage C: NslTensor* of [b, s] segment ids (host float per
+    // packing.rs), or 0 for the classic unmasked backward. Non-zero
+    // REQUIRES a forward-saved logsumexp (see the guard below) and a
+    // `_segmask` phase-2 kernel variant from codegen.
+    segment_ids_ptr: i64,
 ) -> i64 {
     use crate::cuda::inner;
     use std::ffi::c_void;
@@ -4685,6 +5364,42 @@ fn flash_attention_backward_gpu(
         return 0;
     }
 
+    // ── PCA Stage C: forward-saved LSE resolution ──
+    // `logsumexp_ptr`, when non-zero, is an NslTensor* saved by the fused
+    // forward (`nsl_sdpa_fused_forward` returns [out, lse]); its `.data`
+    // is a GPU f32 [b, h, s] buffer Phase 2 can consume directly —
+    // BORROWED, never freed here (`lse_owned` below tracks ownership).
+    // The device/dtype/len guard keeps a host-resident or undersized
+    // tensor from leaking a bad pointer into the kernel.
+    let saved_lse_data: *mut c_void = if logsumexp_ptr != 0 {
+        let lse_t = NslTensor::from_ptr(logsumexp_ptr);
+        if lse_t.device > 0 && lse_t.dtype == 1 && lse_t.len >= (b * h * s) as i64 {
+            lse_t.data
+        } else {
+            std::ptr::null_mut()
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+
+    // ── Segment-mask guard ──
+    // A segment-masked backward REQUIRES the forward-saved logsumexp: the
+    // FLASH_LSE recompute kernel is segment-blind, and a mask-blind
+    // normalizer would silently corrupt every gradient of a packed batch.
+    // Refuse (once per config — no per-call values in the message, so the
+    // warn_once dedup set stays bounded) and let the caller take the
+    // segment-aware CPU reference backward.
+    if segment_ids_ptr != 0 && saved_lse_data.is_null() {
+        flash_bwd_warn_once(&format!(
+            "[flash-bwd] segment-masked backward needs the forward-saved \
+             logsumexp (missing, or not a GPU f32 [b,h,s] tensor) — the \
+             FLASH_LSE recompute kernel is not segment-aware. Falling back \
+             to the segment-aware CPU reference backward (correct but slow) \
+             (batch={b}, heads={h}, seq={s}, head_dim={d})."
+        ));
+        return 0;
+    }
+
     // Sync before reading tensor data pointers
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
@@ -4693,6 +5408,25 @@ fn flash_attention_backward_gpu(
     let k_t = NslTensor::from_ptr(k_ptr);
     let v_t = NslTensor::from_ptr(v_ptr);
     let out_t = NslTensor::from_ptr(out_ptr);
+
+    // ── PCA Stage C: stage [b, s] segment ids to a device u16 buffer ──
+    // Freed after the post-launch sync on every path (success + error).
+    let seg_dev: *mut c_void = if segment_ids_ptr != 0 {
+        match segment_ids_host_u16(segment_ids_ptr, b, s) {
+            Some(host) => stage_segment_ids_device(&host),
+            None => {
+                flash_bwd_warn_once(&format!(
+                    "[flash-bwd] segment_ids tensor is not a [batch={b}, \
+                     seq={s}] float tensor — cannot stage the segment mask \
+                     for the GPU backward; falling back to the CPU \
+                     reference backward."
+                ));
+                return 0;
+            }
+        }
+    } else {
+        std::ptr::null_mut()
+    };
 
     let total_qkv = b * h * s * d;
 
@@ -4746,6 +5480,7 @@ fn flash_attention_backward_gpu(
                  (This means the GPU backward PTX is invalid/unlaunchable for this config.)",
                 res
             );
+            inner::free_managed(seg_dev);
             inner::free_managed(d_buf);
             inner::free_managed(dq_data);
             inner::free_managed(dk_data);
@@ -4780,18 +5515,26 @@ fn flash_attention_backward_gpu(
             + block_q * 4                                  // L (logsumexp) vector
         ) as u32;
 
-        // Compute logsumexp DEVICE-RESIDENT from Q and K. Q/K are already on
-        // the GPU and the dispatch gate guarantees kv_heads == h (MHA), so a
-        // per-row kernel writes lse without any host transfer. This replaces
-        // the previous Q+K device->host copy + O(b*h*s^2*d) CPU score recompute
-        // + host->device copy that ran on EVERY backward call — a severe
-        // hot-path regression once the decorator-free backward started
-        // dispatching here (PR #347). `_logsumexp_ptr` stays unused: the
-        // decomposed decorator-free forward saves no lse buffer, so the caller
-        // passes 0 (wengert_lower.rs); recomputing on-device is correct and
-        // cheap, and its ex2/lg2 approximations match how the backward kernel
-        // itself recomputes P = exp(score - lse).
-        let lse_data = {
+        // Logsumexp source, in preference order:
+        //   1. Forward-saved (PCA Stage C): `nsl_sdpa_fused_forward` returns
+        //      [out, lse]; when the caller threads that lse tensor through,
+        //      use its device buffer directly — borrowed (`lse_owned=false`),
+        //      never freed here. MANDATORY on the segment path (the guard
+        //      above already refused segment-without-saved-lse).
+        //   2. Recompute DEVICE-RESIDENT from Q and K. Q/K are already on
+        //      the GPU and the dispatch gate guarantees kv_heads == h (MHA),
+        //      so a per-row kernel writes lse without any host transfer.
+        //      This replaces the previous Q+K device->host copy +
+        //      O(b*h*s^2*d) CPU score recompute + host->device copy that ran
+        //      on EVERY backward call — a severe hot-path regression once the
+        //      decorator-free backward started dispatching here (PR #347).
+        //      The decomposed decorator-free forward saves no lse buffer (the
+        //      caller passes 0, wengert_lower.rs); recomputing on-device is
+        //      correct and cheap, and its ex2/lg2 approximations match how
+        //      the backward kernel itself recomputes P = exp(score - lse).
+        let (lse_data, lse_owned) = if !saved_lse_data.is_null() {
+            (saved_lse_data, false)
+        } else {
             let total_lse = b * h * s;
             let lse_gpu = inner::alloc_managed(total_lse * 4);
 
@@ -4832,13 +5575,14 @@ fn flash_attention_backward_gpu(
                     lse_res
                 );
                 inner::free_managed(lse_gpu);
+                inner::free_managed(seg_dev);
                 inner::free_managed(d_buf);
                 inner::free_managed(dq_data);
                 inner::free_managed(dk_data);
                 inner::free_managed(dv_data);
                 return 0;
             }
-            lse_gpu
+            (lse_gpu, true)
         };
 
         let mut dout_data = dout_t.data as u64;
@@ -4853,8 +5597,16 @@ fn flash_attention_backward_gpu(
         let mut sc = scale;
         let mut sl = s as u64;
         let mut hd = d as u64;
+        // PCA Stage C: the plain phase-2 kernel declares 12 params; the
+        // `_segmask` variant declares 14 (the 12 above + segment_ids +
+        // heads — `heads` recovers batch_idx from the fused b*h block id).
+        // Codegen pairs the kernel variant with the segment pointer, so
+        // the marshaled arg count always matches the entry signature:
+        // exactly 12 unmasked, exactly 14 masked.
+        let mut seg_p2 = seg_dev as u64;
+        let mut heads_p2 = h as u64;
 
-        let args: [*mut c_void; 12] = [
+        let mut args: Vec<*mut c_void> = vec![
             &mut dout_data as *mut _ as *mut c_void,
             &mut q_data as *mut _ as *mut c_void,
             &mut k_data as *mut _ as *mut c_void,
@@ -4868,6 +5620,10 @@ fn flash_attention_backward_gpu(
             &mut sl as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
         ];
+        if !seg_dev.is_null() {
+            args.push(&mut seg_p2 as *mut _ as *mut c_void);
+            args.push(&mut heads_p2 as *mut _ as *mut c_void);
+        }
 
         let grid = [(b * h) as i64, (s as i64 + block_kv - 1) / block_kv, 1];
         let block = [block_q, 1, 1];
@@ -4890,7 +5646,10 @@ fn flash_attention_backward_gpu(
                 res, shmem
             );
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-            inner::free_managed(lse_data);
+            if lse_owned {
+                inner::free_managed(lse_data);
+            }
+            inner::free_managed(seg_dev);
             inner::free_managed(d_buf);
             inner::free_managed(dq_data);
             inner::free_managed(dk_data);
@@ -4913,7 +5672,10 @@ fn flash_attention_backward_gpu(
                  gradients; caller will fall back to CPU.",
                 sync_rc
             );
-            inner::free_managed(lse_data);
+            if lse_owned {
+                inner::free_managed(lse_data);
+            }
+            inner::free_managed(seg_dev);
             inner::free_managed(d_buf);
             inner::free_managed(dq_data);
             inner::free_managed(dk_data);
@@ -4921,35 +5683,21 @@ fn flash_attention_backward_gpu(
             return 0;
         }
 
-        // Free logsumexp scratch buffer
-        inner::free_managed(lse_data);
+        // Free the logsumexp scratch buffer (only when this function
+        // allocated it — the forward-saved lse is borrowed) and the staged
+        // segment ids (dead now that the post-launch sync completed).
+        if lse_owned {
+            inner::free_managed(lse_data);
+        }
+        inner::free_managed(seg_dev);
     }
 
     // Free D correction buffer
     inner::free_managed(d_buf);
 
     // ── Build output NslTensor wrappers for dQ, dK, dV ──
-    fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
-        let ndim = shape.len() as i64;
-        let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
-        for (i, &s) in shape.iter().enumerate() {
-            unsafe { *shape_ptr.add(i) = s };
-        }
-        let strides = NslTensor::compute_strides(shape_ptr, ndim);
-        let t = Box::new(NslTensor::new(
-            data,
-            shape_ptr,
-            strides,
-            ndim,
-            total as i64,
-            1, // device = GPU
-            1, // dtype = f32
-            1, // refcount
-            0, // flags
-        ));
-        Box::into_raw(t) as i64
-    }
-
+    // (`make_gpu_tensor` was hoisted to file scope when `nsl_sdpa_fused_forward`
+    // started wrapping its [out, lse] buffers with the same idiom.)
     let shape = [b as i64, h as i64, s as i64, d as i64];
     let dq_ptr = make_gpu_tensor(dq_data, &shape, total_qkv);
     let dk_ptr = make_gpu_tensor(dk_data, &shape, total_qkv);
@@ -4997,6 +5745,7 @@ pub fn nsl_test_flash_attention_backward_blocks(
         block_q, block_kv,
         phase1_ptx_ptr, phase1_name_ptr,
         phase2_ptx_ptr, phase2_name_ptr,
+        0, // segment_ids_ptr: the block sweep exercises unmasked configs only
     )
 }
 
@@ -5033,9 +5782,33 @@ pub fn nsl_test_flash_attention_backward_blocks(
 /// even if a variant were provided. The sentinel assertion is retained for
 /// uniformity per planner spec §4.6; the params are accepted but unused.
 ///
+/// # PCA Stage C: segment-masked backward (19th arg)
+///
+/// The trailing `segment_ids_ptr` carries the `[batch, seq]` segment-id
+/// tensor of a packed batch (host float per packing.rs), or `0` for the
+/// classic unmasked backward. When non-zero:
+///   * GPU path: the ids are staged to a device u16 buffer and appended
+///     (together with `heads`) to the phase-2 marshal — codegen guarantees
+///     the paired PTX is the 14-param `_segmask` variant. The
+///     forward-saved `logsumexp_ptr` is REQUIRED (the FLASH_LSE recompute
+///     kernel is segment-blind); without it the GPU path refuses and the
+///     CPU reference below runs instead.
+///   * CPU path: cross-segment (i, j) pairs are excluded from both the
+///     logsumexp and the gradient accumulation — bit-for-bit identical to
+///     the Stage-B additive -1e9 mask, since exp((s - 1e9) - lse)
+///     underflows to exactly 0.0.
+///
+/// # Stride discipline (PCA Stage C parity fix)
+///
+/// The GPU phase-1/phase-2 kernels are stride-blind, so the GPU dispatch
+/// additionally requires dout/q/k/v/out to be canonical row-major; a view
+/// input falls back (warn-once) to the CPU reference, whose tensor reads
+/// are stride-AWARE (they gather through the view's strides).
+///
 /// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_backward(
     dout_ptr: i64,
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -5050,6 +5823,8 @@ pub extern "C" fn nsl_flash_attention_backward(
     // Tier B extension (planner spec §4):
     tier_b_ptx_ptr: i64,
     tier_b_name_ptr: i64,
+    // PCA Stage C: [batch, seq] segment ids for packed batches (0 = none).
+    segment_ids_ptr: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::assert_tier_b_sentinels;
 
@@ -5119,7 +5894,52 @@ pub extern "C" fn nsl_flash_attention_backward(
             }
         }
 
-        if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h && !force_cpu_bwd {
+        // PCA Stage C stride guard: the GPU phase-1/phase-2 kernels read
+        // raw device pointers stride-blind, so a non-contiguous VIEW input
+        // (e.g. reshape(..).transpose(1,2) products) would yield
+        // smoothly-wrong gradients (~1e-4 scale), not an error — found by
+        // the packed-vs-decomposed parity bisection. Require canonical
+        // row-major on all five inputs; otherwise take the stride-aware
+        // CPU reference below.
+        let noncanonical_input: Option<&'static str> = {
+            let q_t = NslTensor::from_ptr(q_ptr);
+            let v_t = NslTensor::from_ptr(v_ptr);
+            let out_t = NslTensor::from_ptr(out_ptr);
+            if !is_canonical_row_major(dout_t) {
+                Some("dout")
+            } else if !is_canonical_row_major(q_t) {
+                Some("q")
+            } else if !is_canonical_row_major(k_t) {
+                Some("k")
+            } else if !is_canonical_row_major(v_t) {
+                Some("v")
+            } else if !is_canonical_row_major(out_t) {
+                Some("out")
+            } else {
+                None
+            }
+        };
+        if let Some(name) = noncanonical_input {
+            // Warn only when the GPU path would otherwise have dispatched —
+            // silent CPU-only configs stay silent.
+            if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h && !force_cpu_bwd {
+                flash_bwd_warn_once(&format!(
+                    "[flash-bwd] input `{name}` is a non-contiguous view — the \
+                     stride-blind GPU backward kernels would compute smoothly-wrong \
+                     gradients; using the stride-aware CPU reference backward \
+                     (correct but slow) (batch={b}, heads={h}, seq={s}, \
+                     head_dim={d}). Materialize .contiguous() inputs to train \
+                     this shape on GPU."
+                ));
+            }
+        }
+
+        if dout_t.device > 0
+            && phase1_ptx_ptr != 0
+            && kv_h == h
+            && !force_cpu_bwd
+            && noncanonical_input.is_none()
+        {
             // Budget-aware backward tile sizes. Must match the sizes codegen used to
             // synthesize the Phase-2 PTX; both sides derive them from head_dim via
             // the same `select_backward_blocks` table (codegen's copy lives in
@@ -5132,6 +5952,7 @@ pub extern "C" fn nsl_flash_attention_backward(
                 block_q, block_kv,
                 phase1_ptx_ptr, phase1_name_ptr,
                 phase2_ptx_ptr, phase2_name_ptr,
+                segment_ids_ptr,
             );
             if gpu_result != 0 {
                 if flash_debug {
@@ -5188,21 +6009,61 @@ pub extern "C" fn nsl_flash_attention_backward(
     let total_kv = b * kv_h * s * d;
     let total_lse = b * h * s;
 
-    // Helper to read tensor data as f32 slice (handles both f32 and f64 dtypes).
-    // Handles GPU tensors by transferring data to CPU via cudaMemcpy.
+    // Helper to read tensor data as a CANONICAL row-major f32 Vec (handles
+    // both f32 and f64 dtypes; GPU tensors transfer via cudaMemcpy).
+    //
+    // PCA Stage C made this STRIDE-AWARE: non-contiguous views (e.g.
+    // reshape(..).transpose(1,2) products from stdlib GQA) used to be read
+    // as if [b,h,s,d]-contiguous, which produced smoothly-wrong (~1e-4
+    // scale) gradients instead of an error — found by the
+    // packed-vs-decomposed parity bisection. Views now pull the underlying
+    // buffer extent and gather through the tensor's strides.
     fn read_f32_data(t: &NslTensor, len: usize) -> Vec<f32> {
+        if len == 0 {
+            return Vec::new();
+        }
         let is_gpu = t.device > 0;
+        let ndim = t.ndim as usize;
+        let shape: Vec<i64> = (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+        let strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
 
-        if t.dtype == 1 {
+        // Canonical tensors read the buffer 1:1. Views read `span` elements
+        // of the UNDERLYING buffer (highest linear element index touched,
+        // plus one — stride-0 expand dims contribute nothing) and gather
+        // below. Negative strides never occur in this runtime
+        // (compute_strides and every view op emit strides >= 0); if one
+        // ever appears, keep the old contiguous read but say so loudly.
+        let mut canonical = is_canonical_row_major(t);
+        if !canonical && strides.iter().any(|&st| st < 0) {
+            eprintln!(
+                "[flash-bwd] tensor has negative strides (unsupported) — \
+                 reading as contiguous; gradients may be WRONG"
+            );
+            canonical = true;
+        }
+        let span = if canonical {
+            len
+        } else {
+            let mut last = 0i64;
+            for dd in 0..ndim {
+                if shape[dd] > 1 {
+                    last += (shape[dd] - 1) * strides[dd];
+                }
+            }
+            (last + 1) as usize
+        };
+
+        // Pull `span` elements of the underlying buffer to host as f32.
+        let raw: Vec<f32> = if t.dtype == 1 {
             // f32 tensor
-            let mut buf = vec![0.0f32; len];
+            let mut buf = vec![0.0f32; span];
             if is_gpu {
                 #[cfg(feature = "cuda")]
                 {
                     crate::cuda::inner::memcpy_dtoh(
                         buf.as_mut_ptr() as *mut std::ffi::c_void,
                         t.data as *const std::ffi::c_void,
-                        len * 4,
+                        span * 4,
                     );
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -5210,8 +6071,8 @@ pub extern "C" fn nsl_flash_attention_backward(
                     eprintln!("[flash-bwd] WARNING: GPU tensor but CUDA not enabled");
                 }
             } else {
-                for i in 0..len {
-                    buf[i] = unsafe { *t.data_f32().add(i) };
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = unsafe { *t.data_f32().add(i) };
                 }
             }
             buf
@@ -5220,20 +6081,39 @@ pub extern "C" fn nsl_flash_attention_backward(
             if is_gpu {
                 // GPU f64 tensors: transfer as f64, then convert
                 #[allow(unused_mut)] // `mut` needed only under `cuda` feature
-                let mut f64_buf = vec![0.0f64; len];
+                let mut f64_buf = vec![0.0f64; span];
                 #[cfg(feature = "cuda")]
                 {
                     crate::cuda::inner::memcpy_dtoh(
                         f64_buf.as_mut_ptr() as *mut std::ffi::c_void,
                         t.data as *const std::ffi::c_void,
-                        len * 8,
+                        span * 8,
                     );
                 }
                 f64_buf.iter().map(|&v| v as f32).collect()
             } else {
-                (0..len).map(|i| unsafe { *t.data_f64().add(i) as f32 }).collect()
+                (0..span).map(|i| unsafe { *t.data_f64().add(i) as f32 }).collect()
             }
+        };
+        if canonical {
+            return raw;
         }
+
+        // Stride gather: walk logical row-major order, dot each
+        // multi-index with the view's strides.
+        let mut out = vec![0.0f32; len];
+        for (flat, slot) in out.iter_mut().enumerate() {
+            let mut rem = flat;
+            let mut off = 0usize;
+            for dd in (0..ndim).rev() {
+                let extent = shape[dd].max(1) as usize;
+                let idx = rem % extent;
+                rem /= extent;
+                off += idx * strides[dd] as usize;
+            }
+            *slot = raw[off];
+        }
+        out
     }
 
     let dout_data = read_f32_data(dout_t, total_qkv);
@@ -5242,15 +6122,45 @@ pub extern "C" fn nsl_flash_attention_backward(
     let v_data = read_f32_data(v_t, total_kv);
     let out_data = read_f32_data(out_t, total_qkv);
 
+    // PCA Stage C: optional [batch, seq] segment ids for packed batches.
+    // Host float tensors slice directly; device-resident copies come back
+    // through read_f32_data's memcpy_dtoh path.
+    let seg_host: Option<Vec<f32>> = if segment_ids_ptr != 0 {
+        let seg_t = NslTensor::from_ptr(segment_ids_ptr);
+        if seg_t.len == (b * s) as i64 {
+            Some(read_f32_data(seg_t, b * s))
+        } else {
+            // Compiler-emitted call sites guarantee the [b, s] shape; a
+            // mismatch is a dispatch bug. This path has no further
+            // fallback, so be LOUD (unconditional — this must never scroll
+            // away) and compute unmasked gradients rather than reading out
+            // of bounds: training fails visibly instead of crashing.
+            eprintln!(
+                "[flash-bwd] segment_ids tensor has len {} but batch*seq = {} \
+                 — IGNORING the segment mask; gradients for this packed \
+                 batch are WRONG. This is a compiler dispatch bug.",
+                seg_t.len,
+                b * s
+            );
+            None
+        }
+    } else {
+        None
+    };
+
     // Read or auto-compute logsumexp.
     // When logsumexp_ptr == 0, the forward was decomposed (not fused FlashAttention)
-    // and no logsumexp buffer was saved. Compute it from Q, K, scale, causal.
+    // and no logsumexp buffer was saved. Compute it from Q, K, scale, causal —
+    // segment-aware when segment ids are present.
     let gqa_groups = if kv_h > 0 { h / kv_h } else { 1 };
     let lse_data = if logsumexp_ptr != 0 {
         let lse_t = NslTensor::from_ptr(logsumexp_ptr);
         read_f32_data(lse_t, total_lse)
     } else {
-        compute_logsumexp_gqa(&q_data, &k_data, b, h, kv_h, s, d, scale, is_causal)
+        compute_logsumexp_gqa(
+            &q_data, &k_data, b, h, kv_h, s, d, scale, is_causal,
+            seg_host.as_deref(),
+        )
     };
 
     // Allocate gradient buffers (zero-initialized)
@@ -5260,13 +6170,14 @@ pub extern "C" fn nsl_flash_attention_backward(
     let mut dk_data = vec![0.0f32; total_kv];
     let mut dv_data = vec![0.0f32; total_kv];
 
-    // Run the CPU backward with GQA support
+    // Run the CPU backward with GQA support (segment-aware when packed)
     flash_attention_backward_cpu_gqa(
         &q_data, &k_data, &v_data,
         &out_data, &lse_data, &dout_data,
         &mut dq_data, &mut dk_data, &mut dv_data,
         b, h, kv_h, s, d,
         scale, is_causal, gqa_groups,
+        seg_host.as_deref(),
     );
 
     // Create output tensors (f32 dtype, matching Q shape for dQ, KV shape for dK/dV)
@@ -5537,7 +6448,7 @@ mod tests {
         let k: Vec<f32> = (0..n).map(|_| nextf()).collect();
 
         for &causal in &[false, true] {
-            let reference = compute_logsumexp_gqa(&q, &k, b, h, h, s, d, scale, causal);
+            let reference = compute_logsumexp_gqa(&q, &k, b, h, h, s, d, scale, causal, None);
 
             let bytes = n * 4;
             let total_lse = b * h * s;
@@ -6372,6 +7283,7 @@ mod tests {
             &mut dq_flash, &mut dk_flash, &mut dv_flash,
             b, h_q, h_kv, s, d,
             scale, false, groups,
+            None,
         );
 
         // Verify shapes implicitly via lengths
@@ -6483,6 +7395,7 @@ mod tests {
             &mut dq_flash, &mut dk_flash, &mut dv_flash,
             b, h_q, h_kv, s, d,
             scale, true, groups,
+            None,
         );
 
         let tol = 1e-4;
@@ -6510,6 +7423,7 @@ mod tests {
             &mut dq_causal, &mut dk_causal, &mut dv_causal,
             b, h_q, h_kv, s, d,
             scale, true, groups,
+            None,
         );
 
         // With causal mask and dout only at row 0, K/V positions j>0
@@ -6527,6 +7441,293 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── PCA Stage C: fused packed-SDPA runtime tests ──────────────────
+
+    /// The fused-forward decline protocol: null PTX (and, on non-CUDA
+    /// builds, everything) must decline with 0 — silently, with no side
+    /// effects — so the wengert_lower dispatch keeps the decomposed SDPA
+    /// graph. Also pins the 13-arg extern signature.
+    #[test]
+    fn sdpa_fused_forward_declines_with_null_ptx() {
+        let r = nsl_sdpa_fused_forward(
+            0, 0, 0,                 // q, k, v
+            1.0f32.to_bits() as i64, // scale_bits
+            1,                       // causal
+            0,                       // segment_ids
+            0, 0,                    // ptx, name (null => decline)
+            0, 0,                    // tier-b sentinel pair (disabled)
+            64, 64,                  // block_q, block_kv
+            0,                       // shared_mem_bytes
+        );
+        assert_eq!(r, 0, "null-PTX fused forward must DECLINE (0), got {r}");
+    }
+
+    /// PCA Stage C: a segment-masked CPU backward over a packed row must
+    /// equal independent backwards over the per-segment sub-sequences —
+    /// block-diagonal attention IS independent attention per segment. The
+    /// two batch rows split at different boundaries (5|3 vs 3|5) so a
+    /// batch-row-blind masking bug (indexing `seg[i]` instead of
+    /// `seg[b_idx * s + i]`) cannot pass.
+    #[test]
+    fn test_segment_masked_backward_cpu_matches_per_segment() {
+        let b = 2usize;
+        let h = 2usize;
+        let s = 8usize;
+        let d = 4usize;
+        let scale = 1.0 / (d as f32).sqrt();
+        let splits: [usize; 2] = [5, 3]; // per-batch segment boundary
+
+        let total = b * h * s * d;
+        let total_lse = b * h * s;
+        let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.11).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..total).map(|i| (i as f32 * 0.19 + 1.0).cos() * 0.5).collect();
+        let v: Vec<f32> = (0..total).map(|i| (i as f32 * 0.29 + 2.0).sin() * 0.5).collect();
+        let dout: Vec<f32> = (0..total).map(|i| (i as f32 * 0.37 + 3.0).cos() * 0.3).collect();
+
+        // seg[b*s + i]: distinct values per (batch, segment). Only equality
+        // matters to the mask, so arbitrary non-uniform ids are fine.
+        let mut seg = vec![0.0f32; b * s];
+        for bb in 0..b {
+            for i in 0..s {
+                seg[bb * s + i] =
+                    if i < splits[bb] { (10 + bb) as f32 } else { (20 + bb) as f32 };
+            }
+        }
+
+        // Extract rows `r` of batch `bb` from a [b, h, s, d] tensor into a
+        // [1, h, r.len(), d] tensor (scatter* invert; scatter3 is the
+        // [b, h, s] logsumexp analog).
+        let extract4 = |src: &[f32], bb: usize, r: std::ops::Range<usize>| -> Vec<f32> {
+            let rl = r.len();
+            let mut sub = vec![0.0f32; h * rl * d];
+            for hh in 0..h {
+                for (ri, i) in r.clone().enumerate() {
+                    for dd in 0..d {
+                        sub[(hh * rl + ri) * d + dd] = src[((bb * h + hh) * s + i) * d + dd];
+                    }
+                }
+            }
+            sub
+        };
+        let scatter4 = |dst: &mut [f32], sub: &[f32], bb: usize, r: std::ops::Range<usize>| {
+            let rl = r.len();
+            for hh in 0..h {
+                for (ri, i) in r.clone().enumerate() {
+                    for dd in 0..d {
+                        dst[((bb * h + hh) * s + i) * d + dd] = sub[(hh * rl + ri) * d + dd];
+                    }
+                }
+            }
+        };
+        let scatter3 = |dst: &mut [f32], sub: &[f32], bb: usize, r: std::ops::Range<usize>| {
+            let rl = r.len();
+            for hh in 0..h {
+                for (ri, i) in r.clone().enumerate() {
+                    dst[(bb * h + hh) * s + i] = sub[hh * rl + ri];
+                }
+            }
+        };
+
+        for causal in [false, true] {
+            // Per-segment reference: independent forward + backward on each
+            // (batch, segment) sub-sequence, stitched into full-shape buffers.
+            let mut out_full = vec![0.0f32; total];
+            let mut lse_full = vec![0.0f32; total_lse];
+            let mut dq_ref = vec![0.0f32; total];
+            let mut dk_ref = vec![0.0f32; total];
+            let mut dv_ref = vec![0.0f32; total];
+            for bb in 0..b {
+                for r in [0..splits[bb], splits[bb]..s] {
+                    let rl = r.len();
+                    let q_sub = extract4(&q, bb, r.clone());
+                    let k_sub = extract4(&k, bb, r.clone());
+                    let v_sub = extract4(&v, bb, r.clone());
+                    let dout_sub = extract4(&dout, bb, r.clone());
+                    let (out_sub, lse_sub) = naive_attention_forward(
+                        &q_sub, &k_sub, &v_sub, 1, h, rl, d, scale, causal,
+                    );
+                    let mut dq_sub = vec![0.0f32; h * rl * d];
+                    let mut dk_sub = vec![0.0f32; h * rl * d];
+                    let mut dv_sub = vec![0.0f32; h * rl * d];
+                    flash_attention_backward_cpu_gqa(
+                        &q_sub, &k_sub, &v_sub, &out_sub, &lse_sub, &dout_sub,
+                        &mut dq_sub, &mut dk_sub, &mut dv_sub,
+                        1, h, h, rl, d,
+                        scale, causal, 1,
+                        None,
+                    );
+                    scatter4(&mut out_full, &out_sub, bb, r.clone());
+                    scatter3(&mut lse_full, &lse_sub, bb, r.clone());
+                    scatter4(&mut dq_ref, &dq_sub, bb, r.clone());
+                    scatter4(&mut dk_ref, &dk_sub, bb, r.clone());
+                    scatter4(&mut dv_ref, &dv_sub, bb, r);
+                }
+            }
+
+            // Masked full-row pass under test: the logsumexp must restrict
+            // each row's normalizer to its own segment...
+            let lse_masked =
+                compute_logsumexp_gqa(&q, &k, b, h, h, s, d, scale, causal, Some(&seg));
+            let lse_err = max_abs_diff(&lse_masked, &lse_full);
+            assert!(
+                lse_err < 1e-5,
+                "causal={causal}: segment-masked lse != per-segment lse (err={lse_err})"
+            );
+
+            // ...and the backward must confine every gradient contribution
+            // to in-segment (i, j) pairs.
+            let mut dq_m = vec![0.0f32; total];
+            let mut dk_m = vec![0.0f32; total];
+            let mut dv_m = vec![0.0f32; total];
+            flash_attention_backward_cpu_gqa(
+                &q, &k, &v, &out_full, &lse_masked, &dout,
+                &mut dq_m, &mut dk_m, &mut dv_m,
+                b, h, h, s, d,
+                scale, causal, 1,
+                Some(&seg),
+            );
+
+            let tol = 1e-4;
+            let dq_err = max_abs_diff(&dq_ref, &dq_m);
+            let dk_err = max_abs_diff(&dk_ref, &dk_m);
+            let dv_err = max_abs_diff(&dv_ref, &dv_m);
+            assert!(dq_err < tol, "causal={causal}: segment-masked dQ err {dq_err} > {tol}");
+            assert!(dk_err < tol, "causal={causal}: segment-masked dK err {dk_err} > {tol}");
+            assert!(dv_err < tol, "causal={causal}: segment-masked dV err {dv_err} > {tol}");
+        }
+    }
+
+    /// PCA Stage C stride-parity fix: the CPU reference backward must read
+    /// its tensor inputs STRIDE-AWARE. Feed the FFI a Q that is a
+    /// manually-strided view (a [b, s, h, d] buffer viewed as [b, h, s, d]
+    /// — exactly the reshape(..).transpose(1, 2) product stdlib GQA emits)
+    /// and the same data pre-materialized contiguous: the gradients must
+    /// match EXACTLY (same values -> same arithmetic -> bitwise-equal),
+    /// where the old stride-blind read produced smoothly-wrong (~1e-4)
+    /// gradients.
+    #[test]
+    fn test_backward_cpu_stride_aware_view_inputs() {
+        let b = 1usize;
+        let h = 2usize;
+        let s = 4usize;
+        let d = 4usize;
+        let scale = 1.0 / (d as f32).sqrt();
+        let total = b * h * s * d;
+
+        // Build a CPU f32 NslTensor with caller-chosen strides (elements).
+        fn mk_tensor(data: &[f32], shape: &[i64], strides: &[i64]) -> i64 {
+            let shape_ptr =
+                crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
+            let strides_ptr =
+                crate::memory::checked_alloc(std::mem::size_of_val(strides)) as *mut i64;
+            for (i, &v) in shape.iter().enumerate() {
+                unsafe { *shape_ptr.add(i) = v };
+            }
+            for (i, &v) in strides.iter().enumerate() {
+                unsafe { *strides_ptr.add(i) = v };
+            }
+            let data_ptr =
+                crate::memory::checked_alloc(std::mem::size_of_val(data)) as *mut f32;
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+            }
+            let t = Box::new(NslTensor::new(
+                data_ptr as *mut std::ffi::c_void,
+                shape_ptr,
+                strides_ptr,
+                shape.len() as i64,
+                shape.iter().product(),
+                0, // device = CPU
+                1, // dtype = f32
+                1, // owns_data
+                0, // data_owner
+            ));
+            Box::into_raw(t) as i64
+        }
+        fn tensor_values(ptr: i64, len: usize) -> Vec<f32> {
+            let t = NslTensor::from_ptr(ptr);
+            assert_eq!(t.dtype, 1, "gradient tensors are f32");
+            assert_eq!(t.device, 0, "CPU inputs must yield CPU gradients");
+            (0..len).map(|i| unsafe { *t.data_f32().add(i) }).collect()
+        }
+
+        // Q's underlying buffer is [b, s, h, d] row-major; the VIEW
+        // presents it as [b, h, s, d] via permuted strides [s*h*d, d, h*d, 1].
+        let q_bshd: Vec<f32> = (0..total).map(|i| (i as f32 * 0.13).sin() * 0.5).collect();
+        let mut q_bhsd = vec![0.0f32; total]; // contiguous twin
+        for bb in 0..b {
+            for hh in 0..h {
+                for ss in 0..s {
+                    for dd in 0..d {
+                        q_bhsd[((bb * h + hh) * s + ss) * d + dd] =
+                            q_bshd[((bb * s + ss) * h + hh) * d + dd];
+                    }
+                }
+            }
+        }
+        let k: Vec<f32> = (0..total).map(|i| (i as f32 * 0.17 + 1.0).cos() * 0.5).collect();
+        let v: Vec<f32> = (0..total).map(|i| (i as f32 * 0.23 + 2.0).sin() * 0.5).collect();
+        let dout: Vec<f32> = (0..total).map(|i| (i as f32 * 0.31 + 3.0).cos() * 0.3).collect();
+        let (out, _lse) = naive_attention_forward(&q_bhsd, &k, &v, b, h, s, d, scale, true);
+
+        let shape = [b as i64, h as i64, s as i64, d as i64];
+        let canon = [(h * s * d) as i64, (s * d) as i64, d as i64, 1];
+        let view_strides = [(s * h * d) as i64, d as i64, (h * d) as i64, 1];
+
+        let run = |q_ptr: i64| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let list_ptr = nsl_flash_attention_backward(
+                mk_tensor(&dout, &shape, &canon),
+                q_ptr,
+                mk_tensor(&k, &shape, &canon),
+                mk_tensor(&v, &shape, &canon),
+                mk_tensor(&out, &shape, &canon),
+                0, // logsumexp: auto-compute
+                scale.to_bits() as i64,
+                b as i64, h as i64, s as i64, d as i64,
+                1, // causal
+                0, 0, 0, 0, // no PTX -> CPU reference
+                0, 0, // tier-b disabled sentinel
+                0, // no segment mask
+            );
+            assert_ne!(list_ptr, 0, "CPU backward must return [dq, dk, dv]");
+            let list = crate::list::NslList::from_ptr(list_ptr);
+            assert_eq!(list.len, 3);
+            let dq = tensor_values(unsafe { *list.data.add(0) }, total);
+            let dk = tensor_values(unsafe { *list.data.add(1) }, total);
+            let dv = tensor_values(unsafe { *list.data.add(2) }, total);
+            (dq, dk, dv)
+        };
+
+        let (dq_c, dk_c, dv_c) = run(mk_tensor(&q_bhsd, &shape, &canon));
+        let (dq_v, dk_v, dv_v) = run(mk_tensor(&q_bshd, &shape, &view_strides));
+
+        // Sanity: the two Q encodings really differ in memory order (the
+        // test would be vacuous otherwise).
+        assert!(
+            max_abs_diff(&q_bshd, &q_bhsd) > 1e-3,
+            "buffer permutation should reorder values"
+        );
+
+        // Stride-aware read => identical logical Q => bitwise-equal grads.
+        assert_eq!(
+            max_abs_diff(&dq_c, &dq_v),
+            0.0,
+            "dQ from a strided Q view must EXACTLY match the contiguous run"
+        );
+        assert_eq!(
+            max_abs_diff(&dk_c, &dk_v),
+            0.0,
+            "dK from a strided Q view must EXACTLY match the contiguous run"
+        );
+        assert_eq!(
+            max_abs_diff(&dv_c, &dv_v),
+            0.0,
+            "dV from a strided Q view must EXACTLY match the contiguous run"
+        );
+        let dq_norm: f32 = dq_c.iter().map(|x| x * x).sum();
+        assert!(dq_norm > 1e-8, "gradients should be non-trivial");
     }
 
     // ── CSHA A.2.5: FFI launch path tests ────────────────────────────

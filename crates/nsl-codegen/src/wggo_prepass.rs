@@ -285,11 +285,40 @@ pub fn stmts_contain_masked_sdpa(
     stmts: &[nsl_ast::stmt::Stmt],
     interner: &nsl_lexer::Interner,
 ) -> bool {
+    // Either masked builtin makes the module packing-capable: the Stage-B
+    // decomposed form and the Stage-C fused-capable packed form both give
+    // the plan a real segment_id lowering channel.
+    stmts_contain_any_call(
+        stmts,
+        interner,
+        &[
+            "scaled_dot_product_attention_masked",
+            "scaled_dot_product_attention_packed",
+        ],
+    )
+}
+
+/// PCA Stage C: does any statement call the PACKED attention builtin
+/// specifically? Distinguishes the fused segment-masked consumption channel
+/// from Stage B's decomposed one in the `[pca]` per-layer verdicts.
+pub fn stmts_contain_packed_sdpa(
+    stmts: &[nsl_ast::stmt::Stmt],
+    interner: &nsl_lexer::Interner,
+) -> bool {
+    stmts_contain_any_call(stmts, interner, &["scaled_dot_product_attention_packed"])
+}
+
+fn stmts_contain_any_call(
+    stmts: &[nsl_ast::stmt::Stmt],
+    interner: &nsl_lexer::Interner,
+    names: &[&str],
+) -> bool {
     use nsl_ast::expr::{Expr, ExprKind};
     use nsl_ast::visitor::{walk_expr, walk_stmt, Visitor};
 
     struct Finder<'a> {
         interner: &'a nsl_lexer::Interner,
+        names: &'a [&'a str],
         found: bool,
     }
     impl Visitor for Finder<'_> {
@@ -299,11 +328,11 @@ pub fn stmts_contain_masked_sdpa(
             }
             if let ExprKind::Call { callee, .. } = &expr.kind {
                 if let ExprKind::Ident(sym) = &callee.kind {
-                    if self.interner.resolve(sym.0)
-                        == Some("scaled_dot_product_attention_masked")
-                    {
-                        self.found = true;
-                        return;
+                    if let Some(name) = self.interner.resolve(sym.0) {
+                        if self.names.contains(&name) {
+                            self.found = true;
+                            return;
+                        }
                     }
                 }
             }
@@ -311,7 +340,11 @@ pub fn stmts_contain_masked_sdpa(
         }
     }
 
-    let mut f = Finder { interner, found: false };
+    let mut f = Finder {
+        interner,
+        names,
+        found: false,
+    };
     for st in stmts {
         if f.found {
             break;
@@ -331,6 +364,20 @@ pub fn fn_bodies_contain_masked_sdpa<'a>(
 ) -> bool {
     for def in bodies {
         if stmts_contain_masked_sdpa(&def.body.stmts, interner) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Companion to [`stmts_contain_packed_sdpa`] for model method bodies
+/// (e.g. the stdlib GQA's `forward_packed`).
+pub fn fn_bodies_contain_packed_sdpa<'a>(
+    bodies: impl Iterator<Item = &'a nsl_ast::decl::FnDef>,
+    interner: &nsl_lexer::Interner,
+) -> bool {
+    for def in bodies {
+        if stmts_contain_packed_sdpa(&def.body.stmts, interner) {
             return true;
         }
     }
@@ -726,9 +773,24 @@ fn plan_train_block(
             matches!(
                 op.op,
                 crate::wengert::PrimalOp::ScaledDotProductAttention { .. }
+                    | crate::wengert::PrimalOp::ScaledDotProductAttentionPacked
                     | crate::wengert::PrimalOp::FlashAttentionBackwardExtract { .. }
+                    | crate::wengert::PrimalOp::FlashAttentionBackwardExtractPacked { .. }
             )
         });
+        // PCA Stage C: the fused segment-masked consumption channel is only
+        // claimed when the TRAINING GRAPH actually reaches the packed op —
+        // an AST scan would over-claim (stdlib GQA always carries
+        // forward_packed as an uncalled method).
+        if extractor.wengert_list().ops.iter().any(|op| {
+            matches!(
+                op.op,
+                crate::wengert::PrimalOp::ScaledDotProductAttentionPacked
+                    | crate::wengert::PrimalOp::FlashAttentionBackwardExtractPacked { .. }
+            )
+        }) {
+            compiler.features.packed_sdpa_in_module = true;
+        }
         let graph_fingerprint = fingerprint_wengert(extractor.wengert_list());
         Some(WggoPrePlan {
             train_block_stmt_id,

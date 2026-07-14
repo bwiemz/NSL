@@ -339,6 +339,94 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     dict
 }
 
+/// PCA Stage C: move packed-batch mask tensors to the training device.
+///
+/// `dict_ptr` — the batch dict produced by `packed_batch_to_dict`
+/// (`input_ids` / `labels` / `attention_mask` / `segment_ids` /
+/// `doc_starts`, all host f32 at creation). `param_list_ptr` — the model
+/// parameter `NslList`; the FIRST parameter tensor's residency decides
+/// the training device.
+///
+/// Called by the train-block batch prep BEFORE the packing-registry
+/// stash (`nsl_packing_metadata_set`), so the registry sees the
+/// POST-move data pointers.
+///
+/// Why this exists: the packed dict tensors were never moved to GPU, so
+/// on GPU runs the decomposed mask-add computed
+/// `nsl_tensor_add(gpu_f32, host_f32)` — the reconciliation dragged the
+/// graph back to CPU f64, and training eventually aborted with
+/// "nsl_tensor_add_inplace: dtype mismatch (dst=1, src=0)" when a
+/// CPU-f64 gradient hit a GPU-f32 FASE `m_partial`.
+///
+/// Behavior:
+///   * No-op (returns 0) when either arg is 0, the param list is empty,
+///     the first param is null or CPU-resident, or the build lacks CUDA.
+///   * Otherwise, each of `attention_mask` and `segment_ids` that is
+///     present in the dict and CPU-resident is moved via
+///     `nsl_tensor_to_device(ptr, 1)` — for the f32 host tensors the
+///     packer emits this is a DIRECT f32->f32 HtoD copy (no f64 detour;
+///     verified against the dtype==1 branch in `nsl_tensor_to_device`).
+///     The dict entry is replaced in place (`nsl_dict_set_str` on an
+///     existing key overwrites the value), and the old HOST tensor is
+///     freed explicitly: the batch dict OWNS its values — the step
+///     epilogue releases them via `nsl_dict_free_tensor_values` — but the
+///     set-overwrite does NOT free the previous value, so skipping the
+///     explicit free would leak one mask + one segment tensor per step.
+///   * `input_ids` / `labels` / `doc_starts` are left untouched —
+///     embedding / CE lowering handle host tensors today.
+///
+/// Returns 1 when at least one tensor moved, else 0.
+#[no_mangle]
+pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        if dict_ptr == 0 || param_list_ptr == 0 {
+            return 0;
+        }
+        let params = crate::list::NslList::from_ptr(param_list_ptr);
+        if params.len == 0 {
+            return 0;
+        }
+        let first_param = unsafe { *params.data.add(0) };
+        if first_param == 0 || NslTensor::from_ptr(first_param).device == 0 {
+            return 0;
+        }
+
+        let mut moved = 0i64;
+        if std::env::var("NSL_ALIGN_DEBUG").is_ok() {
+            eprintln!("[align-debug] fired: first_param_device={}", NslTensor::from_ptr(first_param).device);
+        }
+        for key in ["attention_mask", "segment_ids"] {
+            let k = nsl_str_from_rust(key);
+            // Probe with `contains` first: `nsl_dict_get_str` prints a
+            // loud "key not found" diagnostic for missing keys, and a
+            // maskless batch is a normal case here.
+            if crate::dict::nsl_dict_contains(dict_ptr, k) != 0 {
+                let old_ptr = crate::dict::nsl_dict_get_str(dict_ptr, k);
+                if std::env::var("NSL_ALIGN_DEBUG").is_ok() && old_ptr != 0 {
+                    let t = NslTensor::from_ptr(old_ptr);
+                    eprintln!("[align-debug] {key}: device={} dtype={}", t.device, t.dtype);
+                }
+                if old_ptr != 0 && NslTensor::from_ptr(old_ptr).device == 0 {
+                    let gpu_ptr = crate::tensor::nsl_tensor_to_device(old_ptr, 1);
+                    if gpu_ptr != 0 && gpu_ptr != old_ptr {
+                        nsl_dict_set_str(dict_ptr, k, gpu_ptr);
+                        crate::tensor::nsl_tensor_free(old_ptr);
+                        moved = 1;
+                    }
+                }
+            }
+            crate::string::nsl_string_free(k);
+        }
+        moved
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (dict_ptr, param_list_ptr);
+        0
+    }
+}
+
 /// FFI: packing efficiency — ratio of real tokens to total slots.
 ///
 /// For packed sequences, this measures how much padding is wasted.
@@ -368,6 +456,70 @@ pub extern "C" fn nsl_packing_efficiency(dl_ptr: i64) -> f64 {
 mod tests {
     use super::*;
     use crate::dict::nsl_dict_len;
+
+    /// PCA Stage C: `nsl_packed_batch_align_device` no-op paths. Null
+    /// args, an empty param list, and a CPU-resident first param must all
+    /// return 0 and leave the dict untouched (and on non-CUDA builds the
+    /// FFI is a hard 0 regardless). The GPU move path needs a live device
+    /// and is exercised by the train-block e2e, not here.
+    #[test]
+    fn test_packed_batch_align_device_noop_paths() {
+        // Null args: silent no-ops on every build.
+        assert_eq!(nsl_packed_batch_align_device(0, 0), 0);
+        assert_eq!(nsl_packed_batch_align_device(0, 123), 0);
+        assert_eq!(nsl_packed_batch_align_device(123, 0), 0);
+
+        // Real packed dict + CPU-resident param: no-op, entries unchanged.
+        let stream: Vec<f64> = vec![10.0, 20.0, 0.0, 30.0, 40.0, 50.0, 0.0, 60.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            2, // batch_size
+            4, // seq_len
+            0, // eos_token
+        )
+        .expect("should produce a batch");
+        let dict = packed_batch_to_dict(&batch);
+
+        let k_mask = nsl_str_from_rust("attention_mask");
+        let k_seg = nsl_str_from_rust("segment_ids");
+        let mask_before = crate::dict::nsl_dict_get_str(dict, k_mask);
+        let seg_before = crate::dict::nsl_dict_get_str(dict, k_seg);
+        assert_ne!(mask_before, 0);
+        assert_ne!(seg_before, 0);
+
+        let cpu_param = create_tensor_with_shape_rs_dtype(&[2, 2], 1);
+        let params = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(params, cpu_param);
+
+        assert_eq!(
+            nsl_packed_batch_align_device(dict, params),
+            0,
+            "CPU-resident first param must be a no-op"
+        );
+        assert_eq!(
+            crate::dict::nsl_dict_get_str(dict, k_mask),
+            mask_before,
+            "attention_mask entry must be untouched"
+        );
+        assert_eq!(
+            crate::dict::nsl_dict_get_str(dict, k_seg),
+            seg_before,
+            "segment_ids entry must be untouched"
+        );
+        assert_eq!(NslTensor::from_ptr(mask_before).device, 0);
+        assert_eq!(NslTensor::from_ptr(seg_before).device, 0);
+
+        // Empty param list: also a no-op.
+        let empty_params = crate::list::nsl_list_new();
+        assert_eq!(nsl_packed_batch_align_device(dict, empty_params), 0);
+
+        crate::string::nsl_string_free(k_mask);
+        crate::string::nsl_string_free(k_seg);
+    }
 
     #[test]
     fn test_pack_batch_basic() {

@@ -517,6 +517,31 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // PCA Stage C: PACKED attention — fused segment-masked flash kernel on
+    // GPU (per-doc tile skipping), decomposed additive-mask fallback
+    // elsewhere. scaled_dot_product_attention_packed(Q, K, V, scale, mask,
+    // segment_ids) -> tensor.
+    // CONTRACT: `mask` must be the DataLoader's canonical packed mask
+    // (additive, causal-within-`segment_ids`) and `scale` must be the
+    // default 1/sqrt(head_dim) (the fused backward re-derives it from Q's
+    // shape, like the plain fused op). For arbitrary masks use
+    // scaled_dot_product_attention_masked.
+    def(
+        "scaled_dot_product_attention_packed",
+        Type::Function {
+            params: vec![
+                tensor_ret.clone(),  // Q
+                tensor_ret.clone(),  // K
+                tensor_ret.clone(),  // V
+                Type::Float,         // scale
+                tensor_ret.clone(),  // additive mask (fallback path)
+                tensor_ret.clone(),  // segment_ids [b, s] (fused path)
+            ],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // Tokenizer functions (M15)
     def(
         "byte_tokenizer_new",
