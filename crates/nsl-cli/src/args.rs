@@ -658,7 +658,8 @@ pub(crate) struct BuildArgs {
 
         /// WGGO: lower the plan's optimizer-moment precision decisions
         /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
-        /// training numerics; v1 cast envelope is CPU-only.
+        /// training numerics. Works on CPU and GPU (the GPU cast envelope
+        /// uses the CFTP-v7 PTX cast kernels).
         #[arg(long)]
         pub(crate) wggo_moment_precision: bool,
 
@@ -952,7 +953,8 @@ pub(crate) struct RunArgs {
 
         /// WGGO: lower the plan's optimizer-moment precision decisions
         /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
-        /// training numerics; v1 cast envelope is CPU-only.
+        /// training numerics. Works on CPU and GPU (the GPU cast envelope
+        /// uses the CFTP-v7 PTX cast kernels).
         #[arg(long)]
         pub(crate) wggo_moment_precision: bool,
 

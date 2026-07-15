@@ -87,10 +87,13 @@ impl GpuSpec {
     }
 
     /// Returns true if the GPU supports wgmma.mma_async (128-thread warp groups).
-    /// Requires sm_90 (H100/H200). Enables ~37% more tensor core utilization
-    /// over mma.sync via asynchronous warp group execution.
+    /// Hopper-ONLY (sm_90/sm_90a, H100/H200): Blackwell (sm_100 datacenter,
+    /// sm_120 consumer) removed wgmma in favor of tcgen05 — a `>= 90` check
+    /// would wrongly plan wgmma kernels for B200 and RTX 50-series
+    /// (tightened 2026-07-14 when the RTX-5070-Ti entry landed). Enables
+    /// ~37% more tensor core utilization over mma.sync on Hopper.
     pub fn supports_wgmma(&self) -> bool {
-        self.sm_version >= 90
+        (90..100).contains(&self.sm_version)
     }
 
     /// Returns true if the GPU supports MXFP8 per-block scaling with E8M0 scales.
@@ -150,9 +153,9 @@ impl GpuSpec {
     }
 
     /// Returns true if the GPU supports FP8 wgmma (wgmma.mma_async with e4m3/e5m2 inputs).
-    /// Requires sm_90 (H100/H200) or later.
+    /// Hopper-only, same rationale as [`Self::supports_wgmma`].
     pub fn supports_fp8_wgmma(&self) -> bool {
-        self.sm_version >= 90
+        (90..100).contains(&self.sm_version)
     }
 
     /// Warp group size: 128 threads on Hopper (4 warps collaborate), 32 on older.
@@ -270,6 +273,38 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         registers_per_sm: 65536,
         num_sms: 114,
         empirical_p95_ratio: 1.25,
+    },
+    GpuSpec {
+        // Blackwell consumer (GB203-350). Added 2026-07-14: CSHA's smem
+        // negotiation previously fell back to A100-SXM on this machine
+        // (l1 192KB -> 180KB budget), silently OPTIMISTIC vs the real
+        // 128KB unified L1 (-> 116KB budget; actual max dynamic SMEM per
+        // CTA is ~99KB, consistent with the A100 entry's own optimism —
+        // the budget model is `l1 - 12KB` across the whole database).
+        name: "RTX-5070-Ti",
+        sm_version: 120,
+        peak_fp16_tflops: 175.8,
+        peak_fp8_tflops: 351.5,
+        peak_fp32_tflops: 43.9,
+        peak_bandwidth_gbs: 896.0,
+        vram_gb: 16.0,
+        l2_cache_mb: 48.0,
+        crossover_fp16: 196.2,
+        crossover_fp8: 392.3,
+        crossover_fp32: 49.0,
+        base_clock_mhz: 2300,
+        kernel_launch_overhead_ns: 4000,
+        sync_overhead_ns: 1500,
+        pcie_bandwidth_gbps: 64.0,
+        occupancy_worst_case: 0.5,
+        l2_cache_bytes: 48 * 1024 * 1024,
+        l1_cache_kb: 128,
+        l1_bandwidth_gbs: 7000.0,
+        l2_bandwidth_gbs: 4200.0,
+        max_warps_per_sm: 48,
+        registers_per_sm: 65536,
+        num_sms: 70,
+        empirical_p95_ratio: 1.35,
     },
     GpuSpec {
         name: "RTX-4090",
@@ -701,8 +736,9 @@ mod tests {
 
     #[test]
     fn test_database_has_all_gpus() {
-        assert_eq!(GPU_DATABASE.len(), 12);
+        assert_eq!(GPU_DATABASE.len(), 13);
         let names: Vec<&str> = GPU_DATABASE.iter().map(|g| g.name).collect();
+        assert!(names.contains(&"RTX-5070-Ti"));
         assert!(names.contains(&"A100-SXM"));
         assert!(names.contains(&"H100-SXM"));
         assert!(names.contains(&"RTX-4090"));
@@ -719,7 +755,10 @@ mod tests {
         let b200 = find_gpu("B200").unwrap();
         assert!(b200.supports_mxfp8());
         assert!(b200.supports_fp4());
-        assert!(b200.supports_wgmma());
+        // wgmma is sm_90a-ONLY in the PTX ISA — Blackwell (sm_100+)
+        // replaced it with tcgen05. The pre-2026-07-14 `>= 90` predicate
+        // (and this test's old assertion) encoded the wrong hardware.
+        assert!(!b200.supports_wgmma());
         assert!(b200.supports_fp8_mma());
 
         let h100 = find_gpu("H100").unwrap();

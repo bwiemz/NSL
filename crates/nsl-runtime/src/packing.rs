@@ -50,6 +50,13 @@ pub struct PackedBatch {
     /// CTA prologue). A flat single-table layout would collapse all rows'
     /// document boundaries into row 0's positions.
     pub doc_starts:  Vec<i32>,
+    /// Per-token position WITHIN its document (deferral-closure
+    /// 2026-07-14): `position_ids[b*seq_len + i] = i - doc_start(i)`,
+    /// resetting to 0 at every document boundary. Sibling to
+    /// `segment_ids`; consumed by `RotaryEmbedding.forward_with_positions`
+    /// so packed pretraining applies RoPE with per-document positions
+    /// instead of positions that run continuously across the packed row.
+    pub position_ids: Vec<i32>,
     pub batch_size:  usize,
     pub seq_len:     usize,
 }
@@ -97,6 +104,7 @@ pub fn pack_batch(
     let mut labels = vec![0i64; total];
     let mut mask = vec![-1e9f32; batch_size * seq_len * seq_len];
     let mut segment_ids: Vec<u16> = Vec::with_capacity(total);
+    let mut position_ids: Vec<i32> = Vec::with_capacity(total);
 
     // PCA §4.3 RoPE position-reset accumulator (spec v3, per-row layout).
     //
@@ -141,9 +149,11 @@ pub fn pack_batch(
         // Assign doc_ids by scanning for EOS tokens
         let mut doc_ids = vec![0u32; seq_len];
         let mut current_doc: u32 = 0;
+        let mut current_doc_start: usize = 0;
         for i in 0..seq_len {
             if i > 0 && input_ids[offset + i - 1] == eos_token {
                 current_doc += 1;
+                current_doc_start = i;
                 // PCA §4.3 per-row accumulator: EOS at local position i-1
                 // ends the current doc; the next doc starts at local
                 // position i (row-local, not flat). Write into this row's
@@ -160,6 +170,8 @@ pub fn pack_batch(
                 current_row_doc_idx += 1;
             }
             doc_ids[i] = current_doc;
+            // Per-document RoPE position: index within the current doc.
+            position_ids.push((i - current_doc_start) as i32);
         }
 
         // PCA Tier A (spec §3.5): emit per-position segment IDs alongside
@@ -195,6 +207,7 @@ pub fn pack_batch(
         mask,
         segment_ids,
         doc_starts,
+        position_ids,
         batch_size,
         seq_len,
     })
@@ -319,22 +332,35 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
         unsafe { *ds_data.add(i) = v as f32 };
     }
 
+    // position_ids [B, S] — per-document RoPE positions (sibling to
+    // segment_ids; same f32-backing rationale: row-local positions are
+    // bounded by seq_len << 2^24, so the f32 round-trip is lossless).
+    let pos_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
+    let pos_tensor = NslTensor::from_ptr(pos_ptr);
+    let pos_data = pos_tensor.data_f32();
+    for (i, &v) in batch.position_ids.iter().enumerate() {
+        unsafe { *pos_data.add(i) = v as f32 };
+    }
+
     let dict = nsl_dict_new();
     let k_ids = nsl_str_from_rust("input_ids");
     let k_lbl = nsl_str_from_rust("labels");
     let k_mask = nsl_str_from_rust("attention_mask");
     let k_seg = nsl_str_from_rust("segment_ids");
     let k_ds = nsl_str_from_rust("doc_starts");
+    let k_pos = nsl_str_from_rust("position_ids");
     nsl_dict_set_str(dict, k_ids, ids_ptr);
     nsl_dict_set_str(dict, k_lbl, lbl_ptr);
     nsl_dict_set_str(dict, k_mask, mask_ptr);
     nsl_dict_set_str(dict, k_seg, seg_ptr);
     nsl_dict_set_str(dict, k_ds, ds_ptr);
+    nsl_dict_set_str(dict, k_pos, pos_ptr);
     crate::string::nsl_string_free(k_ids);
     crate::string::nsl_string_free(k_lbl);
     crate::string::nsl_string_free(k_mask);
     crate::string::nsl_string_free(k_seg);
     crate::string::nsl_string_free(k_ds);
+    crate::string::nsl_string_free(k_pos);
 
     dict
 }
@@ -361,8 +387,8 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
 /// Behavior:
 ///   * No-op (returns 0) when either arg is 0, the param list is empty,
 ///     the first param is null or CPU-resident, or the build lacks CUDA.
-///   * Otherwise, each of `attention_mask` and `segment_ids` that is
-///     present in the dict and CPU-resident is moved via
+///   * Otherwise, each of `attention_mask`, `segment_ids` and
+///     `position_ids` that is present in the dict and CPU-resident is moved via
 ///     `nsl_tensor_to_device(ptr, 1)` — for the f32 host tensors the
 ///     packer emits this is a DIRECT f32->f32 HtoD copy (no f64 detour;
 ///     verified against the dtype==1 branch in `nsl_tensor_to_device`).
@@ -396,7 +422,7 @@ pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i
         if std::env::var("NSL_ALIGN_DEBUG").is_ok() {
             eprintln!("[align-debug] fired: first_param_device={}", NslTensor::from_ptr(first_param).device);
         }
-        for key in ["attention_mask", "segment_ids"] {
+        for key in ["attention_mask", "segment_ids", "position_ids"] {
             let k = nsl_str_from_rust(key);
             // Probe with `contains` first: `nsl_dict_get_str` prints a
             // loud "key not found" diagnostic for missing keys, and a
@@ -693,6 +719,52 @@ mod tests {
         assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 1, 1, 1, 1, 2]);
     }
 
+    /// Per-document RoPE positions (deferral-closure 2026-07-14): the
+    /// position counter resets to 0 at every document start, in lockstep
+    /// with the segment-id increments; the EOS token itself is the LAST
+    /// position of its document.
+    #[test]
+    fn pack_batch_position_ids_reset_per_document() {
+        // Same stream as the segment-ids test: [A,A,EOS,B,B,B,EOS,C].
+        // segment_ids:  [0, 0, 0, 1, 1, 1, 1, 2]
+        // position_ids: [0, 1, 2, 0, 1, 2, 3, 0]
+        let stream: Vec<f64> = vec![10.0, 11.0, 2.0, 20.0, 21.0, 22.0, 2.0, 30.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            1,
+            8,
+            2,
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.position_ids, vec![0i32, 1, 2, 0, 1, 2, 3, 0]);
+    }
+
+    /// Positions restart per BATCH ROW (row 1 must not inherit row 0's
+    /// counter), mirroring the per-row segment/doc_starts contract.
+    #[test]
+    fn pack_batch_position_ids_reset_per_row() {
+        // Two rows of 4: row0 = [A,EOS,B,B], row1 = [B,EOS,C,C].
+        let stream: Vec<f64> = vec![10.0, 2.0, 20.0, 21.0, 22.0, 2.0, 30.0, 31.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            2,
+            4,
+            2,
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.position_ids, vec![0i32, 1, 0, 1, 0, 1, 0, 1]);
+    }
+
     #[test]
     fn pack_batch_segment_ids_trailing_eos_does_not_overflow() {
         // Stream ends with EOS: [10, 11, 12, EOS=2] with seq_len=4.
@@ -768,7 +840,7 @@ mod tests {
 
         let dict = packed_batch_to_dict(&batch);
         // input_ids, labels, attention_mask, segment_ids, doc_starts
-        assert_eq!(nsl_dict_len(dict), 5);
+        assert_eq!(nsl_dict_len(dict), 6); // + position_ids (RoPE per-doc reset)
 
         // Verify input_ids tensor shape
         let k = nsl_str_from_rust("input_ids");
@@ -843,8 +915,8 @@ mod tests {
         let dict = packed_batch_to_dict(&batch);
         assert_eq!(
             nsl_dict_len(dict),
-            5,
-            "expected input_ids/labels/attention_mask/segment_ids/doc_starts"
+            6,
+            "expected input_ids/labels/attention_mask/segment_ids/doc_starts/position_ids"
         );
 
         let k_ds = nsl_str_from_rust("doc_starts");

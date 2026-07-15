@@ -1380,9 +1380,21 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // NSL_RECONCILE_DEBUG=1 narrates EVERY reconciliation with the
+            // tensor geometry — the once-warn alone cannot identify WHICH
+            // producer is emitting mismatched gradients.
+            static RECONCILE_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let debug_all = *RECONCILE_DEBUG.get_or_init(|| {
+                std::env::var("NSL_RECONCILE_DEBUG").ok().as_deref() == Some("1")
+            });
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) || debug_all {
+                let dims: Vec<i64> = (0..src_probe.ndim as usize)
+                    .map(|i| unsafe { *src_probe.shape.add(i) })
+                    .collect();
                 eprintln!(
-                    "[nsl] add_inplace: reconciling src (device {} -> {}, dtype {} -> {}, contiguous={}) —                      repeated reconciliation is a perf smell (CPU-lowered producer on a GPU run?)",
+                    "[nsl] add_inplace: reconciling src (device {} -> {}, dtype {} -> {}, \
+                     contiguous={}, shape={dims:?}) — repeated reconciliation is a perf \
+                     smell (CPU-lowered producer on a GPU run?)",
                     src_probe.device, dst.device, src_probe.dtype, dst.dtype,
                     src_probe.is_contiguous()
                 );

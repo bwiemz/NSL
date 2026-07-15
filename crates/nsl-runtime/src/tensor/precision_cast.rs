@@ -58,14 +58,6 @@ use super::{
 #[no_mangle]
 pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     let t = unsafe { &*(src_ptr as *const NslTensor) };
-    // v1 is CPU-only: `t.data` is dereferenced as a host pointer below. A GPU
-    // tensor (device > 0) would be silent UB. Fail loudly instead. GPU support
-    // (host round-trip / on-device conversion) is the Task 15 / v2 boundary.
-    assert_eq!(
-        t.device, 0,
-        "nsl_tensor_cast: GPU tensors not supported in v1 (device={})",
-        t.device
-    );
     // CFTP v6 Finding 2 (HIGH): the cast reads `t.data` LINEARLY for `len`
     // contiguous elements then overwrites the output strides with
     // `compute_strides(shape)` (always row-major contiguous). A non-contiguous
@@ -92,6 +84,16 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     );
     let len = t.len as usize;
     let target = target_dtype as u16;
+
+    // GPU dispatch (deferral-closure 2026-07-14, lifts the #367 refusal):
+    // route through the CFTP-v7 PTX cast kernels, returning a BARE
+    // `Box::into_raw` tensor exactly like the CPU path below — the FASE
+    // optimizer envelope frees the dequant working tensor explicitly each
+    // step, so `publish`'s scope tracking would double-free. Must run
+    // BEFORE any host slice read on `t.data`.
+    if t.device > 0 {
+        return gpu_cast_bare(t, target);
+    }
 
     let src_f32: Vec<f32> = match t.dtype {
         DTYPE_F32 => {
@@ -187,6 +189,81 @@ pub extern "C" fn nsl_tensor_to_f32(src_ptr: i64) -> i64 {
 /// supported by a single kernel; the caller would have to stage via f32.
 /// For the v7 surface (which is only reachable from the three v6 wrappers)
 /// every legitimate (src,target) pair is covered.
+/// Device-side conversion core shared by every GPU cast entry: writes
+/// `len` elements of `src_dtype` at `src_data` into `dst_data` as
+/// `dst_dtype`. Same-dtype pairs use `cuMemcpyDtoD`; converting pairs
+/// launch the CFTP-v7 PTX cast kernels. No sync — callers on the default
+/// in-order stream are ordered against subsequent kernels; callers that
+/// free `src_data` immediately after MUST sync first (see
+/// `nsl_tensor_cast_into`'s GPU branch).
+#[cfg(feature = "cuda")]
+fn gpu_cast_core(src_data: u64, src_dtype: u16, dst_data: u64, dst_dtype: u16, len: usize) {
+    use crate::cuda::precision_cast_kernels;
+    if src_dtype == dst_dtype {
+        let elem: usize = if src_dtype == DTYPE_F32 { 4 } else { 2 };
+        crate::cuda::inner::memcpy_dtod(
+            dst_data as *mut std::ffi::c_void,
+            src_data as *const std::ffi::c_void,
+            len * elem,
+        );
+        return;
+    }
+    let (ptx, kname) = precision_cast_kernels::pick_cast_kernel(src_dtype, dst_dtype)
+        .unwrap_or_else(|| {
+            panic!(
+                "gpu_cast_core: no GPU cast kernel for src dtype {src_dtype} -> \
+                 target {dst_dtype}; supported pairs go through f32 only"
+            )
+        });
+    let rc = precision_cast_kernels::launch_cast(ptx, kname, src_data, dst_data, len as u64);
+    assert_eq!(
+        rc,
+        0,
+        "gpu_cast_core: cast kernel '{}' launch failed (rc={rc})",
+        kname.trim_end_matches('\0')
+    );
+}
+
+/// GPU analog of the CPU `nsl_tensor_cast` body: new device tensor via
+/// bare `Box::into_raw` (caller frees explicitly — the FASE optimizer
+/// envelope's dequant working tensors; `publish` would double-free at the
+/// scope sweep). Contiguity/len invariants were already checked by the
+/// caller.
+#[cfg(feature = "cuda")]
+fn gpu_cast_bare(t: &NslTensor, target_dtype: u16) -> i64 {
+    let len = t.len as usize;
+    assert!(
+        len > 0,
+        "gpu_cast_bare: zero-length cast is not supported (optimizer moments are never empty)"
+    );
+    let elem: usize = match target_dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 | DTYPE_BF16 => 2,
+        other => panic!("gpu_cast_bare: unsupported target dtype {other} (F32/FP16/BF16)"),
+    };
+    let dst_bytes = len * elem;
+    let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
+    crate::cuda::inner::memset_d8(dst_data, dst_bytes);
+    gpu_cast_core(t.data as u64, t.dtype, dst_data as u64, target_dtype, len);
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    let out = Box::new(NslTensor::new(
+        dst_data, shape, strides, t.ndim, t.len, t.device, target_dtype, 1, 0,
+    ));
+    Box::into_raw(out) as i64
+}
+
+/// `cuda` off: a device tensor cannot exist — loud stub (mirrors
+/// `gpu_cast_and_publish`'s non-cuda stub).
+#[cfg(not(feature = "cuda"))]
+fn gpu_cast_bare(t: &NslTensor, _target_dtype: u16) -> i64 {
+    panic!(
+        "gpu_cast_bare: device tensor (device={}) reached cast path but the \
+         runtime was compiled without the `cuda` feature",
+        t.device
+    );
+}
+
 #[cfg(feature = "cuda")]
 fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
     use crate::cuda::precision_cast_kernels;
@@ -400,8 +477,13 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
 pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     let dst = unsafe { &*(dst_ptr as *const NslTensor) };
     let src = unsafe { &*(src_ptr as *const NslTensor) };
-    assert_eq!(dst.device, 0, "nsl_tensor_cast_into: GPU dst not supported in v1 (device={})", dst.device);
-    assert_eq!(src.device, 0, "nsl_tensor_cast_into: GPU src not supported in v1 (device={})", src.device);
+    // Mixed-device pairs have no meaning in the dequant→step→quant
+    // envelope (both live where the parameters live) — refuse loudly.
+    assert_eq!(
+        dst.device, src.device,
+        "nsl_tensor_cast_into: dst (device={}) and src (device={}) must be co-resident",
+        dst.device, src.device
+    );
     // CFTP v6 Finding 2: refuse non-contiguous src/dst — `nsl_tensor_cast_into`
     // does a linear read and a linear in-place write; a non-contiguous view
     // would silently corrupt the underlying buffer.
@@ -417,6 +499,28 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     );
     let len = dst.len as usize;
     assert_eq!(dst.len, src.len, "nsl_tensor_cast_into: length mismatch (dst={}, src={})", dst.len, src.len);
+
+    // GPU dispatch (deferral-closure 2026-07-14): quant-back writes into
+    // `dst`'s EXISTING device buffer, preserving the persistent
+    // optimizer-state identity across steps — no allocation. The terminal
+    // sync makes the immediately-following `nsl_tensor_free(src)` in the
+    // FASE envelope safe even if a future allocator change breaks the
+    // in-order-stream reuse argument (once per param per optimizer step —
+    // cold path relative to per-op kernels).
+    if dst.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            gpu_cast_core(src.data as u64, src.dtype, dst.data as u64, dst.dtype, len);
+            unsafe { crate::cuda::inner::cu_ctx_synchronize() };
+            return;
+        }
+        #[cfg(not(feature = "cuda"))]
+        panic!(
+            "nsl_tensor_cast_into: device tensors (device={}) but the runtime \
+             was compiled without the `cuda` feature",
+            dst.device
+        );
+    }
 
     let src_f32: Vec<f32> = match src.dtype {
         DTYPE_F32 => unsafe { std::slice::from_raw_parts(src.data as *const f32, len) }.to_vec(),
@@ -454,9 +558,8 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     }
 }
 
-/// Allocate a new zero-filled tensor with the same shape as `template_ptr`
-/// but the given `dtype` (v1: F32=1 or FP16=2). CPU-only: the template must
-/// be device=0 (GPU templates are refused loudly — see below). Mirrors
+/// Allocate a new zero-filled tensor with the same shape and device as
+/// `template_ptr` but the given `dtype` (F32=1, FP16=2, BF16=3). Mirrors
 /// `nsl_tensor_zeros_like`'s allocation/ownership; the result is a persistent
 /// optimizer-state buffer (same lifecycle as the FP32 zeros_like output).
 ///
@@ -472,54 +575,57 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
 /// `alloc_zeroed`). 0-bits == 0.0 for both f32 and IEEE-754 f16, so the
 /// buffer is numerically zero for both dtypes without an explicit memset.
 ///
-/// Device: mirrors `tensor_from_shape_list` — CPU only (device=0). GPU
-/// template support requires a CUDA codepath (deferred to v2; only shape
-/// and device are needed from the template, not its data, so a GPU template
-/// whose shape is host-readable in principle could be supported, but parity
-/// with the existing CPU-only creation helpers is the v1 constraint).
-/// A GPU template is REFUSED loudly (see [`refuse_gpu_moment_template`]):
-/// pre-audit this function silently allocated HOST memory but stamped the
-/// result `device = template.device`, producing a device=1 tensor backed by
-/// a host pointer — and GPU training with reduced-precision moments then
-/// aborted much later, mid-step, inside `nsl_tensor_cast` with a generic
-/// message. Refusing here fires at train-block SETUP (moment allocation),
-/// before any forward/backward compute is spent.
+/// Device: follows the template. A CPU template mirrors
+/// `tensor_from_shape_list` (host `checked_alloc_zeroed`). A GPU template
+/// allocates a zero-filled DEVICE buffer via the managed allocator
+/// (deferral-closure 2026-07-14 — this lifted the #367
+/// `refuse_gpu_moment_template` guard, which existed because the whole
+/// dequant→step→quant envelope was CPU-only; `nsl_tensor_cast` /
+/// `nsl_tensor_cast_into` now have GPU paths through the CFTP-v7 PTX cast
+/// kernels, so reduced-precision moments genuinely live on-device).
+/// History preserved for the audit trail: pre-#367 this function silently
+/// allocated HOST memory but stamped the result `device = template.device`
+/// — a device=1 tensor backed by a host pointer that aborted mid-step.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
     let t = unsafe { &*(template_ptr as *const NslTensor) };
-    refuse_gpu_moment_template(t.device);
     let dtype = dtype as u16;
+    if t.device > 0 {
+        return gpu_zeros_like_dtype(t, dtype);
+    }
     zeros_like_dtype_body(t, dtype)
 }
 
-/// Deferral-must-refuse guard for reduced-precision optimizer-moment storage
-/// on GPU-resident parameters.
-///
-/// The v1 dequant→step→quant envelope (FASE's optimizer wrapper) routes
-/// through `nsl_tensor_cast` / `nsl_tensor_cast_into`, which are CPU-only.
-/// The training device is a RUNTIME property in NSL (`m.to(cuda)` transfers
-/// tensors at run time; the compiler has no static device signal at the
-/// train block), so a compile-time `CodegenError` cannot be device-precise —
-/// this setup-time check is the earliest point where the device is knowable.
-/// It fires when the optimizer-state buffers are allocated, i.e. before the
-/// first forward pass, rather than mid-step at the first cast.
-///
-/// Plain Rust fn (not `extern "C"`) so the refusal itself is unit-testable
-/// with `#[should_panic]`. In production the panic unwinds to the
-/// `extern "C"` wrapper's boundary, where Rust's abort-on-unwind shim turns
-/// it into a process abort AFTER the message is printed — the same loud
-/// panic-equals-abort convention every other guard in this module relies on
-/// (see the crate-level FFI note in `lib.rs`).
-fn refuse_gpu_moment_template(device: u8) {
-    assert_eq!(
-        device, 0,
-        "[cpdt] reduced-precision optimizer moments are CPU-only in v1: \
-         nsl_tensor_zeros_like_dtype got a GPU-resident parameter \
-         (device={device}). The dequant->step->quant envelope routes through \
-         nsl_tensor_cast, which has no GPU path yet (GPU cast for optimizer \
-         moments is not yet implemented). Drop --wggo-moment-precision (or \
-         the CPDT FP16 moment tiers) to keep FP32 moments on GPU, or train \
-         on CPU.",
+/// GPU branch of [`nsl_tensor_zeros_like_dtype`]: zero-filled device
+/// buffer, same `publish` lifecycle as the CPU body (persistent
+/// optimizer-state buffers participate in the scope sweep either way).
+#[cfg(feature = "cuda")]
+fn gpu_zeros_like_dtype(t: &NslTensor, dtype: u16) -> i64 {
+    let elem_size: usize = match dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 | DTYPE_BF16 => 2,
+        other => panic!(
+            "nsl_tensor_zeros_like_dtype: unsupported dtype {other} (F32=1, FP16=2, BF16=3)"
+        ),
+    };
+    let data_size = (t.len as usize) * elem_size;
+    let data = crate::cuda::inner::alloc_managed(data_size);
+    crate::cuda::inner::memset_d8(data, data_size); // 0-bits == 0.0 for f32/f16/bf16
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    let tensor = Box::new(NslTensor::new(
+        data, shape, strides, t.ndim, t.len, t.device, dtype, 1, 0,
+    ));
+    NslTensor::publish(tensor)
+}
+
+/// `cuda` off: a device template cannot exist — loud stub.
+#[cfg(not(feature = "cuda"))]
+fn gpu_zeros_like_dtype(t: &NslTensor, _dtype: u16) -> i64 {
+    panic!(
+        "nsl_tensor_zeros_like_dtype: GPU template (device={}) but the \
+         runtime was compiled without the `cuda` feature",
+        t.device
     );
 }
 
@@ -544,7 +650,7 @@ fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
 
     let tensor = Box::new(NslTensor::new(
         data, shape, strides, ndim, len,
-        t.device, // always 0: refuse_gpu_moment_template rejected GPU templates
+        t.device, // always 0 here: GPU templates take gpu_zeros_like_dtype
         dtype,
         1, // owns_data
         0, // data_owner
@@ -1038,21 +1144,14 @@ mod tests {
         assert_ne!(qmant, 0);
     }
 
-    /// Cost-model audit finding 2: GPU-resident templates must be refused at
-    /// optimizer-state allocation (train-block setup), not mid-step at the
-    /// first cast. The guard is a plain Rust fn precisely so this refusal is
-    /// testable — the `extern "C"` wrapper cannot use `#[should_panic]`
-    /// (panic-on-unwind across the FFI boundary aborts the test runner).
-    #[test]
-    #[should_panic(expected = "[cpdt] reduced-precision optimizer moments are CPU-only")]
-    fn zeros_like_dtype_guard_refuses_gpu_template() {
-        refuse_gpu_moment_template(1);
-    }
-
-    #[test]
-    fn zeros_like_dtype_guard_accepts_cpu_template() {
-        refuse_gpu_moment_template(0); // must not panic
-    }
+    // Cost-model audit finding 2 HISTORY: `refuse_gpu_moment_template`
+    // (and its `#[should_panic]` guard test) lived here between PR #367
+    // and the 2026-07-14 deferral closure. The refusal existed because
+    // the dequant→step→quant envelope was CPU-only; the envelope's three
+    // primitives (`nsl_tensor_zeros_like_dtype`, `nsl_tensor_cast`,
+    // `nsl_tensor_cast_into`) now have real GPU paths through the
+    // CFTP-v7 PTX cast kernels, so a GPU template is a supported input —
+    // covered by `precision_cast_gpu_dispatch.rs` (cuda, --ignored).
 
     /// CFTP v6 Finding 2 (HIGH): the contiguity guard precondition is a
     /// load-bearing invariant — verify both positive forms work today.  The

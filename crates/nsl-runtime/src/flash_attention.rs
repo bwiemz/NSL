@@ -25,6 +25,29 @@ static FA_VARIANT_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda")]
 static SDPA_FUSED_LAUNCH_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Per-variant successful-launch counters for `nsl_sdpa_fused_forward`
+/// (index 0 = base segment-masked/plain kernel, 1 = Tier-B tile-skip).
+/// The once-per-process marker above only proves the FIRST launch; the
+/// Tier-B parity gate needs proof that the Tier-B PTX specifically ran —
+/// a dispatch bug that silently fell back to the base kernel would
+/// otherwise produce a vacuous bitwise-equal "pass".
+static SDPA_FUSED_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Test/diagnostic probe: number of successful fused-forward launches for
+/// `variant` (0 = base kernel, 1 = Tier-B tile-skip). Any other variant
+/// returns -1. Counts whole FFI calls, not per-batch-row kernel launches.
+#[no_mangle]
+pub extern "C" fn nsl_sdpa_fused_launch_count(variant: i64) -> i64 {
+    match variant {
+        0 | 1 => SDPA_FUSED_LAUNCH_COUNTS[variant as usize]
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        _ => -1,
+    }
+}
+
 /// Launch FlashAttention-3 (Hopper wgmma) kernel.
 /// Returns 0 on success, -1 if the launch failed (caller should fall back to FA2).
 #[cfg(feature = "cuda")]
@@ -942,7 +965,10 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         inner::free_managed(out_f16);
         inner::free_managed(seg_dev);
 
-        // Once-per-process launch marker (see "Observability" above).
+        // Per-variant launch counter (parity-gate proof, see the static's
+        // doc comment) + once-per-process launch marker.
+        SDPA_FUSED_LAUNCH_COUNTS[if tier_b_selected { 1 } else { 0 }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !SDPA_FUSED_LAUNCH_LOGGED.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "[nsl] sdpa fused forward: launched (segmask={}, head_dim={d}, \

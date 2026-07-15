@@ -76,6 +76,16 @@ pub(crate) mod inner {
         }
     }
 
+    /// Non-panicking probe: has the process-wide CUDA state already been
+    /// initialized (by some prior tensor op)? Diagnostics-only callers
+    /// (e.g. the NSL_PHASE_TIMING device sync) must NOT force-initialize
+    /// CUDA — `state()`'s lazy init asserts on cuInit failure, which would
+    /// abort a pure-CPU run of a cuda-featured binary on a GPU-less
+    /// machine from inside an instrumentation path.
+    pub(crate) fn context_initialized() -> bool {
+        CUDA_STATE.get().is_some()
+    }
+
     fn state() -> &'static Mutex<CudaState> {
         CUDA_STATE.get_or_init(|| {
             unsafe {
@@ -2202,6 +2212,59 @@ pub extern "C" fn nsl_cuda_init() -> i64 {
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }
+}
+
+/// Marketing name of CUDA device 0 with the vendor/brand prefixes stripped
+/// (e.g. "RTX 5070 Ti"), for `nsl-codegen`'s GPU-database lookup
+/// (`gpu_specs::find_gpu` normalizes spaces to dashes). Non-panicking by
+/// design: compiling on a GPU-less machine (or without the cuda feature)
+/// returns `None` and the caller falls back to its default spec — this is
+/// probed at COMPILE time, where an abort would kill the compiler.
+#[cfg(feature = "cuda")]
+pub fn cuda_device_name() -> Option<String> {
+    // Fully self-contained probe (review finding): `inner::state()` /
+    // `device_name_stripped()` route through the asserting lazy init
+    // (cuDevicePrimaryCtxRetain can fail even when cuInit succeeded —
+    // exclusive-mode devices, ECC-pending, OOM), and a panic here fires
+    // at COMPILE time inside the CSHA planner. Every driver call below is
+    // rc-checked; no context is created or retained (cuDeviceGetName
+    // needs only a device ordinal).
+    use cudarc::driver::sys::*;
+    unsafe {
+        if cuInit(0) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut count: i32 = 0;
+        if cuDeviceGetCount(&mut count) != CUresult::CUDA_SUCCESS || count == 0 {
+            return None;
+        }
+        let mut device: CUdevice = 0;
+        if cuDeviceGet(&mut device, 0) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut buf = [0i8; 128];
+        if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
+        let mut name = cstr.to_str().ok()?.trim().to_string();
+        for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                name = rest.to_string();
+            }
+        }
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+}
+
+/// Non-cuda build: no device to name.
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_device_name() -> Option<String> {
+    None
 }
 
 /// Launch a PTX kernel. All params are i64 for Cranelift ABI compatibility.

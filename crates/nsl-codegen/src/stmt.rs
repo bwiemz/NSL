@@ -4148,15 +4148,12 @@ impl Compiler<'_> {
                 // Arbitration:
                 // - WGGO's plan bits lower ONLY behind the explicit opt-in
                 //   (--wggo-moment-precision): reduced-precision moments
-                //   change training numerics, and the v1 cast envelope is
-                //   CPU-only. GPU-resident params are refused loudly at
-                //   train-block setup (nsl_tensor_zeros_like_dtype rejects
-                //   GPU templates when the moment buffers are allocated —
-                //   a compile-time CodegenError is not possible because the
-                //   device is a runtime property: `m.to(cuda)` transfers at
-                //   run time and the compiler has no static device signal
-                //   here). Without the opt-in the decision stays advisory
-                //   with a not-lowered notice.
+                //   change training numerics. The dequant->step->quant cast
+                //   envelope runs on BOTH devices (deferral-closure
+                //   2026-07-14: nsl_tensor_zeros_like_dtype / nsl_tensor_cast
+                //   / nsl_tensor_cast_into dispatch to the CFTP-v7 PTX cast
+                //   kernels for GPU-resident params). Without the opt-in the
+                //   decision stays advisory with a not-lowered notice.
                 // - When both sources are live, merge CONSERVATIVELY per
                 //   param: F32 wins. CPDT's PrecisionPlan carries per-param
                 //   tiers (calibrated critical params pinned to F32) that a
@@ -4181,8 +4178,8 @@ impl Compiler<'_> {
                         eprintln!(
                             "[cpdt] optimizer-moment precision NOT lowered: WGGO's \
                              plan carries reduced-precision m/v decisions but \
-                             --wggo-moment-precision was not passed (opt-in; \
-                             v1 cast envelope is CPU-only). Moments stay FP32."
+                             --wggo-moment-precision was not passed (opt-in: \
+                             changes training numerics). Moments stay FP32."
                         );
                         None
                     }
@@ -4191,10 +4188,10 @@ impl Compiler<'_> {
                         eprintln!(
                             "[cpdt] WGGO optimizer-moment precision active \
                              (merged with the CPDT per-param plan, F32 wins): \
-                             {sub32} moment buffer(s) in FP16 storage. NOTE: \
-                             the cast envelope is CPU-only in v1 — GPU-resident \
-                             training refuses loudly at train-block setup \
-                             (optimizer-state allocation)."
+                             {sub32} moment buffer(s) in FP16 storage \
+                             (device-resident; GPU runs use the CFTP-v7 PTX \
+                             cast kernels for the dequant->step->quant \
+                             envelope)."
                         );
                         Some((m, v))
                     }
@@ -4203,9 +4200,8 @@ impl Compiler<'_> {
                         eprintln!(
                             "[cpdt] WGGO optimizer-moment precision active: {sub32} \
                              moment buffer(s) in FP16 storage (8-bit clamps to FP16 \
-                             in v1). NOTE: the cast envelope is CPU-only in v1 — \
-                             GPU-resident training refuses loudly at train-block \
-                             setup (optimizer-state allocation)."
+                             in v1; device-resident — GPU runs use the CFTP-v7 PTX \
+                             cast kernels for the dequant->step->quant envelope)."
                         );
                         Some((m, v))
                     }
@@ -5710,6 +5706,22 @@ impl Compiler<'_> {
                     }
                 }
 
+                // NSL_PHASE_TIMING (deferral-closure 2026-07-14): per-micro-batch
+                // forward/backward wall-clock split, printed by the runtime as
+                // "[phase] fwd=... bwd=..." lines. Env is read at COMPILE time —
+                // `nsl run` compiles and executes in one process so this IS the
+                // run-time setting; for `nsl build` the instrumentation is baked
+                // in iff the env was set at build time. Source-AD path only (the
+                // tape path's backward is a single opaque nsl_tape_backward call).
+                let phase_timing =
+                    std::env::var("NSL_PHASE_TIMING").ok().as_deref() == Some("1");
+                let phase_t0 = if phase_timing {
+                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                    Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
+                } else {
+                    None
+                };
+
                 let full_lowered = crate::wengert_lower::compile_wengert_ops(
                     self,
                     builder,
@@ -5723,6 +5735,15 @@ impl Compiler<'_> {
                 let loss_val = *full_vars.get(&loss_var_id).ok_or_else(|| {
                     CodegenError::new("source AD: loss VarId not found in compiled forward graph")
                 })?;
+
+                // NSL_PHASE_TIMING: end of forward+loss (all primal ops are
+                // emitted above; adjoint GENERATION below is compile-time only).
+                let phase_t1 = if phase_timing {
+                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                    Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
+                } else {
+                    None
+                };
 
                 // 6. Generate adjoint backward graph from the (possibly
                 //    pruned) primal list.
@@ -5915,6 +5936,15 @@ impl Compiler<'_> {
                         }
                     }
                 };
+                // NSL_PHASE_TIMING: end of backward (all adjoint ops emitted).
+                if let (Some(t0), Some(t1)) = (phase_t0, phase_t1) {
+                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                    let t2 = self.compile_call_by_name(builder, "nsl_clock", &[])?;
+                    let fwd = builder.ins().fsub(t1, t0);
+                    let bwd = builder.ins().fsub(t2, t1);
+                    self.compile_call_by_name(builder, "nsl_phase_fwd_bwd_report", &[fwd, bwd])?;
+                }
+
                 let grad_vars = &grad_lowered.var_map;
                 // When the FASE hook is active, each parameter gradient was
                 // already consumed (accumulated into m_partial) and freed by
@@ -6588,6 +6618,19 @@ impl Compiler<'_> {
             state.current_block = Some(optimizer_block);
         }
 
+        // NSL_PHASE_TIMING: optimizer-phase start (fires only on accumulation
+        // boundaries — this block is skipped on non-step micro-batches). The
+        // matching report is emitted before each of the three
+        // post_optimizer_block jumps below.
+        let phase_timing_opt =
+            std::env::var("NSL_PHASE_TIMING").ok().as_deref() == Some("1");
+        let phase_opt_t0 = if phase_timing_opt {
+            self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+            Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
+        } else {
+            None
+        };
+
         // 7f. Optimizer step: for each param, call optimizer step function
         // FASE Deferred: emit fused per-parameter step; otherwise use existing path.
         //
@@ -6713,6 +6756,12 @@ impl Compiler<'_> {
             }
 
             // Jump to post-optimizer block (merges optimizer and skip paths)
+            if let Some(t0) = phase_opt_t0 {
+                self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                let t3 = self.compile_call_by_name(builder, "nsl_clock", &[])?;
+                let opt = builder.ins().fsub(t3, t0);
+                self.compile_call_by_name(builder, "nsl_phase_optim_report", &[opt])?;
+            }
             builder.ins().jump(post_optimizer_block, &[]);
             builder.switch_to_block(post_optimizer_block);
             builder.seal_block(post_optimizer_block);
@@ -6943,7 +6992,13 @@ impl Compiler<'_> {
                 }
 
                 // Jump to post-optimizer block (merges optimizer and skip paths)
-                builder.ins().jump(post_optimizer_block, &[]);
+                if let Some(t0) = phase_opt_t0 {
+                self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                let t3 = self.compile_call_by_name(builder, "nsl_clock", &[])?;
+                let opt = builder.ins().fsub(t3, t0);
+                self.compile_call_by_name(builder, "nsl_phase_optim_report", &[opt])?;
+            }
+            builder.ins().jump(post_optimizer_block, &[]);
                 builder.switch_to_block(post_optimizer_block);
                 builder.seal_block(post_optimizer_block);
                 state.current_block = Some(post_optimizer_block);
@@ -7093,7 +7148,13 @@ impl Compiler<'_> {
         }
 
         // Jump to post-optimizer block (merges optimizer and skip paths)
-        builder.ins().jump(post_optimizer_block, &[]);
+        if let Some(t0) = phase_opt_t0 {
+                self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                let t3 = self.compile_call_by_name(builder, "nsl_clock", &[])?;
+                let opt = builder.ins().fsub(t3, t0);
+                self.compile_call_by_name(builder, "nsl_phase_optim_report", &[opt])?;
+            }
+            builder.ins().jump(post_optimizer_block, &[]);
         builder.switch_to_block(post_optimizer_block);
         builder.seal_block(post_optimizer_block);
         state.current_block = Some(post_optimizer_block);

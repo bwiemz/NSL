@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use crate::memory::checked_alloc;
 use crate::tensor::{
     nsl_tensor_add as tensor_add,
     nsl_tensor_clone as tensor_clone,
@@ -244,39 +243,52 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
         }
     }
 
-    // If orig had fewer dims, squeeze the leading dims
+    // If orig had fewer dims, squeeze the leading dims. After the keepdim
+    // sums above, every leading (padded) dim of `result` is 1 and the
+    // element count equals product(orig_shape), so the squeeze is a pure
+    // METADATA rewrite on the freshly-owned clone — no data movement.
+    //
+    // Deferral-closure 2026-07-14: the previous implementation byte-copied
+    // `res.data` through HOST memory into a new tensor hard-coded to
+    // `device=0`. That (a) was UB for a GPU-resident grad (dereferencing a
+    // device pointer on the host) and (b) was the ONLY backward reduction
+    // that injected a fresh CPU tensor into a GPU run's gradient graph —
+    // the root of the CPU-f64 gamma-chain smell the add_inplace
+    // reconciling front door papered over.
     if orig_ndim < grad_ndim {
-        let res = NslTensor::from_ptr(result);
-        // Reshape to orig_shape
-        let new_shape = checked_alloc(std::mem::size_of_val(orig_shape)) as *mut i64;
-        for (i, &s) in orig_shape.iter().enumerate().take(orig_ndim) {
-            unsafe { *new_shape.add(i) = s };
-        }
-        let new_strides = NslTensor::compute_strides(new_shape, orig_ndim as i64);
+        let res = unsafe { &mut *(result as *mut NslTensor) };
+        debug_assert!(
+            res.is_contiguous(),
+            "reduce_grad_for_broadcast: clone/sum output must be contiguous"
+        );
         let mut total: i64 = 1;
         for &s in orig_shape {
             total *= s;
         }
-        // Copy data (byte-level copy, preserves dtype)
-        let elem_size = res.element_size();
-        let new_data_raw = checked_alloc((total as usize) * elem_size);
-        unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw, (total as usize) * elem_size) };
-        let out = Box::new(NslTensor::new(
-            new_data_raw as *mut c_void,
-            new_shape,
-            new_strides,
-            orig_ndim as i64,
-            total,
-            0,
-            res.dtype,
-            1,
-            0,
-        ));
-        let out_ptr = Box::into_raw(out) as i64;
-        if result != grad_ptr {
-            tensor_free(result);
+        debug_assert_eq!(
+            total, res.len,
+            "reduce_grad_for_broadcast: leading dims not fully reduced before squeeze"
+        );
+        // Swap in freshly-sized shape/strides arrays and release the old
+        // ones AT THEIR TRUE SIZE — `checked_free` builds a Layout from
+        // the size it is handed, so shrinking `ndim` in place and letting
+        // the tensor's destructor free `grad_ndim`-sized arrays with an
+        // `orig_ndim` size would be a Layout-mismatched dealloc (UB, and
+        // the fuzz harness's byte accounting catches it as a leak).
+        let elem = std::mem::size_of::<i64>();
+        let new_shape = crate::memory::checked_alloc(orig_ndim * elem) as *mut i64;
+        for (i, &s) in orig_shape.iter().enumerate() {
+            unsafe { *new_shape.add(i) = s };
         }
-        return out_ptr;
+        let new_strides = NslTensor::compute_strides(new_shape, orig_ndim as i64);
+        unsafe {
+            crate::memory::checked_free(res.shape as *mut u8, grad_ndim * elem);
+            crate::memory::checked_free(res.strides as *mut u8, grad_ndim * elem);
+        }
+        res.shape = new_shape;
+        res.strides = new_strides;
+        res.ndim = orig_ndim as i64;
+        return result;
     }
 
     result

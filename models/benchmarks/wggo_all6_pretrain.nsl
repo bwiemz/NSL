@@ -4,14 +4,16 @@
 # driven by --pretrain-optimized (source AD + WGGO greedy + CSHA auto):
 #   - PCA:  DataLoader(packing=true) + forward_packed -> the plan's
 #           segment_id decision lowers to the fused segment-masked flash
-#           family (Tier-B tile skip at seq 1024).
+#           family (Tier-B tile skip PROMOTED; per-document RoPE reset via
+#           batch.position_ids).
 #   - FASE: grad_accumulation=4 + grad_clip=1.0 -> Deferred windowed AdamW
 #           with two-phase clip.
 #   - CSHA: consulted per layer (decorator-free path: level advisories).
 #   - WRGA: no @wrga decorators -> the plan must hold adapter rank 0.
 #   - CEP:  random-init weights -> evidence gates must keep all heads.
-#   - CPDT: single-GPU ZeRO/precision evaluation (moment-precision opt-in
-#           NOT set: the GPU cast refusal is by design).
+#   - CPDT: single-GPU ZeRO/precision evaluation (pass
+#           --wggo-moment-precision to lower reduced-precision moments —
+#           the GPU cast envelope is real as of the 2026-07-14 closure).
 #
 # Geometry: d_model=512, 8 Q heads / 2 KV heads, head_dim=64 (in the fused
 # variant table), 6 blocks, FFN 2048, vocab 4096, seq 1024, batch 4.
@@ -30,8 +32,8 @@ model Blk:
     w_up: Tensor = randn([512, 2048]) * 0.02
     w_down: Tensor = randn([2048, 512]) * 0.02
 
-    fn forward(self, h: Tensor, mask: Tensor, seg: Tensor, training: bool) -> Tensor:
-        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, training)
+    fn forward(self, h: Tensor, mask: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, pos, training)
         let h1 = h + a
         let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
         return h1 + f
@@ -41,7 +43,7 @@ model PackedLM:
     blocks: [Blk; 6] = Blk()
     norm_out: Tensor = ones([512])
 
-    fn forward_train(self, input_ids: Tensor, mask: Tensor, seg: Tensor, training: bool) -> Tensor:
+    fn forward_train(self, input_ids: Tensor, mask: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
         let ids_shape = input_ids.shape
         let batch_size = ids_shape[0]
         let seq_len = ids_shape[1]
@@ -49,7 +51,7 @@ model PackedLM:
         let emb = embedding_lookup(self.embed, flat_ids)
         let h = emb.reshape([batch_size, seq_len, 512])
         for block in self.blocks:
-            h = block.forward(h, mask, seg, training)
+            h = block.forward(h, mask, seg, pos, training)
         let hn = rmsnorm(h, self.norm_out, 0.00001)
         # Weight-tied LM head
         return hn @ self.embed.transpose(0, 1)
@@ -69,7 +71,7 @@ print("LOSS_STREAM_BEGIN")
 train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0):
     optimizer: AdamW(lr=0.001, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
     step(batch):
-        let logits = m.forward_train(batch.input_ids, batch.attention_mask, batch.segment_ids, false)
+        let logits = m.forward_train(batch.input_ids, batch.attention_mask, batch.segment_ids, batch.position_ids, false)
         let ls = logits.shape
         let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
         let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
