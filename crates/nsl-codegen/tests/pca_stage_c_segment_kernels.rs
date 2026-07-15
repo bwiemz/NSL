@@ -146,6 +146,27 @@ fn plain_backward_has_no_segment_artifacts() {
                 !name.contains("segmask"),
                 "plain name must not carry the marker"
             );
+
+            // P4: for non-segment configs the module now carries TWO entries
+            // — the plain kernel and the native-GQA `_gqa` grouped kernel.
+            // The GQA entry LEGITIMATELY declares `param_heads` / `param_kv_heads`
+            // (grouped head-count wiring, NOT segment masking), so scope this
+            // assertion to the PLAIN entry only. The plain entry runs from its
+            // `.visible .entry <name>` to the next `.visible .entry` (the `_gqa`
+            // one) or end-of-module.
+            let entry_marker = format!(".visible .entry {name}");
+            let plain_start = p2s
+                .find(&entry_marker)
+                .expect("plain entry must be present in the module");
+            let after_plain = &p2s[plain_start + entry_marker.len()..];
+            let plain_entry = match after_plain.find(".visible .entry") {
+                Some(next) => &after_plain[..next],
+                None => after_plain,
+            };
+
+            // The plain entry must carry NO segment wiring — including
+            // `param_heads`, which the plain (non-GQA, non-segment) kernel
+            // never needs.
             for marker in [
                 "param_segment_ids",
                 "param_heads",
@@ -154,8 +175,17 @@ fn plain_backward_has_no_segment_artifacts() {
                 "%r_seg",
             ] {
                 assert!(
+                    !plain_entry.contains(marker),
+                    "hd={hd} causal={causal}: plain entry leaked segment artifact {marker}"
+                );
+            }
+
+            // And segment masking must never leak into the module at all
+            // (the GQA entry is non-segment too).
+            for marker in ["param_segment_ids", "%p_seg", "%rd_seg", "%r_seg"] {
+                assert!(
                     !p2s.contains(marker),
-                    "hd={hd} causal={causal}: plain PTX leaked segment artifact {marker}"
+                    "hd={hd} causal={causal}: non-segment module leaked segment artifact {marker}"
                 );
             }
         }
