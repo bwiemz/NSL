@@ -727,6 +727,21 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_selective: bool,
 
+        /// With --checkpoint-blocks: allowed SAVED-interior activation
+        /// budget in MiB. The CCR knapsack flips the most
+        /// expensive-to-recompute tensors back to SAVE within the budget.
+        /// Under FASE Deferred the freed-gradient-buffer credit (C-01) is
+        /// added automatically when parameter sizes are statically known.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_budget_mib: Option<u64>,
+
+        /// With --checkpoint-selective: compress the saved matmul-class
+        /// activations to half precision between forward and backward
+        /// (fp16 or bf16). Not bit-exact — backward reads rounded
+        /// activations; validate loss parity at the 3-4 dp standard.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        pub(crate) checkpoint_compress: Option<String>,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -1066,6 +1081,21 @@ pub(crate) struct RunArgs {
         /// Less memory reduction at near-zero recompute cost.
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_selective: bool,
+
+        /// With --checkpoint-blocks: allowed SAVED-interior activation
+        /// budget in MiB. The CCR knapsack flips the most
+        /// expensive-to-recompute tensors back to SAVE within the budget.
+        /// Under FASE Deferred the freed-gradient-buffer credit (C-01) is
+        /// added automatically when parameter sizes are statically known.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_budget_mib: Option<u64>,
+
+        /// With --checkpoint-selective: compress the saved matmul-class
+        /// activations to half precision between forward and backward
+        /// (fp16 or bf16). Not bit-exact — backward reads rounded
+        /// activations; validate loss parity at the 3-4 dp standard.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        pub(crate) checkpoint_compress: Option<String>,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

@@ -57,6 +57,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             optim_state_offload,
             checkpoint_blocks,
             checkpoint_selective,
+            checkpoint_budget_mib,
+            checkpoint_compress,
             weights,
     } = args;
 
@@ -374,6 +376,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 optim_state_offload,
                 checkpoint_blocks,
                 checkpoint_selective,
+                checkpoint_budget_mib,
+                checkpoint_compress,
                 debug_training,
                 shared_lib: false,
                 emit_export_table: false,

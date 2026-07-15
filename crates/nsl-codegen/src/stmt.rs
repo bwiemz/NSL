@@ -5827,6 +5827,16 @@ impl Compiler<'_> {
                     .checkpoint_policies
                     .values()
                     .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
+                let mut effective_primal = effective_primal;
+                let mut ccr_compress_map: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    crate::wengert::VarId,
+                > = Default::default();
+                // Fresh-id watermark for CCR-created vars: starts above the
+                // extractor's range so tail (half) ids can never collide
+                // with adjoint-generator ids (the generator start is bumped
+                // to this watermark below).
+                let mut ccr_fresh: crate::wengert::VarId = extractor.next_var_id();
                 let ccr_plan = if self.compile_options.checkpoint_blocks
                     || ccr_selective_decorated
                 {
@@ -5841,7 +5851,36 @@ impl Compiler<'_> {
                     } else {
                         crate::ccr::CcrPolicy::Block
                     };
-                    crate::ccr::plan(&effective_primal, claimed_ids.as_ref(), policy)
+                    let compress_requested = self.compile_options.checkpoint_compress.is_some();
+                    let plan = crate::ccr::plan(
+                        &effective_primal,
+                        claimed_ids.as_ref(),
+                        policy,
+                        compress_requested,
+                    );
+                    if let (Some(p), Some(dtype)) =
+                        (&plan, self.compile_options.checkpoint_compress.as_deref())
+                    {
+                        if !p.compress.is_empty() {
+                            ccr_compress_map = crate::ccr::append_compressed_saves(
+                                &mut effective_primal,
+                                p,
+                                dtype,
+                                &mut ccr_fresh,
+                            );
+                            eprintln!(
+                                "[ccr] compressed saves: {} matmul-class tensors -> {dtype}",
+                                ccr_compress_map.len()
+                            );
+                        } else if compress_requested {
+                            eprintln!(
+                                "[ccr] --checkpoint-compress requested but no \
+                                 compressible saves exist (policy must be selective \
+                                 with matmul-class interiors); continuing without"
+                            );
+                        }
+                    }
+                    plan
                 } else {
                     None
                 };
@@ -5897,6 +5936,42 @@ impl Compiler<'_> {
                              restriction; running without checkpointing"
                         );
                         ccr_plan = None;
+                    } else if let Some(budget_mib) = self.compile_options.checkpoint_budget_mib {
+                        // P1.c: knapsack arbitration under the byte budget,
+                        // with the C-01 FASE-Deferred credit (the gradient
+                        // buffer Deferred never allocates) when parameter
+                        // sizes are statically known.
+                        let sizes = crate::profiling::captures::size_hints_from_var_nodes(
+                            extractor.var_nodes(),
+                            self.type_map,
+                        );
+                        let mut budget_bytes = budget_mib.saturating_mul(1024 * 1024);
+                        if fase_deferred {
+                            let credit: u64 = effective_primal
+                                .ops
+                                .iter()
+                                .filter(|op| matches!(op.op, crate::wengert::PrimalOp::Param(_)))
+                                .filter_map(|op| sizes.get(&op.result))
+                                .sum();
+                            if credit > 0 {
+                                budget_bytes = budget_bytes.saturating_add(credit);
+                                eprintln!(
+                                    "[ccr] C-01 credit: FASE Deferred frees the gradient \
+                                     buffer — activation budget grows by {} MiB",
+                                    credit / (1024 * 1024)
+                                );
+                            }
+                        }
+                        let flipped = crate::ccr::apply_budget(
+                            plan,
+                            &effective_primal,
+                            &crate::ccr::CcrBudget { sizes, budget_bytes },
+                        );
+                        eprintln!(
+                            "[ccr] budget {} MiB: {} tensors flipped back to SAVE",
+                            budget_bytes / (1024 * 1024),
+                            flipped
+                        );
                     }
                 }
 
@@ -5929,7 +6004,7 @@ impl Compiler<'_> {
 
                 // 6. Generate adjoint backward graph from the (possibly
                 //    pruned) primal list.
-                let start_var = extractor.next_var_id();
+                let start_var = extractor.next_var_id().max(ccr_fresh);
                 let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
                 // T7.1: thread CSHA backward claims into the generator so
                 // the reverse walk can route claimed ops through the fused
@@ -5977,20 +6052,29 @@ impl Compiler<'_> {
                 // and last-use frees are computed against exactly the op
                 // list that will be lowered.
                 if let Some(plan) = &ccr_plan {
-                    let mut ccr_fresh = effective_primal
-                        .ops
-                        .iter()
-                        .map(|o| o.result)
-                        .chain(adjoint.ops.iter().map(|o| o.result))
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
+                    ccr_fresh = ccr_fresh.max(
+                        effective_primal
+                            .ops
+                            .iter()
+                            .map(|o| o.result)
+                            .chain(adjoint.ops.iter().map(|o| o.result))
+                            .max()
+                            .unwrap_or(0)
+                            + 1,
+                    );
                     crate::ccr::apply_to_adjoint(
                         &effective_primal,
                         &mut adjoint,
                         plan,
                         &mut ccr_fresh,
                     )?;
+                    if !ccr_compress_map.is_empty() {
+                        crate::ccr::splice_decompress(
+                            &mut adjoint,
+                            &ccr_compress_map,
+                            &mut ccr_fresh,
+                        )?;
+                    }
                 }
 
                 // ── Build FASE consume-per-param hook (Task 3) ──
@@ -6087,18 +6171,20 @@ impl Compiler<'_> {
                             }
                         }
                     }
-                    let mut ccr_fresh2 = effective_primal
-                        .ops
-                        .iter()
-                        .map(|o| o.result)
-                        .chain(adjoint.ops.iter().map(|o| o.result))
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
+                    ccr_fresh = ccr_fresh.max(
+                        effective_primal
+                            .ops
+                            .iter()
+                            .map(|o| o.result)
+                            .chain(adjoint.ops.iter().map(|o| o.result))
+                            .max()
+                            .unwrap_or(0)
+                            + 1,
+                    );
                     let n = crate::ccr::insert_adjoint_last_use_frees(
                         &mut adjoint,
                         &ccr_protect,
-                        &mut ccr_fresh2,
+                        &mut ccr_fresh,
                     );
                     if std::env::var("NSL_CCR_DEBUG").is_ok() {
                         eprintln!("[ccr] adjoint last-use frees inserted: {n}");
@@ -6501,6 +6587,13 @@ impl Compiler<'_> {
                 // CCR: block interiors were freed right after the forward
                 // (the early-free mini list) — the bulk free must skip them.
                 retained_full_vars.extend(ccr_freed_primal.iter().copied());
+                // CCR compressed saves: originals were freed by the primal
+                // TAIL (recorded on the main primal lowering), and the half
+                // tensors were freed by the adjoint's decompress splice
+                // (recorded on the adjoint lowering, but owned by the
+                // PRIMAL's owned_values since the tail produced them).
+                retained_full_vars.extend(full_lowered.explicit_freed_vars.iter().copied());
+                retained_full_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
                 self.free_wengert_owned_values(
                     builder,
                     &grad_lowered.owned_values,
@@ -6524,10 +6617,14 @@ impl Compiler<'_> {
                     if !retained_full_vars.contains(vid) {
                         wengert_freed.insert(*val);
                     }
-                    // CCR early-freed interiors were freed by the mini list,
-                    // not the bulk cleanup — still "already freed" as far as
-                    // the step-variable sweep is concerned.
-                    if ccr_freed_primal.contains(vid) {
+                    // CCR early-freed interiors (mini list), compressed
+                    // originals (primal tail) and halves (adjoint splice)
+                    // were freed outside the bulk cleanup — still "already
+                    // freed" as far as the step-variable sweep is concerned.
+                    if ccr_freed_primal.contains(vid)
+                        || full_lowered.explicit_freed_vars.contains(vid)
+                        || grad_lowered.explicit_freed_vars.contains(vid)
+                    {
                         wengert_freed.insert(*val);
                     }
                 }

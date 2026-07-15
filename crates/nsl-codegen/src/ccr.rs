@@ -100,6 +100,13 @@ pub struct CcrPlan {
     /// lists are pointer-array sized — nothing worth reclaiming early).
     /// Populated by `restrict_to_owned`.
     pub free_eligible: HashSet<VarId>,
+    /// CCR phases 5-6 (compressed saves): interiors that stay SAVED under
+    /// the Selective policy (matmul-class outputs, consumed only by the
+    /// adjoint) and are compressed to fp16/bf16 between forward and
+    /// backward. Restricted to `selective_saves`-class producers, which
+    /// are tensors by construction — the scalar-misclassification hazard
+    /// cannot arise here. Empty unless compression was requested.
+    pub compress: Vec<VarId>,
 }
 
 impl CcrPlan {
@@ -148,7 +155,7 @@ impl CcrPlan {
             .copied()
             .filter(|v| matches!(owned.get(v), Some(WengertType::Tensor)))
             .collect();
-        !self.free_eligible.is_empty()
+        !self.free_eligible.is_empty() || !self.compress.is_empty()
     }
 }
 
@@ -214,6 +221,12 @@ pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget
         }
     }
     if items.is_empty() || budget.budget_bytes < BUDGET_QUANTUM {
+        if items.is_empty() {
+            eprintln!(
+                "[ccr] budget arbitration: no recompute victims carry static \
+                 size hints (symbolic shapes?) — keeping full recompute"
+            );
+        }
         return 0;
     }
 
@@ -404,6 +417,7 @@ pub fn plan(
     primal: &WengertList,
     csha_claimed_ops: Option<&HashSet<u32>>,
     policy: CcrPolicy,
+    compress_saves: bool,
 ) -> Option<CcrPlan> {
     // ---- 1. Param vars per block key --------------------------------
     let mut param_block: HashMap<VarId, String> = HashMap::new();
@@ -492,6 +506,7 @@ pub fn plan(
     }
 
     let claimed = csha_claimed_ops.cloned().unwrap_or_default();
+    let mut compress: Vec<VarId> = Vec::new();
     let mut segments = Vec::new();
     let mut per_segment_recompute = Vec::new();
     let mut recompute = HashSet::new();
@@ -570,6 +585,9 @@ pub fn plan(
                 _ => {}
             }
             if policy == CcrPolicy::Selective && selective_saves(&op.op) {
+                if compress_saves {
+                    compress.push(op.result);
+                }
                 continue;
             }
             seg_recompute.push(op.result);
@@ -586,7 +604,7 @@ pub fn plan(
         per_segment_recompute.push(seg_recompute);
     }
 
-    if recompute.is_empty() {
+    if recompute.is_empty() && compress.is_empty() {
         eprintln!("[ccr] nothing recomputable found; running without checkpointing");
         return None;
     }
@@ -605,6 +623,7 @@ pub fn plan(
         recompute,
         per_segment_recompute,
         free_eligible,
+        compress,
     })
 }
 
@@ -644,6 +663,153 @@ pub fn build_early_free_list(plan: &CcrPlan) -> WengertList {
         var_names: HashMap::new(),
         var_types: HashMap::new(),
     }
+}
+
+/// CCR phases 5-6: append the compressed-save tail to the PRIMAL list.
+///
+/// For each compress victim v (a Selective-policy saved matmul-class
+/// interior consumed only by the adjoint), append:
+///     half = Passthrough("ccr_cast_fp16"|"ccr_cast_bf16")(v)
+///     FreeTensor(v)
+/// The tail lowers with the main primal call, so the half tensors land in
+/// `full_vars` and are resolvable by the adjoint. The adjoint generator's
+/// reverse walk sees these tail ops FIRST and produces no adjoints (the
+/// ad_rules default arm), which is correct: they wrap saved-for-backward
+/// values.
+///
+/// Returns v -> half VarId. `dtype` must be "fp16" or "bf16".
+pub fn append_compressed_saves(
+    primal: &mut WengertList,
+    plan: &CcrPlan,
+    dtype: &str,
+    fresh: &mut VarId,
+) -> HashMap<VarId, VarId> {
+    let cast_name = match dtype {
+        "fp16" => "ccr_cast_fp16",
+        "bf16" => "ccr_cast_bf16",
+        other => panic!("[ccr] unsupported compress dtype '{other}' (fp16|bf16)"),
+    };
+    let mut map = HashMap::new();
+    for &v in &plan.compress {
+        let half = *fresh;
+        *fresh += 1;
+        let id = primal.ops.len() as u32;
+        primal.ops.push(WengertOp {
+            id,
+            result: half,
+            op: PrimalOp::Passthrough(cast_name.to_string()),
+            inputs: vec![v],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        primal.var_types.insert(half, WengertType::Tensor);
+        if let Some(name) = primal.var_names.get(&v).cloned() {
+            primal.var_names.insert(half, format!("{name}.ccr_half"));
+        }
+        let free_result = *fresh;
+        *fresh += 1;
+        let id = primal.ops.len() as u32;
+        primal.ops.push(WengertOp {
+            id,
+            result: free_result,
+            op: PrimalOp::FreeTensor,
+            inputs: vec![v],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        map.insert(v, half);
+    }
+    map
+}
+
+/// Splice decompression (restore) ops for compressed saves into the
+/// adjoint: before the first consumer of original v, emit
+///     restored = Passthrough("ccr_cast_f32")(half)
+///     FreeTensor(half)
+/// remap all consumers v -> restored, and leave `restored` to the generic
+/// adjoint last-use pass (it is adjoint-produced). Call BEFORE
+/// `insert_adjoint_last_use_frees`.
+pub fn splice_decompress(
+    adjoint: &mut WengertList,
+    compress_map: &HashMap<VarId, VarId>,
+    fresh: &mut VarId,
+) -> Result<(), CodegenError> {
+    // Descending first-use order so insertions don't shift pending sites.
+    let mut sites: Vec<(usize, VarId, VarId)> = Vec::new(); // (idx, v, half)
+    for (&v, &half) in compress_map {
+        let first = adjoint
+            .ops
+            .iter()
+            .position(|op| op.inputs.contains(&v));
+        if let Some(idx) = first {
+            sites.push((idx, v, half));
+        }
+        // No adjoint consumer: the half is still freed at bulk cleanup;
+        // nothing to restore.
+    }
+    sites.sort_by_key(|s| std::cmp::Reverse(s.0));
+    let mut remap: HashMap<VarId, VarId> = HashMap::new();
+    for (at, v, half) in sites {
+        let restored = *fresh;
+        *fresh += 1;
+        let free_result = *fresh;
+        *fresh += 1;
+        adjoint.var_types.insert(restored, WengertType::Tensor);
+        adjoint
+            .var_names
+            .insert(restored, format!("v{v}.ccr_restore"));
+        adjoint.ops.splice(
+            at..at,
+            [
+                WengertOp {
+                    id: 0,
+                    result: restored,
+                    op: PrimalOp::Passthrough("ccr_cast_f32".to_string()),
+                    inputs: vec![half],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                },
+                WengertOp {
+                    id: 0,
+                    result: free_result,
+                    op: PrimalOp::FreeTensor,
+                    inputs: vec![half],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                },
+            ],
+        );
+        remap.insert(v, restored);
+    }
+    for op in adjoint.ops.iter_mut() {
+        if matches!(op.op, PrimalOp::FreeTensor) {
+            continue; // FreeTensor(half) inputs must not be remapped
+        }
+        for input in op.inputs.iter_mut() {
+            if let Some(r) = remap.get(input) {
+                *input = *r;
+            }
+        }
+    }
+    for (i, op) in adjoint.ops.iter_mut().enumerate() {
+        op.id = i as u32;
+    }
+    // Validation: no non-free op may still reference a compressed original.
+    for (idx, op) in adjoint.ops.iter().enumerate() {
+        if matches!(op.op, PrimalOp::FreeTensor) {
+            continue;
+        }
+        for input in &op.inputs {
+            if compress_map.contains_key(input) {
+                return Err(CodegenError::new(format!(
+                    "[ccr] decompress validation: adjoint op {idx} ({:?}) \
+                     still references compressed original v{input}",
+                    op.op
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Splice recompute clones + `FreeTensor` markers into the adjoint and
@@ -908,7 +1074,7 @@ mod tests {
     #[test]
     fn segments_and_interiors() {
         let primal = toy_primal();
-        let plan = plan(&primal, None, CcrPolicy::Block).expect("two blocks segment");
+        let plan = plan(&primal, None, CcrPolicy::Block, false).expect("two blocks segment");
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].layer_key, "blocks.0");
         // v3 is interior to block 0 (only consumed by v4 inside the block);
@@ -923,7 +1089,7 @@ mod tests {
     #[test]
     fn adjoint_splice_remaps_and_frees() {
         let primal = toy_primal();
-        let plan = plan(&primal, None, CcrPolicy::Block).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Block, false).unwrap();
         // Toy adjoint touching both interiors: block-1 grads first (reverse
         // order), then block-0 grads.
         let mut adjoint = WengertList {
@@ -979,7 +1145,7 @@ mod tests {
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        assert!(plan(&primal, None, CcrPolicy::Block).is_none());
+        assert!(plan(&primal, None, CcrPolicy::Block, false).is_none());
     }
 
     #[test]
@@ -987,7 +1153,7 @@ mod tests {
         let mut primal = toy_primal();
         // Replace block-0's interior Matmul with a Dropout.
         primal.ops[3] = op(3, 3, PrimalOp::Dropout { p: 0.1 }, vec![0]);
-        let plan = plan(&primal, None, CcrPolicy::Block).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Block, false).unwrap();
         assert!(!plan.recompute.contains(&3), "dropout must not be replayed");
     }
 
@@ -999,9 +1165,58 @@ mod tests {
         // residual add consumes the Relu instead.
         primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
-        let plan = plan(&primal, None, CcrPolicy::Selective).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Selective, false).unwrap();
         assert!(!plan.recompute.contains(&3), "matmul output must stay saved");
         assert!(plan.recompute.contains(&9), "relu is replayable");
+    }
+
+    #[test]
+    fn compress_targets_selective_saves_and_splices_decompress() {
+        let mut primal = toy_primal();
+        primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+        primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
+        let plan = plan(&primal, None, CcrPolicy::Selective, true).unwrap();
+        assert!(
+            plan.compress.contains(&3) && plan.compress.contains(&5),
+            "both blocks' matmul outputs compressible: {:?}",
+            plan.compress
+        );
+
+        let mut fresh = 300;
+        let map = append_compressed_saves(&mut primal, &plan, "bf16", &mut fresh);
+        let half = map[&3];
+        // Tail = cast + free per compressed original.
+        let casts = primal
+            .ops
+            .iter()
+            .filter(|o| matches!(&o.op, PrimalOp::Passthrough(p) if p == "ccr_cast_bf16"))
+            .count();
+        let frees = primal
+            .ops
+            .iter()
+            .filter(|o| matches!(o.op, PrimalOp::FreeTensor))
+            .count();
+        assert_eq!(casts, 2);
+        assert_eq!(frees, 2);
+        assert!(primal
+            .ops
+            .iter()
+            .any(|o| matches!(o.op, PrimalOp::FreeTensor) && o.inputs == vec![3]));
+
+        // Adjoint consuming the original v3 gets a restore.
+        let mut adjoint = WengertList {
+            ops: vec![op(0, 100, PrimalOp::Mul, vec![3, 0])],
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        splice_decompress(&mut adjoint, &map, &mut fresh).unwrap();
+        assert!(matches!(&adjoint.ops[0].op, PrimalOp::Passthrough(p) if p == "ccr_cast_f32"));
+        assert_eq!(adjoint.ops[0].inputs, vec![half]);
+        assert!(matches!(adjoint.ops[1].op, PrimalOp::FreeTensor));
+        assert_eq!(adjoint.ops[1].inputs, vec![half]);
+        let restored = adjoint.ops[0].result;
+        assert_eq!(adjoint.ops[2].inputs, vec![restored, 0], "consumer remapped");
     }
 
     #[test]
@@ -1009,7 +1224,7 @@ mod tests {
         let primal = toy_primal();
         let mut claimed = HashSet::new();
         claimed.insert(3u32); // op id 3 = block 0's Matmul
-        let plan = plan(&primal, Some(&claimed), CcrPolicy::Block).unwrap();
+        let plan = plan(&primal, Some(&claimed), CcrPolicy::Block, false).unwrap();
         assert!(!plan.recompute.contains(&3), "claimed segment exempt");
         assert!(plan.recompute.contains(&5), "unclaimed segment intact");
     }

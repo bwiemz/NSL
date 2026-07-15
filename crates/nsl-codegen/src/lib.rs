@@ -1192,6 +1192,19 @@ pub struct CompileOptions {
     /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
     /// memory reduction than the block policy at near-zero recompute cost.
     pub checkpoint_selective: bool,
+    /// CCR P1.c (`--checkpoint-budget-mib`): allowed SAVED-interior bytes.
+    /// The per-tensor SAVE/RECOMPUTE knapsack (ccr::apply_budget) flips the
+    /// highest-value tensors back to SAVE within this budget, minimizing
+    /// recompute cost. Under FASE Deferred the C-01 credit (the gradient
+    /// buffer Deferred never materializes) is added when parameter sizes
+    /// are statically known. None = pure policy decision, no arbitration.
+    pub checkpoint_budget_mib: Option<u64>,
+    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
+    /// Selective policy's saved matmul-class interiors to half precision
+    /// between forward and backward (cast-on-save, dequant-on-load via the
+    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
+    /// activations; gated by the repo's 3-4 dp loss-parity standard.
+    pub checkpoint_compress: Option<String>,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1313,6 +1326,8 @@ impl Default for CompileOptions {
             optim_state_offload: false,
             checkpoint_blocks: false,
             checkpoint_selective: false,
+            checkpoint_budget_mib: None,
+            checkpoint_compress: None,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),
