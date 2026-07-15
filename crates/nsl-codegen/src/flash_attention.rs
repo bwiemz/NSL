@@ -3440,6 +3440,20 @@ pub fn flash_attention_bwd_main_kernel_name(config: &FlashAttentionBackwardConfi
     }
 }
 
+/// Kernel name for the native-GQA Phase 2 backward entry.
+///
+/// P4 (pretraining memory reduction): the grouped kernel lives in the SAME
+/// PTX module as the plain Phase-2 entry (`synthesize_flash_attention_backward_ptx`
+/// emits both for non-segment configs), and the runtime derives this name by
+/// appending `_gqa` to the plain name it was handed — keep the suffix rule and
+/// this function in sync with `nsl_flash_attention_backward`'s name derivation.
+/// Only emitted for `!segment_masked` configs: the segment path requires the
+/// forward-saved LSE, and the fused forward declines GQA inputs, so a
+/// segment-masked grouped kernel would be unreachable, untested code.
+pub fn flash_attention_bwd_main_gqa_kernel_name(config: &FlashAttentionBackwardConfig) -> String {
+    format!("{}_gqa", flash_attention_bwd_main_kernel_name(config))
+}
+
 /// Compute shared memory bytes needed by the Phase 2 backward kernel.
 pub fn backward_shared_mem_bytes(config: &FlashAttentionBackwardConfig) -> u32 {
     let pad = 4i64;
@@ -3468,7 +3482,12 @@ pub fn backward_shared_mem_bytes(config: &FlashAttentionBackwardConfig) -> u32 {
 ///
 /// Returns a tuple of two null-terminated PTX byte vectors:
 ///   - `.0` — Phase 1: D-correction vector kernel
-///   - `.1` — Phase 2: main dQ/dK/dV kernel (placeholder for now)
+///   - `.1` — Phase 2: main dQ/dK/dV kernel module. For non-segment configs
+///     this module carries TWO entries: the classic MHA kernel and the
+///     native-GQA grouped kernel (`<name>_gqa`, see
+///     `flash_attention_bwd_main_gqa_kernel_name`). The runtime picks the
+///     entry at launch time from the K tensor's head count, so the variant
+///     table, FFI signature, and wengert lowering stay unchanged.
 pub fn synthesize_flash_attention_backward_ptx(
     config: &FlashAttentionBackwardConfig,
 ) -> (Vec<u8>, Vec<u8>) {
@@ -3479,9 +3498,27 @@ pub fn synthesize_flash_attention_backward_ptx(
     ptx1.push('\0');
 
     // Phase 2: main backward kernel (dQ/dK/dV)
-    let mut ptx2 = String::with_capacity(16384);
+    let mut ptx2 = String::with_capacity(32768);
     emit_ptx_header(&mut ptx2, config.gpu_sm);
-    emit_flash_attention_bwd_main(&mut ptx2, config);
+    // Dynamic shared memory, declared ONCE at MODULE scope (before the
+    // entries; both entries `cvta` the same window and the launcher sizes it
+    // per launch). `backward_shared_mem_bytes` exceeds the 48 KB static cap
+    // for all but the smallest head_dim (e.g. 70.5 KB at head_dim=32), so a
+    // fixed-size static `.shared` array inside the function fails at launch
+    // with CUDA_ERROR_INVALID_VALUE. PTX requires the `.extern .shared`
+    // declaration at module scope, mirroring the v2 emitter
+    // (flash_attention_v2/mod.rs). `kernel_launch` opts in via
+    // cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) for non-zero requests.
+    ptx2.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+    emit_flash_attention_bwd_main(&mut ptx2, config, false);
+    if !config.segment_masked {
+        // Native-GQA grouped entry (P4): grid.x is the fused batch*kv_head
+        // index; the kernel loops the group's q-heads internally, so dK/dV
+        // accumulate deterministically in one CTA's SMEM instead of via the
+        // expand-KV envelope's materialized tensors. Not emitted for
+        // segment-masked configs — see flash_attention_bwd_main_gqa_kernel_name.
+        emit_flash_attention_bwd_main(&mut ptx2, config, true);
+    }
     ptx2.push('\0');
 
     (ptx1.into_bytes(), ptx2.into_bytes())
@@ -3593,21 +3630,36 @@ fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardC
 /// bank conflicts during transpose-style access patterns.
 const BWD_PAD: i64 = 4;
 
-/// Emit the complete Phase 2 backward main kernel PTX.
-fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
-    let kernel_name = flash_attention_bwd_main_kernel_name(config);
-
-    // Dynamic shared memory, declared at MODULE scope (before the entry).
-    // `backward_shared_mem_bytes` exceeds the 48 KB static-shared cap for all but
-    // the smallest head_dim (e.g. 70.5 KB at head_dim=32), so a fixed-size static
-    // `.shared` array inside the function fails at launch with
-    // CUDA_ERROR_INVALID_VALUE. A dynamic `.extern .shared` window (sized per
-    // launch) is required; PTX requires it at module scope, mirroring the v2
-    // emitter (flash_attention_v2/mod.rs). The runtime launcher computes the same
-    // size via its own copy of the layout formula and passes it as the dynamic
-    // shared request; `kernel_launch` opts in via
-    // cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) for any non-zero request.
-    ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+/// Emit the complete Phase 2 backward main kernel PTX (one `.visible .entry`).
+///
+/// The module-scope `.extern .shared` window is declared by the caller
+/// (`synthesize_flash_attention_backward_ptx`) — PTX allows exactly one such
+/// declaration per module, shared by the plain and `_gqa` entries.
+///
+/// `gqa == false` — the classic MHA kernel: `blockIdx.x` is the fused
+/// `batch*head` index, K/V/dK/dV share Q's head count. Emission is
+/// byte-identical to the historical single-entry module.
+///
+/// `gqa == true` (P4, native grouped-query backward) — `blockIdx.x` is the
+/// fused `batch*kv_head` index. K/V (and dK/dV) are `[b, kv_h, s, d]`; the
+/// kernel loads this CTA's K/V tile ONCE, then loops the group's q-heads
+/// (`groups = heads / kv_heads`, both runtime params) around the unchanged
+/// q-tile loop, rebasing the Q/dO/dQ/D/L offsets (`%rd15`/`%rd16`) per group
+/// member. dK/dV accumulate across ALL group members in this CTA's SMEM
+/// accumulators and store once — the group reduction never touches global
+/// atomics, so determinism matches the MHA kernel (dQ keeps the same
+/// cross-CTA `atom.global.add` it always had). Labels are function-scoped in
+/// PTX, so both entries reuse the same `BWD_MAIN_*` label set.
+fn emit_flash_attention_bwd_main(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    gqa: bool,
+) {
+    let kernel_name = if gqa {
+        flash_attention_bwd_main_gqa_kernel_name(config)
+    } else {
+        flash_attention_bwd_main_kernel_name(config)
+    };
 
     // Entry point
     ptx.push_str(&format!(".visible .entry {} (\n", kernel_name));
@@ -3632,33 +3684,63 @@ fn emit_flash_attention_bwd_main(ptx: &mut String, config: &FlashAttentionBackwa
         ptx.push_str("    .param .u64 param_head_dim,\n");
         ptx.push_str("    .param .u64 param_segment_ids,\n");
         ptx.push_str("    .param .u64 param_heads\n");
+    } else if gqa {
+        // P4: grouped entry appends the head counts at the END (same
+        // stay-byte-identical rule as the segmask params above). Runtime
+        // values so the per-head_dim variant table needs no per-ratio rows.
+        ptx.push_str("    .param .u64 param_head_dim,\n");
+        ptx.push_str("    .param .u64 param_heads,\n");
+        ptx.push_str("    .param .u64 param_kv_heads\n");
     } else {
         ptx.push_str("    .param .u64 param_head_dim\n");
     }
     ptx.push_str(")\n");
     ptx.push_str("{\n");
 
-    emit_bwd_main_registers(ptx, config);
+    emit_bwd_main_registers(ptx, config, gqa);
     if backward_uses_mma(config) {
         emit_bwd_mma_registers(ptx, config);
     }
-    emit_bwd_main_param_loads(ptx, config);
-    emit_bwd_main_index_computation(ptx, config);
-    emit_bwd_main_load_kv_tiles(ptx, config);
+    emit_bwd_main_param_loads(ptx, config, gqa);
+    emit_bwd_main_index_computation(ptx, config, gqa);
+    emit_bwd_main_load_kv_tiles(ptx, config, gqa);
     emit_bwd_main_init_dk_dv(ptx, config);
+    if gqa {
+        // Group loop head: iterate the q-heads sharing this CTA's kv-head.
+        // The trip count (%rd_gqa_g) is CTA-uniform, so the loop branches are
+        // uniform and jumping around the body's bar.syncs is safe. Each
+        // iteration rebases the Q-side offsets the q-tile loop reads:
+        //   %rd15 = qh * seq_len * head_dim   (Q/dO/dQ element offset)
+        //   %rd16 = qh * seq_len              (D/L row offset)
+        // The q-tile loop body only READS %rd15/%rd16, so re-deriving them
+        // here is the entire per-head state change.
+        ptx.push_str("    // === Native-GQA group loop over this kv-head's q-heads ===\n");
+        ptx.push_str("    mov.u64 %rd_gqa_gi, 0;\n");
+        ptx.push_str("BWD_MAIN_GQA_GROUP:\n");
+        ptx.push_str("    setp.ge.u64 %p_gqa, %rd_gqa_gi, %rd_gqa_g;\n");
+        ptx.push_str("    @%p_gqa bra BWD_MAIN_GQA_GROUP_DONE;\n");
+        ptx.push_str("    add.u64 %rd15, %rd_gqa_qh0, %rd_gqa_gi;  // qh = qh_base + gi\n");
+        ptx.push_str("    mul.lo.u64 %rd16, %rd15, %rd9;   // qh * seq_len => bh_seq_offset\n");
+        ptx.push_str("    mul.lo.u64 %rd15, %rd16, %rd10;  // * head_dim => bh_elem_offset\n\n");
+    }
     if backward_uses_mma(config) {
         emit_bwd_main_q_tile_loop_mma(ptx, config);
     } else {
         emit_bwd_main_q_tile_loop_scalar(ptx, config);
     }
-    emit_bwd_main_store_dk_dv(ptx, config);
+    if gqa {
+        ptx.push_str("    add.u64 %rd_gqa_gi, %rd_gqa_gi, 1;  // next q-head in group\n");
+        ptx.push_str("    bra BWD_MAIN_GQA_GROUP;\n");
+        ptx.push_str("BWD_MAIN_GQA_GROUP_DONE:\n\n");
+    }
+    emit_bwd_main_store_dk_dv(ptx, config, gqa);
 
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
 }
 
 /// Register declarations for the backward main kernel.
-fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConfig, gqa: bool) {
     if config.segment_masked {
         // PCA Stage C: segment-mask registers. Declared first (and only for
         // the segment variant) so the plain kernel's register block stays
@@ -3666,6 +3748,15 @@ fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConf
         ptx.push_str("    .reg .u64 %rd_seg, %rd_segrow;\n");
         ptx.push_str("    .reg .u32 %r_seg_i, %r_seg_j, %r_seg_kend;\n");
         ptx.push_str("    .reg .pred %p_seg, %p_seg_break;\n");
+    }
+    if gqa {
+        // P4: named GQA registers (group loop + kv-side base). Named so they
+        // can never collide with the numbered scratch (%rd18..%rd63) the
+        // q-tile loop bodies burn through, and declared first so the plain
+        // kernel's register block stays byte-identical.
+        ptx.push_str("    .reg .u64 %rd_gqa_h, %rd_gqa_kvh, %rd_gqa_g;\n");
+        ptx.push_str("    .reg .u64 %rd_gqa_gi, %rd_gqa_qh0, %rd_gqa_kvoff;\n");
+        ptx.push_str("    .reg .pred %p_gqa;\n");
     }
     ptx.push_str("    // === Register declarations ===\n");
     ptx.push_str("    .reg .u32 %r<32>;\n");
@@ -3699,7 +3790,7 @@ fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConf
 }
 
 /// Load kernel parameters into registers.
-fn emit_bwd_main_param_loads(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+fn emit_bwd_main_param_loads(ptx: &mut String, config: &FlashAttentionBackwardConfig, gqa: bool) {
     ptx.push_str("    // === Parameter loads ===\n");
     ptx.push_str("    ld.param.u64 %rd0, [param_dout];\n");
     ptx.push_str("    ld.param.u64 %rd1, [param_q];\n");
@@ -3719,18 +3810,44 @@ fn emit_bwd_main_param_loads(ptx: &mut String, config: &FlashAttentionBackwardCo
         ptx.push_str("    ld.param.u64 %rd_seg, [param_segment_ids];\n");
         ptx.push_str("    ld.param.u64 %rd_segrow, [param_heads];\n\n");
     }
+    if gqa {
+        // P4: runtime head counts — the grouped kernel derives batch/kv/group
+        // indices from these, keeping the variant table per-head_dim only.
+        ptx.push_str("    ld.param.u64 %rd_gqa_h, [param_heads];\n");
+        ptx.push_str("    ld.param.u64 %rd_gqa_kvh, [param_kv_heads];\n\n");
+    }
 }
 
 /// Compute thread/block indices and the base pointers for this thread-block's
 /// (batch-head, kv-tile) assignment.
-fn emit_bwd_main_index_computation(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+///
+/// GQA entry (P4): `blockIdx.x` is the fused `batch*kv_head` index. This
+/// prologue derives the kv-side element offset (`%rd_gqa_kvoff`, consumed by
+/// the K/V tile loads and the dK/dV stores) and the group's first fused
+/// q-head index (`%rd_gqa_qh0 = batch*heads + kv*groups` — the same
+/// consecutive-block head mapping as `flash_attention_backward_cpu_gqa` and
+/// the expand envelope). `%rd15`/`%rd16` are NOT set here — the group loop in
+/// `emit_flash_attention_bwd_main` rebases them per q-head.
+fn emit_bwd_main_index_computation(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    gqa: bool,
+) {
     ptx.push_str("    // === Index computation ===\n");
-    ptx.push_str("    // blockIdx.x = bh (batch*head), blockIdx.y = j_block (KV tile)\n");
+    if gqa {
+        ptx.push_str("    // blockIdx.x = bkv (batch*kv_head), blockIdx.y = j_block (KV tile)\n");
+    } else {
+        ptx.push_str("    // blockIdx.x = bh (batch*head), blockIdx.y = j_block (KV tile)\n");
+    }
     ptx.push_str("    mov.u32 %r0, %tid.x;\n");
     ptx.push_str("    mov.u32 %r1, %ctaid.x;\n");
     ptx.push_str("    mov.u32 %r2, %ctaid.y;\n");
     ptx.push_str("    cvt.u64.u32 %rd11, %r0;  // tid\n");
-    ptx.push_str("    cvt.u64.u32 %rd12, %r1;  // bh\n");
+    if gqa {
+        ptx.push_str("    cvt.u64.u32 %rd12, %r1;  // bkv\n");
+    } else {
+        ptx.push_str("    cvt.u64.u32 %rd12, %r1;  // bh\n");
+    }
     ptx.push_str("    cvt.u64.u32 %rd13, %r2;  // j_block\n\n");
 
     // kv_start = j_block * block_kv
@@ -3739,12 +3856,28 @@ fn emit_bwd_main_index_computation(ptx: &mut String, config: &FlashAttentionBack
         config.block_kv
     ));
 
-    // bh_offset = bh * seq_len * head_dim  (element offset into [B*nh, S, hd])
-    ptx.push_str("    mul.lo.u64 %rd15, %rd12, %rd9;   // bh * seq_len\n");
-    ptx.push_str("    mul.lo.u64 %rd15, %rd15, %rd10;   // * head_dim  => bh_elem_offset\n");
+    if gqa {
+        // kv-side element offset into [B*kv_h, S, hd] — K/V and dK/dV bases.
+        ptx.push_str("    mul.lo.u64 %rd_gqa_kvoff, %rd12, %rd9;   // bkv * seq_len\n");
+        ptx.push_str("    mul.lo.u64 %rd_gqa_kvoff, %rd_gqa_kvoff, %rd10;  // * head_dim\n");
+        // groups = heads / kv_heads (caller guarantees exact division — the
+        // runtime only dispatches this entry when heads % kv_heads == 0).
+        ptx.push_str("    div.u64 %rd_gqa_g, %rd_gqa_h, %rd_gqa_kvh;  // groups = heads / kv_heads\n");
+        // qh_base = (bkv / kv_heads) * heads + (bkv % kv_heads) * groups.
+        // %rd15/%rd16 are free scratch until the group loop assigns them.
+        ptx.push_str("    div.u64 %rd15, %rd12, %rd_gqa_kvh;  // batch = bkv / kv_heads\n");
+        ptx.push_str("    rem.u64 %rd16, %rd12, %rd_gqa_kvh;  // kv = bkv % kv_heads\n");
+        ptx.push_str("    mul.lo.u64 %rd_gqa_qh0, %rd15, %rd_gqa_h;  // batch * heads\n");
+        ptx.push_str("    mul.lo.u64 %rd16, %rd16, %rd_gqa_g;        // kv * groups\n");
+        ptx.push_str("    add.u64 %rd_gqa_qh0, %rd_gqa_qh0, %rd16;   // qh_base\n\n");
+    } else {
+        // bh_offset = bh * seq_len * head_dim  (element offset into [B*nh, S, hd])
+        ptx.push_str("    mul.lo.u64 %rd15, %rd12, %rd9;   // bh * seq_len\n");
+        ptx.push_str("    mul.lo.u64 %rd15, %rd15, %rd10;   // * head_dim  => bh_elem_offset\n");
 
-    // bh_seq_offset = bh * seq_len  (element offset into [B*nh, S])
-    ptx.push_str("    mul.lo.u64 %rd16, %rd12, %rd9;    // bh * seq_len => bh_seq_offset\n\n");
+        // bh_seq_offset = bh * seq_len  (element offset into [B*nh, S])
+        ptx.push_str("    mul.lo.u64 %rd16, %rd12, %rd9;    // bh * seq_len => bh_seq_offset\n\n");
+    }
 
     if config.segment_masked {
         // PCA Stage C: %rd_segrow currently holds `heads` (see param loads).
@@ -3781,24 +3914,36 @@ fn emit_bwd_main_index_computation(ptx: &mut String, config: &FlashAttentionBack
 }
 
 /// Load K[j_block] and V[j_block] tiles into shared memory.
-fn emit_bwd_main_load_kv_tiles(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+///
+/// GQA entry: K/V are `[b, kv_h, s, d]`, so the base offset is the kv-side
+/// `%rd_gqa_kvoff` instead of the q-side `%rd15` — the only difference from
+/// the plain emission (the tile is loaded once per CTA and reused by every
+/// q-head in the group).
+fn emit_bwd_main_load_kv_tiles(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    gqa: bool,
+) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_elems = config.block_kv * hd_padded;
     let _v_tile_elems = config.block_kv * hd_padded;
     let k_tile_bytes = k_tile_elems * 4;
     let v_offset = k_tile_bytes;
+    let kv_base_reg = if gqa { "%rd_gqa_kvoff" } else { "%rd15" };
 
     ptx.push_str("    // === Load K[j_block] and V[j_block] into shared memory ===\n");
 
-    // K global base = k_ptr + (bh_elem_offset + kv_start * head_dim) * 4
+    // K global base = k_ptr + (kv_elem_offset + kv_start * head_dim) * 4
     ptx.push_str("    mul.lo.u64 %rd18, %rd14, %rd10;   // kv_start * head_dim\n");
-    ptx.push_str("    add.u64 %rd18, %rd15, %rd18;       // bh_elem_offset + kv_start*hd\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd18, {kv_base_reg}, %rd18;       // bh_elem_offset + kv_start*hd\n"
+    ));
     ptx.push_str("    shl.b64 %rd18, %rd18, 2;           // * 4 bytes\n");
     ptx.push_str("    add.u64 %rd18, %rd2, %rd18;        // k_global_base\n\n");
 
     // V global base (same layout)
     ptx.push_str("    mul.lo.u64 %rd19, %rd14, %rd10;   // kv_start * head_dim\n");
-    ptx.push_str("    add.u64 %rd19, %rd15, %rd19;\n");
+    ptx.push_str(&format!("    add.u64 %rd19, {kv_base_reg}, %rd19;\n"));
     ptx.push_str("    shl.b64 %rd19, %rd19, 2;\n");
     ptx.push_str("    add.u64 %rd19, %rd3, %rd19;        // v_global_base\n\n");
 
@@ -5870,7 +6015,17 @@ fn emit_atomicadd_mma_to_global_dq(
 }
 
 /// Store dK_local and dV_local from shared memory to global dK/dV arrays.
-fn emit_bwd_main_store_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+///
+/// GQA entry: dK/dV are `[b, kv_h, s, d]` and this runs AFTER the group loop
+/// (where `%rd15` holds the LAST group member's q-head offset), so the base
+/// must be the kv-side `%rd_gqa_kvoff`. The SMEM accumulators at this point
+/// hold the sum over ALL of the group's q-heads — the group reduction is the
+/// serial in-CTA accumulation, not a global-memory reduce.
+fn emit_bwd_main_store_dk_dv(
+    ptx: &mut String,
+    config: &FlashAttentionBackwardConfig,
+    gqa: bool,
+) {
     let hd_padded = config.head_dim + BWD_PAD;
     let k_tile_bytes = config.block_kv * hd_padded * 4;
     let v_tile_bytes = config.block_kv * hd_padded * 4;
@@ -5878,18 +6033,19 @@ fn emit_bwd_main_store_dk_dv(ptx: &mut String, config: &FlashAttentionBackwardCo
     let do_tile_bytes = config.block_q * hd_padded * 4;
     let dk_shmem_offset = k_tile_bytes + v_tile_bytes + q_tile_bytes + do_tile_bytes;
     let dv_shmem_offset = dk_shmem_offset + config.block_kv * hd_padded * 4;
+    let kv_base_reg = if gqa { "%rd_gqa_kvoff" } else { "%rd15" };
 
     ptx.push_str("    // === Store dK_local and dV_local to global memory ===\n");
 
-    // dK global base: dk_ptr + (bh_elem_offset + kv_start * head_dim) * 4
+    // dK global base: dk_ptr + (kv_elem_offset + kv_start * head_dim) * 4
     ptx.push_str("    mul.lo.u64 %rd20, %rd14, %rd10;  // kv_start * head_dim\n");
-    ptx.push_str("    add.u64 %rd20, %rd15, %rd20;\n");
+    ptx.push_str(&format!("    add.u64 %rd20, {kv_base_reg}, %rd20;\n"));
     ptx.push_str("    shl.b64 %rd20, %rd20, 2;\n");
     ptx.push_str("    add.u64 %rd20, %rd5, %rd20;  // dk_global_base\n\n");
 
     // dV global base
     ptx.push_str("    mul.lo.u64 %rd21, %rd14, %rd10;\n");
-    ptx.push_str("    add.u64 %rd21, %rd15, %rd21;\n");
+    ptx.push_str(&format!("    add.u64 %rd21, {kv_base_reg}, %rd21;\n"));
     ptx.push_str("    shl.b64 %rd21, %rd21, 2;\n");
     ptx.push_str("    add.u64 %rd21, %rd6, %rd21;  // dv_global_base\n\n");
 
@@ -7108,16 +7264,22 @@ mod tests {
     fn test_bwd_main_mma_tile_count() {
         // Verify correct number of MMA instructions for block_kv=64, head_dim=64
         // 5 matmuls: S, dP (n_tiles_s=8 each), dV, dQ, dK (n_tiles_hd=8 each)
-        // Total = 5 * 8 = 40
+        // Total = 5 * 8 = 40 — per ENTRY. The non-segment module carries two
+        // entries (plain + native-GQA), each with its own full MMA q-tile
+        // loop, so count within each entry, not across the module.
         let cfg = bwd_config(false);
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
-        let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
-        assert_eq!(
-            mma_count, 40,
-            "expected 40 MMA instructions (5 matmuls * 8 n-tiles), got {}",
-            mma_count
-        );
+        let entries: Vec<&str> = ptx.split(".visible .entry").skip(1).collect();
+        assert_eq!(entries.len(), 2, "plain + gqa entries expected");
+        for entry in entries {
+            let mma_count = entry.matches("mma.sync.aligned.m16n8k16").count();
+            assert_eq!(
+                mma_count, 40,
+                "expected 40 MMA instructions per entry (5 matmuls * 8 n-tiles), got {}",
+                mma_count
+            );
+        }
     }
 
     #[test]
@@ -7134,6 +7296,176 @@ mod tests {
                     "label '{}' does not have BWD_MAIN_ prefix",
                     trimmed
                 );
+            }
+        }
+    }
+
+    // ── Native-GQA grouped backward entry (P4) ─────────────────────────
+
+    /// Split the two-entry Phase-2 module into (plain, gqa) entry bodies.
+    fn split_bwd_entries(ptx: &str) -> (String, String) {
+        let parts: Vec<&str> = ptx.split(".visible .entry").collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "non-segment Phase-2 module must contain exactly 2 entries"
+        );
+        (parts[1].to_string(), parts[2].to_string())
+    }
+
+    #[test]
+    fn test_bwd_main_gqa_kernel_name() {
+        let cfg = bwd_config(true);
+        assert_eq!(
+            flash_attention_bwd_main_gqa_kernel_name(&cfg),
+            "flash_attn_bwd_main_c1_q64_kv64_gqa"
+        );
+    }
+
+    /// The non-segment module carries plain + `_gqa` entries; the grouped
+    /// entry takes runtime head counts at the END of the param list (the
+    /// runtime marshals 12 args for plain, 14 for gqa) and the plain entry's
+    /// signature stays untouched.
+    #[test]
+    fn test_bwd_main_gqa_entry_present_with_head_count_params() {
+        for causal in [false, true] {
+            let cfg = bwd_config(causal);
+            let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+            let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+            let (plain, gqa) = split_bwd_entries(ptx);
+            assert!(
+                plain.starts_with(&format!(" {} (", flash_attention_bwd_main_kernel_name(&cfg))),
+                "first entry must be the plain kernel"
+            );
+            assert!(
+                gqa.starts_with(&format!(
+                    " {} (",
+                    flash_attention_bwd_main_gqa_kernel_name(&cfg)
+                )),
+                "second entry must be the _gqa kernel"
+            );
+            assert!(
+                !plain.contains("param_kv_heads") && !plain.contains("param_heads"),
+                "plain entry must keep the 12-param signature"
+            );
+            assert!(
+                gqa.contains("param_heads") && gqa.contains("param_kv_heads"),
+                "gqa entry must take runtime head counts"
+            );
+        }
+    }
+
+    /// Segment-masked modules must NOT grow a grouped entry: the segment
+    /// backward requires the forward-saved LSE, the fused forward declines
+    /// GQA, so a `_segmask_gqa` kernel would be unreachable untested code —
+    /// deferral-must-refuse says don't emit it.
+    #[test]
+    fn test_bwd_main_gqa_entry_absent_for_segmask() {
+        let cfg = FlashAttentionBackwardConfig {
+            segment_masked: true,
+            ..bwd_config(true)
+        };
+        let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+        assert_eq!(
+            ptx.matches(".visible .entry").count(),
+            1,
+            "segment-masked module must stay single-entry"
+        );
+        assert!(!ptx.contains("_gqa"), "no _gqa entry for segmask configs");
+    }
+
+    /// The grouped entry must index K/V and dK/dV by the kv-side offset
+    /// (`%rd_gqa_kvoff`), wrap the q-tile loop in the group loop, and leave
+    /// the plain entry's `%rd15`-based addressing byte-identical.
+    #[test]
+    fn test_bwd_main_gqa_kv_side_indexing_and_group_loop() {
+        for gpu_sm in [52u32, 80] {
+            let cfg = FlashAttentionBackwardConfig {
+                gpu_sm,
+                ..bwd_config(true)
+            };
+            let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+            let ptx = std::str::from_utf8(&ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+            let (plain, gqa) = split_bwd_entries(ptx);
+
+            // Plain entry: no GQA registers/labels leak in.
+            assert!(
+                !plain.contains("%rd_gqa_") && !plain.contains("BWD_MAIN_GQA_GROUP"),
+                "sm{gpu_sm}: plain entry must not reference GQA registers/labels"
+            );
+
+            // GQA entry: group loop present, K/V + dK/dV bases are kv-side.
+            assert!(
+                gqa.contains("BWD_MAIN_GQA_GROUP:") && gqa.contains("BWD_MAIN_GQA_GROUP_DONE:"),
+                "sm{gpu_sm}: gqa entry must carry the group loop"
+            );
+            assert!(
+                gqa.contains("add.u64 %rd18, %rd_gqa_kvoff, %rd18")
+                    && gqa.contains("add.u64 %rd19, %rd_gqa_kvoff, %rd19"),
+                "sm{gpu_sm}: K/V tile loads must use the kv-side base"
+            );
+            assert!(
+                gqa.contains("add.u64 %rd20, %rd_gqa_kvoff, %rd20")
+                    && gqa.contains("add.u64 %rd21, %rd_gqa_kvoff, %rd21"),
+                "sm{gpu_sm}: dK/dV stores must use the kv-side base"
+            );
+            // Q-side rebase per group member (the loop body reads %rd15/%rd16).
+            assert!(
+                gqa.contains("add.u64 %rd15, %rd_gqa_qh0, %rd_gqa_gi"),
+                "sm{gpu_sm}: group loop must rebase the q-head offsets"
+            );
+            // Consecutive-block head mapping (matches the CPU reference).
+            assert!(
+                gqa.contains("div.u64 %rd_gqa_g, %rd_gqa_h, %rd_gqa_kvh"),
+                "sm{gpu_sm}: groups = heads / kv_heads"
+            );
+        }
+    }
+
+    /// ptxas assembly gate for the two-entry module: PTX labels are
+    /// function-scoped, so both entries reuse the `BWD_MAIN_*` label set —
+    /// this proves the assembler agrees (a duplicate-symbol error here would
+    /// otherwise only surface as CUDA_ERROR_INVALID_PTX at launch). Skips
+    /// when ptxas is not installed.
+    #[test]
+    fn test_bwd_main_gqa_module_assembles() {
+        let ptxas = ["ptxas", "/opt/cuda/bin/ptxas", "/usr/local/cuda/bin/ptxas"]
+            .iter()
+            .find(|p| {
+                std::process::Command::new(p)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+            })
+            .copied();
+        let Some(ptxas) = ptxas else {
+            eprintln!("ptxas not found; skipping assembly gate");
+            return;
+        };
+        for gpu_sm in [52u32, 80] {
+            for causal in [false, true] {
+                let cfg = FlashAttentionBackwardConfig {
+                    gpu_sm,
+                    causal,
+                    ..bwd_config(causal)
+                };
+                let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
+                let dir = std::env::temp_dir();
+                let path = dir.join(format!("nsl_bwd_gqa_sm{gpu_sm}_c{causal}.ptx"));
+                std::fs::write(&path, &ptx2_bytes[..ptx2_bytes.len() - 1]).unwrap();
+                let arch = format!("sm_{}", gpu_sm.max(80));
+                let out = std::process::Command::new(ptxas)
+                    .args(["-arch", arch.as_str(), "-o", "/dev/null"])
+                    .arg(&path)
+                    .output()
+                    .expect("ptxas spawn");
+                assert!(
+                    out.status.success(),
+                    "ptxas rejected the two-entry module (sm{gpu_sm}, causal={causal}):\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
