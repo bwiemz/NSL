@@ -33,6 +33,12 @@ pub(crate) mod inner {
         // caused CUDA_ERROR_NOT_FOUND (rc=500) when a new PTX Vec was
         // allocated at the same address as an old one.
         module_cache: HashMap<u64, CUmodule>,
+        // Resolved CUfunction handles, keyed by (module content hash,
+        // FNV-1a of the entry name). Content-derived keys inherit the
+        // module cache's immunity to heap-address reuse; a CUfunction
+        // stays valid as long as its module is loaded (modules are never
+        // unloaded here).
+        func_cache: HashMap<(u64, u64), CUfunction>,
     }
 
     // SAFETY: CUcontext/CUmodule are opaque pointers managed by the CUDA driver.
@@ -137,6 +143,7 @@ pub(crate) mod inner {
                     device,
                     context,
                     module_cache: HashMap::new(),
+                    func_cache: HashMap::new(),
                 })
             }
         })
@@ -783,12 +790,32 @@ pub(crate) mod inner {
                 module
             };
 
-            let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
-            let mut func: CUfunction = std::ptr::null_mut();
-            let res = unsafe { cuModuleGetFunction(&mut func, module, name.as_ptr()) };
-            if res != CUresult::CUDA_SUCCESS { return res; }
-
-            func
+            // Resolve-once function cache: cuModuleGetFunction used to run
+            // on EVERY launch (the CFIE fast path below existed precisely
+            // to avoid that on the decode loop; training now gets the same
+            // treatment). Keyed by (PTX content hash, name hash) — both
+            // content-derived, so heap-address reuse cannot alias entries.
+            let name_key = {
+                let mut len = 0usize;
+                while unsafe { *name_ptr.add(len) } != 0 { len += 1; }
+                let name_bytes = unsafe { std::slice::from_raw_parts(name_ptr, len) };
+                let mut h: u64 = 14695981039346656037u64;
+                for &b in name_bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211u64);
+                }
+                h
+            };
+            if let Some(f) = guard.func_cache.get(&(cache_key, name_key)) {
+                *f
+            } else {
+                let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
+                let mut func: CUfunction = std::ptr::null_mut();
+                let res = unsafe { cuModuleGetFunction(&mut func, module, name.as_ptr()) };
+                if res != CUresult::CUDA_SUCCESS { return res; }
+                guard.func_cache.insert((cache_key, name_key), func);
+                func
+            }
         }; // guard dropped here — no lock held for CUDA calls
 
         // Profiler: pop event pair (lock-pop-unlock on profiler mutex)
@@ -828,8 +855,13 @@ pub(crate) mod inner {
         //   sm_89  (Ada Lovelace):        99 KB
         //   sm_86  (Ampere high-end):    ~100 KB
         if shared_mem_bytes > 0 {
-            // Query the device's opt-in SMEM limit before attempting the attribute set.
-            let device_smem_limit = {
+            // Query the device's opt-in SMEM limit before attempting the
+            // attribute set. Cached: the limit is a device constant, and the
+            // old per-launch query took a second CUDA_STATE lock + driver
+            // call on every dynamic-SMEM launch (every sum_dim reduction on
+            // the training hot path).
+            static SMEM_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let device_smem_limit = *SMEM_LIMIT.get_or_init(|| {
                 let mut guard2 = state.lock().unwrap();
                 let mut limit: i32 = 0;
                 unsafe {
@@ -841,7 +873,7 @@ pub(crate) mod inner {
                 }
                 let _ = &mut guard2; // keep guard alive to silence lint
                 limit as u32
-            };
+            });
             if shared_mem_bytes > device_smem_limit {
                 // Return the same error code the driver would return, but
                 // without actually making the doomed cuFuncSetAttribute call.
@@ -2494,6 +2526,94 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     NslTensor::publish(out)
 }
 
+/// GPU embedding backward: scatter-add grad rows into a zeroed
+/// `[vocab, embed]` f32 buffer on the device (scaling campaign item 1).
+///
+/// `grad` must be a GPU f32 contiguous `[seq_len, embed_dim]` tensor;
+/// `indices` a GPU tensor of `seq_len` token ids (f32 dtype=1 or i32
+/// dtype=4, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
+/// and negative ids are skipped in-kernel, matching the CPU reference.
+/// Returns a published GPU `[vocab, embed]` NslTensor, or 0 when the
+/// index dtype has no kernel (caller falls back to the host scatter).
+///
+/// The scatter uses f32 atomics, so the per-row accumulation order is
+/// nondeterministic across runs (same policy as the flash phase-2
+/// backward); the caller exposes NSL_EMBEDDING_BWD_CPU=1 to restore the
+/// deterministic host path.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_embedding_backward(
+    grad_ptr: i64,
+    indices_ptr: i64,
+    vocab_size: u64,
+    embed_dim: u64,
+    seq_len: u64,
+) -> i64 {
+    inner::set_oom_context("embedding_backward");
+    use crate::tensor::NslTensor;
+
+    let grad = unsafe { &*(grad_ptr as *const NslTensor) };
+    let indices = unsafe { &*(indices_ptr as *const NslTensor) };
+
+    let (ptx, kernel_name): (&str, &[u8]) = if indices.dtype == 4 {
+        (fused_kernels::EMBEDDING_BWD_I32IDX_PTX, b"nsl_embedding_bwd_i32idx\0")
+    } else if indices.dtype == 1 {
+        (fused_kernels::EMBEDDING_BWD_F32_PTX, b"nsl_embedding_bwd_f32\0")
+    } else {
+        return 0;
+    };
+
+    let out_elems = (vocab_size * embed_dim) as usize;
+    let out_data = inner::alloc_managed(out_elems * 4);
+    inner::memset_d8(out_data, out_elems * 4);
+
+    let mut g_data = grad.data as u64;
+    let mut i_data = indices.data as u64;
+    let mut o_data = out_data as u64;
+    let mut seq_val = seq_len;
+    let mut emb_val = embed_dim;
+    let mut vocab_val = vocab_size;
+
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut seq_val as *mut _ as *mut std::ffi::c_void,
+        &mut emb_val as *mut _ as *mut std::ffi::c_void,
+        &mut vocab_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block_x = 16i64;
+    let block_y = 16i64;
+    let grid_x = ((seq_len as i64) + block_x - 1) / block_x;
+    let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
+
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+    );
+    assert_eq!(result as u32, 0, "GPU embedding_bwd kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *out_shape.add(0) = vocab_size as i64;
+        *out_shape.add(1) = embed_dim as i64;
+    }
+    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        out_elems as i64,
+        grad.device,
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
+}
+
 // ---------------------------------------------------------------------------
 // GPU Bias Add
 // ---------------------------------------------------------------------------
@@ -2815,6 +2935,56 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     let std_val = if variance > 0.0 { variance.sqrt() } else { 0.0 };
 
     [min_val, max_val, mean_val, std_val]
+}
+
+/// GPU sum of squares (Σx²) for an f32 tensor — the RAW `sum_sq` accumulator
+/// from the stats kernel, WITHOUT the mean/std post-processing that
+/// `gpu_tensor_stats_f32` applies to its slot 3. Kept separate precisely
+/// because that helper's public contract is `[min, max, mean, std]` (the
+/// trace debugger depends on the std), so its slot 3 is NOT Σx². Used by
+/// `nsl_tensor_sum_sq`'s GPU fast path — reading `gpu_tensor_stats_f32()[3]`
+/// there returned the population std instead of Σx² and silently disabled
+/// FASE gradient clipping on GPU (the global norm collapsed by ~n).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::TENSOR_STATS_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let n = t.len as u64;
+    if n == 0 {
+        return 0.0;
+    }
+
+    let out_data = inner::alloc_managed(16);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut n_val = n;
+
+    let args: [*mut std::ffi::c_void; 3] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let result = inner::kernel_launch(
+        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let mut raw = [0f32; 4];
+    inner::memcpy_dtoh(
+        raw.as_mut_ptr() as *mut std::ffi::c_void,
+        out_data as *const std::ffi::c_void,
+        16,
+    );
+    inner::free_managed(out_data);
+
+    // raw = [min, max, sum, sum_sq]; slot 3 is the raw Σx² (pre-transform).
+    f64::from(raw[3])
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,12 @@
 # WGGO-orchestrated PACKED pretraining E2E (campaign PR-8).
 #
 # A miniature GQA transformer trained on a packed token stream:
-#   - DataLoader(packing=true) builds PackedBatch dicts at runtime:
-#     input_ids / labels / attention_mask ([b, seq, seq] additive,
-#     block-diagonal causal-within-doc, 0 attend / -1e9 blocked).
+#   - DataLoader(packing=true, emit_attention_mask=true) builds PackedBatch
+#     dicts at runtime: input_ids / labels / attention_mask ([b, seq, seq]
+#     additive, block-diagonal causal-within-doc, 0 attend / -1e9 blocked).
+#     The dense mask is OPT-IN as of the segment-metadata campaign item —
+#     this Stage-B fixture consumes it through forward_masked, so it is the
+#     one caller that still requests it.
 #   - The model consumes the mask through the stdlib GQA forward_masked
 #     (PCA Stage B: scaled_dot_product_attention_masked, decomposed
 #     source-AD backward).
@@ -56,7 +59,7 @@ let m = PackedLM()
 # two documents and the block-diagonal mask has real structure.
 let unit = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
 let tokens = unit.reshape([1, 8]).expand([128, 8]).contiguous().reshape([1024])
-let loader = DataLoader(tokens, batch_size=2, seq_len=16, shuffle=false, drop_last=true, packing=true, pack_separator=0)
+let loader = DataLoader(tokens, batch_size=2, seq_len=16, shuffle=false, drop_last=true, packing=true, pack_separator=0, emit_attention_mask=true)
 
 print("LOSS_STREAM_BEGIN")
 

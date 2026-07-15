@@ -32,7 +32,16 @@ pub const MAX_NUM_DOCS: usize = 256;
 pub struct PackedBatch {
     pub input_ids:   Vec<i64>,
     pub labels:      Vec<i64>,
-    pub mask:        Vec<f32>,   // retained through Task 7b
+    /// Dense block-diagonal causal mask, `[batch, seq, seq]` flat.
+    ///
+    /// OPT-IN as of the segment-metadata campaign item: EMPTY unless
+    /// `pack_batch` was called with `emit_attention_mask=true` (DataLoader
+    /// config key of the same name). The fused packed-attention path and
+    /// the decomposed fallback both key off `segment_ids` now (the
+    /// fallback derives this same mask on demand via
+    /// `nsl_packed_mask_from_segment_ids`); only Stage-B `forward_masked`
+    /// consumers still need the dense tensor.
+    pub mask:        Vec<f32>,
     pub segment_ids: Vec<u16>,   // spec §3.5 — new, additive
     /// PCA §4.3 RoPE position-reset table, sibling to `segment_ids`.
     ///
@@ -63,9 +72,13 @@ pub struct PackedBatch {
 
 /// Pack one batch from a continuous token stream.
 ///
-/// Reads `batch_size * seq_len` tokens starting at `*cursor`, builds shifted
-/// labels (with -100 at EOS and final positions), and a block-diagonal causal
-/// attention mask that prevents cross-document attention.
+/// Reads `batch_size * seq_len` tokens starting at `*cursor` and builds
+/// shifted labels (with -100 at EOS and final positions) plus segment /
+/// position / doc-start metadata. The dense block-diagonal causal
+/// attention mask (`batch_size * seq_len * seq_len` f32 — the O(s²) cost)
+/// is built ONLY when `emit_attention_mask` is true; the packed-attention
+/// consumers key off `segment_ids`, and the decomposed fallback derives
+/// the mask on demand (`nsl_packed_mask_from_segment_ids`).
 ///
 /// Returns `None` when not enough tokens remain (epoch end).
 // Safety: caller must ensure `data` points to a valid array of at least `data_len` elements.
@@ -79,6 +92,7 @@ fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pack_batch(
     data: *const c_void,
     data_len: usize,
@@ -87,6 +101,7 @@ pub fn pack_batch(
     batch_size: usize,
     seq_len: usize,
     eos_token: i64,
+    emit_attention_mask: bool,
 ) -> Option<PackedBatch> {
     let total = batch_size * seq_len;
     if *cursor + total > data_len {
@@ -100,9 +115,13 @@ pub fn pack_batch(
     }
     *cursor += total;
 
-    // Build labels and mask per sequence in the batch
+    // Build labels (and, opt-in, the dense mask) per sequence in the batch
     let mut labels = vec![0i64; total];
-    let mut mask = vec![-1e9f32; batch_size * seq_len * seq_len];
+    let mut mask = if emit_attention_mask {
+        vec![-1e9f32; batch_size * seq_len * seq_len]
+    } else {
+        Vec::new()
+    };
     let mut segment_ids: Vec<u16> = Vec::with_capacity(total);
     let mut position_ids: Vec<i32> = Vec::with_capacity(total);
 
@@ -182,13 +201,15 @@ pub fn pack_batch(
             segment_ids.push(*d as u16);
         }
 
-        // Build block-diagonal causal mask for this sequence
+        // Build block-diagonal causal mask for this sequence (opt-in)
         // mask[b][i][j] = 0.0 if doc_id[i] == doc_id[j] AND j <= i (same doc, causal)
-        let mask_offset = b * seq_len * seq_len;
-        for i in 0..seq_len {
-            for j in 0..seq_len {
-                if doc_ids[i] == doc_ids[j] && j <= i {
-                    mask[mask_offset + i * seq_len + j] = 0.0;
+        if emit_attention_mask {
+            let mask_offset = b * seq_len * seq_len;
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    if doc_ids[i] == doc_ids[j] && j <= i {
+                        mask[mask_offset + i * seq_len + j] = 0.0;
+                    }
                 }
             }
         }
@@ -262,10 +283,14 @@ pub fn build_segment_ids_and_doc_starts(doc_lengths: &[u32]) -> (Vec<u16>, Vec<i
 /// Convert a `PackedBatch` into an NslDict with keys:
 /// - `"input_ids"`: tensor of shape `[B, S]`
 /// - `"labels"`: tensor of shape `[B, S]`
-/// - `"attention_mask"`: tensor of shape `[B, S, S]` (packed sequences need block-diagonal masks)
+/// - `"segment_ids"` / `"doc_starts"` / `"position_ids"`: packing metadata
+/// - `"attention_mask"`: tensor of shape `[B, S, S]` — ONLY when the batch
+///   was packed with `emit_attention_mask=true` (Stage-B `forward_masked`
+///   consumers); the packed-attention path keys off `segment_ids`.
 ///
-/// NOTE: Only packed batches include attention_mask. Standard (non-packed) batches
-/// omit it — the model's GQA layer generates causal_mask(seq_len) internally.
+/// NOTE: Only packed batches (opt-in) include attention_mask. Standard
+/// (non-packed) batches omit it — the model's GQA layer generates
+/// causal_mask(seq_len) internally.
 pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     let b = batch.batch_size as i64;
     let s = batch.seq_len as i64;
@@ -286,13 +311,18 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
         unsafe { *lbl_data.add(i) = v as f32 };
     }
 
-    // attention_mask [B, S, S]
-    let mask_ptr = create_tensor_with_shape_rs_dtype(&[b, s, s], 1);
-    let mask_tensor = NslTensor::from_ptr(mask_ptr);
-    let mask_data = mask_tensor.data_f32();
-    for (i, &v) in batch.mask.iter().enumerate() {
-        unsafe { *mask_data.add(i) = v };
-    }
+    // attention_mask [B, S, S] — opt-in (empty mask vec = not requested)
+    let mask_ptr = if batch.mask.is_empty() {
+        0
+    } else {
+        let mask_ptr = create_tensor_with_shape_rs_dtype(&[b, s, s], 1);
+        let mask_tensor = NslTensor::from_ptr(mask_ptr);
+        let mask_data = mask_tensor.data_f32();
+        for (i, &v) in batch.mask.iter().enumerate() {
+            unsafe { *mask_data.add(i) = v };
+        }
+        mask_ptr
+    };
 
     // segment_ids [B, S] — logical dtype is DTYPE_U16_SEGMENT (spec §3.5),
     // but the current tensor helper allocates f32 storage and data_f32()
@@ -345,19 +375,21 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     let dict = nsl_dict_new();
     let k_ids = nsl_str_from_rust("input_ids");
     let k_lbl = nsl_str_from_rust("labels");
-    let k_mask = nsl_str_from_rust("attention_mask");
     let k_seg = nsl_str_from_rust("segment_ids");
     let k_ds = nsl_str_from_rust("doc_starts");
     let k_pos = nsl_str_from_rust("position_ids");
     nsl_dict_set_str(dict, k_ids, ids_ptr);
     nsl_dict_set_str(dict, k_lbl, lbl_ptr);
-    nsl_dict_set_str(dict, k_mask, mask_ptr);
+    if mask_ptr != 0 {
+        let k_mask = nsl_str_from_rust("attention_mask");
+        nsl_dict_set_str(dict, k_mask, mask_ptr);
+        crate::string::nsl_string_free(k_mask);
+    }
     nsl_dict_set_str(dict, k_seg, seg_ptr);
     nsl_dict_set_str(dict, k_ds, ds_ptr);
     nsl_dict_set_str(dict, k_pos, pos_ptr);
     crate::string::nsl_string_free(k_ids);
     crate::string::nsl_string_free(k_lbl);
-    crate::string::nsl_string_free(k_mask);
     crate::string::nsl_string_free(k_seg);
     crate::string::nsl_string_free(k_ds);
     crate::string::nsl_string_free(k_pos);
@@ -453,6 +485,143 @@ pub extern "C" fn nsl_packed_batch_align_device(dict_ptr: i64, param_list_ptr: i
     }
 }
 
+/// FFI: derive the dense packed attention mask from segment ids.
+///
+/// Campaign item 5 (segment metadata over dense masks): the DataLoader no
+/// longer ships the O(b·s²) `attention_mask` by default — the fused packed
+/// attention keys off `segment_ids` end to end, and the DECOMPOSED fallback
+/// chain (the only real dense-mask consumer) calls this at the decline site
+/// instead.
+///
+/// Input: `[b, s]` segment-ids tensor (f32 or f64; CPU or — CUDA builds —
+/// GPU-resident, read back via DtoH). Output: `[b, 1, s, s]` f32 tensor with
+///
+/// ```text
+/// mask[b][0][i][j] = 0.0   iff seg[b,i] == seg[b,j] && j <= i
+///                    -1e9  otherwise
+/// ```
+///
+/// — bit-identical to the mask `pack_batch` builds with
+/// `emit_attention_mask=true` (same `-1e9_f32` constant, same
+/// causal-within-document predicate), already broadcast-shaped over heads
+/// (the old NSL-side `mask.reshape([b, 1, s, s])`).
+///
+/// The mask is built on the host; when `seg_ptr` is GPU-resident the result
+/// is moved to the GPU (`nsl_tensor_to_device`) before returning so the
+/// decomposed `nsl_tensor_add` does not drag a GPU graph back to CPU-f64
+/// (the FASE dtype-abort hazard `nsl_packed_batch_align_device` exists to
+/// prevent — see its doc above).
+///
+/// Refusals are loud (panic): this FFI is compiler-emitted on the packed
+/// attention decline path, so a malformed segment tensor here is a
+/// producer/compiler bug, not user input.
+#[no_mangle]
+pub extern "C" fn nsl_packed_mask_from_segment_ids(seg_ptr: i64) -> i64 {
+    assert!(
+        seg_ptr != 0,
+        "nsl_packed_mask_from_segment_ids: null segment_ids tensor"
+    );
+    let t = NslTensor::from_ptr(seg_ptr);
+    assert!(
+        t.ndim == 2,
+        "nsl_packed_mask_from_segment_ids: segment_ids must be [batch, seq], got ndim={}",
+        t.ndim
+    );
+    assert!(
+        t.is_contiguous(),
+        "nsl_packed_mask_from_segment_ids: segment_ids must be contiguous (stride-blind reads were the #344 failure mode)"
+    );
+    let b = unsafe { *t.shape.add(0) } as usize;
+    let s = unsafe { *t.shape.add(1) } as usize;
+    let n = b * s;
+    let on_gpu = t.device != 0;
+
+    // Read ids back to host f64 (lossless from f32; ids are exact small
+    // integers, so f64 equality below matches pack_batch's u32 equality).
+    let seg_host: Vec<f64> = if on_gpu {
+        #[cfg(feature = "cuda")]
+        {
+            match t.dtype {
+                1 => {
+                    let mut buf = vec![0.0f32; n];
+                    if n > 0 {
+                        crate::cuda::inner::memcpy_dtoh(
+                            buf.as_mut_ptr() as *mut c_void,
+                            t.data as *const c_void,
+                            n * 4,
+                        );
+                    }
+                    buf.iter().map(|&x| x as f64).collect()
+                }
+                0 => {
+                    let mut buf = vec![0.0f64; n];
+                    if n > 0 {
+                        crate::cuda::inner::memcpy_dtoh(
+                            buf.as_mut_ptr() as *mut c_void,
+                            t.data as *const c_void,
+                            n * 8,
+                        );
+                    }
+                    buf
+                }
+                other => panic!(
+                    "nsl_packed_mask_from_segment_ids: unsupported GPU segment_ids dtype {}",
+                    other
+                ),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            panic!(
+                "nsl_packed_mask_from_segment_ids: GPU-resident segment_ids in a non-CUDA build"
+            );
+        }
+    } else {
+        match t.dtype {
+            1 => (0..n).map(|i| unsafe { *t.data_f32().add(i) as f64 }).collect(),
+            0 => (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect(),
+            other => panic!(
+                "nsl_packed_mask_from_segment_ids: unsupported segment_ids dtype {}",
+                other
+            ),
+        }
+    };
+
+    // Host mask [b, 1, s, s] — EXACTLY pack_batch's fill: -1e9 everywhere,
+    // 0.0 iff same segment AND j <= i (causal within document).
+    let mask_ptr =
+        create_tensor_with_shape_rs_dtype(&[b as i64, 1, s as i64, s as i64], 1);
+    let mask_tensor = NslTensor::from_ptr(mask_ptr);
+    let mask_data = mask_tensor.data_f32();
+    for bi in 0..b {
+        let seg_row = &seg_host[bi * s..(bi + 1) * s];
+        let mask_offset = bi * s * s;
+        for i in 0..s {
+            for j in 0..s {
+                let v = if seg_row[i] == seg_row[j] && j <= i {
+                    0.0f32
+                } else {
+                    -1e9f32
+                };
+                unsafe { *mask_data.add(mask_offset + i * s + j) = v };
+            }
+        }
+    }
+
+    if on_gpu {
+        let gpu_ptr = crate::tensor::nsl_tensor_to_device(mask_ptr, 1);
+        assert!(
+            gpu_ptr != 0,
+            "nsl_packed_mask_from_segment_ids: GPU upload of the derived mask failed"
+        );
+        if gpu_ptr != mask_ptr {
+            crate::tensor::nsl_tensor_free(mask_ptr);
+        }
+        return gpu_ptr;
+    }
+    mask_ptr
+}
+
 /// FFI: packing efficiency — ratio of real tokens to total slots.
 ///
 /// For packed sequences, this measures how much padding is wasted.
@@ -506,6 +675,7 @@ mod tests {
             2, // batch_size
             4, // seq_len
             0, // eos_token
+            true, // emit_attention_mask — this test asserts the mask entry no-ops
         )
         .expect("should produce a batch");
         let dict = packed_batch_to_dict(&batch);
@@ -561,6 +731,7 @@ mod tests {
             2,  // batch_size
             4,  // seq_len
             0,  // eos_token
+            false, // emit_attention_mask
         )
         .expect("should produce a batch");
 
@@ -581,7 +752,8 @@ mod tests {
 
     #[test]
     fn test_pack_batch_mask() {
-        // Stream: [1, 2, EOS=0, 3], batch_size=1, seq_len=4
+        // Stream: [1, 2, EOS=0, 3], batch_size=1, seq_len=4.
+        // The dense mask is OPT-IN now — this test requests it.
         let stream: Vec<f64> = vec![1.0, 2.0, 0.0, 3.0];
         let mut cursor: usize = 0;
 
@@ -593,6 +765,7 @@ mod tests {
             1,  // batch_size
             4,  // seq_len
             0,  // eos_token
+            true, // emit_attention_mask
         )
         .expect("should produce a batch");
 
@@ -616,6 +789,108 @@ mod tests {
         assert_eq!(batch.mask[3 * 4 + 3], 0.0);
     }
 
+    /// Campaign item 5: without `emit_attention_mask` the O(s²) mask is
+    /// neither built nor emitted into the batch dict — packed consumers
+    /// key off segment_ids.
+    #[test]
+    fn test_pack_batch_mask_absent_by_default() {
+        let stream: Vec<f64> = vec![1.0, 2.0, 0.0, 3.0];
+        let mut cursor: usize = 0;
+
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            1,  // batch_size
+            4,  // seq_len
+            0,  // eos_token
+            false, // emit_attention_mask — the default DataLoader config
+        )
+        .expect("should produce a batch");
+
+        assert!(
+            batch.mask.is_empty(),
+            "dense mask must not be materialized unless requested"
+        );
+        // Segment metadata is unconditional.
+        assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 1]);
+
+        let dict = packed_batch_to_dict(&batch);
+        let k_mask = nsl_str_from_rust("attention_mask");
+        assert_eq!(
+            crate::dict::nsl_dict_contains(dict, k_mask),
+            0,
+            "attention_mask key must be absent from the default packed dict"
+        );
+        crate::string::nsl_string_free(k_mask);
+        // input_ids / labels / segment_ids / doc_starts / position_ids
+        assert_eq!(nsl_dict_len(dict), 5);
+    }
+
+    /// Campaign item 5: `nsl_packed_mask_from_segment_ids` must reproduce
+    /// the exact mask `pack_batch` builds (same -1e9 constant, same
+    /// j <= i causal-within-doc predicate) — bit-identical f32 compare on
+    /// a 2-row multi-document pattern, shaped [b, 1, s, s].
+    #[test]
+    fn packed_mask_from_segment_ids_matches_pack_batch_mask() {
+        // Two rows with DIFFERENT doc layouts (mirrors the per-row
+        // doc_starts test): row 0 = [10, 11, EOS=2, 20], row 1 =
+        // [30, 31, 32, EOS=2].
+        let stream: Vec<f64> = vec![10.0, 11.0, 2.0, 20.0, 30.0, 31.0, 32.0, 2.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            2, // batch_size
+            4, // seq_len
+            2, // eos_token
+            true, // emit_attention_mask — the reference to compare against
+        )
+        .expect("should produce a batch");
+        assert_eq!(
+            batch.segment_ids,
+            vec![0u16, 0, 0, 1, 0, 0, 0, 0],
+            "segment precondition for the mask comparison"
+        );
+        assert_eq!(batch.mask.len(), 2 * 4 * 4);
+
+        // The dict's segment_ids tensor is the same producer the compiler
+        // hands to the FFI on the decline path.
+        let dict = packed_batch_to_dict(&batch);
+        let k_seg = nsl_str_from_rust("segment_ids");
+        let seg_ptr = crate::dict::nsl_dict_get_str(dict, k_seg);
+        crate::string::nsl_string_free(k_seg);
+        assert_ne!(seg_ptr, 0);
+
+        let derived_ptr = nsl_packed_mask_from_segment_ids(seg_ptr);
+        assert_ne!(derived_ptr, 0);
+        let derived = NslTensor::from_ptr(derived_ptr);
+        assert_eq!(derived.ndim, 4, "derived mask is [b, 1, s, s]");
+        unsafe {
+            assert_eq!(*derived.shape.add(0), 2);
+            assert_eq!(*derived.shape.add(1), 1);
+            assert_eq!(*derived.shape.add(2), 4);
+            assert_eq!(*derived.shape.add(3), 4);
+        }
+        assert_eq!(derived.dtype, 1, "derived mask is f32 like the packer's");
+        let derived_data = derived.data_f32();
+        for (i, &expected) in batch.mask.iter().enumerate() {
+            let got = unsafe { *derived_data.add(i) };
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "derived mask diverges from pack_batch at flat index {} ({} vs {})",
+                i,
+                got,
+                expected
+            );
+        }
+        crate::tensor::nsl_tensor_free(derived_ptr);
+    }
+
     #[test]
     fn test_pack_batch_epoch_end() {
         let stream: Vec<f64> = vec![1.0, 2.0, 3.0];
@@ -629,6 +904,7 @@ mod tests {
             1,  // batch_size
             4,  // seq_len (needs 4 tokens, only 3 available)
             0,
+            false, // emit_attention_mask
         );
 
         assert!(result.is_none());
@@ -648,6 +924,7 @@ mod tests {
             1,
             4,
             0,
+            false, // emit_attention_mask
         )
         .expect("should produce a batch");
 
@@ -672,6 +949,7 @@ mod tests {
             1,           // batch_size
             8,           // seq_len
             2,           // eos_token
+            false,       // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -691,6 +969,7 @@ mod tests {
             1,
             8,
             255,         // EOS token that never appears in the stream
+            false,       // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -713,6 +992,7 @@ mod tests {
             1,
             8,
             2,
+            false, // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -738,6 +1018,7 @@ mod tests {
             1,
             8,
             2,
+            false, // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -759,6 +1040,7 @@ mod tests {
             2,
             4,
             2,
+            false, // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -781,6 +1063,7 @@ mod tests {
             1,               // batch_size
             4,               // seq_len
             2,               // eos_token
+            false,           // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -835,12 +1118,14 @@ mod tests {
             1,  // batch_size
             4,  // seq_len
             0,
+            false, // emit_attention_mask — default: no dense mask entry
         )
         .expect("should produce a batch");
 
         let dict = packed_batch_to_dict(&batch);
-        // input_ids, labels, attention_mask, segment_ids, doc_starts
-        assert_eq!(nsl_dict_len(dict), 6); // + position_ids (RoPE per-doc reset)
+        // input_ids, labels, segment_ids, doc_starts, position_ids
+        // (attention_mask is opt-in and OFF here)
+        assert_eq!(nsl_dict_len(dict), 5);
 
         // Verify input_ids tensor shape
         let k = nsl_str_from_rust("input_ids");
@@ -879,6 +1164,7 @@ mod tests {
             1,                // batch_size — single-row case
             9,                // seq_len
             2,                // eos_token
+            false,            // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -915,8 +1201,8 @@ mod tests {
         let dict = packed_batch_to_dict(&batch);
         assert_eq!(
             nsl_dict_len(dict),
-            6,
-            "expected input_ids/labels/attention_mask/segment_ids/doc_starts/position_ids"
+            5,
+            "expected input_ids/labels/segment_ids/doc_starts/position_ids (mask opt-in OFF)"
         );
 
         let k_ds = nsl_str_from_rust("doc_starts");
@@ -954,6 +1240,7 @@ mod tests {
             1,
             8,
             255, // EOS token not present in stream
+            false, // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
@@ -999,6 +1286,7 @@ mod tests {
             2,         // batch_size — the point of this test
             6,         // seq_len
             2,         // eos_token
+            false,     // emit_attention_mask
         )
         .expect("pack_batch produced a batch");
 
