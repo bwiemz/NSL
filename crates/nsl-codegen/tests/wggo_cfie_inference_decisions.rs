@@ -165,6 +165,7 @@ fn driver_input<'a>(
         cached_analysis: None,
         packing_supported: true,
         memory_budget_bytes: None,
+        packing_stats: None,
     }
 }
 

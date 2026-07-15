@@ -5060,6 +5060,11 @@ impl Compiler<'_> {
                                 analysis_config,
                                 Some(&self.compile_options),
                                 self.features.packing_supported_in_module,
+                                // Campaign item 6: same doc-length stats the
+                                // pre-pass used (resolved in kernel synthesis),
+                                // so an in-place replan prices packing from the
+                                // real distribution too.
+                                self.features.dataset_packing_stats.clone(),
                             ),
                         };
                         if preplan_was_rejected {

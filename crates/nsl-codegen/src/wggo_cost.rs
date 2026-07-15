@@ -33,6 +33,19 @@ pub struct LayerCostEntry {
     pub feasible: bool,
     /// Classification of the dominant matmul — informs sharding decisions.
     pub classification: BoundClassification,
+    /// The O(s²) attention micro-term (μs) **already included** in
+    /// `forward_us`: the softmax cost, which is the only quadratic-in-seq
+    /// component this coarse model prices (the QKᵀ / AV batched matmuls are
+    /// not modeled — see `evaluate_single`). Exposed so that a *document-
+    /// density-derived* packing saving can discount ONLY this share
+    /// (causal-within-document attention work is Σᵢ sᵢ², not s²), leaving the
+    /// QKV/FFN projection cost untouched. `apply_packing`'s legacy flat-
+    /// constant path ignores this field, staying byte-identical.
+    pub attn_quadratic_us: f64,
+    /// Backward-pass counterpart (μs) of [`attn_quadratic_us`], already
+    /// included in `backward_us` (backward attention ≈ 2× forward with the
+    /// same CSHA fusion bonus).
+    pub attn_quadratic_backward_us: f64,
 }
 
 impl LayerCostEntry {
@@ -251,6 +264,14 @@ fn evaluate_single(
     };
     let forward_us = (1.0 - csha_bonus) * (proj_us + ffn_us + norm_us + softmax_us);
 
+    // The O(s²) attention share carried inside `forward_us` (softmax is the
+    // only quadratic-in-seq term the model prices). Captured separately so a
+    // doc-density packing saving can scale *only* this component; it is a
+    // subset of `forward_us`, so subtracting a fraction of it can never drive
+    // the layer latency negative.
+    let attn_quadratic_us = (1.0 - csha_bonus) * softmax_us;
+    let attn_quadratic_backward_us = 2.0 * attn_quadratic_us * (1.0 - csha_bonus * 0.7);
+
     // Adapters add ~rank · d_model · 2 flops per token; tiny compared to main matmuls
     // unless rank is large.
     let adapter_us = (rank as f64) * (bs as f64) * (shape.d_model as f64) * 2.0
@@ -284,6 +305,8 @@ fn evaluate_single(
         smem_bytes,
         feasible,
         classification,
+        attn_quadratic_us,
+        attn_quadratic_backward_us,
     }
 }
 
@@ -549,6 +572,24 @@ mod tests {
     }
 
     #[test]
+    fn fase_deferred_extra_is_f32_accumulator_plus_one_grad() {
+        // 1M elements at bf16 (2 bytes) ⇒ param_bytes = 2_000_000.
+        let param_bytes = 2_000_000u64;
+        let dtype_bytes = 2u64;
+        let elements = param_bytes / dtype_bytes; // 1_000_000
+        // m_partial is ALWAYS f32 (4 bytes/element) regardless of moment bits;
+        // the one live grad is at the model dtype (= param_bytes). No v_partial.
+        let expect = elements * 4 + param_bytes;
+        assert_eq!(
+            fase_deferred_extra_bytes(param_bytes, dtype_bytes),
+            expect
+        );
+        // The accumulator does NOT shrink with moment precision (it holds raw
+        // gradients): the helper takes no m_bits/v_bits argument by design.
+        assert!(fase_deferred_extra_bytes(param_bytes, dtype_bytes) > param_bytes);
+    }
+
+    #[test]
     fn comm_grows_with_shard_and_bytes() {
         let (c2, _) = comm_optim_us(1_000_000, 2, 2, 300.0, h100());
         let (c8, _) = comm_optim_us(1_000_000, 8, 8, 300.0, h100());
@@ -685,6 +726,27 @@ mod tests {
         let e = lut.get(8, 1408, 2, 4).expect("entry exists");
         assert!(e.forward_us > 0.0);
         assert!(e.param_bytes > 0);
+    }
+
+    #[test]
+    fn attn_quadratic_micro_term_is_a_bounded_subset_of_latency() {
+        // Campaign item 6: the O(s²) attention share exposed for the
+        // doc-density packing discount must be positive and never exceed the
+        // latency it is carved out of (so a fractional discount can't drive the
+        // layer cost negative).
+        let lut = build_lut(&nslcoder_shape(), h100(), &LutAxes::default());
+        let e = lut.get(8, 1408, 0, 0).unwrap();
+        assert!(e.attn_quadratic_us > 0.0, "softmax s² term must be priced");
+        assert!(e.attn_quadratic_us <= e.forward_us);
+        assert!(e.attn_quadratic_backward_us > 0.0);
+        assert!(e.attn_quadratic_backward_us <= e.backward_us);
+        // The quadratic share grows with seq² (it IS the softmax cost over
+        // batch·heads × seq·seq): a 2× longer sequence quadruples it.
+        let long = LayerShape { seq: 2048, ..nslcoder_shape() };
+        let el = build_lut(&long, h100(), &LutAxes::default())
+            .get(8, 1408, 0, 0)
+            .unwrap();
+        assert!(el.attn_quadratic_us > e.attn_quadratic_us);
     }
 
     #[test]

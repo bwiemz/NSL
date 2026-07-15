@@ -313,6 +313,16 @@ pub struct LayerIlpConstraints {
     /// mode (0..=3).  Typical defaults: 0.00, 0.15, 0.25, 0.35 — derived
     /// from the fraction of padded tokens in typical batches.
     pub packing_savings: [f64; 4],
+    /// How [`apply_packing`] interprets [`packing_savings`]. `false` (default)
+    /// = the legacy **flat whole-layer** discount `forward_us·(1−s)` from the
+    /// fictional constants — byte-identical to every pre-campaign-item-6 plan.
+    /// `true` = the saving is a *document-density-derived* reduction of the
+    /// O(s²) attention share ONLY, so it is applied to
+    /// [`LayerCostEntry::attn_quadratic_us`] (and its backward twin) rather
+    /// than the whole layer (campaign item 6 / recon §3-§4). Set to `true`
+    /// only by `wggo::default_constraints_for` when a `dataset` block supplies
+    /// real `mean_doc_length` statistics.
+    pub packing_scales_quadratic_only: bool,
     /// CFIE inference decision axes (audit gap G20) — **opt-in, default
     /// `None` = OFF**.  When `Some`, the solver additionally decides
     /// {fusion level, KV layout, per-layer KV precision, speculative
@@ -360,6 +370,7 @@ impl Default for LayerIlpConstraints {
             fase_backward_speedup: 0.10,
             packing_modes_mask: 0b1111,
             packing_savings: [0.00, 0.15, 0.25, 0.35],
+            packing_scales_quadratic_only: false,
             cfie_infer: None,
             cpkd: None,
         }
@@ -505,6 +516,7 @@ pub fn solve_layer_cpkd(
                                         adj_fase,
                                         pack,
                                         &constraints.packing_savings,
+                                        constraints.packing_scales_quadratic_only,
                                     );
                                     if entry.smem_bytes > constraints.smem_budget {
                                         continue;
@@ -708,7 +720,12 @@ pub fn recost_decision_cpkd(
         return f64::INFINITY;
     }
     let adj = apply_fase(base, d.fase_fused, c.fase_backward_speedup);
-    let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
+    let entry = apply_packing(
+        adj,
+        d.packing_mode,
+        &c.packing_savings,
+        c.packing_scales_quadratic_only,
+    );
     // Mirror `solve_layer`'s objective exactly so a re-cost after conflict
     // resolution is comparable: forward+backward + adapter-comm + optimizer.
     let mut cost = entry.total_us()
@@ -954,6 +971,7 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
         && a.allow_fase == b.allow_fase
         && a.fase_backward_speedup.to_bits() == b.fase_backward_speedup.to_bits()
         && a.packing_modes_mask == b.packing_modes_mask
+        && a.packing_scales_quadratic_only == b.packing_scales_quadratic_only
         && a.packing_savings
             .iter()
             .zip(b.packing_savings.iter())
@@ -1084,6 +1102,7 @@ pub fn solve_layer_greedy_cpkd(
         apply_fase(base, fase_fused, constraints.fase_backward_speedup),
         packing_mode,
         &constraints.packing_savings,
+        constraints.packing_scales_quadratic_only,
     );
     let memory_bytes = ilp_resident_bytes(
         &entry,
@@ -1613,18 +1632,47 @@ fn enumerate_packing_modes(c: &LayerIlpConstraints) -> Vec<u8> {
 }
 
 /// Apply the PCA packing-mode's effective work reduction to an entry.
-/// Packing skips padded tokens, so forward + backward compute both shrink
-/// by the same fraction.  Memory and SMEM are unaffected.
-fn apply_packing(base: LayerCostEntry, mode: u8, savings: &[f64; 4]) -> LayerCostEntry {
+/// Packing skips padded / cross-document tokens, so forward + backward compute
+/// both shrink. Memory and SMEM are unaffected.
+///
+/// Two discount semantics, selected by `quadratic_only`
+/// ([`LayerIlpConstraints::packing_scales_quadratic_only`]):
+///   * `false` — legacy **flat whole-layer** discount `latency·(1−s)` from the
+///     fictional `[0, 0.15, 0.25, 0.35]` constants. Preserved bit-for-bit for
+///     every build whose `dataset` block carries no doc-length statistics.
+///   * `true` — the saving is a *document-density-derived* reduction of the
+///     O(s²) attention share only, so it scales `attn_quadratic_us` (and its
+///     backward twin) and leaves the QKV/FFN projection cost alone. This is the
+///     physically-honest form: causal-within-document attention work is
+///     Σᵢ sᵢ², not s², so denser packing shrinks exactly the quadratic term.
+fn apply_packing(
+    base: LayerCostEntry,
+    mode: u8,
+    savings: &[f64; 4],
+    quadratic_only: bool,
+) -> LayerCostEntry {
     let s = savings.get(mode as usize).copied().unwrap_or(0.0).clamp(0.0, 0.95);
+    let (forward_us, backward_us) = if quadratic_only {
+        // Subtract the saving from the quadratic share only. `attn_quadratic_*`
+        // is a subset of the corresponding latency, so this can never go
+        // negative; a saturating_sub-style max(0.0) guards rounding anyway.
+        (
+            (base.forward_us - base.attn_quadratic_us * s).max(0.0),
+            (base.backward_us - base.attn_quadratic_backward_us * s).max(0.0),
+        )
+    } else {
+        (base.forward_us * (1.0 - s), base.backward_us * (1.0 - s))
+    };
     LayerCostEntry {
-        forward_us: base.forward_us * (1.0 - s),
-        backward_us: base.backward_us * (1.0 - s),
+        forward_us,
+        backward_us,
         param_bytes: base.param_bytes,
         activation_bytes: base.activation_bytes,
         smem_bytes: base.smem_bytes,
         feasible: base.feasible,
         classification: base.classification,
+        attn_quadratic_us: base.attn_quadratic_us,
+        attn_quadratic_backward_us: base.attn_quadratic_backward_us,
     }
 }
 
@@ -1651,6 +1699,13 @@ fn apply_fase(base: LayerCostEntry, fase_fused: bool, speedup: f64) -> LayerCost
         smem_bytes: base.smem_bytes,
         feasible: base.feasible,
         classification: base.classification,
+        // FASE trims backward *latency* by `speedup`; it does not change the
+        // attention quadratic's share, so the micro-terms pass through
+        // unscaled (the forward one is unchanged; the backward one keeps the
+        // pre-speedup magnitude — a slight over-estimate the packing discount
+        // then shrinks, which is the safe direction).
+        attn_quadratic_us: base.attn_quadratic_us,
+        attn_quadratic_backward_us: base.attn_quadratic_backward_us,
     }
 }
 
@@ -1881,6 +1936,7 @@ mod tests {
             apply_fase(base, d.fase_fused, c.fase_backward_speedup),
             d.packing_mode,
             &c.packing_savings,
+            c.packing_scales_quadratic_only,
         );
         let expect =
             ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits, d.fase_fused, c.budget_informed);
@@ -1902,6 +1958,7 @@ mod tests {
             apply_fase(base, d.fase_fused, c.fase_backward_speedup),
             d.packing_mode,
             &c.packing_savings,
+            c.packing_scales_quadratic_only,
         );
         let expect =
             ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits, d.fase_fused, c.budget_informed);
@@ -2368,6 +2425,33 @@ mod tests {
             },
         );
         assert!(with_pack.cost_us < without_pack.cost_us);
+    }
+
+    #[test]
+    fn apply_packing_quadratic_only_scales_only_the_attention_share() {
+        // Campaign item 6: with `quadratic_only = true` the saving must reduce
+        // ONLY `attn_quadratic_us` (and its backward twin), leaving the
+        // QKV/FFN projection cost untouched; the legacy whole-layer branch
+        // scales everything. Both branches must agree only in the degenerate
+        // case where the whole layer IS the quadratic term (never true here).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let base = lut.get(8, 2048, 0, 0).unwrap();
+        let savings = [0.0, 0.5, 0.0, 0.0];
+
+        let quad = apply_packing(base, 1, &savings, true);
+        let whole = apply_packing(base, 1, &savings, false);
+
+        // Quadratic-only: exactly the quadratic share is removed.
+        assert!((quad.forward_us - (base.forward_us - base.attn_quadratic_us * 0.5)).abs() < 1e-9);
+        assert!(
+            (quad.backward_us - (base.backward_us - base.attn_quadratic_backward_us * 0.5)).abs()
+                < 1e-9
+        );
+        // Whole-layer removes far more (the projections dominate the layer).
+        assert!(whole.forward_us < quad.forward_us);
+        // Neither branch can go negative and both preserve the micro-terms.
+        assert!(quad.forward_us > 0.0 && whole.forward_us >= 0.0);
+        assert_eq!(quad.attn_quadratic_us, base.attn_quadratic_us);
     }
 
     #[test]

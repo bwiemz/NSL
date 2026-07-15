@@ -56,6 +56,63 @@ fn build_help_documents_devices_flag() {
 }
 
 #[test]
+fn build_help_documents_memory_budget_flag() {
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.arg("build").arg("--help");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--wggo-memory-budget"));
+}
+
+#[test]
+fn build_rejects_zero_memory_budget() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    fs::write(&src_path, SRC).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg(&src_path)
+        .arg("--source-ad")
+        .arg("--wggo")
+        .arg("full")
+        .arg("--wggo-memory-budget")
+        .arg("0");
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "--wggo-memory-budget must be > 0 MiB",
+    ));
+}
+
+#[test]
+fn build_accepts_generous_memory_budget_and_runs_wggo() {
+    // A generous budget (64 GiB) fits the tiny fixture: the WGGO pass runs to
+    // completion (report renders) and the implied --wggo-moment-precision does
+    // not derail the build. A too-small budget would hard-fail instead.
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    let out_path = tmp.path().join("t_out");
+    fs::write(&src_path, SRC).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg(&src_path)
+        .arg("--source-ad")
+        .arg("--emit-obj")
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--wggo")
+        .arg("full")
+        .arg("--wggo-report")
+        .arg("--wggo-memory-budget")
+        .arg("65536");
+    cmd.assert().success().stderr(predicate::str::contains(
+        "=== WGGO Global Optimization Report ===",
+    ));
+}
+
+#[test]
 fn build_accepts_devices_flag_and_runs_wggo() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("t.nsl");
