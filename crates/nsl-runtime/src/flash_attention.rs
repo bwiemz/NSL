@@ -535,72 +535,6 @@ fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
     Box::into_raw(t) as i64
 }
 
-/// GQA→MHA expansion for the GPU flash backward (scaling campaign item 1).
-///
-/// The phase-1/phase-2 backward kernels index K/V by the fused `b*h` block
-/// id, i.e. they are MHA-only. For GQA inputs this materializes
-/// K/V `[b, kv_h, s, d]` → `[b, h, s, d]` on-device with the same
-/// consecutive-block head mapping the CPU reference uses
-/// (`kv_h_idx = h_idx / gqa_groups` in `flash_attention_backward_cpu_gqa`):
-/// destination head `kv*g + gi` copies source head `kv`. Pure DtoD copies —
-/// `b·h` block copies of `s·d·4` bytes, no new kernels, no host transfer.
-///
-/// Returns an owned GPU `NslTensor*` `[b, h, s, d]`; caller frees.
-#[cfg(feature = "cuda")]
-fn expand_kv_heads_device(
-    kv_ptr: i64, b: usize, kv_h: usize, groups: usize, s: usize, d: usize,
-) -> i64 {
-    let src = NslTensor::from_ptr(kv_ptr);
-    let h = kv_h * groups;
-    let total = b * h * s * d;
-    let buf = crate::cuda::inner::alloc_managed(total * 4);
-    let block_bytes = s * d * 4;
-    for bi in 0..b {
-        for kvi in 0..kv_h {
-            let src_off = (bi * kv_h + kvi) * block_bytes;
-            for gi in 0..groups {
-                let dst_off = (bi * h + kvi * groups + gi) * block_bytes;
-                crate::cuda::inner::memcpy_dtod(
-                    unsafe { (buf as *mut u8).add(dst_off) } as *mut c_void,
-                    unsafe { (src.data as *const u8).add(src_off) } as *const c_void,
-                    block_bytes,
-                );
-            }
-        }
-    }
-    make_gpu_tensor(buf, &[b as i64, h as i64, s as i64, d as i64], total)
-}
-
-/// Reduce expanded-head dK/dV back to KV heads in the backward result list.
-///
-/// The adjoint of the head expansion above is the group-sum
-/// (`ReduceToShape` over the broadcast axis — the same rule stdlib GQA's
-/// decomposed path uses for its `expand` backward), so
-/// `dK[b, kv] = Σ_g dK_exp[b, kv*g + gi]`. Implemented with public FFIs:
-/// reshape `[b,h,s,d]` → `[b,kv,g,s,d]` (zero-copy view of a contiguous
-/// tensor) then `nsl_tensor_sum_dim(dim=2)` on the GPU. Replaces list slots
-/// 1 (dK) and 2 (dV) in place; dQ (slot 0) is untouched.
-#[cfg(feature = "cuda")]
-fn reduce_expanded_kv_grads(
-    list: i64, b: usize, kv_h: usize, groups: usize, s: usize, d: usize,
-) {
-    use crate::tensor::shape_ops::nsl_tensor_reshape;
-    use crate::tensor::reduction::nsl_tensor_sum_dim;
-    for idx in [1i64, 2i64] {
-        let exp_t = crate::list::nsl_list_get(list, idx); // borrow
-        let dims = crate::list::nsl_list_new();
-        for v in [b as i64, kv_h as i64, groups as i64, s as i64, d as i64] {
-            crate::list::nsl_list_push(dims, v);
-        }
-        let view5 = nsl_tensor_reshape(exp_t, dims);
-        crate::list::nsl_list_free(dims);
-        let reduced = nsl_tensor_sum_dim(view5, 2, 0); // [b, kv_h, s, d]
-        crate::tensor::nsl_tensor_free(view5);
-        crate::tensor::nsl_tensor_free(exp_t);
-        crate::list::nsl_list_set(list, idx, reduced);
-    }
-}
-
 /// PCA Stage C: plain fused (decorator-free) SDPA forward with optional
 /// segment masking for packed-sequence batches.
 ///
@@ -5972,54 +5906,65 @@ pub extern "C" fn nsl_flash_attention_backward(
             );
         }
 
-        // GQA GPU envelope (scaling campaign item 1): the phase-1/phase-2
-        // kernels are MHA-only, but a GQA input can be served exactly by
-        // expanding K/V to full heads on-device, running the MHA kernels,
-        // and group-summing dK/dV back (the ReduceToShape adjoint of the
-        // expansion). NSL_FLASH_GQA_BWD_CPU=1 restores the old CPU-reference
-        // routing for this case only (NSL_FLASH_BWD_CPU=1 still forces CPU
-        // for everything).
-        let gqa_groups_env = kv_h > 0 && h % kv_h == 0 && kv_h != h;
-        let force_gqa_cpu =
-            std::env::var("NSL_FLASH_GQA_BWD_CPU").ok().as_deref() == Some("1");
-        let gqa_expandable = gqa_groups_env && !force_gqa_cpu;
-
         if flash_debug && dout_t.device > 0 && !force_cpu_bwd {
             if phase1_ptx_ptr == 0 {
                 eprintln!(
                     "[flash-bwd] no backward PTX provided (phase1_ptx=0) — CPU reference \
                      backward (batch={b}, heads={h}, seq={s}, head_dim={d})"
                 );
-            } else if kv_h != h && !gqa_groups_env {
+            } else if kv_h != h {
                 eprintln!(
-                    "[flash-bwd] irregular GQA layout (kv_heads={kv_h} does not divide \
-                     heads={h}) — CPU reference backward"
-                );
-            } else if kv_h != h && force_gqa_cpu {
-                eprintln!(
-                    "[flash-bwd] NSL_FLASH_GQA_BWD_CPU=1 — GQA expand-KV GPU backward \
-                     disabled; CPU reference backward"
+                    "[flash-bwd] GQA layout (kv_heads={kv_h} != heads={h}) — the classic \
+                     GPU backward kernel is MHA-only; CPU reference backward"
                 );
             }
         }
 
-        // PCA Stage C stride guard, reworked (scaling campaign item 1): the
-        // GPU phase-1/phase-2 kernels read raw device pointers stride-blind,
-        // so a non-contiguous VIEW input (e.g. reshape(..).transpose(1,2)
-        // products — dout arrives that way on EVERY decorator-free
-        // attention backward) would yield smoothly-wrong gradients, not an
-        // error. The original guard routed such inputs to the stride-aware
-        // CPU reference — which silently put the ENTIRE flash backward on
-        // the host for every packed/decorator-free training step (nsys:
-        // ~50% of process CPU time in flash_attention_backward_cpu_gqa at
-        // the 16M base config). Materialize a canonical device-side copy
-        // instead (one strided-copy kernel per non-canonical input) and
-        // keep the backward on the GPU. NSL_FLASH_BWD_CPU=1 still forces
-        // the CPU reference wholesale.
+        // PCA Stage C stride guard: the GPU phase-1/phase-2 kernels read
+        // raw device pointers stride-blind, so a non-contiguous VIEW input
+        // (e.g. reshape(..).transpose(1,2) products) would yield
+        // smoothly-wrong gradients (~1e-4 scale), not an error — found by
+        // the packed-vs-decomposed parity bisection. Require canonical
+        // row-major on all five inputs; otherwise take the stride-aware
+        // CPU reference below.
+        let noncanonical_input: Option<&'static str> = {
+            let q_t = NslTensor::from_ptr(q_ptr);
+            let v_t = NslTensor::from_ptr(v_ptr);
+            let out_t = NslTensor::from_ptr(out_ptr);
+            if !is_canonical_row_major(dout_t) {
+                Some("dout")
+            } else if !is_canonical_row_major(q_t) {
+                Some("q")
+            } else if !is_canonical_row_major(k_t) {
+                Some("k")
+            } else if !is_canonical_row_major(v_t) {
+                Some("v")
+            } else if !is_canonical_row_major(out_t) {
+                Some("out")
+            } else {
+                None
+            }
+        };
+        if let Some(name) = noncanonical_input {
+            // Warn only when the GPU path would otherwise have dispatched —
+            // silent CPU-only configs stay silent.
+            if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h && !force_cpu_bwd {
+                flash_bwd_warn_once(&format!(
+                    "[flash-bwd] input `{name}` is a non-contiguous view — the \
+                     stride-blind GPU backward kernels would compute smoothly-wrong \
+                     gradients; using the stride-aware CPU reference backward \
+                     (correct but slow) (batch={b}, heads={h}, seq={s}, \
+                     head_dim={d}). Materialize .contiguous() inputs to train \
+                     this shape on GPU."
+                ));
+            }
+        }
+
         if dout_t.device > 0
             && phase1_ptx_ptr != 0
-            && (kv_h == h || gqa_expandable)
+            && kv_h == h
             && !force_cpu_bwd
+            && noncanonical_input.is_none()
         {
             // Budget-aware backward tile sizes. Must match the sizes codegen used to
             // synthesize the Phase-2 PTX; both sides derive them from head_dim via
@@ -6027,75 +5972,20 @@ pub extern "C" fn nsl_flash_attention_backward(
             // nsl-codegen; this is the runtime mirror — kept identical by
             // `select_backward_blocks_matches_codegen` in the codegen tests).
             let (block_q, block_kv) = select_backward_blocks(head_dim);
-
-            // Canonical-row-major materialization for the stride-blind
-            // kernels: any view input gets one device-side strided-copy.
-            // Temps collected for freeing after the (synchronizing) launch.
-            let mut canon_temps: Vec<i64> = Vec::new();
-            let mut canon = |ptr: i64, name: &str, temps: &mut Vec<i64>| -> i64 {
-                let t = NslTensor::from_ptr(ptr);
-                if is_canonical_row_major(t) {
-                    return ptr;
-                }
-                if flash_debug {
-                    eprintln!(
-                        "[flash-bwd] input `{name}` is a non-contiguous view — \
-                         materializing a canonical device copy for the \
-                         stride-blind GPU backward kernels"
-                    );
-                }
-                let c = crate::tensor::nsl_tensor_contiguous(ptr);
-                temps.push(c);
-                c
-            };
-            let dout_use = canon(dout_ptr, "dout", &mut canon_temps);
-            let q_use = canon(q_ptr, "q", &mut canon_temps);
-            let k_canon = canon(k_ptr, "k", &mut canon_temps);
-            let v_canon = canon(v_ptr, "v", &mut canon_temps);
-            let out_use = canon(out_ptr, "out", &mut canon_temps);
-
-            // GQA: expand K/V to full heads so the MHA kernels apply; the
-            // group-sum after the launch is the exact expansion adjoint.
-            let groups = if kv_h > 0 { h / kv_h } else { 1 };
-            let (k_use, v_use, k_exp_t, v_exp_t) = if kv_h != h {
-                let ke = expand_kv_heads_device(k_canon, b, kv_h, groups, s, d);
-                let ve = expand_kv_heads_device(v_canon, b, kv_h, groups, s, d);
-                (ke, ve, ke, ve)
-            } else {
-                (k_canon, v_canon, 0i64, 0i64)
-            };
-
             let gpu_result = flash_attention_backward_gpu(
-                dout_use, q_use, k_use, v_use, out_use, logsumexp_ptr,
+                dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
                 scale, b, h, s, d, is_causal,
                 block_q, block_kv,
                 phase1_ptx_ptr, phase1_name_ptr,
                 phase2_ptx_ptr, phase2_name_ptr,
                 segment_ids_ptr,
             );
-
-            // The launcher synchronized before returning on every path, so
-            // the expanded/materialized copies are dead now regardless of
-            // outcome.
-            if k_exp_t != 0 {
-                crate::tensor::nsl_tensor_free(k_exp_t);
-            }
-            if v_exp_t != 0 {
-                crate::tensor::nsl_tensor_free(v_exp_t);
-            }
-            for t in canon_temps {
-                crate::tensor::nsl_tensor_free(t);
-            }
-
             if gpu_result != 0 {
-                if kv_h != h {
-                    reduce_expanded_kv_grads(gpu_result, b, kv_h, groups, s, d);
-                }
                 if flash_debug {
                     eprintln!(
                         "[flash-bwd] GPU backward dispatched \
-                         (batch={b}, heads={h}, kv_heads={kv_h}, seq={s}, head_dim={d}, \
-                         causal={is_causal}, blocks=({block_q},{block_kv}))"
+                         (batch={b}, heads={h}, seq={s}, head_dim={d}, causal={is_causal}, \
+                         blocks=({block_q},{block_kv}))"
                     );
                 }
                 return gpu_result;

@@ -682,28 +682,6 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "F")]
         pub(crate) wggo_prune_fraction: Option<f64>,
 
-        /// WGGO: per-device resident training-memory budget in MiB. When
-        /// set, the planner enforces the cap at both optimization levels
-        /// (inter-layer DP + per-layer ILP) and, under budget pressure,
-        /// organically lowers Adam-moment precision to fit — implies
-        /// --wggo-moment-precision (fp16 moments via the #369 GPU cast
-        /// envelope are the shipped mechanism). Rejected if 0 or
-        /// unparseable. A plan that cannot fit even with 16-bit moments is
-        /// a hard compile error.
-        #[arg(long, value_name = "MIB")]
-        pub(crate) wggo_memory_budget: Option<u64>,
-
-        /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
-        /// Adam/momentum state (m/v) HOST-resident and stage it to the device
-        /// for each optimizer step, freeing 1-2x parameter bytes of VRAM. The
-        /// update math still runs on the GPU in f32, so FASE == AdamW
-        /// exactness is preserved; the cost is one HtoD+DtoH round-trip of the
-        /// state per step. Mutually exclusive with reduced-precision moments
-        /// (--wggo-moment-precision / --wggo-memory-budget): the requant
-        /// copy-back cannot cross devices — passing both is a hard error.
-        #[arg(long)]
-        pub(crate) optim_state_offload: bool,
-
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -998,28 +976,6 @@ pub(crate) struct RunArgs {
         /// Clamped to [0.0, 0.9]; default 0.25.
         #[arg(long, value_name = "F")]
         pub(crate) wggo_prune_fraction: Option<f64>,
-
-        /// WGGO: per-device resident training-memory budget in MiB. When
-        /// set, the planner enforces the cap at both optimization levels
-        /// (inter-layer DP + per-layer ILP) and, under budget pressure,
-        /// organically lowers Adam-moment precision to fit — implies
-        /// --wggo-moment-precision (fp16 moments via the #369 GPU cast
-        /// envelope are the shipped mechanism). Rejected if 0 or
-        /// unparseable. A plan that cannot fit even with 16-bit moments is
-        /// a hard compile error.
-        #[arg(long, value_name = "MIB")]
-        pub(crate) wggo_memory_budget: Option<u64>,
-
-        /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
-        /// Adam/momentum state (m/v) HOST-resident and stage it to the device
-        /// for each optimizer step, freeing 1-2x parameter bytes of VRAM. The
-        /// update math still runs on the GPU in f32, so FASE == AdamW
-        /// exactness is preserved; the cost is one HtoD+DtoH round-trip of the
-        /// state per step. Mutually exclusive with reduced-precision moments
-        /// (--wggo-moment-precision / --wggo-memory-budget): the requant
-        /// copy-back cannot cross devices — passing both is a hard error.
-        #[arg(long)]
-        pub(crate) optim_state_offload: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

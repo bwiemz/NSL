@@ -1901,16 +1901,13 @@ fn lower_single_op(
         }
         PrimalOp::ScaledDotProductAttentionPacked => {
             // PCA Stage C: packed-sequence attention.
-            //   inputs: [q, k, v, scale, segment_ids]
+            //   inputs: [q, k, v, scale, mask, segment_ids]
             // Fused path: segment-masked v2 flash kernel (causal-within-doc
             // derived from segment_ids in-kernel; saves LSE for backward;
             // Tier-B tile-skip variant when the runtime gate admits it).
-            // Decline path: the Stage-B decomposed additive-mask chain,
-            // with the dense [b,1,s,s] mask DERIVED from segment_ids at
-            // the decline site (`nsl_packed_mask_from_segment_ids` — the
-            // DataLoader no longer ships it) — numerically identical
-            // because exp((s - 1e9) - lse) underflows to +0.0 (see the
-            // PrimalOp contract).
+            // Decline path: the Stage-B decomposed additive-mask chain —
+            // numerically identical because exp((s - 1e9) - lse)
+            // underflows to +0.0 (see the PrimalOp contract).
             //
             // No CSHA-claim consultation here: claims target the plain
             // `ScaledDotProductAttention` op only, and the CSHA fused
@@ -1918,7 +1915,8 @@ fn lower_single_op(
             let q = inputs[0];
             let k = inputs[1];
             let v = inputs[2];
-            let seg = inputs[4];
+            let mask = inputs[4];
+            let seg = inputs[5];
 
             let scale_ty = op
                 .inputs
@@ -1943,10 +1941,7 @@ fn lower_single_op(
                 compiler, builder, q, k, v, scale_bits, true, Some(seg),
             )?;
 
-            // Decomposed fallback: softmax((Q @ K.T) * scale + mask) @ V,
-            // where mask is DERIVED from segment_ids here (this code only
-            // runs on decline, so the O(s²) materialization is paid only
-            // when the fused kernel does not).
+            // Decomposed fallback: softmax((Q @ K.T) * scale + mask) @ V.
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let k_t = call(
@@ -1965,15 +1960,8 @@ fn lower_single_op(
                 &[scores, scale_item, flags0_mulsc],
             )?;
             // masked = scaled + mask (additive [b,1,s,s] broadcast over
-            // heads; REPLACES causal — the derived mask encodes
-            // within-doc causality; GPU-resident when seg is, so the add
-            // cannot drag a GPU graph to CPU).
-            let mask = call(
-                compiler,
-                builder,
-                "nsl_packed_mask_from_segment_ids",
-                &[seg],
-            )?;
+            // heads; REPLACES causal — the packed mask already encodes
+            // within-doc causality).
             let flags0_add = builder.ins().iconst(cl_types::I8, 0);
             let masked = call(compiler, builder, "nsl_tensor_add", &[scaled, mask, flags0_add])?;
             let attn = call(compiler, builder, "nsl_tensor_softmax", &[masked, dim_m1])?;
@@ -1982,7 +1970,6 @@ fn lower_single_op(
             free_tensor_value(compiler, builder, k_t)?;
             free_tensor_value(compiler, builder, scores)?;
             free_tensor_value(compiler, builder, scaled)?;
-            free_tensor_value(compiler, builder, mask)?;
             free_tensor_value(compiler, builder, masked)?;
             free_tensor_value(compiler, builder, attn)?;
 

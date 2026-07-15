@@ -3692,10 +3692,10 @@ impl<'a> WengertExtractor<'a> {
                     // PrimalOp doc for the mask ≡ causal-within-segment
                     // contract.
                     "scaled_dot_product_attention_packed" => {
-                        if input_vars.len() < 5 {
+                        if input_vars.len() < 6 {
                             eprintln!(
                                 "[source-ad] scaled_dot_product_attention_packed \
-                                 requires 5 args (q, k, v, scale, segment_ids)"
+                                 requires 6 args (q, k, v, scale, mask, segment_ids)"
                             );
                             return None;
                         }

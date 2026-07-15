@@ -461,47 +461,6 @@ pub extern "C" fn nsl_embedding_backward(
     let idx_c = nsl_tensor_contiguous(indices_ptr);
     let weight_c = nsl_tensor_contiguous(weight_ptr);
     let out_device = NslTensor::from_ptr(grad_c).device;
-
-    // GPU fast path (scaling campaign item 1): device-side scatter-add
-    // kernel. The old unconditional host path moved the gradient, the
-    // indices, AND the full [vocab, embed] weight across PCIe every
-    // micro-batch (~400 MB round-trip at 32k-vocab/d1536), then ran a
-    // single-thread scatter loop. Weight data is never read by the
-    // backward — only its shape — so the GPU path reads shape metadata
-    // (host-resident) and touches no weight bytes. f32 atomics make the
-    // per-row sum order nondeterministic; NSL_EMBEDDING_BWD_CPU=1
-    // restores the deterministic host scatter for bisections/M46 audits.
-    #[cfg(feature = "cuda")]
-    {
-        let grad_t = NslTensor::from_ptr(grad_c);
-        let idx_t = NslTensor::from_ptr(idx_c);
-        let weight_t = NslTensor::from_ptr(weight_c);
-        static FORCE_CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_cpu = *FORCE_CPU.get_or_init(|| {
-            std::env::var("NSL_EMBEDDING_BWD_CPU").ok().as_deref() == Some("1")
-        });
-        if !force_cpu
-            && grad_t.device > 0
-            && idx_t.device == grad_t.device
-            && grad_t.dtype == 1
-            && weight_t.ndim >= 2
-        {
-            let vocab_size = unsafe { *weight_t.shape } as u64;
-            let embed_dim = unsafe { *weight_t.shape.add(1) } as u64;
-            let seq_len = idx_t.len as u64;
-            let gpu_out = crate::cuda::gpu_embedding_backward(
-                grad_c, idx_c, vocab_size, embed_dim, seq_len,
-            );
-            if gpu_out != 0 {
-                nsl_tensor_free(grad_c);
-                nsl_tensor_free(idx_c);
-                nsl_tensor_free(weight_c);
-                return gpu_out;
-            }
-            // Unsupported index dtype: fall through to the host scatter.
-        }
-    }
-
     let (grad_cpu, grad_needs_free) = if NslTensor::from_ptr(grad_c).device > 0 {
         (nsl_tensor_to_device(grad_c, 0), true)
     } else {

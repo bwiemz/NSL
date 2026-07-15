@@ -18,8 +18,7 @@
 #
 #   DataLoader(data, labels=none, batch_size=32, seq_len=128, shuffle=false,
 #              num_workers=1, prefetch=2, packing=false,
-#              pack_separator=0, drop_last=true,
-#              emit_attention_mask=false) -> DataLoader
+#              pack_separator=0, drop_last=true) -> DataLoader
 #       Create a multi-threaded data loader with batching.
 #       Iterate with: for batch in loader:
 #       Each batch is a Dict with keys:
@@ -28,17 +27,8 @@
 #       If `labels` is provided, those labels are used verbatim.
 #       `labels` must be a tensor with the same number of elements as `data`.
 #       Omit it or pass `labels=none` to use shifted labels instead.
-#       `packing=true` builds packed batches with compact segment metadata:
-#           "segment_ids"    [B, S] per-token document ids
-#           "position_ids"   [B, S] per-token position within its document
-#           "doc_starts"     [B, 257] per-row document start table
-#       Packed attention (GQA forward_packed) keys off segment_ids on both
-#       the fused and fallback paths — no dense mask is emitted by default.
-#       `emit_attention_mask=true` (packing only) ALSO emits the dense
-#       [B, S, S] additive block-diagonal "attention_mask" (0 attend /
-#       -1e9 blocked) for models that consume an explicit mask (e.g. GQA
-#       forward_masked). Costs B*S*S*4 bytes per batch — opt in only when
-#       the model actually reads batch["attention_mask"].
+#       `packing=true` builds packed batches with block-diagonal attention masks.
+#       The model's attention layer must read batch["attention_mask"] if present.
 #       `drop_last=false` includes a partial tail batch padded with zeros
 #       (labels padded with -100 so padding doesn't contribute to loss).
 #       `pin_memory=true` is accepted but currently a no-op.

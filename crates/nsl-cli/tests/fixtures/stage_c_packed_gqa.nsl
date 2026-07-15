@@ -4,16 +4,12 @@
 # fused segment-masked flash kernel is ELIGIBLE on GPU:
 #   - head_dim = 32 (in the fused variant table {32, 64, 128}),
 #   - seq_len = 64 (divisible by every candidate tile size),
-#   - DataLoader(packing=true, emit_attention_mask=true) provides
-#     segment_ids + position_ids (per-document RoPE positions) AND the
-#     opt-in dense attention_mask. forward_packed no longer takes the mask
-#     (segment-metadata campaign item) — the fixture still plumbs it so the
-#     harness's forward_masked rewrite (the Stage-B oracle) has it in
-#     scope; in the packed form it is a dead parameter.
+#   - DataLoader(packing=true) provides attention_mask + segment_ids +
+#     position_ids (per-document RoPE positions).
 #
 # The attention call is `forward_packed` (Stage C, with per-document RoPE
 # position reset). The parity harness rewrites markers by exact string match:
-#   - "forward_packed(rmsnorm(h, self.norm_a, 0.00001), seg, pos, training)"
+#   - "forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, pos, training)"
 #     -> the forward_masked form, for the CPU packed==masked differential;
 #   - "batch.position_ids  # POSITION_SOURCE" -> a continuous-position
 #     expression, so the differential compares like-for-like (forward_masked
@@ -33,9 +29,7 @@ model Blk:
     w_down: Tensor = randn([128, 64]) * 0.15
 
     fn forward(self, h: Tensor, mask: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
-        # `mask` is unused in the packed form (masking derives from seg);
-        # kept in the signature for the harness's forward_masked rewrite.
-        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), seg, pos, training)
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, pos, training)
         let h1 = h + a
         let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
         return h1 + f
@@ -65,7 +59,7 @@ let m = PackedLM()
 # documents; the block-diagonal mask and segment ids have real structure.
 let unit = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
 let tokens = unit.reshape([1, 8]).expand([256, 8]).contiguous().reshape([2048])
-let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true, packing=true, pack_separator=0, emit_attention_mask=true)
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true, packing=true, pack_separator=0)
 
 print("LOSS_STREAM_BEGIN")
 

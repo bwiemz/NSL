@@ -71,40 +71,6 @@ fn run_wggo_prune_fraction_out_of_range_rejected() {
 }
 
 #[test]
-fn run_wggo_memory_budget_zero_rejected() {
-    // 0 MiB is meaningless — reject loudly rather than silently disabling
-    // the budget driver.
-    let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", stdlib_path());
-    cmd.arg("run")
-        .arg(fp16_fixture())
-        .arg("--source-ad")
-        .arg("--wggo")
-        .arg("full")
-        .arg("--wggo-memory-budget")
-        .arg("0");
-    cmd.assert().failure().stderr(predicate::str::contains(
-        "--wggo-memory-budget must be > 0 MiB",
-    ));
-}
-
-#[test]
-fn run_wggo_memory_budget_unparseable_rejected() {
-    // A non-numeric value is rejected by clap's u64 parse before our
-    // validation runs.
-    let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", stdlib_path());
-    cmd.arg("run")
-        .arg(fp16_fixture())
-        .arg("--source-ad")
-        .arg("--wggo")
-        .arg("full")
-        .arg("--wggo-memory-budget")
-        .arg("not-a-number");
-    cmd.assert().failure();
-}
-
-#[test]
 fn run_wggo_weights_missing_path_rejected() {
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", stdlib_path());

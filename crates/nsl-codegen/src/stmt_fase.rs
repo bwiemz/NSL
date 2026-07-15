@@ -67,20 +67,8 @@ impl Compiler<'_> {
         recipe: &crate::fase::UpdateRecipe,
         bc_params: Option<(Value, Value)>,  // (bc1_inv, bc2_inv) — None for non-AdamW
         wrap_precision: bool,  // CPDT precision-adaptive: wrap m/v in F32 cast/uncast
-        // Optimizer-state offload (scaling campaign item 4): m/v are
-        // HOST-resident f32; stage them to theta's device at entry, run the
-        // unchanged F32 update on the staged tensors, copy the results back
-        // into the host buffers at exit. Mutually exclusive with
-        // wrap_precision — enforced at flag resolution in stmt.rs
-        // (cast_into cannot cross devices), and asserted here.
-        wrap_offload: bool,
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
-
-        assert!(
-            !(wrap_precision && wrap_offload),
-            "wrap_precision and wrap_offload are mutually exclusive (enforced upstream)"
-        );
 
         let program = emit_final_step(recipe);
 
@@ -108,28 +96,6 @@ impl Compiler<'_> {
             (wm, wv)
         } else {
             (m_ptr, v_ptr)
-        };
-
-        // Offload staging (stage-in). The SGD placeholder alias (v == m)
-        // stages ONCE and aliases the working pointer, mirroring the
-        // wrap_precision alias discipline. On a CPU run `to_device_like`
-        // is a refcount-bump no-op and the exit copy-back is a guarded
-        // self-copy no-op — the envelope is placement-transparent.
-        let offload_v_distinct = wrap_offload && orig_m_ptr != orig_v_ptr;
-        let (work_m, work_v) = if wrap_offload {
-            let wm = self.compile_call_by_name(
-                builder, "nsl_tensor_to_device_like", &[work_m, theta_ptr],
-            )?;
-            let wv = if offload_v_distinct {
-                self.compile_call_by_name(
-                    builder, "nsl_tensor_to_device_like", &[work_v, theta_ptr],
-                )?
-            } else {
-                wm
-            };
-            (wm, wv)
-        } else {
-            (work_m, work_v)
         };
         let m_ptr = work_m;
         let v_ptr = work_v;
@@ -557,20 +523,6 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[v_ptr])?;
         }
 
-        // Offload copy-back (stage-out): DtoH the updated working tensors
-        // into the persistent host buffers, then free the staged copies.
-        // copy_data(dst, src) handles the DtoH direction and no-ops on
-        // self-copy (CPU-run alias); the free balances to_device_like's
-        // ownership (fresh tensor on transfer, refcount bump on alias).
-        if wrap_offload {
-            self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[orig_m_ptr, m_ptr])?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[m_ptr])?;
-            if offload_v_distinct {
-                self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[orig_v_ptr, v_ptr])?;
-                self.compile_call_by_name(builder, "nsl_tensor_free", &[v_ptr])?;
-            }
-        }
-
         Ok(())
     }
 
@@ -707,15 +659,7 @@ impl Compiler<'_> {
         // this, a mixed mode table would step its two arms with different
         // effective bias corrections even given identical gradients.
         t_override: Option<cranelift_codegen::ir::Value>,
-        // Optimizer-state offload (scaling campaign item 4): s1/s2 are
-        // HOST-resident f32; stage to param's device, step, copy back.
-        // Mutually exclusive with wrap_precision (enforced upstream).
-        wrap_offload: bool,
     ) -> Result<(), crate::error::CodegenError> {
-        assert!(
-            !(wrap_precision && wrap_offload),
-            "wrap_precision and wrap_offload are mutually exclusive (enforced upstream)"
-        );
         // CPDT FP16/INT8 wrap envelope (S5). theta and grad are NOT wrapped
         // — params stay in their natural dtype (FP32 by default); CPDT §3.2
         // v1 targets optimizer-state memory only. Only s1/s2 are wrapped.
@@ -732,24 +676,6 @@ impl Compiler<'_> {
                 // preserves the invariant that the FFI sees the same
                 // pointer in both slots (the helper ignores s2 anyway for
                 // these optimizers).
-                ws1
-            };
-            (ws1, ws2)
-        } else {
-            (s1, s2)
-        };
-        // Offload stage-in (mirrors fase_emit_final_step; alias discipline
-        // identical to the cast envelope above).
-        let offload_s2 = wrap_offload && orig_s1 != orig_s2;
-        let (s1, s2) = if wrap_offload {
-            let ws1 = self.compile_call_by_name(
-                builder, "nsl_tensor_to_device_like", &[s1, param_val],
-            )?;
-            let ws2 = if offload_s2 {
-                self.compile_call_by_name(
-                    builder, "nsl_tensor_to_device_like", &[s2, param_val],
-                )?
-            } else {
                 ws1
             };
             (ws1, ws2)
@@ -851,15 +777,6 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[s1])?;
             if wrap_s2 {
                 self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_s2, s2])?;
-                self.compile_call_by_name(builder, "nsl_tensor_free", &[s2])?;
-            }
-        }
-        // Offload copy-back (mirrors fase_emit_final_step's exit).
-        if wrap_offload {
-            self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[orig_s1, s1])?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[s1])?;
-            if offload_s2 {
-                self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[orig_s2, s2])?;
                 self.compile_call_by_name(builder, "nsl_tensor_free", &[s2])?;
             }
         }
@@ -1113,7 +1030,6 @@ impl Compiler<'_> {
                 &fase_plan.recipe,
                 Some((bc1_inv, bc2_inv)),
                 cpdt_precision_dtypes.is_some(),
-                self.compile_options.optim_state_offload,
             )?;
         }
         builder.ins().jump(iter_join, &[]);
@@ -1162,7 +1078,6 @@ impl Compiler<'_> {
             step_count_var,
             cpdt_precision_dtypes.is_some(),
             fullbuf_t_override,
-            self.compile_options.optim_state_offload,
         )?;
         // The Deferred arm's fase_emit_final_step zeroes m_partial via its
         // recipe epilogue; the stdlib call does not. Zero this param's
