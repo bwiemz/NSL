@@ -206,7 +206,10 @@ fn relocation_symbol_set(obj_bytes: &[u8]) -> std::collections::HashSet<String> 
     let file = object::File::parse(obj_bytes).expect("object::File::parse");
     let name_by_index: std::collections::HashMap<_, _> = file
         .symbols()
-        .filter_map(|s| s.name().ok().map(|n| (s.index(), n.to_string())))
+        .filter_map(|s| {
+            let n = s.name().ok()?;
+            Some((s.index(), nsl_codegen::linker::strip_host_symbol_prefix(n).to_string()))
+        })
         .collect();
 
     let mut out = std::collections::HashSet::new();

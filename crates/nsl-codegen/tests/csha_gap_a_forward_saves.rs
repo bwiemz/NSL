@@ -296,7 +296,10 @@ train(model = m, epochs = 1):
     // Build symbol-index → name map once.
     let name_by_index: std::collections::HashMap<_, _> = file
         .symbols()
-        .filter_map(|s| s.name().ok().map(|n| (s.index(), n.to_string())))
+        .filter_map(|s| {
+            let n = s.name().ok()?;
+            Some((s.index(), nsl_codegen::linker::strip_host_symbol_prefix(n).to_string()))
+        })
         .collect();
 
     let mut called: std::collections::HashSet<String> = std::collections::HashSet::new();

@@ -54,24 +54,9 @@ use object::{Object, ObjectSymbol};
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::hooks::{CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 
-/// Strip the host-ABI symbol-name prefix so logical NSL symbol names compare
-/// uniformly across platforms.
-///
-/// Mach-O (macOS) decorates every exported and undefined symbol with a
-/// leading underscore: a symbol declared in Cranelift as `nsl_calib_model_
-/// forward` appears in the object file as `_nsl_calib_model_forward`. ELF
-/// (Linux) and COFF (Windows MSVC) do not. Both production verification
-/// (e.g. `link_calibration_binary` post-checks) and the test assertions
-/// below compare against the un-prefixed logical name, so we strip a single
-/// leading underscore on macOS only.
-#[inline]
-fn strip_host_symbol_prefix(name: &str) -> &str {
-    if cfg!(target_os = "macos") {
-        name.strip_prefix('_').unwrap_or(name)
-    } else {
-        name
-    }
-}
+// Canonical home of the Mach-O leading-underscore normalization; both
+// production post-checks and the object-inspecting tests below use it.
+use crate::linker::strip_host_symbol_prefix;
 use crate::calibration::registry::HookRegistry;
 use crate::calibration::retention_pass::build_arena_layout;
 use crate::calibration::sidecar::{Sidecar, WggoHeadGradients, SIDECAR_VERSION};

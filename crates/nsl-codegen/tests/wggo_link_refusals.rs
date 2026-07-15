@@ -218,14 +218,19 @@ fn link_fails_when_backward_wrapper_missing() {
         use object::{Object, ObjectSymbol};
         let obj_bytes = std::fs::read(&model_obj).expect("read model_obj");
         let obj = object::File::parse(&*obj_bytes).expect("parse model_obj");
+        use nsl_codegen::linker::strip_host_symbol_prefix;
         assert!(
-            obj.symbols()
-                .any(|s| s.name() == Ok("nsl_calib_model_forward") && !s.is_undefined()),
+            obj.symbols().any(|s| {
+                s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_forward")
+                    && !s.is_undefined()
+            }),
             "precondition: calib_model.o must export nsl_calib_model_forward"
         );
         assert!(
-            !obj.symbols()
-                .any(|s| s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()),
+            !obj.symbols().any(|s| {
+                s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_backward")
+                    && !s.is_undefined()
+            }),
             "precondition: calib_model.o must NOT export nsl_calib_model_backward \
              when grad_retention is absent"
         );
@@ -351,18 +356,23 @@ fn backward_wrapper_exported_with_shape_validation() {
     let obj_bytes = std::fs::read(&out_path).expect("read object");
     let obj = object::File::parse(&*obj_bytes).expect("parse object");
 
+    use nsl_codegen::linker::strip_host_symbol_prefix;
     // The backward wrapper must be exported (Task 14/15 requirement).
     assert!(
-        obj.symbols()
-            .any(|s| s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()),
+        obj.symbols().any(|s| {
+            s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_backward")
+                && !s.is_undefined()
+        }),
         "calib_model.o must export nsl_calib_model_backward when grad_retention is set"
     );
 
     // The forward wrapper must also be present (guard that we didn't accidentally
     // replace it when adding backward).
     assert!(
-        obj.symbols()
-            .any(|s| s.name() == Ok("nsl_calib_model_forward") && !s.is_undefined()),
+        obj.symbols().any(|s| {
+            s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_forward")
+                && !s.is_undefined()
+        }),
         "calib_model.o must still export nsl_calib_model_forward alongside backward"
     );
 }

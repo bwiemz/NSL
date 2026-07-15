@@ -98,7 +98,9 @@ fn count_grad_arena_refs(obj_bytes: &[u8]) -> usize {
         for (_offset, reloc) in sec.relocations() {
             if let object::RelocationTarget::Symbol(sym_idx) = reloc.target() {
                 if let Ok(sym) = obj.symbol_by_index(sym_idx) {
-                    if sym.name() == Ok("__nsl_calib_grad_arena") {
+                    if sym.name().map(nsl_codegen::linker::strip_host_symbol_prefix)
+                        == Ok("__nsl_calib_grad_arena")
+                    {
                         count += 1;
                     }
                 }
