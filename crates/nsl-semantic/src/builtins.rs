@@ -108,6 +108,52 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // A1 GPU memory-accounting intrinsics — in-process numeric VRAM getters
+    // (peak / cumulative alloc count / per-surface peak) for regression gates
+    // and WGGO's memory oracle. Return 0 in non-CUDA builds.
+    def(
+        "gpu_peak_bytes",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
+    def(
+        "gpu_alloc_count",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
+    // Surface tag argument: 0=other 1=weights 2=optim_m 3=optim_v 4=m_partial
+    // 5=grads 6=activations 7=attn_workspace.
+    def(
+        "gpu_surface_peak_bytes",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
+    def(
+        "gpu_surface_at_peak_bytes",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
+    def(
+        "gpu_reset_mem_stats",
+        Type::Function {
+            params: vec![],
+            ret: Box::new(Type::Void),
+            effect: Effect::Inferred,
+        },
+    );
+
     // Tensor creation functions
     let tensor_ret = Type::Tensor {
         shape: Shape::unknown(),

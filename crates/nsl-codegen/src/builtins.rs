@@ -141,6 +141,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P0.1 per-surface VRAM accounting (tag values: caching_allocator::SurfaceTag)
     ("nsl_gpu_set_alloc_surface", &[types::I8], None),
     ("nsl_gpu_get_alloc_surface", &[], Some(types::I8)),
+    // A1 unified accounting: numeric VRAM getters (peak / counts / per-surface)
+    // + stable allocation identity. First in-process VRAM-peak API — gates and
+    // WGGO read these instead of scraping NSL_MEMSTATS stderr.
+    ("nsl_gpu_peak_allocated_bytes", &[], Some(types::I64)),
+    ("nsl_gpu_cumulative_alloc_count", &[], Some(types::I64)),
+    ("nsl_gpu_surface_peak_bytes", &[types::I8], Some(types::I64)),
+    ("nsl_gpu_surface_at_peak_bytes", &[types::I8], Some(types::I64)),
+    ("nsl_gpu_reset_mem_stats", &[], None),
+    ("nsl_gpu_set_alloc_identity", &[types::I32, types::I64], None),
+    ("nsl_gpu_clear_alloc_identity", &[], None),
     ("nsl_debug_gpu_alloc_summary", &[types::I64], None),
     // Stdin I/O
     ("nsl_read_line", &[], Some(types::I64)),
