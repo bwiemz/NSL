@@ -90,8 +90,8 @@ model Blk:
     w_up: Tensor = randn([{dm}, {ffn}]) * {init}
     w_down: Tensor = randn([{ffn}, {dm}]) * {init}
 
-    fn forward(self, h: Tensor, mask: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
-        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, pos, training)
+    fn forward(self, h: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), seg, pos, training)
         let h1 = h + a
         let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
         return h1 + f
@@ -101,7 +101,7 @@ model PackedLM:
     blocks: [Blk; {blocks}] = Blk()
     norm_out: Tensor = ones([{dm}])
 
-    fn forward_train(self, input_ids: Tensor, mask: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+    fn forward_train(self, input_ids: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
         let ids_shape = input_ids.shape
         let batch_size = ids_shape[0]
         let seq_len = ids_shape[1]
@@ -109,7 +109,7 @@ model PackedLM:
         let emb = embedding_lookup(self.embed, flat_ids)
         let h = emb.reshape([batch_size, seq_len, {dm}])
         for block in self.blocks:
-            h = block.forward(h, mask, seg, pos, training)
+            h = block.forward(h, seg, pos, training)
         let hn = rmsnorm(h, self.norm_out, 0.00001)
         return hn @ self.embed.transpose(0, 1)
 
@@ -124,7 +124,7 @@ print("LOSS_STREAM_BEGIN")
 train(model=m, epochs=1, grad_accumulation={d['accum']}, grad_clip=1.0):
     optimizer: {opt_line}
     step(batch):
-        let logits = m.forward_train(batch.input_ids, batch.attention_mask, batch.segment_ids, batch.position_ids, false)
+        let logits = m.forward_train(batch.input_ids, batch.segment_ids, batch.position_ids, false)
         let ls = logits.shape
         let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
         let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
