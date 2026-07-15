@@ -1344,6 +1344,13 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_copy_data: dtype mismatch (dst={}, src={})",
         dst.dtype, src.dtype
     );
+    // Self-copy is a no-op. The optimizer-state offload envelope stages
+    // state with `to_device_like`, which on a same-device (CPU) run returns
+    // the SAME tensor with a refcount bump — the copy-back then sees
+    // dst.data == src.data, and copy_nonoverlapping would be UB.
+    if dst.data == src.data {
+        return;
+    }
     let byte_count = (dst.len as usize) * dst.element_size();
     // Handle device memory: use appropriate copy method
     #[cfg(feature = "cuda")]
@@ -1360,6 +1367,49 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     unsafe {
         std::ptr::copy_nonoverlapping(src.data as *const u8, dst.data as *mut u8, byte_count);
     }
+}
+
+/// Allocate a zero-filled HOST-resident f32 tensor with `template`'s shape,
+/// regardless of the template's device (scaling campaign item 4 —
+/// optimizer-state offload).
+///
+/// `nsl_tensor_zeros_like` inherits the template's placement, and the plain
+/// CPU creation path allocates f64 (the CPU dtype convention) — neither
+/// works for offloaded optimizer state, which must be CPU-resident f32 so
+/// (a) `to_device_like` staging is a plain memcpy and (b) the DtoH
+/// copy-back passes `nsl_tensor_copy_data`'s dtype-equality assert against
+/// the staged GPU f32 working tensor.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
+    let t = NslTensor::from_ptr(template_ptr);
+    // CPU-resident template: offload is meaningless (state would sit next
+    // to the params anyway) and CPU params are f64 — an f32 state buffer
+    // would trip the stdlib step's copy_data dtype assert. Delegate to the
+    // plain like-placement allocation so a CPU run with the offload flag
+    // behaves exactly like one without it.
+    if t.device == 0 {
+        return nsl_tensor_zeros_like(template_ptr);
+    }
+    let ndim = t.ndim;
+    let len = t.len as usize;
+    let shape = checked_alloc((ndim as usize).max(1) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim as usize {
+        unsafe { *shape.add(i) = *t.shape.add(i) };
+    }
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data = crate::memory::checked_alloc_zeroed(len * std::mem::size_of::<f32>());
+    let out = Box::new(NslTensor::new(
+        data as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0, // CPU
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
 }
 
 #[no_mangle]

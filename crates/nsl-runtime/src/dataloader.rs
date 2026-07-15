@@ -40,6 +40,11 @@ struct DataLoaderConfig {
     drop_last: bool,
     packing: bool,
     pack_separator: i64,
+    /// Opt-in dense `[b, s, s]` attention_mask in packed batches (Stage-B
+    /// `forward_masked` consumers). Default OFF: the packed-attention path
+    /// keys off `segment_ids`, and the decomposed fallback derives the mask
+    /// on demand (`nsl_packed_mask_from_segment_ids`).
+    emit_attention_mask: bool,
 }
 
 impl DataLoaderConfig {
@@ -59,6 +64,7 @@ impl DataLoaderConfig {
             drop_last: v["drop_last"].as_bool().unwrap_or(false),
             packing: v["packing"].as_bool().unwrap_or(false),
             pack_separator: v["pack_separator"].as_i64().unwrap_or(0),
+            emit_attention_mask: v["emit_attention_mask"].as_bool().unwrap_or(false),
         }
     }
 }
@@ -210,6 +216,7 @@ impl DataLoader {
         let seq_len = self.config.seq_len;
         let packing = self.config.packing;
         let pack_separator = self.config.pack_separator;
+        let emit_attention_mask = self.config.emit_attention_mask;
         let total_batches = self.total_batches;
         let prefetch_limit = self.config.prefetch.max(1);
 
@@ -260,6 +267,7 @@ impl DataLoader {
                             batch_size,
                             seq_len,
                             pack_separator,
+                            emit_attention_mask,
                         ) {
                             Some(batch) => packed_batch_to_dict(&batch),
                             None => continue,

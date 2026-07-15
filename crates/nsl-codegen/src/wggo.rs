@@ -121,6 +121,39 @@ pub struct WggoInput<'a> {
     /// compiles produced different optimizer-state allocations (informed
     /// on miss, uninformed on hit).
     pub cached_analysis: Option<WeightAnalysisReport>,
+    /// Per-device resident training-memory budget in BYTES
+    /// (`--wggo-memory-budget`, converted from MiB at the CLI boundary).
+    /// `None` = no budget, today's behavior byte-identical. When `Some(b)`:
+    ///   * the Level-1 DP's `ClusterSpec::memory_budget` is set to `b`,
+    ///   * each layer's ILP `memory_budget` gets a per-layer share of `b`
+    ///     (minus a modeled non-layer overhead) and `budget_informed = true`,
+    ///     which exempts the moment-precision evidence gate so the solver may
+    ///     organically pick fp16 moments under pressure, and
+    ///   * a plan infeasible even at the fp16-moment floor sets
+    ///     [`WggoPlan::budget_infeasible`] (hard compile failure downstream).
+    pub memory_budget_bytes: Option<u64>,
+}
+
+/// Fatal marker set when `--wggo-memory-budget` is on and the plan cannot fit
+/// even at the fp16-moment floor (the smallest the moment-precision axis can
+/// make the model without dropping below fp16). Carried on [`WggoPlan`] so the
+/// detection is unit-testable; [`run_on_wengert_with_weights`] converts a
+/// `Some(_)` into a hard compile failure (`eprintln!` + `process::exit(1)`,
+/// the repo's compile-fatal convention — cf. `stmt.rs` CPDT validate). This is
+/// deliberately NOT the silent degrade-to-Off warning path: the user asked for
+/// a hard cap and the model does not fit, so the compile must refuse loudly.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetInfeasibility {
+    /// Per-device budget the user requested, in bytes (`--wggo-memory-budget`
+    /// MiB × 1024²).
+    pub budget_bytes: u64,
+    /// Smallest resident footprint achievable at the fp16-moment floor, summed
+    /// across layers (identity structural decision, 16-bit m and v). When this
+    /// exceeds `budget_bytes` no moment-precision decision can rescue the plan.
+    pub required_fp16_floor_bytes: u64,
+    /// Number of layers the per-layer ILP could not fit even after the
+    /// `budget_informed` exemption let it quantize moments to fp16.
+    pub infeasible_layers: usize,
 }
 
 /// Aggregate plan emitted by the driver.
@@ -161,6 +194,12 @@ pub struct WggoPlan {
     /// report's "[cpkd]" section IS the deliverable this cycle.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cpkd_distill: Vec<CpkdLayerDistill>,
+    /// Fatal budget marker (`--wggo-memory-budget`). `None` on every plan that
+    /// did not set a budget or that fits within it — byte-identical to today.
+    /// `Some(_)` means the plan is infeasible even at the fp16-moment floor and
+    /// the compile must hard-fail (surfaced in `run_on_wengert_with_weights`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_infeasible: Option<BudgetInfeasibility>,
 }
 
 impl WggoPlan {
@@ -417,13 +456,45 @@ fn recost_total(
         .sum()
 }
 
+/// Fraction of the per-device budget reserved for resident training surfaces
+/// the per-layer LUT does not model: the loss/logits buffers, saved-for-
+/// backward activations beyond the 4 d_model-wide vectors the cost model
+/// counts, gradient-clip statistics, and allocator slack. The remainder is
+/// split evenly across layers (the ILP charge is per-layer and unsharded-
+/// conservative, so an even split is the honest first-order rule). Chosen
+/// coarse; a measured non-layer footprint is the natural refinement.
+const NON_LAYER_OVERHEAD_FRACTION: f64 = 0.15;
+
+/// Divide a per-device model budget into a per-layer ILP budget: reserve
+/// [`NON_LAYER_OVERHEAD_FRACTION`] for non-layer surfaces, split the rest
+/// evenly across `n_layers`. `None` in → `None` out (no budget). Never returns
+/// 0 (a layer must be allowed at least 1 byte or every candidate is infeasible
+/// for the wrong reason).
+fn per_layer_ilp_budget(model_budget: Option<u64>, n_layers: usize) -> Option<u64> {
+    model_budget.map(|b| {
+        let n = n_layers.max(1) as u64;
+        let usable = (b as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u64;
+        (usable / n).max(1)
+    })
+}
+
 /// Run the WGGO driver.
-pub fn run(input: WggoInput) -> WggoPlan {
+pub fn run(mut input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
 
     // 1. Build the layer graph.
     let graph = build_graph(input.wengert);
+
+    // `--wggo-memory-budget`: enforce the per-device cap at the Level-1 DP
+    // (the ClusterSpec budget the DP knapsack checks) and derive a per-layer
+    // ILP budget for the Level-2 solve. `None` leaves both untouched, so a
+    // build without the flag is byte-identical to today.
+    let model_budget = input.memory_budget_bytes;
+    if let Some(b) = model_budget {
+        input.cluster.memory_budget = b;
+    }
+    let ilp_budget = per_layer_ilp_budget(model_budget, graph.layers.len());
 
     // §2.4 inter-layer shape-compatibility precondition (a *hard* constraint).
     // Every kept layer's output activation width must match what its successors
@@ -473,6 +544,8 @@ pub fn run(input: WggoInput) -> WggoPlan {
             // The §2.4 refusal must not advertise decisions of any kind.
             cfie_inference: Vec::new(),
             cpkd_distill: Vec::new(),
+            // Shape refusal short-circuits before any budget solve.
+            budget_infeasible: None,
         };
     }
 
@@ -491,7 +564,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         let inter =
             dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-            default_constraints_for(&graph, input.packing_supported)
+            default_constraints_for(&graph, input.packing_supported, ilp_budget)
         } else {
             input.ilp_constraints
         };
@@ -528,6 +601,9 @@ pub fn run(input: WggoInput) -> WggoPlan {
             warnings: Vec::new(),
             cfie_inference,
             cpkd_distill,
+            // Off mode intentionally passes an over-budget model through
+            // (bypasses optimization), so it never raises the budget refusal.
+            budget_infeasible: None,
         };
     }
 
@@ -548,6 +624,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // warning, rather than emitting a silently over-budget optimization.
     let mut warnings: Vec<String> = Vec::new();
     let mut effective_mode = input.mode;
+    let mut dp_refused = false;
     let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
         Ok(p) => p,
         Err(e) => {
@@ -555,6 +632,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
                 "inter-layer DP infeasible ({e}); degraded {} -> off (downstream passes run independently)",
                 effective_mode.as_str()
             ));
+            dp_refused = true;
             effective_mode = WggoMode::Off;
             passthrough_plan(&graph, &luts, &dp_cfg, gpu)
         }
@@ -563,7 +641,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
     let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-        default_constraints_for(&graph, input.packing_supported)
+        default_constraints_for(&graph, input.packing_supported, ilp_budget)
     } else {
         input.ilp_constraints
     };
@@ -718,6 +796,36 @@ pub fn run(input: WggoInput) -> WggoPlan {
     // CPKD advisory surface (v1): same contract as the CFIE sidecar.
     let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_constraints);
 
+    // `--wggo-memory-budget` refusal channel: when a budget is set and the
+    // plan came back infeasible — the DP refused the per-device cap, or the
+    // per-layer ILP could not fit a layer even after the `budget_informed`
+    // exemption let it quantize moments to fp16 — compare the fp16-moment
+    // floor (the smallest resident footprint the moment axis can produce)
+    // against the budget. If even that floor does not fit, the model is
+    // genuinely too big and the compile must hard-fail (surfaced downstream).
+    // If the floor DOES fit (DP refused only because it sizes moments at f32
+    // and is precision-blind, but the per-layer fp16 plan is feasible), no
+    // marker is set and the fp16 plan proceeds.
+    let budget_infeasible = model_budget.and_then(|budget| {
+        let infeasible_layers = per_layer.iter().filter(|s| !s.feasible).count();
+        if !dp_refused && infeasible_layers == 0 {
+            return None;
+        }
+        let required_fp16_floor_bytes: u64 = luts
+            .iter()
+            .map(crate::wggo_ilp::fp16_moment_floor_bytes)
+            .fold(0u64, |acc, b| acc.saturating_add(b));
+        if infeasible_layers > 0 || required_fp16_floor_bytes > budget {
+            Some(BudgetInfeasibility {
+                budget_bytes: budget,
+                required_fp16_floor_bytes,
+                infeasible_layers,
+            })
+        } else {
+            None
+        }
+    });
+
     WggoPlan {
         mode: effective_mode,
         target_gpu: gpu.name.to_string(),
@@ -733,6 +841,7 @@ pub fn run(input: WggoInput) -> WggoPlan {
         warnings,
         cfie_inference,
         cpkd_distill,
+        budget_infeasible,
     }
 }
 
@@ -781,7 +890,18 @@ fn role_sensitivity_floor(role: LayerRole) -> f64 {
 
 /// Per-layer default ILP constraints with the [`role_sensitivity_floor`]
 /// applied (used when the caller supplies no explicit `ilp_constraints`).
-fn default_constraints_for(graph: &OptGraph, packing_supported: bool) -> Vec<LayerIlpConstraints> {
+///
+/// `ilp_budget` (`Some` only under `--wggo-memory-budget`) sets each layer's
+/// `memory_budget` to the per-layer share and flips `budget_informed = true`,
+/// which exempts the moment-precision evidence gate (see
+/// [`crate::wggo_ilp::LayerIlpConstraints::budget_informed`]). `None` leaves
+/// the budget at `u64::MAX` and `budget_informed = false` — byte-identical to
+/// today.
+fn default_constraints_for(
+    graph: &OptGraph,
+    packing_supported: bool,
+    ilp_budget: Option<u64>,
+) -> Vec<LayerIlpConstraints> {
     // Packing honesty: only mode 1 (segment_id) has any lowering today
     // (the @pca/CSHA admission fork and the Stage-B masked path), so even
     // a packing-capable module exposes {none, segment_id} — tile_skip and
@@ -803,6 +923,12 @@ fn default_constraints_for(graph: &OptGraph, packing_supported: bool) -> Vec<Lay
             sensitivity: role_sensitivity_floor(l.role),
             packing_modes_mask: mask,
             packing_savings: savings,
+            // Budget driver: cap each layer and flip the evidence-gate
+            // exemption so the ILP may pick fp16 moments under pressure. When
+            // `ilp_budget` is `None` these stay at the `Default` values
+            // (`u64::MAX`, `false`) — byte-identical to today.
+            memory_budget: ilp_budget.unwrap_or(u64::MAX),
+            budget_informed: ilp_budget.is_some(),
             ..Default::default()
         })
         .collect()
@@ -981,6 +1107,8 @@ pub fn run_on_wengert(
         analysis_config: AnalysisConfig::default(),
         scorer: None,
         cached_analysis: None,
+        // Convenience entry point (no CompileOptions) → no budget driver.
+        memory_budget_bytes: None,
     };
     Some(run(input))
 }
@@ -1071,18 +1199,56 @@ pub fn run_on_wengert_with_weights(
             None
         };
 
+    // `--wggo-memory-budget` (bytes; the CLI converted MiB→bytes and validated
+    // non-zero). `None` on every non-budget build → byte-identical to today.
+    let memory_budget_bytes = compile_options.and_then(|o| o.wggo.memory_budget_bytes);
+
+    // LayerShape honesty (recon §3/§5.8): the hardcoded default makes absolute
+    // resident bytes fictional for any real model. When a budget is set — the
+    // ONLY time absolute bytes are compared against a cap — thread the best
+    // available REAL dims so the comparison is honest, falling back to the old
+    // constants when unknown. The threading is gated on the budget so a build
+    // WITHOUT the flag keeps its byte-identical LUT (pinned-plan tests).
+    //
+    // Best available source: the `@fused_lm_ce` decorator config carries the
+    // real hidden_size (= d_model), batch_size, and seq_len (baked into the
+    // fused-CE PTX). head_dim / n_kv_heads are not in reach here and keep the
+    // documented fallback constants; fully threading them (and seq/batch when
+    // no `@fused_lm_ce` is present) needs the train-block shape captured in
+    // stmt.rs — see the orchestrator note in the PR report.
+    let mut layer_shape = LayerShape {
+        batch: 1,
+        seq: 1024,
+        d_model: 512,
+        head_dim: 64,
+        n_kv_heads: 4,
+        dtype_bytes: 2,
+    };
+    if memory_budget_bytes.is_some() {
+        if let Some(opts) = compile_options {
+            if let Some(cfg) = opts
+                .fused_ce_configs
+                .iter()
+                .find(|c| c.hidden_size.is_some() || c.batch_size.is_some() || c.seq_len.is_some())
+            {
+                if let Some(h) = cfg.hidden_size {
+                    layer_shape.d_model = h as u64;
+                }
+                if let Some(b) = cfg.batch_size {
+                    layer_shape.batch = b as u64;
+                }
+                if let Some(s) = cfg.seq_len {
+                    layer_shape.seq = s as u64;
+                }
+            }
+        }
+    }
+
     let mut input = WggoInput {
         mode,
         target,
         wengert,
-        layer_shape: LayerShape {
-            batch: 1,
-            seq: 1024,
-            d_model: 512,
-            head_dim: 64,
-            n_kv_heads: 4,
-            dtype_bytes: 2,
-        },
+        layer_shape,
         cluster,
         lut_axes: LutAxes::default(),
         importance: ImportanceScores::default(),
@@ -1092,6 +1258,7 @@ pub fn run_on_wengert_with_weights(
         scorer,
         packing_supported,
         cached_analysis: cached_report.clone(),
+        memory_budget_bytes,
     };
     // WRGA budget semantics (paper §7.1 @wrga(mode=auto): errata E3's
     // two-level split): when the user opted into adapters via
@@ -1113,6 +1280,33 @@ pub fn run_on_wengert_with_weights(
         }
     }
     let mut plan = run(input);
+
+    // `--wggo-memory-budget` HARD refusal: `run()` set `budget_infeasible`
+    // when the plan cannot fit even at the fp16-moment floor. This is a
+    // compile-fatal diagnostic — the user asked for a hard cap and the model
+    // does not fit, so we refuse loudly rather than silently degrade (the
+    // degrade-to-Off warning path is for the no-budget case). `eprintln!` +
+    // `process::exit(1)` is the repo's compile-fatal convention (cf. the CPDT
+    // weight-map validate in `stmt.rs`). The detection lives on the plan so it
+    // stays unit-testable without spawning a process.
+    if let Some(ref bi) = plan.budget_infeasible {
+        eprintln!(
+            "error: --wggo-memory-budget of {budget} bytes ({budget_mib} MiB) is \
+             infeasible: the model needs at least {required} bytes ({required_mib} MiB) \
+             even at the fp16-moment floor (16-bit Adam m/v, no structural relief){layers}. \
+             Raise the budget or shrink the model.",
+            budget = bi.budget_bytes,
+            budget_mib = bi.budget_bytes / (1024 * 1024),
+            required = bi.required_fp16_floor_bytes,
+            required_mib = bi.required_fp16_floor_bytes / (1024 * 1024),
+            layers = if bi.infeasible_layers > 0 {
+                format!(" ({} layer(s) infeasible at fp16)", bi.infeasible_layers)
+            } else {
+                String::new()
+            },
+        );
+        std::process::exit(1);
+    }
 
     // Surface the weights-load failure (if any) in the report itself, not
     // only on stderr.  Prepended-style: it precedes any degradation warnings
@@ -1193,7 +1387,61 @@ mod tests {
             scorer: None,
             cached_analysis: None,
             packing_supported: true,
+            memory_budget_bytes: None,
         }
+    }
+
+    // ---- --wggo-memory-budget: hard-refusal marker + per-layer split ----
+
+    #[test]
+    fn no_budget_never_sets_infeasible_marker() {
+        // Default path (no --wggo-memory-budget): byte-identical, no marker.
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(plan.budget_infeasible.is_none());
+    }
+
+    #[test]
+    fn generous_budget_fits_and_sets_no_marker() {
+        let w = two_block_wengert();
+        let mut input = toy_input(&w);
+        input.memory_budget_bytes = Some(64u64 * 1024 * 1024 * 1024); // 64 GiB
+        let plan = run(input);
+        assert!(
+            plan.budget_infeasible.is_none(),
+            "a 64 GiB budget must fit a two-block toy model"
+        );
+    }
+
+    #[test]
+    fn budget_below_fp16_floor_sets_hard_refusal_marker() {
+        // A 1-byte budget cannot fit even the fp16-moment floor: the marker
+        // must be set (run_on_wengert_with_weights converts it to a hard fail).
+        let w = two_block_wengert();
+        let mut input = toy_input(&w);
+        input.memory_budget_bytes = Some(1);
+        let plan = run(input);
+        let bi = plan
+            .budget_infeasible
+            .expect("1-byte budget must be flagged infeasible");
+        assert_eq!(bi.budget_bytes, 1);
+        assert!(
+            bi.required_fp16_floor_bytes > bi.budget_bytes,
+            "the fp16 floor must exceed the 1-byte budget"
+        );
+    }
+
+    #[test]
+    fn per_layer_ilp_budget_reserves_overhead_and_splits() {
+        // None in ⇒ None out (no budget driver).
+        assert_eq!(per_layer_ilp_budget(None, 4), None);
+        // Reserve NON_LAYER_OVERHEAD_FRACTION, split the rest evenly.
+        let model = 1_000_000u64;
+        let got = per_layer_ilp_budget(Some(model), 4).unwrap();
+        let expect = ((model as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u64) / 4;
+        assert_eq!(got, expect);
+        // Never returns 0 even for a tiny budget.
+        assert!(per_layer_ilp_budget(Some(1), 100).unwrap() >= 1);
     }
 
     #[test]

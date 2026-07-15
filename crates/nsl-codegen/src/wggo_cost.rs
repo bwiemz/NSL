@@ -433,6 +433,34 @@ pub fn moment_state_bytes(param_bytes: u64, dtype_bytes: u64, m_bits: u8, v_bits
     m_bytes.saturating_add(v_bytes)
 }
 
+/// Extra resident bytes from the FASE **Deferred** fused optimizer step that
+/// [`resident_training_bytes`] does not count. `crate::fase_memory` models
+/// these correctly (`params + accumulator + one-layer-grad + opt_state + peak
+/// activation`) but is disconnected from the cost model, so a budget compared
+/// against the bare `param + m + v + activation` charge under-counts.
+///
+/// Two surfaces are added:
+///   * **`m_partial`** — the windowed gradient-mean accumulator materialised
+///     only when `grad_accumulation > 1`. It is param-sized and **always f32**,
+///     regardless of the chosen moment precision: it accumulates raw gradients,
+///     so it does NOT quantize with `m_bits`/`v_bits`.
+///   * **one live parameter gradient** — the single gradient held during the
+///     deferred per-param epilogue, at the model/compute dtype (`param_bytes`).
+///
+/// There is deliberately **no `v_partial`** term: FASE accumulates only the
+/// first-moment (gradient) window, so the Deferred optimizer adds exactly these
+/// **two** surfaces (making 4 live surfaces total with the base
+/// `param + m + v + activation` — NOT 5). Sized per-layer against the layer's
+/// own `param_bytes`, which is a conservative over-estimate of the true
+/// single-tensor `one-live-param` grad (`fase_memory` uses `max_param_bytes`);
+/// over-estimating is the safe direction for a hard budget gate.
+pub fn fase_deferred_extra_bytes(param_bytes: u64, dtype_bytes: u64) -> u64 {
+    let elements = param_bytes / dtype_bytes.max(1);
+    let m_partial_bytes = elements.saturating_mul(4); // f32 window accumulator
+    let one_live_grad = param_bytes; // model-dtype single live gradient
+    m_partial_bytes.saturating_add(one_live_grad)
+}
+
 /// Resident training memory for one layer under ZeRO sharding — the single
 /// formula shared by the Level-1 DP ([`crate::wggo_dp`]) and the Level-2 ILP
 /// ([`crate::wggo_ilp`]) so the two levels can never diverge on what "resident

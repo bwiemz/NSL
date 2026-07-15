@@ -4269,6 +4269,30 @@ impl Compiler<'_> {
             _ => 1,
         };
 
+        // Optimizer-state offload (scaling campaign item 4): m/v allocate
+        // HOST-resident f32; every optimizer step stages them to the device,
+        // runs the unchanged F32 update, and copies back. Mutually exclusive
+        // with reduced-precision moments: the requant half of that envelope
+        // (`nsl_tensor_cast_into`) asserts co-residency, so combining them
+        // would abort at the first optimizer step — refuse loudly at compile
+        // time instead.
+        if self.compile_options.optim_state_offload {
+            if cpdt_precision_dtypes.is_some() {
+                return Err(CodegenError::new(
+                    "--optim-state-offload cannot combine with reduced-precision \
+                     optimizer moments (--wggo-moment-precision / a CPDT precision \
+                     plan): the requant copy-back cannot cross devices. Drop one \
+                     of the two flags.",
+                ));
+            }
+            eprintln!(
+                "[offload] optimizer state (m/v) is HOST-resident: each optimizer \
+                 step stages state to the device and copies it back (2 PCIe \
+                 round-trips of total state per step). VRAM saved: \
+                 {num_state_buffers}x parameter bytes."
+            );
+        }
+
         let state_list_1 = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         let state_list_2 = if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_new", &[])?
@@ -4307,7 +4331,14 @@ impl Compiler<'_> {
             // storage dtype when active; otherwise use the verbatim FP32 path.
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` and `Value:
             // Copy`, so matching by value inside the loop is fine.
-            let buf1 = if let Some((m_list, _)) = cpdt_precision_dtypes {
+            let buf1 = if self.compile_options.optim_state_offload {
+                // Offload: HOST-resident f32 state (see the gate above).
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_zeros_like_host_f32",
+                    &[param_i],
+                )?
+            } else if let Some((m_list, _)) = cpdt_precision_dtypes {
                 let m_code = self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
                 self.compile_call_by_name(
                     builder,
@@ -4319,7 +4350,13 @@ impl Compiler<'_> {
             };
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
-                let buf2 = if let Some((_, v_list)) = cpdt_precision_dtypes {
+                let buf2 = if self.compile_options.optim_state_offload {
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_zeros_like_host_f32",
+                        &[param_i],
+                    )?
+                } else if let Some((_, v_list)) = cpdt_precision_dtypes {
                     let v_code =
                         self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
                     self.compile_call_by_name(
@@ -6930,6 +6967,7 @@ impl Compiler<'_> {
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
+                        self.compile_options.optim_state_offload,
                     )?;
                     let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
@@ -6979,6 +7017,7 @@ impl Compiler<'_> {
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
+                        self.compile_options.optim_state_offload,
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     let fs_one = builder.ins().iconst(cl_types::I64, 1);
@@ -7066,6 +7105,7 @@ impl Compiler<'_> {
                 step_count_var,
                 false,
                 None,
+                self.compile_options.optim_state_offload,
             )?;
 
             let one_opt = builder.ins().iconst(cl_types::I64, 1);
@@ -8185,6 +8225,15 @@ impl Compiler<'_> {
         let num_params_val = self.compile_call_by_name(builder, "nsl_list_len", &[param_list])?;
 
         // ── 4. Create optimizer state buffers (runtime NslLists) ────────
+        // Optimizer-state offload is NOT wired on the pipelined path (its
+        // optimizer emission does not run through the shared envelope
+        // helpers) — refuse rather than silently keeping state on-device.
+        if self.compile_options.optim_state_offload {
+            return Err(CodegenError::new(
+                "--optim-state-offload is not supported for pipelined train \
+                 blocks yet; remove the flag or use the non-pipelined path.",
+            ));
+        }
         let num_state_buffers = match optimizer_name.as_str() {
             "adam" | "adamw" | "soap" => 2,
             _ => 1,
