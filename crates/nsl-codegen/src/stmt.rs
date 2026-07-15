@@ -4493,7 +4493,19 @@ impl Compiler<'_> {
             builder.switch_to_block(accum_body);
             builder.seal_block(accum_body);
             let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, ai])?;
-            let zeros = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
+            // P3: under --optim-state-offload the FASE window accumulator
+            // (m_partial) is the last device-resident param-sized f32 surface
+            // (~4.15 GB at 1B). Allocate it HOST-resident (pinned) too; the
+            // accumulate hook stages it to the grad's device per micro-batch
+            // and the final step stages it in for the m/v update. m_partial
+            // is ALWAYS f32 (exact-windowed semantics — the reduced-precision
+            // moment path never touches it), so f32 host regardless of the
+            // CPDT precision plan.
+            let zeros = if self.compile_options.optim_state_offload {
+                self.compile_call_by_name(builder, "nsl_tensor_zeros_like_host_f32", &[p])?
+            } else {
+                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?
+            };
             self.compile_call_by_name(builder, "nsl_list_push", &[list, zeros])?;
             let a_one = builder.ins().iconst(cl_types::I64, 1);
             let a_next = builder.ins().iadd(ai, a_one);
@@ -6233,7 +6245,8 @@ impl Compiler<'_> {
                         let _ = plist;
                         let m_partial =
                             c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
-                        c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale)?;
+                        let off = c.compile_options.optim_state_offload;
+                        c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, off)?;
                         c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
                         Ok(())
                     };
@@ -6896,11 +6909,13 @@ impl Compiler<'_> {
                 // Deferred path
                 builder.switch_to_block(ga_deferred);
                 builder.seal_block(ga_deferred);
+                let off = self.compile_options.optim_state_offload;
                 self.fase_emit_accumulate(
                     builder,
                     accum_buf,
                     grad,
                     fase_plan.recipe.accum_scale,
+                    off,
                 )?;
                 builder.ins().jump(ga_join, &[]);
 
@@ -6930,11 +6945,13 @@ impl Compiler<'_> {
             } else if fase_deferred {
                 // Pre-Phase-2 monolithic Deferred path (byte-identical when no overrides).
                 // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
+                let off = self.compile_options.optim_state_offload;
                 self.fase_emit_accumulate(
                     builder,
                     accum_buf,
                     grad,
                     fase_plan.recipe.accum_scale,
+                    off,
                 )?;
             } else {
                 // Pre-Phase-2 monolithic FullBuffer path (byte-identical).
@@ -7209,11 +7226,13 @@ impl Compiler<'_> {
                             "nsl_list_get",
                             &[grads_list, pa_i],
                         )?;
+                        let off = self.compile_options.optim_state_offload;
                         self.fase_emit_accumulate(
                             builder,
                             pa_mpart,
                             pa_grad,
                             fase_plan.recipe.accum_scale,
+                            off,
                         )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
                     }

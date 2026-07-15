@@ -162,6 +162,19 @@ impl Compiler<'_> {
         let m_ptr = work_m;
         let v_ptr = work_v;
 
+        // P3 offload: m_partial is HOST-resident. Stage it to the device
+        // (theta's placement) so the recipe reads/writes a device working
+        // copy — the recipe's internal `Zero` op then zeroes the DEVICE copy
+        // (discarded below), so the host accumulator is zeroed separately
+        // after the recipe for the next window. On a CPU run to_device_like
+        // is a refcount-bump no-op and the host zero below is the real zero.
+        let orig_m_partial = m_partial_ptr;
+        let m_partial_ptr = if wrap_offload {
+            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[orig_m_partial, theta_ptr])?
+        } else {
+            m_partial_ptr
+        };
+
         // Lazily-allocated scratch tensor for the `Tmp` register.  Allocated
         // on first write, freed at end.
         let mut tmp_val: Option<Value> = None;
@@ -558,7 +571,16 @@ impl Compiler<'_> {
         }
 
         // Zero m_partial for the next accumulation window.
-        self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[m_partial_ptr])?;
+        if wrap_offload {
+            // P3: the recipe read the DEVICE working copy (m_partial_ptr);
+            // zero the HOST accumulator (orig_m_partial) for the next window
+            // and free the device staging copy. Zeroing the device copy would
+            // be wasted work — it is discarded here.
+            self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[orig_m_partial])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial_ptr])?;
+        } else {
+            self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[m_partial_ptr])?;
+        }
 
         // Free any live Tmp tensor.
         if let Some(t) = tmp_val {
@@ -633,7 +655,31 @@ impl Compiler<'_> {
         m_partial_ptr: Value,
         grad_ptr: Value,
         accum_scale: f64,
+        wrap_offload: bool,
     ) -> Result<(), crate::error::CodegenError> {
+        // P3 offload: m_partial is HOST-resident. Stage it to the grad's
+        // device, accumulate there, copy the result back to host, and free
+        // the device staging copy — the exact-windowed Σg semantics are
+        // preserved (the accumulate math runs on-device in f32, identical to
+        // the resident path). A sync copy-back keeps this self-contained
+        // (no drain-list interaction with the optimizer-step offload).
+        if wrap_offload {
+            // Stage m_partial host -> grad's device.
+            let work_mp =
+                self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[m_partial_ptr, grad_ptr])?;
+            let scale_val = builder.ins().f64const(accum_scale);
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            let scaled_grad =
+                self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_ptr, scale_val, flags_zero])?;
+            self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[work_mp, scaled_grad])?;
+            // Copy the updated accumulator back to the host buffer, then free
+            // the device staging copy and the scaled-grad scratch.
+            self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[m_partial_ptr, work_mp])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[work_mp])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_grad])?;
+            return Ok(());
+        }
+
         // Step 0: migrate grad to m_partial's (device, dtype). Tape-AD produces
         // CPU f64 gradients while m_partial is GPU f32 (it was allocated via
         // zeros_like(param), inheriting the parameter's placement). Without
