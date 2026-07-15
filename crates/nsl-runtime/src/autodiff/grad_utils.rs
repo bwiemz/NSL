@@ -276,7 +276,7 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
         // `orig_ndim` size would be a Layout-mismatched dealloc (UB, and
         // the fuzz harness's byte accounting catches it as a leak).
         let elem = std::mem::size_of::<i64>();
-        let new_shape = crate::memory::checked_alloc(orig_ndim * elem) as *mut i64;
+        let new_shape = crate::memory::checked_alloc(std::mem::size_of_val(orig_shape)) as *mut i64;
         for (i, &s) in orig_shape.iter().enumerate() {
             unsafe { *new_shape.add(i) = s };
         }

@@ -54,24 +54,9 @@ use object::{Object, ObjectSymbol};
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::hooks::{CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 
-/// Strip the host-ABI symbol-name prefix so logical NSL symbol names compare
-/// uniformly across platforms.
-///
-/// Mach-O (macOS) decorates every exported and undefined symbol with a
-/// leading underscore: a symbol declared in Cranelift as `nsl_calib_model_
-/// forward` appears in the object file as `_nsl_calib_model_forward`. ELF
-/// (Linux) and COFF (Windows MSVC) do not. Both production verification
-/// (e.g. `link_calibration_binary` post-checks) and the test assertions
-/// below compare against the un-prefixed logical name, so we strip a single
-/// leading underscore on macOS only.
-#[inline]
-fn strip_host_symbol_prefix(name: &str) -> &str {
-    if cfg!(target_os = "macos") {
-        name.strip_prefix('_').unwrap_or(name)
-    } else {
-        name
-    }
-}
+// Canonical home of the Mach-O leading-underscore normalization; both
+// production post-checks and the object-inspecting tests below use it.
+use crate::linker::strip_host_symbol_prefix;
 use crate::calibration::registry::HookRegistry;
 use crate::calibration::retention_pass::build_arena_layout;
 use crate::calibration::sidecar::{Sidecar, WggoHeadGradients, SIDECAR_VERSION};
@@ -4697,7 +4682,8 @@ mod backward_wrapper {
 
         assert!(
             obj.symbols().any(|s| {
-                s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()
+                s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_backward")
+                    && !s.is_undefined()
             }),
             "calib_model.o must export nsl_calib_model_backward when grad-retention is set"
         );
@@ -4737,7 +4723,8 @@ mod backward_wrapper {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         assert!(
-            !obj.symbols().any(|s| s.name() == Ok("nsl_calib_model_backward")),
+            !obj.symbols()
+                .any(|s| s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_backward")),
             "calib_model.o must NOT export nsl_calib_model_backward when grad-retention is absent"
         );
     }
@@ -4778,12 +4765,14 @@ mod backward_wrapper {
 
         // Both wrappers must be exported — confirmed by symbol presence.
         let fwd_exported = obj.symbols().any(|s| {
-            s.name() == Ok("nsl_calib_model_forward") && !s.is_undefined()
+            s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_forward")
+                && !s.is_undefined()
         });
         assert!(fwd_exported, "nsl_calib_model_forward must be exported");
 
         let bwd_exported = obj.symbols().any(|s| {
-            s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()
+            s.name().map(strip_host_symbol_prefix) == Ok("nsl_calib_model_backward")
+                && !s.is_undefined()
         });
         assert!(bwd_exported, "nsl_calib_model_backward must be exported");
 
@@ -4791,7 +4780,7 @@ mod backward_wrapper {
         // this object (not imported).  Before Task 15 it was Export; after refactoring
         // for backward use it remains defined here.
         let model_fwd_defined = obj.symbols().any(|s| {
-            s.name() == Ok("model_forward") && !s.is_undefined()
+            s.name().map(strip_host_symbol_prefix) == Ok("model_forward") && !s.is_undefined()
         });
         assert!(
             model_fwd_defined,
@@ -4805,7 +4794,7 @@ mod backward_wrapper {
         // We verify the emission compiles without error as the primary assertion;
         // the symbol check is a belt-and-suspenders indicator.
         let has_mul_scalar = obj.symbols().any(|s| {
-            s.name() == Ok("nsl_tensor_mul_scalar")
+            s.name().map(strip_host_symbol_prefix) == Ok("nsl_tensor_mul_scalar")
         });
         assert!(
             has_mul_scalar,
@@ -5097,7 +5086,7 @@ mod loop_body_dispatch {
                     if let Ok(sym) = obj.symbol_by_index(sym_idx) {
                         if sym
                             .name()
-                            .map(|n| n.starts_with("__nsl_wggo_grad."))
+                            .map(|n| strip_host_symbol_prefix(n).starts_with("__nsl_wggo_grad."))
                             .unwrap_or(false)
                         {
                             count += 1;

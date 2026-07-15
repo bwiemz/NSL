@@ -199,6 +199,26 @@ fn find_runtime_lib() -> Result<PathBuf, CodegenError> {
     ))
 }
 
+/// Strip the host-ABI symbol-name prefix so logical NSL symbol names compare
+/// uniformly across platforms.
+///
+/// Mach-O (macOS) decorates every exported and undefined symbol with a
+/// leading underscore: a symbol declared in Cranelift as
+/// `nsl_calib_model_forward` appears in the object file as
+/// `_nsl_calib_model_forward`. ELF (Linux) and COFF (Windows MSVC) do not.
+/// Every consumer that reads symbol names back out of an emitted object
+/// (production post-checks and object-inspecting tests alike) must compare
+/// against the un-prefixed logical name, so strip a single leading
+/// underscore on macOS only.
+#[inline]
+pub fn strip_host_symbol_prefix(name: &str) -> &str {
+    if cfg!(target_os = "macos") {
+        name.strip_prefix('_').unwrap_or(name)
+    } else {
+        name
+    }
+}
+
 /// Link a single object file into an executable (backward compatible).
 pub fn link(obj_path: &Path, output_path: &Path) -> Result<(), CodegenError> {
     link_multi(&[obj_path.to_path_buf()], output_path)
