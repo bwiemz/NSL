@@ -69,7 +69,12 @@ fn program(masked_form: bool, gpu: bool, continuous_pos: bool, save_path: &Path)
         src = src.replace("# GPU_PLACEMENT", "m.to(cuda)");
     }
     assert!(src.contains("STAGE_C_SAVE_PATH"));
-    src.replace("STAGE_C_SAVE_PATH", &save_path.display().to_string())
+    // NSL string literals treat `\` as an escape introducer; a raw Windows
+    // path (`C:\Users\...`) substituted verbatim produces "unknown escape
+    // sequence" parse errors (`\U`, `\R`, ...). Escape backslashes for the
+    // NSL string literal, matching path.display()'s native separator.
+    let escaped_path = save_path.display().to_string().replace('\\', "\\\\");
+    src.replace("STAGE_C_SAVE_PATH", &escaped_path)
 }
 
 struct RunOutput {
