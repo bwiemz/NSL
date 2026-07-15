@@ -1503,7 +1503,25 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_add_inplace: dtype mismatch (dst={}, src={})",
         dst.dtype, src.dtype
     );
-    // Device memory: must transfer to CPU, compute, copy back
+    // Device memory: co-resident f32 operands take the elementwise add
+    // kernel with the output aliased to dst — zero PCIe traffic, and
+    // bit-identical to the old DtoH → f64 add → downcast → HtoD round-trip
+    // (rounding the exact f64 sum of two f32 values to f32 equals the f32
+    // sum). The FASE per-micro-batch accumulate (m_partial += scaled grad)
+    // runs through here once per parameter per micro-batch, which made the
+    // round-trip the dominant hidden host cost of large-model backwards.
+    #[cfg(feature = "cuda")]
+    if dst.device > 0 && src.device == dst.device && dst.dtype == 1 && src.dtype == 1 {
+        crate::cuda::gpu_elementwise_binary_inplace(
+            dst_ptr,
+            src_ptr,
+            crate::cuda::kernels::ADD_F32_PTX,
+            "nsl_add_f32\0",
+        );
+        return;
+    }
+    // Residual device cases (non-f32 device tensors): transfer to CPU,
+    // compute, copy back.
     #[cfg(feature = "cuda")]
     if dst.device > 0 {
         let dst_cpu = nsl_tensor_to_device(dst_ptr, 0);
@@ -1596,6 +1614,24 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
         return;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    // Device-resident contiguous f32: in-place scale kernel, no PCIe.
+    // The scalar rounds to f32 before the multiply (as every other GPU
+    // scalar op already does); the old round-trip multiplied in f64 and
+    // rounded after, so results can differ by ≤1 ulp when the scalar is
+    // not exactly representable in f32 (e.g. a computed clip factor).
+    // FASE's two-phase clip Phase B applies the factor through here once
+    // per parameter per optimizer step.
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 && tensor.dtype == 1 && tensor.is_contiguous() {
+        crate::cuda::gpu_scalar_op_inplace(
+            tensor_ptr,
+            scalar as f32,
+            crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+            "nsl_mul_scalar_f32\0",
+        );
+        return;
+    }
 
     #[cfg(feature = "cuda")]
     if tensor.device > 0 {
@@ -1838,6 +1874,26 @@ pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
         return 0.0;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    // GPU f32 tensors: fused device-side stats kernel (min/max/sum/sum_sq),
+    // 16-byte readback instead of a full-tensor DtoH + host loop. The kernel
+    // accumulates in f32 where the CPU path accumulates in f64 — for the
+    // clip-norm consumer that shifts the global norm by O(√n·ε_f32) relative,
+    // the same accumulation dtype every other GPU reduction already uses.
+    // NSL_SUM_SQ_CPU=1 restores the exact-f64 CPU reduction for bisections.
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 && tensor.dtype == 1 {
+        static FORCE_CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_cpu = *FORCE_CPU.get_or_init(|| {
+            std::env::var("NSL_SUM_SQ_CPU").ok().as_deref() == Some("1")
+        });
+        if !force_cpu {
+            let contig = nsl_tensor_contiguous(tensor_ptr);
+            let stats = crate::cuda::gpu_tensor_stats_f32(contig);
+            nsl_tensor_free(contig);
+            return f64::from(stats[3]);
+        }
+    }
 
     // GPU tensors: transfer to CPU for reduction.
     let (cpu_ptr, was_gpu) = if tensor.device > 0 {
