@@ -1881,3 +1881,546 @@ fn doc_starts_null_equals_standard_positions_backward() {
         dq_diff, dk_diff, dv_diff, tol,
     );
 }
+
+// ===========================================================================
+// Batch >= 2 segment-masked backward — #372 audit-fix regression guard.
+//
+// The CSHA fused backward launches ONCE with grid_y = batch*heads, unlike
+// the forward, whose per-batch-row host launch loop pre-offsets the
+// segment_ids pointer (seg_dev + bi*row_seg). The backward prelude's
+// cooperative SMEM load must therefore offset segment_ids_ptr by
+// batch_idx*seq_len*2 itself (prelude.rs, "#372 audit fix"). Before the
+// fix every CTA loaded batch-row-0's document boundaries, silently
+// corrupting dQ/dK/dV for rows 1..B-1.
+//
+// Fixture: batch=2, seq_len=32, head_dim=32. Single-tile on purpose —
+// seq_len == block_q == block_kv — because the launcher refuses the
+// multi-tile fused backward at batch>1 (x_raw batch addressing).
+//   row 0: ONE document spanning the whole sequence (all seg_ids = 0);
+//   row 1: TWO documents split at seq/2 ([0..16)=0, [16..32)=1).
+// Row 1's boundaries deliberately DIFFER from row 0's: a kernel that reads
+// row 0's ids for row 1 (the pre-fix bug) degenerates row 1 to the
+// unmasked backward and produces measurably wrong dQ/dK/dV there.
+//
+// Reference: CPU backward (flash_attention_backward_cpu_gqa) over the same
+// host-staged forward saves, masking each batch row with its OWN segment
+// ids (the [batch*seq_len] seg contract). Tolerance 5e-3 — the file's
+// established backward budget.
+// ===========================================================================
+
+struct BatchedForwardSaves {
+    q_f32:   Vec<f32>,
+    k_f32:   Vec<f32>,
+    v_f32:   Vec<f32>,
+    out_f32: Vec<f32>,
+    lse:     Vec<f32>,
+    row_max: Vec<f32>,
+    row_sum: Vec<f32>,
+}
+
+// Stage trusted forward states for every batch row on the host. Each row
+// uses its OWN slice of x and its OWN segment ids; weights are shared
+// (per-model). Pure function — the GPU launcher and the CPU reference call
+// it independently and get identical staging.
+fn stage_batched_forward_saves(
+    x_host:       &[f32],   // [batch × seq_len × head_dim]
+    wq_f16:       &[u16],
+    wk_f16:       &[u16],
+    wv_f16:       &[u16],
+    batch:        usize,
+    seq_len:      usize,
+    head_dim:     usize,
+    seg_ids_host: &[u16],   // [batch × seq_len]; empty → unmasked
+    segment_masked: bool,
+    causal:       bool,
+) -> BatchedForwardSaves {
+    let norm_eps  = 1e-5f32;
+    let scale     = 1.0f32 / (head_dim as f32).sqrt();
+    let row_elems = seq_len * head_dim;
+
+    let mut saves = BatchedForwardSaves {
+        q_f32:   Vec::with_capacity(batch * row_elems),
+        k_f32:   Vec::with_capacity(batch * row_elems),
+        v_f32:   Vec::with_capacity(batch * row_elems),
+        out_f32: Vec::with_capacity(batch * row_elems),
+        lse:     Vec::with_capacity(batch * seq_len),
+        row_max: Vec::with_capacity(batch * seq_len),
+        row_sum: Vec::with_capacity(batch * seq_len),
+    };
+    for b in 0..batch {
+        let x_row = &x_host[b * row_elems..(b + 1) * row_elems];
+        let seg_row: &[u16] = if seg_ids_host.is_empty() {
+            &[]
+        } else {
+            &seg_ids_host[b * seq_len..(b + 1) * seq_len]
+        };
+        let x_norm = rmsnorm_rows(x_row, seq_len, head_dim, norm_eps);
+        let q_row  = project_rows_f16_saved(&x_norm, wq_f16, seq_len, head_dim);
+        let k_row  = project_rows_f16_saved(&x_norm, wk_f16, seq_len, head_dim);
+        let v_row  = project_rows_f16_saved(&x_norm, wv_f16, seq_len, head_dim);
+        let (out_row, lse_row, row_max_row, row_sum_row) =
+            flash_attention_forward_reference_with_stats(
+                &q_row, &k_row, &v_row,
+                seq_len, head_dim, scale, causal,
+                seg_row, segment_masked,
+            );
+        saves.q_f32.extend_from_slice(&q_row);
+        saves.k_f32.extend_from_slice(&k_row);
+        saves.v_f32.extend_from_slice(&v_row);
+        saves.out_f32.extend_from_slice(&out_row);
+        saves.lse.extend_from_slice(&lse_row);
+        saves.row_max.extend_from_slice(&row_max_row);
+        saves.row_sum.extend_from_slice(&row_sum_row);
+    }
+    saves
+}
+
+// Batched clone of `launch_pca_backward` (heads=1). Allocates
+// [batch, heads, seq, hd] buffers, uploads [batch, seq] segment ids
+// contiguously, and launches through the SAME production FFI
+// (`nsl_flash_attention_csha_backward`), which sizes the launch as
+// grid_y = batch*heads — one CTA per (batch row, head, q-block).
+//
+// Single-tile precondition asserted below: the production launcher refuses
+// the multi-tile fused backward at batch>1, so seq_len must equal
+// block_q == block_kv for this helper.
+#[allow(clippy::too_many_arguments)]
+#[allow(unused_unsafe)]                // mirrors launch_pca_backward pattern
+fn launch_pca_backward_batched(
+    x_host:       &[f32],   // [batch × seq_len × head_dim] raw CSHA input, f32
+    wq_f16:       &[u16],   // weight matrices [d_model × head_dim] f16 (shared)
+    wk_f16:       &[u16],
+    wv_f16:       &[u16],
+    do_host_f16:  &[u16],   // upstream gradient [batch × seq_len × head_dim] f16
+    batch:        usize,
+    seq_len:      usize,
+    head_dim:     usize,
+    seg_ids_host: &[u16],   // [batch × seq_len]; empty → unpacked (seg_dev = 0)
+    segment_masked: bool,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let heads = 1usize;
+    let dm    = head_dim;   // d_model == head_dim for these fixtures
+    let norm_eps = 1e-5f32;
+    let scale    = 1.0f32 / (head_dim as f32).sqrt();
+
+    let config = pca_backward_config(segment_masked);
+    assert_eq!(
+        seq_len as i64, config.block_q,
+        "batched launcher is single-tile only: seq_len must equal block_q \
+         (the production launcher refuses multi-tile fused backward at batch>1)",
+    );
+    assert_eq!(
+        seq_len as i64, config.block_kv,
+        "batched launcher is single-tile only: seq_len must equal block_kv",
+    );
+    if segment_masked && !seg_ids_host.is_empty() {
+        assert_eq!(
+            seg_ids_host.len(), batch * seq_len,
+            "seg_ids must be [batch, seq] contiguous",
+        );
+    }
+
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, Direction::Backward) {
+        eprintln!("[pca_bwd_b] backward validator rejected: {e}");
+        return None;
+    }
+
+    // ── Byte counts ──────────────────────────────────────────────────────────
+    let qkv_f16_bytes = (batch * heads * seq_len * head_dim * 2) as i64;
+    let lse_bytes     = (batch * heads * seq_len * 4) as i64;
+    let x_bytes       = (batch * heads * seq_len * head_dim * 4) as i64;  // f32
+    let w_bytes       = (dm * (heads * head_dim) * 2) as i64;             // f16
+    let nw_bytes      = (head_dim * 4) as i64;                             // f32 norm weight
+    let dw_bytes      = (dm * (heads * head_dim) * 2) as i64;
+    let dx_bytes      = (batch * heads * seq_len * head_dim * 4) as i64;
+    let dxn_bytes     = (batch * seq_len * dm * 4) as i64;
+
+    // ── Allocate device buffers ───────────────────────────────────────────────
+    let q_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let k_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let v_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let out_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
+    let x_dev   = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let nw_dev  = unsafe { nsl_test_cuda_alloc(nw_bytes) };
+    let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+    let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
+
+    let all_dev = [
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
+        wq_dev, wk_dev, wv_dev, do_dev, dq_dev, dk_dev, dv_dev,
+        dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
+    ];
+    for &p in &all_dev {
+        if p == 0 {
+            eprintln!("[pca_bwd_b] device alloc returned null (OOM?)");
+            free_all(&all_dev);
+            return None;
+        }
+    }
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(
+            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
+        )
+    };
+    let save_ptrs = [
+        saves.q_proj, saves.k_proj, saves.v_proj,
+        saves.row_max, saves.row_sum, saves.x_raw,
+    ];
+    if save_ptrs.iter().any(|&ptr| ptr == 0) {
+        eprintln!("[pca_bwd_b] CshaBackwardActivations alloc failed");
+        unsafe { nsl_csha_free_backward_activations(saves); }
+        free_all(&all_dev);
+        return None;
+    }
+
+    // ── Stage trusted forward states on the host (per batch row) ────────────
+    let staged = stage_batched_forward_saves(
+        x_host, wq_f16, wk_f16, wv_f16,
+        batch, seq_len, head_dim,
+        seg_ids_host, segment_masked, config.causal,
+    );
+    let q_host_f16:   Vec<u16> = staged.q_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let k_host_f16:   Vec<u16> = staged.k_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let v_host_f16:   Vec<u16> = staged.v_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let out_host_f16: Vec<u16> = staged.out_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+
+    // ── Upload ───────────────────────────────────────────────────────────────
+    let nw_host = vec![1.0f32; head_dim];
+    unsafe {
+        nsl_test_cuda_h2d(q_dev,   q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(k_dev,   k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(v_dev,   v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(out_dev, out_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(lse_dev, staged.lse.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(x_dev,   x_host.as_ptr()    as i64, x_bytes);
+        nsl_test_cuda_h2d(nw_dev,  nw_host.as_ptr()   as i64, nw_bytes);
+        nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.q_proj,  q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.k_proj,  k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.v_proj,  v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.row_max, staged.row_max.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(saves.row_sum, staged.row_sum.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(saves.x_raw,   x_host.as_ptr() as i64, x_bytes);
+    }
+
+    // Upload segment_ids ([batch, seq] u16, contiguous) if needed.
+    let seg_dev: i64 = if segment_masked && !seg_ids_host.is_empty() {
+        let seg_bytes = (seg_ids_host.len() * 2) as i64;
+        let ptr = unsafe { nsl_test_cuda_alloc(seg_bytes) };
+        if ptr == 0 {
+            eprintln!("[pca_bwd_b] segment_ids alloc failed");
+            unsafe { nsl_csha_free_backward_activations(saves); }
+            free_all(&all_dev);
+            return None;
+        }
+        unsafe { nsl_test_cuda_h2d(ptr, seg_ids_host.as_ptr() as i64, seg_bytes); }
+        ptr
+    } else {
+        0i64
+    };
+
+    // ── Backward PTX ─────────────────────────────────────────────────────────
+    let mut bwd_ptx_str = match synthesize_backward(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[pca_bwd_b] synthesize_backward error: {e}");
+            unsafe { nsl_csha_free_backward_activations(saves); }
+            free_all(&all_dev);
+            if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+            return None;
+        }
+    };
+    if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
+    let bwd_ptx  = bwd_ptx_str.into_bytes();
+    let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
+
+    let bwd_smem_total = shared_mem_bytes_v2_backward(&config);
+    let smem_static_cap: u32 = 49152; // 48 KB hard limit for static SMEM
+    let bwd_smem_dyn: i64 = if bwd_smem_total > smem_static_cap {
+        bwd_smem_total as i64
+    } else {
+        0
+    };
+    eprintln!("[pca_bwd_b] batch={batch} bwd_smem_total={bwd_smem_total} bwd_smem_dyn={bwd_smem_dyn}");
+
+    let rc_bwd = unsafe {
+        nsl_flash_attention_csha_backward(
+            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            scale.to_bits() as i64,
+            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
+            0, 0, 0, 0,             // paging
+            0, 0,                   // cos/sin
+            0, 0,                   // ragged
+            bwd_smem_dyn,           // dynamic SMEM bytes (0 if static is sufficient)
+            bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
+            config.block_q as i64, config.block_kv as i64,
+            if config.causal { 1 } else { 0 },
+            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
+            0, norm_eps.to_bits() as i64,
+            heads as i64, dm as i64,
+            saves.q_proj, saves.k_proj, saves.v_proj,
+            saves.row_max, saves.row_sum,
+            saves.x_raw,
+            do_dev, dq_dev, dk_dev, dv_dev,
+            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            dxn_dev,
+            // PCA Task 4B: trailing segment_ids ([batch, seq] base pointer —
+            // the kernel offsets it by batch_idx*seq_len*2, #372 audit fix).
+            seg_dev,
+            // Tier B extension — null (not used for Tier A tests)
+            0i64, 0i64,
+            // doc_starts ptr — null (rope_q=false, no doc-aware positions)
+            0i64,
+            // tier_b2_active — 0: scalar backward path, no Tier-B2 hybrid launch.
+            0i64,
+            // num_docs_or_zero — 0: legacy per-q-block topology (not per-doc).
+            0i64,
+        )
+    };
+    unsafe {
+        let sync_rc = cudarc::driver::sys::cuCtxSynchronize();
+        eprintln!("[pca_bwd_b] bwd rc={rc_bwd} sync_rc={sync_rc:?}");
+        if !matches!(sync_rc, cudarc::driver::sys::CUresult::CUDA_SUCCESS) {
+            nsl_csha_free_backward_activations(saves);
+            free_all(&all_dev);
+            if seg_dev != 0 { nsl_test_cuda_free(seg_dev); }
+            return None;
+        }
+    }
+    if rc_bwd != 0 {
+        let log = unsafe {
+            let p = nsl_test_cuda_jit_log(bwd_ptx.as_ptr() as i64);
+            if p != 0 {
+                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
+            } else { "<no log>".into() }
+        };
+        eprintln!("[pca_bwd_b] backward rc={rc_bwd}\nJIT log:\n{log}");
+        unsafe { nsl_csha_free_backward_activations(saves); }
+        free_all(&all_dev);
+        if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+        return None;
+    }
+
+    // ── Readback dQ, dK, dV (f16 on device → f32 on host) ───────────────────
+    let qkv_elems = batch * heads * seq_len * head_dim;
+    let mut dq_raw = vec![0u16; qkv_elems];
+    let mut dk_raw = vec![0u16; qkv_elems];
+    let mut dv_raw = vec![0u16; qkv_elems];
+    unsafe {
+        nsl_test_cuda_d2h(dq_raw.as_mut_ptr() as i64, dq_dev, (qkv_elems * 2) as i64);
+        nsl_test_cuda_d2h(dk_raw.as_mut_ptr() as i64, dk_dev, (qkv_elems * 2) as i64);
+        nsl_test_cuda_d2h(dv_raw.as_mut_ptr() as i64, dv_dev, (qkv_elems * 2) as i64);
+    }
+    let dq: Vec<f32> = dq_raw.iter().map(|&b| f16_to_f32(b)).collect();
+    let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
+    let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+    free_all(&all_dev);
+    if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+
+    Some((dq, dk, dv))
+}
+
+// CPU oracle for the batched fixtures: same staged forward saves, then
+// `flash_attention_backward_cpu_gqa` with the [batch*seq_len] seg contract —
+// each batch row is masked by its OWN segment ids.
+fn cpu_reference_batched(
+    staged:       &BatchedForwardSaves,
+    do_host_f16:  &[u16],
+    batch:        usize,
+    seq_len:      usize,
+    head_dim:     usize,
+    seg_ids_host: &[u16],
+    segment_masked: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let heads = 1usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // Derive causal from the same config the GPU launcher synthesizes with,
+    // so oracle and kernel can never drift if the shared config changes.
+    let causal = pca_backward_config(segment_masked).causal;
+    let dout: Vec<f32> = do_host_f16.iter().map(|&bits| f16_to_f32(bits)).collect();
+
+    let qkv_elems = batch * heads * seq_len * head_dim;
+    let mut dq = vec![0f32; qkv_elems];
+    let mut dk = vec![0f32; qkv_elems];
+    let mut dv = vec![0f32; qkv_elems];
+    let seg_f32: Vec<f32> = seg_ids_host.iter().map(|&s| s as f32).collect();
+    flash_attention_backward_cpu_gqa(
+        &staged.q_f32, &staged.k_f32, &staged.v_f32,
+        &staged.out_f32, &staged.lse, &dout,
+        &mut dq, &mut dk, &mut dv,
+        batch, heads, heads, seq_len, head_dim,
+        scale, causal, 1,
+        if segment_masked && !seg_ids_host.is_empty() {
+            Some(&seg_f32)
+        } else {
+            None
+        },
+    );
+    (
+        roundtrip_f16_vec(&dq),
+        roundtrip_f16_vec(&dk),
+        roundtrip_f16_vec(&dv),
+    )
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn tier_a_backward_batch2_distinct_row_segments_matches_reference() {
+    if !cuda_available() {
+        eprintln!("skipped: no CUDA device");
+        return;
+    }
+
+    let batch    = 2usize;
+    let seq_len  = 32usize;   // single-tile: seq == block_q == block_kv == 32
+    let head_dim = 32usize;
+    let row_elems = seq_len * head_dim;
+    let total    = batch * row_elems;
+
+    let mut x      = vec![0f32; total];
+    let mut do_f32 = vec![0f32; total];
+    fill_seeded(&mut x,      0xB472_0001);
+    fill_seeded(&mut do_f32, 0xB472_0002);
+
+    let n_weights = head_dim * head_dim;  // d_model=head_dim=32
+    let mut wq_f32 = vec![0f32; n_weights];
+    let mut wk_f32 = vec![0f32; n_weights];
+    let mut wv_f32 = vec![0f32; n_weights];
+    fill_seeded(&mut wq_f32, 0xB472_0003);
+    fill_seeded(&mut wk_f32, 0xB472_0004);
+    fill_seeded(&mut wv_f32, 0xB472_0005);
+    let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+    // Segment ids, [batch, seq] contiguous u16:
+    //   row 0 = one document spanning the whole sequence (all zeros);
+    //   row 1 = two documents split at seq/2 ([0..16)=0, [16..32)=1).
+    let mut seg_ids = vec![0u16; batch * seq_len];
+    for s in seg_ids[seq_len + seq_len / 2..2 * seq_len].iter_mut() { *s = 1; }
+
+    // Causal flag from the shared config (see cpu_reference_batched note).
+    let causal = pca_backward_config(true).causal;
+    let tol = 5e-3f32;
+
+    // ── Sanity: unmasked batch=2 vs CPU reference ────────────────────────────
+    // Isolates generic batch>1 buffer addressing from the segment-ids
+    // batch-row offset under test. If THIS fails, the batched kernel/harness
+    // has a batch bug unrelated to segment masking.
+    eprintln!("Batch-2 — unmasked baseline (segment_masked=false)");
+    let (dq_b, dk_b, dv_b) = launch_pca_backward_batched(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        batch, seq_len, head_dim, &[], false,
+    ).unwrap_or_else(|| panic!(
+        "batch=2 unmasked backward launch failed on a CUDA-capable machine \
+         (kernel crash or launcher refusal — see [pca_bwd_b] log above)"
+    ));
+    let staged_unmasked = stage_batched_forward_saves(
+        &x, &wq_f16, &wk_f16, &wv_f16,
+        batch, seq_len, head_dim, &[], false, causal,
+    );
+    let (dq_br, dk_br, dv_br) = cpu_reference_batched(
+        &staged_unmasked, &do_f16, batch, seq_len, head_dim, &[], false,
+    );
+    let (dqb_diff, dqb_idx) = max_abs_diff(&dq_b, &dq_br);
+    let (dkb_diff, dkb_idx) = max_abs_diff(&dk_b, &dk_br);
+    let (dvb_diff, dvb_idx) = max_abs_diff(&dv_b, &dv_br);
+    eprintln!(
+        "Batch-2 [unmasked sanity]: dq={:.3e}@[{dqb_idx}]  dk={:.3e}@[{dkb_idx}]  dv={:.3e}@[{dvb_idx}]",
+        dqb_diff, dkb_diff, dvb_diff,
+    );
+    assert!(dqb_diff <= tol,
+        "Batch-2 sanity FAILED: unmasked dq={:.3e} > {:.0e} — batch>1 addressing \
+         broken independent of segment masking", dqb_diff, tol);
+    assert!(dkb_diff <= tol,
+        "Batch-2 sanity FAILED: unmasked dk={:.3e} > {:.0e} — batch>1 addressing \
+         broken independent of segment masking", dkb_diff, tol);
+    assert!(dvb_diff <= tol,
+        "Batch-2 sanity FAILED: unmasked dv={:.3e} > {:.0e} — batch>1 addressing \
+         broken independent of segment masking", dvb_diff, tol);
+
+    // ── Main assertion: masked batch=2, per-row DISTINCT segment ids ─────────
+    eprintln!("Batch-2 — PCA backward (segment_masked=true, row0=1 doc, row1=2 docs)");
+    let (dq_pca, dk_pca, dv_pca) = launch_pca_backward_batched(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        batch, seq_len, head_dim, &seg_ids, true,
+    ).unwrap_or_else(|| panic!(
+        "batch=2 segment-masked backward launch failed on a CUDA-capable machine \
+         (kernel crash — see [pca_bwd_b] log above)"
+    ));
+    let staged_masked = stage_batched_forward_saves(
+        &x, &wq_f16, &wk_f16, &wv_f16,
+        batch, seq_len, head_dim, &seg_ids, true, causal,
+    );
+    let (dq_ref, dk_ref, dv_ref) = cpu_reference_batched(
+        &staged_masked, &do_f16, batch, seq_len, head_dim, &seg_ids, true,
+    );
+
+    for (name, arr) in [
+        ("dq_pca", &dq_pca), ("dk_pca", &dk_pca), ("dv_pca", &dv_pca),
+        ("dq_ref", &dq_ref), ("dk_ref", &dk_ref), ("dv_ref", &dv_ref),
+    ] {
+        assert_no_nan(name, arr, "Batch-2 masked");
+    }
+
+    // Per-row breakdown: with the #372 fix reverted, row 0 stays correct
+    // (offset 0) while row 1 reads row 0's all-zero ids and degenerates to
+    // the unmasked backward — the row-1 diffs blow past tolerance.
+    for b in 0..batch {
+        let lo = b * row_elems;
+        let hi = lo + row_elems;
+        let (dq_d, _) = max_abs_diff(&dq_pca[lo..hi], &dq_ref[lo..hi]);
+        let (dk_d, _) = max_abs_diff(&dk_pca[lo..hi], &dk_ref[lo..hi]);
+        let (dv_d, _) = max_abs_diff(&dv_pca[lo..hi], &dv_ref[lo..hi]);
+        eprintln!(
+            "Batch-2 [masked] row {b}: dq={:.3e} dk={:.3e} dv={:.3e}",
+            dq_d, dk_d, dv_d,
+        );
+    }
+
+    let (dq_diff, dq_idx) = max_abs_diff(&dq_pca, &dq_ref);
+    let (dk_diff, dk_idx) = max_abs_diff(&dk_pca, &dk_ref);
+    let (dv_diff, dv_idx) = max_abs_diff(&dv_pca, &dv_ref);
+    eprintln!(
+        "Batch-2 [masked, distinct row segments]: dq={:.3e}@[{dq_idx}]  dk={:.3e}@[{dk_idx}]  dv={:.3e}@[{dv_idx}]",
+        dq_diff, dk_diff, dv_diff,
+    );
+
+    assert!(dq_diff <= tol,
+        "Batch-2 masked FAILED: dq={:.3e} > {:.0e} at flat idx {} (row {}) — \
+         if row 1 is the offender, the backward prelude is likely reading \
+         batch-row-0's segment ids (#372 audit fix regressed)",
+        dq_diff, tol, dq_idx, dq_idx / row_elems);
+    assert!(dk_diff <= tol,
+        "Batch-2 masked FAILED: dk={:.3e} > {:.0e} at flat idx {} (row {}) — \
+         if row 1 is the offender, the backward prelude is likely reading \
+         batch-row-0's segment ids (#372 audit fix regressed)",
+        dk_diff, tol, dk_idx, dk_idx / row_elems);
+    assert!(dv_diff <= tol,
+        "Batch-2 masked FAILED: dv={:.3e} > {:.0e} at flat idx {} (row {}) — \
+         if row 1 is the offender, the backward prelude is likely reading \
+         batch-row-0's segment ids (#372 audit fix regressed)",
+        dv_diff, tol, dv_idx, dv_idx / row_elems);
+    eprintln!(
+        "Batch-2 masked PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol,
+    );
+}

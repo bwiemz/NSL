@@ -559,5 +559,44 @@
    "--wggo-report"
   ],
   "name": "L_base_long"
+ },
+ {
+  "d_model": 512,
+  "n_blocks": 6,
+  "nh": 8,
+  "nkv": 2,
+  "hd": 64,
+  "ffn": 2048,
+  "vocab": 4096,
+  "seq": 1024,
+  "batch": 4,
+  "accum": 4,
+  "n_microbatches": 16,
+  "doc_pattern": 192,
+  "lr": 0.001,
+  "repeats": 3,
+  "timeout": 900,
+  "name": "H_offload_off"
+ },
+ {
+  "d_model": 512,
+  "n_blocks": 6,
+  "nh": 8,
+  "nkv": 2,
+  "hd": 64,
+  "ffn": 2048,
+  "vocab": 4096,
+  "seq": 1024,
+  "batch": 4,
+  "accum": 4,
+  "n_microbatches": 16,
+  "doc_pattern": 192,
+  "lr": 0.001,
+  "repeats": 3,
+  "timeout": 900,
+  "name": "H_offload_on",
+  "extra_args": [
+   "--optim-state-offload"
+  ]
  }
 ]

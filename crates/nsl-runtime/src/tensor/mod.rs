@@ -1151,6 +1151,19 @@ pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
     tensor.refcount.fetch_sub(1, Ordering::SeqCst);
 }
 
+/// Free a HOST (device==0) tensor's data buffer, routing PINNED buffers
+/// (optimizer-state offload, P0.2) to `cuMemFreeHost` via the pinned
+/// registry. Everything else takes the plain heap free. Pinned buffers
+/// are driver allocations — `std::alloc::dealloc` on one is UB.
+fn free_host_tensor_data(data: *mut c_void, size: usize) {
+    #[cfg(feature = "cuda")]
+    if crate::cuda::inner::is_pinned(data) {
+        crate::cuda::inner::free_pinned(data);
+        return;
+    }
+    unsafe { checked_free(data as *mut u8, size) };
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
@@ -1198,7 +1211,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                                 checked_free(owner.data as *mut u8, owner.data_byte_size());
                             }
                         } else {
-                            checked_free(owner.data as *mut u8, owner.data_byte_size());
+                            // Routes pinned offload buffers to cuMemFreeHost.
+                            free_host_tensor_data(owner.data, owner.data_byte_size());
                         }
                     }
                     // Free owner's shape, strides, box
@@ -1226,7 +1240,8 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
                         checked_free(data_ptr as *mut u8, data_size);
                     }
                 } else {
-                    checked_free(data_ptr as *mut u8, data_size);
+                    // Routes pinned offload buffers to cuMemFreeHost.
+                    free_host_tensor_data(data_ptr, data_size);
                 }
             }
 
@@ -1344,6 +1359,13 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_copy_data: dtype mismatch (dst={}, src={})",
         dst.dtype, src.dtype
     );
+    // Self-copy is a no-op. The optimizer-state offload envelope stages
+    // state with `to_device_like`, which on a same-device (CPU) run returns
+    // the SAME tensor with a refcount bump — the copy-back then sees
+    // dst.data == src.data, and copy_nonoverlapping would be UB.
+    if dst.data == src.data {
+        return;
+    }
     let byte_count = (dst.len as usize) * dst.element_size();
     // Handle device memory: use appropriate copy method
     #[cfg(feature = "cuda")]
@@ -1360,6 +1382,254 @@ pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     unsafe {
         std::ptr::copy_nonoverlapping(src.data as *const u8, dst.data as *mut u8, byte_count);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Optimizer-state offload envelope (P0.2): pinned host state, async DtoH
+// copy-back on the per-thread transfer stream, and a drain point emitted
+// once per optimizer step.
+//
+// Env kill-switches (read once, cached):
+//   NSL_OFFLOAD_SYNC=1     — copy-back degrades to the synchronous path
+//                            (nsl_offload_drain becomes a list-flush no-op).
+//   NSL_OFFLOAD_PAGEABLE=1 — host state buffers use pageable heap memory
+//                            instead of cuMemAllocHost (pinned).
+// ---------------------------------------------------------------------------
+
+/// NSL_OFFLOAD_SYNC=1 forces the offload copy-back onto the synchronous
+/// path (kill-switch for the P0.2 async overlap).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))] // async path is cuda-only
+pub(crate) fn offload_sync_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("NSL_OFFLOAD_SYNC").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// NSL_OFFLOAD_PAGEABLE=1 forces pageable host allocation for offloaded
+/// optimizer state (kill-switch for the P0.2 pinned upgrade).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))] // pinned path is cuda-only
+pub(crate) fn offload_pageable_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("NSL_OFFLOAD_PAGEABLE").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+thread_local! {
+    /// Staged device tensors whose async DtoH copy-back is still in flight.
+    /// Freed by `nsl_offload_drain` AFTER the transfer stream synchronizes —
+    /// freeing them inline would hand the block back to the caching
+    /// allocator while the copy still reads it. Thread-local to pair with
+    /// the per-thread transfer stream.
+    static OFFLOAD_DRAIN_TENSORS: std::cell::RefCell<Vec<i64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    /// Raw transient DEVICE buffers (from `alloc_managed`, not full tensors)
+    /// read by an in-flight async DtoH — the P0.3 quant-cast staging
+    /// buffers. Freed via `free_managed` by `nsl_offload_drain` after sync.
+    static OFFLOAD_DRAIN_DEVICE_BUFS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Defer `nsl_tensor_free(ptr)` until the next `nsl_offload_drain()`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))] // enqueued by cuda-only paths
+pub(crate) fn offload_defer_free_tensor(ptr: i64) {
+    OFFLOAD_DRAIN_TENSORS.with(|l| l.borrow_mut().push(ptr));
+}
+
+/// Bound on in-flight drain-deferred device buffers (staged tensors +
+/// quant-cast transients). Without a bound, EVERY parameter's staged
+/// optimizer state stays device-resident until the single per-step drain
+/// — at 1B/f32 that is the full m+v surface (~8 GB), exactly the memory
+/// `--optim-state-offload` exists to evict, and a mid-loop OOM cannot
+/// reclaim it (the caching allocator's recovery only drains POOLED
+/// blocks). 4 buffers ≈ two params' (m, v) — enough pipeline depth for
+/// the copy-back of param i to overlap the update of param i+1, with
+/// residency bounded to O(2 params) instead of O(all params).
+#[cfg(feature = "cuda")]
+const OFFLOAD_MAX_INFLIGHT: usize = 4;
+
+/// Inline flush point called BEFORE enqueueing a new async copy-back:
+/// when the drain lists are saturated, synchronize the transfer stream
+/// and free the deferred buffers. Flushing before (not after) the new
+/// enqueue means the just-issued copy never loses its overlap window —
+/// the sync only waits on copies that are `OFFLOAD_MAX_INFLIGHT` params
+/// old and near-certainly complete.
+#[cfg(feature = "cuda")]
+pub(crate) fn offload_flush_if_saturated() {
+    let inflight = OFFLOAD_DRAIN_TENSORS.with(|l| l.borrow().len())
+        + OFFLOAD_DRAIN_DEVICE_BUFS.with(|l| l.borrow().len());
+    if inflight >= OFFLOAD_MAX_INFLIGHT {
+        nsl_offload_drain();
+    }
+}
+
+/// Defer `free_managed(buf)` until the next `nsl_offload_drain()`.
+#[cfg(feature = "cuda")]
+pub(crate) fn offload_defer_free_device_buf(buf: *mut c_void) {
+    OFFLOAD_DRAIN_DEVICE_BUFS.with(|l| l.borrow_mut().push(buf as usize));
+}
+
+/// Async sibling of `nsl_tensor_copy_data` that CONSUMES `src`.
+///
+/// Fast path (all of: cuda build, `src` device-resident, `dst` host-resident
+/// with a PINNED data buffer, `NSL_OFFLOAD_SYNC` unset): issues the DtoH on
+/// the per-thread transfer stream — ordered after the NULL-stream update
+/// kernels that produced `src`, overlapping with the next parameter's
+/// update — and defers `src`'s free to `nsl_offload_drain()`. The copy is
+/// NOT observable in `dst` until the drain runs.
+///
+/// Fallback (anything else): exactly `nsl_tensor_copy_data(dst, src)`
+/// followed by an inline `nsl_tensor_free(src)`.
+///
+/// Ownership contract: callers replace the emitted pair
+/// `copy_data(dst, src); free(src)` with ONE call to this function, and
+/// emit `nsl_offload_drain()` once per optimizer step after the per-param
+/// loop exits.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_copy_data_async(dst_ptr: i64, src_ptr: i64) {
+    #[cfg(feature = "cuda")]
+    if dst_ptr != 0 && src_ptr != 0 && !offload_sync_forced() {
+        let dst = NslTensor::from_ptr(dst_ptr);
+        let src = NslTensor::from_ptr(src_ptr);
+        if src.device > 0
+            && dst.device == 0
+            && !dst.data.is_null()
+            && !src.data.is_null()
+            && crate::cuda::inner::is_pinned(dst.data)
+        {
+            // Same guards as nsl_tensor_copy_data's sync path.
+            debug_assert!(dst.is_contiguous(), "copy_data_async requires contiguous dst");
+            debug_assert!(src.is_contiguous(), "copy_data_async requires contiguous src");
+            assert_eq!(
+                dst.len, src.len,
+                "nsl_tensor_copy_data_async: dst len {} != src len {}",
+                dst.len, src.len
+            );
+            assert_eq!(
+                dst.dtype, src.dtype,
+                "nsl_tensor_copy_data_async: dtype mismatch (dst={}, src={})",
+                dst.dtype, src.dtype
+            );
+            // Bound in-flight staged buffers BEFORE enqueueing (review M1:
+            // otherwise the whole m+v surface stays device-resident until
+            // the per-step drain, defeating the offload).
+            offload_flush_if_saturated();
+            let byte_count = (dst.len as usize) * dst.element_size();
+            crate::cuda::inner::memcpy_dtoh_async(dst.data, src.data, byte_count);
+            offload_defer_free_tensor(src_ptr);
+            return;
+        }
+    }
+    nsl_tensor_copy_data(dst_ptr, src_ptr);
+    nsl_tensor_free(src_ptr);
+}
+
+/// Drain point for the offload copy-back: synchronize the calling thread's
+/// transfer stream, then free every staged tensor / transient device buffer
+/// whose async DtoH was in flight. Emitted by codegen ONCE per optimizer
+/// step, after the per-parameter loop exits. Cheap no-op when nothing was
+/// enqueued (sync fallback path, CPU runs, non-offload builds).
+#[no_mangle]
+pub extern "C" fn nsl_offload_drain() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::inner::transfer_stream_synchronize();
+    let tensors = OFFLOAD_DRAIN_TENSORS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    for p in tensors {
+        nsl_tensor_free(p);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let bufs = OFFLOAD_DRAIN_DEVICE_BUFS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        for b in bufs {
+            crate::cuda::inner::free_managed(b as *mut c_void);
+        }
+    }
+}
+
+/// Allocate a zero-filled host data buffer for offloaded optimizer state:
+/// PINNED (`cuMemAllocHost_v2`, tracked in the pinned registry so
+/// `nsl_tensor_free` routes it back to `cuMemFreeHost`) when a CUDA
+/// context is already live and `NSL_OFFLOAD_PAGEABLE=1` is not set;
+/// pageable heap otherwise (silent fallback — a GPU-less run must behave
+/// exactly like one without the pinned upgrade).
+pub(crate) fn alloc_host_state_buffer(bytes: usize) -> *mut u8 {
+    #[cfg(feature = "cuda")]
+    if !offload_pageable_forced() && crate::cuda::inner::context_initialized() {
+        match crate::cuda::inner::try_alloc_pinned(bytes) {
+            Some(p) => {
+                // cuMemAllocHost does not zero; offloaded moments must start at 0.
+                unsafe { std::ptr::write_bytes(p as *mut u8, 0, bytes) };
+                return p as *mut u8;
+            }
+            None => {
+                // Page-lock limits / fragmented host memory: degrade to
+                // pageable (copy-back falls to the sync path) instead of
+                // aborting a multi-GB run. Warn once per process.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[offload] cuMemAllocHost failed for a {} MB state buffer — \
+                         falling back to PAGEABLE host memory (sync copy-back). \
+                         Raise the process page-lock limit (ulimit -l) to restore \
+                         the pinned/async path.",
+                        bytes / (1024 * 1024)
+                    );
+                });
+            }
+        }
+    }
+    crate::memory::checked_alloc_zeroed(bytes)
+}
+
+/// Allocate a zero-filled HOST-resident f32 tensor with `template`'s shape,
+/// regardless of the template's device (scaling campaign item 4 —
+/// optimizer-state offload).
+///
+/// `nsl_tensor_zeros_like` inherits the template's placement, and the plain
+/// CPU creation path allocates f64 (the CPU dtype convention) — neither
+/// works for offloaded optimizer state, which must be CPU-resident f32 so
+/// (a) `to_device_like` staging is a plain memcpy and (b) the DtoH
+/// copy-back passes `nsl_tensor_copy_data`'s dtype-equality assert against
+/// the staged GPU f32 working tensor.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
+    let t = NslTensor::from_ptr(template_ptr);
+    // CPU-resident template: offload is meaningless (state would sit next
+    // to the params anyway) and CPU params are f64 — an f32 state buffer
+    // would trip the stdlib step's copy_data dtype assert. Delegate to the
+    // plain like-placement allocation so a CPU run with the offload flag
+    // behaves exactly like one without it.
+    if t.device == 0 {
+        return nsl_tensor_zeros_like(template_ptr);
+    }
+    let ndim = t.ndim;
+    let len = t.len as usize;
+    let shape = checked_alloc((ndim as usize).max(1) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim as usize {
+        unsafe { *shape.add(i) = *t.shape.add(i) };
+    }
+    let strides = NslTensor::compute_strides(shape, ndim);
+    // P0.2: pinned host memory when a CUDA context is live (template is
+    // device-resident here, so one always is) — enables true async DMA on
+    // the copy-back. NSL_OFFLOAD_PAGEABLE=1 restores the pageable buffer.
+    let data = alloc_host_state_buffer(len * std::mem::size_of::<f32>());
+    let out = Box::new(NslTensor::new(
+        data as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0, // CPU
+        1, // f32
+        1,
+        0,
+    ));
+    NslTensor::publish(out)
 }
 
 #[no_mangle]
@@ -1503,7 +1773,25 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         "nsl_tensor_add_inplace: dtype mismatch (dst={}, src={})",
         dst.dtype, src.dtype
     );
-    // Device memory: must transfer to CPU, compute, copy back
+    // Device memory: co-resident f32 operands take the elementwise add
+    // kernel with the output aliased to dst — zero PCIe traffic, and
+    // bit-identical to the old DtoH → f64 add → downcast → HtoD round-trip
+    // (rounding the exact f64 sum of two f32 values to f32 equals the f32
+    // sum). The FASE per-micro-batch accumulate (m_partial += scaled grad)
+    // runs through here once per parameter per micro-batch, which made the
+    // round-trip the dominant hidden host cost of large-model backwards.
+    #[cfg(feature = "cuda")]
+    if dst.device > 0 && src.device == dst.device && dst.dtype == 1 && src.dtype == 1 {
+        crate::cuda::gpu_elementwise_binary_inplace(
+            dst_ptr,
+            src_ptr,
+            crate::cuda::kernels::ADD_F32_PTX,
+            "nsl_add_f32\0",
+        );
+        return;
+    }
+    // Residual device cases (non-f32 device tensors): transfer to CPU,
+    // compute, copy back.
     #[cfg(feature = "cuda")]
     if dst.device > 0 {
         let dst_cpu = nsl_tensor_to_device(dst_ptr, 0);
@@ -1596,6 +1884,24 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
         return;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    // Device-resident contiguous f32: in-place scale kernel, no PCIe.
+    // The scalar rounds to f32 before the multiply (as every other GPU
+    // scalar op already does); the old round-trip multiplied in f64 and
+    // rounded after, so results can differ by ≤1 ulp when the scalar is
+    // not exactly representable in f32 (e.g. a computed clip factor).
+    // FASE's two-phase clip Phase B applies the factor through here once
+    // per parameter per optimizer step.
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 && tensor.dtype == 1 && tensor.is_contiguous() {
+        crate::cuda::gpu_scalar_op_inplace(
+            tensor_ptr,
+            scalar as f32,
+            crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+            "nsl_mul_scalar_f32\0",
+        );
+        return;
+    }
 
     #[cfg(feature = "cuda")]
     if tensor.device > 0 {
@@ -1838,6 +2144,29 @@ pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
         return 0.0;
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
+
+    // GPU f32 tensors: fused device-side sum-of-squares reduction (the RAW
+    // Σx² accumulator from the stats kernel), 16-byte readback instead of a
+    // full-tensor DtoH + host loop. Uses the dedicated `gpu_tensor_sum_sq_f32`
+    // helper — NOT `gpu_tensor_stats_f32`, whose slot 3 is the population std
+    // (mean/std transform applied), so reading it here silently returned std
+    // and collapsed the FASE gradient-clip global norm by ~n on GPU. The
+    // kernel accumulates in f32 where the CPU path accumulates in f64 (the
+    // same accumulation dtype every other GPU reduction already uses).
+    // NSL_SUM_SQ_CPU=1 restores the exact-f64 CPU reduction for bisections.
+    #[cfg(feature = "cuda")]
+    if tensor.device > 0 && tensor.dtype == 1 {
+        static FORCE_CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_cpu = *FORCE_CPU.get_or_init(|| {
+            std::env::var("NSL_SUM_SQ_CPU").ok().as_deref() == Some("1")
+        });
+        if !force_cpu {
+            let contig = nsl_tensor_contiguous(tensor_ptr);
+            let ss = crate::cuda::gpu_tensor_sum_sq_f32(contig);
+            nsl_tensor_free(contig);
+            return ss;
+        }
+    }
 
     // GPU tensors: transfer to CPU for reduction.
     let (cpu_ptr, was_gpu) = if tensor.device > 0 {
@@ -4455,6 +4784,44 @@ mod tests {
         assert_eq!(got, 0.0);
     }
 
+    /// Regression gate for the review-found HIGH bug: the GPU fast path used
+    /// to read `gpu_tensor_stats_f32()[3]`, which is the population STD (the
+    /// helper post-processes the raw sum_sq into std), not Σx². That silently
+    /// collapsed the FASE gradient-clip global norm by ~n on GPU. Assert the
+    /// GPU sum_sq matches the exact CPU reduction on a multi-element f32
+    /// tensor where std and Σx² differ substantially.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU: requires CUDA device"]
+    fn sum_sq_gpu_matches_cpu_reference() {
+        if crate::nsl_cuda_init() != 0 {
+            return;
+        }
+        // [1, 2, -3, 0.5]: Σx² = 14.25; std ≈ 1.98 — off by ~7x, so a
+        // std-vs-sumsq confusion cannot pass this by coincidence.
+        let vals = [1.0f32, 2.0, -3.0, 0.5];
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, vals.len() as i64);
+        let cpu = nsl_tensor_zeros(shape_list);
+        {
+            let t = NslTensor::from_ptr(cpu);
+            for (i, &v) in vals.iter().enumerate() {
+                unsafe { *t.data_f32().add(i) = v };
+            }
+        }
+        let cpu_ss = nsl_tensor_sum_sq(cpu);
+        assert!((cpu_ss - 14.25).abs() < 1e-4, "CPU sum_sq = {cpu_ss}, expected 14.25");
+
+        let gpu = nsl_tensor_to_device(cpu, 1);
+        let gpu_ss = nsl_tensor_sum_sq(gpu);
+        assert!(
+            (gpu_ss - cpu_ss).abs() < 1e-3,
+            "GPU sum_sq = {gpu_ss} but CPU = {cpu_ss} (std would be ~1.98 — a std/sum_sq slot confusion)"
+        );
+        nsl_tensor_free(gpu);
+        nsl_tensor_free(cpu);
+    }
+
     #[test]
     fn mul_scalar_inplace_f32_scales_values() {
         let shape_list = crate::list::nsl_list_new();
@@ -4603,6 +4970,38 @@ pub extern "C" fn nsl_gpu_set_transient_pool() {
     );
 }
 
+/// Set the GPU allocator surface tag for subsequent allocations (P0.1
+/// per-surface VRAM accounting). Tag values match
+/// `caching_allocator::SurfaceTag`: 0=other, 1=weights, 2=optim_m,
+/// 3=optim_v, 4=m_partial, 5=grads, 6=activations, 7=attn_workspace.
+/// Unknown values map to `other`. Purely observational — never affects
+/// allocator placement decisions (see `nsl_gpu_set_persistent_pool` for
+/// those).
+#[no_mangle]
+pub extern "C" fn nsl_gpu_set_alloc_surface(tag: u8) {
+    #[cfg(feature = "cuda")]
+    crate::cuda::caching_allocator::set_alloc_surface(
+        crate::cuda::caching_allocator::SurfaceTag::from_u8(tag),
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = tag;
+}
+
+/// Get the current GPU allocator surface tag (see `nsl_gpu_set_alloc_surface`).
+/// Codegen brackets use get/set to restore the caller's surface, keeping
+/// nested regions safe. Always 0 in non-CUDA builds.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_get_alloc_surface() -> u8 {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::caching_allocator::get_alloc_surface() as u8
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// Release idle GPU memory back to the driver. Called after each training step
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
@@ -4691,10 +5090,89 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                 stats.num_cache_hits, stats.num_cache_misses,
                 stats.num_splits, stats.num_coalesces,
             );
+            // P0.1: per-surface attribution (current/peak). Zero-only
+            // surfaces are elided to keep the line readable.
+            let mut surface_line = String::from("[gpu-mem]    surfaces:");
+            for (name, cur, peak) in alloc.surface_breakdown() {
+                if cur > 0 || peak > 0 {
+                    surface_line.push_str(&format!(
+                        " {}={}MB(peak {}MB)",
+                        name,
+                        cur / (1024 * 1024),
+                        peak / (1024 * 1024),
+                    ));
+                }
+            }
+            if crate::cuda::inner::async_alloc_enabled() {
+                surface_line.push_str(
+                    " [surfaces untracked: NSL_ASYNC_ALLOC=1 bypasses the caching allocator]",
+                );
+            }
+            eprintln!("{}", surface_line);
         }
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = step; }
+}
+
+/// P0.1: the surface-tag FFI is a pure thread-local set/get — no driver
+/// calls — so this is safe on any machine that compiles the cuda feature.
+#[cfg(all(test, feature = "cuda"))]
+mod alloc_surface_ffi_tests {
+    #[test]
+    fn surface_ffi_roundtrip_and_unknown_maps_to_other() {
+        for tag in 0u8..8 {
+            super::nsl_gpu_set_alloc_surface(tag);
+            assert_eq!(super::nsl_gpu_get_alloc_surface(), tag);
+        }
+        // Unknown wire values decode to Other (0), never panic.
+        super::nsl_gpu_set_alloc_surface(200);
+        assert_eq!(super::nsl_gpu_get_alloc_surface(), 0);
+        super::nsl_gpu_set_alloc_surface(0);
+    }
+}
+
+#[cfg(test)]
+mod offload_envelope_tests {
+    use super::*;
+
+    /// Helper: create a 1-D f64 tensor (CPU, dtype=0, contiguous, refcount=1).
+    fn make_tensor_f64(data: &[f64]) -> i64 {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, data.len() as i64);
+        let ptr = crate::tensor::creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = *v };
+        }
+        ptr
+    }
+
+    /// P0.2: without an eligible async fast path (CPU tensors here), the
+    /// consuming copy falls back to `copy_data` + an INLINE free of src.
+    #[test]
+    fn copy_data_async_cpu_fallback_copies_and_consumes() {
+        let src = make_tensor_f64(&[1.0, 2.0, 3.0]);
+        let dst = make_tensor_f64(&[0.0, 0.0, 0.0]);
+        // rc 2 so the consuming free is observable, not destructive.
+        nsl_tensor_retain(src);
+        nsl_tensor_copy_data_async(dst, src);
+        let rc = NslTensor::from_ptr(src).refcount.load(Ordering::SeqCst);
+        assert_eq!(rc, 1, "sync fallback must free src inline (consuming contract)");
+        let d = NslTensor::from_ptr(dst);
+        let got: Vec<f64> = (0..3).map(|i| unsafe { *d.data_f64().add(i) }).collect();
+        assert_eq!(got, vec![1.0, 2.0, 3.0], "payload must be copied");
+        nsl_tensor_free(src);
+        nsl_tensor_free(dst);
+    }
+
+    /// P0.2: draining with nothing enqueued must be a cheap no-op — and
+    /// must NOT force-initialize CUDA (safe on GPU-less machines).
+    #[test]
+    fn offload_drain_is_a_noop_when_nothing_enqueued() {
+        nsl_offload_drain();
+        nsl_offload_drain(); // idempotent
+    }
 }
 
 #[cfg(test)]

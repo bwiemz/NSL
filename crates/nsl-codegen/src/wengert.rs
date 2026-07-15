@@ -220,22 +220,25 @@ pub enum PrimalOp {
         component: u8,
     },
     /// PCA Stage C: packed-sequence attention — causal WITHIN each document,
-    /// fully blocked across documents (`softmax((QK^T)*scale + mask) @ V`).
+    /// fully blocked across documents (`softmax((QK^T)*scale + mask) @ V`,
+    /// mask derived from segment ids).
     ///
-    /// inputs: `[q, k, v, scale, mask, segment_ids]`.
+    /// inputs: `[q, k, v, scale, segment_ids]`.
     ///
-    /// CONTRACT: `mask` must be the DataLoader's canonical packed mask
-    /// (additive `[b, 1, s, s]`, 0 = attend / -1e9 = blocked, encoding
-    /// causal-within-`segment_ids`). The fused GPU lowering derives masking
-    /// from `segment_ids` + in-kernel causality and IGNORES `mask`; the
-    /// decomposed fallback applies `mask` additively. The two agree exactly
-    /// because `exp((s - 1e9) - lse)` underflows to +0.0 — but only when
-    /// the mask really is causal-within-segment. Arbitrary masks belong to
-    /// `scaled_dot_product_attention_masked` (always decomposed).
+    /// CONTRACT: masking is causal-within-`segment_ids` on BOTH paths.
+    /// The fused GPU lowering derives it from `segment_ids` + in-kernel
+    /// causality; the decomposed fallback derives the dense additive
+    /// `[b, 1, s, s]` mask (0 = attend / -1e9 = blocked) from the SAME
+    /// `segment_ids` at the decline site via
+    /// `nsl_packed_mask_from_segment_ids` (bit-identical to the mask the
+    /// DataLoader used to ship) and applies it additively. The two agree
+    /// exactly because `exp((s - 1e9) - lse)` underflows to +0.0.
+    /// Arbitrary masks belong to `scaled_dot_product_attention_masked`
+    /// (always decomposed, takes an explicit mask argument).
     ///
-    /// `mask` and `segment_ids` are non-differentiable inputs: no adjoint
-    /// is produced for either (Stage B's decomposed form produced — and
-    /// discarded — a mask adjoint; this op never materialises one).
+    /// `segment_ids` is a non-differentiable input: no adjoint is produced
+    /// (Stage B's decomposed form produced — and discarded — a mask
+    /// adjoint; this op never materialises one).
     ScaledDotProductAttentionPacked,
     /// PCA Stage C: extract one component (0=dQ, 1=dK, 2=dV) from the
     /// segment-masked FlashAttention backward (`_segmask` phase-2 kernels,
@@ -333,6 +336,24 @@ pub enum PrimalOp {
     PrologueRecompute {
         subgraph_id: SubgraphId,
     },
+    /// CCR (P1.a block-granular recompute): explicit early-free marker.
+    ///
+    /// `inputs = [victim]` — the lowering emits `nsl_tensor_free(victim)`
+    /// (refcount decrement; views holding a reference keep the storage
+    /// alive) and records the freed `VarId` on the lowering result so the
+    /// end-of-backward bulk free excludes it. The op's own `result` is a
+    /// zero placeholder that must never be consumed.
+    ///
+    /// Spliced ONLY by `ccr::apply_to_adjoint` after adjoint generation —
+    /// it never appears in a primal list handed to `AdjointGenerator`, so
+    /// no AD rule exists for it (by construction, not by accident: an
+    /// adjoint of a free is meaningless).
+    ///
+    /// Placement invariant (validated at splice time): no op after a
+    /// `FreeTensor` may reference its victim. The ghost-VarId skip guard
+    /// in `wengert_lower` would otherwise turn such a bug into a silently
+    /// missing gradient.
+    FreeTensor,
     RoPE {
         dim: usize,
     },

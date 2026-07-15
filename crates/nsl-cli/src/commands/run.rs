@@ -53,6 +53,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             wggo_weights,
             wggo_importance,
             wggo_prune_fraction,
+            wggo_memory_budget,
+            optim_state_offload,
+            checkpoint_blocks,
+            checkpoint_selective,
+            checkpoint_budget_mib,
+            checkpoint_compress,
             weights,
     } = args;
 
@@ -123,6 +129,23 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     process::exit(1);
                 }
             }
+            // --wggo-memory-budget: reject 0 loudly (an unparseable value is
+            // already rejected by clap's u64 parse). The flag IMPLIES
+            // --wggo-moment-precision — a budget that forces sub-32 moments is
+            // meaningless unless the bits are actually lowered to storage.
+            // Convert MiB -> bytes here so codegen only ever sees bytes.
+            let wggo_memory_budget_bytes = match wggo_memory_budget {
+                Some(0) => {
+                    eprintln!(
+                        "error: --wggo-memory-budget must be > 0 MiB"
+                    );
+                    process::exit(1);
+                }
+                Some(mib) => Some(mib.saturating_mul(1024 * 1024)),
+                None => None,
+            };
+            let wggo_moment_precision =
+                wggo_moment_precision || wggo_memory_budget_bytes.is_some();
             if let Some(ref p) = wggo_weights {
                 if !p.exists() {
                     eprintln!(
@@ -350,6 +373,11 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 ownership_info: std::collections::HashMap::new(),
                 zero_stage: zero_stage.map(|s| s as u8),
+                optim_state_offload,
+                checkpoint_blocks,
+                checkpoint_selective,
+                checkpoint_budget_mib,
+                checkpoint_compress,
                 debug_training,
                 shared_lib: false,
                 emit_export_table: false,
@@ -370,6 +398,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     weights: wggo_weights.clone(),
                     importance: nsl_codegen::WggoImportance::from(wggo_importance),
                     prune_fraction: wggo_prune_fraction,
+                    memory_budget_bytes: wggo_memory_budget_bytes,
                 },
                 cfie: nsl_codegen::CfieOptions::default(),
                 // Phase 4 Task 6: when a train block is detected with --monitor,

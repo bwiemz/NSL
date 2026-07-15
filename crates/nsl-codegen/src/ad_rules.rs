@@ -802,15 +802,15 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             ]
         }
         // PCA Stage C: packed attention. Q/K/V get fused-backward extracts;
-        // scale, mask and segment_ids are non-differentiable (the Stage B
-        // decomposed form produced a discarded mask adjoint — this op never
-        // materialises one).
+        // scale and segment_ids are non-differentiable (the Stage B
+        // decomposed form produced a discarded mask adjoint — this op has
+        // no mask input at all: the fallback derives it from segment_ids).
         PrimalOp::ScaledDotProductAttentionPacked => {
             let q = op.inputs[0];
             let k = op.inputs[1];
             let v = op.inputs[2];
             let scale = op.inputs[3];
-            let seg = op.inputs[5];
+            let seg = op.inputs[4];
             let fwd_result = op.result;
             vec![
                 InputAdjoint {

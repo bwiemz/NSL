@@ -682,6 +682,66 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "F")]
         pub(crate) wggo_prune_fraction: Option<f64>,
 
+        /// WGGO: per-device resident training-memory budget in MiB. When
+        /// set, the planner enforces the cap at both optimization levels
+        /// (inter-layer DP + per-layer ILP) and, under budget pressure,
+        /// organically lowers Adam-moment precision to fit — implies
+        /// --wggo-moment-precision (fp16 moments via the #369 GPU cast
+        /// envelope are the shipped mechanism). Rejected if 0 or
+        /// unparseable. A plan that cannot fit even with 16-bit moments is
+        /// a hard compile error.
+        #[arg(long, value_name = "MIB")]
+        pub(crate) wggo_memory_budget: Option<u64>,
+
+        /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
+        /// Adam/momentum state (m/v) HOST-resident (pinned when a GPU is
+        /// live) and stage it to the device for each optimizer step, freeing
+        /// 1-2x parameter bytes of VRAM. The update math still runs on the
+        /// GPU in f32, so FASE == AdamW exactness is preserved; the copy-back
+        /// overlaps the next parameter's update on a dedicated transfer
+        /// stream. COMPOSES with reduced-precision moments
+        /// (--wggo-moment-precision / --wggo-memory-budget): host state is
+        /// then stored at the planned dtype and staged through an on-device
+        /// quant/dequant envelope, halving the PCIe staging traffic. Env
+        /// kill-switches: NSL_OFFLOAD_SYNC=1 (synchronous copy-back),
+        /// NSL_OFFLOAD_PAGEABLE=1 (pageable host buffers). Not supported on
+        /// pipelined train blocks.
+        #[arg(long)]
+        pub(crate) optim_state_offload: bool,
+
+        /// CCR (docs/research/CCR.pdf) block-granular activation
+        /// checkpointing on the source-AD path: each transformer block's
+        /// interior activations are freed after the forward and recomputed
+        /// just before that block's backward, so activation residency drops
+        /// from O(layers x interiors) to O(layers x boundaries + one
+        /// block's interiors). Bit-exact — the recompute replays the same
+        /// kernels in the same order on the same inputs (dropout results
+        /// are never replayed; they stay saved). No-op with a stderr note
+        /// on models without `blocks.N`-style structure.
+        #[arg(long)]
+        pub(crate) checkpoint_blocks: bool,
+
+        /// With --checkpoint-blocks: selective policy (never recompute
+        /// matmul-class ops; replay only cheap norms/RoPE/elementwise).
+        /// Less memory reduction at near-zero recompute cost.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_selective: bool,
+
+        /// With --checkpoint-blocks: allowed SAVED-interior activation
+        /// budget in MiB. The CCR knapsack flips the most
+        /// expensive-to-recompute tensors back to SAVE within the budget.
+        /// Under FASE Deferred the freed-gradient-buffer credit (C-01) is
+        /// added automatically when parameter sizes are statically known.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_budget_mib: Option<u64>,
+
+        /// With --checkpoint-selective: compress the saved matmul-class
+        /// activations to half precision between forward and backward
+        /// (fp16 or bf16). Not bit-exact — backward reads rounded
+        /// activations; validate loss parity at the 3-4 dp standard.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        pub(crate) checkpoint_compress: Option<String>,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -976,6 +1036,66 @@ pub(crate) struct RunArgs {
         /// Clamped to [0.0, 0.9]; default 0.25.
         #[arg(long, value_name = "F")]
         pub(crate) wggo_prune_fraction: Option<f64>,
+
+        /// WGGO: per-device resident training-memory budget in MiB. When
+        /// set, the planner enforces the cap at both optimization levels
+        /// (inter-layer DP + per-layer ILP) and, under budget pressure,
+        /// organically lowers Adam-moment precision to fit — implies
+        /// --wggo-moment-precision (fp16 moments via the #369 GPU cast
+        /// envelope are the shipped mechanism). Rejected if 0 or
+        /// unparseable. A plan that cannot fit even with 16-bit moments is
+        /// a hard compile error.
+        #[arg(long, value_name = "MIB")]
+        pub(crate) wggo_memory_budget: Option<u64>,
+
+        /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
+        /// Adam/momentum state (m/v) HOST-resident (pinned when a GPU is
+        /// live) and stage it to the device for each optimizer step, freeing
+        /// 1-2x parameter bytes of VRAM. The update math still runs on the
+        /// GPU in f32, so FASE == AdamW exactness is preserved; the copy-back
+        /// overlaps the next parameter's update on a dedicated transfer
+        /// stream. COMPOSES with reduced-precision moments
+        /// (--wggo-moment-precision / --wggo-memory-budget): host state is
+        /// then stored at the planned dtype and staged through an on-device
+        /// quant/dequant envelope, halving the PCIe staging traffic. Env
+        /// kill-switches: NSL_OFFLOAD_SYNC=1 (synchronous copy-back),
+        /// NSL_OFFLOAD_PAGEABLE=1 (pageable host buffers). Not supported on
+        /// pipelined train blocks.
+        #[arg(long)]
+        pub(crate) optim_state_offload: bool,
+
+        /// CCR (docs/research/CCR.pdf) block-granular activation
+        /// checkpointing on the source-AD path: each transformer block's
+        /// interior activations are freed after the forward and recomputed
+        /// just before that block's backward, so activation residency drops
+        /// from O(layers x interiors) to O(layers x boundaries + one
+        /// block's interiors). Bit-exact — the recompute replays the same
+        /// kernels in the same order on the same inputs (dropout results
+        /// are never replayed; they stay saved). No-op with a stderr note
+        /// on models without `blocks.N`-style structure.
+        #[arg(long)]
+        pub(crate) checkpoint_blocks: bool,
+
+        /// With --checkpoint-blocks: selective policy (never recompute
+        /// matmul-class ops; replay only cheap norms/RoPE/elementwise).
+        /// Less memory reduction at near-zero recompute cost.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_selective: bool,
+
+        /// With --checkpoint-blocks: allowed SAVED-interior activation
+        /// budget in MiB. The CCR knapsack flips the most
+        /// expensive-to-recompute tensors back to SAVE within the budget.
+        /// Under FASE Deferred the freed-gradient-buffer credit (C-01) is
+        /// added automatically when parameter sizes are statically known.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_budget_mib: Option<u64>,
+
+        /// With --checkpoint-selective: compress the saved matmul-class
+        /// activations to half precision between forward and backward
+        /// (fp16 or bf16). Not bit-exact — backward reads rounded
+        /// activations; validate loss parity at the 3-4 dp standard.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        pub(crate) checkpoint_compress: Option<String>,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

@@ -113,6 +113,7 @@ pub mod ptxas_validation;
 
 // --- Autodiff & training -------------------------------------------------
 pub mod ad_rules;
+pub mod ccr;
 pub mod source_ad;
 pub mod training_report;
 pub mod vmap;
@@ -887,6 +888,17 @@ pub struct WggoOptions {
     /// false, sub-32 plan bits stay advisory and a not-lowered notice is
     /// printed.
     pub moment_precision: bool,
+    /// Per-device resident training-memory budget in BYTES for the WGGO
+    /// plan (`--wggo-memory-budget <MiB>`, converted at the CLI boundary,
+    /// which also validates non-zero and sets `moment_precision` — the
+    /// flag implies it). `None` = today's behavior, byte-identical
+    /// (WGGO opt-in precedent: `zero_stage_search`, `snap_to_grid`).
+    /// When `Some`, the budget is enforced by the Level-1 DP
+    /// (`ClusterSpec::memory_budget`) and the per-layer ILP
+    /// (`LayerIlpConstraints::{memory_budget, budget_informed}`), and a
+    /// plan that cannot fit even at the fp16-moment floor is a HARD
+    /// compile failure (no silent degradation).
+    pub memory_budget_bytes: Option<u64>,
 }
 
 /// CFIE: compiler-fused inference-engine options (paper: docs/research/CFIE.pdf).
@@ -1155,6 +1167,44 @@ pub struct CompileOptions {
     pub health_monitor: bool,
     /// Dev Tools Phase 4, Task 4: optional explicit flush-interval setter.
     pub health_flush_interval: Option<u64>,
+    /// Optimizer-state offload (scaling campaign item 4, the single-GPU
+    /// ZeRO-Offload analog): allocate m/v HOST-resident (CPU f32) and wrap
+    /// every optimizer step in a stage-in → GPU-f32 update → copy-back
+    /// envelope. The update math runs on the device exactly as without the
+    /// flag (same kernels, same dtype), so FASE≡AdamW exactness is
+    /// preserved; the cost is one HtoD+DtoH round-trip of the optimizer
+    /// state per step. Frees 2×param bytes of VRAM for Adam-family
+    /// optimizers (1× for momentum-SGD/Lion/Muon). Mutually exclusive with
+    /// reduced-precision moments (`nsl_tensor_cast_into` cannot cross
+    /// devices) — enforced with a loud compile error in stmt.rs.
+    pub optim_state_offload: bool,
+    /// CCR P1.a (`--checkpoint-blocks`): block-granular activation
+    /// checkpointing on the source-AD path. Interiors of each transformer
+    /// block are freed after the forward and recomputed just before that
+    /// block's adjoint runs — activation residency drops from
+    /// O(layers x interiors) to O(layers x boundaries + one block).
+    /// Bit-exact (same kernels, same order, same inputs); Dropout results
+    /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
+    /// note when the tape has no `blocks.N` structure.
+    pub checkpoint_blocks: bool,
+    /// CCR P1.b: with `checkpoint_blocks`, use the SELECTIVE policy —
+    /// matmul-class outputs stay saved, only cheap bandwidth-bound ops
+    /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
+    /// memory reduction than the block policy at near-zero recompute cost.
+    pub checkpoint_selective: bool,
+    /// CCR P1.c (`--checkpoint-budget-mib`): allowed SAVED-interior bytes.
+    /// The per-tensor SAVE/RECOMPUTE knapsack (ccr::apply_budget) flips the
+    /// highest-value tensors back to SAVE within this budget, minimizing
+    /// recompute cost. Under FASE Deferred the C-01 credit (the gradient
+    /// buffer Deferred never materializes) is added when parameter sizes
+    /// are statically known. None = pure policy decision, no arbitration.
+    pub checkpoint_budget_mib: Option<u64>,
+    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
+    /// Selective policy's saved matmul-class interiors to half precision
+    /// between forward and backward (cast-on-save, dequant-on-load via the
+    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
+    /// activations; gated by the repo's 3-4 dp loss-parity standard.
+    pub checkpoint_compress: Option<String>,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1273,6 +1323,11 @@ impl Default for CompileOptions {
             profile_source_file_name: None,
             health_monitor: false,
             health_flush_interval: None,
+            optim_state_offload: false,
+            checkpoint_blocks: false,
+            checkpoint_selective: false,
+            checkpoint_budget_mib: None,
+            checkpoint_compress: None,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),

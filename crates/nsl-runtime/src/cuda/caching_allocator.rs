@@ -31,6 +31,86 @@ pub enum AllocPool {
     Transient,
 }
 
+/// Surface tag — attributes VRAM to a training-loop surface for the
+/// peak-VRAM report (P0.1 pretraining memory reduction). Parallel to
+/// `AllocPool`: captured from a thread-local at alloc time, purely
+/// observational — it never affects placement or reuse decisions.
+///
+/// Discriminants are the FFI wire values of `nsl_gpu_set_alloc_surface` /
+/// `nsl_gpu_get_alloc_surface` and MUST stay in sync with the codegen-side
+/// constants in `nsl-codegen/src/stmt.rs` (train-block brackets).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceTag {
+    Other = 0,
+    Weights = 1,
+    OptimM = 2,
+    OptimV = 3,
+    MPartial = 4,
+    Grads = 5,
+    Activations = 6,
+    AttnWorkspace = 7,
+}
+
+/// Number of `SurfaceTag` variants (array size for per-surface counters).
+pub const NUM_SURFACES: usize = 8;
+
+impl SurfaceTag {
+    /// All variants in discriminant order (report row order).
+    pub const ALL: [SurfaceTag; NUM_SURFACES] = [
+        SurfaceTag::Other,
+        SurfaceTag::Weights,
+        SurfaceTag::OptimM,
+        SurfaceTag::OptimV,
+        SurfaceTag::MPartial,
+        SurfaceTag::Grads,
+        SurfaceTag::Activations,
+        SurfaceTag::AttnWorkspace,
+    ];
+
+    /// Human-readable name used by the memory reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            SurfaceTag::Other => "other",
+            SurfaceTag::Weights => "weights",
+            SurfaceTag::OptimM => "optim_m",
+            SurfaceTag::OptimV => "optim_v",
+            SurfaceTag::MPartial => "m_partial",
+            SurfaceTag::Grads => "grads",
+            SurfaceTag::Activations => "activations",
+            SurfaceTag::AttnWorkspace => "attn_workspace",
+        }
+    }
+
+    /// Decode an FFI byte. Unknown values map to `Other` (never panics —
+    /// this sits on the allocation hot path).
+    pub fn from_u8(v: u8) -> SurfaceTag {
+        match v {
+            1 => SurfaceTag::Weights,
+            2 => SurfaceTag::OptimM,
+            3 => SurfaceTag::OptimV,
+            4 => SurfaceTag::MPartial,
+            5 => SurfaceTag::Grads,
+            6 => SurfaceTag::Activations,
+            7 => SurfaceTag::AttnWorkspace,
+            _ => SurfaceTag::Other,
+        }
+    }
+}
+
+/// Per-surface byte counters, updated under the allocator lock wherever
+/// `allocated_bytes` changes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SurfaceCounters {
+    /// Bytes currently allocated to this surface.
+    pub current_bytes: usize,
+    /// High-water mark of `current_bytes` (this surface's own peak).
+    pub peak_bytes: usize,
+    /// Bytes attributed to this surface at the moment the GLOBAL allocated
+    /// peak was last set — the per-surface decomposition of peak VRAM.
+    pub at_global_peak_bytes: usize,
+}
+
 /// Small/large pool boundary (1 MB).
 const SMALL_THRESHOLD: usize = 1 << 20;
 /// Alignment for small allocations.
@@ -71,6 +151,9 @@ struct Block {
     context: String,
     /// Pool tag inherited from parent segment.
     pool: AllocPool,
+    /// Surface tag captured from the thread-local at hand-out (P0.1
+    /// per-surface VRAM accounting). Meaningful only while `allocated`.
+    surface: SurfaceTag,
 }
 
 /// SAFETY: Block contains raw pointers to GPU memory and sibling Blocks.
@@ -196,6 +279,9 @@ pub(crate) struct CachingAllocator<D: DriverAlloc = CudaDriverAlloc> {
     total_reserved: usize,
     /// Total bytes currently allocated to users.
     total_allocated: usize,
+    /// Per-surface current/peak byte counters (P0.1 VRAM accounting).
+    /// Indexed by `SurfaceTag as usize`; guarded by the same Mutex.
+    surface_counters: [SurfaceCounters; NUM_SURFACES],
     /// Configurable memory limit (0 = unlimited).
     memory_limit: usize,
     /// The driver backend.
@@ -216,6 +302,7 @@ impl CachingAllocator<CudaDriverAlloc> {
             stats: AllocStats::default(),
             total_reserved: 0,
             total_allocated: 0,
+            surface_counters: [SurfaceCounters::default(); NUM_SURFACES],
             memory_limit,
             driver: CudaDriverAlloc,
         }
@@ -234,6 +321,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             stats: AllocStats::default(),
             total_reserved: 0,
             total_allocated: 0,
+            surface_counters: [SurfaceCounters::default(); NUM_SURFACES],
             memory_limit: 0,
             driver,
         }
@@ -314,6 +402,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         block.allocated = true;
         block.requested_size = size_bytes;
         block.context = super::inner::current_oom_context();
+        block.surface = get_alloc_surface();
 
         // Update segment
         let seg = &mut self.segments[block.segment_idx];
@@ -326,9 +415,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.num_cache_hits += 1;
         self.stats.internal_fragmentation_bytes += block.size - size_bytes;
-        if self.total_allocated > self.stats.peak_allocated_bytes {
-            self.stats.peak_allocated_bytes = self.total_allocated;
-        }
+        self.note_surface_alloc(block.surface, block.size);
 
         Some(block.ptr)
     }
@@ -361,6 +448,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             segment_idx: seg_idx,
             context: String::new(),
             pool,
+            surface: SurfaceTag::Other,
         }));
 
         self.segments.push(Segment {
@@ -394,6 +482,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         blk.allocated = true;
         blk.requested_size = size_bytes;
         blk.context = super::inner::current_oom_context();
+        blk.surface = get_alloc_surface();
 
         let seg = &mut self.segments[seg_idx];
         seg.allocated_count += 1;
@@ -403,9 +492,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.num_allocs += 1;
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes += blk.size - size_bytes;
-        if self.total_allocated > self.stats.peak_allocated_bytes {
-            self.stats.peak_allocated_bytes = self.total_allocated;
-        }
+        self.note_surface_alloc(blk.surface, blk.size);
 
         Some(base_ptr)
     }
@@ -427,6 +514,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             segment_idx: block.segment_idx,
             context: String::new(),
             pool: block.pool,
+            surface: SurfaceTag::Other,
         }));
 
         // Update next block's prev pointer
@@ -472,6 +560,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         let old_size = block.size;
         let old_requested = block.requested_size;
+        let old_surface = block.surface;
         block.allocated = false;
         block.requested_size = 0;
         block.context.clear();
@@ -487,6 +576,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes = self.stats.internal_fragmentation_bytes
             .saturating_sub(old_size - old_requested);
+        self.note_surface_free(old_surface, old_size);
 
         // Coalesce with next
         let next = block.next;
@@ -648,6 +738,65 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         freed
     }
 
+    /// Record `size` freshly allocated bytes against `surface`: bump the
+    /// surface's current/peak, and — when the GLOBAL allocated peak moves —
+    /// re-snapshot every surface's current bytes as the peak decomposition.
+    /// Caller must have already added `size` to `total_allocated`.
+    /// Cost: one array add + one compare (plus an 8-slot copy only on a new
+    /// global peak) under the already-held lock — acceptable always-on.
+    fn note_surface_alloc(&mut self, surface: SurfaceTag, size: usize) {
+        let c = &mut self.surface_counters[surface as usize];
+        c.current_bytes += size;
+        if c.current_bytes > c.peak_bytes {
+            c.peak_bytes = c.current_bytes;
+        }
+        if self.total_allocated > self.stats.peak_allocated_bytes {
+            self.stats.peak_allocated_bytes = self.total_allocated;
+            for sc in &mut self.surface_counters {
+                sc.at_global_peak_bytes = sc.current_bytes;
+            }
+        }
+    }
+
+    /// Record `size` bytes returning from `surface` on free. Saturating: a
+    /// counter drift must never poison the allocator (report-only data).
+    fn note_surface_free(&mut self, surface: SurfaceTag, size: usize) {
+        let c = &mut self.surface_counters[surface as usize];
+        c.current_bytes = c.current_bytes.saturating_sub(size);
+    }
+
+    /// Per-surface VRAM accounting snapshot (P0.1), one entry per
+    /// `SurfaceTag` in discriminant order.
+    /// Format: Vec<(surface_name, current_bytes, peak_bytes)>. u64 so
+    /// benchmark consumers get a stable width regardless of platform usize.
+    pub fn surface_breakdown(&self) -> Vec<(&'static str, u64, u64)> {
+        SurfaceTag::ALL
+            .iter()
+            .map(|&t| {
+                let c = self.surface_counters[t as usize];
+                (t.name(), c.current_bytes as u64, c.peak_bytes as u64)
+            })
+            .collect()
+    }
+
+    /// Render the per-surface table for the memory reports, one line per
+    /// surface: name / current / surface peak / bytes at the global
+    /// allocated peak. Each line is prefixed with `indent`.
+    pub fn surface_table_string(&self, indent: &str) -> String {
+        let mut out = String::new();
+        for t in SurfaceTag::ALL {
+            let c = self.surface_counters[t as usize];
+            out.push_str(&format!(
+                "{indent}{:<14} current {:>10}  peak {:>10}  at-global-peak {:>10}\n",
+                t.name(),
+                fmt_bytes(c.current_bytes),
+                fmt_bytes(c.peak_bytes),
+                fmt_bytes(c.at_global_peak_bytes),
+            ));
+        }
+        out
+    }
+
     /// Get a snapshot of current statistics.
     pub(crate) fn stats(&self) -> AllocStats {
         self.stats.clone()
@@ -718,6 +867,46 @@ pub fn get_alloc_pool() -> AllocPool {
     CURRENT_POOL.with(|p| p.get())
 }
 
+thread_local! {
+    /// Current surface tag for P0.1 per-surface VRAM accounting. Codegen
+    /// brackets set this around the train-block allocation regions
+    /// (weights / optim m+v / m_partial / grads / activations);
+    /// runtime-internal workspaces use `SurfaceGuard`. Parallel to
+    /// `CURRENT_POOL` and deliberately independent of it.
+    static CURRENT_SURFACE: std::cell::Cell<SurfaceTag> = const { std::cell::Cell::new(SurfaceTag::Other) };
+}
+
+/// Set the current allocation surface tag for subsequent GPU allocations.
+pub fn set_alloc_surface(surface: SurfaceTag) {
+    CURRENT_SURFACE.with(|s| s.set(surface));
+}
+
+/// Get the current allocation surface tag.
+pub fn get_alloc_surface() -> SurfaceTag {
+    CURRENT_SURFACE.with(|s| s.get())
+}
+
+/// RAII guard: tag every allocation in the enclosing scope with `surface`,
+/// restoring the previous tag on drop (panic-safe — the restore also runs
+/// during unwind).
+pub(crate) struct SurfaceGuard {
+    prev: SurfaceTag,
+}
+
+impl SurfaceGuard {
+    pub(crate) fn new(surface: SurfaceTag) -> SurfaceGuard {
+        let prev = get_alloc_surface();
+        set_alloc_surface(surface);
+        SurfaceGuard { prev }
+    }
+}
+
+impl Drop for SurfaceGuard {
+    fn drop(&mut self) {
+        set_alloc_surface(self.prev);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration parsing
 // ---------------------------------------------------------------------------
@@ -740,6 +929,20 @@ fn parse_mem_limit() -> usize {
     num_str.trim().parse::<usize>().unwrap_or(0) * multiplier
 }
 
+/// Human-readable byte count (shared by the surface table and the
+/// NSL_MEMSTATS summary).
+fn fmt_bytes(b: usize) -> String {
+    if b >= 1 << 30 {
+        format!("{:.2} GB", b as f64 / (1u64 << 30) as f64)
+    } else if b >= 1 << 20 {
+        format!("{:.1} MB", b as f64 / (1u64 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.1} KB", b as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{} B", b)
+    }
+}
+
 /// Check if memory stats printing is enabled.
 pub(crate) fn memstats_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -752,17 +955,7 @@ pub(crate) fn memstats_enabled() -> bool {
 pub(crate) fn print_memory_summary() {
     let alloc = CACHING_ALLOCATOR.lock().unwrap();
     let s = &alloc.stats;
-    let fmt = |b: usize| -> String {
-        if b >= 1 << 30 {
-            format!("{:.2} GB", b as f64 / (1u64 << 30) as f64)
-        } else if b >= 1 << 20 {
-            format!("{:.1} MB", b as f64 / (1u64 << 20) as f64)
-        } else if b >= 1 << 10 {
-            format!("{:.1} KB", b as f64 / (1u64 << 10) as f64)
-        } else {
-            format!("{} B", b)
-        }
-    };
+    let fmt = fmt_bytes;
     let mut context_totals: HashMap<String, (usize, usize)> = HashMap::new();
     for &block_ptr in alloc.allocated_blocks.values() {
         let block = unsafe { &*block_ptr };
@@ -786,6 +979,18 @@ pub(crate) fn print_memory_summary() {
             count,
         ));
     }
+    // P0.1: per-surface VRAM attribution + pool breakdown. Allocations made
+    // through cuMemAllocAsync bypass the caching allocator entirely, so the
+    // surface/pool tables cannot cover them — say so instead of under-reporting
+    // silently.
+    let surface_lines = alloc.surface_table_string("         ");
+    let (p_bytes, p_segs, t_bytes, t_segs) = alloc.pool_breakdown();
+    let async_note = if super::inner::async_alloc_enabled() {
+        "\n         NOTE: NSL_ASYNC_ALLOC=1 — async allocations bypass the caching \
+         allocator; surface/pool tables cover cached allocations only.\n"
+    } else {
+        ""
+    };
     eprintln!(
         "\n[nsl] GPU Memory Summary\n\
          ========================\n\
@@ -801,6 +1006,8 @@ pub(crate) fn print_memory_summary() {
          Block splits:     {}\n\
          Block coalesces:  {}\n\
          Fragmentation:    {}\n\
+         Pools:            persistent {} ({} segs), transient {} ({} segs)\n\
+         Surfaces:\n{}{}\
          Top contexts:\n{}",
         fmt(s.allocated_bytes), s.num_allocs,
         fmt(s.reserved_bytes), alloc.segments.len(),
@@ -814,6 +1021,9 @@ pub(crate) fn print_memory_summary() {
         s.num_splits,
         s.num_coalesces,
         fmt(s.internal_fragmentation_bytes),
+        fmt(p_bytes), p_segs, fmt(t_bytes), t_segs,
+        surface_lines,
+        async_note,
         top_context_lines,
     );
 }
@@ -1095,5 +1305,118 @@ mod tests {
         // Should only have 1 driver allocation (the initial segment)
         assert_eq!(a.driver.alloc_count.load(Ordering::Relaxed), 1,
                    "repeated same-size alloc/free should reuse, not grow");
+    }
+
+    // ── P0.1 per-surface VRAM accounting ─────────────────────────────
+
+    /// Restore the thread-local surface on scope exit so a failing assert
+    /// can't leak a non-default tag into other tests on this thread.
+    fn with_default_surface() -> SurfaceGuard {
+        SurfaceGuard::new(SurfaceTag::Other)
+    }
+
+    #[test]
+    fn test_surface_current_and_peak_tracking() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+
+        set_alloc_surface(SurfaceTag::Weights);
+        let p1 = a.alloc_with_grow(1024).unwrap();
+        set_alloc_surface(SurfaceTag::Grads);
+        let p2 = a.alloc_from_cache(2048).unwrap();
+
+        let w = a.surface_counters[SurfaceTag::Weights as usize];
+        let g = a.surface_counters[SurfaceTag::Grads as usize];
+        assert_eq!(w.current_bytes, 1024);
+        assert_eq!(g.current_bytes, 2048);
+
+        a.free_block(p1);
+        a.free_block(p2);
+        let w = a.surface_counters[SurfaceTag::Weights as usize];
+        let g = a.surface_counters[SurfaceTag::Grads as usize];
+        assert_eq!(w.current_bytes, 0, "weights current returns to 0 on free");
+        assert_eq!(g.current_bytes, 0, "grads current returns to 0 on free");
+        assert_eq!(w.peak_bytes, 1024, "weights peak survives the free");
+        assert_eq!(g.peak_bytes, 2048, "grads peak survives the free");
+    }
+
+    /// Untagged allocations land on the `Other` surface (the thread-local
+    /// default), and the sum over surfaces matches `allocated_bytes`.
+    #[test]
+    fn test_surface_default_is_other_and_sums_match() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+        let _p = a.alloc_with_grow(4096).unwrap();
+        let o = a.surface_counters[SurfaceTag::Other as usize];
+        assert_eq!(o.current_bytes, 4096);
+        let total: usize = a.surface_counters.iter().map(|c| c.current_bytes).sum();
+        assert_eq!(total, a.stats.allocated_bytes);
+    }
+
+    /// The at-global-peak snapshot is the per-surface decomposition of the
+    /// moment `peak_allocated_bytes` was last set — later churn below the
+    /// peak must not disturb it.
+    #[test]
+    fn test_surface_snapshot_at_global_peak() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+
+        set_alloc_surface(SurfaceTag::Weights);
+        let _p1 = a.alloc_with_grow(1024).unwrap();
+        set_alloc_surface(SurfaceTag::Grads);
+        let p2 = a.alloc_from_cache(4096).unwrap();
+        // Global peak: 5120 bytes = weights 1024 + grads 4096.
+
+        a.free_block(p2);
+        set_alloc_surface(SurfaceTag::Activations);
+        let _p3 = a.alloc_from_cache(2048).unwrap();
+        // Total now 3072 < peak — the snapshot must still show the peak mix.
+
+        assert_eq!(a.stats.peak_allocated_bytes, 5120);
+        let w = a.surface_counters[SurfaceTag::Weights as usize];
+        let g = a.surface_counters[SurfaceTag::Grads as usize];
+        let act = a.surface_counters[SurfaceTag::Activations as usize];
+        assert_eq!(w.at_global_peak_bytes, 1024);
+        assert_eq!(g.at_global_peak_bytes, 4096);
+        assert_eq!(act.at_global_peak_bytes, 0, "activations were not live at the peak");
+    }
+
+    #[test]
+    fn test_surface_guard_restores_on_drop_and_nests() {
+        let _restore = with_default_surface();
+        assert_eq!(get_alloc_surface(), SurfaceTag::Other);
+        {
+            let _g1 = SurfaceGuard::new(SurfaceTag::AttnWorkspace);
+            assert_eq!(get_alloc_surface(), SurfaceTag::AttnWorkspace);
+            {
+                let _g2 = SurfaceGuard::new(SurfaceTag::Grads);
+                assert_eq!(get_alloc_surface(), SurfaceTag::Grads);
+            }
+            assert_eq!(get_alloc_surface(), SurfaceTag::AttnWorkspace);
+        }
+        assert_eq!(get_alloc_surface(), SurfaceTag::Other);
+    }
+
+    #[test]
+    fn test_surface_breakdown_names_and_order() {
+        let a = make_alloc();
+        let b = a.surface_breakdown();
+        assert_eq!(b.len(), NUM_SURFACES);
+        let names: Vec<&str> = b.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "other", "weights", "optim_m", "optim_v",
+                "m_partial", "grads", "activations", "attn_workspace",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_surface_tag_from_u8_roundtrip_and_unknown() {
+        for t in SurfaceTag::ALL {
+            assert_eq!(SurfaceTag::from_u8(t as u8), t);
+        }
+        assert_eq!(SurfaceTag::from_u8(200), SurfaceTag::Other);
     }
 }

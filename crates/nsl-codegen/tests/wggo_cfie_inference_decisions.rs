@@ -87,10 +87,14 @@ fn tiny_constraints() -> LayerIlpConstraints {
         gqa_group: 4,
         packing_modes_mask: 0b0001,
         allow_fase: false,
-        // The memory arithmetic below assumes the solver's 8-bit Adam
+        // The memory arithmetic below assumes the solver's 16-bit Adam
         // moments ("sensitivity = 0"), i.e. an INFORMED zero-sensitivity
-        // layer. Uninformed layers are pinned to 32-bit moments since the
-        // optim-bit lowering landed.
+        // layer. 16 (not 8) is the cheapest STORABLE tier: the storage
+        // lowering clamps any sub-32 request to fp16, and the solver's
+        // `prec_allowed` domain was narrowed to {32,16} to match (the
+        // scaling-campaign review fix — accounting 8-bit decisions at
+        // 1 B while storing 2 B was an OOM hazard). Uninformed layers
+        // are pinned to 32-bit moments since the optim-bit lowering landed.
         sensitivity_informed: true,
         ..Default::default()
     }
@@ -164,6 +168,8 @@ fn driver_input<'a>(
         scorer: None,
         cached_analysis: None,
         packing_supported: true,
+        memory_budget_bytes: None,
+        packing_stats: None,
     }
 }
 
@@ -322,9 +328,9 @@ fn speculative_on_only_when_acceptance_justifies_it() {
 #[test]
 fn static_layout_wins_unless_memory_budget_forces_paged() {
     // Training-resident bytes of the single LUT entry at the cheapest
-    // (8-bit) Adam moments the solver will pick (sensitivity = 0):
-    //   param 2,097,152 + moments 2*(1,048,576 elems * 1 B) = 2,097,152
-    //   + activation 131,072 = 4,325,376 B.
+    // (16-bit) Adam moments the solver will pick (sensitivity = 0):
+    //   param 2,097,152 + moments 2*(1,048,576 elems * 2 B) = 4,194,304
+    //   + activation 131,072 = 6,422,528 B.
     // KV pools at max_seq=4096 (kv_seq 2048):
     //   static fp16 = 1024*4096 = 4,194,304   paged fp16 = 1024*2048 = 2,097,152
     //   static int8 =  512*4096 = 2,097,152   paged int8 =  512*2048 = 1,048,576
@@ -341,21 +347,21 @@ fn static_layout_wins_unless_memory_budget_forces_paged() {
     assert_eq!(u.kv_layout, LayoutKind::Static);
     assert_eq!(u.kv_precision, KvPrecision::Fp16);
 
-    // Budget 6,000,000 B: resident 4,325,376 +
-    //   static int8  => 6,422,528 > budget  (infeasible)
-    //   paged  fp16  => 6,422,528 > budget  (infeasible)
-    //   paged  int8  => 5,373,952 <= budget (the ONLY fit)
+    // Budget 8,000,000 B: resident 6,422,528 +
+    //   static int8  => 8,519,680 > budget  (infeasible)
+    //   paged  fp16  => 8,519,680 > budget  (infeasible)
+    //   paged  int8  => 7,471,104 <= budget (the ONLY fit)
     // so the ILP must fall to (Paged, Int8) even though the dequant term
     // says fp16 and the latency term says static — memory is binding.
     let mut tight = gate_on(cfg);
-    tight.memory_budget = 6_000_000;
+    tight.memory_budget = 8_000_000;
     let (sol, forced) = solve_layer_cfie(&tiny_lut(), &tight);
-    assert!(sol.feasible, "paged-int8 fits: 5,373,952 <= 6,000,000");
+    assert!(sol.feasible, "paged-int8 fits: 7,471,104 <= 8,000,000");
     let f = forced.unwrap();
     assert_eq!(f.kv_layout, LayoutKind::Paged);
     assert_eq!(f.kv_precision, KvPrecision::Int8);
     // The reported memory includes the KV pool.
-    assert_eq!(sol.memory_bytes, 4_325_376 + 1_048_576);
+    assert_eq!(sol.memory_bytes, 6_422_528 + 1_048_576);
 }
 
 // ---------------------------------------------------------------------------
@@ -498,17 +504,17 @@ fn greedy_advises_when_on_refuses_when_pool_cannot_fit() {
     assert!(sols_on[0].feasible);
     assert!(on[0].is_some());
 
-    // Gate on, budget 5,000,000: training-resident bytes are 4,325,376
-    // (see the layout test) leaving 674,624 B of headroom — below even the
+    // Gate on, budget 7,000,000: training-resident bytes are 6,422,528
+    // (see the layout test) leaving 577,472 B of headroom — below even the
     // smallest pool (paged int8 = 1,048,576).  Greedy must keep the layer
     // feasible but REFUSE to advise rather than surface an over-budget
     // pool.
     let mut squeezed = gate_on(fixture_cfg());
-    squeezed.memory_budget = 5_000_000;
+    squeezed.memory_budget = 7_000_000;
     let (sols_sq, sq) = solve_all_greedy_cfie(&luts, &[squeezed]);
     assert!(sols_sq[0].feasible, "the layer itself fits without a pool");
     assert!(
         sq[0].is_none(),
-        "no pool fits in 674,624 B of headroom — greedy must refuse to advise"
+        "no pool fits in 577,472 B of headroom — greedy must refuse to advise"
     );
 }

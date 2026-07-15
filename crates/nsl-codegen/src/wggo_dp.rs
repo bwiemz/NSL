@@ -281,6 +281,8 @@ fn layer_cost(decision: CoarseDecision, lut_best: Option<LayerCostEntry>) -> (f6
         smem_bytes: 0,
         feasible: true,
         classification: crate::cost_model::BoundClassification::Unknown,
+        attn_quadratic_us: 0.0,
+        attn_quadratic_backward_us: 0.0,
     });
     match decision {
         CoarseDecision::KeepFull => (

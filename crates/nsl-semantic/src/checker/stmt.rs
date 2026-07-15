@@ -811,11 +811,16 @@ impl<'a> TypeChecker<'a> {
                                         self.effect_checker.mark_checkpointed(&fn_name);
                                     }
                                     Some("selective") => {
-                                        self.diagnostics.push(
-                                            Diagnostic::error(
-                                                "@checkpoint(policy=\"selective\") reserved for §5.3-v2/v3; not implemented in v1".to_string(),
-                                            )
-                                            .with_label(policy_arg_span.unwrap_or(deco.span), "reserved policy")
+                                        // CCR P1.b: publish the Selective
+                                        // policy; the train-block CCR gate
+                                        // (stmt.rs) enables selective
+                                        // block-granular recompute. The
+                                        // CSHA prologue-stamping pass
+                                        // ignores this variant.
+                                        self.effect_checker.mark_checkpointed(&fn_name);
+                                        self.effect_checker.mark_checkpointed_with_policy(
+                                            &fn_name,
+                                            crate::effects::CheckpointPolicy::Selective,
                                         );
                                     }
                                     Some("selective_postnorm") => {

@@ -64,6 +64,12 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             wggo_weights,
             wggo_importance,
             wggo_prune_fraction,
+            wggo_memory_budget,
+            optim_state_offload,
+            checkpoint_blocks,
+            checkpoint_selective,
+            checkpoint_budget_mib,
+            checkpoint_compress,
             devices,
             csha,
             csha_report,
@@ -104,6 +110,24 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
 
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
+
+            // --wggo-memory-budget: reject 0 loudly (clap already rejects an
+            // unparseable value at the u64 parse). The flag IMPLIES
+            // --wggo-moment-precision — a budget that forces sub-32 moments is
+            // meaningless unless the bits are actually lowered to storage.
+            // Convert MiB -> bytes here so codegen only ever sees bytes. This
+            // runs before the CompileOptions build below because the wggo
+            // sub-struct is constructed there. (Mirrors `nsl run`.)
+            let wggo_memory_budget_bytes = match wggo_memory_budget {
+                Some(0) => {
+                    eprintln!("error: --wggo-memory-budget must be > 0 MiB");
+                    process::exit(1);
+                }
+                Some(mib) => Some(mib.saturating_mul(1024 * 1024)),
+                None => None,
+            };
+            let wggo_moment_precision =
+                wggo_moment_precision || wggo_memory_budget_bytes.is_some();
 
             if cep_prune && cep_joint {
                 eprintln!(
@@ -373,6 +397,11 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 linear_types_enabled: linear_types,
                 ownership_info: std::collections::HashMap::new(), // populated by loader
                 zero_stage: zero_stage.map(|s| s as u8),
+                optim_state_offload,
+                checkpoint_blocks,
+                checkpoint_selective,
+                checkpoint_budget_mib,
+                checkpoint_compress,
                 debug_training,
                 shared_lib,
                 emit_export_table: shared_lib,
@@ -388,6 +417,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     weights: wggo_weights.clone(),
                     importance: nsl_codegen::WggoImportance::from(wggo_importance),
                     prune_fraction: wggo_prune_fraction,
+                    memory_budget_bytes: wggo_memory_budget_bytes,
                 },
                 cfie: nsl_codegen::CfieOptions {
                     mode_override: cfie.clone(),

@@ -67,8 +67,24 @@ impl Compiler<'_> {
         recipe: &crate::fase::UpdateRecipe,
         bc_params: Option<(Value, Value)>,  // (bc1_inv, bc2_inv) — None for non-AdamW
         wrap_precision: bool,  // CPDT precision-adaptive: wrap m/v in F32 cast/uncast
+        // Optimizer-state offload (scaling campaign item 4): m/v are
+        // HOST-resident; stage them to theta's device at entry, run the
+        // unchanged F32 update on the staged tensors, copy the results back
+        // into the host buffers at exit. P0.3: COMPOSES with wrap_precision —
+        // when both are set, m/v are host-resident REDUCED-PRECISION buffers
+        // and the combined envelope stages each direction with ONE
+        // cross-device cast (nsl_tensor_cast_from_host in,
+        // nsl_tensor_cast_to_host_into out) instead of chaining the two
+        // single-purpose envelopes (nsl_tensor_cast_into asserts
+        // co-residency, so chaining cannot work).
+        wrap_offload: bool,
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
+
+        // P0.3 combined envelope: offload + reduced-precision moments.
+        // The pure single-purpose paths below stay byte-identical when the
+        // other flag is off.
+        let offload_combined = wrap_precision && wrap_offload;
 
         let program = emit_final_step(recipe);
 
@@ -83,7 +99,7 @@ impl Compiler<'_> {
         // discriminator — the `precision_active` gate does NOT inspect optimizer
         // arity, so this guard (not the gate) is what makes single-state
         // optimizers safe if a caller ever passes wrap_precision=true for one.
-        let wrap_precision = wrap_precision && m_ptr != v_ptr;
+        let wrap_precision = wrap_precision && !offload_combined && m_ptr != v_ptr;
         let orig_m_ptr = m_ptr;
         let orig_v_ptr = v_ptr;
         // Note: emit the f32_code iconst and the cast calls ONLY inside the
@@ -97,8 +113,67 @@ impl Compiler<'_> {
         } else {
             (m_ptr, v_ptr)
         };
+
+        // Offload staging (stage-in). The SGD placeholder alias (v == m)
+        // stages ONCE and aliases the working pointer, mirroring the
+        // wrap_precision alias discipline. On a CPU run `to_device_like`
+        // is a refcount-bump no-op and the exit copy-back is a guarded
+        // self-copy no-op — the envelope is placement-transparent.
+        let offload_only = wrap_offload && !offload_combined;
+        let offload_v_distinct = offload_only && orig_m_ptr != orig_v_ptr;
+        let (work_m, work_v) = if offload_only {
+            let wm = self.compile_call_by_name(
+                builder, "nsl_tensor_to_device_like", &[work_m, theta_ptr],
+            )?;
+            let wv = if offload_v_distinct {
+                self.compile_call_by_name(
+                    builder, "nsl_tensor_to_device_like", &[work_v, theta_ptr],
+                )?
+            } else {
+                wm
+            };
+            (wm, wv)
+        } else {
+            (work_m, work_v)
+        };
+
+        // Combined stage-in (P0.3): m/v are HOST-resident reduced-precision
+        // buffers — one cross-device dequant per state buffer produces the
+        // device-resident F32 working tensors the recipe expects. Alias
+        // discipline matches the offload path (SGD stages once). On a CPU
+        // run cast_from_host degrades to the CPU nsl_tensor_cast (a fresh
+        // owned F32 copy) — placement-transparent like the pure paths.
+        let combined_v_distinct = offload_combined && orig_m_ptr != orig_v_ptr;
+        let (work_m, work_v) = if offload_combined {
+            let wm = self.compile_call_by_name(
+                builder, "nsl_tensor_cast_from_host", &[orig_m_ptr, theta_ptr],
+            )?;
+            let wv = if combined_v_distinct {
+                self.compile_call_by_name(
+                    builder, "nsl_tensor_cast_from_host", &[orig_v_ptr, theta_ptr],
+                )?
+            } else {
+                wm
+            };
+            (wm, wv)
+        } else {
+            (work_m, work_v)
+        };
         let m_ptr = work_m;
         let v_ptr = work_v;
+
+        // P3 offload: m_partial is HOST-resident. Stage it to the device
+        // (theta's placement) so the recipe reads/writes a device working
+        // copy — the recipe's internal `Zero` op then zeroes the DEVICE copy
+        // (discarded below), so the host accumulator is zeroed separately
+        // after the recipe for the next window. On a CPU run to_device_like
+        // is a refcount-bump no-op and the host zero below is the real zero.
+        let orig_m_partial = m_partial_ptr;
+        let m_partial_ptr = if wrap_offload {
+            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[orig_m_partial, theta_ptr])?
+        } else {
+            m_partial_ptr
+        };
 
         // Lazily-allocated scratch tensor for the `Tmp` register.  Allocated
         // on first write, freed at end.
@@ -496,7 +571,16 @@ impl Compiler<'_> {
         }
 
         // Zero m_partial for the next accumulation window.
-        self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[m_partial_ptr])?;
+        if wrap_offload {
+            // P3: the recipe read the DEVICE working copy (m_partial_ptr);
+            // zero the HOST accumulator (orig_m_partial) for the next window
+            // and free the device staging copy. Zeroing the device copy would
+            // be wasted work — it is discarded here.
+            self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[orig_m_partial])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial_ptr])?;
+        } else {
+            self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[m_partial_ptr])?;
+        }
 
         // Free any live Tmp tensor.
         if let Some(t) = tmp_val {
@@ -523,6 +607,33 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[v_ptr])?;
         }
 
+        // Offload copy-back (stage-out): DtoH the updated working tensors
+        // into the persistent host buffers. P0.2: copy_data_async CONSUMES
+        // the staged tensor — async fast path (device src + pinned host
+        // dst) defers the free to the per-step nsl_offload_drain() emitted
+        // at the optimizer loop exit in stmt.rs; every other case degrades
+        // to the old copy_data + inline free pair inside the runtime.
+        // Self-copy on a CPU-run alias remains a guarded no-op; the
+        // consuming free balances to_device_like's ownership (fresh tensor
+        // on transfer, refcount bump on alias).
+        if offload_only {
+            self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_m_ptr, m_ptr])?;
+            if offload_v_distinct {
+                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_v_ptr, v_ptr])?;
+            }
+        }
+
+        // Combined stage-out (P0.3): device-side quant-cast F32 -> host
+        // dtype, then DtoH into the persistent host buffer (async when
+        // pinned, drain-deferred frees). cast_to_host_into CONSUMES the
+        // staged working tensor — no explicit free here.
+        if offload_combined {
+            self.compile_call_by_name(builder, "nsl_tensor_cast_to_host_into", &[orig_m_ptr, m_ptr])?;
+            if combined_v_distinct {
+                self.compile_call_by_name(builder, "nsl_tensor_cast_to_host_into", &[orig_v_ptr, v_ptr])?;
+            }
+        }
+
         Ok(())
     }
 
@@ -544,7 +655,31 @@ impl Compiler<'_> {
         m_partial_ptr: Value,
         grad_ptr: Value,
         accum_scale: f64,
+        wrap_offload: bool,
     ) -> Result<(), crate::error::CodegenError> {
+        // P3 offload: m_partial is HOST-resident. Stage it to the grad's
+        // device, accumulate there, copy the result back to host, and free
+        // the device staging copy — the exact-windowed Σg semantics are
+        // preserved (the accumulate math runs on-device in f32, identical to
+        // the resident path). A sync copy-back keeps this self-contained
+        // (no drain-list interaction with the optimizer-step offload).
+        if wrap_offload {
+            // Stage m_partial host -> grad's device.
+            let work_mp =
+                self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[m_partial_ptr, grad_ptr])?;
+            let scale_val = builder.ins().f64const(accum_scale);
+            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+            let scaled_grad =
+                self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_ptr, scale_val, flags_zero])?;
+            self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[work_mp, scaled_grad])?;
+            // Copy the updated accumulator back to the host buffer, then free
+            // the device staging copy and the scaled-grad scratch.
+            self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[m_partial_ptr, work_mp])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[work_mp])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_grad])?;
+            return Ok(());
+        }
+
         // Step 0: migrate grad to m_partial's (device, dtype). Tape-AD produces
         // CPU f64 gradients while m_partial is GPU f32 (it was allocated via
         // zeros_like(param), inheriting the parameter's placement). Without
@@ -659,7 +794,16 @@ impl Compiler<'_> {
         // this, a mixed mode table would step its two arms with different
         // effective bias corrections even given identical gradients.
         t_override: Option<cranelift_codegen::ir::Value>,
+        // Optimizer-state offload (scaling campaign item 4): s1/s2 are
+        // HOST-resident; stage to param's device, step, copy back. P0.3:
+        // composes with wrap_precision — both set means host-resident
+        // reduced-precision state staged through the combined cross-device
+        // cast envelope (see fase_emit_final_step).
+        wrap_offload: bool,
     ) -> Result<(), crate::error::CodegenError> {
+        // P0.3 combined envelope: offload + reduced-precision moments.
+        let offload_combined = wrap_precision && wrap_offload;
+        let wrap_precision = wrap_precision && !offload_combined;
         // CPDT FP16/INT8 wrap envelope (S5). theta and grad are NOT wrapped
         // — params stay in their natural dtype (FP32 by default); CPDT §3.2
         // v1 targets optimizer-state memory only. Only s1/s2 are wrapped.
@@ -676,6 +820,44 @@ impl Compiler<'_> {
                 // preserves the invariant that the FFI sees the same
                 // pointer in both slots (the helper ignores s2 anyway for
                 // these optimizers).
+                ws1
+            };
+            (ws1, ws2)
+        } else {
+            (s1, s2)
+        };
+        // Offload stage-in (mirrors fase_emit_final_step; alias discipline
+        // identical to the cast envelope above).
+        let offload_only = wrap_offload && !offload_combined;
+        let offload_s2 = offload_only && orig_s1 != orig_s2;
+        let (s1, s2) = if offload_only {
+            let ws1 = self.compile_call_by_name(
+                builder, "nsl_tensor_to_device_like", &[s1, param_val],
+            )?;
+            let ws2 = if offload_s2 {
+                self.compile_call_by_name(
+                    builder, "nsl_tensor_to_device_like", &[s2, param_val],
+                )?
+            } else {
+                ws1
+            };
+            (ws1, ws2)
+        } else {
+            (s1, s2)
+        };
+        // Combined stage-in (P0.3): host reduced-precision s1/s2 -> device
+        // F32 working tensors via one cross-device dequant each (mirrors
+        // fase_emit_final_step's combined arm).
+        let combined_s2 = offload_combined && orig_s1 != orig_s2;
+        let (s1, s2) = if offload_combined {
+            let ws1 = self.compile_call_by_name(
+                builder, "nsl_tensor_cast_from_host", &[orig_s1, param_val],
+            )?;
+            let ws2 = if combined_s2 {
+                self.compile_call_by_name(
+                    builder, "nsl_tensor_cast_from_host", &[orig_s2, param_val],
+                )?
+            } else {
                 ws1
             };
             (ws1, ws2)
@@ -778,6 +960,23 @@ impl Compiler<'_> {
             if wrap_s2 {
                 self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_s2, s2])?;
                 self.compile_call_by_name(builder, "nsl_tensor_free", &[s2])?;
+            }
+        }
+        // Offload copy-back (mirrors fase_emit_final_step's exit). P0.2:
+        // copy_data_async CONSUMES the staged tensor (async DtoH on pinned
+        // hosts, drain-deferred free; sync copy + inline free otherwise).
+        if offload_only {
+            self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
+            if offload_s2 {
+                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+            }
+        }
+        // Combined copy-back (P0.3): quant-cast to the host dtype + DtoH;
+        // consumes the staged working tensors (see fase_emit_final_step).
+        if offload_combined {
+            self.compile_call_by_name(builder, "nsl_tensor_cast_to_host_into", &[orig_s1, s1])?;
+            if combined_s2 {
+                self.compile_call_by_name(builder, "nsl_tensor_cast_to_host_into", &[orig_s2, s2])?;
             }
         }
         Ok(())
@@ -1030,6 +1229,7 @@ impl Compiler<'_> {
                 &fase_plan.recipe,
                 Some((bc1_inv, bc2_inv)),
                 cpdt_precision_dtypes.is_some(),
+                self.compile_options.optim_state_offload,
             )?;
         }
         builder.ins().jump(iter_join, &[]);
@@ -1078,6 +1278,7 @@ impl Compiler<'_> {
             step_count_var,
             cpdt_precision_dtypes.is_some(),
             fullbuf_t_override,
+            self.compile_options.optim_state_offload,
         )?;
         // The Deferred arm's fase_emit_final_step zeroes m_partial via its
         // recipe epilogue; the stdlib call does not. Zero this param's
@@ -1102,6 +1303,13 @@ impl Compiler<'_> {
         builder.switch_to_block(exit);
         builder.seal_block(exit);
         state.current_block = Some(exit);
+
+        // Offload P0.2: ONE drain per optimizer step, after the per-param
+        // loop exits — synchronizes the transfer stream and frees the
+        // drain-deferred staged tensors whose async DtoH was in flight.
+        if self.compile_options.optim_state_offload {
+            self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
+        }
 
         Ok(())
     }

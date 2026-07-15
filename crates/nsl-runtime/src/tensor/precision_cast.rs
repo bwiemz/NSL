@@ -662,6 +662,258 @@ fn zeros_like_dtype_body(t: &NslTensor, dtype: u16) -> i64 {
     NslTensor::publish(tensor)
 }
 
+// ---------------------------------------------------------------------------
+// P0.3 — offload x reduced-precision composition: cross-device cast envelope.
+//
+// The single-purpose envelopes cannot compose: `nsl_tensor_cast_into`
+// asserts co-residency (quant-back is an in-place same-device write) and
+// `nsl_tensor_copy_data` asserts dtype equality (offload copy-back is a
+// raw memcpy). These two FFIs are the composition: each stages through a
+// transient DEVICE buffer at the host dtype, so the PCIe leg moves the
+// 2-byte payload (half the f32 offload traffic) and the quant/dequant
+// runs on-device through the CFTP-v7 PTX cast kernels.
+// ---------------------------------------------------------------------------
+
+/// Dequant-stage a HOST-resident optimizer-state tensor to a NEW
+/// device-resident F32 working tensor (offload+precision stage-in).
+///
+/// * `host_src`: persistent host state buffer (F32/FP16/BF16, device 0).
+///   NOT consumed.
+/// * `device_template`: placement donor (theta) — only its device is used.
+///
+/// GPU template: HtoD the raw half payload into a transient device buffer,
+/// dequant to F32 on-device, free the transient. F32 host state skips the
+/// transient (plain HtoD into the result). CPU template (GPU-less run):
+/// degrades to the CPU `nsl_tensor_cast(src, F32)` — placement-transparent
+/// like the offload-only envelope.
+///
+/// Ownership: BARE `Box::into_raw`, exactly like `nsl_tensor_cast` — the
+/// FASE envelope frees the working tensor each step (via the consuming
+/// `nsl_tensor_cast_to_host_into`); `publish` would double-free at the
+/// scope sweep.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_ptr: i64) -> i64 {
+    let src = unsafe { &*(host_src_ptr as *const NslTensor) };
+    let template = unsafe { &*(device_template_ptr as *const NslTensor) };
+    assert!(
+        src.is_contiguous(),
+        "nsl_tensor_cast_from_host: src must be contiguous (ndim={})",
+        src.ndim
+    );
+    assert_eq!(
+        src.len,
+        NslTensor::total_elements(src.shape, src.ndim),
+        "nsl_tensor_cast_from_host: src.len ({}) != product(src.shape) — invariant violation",
+        src.len
+    );
+    assert_eq!(
+        src.device, 0,
+        "nsl_tensor_cast_from_host: src must be HOST-resident (device={})",
+        src.device
+    );
+    if template.device == 0 {
+        // CPU run: the whole envelope degrades to the co-resident CPU cast.
+        return nsl_tensor_cast(host_src_ptr, DTYPE_F32 as i64);
+    }
+    assert_eq!(
+        src.len, template.len,
+        "nsl_tensor_cast_from_host: src len {} != template len {}",
+        src.len, template.len
+    );
+    #[cfg(feature = "cuda")]
+    {
+        let len = src.len as usize;
+        assert!(
+            len > 0,
+            "nsl_tensor_cast_from_host: zero-length cast is not supported \
+             (optimizer moments are never empty)"
+        );
+        let dst_bytes = len * 4;
+        let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
+        match src.dtype {
+            DTYPE_F32 => {
+                // f32-tier param under the combined plan: no cast needed —
+                // identical to the offload-only stage-in transfer.
+                crate::cuda::inner::memcpy_htod(dst_data, src.data, dst_bytes);
+            }
+            DTYPE_FP16 | DTYPE_BF16 => {
+                let half_bytes = len * 2;
+                let transient = crate::cuda::inner::alloc_managed(half_bytes);
+                crate::cuda::inner::memcpy_htod(transient, src.data, half_bytes);
+                gpu_cast_core(transient as u64, src.dtype, dst_data as u64, DTYPE_F32, len);
+                // Inline free is safe: the dequant kernel runs on the NULL
+                // stream, and any reuse of the recycled block is written by
+                // later NULL-stream-ordered work (same in-order argument as
+                // gpu_cast_bare's caller-side frees).
+                crate::cuda::inner::free_managed(transient);
+            }
+            other => panic!(
+                "nsl_tensor_cast_from_host: unsupported host state dtype {other} \
+                 (F32=1, FP16=2, BF16=3)"
+            ),
+        }
+        let shape = NslTensor::copy_shape(src.shape, src.ndim);
+        let strides = NslTensor::compute_strides(shape, src.ndim);
+        let out = Box::new(NslTensor::new(
+            dst_data, shape, strides, src.ndim, src.len, template.device, DTYPE_F32, 1, 0,
+        ));
+        return Box::into_raw(out) as i64;
+    }
+    #[cfg(not(feature = "cuda"))]
+    panic!(
+        "nsl_tensor_cast_from_host: device template (device={}) but the runtime \
+         was compiled without the `cuda` feature",
+        template.device
+    );
+}
+
+/// Quant-store a device-resident F32 working tensor back into its
+/// persistent HOST-resident reduced-precision buffer (offload+precision
+/// stage-out). CONSUMES `device_src` — the staged working tensor is freed
+/// inline on the sync path or drain-deferred (freed by
+/// `nsl_offload_drain`) on the async path, mirroring
+/// `nsl_tensor_copy_data_async`'s ownership contract.
+///
+/// GPU src: on-device quant-cast F32 -> host dtype into a transient device
+/// buffer, then DtoH into `host_dst` — async on the transfer stream when
+/// `host_dst` is pinned and `NSL_OFFLOAD_SYNC` is unset (transient +
+/// staged tensor ride the drain list), synchronous otherwise. Same-dtype
+/// pairs delegate to `nsl_tensor_copy_data_async` (no cast kernel).
+/// CPU src (GPU-less run): degrades to the co-resident CPU
+/// `nsl_tensor_cast_into` + inline free.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_cast_to_host_into(host_dst_ptr: i64, device_src_ptr: i64) {
+    let dst = unsafe { &*(host_dst_ptr as *const NslTensor) };
+    let src = unsafe { &*(device_src_ptr as *const NslTensor) };
+    assert!(
+        dst.is_contiguous(),
+        "nsl_tensor_cast_to_host_into: dst must be contiguous (ndim={})",
+        dst.ndim
+    );
+    assert!(
+        src.is_contiguous(),
+        "nsl_tensor_cast_to_host_into: src must be contiguous (ndim={})",
+        src.ndim
+    );
+    assert_eq!(
+        dst.len, src.len,
+        "nsl_tensor_cast_to_host_into: length mismatch (dst={}, src={})",
+        dst.len, src.len
+    );
+    if src.device == 0 {
+        // CPU run: co-resident quant-back, then the consuming free.
+        nsl_tensor_cast_into(host_dst_ptr, device_src_ptr);
+        crate::tensor::nsl_tensor_free(device_src_ptr);
+        return;
+    }
+    assert_eq!(
+        dst.device, 0,
+        "nsl_tensor_cast_to_host_into: dst must be HOST-resident (device={})",
+        dst.device
+    );
+    if dst.dtype == src.dtype {
+        // f32-tier param under the combined plan: plain copy-back
+        // (consuming, pinned-aware, async-capable).
+        crate::tensor::nsl_tensor_copy_data_async(host_dst_ptr, device_src_ptr);
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        assert_eq!(
+            src.dtype, DTYPE_F32,
+            "nsl_tensor_cast_to_host_into: staged working tensor must be F32 \
+             (got dtype {}) — the FASE envelope updates in F32",
+            src.dtype
+        );
+        assert!(
+            dst.dtype == DTYPE_FP16 || dst.dtype == DTYPE_BF16,
+            "nsl_tensor_cast_to_host_into: unsupported host state dtype {} \
+             (FP16=2, BF16=3; F32 pairs take the copy_data path above)",
+            dst.dtype
+        );
+        let len = src.len as usize;
+        assert!(
+            len > 0,
+            "nsl_tensor_cast_to_host_into: zero-length cast is not supported \
+             (optimizer moments are never empty)"
+        );
+        let half_bytes = len * 2;
+        // Bound in-flight staged buffers BEFORE allocating the transient
+        // (review M1) — a saturated flush both caps device residency and
+        // returns the oldest transients to the caching allocator so this
+        // alloc can reuse them.
+        crate::tensor::offload_flush_if_saturated();
+        let transient = crate::cuda::inner::alloc_managed(half_bytes);
+        // Quant-cast on the NULL stream (ordered after the update kernels
+        // that produced src).
+        gpu_cast_core(src.data as u64, DTYPE_F32, transient as u64, dst.dtype, len);
+        if crate::cuda::inner::is_pinned(dst.data) && !crate::tensor::offload_sync_forced() {
+            // Async DtoH on the transfer stream (event-ordered after the
+            // cast kernel). Both device buffers stay alive until the
+            // per-step nsl_offload_drain().
+            crate::cuda::inner::memcpy_dtoh_async(dst.data, transient, half_bytes);
+            crate::tensor::offload_defer_free_device_buf(transient);
+            crate::tensor::offload_defer_free_tensor(device_src_ptr);
+        } else {
+            // Sync fallback (pageable host buffer or NSL_OFFLOAD_SYNC=1):
+            // the synchronous DtoH serializes with the NULL stream, so the
+            // cast kernel is complete when it returns — inline frees safe.
+            crate::cuda::inner::memcpy_dtoh(dst.data, transient, half_bytes);
+            crate::cuda::inner::free_managed(transient);
+            crate::tensor::nsl_tensor_free(device_src_ptr);
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    panic!(
+        "nsl_tensor_cast_to_host_into: device src (device={}) but the runtime \
+         was compiled without the `cuda` feature",
+        src.device
+    );
+}
+
+/// Allocate a zero-filled HOST-resident tensor with `template`'s shape at
+/// the given `dtype` (F32=1, FP16=2, BF16=3) — the offload+precision
+/// analog of `nsl_tensor_zeros_like_host_f32` (P0.3 item 8).
+///
+/// GPU template: host buffer via the pinned-aware offload allocator
+/// (pinned unless NSL_OFFLOAD_PAGEABLE=1 or no CUDA context; element size
+/// 2 for FP16/BF16). CPU template: delegates to
+/// `nsl_tensor_zeros_like_dtype` so a GPU-less run with both flags behaves
+/// exactly like precision-only (mirrors `nsl_tensor_zeros_like_host_f32`'s
+/// CPU delegation rationale). Ownership: `NslTensor::publish`, same
+/// persistent-state lifecycle as both parents.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_like_host_dtype(template_ptr: i64, dtype: i64) -> i64 {
+    let t = unsafe { &*(template_ptr as *const NslTensor) };
+    let dtype = dtype as u16;
+    let elem_size: usize = match dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 | DTYPE_BF16 => 2,
+        other => panic!(
+            "nsl_tensor_zeros_like_host_dtype: unsupported dtype {other} (F32=1, FP16=2, BF16=3)"
+        ),
+    };
+    if t.device == 0 {
+        return nsl_tensor_zeros_like_dtype(template_ptr, dtype as i64);
+    }
+    let len = t.len as usize;
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    let data = crate::tensor::alloc_host_state_buffer(len * elem_size);
+    let out = Box::new(NslTensor::new(
+        data as *mut c_void,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        0, // CPU
+        dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,5 +1435,186 @@ mod tests {
         assert_eq!(t.len, 4);
         crate::tensor::nsl_tensor_free(src);
         crate::tensor::nsl_tensor_free(bf16);
+    }
+
+    // -----------------------------------------------------------------
+    // P0.3 — offload x precision composition, CPU (GPU-less) degradations.
+    // The GPU fast paths live in the `gpu` submodule below (cuda-gated).
+    // -----------------------------------------------------------------
+
+    /// cast_from_host with a CPU template degrades to the co-resident CPU
+    /// `nsl_tensor_cast(src, F32)` — a fresh owned F32 widening of the host
+    /// reduced-precision state (placement-transparent GPU-less run).
+    #[test]
+    fn cast_from_host_cpu_template_widens_to_f32() {
+        let vals = [1.5_f32, -2.25, 0.5];
+        let src = fp16_tensor(&vals);
+        let template = f32_tensor(&[0.0; 3]); // CPU placement donor
+        let work = nsl_tensor_cast_from_host(src, template);
+        let t = unsafe { &*(work as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_F32, "working tensor must be F32");
+        assert_eq!(t.device, 0, "CPU template keeps the working tensor on CPU");
+        let got = read_f32(work);
+        for (i, &v) in vals.iter().enumerate() {
+            // Exact: these values round-trip fp16 losslessly.
+            let expected = f16_bits_to_f32(f32_to_f16_bits(v));
+            assert_eq!(got[i], expected, "elem {i}");
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(work);
+    }
+
+    /// cast_to_host_into on a CPU run = co-resident `nsl_tensor_cast_into`
+    /// plus the consuming free of the staged working tensor (ownership
+    /// contract shared with the GPU paths).
+    #[test]
+    fn cast_to_host_into_cpu_quantizes_and_consumes_src() {
+        let dst = fp16_tensor(&[0.0, 0.0, 0.0]);
+        let src = f32_tensor(&[1.0001, 3.14159, -2.5]);
+        // Keep src alive across the consuming call so the refcount drop is
+        // observable (rc 2 -> 1) rather than an actual free.
+        crate::tensor::nsl_tensor_retain(src);
+        nsl_tensor_cast_to_host_into(dst, src);
+        let src_rc = unsafe { &*(src as *const NslTensor) }
+            .refcount
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(src_rc, 1, "cast_to_host_into must CONSUME src (one refcount drop)");
+        let t = unsafe { &*(dst as *const NslTensor) };
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
+        for (i, &v) in [1.0001_f32, 3.14159, -2.5].iter().enumerate() {
+            assert_eq!(bits[i], f32_to_f16_bits(v), "elem {i} not quantized to the primitive");
+        }
+        crate::tensor::nsl_tensor_free(dst);
+        crate::tensor::nsl_tensor_free(src);
+    }
+
+    /// zeros_like_host_dtype with a CPU template delegates to
+    /// `nsl_tensor_zeros_like_dtype` so a GPU-less run with offload +
+    /// precision behaves exactly like precision-only.
+    #[test]
+    fn zeros_like_host_dtype_cpu_template_delegates() {
+        let template = f32_tensor(&[5.0, 6.0, 7.0]);
+        let z = nsl_tensor_zeros_like_host_dtype(template, DTYPE_BF16 as i64);
+        let t = unsafe { &*(z as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16, "dtype is BF16");
+        assert_eq!(t.device, 0, "host-resident");
+        assert_eq!(t.len, 3);
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
+        assert!(bits.iter().all(|&b| bf16_bits_to_f32(b) == 0.0), "all zero");
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(z);
+    }
+
+    /// P0.3 GPU coverage — gated exactly like `cuda/mod.rs`'s unit tests:
+    /// compiled only under `--features cuda`, requires a live GPU at runtime
+    /// (`cargo test -p nsl-runtime --features cuda`).
+    #[cfg(feature = "cuda")]
+    mod gpu {
+        use super::*;
+
+        /// Offloaded state buffers must come back PINNED once a CUDA
+        /// context is live, and `nsl_tensor_free` must route the buffer
+        /// through the pinned registry to `cuMemFreeHost`.
+        #[test]
+        fn zeros_like_host_f32_is_pinned_and_free_unregisters() {
+            if crate::tensor::offload_pageable_forced() {
+                eprintln!("skipping: NSL_OFFLOAD_PAGEABLE=1 in the environment");
+                return;
+            }
+            let cpu = f32_tensor(&[1.0; 8]);
+            let gpu_t = crate::tensor::nsl_tensor_to_device(cpu, 1);
+            let host_state = crate::tensor::nsl_tensor_zeros_like_host_f32(gpu_t);
+            let t = unsafe { &*(host_state as *const NslTensor) };
+            assert_eq!(t.device, 0, "state is host-resident");
+            assert_eq!(t.dtype, DTYPE_F32);
+            assert!(
+                crate::cuda::inner::is_pinned(t.data),
+                "offloaded state must be pinned when a CUDA context is live"
+            );
+            let data = t.data;
+            crate::tensor::nsl_tensor_free(host_state);
+            assert!(
+                !crate::cuda::inner::is_pinned(data),
+                "nsl_tensor_free must unregister + cuMemFreeHost the pinned buffer"
+            );
+            crate::tensor::nsl_tensor_free(gpu_t);
+            crate::tensor::nsl_tensor_free(cpu);
+        }
+
+        /// P0.2 ownership contract: on the pinned async path the staged
+        /// tensor's free is DEFERRED until nsl_offload_drain(); the copy
+        /// itself must land after the drain.
+        #[test]
+        fn copy_data_async_pinned_defers_free_until_drain() {
+            if crate::tensor::offload_pageable_forced() || crate::tensor::offload_sync_forced() {
+                eprintln!("skipping: offload kill-switch env set");
+                return;
+            }
+            let vals = [3.0_f32, -4.0, 5.5, 0.25];
+            let cpu = f32_tensor(&vals);
+            let dev = crate::tensor::nsl_tensor_to_device(cpu, 1);
+            let host = crate::tensor::nsl_tensor_zeros_like_host_f32(dev);
+            // rc 2 so the consuming free is observable, not destructive.
+            crate::tensor::nsl_tensor_retain(dev);
+            crate::tensor::nsl_tensor_copy_data_async(host, dev);
+            let rc_before = unsafe { &*(dev as *const NslTensor) }
+                .refcount
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                rc_before, 2,
+                "async path must NOT free the staged tensor before the drain"
+            );
+            crate::tensor::nsl_offload_drain();
+            let rc_after = unsafe { &*(dev as *const NslTensor) }
+                .refcount
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(rc_after, 1, "drain must perform the deferred free");
+            let got = read_f32(host);
+            assert_eq!(got, vals.to_vec(), "async DtoH must land by drain time");
+            crate::tensor::nsl_tensor_free(host);
+            crate::tensor::nsl_tensor_free(dev);
+            crate::tensor::nsl_tensor_free(cpu);
+        }
+
+        /// P0.3 combined envelope end-to-end on the GPU: pinned host FP16
+        /// state -> device F32 working tensor -> quant-cast back into the
+        /// same host buffer (async, drain-deferred frees). Values chosen
+        /// exactly representable in fp16 so the round-trip is bit-exact.
+        #[test]
+        fn cast_from_host_and_back_gpu_round_trip_fp16() {
+            let vals = [1.0_f32, -2.5, 0.75, 1234.5];
+            let cpu = f32_tensor(&vals);
+            let theta = crate::tensor::nsl_tensor_to_device(cpu, 1);
+            // Pinned host FP16 state buffer (the P0.3 allocation path).
+            let host = nsl_tensor_zeros_like_host_dtype(theta, DTYPE_FP16 as i64);
+            let ht = unsafe { &*(host as *const NslTensor) };
+            assert_eq!(ht.dtype, DTYPE_FP16);
+            {
+                let bits = unsafe { std::slice::from_raw_parts_mut(ht.data as *mut u16, 4) };
+                for (i, &v) in vals.iter().enumerate() {
+                    bits[i] = f32_to_f16_bits(v);
+                }
+            }
+            // Stage-in: host fp16 -> device f32.
+            let work = nsl_tensor_cast_from_host(host, theta);
+            let wt = unsafe { &*(work as *const NslTensor) };
+            assert!(wt.device > 0, "working tensor must be device-resident");
+            assert_eq!(wt.dtype, DTYPE_F32);
+            // Stage-out: device f32 -> host fp16 (consumes `work`).
+            nsl_tensor_cast_to_host_into(host, work);
+            crate::tensor::nsl_offload_drain();
+            let bits = unsafe { std::slice::from_raw_parts(ht.data as *const u16, 4) };
+            for (i, &v) in vals.iter().enumerate() {
+                assert_eq!(
+                    bits[i],
+                    f32_to_f16_bits(v),
+                    "elem {i}: fp16 -> f32 -> fp16 GPU round-trip must be bit-exact"
+                );
+            }
+            crate::tensor::nsl_tensor_free(host);
+            crate::tensor::nsl_tensor_free(theta);
+            crate::tensor::nsl_tensor_free(cpu);
+        }
     }
 }

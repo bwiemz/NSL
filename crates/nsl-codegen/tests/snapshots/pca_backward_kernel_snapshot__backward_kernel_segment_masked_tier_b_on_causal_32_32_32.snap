@@ -162,6 +162,9 @@ expression: ptx
     // --- PCA Tier A: load segment_ids from global to shared ---
     ld.param.u64 %rd_seg_global, [segment_ids_ptr];
     setp.eq.u64 %p_seg_null, %rd_seg_global, 0;
+    mul.lo.u64 %rd_pca_off, %batch_idx, %rd6;
+    shl.b64 %rd_pca_off, %rd_pca_off, 1;
+    add.u64 %rd_seg_global, %rd_seg_global, %rd_pca_off;
     add.u64 %seg_base, %shmem_base, 45440;  // bwd_total - seg_smem starts here
     setp.lt.u32 %p_pca_load, %tid_x, 32;
     @!%p_pca_load bra BW_PCA_LOAD_DONE;
