@@ -138,6 +138,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_gpu_drain_cache", &[], None),
     ("nsl_gpu_set_persistent_pool", &[], None),
     ("nsl_gpu_set_transient_pool", &[], None),
+    // P0.1 per-surface VRAM accounting (tag values: caching_allocator::SurfaceTag)
+    ("nsl_gpu_set_alloc_surface", &[types::I8], None),
+    ("nsl_gpu_get_alloc_surface", &[], Some(types::I8)),
     ("nsl_debug_gpu_alloc_summary", &[types::I64], None),
     // Stdin I/O
     ("nsl_read_line", &[], Some(types::I64)),
@@ -502,6 +505,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Optimizer-state offload (scaling campaign item 4): host-resident f32
     // zeros with the template's shape, regardless of the template's device.
     ("nsl_tensor_zeros_like_host_f32", &[types::I64], Some(types::I64)),
+    // Offload P0.2: async copy-back (CONSUMES src — replaces the emitted
+    // copy_data+free pair) + the once-per-step drain point.
+    ("nsl_tensor_copy_data_async", &[types::I64, types::I64], None),
+    ("nsl_offload_drain", &[], None),
+    // Offload P0.3 (offload x reduced-precision composition): host state
+    // at the planned dtype + the cross-device quant/dequant envelope.
+    ("nsl_tensor_zeros_like_host_dtype", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_cast_to_host_into", &[types::I64, types::I64], None),
+    ("nsl_tensor_cast_from_host", &[types::I64, types::I64], Some(types::I64)),
     // CPDT §3.2: INT8 blockwise quantization (the headline 4× memory result)
     ("nsl_tensor_quant_int8_blockwise", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_dequant_int8_blockwise", &[types::I64], Some(types::I64)),

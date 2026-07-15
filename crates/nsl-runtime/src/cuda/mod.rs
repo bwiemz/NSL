@@ -239,14 +239,51 @@ pub(crate) mod inner {
         } else {
             format!("\n  Operation: {}", ctx)
         };
+        // P0.1: attribute the VRAM that caused this OOM. try_lock — the
+        // caller dropped the allocator lock before panicking, but another
+        // thread may hold it; a diagnostic must never deadlock or double-
+        // panic on a poisoned lock.
+        let allocator_report = match super::caching_allocator::CACHING_ALLOCATOR.try_lock() {
+            Ok(alloc) => {
+                let (p_bytes, p_segs, t_bytes, t_segs) = alloc.pool_breakdown();
+                let mut r = format!(
+                    "\n\nAllocator surfaces (current / peak / at-global-peak):\n{}\
+                     Pools: persistent {} ({} segs), transient {} ({} segs)\n\
+                     Top allocation contexts:\n",
+                    alloc.surface_table_string("  "),
+                    format_bytes(p_bytes), p_segs,
+                    format_bytes(t_bytes), t_segs,
+                );
+                for (context, count, bytes) in
+                    alloc.allocated_block_summary().into_iter().take(8)
+                {
+                    r.push_str(&format!(
+                        "  {}: {} ({} blocks)\n",
+                        context,
+                        format_bytes(bytes),
+                        count,
+                    ));
+                }
+                r
+            }
+            Err(_) => {
+                "\n\n(allocator lock unavailable — no surface/context breakdown)\n"
+                    .to_string()
+            }
+        };
+        let async_note = if async_alloc_enabled() {
+            "\nNOTE: surfaces untracked (NSL_ASYNC_ALLOC=1 — async allocations \
+             bypass the caching allocator)\n"
+        } else {
+            ""
+        };
         format!(
             "[nsl] GPU out of memory\n\
              \n\
                Requested:    {} ({})\n\
                VRAM free:    {} / {}\n\
                Pool drained: {}\n\
-               Allocation #: {}{}\n\
-             \n\
+               Allocation #: {}{}{}{}\n\
              Suggestions:\n\
                - Reduce batch size or sequence length\n\
                - Enable gradient checkpointing (@checkpoint)\n\
@@ -256,6 +293,8 @@ pub(crate) mod inner {
             format_bytes(free_vram), format_bytes(total_vram),
             format_bytes(pool_freed),
             alloc_num, op_line,
+            allocator_report,
+            async_note,
         )
     }
 
@@ -439,7 +478,10 @@ pub(crate) mod inner {
 
     /// Check if async allocation is enabled and supported.
     /// Uses OnceLock to avoid TOCTOU race on initialization.
-    fn async_alloc_enabled() -> bool {
+    /// pub(crate): the memory reports (memstats summary, nsl_debug_gpu_mem)
+    /// note that async allocations bypass the caching allocator's
+    /// surface/pool accounting.
+    pub(crate) fn async_alloc_enabled() -> bool {
         *ASYNC_ALLOC_RESULT.get_or_init(|| {
             let env_enabled = std::env::var("NSL_ASYNC_ALLOC")
                 .map(|v| v == "1")
@@ -563,29 +605,74 @@ pub(crate) mod inner {
         }
     }
 
-    /// Test-only helper for allocating pinned (page-locked) host memory.
-    /// Production tensor transfers use plain heap staging instead.
-    #[cfg(test)]
-    pub(crate) fn alloc_pinned(size_bytes: usize) -> *mut c_void {
+    // ------------------------------------------------------------------
+    // Pinned (page-locked) host memory — optimizer-state offload (P0.2)
+    // ------------------------------------------------------------------
+
+    /// Registry of live pinned host buffers (data pointers). The tensor
+    /// free path (`nsl_tensor_free`) consults this set to route a host
+    /// tensor's data buffer to `cuMemFreeHost` instead of the Rust heap
+    /// free — pinned buffers are driver allocations and MUST NOT go
+    /// through `std::alloc::dealloc`.
+    static PINNED_HOST_SET: std::sync::LazyLock<std::sync::Mutex<HashSet<usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+    /// Live pinned-buffer count — lock-free fast path for `is_pinned`,
+    /// which sits on the free path of EVERY host tensor. Runs that never
+    /// pin (no offload) skip the registry mutex entirely.
+    static PINNED_LIVE_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Is `ptr` a live pinned host buffer allocated by `alloc_pinned`?
+    pub(crate) fn is_pinned(ptr: *mut c_void) -> bool {
+        if ptr.is_null() { return false; }
+        if PINNED_LIVE_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return false;
+        }
+        PINNED_HOST_SET.lock().unwrap().contains(&(ptr as usize))
+    }
+
+    /// Try to allocate pinned (page-locked) host memory via
+    /// `cuMemAllocHost_v2`; `None` on driver failure (page-lock limits /
+    /// fragmented host memory) so callers can degrade to pageable instead
+    /// of aborting a multi-GB training run.
+    ///
+    /// Used by the optimizer-state offload envelope (P0.2): pinned staging
+    /// buffers let `cuMemcpyDtoHAsync` run as true async DMA overlap
+    /// instead of the pageable double-buffer bounce. The pointer is
+    /// tracked in `PINNED_HOST_SET` so the tensor free path can route it
+    /// back to `cuMemFreeHost`.
+    pub(crate) fn try_alloc_pinned(size_bytes: usize) -> Option<*mut c_void> {
         ensure_context();
         unsafe {
             let mut ptr: *mut c_void = std::ptr::null_mut();
             let result = cuMemAllocHost_v2(&mut ptr, size_bytes);
-            assert_eq!(
-                result,
-                CUresult::CUDA_SUCCESS,
-                "cuMemAllocHost_v2({} bytes) failed: {:?}",
-                size_bytes,
-                result
-            );
-            ptr
+            if result != CUresult::CUDA_SUCCESS || ptr.is_null() {
+                return None;
+            }
+            PINNED_HOST_SET.lock().unwrap().insert(ptr as usize);
+            PINNED_LIVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+            Some(ptr)
         }
     }
 
+    /// Panicking wrapper over [`try_alloc_pinned`] for callers that treat
+    /// pinned allocation failure as a bug (tests, small transfer buffers).
+    /// Production state buffers go through `try_alloc_pinned` + pageable
+    /// fallback instead — only the unit tests call this today.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn alloc_pinned(size_bytes: usize) -> *mut c_void {
+        try_alloc_pinned(size_bytes).unwrap_or_else(|| {
+            panic!("cuMemAllocHost_v2({} bytes) failed", size_bytes)
+        })
+    }
+
     /// Free pinned host memory allocated with `alloc_pinned`.
-    #[cfg(test)]
     pub(crate) fn free_pinned(ptr: *mut c_void) {
         ensure_context();
+        if PINNED_HOST_SET.lock().unwrap().remove(&(ptr as usize)) {
+            PINNED_LIVE_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
         unsafe {
             let result = cuMemFreeHost(ptr);
             assert_eq!(
@@ -647,6 +734,151 @@ pub(crate) mod inner {
                 result
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-thread transfer stream — optimizer-state offload (P0.2)
+    //
+    // Kernel launches go to the legacy NULL stream (see `current_stream`),
+    // so a NON_BLOCKING side stream lets the offload copy-back overlap
+    // with the next parameter's update kernels: NULL-stream work never
+    // waits on the transfer stream. Correctness ordering (the copy must
+    // not start before the update kernels that produced its source have
+    // finished) is enforced per copy with a NULL-stream event that the
+    // transfer stream waits on.
+    //
+    // CUDA contexts are THREAD-LOCAL in this runtime, so the stream is
+    // thread-local too (mirrors `inspect/stream.rs`). Env kill-switches
+    // (documented at their read sites in `tensor/mod.rs`):
+    //   NSL_OFFLOAD_SYNC=1     — force synchronous copy-back
+    //   NSL_OFFLOAD_PAGEABLE=1 — force pageable host state buffers
+    // ------------------------------------------------------------------
+
+    thread_local! {
+        // CUstream stored as usize (raw handles are !Send; 0 = not created).
+        static TRANSFER_STREAM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Lazily create (once per thread) and return the offload transfer
+    /// stream. Must only be called when a CUDA context exists (it calls
+    /// `ensure_context`, which force-initializes CUDA).
+    pub(crate) fn transfer_stream() -> CUstream {
+        TRANSFER_STREAM.with(|s| {
+            let cur = s.get();
+            if cur != 0 {
+                return cur as CUstream;
+            }
+            ensure_context();
+            let mut stream: CUstream = std::ptr::null_mut();
+            unsafe {
+                // 0x1 = CU_STREAM_NON_BLOCKING: no implicit synchronization
+                // with the legacy NULL stream (ordering is via events).
+                let result = cuStreamCreate(&mut stream, 0x1);
+                assert_eq!(
+                    result,
+                    CUresult::CUDA_SUCCESS,
+                    "cuStreamCreate (offload transfer stream) failed: {:?}",
+                    result
+                );
+            }
+            s.set(stream as usize);
+            stream
+        })
+    }
+
+    /// Make the calling thread's transfer stream wait for all work
+    /// previously launched on the legacy NULL stream (record + wait via a
+    /// throwaway event; `cuEventDestroy` defers actual destruction until
+    /// the wait completes, so destroying immediately is safe).
+    unsafe fn transfer_stream_wait_null_stream(stream: CUstream) {
+        let mut ev: CUevent = std::ptr::null_mut();
+        // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest event flavor).
+        let r = cuEventCreate(&mut ev, 0x2);
+        assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (offload) failed: {:?}", r);
+        let r = cuEventRecord(ev, std::ptr::null_mut());
+        assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (offload) failed: {:?}", r);
+        let r = cuStreamWaitEvent(stream, ev, 0);
+        assert_eq!(r, CUresult::CUDA_SUCCESS, "cuStreamWaitEvent (offload) failed: {:?}", r);
+        cuEventDestroy_v2(ev);
+    }
+
+    /// Async DtoH on the per-thread transfer stream, ordered AFTER all
+    /// previously-launched NULL-stream work (the update kernels that
+    /// produced `src_device`). `dst_host` MUST be pinned — the caller
+    /// checks `is_pinned` first; an async copy into pageable memory
+    /// silently degrades to a staged sync copy inside the driver.
+    ///
+    /// The copy is NOT complete when this returns: the caller must keep
+    /// `src_device` alive until `transfer_stream_synchronize()` (the
+    /// offload drain list in `tensor/mod.rs` owns that deferral).
+    pub(crate) fn memcpy_dtoh_async(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        ensure_context();
+        let stream = transfer_stream();
+        unsafe {
+            transfer_stream_wait_null_stream(stream);
+            let result = cuMemcpyDtoHAsync_v2(dst_host, src_device as CUdeviceptr, size_bytes, stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyDtoHAsync_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+        }
+    }
+
+    /// Async HtoD on the per-thread transfer stream (P0.2 item 3; the HtoD
+    /// prefetch consumer is a deferred follow-up — no production caller
+    /// yet). `src_host` should be pinned for true async DMA. NULL-stream
+    /// consumers of `dst_device` are NOT ordered after this copy (the
+    /// stream is non-blocking): the caller MUST call
+    /// `transfer_stream_synchronize()` before launching kernels that read
+    /// `dst_device`.
+    ///
+    /// ALLOCATOR INVARIANT (load-bearing for the offload envelope's inline
+    /// frees, e.g. `nsl_tensor_cast_from_host`'s transient): recycled
+    /// caching-allocator blocks may only be RE-WRITTEN by NULL-stream-
+    /// ordered work. This function is the one primitive that writes device
+    /// memory on the non-blocking transfer stream — a future caller must
+    /// only target buffers that were never freed-and-recycled with pending
+    /// NULL-stream readers, or must drain before reuse.
+    #[allow(dead_code)]
+    pub(crate) fn memcpy_htod_async(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        ensure_context();
+        let stream = transfer_stream();
+        unsafe {
+            transfer_stream_wait_null_stream(stream);
+            let result = cuMemcpyHtoDAsync_v2(dst_device as CUdeviceptr, src_host, size_bytes, stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyHtoDAsync_v2({} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+        }
+    }
+
+    /// Synchronize the calling thread's transfer stream. No-op when the
+    /// stream was never created on this thread (does NOT force-initialize
+    /// CUDA — safe to call unconditionally from the offload drain).
+    pub(crate) fn transfer_stream_synchronize() {
+        TRANSFER_STREAM.with(|s| {
+            let cur = s.get();
+            if cur == 0 {
+                return;
+            }
+            ensure_context();
+            unsafe {
+                let result = cuStreamSynchronize(cur as CUstream);
+                assert_eq!(
+                    result,
+                    CUresult::CUDA_SUCCESS,
+                    "cuStreamSynchronize (offload transfer stream) failed: {:?}",
+                    result
+                );
+            }
+        })
     }
 
     /// Zero-fill device memory.
@@ -5228,6 +5460,33 @@ DONE:
         }
 
         inner::free_pinned(ptr);
+    }
+
+    /// P0.2: the pinned registry must track alloc_pinned buffers so the
+    /// tensor free path can route them to cuMemFreeHost.
+    #[test]
+    fn test_pinned_registry_tracks_alloc_and_free() {
+        let ptr = inner::alloc_pinned(128);
+        assert!(inner::is_pinned(ptr), "alloc_pinned must register the buffer");
+        inner::free_pinned(ptr);
+        assert!(!inner::is_pinned(ptr), "free_pinned must unregister the buffer");
+    }
+
+    /// P0.2: async DtoH on the per-thread transfer stream lands after
+    /// transfer_stream_synchronize (round-trip through device memory).
+    #[test]
+    fn test_transfer_stream_async_dtoh_roundtrip() {
+        let vals: Vec<f32> = (0..256).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let bytes = vals.len() * std::mem::size_of::<f32>();
+        let dev = inner::alloc_device(bytes);
+        inner::memcpy_htod(dev, vals.as_ptr() as *const std::ffi::c_void, bytes);
+        let pinned = inner::alloc_pinned(bytes);
+        inner::memcpy_dtoh_async(pinned, dev, bytes);
+        inner::transfer_stream_synchronize();
+        let got = unsafe { std::slice::from_raw_parts(pinned as *const f32, vals.len()) };
+        assert_eq!(got, vals.as_slice(), "async DtoH must be complete after stream sync");
+        inner::free_pinned(pinned);
+        inner::free_device(dev);
     }
 
     #[test]
