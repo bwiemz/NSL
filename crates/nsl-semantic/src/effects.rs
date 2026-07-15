@@ -22,8 +22,17 @@ use nsl_errors::{Diagnostic, FileId};
 /// Paper §5.3 checkpointing-aware backward policy (semantic-layer copy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CheckpointPolicy {
-    /// Full prologue recompute during backward (v1 only variant).
+    /// Full prologue recompute during backward (the cycle-10 CSHA
+    /// attention-prologue machinery).
     Full,
+    /// CCR P1.b — SELECTIVE block-granular recompute on the source-AD
+    /// path: matmul-class outputs stay saved; only cheap bandwidth-bound
+    /// ops (norms, RoPE, elementwise, softmax) are replayed during the
+    /// backward. Consumed by stmt.rs's train-block CCR gate (equivalent
+    /// to `--checkpoint-blocks --checkpoint-selective`); deliberately NOT
+    /// consumed by the CSHA prologue-stamping pass. `selective_postnorm`
+    /// and `custom` remain reserved/refused.
+    Selective,
 }
 
 // ---------------------------------------------------------------------------

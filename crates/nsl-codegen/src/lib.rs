@@ -1187,6 +1187,11 @@ pub struct CompileOptions {
     /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
     /// note when the tape has no `blocks.N` structure.
     pub checkpoint_blocks: bool,
+    /// CCR P1.b: with `checkpoint_blocks`, use the SELECTIVE policy —
+    /// matmul-class outputs stay saved, only cheap bandwidth-bound ops
+    /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
+    /// memory reduction than the block policy at near-zero recompute cost.
+    pub checkpoint_selective: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1307,6 +1312,7 @@ impl Default for CompileOptions {
             health_flush_interval: None,
             optim_state_offload: false,
             checkpoint_blocks: false,
+            checkpoint_selective: false,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),

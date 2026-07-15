@@ -1841,6 +1841,12 @@ impl<'a> WengertExtractor<'a> {
             return;
         };
         match policy {
+            // CCR P1.b: Selective is consumed by the train-block CCR gate
+            // in stmt.rs (block-granular recompute with matmul outputs
+            // saved) — it must NOT trigger the CSHA prologue stamping,
+            // which would suppress save-pointer emission for a policy
+            // whose whole point is keeping the expensive saves.
+            CheckpointPolicy::Selective => {}
             CheckpointPolicy::Full => {
                 // Stamp every previously-emitted op as checkpointed EXCEPT
                 // function-entry roots (Input / Param). The roots are not

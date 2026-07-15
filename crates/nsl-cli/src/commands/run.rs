@@ -55,6 +55,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             wggo_prune_fraction,
             wggo_memory_budget,
             optim_state_offload,
+            checkpoint_blocks,
+            checkpoint_selective,
             weights,
     } = args;
 
@@ -370,6 +372,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 ownership_info: std::collections::HashMap::new(),
                 zero_stage: zero_stage.map(|s| s as u8),
                 optim_state_offload,
+                checkpoint_blocks,
+                checkpoint_selective,
                 debug_training,
                 shared_lib: false,
                 emit_export_table: false,

@@ -4052,6 +4052,20 @@ impl Compiler<'_> {
         // Persistent pool for param_list and optimizer state allocation
         self.compile_call_by_name(builder, "nsl_gpu_set_persistent_pool", &[])?;
 
+        // P0.1 per-surface VRAM accounting: tag values MUST match
+        // `nsl_runtime::cuda::caching_allocator::SurfaceTag` (#[repr(u8)]).
+        // Each bracket below sets a surface for its allocation region and
+        // restores the caller's surface afterwards (get/set — nesting-safe).
+        const SURFACE_WEIGHTS: i64 = 1;
+        const SURFACE_OPTIM_M: i64 = 2;
+        const SURFACE_OPTIM_V: i64 = 3;
+        const SURFACE_M_PARTIAL: i64 = 4;
+        const SURFACE_GRADS: i64 = 5;
+        const SURFACE_ACTIVATIONS: i64 = 6;
+        let surface_prev = self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+        let surface_weights = builder.ins().iconst(cl_types::I8, SURFACE_WEIGHTS);
+        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_weights])?;
+
         let param_paths = self.enumerate_model_tensor_paths(&model_var_name, &model_type_name);
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for path in &param_paths {
@@ -4065,6 +4079,8 @@ impl Compiler<'_> {
                 })?;
             self.compile_call_by_name(builder, "nsl_list_push", &[param_list, param_ptr])?;
         }
+        // End of the Weights bracket — restore the caller's surface.
+        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
         let num_params_val = builder
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
@@ -4270,27 +4286,34 @@ impl Compiler<'_> {
         };
 
         // Optimizer-state offload (scaling campaign item 4): m/v allocate
-        // HOST-resident f32; every optimizer step stages them to the device,
-        // runs the unchanged F32 update, and copies back. Mutually exclusive
-        // with reduced-precision moments: the requant half of that envelope
-        // (`nsl_tensor_cast_into`) asserts co-residency, so combining them
-        // would abort at the first optimizer step — refuse loudly at compile
-        // time instead.
+        // HOST-resident (pinned when a GPU is live — P0.2); every optimizer
+        // step stages them to the device, runs the unchanged F32 update, and
+        // copies back on the transfer stream. P0.3: COMPOSES with
+        // reduced-precision moments on this (non-pipelined) path — host m/v
+        // are stored at the planned dtype and staged through the combined
+        // cross-device cast envelope (nsl_tensor_cast_from_host /
+        // nsl_tensor_cast_to_host_into), which replaces the co-resident
+        // nsl_tensor_cast_into requant that used to force a hard refusal
+        // here. The pipelined train path still refuses offload outright
+        // (see compile_train_block_pipelined).
         if self.compile_options.optim_state_offload {
             if cpdt_precision_dtypes.is_some() {
-                return Err(CodegenError::new(
-                    "--optim-state-offload cannot combine with reduced-precision \
-                     optimizer moments (--wggo-moment-precision / a CPDT precision \
-                     plan): the requant copy-back cannot cross devices. Drop one \
-                     of the two flags.",
-                ));
+                eprintln!(
+                    "[offload] optimizer state (m/v) is HOST-resident at the \
+                     planned reduced-precision dtypes (offload x \
+                     --wggo-moment-precision/CPDT composition): each optimizer \
+                     step dequants host state to device F32, updates, and \
+                     quant-casts back (halved PCIe staging traffic vs f32 \
+                     offload). VRAM saved: {num_state_buffers}x parameter bytes."
+                );
+            } else {
+                eprintln!(
+                    "[offload] optimizer state (m/v) is HOST-resident: each optimizer \
+                     step stages state to the device and copies it back (2 PCIe \
+                     round-trips of total state per step). VRAM saved: \
+                     {num_state_buffers}x parameter bytes."
+                );
             }
-            eprintln!(
-                "[offload] optimizer state (m/v) is HOST-resident: each optimizer \
-                 step stages state to the device and copies it back (2 PCIe \
-                 round-trips of total state per step). VRAM saved: \
-                 {num_state_buffers}x parameter bytes."
-            );
         }
 
         let state_list_1 = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -4327,17 +4350,36 @@ impl Compiler<'_> {
             state.current_block = Some(init_body);
 
             let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
+            // P0.1: first-moment buffers under the OptimM surface. The
+            // offload variant allocates HOST tensors — those never reach the
+            // GPU caching allocator, so the tag is inert there (correct:
+            // host state is not VRAM).
+            let surface_optim_m = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_M);
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_m])?;
             // CPDT precision-adaptive: allocate optimizer state at the planned
             // storage dtype when active; otherwise use the verbatim FP32 path.
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` and `Value:
             // Copy`, so matching by value inside the loop is fine.
             let buf1 = if self.compile_options.optim_state_offload {
-                // Offload: HOST-resident f32 state (see the gate above).
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_tensor_zeros_like_host_f32",
-                    &[param_i],
-                )?
+                if let Some((m_list, _)) = cpdt_precision_dtypes {
+                    // P0.3 composition: HOST-resident state at the planned
+                    // reduced-precision dtype (same per-param dtype list the
+                    // device zeros_like_dtype path uses).
+                    let m_code =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_zeros_like_host_dtype",
+                        &[param_i, m_code],
+                    )?
+                } else {
+                    // Offload-only: HOST-resident f32 state (see the gate above).
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_zeros_like_host_f32",
+                        &[param_i],
+                    )?
+                }
             } else if let Some((m_list, _)) = cpdt_precision_dtypes {
                 let m_code = self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
                 self.compile_call_by_name(
@@ -4350,12 +4392,26 @@ impl Compiler<'_> {
             };
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
+                // P0.1: second-moment buffers under the OptimV surface.
+                let surface_optim_v = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_V);
+                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_v])?;
                 let buf2 = if self.compile_options.optim_state_offload {
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_zeros_like_host_f32",
-                        &[param_i],
-                    )?
+                    if let Some((_, v_list)) = cpdt_precision_dtypes {
+                        // P0.3 composition (see buf1).
+                        let v_code =
+                            self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_zeros_like_host_dtype",
+                            &[param_i, v_code],
+                        )?
+                    } else {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_zeros_like_host_f32",
+                            &[param_i],
+                        )?
+                    }
                 } else if let Some((_, v_list)) = cpdt_precision_dtypes {
                     let v_code =
                         self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
@@ -4380,6 +4436,9 @@ impl Compiler<'_> {
             builder.switch_to_block(init_exit);
             builder.seal_block(init_exit);
             state.current_block = Some(init_exit);
+
+            // End of the OptimM/OptimV bracket — restore the caller's surface.
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
         }
 
         // ── 5. Initialize lr and step_count variables ───────────────────
@@ -4412,6 +4471,9 @@ impl Compiler<'_> {
         // the optimizer step every N batches.
         let accum_list = if grad_accumulation_steps > 1 {
             let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            // P0.1: grad-accumulation buffers under the MPartial surface.
+            let surface_m_partial = builder.ins().iconst(cl_types::I8, SURFACE_M_PARTIAL);
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_m_partial])?;
             // Runtime loop over param_list (not layout.fields — which may include sub-models)
             let accum_i_var = state.new_variable();
             builder.declare_var(accum_i_var, cl_types::I64);
@@ -4441,6 +4503,8 @@ impl Compiler<'_> {
             builder.switch_to_block(accum_exit);
             builder.seal_block(accum_exit);
             state.current_block = Some(accum_exit);
+            // End of the MPartial bracket — restore the caller's surface.
+            self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
             Some(list)
         } else {
             None
@@ -4680,6 +4744,10 @@ impl Compiler<'_> {
 
         // Switch to transient GPU pool for forward/backward intermediates
         self.compile_call_by_name(builder, "nsl_gpu_set_transient_pool", &[])?;
+        // P0.1: default surface during fwd/bwd is Activations (restored to
+        // the caller's surface at the end-of-step persistent-pool flip).
+        let surface_activations = builder.ins().iconst(cl_types::I8, SURFACE_ACTIVATIONS);
+        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_activations])?;
 
         // Debug: GPU memory at start of step
         {
@@ -5748,6 +5816,36 @@ impl Compiler<'_> {
                     }
                 }
 
+                // CCR P1.a (--checkpoint-blocks): segment the final primal
+                // tape and decide the per-block recompute set BEFORE any
+                // lowering. Reads the CSHA claim table non-destructively
+                // (the generator `take()`s it later) so claimed segments
+                // can be exempted — the claim table is keyed by primal
+                // OpId, which a recompute clone cannot satisfy.
+                let ccr_selective_decorated = self
+                    .compile_options
+                    .checkpoint_policies
+                    .values()
+                    .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
+                let ccr_plan = if self.compile_options.checkpoint_blocks
+                    || ccr_selective_decorated
+                {
+                    let claimed_ids: Option<std::collections::HashSet<u32>> =
+                        self.csha_backward_claims.as_ref().map(|claims| {
+                            claims.op_to_chain.keys().copied().collect()
+                        });
+                    let policy = if self.compile_options.checkpoint_selective
+                        || ccr_selective_decorated
+                    {
+                        crate::ccr::CcrPolicy::Selective
+                    } else {
+                        crate::ccr::CcrPolicy::Block
+                    };
+                    crate::ccr::plan(&effective_primal, claimed_ids.as_ref(), policy)
+                } else {
+                    None
+                };
+
                 // NSL_PHASE_TIMING (deferral-closure 2026-07-14): per-micro-batch
                 // forward/backward wall-clock split, printed by the runtime as
                 // "[phase] fwd=... bwd=..." lines. Env is read at COMPILE time —
@@ -5777,6 +5875,48 @@ impl Compiler<'_> {
                 let loss_val = *full_vars.get(&loss_var_id).ok_or_else(|| {
                     CodegenError::new("source AD: loss VarId not found in compiled forward graph")
                 })?;
+
+                // CCR P1.a: restrict the recompute set to what the primal
+                // lowering itself classified as owned Tensors — the tape's
+                // type default over-claims for scalar arithmetic (raw f64
+                // SSA values), which must neither be cloned nor freed; the
+                // adjoint keeps consuming the original scalar values.
+                let mut ccr_plan = ccr_plan;
+                if let Some(plan) = &mut ccr_plan {
+                    let owned: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::WengertType,
+                    > = full_lowered
+                        .owned_values
+                        .iter()
+                        .map(|(vid, _, ty)| (*vid, *ty))
+                        .collect();
+                    if !plan.restrict_to_owned(&owned) {
+                        eprintln!(
+                            "[ccr] nothing recomputable after the owned-tensor \
+                             restriction; running without checkpointing"
+                        );
+                        ccr_plan = None;
+                    }
+                }
+
+                // CCR P1.a: free the checkpointed block interiors NOW —
+                // the forward is done and the backward will recompute them.
+                // Lowered as a tiny FreeTensor-only list seeded with the
+                // primal var_map; `explicit_freed_vars` flows into the
+                // bulk-free exclusion below so nothing double-frees.
+                // (Refcounted runtime: views holding a reference keep the
+                // storage alive, so this is a decrement, not a hard free.)
+                let ccr_freed_primal: std::collections::HashSet<crate::wengert::VarId> =
+                    if let Some(plan) = &ccr_plan {
+                        let free_list = crate::ccr::build_early_free_list(plan);
+                        let freed_lowered = crate::wengert_lower::compile_wengert_ops(
+                            self, builder, state, &free_list, full_vars, None,
+                        )?;
+                        freed_lowered.explicit_freed_vars
+                    } else {
+                        Default::default()
+                    };
 
                 // NSL_PHASE_TIMING: end of forward+loss (all primal ops are
                 // emitted above; adjoint GENERATION below is compile-time only).
@@ -5828,6 +5968,29 @@ impl Compiler<'_> {
                         adjoint.ops =
                             crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
                     }
+                }
+
+                // 6c. CCR P1.a: splice recompute clones + FreeTensor markers
+                // into the (final, post-eliminate) adjoint and remap its
+                // references from the early-freed originals to the clones.
+                // Runs AFTER the eliminate passes so the splice positions
+                // and last-use frees are computed against exactly the op
+                // list that will be lowered.
+                if let Some(plan) = &ccr_plan {
+                    let mut ccr_fresh = effective_primal
+                        .ops
+                        .iter()
+                        .map(|o| o.result)
+                        .chain(adjoint.ops.iter().map(|o| o.result))
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    crate::ccr::apply_to_adjoint(
+                        &effective_primal,
+                        &mut adjoint,
+                        plan,
+                        &mut ccr_fresh,
+                    )?;
                 }
 
                 // ── Build FASE consume-per-param hook (Task 3) ──
@@ -5894,6 +6057,51 @@ impl Compiler<'_> {
                                 accum_idx,
                             },
                         );
+                    }
+                }
+
+                // 6d. CCR: adjoint-region last-use freeing. The 500M/seq1024
+                // per-surface OOM decomposition showed adjoint intermediates
+                // (dx-chain temporaries) are the binding activation wall —
+                // they all lived to the end-of-backward bulk free. Insert a
+                // FreeTensor after each adjoint var's last use. Protected:
+                // every param-gradient adjoint (consumed by the FASE hook or
+                // by post-lowering grad collection) plus the inputs of the
+                // ops producing them (the hook's reduce_to_shape identity
+                // path emits its own extra free for those raw grads).
+                if ccr_plan.is_some() {
+                    let mut ccr_protect: std::collections::HashSet<crate::wengert::VarId> =
+                        std::collections::HashSet::new();
+                    for (param_name, primal_vid) in extractor.named_param_var_ids() {
+                        if !self.is_trainable_param_name(param_name) {
+                            continue;
+                        }
+                        if let Some(adj_vid) = gen.adjoint_of(*primal_vid) {
+                            ccr_protect.insert(adj_vid);
+                        }
+                    }
+                    for op in &adjoint.ops {
+                        if ccr_protect.contains(&op.result) {
+                            for input in &op.inputs {
+                                ccr_protect.insert(*input);
+                            }
+                        }
+                    }
+                    let mut ccr_fresh2 = effective_primal
+                        .ops
+                        .iter()
+                        .map(|o| o.result)
+                        .chain(adjoint.ops.iter().map(|o| o.result))
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    let n = crate::ccr::insert_adjoint_last_use_frees(
+                        &mut adjoint,
+                        &ccr_protect,
+                        &mut ccr_fresh2,
+                    );
+                    if std::env::var("NSL_CCR_DEBUG").is_ok() {
+                        eprintln!("[ccr] adjoint last-use frees inserted: {n}");
                     }
                 }
 
@@ -6004,6 +6212,10 @@ impl Compiler<'_> {
                     // These VarIds must NOT be freed again by end-of-adjoint cleanup.
                     freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
                 }
+                // CCR: recompute clones were freed by the spliced FreeTensor
+                // markers during adjoint lowering — exclude them from the
+                // end-of-backward bulk free.
+                freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
 
                 if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {
                     let summarize_owned = |label: &str,
@@ -6075,6 +6287,14 @@ impl Compiler<'_> {
                 let grads = if !fase_hook_active {
                 let grads_inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
 
+                // P0.1: gradient seed buffers under the Grads surface. The
+                // ambient surface here is Activations (set at the transient-
+                // pool flip); get/set keeps the bracket nesting-safe.
+                let surface_grads_prev =
+                    self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                let surface_grads = builder.ins().iconst(cl_types::I8, SURFACE_GRADS);
+                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_grads])?;
+
                 // 8a. Initialize one zero gradient per runtime parameter.
                 let fill_i_var = state.new_variable();
                 builder.declare_var(fill_i_var, cl_types::I64);
@@ -6103,6 +6323,13 @@ impl Compiler<'_> {
                 builder.switch_to_block(fill_exit);
                 builder.seal_block(fill_exit);
                 state.current_block = Some(fill_exit);
+
+                // End of the Grads bracket — restore the ambient surface.
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_gpu_set_alloc_surface",
+                    &[surface_grads_prev],
+                )?;
 
                 // 8b. Replace zero slots with actual source-AD gradients by
                 // scanning the runtime param_list for each resolved parameter
@@ -6271,6 +6498,9 @@ impl Compiler<'_> {
 
                 let mut retained_full_vars = std::collections::HashSet::new();
                 retained_full_vars.insert(loss_var_id);
+                // CCR: block interiors were freed right after the forward
+                // (the early-free mini list) — the bulk free must skip them.
+                retained_full_vars.extend(ccr_freed_primal.iter().copied());
                 self.free_wengert_owned_values(
                     builder,
                     &grad_lowered.owned_values,
@@ -6292,6 +6522,12 @@ impl Compiler<'_> {
                 }
                 for (vid, val, _) in &full_lowered.owned_values {
                     if !retained_full_vars.contains(vid) {
+                        wengert_freed.insert(*val);
+                    }
+                    // CCR early-freed interiors were freed by the mini list,
+                    // not the bulk cleanup — still "already freed" as far as
+                    // the step-variable sweep is concerned.
+                    if ccr_freed_primal.contains(vid) {
                         wengert_freed.insert(*val);
                     }
                 }
@@ -6982,6 +7218,11 @@ impl Compiler<'_> {
                     builder.seal_block(pb_hdr);
                     builder.seal_block(pb_exit);
                     state.current_block = Some(pb_exit);
+                    // Offload P0.2: one drain per optimizer step (transfer-
+                    // stream sync + deferred frees of the staged tensors).
+                    if self.compile_options.optim_state_offload {
+                        self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
+                    }
                 } else {
                     // ── Non-clip Deferred path: per-parameter fused final step ──
                     // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
@@ -7033,6 +7274,11 @@ impl Compiler<'_> {
                     builder.switch_to_block(fs_exit);
                     builder.seal_block(fs_exit);
                     state.current_block = Some(fs_exit);
+                    // Offload P0.2: one drain per optimizer step (transfer-
+                    // stream sync + deferred frees of the staged tensors).
+                    if self.compile_options.optim_state_offload {
+                        self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
+                    }
                 }
 
                 // Jump to post-optimizer block (merges optimizer and skip paths)
@@ -7122,6 +7368,12 @@ impl Compiler<'_> {
             builder.switch_to_block(opt_exit);
             builder.seal_block(opt_exit);
             state.current_block = Some(opt_exit);
+
+            // Offload P0.2: one drain per optimizer step (transfer-stream
+            // sync + deferred frees of the staged tensors).
+            if self.compile_options.optim_state_offload {
+                self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
+            }
         }
 
         // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
@@ -7491,6 +7743,8 @@ impl Compiler<'_> {
 
         // Switch back to persistent pool (for epoch callbacks, optimizer state updates)
         self.compile_call_by_name(builder, "nsl_gpu_set_persistent_pool", &[])?;
+        // P0.1: end of the Activations bracket — restore the caller's surface.
+        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
 
         // Drain GPU caching allocator — only releases Transient segments,
         // which are now fully free since forward/backward intermediates were freed.

@@ -694,15 +694,38 @@ pub(crate) struct BuildArgs {
         pub(crate) wggo_memory_budget: Option<u64>,
 
         /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
-        /// Adam/momentum state (m/v) HOST-resident and stage it to the device
-        /// for each optimizer step, freeing 1-2x parameter bytes of VRAM. The
-        /// update math still runs on the GPU in f32, so FASE == AdamW
-        /// exactness is preserved; the cost is one HtoD+DtoH round-trip of the
-        /// state per step. Mutually exclusive with reduced-precision moments
-        /// (--wggo-moment-precision / --wggo-memory-budget): the requant
-        /// copy-back cannot cross devices — passing both is a hard error.
+        /// Adam/momentum state (m/v) HOST-resident (pinned when a GPU is
+        /// live) and stage it to the device for each optimizer step, freeing
+        /// 1-2x parameter bytes of VRAM. The update math still runs on the
+        /// GPU in f32, so FASE == AdamW exactness is preserved; the copy-back
+        /// overlaps the next parameter's update on a dedicated transfer
+        /// stream. COMPOSES with reduced-precision moments
+        /// (--wggo-moment-precision / --wggo-memory-budget): host state is
+        /// then stored at the planned dtype and staged through an on-device
+        /// quant/dequant envelope, halving the PCIe staging traffic. Env
+        /// kill-switches: NSL_OFFLOAD_SYNC=1 (synchronous copy-back),
+        /// NSL_OFFLOAD_PAGEABLE=1 (pageable host buffers). Not supported on
+        /// pipelined train blocks.
         #[arg(long)]
         pub(crate) optim_state_offload: bool,
+
+        /// CCR (docs/research/CCR.pdf) block-granular activation
+        /// checkpointing on the source-AD path: each transformer block's
+        /// interior activations are freed after the forward and recomputed
+        /// just before that block's backward, so activation residency drops
+        /// from O(layers x interiors) to O(layers x boundaries + one
+        /// block's interiors). Bit-exact — the recompute replays the same
+        /// kernels in the same order on the same inputs (dropout results
+        /// are never replayed; they stay saved). No-op with a stderr note
+        /// on models without `blocks.N`-style structure.
+        #[arg(long)]
+        pub(crate) checkpoint_blocks: bool,
+
+        /// With --checkpoint-blocks: selective policy (never recompute
+        /// matmul-class ops; replay only cheap norms/RoPE/elementwise).
+        /// Less memory reduction at near-zero recompute cost.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_selective: bool,
 
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
@@ -1011,15 +1034,38 @@ pub(crate) struct RunArgs {
         pub(crate) wggo_memory_budget: Option<u64>,
 
         /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
-        /// Adam/momentum state (m/v) HOST-resident and stage it to the device
-        /// for each optimizer step, freeing 1-2x parameter bytes of VRAM. The
-        /// update math still runs on the GPU in f32, so FASE == AdamW
-        /// exactness is preserved; the cost is one HtoD+DtoH round-trip of the
-        /// state per step. Mutually exclusive with reduced-precision moments
-        /// (--wggo-moment-precision / --wggo-memory-budget): the requant
-        /// copy-back cannot cross devices — passing both is a hard error.
+        /// Adam/momentum state (m/v) HOST-resident (pinned when a GPU is
+        /// live) and stage it to the device for each optimizer step, freeing
+        /// 1-2x parameter bytes of VRAM. The update math still runs on the
+        /// GPU in f32, so FASE == AdamW exactness is preserved; the copy-back
+        /// overlaps the next parameter's update on a dedicated transfer
+        /// stream. COMPOSES with reduced-precision moments
+        /// (--wggo-moment-precision / --wggo-memory-budget): host state is
+        /// then stored at the planned dtype and staged through an on-device
+        /// quant/dequant envelope, halving the PCIe staging traffic. Env
+        /// kill-switches: NSL_OFFLOAD_SYNC=1 (synchronous copy-back),
+        /// NSL_OFFLOAD_PAGEABLE=1 (pageable host buffers). Not supported on
+        /// pipelined train blocks.
         #[arg(long)]
         pub(crate) optim_state_offload: bool,
+
+        /// CCR (docs/research/CCR.pdf) block-granular activation
+        /// checkpointing on the source-AD path: each transformer block's
+        /// interior activations are freed after the forward and recomputed
+        /// just before that block's backward, so activation residency drops
+        /// from O(layers x interiors) to O(layers x boundaries + one
+        /// block's interiors). Bit-exact — the recompute replays the same
+        /// kernels in the same order on the same inputs (dropout results
+        /// are never replayed; they stay saved). No-op with a stderr note
+        /// on models without `blocks.N`-style structure.
+        #[arg(long)]
+        pub(crate) checkpoint_blocks: bool,
+
+        /// With --checkpoint-blocks: selective policy (never recompute
+        /// matmul-class ops; replay only cheap norms/RoPE/elementwise).
+        /// Less memory reduction at near-zero recompute cost.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) checkpoint_selective: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

@@ -58,7 +58,10 @@ fn block(x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
 }
 
 #[test]
-fn checkpoint_policy_selective_is_refused() {
+fn checkpoint_policy_selective_is_published() {
+    // CCR P1.b: "selective" is no longer reserved — it publishes the
+    // Selective policy for the train-block CCR gate (block-granular
+    // recompute with matmul-class outputs saved).
     let src = r#"
 @pure
 @checkpoint(policy="selective")
@@ -71,11 +74,11 @@ fn block(x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
         .iter()
         .filter(|d| matches!(d.level, nsl_errors::Level::Error))
         .collect();
-    assert!(
-        errors
-            .iter()
-            .any(|d| d.message.contains("reserved for §5.3-v2/v3")),
-        "expected v2/v3 refusal; got: {errors:?}"
+    assert!(errors.is_empty(), "selective must be accepted; got: {errors:?}");
+    assert_eq!(
+        res.checkpoint_policies.get("block"),
+        Some(&CheckpointPolicy::Selective),
+        "policy map must carry Selective for the decorated fn"
     );
 }
 

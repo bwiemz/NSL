@@ -66,6 +66,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             wggo_prune_fraction,
             wggo_memory_budget,
             optim_state_offload,
+            checkpoint_blocks,
+            checkpoint_selective,
             devices,
             csha,
             csha_report,
@@ -394,6 +396,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 ownership_info: std::collections::HashMap::new(), // populated by loader
                 zero_stage: zero_stage.map(|s| s as u8),
                 optim_state_offload,
+                checkpoint_blocks,
+                checkpoint_selective,
                 debug_training,
                 shared_lib,
                 emit_export_table: shared_lib,

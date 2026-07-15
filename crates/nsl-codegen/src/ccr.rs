@@ -36,6 +36,35 @@ use std::collections::{HashMap, HashSet};
 use crate::wengert::{PrimalOp, VarId, WengertList, WengertOp, WengertType, type_for_op};
 use crate::CodegenError;
 
+/// Recompute policy (P1.a / P1.b of the memory-reduction plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CcrPolicy {
+    /// Recompute every (owned, replayable) block interior — maximum memory
+    /// reduction, pays ~one extra forward of block-interior compute.
+    Block,
+    /// Megatron-style selective: NEVER recompute matmul-class ops (their
+    /// outputs stay saved); replay only cheap bandwidth-bound work — norms,
+    /// RoPE, elementwise activations, softmax, reshapes. Saves less memory
+    /// than `Block` at near-zero recompute cost.
+    Selective,
+}
+
+/// Matmul-class ops whose outputs are SAVED under `CcrPolicy::Selective`.
+fn selective_saves(op: &PrimalOp) -> bool {
+    matches!(
+        op,
+        PrimalOp::Matmul
+            | PrimalOp::Conv2d { .. }
+            | PrimalOp::ScaledDotProductAttention { .. }
+            | PrimalOp::ScaledDotProductAttentionPacked
+            | PrimalOp::FusedLinearCe { .. }
+            | PrimalOp::FusedKlCe { .. }
+            | PrimalOp::FusedGatedLoraMatmul { .. }
+            | PrimalOp::FusedLoraMatmul { .. }
+            | PrimalOp::FusedIa3Matmul { .. }
+    )
+}
+
 /// One transformer block's contiguous slice of the primal tape.
 #[derive(Debug)]
 pub struct BlockSegment {
@@ -123,6 +152,233 @@ impl CcrPlan {
     }
 }
 
+/// P1.c — budget-driven per-tensor SAVE/RECOMPUTE arbitration (the CCR
+/// paper's MILP, section 3.3).
+///
+/// Structural simplification that makes the optimum EXACT: this transform
+/// recomputes each victim exactly once per backward, from always-available
+/// inputs (saved boundaries / params / earlier clones), so per-tensor
+/// costs are independent — no recompute-chain multiplicities, no DAG
+/// cycles (the paper's F-15 is impossible by construction). The MILP
+/// therefore reduces to a 0/1 knapsack: choose the SAVE subset that
+/// maximizes avoided recompute cost subject to saved-interior bytes <=
+/// budget, solved optimally by DP over a quantized budget axis.
+pub struct CcrBudget {
+    /// Bytes per VarId where the type map had a concrete shape. Vars
+    /// WITHOUT a size hint cannot be budgeted and stay RECOMPUTE.
+    pub sizes: HashMap<VarId, u64>,
+    /// Allowed SAVED-interior bytes across all segments (after any C-01
+    /// credit the caller applied).
+    pub budget_bytes: u64,
+}
+
+/// Relative cost of recomputing one output byte of this op — a bandwidth /
+/// arithmetic-intensity proxy, not a calibrated model. Matmul-class ops
+/// dominate; pure data movement is nearly free.
+fn recompute_cost_weight(op: &PrimalOp) -> u64 {
+    if selective_saves(op) {
+        25 // matmul / attention class: arithmetic-intensity-heavy
+    } else {
+        match op {
+            PrimalOp::Transpose { .. } | PrimalOp::Passthrough(_) => 1,
+            _ => 4, // norms, RoPE, elementwise, softmax: bandwidth-bound
+        }
+    }
+}
+
+/// Knapsack granularity: 256 KiB per DP cell keeps the state table small
+/// (a 16 GiB budget = 65 536 cells) while activation tensors of interest
+/// are MiB-scale.
+const BUDGET_QUANTUM: u64 = 256 * 1024;
+
+/// Refine a `Block`-policy plan under a byte budget: pick the SAVE subset
+/// (removed from `recompute`) that maximizes avoided recompute cost while
+/// keeping saved-interior bytes within `budget.budget_bytes`. Returns the
+/// number of tensors flipped to SAVE.
+pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget) -> usize {
+    // Candidate items: recompute victims with a known size.
+    let mut items: Vec<(VarId, u64, u64)> = Vec::new(); // (var, bytes, value)
+    for victims in &plan.per_segment_recompute {
+        for &v in victims {
+            let Some(&bytes) = budget.sizes.get(&v) else {
+                continue;
+            };
+            if bytes == 0 {
+                continue;
+            }
+            let weight = primal
+                .find_producer(v)
+                .map(|op| recompute_cost_weight(&op.op))
+                .unwrap_or(1);
+            items.push((v, bytes, bytes.saturating_mul(weight)));
+        }
+    }
+    if items.is_empty() || budget.budget_bytes < BUDGET_QUANTUM {
+        return 0;
+    }
+
+    let cap = (budget.budget_bytes / BUDGET_QUANTUM) as usize;
+    // dp[w] = best total value using <= w quanta; choice tracking per item.
+    let mut dp = vec![0u64; cap + 1];
+    let mut take = vec![vec![false; cap + 1]; items.len()];
+    for (i, (_, bytes, value)) in items.iter().enumerate() {
+        let w = (bytes.div_ceil(BUDGET_QUANTUM)) as usize;
+        if w > cap {
+            continue;
+        }
+        for c in (w..=cap).rev() {
+            let cand = dp[c - w] + value;
+            if cand > dp[c] {
+                dp[c] = cand;
+                take[i][c] = true;
+            }
+        }
+    }
+    // Walk back the chosen set.
+    let mut saved: HashSet<VarId> = HashSet::new();
+    let mut c = cap;
+    for i in (0..items.len()).rev() {
+        if take[i][c] {
+            let (v, bytes, _) = items[i];
+            saved.insert(v);
+            c -= (bytes.div_ceil(BUDGET_QUANTUM)) as usize;
+        }
+    }
+    if saved.is_empty() {
+        return 0;
+    }
+    for victims in plan.per_segment_recompute.iter_mut() {
+        victims.retain(|v| !saved.contains(v));
+    }
+    plan.recompute.retain(|v| !saved.contains(v));
+    plan.free_eligible.retain(|v| !saved.contains(v));
+    saved.len()
+}
+
+/// P1 completion — adjoint-region last-use freeing.
+///
+/// The 500M/seq-1024 OOM decomposition (per-surface accounting) showed the
+/// binding wall is ADJOINT intermediates: every dx-chain temporary lives
+/// until the end-of-backward bulk free (hundreds of `nsl_add_f32` /
+/// `sum_dim_f32` blocks live simultaneously). This pass inserts a
+/// `FreeTensor` marker immediately after each adjoint-produced var's last
+/// use inside the adjoint list.
+///
+/// Safety rails:
+/// - `protect` (param-gradient adjoints — consumed by the FASE hook or by
+///   post-lowering grad collection — plus anything the caller retains) is
+///   never freed;
+/// - vars already freed by an existing `FreeTensor` (the recompute-clone
+///   frees) are skipped;
+/// - NslList hazard: a var consumed by a List-building op is kept alive
+///   until the LIST's own last use (lists hold raw, un-refcounted element
+///   pointers — the tape's `cat` consumes the list var, not the elements),
+///   propagated transitively for nested lists;
+/// - vars with no use after their producer (dead results) are freed
+///   immediately after production;
+/// - the lowering-side FreeTensor guard (I64 + Tensor-typed only) remains
+///   the final authority on what actually emits a free.
+///
+/// Returns the number of markers inserted.
+pub fn insert_adjoint_last_use_frees(
+    adjoint: &mut WengertList,
+    protect: &HashSet<VarId>,
+    fresh: &mut VarId,
+) -> usize {
+    // Vars produced in the adjoint region (only these are candidates —
+    // primal values are owned by the primal cleanup path).
+    let produced: HashMap<VarId, usize> = adjoint
+        .ops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| (op.result, i))
+        .collect();
+    let already_freed: HashSet<VarId> = adjoint
+        .ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::FreeTensor))
+        .map(|op| op.inputs[0])
+        .collect();
+
+    // Last use per var (tape-level).
+    let mut last_use: HashMap<VarId, usize> = HashMap::new();
+    for (idx, op) in adjoint.ops.iter().enumerate() {
+        for input in &op.inputs {
+            last_use.insert(*input, idx);
+        }
+    }
+    // List-chain propagation: an element of a list lives as long as the
+    // list itself (and lists of lists, to fixpoint — bounded by nesting).
+    loop {
+        let mut changed = false;
+        for op in adjoint.ops.iter() {
+            let is_list = matches!(
+                adjoint.var_types.get(&op.result),
+                Some(WengertType::List)
+            ) || matches!(&op.op, PrimalOp::Passthrough(n) if n == "list");
+            if !is_list {
+                continue;
+            }
+            let Some(&list_last) = last_use.get(&op.result) else {
+                continue;
+            };
+            for input in &op.inputs {
+                let e = last_use.entry(*input).or_insert(list_last);
+                if *e < list_last {
+                    *e = list_last;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Collect (insert_after_idx, victim) — free at last use, or right
+    // after production for dead results.
+    let mut pending: Vec<(usize, VarId)> = Vec::new();
+    for (var, &prod_idx) in &produced {
+        if protect.contains(var) || already_freed.contains(var) {
+            continue;
+        }
+        if matches!(adjoint.ops[prod_idx].op, PrimalOp::FreeTensor) {
+            continue;
+        }
+        // Only Tensor-typed (or untyped-defaulting-to-tensor) results; the
+        // lowering guard re-checks against the actual SSA value type.
+        if let Some(ty) = adjoint.var_types.get(var) {
+            if !matches!(ty, WengertType::Tensor) {
+                continue;
+            }
+        }
+        let at = last_use.get(var).copied().unwrap_or(prod_idx).max(prod_idx);
+        pending.push((at, *var));
+    }
+    // Insert from the back so earlier indices stay valid.
+    pending.sort_by_key(|p| std::cmp::Reverse(p.0));
+    let inserted = pending.len();
+    for (at, victim) in pending {
+        let result = *fresh;
+        *fresh += 1;
+        adjoint.ops.insert(
+            at + 1,
+            WengertOp {
+                id: 0,
+                result,
+                op: PrimalOp::FreeTensor,
+                inputs: vec![victim],
+                saved_for_backward: false,
+                checkpointed: false,
+            },
+        );
+    }
+    for (i, op) in adjoint.ops.iter_mut().enumerate() {
+        op.id = i as u32;
+    }
+    inserted
+}
+
 /// Effective Wengert type of a result (falls back to the op default).
 fn effective_type(list: &WengertList, op: &WengertOp) -> WengertType {
     list.var_types
@@ -147,6 +403,7 @@ fn block_ordinal(key: &str) -> Option<u64> {
 pub fn plan(
     primal: &WengertList,
     csha_claimed_ops: Option<&HashSet<u32>>,
+    policy: CcrPolicy,
 ) -> Option<CcrPlan> {
     // ---- 1. Param vars per block key --------------------------------
     let mut param_block: HashMap<VarId, String> = HashMap::new();
@@ -311,6 +568,9 @@ pub fn plan(
                 PrimalOp::Dropout { .. } | PrimalOp::PrologueRecompute { .. } => continue,
                 PrimalOp::FreeTensor => continue,
                 _ => {}
+            }
+            if policy == CcrPolicy::Selective && selective_saves(&op.op) {
+                continue;
             }
             seg_recompute.push(op.result);
             recompute.insert(op.result);
@@ -648,7 +908,7 @@ mod tests {
     #[test]
     fn segments_and_interiors() {
         let primal = toy_primal();
-        let plan = plan(&primal, None).expect("two blocks segment");
+        let plan = plan(&primal, None, CcrPolicy::Block).expect("two blocks segment");
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].layer_key, "blocks.0");
         // v3 is interior to block 0 (only consumed by v4 inside the block);
@@ -663,7 +923,7 @@ mod tests {
     #[test]
     fn adjoint_splice_remaps_and_frees() {
         let primal = toy_primal();
-        let plan = plan(&primal, None).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Block).unwrap();
         // Toy adjoint touching both interiors: block-1 grads first (reverse
         // order), then block-0 grads.
         let mut adjoint = WengertList {
@@ -719,7 +979,7 @@ mod tests {
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        assert!(plan(&primal, None).is_none());
+        assert!(plan(&primal, None, CcrPolicy::Block).is_none());
     }
 
     #[test]
@@ -727,8 +987,21 @@ mod tests {
         let mut primal = toy_primal();
         // Replace block-0's interior Matmul with a Dropout.
         primal.ops[3] = op(3, 3, PrimalOp::Dropout { p: 0.1 }, vec![0]);
-        let plan = plan(&primal, None).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Block).unwrap();
         assert!(!plan.recompute.contains(&3), "dropout must not be replayed");
+    }
+
+    #[test]
+    fn selective_saves_matmuls_recomputes_cheap() {
+        let mut primal = toy_primal();
+        // Insert a Relu over block-0's Matmul so the block has one cheap
+        // and one expensive interior: v3 = Matmul, v9 = Relu(v3), and the
+        // residual add consumes the Relu instead.
+        primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+        primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
+        let plan = plan(&primal, None, CcrPolicy::Selective).unwrap();
+        assert!(!plan.recompute.contains(&3), "matmul output must stay saved");
+        assert!(plan.recompute.contains(&9), "relu is replayable");
     }
 
     #[test]
@@ -736,7 +1009,7 @@ mod tests {
         let primal = toy_primal();
         let mut claimed = HashSet::new();
         claimed.insert(3u32); // op id 3 = block 0's Matmul
-        let plan = plan(&primal, Some(&claimed)).unwrap();
+        let plan = plan(&primal, Some(&claimed), CcrPolicy::Block).unwrap();
         assert!(!plan.recompute.contains(&3), "claimed segment exempt");
         assert!(plan.recompute.contains(&5), "unclaimed segment intact");
     }
