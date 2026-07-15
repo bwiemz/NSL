@@ -6057,6 +6057,23 @@ impl Compiler<'_> {
                     }
                 }
 
+                // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
+                // schedule when NSL_CSLA_REPORT=1. Pure analysis over the final
+                // adjoint — no codegen change. Element counts are left
+                // unquantified here (Stage-2 wires the memory planner's shapes);
+                // the layer grouping + tied/cross-layer classification is the
+                // correctness-relevant part.
+                if std::env::var("NSL_CSLA_REPORT").ok().as_deref() == Some("1") {
+                    let params: Vec<(String, crate::wengert::VarId)> = extractor
+                        .named_param_var_ids()
+                        .iter()
+                        .filter(|(name, _)| self.is_trainable_param_name(name))
+                        .map(|(n, v)| (n.clone(), *v))
+                        .collect();
+                    let plan = crate::layerwise::analyze(&adjoint, &params, &|_| None);
+                    eprintln!("[csla]\n{}", plan.render_report("  "));
+                }
+
                 // 6c. CCR P1.a: splice recompute clones + FreeTensor markers
                 // into the (final, post-eliminate) adjoint and remap its
                 // references from the early-freed originals to the clones.
