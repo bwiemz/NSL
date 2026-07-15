@@ -554,6 +554,13 @@ impl Compiler<'_> {
                         .flat_map(|m| m.values()),
                     self.interner,
                 );
+        // WGGO campaign item 6: resolve the train block's packed-dataset
+        // document-length statistics once here (AST-only, same lifetime as the
+        // packing-supported signal) so both the pre-pass and the in-place
+        // planner can price packing from the real distribution. `None` when no
+        // train block references a packing-enabled dataset — legacy planning.
+        self.features.dataset_packing_stats =
+            crate::pca_activation::resolve_packing_config_for_stmts(stmts, self.interner);
         // PCA Stage C note: `packed_sdpa_in_module` is deliberately NOT set
         // here. An AST scan over model method bodies would over-claim — the
         // stdlib GQA model always CARRIES forward_packed, so every GQA module

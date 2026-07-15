@@ -66,6 +66,8 @@ fn empty_plan() -> WggoPlan {
         cfie_inference: Vec::new(),
         // CPKD v1: distillation decisions (advisory sidecar; empty = gate off).
         cpkd_distill: Vec::new(),
+        // Budget driver: no `--wggo-memory-budget` in this fixture.
+        budget_infeasible: None,
     }
 }
 

@@ -5,8 +5,10 @@
 # Config: batch_size=32, seq_len=1024 (matches pretrain config)
 # Each batch: 32 * 1024 = 32,768 tokens
 # Each token: 2 bytes (u16) in mmap, 4 bytes (f32) after conversion
-# Batch data size: 32,768 * 4 = 128KB (input_ids) + 128KB (labels) + 128MB (attention_mask)
-#   Note: attention_mask is [32, 1024, 1024] = 128MB — this dominates!
+# Batch data size: 32,768 * 4 = 128KB (input_ids) + 128KB (labels)
+#   Note: the dense [32, 1024, 1024] = 128MB attention_mask is opt-in now
+#   (packing=true + emit_attention_mask=true); packed batches default to
+#   compact segment metadata instead.
 
 let tokens = load_mmap("C:/Users/bwiem/ai testing/codeforge/data/pretokenized/150m/tokens.bin", 3)
 let loader = DataLoader(tokens, batch_size=32, seq_len=1024, shuffle=false, drop_last=true)

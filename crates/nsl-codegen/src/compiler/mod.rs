@@ -443,6 +443,15 @@ pub struct FeatureConfigs {
     /// the plan's segment_id consumption verdict to the fused kernel
     /// family on CUDA.
     pub packed_sdpa_in_module: bool,
+    /// WGGO campaign item 6: the document-length statistics resolved from the
+    /// first train block's `dataset` block (`mean_doc_length` /
+    /// `doc_length_stddev` / `max_sequence_length`). Computed once during
+    /// kernel synthesis alongside `packing_supported_in_module` and read by
+    /// BOTH the WGGO pre-pass and the in-place train-block planner so the cost
+    /// model prices packing from the real document-length distribution rather
+    /// than fictional flat constants. `None` when no train block references a
+    /// packing-enabled dataset → legacy byte-identical planning.
+    pub dataset_packing_stats: Option<crate::pca_detect::DatasetPackingConfig>,
 
     // ── Weight Intelligence (M52) ────────────────────────────────────
     /// M52: Loaded weight map (populated when --weights is passed)
@@ -494,6 +503,7 @@ impl FeatureConfigs {
             source_ad_enabled: options.source_ad,
             packing_supported_in_module: false,
             packed_sdpa_in_module: false,
+            dataset_packing_stats: None,
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,

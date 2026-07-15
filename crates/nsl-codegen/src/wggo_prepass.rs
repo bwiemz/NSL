@@ -239,20 +239,28 @@ pub fn fingerprint_wengert(list: &crate::wengert::WengertList) -> u64 {
 /// Module-level packing-preference aggregation for the admission gate.
 /// Kernel synthesis is per train block (module-scoped), so the per-layer
 /// packing decisions collapse to one preference: `true` iff at least one
-/// layer requested packing AND every layer that did chose segment_id
-/// (mode 1). Mixed or zero preferences are ambiguous at module scope and
-/// must not flip admission.
+/// layer requested packing AND every layer that did chose a **segment-driven**
+/// mode — segment_id (mode 1) OR tile_skip (mode 2). Both dispatch through the
+/// SAME promoted Tier-B segment-masked kernel family (tile-skip is intrinsic to
+/// Tier-B: it skips fully-masked `bkv` tiles, runtime-gated by
+/// `should_dispatch_tier_b_at_runtime`); there is no separate tile_skip kernel
+/// to admit, so the cost model preferring mode 2 must NOT flip admission off
+/// (campaign item 6, recon §6 step 4). multi_seq (mode 3) stays excluded — it
+/// has no kernel and is masked out in the cost model. Mixed (some mode 3) or
+/// zero preferences are ambiguous at module scope and must not flip admission.
 pub fn plan_prefers_segment_id(overrides: &crate::wggo_overrides::WggoOverrides) -> bool {
     let mut any_nonzero = false;
-    let all_segment_id = overrides.per_layer.iter().all(|l| {
+    let all_segment_driven = overrides.per_layer.iter().all(|l| {
         if l.packing_mode == 0 {
             true
         } else {
             any_nonzero = true;
-            l.packing_mode == 1
+            // mode 1 (segment_id) and mode 2 (tile_skip) both dispatch the
+            // segment-masked Tier-B path.
+            l.packing_mode == 1 || l.packing_mode == 2
         }
     });
-    any_nonzero && all_segment_id
+    any_nonzero && all_segment_driven
 }
 
 fn primal_op_tag(op: &crate::wengert::PrimalOp) -> String {
@@ -667,10 +675,16 @@ mod tests {
     }
 
     #[test]
-    fn segment_id_preference_requires_unambiguous_mode_1() {
+    fn segment_id_preference_accepts_segment_driven_modes() {
         // All packing layers chose segment_id → prefer.
         assert!(plan_prefers_segment_id(&overrides_with_modes(&[0, 1, 1])));
-        // Mixed 1 and 3 → ambiguous → no flip.
+        // Campaign item 6: tile_skip (mode 2) is segment-driven too — it
+        // dispatches the SAME Tier-B segment-masked kernel family, so a
+        // cost-model preference for tile_skip must NOT flip admission off.
+        assert!(plan_prefers_segment_id(&overrides_with_modes(&[0, 2, 2])));
+        // Mixed segment_id + tile_skip → still segment-driven → prefer.
+        assert!(plan_prefers_segment_id(&overrides_with_modes(&[1, 2])));
+        // Mixed 1 and 3 → ambiguous (mode 3 has no kernel) → no flip.
         assert!(!plan_prefers_segment_id(&overrides_with_modes(&[1, 3])));
         // No packing anywhere → no flip.
         assert!(!plan_prefers_segment_id(&overrides_with_modes(&[0, 0])));
@@ -767,6 +781,10 @@ fn plan_train_block(
             analysis_config,
             Some(&compiler.compile_options),
             compiler.features.packing_supported_in_module,
+            // Campaign item 6: doc-length stats resolved in kernel synthesis
+            // (before this pre-pass) so packing is priced from the real
+            // distribution; `None` on non-packed modules → legacy constants.
+            compiler.features.dataset_packing_stats.clone(),
         )?;
         let overrides = crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied);
         let contains_attention = extractor.wengert_list().ops.iter().any(|op| {

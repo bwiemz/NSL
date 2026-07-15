@@ -264,6 +264,18 @@ pub struct LayerIlpConstraints {
     /// Role-based floors (`role_sensitivity_floor`) still apply on top
     /// when informed.
     pub sensitivity_informed: bool,
+    /// Set only when the user passed `--wggo-memory-budget`. It EXEMPTS the
+    /// `sensitivity_informed` evidence gate for sub-32 **moment** precision
+    /// (`optim_m_bits`/`optim_v_bits`) — and nothing else — because the user
+    /// explicitly traded moment precision for capacity (fp16 moments with the
+    /// #369 GPU cast envelope is the shipped mechanism). The role/sensitivity
+    /// CEILINGS (`high_prec_threshold`/`critical_prec_threshold`) still bind
+    /// when sensitivity data is present, so fragile layers stay high-precision
+    /// even under budget pressure. Off (default `false`) → byte-identical to
+    /// today. Also gates the FASE-Deferred resident surcharge in
+    /// [`ilp_resident_bytes`] so the budget is compared against an honest
+    /// footprint without perturbing non-budget plans' reported `memory_bytes`.
+    pub budget_informed: bool,
     /// Whether `head_importance` / `min_retained_importance` are backed by
     /// a REAL weight signal. When false, the full solver restricts the
     /// structural axes to identity: keep-all heads and full FFN width.
@@ -301,6 +313,16 @@ pub struct LayerIlpConstraints {
     /// mode (0..=3).  Typical defaults: 0.00, 0.15, 0.25, 0.35 — derived
     /// from the fraction of padded tokens in typical batches.
     pub packing_savings: [f64; 4],
+    /// How [`apply_packing`] interprets [`packing_savings`]. `false` (default)
+    /// = the legacy **flat whole-layer** discount `forward_us·(1−s)` from the
+    /// fictional constants — byte-identical to every pre-campaign-item-6 plan.
+    /// `true` = the saving is a *document-density-derived* reduction of the
+    /// O(s²) attention share ONLY, so it is applied to
+    /// [`LayerCostEntry::attn_quadratic_us`] (and its backward twin) rather
+    /// than the whole layer (campaign item 6 / recon §3-§4). Set to `true`
+    /// only by `wggo::default_constraints_for` when a `dataset` block supplies
+    /// real `mean_doc_length` statistics.
+    pub packing_scales_quadratic_only: bool,
     /// CFIE inference decision axes (audit gap G20) — **opt-in, default
     /// `None` = OFF**.  When `Some`, the solver additionally decides
     /// {fusion level, KV layout, per-layer KV precision, speculative
@@ -338,6 +360,7 @@ impl Default for LayerIlpConstraints {
             gqa_group: 1,
             sensitivity: 0.0,
             sensitivity_informed: false,
+            budget_informed: false,
             importance_informed: false,
             high_prec_threshold: 0.5,
             critical_prec_threshold: 0.9,
@@ -347,6 +370,7 @@ impl Default for LayerIlpConstraints {
             fase_backward_speedup: 0.10,
             packing_modes_mask: 0b1111,
             packing_savings: [0.00, 0.15, 0.25, 0.35],
+            packing_scales_quadratic_only: false,
             cfie_infer: None,
             cpkd: None,
         }
@@ -492,6 +516,7 @@ pub fn solve_layer_cpkd(
                                         adj_fase,
                                         pack,
                                         &constraints.packing_savings,
+                                        constraints.packing_scales_quadratic_only,
                                     );
                                     if entry.smem_bytes > constraints.smem_budget {
                                         continue;
@@ -528,9 +553,16 @@ pub fn solve_layer_cpkd(
                                             ),
                                             _ => (0.0, 0u64),
                                         };
-                                    if ilp_resident_bytes(&entry, lut, m_bits, v_bits)
-                                        .saturating_add(cfie_pool)
-                                        .saturating_add(cpkd_bytes)
+                                    if ilp_resident_bytes(
+                                        &entry,
+                                        lut,
+                                        m_bits,
+                                        v_bits,
+                                        fase,
+                                        constraints.budget_informed,
+                                    )
+                                    .saturating_add(cfie_pool)
+                                    .saturating_add(cpkd_bytes)
                                         > constraints.memory_budget
                                     {
                                         continue;
@@ -607,10 +639,16 @@ pub fn solve_layer_cpkd(
                 (Some(ch), Some(cfg)) => crate::wggo_cpkd::choice_bytes(ch, cfg),
                 _ => 0,
             };
-            let memory_bytes =
-                ilp_resident_bytes(&entry, lut, decision.optim_m_bits, decision.optim_v_bits)
-                    .saturating_add(cfie_pool)
-                    .saturating_add(cpkd_bytes);
+            let memory_bytes = ilp_resident_bytes(
+                &entry,
+                lut,
+                decision.optim_m_bits,
+                decision.optim_v_bits,
+                decision.fase_fused,
+                constraints.budget_informed,
+            )
+            .saturating_add(cfie_pool)
+            .saturating_add(cpkd_bytes);
             (
                 LayerIlpSolution {
                     decision,
@@ -682,7 +720,12 @@ pub fn recost_decision_cpkd(
         return f64::INFINITY;
     }
     let adj = apply_fase(base, d.fase_fused, c.fase_backward_speedup);
-    let entry = apply_packing(adj, d.packing_mode, &c.packing_savings);
+    let entry = apply_packing(
+        adj,
+        d.packing_mode,
+        &c.packing_savings,
+        c.packing_scales_quadratic_only,
+    );
     // Mirror `solve_layer`'s objective exactly so a re-cost after conflict
     // resolution is comparable: forward+backward + adapter-comm + optimizer.
     let mut cost = entry.total_us()
@@ -719,15 +762,77 @@ pub fn recost_decision_cpkd(
 /// Routing through the same formula the DP uses is what closes the gap-#3
 /// divergence — the ILP used to charge a bare `param + activation`, silently
 /// dropping the optimizer state (the Adam moments) the DP always counted.
-fn ilp_resident_bytes(entry: &LayerCostEntry, lut: &LayerCostLut, m_bits: u8, v_bits: u8) -> u64 {
+///
+/// When `budget_informed` is set (the user passed `--wggo-memory-budget`) AND
+/// the candidate fuses the FASE Deferred optimizer step (`fase_fused`), the two
+/// FASE-Deferred resident surfaces the base formula omits — the f32 `m_partial`
+/// window accumulator and the one live parameter gradient — are added via
+/// [`crate::wggo_cost::fase_deferred_extra_bytes`], so the budget is compared
+/// against an honest footprint. The surcharge is gated on `budget_informed` so
+/// non-budget plans' reported `memory_bytes` stay byte-identical to today
+/// (pinned tests depend on it). `apply_fase` already removed one param-sized
+/// buffer from `entry.activation_bytes`; the surcharge re-introduces the true
+/// Deferred surfaces (one live grad + the accumulator that the full grad buffer
+/// is replaced by).
+fn ilp_resident_bytes(
+    entry: &LayerCostEntry,
+    lut: &LayerCostLut,
+    m_bits: u8,
+    v_bits: u8,
+    fase_fused: bool,
+    budget_informed: bool,
+) -> u64 {
     let optimizer_state =
         crate::wggo_cost::moment_state_bytes(entry.param_bytes, lut.dtype_bytes, m_bits, v_bits);
-    crate::wggo_cost::resident_training_bytes(
+    let base = crate::wggo_cost::resident_training_bytes(
         entry.param_bytes,
         optimizer_state,
         entry.activation_bytes,
         1,
-    )
+    );
+    if budget_informed && fase_fused {
+        base.saturating_add(crate::wggo_cost::fase_deferred_extra_bytes(
+            entry.param_bytes,
+            lut.dtype_bytes,
+        ))
+    } else {
+        base
+    }
+}
+
+/// Smallest resident footprint the moment-precision axis can give a layer
+/// without dropping below fp16 — the identity structural decision (max heads,
+/// max FFN, no adapter, no CSHA, no packing, FASE off) charged at 16-bit m and
+/// v. This is the "fp16-moment floor": if the budget cannot fit even this, no
+/// moment-precision decision the solver can make will help, so the budget path
+/// hard-fails with a required-vs-budget diagnostic (see `wggo::run`).
+pub fn fp16_moment_floor_bytes(lut: &LayerCostLut) -> u64 {
+    moment_floor_bytes(lut, 16, 16)
+}
+
+/// The identity-structural resident footprint of a layer at an EXPLICIT moment
+/// precision — the generalization of [`fp16_moment_floor_bytes`]. Used by the
+/// budget refusal to size each layer at its OWN role-permitted precision floor
+/// (32-bit for a critical-sensitivity layer such as the embedding / LM-head,
+/// 16-bit for a quantizable transformer block) instead of assuming every layer
+/// can reach fp16 — a role-pinned 32-bit layer whose fp16 floor fit the budget
+/// but whose real 32-bit floor does not would otherwise slip through the
+/// global feasibility check and OOM at runtime.
+pub fn moment_floor_bytes(lut: &LayerCostLut, m_bits: u8, v_bits: u8) -> u64 {
+    let max_heads = lut
+        .axes_head_counts
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_ffn = lut.axes_ffn_widths.iter().copied().max().unwrap_or(1);
+    let min_rank = lut.axes_adapter_ranks.iter().copied().min().unwrap_or(0);
+    match lut.get(max_heads, max_ffn, 0, min_rank) {
+        // Identity decision: FASE off, so no Deferred surcharge in the floor.
+        Some(entry) => ilp_resident_bytes(&entry, lut, m_bits, v_bits, false, false),
+        None => 0,
+    }
 }
 
 /// Diagnostic counters for [`solve_all_templated`].
@@ -865,6 +970,7 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
         && a.gqa_group == b.gqa_group
         && a.sensitivity.to_bits() == b.sensitivity.to_bits()
         && a.sensitivity_informed == b.sensitivity_informed
+        && a.budget_informed == b.budget_informed
         && a.importance_informed == b.importance_informed
         && a.high_prec_threshold.to_bits() == b.high_prec_threshold.to_bits()
         && a.critical_prec_threshold.to_bits() == b.critical_prec_threshold.to_bits()
@@ -877,6 +983,7 @@ fn constraints_eq(a: &LayerIlpConstraints, b: &LayerIlpConstraints) -> bool {
         && a.allow_fase == b.allow_fase
         && a.fase_backward_speedup.to_bits() == b.fase_backward_speedup.to_bits()
         && a.packing_modes_mask == b.packing_modes_mask
+        && a.packing_scales_quadratic_only == b.packing_scales_quadratic_only
         && a.packing_savings
             .iter()
             .zip(b.packing_savings.iter())
@@ -1007,8 +1114,16 @@ pub fn solve_layer_greedy_cpkd(
         apply_fase(base, fase_fused, constraints.fase_backward_speedup),
         packing_mode,
         &constraints.packing_savings,
+        constraints.packing_scales_quadratic_only,
     );
-    let memory_bytes = ilp_resident_bytes(&entry, lut, m_bits, v_bits);
+    let memory_bytes = ilp_resident_bytes(
+        &entry,
+        lut,
+        m_bits,
+        v_bits,
+        fase_fused,
+        constraints.budget_informed,
+    );
     // G20 greedy: locally-best CFIE choice that fits the memory headroom
     // left after the training-resident bytes.  Gate off => (None, 0.0, 0),
     // leaving every expression below bit-identical to the pre-G20 solver.
@@ -1196,8 +1311,33 @@ fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
 }
 
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
-    // No evidence → no quantization. See `sensitivity_informed`.
-    if !c.sensitivity_informed && bits < 32 {
+    // Storage-tier reality gate (review fix): codegen v1 has NO distinct
+    // sub-16 moment storage — `build_dtype_lists_from_overrides` clamps ANY
+    // sub-32 moment bits to DTYPE_FP16 (2 bytes). So an 8-bit decision would
+    // be STORED as fp16 but ACCOUNTED at 1 byte in `moment_state_bytes`,
+    // letting a budget-pressured solve pick 8-bit, pass the budget check at
+    // half the true size, and OOM at runtime. Until an actual int8-moment
+    // storage tier exists, the moment decision space is {32, 16}: reject any
+    // sub-16 request outright so the solver never chooses a precision codegen
+    // cannot store. (This is separate from the sensitivity ceilings below,
+    // which further restrict 16-bit for fragile layers.)
+    if bits < 16 {
+        return false;
+    }
+    // Evidence gate: with no real sensitivity signal, sub-32 MOMENT precision
+    // is forbidden outright (the objective is cost-only, so without evidence
+    // the solver would always quantize). See `sensitivity_informed`.
+    //
+    // `budget_informed` (the user passed `--wggo-memory-budget`) EXEMPTS this
+    // evidence gate: the user explicitly traded moment precision for capacity,
+    // and fp16 moments via the #369 GPU cast envelope is the shipped mechanism.
+    // The exemption is scoped to this evidence gate ONLY — the sensitivity
+    // CEILINGS below are unchanged, so when sensitivity data IS present the
+    // role floors still pin fragile layers (embeddings / LM-head) to
+    // high-precision moments even under budget pressure. `prec_allowed` governs
+    // only `optim_m_bits`/`optim_v_bits`; no other precision axis routes through
+    // it, so nothing else is loosened.
+    if !c.sensitivity_informed && !c.budget_informed && bits < 32 {
         return false;
     }
     if c.sensitivity >= c.critical_prec_threshold && bits < 32 {
@@ -1517,18 +1657,47 @@ fn enumerate_packing_modes(c: &LayerIlpConstraints) -> Vec<u8> {
 }
 
 /// Apply the PCA packing-mode's effective work reduction to an entry.
-/// Packing skips padded tokens, so forward + backward compute both shrink
-/// by the same fraction.  Memory and SMEM are unaffected.
-fn apply_packing(base: LayerCostEntry, mode: u8, savings: &[f64; 4]) -> LayerCostEntry {
+/// Packing skips padded / cross-document tokens, so forward + backward compute
+/// both shrink. Memory and SMEM are unaffected.
+///
+/// Two discount semantics, selected by `quadratic_only`
+/// ([`LayerIlpConstraints::packing_scales_quadratic_only`]):
+///   * `false` — legacy **flat whole-layer** discount `latency·(1−s)` from the
+///     fictional `[0, 0.15, 0.25, 0.35]` constants. Preserved bit-for-bit for
+///     every build whose `dataset` block carries no doc-length statistics.
+///   * `true` — the saving is a *document-density-derived* reduction of the
+///     O(s²) attention share only, so it scales `attn_quadratic_us` (and its
+///     backward twin) and leaves the QKV/FFN projection cost alone. This is the
+///     physically-honest form: causal-within-document attention work is
+///     Σᵢ sᵢ², not s², so denser packing shrinks exactly the quadratic term.
+fn apply_packing(
+    base: LayerCostEntry,
+    mode: u8,
+    savings: &[f64; 4],
+    quadratic_only: bool,
+) -> LayerCostEntry {
     let s = savings.get(mode as usize).copied().unwrap_or(0.0).clamp(0.0, 0.95);
+    let (forward_us, backward_us) = if quadratic_only {
+        // Subtract the saving from the quadratic share only. `attn_quadratic_*`
+        // is a subset of the corresponding latency, so this can never go
+        // negative; a saturating_sub-style max(0.0) guards rounding anyway.
+        (
+            (base.forward_us - base.attn_quadratic_us * s).max(0.0),
+            (base.backward_us - base.attn_quadratic_backward_us * s).max(0.0),
+        )
+    } else {
+        (base.forward_us * (1.0 - s), base.backward_us * (1.0 - s))
+    };
     LayerCostEntry {
-        forward_us: base.forward_us * (1.0 - s),
-        backward_us: base.backward_us * (1.0 - s),
+        forward_us,
+        backward_us,
         param_bytes: base.param_bytes,
         activation_bytes: base.activation_bytes,
         smem_bytes: base.smem_bytes,
         feasible: base.feasible,
         classification: base.classification,
+        attn_quadratic_us: base.attn_quadratic_us,
+        attn_quadratic_backward_us: base.attn_quadratic_backward_us,
     }
 }
 
@@ -1555,6 +1724,13 @@ fn apply_fase(base: LayerCostEntry, fase_fused: bool, speedup: f64) -> LayerCost
         smem_bytes: base.smem_bytes,
         feasible: base.feasible,
         classification: base.classification,
+        // FASE trims backward *latency* by `speedup`; it does not change the
+        // attention quadratic's share, so the micro-terms pass through
+        // unscaled (the forward one is unchanged; the backward one keeps the
+        // pre-speedup magnitude — a slight over-estimate the packing discount
+        // then shrinks, which is the safe direction).
+        attn_quadratic_us: base.attn_quadratic_us,
+        attn_quadratic_backward_us: base.attn_quadratic_backward_us,
     }
 }
 
@@ -1635,9 +1811,10 @@ mod tests {
         let e = lut.argmin_feasible().unwrap().4;
         assert!(e.param_bytes > 0);
         let bare = e.param_bytes + e.activation_bytes;
-        let hi = ilp_resident_bytes(&e, &lut, 32, 32);
+        // budget_informed = false ⇒ no FASE surcharge (byte-identical to today).
+        let hi = ilp_resident_bytes(&e, &lut, 32, 32, false, false);
         assert!(hi > bare, "resident must count optimizer state: {hi} !> {bare}");
-        let lo = ilp_resident_bytes(&e, &lut, 8, 8);
+        let lo = ilp_resident_bytes(&e, &lut, 8, 8, false, false);
         assert!(lo < hi, "lower moment precision ⇒ less resident memory");
         assert!(lo >= bare, "still charges some optimizer state");
         // Exactly the shared formula, sized unsharded (shard = 1).
@@ -1648,6 +1825,128 @@ mod tests {
             1,
         );
         assert_eq!(hi, expect);
+    }
+
+    // ---- --wggo-memory-budget: budget_informed moment-precision gate ----
+
+    #[test]
+    fn prec_allowed_budget_informed_exempts_evidence_gate_only() {
+        // Without evidence and without the budget flag, sub-32 moments are
+        // forbidden outright (the cost-only objective would always quantize).
+        let none = LayerIlpConstraints {
+            sensitivity: 0.0,
+            sensitivity_informed: false,
+            budget_informed: false,
+            ..Default::default()
+        };
+        assert!(prec_allowed(32, &none));
+        assert!(!prec_allowed(16, &none), "no flag ⇒ 16-bit moments forbidden");
+        assert!(!prec_allowed(8, &none));
+
+        // `--wggo-memory-budget` (budget_informed) EXEMPTS the evidence gate:
+        // with no sensitivity ceiling (sensitivity = 0) all precisions open up.
+        let budget = LayerIlpConstraints {
+            sensitivity: 0.0,
+            sensitivity_informed: false,
+            budget_informed: true,
+            ..Default::default()
+        };
+        assert!(prec_allowed(32, &budget));
+        assert!(prec_allowed(16, &budget), "budget unlocks fp16 moments");
+        // 8-bit moments have NO codegen storage tier (clamped to fp16), so
+        // they are rejected regardless of the budget exemption — the solver
+        // must never pick a precision that would be mis-accounted at 1 byte
+        // and OOM at runtime.
+        assert!(!prec_allowed(8, &budget), "8-bit moments have no storage tier");
+    }
+
+    #[test]
+    fn prec_allowed_budget_informed_keeps_sensitivity_ceilings() {
+        // The exemption is scoped to the evidence gate — the role/sensitivity
+        // CEILINGS still bind even with the budget flag on.
+        // high (0.5) ≤ sensitivity < critical (0.9): 8-bit forbidden, 16 ok.
+        let high = LayerIlpConstraints {
+            sensitivity: 0.6,
+            sensitivity_informed: false,
+            budget_informed: true,
+            ..Default::default()
+        };
+        assert!(prec_allowed(32, &high));
+        assert!(prec_allowed(16, &high));
+        assert!(!prec_allowed(8, &high), "high-sensitivity ceiling forbids 8-bit");
+
+        // sensitivity ≥ critical (0.9): moments pinned to 32-bit despite budget.
+        let critical = LayerIlpConstraints {
+            sensitivity: 0.95,
+            sensitivity_informed: false,
+            budget_informed: true,
+            ..Default::default()
+        };
+        assert!(prec_allowed(32, &critical));
+        assert!(!prec_allowed(16, &critical), "critical ceiling forbids sub-32");
+        assert!(!prec_allowed(8, &critical));
+    }
+
+    #[test]
+    fn budget_informed_flips_moments_32_to_16_under_memory_pressure() {
+        // LutEntry scenario: 32-bit moments exceed the budget, 16-bit fit. The
+        // sensitivity ceiling forbids 8-bit, so the feasible+cheapest choice is
+        // exactly 16-bit — a clean 32→16 flip driven by the budget flag.
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        // Pin the structural axes so param/activation bytes are fixed: keep-all
+        // heads + max FFN (importance_informed=false), no FASE surcharge
+        // (allow_fase=false), packing off. That makes the resident footprint a
+        // function of moment precision alone.
+        let max_ffn = *lut.axes_ffn_widths.iter().max().unwrap();
+        let entry = lut.get(8, max_ffn, 0, 0).expect("base entry present");
+        let resident = |m: u8, v: u8| {
+            crate::wggo_cost::resident_training_bytes(
+                entry.param_bytes,
+                crate::wggo_cost::moment_state_bytes(entry.param_bytes, lut.dtype_bytes, m, v),
+                entry.activation_bytes,
+                1,
+            )
+        };
+        let r16 = resident(16, 16);
+        let r32 = resident(32, 32);
+        assert!(r16 < r32, "fp16 moments must be smaller than fp32");
+        // Budget just below the 32-bit footprint: 16 fits, 32 does not.
+        let budget = r32 - 1;
+
+        let base = LayerIlpConstraints {
+            num_heads: 8,
+            gqa_group: 1,
+            sensitivity: 0.6, // forbids 8-bit via the high ceiling
+            importance_informed: false,
+            allow_fase: false,
+            packing_modes_mask: 0b0001,
+            memory_budget: budget,
+            ..Default::default()
+        };
+
+        // Budget ON: the solver quantizes moments to 16-bit and fits.
+        let with_budget = LayerIlpConstraints {
+            budget_informed: true,
+            ..base.clone()
+        };
+        let sol = solve_layer(&lut, &with_budget);
+        assert!(sol.feasible, "16-bit moments must fit the budget");
+        assert_eq!(sol.decision.optim_m_bits, 16, "m flips 32→16 under budget");
+        assert_eq!(sol.decision.optim_v_bits, 16, "v flips 32→16 under budget");
+        assert!(sol.memory_bytes <= budget);
+        assert!(r16 <= budget);
+
+        // Budget OFF (same tight cap, but no exemption): 16-bit is forbidden by
+        // the evidence gate and 32-bit is over budget ⇒ no feasible candidate.
+        let without_budget = LayerIlpConstraints {
+            budget_informed: false,
+            ..base
+        };
+        let sol_off = solve_layer(&lut, &without_budget);
+        assert!(
+            !sol_off.feasible,
+            "without the flag, fp16 is gated off and fp32 is over budget"
+        );
     }
 
     #[test]
@@ -1666,8 +1965,10 @@ mod tests {
             apply_fase(base, d.fase_fused, c.fase_backward_speedup),
             d.packing_mode,
             &c.packing_savings,
+            c.packing_scales_quadratic_only,
         );
-        let expect = ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits);
+        let expect =
+            ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits, d.fase_fused, c.budget_informed);
         assert_eq!(sol.memory_bytes, expect);
         assert!(sol.memory_bytes > entry.param_bytes + entry.activation_bytes);
     }
@@ -1686,8 +1987,10 @@ mod tests {
             apply_fase(base, d.fase_fused, c.fase_backward_speedup),
             d.packing_mode,
             &c.packing_savings,
+            c.packing_scales_quadratic_only,
         );
-        let expect = ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits);
+        let expect =
+            ilp_resident_bytes(&entry, &lut, d.optim_m_bits, d.optim_v_bits, d.fase_fused, c.budget_informed);
         assert_eq!(sol.memory_bytes, expect);
     }
 
@@ -1821,9 +2124,13 @@ mod tests {
     #[test]
     fn low_sensitivity_picks_low_optimizer_precision_when_informed() {
         // Gap #2: with the optimizer-cost term in the objective, a layer with
-        // no numerical-sensitivity floor prefers the cheapest (lowest-bit)
-        // moments — but only when the sensitivity value is backed by a real
-        // signal (weight analysis / calibration).
+        // no numerical-sensitivity floor prefers the cheapest STORABLE moments
+        // — but only when the sensitivity value is backed by a real signal
+        // (weight analysis / calibration). The cheapest storable moment tier
+        // is 16-bit: codegen clamps any sub-32 moment to fp16, so the
+        // decision space is {32, 16} and `prec_allowed` rejects 8-bit (review
+        // fix — an 8-bit decision would be stored as fp16 but accounted at
+        // 1 byte, over-fitting a memory budget and OOMing at runtime).
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let constraints = LayerIlpConstraints {
             sensitivity_informed: true, // evidence present, sensitivity = 0
@@ -1831,8 +2138,8 @@ mod tests {
         };
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
-        assert_eq!(sol.decision.optim_m_bits, 8);
-        assert_eq!(sol.decision.optim_v_bits, 8);
+        assert_eq!(sol.decision.optim_m_bits, 16);
+        assert_eq!(sol.decision.optim_v_bits, 16);
     }
 
     #[test]
@@ -2151,6 +2458,33 @@ mod tests {
             },
         );
         assert!(with_pack.cost_us < without_pack.cost_us);
+    }
+
+    #[test]
+    fn apply_packing_quadratic_only_scales_only_the_attention_share() {
+        // Campaign item 6: with `quadratic_only = true` the saving must reduce
+        // ONLY `attn_quadratic_us` (and its backward twin), leaving the
+        // QKV/FFN projection cost untouched; the legacy whole-layer branch
+        // scales everything. Both branches must agree only in the degenerate
+        // case where the whole layer IS the quadratic term (never true here).
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let base = lut.get(8, 2048, 0, 0).unwrap();
+        let savings = [0.0, 0.5, 0.0, 0.0];
+
+        let quad = apply_packing(base, 1, &savings, true);
+        let whole = apply_packing(base, 1, &savings, false);
+
+        // Quadratic-only: exactly the quadratic share is removed.
+        assert!((quad.forward_us - (base.forward_us - base.attn_quadratic_us * 0.5)).abs() < 1e-9);
+        assert!(
+            (quad.backward_us - (base.backward_us - base.attn_quadratic_backward_us * 0.5)).abs()
+                < 1e-9
+        );
+        // Whole-layer removes far more (the projections dominate the layer).
+        assert!(whole.forward_us < quad.forward_us);
+        // Neither branch can go negative and both preserve the micro-terms.
+        assert!(quad.forward_us > 0.0 && whole.forward_us >= 0.0);
+        assert_eq!(quad.attn_quadratic_us, base.attn_quadratic_us);
     }
 
     #[test]

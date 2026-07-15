@@ -150,8 +150,18 @@ Three configurations, three distinct walls, all at 15.7–15.8 GiB:
 
 1. **AdamW, accum 8** — dies at optimizer-STATE allocation
    (`nsl_tensor_zeros_like`): FASE-Deferred AdamW state is
-   weights + m + v + m_partial + v_partial = 5 × 4 B ≈ **20.7 GB > 16 GB**
-   before the first forward.
+   weights + m + v + m_partial = 4 × 4 B ≈ **16.6 GB > 16 GB**
+   before the first forward. *(Correction 2026-07-14: this doc originally
+   counted a fifth `v_partial` surface at 5 × 4 B ≈ 20.7 GB — that surface
+   does not exist. FASE-Deferred keeps ONE intra-window accumulator,
+   `m_partial` = the running window-mean gradient; `v` squares the
+   COMPLETED window sum at merge time (`fase_optimizer.rs`), which is
+   exactly why the fourth surface is fundamental to the exact-windowed
+   semantics: `v` needs `(Σᵢgᵢ)²`, whose cross-terms cannot be streamed
+   per micro-batch — any partial-free scheme is Option-B `mean(g²)`,
+   which changes numerics by `(1−β₂)·Var(g)` per window (Jensen) and is
+   pinned against by `fase_numerical_validation.rs`. The corrected
+   arithmetic still exceeds 16 GB, so the conclusion stands.)*
 2. **SGD+momentum, accum 8** — state (w + velocity + partials) fits
    allocation, dies in the first forward matmul.
 3. **SGD+momentum, accum 1** — forward completes (11.7 GiB), dies in the

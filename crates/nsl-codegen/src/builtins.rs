@@ -499,6 +499,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
     ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
+    // Optimizer-state offload (scaling campaign item 4): host-resident f32
+    // zeros with the template's shape, regardless of the template's device.
+    ("nsl_tensor_zeros_like_host_f32", &[types::I64], Some(types::I64)),
     // CPDT §3.2: INT8 blockwise quantization (the headline 4× memory result)
     ("nsl_tensor_quant_int8_blockwise", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_dequant_int8_blockwise", &[types::I64], Some(types::I64)),
@@ -1375,6 +1378,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[
             types::I64, // batch dict (NslDict*)
             types::I64, // param list (NslList*) — device reference
+        ],
+        Some(types::I64),
+    ),
+    // Campaign item 5: derive the dense [b,1,s,s] packed mask from
+    // segment_ids at the decomposed-fallback site (the DataLoader no
+    // longer ships attention_mask by default). Keep in lock-step with
+    // `nsl_packed_mask_from_segment_ids` in nsl-runtime/src/packing.rs.
+    (
+        "nsl_packed_mask_from_segment_ids",
+        &[
+            types::I64, // segment_ids (NslTensor* [b,s], f32/f64, CPU or GPU)
         ],
         Some(types::I64),
     ),

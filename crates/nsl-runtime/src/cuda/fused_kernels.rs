@@ -119,6 +119,135 @@ DONE: ret;\n\
 }\0";
 
 // ---------------------------------------------------------------------------
+// GPU Embedding Backward (scatter-add)
+// Thread (i, j): red.global.add out[indices[i], j] += grad[i, j]
+// Grid:  (ceil(seq_len/16), ceil(embed_dim/16), 1)
+// Block: (16, 16, 1)
+// Params: grad ptr, indices ptr, out ptr (pre-zeroed [vocab, embed]),
+//         seq_len (u64), embed_dim (u64), vocab (u64)
+// indices stored as f32 (GPU dtype=1 convention); converted via
+// cvt.rzi.s64.f32 with explicit [0, vocab) guards so negative or
+// out-of-range ids are skipped exactly like the CPU reference's
+// `tok < vocab_size` check (negative usize-wrap skips there).
+// f32 atomics make the row sum order nondeterministic across runs (same
+// policy as the flash phase-2 backward); NSL_EMBEDDING_BWD_CPU=1 in the
+// launcher restores the deterministic host scatter.
+// ---------------------------------------------------------------------------
+pub(crate) const EMBEDDING_BWD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_embedding_bwd_f32(\n\
+    .param .u64 grad, .param .u64 indices, .param .u64 out,\n\
+    .param .u64 seq_len, .param .u64 embed_dim, .param .u64 vocab\n\
+) {\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<3>;\n\
+    .reg .pred %p<3>;\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r2, %tid.x;\n\
+    add.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r3, %ctaid.y;\n\
+    mov.u32 %r4, %ntid.y;\n\
+    mul.lo.u32 %r3, %r3, %r4;\n\
+    mov.u32 %r4, %tid.y;\n\
+    add.u32 %r3, %r3, %r4;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [indices];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [seq_len];\n\
+    ld.param.u64 %rd5, [embed_dim];\n\
+    ld.param.u64 %rd12, [vocab];\n\
+    cvt.u64.u32 %rd6, %r1;\n\
+    cvt.u64.u32 %rd7, %r3;\n\
+    setp.ge.u64 %p1, %rd6, %rd4;\n\
+    @%p1 bra DONE;\n\
+    setp.ge.u64 %p1, %rd7, %rd5;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd8, %rd6, 2;\n\
+    add.u64 %rd8, %rd2, %rd8;\n\
+    ld.global.f32 %f1, [%rd8];\n\
+    cvt.rzi.s64.f32 %rd9, %f1;\n\
+    setp.lt.s64 %p2, %rd9, 0;\n\
+    @%p2 bra DONE;\n\
+    setp.ge.s64 %p2, %rd9, %rd12;\n\
+    @%p2 bra DONE;\n\
+    mul.lo.u64 %rd11, %rd6, %rd5;\n\
+    add.u64 %rd11, %rd11, %rd7;\n\
+    shl.b64 %rd11, %rd11, 2;\n\
+    add.u64 %rd11, %rd1, %rd11;\n\
+    ld.global.f32 %f2, [%rd11];\n\
+    mul.lo.u64 %rd10, %rd9, %rd5;\n\
+    add.u64 %rd10, %rd10, %rd7;\n\
+    shl.b64 %rd10, %rd10, 2;\n\
+    add.u64 %rd10, %rd3, %rd10;\n\
+    red.global.add.f32 [%rd10], %f2;\n\
+DONE: ret;\n\
+}\0";
+
+/// GPU embedding backward with i32 integer indices (mirrors
+/// EMBEDDING_I32IDX_PTX's ld.global.s32 + cvt.s64.s32 index read).
+pub(crate) const EMBEDDING_BWD_I32IDX_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_embedding_bwd_i32idx(\n\
+    .param .u64 grad, .param .u64 indices, .param .u64 out,\n\
+    .param .u64 seq_len, .param .u64 embed_dim, .param .u64 vocab\n\
+) {\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .u32 %r<7>;\n\
+    .reg .f32 %f<3>;\n\
+    .reg .pred %p<3>;\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r2, %tid.x;\n\
+    add.u32 %r1, %r1, %r2;\n\
+    mov.u32 %r3, %ctaid.y;\n\
+    mov.u32 %r4, %ntid.y;\n\
+    mul.lo.u32 %r3, %r3, %r4;\n\
+    mov.u32 %r4, %tid.y;\n\
+    add.u32 %r3, %r3, %r4;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [indices];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [seq_len];\n\
+    ld.param.u64 %rd5, [embed_dim];\n\
+    ld.param.u64 %rd12, [vocab];\n\
+    cvt.u64.u32 %rd6, %r1;\n\
+    cvt.u64.u32 %rd7, %r3;\n\
+    setp.ge.u64 %p1, %rd6, %rd4;\n\
+    @%p1 bra DONE;\n\
+    setp.ge.u64 %p1, %rd7, %rd5;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd8, %rd6, 2;\n\
+    add.u64 %rd8, %rd2, %rd8;\n\
+    ld.global.s32 %r5, [%rd8];\n\
+    cvt.s64.s32 %rd9, %r5;\n\
+    setp.lt.s64 %p2, %rd9, 0;\n\
+    @%p2 bra DONE;\n\
+    setp.ge.s64 %p2, %rd9, %rd12;\n\
+    @%p2 bra DONE;\n\
+    mul.lo.u64 %rd11, %rd6, %rd5;\n\
+    add.u64 %rd11, %rd11, %rd7;\n\
+    shl.b64 %rd11, %rd11, 2;\n\
+    add.u64 %rd11, %rd1, %rd11;\n\
+    ld.global.f32 %f2, [%rd11];\n\
+    mul.lo.u64 %rd10, %rd9, %rd5;\n\
+    add.u64 %rd10, %rd10, %rd7;\n\
+    shl.b64 %rd10, %rd10, 2;\n\
+    add.u64 %rd10, %rd3, %rd10;\n\
+    red.global.add.f32 [%rd10], %f2;\n\
+DONE: ret;\n\
+}\0";
+
+// ---------------------------------------------------------------------------
 // GPU Bias Add
 // Thread i handles element out[i] = in[i] + bias[i % cols]
 // Grid:  (ceil(rows*cols / 256), 1, 1)
@@ -2981,6 +3110,8 @@ DQFP8_DONE: ret;\n\
 pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("EMBEDDING_F32_PTX", EMBEDDING_F32_PTX),
     ("EMBEDDING_I32IDX_PTX", EMBEDDING_I32IDX_PTX),
+    ("EMBEDDING_BWD_F32_PTX", EMBEDDING_BWD_F32_PTX),
+    ("EMBEDDING_BWD_I32IDX_PTX", EMBEDDING_BWD_I32IDX_PTX),
     ("BIAS_ADD_F32_PTX", BIAS_ADD_F32_PTX),
     ("SOFTMAX_F32_PTX", SOFTMAX_F32_PTX),
     ("LOG_SOFTMAX_F32_PTX", LOG_SOFTMAX_F32_PTX),
