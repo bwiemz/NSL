@@ -499,7 +499,21 @@ pub fn emit(
         // PCA Tier A null-guard (spec §4.2): null segment_ids_ptr → write the
         // all-zero sentinel (uniform segment 0 → no masking). Mirrors the
         // forward prelude guard; BW_ labels keep this kernel's symbols unique.
+        // Computed on the RAW param, BEFORE the batch-row offset below.
         ptx.push_str("    setp.eq.u64 %p_seg_null, %rd_seg_global, 0;\n");
+        // Batch-row offset (#372 audit fix): segment_ids is [batch, seq]
+        // u16 and this kernel launches ONCE with grid_y = batch*heads —
+        // unlike the forward's per-batch-row host launch loop, which
+        // pre-offsets the pointer (seg_dev + bi*row_seg). Without this,
+        // every CTA loads batch-row-0's document boundaries, silently
+        // corrupting gradients for rows 1..B-1. Mirrors the doc_starts
+        // subtable pattern (pca_rope.rs: null-check raw, then offset).
+        // %rd_pca_off is the load-loop scratch, dead until the loop
+        // reinitializes it; on the null path the offset is added to a
+        // dead pointer that is never dereferenced.
+        ptx.push_str("    mul.lo.u64 %rd_pca_off, %batch_idx, %rd6;\n");
+        ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");
+        ptx.push_str("    add.u64 %rd_seg_global, %rd_seg_global, %rd_pca_off;\n");
         // seg_base = shmem_base + backward_total_bytes — embed seg_smem at
         // the tail of the extern shmem region (see prelude register-decl
         // comment for the Blackwell illegal-address rationale). The launcher

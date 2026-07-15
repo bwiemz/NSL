@@ -336,6 +336,24 @@ pub enum PrimalOp {
     PrologueRecompute {
         subgraph_id: SubgraphId,
     },
+    /// CCR (P1.a block-granular recompute): explicit early-free marker.
+    ///
+    /// `inputs = [victim]` — the lowering emits `nsl_tensor_free(victim)`
+    /// (refcount decrement; views holding a reference keep the storage
+    /// alive) and records the freed `VarId` on the lowering result so the
+    /// end-of-backward bulk free excludes it. The op's own `result` is a
+    /// zero placeholder that must never be consumed.
+    ///
+    /// Spliced ONLY by `ccr::apply_to_adjoint` after adjoint generation —
+    /// it never appears in a primal list handed to `AdjointGenerator`, so
+    /// no AD rule exists for it (by construction, not by accident: an
+    /// adjoint of a free is meaningless).
+    ///
+    /// Placement invariant (validated at splice time): no op after a
+    /// `FreeTensor` may reference its victim. The ghost-VarId skip guard
+    /// in `wengert_lower` would otherwise turn such a bug into a silently
+    /// missing gradient.
+    FreeTensor,
     RoPE {
         dim: usize,
     },

@@ -31,6 +31,12 @@ pub struct LoweredWengert {
     /// This is also correct when shapes differ (normal clone path): the input
     /// grad (rc=1) is freed immediately by the extra call, and cleanup skips it.
     pub hook_freed_input_vars: std::collections::HashSet<VarId>,
+    /// CCR: victims of `PrimalOp::FreeTensor` markers emitted in this
+    /// lowering.  stmt.rs merges these into the bulk-free exclusion sets so
+    /// `free_wengert_owned_values` does not double-free them.  Distinct from
+    /// `hook_freed_input_vars` only in provenance (explicit tape markers vs
+    /// the FASE hook's identity-path extra free).
+    pub explicit_freed_vars: std::collections::HashSet<VarId>,
 }
 
 /// Lower a WengertList to Cranelift IR by dispatching each PrimalOp to its runtime FFI call.
@@ -66,6 +72,7 @@ pub fn compile_wengert_ops(
     let mut var_map = primal_vars.clone();
     let mut owned_values = Vec::new();
     let mut hook_freed_input_vars = std::collections::HashSet::new();
+    let mut explicit_freed_vars = std::collections::HashSet::new();
     // Clone var_types so the lowerer can look up types for any VarId and
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
@@ -88,6 +95,40 @@ pub fn compile_wengert_ops(
                     op.result, op.op, missing
                 );
             }
+            continue;
+        }
+        // CCR early-free marker: emit the refcount decrement here in the
+        // main loop (not in `lower_single_op`) so the freed VarId can be
+        // recorded on the lowering result — the end-of-backward bulk free
+        // consults `explicit_freed_vars` to skip these, exactly like the
+        // FASE hook's `hook_freed_input_vars`. The victim stays in
+        // `var_map` on purpose: `ccr::apply_to_adjoint` statically
+        // validated that no later op references it, and keeping it mapped
+        // means a validation bug would surface as a use-after-free under
+        // compute-sanitizer rather than a silent ghost-skip (missing
+        // gradient) — loud over silent.
+        if matches!(op.op, PrimalOp::FreeTensor) {
+            let victim_vid = op.inputs[0];
+            let victim_val = var_map[&victim_vid];
+            // Free ONLY what the end-of-backward bulk free would have
+            // freed: a Tensor-typed victim whose lowered Value is an I64
+            // pointer. The tape-level type default ("Tensor") over-claims
+            // for scalar arithmetic, which lowers to raw f64 — freeing
+            // that is a verifier error (and an integer masquerading as a
+            // pointer would be worse). Skipped victims simply keep their
+            // present end-of-backward lifetime; they hold no device memory.
+            let is_tensor_ptr = builder.func.dfg.value_type(victim_val) == cl_types::I64
+                && matches!(
+                    var_types.get(&victim_vid),
+                    Some(WengertType::Tensor) | None
+                );
+            if is_tensor_ptr {
+                call(compiler, builder, "nsl_tensor_free", &[victim_val])?;
+                explicit_freed_vars.insert(victim_vid);
+            }
+            let placeholder = builder.ins().iconst(cl_types::I64, 0);
+            var_map.insert(op.result, placeholder);
+            var_types.insert(op.result, WengertType::Integer);
             continue;
         }
         let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
@@ -170,6 +211,7 @@ pub fn compile_wengert_ops(
         var_map,
         owned_values,
         hook_freed_input_vars,
+        explicit_freed_vars,
     })
 }
 
@@ -924,6 +966,13 @@ fn lower_single_op(
     match &op.op {
         // Already handled above
         PrimalOp::Input(_) | PrimalOp::Param(_) | PrimalOp::Constant(_) => unreachable!(),
+
+        // Handled in the compile_wengert_ops main loop (the freed VarId
+        // must be recorded on the lowering result); reaching here means a
+        // FreeTensor leaked into a context that doesn't support it.
+        PrimalOp::FreeTensor => unreachable!(
+            "PrimalOp::FreeTensor must be intercepted by compile_wengert_ops"
+        ),
 
         // === Elementwise unary (11 ops) ===
         // Promote scalar/integer inputs to tensor before calling tensor ops.

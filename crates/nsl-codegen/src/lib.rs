@@ -113,6 +113,7 @@ pub mod ptxas_validation;
 
 // --- Autodiff & training -------------------------------------------------
 pub mod ad_rules;
+pub mod ccr;
 pub mod source_ad;
 pub mod training_report;
 pub mod vmap;
@@ -1177,6 +1178,15 @@ pub struct CompileOptions {
     /// reduced-precision moments (`nsl_tensor_cast_into` cannot cross
     /// devices) — enforced with a loud compile error in stmt.rs.
     pub optim_state_offload: bool,
+    /// CCR P1.a (`--checkpoint-blocks`): block-granular activation
+    /// checkpointing on the source-AD path. Interiors of each transformer
+    /// block are freed after the forward and recomputed just before that
+    /// block's adjoint runs — activation residency drops from
+    /// O(layers x interiors) to O(layers x boundaries + one block).
+    /// Bit-exact (same kernels, same order, same inputs); Dropout results
+    /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
+    /// note when the tape has no `blocks.N` structure.
+    pub checkpoint_blocks: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1296,6 +1306,7 @@ impl Default for CompileOptions {
             health_monitor: false,
             health_flush_interval: None,
             optim_state_offload: false,
+            checkpoint_blocks: false,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),
