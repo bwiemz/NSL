@@ -807,6 +807,18 @@ fn ilp_resident_bytes(
 /// moment-precision decision the solver can make will help, so the budget path
 /// hard-fails with a required-vs-budget diagnostic (see `wggo::run`).
 pub fn fp16_moment_floor_bytes(lut: &LayerCostLut) -> u64 {
+    moment_floor_bytes(lut, 16, 16)
+}
+
+/// The identity-structural resident footprint of a layer at an EXPLICIT moment
+/// precision — the generalization of [`fp16_moment_floor_bytes`]. Used by the
+/// budget refusal to size each layer at its OWN role-permitted precision floor
+/// (32-bit for a critical-sensitivity layer such as the embedding / LM-head,
+/// 16-bit for a quantizable transformer block) instead of assuming every layer
+/// can reach fp16 — a role-pinned 32-bit layer whose fp16 floor fit the budget
+/// but whose real 32-bit floor does not would otherwise slip through the
+/// global feasibility check and OOM at runtime.
+pub fn moment_floor_bytes(lut: &LayerCostLut, m_bits: u8, v_bits: u8) -> u64 {
     let max_heads = lut
         .axes_head_counts
         .iter()
@@ -818,7 +830,7 @@ pub fn fp16_moment_floor_bytes(lut: &LayerCostLut) -> u64 {
     let min_rank = lut.axes_adapter_ranks.iter().copied().min().unwrap_or(0);
     match lut.get(max_heads, max_ffn, 0, min_rank) {
         // Identity decision: FASE off, so no Deferred surcharge in the floor.
-        Some(entry) => ilp_resident_bytes(&entry, lut, 16, 16, false, false),
+        Some(entry) => ilp_resident_bytes(&entry, lut, m_bits, v_bits, false, false),
         None => 0,
     }
 }
@@ -1299,6 +1311,19 @@ fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
 }
 
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
+    // Storage-tier reality gate (review fix): codegen v1 has NO distinct
+    // sub-16 moment storage — `build_dtype_lists_from_overrides` clamps ANY
+    // sub-32 moment bits to DTYPE_FP16 (2 bytes). So an 8-bit decision would
+    // be STORED as fp16 but ACCOUNTED at 1 byte in `moment_state_bytes`,
+    // letting a budget-pressured solve pick 8-bit, pass the budget check at
+    // half the true size, and OOM at runtime. Until an actual int8-moment
+    // storage tier exists, the moment decision space is {32, 16}: reject any
+    // sub-16 request outright so the solver never chooses a precision codegen
+    // cannot store. (This is separate from the sensitivity ceilings below,
+    // which further restrict 16-bit for fragile layers.)
+    if bits < 16 {
+        return false;
+    }
     // Evidence gate: with no real sensitivity signal, sub-32 MOMENT precision
     // is forbidden outright (the objective is cost-only, so without evidence
     // the solver would always quantize). See `sensitivity_informed`.
@@ -1828,7 +1853,11 @@ mod tests {
         };
         assert!(prec_allowed(32, &budget));
         assert!(prec_allowed(16, &budget), "budget unlocks fp16 moments");
-        assert!(prec_allowed(8, &budget));
+        // 8-bit moments have NO codegen storage tier (clamped to fp16), so
+        // they are rejected regardless of the budget exemption — the solver
+        // must never pick a precision that would be mis-accounted at 1 byte
+        // and OOM at runtime.
+        assert!(!prec_allowed(8, &budget), "8-bit moments have no storage tier");
     }
 
     #[test]
@@ -2095,9 +2124,13 @@ mod tests {
     #[test]
     fn low_sensitivity_picks_low_optimizer_precision_when_informed() {
         // Gap #2: with the optimizer-cost term in the objective, a layer with
-        // no numerical-sensitivity floor prefers the cheapest (lowest-bit)
-        // moments — but only when the sensitivity value is backed by a real
-        // signal (weight analysis / calibration).
+        // no numerical-sensitivity floor prefers the cheapest STORABLE moments
+        // — but only when the sensitivity value is backed by a real signal
+        // (weight analysis / calibration). The cheapest storable moment tier
+        // is 16-bit: codegen clamps any sub-32 moment to fp16, so the
+        // decision space is {32, 16} and `prec_allowed` rejects 8-bit (review
+        // fix — an 8-bit decision would be stored as fp16 but accounted at
+        // 1 byte, over-fitting a memory budget and OOMing at runtime).
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let constraints = LayerIlpConstraints {
             sensitivity_informed: true, // evidence present, sensitivity = 0
@@ -2105,8 +2138,8 @@ mod tests {
         };
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
-        assert_eq!(sol.decision.optim_m_bits, 8);
-        assert_eq!(sol.decision.optim_v_bits, 8);
+        assert_eq!(sol.decision.optim_m_bits, 16);
+        assert_eq!(sol.decision.optim_v_bits, 16);
     }
 
     #[test]

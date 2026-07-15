@@ -2937,6 +2937,56 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     [min_val, max_val, mean_val, std_val]
 }
 
+/// GPU sum of squares (Σx²) for an f32 tensor — the RAW `sum_sq` accumulator
+/// from the stats kernel, WITHOUT the mean/std post-processing that
+/// `gpu_tensor_stats_f32` applies to its slot 3. Kept separate precisely
+/// because that helper's public contract is `[min, max, mean, std]` (the
+/// trace debugger depends on the std), so its slot 3 is NOT Σx². Used by
+/// `nsl_tensor_sum_sq`'s GPU fast path — reading `gpu_tensor_stats_f32()[3]`
+/// there returned the population std instead of Σx² and silently disabled
+/// FASE gradient clipping on GPU (the global norm collapsed by ~n).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::TENSOR_STATS_F32_PTX;
+
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let n = t.len as u64;
+    if n == 0 {
+        return 0.0;
+    }
+
+    let out_data = inner::alloc_managed(16);
+
+    let mut in_data = t.data as u64;
+    let mut out_data_u64 = out_data as u64;
+    let mut n_val = n;
+
+    let args: [*mut std::ffi::c_void; 3] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_data_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let result = inner::kernel_launch(
+        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
+    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+
+    let mut raw = [0f32; 4];
+    inner::memcpy_dtoh(
+        raw.as_mut_ptr() as *mut std::ffi::c_void,
+        out_data as *const std::ffi::c_void,
+        16,
+    );
+    inner::free_managed(out_data);
+
+    // raw = [min, max, sum, sum_sq]; slot 3 is the raw Σx² (pre-transform).
+    f64::from(raw[3])
+}
+
 // ---------------------------------------------------------------------------
 // M42b: KV-cache GPU dequantization
 // ---------------------------------------------------------------------------

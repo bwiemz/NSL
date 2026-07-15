@@ -834,21 +834,45 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // ≤ (1-overhead)·budget < budget), so we let the fp16 plan proceed (the DP
     // degrades to Off with its warning, already pushed above).
     let budget_infeasible = model_budget.and_then(|budget| {
-        let infeasible_layers = per_layer.iter().filter(|s| !s.feasible).count();
-        if infeasible_layers == 0 {
-            return None;
-        }
-        // Diagnostic only: the minimum budget that would fit the fp16 floor.
-        // Layers receive `1 - overhead` of the budget, so gross the per-layer
-        // floor sum up by the reserve — this always exceeds `budget` when the
-        // per-layer split made a layer infeasible, keeping the message honest
-        // (a raw sum could sit below the budget inside the reserved band).
-        let floor_sum: u64 = luts
-            .iter()
-            .map(crate::wggo_ilp::fp16_moment_floor_bytes)
+        // GLOBAL role-aware feasibility (review fix). The per-layer ILP solves
+        // against an EVEN `budget/n` share, so a role-pinned high-precision
+        // layer (embedding / LM-head, held at 32-bit moments by its
+        // sensitivity ceiling) can be infeasible against its 1/n slice while
+        // the quantizable transformer blocks leave slack — a model that fits
+        // GLOBALLY. Refusing on per-share infeasibility therefore false-failed
+        // exactly those fittable models. Instead, size EACH layer at its OWN
+        // role-permitted moment floor (32-bit when its sensitivity clears the
+        // critical threshold, else 16-bit — the lowest tier codegen stores),
+        // sum, gross up by the non-layer overhead reserve, and hard-fail only
+        // when that true minimum exceeds the budget. (A pure fp16 floor for
+        // every layer would UNDER-count the role-pinned 32-bit layers and let
+        // a genuinely-infeasible model slip through to a runtime OOM.)
+        let floor_sum: u64 = (0..per_layer.len())
+            .map(|i| {
+                let lut = luts.get(i).or_else(|| luts.first());
+                let c = ilp_constraints.get(i).or_else(|| ilp_constraints.first());
+                match (lut, c) {
+                    (Some(lut), Some(c)) => {
+                        let floor_bits: u8 =
+                            if c.sensitivity >= c.critical_prec_threshold { 32 } else { 16 };
+                        crate::wggo_ilp::moment_floor_bytes(lut, floor_bits, floor_bits)
+                    }
+                    _ => 0,
+                }
+            })
             .fold(0u64, |acc, b| acc.saturating_add(b));
         let required_fp16_floor_bytes =
             (floor_sum as f64 / (1.0 - NON_LAYER_OVERHEAD_FRACTION)).ceil() as u64;
+        if required_fp16_floor_bytes <= budget {
+            // The model fits at its role-aware floor; any per-share
+            // infeasibility was an artifact of the even split (some layers
+            // simply need more than 1/n while others need less). Let the fp16
+            // plan proceed rather than hard-failing a fittable model.
+            return None;
+        }
+        // Report how many layers the even-share ILP could not seat, for the
+        // diagnostic (the authoritative refusal is the global floor above).
+        let infeasible_layers = per_layer.iter().filter(|s| !s.feasible).count();
         Some(BudgetInfeasibility {
             budget_bytes: budget,
             required_fp16_floor_bytes,
@@ -1548,6 +1572,42 @@ mod tests {
         assert!(
             bi.required_fp16_floor_bytes > bi.budget_bytes,
             "the fp16 floor must exceed the 1-byte budget"
+        );
+    }
+
+    #[test]
+    fn budget_refusal_keys_on_global_floor_not_even_share() {
+        // MED-2 regression: the hard-refusal boundary is the GLOBAL role-aware
+        // floor, not the even per-layer share. A budget exactly at the
+        // reported floor must FIT (no marker); one byte below must refuse.
+        // This proves a budget that clears the global floor is not false-failed
+        // by the artifact that some individual layer exceeds its 1/n slice.
+        let w = two_block_wengert();
+
+        // First pass: a 1-byte budget reports the required global floor.
+        let mut probe = toy_input(&w);
+        probe.memory_budget_bytes = Some(1);
+        let floor = run(probe)
+            .budget_infeasible
+            .expect("1-byte budget infeasible")
+            .required_fp16_floor_bytes;
+        assert!(floor > 1);
+
+        // Exactly at the floor: fits (boundary is inclusive, required <= budget).
+        let mut at = toy_input(&w);
+        at.memory_budget_bytes = Some(floor);
+        assert!(
+            run(at).budget_infeasible.is_none(),
+            "a budget equal to the global role-aware floor must fit, even if the \
+             even 1/n split would seat some layer below its share"
+        );
+
+        // One byte below the floor: refuses.
+        let mut below = toy_input(&w);
+        below.memory_budget_bytes = Some(floor - 1);
+        assert!(
+            run(below).budget_infeasible.is_some(),
+            "a budget below the global floor must hard-refuse"
         );
     }
 

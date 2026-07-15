@@ -1925,11 +1925,14 @@ pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
 
-    // GPU f32 tensors: fused device-side stats kernel (min/max/sum/sum_sq),
-    // 16-byte readback instead of a full-tensor DtoH + host loop. The kernel
-    // accumulates in f32 where the CPU path accumulates in f64 — for the
-    // clip-norm consumer that shifts the global norm by O(√n·ε_f32) relative,
-    // the same accumulation dtype every other GPU reduction already uses.
+    // GPU f32 tensors: fused device-side sum-of-squares reduction (the RAW
+    // Σx² accumulator from the stats kernel), 16-byte readback instead of a
+    // full-tensor DtoH + host loop. Uses the dedicated `gpu_tensor_sum_sq_f32`
+    // helper — NOT `gpu_tensor_stats_f32`, whose slot 3 is the population std
+    // (mean/std transform applied), so reading it here silently returned std
+    // and collapsed the FASE gradient-clip global norm by ~n on GPU. The
+    // kernel accumulates in f32 where the CPU path accumulates in f64 (the
+    // same accumulation dtype every other GPU reduction already uses).
     // NSL_SUM_SQ_CPU=1 restores the exact-f64 CPU reduction for bisections.
     #[cfg(feature = "cuda")]
     if tensor.device > 0 && tensor.dtype == 1 {
@@ -1939,9 +1942,9 @@ pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
         });
         if !force_cpu {
             let contig = nsl_tensor_contiguous(tensor_ptr);
-            let stats = crate::cuda::gpu_tensor_stats_f32(contig);
+            let ss = crate::cuda::gpu_tensor_sum_sq_f32(contig);
             nsl_tensor_free(contig);
-            return f64::from(stats[3]);
+            return ss;
         }
     }
 
@@ -4559,6 +4562,44 @@ mod tests {
     fn sum_sq_null_pointer_returns_zero() {
         let got = nsl_tensor_sum_sq(0);
         assert_eq!(got, 0.0);
+    }
+
+    /// Regression gate for the review-found HIGH bug: the GPU fast path used
+    /// to read `gpu_tensor_stats_f32()[3]`, which is the population STD (the
+    /// helper post-processes the raw sum_sq into std), not Σx². That silently
+    /// collapsed the FASE gradient-clip global norm by ~n on GPU. Assert the
+    /// GPU sum_sq matches the exact CPU reduction on a multi-element f32
+    /// tensor where std and Σx² differ substantially.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU: requires CUDA device"]
+    fn sum_sq_gpu_matches_cpu_reference() {
+        if crate::nsl_cuda_init() != 0 {
+            return;
+        }
+        // [1, 2, -3, 0.5]: Σx² = 14.25; std ≈ 1.98 — off by ~7x, so a
+        // std-vs-sumsq confusion cannot pass this by coincidence.
+        let vals = [1.0f32, 2.0, -3.0, 0.5];
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, vals.len() as i64);
+        let cpu = nsl_tensor_zeros(shape_list);
+        {
+            let t = NslTensor::from_ptr(cpu);
+            for (i, &v) in vals.iter().enumerate() {
+                unsafe { *t.data_f32().add(i) = v };
+            }
+        }
+        let cpu_ss = nsl_tensor_sum_sq(cpu);
+        assert!((cpu_ss - 14.25).abs() < 1e-4, "CPU sum_sq = {cpu_ss}, expected 14.25");
+
+        let gpu = nsl_tensor_to_device(cpu, 1);
+        let gpu_ss = nsl_tensor_sum_sq(gpu);
+        assert!(
+            (gpu_ss - cpu_ss).abs() < 1e-3,
+            "GPU sum_sq = {gpu_ss} but CPU = {cpu_ss} (std would be ~1.98 — a std/sum_sq slot confusion)"
+        );
+        nsl_tensor_free(gpu);
+        nsl_tensor_free(cpu);
     }
 
     #[test]
