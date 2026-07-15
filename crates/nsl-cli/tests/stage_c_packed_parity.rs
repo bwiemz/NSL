@@ -53,10 +53,7 @@ fn fixture_src() -> String {
 fn program(masked_form: bool, gpu: bool, continuous_pos: bool, save_path: &Path) -> String {
     let mut src = fixture_src();
     if masked_form {
-        // forward_packed is 5-arg (no dense mask — masking derives from
-        // seg); the fixture still plumbs `mask` so this rewrite to the
-        // Stage-B oracle has it in scope.
-        let from = "self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), seg, pos, training)";
+        let from = "self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), mask, seg, pos, training)";
         let to = "self.attn.forward_masked(rmsnorm(h, self.norm_a, 0.00001), mask, training)";
         assert!(src.contains(from), "packed call marker not found — resync fixture");
         src = src.replace(from, to);

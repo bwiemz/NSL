@@ -23,7 +23,6 @@ use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
 use crate::wengert::WengertList;
 use crate::wggo_apply::{apply, AppliedPlan};
 use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
-use crate::pca_detect::DatasetPackingConfig;
 use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{
     passthrough_plan, solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan,
@@ -122,55 +121,6 @@ pub struct WggoInput<'a> {
     /// compiles produced different optimizer-state allocations (informed
     /// on miss, uninformed on hit).
     pub cached_analysis: Option<WeightAnalysisReport>,
-    /// Per-device resident training-memory budget in BYTES
-    /// (`--wggo-memory-budget`, converted from MiB at the CLI boundary).
-    /// `None` = no budget, today's behavior byte-identical. When `Some(b)`:
-    ///   * the Level-1 DP's `ClusterSpec::memory_budget` is set to `b`,
-    ///   * each layer's ILP `memory_budget` gets a per-layer share of `b`
-    ///     (minus a modeled non-layer overhead) and `budget_informed = true`,
-    ///     which exempts the moment-precision evidence gate so the solver may
-    ///     organically pick fp16 moments under pressure, and
-    ///   * a plan infeasible even at the fp16-moment floor sets
-    ///     [`WggoPlan::budget_infeasible`] (hard compile failure downstream).
-    pub memory_budget_bytes: Option<u64>,
-    /// Document-packing statistics resolved from the train block's `dataset`
-    /// block (`mean_doc_length` / `doc_length_stddev` / `max_sequence_length`),
-    /// campaign item 6. When `Some` AND `packing_supported`, the per-layer
-    /// packing constraints are derived from the document-length *distribution*
-    /// (recon §4: the fraction of the s²-quadratic attention work that survives
-    /// packing is ≈ (mean/seq)·(1+cv²)) instead of the fictional flat
-    /// `[0, 0.15, …]` constants, and mode 2 (tile_skip, promoted Tier-B) is
-    /// unlocked when documents are dense enough to strand whole `bkv` tiles.
-    /// `None` → the legacy constants, byte-identical to every pre-item-6 plan.
-    pub packing_stats: Option<DatasetPackingConfig>,
-}
-
-/// Fatal marker set when `--wggo-memory-budget` is on and the plan cannot fit
-/// even at the fp16-moment floor (the smallest the moment-precision axis can
-/// make the model without dropping below fp16). Carried on [`WggoPlan`] so the
-/// detection is unit-testable; [`run_on_wengert_with_weights`] converts a
-/// `Some(_)` into a hard compile failure (`eprintln!` + `process::exit(1)`,
-/// the repo's compile-fatal convention — cf. `stmt.rs` CPDT validate). This is
-/// deliberately NOT the silent degrade-to-Off warning path: the user asked for
-/// a hard cap and the model does not fit, so the compile must refuse loudly.
-#[derive(Debug, Clone, Serialize)]
-pub struct BudgetInfeasibility {
-    /// Per-device budget the user requested, in bytes (`--wggo-memory-budget`
-    /// MiB × 1024²).
-    pub budget_bytes: u64,
-    /// Minimum per-device budget (bytes) that would make the plan fit at the
-    /// fp16-moment floor: the sum of per-layer floors (identity structural
-    /// decision, 16-bit m and v) **grossed up** by the modeled non-layer
-    /// overhead reserve ([`NON_LAYER_OVERHEAD_FRACTION`]), because layers only
-    /// receive `1 - overhead` of the budget. Reporting the grossed-up figure
-    /// (rather than the raw layer-floor sum) keeps the diagnostic consistent
-    /// with the refusal: it always exceeds `budget_bytes` whenever the marker
-    /// is set by the per-layer split, instead of showing a raw sum that can sit
-    /// below the budget inside the reserved band.
-    pub required_fp16_floor_bytes: u64,
-    /// Number of layers the per-layer ILP could not fit even after the
-    /// `budget_informed` exemption let it quantize moments to fp16.
-    pub infeasible_layers: usize,
 }
 
 /// Aggregate plan emitted by the driver.
@@ -211,12 +161,6 @@ pub struct WggoPlan {
     /// report's "[cpkd]" section IS the deliverable this cycle.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cpkd_distill: Vec<CpkdLayerDistill>,
-    /// Fatal budget marker (`--wggo-memory-budget`). `None` on every plan that
-    /// did not set a budget or that fits within it — byte-identical to today.
-    /// `Some(_)` means the plan is infeasible even at the fp16-moment floor and
-    /// the compile must hard-fail (surfaced in `run_on_wengert_with_weights`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget_infeasible: Option<BudgetInfeasibility>,
 }
 
 impl WggoPlan {
@@ -473,45 +417,13 @@ fn recost_total(
         .sum()
 }
 
-/// Fraction of the per-device budget reserved for resident training surfaces
-/// the per-layer LUT does not model: the loss/logits buffers, saved-for-
-/// backward activations beyond the 4 d_model-wide vectors the cost model
-/// counts, gradient-clip statistics, and allocator slack. The remainder is
-/// split evenly across layers (the ILP charge is per-layer and unsharded-
-/// conservative, so an even split is the honest first-order rule). Chosen
-/// coarse; a measured non-layer footprint is the natural refinement.
-const NON_LAYER_OVERHEAD_FRACTION: f64 = 0.15;
-
-/// Divide a per-device model budget into a per-layer ILP budget: reserve
-/// [`NON_LAYER_OVERHEAD_FRACTION`] for non-layer surfaces, split the rest
-/// evenly across `n_layers`. `None` in → `None` out (no budget). Never returns
-/// 0 (a layer must be allowed at least 1 byte or every candidate is infeasible
-/// for the wrong reason).
-fn per_layer_ilp_budget(model_budget: Option<u64>, n_layers: usize) -> Option<u64> {
-    model_budget.map(|b| {
-        let n = n_layers.max(1) as u64;
-        let usable = (b as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u64;
-        (usable / n).max(1)
-    })
-}
-
 /// Run the WGGO driver.
-pub fn run(mut input: WggoInput) -> WggoPlan {
+pub fn run(input: WggoInput) -> WggoPlan {
     let t0 = std::time::Instant::now();
     let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
 
     // 1. Build the layer graph.
     let graph = build_graph(input.wengert);
-
-    // `--wggo-memory-budget`: enforce the per-device cap at the Level-1 DP
-    // (the ClusterSpec budget the DP knapsack checks) and derive a per-layer
-    // ILP budget for the Level-2 solve. `None` leaves both untouched, so a
-    // build without the flag is byte-identical to today.
-    let model_budget = input.memory_budget_bytes;
-    if let Some(b) = model_budget {
-        input.cluster.memory_budget = b;
-    }
-    let ilp_budget = per_layer_ilp_budget(model_budget, graph.layers.len());
 
     // §2.4 inter-layer shape-compatibility precondition (a *hard* constraint).
     // Every kept layer's output activation width must match what its successors
@@ -561,8 +473,6 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
             // The §2.4 refusal must not advertise decisions of any kind.
             cfie_inference: Vec::new(),
             cpkd_distill: Vec::new(),
-            // Shape refusal short-circuits before any budget solve.
-            budget_infeasible: None,
         };
     }
 
@@ -581,12 +491,7 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         let inter =
             dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
         let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-            default_constraints_for(
-                &graph,
-                input.packing_supported,
-                ilp_budget,
-                input.packing_stats.as_ref(),
-            )
+            default_constraints_for(&graph, input.packing_supported)
         } else {
             input.ilp_constraints
         };
@@ -623,9 +528,6 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
             warnings: Vec::new(),
             cfie_inference,
             cpkd_distill,
-            // Off mode intentionally passes an over-budget model through
-            // (bypasses optimization), so it never raises the budget refusal.
-            budget_infeasible: None,
         };
     }
 
@@ -661,12 +563,7 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // 5. Level 2 ILP (per layer, independent once inter-layer decisions
     //    are fixed — paper §5.2).
     let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-        default_constraints_for(
-            &graph,
-            input.packing_supported,
-            ilp_budget,
-            input.packing_stats.as_ref(),
-        )
+        default_constraints_for(&graph, input.packing_supported)
     } else {
         input.ilp_constraints
     };
@@ -821,65 +718,6 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // CPKD advisory surface (v1): same contract as the CFIE sidecar.
     let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_constraints);
 
-    // `--wggo-memory-budget` refusal channel. The AUTHORITATIVE "infeasible
-    // even at fp16" signal is the per-layer ILP: each layer is admitted against
-    // its per-device share only if some config fits — and `budget_informed` let
-    // the solver quantize moments to fp16 (and, when importance-informed, thin
-    // structure). So `feasible == false` means "no fp16 plan fits this layer".
-    //
-    // A DP refusal alone does NOT hard-fail: the Level-1 DP is precision-blind
-    // (it sizes moments at f32), so under any tight budget it refuses even when
-    // the per-layer fp16 plan fits — hard-failing on that would defeat the whole
-    // feature. When every layer is feasible the model fits (Σ per-layer shares
-    // ≤ (1-overhead)·budget < budget), so we let the fp16 plan proceed (the DP
-    // degrades to Off with its warning, already pushed above).
-    let budget_infeasible = model_budget.and_then(|budget| {
-        // GLOBAL role-aware feasibility (review fix). The per-layer ILP solves
-        // against an EVEN `budget/n` share, so a role-pinned high-precision
-        // layer (embedding / LM-head, held at 32-bit moments by its
-        // sensitivity ceiling) can be infeasible against its 1/n slice while
-        // the quantizable transformer blocks leave slack — a model that fits
-        // GLOBALLY. Refusing on per-share infeasibility therefore false-failed
-        // exactly those fittable models. Instead, size EACH layer at its OWN
-        // role-permitted moment floor (32-bit when its sensitivity clears the
-        // critical threshold, else 16-bit — the lowest tier codegen stores),
-        // sum, gross up by the non-layer overhead reserve, and hard-fail only
-        // when that true minimum exceeds the budget. (A pure fp16 floor for
-        // every layer would UNDER-count the role-pinned 32-bit layers and let
-        // a genuinely-infeasible model slip through to a runtime OOM.)
-        let floor_sum: u64 = (0..per_layer.len())
-            .map(|i| {
-                let lut = luts.get(i).or_else(|| luts.first());
-                let c = ilp_constraints.get(i).or_else(|| ilp_constraints.first());
-                match (lut, c) {
-                    (Some(lut), Some(c)) => {
-                        let floor_bits: u8 =
-                            if c.sensitivity >= c.critical_prec_threshold { 32 } else { 16 };
-                        crate::wggo_ilp::moment_floor_bytes(lut, floor_bits, floor_bits)
-                    }
-                    _ => 0,
-                }
-            })
-            .fold(0u64, |acc, b| acc.saturating_add(b));
-        let required_fp16_floor_bytes =
-            (floor_sum as f64 / (1.0 - NON_LAYER_OVERHEAD_FRACTION)).ceil() as u64;
-        if required_fp16_floor_bytes <= budget {
-            // The model fits at its role-aware floor; any per-share
-            // infeasibility was an artifact of the even split (some layers
-            // simply need more than 1/n while others need less). Let the fp16
-            // plan proceed rather than hard-failing a fittable model.
-            return None;
-        }
-        // Report how many layers the even-share ILP could not seat, for the
-        // diagnostic (the authoritative refusal is the global floor above).
-        let infeasible_layers = per_layer.iter().filter(|s| !s.feasible).count();
-        Some(BudgetInfeasibility {
-            budget_bytes: budget,
-            required_fp16_floor_bytes,
-            infeasible_layers,
-        })
-    });
-
     WggoPlan {
         mode: effective_mode,
         target_gpu: gpu.name.to_string(),
@@ -895,7 +733,6 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         warnings,
         cfie_inference,
         cpkd_distill,
-        budget_infeasible,
     }
 }
 
@@ -942,103 +779,22 @@ fn role_sensitivity_floor(role: LayerRole) -> f64 {
     }
 }
 
-/// Below this per-document fraction (`mean_doc_length / max_sequence_length`)
-/// the packed sequence holds enough document boundaries that whole `bkv`
-/// attention tiles fall entirely outside every document overlapping them —
-/// the condition the promoted Tier-B kernel needs to *skip* a tile
-/// (`should_dispatch_tier_b_at_runtime`). Only then is mode 2 (tile_skip)
-/// unlocked in the cost model. Chosen looser than PCA's per-doc-CTA threshold
-/// (`PcaDetectConfig::per_doc_threshold` = 0.25): tile-skip helps the general
-/// segment-masked kernel as soon as there are ≳2 documents per pack, whereas
-/// per-doc CTA needs many short, even documents.
-const TILE_SKIP_UNLOCK_DOC_FRACTION: f64 = 0.5;
-
-/// Multiplicative bonus applied to mode 2 (tile_skip) over mode 1
-/// (segment_id): Tier-B eliminates whole fully-masked tiles on top of the
-/// intra-tile masking segment_id already models, and that surplus grows with
-/// packing density (recon §4). Modeled as a flat proportional surplus on the
-/// density saving — enough to make the solver prefer tile_skip when it is
-/// unlocked, without over-claiming a magnitude the coarse LUT cannot justify.
-const TILE_SKIP_BONUS: f64 = 0.15;
-
-/// Derive per-mode packing savings (and the mode mask) from a resolved
-/// `dataset` block's document-length statistics (campaign item 6, recon §4).
-///
-/// Returns `(mask, savings, quadratic_only)`. `quadratic_only = true` marks
-/// the savings as a reduction of the O(s²) attention share ONLY (see
-/// [`crate::wggo_ilp::apply_packing`]). Returns `None` — falling back to the
-/// legacy flat constants — when the statistics are insufficient to compute a
-/// distribution (no `mean_doc_length`, or a zero `max_sequence_length`).
-///
-/// Formula: with mean doc length `m`, packed sequence `s`, and coefficient of
-/// variation `cv = σ/m`, the fraction of the s²-quadratic attention work that
-/// *survives* document-causal packing is `f = (m/s)·(1 + cv²)` (E[Σᵢ sᵢ²]/s²),
-/// clamped to `[0, 1]`. The saving on the attention-quadratic share is `1 − f`.
-fn density_packing_savings(cfg: &DatasetPackingConfig) -> Option<(u8, [f64; 4], bool)> {
-    let seq = cfg.max_sequence_length;
-    let mean = cfg.mean_doc_length?; // no doc-length signal → legacy constants
-    if seq == 0 || mean == 0 {
-        return None;
-    }
-    let seq_f = seq as f64;
-    let mean_f = mean as f64;
-    let stddev_f = cfg.doc_length_stddev.unwrap_or(0) as f64;
-    let doc_fraction = mean_f / seq_f; // m/s
-    let cv = stddev_f / mean_f; // σ/μ
-    let surviving = (doc_fraction * (1.0 + cv * cv)).clamp(0.0, 1.0);
-    let base_saving = (1.0 - surviving).clamp(0.0, 0.95);
-
-    // Mode 2 (tile_skip) only unlocks when documents are dense enough for
-    // whole-tile skips to fire; otherwise segment_id (mode 1) is the ceiling.
-    let (mask, mode2_saving) = if doc_fraction < TILE_SKIP_UNLOCK_DOC_FRACTION {
-        // 0b0111 = {none, segment_id, tile_skip}. multi_seq (mode 3) stays
-        // masked out — it has no kernel.
-        (0b0111u8, (base_saving * (1.0 + TILE_SKIP_BONUS)).clamp(0.0, 0.95))
-    } else {
-        (0b0011u8, 0.0)
-    };
-    Some((mask, [0.0, base_saving, mode2_saving, 0.0], true))
-}
-
 /// Per-layer default ILP constraints with the [`role_sensitivity_floor`]
 /// applied (used when the caller supplies no explicit `ilp_constraints`).
-///
-/// `ilp_budget` (`Some` only under `--wggo-memory-budget`) sets each layer's
-/// `memory_budget` to the per-layer share and flips `budget_informed = true`,
-/// which exempts the moment-precision evidence gate (see
-/// [`crate::wggo_ilp::LayerIlpConstraints::budget_informed`]). `None` leaves
-/// the budget at `u64::MAX` and `budget_informed = false` — byte-identical to
-/// today.
-///
-/// `packing_stats` (`Some` only when a `dataset` block supplied real
-/// `mean_doc_length` and the module can lower packing) replaces the fictional
-/// flat savings with the document-density-derived savings
-/// ([`density_packing_savings`]); when `None` the legacy `[0, 0.15, 0, 0]`
-/// constants are used — byte-identical to every pre-campaign-item-6 plan.
-fn default_constraints_for(
-    graph: &OptGraph,
-    packing_supported: bool,
-    ilp_budget: Option<u64>,
-    packing_stats: Option<&DatasetPackingConfig>,
-) -> Vec<LayerIlpConstraints> {
-    // Packing honesty: a module with no packed dataset and no masked-attention
-    // call exposes mode 0 only, with zeroed savings — advertising savings for
-    // unlowerable modes made the solver "choose" packing it could never apply.
-    //
-    // When the module IS packing-capable:
-    //   * with real doc-length statistics (`density_packing_savings`), the
-    //     savings come from the document-length DISTRIBUTION and mode 2
-    //     (tile_skip, promoted Tier-B) unlocks under dense docs — the saving
-    //     scales only the O(s²) attention share (`quadratic_only = true`);
-    //   * without statistics, the legacy `{none, segment_id}` mask with the
-    //     flat `[0, 0.15, 0, 0]` constants applies (whole-layer discount) —
-    //     BYTE-IDENTICAL to every pre-item-6 plan.
-    let (mask, savings, quadratic_only) = if packing_supported {
-        packing_stats
-            .and_then(density_packing_savings)
-            .unwrap_or((0b0011, [0.0, 0.15, 0.0, 0.0], false))
+fn default_constraints_for(graph: &OptGraph, packing_supported: bool) -> Vec<LayerIlpConstraints> {
+    // Packing honesty: only mode 1 (segment_id) has any lowering today
+    // (the @pca/CSHA admission fork and the Stage-B masked path), so even
+    // a packing-capable module exposes {none, segment_id} — tile_skip and
+    // multi_seq unlock when their kernels exist. A module with no packed
+    // dataset and no masked-attention call exposes mode 0 only, with
+    // zeroed savings: the modeled savings are estimates, and advertising
+    // them for unlowerable modes made the solver "choose" packing it
+    // could never apply (then reject it downstream with
+    // packing_requires_packed_dataset noise).
+    let (mask, savings) = if packing_supported {
+        (0b0011, [0.0, 0.15, 0.0, 0.0])
     } else {
-        (0b0001, [0.0; 4], false)
+        (0b0001, [0.0; 4])
     };
     graph
         .layers
@@ -1047,13 +803,6 @@ fn default_constraints_for(
             sensitivity: role_sensitivity_floor(l.role),
             packing_modes_mask: mask,
             packing_savings: savings,
-            packing_scales_quadratic_only: quadratic_only,
-            // Budget driver: cap each layer and flip the evidence-gate
-            // exemption so the ILP may pick fp16 moments under pressure. When
-            // `ilp_budget` is `None` these stay at the `Default` values
-            // (`u64::MAX`, `false`) — byte-identical to today.
-            memory_budget: ilp_budget.unwrap_or(u64::MAX),
-            budget_informed: ilp_budget.is_some(),
             ..Default::default()
         })
         .collect()
@@ -1232,10 +981,6 @@ pub fn run_on_wengert(
         analysis_config: AnalysisConfig::default(),
         scorer: None,
         cached_analysis: None,
-        // Convenience entry point (no CompileOptions) → no budget driver.
-        memory_budget_bytes: None,
-        // No dataset/stmt context here → legacy flat packing constants.
-        packing_stats: None,
     };
     Some(run(input))
 }
@@ -1259,7 +1004,6 @@ pub fn run_on_wengert_with_weights(
     analysis_config: AnalysisConfig,
     compile_options: Option<&crate::CompileOptions>,
     packing_supported: bool,
-    packing_stats: Option<DatasetPackingConfig>,
 ) -> Option<WggoPlan> {
     use crate::wggo_gradient_scorer::build_scorer;
     use std::sync::Arc;
@@ -1327,70 +1071,18 @@ pub fn run_on_wengert_with_weights(
             None
         };
 
-    // `--wggo-memory-budget` (bytes; the CLI converted MiB→bytes and validated
-    // non-zero). `None` on every non-budget build → byte-identical to today.
-    let memory_budget_bytes = compile_options.and_then(|o| o.wggo.memory_budget_bytes);
-
-    // LayerShape honesty (recon §3/§5.8): the hardcoded default makes absolute
-    // resident bytes fictional for any real model. When a budget is set — the
-    // ONLY time absolute bytes are compared against a cap — thread the best
-    // available REAL dims so the comparison is honest, falling back to the old
-    // constants when unknown. The threading is gated on the budget so a build
-    // WITHOUT the flag keeps its byte-identical LUT (pinned-plan tests).
-    //
-    // Best available source: the `@fused_lm_ce` decorator config carries the
-    // real hidden_size (= d_model), batch_size, and seq_len (baked into the
-    // fused-CE PTX). head_dim / n_kv_heads are not in reach here and keep the
-    // documented fallback constants; fully threading them (and seq/batch when
-    // no `@fused_lm_ce` is present) needs the train-block shape captured in
-    // stmt.rs — see the orchestrator note in the PR report.
-    let mut layer_shape = LayerShape {
-        batch: 1,
-        seq: 1024,
-        d_model: 512,
-        head_dim: 64,
-        n_kv_heads: 4,
-        dtype_bytes: 2,
-    };
-    if memory_budget_bytes.is_some() {
-        if let Some(opts) = compile_options {
-            if let Some(cfg) = opts
-                .fused_ce_configs
-                .iter()
-                .find(|c| c.hidden_size.is_some() || c.batch_size.is_some() || c.seq_len.is_some())
-            {
-                if let Some(h) = cfg.hidden_size {
-                    layer_shape.d_model = h as u64;
-                }
-                if let Some(b) = cfg.batch_size {
-                    layer_shape.batch = b as u64;
-                }
-                if let Some(s) = cfg.seq_len {
-                    layer_shape.seq = s as u64;
-                }
-            }
-        }
-    }
-    // Cheap fidelity bundle (recon §6 footnote): when a `dataset` block carries
-    // a real packed `max_sequence_length`, use it for the s²-quadratic cost
-    // term so the modeled attention seq matches the density ratio's denominator
-    // (`density_packing_savings` uses the SAME `max_sequence_length` as `s`).
-    // Gated on `packing_stats.is_some()`, so a build with no dataset annotation
-    // keeps the byte-identical hardcoded seq (pinned-plan tests). Takes
-    // precedence over the budget path's fused-CE `seq_len` because the packed
-    // sequence is the geometry both the cost term and the packing saving must
-    // agree on.
-    if let Some(cfg) = packing_stats.as_ref() {
-        if cfg.max_sequence_length > 0 {
-            layer_shape.seq = cfg.max_sequence_length as u64;
-        }
-    }
-
     let mut input = WggoInput {
         mode,
         target,
         wengert,
-        layer_shape,
+        layer_shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
         cluster,
         lut_axes: LutAxes::default(),
         importance: ImportanceScores::default(),
@@ -1400,8 +1092,6 @@ pub fn run_on_wengert_with_weights(
         scorer,
         packing_supported,
         cached_analysis: cached_report.clone(),
-        memory_budget_bytes,
-        packing_stats,
     };
     // WRGA budget semantics (paper §7.1 @wrga(mode=auto): errata E3's
     // two-level split): when the user opted into adapters via
@@ -1423,33 +1113,6 @@ pub fn run_on_wengert_with_weights(
         }
     }
     let mut plan = run(input);
-
-    // `--wggo-memory-budget` HARD refusal: `run()` set `budget_infeasible`
-    // when the plan cannot fit even at the fp16-moment floor. This is a
-    // compile-fatal diagnostic — the user asked for a hard cap and the model
-    // does not fit, so we refuse loudly rather than silently degrade (the
-    // degrade-to-Off warning path is for the no-budget case). `eprintln!` +
-    // `process::exit(1)` is the repo's compile-fatal convention (cf. the CPDT
-    // weight-map validate in `stmt.rs`). The detection lives on the plan so it
-    // stays unit-testable without spawning a process.
-    if let Some(ref bi) = plan.budget_infeasible {
-        eprintln!(
-            "error: --wggo-memory-budget of {budget} bytes ({budget_mib} MiB) is \
-             infeasible: the model needs at least {required} bytes ({required_mib} MiB) \
-             even at the fp16-moment floor (16-bit Adam m/v, no structural relief){layers}. \
-             Raise the budget or shrink the model.",
-            budget = bi.budget_bytes,
-            budget_mib = bi.budget_bytes / (1024 * 1024),
-            required = bi.required_fp16_floor_bytes,
-            required_mib = bi.required_fp16_floor_bytes / (1024 * 1024),
-            layers = if bi.infeasible_layers > 0 {
-                format!(" ({} layer(s) infeasible at fp16)", bi.infeasible_layers)
-            } else {
-                String::new()
-            },
-        );
-        std::process::exit(1);
-    }
 
     // Surface the weights-load failure (if any) in the report itself, not
     // only on stderr.  Prepended-style: it precedes any degradation warnings
@@ -1530,98 +1193,7 @@ mod tests {
             scorer: None,
             cached_analysis: None,
             packing_supported: true,
-            memory_budget_bytes: None,
-            packing_stats: None,
         }
-    }
-
-    // ---- --wggo-memory-budget: hard-refusal marker + per-layer split ----
-
-    #[test]
-    fn no_budget_never_sets_infeasible_marker() {
-        // Default path (no --wggo-memory-budget): byte-identical, no marker.
-        let w = two_block_wengert();
-        let plan = run(toy_input(&w));
-        assert!(plan.budget_infeasible.is_none());
-    }
-
-    #[test]
-    fn generous_budget_fits_and_sets_no_marker() {
-        let w = two_block_wengert();
-        let mut input = toy_input(&w);
-        input.memory_budget_bytes = Some(64u64 * 1024 * 1024 * 1024); // 64 GiB
-        let plan = run(input);
-        assert!(
-            plan.budget_infeasible.is_none(),
-            "a 64 GiB budget must fit a two-block toy model"
-        );
-    }
-
-    #[test]
-    fn budget_below_fp16_floor_sets_hard_refusal_marker() {
-        // A 1-byte budget cannot fit even the fp16-moment floor: the marker
-        // must be set (run_on_wengert_with_weights converts it to a hard fail).
-        let w = two_block_wengert();
-        let mut input = toy_input(&w);
-        input.memory_budget_bytes = Some(1);
-        let plan = run(input);
-        let bi = plan
-            .budget_infeasible
-            .expect("1-byte budget must be flagged infeasible");
-        assert_eq!(bi.budget_bytes, 1);
-        assert!(
-            bi.required_fp16_floor_bytes > bi.budget_bytes,
-            "the fp16 floor must exceed the 1-byte budget"
-        );
-    }
-
-    #[test]
-    fn budget_refusal_keys_on_global_floor_not_even_share() {
-        // MED-2 regression: the hard-refusal boundary is the GLOBAL role-aware
-        // floor, not the even per-layer share. A budget exactly at the
-        // reported floor must FIT (no marker); one byte below must refuse.
-        // This proves a budget that clears the global floor is not false-failed
-        // by the artifact that some individual layer exceeds its 1/n slice.
-        let w = two_block_wengert();
-
-        // First pass: a 1-byte budget reports the required global floor.
-        let mut probe = toy_input(&w);
-        probe.memory_budget_bytes = Some(1);
-        let floor = run(probe)
-            .budget_infeasible
-            .expect("1-byte budget infeasible")
-            .required_fp16_floor_bytes;
-        assert!(floor > 1);
-
-        // Exactly at the floor: fits (boundary is inclusive, required <= budget).
-        let mut at = toy_input(&w);
-        at.memory_budget_bytes = Some(floor);
-        assert!(
-            run(at).budget_infeasible.is_none(),
-            "a budget equal to the global role-aware floor must fit, even if the \
-             even 1/n split would seat some layer below its share"
-        );
-
-        // One byte below the floor: refuses.
-        let mut below = toy_input(&w);
-        below.memory_budget_bytes = Some(floor - 1);
-        assert!(
-            run(below).budget_infeasible.is_some(),
-            "a budget below the global floor must hard-refuse"
-        );
-    }
-
-    #[test]
-    fn per_layer_ilp_budget_reserves_overhead_and_splits() {
-        // None in ⇒ None out (no budget driver).
-        assert_eq!(per_layer_ilp_budget(None, 4), None);
-        // Reserve NON_LAYER_OVERHEAD_FRACTION, split the rest evenly.
-        let model = 1_000_000u64;
-        let got = per_layer_ilp_budget(Some(model), 4).unwrap();
-        let expect = ((model as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u64) / 4;
-        assert_eq!(got, expect);
-        // Never returns 0 even for a tiny budget.
-        assert!(per_layer_ilp_budget(Some(1), 100).unwrap() >= 1);
     }
 
     #[test]
@@ -1866,7 +1438,6 @@ mod tests {
             crate::wggo_weight_analysis::AnalysisConfig::default(),
             None,
             true,
-            None,
         )
         .expect("plan");
         // Every layer should be counted as without_weights since the
@@ -2111,7 +1682,6 @@ mod tests {
             AnalysisConfig::default(),
             None,
             true,
-            None,
         )
         .expect("plan is still produced via uniform-importance fallback");
         assert!(
@@ -2361,7 +1931,6 @@ mod tests {
             crate::wggo_weight_analysis::AnalysisConfig::default(),
             Some(&opts),
             true,
-            None,
         )
         .expect("plan");
 
@@ -2486,21 +2055,17 @@ mod tests {
     }
 
     #[test]
-    fn packed_module_without_stats_stays_on_legacy_segment_id_ceiling() {
-        // BYTE-IDENTICAL guard (campaign item 6): packing_supported=true but
-        // NO `dataset` doc-length statistics → the legacy `{none, segment_id}`
-        // mask + flat `[0, 0.15, 0, 0]` constants apply, so tile_skip/multi_seq
-        // stay masked and the cost-only solver's ceiling is mode 1 — exactly as
-        // before item 6. (Dense-doc stats lift this ceiling to mode 2; see
-        // `dense_doc_stats_unlock_and_prefer_tile_skip`.)
+    fn packed_module_can_choose_segment_id_but_not_unlowerable_modes() {
+        // packing_supported=true exposes {none, segment_id} only: tile_skip
+        // and multi_seq have no kernels, and advertising their fictional
+        // savings made the solver pick modes that were then rejected
+        // downstream with packing_requires_packed_dataset noise.
         let w = two_block_wengert();
-        let inp = toy_input(&w); // packing_supported: true, packing_stats: None
-        assert!(inp.packing_stats.is_none(), "this guard covers the stats-absent path");
-        let plan = run(inp);
+        let plan = run(toy_input(&w)); // packing_supported: true in the fixture
         for sol in &plan.per_layer {
             assert!(
                 sol.decision.packing_mode <= 1,
-                "without doc stats only mode 0/1 are reachable; got {}",
+                "only mode 0/1 are lowerable; got {}",
                 sol.decision.packing_mode
             );
         }
@@ -2510,101 +2075,4 @@ mod tests {
         );
     }
 
-    fn dataset_cfg(mean: u32, stddev: u32, seq: u32) -> DatasetPackingConfig {
-        DatasetPackingConfig {
-            enabled: true,
-            max_sequence_length: seq,
-            mean_doc_length: Some(mean),
-            doc_length_stddev: Some(stddev),
-            separator_token_id: Some(2),
-        }
-    }
-
-    #[test]
-    fn default_constraints_for_is_byte_identical_without_stats() {
-        // The stats-absent path must reproduce the exact pre-item-6 defaults:
-        // mask 0b0011, flat savings [0, 0.15, 0, 0], whole-layer discount.
-        let w = two_block_wengert();
-        let graph = build_graph(&w);
-        let cs = default_constraints_for(&graph, true, None, None);
-        assert!(!cs.is_empty());
-        for c in &cs {
-            assert_eq!(c.packing_modes_mask, 0b0011);
-            assert_eq!(c.packing_savings, [0.0, 0.15, 0.0, 0.0]);
-            assert!(!c.packing_scales_quadratic_only, "legacy whole-layer discount");
-        }
-        // And packing_supported=false collapses to mode 0 with zeroed savings.
-        let cs0 = default_constraints_for(&graph, false, None, None);
-        for c in &cs0 {
-            assert_eq!(c.packing_modes_mask, 0b0001);
-            assert_eq!(c.packing_savings, [0.0; 4]);
-            assert!(!c.packing_scales_quadratic_only);
-        }
-    }
-
-    #[test]
-    fn density_savings_dense_vs_sparse_documents() {
-        // Dense docs (mean 64 ≪ seq 1024): most of the s² quadratic attention
-        // work is eliminated (surviving fraction ≈ 0.0625), mode 2 (tile_skip)
-        // unlocks (mask 0b0111), and the saving is quadratic-scaled.
-        let (mask, sav, quad) = density_packing_savings(&dataset_cfg(64, 0, 1024)).unwrap();
-        assert_eq!(mask, 0b0111, "dense docs unlock tile_skip");
-        assert!(quad, "density savings scale the quadratic share only");
-        assert!(sav[1] > 0.9, "segment_id saving is large under dense docs: {}", sav[1]);
-        assert!(sav[2] >= sav[1], "tile_skip compounds the density saving");
-
-        // Sparse docs (mean 1000 ≈ seq 1024): little quadratic work is
-        // eliminated, tile_skip does NOT unlock (mask stays 0b0011), and the
-        // saving is small.
-        let (mask_s, sav_s, quad_s) =
-            density_packing_savings(&dataset_cfg(1000, 0, 1024)).unwrap();
-        assert_eq!(mask_s, 0b0011, "sparse docs keep tile_skip masked");
-        assert!(quad_s);
-        assert!(sav_s[1] < 0.1, "segment_id saving is small under sparse docs: {}", sav_s[1]);
-        assert_eq!(sav_s[2], 0.0, "tile_skip stays zeroed when masked");
-
-        // The high-variance term (1+cv²) increases the surviving fraction,
-        // shrinking the saving relative to the zero-variance case.
-        let (_, sav_lo, _) = density_packing_savings(&dataset_cfg(200, 0, 1024)).unwrap();
-        let (_, sav_hi, _) = density_packing_savings(&dataset_cfg(200, 400, 1024)).unwrap();
-        assert!(sav_hi[1] < sav_lo[1], "higher cv ⇒ more surviving work ⇒ smaller saving");
-
-        // No mean_doc_length ⇒ no distribution ⇒ fall back to legacy constants.
-        let mut no_mean = dataset_cfg(64, 0, 1024);
-        no_mean.mean_doc_length = None;
-        assert!(density_packing_savings(&no_mean).is_none());
-    }
-
-    #[test]
-    fn dense_doc_stats_unlock_and_prefer_tile_skip() {
-        // End-to-end through the solver: with dense-doc statistics the ILP
-        // prefers mode 2 (tile_skip) — a HIGHER packing mode than the mode-1
-        // ceiling of the stats-absent path — while sparse-doc statistics keep
-        // it on segment_id (mode 1). This is the campaign-item-6 behavior.
-        let w = two_block_wengert();
-
-        let mut dense = toy_input(&w);
-        dense.packing_stats = Some(dataset_cfg(64, 0, 1024));
-        let dense_plan = run(dense);
-        assert!(
-            dense_plan.per_layer.iter().any(|s| s.decision.packing_mode == 2),
-            "dense docs should unlock and prefer tile_skip (mode 2)"
-        );
-        assert!(
-            dense_plan.per_layer.iter().all(|s| s.decision.packing_mode == 0
-                || s.decision.packing_mode == 2),
-            "dense-doc layers pick either none or tile_skip"
-        );
-
-        let mut sparse = toy_input(&w);
-        sparse.packing_stats = Some(dataset_cfg(1000, 0, 1024));
-        let sparse_plan = run(sparse);
-        for s in &sparse_plan.per_layer {
-            assert!(
-                s.decision.packing_mode <= 1,
-                "sparse docs keep tile_skip masked; got {}",
-                s.decision.packing_mode
-            );
-        }
-    }
 }

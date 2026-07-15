@@ -1243,33 +1243,28 @@ impl Compiler<'_> {
         }
 
         // PCA Stage C: scaled_dot_product_attention_packed(Q, K, V, scale,
-        // segment_ids) on the TAPE path — always the naive additive-mask
-        // chain (identical numerics to the fused/source-AD path). The dense
-        // [b,1,s,s] mask is DERIVED from segment_ids at runtime
-        // (`nsl_packed_mask_from_segment_ids` — the DataLoader no longer
-        // ships it); the fused segment kernel family remains a
-        // source-AD-only dispatch (WGGO consumption requires source AD
-        // anyway), so tape replay through primitive ops needs no segment
-        // awareness beyond the derived mask.
+        // mask, segment_ids) on the TAPE path — always the naive additive-
+        // mask chain (identical numerics to the fused/source-AD path; the
+        // mask encodes causal-within-segment by contract). segment_ids is
+        // compiled for its side effects but unused here: the fused segment
+        // kernel family is a source-AD-only dispatch (WGGO consumption
+        // requires source AD anyway), and tape replay through primitive ops
+        // needs no segment awareness because the mask carries the masking.
         if func_name == "scaled_dot_product_attention_packed"
             && !self.registry.functions.contains_key(&func_name)
         {
-            if args.len() != 5 {
+            if args.len() != 6 {
                 return Err(CodegenError::new(
-                    "scaled_dot_product_attention_packed() requires exactly 5 arguments \
-                     (Q, K, V, scale, segment_ids)",
+                    "scaled_dot_product_attention_packed() requires exactly 6 arguments \
+                     (Q, K, V, scale, mask, segment_ids)",
                 ));
             }
             let q_val = self.compile_expr(builder, state, &args[0].value)?;
             let k_val = self.compile_expr(builder, state, &args[1].value)?;
             let v_val = self.compile_expr(builder, state, &args[2].value)?;
             let scale_val = self.compile_expr(builder, state, &args[3].value)?;
-            let seg_val = self.compile_expr(builder, state, &args[4].value)?;
-            let mask_val = self.compile_call_by_name(
-                builder,
-                "nsl_packed_mask_from_segment_ids",
-                &[seg_val],
-            )?;
+            let mask_val = self.compile_expr(builder, state, &args[4].value)?;
+            let _seg_val = self.compile_expr(builder, state, &args[5].value)?;
 
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
@@ -1291,18 +1286,11 @@ impl Compiler<'_> {
             let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let attn =
                 self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
-            let out = self.compile_traced_call(
+            return self.compile_traced_call(
                 builder,
                 "nsl_tensor_matmul",
                 &[attn, v_val, flags0],
-            )?;
-            // The derived mask is a fresh runtime allocation owned by this
-            // call site (unlike the old dict-owned tensor). Add backward
-            // never dereferences its inputs (TapeOp::Add stores tape ids +
-            // shapes only), so freeing right after use is safe even while
-            // the tape is recording.
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[mask_val])?;
-            return Ok(out);
+            );
         }
 
         // M27: scaled_dot_product_attention(Q, K, V, scale, causal=false)
@@ -2850,12 +2838,7 @@ impl Compiler<'_> {
             }
 
             // Packing is accepted; the runtime builds packed batches with
-            // segment_ids/doc_starts/position_ids metadata. The dense
-            // [b,s,s] attention_mask is OPT-IN via the
-            // `emit_attention_mask=true` named arg (flows through the
-            // generic named-arg -> JSON path above, like `packing`) —
-            // only Stage-B `forward_masked` consumers need it; the packed
-            // attention path keys off segment_ids.
+            // attention_mask. Model attention must read the mask if present.
 
             if let Some(labels_expr) = labels_arg {
                 let labels_ty = self.node_type(labels_expr.id).clone();
