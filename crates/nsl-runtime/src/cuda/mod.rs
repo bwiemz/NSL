@@ -2786,12 +2786,30 @@ pub(crate) fn gpu_embedding_backward(
     let grad = unsafe { &*(grad_ptr as *const NslTensor) };
     let indices = unsafe { &*(indices_ptr as *const NslTensor) };
 
-    let (ptx, kernel_name): (&str, &[u8]) = if indices.dtype == 4 {
-        (fused_kernels::EMBEDDING_BWD_I32IDX_PTX, b"nsl_embedding_bwd_i32idx\0")
-    } else if indices.dtype == 1 {
-        (fused_kernels::EMBEDDING_BWD_F32_PTX, b"nsl_embedding_bwd_f32\0")
-    } else {
-        return 0;
+    // A2 / M46: under deterministic mode, use the per-output-row kernel
+    // (no atomics -> bit-identical to the CPU reference, run-to-run stable).
+    // The atomicAdd variant stays the production default (deterministic
+    // kernel is O(vocab*embed*seq)). `--deterministic`/nsl_set_deterministic
+    // sets this; NSL_EMBEDDING_BWD_CPU handled by the caller (host scatter).
+    let deterministic = crate::deterministic_ops::is_deterministic();
+    let (ptx, kernel_name): (&str, &[u8]) = match (deterministic, indices.dtype) {
+        (true, 4) => (
+            fused_kernels::EMBEDDING_BWD_DET_I32IDX_PTX,
+            b"nsl_embedding_bwd_det_i32idx\0",
+        ),
+        (true, 1) => (
+            fused_kernels::EMBEDDING_BWD_DET_F32_PTX,
+            b"nsl_embedding_bwd_det_f32\0",
+        ),
+        (false, 4) => (
+            fused_kernels::EMBEDDING_BWD_I32IDX_PTX,
+            b"nsl_embedding_bwd_i32idx\0",
+        ),
+        (false, 1) => (
+            fused_kernels::EMBEDDING_BWD_F32_PTX,
+            b"nsl_embedding_bwd_f32\0",
+        ),
+        _ => return 0,
     };
 
     let out_elems = (vocab_size * embed_dim) as usize;
@@ -2816,7 +2834,10 @@ pub(crate) fn gpu_embedding_backward(
 
     let block_x = 16i64;
     let block_y = 16i64;
-    let grid_x = ((seq_len as i64) + block_x - 1) / block_x;
+    // Deterministic kernel maps one thread per OUTPUT element (vocab x embed);
+    // the atomicAdd variant maps one thread per INPUT element (seq x embed).
+    let dim_x = if deterministic { vocab_size } else { seq_len } as i64;
+    let grid_x = (dim_x + block_x - 1) / block_x;
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
     let result = inner::kernel_launch(

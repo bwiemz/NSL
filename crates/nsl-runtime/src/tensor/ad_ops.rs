@@ -1547,6 +1547,86 @@ mod tests {
         (0..t.len as usize).map(|i| unsafe { *t.data_f32().add(i) }).collect()
     }
 
+    // Helper: create a 2D f32 tensor (row-major) from a flat slice.
+    #[cfg(feature = "cuda")]
+    fn make_2d_f32(rows: usize, cols: usize, vals: &[f32]) -> i64 {
+        let shape_list = nsl_list_new();
+        nsl_list_push(shape_list, rows as i64);
+        nsl_list_push(shape_list, cols as i64);
+        let ptr = tensor_from_shape_list(shape_list, 0.0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *t.data_f32().add(i) = v };
+        }
+        ptr
+    }
+
+    /// A2 / M46: the deterministic GPU embedding backward must be (a) bit-exact
+    /// with the CPU reference summation order, and (b) run-to-run identical.
+    /// The atomicAdd default computes the same sum, so it matches within f32
+    /// tolerance. Indices carry duplicates so multiple positions land on one
+    /// row — the accumulation the atomicAdd path orders nondeterministically.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU: requires CUDA device"]
+    fn embedding_backward_deterministic_gpu_matches_cpu_and_is_stable() {
+        if crate::nsl_cuda_init() != 0 {
+            return;
+        }
+        let seq = 6usize;
+        let embed = 4usize;
+        let vocab = 3usize;
+        let idx_vals = [0.0f32, 1.0, 0.0, 2.0, 1.0, 0.0]; // row 0 x3, row 1 x2, row 2 x1
+        let grad_vals: Vec<f32> = (0..seq * embed).map(|k| (k as f32) * 0.5 - 3.0).collect();
+
+        // CPU reference: dW[v,e] = sum_{i: idx[i]==v} grad[i,e] in position order.
+        let mut expected = vec![0.0f32; vocab * embed];
+        for i in 0..seq {
+            let v = idx_vals[i] as usize;
+            for e in 0..embed {
+                expected[v * embed + e] += grad_vals[i * embed + e];
+            }
+        }
+
+        let run = |deterministic: bool| -> Vec<f32> {
+            crate::deterministic_ops::nsl_set_deterministic(i64::from(deterministic));
+            let grad_cpu = make_2d_f32(seq, embed, &grad_vals);
+            let idx_cpu = make_1d_f32(&idx_vals);
+            let weight_cpu = make_2d_f32(vocab, embed, &vec![0.0f32; vocab * embed]);
+            let grad_gpu = nsl_tensor_to_device(grad_cpu, 1);
+            let idx_gpu = nsl_tensor_to_device(idx_cpu, 1);
+            let dw = nsl_embedding_backward(grad_gpu, idx_gpu, weight_cpu);
+            // GPU f32 -> CPU f64 (the CPU=f64/GPU=f32 convention). The
+            // conversion is lossless, so cast back to the exact f32.
+            let dw_cpu = nsl_tensor_to_device(dw, 0);
+            let out: Vec<f32> = (0..vocab * embed)
+                .map(|k| unsafe { *NslTensor::from_ptr(dw_cpu).data_f64().add(k) } as f32)
+                .collect();
+            nsl_tensor_free(grad_cpu);
+            nsl_tensor_free(idx_cpu);
+            nsl_tensor_free(weight_cpu);
+            nsl_tensor_free(grad_gpu);
+            nsl_tensor_free(idx_gpu);
+            nsl_tensor_free(dw);
+            nsl_tensor_free(dw_cpu);
+            out
+        };
+
+        let det1 = run(true);
+        let det2 = run(true);
+        assert_eq!(det1, expected, "deterministic GPU embedding backward != CPU reference");
+        assert_eq!(det1, det2, "deterministic GPU embedding backward is not run-to-run stable");
+
+        let atomic = run(false);
+        crate::deterministic_ops::nsl_set_deterministic(0); // restore global mode
+        for (k, (&a, &e)) in atomic.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() < 1e-4,
+                "atomicAdd GPU embedding backward elem {k}: {a} vs expected {e}"
+            );
+        }
+    }
+
     #[test]
     fn test_tensor_compare_gt() {
         let a = make_1d_f32(&[1.0, 3.0, 2.0, 0.0]);
