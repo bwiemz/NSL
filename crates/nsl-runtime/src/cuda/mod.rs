@@ -271,12 +271,10 @@ pub(crate) mod inner {
                     .to_string()
             }
         };
-        let async_note = if async_alloc_enabled() {
-            "\nNOTE: surfaces untracked (NSL_ASYNC_ALLOC=1 — async allocations \
-             bypass the caching allocator)\n"
-        } else {
-            ""
-        };
+        // A1: async and direct-device allocations are now routed through the
+        // unified surface/pool accounting, so the tables below cover them —
+        // no more "untracked" caveat.
+        let async_note = "";
         format!(
             "[nsl] GPU out of memory\n\
              \n\
@@ -325,6 +323,19 @@ pub(crate) mod inner {
             let cptr = ptr as *mut c_void;
             register_cuda_alloc(cptr);
             ASYNC_ALLOC_SET.lock().unwrap().insert(cptr as usize);
+            // A1: route async allocations through the unified accounting so
+            // their bytes reach the surface counters, the global peak, and
+            // the allocation-count gates — they used to be invisible.
+            {
+                let meta = super::caching_allocator::current_alloc_metadata(
+                    size_bytes,
+                    super::caching_allocator::AllocationLifetime::Async,
+                );
+                super::caching_allocator::CACHING_ALLOCATOR
+                    .lock()
+                    .unwrap()
+                    .record_external_alloc(cptr, meta);
+            }
             cptr
         }
     }
@@ -526,6 +537,11 @@ pub(crate) mod inner {
         if ptr.is_null() { return; }
         CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         ASYNC_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
+        // A1: decrement the unified accounting for this async allocation.
+        super::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap()
+            .record_external_free(ptr);
         ensure_context();
         unsafe {
             let result = cuMemFreeAsync(ptr as CUdeviceptr, std::ptr::null_mut());
@@ -542,6 +558,25 @@ pub(crate) mod inner {
         ASYNC_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
     }
 
+    /// A1: attribute a direct `cuMemAlloc_v2` region (slab, paged KV,
+    /// attention workspace) to the unified accounting, returning `ptr`
+    /// unchanged. These allocations bypass the caching pool but are still
+    /// device VRAM, so without this they were invisible to the surface
+    /// counters and the peak report.
+    fn account_direct_device(ptr: *mut c_void, size_bytes: usize) -> *mut c_void {
+        if !ptr.is_null() {
+            let meta = super::caching_allocator::current_alloc_metadata(
+                size_bytes,
+                super::caching_allocator::AllocationLifetime::DirectDevice,
+            );
+            super::caching_allocator::CACHING_ALLOCATOR
+                .lock()
+                .unwrap()
+                .record_external_alloc(ptr, meta);
+        }
+        ptr
+    }
+
     /// Allocate device-only memory (not accessible from host without explicit copy).
     /// On OOM, attempts sync + pool drain recovery before panicking.
     pub(crate) fn alloc_device(size_bytes: usize) -> *mut c_void {
@@ -550,7 +585,7 @@ pub(crate) mod inner {
             let mut ptr: CUdeviceptr = 0;
             let result = cuMemAlloc_v2(&mut ptr, size_bytes);
             if result == CUresult::CUDA_SUCCESS && ptr != 0 {
-                return ptr as *mut c_void;
+                return account_direct_device(ptr as *mut c_void, size_bytes);
             }
 
             // Non-OOM errors: panic immediately
@@ -573,7 +608,7 @@ pub(crate) mod inner {
             ptr = 0;
             let result = cuMemAlloc_v2(&mut ptr, size_bytes);
             if result == CUresult::CUDA_SUCCESS && ptr != 0 {
-                return ptr as *mut c_void;
+                return account_direct_device(ptr as *mut c_void, size_bytes);
             }
 
             // Drain pool and retry unconditionally: even if drain freed 0 bytes,
@@ -583,7 +618,7 @@ pub(crate) mod inner {
             ptr = 0;
             let result = cuMemAlloc_v2(&mut ptr, size_bytes);
             if result == CUresult::CUDA_SUCCESS && ptr != 0 {
-                return ptr as *mut c_void;
+                return account_direct_device(ptr as *mut c_void, size_bytes);
             }
 
             let n = ALLOC_COUNT_DBG.load(std::sync::atomic::Ordering::Relaxed);
@@ -593,6 +628,11 @@ pub(crate) mod inner {
 
     /// Free device-only memory allocated with `alloc_device`.
     pub(crate) fn free_device(ptr: *mut c_void) {
+        // A1: decrement the unified accounting for this direct allocation.
+        super::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap()
+            .record_external_free(ptr);
         ensure_context();
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);

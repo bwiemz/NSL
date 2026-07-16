@@ -105,7 +105,26 @@ impl Compiler<'_> {
                 if member_name == "to" && args.len() == 1 {
                     let model_val = self.compile_expr(builder, state, object)?;
                     let device_val = self.compile_expr(builder, state, &args[0].value)?;
+                    // A1: model weights are allocated on the device here, OUTSIDE
+                    // the train block's surface brackets, so without this they
+                    // land in `other`. Tag the whole (recursive) transfer as
+                    // Weights (surface tag 1 = caching_allocator::SurfaceTag::
+                    // Weights), restoring the caller's surface after (get/set is
+                    // nesting-safe). Harmless for `.to(cpu)` — no device allocs.
+                    let surface_prev =
+                        self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                    let surface_weights = builder.ins().iconst(cl_types::I8, 1);
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_gpu_set_alloc_surface",
+                        &[surface_weights],
+                    )?;
                     self.emit_model_to_device(builder, &model_name, model_val, device_val)?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_gpu_set_alloc_surface",
+                        &[surface_prev],
+                    )?;
                     return Ok(model_val);
                 }
                 return self.compile_model_method_call(
@@ -369,6 +388,29 @@ impl Compiler<'_> {
         }
         if func_name == "alloc_bytes" && args.is_empty() {
             return self.compile_call_by_name(builder, "nsl_alloc_bytes", &[]);
+        }
+        // A1 GPU memory-accounting intrinsics (numeric VRAM getters).
+        if func_name == "gpu_peak_bytes" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_gpu_peak_allocated_bytes", &[]);
+        }
+        if func_name == "gpu_alloc_count" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_gpu_cumulative_alloc_count", &[]);
+        }
+        if func_name == "gpu_reset_mem_stats" && args.is_empty() {
+            return self.compile_call_by_name(builder, "nsl_gpu_reset_mem_stats", &[]);
+        }
+        if matches!(func_name.as_str(), "gpu_surface_peak_bytes" | "gpu_surface_at_peak_bytes")
+            && args.len() == 1
+        {
+            // NSL Int arg (i64) → FFI u8 surface tag.
+            let tag = self.compile_expr(builder, state, &args[0].value)?;
+            let tag_i8 = builder.ins().ireduce(cl_types::I8, tag);
+            let ffi = if func_name == "gpu_surface_peak_bytes" {
+                "nsl_gpu_surface_peak_bytes"
+            } else {
+                "nsl_gpu_surface_at_peak_bytes"
+            };
+            return self.compile_call_by_name(builder, ffi, &[tag_i8]);
         }
         if matches!(func_name.as_str(), "int" | "float" | "str" | "bool") {
             return self.compile_type_conversion(builder, state, &func_name, args);

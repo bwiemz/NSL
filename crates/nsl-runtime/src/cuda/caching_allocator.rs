@@ -111,6 +111,61 @@ pub struct SurfaceCounters {
     pub at_global_peak_bytes: usize,
 }
 
+/// The mechanism by which a device VRAM allocation was obtained. Every
+/// device allocation — pooled block, stream-ordered async, or direct
+/// `cuMemAlloc_v2` region — carries one so the memory report and peak
+/// decomposition cover the whole process, not just the caching pool (A1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationLifetime {
+    /// A splittable/coalescible block from the caching pool (`alloc_managed`).
+    Pooled,
+    /// A stream-ordered `cuMemAllocAsync` allocation (`NSL_ASYNC_ALLOC=1`).
+    Async,
+    /// A direct `cuMemAlloc_v2` region outside the pool: the M36 slab, the
+    /// paged-KV pools, and flash-attention scratch workspaces.
+    DirectDevice,
+}
+
+/// Stable identity + attribution for one device allocation — the single
+/// accounting record every VRAM allocation flows through (A1). For pooled
+/// blocks the surface/pool live on the `Block` itself; async and direct
+/// allocations keep an `AllocationMetadata` in the allocator's
+/// `external_allocs` side table so their bytes still reach the surface
+/// counters, the global peak, and the allocation-count gates.
+///
+/// `op_id` / `tensor_id` are the stable Wengert-op / tensor identities,
+/// captured from a thread-local (`nsl_gpu_set_alloc_identity`) when the
+/// allocation originates from a compiled op; runtime-internal library
+/// allocations leave them `None`. They are the hook the compile-time arena
+/// and CUDA-graph work (Milestone C) consume — populated opportunistically
+/// now, load-bearing later.
+#[derive(Clone, Copy, Debug)]
+pub struct AllocationMetadata {
+    pub surface: SurfaceTag,
+    pub pool: AllocPool,
+    pub bytes: usize,
+    pub lifetime: AllocationLifetime,
+    pub op_id: Option<u32>,
+    pub tensor_id: Option<u64>,
+}
+
+/// Aggregate view of the live external (non-pooled) allocations for the
+/// memory report — see [`CachingAllocator::external_summary`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExternalSummary {
+    /// Bytes held by stream-ordered `cuMemAllocAsync` allocations.
+    pub async_bytes: usize,
+    /// Bytes held by direct `cuMemAlloc_v2` regions (slab, paged KV, attn
+    /// workspaces).
+    pub direct_bytes: usize,
+    /// External bytes tagged to the persistent pool.
+    pub persistent_bytes: usize,
+    /// External allocations carrying a stable op/tensor identity.
+    pub identified_count: usize,
+    /// Total live external allocations.
+    pub total_count: usize,
+}
+
 /// Small/large pool boundary (1 MB).
 const SMALL_THRESHOLD: usize = 1 << 20;
 /// Alignment for small allocations.
@@ -214,6 +269,15 @@ pub struct AllocStats {
     pub num_splits: usize,
     pub num_coalesces: usize,
     pub internal_fragmentation_bytes: usize,
+    /// Cumulative count of allocation events since the last
+    /// `reset_peak_and_counts` — pooled blocks AND external (async / direct)
+    /// allocations. Never decremented on free. This is the allocation-count
+    /// signal the A4 regression gates watch: an unexpected jump means the
+    /// train loop grew a per-step allocation the arena/liveness passes missed.
+    pub cumulative_allocs: u64,
+    /// Cumulative count of external (async / direct `cuMemAlloc_v2`)
+    /// allocations recorded through `record_external_alloc`.
+    pub num_external_allocs: u64,
 }
 
 /// Backend trait for driver-level allocation. Allows mock in tests.
@@ -282,6 +346,11 @@ pub(crate) struct CachingAllocator<D: DriverAlloc = CudaDriverAlloc> {
     /// Per-surface current/peak byte counters (P0.1 VRAM accounting).
     /// Indexed by `SurfaceTag as usize`; guarded by the same Mutex.
     surface_counters: [SurfaceCounters; NUM_SURFACES],
+    /// Device allocations that are NOT pooled blocks — stream-ordered async
+    /// (`cuMemAllocAsync`) and direct `cuMemAlloc_v2` regions (slab, paged
+    /// KV, attention workspaces). Keyed by device-ptr address so the free
+    /// path can decrement the surface/pool/peak counters (A1 unification).
+    external_allocs: HashMap<usize, AllocationMetadata>,
     /// Configurable memory limit (0 = unlimited).
     memory_limit: usize,
     /// The driver backend.
@@ -303,6 +372,7 @@ impl CachingAllocator<CudaDriverAlloc> {
             total_reserved: 0,
             total_allocated: 0,
             surface_counters: [SurfaceCounters::default(); NUM_SURFACES],
+            external_allocs: HashMap::new(),
             memory_limit,
             driver: CudaDriverAlloc,
         }
@@ -322,6 +392,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             total_reserved: 0,
             total_allocated: 0,
             surface_counters: [SurfaceCounters::default(); NUM_SURFACES],
+            external_allocs: HashMap::new(),
             memory_limit: 0,
             driver,
         }
@@ -415,6 +486,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.num_cache_hits += 1;
         self.stats.internal_fragmentation_bytes += block.size - size_bytes;
+        self.stats.cumulative_allocs += 1;
         self.note_surface_alloc(block.surface, block.size);
 
         Some(block.ptr)
@@ -492,6 +564,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.num_allocs += 1;
         self.stats.allocated_bytes = self.total_allocated;
         self.stats.internal_fragmentation_bytes += blk.size - size_bytes;
+        self.stats.cumulative_allocs += 1;
         self.note_surface_alloc(blk.surface, blk.size);
 
         Some(base_ptr)
@@ -765,6 +838,108 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         c.current_bytes = c.current_bytes.saturating_sub(size);
     }
 
+    /// A1: record a device VRAM allocation that is NOT a pooled block — a
+    /// stream-ordered async allocation (`cuMemAllocAsync`) or a direct
+    /// `cuMemAlloc_v2` region (slab, paged KV, attention workspace). Routes
+    /// it through the SAME surface/pool/peak/count accounting as pooled
+    /// blocks so the memory report and peak decomposition cover every device
+    /// allocation, not just the caching pool. The caller supplies the
+    /// metadata snapshot (surface/pool/identity captured from the
+    /// thread-locals at the allocation site via `current_alloc_metadata`).
+    pub(crate) fn record_external_alloc(&mut self, ptr: *mut c_void, meta: AllocationMetadata) {
+        if ptr.is_null() || meta.bytes == 0 {
+            return;
+        }
+        // Idempotence guard: a re-recorded ptr (should not happen without an
+        // intervening free) must not double-count — reconcile via the delta.
+        if let Some(old) = self.external_allocs.insert(ptr as usize, meta) {
+            self.total_allocated = self.total_allocated.saturating_sub(old.bytes);
+            self.note_surface_free(old.surface, old.bytes);
+        }
+        self.total_allocated += meta.bytes;
+        self.stats.allocated_bytes = self.total_allocated;
+        self.stats.cumulative_allocs += 1;
+        self.stats.num_external_allocs += 1;
+        self.note_surface_alloc(meta.surface, meta.bytes);
+    }
+
+    /// A1: reverse of `record_external_alloc`. Returns true if `ptr` was a
+    /// tracked external allocation. Saturating: counter drift never poisons
+    /// the pool (report-only data).
+    pub(crate) fn record_external_free(&mut self, ptr: *mut c_void) -> bool {
+        match self.external_allocs.remove(&(ptr as usize)) {
+            Some(meta) => {
+                self.total_allocated = self.total_allocated.saturating_sub(meta.bytes);
+                self.stats.allocated_bytes = self.total_allocated;
+                self.note_surface_free(meta.surface, meta.bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Global peak allocated device bytes across every surface and every
+    /// allocation mechanism (pooled + async + direct). A4 gate input.
+    pub(crate) fn peak_allocated_bytes(&self) -> usize {
+        self.stats.peak_allocated_bytes
+    }
+
+    /// Cumulative allocation-event count since the last
+    /// `reset_peak_and_counts` (pooled + external). A4 gate input: an
+    /// unexpected jump means the train loop grew a per-step allocation.
+    pub(crate) fn cumulative_alloc_count(&self) -> u64 {
+        self.stats.cumulative_allocs
+    }
+
+    /// This surface's own high-water mark in bytes.
+    pub(crate) fn surface_peak(&self, t: SurfaceTag) -> usize {
+        self.surface_counters[t as usize].peak_bytes
+    }
+
+    /// This surface's bytes at the moment the global allocated peak was set —
+    /// the per-surface decomposition of peak VRAM.
+    pub(crate) fn surface_at_global_peak(&self, t: SurfaceTag) -> usize {
+        self.surface_counters[t as usize].at_global_peak_bytes
+    }
+
+    /// Diagnostic over the external (non-pooled) allocations currently live:
+    /// async vs direct-device bytes, persistent-pool bytes, and how many carry
+    /// a stable op/tensor identity. Reads every `AllocationMetadata` field so
+    /// the identity record is observable in the memory report, not merely
+    /// stored — and it is the surface the Milestone-C arena/CUDA-graph work
+    /// reads back.
+    pub(crate) fn external_summary(&self) -> ExternalSummary {
+        let mut s = ExternalSummary::default();
+        for m in self.external_allocs.values() {
+            s.total_count += 1;
+            match m.lifetime {
+                AllocationLifetime::Async => s.async_bytes += m.bytes,
+                AllocationLifetime::DirectDevice => s.direct_bytes += m.bytes,
+                AllocationLifetime::Pooled => {}
+            }
+            if m.pool == AllocPool::Persistent {
+                s.persistent_bytes += m.bytes;
+            }
+            if m.op_id.is_some() || m.tensor_id.is_some() {
+                s.identified_count += 1;
+            }
+        }
+        s
+    }
+
+    /// Reset the peak high-water marks and cumulative counters so a caller can
+    /// measure a fresh region (e.g. one training step). Current live bytes are
+    /// preserved; peaks re-seed to the current live level.
+    pub(crate) fn reset_peak_and_counts(&mut self) {
+        self.stats.peak_allocated_bytes = self.total_allocated;
+        self.stats.cumulative_allocs = 0;
+        self.stats.num_external_allocs = 0;
+        for sc in &mut self.surface_counters {
+            sc.peak_bytes = sc.current_bytes;
+            sc.at_global_peak_bytes = sc.current_bytes;
+        }
+    }
+
     /// Per-surface VRAM accounting snapshot (P0.1), one entry per
     /// `SurfaceTag` in discriminant order.
     /// Format: Vec<(surface_name, current_bytes, peak_bytes)>. u64 so
@@ -886,6 +1061,50 @@ pub fn get_alloc_surface() -> SurfaceTag {
     CURRENT_SURFACE.with(|s| s.get())
 }
 
+thread_local! {
+    /// Stable `(op_id, tensor_id)` identity for subsequent allocations, set
+    /// by codegen around a compiled op's allocations. `(0, 0)` = unset
+    /// (mapped to `None` in the metadata snapshot). The hook the
+    /// compile-time arena and CUDA-graph work (Milestone C) consume;
+    /// populated opportunistically today, load-bearing later.
+    static CURRENT_ALLOC_IDENTITY: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Set the stable `(op_id, tensor_id)` identity for subsequent allocations.
+pub fn set_alloc_identity(op_id: u32, tensor_id: u64) {
+    CURRENT_ALLOC_IDENTITY.with(|c| c.set((op_id, tensor_id)));
+}
+
+/// Clear the allocation identity (back to unset).
+pub fn clear_alloc_identity() {
+    CURRENT_ALLOC_IDENTITY.with(|c| c.set((0, 0)));
+}
+
+/// Read the current allocation identity as optionals (`0` sentinel → `None`).
+pub fn get_alloc_identity() -> (Option<u32>, Option<u64>) {
+    let (o, t) = CURRENT_ALLOC_IDENTITY.with(|c| c.get());
+    (
+        if o == 0 { None } else { Some(o) },
+        if t == 0 { None } else { Some(t) },
+    )
+}
+
+/// Snapshot the current surface / pool / identity thread-locals into an
+/// [`AllocationMetadata`] for an external (non-pooled) allocation of `bytes`.
+/// This is the single capture path both external-allocation sites use, so
+/// async and direct allocations are attributed exactly like pooled blocks.
+pub fn current_alloc_metadata(bytes: usize, lifetime: AllocationLifetime) -> AllocationMetadata {
+    let (op_id, tensor_id) = get_alloc_identity();
+    AllocationMetadata {
+        surface: get_alloc_surface(),
+        pool: get_alloc_pool(),
+        bytes,
+        lifetime,
+        op_id,
+        tensor_id,
+    }
+}
+
 /// RAII guard: tag every allocation in the enclosing scope with `surface`,
 /// restoring the previous tag on drop (panic-safe — the restore also runs
 /// during unwind).
@@ -979,15 +1198,16 @@ pub(crate) fn print_memory_summary() {
             count,
         ));
     }
-    // P0.1: per-surface VRAM attribution + pool breakdown. Allocations made
-    // through cuMemAllocAsync bypass the caching allocator entirely, so the
-    // surface/pool tables cannot cover them — say so instead of under-reporting
-    // silently.
+    // P0.1 / A1: per-surface VRAM attribution + pool breakdown. Async
+    // (cuMemAllocAsync) and direct cuMemAlloc_v2 regions are now routed
+    // through the unified surface accounting (external_allocs side table), so
+    // the surface table covers them. The pool breakdown below still reflects
+    // caching-pool segments only (async/direct allocations own no segment).
     let surface_lines = alloc.surface_table_string("         ");
     let (p_bytes, p_segs, t_bytes, t_segs) = alloc.pool_breakdown();
     let async_note = if super::inner::async_alloc_enabled() {
-        "\n         NOTE: NSL_ASYNC_ALLOC=1 — async allocations bypass the caching \
-         allocator; surface/pool tables cover cached allocations only.\n"
+        "\n         NOTE: NSL_ASYNC_ALLOC=1 — surface bytes include async \
+         allocations; the pool (segment) breakdown covers cached blocks only.\n"
     } else {
         ""
     };
@@ -1418,5 +1638,121 @@ mod tests {
             assert_eq!(SurfaceTag::from_u8(t as u8), t);
         }
         assert_eq!(SurfaceTag::from_u8(200), SurfaceTag::Other);
+    }
+
+    // ── A1 unified accounting: external (async / direct-device) allocs ────
+
+    fn ext_meta(surface: SurfaceTag, bytes: usize, lifetime: AllocationLifetime) -> AllocationMetadata {
+        AllocationMetadata { surface, pool: AllocPool::Transient, bytes, lifetime, op_id: None, tensor_id: None }
+    }
+
+    /// External allocations reach the surface counters, allocated_bytes, the
+    /// global peak, and the cumulative-count gate — and reverse cleanly.
+    #[test]
+    fn test_external_alloc_accounted_and_reversible() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+        // A workspace (attn_workspace) allocated directly via cuMemAlloc_v2.
+        let ws = 0x1000usize as *mut c_void;
+        a.record_external_alloc(ws, ext_meta(SurfaceTag::AttnWorkspace, 4096, AllocationLifetime::DirectDevice));
+        assert_eq!(a.stats.allocated_bytes, 4096);
+        assert_eq!(a.surface_counters[SurfaceTag::AttnWorkspace as usize].current_bytes, 4096);
+        assert_eq!(a.peak_allocated_bytes(), 4096);
+        assert_eq!(a.cumulative_alloc_count(), 1);
+        assert_eq!(a.stats.num_external_allocs, 1);
+
+        assert!(a.record_external_free(ws), "known ptr frees");
+        assert_eq!(a.stats.allocated_bytes, 0);
+        assert_eq!(a.surface_counters[SurfaceTag::AttnWorkspace as usize].current_bytes, 0);
+        assert_eq!(a.surface_peak(SurfaceTag::AttnWorkspace), 4096, "peak survives free");
+        assert!(!a.record_external_free(ws), "double free is a no-op");
+    }
+
+    /// The surface-sum invariant holds across a MIX of pooled blocks and
+    /// external allocations — the core A1 unification guarantee.
+    #[test]
+    fn test_external_and_pooled_sum_invariant() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+
+        set_alloc_surface(SurfaceTag::Weights);
+        let p = a.alloc_with_grow(2048).unwrap(); // pooled weights
+        set_alloc_surface(SurfaceTag::Other);
+        // Async allocation (e.g. NSL_ASYNC_ALLOC path) tagged Grads.
+        a.record_external_alloc(0x2000usize as *mut c_void, ext_meta(SurfaceTag::Grads, 8192, AllocationLifetime::Async));
+
+        let total: usize = a.surface_counters.iter().map(|c| c.current_bytes).sum();
+        assert_eq!(total, a.stats.allocated_bytes, "surfaces sum to allocated_bytes across pooled+external");
+        assert!(a.stats.allocated_bytes >= 2048 + 8192);
+
+        a.free_block(p);
+        assert!(a.record_external_free(0x2000usize as *mut c_void));
+        let total: usize = a.surface_counters.iter().map(|c| c.current_bytes).sum();
+        assert_eq!(total, 0);
+        assert_eq!(a.stats.allocated_bytes, 0);
+    }
+
+    /// The global-peak decomposition includes external allocations that were
+    /// live at the peak (previously these were invisible → under-reported peak).
+    #[test]
+    fn test_external_contributes_to_global_peak_decomposition() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+        set_alloc_surface(SurfaceTag::Weights);
+        let _p = a.alloc_with_grow(1024).unwrap();
+        // Direct workspace live at the peak.
+        a.record_external_alloc(0x3000usize as *mut c_void, ext_meta(SurfaceTag::AttnWorkspace, 16384, AllocationLifetime::DirectDevice));
+        assert_eq!(a.peak_allocated_bytes(), 1024 + 16384);
+        assert_eq!(a.surface_at_global_peak(SurfaceTag::AttnWorkspace), 16384);
+        assert_eq!(a.surface_at_global_peak(SurfaceTag::Weights), 1024);
+    }
+
+    /// `reset_peak_and_counts` re-seeds peaks to current live bytes and zeroes
+    /// the cumulative counters — the per-step measurement primitive.
+    #[test]
+    fn test_reset_peak_and_counts() {
+        let _restore = with_default_surface();
+        let mut a = make_alloc();
+        set_alloc_surface(SurfaceTag::Weights);
+        let p = a.alloc_with_grow(4096).unwrap(); // persistent-ish live bytes
+        a.record_external_alloc(0x4000usize as *mut c_void, ext_meta(SurfaceTag::AttnWorkspace, 8192, AllocationLifetime::DirectDevice));
+        assert!(a.record_external_free(0x4000usize as *mut c_void));
+        // Peak captured 4096+8192; cumulative counted 2 allocs.
+        assert_eq!(a.peak_allocated_bytes(), 12288);
+        assert_eq!(a.cumulative_alloc_count(), 2);
+
+        a.reset_peak_and_counts();
+        assert_eq!(a.cumulative_alloc_count(), 0, "counts zeroed");
+        assert_eq!(a.peak_allocated_bytes(), 4096, "peak re-seeds to current live bytes");
+        assert_eq!(a.surface_peak(SurfaceTag::Weights), 4096);
+        assert_eq!(a.surface_peak(SurfaceTag::AttnWorkspace), 0, "freed surface re-seeds to 0");
+        a.free_block(p);
+    }
+
+    /// The identity thread-local snapshots into `current_alloc_metadata`.
+    #[test]
+    fn test_alloc_identity_snapshot() {
+        let _restore = with_default_surface();
+        let _id_restore = IdentityRestore;
+        set_alloc_surface(SurfaceTag::Grads);
+        set_alloc_identity(42, 1234);
+        let m = current_alloc_metadata(256, AllocationLifetime::Async);
+        assert_eq!(m.surface, SurfaceTag::Grads);
+        assert_eq!(m.op_id, Some(42));
+        assert_eq!(m.tensor_id, Some(1234));
+        assert_eq!(m.lifetime, AllocationLifetime::Async);
+        clear_alloc_identity();
+        let m2 = current_alloc_metadata(256, AllocationLifetime::Async);
+        assert_eq!(m2.op_id, None);
+        assert_eq!(m2.tensor_id, None);
+    }
+
+    /// Restore the identity thread-local on scope exit so a failing assert
+    /// can't leak a non-default identity into other tests on this thread.
+    struct IdentityRestore;
+    impl Drop for IdentityRestore {
+        fn drop(&mut self) {
+            clear_alloc_identity();
+        }
     }
 }

@@ -5002,6 +5002,109 @@ pub extern "C" fn nsl_gpu_get_alloc_surface() -> u8 {
     }
 }
 
+/// A1: set the stable `(op_id, tensor_id)` allocation identity for
+/// subsequent GPU allocations (arena / CUDA-graph attribution hook). No-op
+/// in non-CUDA builds.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_set_alloc_identity(op_id: u32, tensor_id: u64) {
+    #[cfg(feature = "cuda")]
+    crate::cuda::caching_allocator::set_alloc_identity(op_id, tensor_id);
+    #[cfg(not(feature = "cuda"))]
+    let _ = (op_id, tensor_id);
+}
+
+/// A1: clear the allocation identity set by `nsl_gpu_set_alloc_identity`.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_clear_alloc_identity() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::caching_allocator::clear_alloc_identity();
+}
+
+/// A1: global peak allocated device bytes across every surface and every
+/// allocation mechanism (pooled + async + direct). This is the first
+/// in-process numeric VRAM-peak getter — regression gates and WGGO read it
+/// directly instead of scraping `NSL_MEMSTATS` stderr. `0` in non-CUDA builds.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_peak_allocated_bytes() -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap()
+            .peak_allocated_bytes() as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
+/// A1: cumulative allocation-event count since the last
+/// `nsl_gpu_reset_mem_stats` (pooled + external). An unexpected jump between
+/// steps flags a per-step allocation the arena/liveness passes missed.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_cumulative_alloc_count() -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap()
+            .cumulative_alloc_count() as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
+/// A1: this surface's bytes at the moment the global allocated peak was set
+/// — the per-surface decomposition of peak VRAM. Tag values match
+/// `SurfaceTag` (0=other … 7=attn_workspace). `0` in non-CUDA builds.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_surface_at_peak_bytes(tag: u8) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap()
+            .surface_at_global_peak(crate::cuda::caching_allocator::SurfaceTag::from_u8(tag)) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = tag;
+        0
+    }
+}
+
+/// A1: this surface's own high-water mark in bytes. `0` in non-CUDA builds.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_surface_peak_bytes(tag: u8) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap()
+            .surface_peak(crate::cuda::caching_allocator::SurfaceTag::from_u8(tag)) as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = tag;
+        0
+    }
+}
+
+/// A1: reset the peak high-water marks and cumulative allocation counters so
+/// a caller can measure a fresh region (e.g. one training step). Live bytes
+/// are preserved; peaks re-seed to the current live level.
+#[no_mangle]
+pub extern "C" fn nsl_gpu_reset_mem_stats() {
+    #[cfg(feature = "cuda")]
+    crate::cuda::caching_allocator::CACHING_ALLOCATOR
+        .lock()
+        .unwrap()
+        .reset_peak_and_counts();
+}
+
 /// Release idle GPU memory back to the driver. Called after each training step
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
@@ -5103,12 +5206,21 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                     ));
                 }
             }
-            if crate::cuda::inner::async_alloc_enabled() {
-                surface_line.push_str(
-                    " [surfaces untracked: NSL_ASYNC_ALLOC=1 bypasses the caching allocator]",
+            eprintln!("{}", surface_line);
+            // A1: external (non-pooled) allocation breakdown — async /
+            // direct-device / identity coverage. Only when any exist.
+            let ext = alloc.external_summary();
+            if ext.total_count > 0 {
+                eprintln!(
+                    "[gpu-mem]    external: async={}MB direct={}MB persistent={}MB \
+                     ({} allocs, {} with op/tensor identity)",
+                    ext.async_bytes / (1024 * 1024),
+                    ext.direct_bytes / (1024 * 1024),
+                    ext.persistent_bytes / (1024 * 1024),
+                    ext.total_count,
+                    ext.identified_count,
                 );
             }
-            eprintln!("{}", surface_line);
         }
     }
     #[cfg(not(feature = "cuda"))]
@@ -5129,6 +5241,27 @@ mod alloc_surface_ffi_tests {
         super::nsl_gpu_set_alloc_surface(200);
         assert_eq!(super::nsl_gpu_get_alloc_surface(), 0);
         super::nsl_gpu_set_alloc_surface(0);
+    }
+
+    /// A1: identity setter/clearer round-trips through the thread-local and
+    /// the numeric getters return sane values without panicking (they lock
+    /// the global allocator and read — safe with no GPU present).
+    #[test]
+    fn alloc_identity_and_numeric_getters() {
+        super::nsl_gpu_set_alloc_identity(7, 99);
+        let (op, ten) = crate::cuda::caching_allocator::get_alloc_identity();
+        assert_eq!(op, Some(7));
+        assert_eq!(ten, Some(99));
+        super::nsl_gpu_clear_alloc_identity();
+        let (op, ten) = crate::cuda::caching_allocator::get_alloc_identity();
+        assert_eq!(op, None);
+        assert_eq!(ten, None);
+
+        // Getters are non-negative and never panic (empty global allocator).
+        assert!(super::nsl_gpu_peak_allocated_bytes() >= 0);
+        assert!(super::nsl_gpu_cumulative_alloc_count() >= 0);
+        assert!(super::nsl_gpu_surface_peak_bytes(1) >= 0);
+        assert!(super::nsl_gpu_surface_at_peak_bytes(1) >= 0);
     }
 }
 

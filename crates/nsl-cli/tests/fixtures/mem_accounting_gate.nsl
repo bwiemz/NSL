@@ -1,0 +1,88 @@
+# A1 memory-accounting gate fixture: a small GQA transformer moved to GPU,
+# then trained a few steps. Exercises the unified device-allocation
+# accounting (PR-A1):
+#   - `m.to(cuda)` allocates the weights OUTSIDE the train block, so the
+#     Weights surface bracket around model.to(device) must attribute them to
+#     `weights` (surface tag 1), NOT `other` (the #374 LOW finding).
+#   - the new in-process numeric getters (gpu_surface_peak_bytes / gpu_peak_bytes
+#     / gpu_alloc_count) report the accounting to the program itself.
+#
+# The Rust harness (mem_accounting_gpu_gate.rs) parses the WEIGHTS_PEAK /
+# OTHER_PEAK / PEAK markers and the auto-emitted `[gpu-mem] step=N` lines and
+# asserts weights are attributed correctly and per-step allocation is stable.
+
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_a: Tensor = ones([128])
+    norm_f: Tensor = ones([128])
+    attn: GroupedQueryAttention = GroupedQueryAttention(128, 2, 1, 64, 0.0)
+    w_up: Tensor = randn([128, 256]) * 0.08
+    w_down: Tensor = randn([256, 128]) * 0.08
+
+    fn forward(self, h: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), seg, pos, training)
+        let h1 = h + a
+        let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h1 + f
+
+model PackedLM:
+    embed: Tensor = randn([128, 128]) * 0.1
+    blocks: [Blk; 4] = Blk()
+    norm_out: Tensor = ones([128])
+
+    fn forward_train(self, input_ids: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 128])
+        for block in self.blocks:
+            h = block.forward(h, seg, pos, training)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = PackedLM()
+m.to(cuda)
+
+# Weights are now resident on the GPU. Report the per-surface peaks so the
+# harness can confirm they landed on `weights`, not `other`. print() takes a
+# single argument, so emit a label line then the value line.
+let weights_peak0 = gpu_surface_peak_bytes(1)
+let other_peak0 = gpu_surface_peak_bytes(0)
+print("WEIGHTS_PEAK")
+print(weights_peak0)
+print("OTHER_PEAK")
+print(other_peak0)
+
+let unit = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let tokens = unit.reshape([1, 8]).expand([256, 8]).contiguous().reshape([2048])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true, packing=true, pack_separator=0, emit_attention_mask=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2, grad_clip=1.0):
+    optimizer: AdamW(lr=0.002, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let pos = batch.position_ids
+        let logits = m.forward_train(batch.input_ids, batch.segment_ids, pos, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+# Final accounting snapshot. WEIGHTS_PEAK should still dominate the persistent
+# surfaces; PEAK is the global high-water mark across the whole run.
+let weights_final = gpu_surface_peak_bytes(1)
+let global_peak = gpu_peak_bytes()
+print("WEIGHTS_PEAK_FINAL")
+print(weights_final)
+print("PEAK")
+print(global_peak)
