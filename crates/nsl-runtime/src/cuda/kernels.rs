@@ -888,6 +888,109 @@ pub(crate) const SILU_BACKWARD_SRCAD_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
+// Source-AD SIGMOID backward (Milestone C · p4 slice 3). Fuses the three
+// adjoint kernels source-AD emits for `SigmoidBackward` — Sub, Mul, Mul — into
+// ONE launch, and is BIT-EXACT with them. Input `y` is the sigmoid OUTPUT (the
+// adjoint carries `op.result`, not the pre-activation).
+//
+// Computes, per element, in source-AD's exact operation order:
+//   t1 = 1.0 - y
+//   t2 = y * t1
+//   out = grad * t2     => grad * y*(1 - y)
+//
+// `.rn` on every op (round-to-nearest, already the default) forbids ptxas from
+// contracting any register-dependent mul+add into a single `fma` — each op
+// rounds independently, exactly like the three separate kernels whose
+// intermediates round to f32 through global memory. (Sigmoid backward has no
+// mul-feeding-add pair, but `.rn` documents intent and is zero-cost.)
+pub(crate) const SIGMOID_BACKWARD_SRCAD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sigmoid_backward_srcad_f32(\n\
+    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<4>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [input];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    sub.rn.f32 %fs3, 0f3F800000, %fs2;\n\
+    mul.rn.f32 %fs3, %fs2, %fs3;\n\
+    mul.rn.f32 %fs3, %fs1, %fs3;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs3;\n\
+DONE: ret;\n\
+}\0";
+
+// Source-AD TANH backward (Milestone C · p4 slice 3). Fuses the three adjoint
+// kernels source-AD emits for `TanhBackward` — Mul, Sub, Mul — into ONE launch,
+// and is BIT-EXACT with them. Input `y` is the tanh OUTPUT.
+//
+// Computes, per element, in source-AD's exact operation order:
+//   t1 = y * y
+//   t2 = 1.0 - t1
+//   out = grad * t2     => grad * (1 - y*y)
+//
+// LOAD-BEARING `.rn`: `t1 = y*y` feeds `t2 = 1.0 - t1`, a mul-feeding-sub that
+// ptxas would otherwise contract into a single-rounding `fma(-y, y, 1.0)` (~1
+// ULP drift). `.rn` on the mul forces `y*y` to round to f32 first — exactly as
+// the decomposed path does when it stores `y_sq` to global memory before the
+// subtract — and `.rn` on the sub keeps them separate.
+pub(crate) const TANH_BACKWARD_SRCAD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_tanh_backward_srcad_f32(\n\
+    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %fs<4>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [grad];\n\
+    ld.param.u64 %rd2, [input];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.f32 %fs1, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    mul.rn.f32 %fs3, %fs2, %fs2;\n\
+    sub.rn.f32 %fs3, 0f3F800000, %fs3;\n\
+    mul.rn.f32 %fs3, %fs1, %fs3;\n\
+    add.u64 %rd8, %rd3, %rd6;\n\
+    st.global.f32 [%rd8], %fs3;\n\
+DONE: ret;\n\
+}\0";
+
 /// clamp_backward: out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0
 pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
 .version 7.0\n\
@@ -1180,6 +1283,8 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("GELU_BACKWARD_F32_PTX", GELU_BACKWARD_F32_PTX),
     ("SILU_BACKWARD_F32_PTX", SILU_BACKWARD_F32_PTX),
     ("SILU_BACKWARD_SRCAD_F32_PTX", SILU_BACKWARD_SRCAD_F32_PTX),
+    ("SIGMOID_BACKWARD_SRCAD_F32_PTX", SIGMOID_BACKWARD_SRCAD_F32_PTX),
+    ("TANH_BACKWARD_SRCAD_F32_PTX", TANH_BACKWARD_SRCAD_F32_PTX),
     ("CLAMP_BACKWARD_F32_PTX", CLAMP_BACKWARD_F32_PTX),
     ("SIN_F32_PTX", SIN_F32_PTX),
     ("COS_F32_PTX", COS_F32_PTX),

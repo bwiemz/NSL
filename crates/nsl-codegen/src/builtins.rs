@@ -2713,6 +2713,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
+    (
+        "nsl_tensor_sigmoid_backward",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
+    // p4 slice 3: fused Tanh backward — grad * (1 - y*y), y = tanh output.
+    (
+        "nsl_tensor_tanh_backward",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_logsoftmax",
         &[types::I64, types::I64],
