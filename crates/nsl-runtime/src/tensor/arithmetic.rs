@@ -817,6 +817,66 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     result
 }
 
+/// FASE fused scaled-add epilogue (Milestone C · p4): `m += s * g`, in place
+/// into `m`, leaving `g` untouched (the caller still owns and frees it).
+///
+/// Bit-exact replacement for the two-kernel `nsl_tensor_mul_scalar(g, s)` then
+/// `nsl_tensor_add_inplace(m, scaled)` used by `fase_emit_accumulate`: it does
+/// `t = round(g[i] * s)` then `m[i] = round(m[i] + t)` with the SAME per-op
+/// rounding (two roundings, deliberately NON-FMA), removing one kernel launch
+/// and one parameter-sized temporary per accumulate (~217/step at 500M,
+/// grad_accum=8). Fast paths cover the operands the FASE path actually produces
+/// after its `to_device_like` pre-migration — GPU f32, CPU f32, CPU f64;
+/// anything else (dtype/device/shape mismatch, or half precision, whose
+/// materialized-intermediate rounding a single kernel could not reproduce)
+/// falls back to the exact decomposed two-op path.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f64) {
+    let m = NslTensor::from_ptr(m_ptr);
+    let g = NslTensor::from_ptr(g_ptr);
+    if m.device == g.device
+        && m.dtype == g.dtype
+        && m.len == g.len
+        && m.is_contiguous()
+        && g.is_contiguous()
+    {
+        let n = m.len as usize;
+        if m.device > 0 {
+            // GPU tensors are f32 (NslTensor invariant); other GPU dtypes fall
+            // through to the two-op path below.
+            #[cfg(feature = "cuda")]
+            if m.dtype == crate::tensor::DTYPE_F32 {
+                crate::cuda::gpu_scalar_mul_add_inplace_f32(m_ptr, g_ptr, s as f32);
+                return;
+            }
+        } else if m.dtype == crate::tensor::DTYPE_F32 {
+            let mp = m.data as *mut f32;
+            let gp = g.data as *const f32;
+            let sf = s as f32;
+            for i in 0..n {
+                // Two SEPARATE f32 roundings via the explicit `t` temporary,
+                // matching mul_scalar's `mul.f32` then add_inplace's `add.f32`.
+                let t = unsafe { *gp.add(i) } * sf;
+                unsafe { *mp.add(i) += t };
+            }
+            return;
+        } else if m.dtype == crate::tensor::DTYPE_F64 {
+            let mp = m.data as *mut f64;
+            let gp = g.data as *const f64;
+            for i in 0..n {
+                let t = unsafe { *gp.add(i) } * s;
+                unsafe { *mp.add(i) += t };
+            }
+            return;
+        }
+    }
+    // Fallback: the exact decomposed path. flags=0 scales `g` out-of-place so
+    // `g` is left intact for the caller; add into `m`; free the temporary.
+    let scaled = nsl_tensor_mul_scalar(g_ptr, s, 0);
+    crate::tensor::nsl_tensor_add_inplace(m_ptr, scaled);
+    nsl_tensor_free(scaled);
+}
+
 // === Sparse matrix multiply (M52c: weight-aware CSR SpMM) ===
 
 /// CSR sparse matmul: C = A_sparse @ B_dense
@@ -1149,6 +1209,115 @@ mod fbip_add_tests {
     fn read_f64(ptr: i64, idx: usize) -> f64 {
         let t = unsafe { &*(ptr as *const NslTensor) };
         unsafe { *(t.data as *const f64).add(idx) }
+    }
+
+    /// Helper: create a 1-D f32 tensor (CPU, dtype=1, contiguous, refcount=1).
+    fn make_tensor_f32(data: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 1);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() {
+            unsafe { *t.data_f32().add(i) = *v };
+        }
+        ptr
+    }
+
+    /// p4 — the fused `nsl_tensor_scalar_mul_add_inplace` must be BIT-EXACT with
+    /// the decomposed `mul_scalar` (flags=0) then `add_inplace` it replaces, for
+    /// every operand kind the FASE accumulate path produces.
+    #[test]
+    fn scalar_mul_add_inplace_cpu_f64_matches_two_op() {
+        let m0 = [1.5f64, -2.25, 3.125, 0.0, 1e10, -7.7];
+        let g = [0.3f64, 4.0, -1.5, 9.9, 2.5e-3, -8.125];
+        let s = 0.10000000000000009f64; // a value with no exact f32/f64 form
+        // Reference: two-op path.
+        let m_ref = make_tensor_f64(&m0);
+        let g_ref = make_tensor_f64(&g);
+        let scaled = nsl_tensor_mul_scalar(g_ref, s, 0);
+        crate::tensor::nsl_tensor_add_inplace(m_ref, scaled);
+        nsl_tensor_free(scaled);
+        // Fused.
+        let m_fused = make_tensor_f64(&m0);
+        let g_fused = make_tensor_f64(&g);
+        nsl_tensor_scalar_mul_add_inplace(m_fused, g_fused, s);
+        for i in 0..m0.len() {
+            assert_eq!(
+                read_f64(m_ref, i).to_bits(),
+                read_f64(m_fused, i).to_bits(),
+                "f64 mismatch at {i}"
+            );
+        }
+        // g must be left intact by the fused op.
+        assert_eq!(read_f64(g_fused, 0).to_bits(), g[0].to_bits());
+        for p in [m_ref, g_ref, m_fused, g_fused] { nsl_tensor_free(p); }
+    }
+
+    #[test]
+    fn scalar_mul_add_inplace_cpu_f32_matches_two_op() {
+        let m0 = [1.5f32, -2.25, 3.125, 0.0, 1e7, -7.7];
+        let g = [0.3f32, 4.0, -1.5, 9.9, 2.5e-3, -8.125];
+        let s = 0.1f64;
+        let read_f32 = |ptr: i64, i: usize| -> f32 {
+            let t = unsafe { &*(ptr as *const NslTensor) };
+            unsafe { *(t.data as *const f32).add(i) }
+        };
+        let m_ref = make_tensor_f32(&m0);
+        let g_ref = make_tensor_f32(&g);
+        let scaled = nsl_tensor_mul_scalar(g_ref, s, 0);
+        crate::tensor::nsl_tensor_add_inplace(m_ref, scaled);
+        nsl_tensor_free(scaled);
+        let m_fused = make_tensor_f32(&m0);
+        let g_fused = make_tensor_f32(&g);
+        nsl_tensor_scalar_mul_add_inplace(m_fused, g_fused, s);
+        for i in 0..m0.len() {
+            assert_eq!(
+                read_f32(m_ref, i).to_bits(),
+                read_f32(m_fused, i).to_bits(),
+                "f32 mismatch at {i}"
+            );
+        }
+        for p in [m_ref, g_ref, m_fused, g_fused] { nsl_tensor_free(p); }
+    }
+
+    /// GPU f32 path: the fused kernel vs the two GPU kernels, bit-exact. Compared
+    /// via the CPU upcast (GPU f32 → CPU f64 is lossless, so equal upcast values
+    /// prove equal f32 bits).
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn scalar_mul_add_inplace_gpu_f32_matches_two_op() {
+        let n = 257usize; // not a multiple of the 256 block, exercises the tail guard
+        let m0: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).sin() * 3.0).collect();
+        let g: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.031).cos() * 5.0).collect();
+        let s = 0.1f64;
+        let to_gpu = |data: &[f32]| -> i64 {
+            let cpu = make_tensor_f32(data);
+            crate::tensor::nsl_tensor_to_device(cpu, 1) // CPU f32 -> GPU f32
+        };
+        let upcast = |gpu_ptr: i64| -> Vec<f64> {
+            let cpu = crate::tensor::nsl_tensor_to_device(gpu_ptr, 0); // GPU f32 -> CPU f64
+            let t = NslTensor::from_ptr(cpu);
+            (0..n).map(|i| unsafe { *(t.data as *const f64).add(i) }).collect()
+        };
+        // Reference (two GPU kernels).
+        let m_ref = to_gpu(&m0);
+        let g_ref = to_gpu(&g);
+        let scaled = nsl_tensor_mul_scalar(g_ref, s, 0);
+        crate::tensor::nsl_tensor_add_inplace(m_ref, scaled);
+        nsl_tensor_free(scaled);
+        // Fused (one GPU kernel).
+        let m_fused = to_gpu(&m0);
+        let g_fused = to_gpu(&g);
+        nsl_tensor_scalar_mul_add_inplace(m_fused, g_fused, s);
+
+        let ref_vals = upcast(m_ref);
+        let fused_vals = upcast(m_fused);
+        for i in 0..n {
+            assert_eq!(
+                ref_vals[i].to_bits(),
+                fused_vals[i].to_bits(),
+                "GPU f32 mismatch at {i}: ref={} fused={}",
+                ref_vals[i], fused_vals[i]
+            );
+        }
     }
 
     /// flags=0 — both operands untouched, fresh output.

@@ -264,6 +264,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::F64, types::I8],
         Some(types::I64),
     ),
+    // FASE fused scaled-add epilogue (p4): m += s * g, in place, void.
+    (
+        "nsl_tensor_scalar_mul_add_inplace",
+        &[types::I64, types::I64, types::F64],
+        None,
+    ),
     // FASE Deferred bias correction: 1/(1 - base^step).  Scalar, no tensor args.
     (
         "nsl_bias_correction_inv",

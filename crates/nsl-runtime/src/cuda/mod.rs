@@ -2217,6 +2217,42 @@ pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_n
     inner::sync_after_kernel();
 }
 
+/// FASE fused scaled-add (Milestone C · p4): `m[i] = m[i] + g[i] * scale`,
+/// in place into `m`. `m` and `g` must be contiguous device f32 buffers of the
+/// same length `n`. Bit-exact with `gpu_scalar_op_inplace(g, scale, MUL_SCALAR)`
+/// then `gpu_elementwise_binary_inplace(m, g, ADD)` — one launch, no temp.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_scalar_mul_add_inplace_f32(m_ptr: i64, g_ptr: i64, scale: f32) {
+    use crate::tensor::NslTensor;
+    let m = unsafe { &*(m_ptr as *const NslTensor) };
+    let g = unsafe { &*(g_ptr as *const NslTensor) };
+    let n = m.len as usize;
+    debug_assert_eq!(m.len, g.len, "scalar_mul_add_inplace length mismatch");
+
+    let mut m_data = m.data as u64;
+    let mut g_data = g.data as u64;
+    let mut s_val = scale;
+    let mut n_val = n as u64;
+    let args = [
+        &mut m_data as *mut _ as *mut std::ffi::c_void,
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut s_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::SCALAR_MUL_ADD_INPLACE_F32_PTX.as_ptr(),
+        b"nsl_scalar_mul_add_inplace_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU scalar_mul_add_inplace kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
