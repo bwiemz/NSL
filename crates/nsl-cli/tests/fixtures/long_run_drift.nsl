@@ -1,0 +1,70 @@
+# A3 long-run drift fixture: a small packed-GQA LM trained for ~48 optimizer
+# steps. Sustained testing of CCR / async memory ownership / FASE state
+# transitions — a slow accumulator or recompute drift that a 2-step gate
+# misses shows up here as a per-step loss divergence or a creeping allocator
+# reserve.
+#
+# Identical model to stage_c_packed_gqa.nsl (proven GPU-eligible: head_dim=32,
+# seq_len=64), with a much longer token stream. The harness
+# (long_run_drift_gpu_gate.rs) runs it with `--deterministic` (baseline) and
+# `--deterministic --checkpoint-blocks`, and asserts the loss is bit-exact at
+# EVERY step, plus allocator reserve/alloc-count stability across the run.
+
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_a: Tensor = ones([64])
+    norm_f: Tensor = ones([64])
+    attn: GroupedQueryAttention = GroupedQueryAttention(64, 2, 1, 32, 0.0)
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+        let a = self.attn.forward_packed(rmsnorm(h, self.norm_a, 0.00001), seg, pos, training)
+        let h1 = h + a
+        let f = (rmsnorm(h1, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h1 + f
+
+model PackedLM:
+    embed: Tensor = randn([64, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+
+    fn forward_train(self, input_ids: Tensor, seg: Tensor, pos: Tensor, training: bool) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h, seg, pos, training)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = PackedLM()
+m.to(cuda)
+
+# ~48 optimizer steps: 12288 tokens / (batch 2 * seq 64) = 96 micro-batches;
+# grad_accumulation=2 -> 48 optimizer steps.
+let unit = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let tokens = unit.reshape([1, 8]).expand([1536, 8]).contiguous().reshape([12288])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true, packing=true, pack_separator=0, emit_attention_mask=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2, grad_clip=1.0):
+    optimizer: AdamW(lr=0.002, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let pos = batch.position_ids
+        let logits = m.forward_train(batch.input_ids, batch.segment_ids, pos, false)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
