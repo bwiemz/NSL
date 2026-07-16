@@ -229,6 +229,7 @@ pub mod wggo_cost;
 pub mod wggo_dp;
 pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
+pub mod layerwise;
 pub mod wggo_ilp;
 pub mod wggo_overrides;
 pub mod wggo_prepass;
