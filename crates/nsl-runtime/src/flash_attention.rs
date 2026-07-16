@@ -1315,9 +1315,11 @@ fn csha_is_fused_projection_kernel(name_ptr: i64) -> bool {
     name_bytes[pos..].windows(3).any(|w| w == b"_p1")
 }
 
-/// Tier B.1 per-call x-scratch RAII holder. Drops free the GPU scratch
-/// buffer after `cuCtxSynchronize`, ensuring the kernel reading from
-/// it has completed.
+/// Tier B.1 per-call x-scratch RAII holder. Drop queues the GPU scratch
+/// buffer for a stream-ordered deferred free (p3-remainder): a NULL-stream
+/// event is recorded after the main kernel that reads the scratch, and the
+/// raw `cuMemFree` runs once that event completes — no host stall on the
+/// inference hot path. `NSL_CUDA_SYNC=1` restores the eager sync-then-free.
 ///
 /// **W is NOT held here.** Chunkified Wq/Wk/Wv buffers are owned by
 /// the process-global cache in `cuda::tier_b1_prepass::w_cache` —
@@ -1331,12 +1333,11 @@ struct PrepassScratch {
 #[cfg(feature = "cuda")]
 impl Drop for PrepassScratch {
     fn drop(&mut self) {
-        unsafe {
-            cudarc::driver::sys::cuCtxSynchronize();
-            if !self.x_scratch.is_null() {
-                let _ = cudarc::driver::sys::cuMemFree_v2(self.x_scratch as cudarc::driver::sys::CUdeviceptr);
-            }
-        }
+        // Stream-ordered deferred free — see the struct doc. `defer_free_device`
+        // ignores a null pointer and records the completion event on the same
+        // NULL stream the main kernel launched on, so the free cannot run
+        // before that kernel finishes reading the scratch.
+        crate::cuda::inner::defer_free_device(self.x_scratch);
     }
 }
 
@@ -1345,9 +1346,10 @@ impl Drop for PrepassScratch {
 /// `x` and the narrow + col-major chunkify on `Wq/Wk/Wv` (all on the
 /// GPU via `cuda::tier_b1_prepass`), writing to freshly-allocated
 /// scratch. Returns the substituted (x, Wq, Wk, Wv) pointers + RAII
-/// scratch handle whose `Drop` runs `cuCtxSynchronize` + frees the
-/// buffers. The caller MUST keep the handle alive until after the main
-/// kernel launch.
+/// scratch handle whose `Drop` queues a stream-ordered deferred free of
+/// the buffers (NULL-stream event, freed once complete). The caller MUST
+/// keep the handle alive until after the main kernel launch, so the event
+/// is recorded after the consuming kernel.
 ///
 /// Returns `None` when the kernel is not Tier B.1 (caller uses original
 /// pointers unchanged).
@@ -1679,9 +1681,11 @@ pub extern "C" fn nsl_flash_attention_csha(
         // in the Tier B.1 dispatch path) so it reads the pre-pass'd x
         // directly without re-RMSNormalizing.
         //
-        // `_prepass_handle` is an RAII guard: its Drop runs
-        // `cuCtxSynchronize` and frees the scratch buffers. It MUST
-        // live until after `kernel_launch` returns.
+        // `_prepass_handle` is an RAII guard: its Drop queues the scratch
+        // buffer for a stream-ordered deferred free (records a NULL-stream
+        // completion event, then frees once it fires). It MUST live until
+        // after `kernel_launch` returns — dropping earlier would record the
+        // event before the consuming kernel, allowing the free to race.
         let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
             csha_tier_b1_prepass_substitute(
                 effective_name_ptr,
@@ -2068,9 +2072,11 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         // compiled with `skip_rmsnorm_prologue=true` so it reads the
         // pre-pass'd x directly.
         //
-        // `_prepass_handle` is RAII: its Drop runs `cuCtxSynchronize`
-        // and frees the per-call x-scratch. It MUST live until after
-        // `kernel_launch` returns.
+        // `_prepass_handle` is RAII: its Drop queues the per-call x-scratch
+        // for a stream-ordered deferred free (records a NULL-stream event,
+        // frees once it fires). It MUST live until after `kernel_launch`
+        // returns — dropping earlier would record the event before the
+        // consuming kernel, allowing the free to race.
         let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
             csha_tier_b1_prepass_substitute(
                 effective_name_ptr,
@@ -6573,16 +6579,21 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
 /// pointers: every "free" was a no-op and each alloc/free cycle leaked all
 /// six buffers (~B*H*S*(10*D+8) bytes per CSHA layer per step).
 ///
-/// Synchronizes the context before freeing when any pointer is live:
-/// callers invoke this right after asynchronous kernel launches that still
-/// read/write the buffers (`nsl_flash_attention_csha_backward` on the
-/// @train path; the with-saves forward on the scope-immediate inference
-/// path in `expr/advanced.rs`), and `kernel_launch` does NOT synchronize
-/// (outside opt-in `--cuda-sync`).  Same sync-then-free pattern as
-/// `PrepassScratch::drop`.  Do NOT "fix" the pairing by registering the
-/// pointers in `CUDA_ALLOC_SET` instead — that would route the frees
-/// through the caching allocator, whose reuse semantics differ from raw
-/// `cuMemFree`.
+/// Stream-ordered deferred free (p3-remainder): callers invoke this right
+/// after asynchronous kernel launches that still read/write the buffers
+/// (`nsl_flash_attention_csha_backward` on the @train path; the with-saves
+/// forward on the scope-immediate inference path in `expr/advanced.rs`), and
+/// `kernel_launch` does NOT synchronize (outside opt-in `--cuda-sync`). Rather
+/// than block on a `cuCtxSynchronize` before freeing, `defer_free_device_batch`
+/// records one NULL-stream completion event covering all six buffers and runs
+/// the raw `cuMemFree`s once that event completes — same "physically return to
+/// the driver" semantics as before, without the host stall. `NSL_CUDA_SYNC=1`
+/// restores the eager sync-then-free.
+///
+/// Do NOT "fix" the pairing by registering the pointers in `CUDA_ALLOC_SET`
+/// instead — that would route the frees through the caching allocator, whose
+/// pooling reuse semantics differ from the raw `cuMemFree` these buffers need
+/// (raw free returns the VRAM to the driver; pooling keeps it resident).
 #[no_mangle]
 pub unsafe extern "C" fn nsl_csha_free_backward_activations(
     a: CshaBackwardActivations,
@@ -6590,23 +6601,17 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations(
     #[cfg(feature = "cuda")]
     {
         use crate::cuda::inner;
-        let any_live = a.q_proj != 0
-            || a.k_proj != 0
-            || a.v_proj != 0
-            || a.row_max != 0
-            || a.row_sum != 0
-            || a.x_raw != 0;
-        if !any_live {
-            return;
-        }
-        inner::ensure_context();
-        cudarc::driver::sys::cuCtxSynchronize();
-        if a.q_proj != 0 { inner::free_device(a.q_proj as *mut std::ffi::c_void); }
-        if a.k_proj != 0 { inner::free_device(a.k_proj as *mut std::ffi::c_void); }
-        if a.v_proj != 0 { inner::free_device(a.v_proj as *mut std::ffi::c_void); }
-        if a.row_max != 0 { inner::free_device(a.row_max as *mut std::ffi::c_void); }
-        if a.row_sum != 0 { inner::free_device(a.row_sum as *mut std::ffi::c_void); }
-        if a.x_raw != 0 { inner::free_device(a.x_raw as *mut std::ffi::c_void); }
+        // All six buffers share one lifetime (consumed by the same preceding
+        // kernel), so a single completion event guards the group. Null slots
+        // are filtered inside `defer_free_device_batch`.
+        inner::defer_free_device_batch(&[
+            a.q_proj as *mut std::ffi::c_void,
+            a.k_proj as *mut std::ffi::c_void,
+            a.v_proj as *mut std::ffi::c_void,
+            a.row_max as *mut std::ffi::c_void,
+            a.row_sum as *mut std::ffi::c_void,
+            a.x_raw as *mut std::ffi::c_void,
+        ]);
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = a; }
@@ -6862,6 +6867,12 @@ mod tests {
     /// Broken pairing leaks ~250 MB; the assertion threshold of 128 MB
     /// leaves generous headroom for concurrent tests / desktop VRAM
     /// noise while still catching the regression by a wide margin.
+    ///
+    /// p3-remainder: `nsl_csha_free_backward_activations` now defers the raw
+    /// `cuMemFree` behind a NULL-stream event, so `drain_all_deferred_frees`
+    /// is called before the final measurement to force every deferred free to
+    /// complete. This asserts the STRONGER property that deferred free returns
+    /// all VRAM to the driver (it is a latency shift, never a leak).
     #[test]
     #[cfg(feature = "cuda")]
     fn csha_free_backward_activations_returns_memory_to_driver() {
@@ -6880,6 +6891,11 @@ mod tests {
             assert_ne!(r.x_raw, 0, "x_raw alloc failed");
             unsafe { nsl_csha_free_backward_activations(r); }
         }
+        // Force this cycle's event-deferred frees to complete before
+        // measuring. (A global pending==0 assertion would be racy — the
+        // deferred-free queue is shared across the whole test binary — so we
+        // rely on the VRAM-delta bound below, which has ample headroom.)
+        crate::cuda::inner::drain_all_deferred_frees();
         let (free_after, _total) = crate::cuda::inner::query_vram();
 
         let dropped = free_before.saturating_sub(free_after);

@@ -5221,6 +5221,16 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
                     ext.identified_count,
                 );
             }
+            drop(alloc);
+            // p3-remainder: raw `alloc_device` buffers (CSHA backward saves,
+            // Tier B.1 x-scratch) freed via the stream-ordered deferred path
+            // are physically resident until their completion event fires and a
+            // drain runs. Surface the count so the report distinguishes this
+            // transient hold-over from a genuine leak.
+            let pending = crate::cuda::inner::deferred_free_pending();
+            if pending > 0 {
+                eprintln!("[gpu-mem]    deferred-free pending: {} buffer(s)", pending);
+            }
         }
     }
     #[cfg(not(feature = "cuda"))]
