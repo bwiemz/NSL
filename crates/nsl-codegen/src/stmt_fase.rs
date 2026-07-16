@@ -668,15 +668,18 @@ impl Compiler<'_> {
             let work_mp =
                 self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[m_partial_ptr, grad_ptr])?;
             let scale_val = builder.ins().f64const(accum_scale);
-            let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-            let scaled_grad =
-                self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_ptr, scale_val, flags_zero])?;
-            self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[work_mp, scaled_grad])?;
+            // Fused (p4): work_mp += accum_scale * grad in one launch, `grad`
+            // left intact — same on-device f32 math as the prior
+            // mul_scalar+add_inplace, minus the scaled-grad scratch.
+            self.compile_call_by_name(
+                builder,
+                "nsl_tensor_scalar_mul_add_inplace",
+                &[work_mp, grad_ptr, scale_val],
+            )?;
             // Copy the updated accumulator back to the host buffer, then free
-            // the device staging copy and the scaled-grad scratch.
+            // the device staging copy.
             self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[m_partial_ptr, work_mp])?;
             self.compile_call_by_name(builder, "nsl_tensor_free", &[work_mp])?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_grad])?;
             return Ok(());
         }
 
@@ -689,23 +692,20 @@ impl Compiler<'_> {
         let grad_migrated =
             self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[grad_ptr, m_partial_ptr])?;
 
-        // Step 1: scaled_grad = grad_migrated * accum_scale  (owned new tensor)
+        // Steps 1+2 fused (p4): m_partial += accum_scale * grad_migrated in ONE
+        // kernel launch, bit-exact with the prior `mul_scalar` then
+        // `add_inplace` pair (t=round(g·s); m=round(m+t), NON-FMA) and dropping
+        // the parameter-sized scaled-grad temporary. `grad_migrated` is left
+        // intact by the fused op, so we free it once below (~217 launches +
+        // ~217 temps saved per step at 500M with grad_accumulation=8).
         let scale_val = builder.ins().f64const(accum_scale);
-        // flags=1: relinquish `grad_migrated` — we own the refcount bump from
-        // to_device_like and mul_scalar can reuse the buffer when unique.
-        let flags_relinq = builder.ins().iconst(cl_types::I8, 1);
-        let scaled_grad =
-            self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_migrated, scale_val, flags_relinq])?;
+        self.compile_call_by_name(
+            builder,
+            "nsl_tensor_scalar_mul_add_inplace",
+            &[m_partial_ptr, grad_migrated, scale_val],
+        )?;
 
-        // Step 2: m_partial += scaled_grad  (in-place, void)
-        self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[m_partial_ptr, scaled_grad])?;
-
-        // Step 3: free both refs to the buffer mul_scalar relinquished into.
-        // Under FBIP, scaled_grad and grad_migrated alias the same tensor
-        // with rc=2; both frees together drop it to 0. Without the second
-        // free this leaks one parameter-sized tensor per accumulate call —
-        // ~217/step at 500M with grad_accumulation=8.
-        self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_grad])?;
+        // Step 3: free the migrated grad (the refcount bump from to_device_like).
         self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_migrated])?;
 
         Ok(())

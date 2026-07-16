@@ -296,6 +296,54 @@ pub(crate) const MUL_SCALAR_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
+// Fused scaled-add (FASE accumulate epilogue, Milestone C · p4):
+//   m[i] = m[i] + (g[i] * s)      (m read-write, g read-only, s a host f32)
+// Bit-exact replacement for `nsl_mul_scalar_f32` then `nsl_add_f32`, saving one
+// launch and the scaled-grad temp.
+//
+// LOAD-BEARING `.rn`: the two GPU kernels it replaces double-round (the mul
+// result is stored to global memory as f32, then reloaded and added). Within a
+// single kernel, ptxas would by default CONTRACT a register-dependent
+// `mul.f32`+`add.f32` into one `fma.f32` (a single rounding), diverging from the
+// decomposed path by up to 1 ULP. The explicit `.rn` (round-to-nearest) modifier
+// on `mul.rn.f32`/`add.rn.f32` forbids that contraction — same numerics as plain
+// `.f32` (round-to-nearest is already the default), but each op rounds
+// independently, reproducing the two-kernel double-rounding element-for-element.
+pub(crate) const SCALAR_MUL_ADD_INPLACE_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_scalar_mul_add_inplace_f32(\n\
+    .param .u64 m, .param .u64 g, .param .f32 s, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<8>;\n\
+    .reg .f32 %fs<4>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [m];\n\
+    ld.param.u64 %rd2, [g];\n\
+    ld.param.f32 %fs3, [s];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    setp.ge.u64 %p1, %rd4, %rd3;\n\
+    @%p1 bra DONE;\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    ld.global.f32 %fs1, [%rd6];\n\
+    mul.rn.f32 %fs1, %fs1, %fs3;\n\
+    add.u64 %rd7, %rd1, %rd5;\n\
+    ld.global.f32 %fs2, [%rd7];\n\
+    add.rn.f32 %fs2, %fs2, %fs1;\n\
+    st.global.f32 [%rd7], %fs2;\n\
+DONE: ret;\n\
+}\0";
+
 // --- Matrix multiplication ---
 //
 // The f32 single-matmul PTX kernel (`nsl_matmul_f32`) was deleted 2026-04-21
@@ -1050,6 +1098,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("NEG_F32_PTX", NEG_F32_PTX),
     ("RELU_F32_PTX", RELU_F32_PTX),
     ("MUL_SCALAR_F32_PTX", MUL_SCALAR_F32_PTX),
+    ("SCALAR_MUL_ADD_INPLACE_F32_PTX", SCALAR_MUL_ADD_INPLACE_F32_PTX),
     ("ADD_SCALAR_F32_PTX", ADD_SCALAR_F32_PTX),
     ("EXP_F32_PTX", EXP_F32_PTX),
     ("LOG_F32_PTX", LOG_F32_PTX),
