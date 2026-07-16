@@ -57,6 +57,31 @@ pub(crate) mod inner {
         CUDA_SYNC_MODE.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Milestone C·p3: post-kernel synchronization policy.
+    ///
+    /// Every kernel launches on the NULL stream (self-ordering), and every host
+    /// read goes through the *synchronous* `cuMemcpyDtoH_v2` — itself a
+    /// NULL-stream barrier. So a `cuCtxSynchronize` after a pure-GPU kernel is
+    /// redundant for correctness: it only forces the CPU to block until the GPU
+    /// drains, destroying CPU/GPU overlap and serializing launch overhead with
+    /// execution. `kernel_launch` already gates its own post-launch sync on
+    /// `sync_mode_enabled()`; this helper lets the op sites that added a
+    /// *separate* unconditional sync adopt the same policy in one call.
+    ///
+    /// Default: no-op (stream ordering carries correctness). With
+    /// `NSL_CUDA_SYNC=1` (CLI `--cuda-sync`) it restores an eager
+    /// `cuCtxSynchronize` — the bisection kill-switch: if a result changes with
+    /// it off but matches with it on, a genuine host-read site was mis-gated and
+    /// must keep an explicit sync.
+    #[inline]
+    pub(crate) fn sync_after_kernel() {
+        if sync_mode_enabled() {
+            unsafe {
+                cuCtxSynchronize();
+            }
+        }
+    }
+
     #[cfg(test)]
     use std::collections::HashMap as TestHashMap;
     #[cfg(test)]
@@ -1694,7 +1719,7 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
         inner::free_managed(out_data);
         return 0;
     }
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     out_ptr as i64
 }
 
@@ -1786,7 +1811,7 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     out_ptr as i64
 }
 
@@ -1892,7 +1917,7 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
         KERNEL_NAME.trim_end_matches('\0'),
         result as u32
     );
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     if contiguous_ptr != tensor_ptr {
         crate::tensor::nsl_tensor_free(contiguous_ptr);
@@ -1923,7 +1948,7 @@ pub(crate) fn gpu_elementwise_unary_inplace(a_ptr: i64, ptx: &str, kernel_name: 
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU inplace kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 }
 
 /// GPU elementwise binary op — in-place (FBIP). Writes output to left operand's buffer.
@@ -1953,7 +1978,7 @@ pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, 
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU inplace kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 }
 
 /// GPU scalar op — in-place (FBIP). Writes output to input buffer.
@@ -1980,7 +2005,7 @@ pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_n
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU inplace scalar kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 }
 
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
@@ -2177,7 +2202,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         );
         assert_eq!(result as u32, 0, "GPU BMM kernel failed: {}", result as u32);
     }
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     out_ptr as i64
 }
@@ -2232,7 +2257,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     out_ptr as i64
 }
 
@@ -2283,7 +2308,7 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     );
     assert_eq!(result as u32, 0, "GPU backward kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
     #[allow(unused_unsafe)]
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     out_ptr as i64
 }
 
@@ -2376,7 +2401,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU clamp kernel failed: {}", result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     out_ptr as i64
 }
 
@@ -2407,7 +2432,7 @@ pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU clamp inplace kernel failed: {}", result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 }
 
 #[cfg(feature = "cuda")]
@@ -2458,7 +2483,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     );
     assert_eq!(result as u32, 0, "GPU clamp_backward kernel failed: {}", result as u32);
     #[allow(unused_unsafe)]
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     out_ptr as i64
 }
 
@@ -2497,7 +2522,7 @@ pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2,
     );
     assert_eq!(result as u32, 0, "GPU log_softmax kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
     let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, t.ndim, t.len, t.device, 1, 1, 0));
     NslTensor::publish(out)
 }
@@ -2780,7 +2805,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU embedding kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -2885,7 +2910,7 @@ pub(crate) fn gpu_embedding_backward(
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU embedding_bwd kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
@@ -2967,7 +2992,7 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     crate::tensor::nsl_tensor_free(bias_on_gpu);
 
@@ -3027,7 +3052,7 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2, // shared mem: smax[256] + ssum[256]
     );
     assert_eq!(result as u32, 0, "GPU softmax kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3106,7 +3131,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU sum_dim kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3156,7 +3181,7 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU global_sum kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3466,7 +3491,7 @@ pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
         [1, 1, 1], [1, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_global_sum kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3545,7 +3570,7 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
         [grid, 1, 1], [1, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_sum_dim kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3641,7 +3666,7 @@ pub(crate) fn gpu_det_scatter_add_f32(
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_scatter_add kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -3717,7 +3742,7 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU max_dim kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3783,7 +3808,7 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU layernorm kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3846,7 +3871,7 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU rmsnorm kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3936,7 +3961,7 @@ pub(crate) fn gpu_scatter_add_f32(
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU scatter_add kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -4036,7 +4061,7 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU gather kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -4160,7 +4185,7 @@ pub(crate) fn gpu_conv2d_f32(
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU conv2d kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     crate::tensor::nsl_tensor_free(weight_on_gpu);
 
@@ -4327,7 +4352,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dropout kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     let out = Box::new(NslTensor::new(
         out_data, out_shape, out_strides,
@@ -4440,7 +4465,7 @@ pub(crate) fn gpu_slice_f32_with_shape(
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU slice kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     // Free GPU metadata arrays
     inner::free_managed(gpu_shape);
@@ -4528,7 +4553,7 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
         [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
@@ -4598,7 +4623,7 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU COO SpMM kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     inner::free_managed(gpu_ri);
     inner::free_managed(gpu_ci);
@@ -4673,7 +4698,7 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMV kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
@@ -4764,7 +4789,7 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
         [grid_x, grid_y, 1], [block_x, br as i64, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU BSR SpMM kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
@@ -4827,7 +4852,7 @@ pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU COO SpMV kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     inner::free_managed(gpu_ri);
     inner::free_managed(gpu_ci);
@@ -4919,7 +4944,7 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
         [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     // Free device CSR arrays
     inner::free_managed(gpu_row_ptrs);
@@ -4997,7 +5022,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    inner::sync_after_kernel();
 
     // Free GPU metadata arrays
     inner::free_managed(gpu_shape);
