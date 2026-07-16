@@ -6220,6 +6220,29 @@ impl Compiler<'_> {
                     }
                 }
 
+                // 6e. Milestone C·p2: transient-memory arena projection.
+                // Reuses the M36 interference/BFD engine (transient_arena.rs)
+                // over the *final* forward+adjoint tape — post-CCR-splice and
+                // post-adjoint-last-use-frees, so FreeTensor markers bound each
+                // interval exactly. This is the backward+forward transient
+                // surface the M36 slab planner (AST, forward-only) never sees.
+                // Pure analysis; no codegen change. Gated by --memory-report or
+                // NSL_ARENA_REPORT=1.
+                if self.compile_options.memory_report
+                    || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1")
+                {
+                    // Transients are runtime-shaped here, so element counts are
+                    // unquantified (|_| None) and the headline is peak
+                    // concurrency (the arena slot count). Stage-2 wires shapes.
+                    let arena = crate::transient_arena::analyze(
+                        &effective_primal,
+                        &adjoint,
+                        &|_| None,
+                        4, // GPU f32 training dtype width
+                    );
+                    eprintln!("[arena]\n{}", arena.render_report("  "));
+                }
+
                 // 7. Lower ADJOINT Wengert list using full_vars, which now
                 //    contains all intermediate VarId → Value mappings from
                 //    the forward pass. This is the key fix: the old code only

@@ -486,7 +486,7 @@ impl SlabPlan {
 }
 
 /// GPU alignment for slab offsets (256 bytes).
-const SLAB_ALIGNMENT: u64 = 256;
+pub const SLAB_ALIGNMENT: u64 = 256;
 
 // ---------------------------------------------------------------------------
 // Rematerialization
