@@ -129,12 +129,36 @@ is elementwise/matmul-bound, so the flash/CE syncs were a small part of its
 budget; the win is proportionally larger on attention-heavy / long-sequence
 models where the fused SDPA fwd/bwd dominate.
 
-## 6. Still remaining
+## 6. Stream-ordered deferred free (p3-remainder — done)
 
-- The raw-`cuMemFree` free-safety syncs (flash `PrepassScratch::drop`,
-  `nsl_csha_free_backward_activations`, and the error-path free in
-  `flash_attention_backward_gpu`) are KEPT: they guard a physical device free, so
-  they need event-based deferred free (the "stream-ordered allocator" half of
-  p3's title) before their syncs can go. This also composes with p8 (CUDA
-  graphs), which need stable device pointers and no per-op host syncs across the
-  captured region.
+The two raw-`cuMemFree` free-safety syncs on the hot path — flash
+`PrepassScratch::drop` (Tier B.1 x-scratch) and
+`nsl_csha_free_backward_activations` (the six CSHA backward save buffers) — are
+now event-deferred. See `docs/research/stream-ordered-deferred-free.md` for the
+full design. In short: instead of `cuCtxSynchronize(); cuMemFree(ptr)`,
+`defer_free_device` records a NULL-stream completion event *after* the consuming
+kernels and physically frees once the event is observed complete
+(`drain_completed_frees`, polled opportunistically + forced on OOM recovery and
+`pool_drain`). NULL-stream ordering guarantees the event cannot complete before
+those kernels do, so the raw free stays safe with no host stall — and the
+"physically return VRAM to the driver" semantics (required by the
+memory-reduction campaign; the caching allocator would pool it instead) are
+preserved. `NSL_CUDA_SYNC=1` restores the eager sync-then-free.
+
+Validated by `crates/nsl-cli/tests/deferred_free_gpu_gate.rs`: a `@flash_attention`
+model trained with source-AD (which dispatches the CSHA fused backward, freeing
+the six save buffers every step) produces **bit-identical** trained-parameter
+sums under eager (`NSL_CUDA_SYNC=1`) and default (deferred) — a use-after-free
+would corrupt the gradients and diverge. Plus the `nsl-runtime` unit tests
+`test_deferred_free_device_reclaims_vram` (VRAM is returned, not leaked) and
+`test_deferred_free_handles_null_and_empty` (guards).
+
+The remaining synced free is the **error-path free in
+`flash_attention_backward_gpu`** (Phase-2 launch failure / async-fault trap):
+its frees go through `free_managed` (the stream-safe caching allocator, not a
+raw `cuMemFree`), and it is a cold path that returns 0 to trigger the CPU
+fallback — so its defensive drain has no hot-path cost and is deliberately left
+as-is.
+
+This composes with p8 (CUDA graphs), which need stable device pointers and no
+per-op host syncs across the captured region.

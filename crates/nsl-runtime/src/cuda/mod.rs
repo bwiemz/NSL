@@ -217,6 +217,13 @@ pub(crate) mod inner {
     /// Releases fully-free segments back to the CUDA driver.
     /// Returns total bytes freed.
     fn pool_drain() -> usize {
+        // Flush stream-ordered deferred frees first: `pool_drain` is the
+        // "reclaim everything reclaimable" path (OOM recovery / explicit cache
+        // empty), so raw frees still waiting on a completion event are forced
+        // to complete and physically returned to the driver here too. Runs
+        // before the allocator lock is taken (it frees via `free_device`,
+        // which itself locks the allocator).
+        drain_all_deferred_frees();
         ensure_context();
         let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
         alloc.drain_all()
@@ -436,6 +443,9 @@ pub(crate) mod inner {
         // === OOM Recovery ===
         // Step 1: synchronize device — flushes pending async frees
         unsafe { cuCtxSynchronize(); }
+        // The sync above completed every deferred-free event, so their raw
+        // buffers can now be physically returned to the driver before retry.
+        drain_completed_frees();
         if let Some(ptr) = caching_alloc(size_bytes) {
             return ptr;
         }
@@ -630,6 +640,8 @@ pub(crate) mod inner {
 
             // OOM recovery: sync and retry
             cuCtxSynchronize();
+            // Reclaim event-deferred raw frees (now complete after the sync).
+            drain_completed_frees();
             ptr = 0;
             let result = cuMemAlloc_v2(&mut ptr, size_bytes);
             if result == CUresult::CUDA_SUCCESS && ptr != 0 {
@@ -667,6 +679,203 @@ pub(crate) mod inner {
                 "cuMemFree_v2 (device) failed: {:?}",
                 result
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stream-ordered deferred free (Milestone C · p3-remainder)
+    //
+    // A raw `alloc_device` buffer (CSHA backward activations, Tier B.1
+    // x-scratch) must be physically returned to the driver via
+    // `cuMemFree_v2` — routing it through the caching allocator would keep
+    // it pooled and defeat the memory-reduction campaign's VRAM profile. But
+    // a raw `cuMemFree` is NOT stream-ordered: it must not run until the
+    // kernels reading the buffer have finished. The previous code guaranteed
+    // that with a blocking `cuCtxSynchronize` before every free — a device-
+    // wide host stall on the hot path.
+    //
+    // This replaces the host barrier with a CUDA event. `defer_free_device`
+    // records an event on the NULL stream (the one stream every kernel
+    // launches on) AFTER the consuming kernels, enqueues (ptrs, event), and
+    // `drain_completed_frees` physically frees once the event is observed
+    // complete. NULL-stream ordering guarantees the event cannot complete
+    // before those kernels do, so the free stays safe with no CPU stall.
+    //
+    // `NSL_CUDA_SYNC=1` restores the eager sync-then-free behavior — the same
+    // bisection kill-switch used across p3: if a result changes with it off
+    // but matches with it on, a genuine use-after-free was exposed.
+    // ------------------------------------------------------------------
+
+    struct DeferredFree {
+        /// Buffers sharing one lifetime (all consumed by the same preceding
+        /// kernels), guarded by a single completion event.
+        ptrs: Vec<usize>,
+        event: CUevent,
+    }
+    // SAFETY: `CUevent` is an opaque driver handle (raw pointer) that is never
+    // dereferenced on the Rust side; every driver call that touches it first
+    // re-establishes the shared primary context via `ensure_context`. Moving
+    // the handle between threads (the queue is a global `static`) is therefore
+    // sound.
+    unsafe impl Send for DeferredFree {}
+
+    static DEFERRED_FREES: std::sync::LazyLock<Mutex<std::collections::VecDeque<DeferredFree>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+    /// Recycled disable-timing events, to avoid create/destroy churn.
+    static FREE_EVENT_POOL: std::sync::LazyLock<Mutex<Vec<usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+    fn acquire_free_event() -> CUevent {
+        if let Some(ev) = FREE_EVENT_POOL.lock().unwrap().pop() {
+            return ev as CUevent;
+        }
+        let mut ev: CUevent = std::ptr::null_mut();
+        // 0x2 = CU_EVENT_DISABLE_TIMING — cheapest event; we only poll completion.
+        let r = unsafe { cuEventCreate(&mut ev, 0x2) };
+        assert_eq!(
+            r,
+            CUresult::CUDA_SUCCESS,
+            "cuEventCreate (deferred-free) failed: {:?}",
+            r
+        );
+        ev
+    }
+
+    fn recycle_free_event(ev: CUevent) {
+        FREE_EVENT_POOL.lock().unwrap().push(ev as usize);
+    }
+
+    /// Number of buffers currently awaiting a deferred physical free.
+    /// Exposed for tests and the memory diagnostics.
+    pub(crate) fn deferred_free_pending() -> usize {
+        DEFERRED_FREES
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.ptrs.len())
+            .sum()
+    }
+
+    /// Stream-ordered deferred free of a single raw `alloc_device` buffer.
+    pub(crate) fn defer_free_device(ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        defer_free_device_batch(&[ptr]);
+    }
+
+    /// Stream-ordered deferred free of one or more raw `alloc_device` buffers
+    /// that share a lifetime (all consumed by the same preceding kernels).
+    /// A single event guards the whole group.
+    pub(crate) fn defer_free_device_batch(ptrs: &[*mut c_void]) {
+        let live: Vec<usize> = ptrs
+            .iter()
+            .filter(|p| !p.is_null())
+            .map(|p| *p as usize)
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        ensure_context();
+        if sync_mode_enabled() {
+            // Eager kill-switch (NSL_CUDA_SYNC=1): the old sync-then-free path.
+            unsafe { cuCtxSynchronize(); }
+            for p in live {
+                free_device(p as *mut c_void);
+            }
+            return;
+        }
+        let event = acquire_free_event();
+        // Record on the NULL stream: completes only after every previously
+        // launched NULL-stream kernel (including this buffer's consumers).
+        let rc = unsafe { cuEventRecord(event, current_stream()) };
+        if rc != CUresult::CUDA_SUCCESS {
+            // Recording failed — fall back to a safe synchronous free rather
+            // than risk a use-after-free.
+            recycle_free_event(event);
+            unsafe { cuCtxSynchronize(); }
+            for p in live {
+                free_device(p as *mut c_void);
+            }
+            return;
+        }
+        DEFERRED_FREES
+            .lock()
+            .unwrap()
+            .push_back(DeferredFree { ptrs: live, event });
+        drain_completed_frees();
+    }
+
+    /// Poll the deferred-free queue and physically free every entry whose
+    /// event has completed. Each event is queried independently, so this is
+    /// correct regardless of the order entries were enqueued vs. recorded.
+    ///
+    /// Precondition: a CUDA context must be current on the calling thread (for
+    /// `cuEventQuery`). Every in-tree caller ensures this — `defer_free_device*`
+    /// and both OOM-recovery sites call `ensure_context` first — so this hot
+    /// path does not re-acquire the CUDA-state lock. Without a current context
+    /// `cuEventQuery` returns an error, treated as "not ready" below, which only
+    /// defers reclaim (never a use-after-free).
+    pub(crate) fn drain_completed_frees() {
+        // Collect completed entries under the lock, then free outside it:
+        // `free_device` takes the CACHING_ALLOCATOR lock, and holding
+        // DEFERRED_FREES across that call would nest two locks.
+        let mut ready: Vec<DeferredFree> = Vec::new();
+        {
+            let mut q = DEFERRED_FREES.lock().unwrap();
+            let mut i = 0;
+            while i < q.len() {
+                // Only CUDA_SUCCESS means "done". CUDA_ERROR_NOT_READY (and, in a
+                // faulted context, a sticky error) keeps the entry queued —
+                // `drain_all_deferred_frees`'s hard wait reclaims it later.
+                if unsafe { cuEventQuery(q[i].event) } == CUresult::CUDA_SUCCESS {
+                    ready.push(q.remove(i).unwrap());
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for entry in ready {
+            recycle_free_event(entry.event);
+            for p in entry.ptrs {
+                free_device(p as *mut c_void);
+            }
+        }
+    }
+
+    /// Force every currently-pending deferred free to complete, then physically
+    /// free it. Called from `pool_drain` (OOM recovery / explicit cache empty)
+    /// and available for shutdown / test determinism.
+    ///
+    /// Snapshots the queue FIRST, then waits on each snapshotted entry's own
+    /// completion event — deliberately NOT a single global `cuCtxSynchronize`
+    /// followed by an unconditional drain. A global-sync-then-sweep has a TOCTOU
+    /// hole: another thread could enqueue a deferred free (its event recorded
+    /// AFTER our sync) in the window before the drain, and we would then free
+    /// its buffer without ever waiting for its consuming kernel — a
+    /// use-after-free. Per-entry `cuEventSynchronize` on the snapshot closes that
+    /// window; entries enqueued after the snapshot simply stay queued for the
+    /// next drain.
+    pub(crate) fn drain_all_deferred_frees() {
+        let drained: Vec<DeferredFree> = {
+            let mut q = DEFERRED_FREES.lock().unwrap();
+            if q.is_empty() {
+                return;
+            }
+            q.drain(..).collect()
+        };
+        ensure_context();
+        for entry in &drained {
+            // The event was recorded after this buffer's consumers on the NULL
+            // stream, so waiting on it guarantees those kernels have retired —
+            // the physical free below cannot race them.
+            unsafe { cuEventSynchronize(entry.event); }
+        }
+        for entry in drained {
+            recycle_free_event(entry.event);
+            for p in entry.ptrs {
+                free_device(p as *mut c_void);
+            }
         }
     }
 
@@ -5528,6 +5737,62 @@ DONE:
         let ptr = inner::alloc_device(1024);
         assert!(!ptr.is_null(), "alloc_device returned null");
         inner::free_device(ptr);
+    }
+
+    /// p3-remainder: the stream-ordered deferred free must physically return a
+    /// raw `alloc_device` buffer to the driver once drained — it is a latency
+    /// shift, never a leak. Mirrors the CSHA save-buffer regression test but
+    /// exercises the raw `alloc_device`→`defer_free_device`→drain path directly.
+    ///
+    /// A broken deferred free (never physically freeing) would leak ~200 MB
+    /// over the loop; the 128 MB threshold has generous headroom for
+    /// concurrent tests / desktop VRAM noise while still catching a regression.
+    #[test]
+    fn test_deferred_free_device_reclaims_vram() {
+        const ITERS: usize = 50;
+        const BUF_BYTES: usize = 4 * 1024 * 1024; // 4 MB → ~200 MB total
+        const MAX_ALLOWED_DROP_BYTES: usize = 128 * 1024 * 1024;
+
+        // Establish the context and flush any prior stragglers so the delta is
+        // attributable to this loop.
+        inner::ensure_context();
+        inner::drain_all_deferred_frees();
+        let (free_before, _total) = inner::query_vram();
+        for _ in 0..ITERS {
+            let ptr = inner::alloc_device(BUF_BYTES);
+            assert!(!ptr.is_null(), "alloc_device returned null");
+            inner::defer_free_device(ptr);
+        }
+        // Force every deferred free to complete, then measure.
+        inner::drain_all_deferred_frees();
+        let (free_after, _total) = inner::query_vram();
+
+        let dropped = free_before.saturating_sub(free_after);
+        assert!(
+            dropped < MAX_ALLOWED_DROP_BYTES,
+            "deferred alloc/free cycle leaked device memory: free VRAM dropped \
+             by {} bytes over {} iterations (before={}, after={})",
+            dropped, ITERS, free_before, free_after,
+        );
+    }
+
+    /// The deferred-free guards must tolerate null pointers, all-null batches,
+    /// and draining an empty queue without touching the driver or panicking.
+    #[test]
+    fn test_deferred_free_handles_null_and_empty() {
+        // Null single free is a no-op.
+        inner::defer_free_device(std::ptr::null_mut());
+        // An all-null batch enqueues nothing.
+        inner::defer_free_device_batch(&[std::ptr::null_mut(), std::ptr::null_mut()]);
+        // Draining an empty (or already-drained) queue must not sync or panic.
+        inner::drain_completed_frees();
+        inner::drain_all_deferred_frees();
+        // A batch that mixes null and live buffers frees only the live ones.
+        let a = inner::alloc_device(1024);
+        let b = inner::alloc_device(1024);
+        assert!(!a.is_null() && !b.is_null());
+        inner::defer_free_device_batch(&[a, std::ptr::null_mut(), b]);
+        inner::drain_all_deferred_frees();
     }
 
     #[test]
