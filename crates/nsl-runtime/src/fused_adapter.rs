@@ -300,7 +300,13 @@ fn try_cuda_launch_fused_lora(
         inner::free_managed(out_data);
         return None;
     }
-    let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    // p3: stream-ordered by default; the CPU-fallback fault trap stays under
+    // NSL_CUDA_SYNC=1. The error-path free below uses the caching allocator.
+    let sync_result = if inner::sync_mode_enabled() {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+    } else {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    };
     if sync_result as u32 != 0 {
         eprintln!(
             "[nsl-wrga] fused LoRA kernel caused GPU error ({:?}) — falling back to CPU math",
@@ -407,9 +413,7 @@ fn try_cuda_launch_fused_ia3(
         let _ = kernel_handle;
         return None;
     }
-    unsafe {
-        cudarc::driver::sys::cuCtxSynchronize();
-    }
+    inner::sync_after_kernel(); // p3: stream-ordered by default
     record_fused_gpu_launch();
     Some(out_ptr as i64)
 }
@@ -712,7 +716,12 @@ fn try_cuda_launch_fused_gatedlora(
         inner::free_managed(out_data);
         return None;
     }
-    let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    // p3: stream-ordered by default; CPU-fallback fault trap under NSL_CUDA_SYNC=1.
+    let sync_result = if inner::sync_mode_enabled() {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+    } else {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    };
     if sync_result as u32 != 0 {
         eprintln!(
             "[nsl-wrga] fused GatedLoRA kernel caused GPU error ({:?}) - falling back to CPU math",
