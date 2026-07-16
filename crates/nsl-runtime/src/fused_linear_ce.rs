@@ -232,11 +232,10 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
             );
             return -(rc as i64);
         }
-        // Synchronise so the test can read results immediately.
+        // p3: stream-ordered by default. Tests read results via memcpy_dtoh
+        // (a NULL-stream barrier that self-synchronizes), so no eager sync here.
         #[cfg(feature = "cuda")]
-        unsafe {
-            cudarc::driver::sys::cuCtxSynchronize();
-        }
+        crate::cuda::inner::sync_after_kernel();
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -337,7 +336,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
             eprintln!("nsl_fused_linear_ce_forward_large: CUDA launch failed rc={rc}");
             return -(rc as i64);
         }
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -440,9 +439,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
             return -(rc as i64);
         }
         #[cfg(feature = "cuda")]
-        unsafe {
-            cudarc::driver::sys::cuCtxSynchronize();
-        }
+        crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         0
     }
     #[cfg(not(feature = "cuda"))]

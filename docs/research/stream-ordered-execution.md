@@ -93,12 +93,48 @@ SpMM/SpMV family — from `cuCtxSynchronize()` to `inner::sync_after_kernel()`.
   (3.24×)** end-to-end (including the fixed NSL-program compile); the training
   loop itself speeds up more.
 
-## 5. Follow-up
+## 5. Flash-attention + fused-kernel sites (done, follow-up PR)
 
-- Convert the flash-attention and fused-CE/adapter (R) sites, folding their
-  GPU-error → CPU-fallback trap into the `NSL_CUDA_SYNC` path so the default
-  stays async.
-- Make the raw-`cuMemFree` free-safety sites stream-ordered (event-based deferred
-  free) so their guarding syncs can go too — the "stream-ordered allocator" half
-  of p3's title. This also composes with p8 (CUDA graphs), which need stable
-  device pointers and no per-op host syncs across the captured region.
+The 14 remaining (R) syncs in the op files are now gated too:
+
+- **Simple tails** (flash FA3-Hopper, SDPA-backward entry+tail, `fused_kl_ce`
+  fwd/bwd, `fused_linear_ce` fwd/large/bwd, `fused_adapter` IA³, CSR-SpMM) →
+  `sync_after_kernel()`. The SDPA-backward-entry sync only preceded
+  `NslTensor::from_ptr`, which reads the host-side struct (the `.data` address),
+  never device memory — so it was pure defensiveness.
+- **Fault-trap sites** (flash SDPA fwd `nsl_sdpa_fused_forward`, backward
+  `flash_attention_backward_gpu`, `fused_adapter` LoRA + GatedLoRA) capture the
+  sync result to drive a GPU-error → CPU-fallback. Gated as
+  `let rc = if sync_mode_enabled() { cuCtxSynchronize() } else { SUCCESS };` — the
+  trap stays under `NSL_CUDA_SYNC=1`; by default `rc` is `SUCCESS`, so the check
+  is a no-op and a real async fault surfaces later. Every free on these paths is
+  `free_managed` (caching allocator), which is stream-safe.
+
+**Conscious tradeoff (fault-trap sites).** Those four syncs previously caught an
+*asynchronous* GPU execution fault (illegal address mid-kernel) and routed to the
+graceful CPU fallback — the `#324` "never return silent zeros / corrupt
+gradients" guard. Gated off by default, a genuine async fault is no longer caught
+*here*; because a CUDA fault is sticky, it surfaces loudly at the next
+synchronous `memcpy_dtoh` as a panic rather than a clean CPU fallback. This is
+**not** a silent-wrong-results risk (the `#324` guarantee holds — it is a loud
+crash, never quiet corruption), and `NSL_CUDA_SYNC=1` fully restores the eager
+fallback. The accepted net effect: on a real kernel fault (a bug in an
+admission-guarded, validated kernel — rare) these four paths hard-crash instead
+of degrading to CPU, which also stops such a bug from being silently masked.
+
+Validated: the 797 `nsl-runtime` cuda unit tests (which directly exercise the
+flash/fused functions) pass, and the differential gate stays bit-exact at 96/96
+steps. The packed-GQA fixture's *default*-path speedup is unchanged (3.3×) — it
+is elementwise/matmul-bound, so the flash/CE syncs were a small part of its
+budget; the win is proportionally larger on attention-heavy / long-sequence
+models where the fused SDPA fwd/bwd dominate.
+
+## 6. Still remaining
+
+- The raw-`cuMemFree` free-safety syncs (flash `PrepassScratch::drop`,
+  `nsl_csha_free_backward_activations`, and the error-path free in
+  `flash_attention_backward_gpu`) are KEPT: they guard a physical device free, so
+  they need event-based deferred free (the "stream-ordered allocator" half of
+  p3's title) before their syncs can go. This also composes with p8 (CUDA
+  graphs), which need stable device pointers and no per-op host syncs across the
+  captured region.

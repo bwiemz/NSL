@@ -125,7 +125,7 @@ fn flash_attention_hopper(
         return -1;
     }
 
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
     0
 }
 
@@ -1013,7 +1013,14 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         // f16 staging output on every call; the staged segment ids on the
         // packed path) — and surface asynchronous execution faults while
         // at it.
-        let sync_rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+        // p3: stream-ordered by default. The sync only surfaces async faults;
+        // the scratch frees below go through the caching allocator (free_managed),
+        // which is stream-safe. Under NSL_CUDA_SYNC=1 the eager fault-check stays.
+        let sync_rc = if inner::sync_mode_enabled() {
+            unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+        } else {
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS
+        };
 
         if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
             || conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
@@ -5521,8 +5528,11 @@ fn flash_attention_backward_gpu(
         return 0;
     }
 
-    // Sync before reading tensor data pointers
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    // p3: stream-ordered by default. `from_ptr` reads only the host-side
+    // NslTensor struct (the .data device address), never device memory, so no
+    // sync is needed here; the backward kernels are NULL-stream-ordered after
+    // the forward that produced Q/K/V.
+    crate::cuda::inner::sync_after_kernel();
 
     let dout_t = NslTensor::from_ptr(dout_ptr);
     let q_t = NslTensor::from_ptr(q_ptr);
@@ -5858,7 +5868,14 @@ fn flash_attention_backward_gpu(
         // non-CUDA_SYNC_MODE config `kernel_launch` does not itself check). Route a
         // faulted sync through the same free-and-return-0 path so the caller falls
         // back to the correct CPU backward rather than returning corrupt gradients.
-        let sync_rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+        // p3: stream-ordered by default; frees below use the caching allocator
+        // (free_managed), which is stream-safe. The async-fault trap stays under
+        // NSL_CUDA_SYNC=1 (a faulted GPU kernel then falls back to CPU backward).
+        let sync_rc = if inner::sync_mode_enabled() {
+            unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+        } else {
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS
+        };
         if sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             eprintln!(
                 "[flash-bwd] backward kernels reported an ASYNCHRONOUS execution fault \
@@ -6240,7 +6257,7 @@ pub extern "C" fn nsl_flash_attention_backward(
         }
 
         if dout_t.device > 0 {
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         }
     }
 

@@ -94,9 +94,7 @@ pub extern "C" fn nsl_fused_kl_ce_forward(
             eprintln!("nsl_fused_kl_ce_forward: CUDA launch failed rc={rc}");
             return -(rc as i64);
         }
-        unsafe {
-            cudarc::driver::sys::cuCtxSynchronize();
-        }
+        crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -200,9 +198,7 @@ pub extern "C" fn nsl_fused_kl_ce_backward(
             eprintln!("nsl_fused_kl_ce_backward: CUDA launch failed rc={rc}");
             return -(rc as i64);
         }
-        unsafe {
-            cudarc::driver::sys::cuCtxSynchronize();
-        }
+        crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         0
     }
     #[cfg(not(feature = "cuda"))]

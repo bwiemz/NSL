@@ -876,7 +876,7 @@ pub extern "C" fn nsl_sparse_matmul(
                 [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
             );
             assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
 
             let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
             unsafe {
