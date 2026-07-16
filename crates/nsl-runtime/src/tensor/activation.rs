@@ -867,6 +867,102 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     result
 }
 
+/// Source-AD SiLU backward, fused (Milestone C · p4 slice 2):
+///   out = grad * silu'(x),  silu'(x) = σ(x) * (1 + x*(1 - σ(x))),  σ(x)=1/(1+e^-x)
+///
+/// One call replaces the six adjoint ops source-AD emits for `SiluBackward`
+/// (Sigmoid, Sub, Mul, Add, Mul, Mul) — see `AdjointExpr::SiluBackward`. It is
+/// BIT-EXACT with that decomposed path: the GPU kernel
+/// (`SILU_BACKWARD_SRCAD_F32_PTX`) reproduces the exact operation ORDER and the
+/// SIGMOID_F32_PTX instructions, with `.rn` on the derivative ops to block ptxas
+/// fma-contraction; the CPU path computes the same order in f64/f32 (Rust emits
+/// no FMA for separate `*`/`+`). `grad` and `x` are made contiguous first, as the
+/// decomposed path's per-op kernels do.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
+    let xt = unsafe { &*(x_ptr as *const NslTensor) };
+    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    // Elementwise backward: the incoming adjoint always shares the saved input's
+    // shape and placement. Assert both (parity with `gpu_backward_binary`'s
+    // length check; the CPU path is flat-indexed so a shorter grad would OOB).
+    assert_eq!(
+        gt.len, xt.len,
+        "silu_backward: grad len {} != x len {}",
+        gt.len, xt.len
+    );
+    debug_assert_eq!(
+        gt.device, xt.device,
+        "silu_backward: grad/x device mismatch ({} vs {})",
+        gt.device, xt.device
+    );
+    let x_dev = xt.device;
+    if x_dev > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            // Contiguous inputs (the decomposed Sigmoid/mul/etc kernels are
+            // flat-indexed too). `nsl_tensor_contiguous` always returns an owned
+            // ref, so both are freed unconditionally.
+            let grad_c = nsl_tensor_contiguous(grad_ptr);
+            let x_c = nsl_tensor_contiguous(x_ptr);
+            let out = crate::cuda::gpu_backward_binary(
+                grad_c,
+                x_c,
+                crate::cuda::kernels::SILU_BACKWARD_SRCAD_F32_PTX,
+                "nsl_silu_backward_srcad_f32\0",
+            );
+            nsl_tensor_free(grad_c);
+            nsl_tensor_free(x_c);
+            return out;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+    // CPU path: same order as the decomposed sigmoid + sub/mul/add/mul/mul,
+    // each a round-to-nearest op (no FMA), so byte-identical.
+    let grad_c = nsl_tensor_contiguous(grad_ptr);
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let g = NslTensor::from_ptr(grad_c);
+    let a = NslTensor::from_ptr(x_c);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            let av = unsafe { *a.data_f32().add(i) };
+            let gv = unsafe { *g.data_f32().add(i) };
+            let s = 1.0_f32 / (1.0_f32 + (-av).exp());
+            let t1 = 1.0_f32 - s;
+            let t2 = av * t1;
+            let t3 = 1.0_f32 + t2;
+            let t4 = s * t3;
+            unsafe { *buf.add(i) = gv * t4 };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            let av = unsafe { *a.data_f64().add(i) };
+            let gv = unsafe { *g.data_f64().add(i) };
+            let s = 1.0 / (1.0 + (-av).exp());
+            let t1 = 1.0 - s;
+            let t2 = av * t1;
+            let t3 = 1.0 + t2;
+            let t4 = s * t3;
+            unsafe { *buf.add(i) = gv * t4 };
+        }
+        buf as *mut c_void
+    };
+    let result = Box::new(NslTensor::new(
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(grad_c);
+    nsl_tensor_free(x_c);
+    result
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     {
@@ -1258,4 +1354,89 @@ pub extern "C" fn nsl_tensor_div_inplace_fbip(left_ptr: i64, right_ptr: i64) -> 
     }
     super::fbip_record_reuse();
     left_ptr
+}
+
+#[cfg(test)]
+mod silu_backward_tests {
+    use super::*;
+    use crate::tensor::NslTensor;
+    use std::sync::atomic::Ordering;
+
+    fn make_f32(data: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 1);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f32().add(i) = *v }; }
+        ptr
+    }
+    fn make_f64(data: &[f64]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f64().add(i) = *v }; }
+        ptr
+    }
+
+    /// The decomposed source-AD `SiluBackward`: Sigmoid, Sub, Mul, Add, Mul, Mul
+    /// (flags=0 everywhere so `grad` and `x` are preserved). Returns a new tensor.
+    /// This is exactly what `nsl_tensor_silu_backward` must reproduce bit-for-bit.
+    fn silu_bwd_6op(grad: i64, x: i64) -> i64 {
+        // s = sigmoid(x), without mutating x (bump so it can't take the FBIP path).
+        NslTensor::from_ptr(x).refcount.fetch_add(1, Ordering::SeqCst);
+        let s = nsl_tensor_sigmoid(x);
+        NslTensor::from_ptr(x).refcount.fetch_sub(1, Ordering::SeqCst);
+        // Same-dtype ones (nsl_tensor_ones_like returns f32 even for an f64
+        // input on CPU, which would force a dtype reconcile in the reference).
+        let xt = NslTensor::from_ptr(x);
+        let one = if xt.device == 0 && xt.dtype == 0 {
+            make_f64(&vec![1.0f64; xt.len as usize])
+        } else {
+            crate::tensor::nsl_tensor_ones_like(x)
+        };
+        let t1 = crate::tensor::nsl_tensor_sub(one, s, 0);    // 1 - s
+        let t2 = crate::tensor::nsl_tensor_mul(x, t1, 0);     // x * (1 - s)
+        let t3 = crate::tensor::nsl_tensor_add(one, t2, 0);   // 1 + t2
+        let t4 = crate::tensor::nsl_tensor_mul(s, t3, 0);     // s * t3
+        let out = crate::tensor::nsl_tensor_mul(grad, t4, 0); // grad * t4
+        for p in [s, one, t1, t2, t3, t4] { nsl_tensor_free(p); }
+        out
+    }
+
+    #[test]
+    fn silu_backward_cpu_f64_matches_6op() {
+        let xs = [-3.0, -0.5, 0.0, 0.5, 2.0, 7.0, -1.25, 12.0, -9.0];
+        let gs = [0.3, -1.1, 2.0, 0.75, -0.5, 1.0, 4.2, -0.01, 3.3];
+        let (xr, gr) = (make_f64(&xs), make_f64(&gs));
+        let ref_out = silu_bwd_6op(gr, xr);
+        let (xf, gf) = (make_f64(&xs), make_f64(&gs));
+        let fused = nsl_tensor_silu_backward(gf, xf);
+        let (ro, fo) = (NslTensor::from_ptr(ref_out), NslTensor::from_ptr(fused));
+        for i in 0..xs.len() {
+            let (r, f) = unsafe { (*ro.data_f64().add(i), *fo.data_f64().add(i)) };
+            assert_eq!(r.to_bits(), f.to_bits(), "cpu f64 mismatch at {i}: {r} vs {f}");
+        }
+        for p in [xr, gr, ref_out, xf, gf, fused] { nsl_tensor_free(p); }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn silu_backward_gpu_f32_matches_6op() {
+        let n = 257usize; // not a multiple of 256 — exercises the block tail guard
+        let xs: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 6.0).collect(); // ~[-6, 6.8]
+        let gs: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 2.0).collect();
+        let to_gpu = |d: &[f32]| crate::tensor::nsl_tensor_to_device(make_f32(d), 1);
+        let (xr, gr) = (to_gpu(&xs), to_gpu(&gs));
+        let ref_out = silu_bwd_6op(gr, xr);
+        let (xf, gf) = (to_gpu(&xs), to_gpu(&gs));
+        let fused = nsl_tensor_silu_backward(gf, xf);
+        // GPU f32 -> CPU f64 upcast is lossless, so equal upcast == equal f32 bits.
+        let up = |p: i64| -> Vec<f64> {
+            let c = crate::tensor::nsl_tensor_to_device(p, 0);
+            let t = NslTensor::from_ptr(c);
+            (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect()
+        };
+        let (r, f) = (up(ref_out), up(fused));
+        for i in 0..n {
+            assert_eq!(r[i].to_bits(), f[i].to_bits(), "gpu f32 mismatch at {i}: {} vs {}", r[i], f[i]);
+        }
+        for p in [xr, gr, ref_out, xf, gf, fused] { nsl_tensor_free(p); }
+    }
 }

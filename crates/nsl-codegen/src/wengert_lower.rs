@@ -3080,6 +3080,17 @@ fn lower_single_op(
                         &[inputs[0], inputs[1], inputs[2]],
                     )
                 }
+                "silu_backward" => {
+                    // inputs = [grad, x] — p4 slice 2 fused SiLU backward:
+                    // grad * σ(x)*(1 + x*(1-σ(x))), one launch, bit-exact with
+                    // the six-op source-AD expansion.
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_silu_backward",
+                        &[inputs[0], inputs[1]],
+                    )
+                }
                 "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
                     let rt_name = format!("nsl_tensor_{}", name);
                     call(compiler, builder, &rt_name, &inputs)

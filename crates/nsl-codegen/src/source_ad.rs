@@ -924,14 +924,14 @@ impl AdjointGenerator {
             }
 
             // --- SiLU backward: d/dx[x * σ(x)] = σ(x) * (1 + x * (1 - σ(x))) ---
+            // Fused (Milestone C · p4 slice 2): the six-op expansion below
+            // (Sigmoid, Sub, Mul, Add, Mul, Mul → six kernels + five
+            // intermediates) collapses to a single `nsl_tensor_silu_backward`
+            // launch. The runtime kernel reproduces this exact operation order,
+            // so it is BIT-EXACT with the decomposed path — see
+            // `nsl_tensor_silu_backward` / `SILU_BACKWARD_SRCAD_F32_PTX`.
             AdjointExpr::SiluBackward(y_bar, x) => {
-                let sig_x = self.emit_op(PrimalOp::Sigmoid, vec![x]);
-                let one = self.emit_constant(1.0);
-                let one_minus_sig = self.emit_op(PrimalOp::Sub, vec![one, sig_x]);
-                let x_term = self.emit_op(PrimalOp::Mul, vec![x, one_minus_sig]);
-                let one_plus_x_term = self.emit_op(PrimalOp::Add, vec![one, x_term]);
-                let silu_deriv = self.emit_op(PrimalOp::Mul, vec![sig_x, one_plus_x_term]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, silu_deriv])
+                self.emit_op(PrimalOp::Passthrough("silu_backward".into()), vec![y_bar, x])
             }
 
             // --- Abs backward: grad * sign(x) ---

@@ -2707,6 +2707,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // p4 slice 2: fused SiLU backward — grad * σ(x)*(1 + x*(1-σ(x))).
+    (
+        "nsl_tensor_silu_backward",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     (
         "nsl_tensor_logsoftmax",
         &[types::I64, types::I64],
