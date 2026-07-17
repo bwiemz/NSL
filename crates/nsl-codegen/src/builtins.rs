@@ -2734,6 +2734,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    // p9: fused per-param FASE-Deferred AdamW step — one launch for the whole
+    // m/v/θ update. (theta, m, v, m_partial, lr, β₁, 1-β₁, β₂, 1-β₂, ε, wd,
+    // bc1_inv, bc2_inv) → void.
+    (
+        "nsl_fase_fused_adamw_step",
+        &[
+            types::I64, types::I64, types::I64, types::I64,
+            types::F64, types::F64, types::F64, types::F64, types::F64,
+            types::F64, types::F64, types::F64, types::F64,
+        ],
+        None,
+    ),
     (
         "nsl_tensor_logsoftmax",
         &[types::I64, types::I64],
