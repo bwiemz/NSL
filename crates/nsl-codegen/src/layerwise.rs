@@ -13,9 +13,9 @@
 //!
 //! See `docs/research/CSLA-compiler-scheduled-layerwise-accumulation.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::wengert::{VarId, WengertList};
+use crate::wengert::{PrimalOp, VarId, WengertList};
 use crate::wggo_graph::layer_prefix;
 
 /// Why a parameter cannot be updated layer-locally.
@@ -212,6 +212,44 @@ pub fn analyze(
     }
 }
 
+/// CSLA Stage-2: the adjoint's imports from the primal tape — every VarId
+/// produced by a primal op and read by at least one adjoint op.
+///
+/// These are exactly the values the window-buffered schedule must carry from
+/// each micro-batch's forward to the deferred backward phase. `Param` and
+/// `Constant` leaves are excluded: their lowered values are loop-invariant
+/// (the same runtime parameter pointer / immediate every micro-batch — FASE
+/// Deferred only updates θ at window boundaries, after the buffered backward
+/// has consumed the window), so the backward loop reuses the current
+/// iteration's SSA values for them. `Input` leaves (the batch dict and
+/// anything else fed per step) ARE included — they change every micro-batch.
+///
+/// Must be computed on the FINAL adjoint (post `eliminate_dead_gradients`,
+/// post CCR `apply_to_adjoint`/`splice_decompress`/`insert_adjoint_last_use_
+/// frees`) so recompute-victim reads — remapped to adjoint-local clones — are
+/// correctly absent, and only true boundary/saved values are buffered.
+///
+/// Sorted by VarId so buffer slot indices are deterministic across builds.
+pub fn adjoint_primal_imports(primal: &WengertList, adjoint: &WengertList) -> Vec<VarId> {
+    let mut loop_invariant: HashSet<VarId> = HashSet::new();
+    let mut primal_results: HashSet<VarId> = HashSet::new();
+    for op in &primal.ops {
+        primal_results.insert(op.result);
+        if matches!(op.op, PrimalOp::Param(_) | PrimalOp::Constant(_)) {
+            loop_invariant.insert(op.result);
+        }
+    }
+    let import_set: HashSet<VarId> = adjoint
+        .ops
+        .iter()
+        .flat_map(|op| op.inputs.iter().copied())
+        .filter(|v| primal_results.contains(v) && !loop_invariant.contains(v))
+        .collect();
+    let mut imports: Vec<VarId> = import_set.into_iter().collect();
+    imports.sort_unstable();
+    imports
+}
+
 impl LayerwisePlan {
     /// A human-readable schedule + projection for `nsl check --training-report`.
     pub fn render_report(&self, indent: &str) -> String {
@@ -388,5 +426,56 @@ mod tests {
         assert!(plan.layers.is_empty());
         assert!(plan.global_params.is_empty());
         assert_eq!(plan.projection.reduction_factor, 1.0);
+    }
+
+    fn primal_op(id: u32, result: VarId, op: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
+        WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        }
+    }
+
+    #[test]
+    fn imports_are_adjoint_read_primal_values_minus_invariant_leaves() {
+        // Primal: param(1), constant(2), input(3), act = input @ param (4),
+        // loss = act + constant (5).
+        let primal = adjoint(vec![
+            primal_op(0, 1, PrimalOp::Param("m.w".into()), vec![]),
+            primal_op(1, 2, PrimalOp::Constant(1.0), vec![]),
+            primal_op(2, 3, PrimalOp::Input("batch".into()), vec![]),
+            primal_op(3, 4, PrimalOp::Matmul, vec![3, 1]),
+            primal_op(4, 5, PrimalOp::Add, vec![4, 2]),
+        ]);
+        // Adjoint reads: loss(5) for the seed, act(4) and param(1) for the
+        // matmul backward, input(3) for the param-grad side, constant(2) for
+        // the add backward, plus an adjoint-internal value (100).
+        let adj = adjoint(vec![
+            primal_op(0, 100, PrimalOp::Add, vec![5]),
+            primal_op(1, 101, PrimalOp::Matmul, vec![100, 1, 4]),
+            primal_op(2, 102, PrimalOp::Matmul, vec![100, 3, 2]),
+            primal_op(3, 103, PrimalOp::Add, vec![101, 102]),
+        ]);
+        let imports = adjoint_primal_imports(&primal, &adj);
+        // Param(1) and Constant(2) excluded (loop-invariant); adjoint-internal
+        // 100/101/102 excluded (not primal results). Input(3), act(4), and
+        // loss(5) are the window-buffered set.
+        assert_eq!(imports, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn imports_are_deterministically_sorted_and_deduped() {
+        let primal = adjoint(vec![
+            primal_op(0, 9, PrimalOp::Input("b".into()), vec![]),
+            primal_op(1, 4, PrimalOp::Relu, vec![9]),
+        ]);
+        let adj = adjoint(vec![
+            primal_op(0, 200, PrimalOp::Relu, vec![9, 4]),
+            primal_op(1, 201, PrimalOp::Relu, vec![4, 9]),
+        ]);
+        assert_eq!(adjoint_primal_imports(&primal, &adj), vec![4, 9]);
     }
 }

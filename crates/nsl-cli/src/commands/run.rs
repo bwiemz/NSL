@@ -59,6 +59,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             checkpoint_selective,
             checkpoint_budget_mib,
             checkpoint_compress,
+            layerwise_accum,
             weights,
     } = args;
 
@@ -378,6 +379,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 checkpoint_selective,
                 checkpoint_budget_mib,
                 checkpoint_compress,
+                layerwise_accum,
                 debug_training,
                 shared_lib: false,
                 emit_export_table: false,
