@@ -161,7 +161,7 @@ fn deferred_free_matches_eager_bit_exact() {
         "expected 4 AFTER_ sums, got {n}:\neager=\n{eager_sums}"
     );
     assert!(
-        eager_sums.contains("wv=") && !eager_sums.contains("wv=1024.0\n"),
+        eager_sums.contains("wv=") && !eager_sums.contains("wv=1024\n"),
         "expected wv to move from its 1024.0 init (a real gradient step):\n{eager_sums}"
     );
 

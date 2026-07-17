@@ -59,7 +59,8 @@ pub(crate) mod inner {
 
     /// Milestone C·p3: post-kernel synchronization policy.
     ///
-    /// Every kernel launches on the NULL stream (self-ordering), and every host
+    /// Every kernel launches on one per-thread compute stream (self-ordering;
+    /// p8 PR-A — NULL under NSL_LEGACY_NULL_STREAM=1), and every host
     /// read goes through the *synchronous* `cuMemcpyDtoH_v2` — itself a
     /// NULL-stream barrier. So a `cuCtxSynchronize` after a pure-GPU kernel is
     /// redundant for correctness: it only forces the CPU to block until the GPU
@@ -1013,8 +1014,9 @@ pub(crate) mod inner {
     // ------------------------------------------------------------------
     // Per-thread transfer stream — optimizer-state offload (P0.2)
     //
-    // Kernel launches go to the legacy NULL stream (see `current_stream`),
-    // so a NON_BLOCKING side stream lets the offload copy-back overlap
+    // Kernel launches go to the per-thread compute stream (see
+    // `current_stream`; legacy NULL under the kill-switch), so a
+    // NON_BLOCKING side stream lets the offload copy-back overlap
     // with the next parameter's update kernels: NULL-stream work never
     // waits on the transfer stream. Correctness ordering (the copy must
     // not start before the update kernels that produced its source have
@@ -1060,16 +1062,22 @@ pub(crate) mod inner {
         })
     }
 
-    /// Make the calling thread's transfer stream wait for all work
-    /// previously launched on the legacy NULL stream (record + wait via a
-    /// throwaway event; `cuEventDestroy` defers actual destruction until
-    /// the wait completes, so destroying immediately is safe).
+    /// Make the calling thread's transfer stream wait for all previously
+    /// launched compute work (record + wait via a throwaway event;
+    /// `cuEventDestroy` defers actual destruction until the wait completes,
+    /// so destroying immediately is safe).
+    ///
+    /// p8 PR-A: the event is recorded on `current_stream()` — the compute
+    /// stream that now carries every kernel (or the NULL stream under the
+    /// legacy kill-switch). Blocking-stream semantics mean work recorded
+    /// there is also ordered after any interleaved NULL-stream memcpys, so
+    /// this wait covers everything the old NULL-stream record covered.
     unsafe fn transfer_stream_wait_null_stream(stream: CUstream) {
         let mut ev: CUevent = std::ptr::null_mut();
         // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest event flavor).
         let r = cuEventCreate(&mut ev, 0x2);
         assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (offload) failed: {:?}", r);
-        let r = cuEventRecord(ev, std::ptr::null_mut());
+        let r = cuEventRecord(ev, current_stream());
         assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (offload) failed: {:?}", r);
         let r = cuStreamWaitEvent(stream, ev, 0);
         assert_eq!(r, CUresult::CUDA_SUCCESS, "cuStreamWaitEvent (offload) failed: {:?}", r);
@@ -1210,16 +1218,81 @@ pub(crate) mod inner {
         cuEventRecord(event as CUevent, stream as CUstream);
     }
 
-    /// Returns the CUstream that `kernel_launch` issues work onto. `kernel_launch`
-    /// currently passes `std::ptr::null_mut()` (the NULL/default stream) to
-    /// `cuLaunchKernel`, so events recorded on this stream correctly serialize
-    /// with kernel execution rather than capturing host-submit latency.
+    // ------------------------------------------------------------------
+    // Per-thread COMPUTE stream — p8 PR-A stream migration
+    //
+    // All kernel launches (and cuBLAS, via a per-call cublasSetStream_v2)
+    // now issue onto a dedicated per-thread stream created with
+    // CU_STREAM_DEFAULT (flags=0, a BLOCKING stream). Blocking-stream
+    // semantics make this migration ordering-neutral: the legacy NULL
+    // stream is an implicit two-way barrier against every blocking
+    // stream, so the runtime's synchronous memcpys (HtoD uploads, the
+    // sync-DtoH-as-barrier policy at the top of this file) and any
+    // remaining NULL-stream work interleave with compute work in exactly
+    // the same total order as before. What changes: the compute stream
+    // is a REAL stream, which CUDA graph capture (p8 PR-B) can capture —
+    // the legacy NULL stream cannot be captured at all.
+    //
+    // Kill-switch: NSL_LEGACY_NULL_STREAM=1 restores the old NULL-stream
+    // launches (read once, cached). The differential gates prove the two
+    // modes bit-identical.
+    // ------------------------------------------------------------------
+
+    thread_local! {
+        // CUstream stored as usize (raw handles are !Send; 0 = not created).
+        static COMPUTE_STREAM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    static LEGACY_NULL_STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    /// Returns the CUstream that `kernel_launch` issues work onto: the
+    /// per-thread blocking compute stream (lazily created), or the legacy
+    /// NULL stream under `NSL_LEGACY_NULL_STREAM=1`. Events recorded on this
+    /// stream correctly serialize with kernel execution rather than capturing
+    /// host-submit latency.
     ///
-    /// Exposed for the Phase 2 kernel-timing profiler (see
+    /// Also used by the Phase 2 kernel-timing profiler (see
     /// `crate::profiler::cuda_clock::CudaEventClock`) so that begin/end event
-    /// recording uses the *same* stream as the launch.
+    /// recording uses the *same* stream as the launch, and by the deferred-free
+    /// machinery for its completion events.
+    ///
+    /// Only call when CUDA work is (about to be) in flight — creating the
+    /// stream force-initializes the context via `ensure_context`.
+    ///
+    /// SAME-THREAD CONTRACT (p8 PR-A): the compute stream is per-thread and
+    /// two blocking streams do NOT synchronize with each other (only with the
+    /// legacy NULL stream). Every consumer that records ordering events
+    /// against "the work that touched this buffer" (`defer_free_device*`, the
+    /// offload transfer-stream wait) must run on the SAME thread that
+    /// launched that work. All in-tree launches are single-threaded today; a
+    /// future multi-threaded dispatcher must add cross-stream events.
     pub fn current_stream() -> CUstream {
-        std::ptr::null_mut()
+        if *LEGACY_NULL_STREAM
+            .get_or_init(|| std::env::var("NSL_LEGACY_NULL_STREAM").ok().as_deref() == Some("1"))
+        {
+            return std::ptr::null_mut();
+        }
+        COMPUTE_STREAM.with(|s| {
+            let cur = s.get();
+            if cur != 0 {
+                return cur as CUstream;
+            }
+            ensure_context();
+            let mut stream: CUstream = std::ptr::null_mut();
+            unsafe {
+                // 0 = CU_STREAM_DEFAULT: a BLOCKING stream — implicit two-way
+                // synchronization with the legacy NULL stream (load-bearing;
+                // see the module comment above).
+                let result = cuStreamCreate(&mut stream, 0);
+                assert_eq!(
+                    result,
+                    CUresult::CUDA_SUCCESS,
+                    "cuStreamCreate (compute stream) failed: {:?}",
+                    result
+                );
+            }
+            s.set(stream as usize);
+            stream
+        })
     }
 
     pub unsafe fn cu_event_synchronize_raw(event: u64) -> CUresult {
@@ -1333,7 +1406,7 @@ pub(crate) mod inner {
 
         // Record start event before launch
         if let Some((start, _, _)) = &profiler_events {
-            unsafe { cuEventRecord(*start as CUevent, std::ptr::null_mut()); }
+            unsafe { cuEventRecord(*start as CUevent, current_stream()); }
         }
 
         // Dynamic SMEM opt-in for kernels using `.extern .shared` PTX declarations.
@@ -1406,14 +1479,16 @@ pub(crate) mod inner {
             "kernel_launch: block size {} exceeds max 1024 threads",
             block[0] * block[1] * block[2]);
 
-        // Launch kernel (no lock held)
+        // Launch kernel (no lock held) — on the per-thread compute stream
+        // (p8 PR-A; ordering-neutral vs the old NULL-stream launch, see
+        // `current_stream`).
         let mut kernel_args: Vec<*mut c_void> = args.to_vec();
         let res = unsafe {
             cuLaunchKernel(
                 func,
                 grid[0] as u32, grid[1] as u32, grid[2] as u32,
                 block[0] as u32, block[1] as u32, block[2] as u32,
-                shared_mem_bytes, std::ptr::null_mut(),
+                shared_mem_bytes, current_stream(),
                 kernel_args.as_mut_ptr(), std::ptr::null_mut(),
             )
         };
@@ -1433,7 +1508,7 @@ pub(crate) mod inner {
 
         // Record stop event after launch
         if let Some((_, stop, _)) = &profiler_events {
-            unsafe { cuEventRecord(*stop as CUevent, std::ptr::null_mut()); }
+            unsafe { cuEventRecord(*stop as CUevent, current_stream()); }
             // Push trace (lock-push-unlock on profiler mutex)
             let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
             let name_str = name.to_str().unwrap_or("unknown");
@@ -1564,7 +1639,7 @@ pub(crate) mod inner {
                 func as CUfunction,
                 grid[0], grid[1], grid[2],
                 block[0], block[1], block[2],
-                smem_dyn_bytes, std::ptr::null_mut(),
+                smem_dyn_bytes, current_stream(),
                 kernel_args.as_mut_ptr(), std::ptr::null_mut(),
             )
         };
@@ -1582,7 +1657,7 @@ pub(crate) mod inner {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use inner::{cu_event_create, cu_event_record, cu_event_elapsed_time, cu_event_destroy, cu_ctx_synchronize};
+pub(crate) use inner::{cu_event_create, cu_event_elapsed_time, cu_event_destroy, cu_ctx_synchronize};
 
 #[cfg(feature = "cuda")]
 pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
@@ -1728,6 +1803,26 @@ pub(crate) mod cublas_inner {
             "sgemm dims must fit in i32"
         );
         let handle = cublas_handle();
+        // p8 PR-A: bind the gemm to the per-thread compute stream so cuBLAS
+        // kernels ride the same stream as every other kernel (ordering-neutral
+        // vs the old NULL-stream default thanks to blocking-stream semantics;
+        // required for future graph capture). Set per call — the handle is
+        // process-global while the stream is per-thread, and cublasSetStream_v2
+        // is a cheap handle-field write.
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                // Ordering stays correct on failure (the handle falls back to
+                // its previous stream, still barrier-ordered) but graph
+                // capture (PR-B) would silently miss the gemm — log loudly.
+                eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — gemm stays on its previous stream", r);
+            }
+        }
         // Safe API takes alpha/beta by value via *const pointers. Under
         // CUBLAS_POINTER_MODE_HOST (default) cuBLAS reads these synchronously
         // before the FFI returns, but we pin them as locals here since
@@ -2412,7 +2507,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             unsafe {
                 cudarc::driver::sys::cuEventRecord(
                     *start as cudarc::driver::sys::CUevent,
-                    std::ptr::null_mut(),
+                    inner::current_stream(),
                 );
             }
         }
@@ -2451,7 +2546,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             unsafe {
                 cudarc::driver::sys::cuEventRecord(
                     *stop as cudarc::driver::sys::CUevent,
-                    std::ptr::null_mut(),
+                    inner::current_stream(),
                 );
             }
             // Name picked to satisfy spec §3's `contains("sgemm") || contains("gemm_")`
