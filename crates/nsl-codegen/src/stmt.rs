@@ -4056,6 +4056,14 @@ impl Compiler<'_> {
                      the layerwise gate is bit-exact and compressed saves are not",
                 ));
             }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--layerwise-accum is incompatible with --zero-stage: the M43 \
+                     ZeRO hooks read every accum slot after the backward, but the \
+                     layerwise schedule's per-layer accumulators are freed before \
+                     the optimizer gate. Drop one",
+                ));
+            }
         }
 
         // ── 3. Resolve model type and build param list ──────────────────
@@ -4570,7 +4578,18 @@ impl Compiler<'_> {
             // is ALWAYS f32 (exact-windowed semantics — the reduced-precision
             // moment path never touches it), so f32 host regardless of the
             // CPDT precision plan.
-            let zeros = if self.compile_options.optim_state_offload {
+            //
+            // CSLA (D1b): the whole point — do NOT allocate the full-model
+            // window here. Slots start NULL; the window backward allocates
+            // each layer's accumulators just before that layer's replay and
+            // frees them right after its per-layer update, so the live
+            // accumulator surface is max(one layer) + the epilogue globals
+            // instead of 4·P bytes. (All accumulation happens inside the
+            // window region under csla — the per-micro-batch ga_body loop is
+            // hook-skipped — so a NULL slot is never read between windows.)
+            let zeros = if csla_active {
+                builder.ins().iconst(cl_types::I64, 0)
+            } else if self.compile_options.optim_state_offload {
                 self.compile_call_by_name(builder, "nsl_tensor_zeros_like_host_f32", &[p])?
             } else {
                 self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?
@@ -4590,6 +4609,22 @@ impl Compiler<'_> {
         } else {
             None
         };
+
+        // ── 5b2. CSLA (D1b): one-time pointer-tie guard ─────────────────
+        // Pointer-tied weights (two fields aliasing one storage) are
+        // invisible to the compile-time layerwise analysis; a per-layer
+        // in-place θ update through one alias would corrupt the other
+        // alias's pending backward. The runtime scan aborts loudly on the
+        // first aliased pair (tensor-pointer or data-pointer identity).
+        // Param pointers are stable for the whole run (updates are
+        // in-place), so once at setup suffices.
+        if csla_active {
+            self.compile_call_by_name(
+                builder,
+                "nsl_csla_assert_params_unaliased",
+                &[param_list],
+            )?;
+        }
 
         // ── 5c. CSLA Stage-2: window buffer lists ───────────────────────
         // One inner NslList per buffered micro-batch (holding the adjoint's
@@ -4795,6 +4830,22 @@ impl Compiler<'_> {
             /// f64 scalar, stored via a same-width bitcast; never freed.
             F64Bits,
         }
+        /// One trainable tensor parameter's compile-time facts for the
+        /// layer-major update schedule (D1b).
+        struct CslaParam {
+            name: String,
+            /// Primal leaf VarId (for the view-of-θ hazard check).
+            primal_vid: crate::wengert::VarId,
+            /// Adjoint (gradient) VarId, when the param is read in the
+            /// backward; `None` = dead/frozen — no gradient ever
+            /// accumulates, but the update still fires (weight decay +
+            /// moment decay mutate θ on zero gradients, exactly like the
+            /// baseline's unconditional 0..num_params update loop).
+            adj_vid: Option<crate::wengert::VarId>,
+            /// param_paths index — the universal join key for
+            /// param_list/state lists/accum_list.
+            accum_idx: i64,
+        }
         /// Compile-time context carried from the save phase (inside the
         /// source-AD arm) to the window-backward emission site just before
         /// the optimizer gate.
@@ -4812,6 +4863,18 @@ impl Compiler<'_> {
             /// on_step/on_epoch after the backward phase; it is freed by the
             /// conditional at the per-iteration loss-free site instead).
             loss_slot: Option<usize>,
+            /// D1b: the layerwise schedule (computed on the FINAL adjoint,
+            /// so its indices match the replay slices exactly) and the
+            /// per-param update facts.
+            plan: crate::layerwise::LayerwisePlan,
+            params: Vec<CslaParam>,
+            /// PRIMAL-side zero-copy views of trainable params (transpose /
+            /// reshape chains rooted at a param leaf): view result vid →
+            /// param leaf vid. These ride the window buffer as slots but
+            /// ALIAS θ's storage — a read after θ's per-layer update would
+            /// see half-updated weights (review D1b-2).
+            primal_view_of:
+                std::collections::HashMap<crate::wengert::VarId, crate::wengert::VarId>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -6469,6 +6532,63 @@ impl Compiler<'_> {
                             .iter()
                             .map(|(vid, e)| (*vid, e.accum_idx))
                             .collect();
+                    // D1b: the layerwise schedule over the FINAL adjoint (its
+                    // op indices are exactly the replay slice indices) + the
+                    // per-param update facts. `params` covers every trainable
+                    // tensor param the extractor saw that has an accum slot;
+                    // param_paths slots NOT covered (unused-in-forward params)
+                    // fall into the epilogue update group at the window site.
+                    let csla_trainable: Vec<(String, crate::wengert::VarId)> = extractor
+                        .named_param_var_ids()
+                        .iter()
+                        .filter(|(name, _)| self.is_trainable_param_name(name))
+                        .map(|(n, v)| (n.clone(), *v))
+                        .collect();
+                    let plan =
+                        crate::layerwise::analyze(&adjoint, &csla_trainable, &|_| None);
+                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
+                        param_paths
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| (p.as_str(), i as i64))
+                            .collect();
+                    let csla_params: Vec<CslaParam> = csla_trainable
+                        .iter()
+                        .filter_map(|(name, primal_vid)| {
+                            let &accum_idx = param_name_to_accum_idx.get(name.as_str())?;
+                            Some(CslaParam {
+                                name: name.clone(),
+                                primal_vid: *primal_vid,
+                                adj_vid: gen.adjoint_of(*primal_vid),
+                                accum_idx,
+                            })
+                        })
+                        .collect();
+                    // PRIMAL-side view chains rooted at trainable params
+                    // (tied-head `embed.transpose(0,1)` etc.) — buffered as
+                    // slots but aliasing θ; the window site checks their
+                    // reads against each param's update range.
+                    let trainable_vid_set: std::collections::HashSet<crate::wengert::VarId> =
+                        csla_trainable.iter().map(|(_, v)| *v).collect();
+                    let mut primal_view_of: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::VarId,
+                    > = std::collections::HashMap::new();
+                    for op in &effective_primal.ops {
+                        if matches!(
+                            op.op,
+                            crate::wengert::PrimalOp::Transpose { .. }
+                                | crate::wengert::PrimalOp::Reshape { .. }
+                        ) {
+                            for &input in &op.inputs {
+                                if trainable_vid_set.contains(&input) {
+                                    primal_view_of.insert(op.result, input);
+                                } else if let Some(&p) = primal_view_of.get(&input) {
+                                    primal_view_of.insert(op.result, p);
+                                }
+                            }
+                        }
+                    }
                     csla_loss_buffered = loss_slot.is_some();
                     csla_teardown_slots = Some(
                         slots
@@ -6493,6 +6613,9 @@ impl Compiler<'_> {
                         hook_accum_idx,
                         accum_scale: fase_plan.recipe.accum_scale,
                         loss_slot,
+                        plan,
+                        params: csla_params,
+                        primal_view_of,
                     });
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
@@ -7328,6 +7451,378 @@ impl Compiler<'_> {
             let accum_val = accum_list
                 .ok_or_else(|| CodegenError::new("csla requires accum_list"))?;
 
+            // ── D1b compile-time schedule derivation ────────────────────
+            // Positional partition of the FINAL adjoint into replay ranges
+            // (prologue, one per layer in backward order; the last range
+            // swallows the embedding-backward epilogue ops).
+            let adjoint_len = pending.adjoint.ops.len();
+            let mut ranges = crate::layerwise::partition_ranges(&pending.plan, adjoint_len);
+            if ranges.is_empty() {
+                // Degenerate (empty adjoint): one empty prologue so the
+                // update groups still fire.
+                ranges.push(crate::layerwise::ReplayRange {
+                    start: 0,
+                    end: adjoint_len,
+                    layer: None,
+                });
+            }
+            let n_ranges = ranges.len();
+            let last_ri = n_ranges - 1;
+
+            // Adjoint op position by result vid — for grad-op containment
+            // and the carry analysis.
+            let adj_pos: std::collections::HashMap<crate::wengert::VarId, usize> = pending
+                .adjoint
+                .ops
+                .iter()
+                .enumerate()
+                .map(|(i, op)| (op.result, i))
+                .collect();
+
+            // Update groups. A layer's param updates right after its range's
+            // replay iff its gradient op sits positionally INSIDE that range
+            // (positional attribution slop demotes it to the epilogue group
+            // — always correct, merely later; its window-lived accumulator
+            // then covers a grad op in ANY range). Dead params (no adjoint)
+            // update with their layer on a zero accumulator — weight decay
+            // and moment decay still mutate θ, exactly like the baseline's
+            // unconditional 0..num_params loop. Every param_paths slot lands
+            // in exactly one group.
+            let mut layer_group: Vec<Vec<i64>> = vec![Vec::new(); n_ranges];
+            let mut grouped: std::collections::HashSet<i64> = Default::default();
+            {
+                let param_by_name: std::collections::HashMap<&str, &CslaParam> =
+                    pending.params.iter().map(|p| (p.name.as_str(), p)).collect();
+                for (ri, range) in ranges.iter().enumerate() {
+                    let Some(li) = range.layer else { continue };
+                    for pinfo in &pending.plan.layers[li].params {
+                        let Some(cp) = param_by_name.get(pinfo.name.as_str()) else {
+                            continue;
+                        };
+                        let in_range = match cp.adj_vid.and_then(|a| adj_pos.get(&a)) {
+                            Some(&pos) => pos >= range.start && pos < range.end,
+                            None => true,
+                        };
+                        if in_range && grouped.insert(cp.accum_idx) {
+                            layer_group[ri].push(cp.accum_idx);
+                        }
+                    }
+                    layer_group[ri].sort_unstable();
+                }
+            }
+            let global_group: Vec<i64> = (0..param_paths.len() as i64)
+                .filter(|i| !grouped.contains(i))
+                .collect();
+            // Compile-time schedule line — the gates' anti-vacuity anchor
+            // for the LAYER-MAJOR shape itself (the runtime window counter
+            // can't distinguish a degenerate all-epilogue schedule from the
+            // real k-range one).
+            eprintln!(
+                "[csla] layer-major schedule: {} ranges, {} layer-grouped params, \
+                 {} epilogue params",
+                n_ranges,
+                grouped.len(),
+                global_group.len(),
+            );
+
+            // Carry analysis: adjoint values produced in one range and read
+            // in a later one (the boundary adjoints d(residual-after-L) plus
+            // any straggler temporaries). Slot order sorted-by-vid.
+            let mut produced_range: std::collections::HashMap<crate::wengert::VarId, usize> =
+                std::collections::HashMap::new();
+            for (ri, r) in ranges.iter().enumerate() {
+                for op in &pending.adjoint.ops[r.start..r.end] {
+                    produced_range.insert(op.result, ri);
+                }
+            }
+            let mut carry_set: std::collections::BTreeSet<crate::wengert::VarId> =
+                Default::default();
+            let mut carry_last_read: std::collections::HashMap<crate::wengert::VarId, usize> =
+                std::collections::HashMap::new();
+            let mut carry_freed_by_marker: std::collections::HashSet<crate::wengert::VarId> =
+                Default::default();
+            for (ri, r) in ranges.iter().enumerate() {
+                for op in &pending.adjoint.ops[r.start..r.end] {
+                    for &input in &op.inputs {
+                        let Some(&pr) = produced_range.get(&input) else {
+                            continue;
+                        };
+                        if pr < ri {
+                            carry_set.insert(input);
+                            let e = carry_last_read.entry(input).or_insert(ri);
+                            if *e < ri {
+                                *e = ri;
+                            }
+                            if matches!(op.op, crate::wengert::PrimalOp::FreeTensor) {
+                                carry_freed_by_marker.insert(input);
+                            }
+                        }
+                    }
+                }
+            }
+            let carry_vids: Vec<crate::wengert::VarId> = carry_set.into_iter().collect();
+            let carry_slot: std::collections::HashMap<crate::wengert::VarId, usize> =
+                carry_vids.iter().enumerate().map(|(i, v)| (*v, i)).collect();
+            let n_carry = carry_vids.len();
+            let mut exports_per_range: Vec<Vec<crate::wengert::VarId>> =
+                vec![Vec::new(); n_ranges];
+            for &v in &carry_vids {
+                exports_per_range[produced_range[&v]].push(v);
+            }
+            let mut imports_per_range: Vec<Vec<crate::wengert::VarId>> =
+                vec![Vec::new(); n_ranges];
+            for (ri, r) in ranges.iter().enumerate() {
+                let mut seen = std::collections::HashSet::new();
+                for op in &pending.adjoint.ops[r.start..r.end] {
+                    for &input in &op.inputs {
+                        if carry_slot.contains_key(&input)
+                            && produced_range[&input] < ri
+                            && seen.insert(input)
+                        {
+                            imports_per_range[ri].push(input);
+                        }
+                    }
+                }
+                imports_per_range[ri].sort_unstable();
+            }
+            // Fixpoint-extended last-use POSITIONS (review D1b-3): frees must
+            // key off list-membership-extended last use — a slot or carry
+            // consumed by a list-building op in range R whose LIST is read in
+            // range S>R must survive to S (lists hold raw, un-refcounted
+            // element pointers; freeing at the direct read would dangle
+            // them). Seeding stays direct-read-based (only actual op inputs
+            // need values).
+            let extended_last_pos: std::collections::HashMap<crate::wengert::VarId, usize> = {
+                let mut lu: std::collections::HashMap<crate::wengert::VarId, usize> =
+                    std::collections::HashMap::new();
+                for (idx, op) in pending.adjoint.ops.iter().enumerate() {
+                    for &input in &op.inputs {
+                        lu.insert(input, idx);
+                    }
+                }
+                crate::ccr::extend_last_use_through_lists(&pending.adjoint, &mut lu);
+                lu
+            };
+            let range_of_pos = |pos: usize| -> usize {
+                ranges
+                    .iter()
+                    .position(|r| pos >= r.start && pos < r.end)
+                    .unwrap_or(last_ri)
+            };
+
+            // Carried Tensor-typed values with NO FreeTensor consumer get an
+            // explicit free after their (fixpoint-extended) last consuming
+            // range's replay — the belt for values the last-use-frees pass
+            // protected or never saw. Skips at emission time (below) also
+            // exclude hook-freed raw grads (review D1b-1: a range boundary
+            // landing ON a reduce_to_shape grad op makes its raw-grad input a
+            // carry that the hook's extra free already releases — freeing it
+            // again here would be a double free). List-typed carries are
+            // never freed (matching free_eligible's List exclusion).
+            let mut carry_explicit_free: Vec<Vec<crate::wengert::VarId>> =
+                vec![Vec::new(); n_ranges];
+            for &v in &carry_vids {
+                if carry_freed_by_marker.contains(&v) {
+                    continue;
+                }
+                if !matches!(
+                    pending.adjoint.var_types.get(&v),
+                    Some(crate::wengert::WengertType::Tensor) | None
+                ) {
+                    continue;
+                }
+                let last_pos = extended_last_pos
+                    .get(&v)
+                    .copied()
+                    .unwrap_or(pending.adjoint.ops.len().saturating_sub(1));
+                let ri = range_of_pos(last_pos).max(carry_last_read[&v]);
+                carry_explicit_free[ri].push(v);
+            }
+            // Primal-slot schedule: which ranges read each buffered slot
+            // (seed only there — direct reads) and which range is a slot's
+            // fixpoint-extended LAST reader (free it there, with the
+            // loss-slot b<N-1 conditional).
+            let mut slot_seed_per_range: Vec<Vec<usize>> = vec![Vec::new(); n_ranges];
+            let mut slot_free_per_range: Vec<Vec<usize>> = vec![Vec::new(); n_ranges];
+            {
+                let slot_of: std::collections::HashMap<crate::wengert::VarId, usize> = pending
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (v, _))| (*v, i))
+                    .collect();
+                for (ri, r) in ranges.iter().enumerate() {
+                    let mut seen = std::collections::HashSet::new();
+                    for op in &pending.adjoint.ops[r.start..r.end] {
+                        for &input in &op.inputs {
+                            if let Some(&si) = slot_of.get(&input) {
+                                if seen.insert(si) {
+                                    slot_seed_per_range[ri].push(si);
+                                }
+                            }
+                        }
+                    }
+                    slot_seed_per_range[ri].sort_unstable();
+                }
+                for (vid, si) in &slot_of {
+                    if let Some(&pos) = extended_last_pos.get(vid) {
+                        slot_free_per_range[range_of_pos(pos)].push(*si);
+                    }
+                }
+                for v in slot_free_per_range.iter_mut() {
+                    v.sort_unstable();
+                }
+            }
+
+            // Review D1b-2: zero-copy VIEWS OF θ (transpose/reshape chains
+            // rooted at a trainable param) alias parameter storage, so a
+            // read through one AFTER that param's per-layer update would see
+            // half-updated weights — invisible to the classification, which
+            // tracks only the param's DIRECT reads. Refuse any read of a
+            // view-of-θ in a range strictly after θ's update range. Views of
+            // epilogue-group params (update range = MAX — after every
+            // range) can never trip this: the tied-embedding LM head is the
+            // canonical safe case. Both primal-side view chains (buffered
+            // slots) and adjoint-side view chains are tracked transitively.
+            {
+                let idx_update_range: std::collections::HashMap<i64, usize> = layer_group
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(ri, g)| g.iter().map(move |&i| (i, ri)))
+                    .collect();
+                let update_range_of_vid: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    usize,
+                > = pending
+                    .params
+                    .iter()
+                    .map(|cp| {
+                        (
+                            cp.primal_vid,
+                            idx_update_range
+                                .get(&cp.accum_idx)
+                                .copied()
+                                .unwrap_or(usize::MAX),
+                        )
+                    })
+                    .collect();
+                let mut view_param: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    crate::wengert::VarId,
+                > = pending.primal_view_of.clone();
+                for (ri, r) in ranges.iter().enumerate() {
+                    for op in &pending.adjoint.ops[r.start..r.end] {
+                        for &input in &op.inputs {
+                            if let Some(&p) = view_param.get(&input) {
+                                let ur = update_range_of_vid
+                                    .get(&p)
+                                    .copied()
+                                    .unwrap_or(usize::MAX);
+                                if ri > ur {
+                                    return Err(CodegenError::new(format!(
+                                        "--layerwise-accum: a view of parameter \
+                                         VarId {p} is read in replay range {ri}, \
+                                         after the param's per-layer update in \
+                                         range {ur} — the view aliases θ's storage \
+                                         and would see half-updated weights. This \
+                                         adjoint shape is unsupported; drop \
+                                         --layerwise-accum",
+                                    )));
+                                }
+                            }
+                        }
+                        if matches!(
+                            op.op,
+                            crate::wengert::PrimalOp::Transpose { .. }
+                                | crate::wengert::PrimalOp::Reshape { .. }
+                        ) {
+                            for &input in &op.inputs {
+                                if update_range_of_vid.contains_key(&input) {
+                                    view_param.insert(op.result, input);
+                                } else if let Some(&p) = view_param.get(&input) {
+                                    view_param.insert(op.result, p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Emission helpers (compile-time unrolled per group) ──────
+            fn emit_csla_accum_alloc(
+                c: &mut Compiler,
+                builder: &mut FunctionBuilder,
+                param_list: Value,
+                accum_val: Value,
+                idxs: &[i64],
+            ) -> Result<(), CodegenError> {
+                if idxs.is_empty() {
+                    return Ok(());
+                }
+                // Fresh zeros_like per window under the MPartial surface —
+                // identical initial bytes to the baseline's zeroed
+                // persistent buffers.
+                let prev =
+                    c.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                let surf = builder.ins().iconst(cl_types::I8, SURFACE_M_PARTIAL);
+                c.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surf])?;
+                for &i in idxs {
+                    let iv = builder.ins().iconst(cl_types::I64, i);
+                    let p = c.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                    let z = c.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
+                    c.compile_call_by_name(builder, "nsl_list_set", &[accum_val, iv, z])?;
+                }
+                c.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev])?;
+                Ok(())
+            }
+            #[allow(clippy::too_many_arguments)]
+            fn emit_csla_group_update(
+                c: &mut Compiler,
+                builder: &mut FunctionBuilder,
+                param_list: Value,
+                state_list_1: Value,
+                state_list_2: Value,
+                two_state: bool,
+                accum_val: Value,
+                recipe: &crate::fase::UpdateRecipe,
+                bc: (Value, Value),
+                wrap_precision: bool,
+                idxs: &[i64],
+            ) -> Result<(), CodegenError> {
+                for &i in idxs {
+                    let iv = builder.ins().iconst(cl_types::I64, i);
+                    let theta =
+                        c.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                    let m =
+                        c.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, iv])?;
+                    let m_partial =
+                        c.compile_call_by_name(builder, "nsl_list_get", &[accum_val, iv])?;
+                    let v = if two_state {
+                        c.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, iv])?
+                    } else {
+                        m
+                    };
+                    c.fase_emit_final_step(
+                        builder,
+                        theta,
+                        m,
+                        m_partial,
+                        v,
+                        recipe,
+                        Some(bc),
+                        wrap_precision,
+                        false,
+                    )?;
+                    // The baseline zeroes m_partial for reuse; the layerwise
+                    // schedule frees it — next window allocates fresh zeros.
+                    c.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial])?;
+                    let z = builder.ins().iconst(cl_types::I64, 0);
+                    c.compile_call_by_name(builder, "nsl_list_set", &[accum_val, iv, z])?;
+                }
+                Ok(())
+            }
+
+            // ── Window region ───────────────────────────────────────────
             let bwd_block = builder.create_block();
             let bwd_join = builder.create_block();
             let ss = builder.use_var(should_step_var);
@@ -7353,176 +7848,370 @@ impl Compiler<'_> {
             let len_msg_ptr = self.compile_string_literal(builder, &len_msg)?;
             self.compile_call_by_name(builder, "nsl_assert", &[len_ok, len_msg_ptr])?;
 
-            // b-loop over the buffered micro-batches, oldest first.
-            let b_var = state.new_variable();
-            builder.declare_var(b_var, cl_types::I64);
-            let b_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(b_var, b_zero);
-            let b_hdr = builder.create_block();
-            let b_body = builder.create_block();
-            let b_exit = builder.create_block();
-            builder.ins().jump(b_hdr, &[]);
-            builder.switch_to_block(b_hdr);
-            let b_i = builder.use_var(b_var);
-            let b_cont = builder.ins().icmp(IntCC::SignedLessThan, b_i, n_val);
-            builder.ins().brif(b_cont, b_body, &[], b_exit, &[]);
-            builder.switch_to_block(b_body);
-            builder.seal_block(b_body);
-            state.current_block = Some(b_body);
+            // Bias correction — the same expression the (now-bypassed)
+            // optimizer site computes; step_count is untouched between here
+            // and there, so every group in this window shares one pair.
+            let sc_val = builder.use_var(step_count_var);
+            let one_i64 = builder.ins().iconst(cl_types::I64, 1);
+            let sc_plus_one = builder.ins().iadd(sc_val, one_i64);
+            let ga_const = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+            let opt_step = builder.ins().sdiv(sc_plus_one, ga_const);
+            let b1c = builder.ins().f64const(fase_plan.recipe.beta1);
+            let b2c = builder.ins().f64const(fase_plan.recipe.beta2);
+            let bc1_inv = self.compile_call_by_name(
+                builder,
+                "nsl_bias_correction_inv",
+                &[b1c, opt_step],
+            )?;
+            let bc2_inv = self.compile_call_by_name(
+                builder,
+                "nsl_bias_correction_inv",
+                &[b2c, opt_step],
+            )?;
+            let wrap_precision = cpdt_precision_dtypes.is_some();
+            let two_state = num_state_buffers >= 2;
 
-            let so_in = builder.use_var(saves_outer_var);
-            let b_now = builder.use_var(b_var);
-            let inner = self.compile_call_by_name(builder, "nsl_list_get", &[so_in, b_now])?;
-            let dict_b = if has_dataloader.is_some() {
-                let dl = builder.use_var(dicts_var);
-                let d = self.compile_call_by_name(builder, "nsl_list_get", &[dl, b_now])?;
-                // Re-install micro-batch b's packing metadata: the registry
-                // is thread-local per-batch state read at @flash_attention
-                // launch time, and it currently holds the LAST batch's
-                // pointers.
-                self.emit_packing_registry_stash(builder, d)?;
-                Some(d)
+            // Global/epilogue accumulators live for the whole window (their
+            // grads may come from any range).
+            emit_csla_accum_alloc(self, builder, param_list, accum_val, &global_group)?;
+
+            // Cross-range adjoint carry: one inner list per micro-batch,
+            // slot-indexed, created by the first range's replay loop.
+            let carry_outer = if n_carry > 0 {
+                Some(self.compile_call_by_name(builder, "nsl_list_new", &[])?)
             } else {
                 None
             };
 
-            // Seed map: forward values (params, constants, untainted SSA)
-            // overridden with this micro-batch's buffered imports.
-            let mut seed = pending.seed_base.clone();
-            for (idx, (vid, kind)) in pending.slots.iter().enumerate() {
-                let idx_val = builder.ins().iconst(cl_types::I64, idx as i64);
-                let raw =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
-                let val = match kind {
-                    CslaSlotKind::Raw { .. } => raw,
-                    CslaSlotKind::F64Bits => {
-                        builder
-                            .ins()
-                            .bitcast(cl_types::F64, MemFlags::new(), raw)
+            // Exports that ghost-skipped at their producing range (compile-
+            // time knowledge accumulated range by range): later ranges skip
+            // seeding them so their consumers ghost-skip identically.
+            let mut ghost_carries: std::collections::HashSet<crate::wengert::VarId> =
+                Default::default();
+
+            for (ri, range) in ranges.iter().enumerate() {
+                // This layer's accumulators exist only from here to its
+                // update below — the m_partial surface the schedule shrinks.
+                emit_csla_accum_alloc(self, builder, param_list, accum_val, &layer_group[ri])?;
+
+                let slice = crate::wengert::WengertList {
+                    ops: pending.adjoint.ops[range.start..range.end].to_vec(),
+                    output: pending.adjoint.output,
+                    var_names: pending.adjoint.var_names.clone(),
+                    var_types: pending.adjoint.var_types.clone(),
+                };
+
+                // b-loop over the buffered micro-batches, oldest first.
+                let b_var = state.new_variable();
+                builder.declare_var(b_var, cl_types::I64);
+                let b_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(b_var, b_zero);
+                let b_hdr = builder.create_block();
+                let b_body = builder.create_block();
+                let b_exit = builder.create_block();
+                builder.ins().jump(b_hdr, &[]);
+                builder.switch_to_block(b_hdr);
+                let b_i = builder.use_var(b_var);
+                let b_cont = builder.ins().icmp(IntCC::SignedLessThan, b_i, n_val);
+                builder.ins().brif(b_cont, b_body, &[], b_exit, &[]);
+                builder.switch_to_block(b_body);
+                builder.seal_block(b_body);
+                state.current_block = Some(b_body);
+
+                let so_in = builder.use_var(saves_outer_var);
+                let b_now = builder.use_var(b_var);
+                let inner =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[so_in, b_now])?;
+                let dict_b = if has_dataloader.is_some() {
+                    let dl = builder.use_var(dicts_var);
+                    let d = self.compile_call_by_name(builder, "nsl_list_get", &[dl, b_now])?;
+                    // Re-install micro-batch b's packing metadata every
+                    // range: the registry is thread-local per-batch state
+                    // read at @flash_attention launch time, and any range
+                    // may contain attention backward ops.
+                    self.emit_packing_registry_stash(builder, d)?;
+                    Some(d)
+                } else {
+                    None
+                };
+                let inner_carry = if let Some(co) = carry_outer {
+                    if ri == 0 {
+                        // First range: create this micro-batch's carry list,
+                        // pre-filled so later nsl_list_set slots are in-bounds.
+                        let ic = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        let zero = builder.ins().iconst(cl_types::I64, 0);
+                        for _ in 0..n_carry {
+                            self.compile_call_by_name(builder, "nsl_list_push", &[ic, zero])?;
+                        }
+                        self.compile_call_by_name(builder, "nsl_list_push", &[co, ic])?;
+                        Some(ic)
+                    } else {
+                        Some(self.compile_call_by_name(builder, "nsl_list_get", &[co, b_now])?)
+                    }
+                } else {
+                    None
+                };
+
+                // Seed: forward values (params/constants/loop-invariant SSA)
+                // + this range's buffered primal imports + this range's
+                // cross-range adjoint imports.
+                let mut seed = pending.seed_base.clone();
+                for &si in &slot_seed_per_range[ri] {
+                    let (vid, kind) = &pending.slots[si];
+                    let idx_val = builder.ins().iconst(cl_types::I64, si as i64);
+                    let raw =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                    let val = match kind {
+                        CslaSlotKind::Raw { .. } => raw,
+                        CslaSlotKind::F64Bits => {
+                            builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw)
+                        }
+                    };
+                    seed.insert(*vid, val);
+                }
+                for &cv in &imports_per_range[ri] {
+                    if ghost_carries.contains(&cv) {
+                        continue;
+                    }
+                    let ic = inner_carry.expect("carry imports imply carry_outer");
+                    let slot_val = builder
+                        .ins()
+                        .iconst(cl_types::I64, carry_slot[&cv] as i64);
+                    let val =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[ic, slot_val])?;
+                    seed.insert(cv, val);
+                }
+
+                // FASE hook: identical to the baseline's fase_cb — accumulate
+                // each parameter gradient into its compile-time accum_list
+                // slot (allocated at window start or at this range's head)
+                // and free it immediately. wrap_offload is const false: the
+                // admission refused --optim-state-offload.
+                let hook_idx_map = &pending.hook_accum_idx;
+                let accum_scale = pending.accum_scale;
+                let mut fase_cb = |c: &mut Compiler,
+                                   var_id: crate::wengert::VarId,
+                                   grad_ptr: Value,
+                                   b: &mut cranelift_frontend::FunctionBuilder|
+                 -> Result<(), CodegenError> {
+                    let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
+                        return Ok(());
+                    };
+                    let idx_val =
+                        b.ins().iconst(cranelift_codegen::ir::types::I64, accum_idx);
+                    let m_partial =
+                        c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
+                    c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, false)?;
+                    c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                    Ok(())
+                };
+                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+                    self,
+                    builder,
+                    state,
+                    &slice,
+                    &seed,
+                    Some((&pending.param_adj_set, &mut fase_cb)),
+                ) {
+                    Ok(gv) => gv,
+                    Err(e) => {
+                        eprintln!(
+                            "[nsl] csla window backward lowering failed (range {ri}: {}), \
+                             rerun without --layerwise-accum",
+                            e
+                        );
+                        return Err(e);
                     }
                 };
-                seed.insert(*vid, val);
+
+                // Exports: store this range's boundary adjoints into the
+                // carry list for later ranges (ghost-skips recorded so
+                // consumers ghost-skip identically to the baseline).
+                for &ev in &exports_per_range[ri] {
+                    match grad_lowered.var_map.get(&ev) {
+                        Some(&val) => {
+                            // Review D1b-4: only i64-typed values (tensor /
+                            // list pointers, integers) can ride the carry
+                            // list; a scalar f64 crossing a range boundary
+                            // would otherwise be a Cranelift verifier ICE.
+                            // AD rules emit constants adjacent to consumers,
+                            // so this is unreachable today — refuse loudly
+                            // if that ever changes.
+                            let vty = builder.func.dfg.value_type(val);
+                            if vty != cl_types::I64 {
+                                return Err(CodegenError::new(format!(
+                                    "--layerwise-accum: cross-range adjoint value \
+                                     VarId {ev} has non-i64 Cranelift type {vty}; \
+                                     scalar carries are unsupported — drop \
+                                     --layerwise-accum",
+                                )));
+                            }
+                            let ic = inner_carry.expect("exports imply carry_outer");
+                            let slot_val = builder
+                                .ins()
+                                .iconst(cl_types::I64, carry_slot[&ev] as i64);
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_set",
+                                &[ic, slot_val, val],
+                            )?;
+                        }
+                        None => {
+                            ghost_carries.insert(ev);
+                        }
+                    }
+                }
+
+                // Per-replay cleanup: adjoint-owned intermediates minus
+                // hook-consumed gradients, explicit FreeTensor victims, and
+                // the exports (they outlive this range; their frees are the
+                // consuming ranges' markers or the explicit list below).
+                let mut freed_adjoint_vars: std::collections::HashSet<crate::wengert::VarId> =
+                    pending.param_adj_set.iter().copied().collect();
+                freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
+                freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
+                freed_adjoint_vars.extend(exports_per_range[ri].iter().copied());
+                self.free_wengert_owned_values(
+                    builder,
+                    &grad_lowered.owned_values,
+                    &freed_adjoint_vars,
+                )?;
+
+                // Carried values whose last consumer is this range and that
+                // no FreeTensor marker covers: free their seeded value now.
+                // Review D1b-1 (HIGH): skip anything the replay itself
+                // already freed — the hook's reduce_to_shape extra free
+                // (hook_freed_input_vars) releases a carried RAW grad when a
+                // range boundary lands on the reduce op, and explicit
+                // FreeTensor victims are covered by their markers. Freeing
+                // either again here would be a double free.
+                for &cv in &carry_explicit_free[ri] {
+                    if ghost_carries.contains(&cv)
+                        || grad_lowered.hook_freed_input_vars.contains(&cv)
+                        || grad_lowered.explicit_freed_vars.contains(&cv)
+                    {
+                        continue;
+                    }
+                    if let Some(&val) = seed.get(&cv) {
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[val])?;
+                    }
+                }
+
+                // Free the buffered primal slots whose LAST reader is this
+                // range (owned tensors/lists only). The loss slot skips the
+                // window's LAST entry: that is the CURRENT iteration's loss,
+                // still read by on_step / on_epoch after this phase; the
+                // conditional per-iteration loss-free site below owns it.
+                let n_minus_1 =
+                    builder.ins().iconst(cl_types::I64, grad_accumulation_steps - 1);
+                for &si in &slot_free_per_range[ri] {
+                    let (_vid, kind) = &pending.slots[si];
+                    let CslaSlotKind::Raw { owned: Some(ty) } = kind else {
+                        continue;
+                    };
+                    let free_fn = match ty {
+                        crate::wengert::WengertType::Tensor => "nsl_tensor_free",
+                        crate::wengert::WengertType::List => "nsl_list_free",
+                        _ => continue,
+                    };
+                    let idx_val = builder.ins().iconst(cl_types::I64, si as i64);
+                    let slot_val =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                    if Some(si) == pending.loss_slot {
+                        let b_cur = builder.use_var(b_var);
+                        let is_last = builder.ins().icmp(IntCC::Equal, b_cur, n_minus_1);
+                        let loss_free = builder.create_block();
+                        let loss_join = builder.create_block();
+                        builder.ins().brif(is_last, loss_join, &[], loss_free, &[]);
+                        builder.switch_to_block(loss_free);
+                        builder.seal_block(loss_free);
+                        self.compile_call_by_name(builder, free_fn, &[slot_val])?;
+                        builder.ins().jump(loss_join, &[]);
+                        builder.switch_to_block(loss_join);
+                        builder.seal_block(loss_join);
+                        state.current_block = Some(loss_join);
+                    } else {
+                        self.compile_call_by_name(builder, free_fn, &[slot_val])?;
+                    }
+                }
+
+                if ri == last_ri {
+                    // Batch dict values die with their micro-batch's LAST
+                    // replay (the per-iteration dict free is suppressed
+                    // under csla), then the shells. INVARIANT (review L2):
+                    // on step iterations this destroys the CURRENT batch
+                    // dict at b==N-1, i.e. BEFORE the optimizer updates and
+                    // the on_step callback — nothing after this point may
+                    // read step_param_var's dict (on_step receives only
+                    // (step, loss)). nsl_dict_free_tensor_values destroys
+                    // the WHOLE dict structure, matching the baseline's
+                    // per-iteration call — popped dicts are never touched by
+                    // the DataLoader teardown.
+                    if let Some(d) = dict_b {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_dict_free_tensor_values",
+                            &[d],
+                        )?;
+                    }
+                    self.compile_call_by_name(builder, "nsl_list_free", &[inner])?;
+                    if let Some(ic) = inner_carry {
+                        self.compile_call_by_name(builder, "nsl_list_free", &[ic])?;
+                    }
+                }
+
+                let b_cur = builder.use_var(b_var);
+                let b_one = builder.ins().iconst(cl_types::I64, 1);
+                let b_next = builder.ins().iadd(b_cur, b_one);
+                builder.def_var(b_var, b_next);
+                builder.ins().jump(b_hdr, &[]);
+                builder.seal_block(b_hdr);
+                builder.switch_to_block(b_exit);
+                builder.seal_block(b_exit);
+                state.current_block = Some(b_exit);
+
+                // Per-layer update: this layer's accumulators are complete
+                // (all N micro-batches replayed) and — by the CrossLayer
+                // classification + the list-membership fixpoint — no later
+                // range reads these params' OLD θ. Update, then free the
+                // layer's accumulators.
+                emit_csla_group_update(
+                    self,
+                    builder,
+                    param_list,
+                    state_list_1,
+                    state_list_2,
+                    two_state,
+                    accum_val,
+                    &fase_plan.recipe,
+                    (bc1_inv, bc2_inv),
+                    wrap_precision,
+                    &layer_group[ri],
+                )?;
             }
 
-            // FASE hook: identical to the baseline's fase_cb — accumulate
-            // each parameter gradient into its compile-time accum_list slot
-            // and free it immediately. wrap_offload is const false: the
-            // admission refused --optim-state-offload.
-            let hook_idx_map = &pending.hook_accum_idx;
-            let accum_scale = pending.accum_scale;
-            let mut fase_cb = |c: &mut Compiler,
-                               var_id: crate::wengert::VarId,
-                               grad_ptr: Value,
-                               b: &mut cranelift_frontend::FunctionBuilder|
-             -> Result<(), CodegenError> {
-                let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
-                    return Ok(());
-                };
-                let idx_val =
-                    b.ins().iconst(cranelift_codegen::ir::types::I64, accum_idx);
-                let m_partial =
-                    c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
-                c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, false)?;
-                c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
-                Ok(())
-            };
-            let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+            // Epilogue: globals (embedding / final norm / LM head), tied and
+            // cross-layer params, dead layers, and anything the extractor
+            // never saw — after the whole backward, like the baseline.
+            emit_csla_group_update(
                 self,
                 builder,
-                state,
-                &pending.adjoint,
-                &seed,
-                Some((&pending.param_adj_set, &mut fase_cb)),
-            ) {
-                Ok(gv) => gv,
-                Err(e) => {
-                    eprintln!(
-                        "[nsl] csla window backward lowering failed ({}), \
-                         rerun without --layerwise-accum",
-                        e
-                    );
-                    return Err(e);
-                }
-            };
-
-            // Per-replay cleanup, mirroring the baseline's end-of-backward
-            // bulk free: adjoint-owned intermediates minus hook-consumed
-            // gradients and explicit FreeTensor victims.
-            let mut freed_adjoint_vars: std::collections::HashSet<crate::wengert::VarId> =
-                pending.param_adj_set.iter().copied().collect();
-            freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
-            freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
-            self.free_wengert_owned_values(
-                builder,
-                &grad_lowered.owned_values,
-                &freed_adjoint_vars,
+                param_list,
+                state_list_1,
+                state_list_2,
+                two_state,
+                accum_val,
+                &fase_plan.recipe,
+                (bc1_inv, bc2_inv),
+                wrap_precision,
+                &global_group,
             )?;
 
-            // Free this micro-batch's buffered imports (owned tensors/lists
-            // only — borrowed dict members and loop-invariant pointers are
-            // owned elsewhere). The loss slot skips the window's LAST entry:
-            // that is the CURRENT iteration's loss, still read by on_step /
-            // on_epoch after this phase; the conditional per-iteration
-            // loss-free site below owns it.
-            let n_minus_1 = builder.ins().iconst(cl_types::I64, grad_accumulation_steps - 1);
-            for (idx, (_vid, kind)) in pending.slots.iter().enumerate() {
-                let CslaSlotKind::Raw { owned: Some(ty) } = kind else {
-                    continue;
-                };
-                let free_fn = match ty {
-                    crate::wengert::WengertType::Tensor => "nsl_tensor_free",
-                    crate::wengert::WengertType::List => "nsl_list_free",
-                    _ => continue,
-                };
-                let idx_val = builder.ins().iconst(cl_types::I64, idx as i64);
-                let slot_val =
-                    self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
-                if Some(idx) == pending.loss_slot {
-                    let b_cur = builder.use_var(b_var);
-                    let is_last = builder.ins().icmp(IntCC::Equal, b_cur, n_minus_1);
-                    let loss_free = builder.create_block();
-                    let loss_join = builder.create_block();
-                    builder.ins().brif(is_last, loss_join, &[], loss_free, &[]);
-                    builder.switch_to_block(loss_free);
-                    builder.seal_block(loss_free);
-                    self.compile_call_by_name(builder, free_fn, &[slot_val])?;
-                    builder.ins().jump(loss_join, &[]);
-                    builder.switch_to_block(loss_join);
-                    builder.seal_block(loss_join);
-                    state.current_block = Some(loss_join);
-                } else {
-                    self.compile_call_by_name(builder, free_fn, &[slot_val])?;
-                }
+            // Window cleanup: drop the shells and start fresh lists for the
+            // next window (carry inner shells died with the last range).
+            if let Some(co) = carry_outer {
+                self.compile_call_by_name(builder, "nsl_list_free", &[co])?;
             }
-            // Batch dict values die with their micro-batch's replay (the
-            // per-iteration dict free is suppressed under csla), then the
-            // inner slot-list shell. INVARIANT (review L2): on step
-            // iterations this destroys the CURRENT batch dict at b==N-1,
-            // i.e. BEFORE the optimizer region and the on_step callback —
-            // earlier than the baseline's end-of-iteration free. Nothing
-            // after this point may read step_param_var's dict (on_step
-            // receives only (step, loss); verified at review time).
-            // nsl_dict_free_tensor_values destroys the WHOLE dict structure
-            // (free_dict_impl(_, true)), matching the baseline's per-
-            // iteration call — popped dicts are never touched by the
-            // DataLoader teardown, which only drains its reorder buffer.
-            if let Some(d) = dict_b {
-                self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[d])?;
-            }
-            self.compile_call_by_name(builder, "nsl_list_free", &[inner])?;
-
-            let b_cur = builder.use_var(b_var);
-            let b_one = builder.ins().iconst(cl_types::I64, 1);
-            let b_next = builder.ins().iadd(b_cur, b_one);
-            builder.def_var(b_var, b_next);
-            builder.ins().jump(b_hdr, &[]);
-            builder.seal_block(b_hdr);
-            builder.switch_to_block(b_exit);
-            builder.seal_block(b_exit);
-            state.current_block = Some(b_exit);
-
-            // Window cleanup: drop the outer shells and start fresh lists for
-            // the next window.
             let so_done = builder.use_var(saves_outer_var);
             self.compile_call_by_name(builder, "nsl_list_free", &[so_done])?;
             let so_new = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -7709,7 +8398,23 @@ impl Compiler<'_> {
             builder.seal_block(post_optimizer_block);
             state.current_block = Some(post_optimizer_block);
         } else if fase_deferred {
-            if let Some(accum) = accum_list {
+            // CSLA (D1b): every parameter was already updated inside the
+            // window backward region (per-layer groups + the epilogue group,
+            // with the same bias-correction pair this site would compute) —
+            // the monolithic loop below must not run on the NULL accumulator
+            // slots. Emit only the pass-through to post_optimizer_block.
+            if csla_active {
+                if let Some(t0) = phase_opt_t0 {
+                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                    let t3 = self.compile_call_by_name(builder, "nsl_clock", &[])?;
+                    let opt = builder.ins().fsub(t3, t0);
+                    self.compile_call_by_name(builder, "nsl_phase_optim_report", &[opt])?;
+                }
+                builder.ins().jump(post_optimizer_block, &[]);
+                builder.switch_to_block(post_optimizer_block);
+                builder.seal_block(post_optimizer_block);
+                state.current_block = Some(post_optimizer_block);
+            } else if let Some(accum) = accum_list {
                 // ── FASE Deferred: compute bias-correction scalars once per step ──
                 // opt_step = (step_count + 1) / grad_accumulation_steps
                 // bc_inv = nsl_bias_correction_inv(β, opt_step)
@@ -8572,8 +9277,14 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_free", &[state_list_2])?;
         }
 
-        // Free gradient accumulation buffers (if allocated) — runtime loop
-        if let Some(accum) = accum_list {
+        // Free gradient accumulation buffers (if allocated) — runtime loop.
+        // CSLA (D1b): slots are NULL between windows (each window allocates
+        // its accumulators fresh and frees them after its group updates;
+        // the partial tail never allocates), so only the shell needs
+        // freeing — the per-slot loop would nsl_tensor_free(0).
+        if let Some(accum) = accum_list.filter(|_| csla_active) {
+            self.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
+        } else if let Some(accum) = accum_list {
             let fa_i_var = state.new_variable();
             builder.declare_var(fa_i_var, cl_types::I64);
             let fa_z = builder.ins().iconst(cl_types::I64, 0);

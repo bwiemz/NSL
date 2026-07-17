@@ -87,6 +87,13 @@ pub struct LayerwisePlan {
 }
 
 /// Build first/last adjoint-op indices for every VarId read in the backward.
+///
+/// `last` is extended through NslList membership (ccr's fixpoint): a param
+/// feeding a list-building op (RoPE `tensor_cat`) must not be classified
+/// layer-local by its direct read position — the LIST's last read is the
+/// param's true last backward use, and an earlier in-place θ update would
+/// corrupt it (Stage-1 originally shipped without this; Stage-2's per-layer
+/// update guard made it load-bearing).
 fn adjoint_use_ranges(adjoint: &WengertList) -> (HashMap<VarId, usize>, HashMap<VarId, usize>) {
     let mut first: HashMap<VarId, usize> = HashMap::new();
     let mut last: HashMap<VarId, usize> = HashMap::new();
@@ -96,6 +103,7 @@ fn adjoint_use_ranges(adjoint: &WengertList) -> (HashMap<VarId, usize>, HashMap<
             last.insert(input, idx); // monotonic -> ends at the last consuming index
         }
     }
+    crate::ccr::extend_last_use_through_lists(adjoint, &mut last);
     (first, last)
 }
 
@@ -248,6 +256,67 @@ pub fn adjoint_primal_imports(primal: &WengertList, adjoint: &WengertList) -> Ve
     let mut imports: Vec<VarId> = import_set.into_iter().collect();
     imports.sort_unstable();
     imports
+}
+
+/// CSLA Stage-2 (D1b): one contiguous replay range of the adjoint tape.
+#[derive(Debug, Clone)]
+pub struct ReplayRange {
+    /// Half-open op-index range `[start, end)` into the FINAL adjoint.
+    pub start: usize,
+    pub end: usize,
+    /// Index into `LayerwisePlan.layers` whose layer-local params update
+    /// after this range's replay completes; `None` for the prologue (loss /
+    /// LM-head / final-norm adjoints before the first layer boundary).
+    pub layer: Option<usize>,
+}
+
+/// CSLA Stage-2 (D1b): positional partition of the adjoint into replay
+/// ranges.
+///
+/// Boundaries are the layers' `adjoint_first` indices in plan order (=
+/// backward visit order); range 0 is the prologue `[0, first_0)`; the LAST
+/// range extends to `adjoint_len` so the epilogue ops after the final
+/// layer's region (the embedding backward) replay with it — their
+/// gradients belong to global-scope params whose accumulators live for the
+/// whole window, so positional attribution slop is safe by construction
+/// (the same slop CCR's segmentation tolerates). Layers whose
+/// `adjoint_first` is `None` (all params dead — never read in the
+/// backward) contribute no boundary; the caller must route their params to
+/// the epilogue update group.
+///
+/// Every op index in `[0, adjoint_len)` lands in exactly one range. An
+/// empty prologue is dropped.
+pub fn partition_ranges(plan: &LayerwisePlan, adjoint_len: usize) -> Vec<ReplayRange> {
+    let mut boundaries: Vec<(usize, usize)> = plan
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(li, l)| l.adjoint_first.map(|f| (f, li)))
+        .collect();
+    // plan.layers is sorted by adjoint_first ascending already; keep the
+    // sort local so the contract doesn't lean on the caller.
+    boundaries.sort_unstable();
+    let mut ranges = Vec::with_capacity(boundaries.len() + 1);
+    let first_boundary = boundaries.first().map(|&(f, _)| f).unwrap_or(adjoint_len);
+    if first_boundary > 0 {
+        ranges.push(ReplayRange {
+            start: 0,
+            end: first_boundary,
+            layer: None,
+        });
+    }
+    for (i, &(start, li)) in boundaries.iter().enumerate() {
+        let end = boundaries
+            .get(i + 1)
+            .map(|&(next, _)| next)
+            .unwrap_or(adjoint_len);
+        ranges.push(ReplayRange {
+            start,
+            end,
+            layer: Some(li),
+        });
+    }
+    ranges
 }
 
 impl LayerwisePlan {
@@ -477,5 +546,80 @@ mod tests {
             primal_op(1, 201, PrimalOp::Relu, vec![4, 9]),
         ]);
         assert_eq!(adjoint_primal_imports(&primal, &adj), vec![4, 9]);
+    }
+
+    #[test]
+    fn list_membership_extends_param_last_use() {
+        // Param 10 read directly at op 0, but op 0 BUILDS a list consumed at
+        // op 3 — inside a later layer's range. Without the fixpoint the param
+        // would classify layer-local with last use 0; with it, last use is 3
+        // and it must go CrossLayer.
+        let mut adj = adjoint(vec![
+            read_op(0, vec![10]),      // list build reading blocks.1.w
+            read_op(1, vec![11]),      // blocks.0.w read (later layer starts)
+            read_op(2, vec![11]),
+            read_op(3, vec![1000]),    // consumes the LIST (op 0's result)
+        ]);
+        adj.var_types.insert(1000, crate::wengert::WengertType::List);
+        let params = vec![
+            ("m.blocks.1.w".to_string(), 10u32),
+            ("m.blocks.0.w".to_string(), 11u32),
+        ];
+        let plan = analyze(&adj, &params, &|_| None);
+        let w1 = plan
+            .global_params
+            .iter()
+            .find(|g| g.name == "m.blocks.1.w")
+            .expect("list-fed param must be CrossLayer");
+        assert_eq!(w1.reason, GlobalReason::CrossLayer);
+        assert_eq!(w1.last_backward_use, Some(3));
+    }
+
+    #[test]
+    fn partition_covers_tape_exactly_in_backward_order() {
+        // Prologue ops 0-1, blocks.1 range 2-4, blocks.0 range 5-7, epilogue
+        // ops 8-9 swallowed into the last range.
+        let adj = adjoint(vec![
+            read_op(0, vec![50]),  // loss/LM-head adjoints (no layer param)
+            read_op(1, vec![50]),
+            read_op(2, vec![10]),  // blocks.1
+            read_op(3, vec![10]),
+            read_op(4, vec![50]),
+            read_op(5, vec![11]),  // blocks.0
+            read_op(6, vec![11]),
+            read_op(7, vec![50]),
+            read_op(8, vec![50]),  // embedding backward epilogue
+            read_op(9, vec![50]),
+        ]);
+        let params = vec![
+            ("m.blocks.1.w".to_string(), 10u32),
+            ("m.blocks.0.w".to_string(), 11u32),
+        ];
+        let plan = analyze(&adj, &params, &|_| None);
+        let ranges = partition_ranges(&plan, adj.ops.len());
+        assert_eq!(ranges.len(), 3);
+        assert_eq!((ranges[0].start, ranges[0].end, ranges[0].layer), (0, 2, None));
+        assert_eq!((ranges[1].start, ranges[1].end), (2, 5));
+        assert_eq!(
+            plan.layers[ranges[1].layer.unwrap()].layer_key,
+            "blocks.1"
+        );
+        assert_eq!((ranges[2].start, ranges[2].end), (5, 10));
+        assert_eq!(
+            plan.layers[ranges[2].layer.unwrap()].layer_key,
+            "blocks.0"
+        );
+        // Exact coverage, no overlap.
+        let covered: usize = ranges.iter().map(|r| r.end - r.start).sum();
+        assert_eq!(covered, adj.ops.len());
+    }
+
+    #[test]
+    fn partition_without_layers_is_one_prologue_range() {
+        let adj = adjoint(vec![read_op(0, vec![50]), read_op(1, vec![50])]);
+        let plan = analyze(&adj, &[], &|_| None);
+        let ranges = partition_ranges(&plan, adj.ops.len());
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start, ranges[0].end, ranges[0].layer), (0, 2, None));
     }
 }

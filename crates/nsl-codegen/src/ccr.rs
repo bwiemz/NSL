@@ -268,6 +268,44 @@ pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget
     saved.len()
 }
 
+/// List-chain propagation: raise each var's last-use index through list
+/// membership — an element of a list lives as long as the list itself (and
+/// lists of lists, to fixpoint — bounded by nesting). Lists hold raw,
+/// un-refcounted element pointers, so any pass that frees (or, for CSLA's
+/// layer-local update guard, MUTATES) a var at its direct last read would
+/// corrupt a later read through the containing list. Shared by
+/// `insert_adjoint_last_use_frees` below and `layerwise::analyze`.
+pub fn extend_last_use_through_lists(
+    adjoint: &WengertList,
+    last_use: &mut HashMap<VarId, usize>,
+) {
+    loop {
+        let mut changed = false;
+        for op in adjoint.ops.iter() {
+            let is_list = matches!(
+                adjoint.var_types.get(&op.result),
+                Some(WengertType::List)
+            ) || matches!(&op.op, PrimalOp::Passthrough(n) if n == "list");
+            if !is_list {
+                continue;
+            }
+            let Some(&list_last) = last_use.get(&op.result) else {
+                continue;
+            };
+            for input in &op.inputs {
+                let e = last_use.entry(*input).or_insert(list_last);
+                if *e < list_last {
+                    *e = list_last;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// P1 completion — adjoint-region last-use freeing.
 ///
 /// The 500M/seq-1024 OOM decomposition (per-surface accounting) showed the
@@ -284,9 +322,7 @@ pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget
 /// - vars already freed by an existing `FreeTensor` (the recompute-clone
 ///   frees) are skipped;
 /// - NslList hazard: a var consumed by a List-building op is kept alive
-///   until the LIST's own last use (lists hold raw, un-refcounted element
-///   pointers — the tape's `cat` consumes the list var, not the elements),
-///   propagated transitively for nested lists;
+///   until the LIST's own last use (`extend_last_use_through_lists`);
 /// - vars with no use after their producer (dead results) are freed
 ///   immediately after production;
 /// - the lowering-side FreeTensor guard (I64 + Tensor-typed only) remains
@@ -313,40 +349,14 @@ pub fn insert_adjoint_last_use_frees(
         .map(|op| op.inputs[0])
         .collect();
 
-    // Last use per var (tape-level).
+    // Last use per var (tape-level), extended through list membership.
     let mut last_use: HashMap<VarId, usize> = HashMap::new();
     for (idx, op) in adjoint.ops.iter().enumerate() {
         for input in &op.inputs {
             last_use.insert(*input, idx);
         }
     }
-    // List-chain propagation: an element of a list lives as long as the
-    // list itself (and lists of lists, to fixpoint — bounded by nesting).
-    loop {
-        let mut changed = false;
-        for op in adjoint.ops.iter() {
-            let is_list = matches!(
-                adjoint.var_types.get(&op.result),
-                Some(WengertType::List)
-            ) || matches!(&op.op, PrimalOp::Passthrough(n) if n == "list");
-            if !is_list {
-                continue;
-            }
-            let Some(&list_last) = last_use.get(&op.result) else {
-                continue;
-            };
-            for input in &op.inputs {
-                let e = last_use.entry(*input).or_insert(list_last);
-                if *e < list_last {
-                    *e = list_last;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    extend_last_use_through_lists(adjoint, &mut last_use);
 
     // Collect (insert_after_idx, victim) — free at last use, or right
     // after production for dead results.

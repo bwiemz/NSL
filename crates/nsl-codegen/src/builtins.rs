@@ -2751,6 +2751,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // in-process getter for gates.
     ("nsl_csla_window_mark", &[], None),
     ("nsl_csla_window_count", &[], Some(types::I64)),
+    // D1b: one-time pointer-tie guard over param_list (aborts loudly on any
+    // aliased pair — per-layer in-place updates would corrupt the alias).
+    ("nsl_csla_assert_params_unaliased", &[types::I64], None),
     (
         "nsl_tensor_logsoftmax",
         &[types::I64, types::I64],
