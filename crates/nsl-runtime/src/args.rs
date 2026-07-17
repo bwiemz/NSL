@@ -76,6 +76,25 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(nsl_fase_fused_step_count_atexit);
         }
     }
+
+    // D1 (CSLA Stage-2): layerwise window-backward count, enabled when
+    // NSL_CSLA_COUNTER=1. Lets the differential gate assert the buffered
+    // backward phase actually fired (anti-vacuity), same pattern as above.
+    if std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_csla_window_count_atexit);
+        }
+    }
+}
+
+extern "C" fn nsl_csla_window_count_atexit() {
+    eprintln!(
+        "[csla] window backward phases: {}",
+        crate::csla_stat::nsl_csla_window_count()
+    );
 }
 
 extern "C" fn nsl_fase_fused_step_count_atexit() {

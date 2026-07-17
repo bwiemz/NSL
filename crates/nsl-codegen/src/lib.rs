@@ -1207,6 +1207,17 @@ pub struct CompileOptions {
     /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
     /// activations; gated by the repo's 3-4 dp loss-parity standard.
     pub checkpoint_compress: Option<String>,
+    /// CSLA Stage-2 (`--layerwise-accum`): window-buffered training schedule.
+    /// The N micro-batches of a FASE-Deferred accumulation window run their
+    /// forwards first (saving only the adjoint-read, batch-dependent tensors
+    /// plus the batch dicts), then the backward phase replays the whole window
+    /// through a runtime loop over the buffered micro-batches. Bit-exact with
+    /// the interleaved baseline (same kernels, same inputs, same per-parameter
+    /// accumulation order). Requires `--source-ad`, `--checkpoint-blocks`, and
+    /// a FASE-Deferred plan (AdamW/Adam + grad_accumulation >= 2); refuses
+    /// loudly on grad_clip, WGGO mode tables, `--optim-state-offload`,
+    /// `--checkpoint-compress`, and the pipelined/tape paths.
+    pub layerwise_accum: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1330,6 +1341,7 @@ impl Default for CompileOptions {
             checkpoint_selective: false,
             checkpoint_budget_mib: None,
             checkpoint_compress: None,
+            layerwise_accum: false,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),

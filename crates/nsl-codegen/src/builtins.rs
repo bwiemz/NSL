@@ -2746,6 +2746,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         None,
     ),
+    // D1 (CSLA Stage-2): window-backward anti-vacuity counter — mark once per
+    // accumulation window at the head of the buffered backward phase, plus the
+    // in-process getter for gates.
+    ("nsl_csla_window_mark", &[], None),
+    ("nsl_csla_window_count", &[], Some(types::I64)),
     (
         "nsl_tensor_logsoftmax",
         &[types::I64, types::I64],

@@ -742,6 +742,17 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
         pub(crate) checkpoint_compress: Option<String>,
 
+        /// CSLA Stage-2 (docs/research/CSLA paper §7): window-buffered
+        /// training schedule. The N micro-batches of a FASE-Deferred
+        /// accumulation window run their forwards first (buffering only
+        /// the adjoint-read batch-dependent tensors), then the backward
+        /// replays the whole window. Bit-exact with the interleaved
+        /// baseline. Requires --checkpoint-blocks + --source-ad and a
+        /// FASE-Deferred plan (AdamW/Adam, grad_accumulation >= 2);
+        /// refuses grad_clip / --optim-state-offload / mode tables loudly.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) layerwise_accum: bool,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -1096,6 +1107,17 @@ pub(crate) struct RunArgs {
         /// activations; validate loss parity at the 3-4 dp standard.
         #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
         pub(crate) checkpoint_compress: Option<String>,
+
+        /// CSLA Stage-2 (docs/research/CSLA paper §7): window-buffered
+        /// training schedule. The N micro-batches of a FASE-Deferred
+        /// accumulation window run their forwards first (buffering only
+        /// the adjoint-read batch-dependent tensors), then the backward
+        /// replays the whole window. Bit-exact with the interleaved
+        /// baseline. Requires --checkpoint-blocks + --source-ad and a
+        /// FASE-Deferred plan (AdamW/Adam, grad_accumulation >= 2);
+        /// refuses grad_clip / --optim-state-offload / mode tables loudly.
+        #[arg(long, requires = "checkpoint_blocks")]
+        pub(crate) layerwise_accum: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

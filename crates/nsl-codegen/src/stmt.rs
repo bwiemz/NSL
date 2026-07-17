@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{InstBuilder, MemFlags};
-use cranelift_frontend::FunctionBuilder;
+use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_module::Module;
 
 use nsl_ast::block::{QuantDtype, QuantGranularity, TrainSection};
@@ -3637,6 +3637,13 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         // M43b: Pipeline parallel detection
         if self.features.pipeline_config.is_some() {
+            if self.compile_options.layerwise_accum {
+                return Err(CodegenError::new(
+                    "--layerwise-accum is not supported on the pipelined train \
+                     path (@pipeline): the window-buffered schedule was built \
+                     for the single-device source-AD emission. Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
@@ -3997,6 +4004,60 @@ impl Compiler<'_> {
         // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
+        // ── CSLA Stage-2 (`--layerwise-accum`) admission ────────────────
+        // Window-buffered scheduling only composes with the exact set of
+        // paths it was validated on; everything else refuses loudly (the
+        // repo's deferral-must-refuse rule) instead of silently running the
+        // interleaved baseline under a flag that claims otherwise.
+        let csla_active = self.compile_options.layerwise_accum;
+        if csla_active {
+            if !self.features.source_ad_enabled {
+                return Err(CodegenError::new(
+                    "--layerwise-accum requires --source-ad: the window-buffered \
+                     schedule replays the compile-time adjoint tape; the runtime \
+                     tape-AD backward cannot be partitioned",
+                ));
+            }
+            if grad_accumulation_steps <= 1 {
+                return Err(CodegenError::new(
+                    "--layerwise-accum requires grad_accumulation >= 2 in the train \
+                     block: with a single-micro-batch window there is no \
+                     accumulation window to buffer",
+                ));
+            }
+            if !fase_deferred {
+                return Err(CodegenError::new(format!(
+                    "--layerwise-accum requires a FASE-Deferred plan (AdamW/Adam + \
+                     grad_accumulation >= 2); this train block resolved to \
+                     {:?}. Use AdamW or Adam, or drop --layerwise-accum",
+                    fase_plan.mode
+                )));
+            }
+            if grad_clip < f64::MAX {
+                return Err(CodegenError::new(
+                    "--layerwise-accum is incompatible with grad_clip: two-phase \
+                     clipping needs the GLOBAL L2 norm over every parameter's \
+                     completed m_partial before any update, which the layerwise \
+                     schedule never materializes. Remove grad_clip or drop \
+                     --layerwise-accum",
+                ));
+            }
+            if self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--layerwise-accum is incompatible with --optim-state-offload: \
+                     layerwise accumulation is the replacement for m_partial \
+                     offload (the P3 staging path); the combination is untested \
+                     and the offload flag also controls m/v residency. Drop one",
+                ));
+            }
+            if self.compile_options.checkpoint_compress.is_some() {
+                return Err(CodegenError::new(
+                    "--layerwise-accum is incompatible with --checkpoint-compress: \
+                     the layerwise gate is bit-exact and compressed saves are not",
+                ));
+            }
+        }
+
         // ── 3. Resolve model type and build param list ──────────────────
         // Get the model pointer from state
         let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
@@ -4271,6 +4332,14 @@ impl Compiler<'_> {
                 None => None,
             }
         };
+        if csla_active && mode_table_base.is_some() {
+            return Err(CodegenError::new(
+                "--layerwise-accum is incompatible with a WGGO per-parameter FASE \
+                 mode table (mixed Deferred/FullBuffer accumulation): the \
+                 window-buffered backward assumes the uniform Deferred hook. \
+                 Drop --wggo overrides or --layerwise-accum",
+            ));
+        }
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
@@ -4522,6 +4591,28 @@ impl Compiler<'_> {
             None
         };
 
+        // ── 5c. CSLA Stage-2: window buffer lists ───────────────────────
+        // One inner NslList per buffered micro-batch (holding the adjoint's
+        // primal imports in a fixed compile-time slot order) pushed into
+        // `saves_outer`, plus the batch dict pointers in `dicts` so their
+        // tensor values survive to the window's deferred backward. Held as
+        // Cranelift Variables: the window cleanup frees the shells and
+        // re-news them for the next window. The lists are host heap objects —
+        // no GPU surface bracket applies.
+        let csla_buffers: Option<(Variable, Variable)> = if csla_active {
+            let saves_outer_var = state.new_variable();
+            builder.declare_var(saves_outer_var, cl_types::I64);
+            let so = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            builder.def_var(saves_outer_var, so);
+            let dicts_var = state.new_variable();
+            builder.declare_var(dicts_var, cl_types::I64);
+            let dl = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            builder.def_var(dicts_var, dl);
+            Some((saves_outer_var, dicts_var))
+        } else {
+            None
+        };
+
         // ── 6. Emit epoch loop ──────────────────────────────────────────
         let epoch_counter_var = state.new_variable();
         builder.declare_var(epoch_counter_var, cl_types::I64);
@@ -4635,100 +4726,13 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[ids_tensor, device_1])?;
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
 
-            // CFTP §4.3 / Tier A activation (spec 2026-05-17): probe batch
-            // for segment_ids + doc_starts. When the DataLoader has
-            // packing=true, the packer (packing.rs::packed_batch_to_dict)
-            // emits both tensors per batch. Extract device pointers and
-            // stash them in the thread-local packing registry; the model's
-            // compiled @flash_attention call sites read them per launch.
-            //
-            // Probing at runtime (not codegen time) lets a single train
-            // block tolerate mixed-batch workloads or DataLoader
-            // implementations that conditionally emit segment_ids based
-            // on actual document structure. The probe is one CStr lookup
-            // — negligible cost vs kernel launches.
-            use cranelift_codegen::ir::condcodes::IntCC;
-            let k_seg = self.compile_string_literal(builder, "segment_ids")?;
-            let has_seg = self.compile_call_by_name(
-                builder,
-                "nsl_dict_contains",
-                &[batch_val, k_seg],
-            )?;
-            let has_seg_block = builder.create_block();
-            let no_seg_block = builder.create_block();
-            let after_block = builder.create_block();
-            let has_seg_cond = builder.ins().icmp_imm(IntCC::NotEqual, has_seg, 0);
-            builder.ins().brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
-
-            // Packing-enabled batch: extract device pointers and set the
-            // registry. Both segment_ids and doc_starts must be present
-            // together — the packer emits them as a pair.
-            builder.switch_to_block(has_seg_block);
-            builder.seal_block(has_seg_block);
-            let seg_tensor = self.compile_call_by_name(
-                builder,
-                "nsl_dict_get_str",
-                &[batch_val, k_seg],
-            )?;
-            let k_doc = self.compile_string_literal(builder, "doc_starts")?;
-            let doc_tensor = self.compile_call_by_name(
-                builder,
-                "nsl_dict_get_str",
-                &[batch_val, k_doc],
-            )?;
-            let seg_data_ptr = self.compile_call_by_name(
-                builder,
-                "nsl_tensor_data_ptr",
-                &[seg_tensor],
-            )?;
-            let doc_data_ptr = self.compile_call_by_name(
-                builder,
-                "nsl_tensor_data_ptr",
-                &[doc_tensor],
-            )?;
-            self.compile_call_by_name(
-                builder,
-                "nsl_packing_metadata_set",
-                &[seg_data_ptr, doc_data_ptr],
-            )?;
-            builder.ins().jump(after_block, &[]);
-
-            // Packing-disabled batch: clear the registry so stale state
-            // from a prior step doesn't leak. Setting to (0, 0) is the
-            // spec-defined sentinel for "identity path" at the kernel.
-            builder.switch_to_block(no_seg_block);
-            builder.seal_block(no_seg_block);
-            let zero = builder.ins().iconst(cl_types::I64, 0);
-            self.compile_call_by_name(
-                builder,
-                "nsl_packing_metadata_set",
-                &[zero, zero],
-            )?;
-            builder.ins().jump(after_block, &[]);
-
-            builder.switch_to_block(after_block);
-            builder.seal_block(after_block);
-
-            // PCA Tier A (spec §6.1): when a segment-masked kernel was
-            // synthesized for this module, warn once if no segment_ids ever
-            // appear in the first N steps (DataLoader-never-packs footgun).
-            // Gated on the ACTUAL synthesized config so non-packed training
-            // (the common case) never sees this call. has_seg is the
-            // nsl_dict_contains("segment_ids") i64 result from above.
-            let module_is_masked = self
-                .kernels
-                .flash_attention_context
-                .as_ref()
-                .and_then(|c| c.csha_training_config.as_ref())
-                .map(|cfg| cfg.segment_masked)
-                .unwrap_or(false);
-            if module_is_masked {
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_pca_packing_mismatch_check",
-                    &[has_seg],
-                )?;
-            }
+            // CFTP §4.3 / Tier A activation: probe batch for segment_ids +
+            // doc_starts and stash their device pointers in the thread-local
+            // packing registry (factored into a helper so the CSLA window
+            // backward can re-install micro-batch b's metadata before
+            // replaying its adjoint — the registry is per-batch state read
+            // at @flash_attention LAUNCH time).
+            self.emit_packing_registry_stash(builder, batch_val)?;
         }
 
         let prev_batch_scope = state.flags.in_dataloader_batch_scope;
@@ -4777,6 +4781,45 @@ impl Compiler<'_> {
         // The downstream grads_list construction + accumulation loops are
         // skipped; grads_list is a null sentinel (i64 0).
         let fase_hook_active = fase_deferred && self.features.source_ad_enabled;
+
+        /// CSLA Stage-2 (D1a): one buffered import slot of a micro-batch's
+        /// window save list.
+        enum CslaSlotKind {
+            /// i64-typed lowered value (tensor/list pointer or integer).
+            /// `owned` carries the forward lowering's ownership type: the
+            /// window backward frees Tensor/List-owned slots after their
+            /// micro-batch's replay (mirroring `free_wengert_owned_values`).
+            Raw {
+                owned: Option<crate::wengert::WengertType>,
+            },
+            /// f64 scalar, stored via a same-width bitcast; never freed.
+            F64Bits,
+        }
+        /// Compile-time context carried from the save phase (inside the
+        /// source-AD arm) to the window-backward emission site just before
+        /// the optimizer gate.
+        struct CslaPending {
+            adjoint: crate::wengert::WengertList,
+            slots: Vec<(crate::wengert::VarId, CslaSlotKind)>,
+            seed_base: crate::wengert_lower::VarMap,
+            param_adj_set: std::collections::HashSet<crate::wengert::VarId>,
+            /// adjoint grad VarId → compile-time accum_list index.
+            hook_accum_idx: std::collections::HashMap<crate::wengert::VarId, i64>,
+            accum_scale: f64,
+            /// Slot index of the loss import, when the adjoint reads the loss
+            /// tensor itself: that slot's per-b free must skip the window's
+            /// LAST micro-batch (the current iteration's loss — still read by
+            /// on_step/on_epoch after the backward phase; it is freed by the
+            /// conditional at the per-iteration loss-free site instead).
+            loss_slot: Option<usize>,
+        }
+        let mut csla_pending: Option<CslaPending> = None;
+        let mut csla_loss_buffered = false;
+        // Teardown sweep plan for the trailing partial window: (slot index,
+        // free fn) for every owned buffered slot. Outlives csla_pending
+        // (which the window-backward emission consumes).
+        let mut csla_teardown_slots: Option<Vec<(i64, &'static str)>> = None;
+
         let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
             // === Source AD path (compile-time backward) ===
             eprintln!("[nsl] Using source-to-source AD for backward pass");
@@ -4896,6 +4939,18 @@ impl Compiler<'_> {
                          the tape would record teacher ops and allocate teacher \
                          gradient buffers). Restrict the step body to \
                          source-AD-supported operations",
+                    ));
+                }
+
+                // CSLA: the layerwise schedule replays the compile-time
+                // adjoint; a silent tape fallback would run the interleaved
+                // baseline under a flag claiming the buffered schedule.
+                if csla_active {
+                    return Err(CodegenError::new(
+                        "--layerwise-accum requires source-AD extraction, but the \
+                         step body could not be extracted (dynamic control flow?). \
+                         Restrict the step body to source-AD-supported operations \
+                         or drop --layerwise-accum",
                     ));
                 }
 
@@ -5994,6 +6049,22 @@ impl Compiler<'_> {
                     }
                 }
 
+                // CSLA: the window-buffered schedule leans on CCR — without a
+                // plan, "buffer what the adjoint reads" degenerates to N full
+                // activation sets (strictly worse than the baseline). Refuse
+                // instead of silently buffering everything: either the
+                // --checkpoint-blocks flag is missing, the tape has no
+                // blocks.N structure (ccr::plan declined with its own stderr
+                // note), or the owned-tensor restriction emptied the plan.
+                if csla_active && ccr_plan.is_none() {
+                    return Err(CodegenError::new(
+                        "--layerwise-accum requires an active checkpoint plan: pass \
+                         --checkpoint-blocks on a model with blocks.N structure \
+                         (see the [ccr] stderr note above for why checkpointing \
+                         declined)",
+                    ));
+                }
+
                 // CCR P1.a: free the checkpointed block interiors NOW —
                 // the forward is done and the backward will recompute them.
                 // Lowered as a tiny FreeTensor-only list seeded with the
@@ -6255,7 +6326,176 @@ impl Compiler<'_> {
                 //    the forward pass. This is the key fix: the old code only
                 //    had named variables in primal_vars, so intermediate
                 //    VarIds (unnamed temporaries like `x @ m.w`) were missing.
-                let grad_lowered = if fase_hook_active && !param_adj_set.is_empty() {
+                let grad_lowered: Option<crate::wengert_lower::LoweredWengert> = if csla_active {
+                    // === CSLA Stage-2 (D1a): window-buffered save phase ===
+                    //
+                    // Instead of lowering the adjoint here (the interleaved
+                    // schedule), push every adjoint-read primal value into
+                    // this micro-batch's slot list and defer the whole
+                    // window's backward to the should_step region, where a
+                    // runtime loop replays the adjoint once per buffered
+                    // micro-batch (one tape, N executions — unrolling would
+                    // break CCR's anchor segmentation). Param/Constant leaves
+                    // are loop-invariant (FASE Deferred updates θ only at
+                    // window boundaries, after the replay), so the replay
+                    // reuses the current iteration's SSA values for them via
+                    // seed_base.
+                    debug_assert!(fase_hook_active);
+
+                    // Review findings H1/H2/M1 (D1a adversarial review): three
+                    // compile-time SIDE CHANNELS travel by SSA Value instead
+                    // of the tape, so the window replay cannot see them —
+                    // refuse each loudly rather than replay wrong.
+                    //
+                    // H1 — CSHA-claimed fused backward: `csha_forward_saves`
+                    // is keyed by layer name and holds the STEP iteration's
+                    // save-buffer SSA values; the claimed backward consumes
+                    // AND frees them once — inside the b-loop that means
+                    // stale saves for b<N-1 plus an N-fold double-free.
+                    if !self.csha_forward_saves.is_empty()
+                        || adjoint.ops.iter().any(|op| {
+                            matches!(
+                                op.op,
+                                crate::wengert::PrimalOp::FusedCshaBackward { .. }
+                                    | crate::wengert::PrimalOp::CshaFusedBackwardExtract { .. }
+                            )
+                        })
+                    {
+                        return Err(CodegenError::new(
+                            "--layerwise-accum is incompatible with CSHA-claimed \
+                             fused attention backward: the claimed saves travel \
+                             through a compile-time side channel \
+                             (csha_forward_saves) that the window replay cannot \
+                             re-bind per micro-batch. Drop @csha/@flash_attention \
+                             claims or --layerwise-accum",
+                        ));
+                    }
+                    // H2 — fused SDPA dispatch: the forward-saved logsumexp
+                    // rides `flash_attn_aux` (keyed by the forward's SSA
+                    // Value) + a u32::MAX-sentinel owned entry; the replay's
+                    // freshly loaded value misses the map, so on a runtime
+                    // fused launch the emitted backward would silently
+                    // substitute the reference kernel (non-bit-exact + perf
+                    // cliff). The sentinel entry below is exactly "a fused
+                    // dispatch with a real LSE was emitted in this forward".
+                    if full_lowered
+                        .owned_values
+                        .iter()
+                        .any(|(vid, _, _)| *vid == u32::MAX)
+                    {
+                        return Err(CodegenError::new(
+                            "--layerwise-accum does not yet support attention on \
+                             CUDA targets: the fused SDPA dispatch (emitted for \
+                             every SDPA op on GPU, with runtime variant \
+                             selection) saves its logsumexp through an SSA \
+                             side-band (flash_attn_aux) the window replay cannot \
+                             see. Train on CPU, or drop --layerwise-accum until \
+                             the tape-carry follow-up lands",
+                        ));
+                    }
+                    // M1 — @fused_lm_ce / distill backward consult Value-keyed
+                    // cast caches (fused_ce_fwd_casts / fused_kl_ce_bwd_cache);
+                    // a replay miss re-emits fresh casts per window with no
+                    // free. Refuse until those are tape-carried.
+                    if self.active_fused_ce_config.is_some()
+                        || self.active_distill_context.is_some()
+                    {
+                        return Err(CodegenError::new(
+                            "--layerwise-accum is incompatible with @fused_lm_ce \
+                             / distill blocks: their backward reads Value-keyed \
+                             forward cast caches the window replay cannot see. \
+                             Drop the decorator or --layerwise-accum",
+                        ));
+                    }
+
+                    let (saves_outer_var, dicts_var) =
+                        csla_buffers.expect("csla_buffers allocated when csla_active");
+                    let imports =
+                        crate::layerwise::adjoint_primal_imports(&effective_primal, &adjoint);
+                    let owned_map: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::WengertType,
+                    > = full_lowered
+                        .owned_values
+                        .iter()
+                        .map(|(vid, _, ty)| (*vid, *ty))
+                        .collect();
+                    let inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                    let mut slots: Vec<(crate::wengert::VarId, CslaSlotKind)> = Vec::new();
+                    let mut loss_slot: Option<usize> = None;
+                    for v in imports {
+                        // Ghost VarIds (never lowered) are skipped here AND at
+                        // replay seed time — the adjoint lowering ghost-skips
+                        // their consumers identically to the baseline.
+                        let Some(&val) = full_vars.get(&v) else { continue };
+                        let vty = builder.func.dfg.value_type(val);
+                        if vty == cl_types::I64 {
+                            self.compile_call_by_name(builder, "nsl_list_push", &[inner, val])?;
+                            if v == loss_var_id {
+                                loss_slot = Some(slots.len());
+                            }
+                            slots.push((
+                                v,
+                                CslaSlotKind::Raw {
+                                    owned: owned_map.get(&v).copied(),
+                                },
+                            ));
+                        } else if vty == cl_types::F64 {
+                            let bits = builder.ins().bitcast(
+                                cl_types::I64,
+                                MemFlags::new(),
+                                val,
+                            );
+                            self.compile_call_by_name(builder, "nsl_list_push", &[inner, bits])?;
+                            slots.push((v, CslaSlotKind::F64Bits));
+                        } else {
+                            return Err(CodegenError::new(format!(
+                                "--layerwise-accum: adjoint-imported primal VarId {v} \
+                                 lowered to unsupported Cranelift type {vty} — the \
+                                 window buffer stores i64 pointers/integers and \
+                                 bitcast f64 scalars only",
+                            )));
+                        }
+                    }
+                    let so = builder.use_var(saves_outer_var);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[so, inner])?;
+                    if has_dataloader.is_some() {
+                        let dl = builder.use_var(dicts_var);
+                        let batch_now = builder.use_var(step_param_var);
+                        self.compile_call_by_name(builder, "nsl_list_push", &[dl, batch_now])?;
+                    }
+                    let hook_accum_idx: std::collections::HashMap<crate::wengert::VarId, i64> =
+                        adj_vid_to_hook_entry
+                            .iter()
+                            .map(|(vid, e)| (*vid, e.accum_idx))
+                            .collect();
+                    csla_loss_buffered = loss_slot.is_some();
+                    csla_teardown_slots = Some(
+                        slots
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, (_, kind))| match kind {
+                                CslaSlotKind::Raw {
+                                    owned: Some(crate::wengert::WengertType::Tensor),
+                                } => Some((idx as i64, "nsl_tensor_free")),
+                                CslaSlotKind::Raw {
+                                    owned: Some(crate::wengert::WengertType::List),
+                                } => Some((idx as i64, "nsl_list_free")),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                    csla_pending = Some(CslaPending {
+                        adjoint: adjoint.clone(),
+                        slots,
+                        seed_base: full_vars.clone(),
+                        param_adj_set: param_adj_set.clone(),
+                        hook_accum_idx,
+                        accum_scale: fase_plan.recipe.accum_scale,
+                        loss_slot,
+                    });
+                    None
+                } else if fase_hook_active && !param_adj_set.is_empty() {
                     // FASE Deferred: consume each param gradient immediately.
                     // The callback receives &mut Compiler explicitly so no
                     // double-borrow occurs.
@@ -6305,7 +6545,7 @@ impl Compiler<'_> {
                         full_vars,
                         Some((&param_adj_set, &mut fase_cb)),
                     ) {
-                        Ok(gv) => gv,
+                        Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
                                 "[nsl] source AD lowering (FASE hook) failed ({}), \
@@ -6320,7 +6560,7 @@ impl Compiler<'_> {
                         self, builder, state, &adjoint, full_vars,
                         None,
                     ) {
-                        Ok(gv) => gv,
+                        Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
                                 "[nsl] source AD lowering failed ({}), \
@@ -6341,27 +6581,32 @@ impl Compiler<'_> {
                     self.compile_call_by_name(builder, "nsl_phase_fwd_bwd_report", &[fwd, bwd])?;
                 }
 
-                let grad_vars = &grad_lowered.var_map;
+                // CSLA: no adjoint was lowered here (the window backward
+                // replays it later), so every grad_lowered consumer below is
+                // guarded on its presence.
+                let grad_vars = grad_lowered.as_ref().map(|g| &g.var_map);
                 // When the FASE hook is active, each parameter gradient was
                 // already consumed (accumulated into m_partial) and freed by
                 // the per-param callback during adjoint lowering.  Add those
                 // VarIds to freed_adjoint_vars so free_wengert_owned_values
                 // skips them and does not emit a second nsl_tensor_free.
                 let mut freed_adjoint_vars = std::collections::HashSet::new();
-                if fase_hook_active {
-                    freed_adjoint_vars.extend(param_adj_set.iter().copied());
-                    // Also skip raw_grad VarIds that were freed early by the
-                    // reduce_to_shape identity path in wengert_lower.  When
-                    // shapes match, reduce_to_shape returns the input with a
-                    // refcount bump; the hook's nsl_tensor_free drops rc 2→1
-                    // and wengert_lower emits a second free that drops rc 1→0.
-                    // These VarIds must NOT be freed again by end-of-adjoint cleanup.
-                    freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
+                if let Some(gl) = &grad_lowered {
+                    if fase_hook_active {
+                        freed_adjoint_vars.extend(param_adj_set.iter().copied());
+                        // Also skip raw_grad VarIds that were freed early by the
+                        // reduce_to_shape identity path in wengert_lower.  When
+                        // shapes match, reduce_to_shape returns the input with a
+                        // refcount bump; the hook's nsl_tensor_free drops rc 2→1
+                        // and wengert_lower emits a second free that drops rc 1→0.
+                        // These VarIds must NOT be freed again by end-of-adjoint cleanup.
+                        freed_adjoint_vars.extend(gl.hook_freed_input_vars.iter().copied());
+                    }
+                    // CCR: recompute clones were freed by the spliced FreeTensor
+                    // markers during adjoint lowering — exclude them from the
+                    // end-of-backward bulk free.
+                    freed_adjoint_vars.extend(gl.explicit_freed_vars.iter().copied());
                 }
-                // CCR: recompute clones were freed by the spliced FreeTensor
-                // markers during adjoint lowering — exclude them from the
-                // end-of-backward bulk free.
-                freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
 
                 if std::env::var("NSL_DEBUG_SOURCE_AD_OWNED").is_ok() {
                     let summarize_owned = |label: &str,
@@ -6392,7 +6637,9 @@ impl Compiler<'_> {
                         extractor.wengert_list(),
                         &full_lowered.owned_values,
                     );
-                    summarize_owned("adjoint", &adjoint, &grad_lowered.owned_values);
+                    if let Some(gl) = &grad_lowered {
+                        summarize_owned("adjoint", &adjoint, &gl.owned_values);
+                    }
 
                     let mut final_grad_counts: std::collections::HashMap<String, usize> =
                         std::collections::HashMap::new();
@@ -6523,7 +6770,11 @@ impl Compiler<'_> {
                         grad_skipped_no_adjoint += 1;
                         continue;
                     };
-                    let Some(grad_val) = grad_vars.get(&adj_vid).copied() else {
+                    let Some(grad_val) = grad_vars
+                        .expect("non-hook path always lowers the adjoint inline")
+                        .get(&adj_vid)
+                        .copied()
+                    else {
                         eprintln!("[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
                         grad_skipped_no_lowered += 1;
                         continue;
@@ -6653,12 +6904,23 @@ impl Compiler<'_> {
                 // (recorded on the adjoint lowering, but owned by the
                 // PRIMAL's owned_values since the tail produced them).
                 retained_full_vars.extend(full_lowered.explicit_freed_vars.iter().copied());
-                retained_full_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
-                self.free_wengert_owned_values(
-                    builder,
-                    &grad_lowered.owned_values,
-                    &freed_adjoint_vars,
-                )?;
+                if let Some(gl) = &grad_lowered {
+                    retained_full_vars.extend(gl.explicit_freed_vars.iter().copied());
+                }
+                // CSLA: the window-buffered imports must survive this
+                // iteration — their frees happen after each buffered
+                // micro-batch's replay in the window backward (or at the
+                // window/teardown sweeps for shells and the partial tail).
+                if let Some(p) = &csla_pending {
+                    retained_full_vars.extend(p.slots.iter().map(|(v, _)| *v));
+                }
+                if let Some(gl) = &grad_lowered {
+                    self.free_wengert_owned_values(
+                        builder,
+                        &gl.owned_values,
+                        &freed_adjoint_vars,
+                    )?;
+                }
                 self.free_wengert_owned_values(
                     builder,
                     &full_lowered.owned_values,
@@ -6668,9 +6930,11 @@ impl Compiler<'_> {
                 // Collect all Cranelift Values freed by the Wengert cleanup so the
                 // step-variable sweep (below) doesn't double-free them.
                 let mut wengert_freed: std::collections::HashSet<Value> = std::collections::HashSet::new();
-                for (vid, val, _) in &grad_lowered.owned_values {
-                    if !freed_adjoint_vars.contains(vid) {
-                        wengert_freed.insert(*val);
+                if let Some(gl) = &grad_lowered {
+                    for (vid, val, _) in &gl.owned_values {
+                        if !freed_adjoint_vars.contains(vid) {
+                            wengert_freed.insert(*val);
+                        }
                     }
                 }
                 for (vid, val, _) in &full_lowered.owned_values {
@@ -6683,9 +6947,22 @@ impl Compiler<'_> {
                     // freed" as far as the step-variable sweep is concerned.
                     if ccr_freed_primal.contains(vid)
                         || full_lowered.explicit_freed_vars.contains(vid)
-                        || grad_lowered.explicit_freed_vars.contains(vid)
+                        || grad_lowered
+                            .as_ref()
+                            .is_some_and(|gl| gl.explicit_freed_vars.contains(vid))
                     {
                         wengert_freed.insert(*val);
+                    }
+                }
+                // CSLA: buffered imports are handled by the window backward's
+                // per-b frees — the step-variable sweep must treat them as
+                // already handled or it would free a buffered value that a
+                // later micro-batch's replay still reads.
+                if let Some(p) = &csla_pending {
+                    for (vid, _) in &p.slots {
+                        if let Some(v) = full_vars.get(vid) {
+                            wengert_freed.insert(*v);
+                        }
                     }
                 }
 
@@ -7034,6 +7311,232 @@ impl Compiler<'_> {
             }
         }
         } // end if !fase_hook_active (per-micro-batch accumulation guard)
+
+        // ── 7e3b. CSLA Stage-2: window backward phase ───────────────────
+        // On accumulation boundaries, replay the adjoint once per buffered
+        // micro-batch. Each replay seeds a fresh VarMap from seed_base (the
+        // step iteration's forward values — loop-invariant Params/Constants
+        // resolve there) overridden with that micro-batch's buffered imports,
+        // then lowers the SAME adjoint tape inside a runtime b-loop (one
+        // tape, N executions). The FASE hook accumulates every parameter
+        // gradient into the same m_partial slot in micro-batch-ascending
+        // order — exactly the baseline's per-parameter accumulation sequence,
+        // so the optimizer region below consumes bit-identical m_partial.
+        if let Some(pending) = csla_pending.take() {
+            let (saves_outer_var, dicts_var) =
+                csla_buffers.expect("csla_buffers allocated when csla_pending set");
+            let accum_val = accum_list
+                .ok_or_else(|| CodegenError::new("csla requires accum_list"))?;
+
+            let bwd_block = builder.create_block();
+            let bwd_join = builder.create_block();
+            let ss = builder.use_var(should_step_var);
+            builder.ins().brif(ss, bwd_block, &[], bwd_join, &[]);
+            builder.switch_to_block(bwd_block);
+            builder.seal_block(bwd_block);
+            state.current_block = Some(bwd_block);
+
+            // Anti-vacuity mark + loud window-size assert: the modulo fires
+            // every N micro-batches exactly (the counter is global, windows
+            // straddle epochs, the trailing partial window never fires), so
+            // the buffer MUST hold exactly N entries here.
+            self.compile_call_by_name(builder, "nsl_csla_window_mark", &[])?;
+            let so = builder.use_var(saves_outer_var);
+            let win_len = self.compile_call_by_name(builder, "nsl_list_len", &[so])?;
+            let n_val = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+            let len_ok = builder.ins().icmp(IntCC::Equal, win_len, n_val);
+            let len_msg = format!(
+                "csla window backward: buffered micro-batch count != \
+                 grad_accumulation ({grad_accumulation_steps})"
+            );
+            self.intern_string(&len_msg)?;
+            let len_msg_ptr = self.compile_string_literal(builder, &len_msg)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[len_ok, len_msg_ptr])?;
+
+            // b-loop over the buffered micro-batches, oldest first.
+            let b_var = state.new_variable();
+            builder.declare_var(b_var, cl_types::I64);
+            let b_zero = builder.ins().iconst(cl_types::I64, 0);
+            builder.def_var(b_var, b_zero);
+            let b_hdr = builder.create_block();
+            let b_body = builder.create_block();
+            let b_exit = builder.create_block();
+            builder.ins().jump(b_hdr, &[]);
+            builder.switch_to_block(b_hdr);
+            let b_i = builder.use_var(b_var);
+            let b_cont = builder.ins().icmp(IntCC::SignedLessThan, b_i, n_val);
+            builder.ins().brif(b_cont, b_body, &[], b_exit, &[]);
+            builder.switch_to_block(b_body);
+            builder.seal_block(b_body);
+            state.current_block = Some(b_body);
+
+            let so_in = builder.use_var(saves_outer_var);
+            let b_now = builder.use_var(b_var);
+            let inner = self.compile_call_by_name(builder, "nsl_list_get", &[so_in, b_now])?;
+            let dict_b = if has_dataloader.is_some() {
+                let dl = builder.use_var(dicts_var);
+                let d = self.compile_call_by_name(builder, "nsl_list_get", &[dl, b_now])?;
+                // Re-install micro-batch b's packing metadata: the registry
+                // is thread-local per-batch state read at @flash_attention
+                // launch time, and it currently holds the LAST batch's
+                // pointers.
+                self.emit_packing_registry_stash(builder, d)?;
+                Some(d)
+            } else {
+                None
+            };
+
+            // Seed map: forward values (params, constants, untainted SSA)
+            // overridden with this micro-batch's buffered imports.
+            let mut seed = pending.seed_base.clone();
+            for (idx, (vid, kind)) in pending.slots.iter().enumerate() {
+                let idx_val = builder.ins().iconst(cl_types::I64, idx as i64);
+                let raw =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                let val = match kind {
+                    CslaSlotKind::Raw { .. } => raw,
+                    CslaSlotKind::F64Bits => {
+                        builder
+                            .ins()
+                            .bitcast(cl_types::F64, MemFlags::new(), raw)
+                    }
+                };
+                seed.insert(*vid, val);
+            }
+
+            // FASE hook: identical to the baseline's fase_cb — accumulate
+            // each parameter gradient into its compile-time accum_list slot
+            // and free it immediately. wrap_offload is const false: the
+            // admission refused --optim-state-offload.
+            let hook_idx_map = &pending.hook_accum_idx;
+            let accum_scale = pending.accum_scale;
+            let mut fase_cb = |c: &mut Compiler,
+                               var_id: crate::wengert::VarId,
+                               grad_ptr: Value,
+                               b: &mut cranelift_frontend::FunctionBuilder|
+             -> Result<(), CodegenError> {
+                let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
+                    return Ok(());
+                };
+                let idx_val =
+                    b.ins().iconst(cranelift_codegen::ir::types::I64, accum_idx);
+                let m_partial =
+                    c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
+                c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, false)?;
+                c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                Ok(())
+            };
+            let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+                self,
+                builder,
+                state,
+                &pending.adjoint,
+                &seed,
+                Some((&pending.param_adj_set, &mut fase_cb)),
+            ) {
+                Ok(gv) => gv,
+                Err(e) => {
+                    eprintln!(
+                        "[nsl] csla window backward lowering failed ({}), \
+                         rerun without --layerwise-accum",
+                        e
+                    );
+                    return Err(e);
+                }
+            };
+
+            // Per-replay cleanup, mirroring the baseline's end-of-backward
+            // bulk free: adjoint-owned intermediates minus hook-consumed
+            // gradients and explicit FreeTensor victims.
+            let mut freed_adjoint_vars: std::collections::HashSet<crate::wengert::VarId> =
+                pending.param_adj_set.iter().copied().collect();
+            freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
+            freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
+            self.free_wengert_owned_values(
+                builder,
+                &grad_lowered.owned_values,
+                &freed_adjoint_vars,
+            )?;
+
+            // Free this micro-batch's buffered imports (owned tensors/lists
+            // only — borrowed dict members and loop-invariant pointers are
+            // owned elsewhere). The loss slot skips the window's LAST entry:
+            // that is the CURRENT iteration's loss, still read by on_step /
+            // on_epoch after this phase; the conditional per-iteration
+            // loss-free site below owns it.
+            let n_minus_1 = builder.ins().iconst(cl_types::I64, grad_accumulation_steps - 1);
+            for (idx, (_vid, kind)) in pending.slots.iter().enumerate() {
+                let CslaSlotKind::Raw { owned: Some(ty) } = kind else {
+                    continue;
+                };
+                let free_fn = match ty {
+                    crate::wengert::WengertType::Tensor => "nsl_tensor_free",
+                    crate::wengert::WengertType::List => "nsl_list_free",
+                    _ => continue,
+                };
+                let idx_val = builder.ins().iconst(cl_types::I64, idx as i64);
+                let slot_val =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                if Some(idx) == pending.loss_slot {
+                    let b_cur = builder.use_var(b_var);
+                    let is_last = builder.ins().icmp(IntCC::Equal, b_cur, n_minus_1);
+                    let loss_free = builder.create_block();
+                    let loss_join = builder.create_block();
+                    builder.ins().brif(is_last, loss_join, &[], loss_free, &[]);
+                    builder.switch_to_block(loss_free);
+                    builder.seal_block(loss_free);
+                    self.compile_call_by_name(builder, free_fn, &[slot_val])?;
+                    builder.ins().jump(loss_join, &[]);
+                    builder.switch_to_block(loss_join);
+                    builder.seal_block(loss_join);
+                    state.current_block = Some(loss_join);
+                } else {
+                    self.compile_call_by_name(builder, free_fn, &[slot_val])?;
+                }
+            }
+            // Batch dict values die with their micro-batch's replay (the
+            // per-iteration dict free is suppressed under csla), then the
+            // inner slot-list shell. INVARIANT (review L2): on step
+            // iterations this destroys the CURRENT batch dict at b==N-1,
+            // i.e. BEFORE the optimizer region and the on_step callback —
+            // earlier than the baseline's end-of-iteration free. Nothing
+            // after this point may read step_param_var's dict (on_step
+            // receives only (step, loss); verified at review time).
+            // nsl_dict_free_tensor_values destroys the WHOLE dict structure
+            // (free_dict_impl(_, true)), matching the baseline's per-
+            // iteration call — popped dicts are never touched by the
+            // DataLoader teardown, which only drains its reorder buffer.
+            if let Some(d) = dict_b {
+                self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[d])?;
+            }
+            self.compile_call_by_name(builder, "nsl_list_free", &[inner])?;
+
+            let b_cur = builder.use_var(b_var);
+            let b_one = builder.ins().iconst(cl_types::I64, 1);
+            let b_next = builder.ins().iadd(b_cur, b_one);
+            builder.def_var(b_var, b_next);
+            builder.ins().jump(b_hdr, &[]);
+            builder.seal_block(b_hdr);
+            builder.switch_to_block(b_exit);
+            builder.seal_block(b_exit);
+            state.current_block = Some(b_exit);
+
+            // Window cleanup: drop the outer shells and start fresh lists for
+            // the next window.
+            let so_done = builder.use_var(saves_outer_var);
+            self.compile_call_by_name(builder, "nsl_list_free", &[so_done])?;
+            let so_new = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            builder.def_var(saves_outer_var, so_new);
+            let dl_done = builder.use_var(dicts_var);
+            self.compile_call_by_name(builder, "nsl_list_free", &[dl_done])?;
+            let dl_new = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            builder.def_var(dicts_var, dl_new);
+
+            builder.ins().jump(bwd_join, &[]);
+            builder.switch_to_block(bwd_join);
+            builder.seal_block(bwd_join);
+            state.current_block = Some(bwd_join);
+        }
 
         // 7e4. Gradient accumulation gate: only step optimizer every N batches
         let optimizer_block = builder.create_block();
@@ -7844,7 +8347,26 @@ impl Compiler<'_> {
         // already cloned it into epoch_loss_var, and on_step has finished reading.
         // Previously guarded by !on_step_binds_loss which leaked one loss per step.
         if source_ad_loss_owned {
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[loss_val])?;
+            if csla_loss_buffered {
+                // CSLA with an adjoint-read loss: on non-step iterations the
+                // loss must survive in the window buffer (its replay reads
+                // it); the window backward frees the older entries and this
+                // conditional frees the CURRENT iteration's loss only on the
+                // step iteration, after its replay is done.
+                let lf_block = builder.create_block();
+                let lf_join = builder.create_block();
+                let ss_here = builder.use_var(should_step_var);
+                builder.ins().brif(ss_here, lf_block, &[], lf_join, &[]);
+                builder.switch_to_block(lf_block);
+                builder.seal_block(lf_block);
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[loss_val])?;
+                builder.ins().jump(lf_join, &[]);
+                builder.switch_to_block(lf_join);
+                builder.seal_block(lf_join);
+                state.current_block = Some(lf_join);
+            } else {
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[loss_val])?;
+            }
             wengert_freed_vals.insert(loss_val);
         }
 
@@ -7891,12 +8413,20 @@ impl Compiler<'_> {
         if has_dataloader.is_some() {
             let current_blk = state.current_block.unwrap_or(batch_body_block);
             if !is_block_filled(builder, current_blk) {
-                let batch_to_free = builder.use_var(step_param_var);
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_dict_free_tensor_values",
-                    &[batch_to_free],
-                )?;
+                // CSLA: the batch dict was pushed into the window buffer —
+                // its tensor values (input_ids for the embedding scatter,
+                // labels for the loss adjoint) must survive to the window
+                // backward, which frees each dict's values after its
+                // micro-batch's replay (partial-tail dicts are swept at
+                // teardown).
+                if !csla_active {
+                    let batch_to_free = builder.use_var(step_param_var);
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_dict_free_tensor_values",
+                        &[batch_to_free],
+                    )?;
+                }
                 let zero = builder.ins().iconst(cl_types::I64, 0);
                 builder.def_var(step_param_var, zero);
             }
@@ -8073,6 +8603,83 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
         }
 
+        // CSLA: sweep the trailing partial window. A window that never
+        // reached the modulo boundary left its buffered saves + batch dicts
+        // alive (the baseline discards the same tail's m_partial content —
+        // its gradients never influence θ either way, so parity holds; this
+        // sweep is purely against leaks). Every entry here is stale: its
+        // iteration's callbacks are long done, so loss slots free
+        // unconditionally too.
+        if let (Some((saves_outer_var, dicts_var)), Some(sweep)) =
+            (csla_buffers, &csla_teardown_slots)
+        {
+            let so = builder.use_var(saves_outer_var);
+            let tail_len = self.compile_call_by_name(builder, "nsl_list_len", &[so])?;
+            let sw_i_var = state.new_variable();
+            builder.declare_var(sw_i_var, cl_types::I64);
+            let sw_z = builder.ins().iconst(cl_types::I64, 0);
+            builder.def_var(sw_i_var, sw_z);
+            let sw_hdr = builder.create_block();
+            let sw_body = builder.create_block();
+            let sw_exit = builder.create_block();
+            builder.ins().jump(sw_hdr, &[]);
+            builder.switch_to_block(sw_hdr);
+            let swi = builder.use_var(sw_i_var);
+            let swc = builder.ins().icmp(IntCC::SignedLessThan, swi, tail_len);
+            builder.ins().brif(swc, sw_body, &[], sw_exit, &[]);
+            builder.switch_to_block(sw_body);
+            builder.seal_block(sw_body);
+            let inner = self.compile_call_by_name(builder, "nsl_list_get", &[so, swi])?;
+            for (idx, free_fn) in sweep {
+                let idx_val = builder.ins().iconst(cl_types::I64, *idx);
+                let slot_val =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                self.compile_call_by_name(builder, free_fn, &[slot_val])?;
+            }
+            self.compile_call_by_name(builder, "nsl_list_free", &[inner])?;
+            let sw_one = builder.ins().iconst(cl_types::I64, 1);
+            let sw_next = builder.ins().iadd(swi, sw_one);
+            builder.def_var(sw_i_var, sw_next);
+            builder.ins().jump(sw_hdr, &[]);
+            builder.seal_block(sw_hdr);
+            builder.switch_to_block(sw_exit);
+            builder.seal_block(sw_exit);
+            state.current_block = Some(sw_exit);
+            self.compile_call_by_name(builder, "nsl_list_free", &[so])?;
+
+            // Tail batch dicts: nsl_dict_free_tensor_values destroys the
+            // whole dict structure (values + shell, free_dict_impl(_, true))
+            // — the same call the baseline makes per iteration; the
+            // DataLoader teardown never touches popped dicts.
+            let dl = builder.use_var(dicts_var);
+            let dl_len = self.compile_call_by_name(builder, "nsl_list_len", &[dl])?;
+            let dw_i_var = state.new_variable();
+            builder.declare_var(dw_i_var, cl_types::I64);
+            let dw_z = builder.ins().iconst(cl_types::I64, 0);
+            builder.def_var(dw_i_var, dw_z);
+            let dw_hdr = builder.create_block();
+            let dw_body = builder.create_block();
+            let dw_exit = builder.create_block();
+            builder.ins().jump(dw_hdr, &[]);
+            builder.switch_to_block(dw_hdr);
+            let dwi = builder.use_var(dw_i_var);
+            let dwc = builder.ins().icmp(IntCC::SignedLessThan, dwi, dl_len);
+            builder.ins().brif(dwc, dw_body, &[], dw_exit, &[]);
+            builder.switch_to_block(dw_body);
+            builder.seal_block(dw_body);
+            let tail_dict = self.compile_call_by_name(builder, "nsl_list_get", &[dl, dwi])?;
+            self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[tail_dict])?;
+            let dw_one = builder.ins().iconst(cl_types::I64, 1);
+            let dw_next = builder.ins().iadd(dwi, dw_one);
+            builder.def_var(dw_i_var, dw_next);
+            builder.ins().jump(dw_hdr, &[]);
+            builder.seal_block(dw_hdr);
+            builder.switch_to_block(dw_exit);
+            builder.seal_block(dw_exit);
+            state.current_block = Some(dw_exit);
+            self.compile_call_by_name(builder, "nsl_list_free", &[dl])?;
+        }
+
         state.variables = saved_variables;
         state.variable_types = saved_variable_types;
         state.dataloader_symbols = saved_dataloader_symbols;
@@ -8138,6 +8745,91 @@ impl Compiler<'_> {
         self.compile_call_by_name(builder, "nsl_set_training_mode", &[false_val])?;
 
         Ok((grads_list, loss_val))
+    }
+
+    /// CFTP §4.3 / Tier A activation (spec 2026-05-17): probe a batch dict
+    /// for segment_ids + doc_starts. When the DataLoader has packing=true,
+    /// the packer (packing.rs::packed_batch_to_dict) emits both tensors per
+    /// batch. Extract device pointers and stash them in the thread-local
+    /// packing registry; the model's compiled @flash_attention call sites
+    /// read them per launch.
+    ///
+    /// Probing at runtime (not codegen time) lets a single train block
+    /// tolerate mixed-batch workloads or DataLoader implementations that
+    /// conditionally emit segment_ids based on actual document structure.
+    /// The probe is one CStr lookup — negligible cost vs kernel launches.
+    ///
+    /// Called once per micro-batch in the train loop, and again per buffered
+    /// micro-batch at the head of the CSLA window-backward body (the registry
+    /// holds the LAST batch's pointers otherwise, which would mis-mask every
+    /// earlier micro-batch's replayed attention backward).
+    fn emit_packing_registry_stash(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        batch_val: Value,
+    ) -> Result<(), CodegenError> {
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let k_seg = self.compile_string_literal(builder, "segment_ids")?;
+        let has_seg =
+            self.compile_call_by_name(builder, "nsl_dict_contains", &[batch_val, k_seg])?;
+        let has_seg_block = builder.create_block();
+        let no_seg_block = builder.create_block();
+        let after_block = builder.create_block();
+        let has_seg_cond = builder.ins().icmp_imm(IntCC::NotEqual, has_seg, 0);
+        builder
+            .ins()
+            .brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
+
+        // Packing-enabled batch: extract device pointers and set the
+        // registry. Both segment_ids and doc_starts must be present
+        // together — the packer emits them as a pair.
+        builder.switch_to_block(has_seg_block);
+        builder.seal_block(has_seg_block);
+        let seg_tensor =
+            self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_seg])?;
+        let k_doc = self.compile_string_literal(builder, "doc_starts")?;
+        let doc_tensor =
+            self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_doc])?;
+        let seg_data_ptr =
+            self.compile_call_by_name(builder, "nsl_tensor_data_ptr", &[seg_tensor])?;
+        let doc_data_ptr =
+            self.compile_call_by_name(builder, "nsl_tensor_data_ptr", &[doc_tensor])?;
+        self.compile_call_by_name(
+            builder,
+            "nsl_packing_metadata_set",
+            &[seg_data_ptr, doc_data_ptr],
+        )?;
+        builder.ins().jump(after_block, &[]);
+
+        // Packing-disabled batch: clear the registry so stale state
+        // from a prior step doesn't leak. Setting to (0, 0) is the
+        // spec-defined sentinel for "identity path" at the kernel.
+        builder.switch_to_block(no_seg_block);
+        builder.seal_block(no_seg_block);
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        self.compile_call_by_name(builder, "nsl_packing_metadata_set", &[zero, zero])?;
+        builder.ins().jump(after_block, &[]);
+
+        builder.switch_to_block(after_block);
+        builder.seal_block(after_block);
+
+        // PCA Tier A (spec §6.1): when a segment-masked kernel was
+        // synthesized for this module, warn once if no segment_ids ever
+        // appear in the first N steps (DataLoader-never-packs footgun).
+        // Gated on the ACTUAL synthesized config so non-packed training
+        // (the common case) never sees this call. has_seg is the
+        // nsl_dict_contains("segment_ids") i64 result from above.
+        let module_is_masked = self
+            .kernels
+            .flash_attention_context
+            .as_ref()
+            .and_then(|c| c.csha_training_config.as_ref())
+            .map(|cfg| cfg.segment_masked)
+            .unwrap_or(false);
+        if module_is_masked {
+            self.compile_call_by_name(builder, "nsl_pca_packing_mismatch_check", &[has_seg])?;
+        }
+        Ok(())
     }
 
     fn free_wengert_owned_values(
