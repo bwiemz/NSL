@@ -8059,6 +8059,16 @@ impl Compiler<'_> {
                 &[b2c, opt_step],
             )?;
             let wrap_precision = cpdt_precision_dtypes.is_some();
+            // Review D2a-1: csla x offload x reduced-precision moments (the
+            // P0.3 combined cast_from_host arm) became reachable when the
+            // offload refusal narrowed. The walk-through found no defect,
+            // but zero gates cover the combination — refuse until a parity
+            // gate exists (deferral-must-refuse).
+            if wrap_precision && self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--layerwise-accum with --optim-state-offload does not yet                      support a CPDT reduced-precision moment plan (the P0.3                      combined staging arm is ungated under the layerwise                      schedule). Drop the precision plan or --optim-state-offload",
+                ));
+            }
             let two_state = num_state_buffers >= 2;
 
             // Global/epilogue accumulators live for the whole window (their
@@ -8208,8 +8218,11 @@ impl Compiler<'_> {
                 // FASE hook: identical to the baseline's fase_cb — accumulate
                 // each parameter gradient into its compile-time accum_list
                 // slot (allocated at window start or at this range's head)
-                // and free it immediately. wrap_offload is const false: the
-                // admission refused --optim-state-offload.
+                // and free it immediately. wrap_offload is const false BY
+                // DESIGN (review D2a-2): the per-layer accumulators are
+                // device-resident — that is D1's point — and the offload
+                // envelope applies only at the update sites, where one
+                // layer's m/v stage through at a time.
                 let hook_idx_map = &pending.hook_accum_idx;
                 let accum_scale = pending.accum_scale;
                 let mut fase_cb = |c: &mut Compiler,
