@@ -56,9 +56,17 @@ pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
 
 /// Register a GPU-resident f32 parameter for streaming: allocate a pinned
 /// host mirror, copy the current device bytes into it, free the device
-/// buffer, and null `t.data` (evicted state). No-op (with a loud note) on
-/// CPU tensors, views, or non-owning tensors — the codegen admission is
-/// expected to route only plain owning device params here.
+/// buffer, and null `t.data` (evicted state).
+///
+/// IDEMPOTENT ACROSS WINDOWS: on an already-registered RESIDENT tensor this
+/// degenerates to a writeback-free evict — the mirror is current by
+/// construction (post-update evicts write back; forwards never mutate θ;
+/// the window-end restore uploads from that same mirror), so the device
+/// bytes equal the mirror and a pure free suffices. Emitted at every
+/// window start for each layer-grouped param.
+///
+/// Aborts loudly on CPU tensors, views, or non-owning tensors — the
+/// codegen admission routes only plain owning device params here.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
     if tensor_ptr == 0 {
@@ -76,6 +84,15 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
     }
     #[cfg(feature = "cuda")]
     {
+        {
+            let guard = MIRRORS.lock().unwrap();
+            if guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr)) {
+                drop(guard);
+                // Already registered: window-start re-evict, mirror current.
+                nsl_weight_stream_evict(tensor_ptr, 0);
+                return;
+            }
+        }
         let bytes = t.data_byte_size();
         let host = crate::tensor::alloc_host_state_buffer(bytes);
         crate::cuda::inner::ensure_context();
@@ -160,6 +177,27 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
         let _ = writeback;
         eprintln!("[weight-stream] evict called in a non-CUDA build");
         std::process::abort();
+    }
+}
+
+/// Restore every registered, currently-evicted parameter to device
+/// residency WITHOUT dropping the table — emitted after the window's
+/// epilogue updates so the next iterations' forwards see ordinary resident
+/// weights (the window-scoped eviction cycle).
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_upload_all() {
+    #[cfg(feature = "cuda")]
+    {
+        let keys: Vec<i64> = {
+            let guard = MIRRORS.lock().unwrap();
+            guard
+                .as_ref()
+                .map(|g| g.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        for ptr in keys {
+            nsl_weight_stream_upload(ptr);
+        }
     }
 }
 

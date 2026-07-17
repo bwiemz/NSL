@@ -4010,6 +4010,12 @@ impl Compiler<'_> {
         // repo's deferral-must-refuse rule) instead of silently running the
         // interleaved baseline under a flag that claims otherwise.
         let csla_active = self.compile_options.layerwise_accum;
+        if self.compile_options.weight_stream && !csla_active {
+            return Err(CodegenError::new(
+                "--weight-stream requires --layerwise-accum (the window-scoped \
+                 eviction cycle is defined by the layer-major schedule)",
+            ));
+        }
         if csla_active {
             if !self.features.source_ad_enabled {
                 return Err(CodegenError::new(
@@ -8038,6 +8044,27 @@ impl Compiler<'_> {
             let len_msg_ptr = self.compile_string_literal(builder, &len_msg)?;
             self.compile_call_by_name(builder, "nsl_assert", &[len_ok, len_msg_ptr])?;
 
+            // D2b window-scoped weight eviction: drop every layer-grouped
+            // param's device buffer for the duration of the window backward
+            // (idempotent register: first window mirrors + evicts; later
+            // windows pure-free — the mirror is current by construction:
+            // post-update evicts write back, forwards never mutate θ, and
+            // the window-end restore uploads from that same mirror). Each
+            // layer re-uploads at its range head and evicts+writes-back
+            // after its update; epilogue params never stream.
+            let ws_active = self.compile_options.weight_stream;
+            if ws_active {
+                let mut ws_all: Vec<i64> =
+                    layer_group.iter().flatten().copied().collect();
+                ws_all.sort_unstable();
+                for &idx in &ws_all {
+                    let iv = builder.ins().iconst(cl_types::I64, idx);
+                    let pw =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                    self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
+                }
+            }
+
             // Bias correction — the same expression the (now-bypassed)
             // optimizer site computes; step_count is untouched between here
             // and there, so every group in this window shares one pair.
@@ -8093,6 +8120,22 @@ impl Compiler<'_> {
                 // This layer's accumulators exist only from here to its
                 // update below — the m_partial surface the schedule shrinks.
                 emit_csla_accum_alloc(self, builder, param_list, accum_val, &layer_group[ri])?;
+                // D2b: re-upload this layer's weights for its replay range
+                // (recompute clones + adjoint reads need them) under the
+                // Weights surface bracket. Values dominate the b-loop.
+                if ws_active && !layer_group[ri].is_empty() {
+                    let prev_surf =
+                        self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                    let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
+                    self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
+                    for &idx in &layer_group[ri] {
+                        let iv = builder.ins().iconst(cl_types::I64, idx);
+                        let pw = self
+                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                        self.compile_call_by_name(builder, "nsl_weight_stream_upload", &[pw])?;
+                    }
+                    self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev_surf])?;
+                }
 
                 let slice = crate::wengert::WengertList {
                     ops: pending.adjoint.ops[range.start..range.end].to_vec(),
@@ -8450,6 +8493,17 @@ impl Compiler<'_> {
                     self.compile_options.optim_state_offload,
                     &layer_group[ri],
                 )?;
+                // D2b: this layer's θ is final for the window — write back
+                // to the mirror and drop the device buffer.
+                if ws_active {
+                    for &idx in &layer_group[ri] {
+                        let iv = builder.ins().iconst(cl_types::I64, idx);
+                        let pw = self
+                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                        let wb = builder.ins().iconst(cl_types::I64, 1);
+                        self.compile_call_by_name(builder, "nsl_weight_stream_evict", &[pw, wb])?;
+                    }
+                }
             }
 
             // Epilogue: globals (embedding / final norm / LM head), tied and
@@ -8469,6 +8523,17 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 &global_group,
             )?;
+            // D2b: restore residency for the next iterations' forwards (the
+            // forward reads every layer every micro-batch; forward-side
+            // streaming is the 7B follow-up).
+            if ws_active {
+                let prev_surf =
+                    self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
+                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
+                self.compile_call_by_name(builder, "nsl_weight_stream_upload_all", &[])?;
+                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev_surf])?;
+            }
 
             // Window cleanup: drop the shells and start fresh lists for the
             // next window (carry inner shells died with the last range).
@@ -9652,6 +9717,15 @@ impl Compiler<'_> {
             builder.seal_block(dw_exit);
             state.current_block = Some(dw_exit);
             self.compile_call_by_name(builder, "nsl_list_free", &[dl])?;
+        }
+
+        // D2b: restore any evicted weights and release the pinned mirrors so
+        // post-training code (model_save, eval) sees ordinary device
+        // tensors. Steady state between windows is already resident; this
+        // covers a partial-tail exit mid... (params stay resident during the
+        // tail, so this is belt-and-braces + the mirror release).
+        if csla_active && self.compile_options.weight_stream {
+            self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
         }
 
         state.variables = saved_variables;
