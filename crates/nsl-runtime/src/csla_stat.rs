@@ -24,3 +24,50 @@ pub extern "C" fn nsl_csla_window_mark() {
 pub extern "C" fn nsl_csla_window_count() -> i64 {
     CSLA_WINDOW_COUNT.load(Ordering::Relaxed) as i64
 }
+
+/// D1b: one-time pointer-tie guard, emitted at train setup under
+/// `--layerwise-accum`.
+///
+/// Pointer-tied weights (two model fields aliasing one storage) are
+/// invisible to the compile-time layerwise analysis — each alias would
+/// classify independently, and a per-layer in-place θ update through one
+/// alias would corrupt the pending backward reads through the other.
+/// Structural ties (the same compound field read twice) are handled by
+/// source-AD memoization + the CrossLayer classification; this guard covers
+/// only the runtime-aliasing representation, which the compiler cannot see.
+///
+/// Aborts loudly on the first aliased pair: both NslTensor-pointer identity
+/// (assignment ties) and data-pointer identity (view ties) count.
+#[no_mangle]
+pub extern "C" fn nsl_csla_assert_params_unaliased(list_ptr: i64) {
+    if list_ptr == 0 {
+        return;
+    }
+    let list = unsafe { &*(list_ptr as *const crate::list::NslList) };
+    let n = list.len as usize;
+    let slots: &[i64] = unsafe { std::slice::from_raw_parts(list.data, n) };
+    for i in 0..n {
+        if slots[i] == 0 {
+            continue;
+        }
+        let ti = unsafe { &*(slots[i] as *const crate::tensor::NslTensor) };
+        for (j, &sj) in slots.iter().enumerate().skip(i + 1) {
+            if sj == 0 {
+                continue;
+            }
+            let tj = unsafe { &*(sj as *const crate::tensor::NslTensor) };
+            if slots[i] == sj || ti.data == tj.data {
+                eprintln!(
+                    "[csla] FATAL: model parameters {i} and {j} alias the same \
+                     storage (tensor {} == {} or data {:p} == {:p}). Pointer-tied \
+                     weights are unsupported under --layerwise-accum: a per-layer \
+                     in-place update through one alias would corrupt the other \
+                     alias's pending backward. Untie the weights or drop \
+                     --layerwise-accum.",
+                    slots[i], sj, ti.data, tj.data
+                );
+                std::process::abort();
+            }
+        }
+    }
+}

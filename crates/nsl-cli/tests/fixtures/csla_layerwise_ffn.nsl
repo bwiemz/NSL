@@ -77,4 +77,12 @@ train(model=m, epochs=1, grad_accumulation=2):
 
 print("LOSS_STREAM_END")
 
+# D1b memory-win probe (GPU runs): peak bytes ever allocated under the
+# MPartial surface (tag 4). Baseline allocates the FULL m_partial window
+# up front; the layerwise schedule's peak is max(one layer) + epilogue
+# globals. 0 on CPU runs (no GPU allocator) — the surface gate is GPU-only.
+print("MPARTIAL_PEAK_BEGIN")
+print(gpu_surface_peak_bytes(4))
+print("MPARTIAL_PEAK_END")
+
 model_save(m, "CSLA_SAVE_PATH")

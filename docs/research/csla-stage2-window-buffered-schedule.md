@@ -1,13 +1,14 @@
-# CSLA Stage-2, slice 1 (D1a): the window-buffered schedule
+# CSLA Stage-2 (D1a + D1b): the window-buffered, layer-major schedule
 
-**`--layerwise-accum` — buffering an entire FASE-Deferred accumulation window
-and replaying its backward as one runtime loop, bit-exact with the
-interleaved baseline.**
+**`--layerwise-accum` — buffering an entire FASE-Deferred accumulation window,
+replaying its backward layer-by-layer, and updating each layer's parameters
+the moment its accumulation completes — bit-exact with the interleaved
+baseline, with the accumulator surface shrunk from `4·P` to
+`max(one layer) + epilogue globals`.**
 
 Companion to `CSLA-compiler-scheduled-layerwise-accumulation.md` (the design
-paper); this note documents what Stage-2's first slice actually built, the
-structural facts that shaped it, and the seam the layer-major slice (D1b)
-plugs into.
+paper); this note documents what Stage-2 actually built: §§1-5 the D1a
+window-buffering slice, §6 the D1b layer-major slice on top of it.
 
 ---
 
@@ -135,6 +136,12 @@ on the baseline. Green on 2026-07-17 (RTX 5070 Ti, sm_120, `--target` default,
 | `csla_parity_ffn_gpu` | GPU twin (attention-free — SDPA on CUDA is refused in D1a) | bit-exact |
 | `csla_parity_packed_gqa_cpu` | packed GQA on CPU: buffered packed dict state + per-b packing-registry re-install + packed EmbeddingBackward from buffered input_ids | bit-exact |
 | `csla_refusals` | grad_clip / missing `--checkpoint-blocks` / SDPA-on-CUDA (cuda feature) / missing `--source-ad` | all refuse loudly |
+| `csla_mpartial_surface_shrinks_gpu` | D1b memory win: MPartial surface peak under the flag vs baseline | ratio ≤ 0.7 (projected 0.556) |
+
+All parity gates additionally assert the exact
+`[csla] layer-major schedule` line (D1b): the FFN fixture must produce
+`3 ranges, 6 layer-grouped params, 2 epilogue params` and the packed-GQA
+fixture `3 ranges, 16 layer-grouped params, 2 epilogue params`.
 
 Known limitations (review LOW findings, accepted for D1a): `NSL_PHASE_TIMING`
 attributes the backward phase to nothing under the flag (the bwd region it
@@ -147,25 +154,67 @@ Full regression battery unchanged-green with the flag off: 855 CPU tests, CCR
 parity ×4 (incl. production tolerance), 48-step long-run drift, fused-step /
 stream-migration / deferred-free / mem-accounting GPU gates.
 
-## 6. What D1a deliberately does NOT deliver, and the D1b seam
+## 6. D1b: the layer-major schedule (the paper §3 realized)
 
-D1a's memory profile is *worse* than the baseline (N× the boundary-residual
-surface, N batch dicts) — it is the enabling seam, default-off. The paper's
-actual win (killing the full-model `m_partial`) is D1b:
+D1b generalizes the single backward range to the k ranges of
+`layerwise::partition_ranges`: positional boundaries at each layer's
+`adjoint_first` in backward-visit order; range 0 is the prologue (loss /
+LM-head / final-norm adjoints), the last range swallows the
+embedding-backward epilogue ops. Emission per window:
 
-- generalize the single backward range to the k ranges of
-  `layerwise::analyze` (prologue / per-layer / epilogue partition of the
-  adjoint by `adjoint_first` boundaries);
-- per range, the same import/export machinery buffers the *boundary
-  adjoints* between ranges (they are adjoint-produced — NOT in CCR's
-  `escaping` set, which holds primal forward values only);
-- fire `fase_emit_final_step` per layer for layer-local params (it is already
-  strictly per-parameter; `bc1_inv`/`bc2_inv` are shared per window),
-  guarded by the last-backward-use analysis *extended with the NslList
-  lifetime fixpoint* (hoist ccr.rs's; layerwise.rs's Stage-1 scan lacks it)
-  and a one-time runtime pointer-alias assert (pointer-tied weights are
-  invisible to the compile-time analysis);
-- shrink the accumulator from full-model to per-layer alloc/step/free.
+```
+alloc epilogue-global accumulators (window-lived)
+for range R in backward order:
+    alloc layer(R)'s accumulators            # the shrunk m_partial surface
+    for b in 0..N:                           # same replay loop as D1a
+        seed = forward values + R's primal slots + R's carried adjoints
+        lower slice R with the FASE hook     # accumulates layer(R)'s grads
+        export R's boundary adjoints to the per-b carry list
+        free slots/carries whose last reader is R
+    per-layer update: fase_emit_final_step for layer(R)'s local params
+    free layer(R)'s accumulators
+epilogue update: globals, tied/cross-layer, dead layers, unseen params
+```
 
-The b-loop, buffer lists, seed-override mechanism, packing re-install,
-partial-tail semantics, and the parity harness all carry over unchanged.
+Key mechanics:
+
+- **Carry buffers**: boundary adjoints (`d(residual-after-L)`) are
+  adjoint-produced — NOT in CCR's `escaping` set (primal values only). A
+  per-micro-batch slot list carries them between ranges; exports are
+  excluded from the producing range's bulk free, and their frees are the
+  consuming ranges' existing FreeTensor markers (belt: an explicit free
+  after the last consuming range for marker-less Tensor carries).
+  Ghost-skipped exports are recorded at compile time so later ranges skip
+  seeding them — consumers ghost-skip identically to the baseline.
+- **Update groups**: a layer's param updates after its range iff its
+  gradient op sits positionally inside that range (attribution slop demotes
+  to the epilogue group — always correct, merely later). Dead params (no
+  adjoint) update with their layer on zero accumulators — weight/moment
+  decay still fire, exactly like the baseline's unconditional loop. Every
+  `param_paths` slot lands in exactly one group; per-param updates are
+  order-independent (no cross-param state in `fase_emit_final_step`, one
+  shared `bc1_inv/bc2_inv` pair computed from the same `step_count`
+  expression as the — now bypassed — optimizer site), so bit-exactness
+  survives the reordering.
+- **Update guard**: the CrossLayer classification runs on the FINAL adjoint
+  with the last-use analysis *extended through NslList membership*
+  (`ccr::extend_last_use_through_lists`, hoisted and now shared — Stage-1's
+  scan lacked it, which per-layer in-place θ updates made load-bearing), and
+  a one-time runtime pointer-alias abort
+  (`nsl_csla_assert_params_unaliased`) covers pointer-tied weights the
+  compile-time analysis cannot see.
+- **Accumulator lifecycle**: setup pushes NULL accum slots (no full-model
+  window, ever); each window allocates fresh `zeros_like` per group under
+  the MPartial surface and frees after the group's update — identical
+  initial bytes to the baseline's zeroed persistent buffers. The teardown
+  loop skips per-slot frees (slots are NULL between windows).
+- **Anti-vacuity**: the compile-time
+  `[csla] layer-major schedule: k ranges, X layer-grouped params, Y epilogue
+  params` line is asserted EXACTLY in the gates (a degenerate all-epilogue
+  schedule would replicate D1a and pass the parity gates vacuously), and the
+  GPU surface gate asserts `gpu_surface_peak_bytes(MPartial)` under the flag
+  is ≤ 0.7× the baseline's (the FFN fixture projects 0.556×).
+
+The D1a b-loop, buffer lists, seed-override mechanism, packing re-install
+(now per range — any range may hold attention backward ops), partial-tail
+semantics, refusals, and the parity harness all carry over unchanged.

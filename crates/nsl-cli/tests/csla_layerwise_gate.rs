@@ -137,6 +137,32 @@ fn parity_case(
     common_args: &[&str],
     expected_windows: i64,
 ) {
+    parity_case_with_schedule(
+        fixture,
+        cuda,
+        deterministic,
+        tag,
+        rewrites,
+        common_args,
+        expected_windows,
+        None,
+    )
+}
+
+/// `expected_schedule`: the exact `[csla] layer-major schedule: ...` stderr
+/// line (D1b anti-vacuity — proves the k-range layer-major shape engaged,
+/// not a degenerate all-epilogue schedule that would replicate D1a).
+#[allow(clippy::too_many_arguments)]
+fn parity_case_with_schedule(
+    fixture: &str,
+    cuda: bool,
+    deterministic: bool,
+    tag: &str,
+    rewrites: &[(&str, &str)],
+    common_args: &[&str],
+    expected_windows: i64,
+    expected_schedule: Option<&str>,
+) {
     let tmp = std::env::temp_dir().join(format!("nsl_csla_saves_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let save_a = tmp.join("base_a.nslm");
@@ -195,6 +221,14 @@ fn parity_case(
         "csla arm window-phase count != expected {expected_windows}:\n{}",
         csla.stderr
     );
+    // D1b anti-vacuity: the layer-major schedule shape itself.
+    if let Some(sched) = expected_schedule {
+        assert!(
+            csla.stderr.contains(sched),
+            "expected layer-major schedule line '{sched}' in:\n{}",
+            csla.stderr
+        );
+    }
     let bytes_c = std::fs::read(&save_c).expect("csla model_save missing");
 
     if env_deterministic {
@@ -224,7 +258,16 @@ fn parity_case(
 /// batches, N=2): exercises the save/replay machinery AND the teardown sweep.
 #[test]
 fn csla_parity_ffn_cpu() {
-    parity_case("csla_layerwise_ffn.nsl", false, false, "ffn_cpu", &[], &[], 6);
+    parity_case_with_schedule(
+        "csla_layerwise_ffn.nsl",
+        false,
+        false,
+        "ffn_cpu",
+        &[],
+        &[],
+        6,
+        Some("[csla] layer-major schedule: 3 ranges, 6 layer-grouped params, 2 epilogue params"),
+    );
 }
 
 /// CPU gate — loss tensor READ BY THE ADJOINT (review M2): tanh's backward
@@ -268,7 +311,16 @@ fn csla_parity_ffn_cpu_epoch_straddle() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csla_parity_ffn_gpu() {
-    parity_case("csla_layerwise_ffn.nsl", true, true, "ffn_gpu", &[], &[], 6);
+    parity_case_with_schedule(
+        "csla_layerwise_ffn.nsl",
+        true,
+        true,
+        "ffn_gpu",
+        &[],
+        &[],
+        6,
+        Some("[csla] layer-major schedule: 3 ranges, 6 layer-grouped params, 2 epilogue params"),
+    );
 }
 
 /// Packed-GQA composition, CPU: buffered packed-batch dict state
@@ -280,7 +332,7 @@ fn csla_parity_ffn_gpu() {
 /// in csla_refusals; the D1b tape-carry restores GPU attention parity.
 #[test]
 fn csla_parity_packed_gqa_cpu() {
-    parity_case(
+    parity_case_with_schedule(
         "csla_layerwise_packed_gqa.nsl",
         false,
         false,
@@ -291,6 +343,87 @@ fn csla_parity_packed_gqa_cpu() {
         // refusal (correctly) rejects. Both arms share the target.
         &["--target", "cpu"],
         8,
+        Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
+    );
+}
+
+/// D1b memory-win gate (GPU): the whole point of the layer-major schedule —
+/// the m_partial surface peak drops from the full-model window (baseline
+/// allocates every accumulator up front) to max(one layer) + the epilogue
+/// globals. FFN fixture: full = 37056 elems, layerwise peak = 16448 + 4160 =
+/// 20608 elems → ratio 0.556; assert <= 0.7 for allocator-rounding headroom,
+/// plus both peaks nonzero (anti-vacuity).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_mpartial_surface_shrinks_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_surface_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let peak_of = |tag: &str, extra: &[&str]| -> f64 {
+        let src = program(
+            "csla_layerwise_ffn.nsl",
+            true,
+            &tmp.join(format!("{tag}.nslm")),
+            &[],
+        );
+        let root = repo_root();
+        let dir = tmp.join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prog = dir.join("surface.nsl");
+        std::fs::write(&prog, src).unwrap();
+        let out = Command::new(env!("CARGO"))
+            .args(["run", "-q", "--features", "cuda"])
+            .arg("--manifest-path")
+            .arg(root.join("Cargo.toml"))
+            .args(["-p", "nsl-cli", "--", "run", "--source-ad", "--deterministic"])
+            .args(extra)
+            .arg(&prog)
+            .current_dir(&dir)
+            .env("NSL_STDLIB_PATH", root.join("stdlib"))
+            .env("NSL_EMBEDDING_BWD_CPU", "1")
+            .output()
+            .expect("spawn nsl run");
+        assert!(
+            out.status.success(),
+            "{tag} run failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut in_peak = false;
+        for line in stdout.lines() {
+            match line.trim() {
+                "MPARTIAL_PEAK_BEGIN" => in_peak = true,
+                "MPARTIAL_PEAK_END" => in_peak = false,
+                l if in_peak => {
+                    let cleaned = l
+                        .trim()
+                        .trim_start_matches("tensor([")
+                        .trim_end_matches("])");
+                    if let Ok(v) = cleaned.parse::<f64>() {
+                        return v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("MPARTIAL_PEAK markers missing in {tag} stdout:\n{stdout}");
+    };
+
+    let base_peak = peak_of("base", &["--checkpoint-blocks"]);
+    let csla_peak = peak_of("csla", &["--checkpoint-blocks", "--layerwise-accum"]);
+    assert!(
+        base_peak > 0.0 && csla_peak > 0.0,
+        "m_partial surface peaks must be nonzero (base {base_peak}, csla {csla_peak})"
+    );
+    let ratio = csla_peak / base_peak;
+    assert!(
+        ratio <= 0.7,
+        "layerwise m_partial peak did not shrink: csla {csla_peak} / base {base_peak} \
+         = {ratio:.3} (expected <= 0.7; schedule projects 0.556 on this fixture)"
+    );
+    eprintln!(
+        "[csla-surface] m_partial peak: baseline {base_peak}B -> layerwise {csla_peak}B \
+         (ratio {ratio:.3})"
     );
 }
 
