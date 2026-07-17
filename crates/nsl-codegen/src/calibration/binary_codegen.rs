@@ -1520,7 +1520,14 @@ fn emit_model_backward_bridge(
         }
 
         // ── Step 3: lower primal forward ──────────────────────────────────
+        // Suppress forward FBIP so a uniquely-owned primal input is preserved for
+        // the input-reading adjoint (see `Compiler::emit_inplace_suppress`);
+        // dropped before the adjoint lowering in Step 5.
         let mut func_state = crate::context::FuncState::default();
+        map_codegen_error(
+            "model_backward: raise in-place suppression",
+            compiler.emit_inplace_suppress(&mut b, true),
+        )?;
         let full_lowered = map_codegen_error(
             "model_backward: lower primal forward",
             crate::wengert_lower::compile_wengert_ops(
@@ -1531,6 +1538,10 @@ fn emit_model_backward_bridge(
                 &primal_vars,
                 None,
             ),
+        )?;
+        map_codegen_error(
+            "model_backward: drop in-place suppression",
+            compiler.emit_inplace_suppress(&mut b, false),
         )?;
         let mut full_vars = full_lowered.var_map.clone();
 

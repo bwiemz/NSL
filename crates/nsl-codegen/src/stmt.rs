@@ -5913,6 +5913,12 @@ impl Compiler<'_> {
                     None
                 };
 
+                // Preserve primal inputs for the adjoint: block forward FBIP from
+                // overwriting a uniquely-owned activation input (e.g. the matmul
+                // temp feeding `silu(x@W)`, refcount 1) that an input-reading
+                // backward still needs. Dropped before the adjoint lowering below.
+                // See `emit_inplace_suppress`.
+                self.emit_inplace_suppress(builder, true)?;
                 let full_lowered = crate::wengert_lower::compile_wengert_ops(
                     self,
                     builder,
@@ -5921,6 +5927,7 @@ impl Compiler<'_> {
                     &primal_vars,
                     None, // FASE on_param_grad hook — wired in Task 3
                 )?;
+                self.emit_inplace_suppress(builder, false)?;
                 let full_vars = &full_lowered.var_map;
 
                 let loss_val = *full_vars.get(&loss_var_id).ok_or_else(|| {
@@ -9120,6 +9127,25 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Emit the runtime in-place-suppression guard around a source-AD FORWARD
+    /// primal pass. Raise (`on=true`) before lowering the forward `WengertList`
+    /// so FBIP does not overwrite a uniquely-owned input the adjoint still reads
+    /// (e.g. `silu(x@W)`'s matmul temp, refcount 1, feeding an input-reading
+    /// `SiluBackward`); lower (`on=false`) before the adjoint pass so backward
+    /// FBIP still reclaims memory. Tape-AD gets this for free from
+    /// `is_recording()`; source-AD builds no tape, so every source-AD forward
+    /// site — grad blocks, train blocks, and model calibration — must bracket
+    /// its primal lowering with this. Paired inc/dec so nested blocks compose.
+    pub(crate) fn emit_inplace_suppress(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        on: bool,
+    ) -> Result<(), CodegenError> {
+        let v = builder.ins().iconst(cl_types::I64, i64::from(on));
+        self.compile_call_by_name(builder, "nsl_set_inplace_suppressed", &[v])?;
+        Ok(())
+    }
+
     fn compile_source_ad_grad_block(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -9234,6 +9260,8 @@ impl Compiler<'_> {
             }
         }
 
+        // Preserve primal inputs for the adjoint (see `emit_inplace_suppress`).
+        self.emit_inplace_suppress(builder, true)?;
         let full_lowered = crate::wengert_lower::compile_wengert_ops(
             self,
             builder,
@@ -9242,6 +9270,8 @@ impl Compiler<'_> {
             &primal_vars,
             None, // FASE on_param_grad hook — wired in Task 3
         )?;
+        self.emit_inplace_suppress(builder, false)?;
+
         let full_vars = &full_lowered.var_map;
 
         let loss_tensor = *full_vars.get(&loss_var_id).ok_or_else(|| {

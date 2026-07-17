@@ -1,0 +1,24 @@
+# Source-AD SiLU backward + forward-input preservation (run with --source-ad).
+#
+# grad(x): sum(silu(x))  =>  silu'(x) = σ(x)·(1 + x·(1 - σ(x))).
+#
+# The forward silu(x) must NOT consume x in place: source-AD raises an
+# in-place-suppression guard around the forward pass so the primal input the
+# adjoint reads survives. Before that guard, a uniquely-owned x was mutated to
+# silu(x) and the gradient came out as silu'(silu(x)) — silently wrong. Tape-AD
+# was always correct because its recording flag already blocked FBIP.
+
+let x = tensor_cat([full([1], 0.0), full([1], 1.0), full([1], -1.0)], 0)
+
+let (loss, dx) = grad(x):
+    sum(silu(x))
+
+# silu'([0, 1, -1]) = [0.5, 0.92767054, 0.07232949]
+let expected = tensor_cat([full([1], 0.5), full([1], 0.92767054), full([1], 0.07232949)], 0)
+assert_close(dx, expected, 0.0001, 0.0001)
+
+# The forward must have left x byte-intact (exact equality — no mutation at all).
+let x_orig = tensor_cat([full([1], 0.0), full([1], 1.0), full([1], -1.0)], 0)
+assert_close(x, x_orig, 0.0, 0.0)
+
+print("silu-source-ad-grad-preserves-input-ok")
