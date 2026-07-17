@@ -399,6 +399,14 @@ impl Compiler<'_> {
         if func_name == "gpu_reset_mem_stats" && args.is_empty() {
             return self.compile_call_by_name(builder, "nsl_gpu_reset_mem_stats", &[]);
         }
+        // CSLA tape-carry gate intrinsic: fused-SDPA FORWARD launch counter
+        // (variant 0 = base kernel, 1 = Tier-B tile-skip) — lets parity
+        // fixtures assert the fused kernel actually fired instead of the
+        // decomposed path.
+        if func_name == "sdpa_fused_launch_count" && args.len() == 1 {
+            let variant = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_sdpa_fused_launch_count", &[variant]);
+        }
         if matches!(func_name.as_str(), "gpu_surface_peak_bytes" | "gpu_surface_at_peak_bytes")
             && args.len() == 1
         {

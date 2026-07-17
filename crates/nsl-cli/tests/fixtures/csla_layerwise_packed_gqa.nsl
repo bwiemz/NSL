@@ -4,19 +4,26 @@
 # the global L2 norm over the full m_partial window, which --layerwise-accum
 # refuses by design).
 #
-# Dual role (review finding H2): on CUDA targets EVERY SDPA op emits the
-# fused dispatch (runtime variant selection over head_dims {32,64,128}) whose
-# forward-saved logsumexp travels by SSA side-band (flash_attn_aux) — the
-# window replay cannot see it, so csla REFUSES attention-on-GPU in D1a. This
-# fixture therefore gates:
-#   - CPU PARITY (empty variant table on CPU targets -> attention decomposes
-#     at compile time -> admitted): packed dict buffering (segment_ids /
+# Gate roles:
+#   - CPU PARITY (--target cpu -> empty variant table -> attention
+#     decomposes at compile time): packed dict buffering (segment_ids /
 #     position_ids / input_ids per micro-batch), the per-b packing-registry
 #     re-install, and the packed EmbeddingBackward reading buffered
 #     input_ids at replay time;
-#   - the GPU REFUSAL case in csla_refusals (same source, m.to(cuda)).
-# The D1b tape-carry (route the LSE through a real tape VarId) restores GPU
-# attention parity.
+#   - GPU PARITY, two distinct attention-backward paths (the [csla] lse
+#     tape-carry stderr line names which one ran; gates assert it exactly):
+#       * Block policy (--checkpoint-blocks alone): SDPA outs are recompute
+#         victims — the replay's spliced clone RE-LAUNCHES the fused
+#         forward per micro-batch and re-establishes the Value-keyed aux
+#         locally; the LSE carry is INERT (0 slots). The GQA form's
+#         expanded strided K/V declines the fused launch at runtime; the
+#         harness's MHA rewrite (kv_heads == heads) makes it FIRE, proven
+#         by the sdpa_fused_launch_count markers below.
+#       * Selective policy (+ --checkpoint-selective): SDPA outs are SAVED
+#         -> adjoint imports -> the save phase buffers the aux entries
+#         (2 slots) and the replay re-binds each micro-batch's REAL
+#         forward-saved logsumexp into the fused phase-2 backward — the
+#         live tape-carry configuration.
 #
 # 2048 tokens / (batch 2 x seq 64) = 16 micro-batches; grad_accumulation=2
 # -> 8 optimizer steps, no trailing partial window.
@@ -82,5 +89,12 @@ train(model=m, epochs=1, grad_accumulation=2):
             print(loss)
 
 print("LOSS_STREAM_END")
+
+# Fused-SDPA launch counter (variant 0 = base fused forward kernel): 0 when
+# every launch declined (GQA strided K/V, or CPU target), > 0 when the fused
+# path fired — the MHA GPU gate asserts equality across arms and > 0.
+print("SDPA_FUSED_BEGIN")
+print(sdpa_fused_launch_count(0))
+print("SDPA_FUSED_END")
 
 model_save(m, "CSLA_SAVE_PATH")
