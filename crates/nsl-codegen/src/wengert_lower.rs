@@ -3113,6 +3113,17 @@ fn lower_single_op(
                         &[inputs[0], inputs[1]],
                     )
                 }
+                "gelu_backward" => {
+                    // inputs = [grad, x] — p4 GELU fix: grad * gelu'(x), one
+                    // launch, derivative matched to each device's forward
+                    // (replaces the FBIP-corrupted 7-op expansion).
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_gelu_backward",
+                        &[inputs[0], inputs[1]],
+                    )
+                }
                 "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
                     let rt_name = format!("nsl_tensor_{}", name);
                     call(compiler, builder, &rt_name, &inputs)

@@ -909,21 +909,23 @@ impl AdjointGenerator {
             // Compound backward rules — multi-instruction lowerings
             // =================================================================
 
-            // --- GELU backward: d/dx[x * Φ(x)] = Φ(x) + x * φ(x) ---
-            // Approximation: GELU'(x) ≈ 0.5*(1+tanh(√(2/π)*(x+0.044715*x³)))
-            //   + 0.5*x*sech²(√(2/π)*(x+0.044715*x³))*√(2/π)*(1+3*0.044715*x²)
-            // Simplified: we use the identity d/dx[GELU(x)] = σ(1.702*x)*(1 + 1.702*x*(1-σ(1.702*x)))
-            // which is the exact derivative of the sigmoid-linear approximation GELU(x) ≈ x*σ(1.702*x)
+            // --- GELU backward: grad * gelu'(x) ---
+            // Fused (Milestone C · p4 GELU fix): a single
+            // `nsl_tensor_gelu_backward(grad, x)` launch computing the derivative
+            // of the forward each device actually ran (GPU: sigmoid approx
+            // σ(1.702x)·(1+1.702x·(1−σ)); CPU: tanh-approx, same as tape-AD).
+            //
+            // The previous 7-op expansion here was numerically WRONG: its
+            // internal temp `kx = Mul(1.702, x)` had refcount 1, and the
+            // expansion's own `Sigmoid(kx)` FBIP-mutated it in place during the
+            // adjoint pass (where the in-place-suppression guard is deliberately
+            // clear), so the later `Mul(kx, 1−s)` read σ(kx) and the result was
+            // s·(1+s·(1−s)) — 0.625 instead of 0.5 at x=0. This was the ONLY
+            // adjoint expansion creating an internal temp that is consumed by an
+            // FBIP-capable unary op and then read again; do not reintroduce that
+            // pattern (fuse instead, or keep temps single-use).
             AdjointExpr::GeluBackward(y_bar, x) => {
-                let k = self.emit_constant(1.702);
-                let kx = self.emit_op(PrimalOp::Mul, vec![k, x]);
-                let sig_kx = self.emit_op(PrimalOp::Sigmoid, vec![kx]);
-                let one = self.emit_constant(1.0);
-                let one_minus_sig = self.emit_op(PrimalOp::Sub, vec![one, sig_kx]);
-                let kx_term = self.emit_op(PrimalOp::Mul, vec![kx, one_minus_sig]);
-                let one_plus_kx_term = self.emit_op(PrimalOp::Add, vec![one, kx_term]);
-                let gelu_deriv = self.emit_op(PrimalOp::Mul, vec![sig_kx, one_plus_kx_term]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, gelu_deriv])
+                self.emit_op(PrimalOp::Passthrough("gelu_backward".into()), vec![y_bar, x])
             }
 
             // --- SiLU backward: d/dx[x * σ(x)] = σ(x) * (1 + x * (1 - σ(x))) ---

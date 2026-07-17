@@ -1,0 +1,24 @@
+# Source-AD GELU backward correctness (run with --source-ad).
+#
+# The old 7-op GeluBackward expansion computed s·(1+s·(1-s)) instead of
+# s·(1+kx·(1-s)): its internal temp kx was FBIP-mutated by the expansion's own
+# Sigmoid(kx) during the adjoint pass. Observable as dx = [0.625, 0.956, 0.174]
+# at x = [0, 1, -1] — wrong even at x=0, where EVERY gelu derivative is 0.5.
+#
+# The fused nsl_tensor_gelu_backward computes the derivative of the forward this
+# device runs (CPU: tanh approximation — the same formula tape-AD uses), so the
+# expected values below are exactly the tape-AD gradients.
+
+let x = tensor_cat([full([1], 0.0), full([1], 1.0), full([1], -1.0)], 0)
+
+let (loss, dx) = grad(x):
+    sum(gelu(x))
+
+let expected = tensor_cat([full([1], 0.5), full([1], 1.08296406), full([1], -0.08296406)], 0)
+assert_close(dx, expected, 0.0001, 0.0001)
+
+# The forward must have left x byte-intact.
+let x_orig = tensor_cat([full([1], 0.0), full([1], 1.0), full([1], -1.0)], 0)
+assert_close(x, x_orig, 0.0, 0.0)
+
+print("gelu-source-ad-grad-ok")
