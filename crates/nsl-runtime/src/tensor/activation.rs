@@ -1161,6 +1161,164 @@ pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     result
 }
 
+/// Derivative of the CPU forward gelu's TANH approximation
+/// (`0.5·x·(1+tanh(k))`, `k = √(2/π)·(x + 0.044715x³)`):
+///   gelu'(x) = 0.5·(1+tanh(k)) + 0.5·x·sech²(k)·√(2/π)·(1 + 3·0.044715·x²)
+#[inline]
+fn gelu_tanh_deriv_f32(x: f32) -> f32 {
+    let c = (2.0_f32 / std::f32::consts::PI).sqrt();
+    let k = c * (x + 0.044715_f32 * x * x * x);
+    let t = k.tanh();
+    let sech2 = 1.0_f32 - t * t;
+    0.5_f32 * (1.0_f32 + t) + 0.5_f32 * x * sech2 * c * (1.0_f32 + 3.0_f32 * 0.044715_f32 * x * x)
+}
+#[inline]
+fn gelu_tanh_deriv_f64(x: f64) -> f64 {
+    let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+    let k = c * (x + 0.044715 * x * x * x);
+    let t = k.tanh();
+    let sech2 = 1.0 - t * t;
+    0.5 * (1.0 + t) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x)
+}
+
+/// Materialize `gelu'(x)` (CPU tanh-approx derivative) as a fresh tensor of
+/// `x`'s shape/dtype. Used by the broadcast-grad fallback.
+fn gelu_deriv_cpu(x_ptr: i64) -> i64 {
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let a = NslTensor::from_ptr(x_c);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = gelu_tanh_deriv_f32(*a.data_f32().add(i)) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            unsafe { *buf.add(i) = gelu_tanh_deriv_f64(*a.data_f64().add(i)) };
+        }
+        buf as *mut c_void
+    };
+    let result = Box::new(NslTensor::new(
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(x_c);
+    result
+}
+
+/// Source-AD GELU backward, fused (Milestone C · p4 GELU fix): one call computing
+/// `grad * gelu'(x)`, where `gelu'` is the derivative of the forward THIS DEVICE
+/// actually ran:
+/// - **GPU**: sigmoid approximation `x·σ(1.702x)` (`GELU_F32_PTX`) →
+///   `GELU_BACKWARD_SRCAD_F32_PTX` computes `σ(1.702x)·(1+1.702x·(1−σ(1.702x)))`.
+/// - **CPU**: tanh approximation (the `nsl_tensor_gelu` CPU loop) →
+///   `gelu_tanh_deriv_*` above (same formula as the tape backward).
+///
+/// Replaces the source-AD 7-op expansion of `AdjointExpr::GeluBackward`, which
+/// was numerically WRONG: its internal temp `kx = 1.702·x` (refcount 1) was
+/// FBIP-mutated in place by the expansion's own `Sigmoid(kx)` during the adjoint
+/// pass (guard deliberately clear there), so the later `Mul(kx, 1−s)` read
+/// `σ(kx)` and the whole expression became `s·(1+s·(1−s))` — 0.625 instead of
+/// 0.5 at x=0. Fusing eliminates the temp; no aliasing exists inside one kernel.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
+    let xt = unsafe { &*(x_ptr as *const NslTensor) };
+    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    assert!(
+        (xt.dtype == 0 || xt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
+        "gelu_backward: unsupported dtype (x={}, grad={}); f16/bf16 activation backward is not implemented",
+        xt.dtype, gt.dtype
+    );
+    // Broadcast/mismatched-grad fallback (scalar sum/mean seed vs x[n],
+    // cross-device, mixed dtype): materialize `deriv = gelu'(x)` as a fresh
+    // tensor, then `grad * deriv` via the broadcasting `nsl_tensor_mul` (grad
+    // first, matching the pre-fusion final-op order so the output follows
+    // grad's placement).
+    if !gt.shape_eq(xt) || gt.device != xt.device || gt.dtype != xt.dtype {
+        let deriv = if xt.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                // GPU tensors are f32, so ones_like yields a matching GPU ones;
+                // deriv = fused kernel evaluated with grad = 1.
+                let ones = crate::tensor::nsl_tensor_ones_like(x_ptr);
+                let x_c = nsl_tensor_contiguous(x_ptr);
+                let d = crate::cuda::gpu_backward_binary(
+                    ones,
+                    x_c,
+                    crate::cuda::kernels::GELU_BACKWARD_SRCAD_F32_PTX,
+                    "nsl_gelu_backward_srcad_f32\0",
+                );
+                nsl_tensor_free(ones);
+                nsl_tensor_free(x_c);
+                d
+            }
+            #[cfg(not(feature = "cuda"))]
+            { panic!("CUDA support not compiled"); }
+        } else {
+            gelu_deriv_cpu(x_ptr)
+        };
+        let out = crate::tensor::nsl_tensor_mul(grad_ptr, deriv, 0);
+        nsl_tensor_free(deriv);
+        return out;
+    }
+    if xt.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            let grad_c = nsl_tensor_contiguous(grad_ptr);
+            let x_c = nsl_tensor_contiguous(x_ptr);
+            let out = crate::cuda::gpu_backward_binary(
+                grad_c,
+                x_c,
+                crate::cuda::kernels::GELU_BACKWARD_SRCAD_F32_PTX,
+                "nsl_gelu_backward_srcad_f32\0",
+            );
+            nsl_tensor_free(grad_c);
+            nsl_tensor_free(x_c);
+            return out;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+    // CPU: tanh-approx derivative (the CPU forward's formula), elementwise.
+    let grad_c = nsl_tensor_contiguous(grad_ptr);
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let g = NslTensor::from_ptr(grad_c);
+    let a = NslTensor::from_ptr(x_c);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            let xv = unsafe { *a.data_f32().add(i) };
+            let gv = unsafe { *g.data_f32().add(i) };
+            unsafe { *buf.add(i) = gv * gelu_tanh_deriv_f32(xv) };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            let xv = unsafe { *a.data_f64().add(i) };
+            let gv = unsafe { *g.data_f64().add(i) };
+            unsafe { *buf.add(i) = gv * gelu_tanh_deriv_f64(xv) };
+        }
+        buf as *mut c_void
+    };
+    let result = Box::new(NslTensor::new(
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(grad_c);
+    nsl_tensor_free(x_c);
+    result
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     {
@@ -1897,5 +2055,183 @@ mod sigmoid_tanh_backward_tests {
             assert_eq!(r[i].to_bits(), f[i].to_bits(), "gpu f32 mismatch at {i}: {} vs {}", r[i], f[i]);
         }
         for p in [yr, gr, ref_out, yf, gf, fused] { nsl_tensor_free(p); }
+    }
+}
+
+#[cfg(test)]
+mod gelu_backward_tests {
+    use super::*;
+    use crate::tensor::NslTensor;
+
+    #[cfg(feature = "cuda")]
+    fn make_f32(data: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 1);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f32().add(i) = *v }; }
+        ptr
+    }
+    fn make_f64(data: &[f64]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f64().add(i) = *v }; }
+        ptr
+    }
+
+    /// CPU f64: fused output equals grad · gelu_tanh_deriv (same formula, same
+    /// order → bit-equal), and at x=0 the derivative is exactly 0.5 (true for
+    /// EVERY gelu approximation — the old expansion returned 0.625 there).
+    #[test]
+    fn gelu_backward_cpu_f64_matches_tanh_deriv() {
+        let xs = [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0];
+        let gs = [0.3, -1.1, 2.0, 1.0, 0.75, -0.5, 1.0, 4.2];
+        let (x, g) = (make_f64(&xs), make_f64(&gs));
+        let out = nsl_tensor_gelu_backward(g, x);
+        let ot = NslTensor::from_ptr(out);
+        for (i, (&xv, &gv)) in xs.iter().zip(&gs).enumerate() {
+            let expected = gv * gelu_tanh_deriv_f64(xv);
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert_eq!(got.to_bits(), expected.to_bits(), "at {i}: {got} vs {expected}");
+        }
+        // x=0 (index 3, grad 1.0): every gelu' is exactly 0.5 there.
+        assert_eq!(unsafe { *ot.data_f64().add(3) }, 0.5);
+        for p in [x, g, out] { nsl_tensor_free(p); }
+    }
+
+    /// CPU f64 finite differences against the ACTUAL forward `nsl_tensor_gelu`:
+    /// gelu'(x) ≈ (gelu(x+h) − gelu(x−h)) / 2h. The gold-standard check that the
+    /// backward is the derivative of the forward this device runs.
+    #[test]
+    fn gelu_backward_cpu_f64_finite_differences() {
+        let xs = [-2.5, -1.0, -0.3, 0.0, 0.4, 1.0, 1.7, 3.0];
+        let h = 1e-6_f64;
+        let gelu_at = |vals: &Vec<f64>| -> Vec<f64> {
+            let t = make_f64(vals);
+            // Bump so the forward can't FBIP-consume our handle mid-test.
+            NslTensor::from_ptr(t).refcount.fetch_add(1, Ordering::SeqCst);
+            let y = nsl_tensor_gelu(t);
+            NslTensor::from_ptr(t).refcount.fetch_sub(1, Ordering::SeqCst);
+            let yt = NslTensor::from_ptr(y);
+            let out = (0..vals.len()).map(|i| unsafe { *yt.data_f64().add(i) }).collect();
+            nsl_tensor_free(y);
+            nsl_tensor_free(t);
+            out
+        };
+        let up = gelu_at(&xs.iter().map(|v| v + h).collect());
+        let dn = gelu_at(&xs.iter().map(|v| v - h).collect());
+        let (x, ones) = (make_f64(&xs), make_f64(&vec![1.0; xs.len()]));
+        let out = nsl_tensor_gelu_backward(ones, x);
+        let ot = NslTensor::from_ptr(out);
+        for i in 0..xs.len() {
+            let fd = (up[i] - dn[i]) / (2.0 * h);
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert!((got - fd).abs() < 1e-7, "at {i} (x={}): fused {got} vs FD {fd}", xs[i]);
+        }
+        for p in [x, ones, out] { nsl_tensor_free(p); }
+    }
+
+    /// Scalar `sum`-seed grad broadcasts via the fallback (deriv materialized,
+    /// then broadcast mul) instead of panicking.
+    #[test]
+    fn gelu_backward_scalar_grad_broadcasts() {
+        let xs = [-2.0, -0.5, 0.0, 1.0, 3.0];
+        let c = 1.5_f64;
+        let (x, grad) = (make_f64(&xs), make_f64(&[c]));
+        let out = nsl_tensor_gelu_backward(grad, x);
+        assert_eq!(NslTensor::from_ptr(out).len, xs.len() as i64, "output must be x-shaped");
+        let ot = NslTensor::from_ptr(out);
+        for (i, &xv) in xs.iter().enumerate() {
+            let expected = c * gelu_tanh_deriv_f64(xv);
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert!((got - expected).abs() < 1e-12, "at {i}: {got} vs {expected}");
+        }
+        for p in [x, grad, out] { nsl_tensor_free(p); }
+    }
+
+    /// GPU f32: fused kernel vs the host-computed sigmoid-approx derivative
+    /// σ(1.702x)·(1+1.702x·(1−σ)) — the derivative of GELU_F32_PTX's forward.
+    /// Tolerance covers ex2.approx/rcp.approx (~1-2 ulp each).
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn gelu_backward_gpu_f32_matches_sigmoid_deriv() {
+        let n = 257usize; // 256-block tail guard
+        let xs: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 6.0).collect();
+        let gs: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 2.0).collect();
+        let to_gpu = |d: &[f32]| crate::tensor::nsl_tensor_to_device(make_f32(d), 1);
+        let (x, g) = (to_gpu(&xs), to_gpu(&gs));
+        let out = nsl_tensor_gelu_backward(g, x);
+        let cpu = crate::tensor::nsl_tensor_to_device(out, 0);
+        let ot = NslTensor::from_ptr(cpu);
+        for i in 0..n {
+            let (xv, gv) = (xs[i] as f64, gs[i] as f64);
+            let kx = 1.702_f32 as f64 * xv;
+            let s = 1.0 / (1.0 + (-kx).exp());
+            let expected = gv * (s * (1.0 + kx * (1.0 - s)));
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert!(
+                (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
+                "at {i} (x={xv}): fused {got} vs analytic {expected}"
+            );
+        }
+        for p in [x, g, out, cpu] { nsl_tensor_free(p); }
+    }
+
+    /// GPU f32 finite differences against the GPU forward (GELU_F32_PTX):
+    /// central difference with h=1e-2; tolerance dominated by f32 rounding noise.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn gelu_backward_gpu_f32_finite_differences() {
+        let xs: Vec<f32> = vec![-2.5, -1.0, -0.3, 0.0, 0.4, 1.0, 1.7, 3.0];
+        let n = xs.len();
+        let h = 1e-2_f32;
+        let gelu_gpu = |vals: &Vec<f32>| -> Vec<f64> {
+            let t = crate::tensor::nsl_tensor_to_device(make_f32(vals), 1);
+            NslTensor::from_ptr(t).refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let y = nsl_tensor_gelu(t);
+            NslTensor::from_ptr(t).refcount.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let c = crate::tensor::nsl_tensor_to_device(y, 0);
+            let ct = NslTensor::from_ptr(c);
+            let out = (0..n).map(|i| unsafe { *ct.data_f64().add(i) }).collect();
+            for p in [t, y, c] { nsl_tensor_free(p); }
+            out
+        };
+        let up = gelu_gpu(&xs.iter().map(|v| v + h).collect());
+        let dn = gelu_gpu(&xs.iter().map(|v| v - h).collect());
+        let to_gpu = |d: &[f32]| crate::tensor::nsl_tensor_to_device(make_f32(d), 1);
+        let (x, ones) = (to_gpu(&xs), to_gpu(&vec![1.0_f32; n]));
+        let out = nsl_tensor_gelu_backward(ones, x);
+        let cpu = crate::tensor::nsl_tensor_to_device(out, 0);
+        let ot = NslTensor::from_ptr(cpu);
+        for i in 0..n {
+            let fd = (up[i] - dn[i]) / (2.0 * h as f64);
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert!((got - fd).abs() < 5e-3, "at {i} (x={}): fused {got} vs FD {fd}", xs[i]);
+        }
+        for p in [x, ones, out, cpu] { nsl_tensor_free(p); }
+    }
+
+    /// GPU scalar-grad broadcast: exercises the deriv-materialization fallback
+    /// (ones_like → fused kernel → broadcasting mul → 3 frees) on device.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn gelu_backward_gpu_scalar_grad_broadcasts() {
+        let xs: Vec<f32> = (0..300).map(|i| (i as f32) * 0.03 - 4.5).collect();
+        let c = 2.5_f32;
+        let x = crate::tensor::nsl_tensor_to_device(make_f32(&xs), 1);
+        let grad = crate::tensor::nsl_tensor_to_device(make_f32(&[c]), 1);
+        let out = nsl_tensor_gelu_backward(grad, x);
+        assert_eq!(NslTensor::from_ptr(out).len, xs.len() as i64, "output must be x-shaped");
+        let cpu = crate::tensor::nsl_tensor_to_device(out, 0);
+        let ot = NslTensor::from_ptr(cpu);
+        for (i, &xv) in xs.iter().enumerate() {
+            let kx = 1.702_f32 as f64 * xv as f64;
+            let s = 1.0 / (1.0 + (-kx).exp());
+            let expected = c as f64 * (s * (1.0 + kx * (1.0 - s)));
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert!(
+                (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
+                "at {i} (x={xv}): {got} vs {expected}"
+            );
+        }
+        for p in [x, grad, out, cpu] { nsl_tensor_free(p); }
     }
 }

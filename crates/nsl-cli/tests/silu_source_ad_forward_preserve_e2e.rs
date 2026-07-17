@@ -129,3 +129,42 @@ fn e2e_silu_train_source_ad_matches_tape() {
     );
 }
 
+
+/// GELU: the old source-AD 7-op expansion was numerically wrong (its internal
+/// `kx` temp was FBIP-clobbered by the expansion's own Sigmoid during the
+/// adjoint pass → s·(1+s·(1−s)), i.e. 0.625 instead of 0.5 at x=0). The fused
+/// `nsl_tensor_gelu_backward` computes the derivative of the device's actual
+/// forward; on CPU that is the tanh approximation, identical to tape-AD, so the
+/// fixture asserts the exact tape values.
+#[test]
+fn e2e_gelu_source_ad_gradient_correct() {
+    let root = workspace_root();
+    let example = root.join("examples/gelu_source_ad_grad.nsl");
+    let output = Command::new(env!("CARGO"))
+        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .arg(&example)
+        .current_dir(&root)
+        .output()
+        .expect("failed to execute nsl run --source-ad");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "gelu source-AD gradient e2e failed (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("gelu-source-ad-grad-ok"),
+        "expected 'gelu-source-ad-grad-ok' in stdout:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stderr.contains("Using source-to-source AD for grad block")
+            && !stderr.contains("falling back to tape-based AD"),
+        "source AD was not exercised.\nstderr:\n{}",
+        stderr
+    );
+}
