@@ -4875,6 +4875,17 @@ impl Compiler<'_> {
             /// see half-updated weights (review D1b-2).
             primal_view_of:
                 std::collections::HashMap<crate::wengert::VarId, crate::wengert::VarId>,
+            /// LSE tape-carry (lifts the D1a fused-SDPA refusal): one extra
+            /// inner-list slot per `flash_attn_aux` entry, holding the
+            /// forward-saved logsumexp (a real tensor when the fused
+            /// dispatch launched, runtime 0 when it declined — the FFI's
+            /// existing decline semantics). `(inner slot index, the fwd-out
+            /// vids whose seeded Values must key the aux re-insert)`. The
+            /// replay re-binds `flash_attn_aux[seed[vid]] = lse[b]` before
+            /// each consuming range's lowering, so the emitted SDPA backward
+            /// reads micro-batch b's LSE instead of missing the Value-keyed
+            /// side-band.
+            lse_slots: Vec<(usize, Vec<crate::wengert::VarId>)>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -6433,29 +6444,16 @@ impl Compiler<'_> {
                              claims or --layerwise-accum",
                         ));
                     }
-                    // H2 — fused SDPA dispatch: the forward-saved logsumexp
-                    // rides `flash_attn_aux` (keyed by the forward's SSA
-                    // Value) + a u32::MAX-sentinel owned entry; the replay's
-                    // freshly loaded value misses the map, so on a runtime
-                    // fused launch the emitted backward would silently
-                    // substitute the reference kernel (non-bit-exact + perf
-                    // cliff). The sentinel entry below is exactly "a fused
-                    // dispatch with a real LSE was emitted in this forward".
-                    if full_lowered
-                        .owned_values
-                        .iter()
-                        .any(|(vid, _, _)| *vid == u32::MAX)
-                    {
-                        return Err(CodegenError::new(
-                            "--layerwise-accum does not yet support attention on \
-                             CUDA targets: the fused SDPA dispatch (emitted for \
-                             every SDPA op on GPU, with runtime variant \
-                             selection) saves its logsumexp through an SSA \
-                             side-band (flash_attn_aux) the window replay cannot \
-                             see. Train on CPU, or drop --layerwise-accum until \
-                             the tape-carry follow-up lands",
-                        ));
-                    }
+                    // H2 (RESOLVED by the LSE tape-carry): the fused SDPA
+                    // dispatch saves its logsumexp through the Value-keyed
+                    // `flash_attn_aux` side-band + a u32::MAX-sentinel owned
+                    // entry. The save phase below buffers every aux entry as
+                    // an extra window slot, and the replay re-binds the aux
+                    // map per micro-batch before each consuming range's
+                    // lowering — the emitted backward then consumes the SAME
+                    // per-batch LSE the baseline did (or the runtime-0
+                    // decline sentinel), keeping the fused phase-2 kernel on
+                    // the fused path.
                     // M1 — @fused_lm_ce / distill backward consult Value-keyed
                     // cast caches (fused_ce_fwd_casts / fused_kl_ce_bwd_cache);
                     // a replay miss re-emits fresh casts per window with no
@@ -6520,6 +6518,54 @@ impl Compiler<'_> {
                             )));
                         }
                     }
+                    // LSE tape-carry: append one slot per fused-SDPA aux
+                    // entry whose forward output the adjoint reads. The
+                    // stored value is the aux LSE (join-block param on the
+                    // dispatch arm — a real tensor when the fused launch
+                    // fired, runtime 0 when it declined; the decomposed
+                    // arm's compile-time iconst 0 buffers as a plain 0).
+                    // Sorted by min fwd-out vid so slot order is
+                    // deterministic.
+                    let mut lse_slots: Vec<(usize, Vec<crate::wengert::VarId>)> = Vec::new();
+                    if !self.flash_attn_aux.is_empty() {
+                        let slot_vid_set: std::collections::HashSet<crate::wengert::VarId> =
+                            slots.iter().map(|(v, _)| *v).collect();
+                        let mut by_val: std::collections::HashMap<
+                            Value,
+                            Vec<crate::wengert::VarId>,
+                        > = std::collections::HashMap::new();
+                        for (vid, val) in full_vars.iter() {
+                            by_val.entry(*val).or_default().push(*vid);
+                        }
+                        let mut entries: Vec<(Vec<crate::wengert::VarId>, Value)> = self
+                            .flash_attn_aux
+                            .iter()
+                            .filter_map(|(out_val, (_, lse_val))| {
+                                let mut vids: Vec<crate::wengert::VarId> = by_val
+                                    .get(out_val)?
+                                    .iter()
+                                    .copied()
+                                    .filter(|v| slot_vid_set.contains(v))
+                                    .collect();
+                                if vids.is_empty() {
+                                    return None;
+                                }
+                                vids.sort_unstable();
+                                Some((vids, *lse_val))
+                            })
+                            .collect();
+                        entries.sort_by_key(|(vids, _)| vids[0]);
+                        for (vids, lse_val) in entries {
+                            let idx = slots.len() + lse_slots.len();
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_push",
+                                &[inner, lse_val],
+                            )?;
+                            lse_slots.push((idx, vids));
+                        }
+                    }
+
                     let so = builder.use_var(saves_outer_var);
                     self.compile_call_by_name(builder, "nsl_list_push", &[so, inner])?;
                     if has_dataloader.is_some() {
@@ -6603,6 +6649,14 @@ impl Compiler<'_> {
                                 } => Some((idx as i64, "nsl_list_free")),
                                 _ => None,
                             })
+                            // LSE slots: owned tensors when the fused launch
+                            // fired, runtime 0 when it declined — the
+                            // null-safe free covers both.
+                            .chain(
+                                lse_slots
+                                    .iter()
+                                    .map(|(idx, _)| (*idx as i64, "nsl_tensor_free_if_valid")),
+                            )
                             .collect(),
                     );
                     csla_pending = Some(CslaPending {
@@ -6616,6 +6670,7 @@ impl Compiler<'_> {
                         plan,
                         params: csla_params,
                         primal_view_of,
+                        lse_slots,
                     });
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
@@ -7036,6 +7091,13 @@ impl Compiler<'_> {
                 // window/teardown sweeps for shells and the partial tail).
                 if let Some(p) = &csla_pending {
                     retained_full_vars.extend(p.slots.iter().map(|(v, _)| *v));
+                    // LSE tape-carry: the fused-SDPA saved logsumexps ride
+                    // owned_values under the u32::MAX sentinel — buffered per
+                    // micro-batch, freed by the window backward (or the
+                    // teardown sweep), never by this per-iteration bulk free.
+                    if !p.lse_slots.is_empty() {
+                        retained_full_vars.insert(u32::MAX);
+                    }
                 }
                 if let Some(gl) = &grad_lowered {
                     self.free_wengert_owned_values(
@@ -7085,6 +7147,15 @@ impl Compiler<'_> {
                     for (vid, _) in &p.slots {
                         if let Some(v) = full_vars.get(vid) {
                             wengert_freed.insert(*v);
+                        }
+                    }
+                    // LSE tape-carry: the sentinel-owned logsumexp values are
+                    // buffer-managed too.
+                    if !p.lse_slots.is_empty() {
+                        for (vid, val, _) in &full_lowered.owned_values {
+                            if *vid == u32::MAX {
+                                wengert_freed.insert(*val);
+                            }
                         }
                     }
                 }
@@ -7674,6 +7745,22 @@ impl Compiler<'_> {
                 }
             }
 
+            // LSE tape-carry: which range frees each buffered logsumexp —
+            // the last (fixpoint-extended) range reading ANY of its fwd-out
+            // vids; that range necessarily seeds the vid, so the loaded LSE
+            // value is in scope for the null-safe free.
+            let lse_free_range: Vec<usize> = pending
+                .lse_slots
+                .iter()
+                .map(|(_, vids)| {
+                    vids.iter()
+                        .filter_map(|v| extended_last_pos.get(v))
+                        .map(|&p| range_of_pos(p))
+                        .max()
+                        .unwrap_or(last_ri)
+                })
+                .collect();
+
             // Review D1b-2: zero-copy VIEWS OF θ (transpose/reshape chains
             // rooted at a trainable param) alias parameter storage, so a
             // read through one AFTER that param's per-layer update would see
@@ -7982,6 +8069,39 @@ impl Compiler<'_> {
                     seed.insert(cv, val);
                 }
 
+                // LSE tape-carry: re-bind the fused-SDPA aux side-band to
+                // this micro-batch's buffered logsumexp for every fwd-out
+                // vid seeded in this range — BEFORE the slice lowering emits
+                // the SDPA backward that consults the Value-keyed map. The
+                // loaded value is the fused forward's real LSE (or its
+                // runtime-0 decline sentinel), so the emitted backward takes
+                // the same kernel arm the baseline did.
+                let seeded_vids_here: std::collections::HashSet<crate::wengert::VarId> =
+                    slot_seed_per_range[ri]
+                        .iter()
+                        .map(|&si| pending.slots[si].0)
+                        .collect();
+                let mut lse_loaded_here: Vec<(usize, Value)> = Vec::new();
+                for (k, (idx, vids)) in pending.lse_slots.iter().enumerate() {
+                    let targets: Vec<crate::wengert::VarId> = vids
+                        .iter()
+                        .copied()
+                        .filter(|v| seeded_vids_here.contains(v))
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let idx_val = builder.ins().iconst(cl_types::I64, *idx as i64);
+                    let lse =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                    for v in targets {
+                        if let Some(&out_seed) = seed.get(&v) {
+                            self.flash_attn_aux.insert(out_seed, (out_seed, lse));
+                        }
+                    }
+                    lse_loaded_here.push((k, lse));
+                }
+
                 // FASE hook: identical to the baseline's fase_cb — accumulate
                 // each parameter gradient into its compile-time accum_list
                 // slot (allocated at window start or at this range's head)
@@ -8132,6 +8252,19 @@ impl Compiler<'_> {
                         state.current_block = Some(loss_join);
                     } else {
                         self.compile_call_by_name(builder, free_fn, &[slot_val])?;
+                    }
+                }
+
+                // LSE tape-carry: free this micro-batch's logsumexps whose
+                // last consuming range is this one (null-safe — the decline
+                // sentinel is a runtime 0).
+                for (k, lse) in &lse_loaded_here {
+                    if lse_free_range[*k] == ri {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_free_if_valid",
+                            &[*lse],
+                        )?;
                     }
                 }
 

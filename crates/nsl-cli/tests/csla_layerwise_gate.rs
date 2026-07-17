@@ -62,6 +62,7 @@ fn program(fixture: &str, gpu: bool, save_path: &Path, rewrites: &[(&str, &str)]
 
 struct RunOutput {
     loss_stream: String,
+    stdout: String,
     stderr: String,
     success: bool,
 }
@@ -112,9 +113,29 @@ fn run_program(source: &str, tag: &str, cuda: bool, deterministic: bool, extra_a
     }
     RunOutput {
         loss_stream,
+        stdout,
         stderr,
         success: output.status.success(),
     }
+}
+
+/// Parse the number between SDPA_FUSED_BEGIN/END markers (bare integer).
+fn sdpa_fused_count(out: &RunOutput) -> Option<i64> {
+    let mut in_block = false;
+    for line in out.stdout.lines() {
+        match line.trim() {
+            "SDPA_FUSED_BEGIN" => in_block = true,
+            "SDPA_FUSED_END" => in_block = false,
+            l if in_block => {
+                let cleaned = l.trim().trim_start_matches("tensor([").trim_end_matches("])");
+                if let Ok(v) = cleaned.parse::<f64>() {
+                    return Some(v as i64);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse the `[csla] window backward phases: N` atexit report.
@@ -146,7 +167,7 @@ fn parity_case(
         common_args,
         expected_windows,
         None,
-    )
+    );
 }
 
 /// `expected_schedule`: the exact `[csla] layer-major schedule: ...` stderr
@@ -162,7 +183,7 @@ fn parity_case_with_schedule(
     common_args: &[&str],
     expected_windows: i64,
     expected_schedule: Option<&str>,
-) {
+) -> (RunOutput, RunOutput) {
     let tmp = std::env::temp_dir().join(format!("nsl_csla_saves_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let save_a = tmp.join("base_a.nslm");
@@ -252,6 +273,7 @@ fn parity_case_with_schedule(
             "first loss (pure forward on deterministic init) must still match"
         );
     }
+    (base_a, csla)
 }
 
 /// CPU gate — 6 complete windows + a trailing partial window (13 micro-
@@ -344,6 +366,66 @@ fn csla_parity_packed_gqa_cpu() {
         &["--target", "cpu"],
         8,
         Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
+    );
+}
+
+/// GPU packed-GQA parity (LSE tape-carry): the fused SDPA dispatch is
+/// emitted (head_dim=32 is in the variant table) and its saved logsumexp is
+/// window-buffered + re-bound per micro-batch. The GQA form's expanded
+/// (strided) K/V declines the fused launch at RUNTIME, so both arms carry
+/// the 0 sentinel — parity of the dispatch/decline plumbing itself.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_parity_packed_gqa_gpu() {
+    let (base, csla) = parity_case_with_schedule(
+        "csla_layerwise_packed_gqa.nsl",
+        true,
+        true,
+        "packed_gpu",
+        &[],
+        &[],
+        8,
+        Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
+    );
+    // Same fused-launch behavior on both arms (0 here — strided K/V).
+    assert_eq!(
+        sdpa_fused_count(&base),
+        sdpa_fused_count(&csla),
+        "fused-launch counts diverged between arms"
+    );
+}
+
+/// GPU packed-MHA parity (LSE tape-carry, fused path LIVE): kv_heads ==
+/// heads gives contiguous K/V, so the fused forward actually FIRES and a
+/// REAL logsumexp rides the window buffer into the fused phase-2 backward.
+/// The launch-count assert is the anti-vacuity: > 0 on BOTH arms and equal,
+/// so a silent decline (or a replay falling back to the reference backward)
+/// cannot produce a vacuous pass.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_parity_packed_mha_gpu_fused() {
+    let (base, csla) = parity_case_with_schedule(
+        "csla_layerwise_packed_gqa.nsl",
+        true,
+        true,
+        "packed_mha_gpu",
+        &[(
+            "GroupedQueryAttention(64, 2, 1, 32, 0.0)",
+            "GroupedQueryAttention(64, 2, 2, 32, 0.0)",
+        )],
+        &[],
+        8,
+        Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
+    );
+    let base_n = sdpa_fused_count(&base).expect("SDPA_FUSED markers missing (baseline)");
+    let csla_n = sdpa_fused_count(&csla).expect("SDPA_FUSED markers missing (csla)");
+    assert!(
+        base_n > 0,
+        "fused SDPA forward never fired on the MHA baseline — the gate is vacuous"
+    );
+    assert_eq!(
+        base_n, csla_n,
+        "fused-launch counts diverged between arms (base {base_n} vs csla {csla_n})"
     );
 }
 
@@ -470,39 +552,6 @@ fn csla_refusals() {
         "expected the clap requires error naming checkpoint-blocks, got:\n{}",
         noccr.stderr
     );
-
-    // (b2) attention on a CUDA target (review H2): every SDPA op on GPU
-    // emits the fused dispatch (runtime variant selection) whose saved
-    // logsumexp travels by SSA side-band — csla must refuse at compile time.
-    // CPU targets build an empty variant table, so this arm only runs under
-    // the cuda feature.
-    #[cfg(feature = "cuda")]
-    {
-        let fused_src = program(
-            "csla_layerwise_packed_gqa.nsl",
-            true,
-            &tmp.join("fused.nslm"),
-            &[],
-        );
-        let fused = run_program(
-            &fused_src,
-            "refuse_fused_sdpa",
-            true,
-            true,
-            &["--checkpoint-blocks", "--layerwise-accum"],
-        );
-        assert!(
-            !fused.success,
-            "SDPA attention on CUDA + --layerwise-accum must refuse"
-        );
-        assert!(
-            fused
-                .stderr
-                .contains("does not yet support attention on CUDA targets"),
-            "expected the fused-SDPA refusal, got:\n{}",
-            fused.stderr
-        );
-    }
 
     // (c) missing --source-ad: codegen admission error. Bypass the shared
     // runner (it always passes --source-ad) with a direct invocation.

@@ -1,0 +1,83 @@
+# models/coder1b/pretrain_layerwise_fit.nsl
+#
+# CSLA Stage-2 (D1) fit check: 1B no-offload training on a 16 GiB card.
+#
+# The CSLA paper §7.5 asks Stage-2 to "confirm no-offload 1B training fits
+# 16 GiB". Before CSLA, the no-offload exact-fidelity path OOMed: the
+# full-model f32 m_partial window (~3.86 GiB at 1.07B) sat on top of
+# weights (3.86) + m/v (7.7) + activations. Under --layerwise-accum the
+# accumulator surface is max(one layer) + the epilogue globals (embed is
+# weight-tied and dominates), and the window buffers hold N micro-batches
+# of CCR boundary residuals instead.
+#
+# Differences from pretrain_fase.nsl: NO grad_clip (two-phase clip is
+# refused under --layerwise-accum), 2 optimizer steps' worth of tokens
+# (enough to cross a window boundary twice), and in-process peak printing.
+#
+# Run (from repo root, release build recommended):
+#   nsl run --source-ad --checkpoint-blocks --layerwise-accum \
+#       models/coder1b/pretrain_layerwise_fit.nsl
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+print("NSL-Coder-1B CSLA layerwise no-offload fit check")
+print("Config: d_model=2048, n_layers=16, ~1.07B params, f32, batch=1, grad_accum=2")
+
+let m = NSLCoder()
+m.to(cuda)
+print("Model on GPU")
+
+# 4 optimizer steps x grad_accum=2 x batch=1 x seq=512 = 4096 tokens.
+# Measured walls on the way here (2026-07-17, RTX 5070 Ti 16 GiB):
+#   - batch=2, accum=8: OOM in the FIRST forward — weights+m+v pin 12.3 GiB
+#     and the batch-2 activation set needs ~4 GiB;
+#   - batch=1, accum=8: OOM mid-window — the D1a window buffers hold every
+#     adjoint-read value per micro-batch, and the materialized CE logits
+#     (512 x vocab f32 per micro-batch) dominate: ~8 x ~150 MiB on top of a
+#     ~15 GiB-committed card. @fused_lm_ce would remove the logits surface
+#     but is refused under --layerwise-accum until its cast cache is
+#     tape-carried.
+#   - batch=1, accum=2, seq=512: STILL OOM in the first forward — the
+#     seq-512 working set (attention chain + the 512 x 49152 CE logits
+#     chain) does not fit the ~2.5 GiB left beside 12.3 GiB of resident
+#     f32 weights+m+v. The f32 optimizer-moment residency is the wall the
+#     P0.3 fp16-moment path / D2 weight streaming address — NOT m_partial,
+#     which the layerwise schedule already removed from the equation.
+# MEASURED RESULT (2026-07-17): even batch=1/seq=256/accum=2 (and with
+# NSL_ASYNC_ALLOC=1) completes ONE full layer-major window + optimizer step
+# (loss 11.7769 = ~ln(49152) sanity) and then OOMs 384 MiB short in the
+# SECOND window's tied-embedding gradient chain (sum_dim under
+# reduce_to_shape). The layerwise schedule did its job — the allocator
+# report shows m_partial AT-GLOBAL-PEAK = 0 B (vs the 3.86 GiB full-model
+# window this schedule replaced) with only the 384 MiB tied-embed epilogue
+# accumulator live — but the remaining wall is 12 GiB of RESIDENT f32
+# weights+m/v plus the ~1.2 GiB embed-grad transient chain. Truly
+# no-offload f32 1B training does NOT fit 16 GiB; the fix stack is fp16
+# moments (P0.3, frees ~4.1 GiB) and/or D2 weight streaming. This fixture
+# stays as the reproducible boundary experiment.
+let tokens = full([2048], 1.0)
+let loader = DataLoader(tokens, batch_size=1, seq_len=256, shuffle=false, drop_last=true)
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("PEAK_TOTAL_BYTES")
+print(gpu_peak_bytes())
+print("PEAK_MPARTIAL_BYTES")
+print(gpu_surface_peak_bytes(4))
+print("PEAK_ACTIVATIONS_BYTES")
+print(gpu_surface_peak_bytes(6))
+print("PEAK_OTHER_BYTES")
+print(gpu_surface_peak_bytes(0))
+print("FIT_CHECK_COMPLETE")

@@ -137,6 +137,18 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // CSLA tape-carry gate intrinsic: fused-SDPA launch counter (variant
+    // 0 = base fused forward kernel, 1 = Tier-B tile-skip). Returns 0 when
+    // the fused path never launched (declined / CPU builds), -1 on an
+    // unknown variant.
+    def(
+        "sdpa_fused_launch_count",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
     def(
         "gpu_surface_at_peak_bytes",
         Type::Function {

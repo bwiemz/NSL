@@ -143,6 +143,38 @@ All parity gates additionally assert the exact
 `3 ranges, 6 layer-grouped params, 2 epilogue params` and the packed-GQA
 fixture `3 ranges, 16 layer-grouped params, 2 epilogue params`.
 
+### 5b. The LSE tape-carry and the measured 1B boundary
+
+The follow-up slice lifted the fused-SDPA refusal: the save phase buffers
+every `flash_attn_aux` entry as an extra window slot, and the replay
+re-binds the aux map per micro-batch before each consuming range's lowering
+(`flash_attn_aux[seed[fwd_out]] = lse[b]`), so the emitted backward consumes
+the SAME per-batch logsumexp the baseline did — real tensor when the fused
+launch fired, the runtime-0 decline sentinel otherwise. Gates:
+`csla_parity_packed_gqa_gpu` (dispatch emitted, GQA strides decline at
+runtime — parity of the decline plumbing) and
+`csla_parity_packed_mha_gpu_fused` (contiguous MHA K/V — the fused forward
+FIRES, `sdpa_fused_launch_count(0)` asserted > 0 and equal on both arms, and
+the carried LSE feeds the fused phase-2 backward bit-exactly).
+
+With attention unblocked, the paper §7.5's "confirm no-offload 1B fits
+16 GiB" was RUN (`models/coder1b/pretrain_layerwise_fit.nsl`, RTX 5070 Ti).
+**Measured answer: it does not fit — and m_partial is no longer the reason.**
+The schedule engaged at scale (`17 ranges, 144 layer-grouped params, 2
+epilogue params`), a full window backward + fused optimizer step completed
+(loss 11.7769 ≈ ln(vocab)), and the allocator report at the OOM shows
+`m_partial at-global-peak = 0 B` — the 3.86 GiB full-model window this
+schedule replaced is gone, with only the 384 MiB tied-embedding epilogue
+accumulator live. The binding wall is 12 GiB of RESIDENT f32 weights + m/v
+plus the tied-embedding gradient chain's ~1.2 GiB transient spike: batch 2 /
+seq 512 OOMs in the first forward; batch 1 at seq 512 and even seq 256 /
+accum 2 (with and without `NSL_ASYNC_ALLOC=1`) OOM 384 MiB short in the
+second window. The fix stack is orthogonal to CSLA: fp16 moments (P0.3,
+frees ~4.1 GiB) and/or D2 weight streaming. A pre-existing runtime bug
+surfaced on the way: the GPU-OOM CPU-fallback path
+(`cpu_fallback_binary` → `nsl_tensor_to_device`) aborts with "panic in a
+function that cannot unwind" instead of recovering.
+
 Known limitations (review LOW findings, accepted for D1a): `NSL_PHASE_TIMING`
 attributes the backward phase to nothing under the flag (the bwd region it
 brackets is empty; the window backward is untimed); an early `return` out of
