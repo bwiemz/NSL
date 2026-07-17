@@ -482,6 +482,27 @@ fn csla_parity_packed_mha_gpu_selective_carry() {
     );
 }
 
+/// D2a m/v-streaming parity (GPU): `--optim-state-offload` composes with the
+/// layerwise schedule — m/v allocate host-pinned and stage through the
+/// wrap_offload envelope AT THE PER-LAYER UPDATE SITES (one layer's staged
+/// tensors in flight at a time, drained per group update). Baseline arm =
+/// the P3 interleaved offload path; staging is byte-preserving, so parity
+/// stays bit-exact.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_parity_ffn_gpu_mv_streaming() {
+    parity_case_with_schedule(
+        "csla_layerwise_ffn.nsl",
+        true,
+        true,
+        "ffn_gpu_mv",
+        &[],
+        &["--optim-state-offload"],
+        6,
+        Some("[csla] layer-major schedule: 3 ranges, 6 layer-grouped params, 2 epilogue params"),
+    );
+}
+
 /// D1b memory-win gate (GPU): the whole point of the layer-major schedule —
 /// the m_partial surface peak drops from the full-model window (baseline
 /// allocates every accumulator up front) to max(one layer) + the epilogue

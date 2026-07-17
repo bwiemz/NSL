@@ -4042,14 +4042,16 @@ impl Compiler<'_> {
                      --layerwise-accum",
                 ));
             }
-            if self.compile_options.optim_state_offload {
-                return Err(CodegenError::new(
-                    "--layerwise-accum is incompatible with --optim-state-offload: \
-                     layerwise accumulation is the replacement for m_partial \
-                     offload (the P3 staging path); the combination is untested \
-                     and the offload flag also controls m/v residency. Drop one",
-                ));
-            }
+            // D2a: --optim-state-offload NOW COMPOSES. The D1a refusal
+            // protected against the P3 m_partial-staging half of the flag,
+            // which is structurally moot under csla (the accumulator branch
+            // checks csla FIRST, so slots stay NULL/device — host m_partial
+            // cannot resurrect). What remains is exactly D2a's target: m/v
+            // allocate host-pinned (the existing P0.2 path) and stage
+            // per LAYER through fase_emit_final_step's wrap_offload
+            // envelope at the per-layer update sites, with a drain after
+            // each group update. The window's own accumulate hook stays
+            // device-resident (wrap_offload=false at the hook site).
             if self.compile_options.checkpoint_compress.is_some() {
                 return Err(CodegenError::new(
                     "--layerwise-accum is incompatible with --checkpoint-compress: \
@@ -7960,6 +7962,7 @@ impl Compiler<'_> {
                 recipe: &crate::fase::UpdateRecipe,
                 bc: (Value, Value),
                 wrap_precision: bool,
+                wrap_offload: bool,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
                 for &i in idxs {
@@ -7975,6 +7978,14 @@ impl Compiler<'_> {
                     } else {
                         m
                     };
+                    // D2a: wrap_offload stages host-pinned m/v to θ's device
+                    // for the update and streams them back asynchronously —
+                    // the whole point of the layer-major schedule is that
+                    // only ONE layer's m/v are staged at a time. The
+                    // envelope's m_partial leg degenerates safely here (the
+                    // accumulator is device-resident, so its "stage" is a
+                    // same-device refcount bump and the tail's zero is
+                    // wasted-but-correct before our free below).
                     c.fase_emit_final_step(
                         builder,
                         theta,
@@ -7984,13 +7995,19 @@ impl Compiler<'_> {
                         recipe,
                         Some(bc),
                         wrap_precision,
-                        false,
+                        wrap_offload,
                     )?;
                     // The baseline zeroes m_partial for reuse; the layerwise
                     // schedule frees it — next window allocates fresh zeros.
                     c.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial])?;
                     let z = builder.ins().iconst(cl_types::I64, 0);
                     c.compile_call_by_name(builder, "nsl_list_set", &[accum_val, iv, z])?;
+                }
+                // D2a: the async DtoH stage-outs defer their frees to the
+                // drain — one per GROUP update, so at most one layer's
+                // staged tensors are ever in flight.
+                if wrap_offload && !idxs.is_empty() {
+                    c.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
                 }
                 Ok(())
             }
@@ -8042,6 +8059,16 @@ impl Compiler<'_> {
                 &[b2c, opt_step],
             )?;
             let wrap_precision = cpdt_precision_dtypes.is_some();
+            // Review D2a-1: csla x offload x reduced-precision moments (the
+            // P0.3 combined cast_from_host arm) became reachable when the
+            // offload refusal narrowed. The walk-through found no defect,
+            // but zero gates cover the combination — refuse until a parity
+            // gate exists (deferral-must-refuse).
+            if wrap_precision && self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--layerwise-accum with --optim-state-offload does not yet                      support a CPDT reduced-precision moment plan (the P0.3                      combined staging arm is ungated under the layerwise                      schedule). Drop the precision plan or --optim-state-offload",
+                ));
+            }
             let two_state = num_state_buffers >= 2;
 
             // Global/epilogue accumulators live for the whole window (their
@@ -8191,8 +8218,11 @@ impl Compiler<'_> {
                 // FASE hook: identical to the baseline's fase_cb — accumulate
                 // each parameter gradient into its compile-time accum_list
                 // slot (allocated at window start or at this range's head)
-                // and free it immediately. wrap_offload is const false: the
-                // admission refused --optim-state-offload.
+                // and free it immediately. wrap_offload is const false BY
+                // DESIGN (review D2a-2): the per-layer accumulators are
+                // device-resident — that is D1's point — and the offload
+                // envelope applies only at the update sites, where one
+                // layer's m/v stage through at a time.
                 let hook_idx_map = &pending.hook_accum_idx;
                 let accum_scale = pending.accum_scale;
                 let mut fase_cb = |c: &mut Compiler,
@@ -8417,6 +8447,7 @@ impl Compiler<'_> {
                     &fase_plan.recipe,
                     (bc1_inv, bc2_inv),
                     wrap_precision,
+                    self.compile_options.optim_state_offload,
                     &layer_group[ri],
                 )?;
             }
@@ -8435,6 +8466,7 @@ impl Compiler<'_> {
                 &fase_plan.recipe,
                 (bc1_inv, bc2_inv),
                 wrap_precision,
+                self.compile_options.optim_state_offload,
                 &global_group,
             )?;
 
