@@ -150,12 +150,28 @@ every `flash_attn_aux` entry as an extra window slot, and the replay
 re-binds the aux map per micro-batch before each consuming range's lowering
 (`flash_attn_aux[seed[fwd_out]] = lse[b]`), so the emitted backward consumes
 the SAME per-batch logsumexp the baseline did — real tensor when the fused
-launch fired, the runtime-0 decline sentinel otherwise. Gates:
-`csla_parity_packed_gqa_gpu` (dispatch emitted, GQA strides decline at
-runtime — parity of the decline plumbing) and
-`csla_parity_packed_mha_gpu_fused` (contiguous MHA K/V — the fused forward
-FIRES, `sdpa_fused_launch_count(0)` asserted > 0 and equal on both arms, and
-the carried LSE feeds the fused phase-2 backward bit-exactly).
+launch fired, the runtime-0 decline sentinel otherwise.
+
+The adversarial review (F1) sharpened WHICH path each policy takes — the
+`[csla] lse tape-carry: N slots` compile-time line names it and the gates
+assert it exactly:
+
+- **Block policy** (`--checkpoint-blocks` alone): SDPA outs are recompute
+  victims, so they are never adjoint imports and the carry is INERT
+  (0 slots) — the replay's spliced clone RE-LAUNCHES the fused forward per
+  micro-batch and re-establishes the Value-keyed aux locally.
+  `csla_parity_packed_gqa_gpu` (runtime decline plumbing) and
+  `csla_parity_packed_mha_gpu_fused` (fused forward fires; launch counts
+  equal by structure: one clone replay per micro-batch = one baseline
+  launch per iteration) gate this path.
+- **Selective policy** (`+ --checkpoint-selective`): SDPA outs are SAVED →
+  adjoint imports → the save phase buffers the aux entries (2 slots on the
+  fixture) and each micro-batch's REAL forward-saved logsumexp feeds the
+  fused phase-2 backward. `csla_parity_packed_mha_gpu_selective_carry`
+  gates this — the live carry configuration.
+
+`sdpa_fused_launch_count(0)` is asserted > 0 and equal on both arms of the
+MHA gates.
 
 With attention unblocked, the paper §7.5's "confirm no-offload 1B fits
 16 GiB" was RUN (`models/coder1b/pretrain_layerwise_fit.nsl`, RTX 5070 Ti).
@@ -167,9 +183,10 @@ epilogue params`), a full window backward + fused optimizer step completed
 schedule replaced is gone, with only the 384 MiB tied-embedding epilogue
 accumulator live. The binding wall is 12 GiB of RESIDENT f32 weights + m/v
 plus the tied-embedding gradient chain's ~1.2 GiB transient spike: batch 2 /
-seq 512 OOMs in the first forward; batch 1 at seq 512 and even seq 256 /
-accum 2 (with and without `NSL_ASYNC_ALLOC=1`) OOM 384 MiB short in the
-second window. The fix stack is orthogonal to CSLA: fp16 moments (P0.3,
+seq 512 and batch 1 / seq 512 both OOM in the FIRST window's forward; batch
+1 / seq 256 / accum 2 (with and without `NSL_ASYNC_ALLOC=1`) completes one
+full window + step and then OOMs 384 MiB short in the second window's
+embedding-gradient reduction. The fix stack is orthogonal to CSLA: fp16 moments (P0.3,
 frees ~4.1 GiB) and/or D2 weight streaming. A pre-existing runtime bug
 surfaced on the way: the GPU-OOM CPU-fallback path
 (`cpu_fallback_binary` → `nsl_tensor_to_device`) aborts with "panic in a

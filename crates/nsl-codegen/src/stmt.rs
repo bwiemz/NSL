@@ -4886,6 +4886,12 @@ impl Compiler<'_> {
             /// reads micro-batch b's LSE instead of missing the Value-keyed
             /// side-band.
             lse_slots: Vec<(usize, Vec<crate::wengert::VarId>)>,
+            /// The lse Values actually pushed as window slots (tape-carry
+            /// review F2): the u32::MAX-sentinel bulk-free retention is
+            /// per-Value — aux entries whose out mapped to NO buffered slot
+            /// were never pushed and their LSEs must still free per
+            /// iteration or every fused-fired one leaks for the whole run.
+            lse_pushed: std::collections::HashSet<Value>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -6527,6 +6533,8 @@ impl Compiler<'_> {
                     // Sorted by min fwd-out vid so slot order is
                     // deterministic.
                     let mut lse_slots: Vec<(usize, Vec<crate::wengert::VarId>)> = Vec::new();
+                    let mut csla_lse_pushed: std::collections::HashSet<Value> =
+                        std::collections::HashSet::new();
                     if !self.flash_attn_aux.is_empty() {
                         let slot_vid_set: std::collections::HashSet<crate::wengert::VarId> =
                             slots.iter().map(|(v, _)| *v).collect();
@@ -6562,9 +6570,19 @@ impl Compiler<'_> {
                                 "nsl_list_push",
                                 &[inner, lse_val],
                             )?;
+                            csla_lse_pushed.insert(lse_val);
                             lse_slots.push((idx, vids));
                         }
                     }
+                    // Anti-vacuity marker (tape-carry review F1): under the
+                    // Block checkpoint policy every in-block SDPA out is a
+                    // recompute victim (the clone RE-LAUNCHES the fused
+                    // forward during replay and re-establishes the aux
+                    // side-band locally), so lse_slots is 0 and the carry is
+                    // inert; the carry engages under --checkpoint-selective
+                    // (SDPA outs saved). Gates assert this line's exact slot
+                    // count so the tested path is named, not assumed.
+                    eprintln!("[csla] lse tape-carry: {} slots", lse_slots.len());
 
                     let so = builder.use_var(saves_outer_var);
                     self.compile_call_by_name(builder, "nsl_list_push", &[so, inner])?;
@@ -6671,6 +6689,7 @@ impl Compiler<'_> {
                         params: csla_params,
                         primal_view_of,
                         lse_slots,
+                        lse_pushed: csla_lse_pushed,
                     });
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
@@ -7091,12 +7110,25 @@ impl Compiler<'_> {
                 // window/teardown sweeps for shells and the partial tail).
                 if let Some(p) = &csla_pending {
                     retained_full_vars.extend(p.slots.iter().map(|(v, _)| *v));
-                    // LSE tape-carry: the fused-SDPA saved logsumexps ride
-                    // owned_values under the u32::MAX sentinel — buffered per
-                    // micro-batch, freed by the window backward (or the
-                    // teardown sweep), never by this per-iteration bulk free.
+                    // LSE tape-carry: the PUSHED logsumexps ride owned_values
+                    // under the u32::MAX sentinel — buffered per micro-batch,
+                    // freed by the window backward (or the teardown sweep),
+                    // never by this per-iteration bulk free. Retention is
+                    // per-VALUE (review F2): sentinel entries whose aux out
+                    // mapped to no buffered slot were NOT pushed — free those
+                    // right here, per iteration, exactly as the baseline
+                    // would have.
                     if !p.lse_slots.is_empty() {
                         retained_full_vars.insert(u32::MAX);
+                        for (vid, val, _) in &full_lowered.owned_values {
+                            if *vid == u32::MAX && !p.lse_pushed.contains(val) {
+                                self.compile_call_by_name(
+                                    builder,
+                                    "nsl_tensor_free_if_valid",
+                                    &[*val],
+                                )?;
+                            }
+                        }
                     }
                 }
                 if let Some(gl) = &grad_lowered {
@@ -7745,6 +7777,60 @@ impl Compiler<'_> {
                 }
             }
 
+            // Tape-carry review F3: an SDPA backward CLUSTER — the recompute
+            // clone of the forward (whose Value keys the aux re-bind under
+            // the Block policy) plus its dQ/dK/dV extract ops — must not be
+            // split across replay ranges. The aux insert and the
+            // flash_attn_bwd_cache are Value-keyed within one range's
+            // lowering: a split would silently downgrade the packed backward
+            // to the CPU reference (numeric divergence) and double-emit the
+            // full backward triplet. Sequential-block models are
+            // structurally safe (a layer's extracts sit inside its own
+            // range); this guard makes any future violation loud.
+            {
+                let mut fwdout_range: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    usize,
+                > = std::collections::HashMap::new();
+                for (ri, r) in ranges.iter().enumerate() {
+                    for op in &pending.adjoint.ops[r.start..r.end] {
+                        let is_extract = matches!(
+                            op.op,
+                            crate::wengert::PrimalOp::FlashAttentionBackwardExtract { .. }
+                                | crate::wengert::PrimalOp::FlashAttentionBackwardExtractPacked { .. }
+                        );
+                        if !is_extract {
+                            continue;
+                        }
+                        let Some(&fo) = op.inputs.get(4) else { continue };
+                        if let Some(&pr) = produced_range.get(&fo) {
+                            if pr != ri {
+                                return Err(CodegenError::new(format!(
+                                    "--layerwise-accum: an SDPA backward extract in \
+                                     replay range {ri} reads a forward clone from \
+                                     range {pr} — the Value-keyed attention \
+                                     side-bands cannot cross ranges. This adjoint \
+                                     shape is unsupported; drop --layerwise-accum",
+                                )));
+                            }
+                        }
+                        if let Some(&prev) = fwdout_range.get(&fo) {
+                            if prev != ri {
+                                return Err(CodegenError::new(format!(
+                                    "--layerwise-accum: sibling SDPA backward \
+                                     extracts for one attention op are split \
+                                     across replay ranges {prev} and {ri}. This \
+                                     adjoint shape is unsupported; drop \
+                                     --layerwise-accum",
+                                )));
+                            }
+                        } else {
+                            fwdout_range.insert(fo, ri);
+                        }
+                    }
+                }
+            }
+
             // LSE tape-carry: which range frees each buffered logsumexp —
             // the last (fixpoint-extended) range reading ANY of its fwd-out
             // vids; that range necessarily seeds the vid, so the loaded LSE
@@ -8257,15 +8343,27 @@ impl Compiler<'_> {
 
                 // LSE tape-carry: free this micro-batch's logsumexps whose
                 // last consuming range is this one (null-safe — the decline
-                // sentinel is a runtime 0).
-                for (k, lse) in &lse_loaded_here {
-                    if lse_free_range[*k] == ri {
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_tensor_free_if_valid",
-                            &[*lse],
-                        )?;
+                // sentinel is a runtime 0). Re-load from the inner list when
+                // this range didn't seed any of the slot's vids (review F4:
+                // the fixpoint-extended free range can trail the direct
+                // reads through list membership — mirror the regular slot
+                // frees' unconditional re-load instead of leaking).
+                for (k, (idx, _vids)) in pending.lse_slots.iter().enumerate() {
+                    if lse_free_range[k] != ri {
+                        continue;
                     }
+                    let lse = match lse_loaded_here.iter().find(|(lk, _)| *lk == k) {
+                        Some((_, v)) => *v,
+                        None => {
+                            let idx_val = builder.ins().iconst(cl_types::I64, *idx as i64);
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_get",
+                                &[inner, idx_val],
+                            )?
+                        }
+                    };
+                    self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[lse])?;
                 }
 
                 if ri == last_ri {

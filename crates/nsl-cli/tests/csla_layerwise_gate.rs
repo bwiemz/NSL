@@ -369,11 +369,13 @@ fn csla_parity_packed_gqa_cpu() {
     );
 }
 
-/// GPU packed-GQA parity (LSE tape-carry): the fused SDPA dispatch is
-/// emitted (head_dim=32 is in the variant table) and its saved logsumexp is
-/// window-buffered + re-bound per micro-batch. The GQA form's expanded
-/// (strided) K/V declines the fused launch at RUNTIME, so both arms carry
-/// the 0 sentinel — parity of the dispatch/decline plumbing itself.
+/// GPU packed-GQA parity: the fused SDPA dispatch is emitted (head_dim=32
+/// is in the variant table); the GQA form's expanded (strided) K/V declines
+/// the fused launch at RUNTIME on both arms — parity of the
+/// dispatch/decline plumbing. Under the Block checkpoint policy the SDPA
+/// out is a recompute victim, so the LSE carry is INERT here (0 slots,
+/// asserted) — the replay's recompute clone re-establishes the aux
+/// side-band locally.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csla_parity_packed_gqa_gpu() {
@@ -387,20 +389,26 @@ fn csla_parity_packed_gqa_gpu() {
         8,
         Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
     );
-    // Same fused-launch behavior on both arms (0 here — strided K/V).
+    assert!(
+        csla.stderr.contains("[csla] lse tape-carry: 0 slots"),
+        "expected the inert-carry marker under the Block policy:\n{}",
+        csla.stderr
+    );
+    let base_n = sdpa_fused_count(&base).expect("SDPA_FUSED markers missing (baseline)");
+    let csla_n = sdpa_fused_count(&csla).expect("SDPA_FUSED markers missing (csla)");
     assert_eq!(
-        sdpa_fused_count(&base),
-        sdpa_fused_count(&csla),
-        "fused-launch counts diverged between arms"
+        base_n, csla_n,
+        "fused-launch counts diverged between arms (base {base_n} vs csla {csla_n})"
     );
 }
 
-/// GPU packed-MHA parity (LSE tape-carry, fused path LIVE): kv_heads ==
-/// heads gives contiguous K/V, so the fused forward actually FIRES and a
-/// REAL logsumexp rides the window buffer into the fused phase-2 backward.
-/// The launch-count assert is the anti-vacuity: > 0 on BOTH arms and equal,
-/// so a silent decline (or a replay falling back to the reference backward)
-/// cannot produce a vacuous pass.
+/// GPU packed-MHA parity, Block policy — the RECOMPUTE path: kv_heads ==
+/// heads gives contiguous K/V so the fused forward FIRES, but under
+/// --checkpoint-blocks the SDPA out is a recompute victim: the replay's
+/// spliced clone RE-LAUNCHES the fused forward per micro-batch and
+/// re-establishes the Value-keyed aux locally (carry inert — 0 slots,
+/// asserted). Launch-count equality across arms is structural (each clone
+/// replays once per micro-batch = the baseline's once per iteration).
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csla_parity_packed_mha_gpu_fused() {
@@ -416,6 +424,51 @@ fn csla_parity_packed_mha_gpu_fused() {
         &[],
         8,
         Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
+    );
+    assert!(
+        csla.stderr.contains("[csla] lse tape-carry: 0 slots"),
+        "expected the inert-carry marker under the Block policy:\n{}",
+        csla.stderr
+    );
+    let base_n = sdpa_fused_count(&base).expect("SDPA_FUSED markers missing (baseline)");
+    let csla_n = sdpa_fused_count(&csla).expect("SDPA_FUSED markers missing (csla)");
+    assert!(
+        base_n > 0,
+        "fused SDPA forward never fired on the MHA baseline — the gate is vacuous"
+    );
+    assert_eq!(
+        base_n, csla_n,
+        "fused-launch counts diverged between arms (base {base_n} vs csla {csla_n})"
+    );
+}
+
+/// GPU packed-MHA parity, SELECTIVE policy — the LIVE tape-carry (review
+/// F1): --checkpoint-selective SAVES the SDPA outs, so they are adjoint
+/// imports, the save phase buffers the aux entries (2 slots, asserted
+/// exactly), and the replay re-binds each micro-batch's REAL forward-saved
+/// logsumexp into the aux side-band feeding the fused phase-2 backward.
+/// This is the configuration the carry machinery exists for.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_parity_packed_mha_gpu_selective_carry() {
+    let (base, csla) = parity_case_with_schedule(
+        "csla_layerwise_packed_gqa.nsl",
+        true,
+        true,
+        "packed_mha_sel_gpu",
+        &[(
+            "GroupedQueryAttention(64, 2, 1, 32, 0.0)",
+            "GroupedQueryAttention(64, 2, 2, 32, 0.0)",
+        )],
+        &["--checkpoint-selective"],
+        8,
+        Some("[csla] layer-major schedule: 3 ranges, 16 layer-grouped params, 2 epilogue params"),
+    );
+    assert!(
+        csla.stderr.contains("[csla] lse tape-carry: 2 slots"),
+        "expected the LIVE carry marker (2 buffered LSE slots) under the \
+         Selective policy:\n{}",
+        csla.stderr
     );
     let base_n = sdpa_fused_count(&base).expect("SDPA_FUSED markers missing (baseline)");
     let csla_n = sdpa_fused_count(&csla).expect("SDPA_FUSED markers missing (csla)");

@@ -10,14 +10,20 @@
 #     position_ids / input_ids per micro-batch), the per-b packing-registry
 #     re-install, and the packed EmbeddingBackward reading buffered
 #     input_ids at replay time;
-#   - GPU PARITY (LSE tape-carry): the fused SDPA dispatch's forward-saved
-#     logsumexp is buffered per micro-batch and re-bound into the aux
-#     side-band before each consuming range's replay. The GQA form
-#     (kv_heads < heads -> expanded, strided K/V) declines the fused launch
-#     at runtime (LSE = 0 sentinel both arms); the harness's MHA rewrite
-#     (kv_heads == heads -> contiguous K/V) makes the fused forward FIRE,
-#     proven by the sdpa_fused_launch_count markers below — that arm
-#     exercises a REAL carried LSE feeding the fused phase-2 backward.
+#   - GPU PARITY, two distinct attention-backward paths (the [csla] lse
+#     tape-carry stderr line names which one ran; gates assert it exactly):
+#       * Block policy (--checkpoint-blocks alone): SDPA outs are recompute
+#         victims — the replay's spliced clone RE-LAUNCHES the fused
+#         forward per micro-batch and re-establishes the Value-keyed aux
+#         locally; the LSE carry is INERT (0 slots). The GQA form's
+#         expanded strided K/V declines the fused launch at runtime; the
+#         harness's MHA rewrite (kv_heads == heads) makes it FIRE, proven
+#         by the sdpa_fused_launch_count markers below.
+#       * Selective policy (+ --checkpoint-selective): SDPA outs are SAVED
+#         -> adjoint imports -> the save phase buffers the aux entries
+#         (2 slots) and the replay re-binds each micro-batch's REAL
+#         forward-saved logsumexp into the fused phase-2 backward — the
+#         live tape-carry configuration.
 #
 # 2048 tokens / (batch 2 x seq 64) = 16 micro-batches; grad_accumulation=2
 # -> 8 optimizer steps, no trailing partial window.
