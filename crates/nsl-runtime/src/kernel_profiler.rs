@@ -135,7 +135,10 @@ pub(crate) fn ensure_event_pool_initialized() {
     if *base == 0 {
         unsafe {
             crate::cuda::cu_event_create(&mut *base);
-            crate::cuda::cu_event_record(*base, std::ptr::null_mut());
+            // Base epoch rides the same stream as kernel begin/end events
+            // (the compute stream post-p8-PR-A) so relative timestamps stay
+            // internally consistent.
+            let _ = crate::cuda::cu_event_record_on_current_stream(*base);
         }
     }
     // Both guards drop at end of scope.
