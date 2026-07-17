@@ -6341,6 +6341,73 @@ impl Compiler<'_> {
                     // reuses the current iteration's SSA values for them via
                     // seed_base.
                     debug_assert!(fase_hook_active);
+
+                    // Review findings H1/H2/M1 (D1a adversarial review): three
+                    // compile-time SIDE CHANNELS travel by SSA Value instead
+                    // of the tape, so the window replay cannot see them —
+                    // refuse each loudly rather than replay wrong.
+                    //
+                    // H1 — CSHA-claimed fused backward: `csha_forward_saves`
+                    // is keyed by layer name and holds the STEP iteration's
+                    // save-buffer SSA values; the claimed backward consumes
+                    // AND frees them once — inside the b-loop that means
+                    // stale saves for b<N-1 plus an N-fold double-free.
+                    if !self.csha_forward_saves.is_empty()
+                        || adjoint.ops.iter().any(|op| {
+                            matches!(
+                                op.op,
+                                crate::wengert::PrimalOp::FusedCshaBackward { .. }
+                                    | crate::wengert::PrimalOp::CshaFusedBackwardExtract { .. }
+                            )
+                        })
+                    {
+                        return Err(CodegenError::new(
+                            "--layerwise-accum is incompatible with CSHA-claimed \
+                             fused attention backward: the claimed saves travel \
+                             through a compile-time side channel \
+                             (csha_forward_saves) that the window replay cannot \
+                             re-bind per micro-batch. Drop @csha/@flash_attention \
+                             claims or --layerwise-accum",
+                        ));
+                    }
+                    // H2 — fused SDPA dispatch: the forward-saved logsumexp
+                    // rides `flash_attn_aux` (keyed by the forward's SSA
+                    // Value) + a u32::MAX-sentinel owned entry; the replay's
+                    // freshly loaded value misses the map, so on a runtime
+                    // fused launch the emitted backward would silently
+                    // substitute the reference kernel (non-bit-exact + perf
+                    // cliff). The sentinel entry below is exactly "a fused
+                    // dispatch with a real LSE was emitted in this forward".
+                    if full_lowered
+                        .owned_values
+                        .iter()
+                        .any(|(vid, _, _)| *vid == u32::MAX)
+                    {
+                        return Err(CodegenError::new(
+                            "--layerwise-accum does not yet support attention on \
+                             CUDA targets: the fused SDPA dispatch (emitted for \
+                             every SDPA op on GPU, with runtime variant \
+                             selection) saves its logsumexp through an SSA \
+                             side-band (flash_attn_aux) the window replay cannot \
+                             see. Train on CPU, or drop --layerwise-accum until \
+                             the tape-carry follow-up lands",
+                        ));
+                    }
+                    // M1 — @fused_lm_ce / distill backward consult Value-keyed
+                    // cast caches (fused_ce_fwd_casts / fused_kl_ce_bwd_cache);
+                    // a replay miss re-emits fresh casts per window with no
+                    // free. Refuse until those are tape-carried.
+                    if self.active_fused_ce_config.is_some()
+                        || self.active_distill_context.is_some()
+                    {
+                        return Err(CodegenError::new(
+                            "--layerwise-accum is incompatible with @fused_lm_ce \
+                             / distill blocks: their backward reads Value-keyed \
+                             forward cast caches the window replay cannot see. \
+                             Drop the decorator or --layerwise-accum",
+                        ));
+                    }
+
                     let (saves_outer_var, dicts_var) =
                         csla_buffers.expect("csla_buffers allocated when csla_active");
                     let imports =
@@ -7429,7 +7496,16 @@ impl Compiler<'_> {
             }
             // Batch dict values die with their micro-batch's replay (the
             // per-iteration dict free is suppressed under csla), then the
-            // inner slot-list shell.
+            // inner slot-list shell. INVARIANT (review L2): on step
+            // iterations this destroys the CURRENT batch dict at b==N-1,
+            // i.e. BEFORE the optimizer region and the on_step callback —
+            // earlier than the baseline's end-of-iteration free. Nothing
+            // after this point may read step_param_var's dict (on_step
+            // receives only (step, loss); verified at review time).
+            // nsl_dict_free_tensor_values destroys the WHOLE dict structure
+            // (free_dict_impl(_, true)), matching the baseline's per-
+            // iteration call — popped dicts are never touched by the
+            // DataLoader teardown, which only drains its reorder buffer.
             if let Some(d) = dict_b {
                 self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[d])?;
             }
@@ -8571,8 +8647,10 @@ impl Compiler<'_> {
             state.current_block = Some(sw_exit);
             self.compile_call_by_name(builder, "nsl_list_free", &[so])?;
 
-            // Tail batch dicts: free their tensor values (the dict shells
-            // belong to the DataLoader teardown, as on the baseline path).
+            // Tail batch dicts: nsl_dict_free_tensor_values destroys the
+            // whole dict structure (values + shell, free_dict_impl(_, true))
+            // — the same call the baseline makes per iteration; the
+            // DataLoader teardown never touches popped dicts.
             let dl = builder.use_var(dicts_var);
             let dl_len = self.compile_call_by_name(builder, "nsl_list_len", &[dl])?;
             let dw_i_var = state.new_variable();

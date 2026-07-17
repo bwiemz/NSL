@@ -134,6 +134,7 @@ fn parity_case(
     deterministic: bool,
     tag: &str,
     rewrites: &[(&str, &str)],
+    common_args: &[&str],
     expected_windows: i64,
 ) {
     let tmp = std::env::temp_dir().join(format!("nsl_csla_saves_{tag}_{}", std::process::id()));
@@ -148,7 +149,7 @@ fn parity_case(
         &format!("{tag}_a"),
         cuda,
         deterministic,
-        &["--checkpoint-blocks"],
+        &[&["--checkpoint-blocks"], common_args].concat(),
     );
     assert!(base_a.success, "baseline run A failed:\n{}", base_a.stderr);
     let base_b = run_program(
@@ -156,7 +157,7 @@ fn parity_case(
         &format!("{tag}_b"),
         cuda,
         deterministic,
-        &["--checkpoint-blocks"],
+        &[&["--checkpoint-blocks"], common_args].concat(),
     );
     assert!(base_b.success, "baseline run B failed:\n{}", base_b.stderr);
     let bytes_a = std::fs::read(&save_a).expect("baseline A model_save missing");
@@ -177,7 +178,7 @@ fn parity_case(
         &format!("{tag}_c"),
         cuda,
         deterministic,
-        &["--checkpoint-blocks", "--layerwise-accum"],
+        &[&["--checkpoint-blocks", "--layerwise-accum"], common_args].concat(),
     );
     assert!(csla.success, "--layerwise-accum run failed:\n{}", csla.stderr);
     assert!(
@@ -223,7 +224,28 @@ fn parity_case(
 /// batches, N=2): exercises the save/replay machinery AND the teardown sweep.
 #[test]
 fn csla_parity_ffn_cpu() {
-    parity_case("csla_layerwise_ffn.nsl", false, false, "ffn_cpu", &[], 6);
+    parity_case("csla_layerwise_ffn.nsl", false, false, "ffn_cpu", &[], &[], 6);
+}
+
+/// CPU gate — loss tensor READ BY THE ADJOINT (review M2): tanh's backward
+/// reads its own output, so wrapping the loss in tanh() makes the loss VarId
+/// a window-buffered import and engages the loss_slot machinery (b<N-1 skip
+/// in the replay loop + the should_step-conditional per-iteration free) that
+/// the cross_entropy fixtures never touch.
+#[test]
+fn csla_parity_ffn_cpu_loss_read_by_adjoint() {
+    parity_case(
+        "csla_layerwise_ffn.nsl",
+        false,
+        false,
+        "ffn_loss_read",
+        &[(
+            "let loss = cross_entropy(flat_logits, flat_labels)",
+            "let loss = tanh(cross_entropy(flat_logits, flat_labels))",
+        )],
+        &[],
+        6,
+    );
 }
 
 /// CPU gate — epochs=2: 26 micro-batches -> 13 windows, one of which spans
@@ -236,6 +258,7 @@ fn csla_parity_ffn_cpu_epoch_straddle() {
         false,
         "ffn_straddle",
         &[("epochs=1", "epochs=2")],
+        &[],
         13,
     );
 }
@@ -245,23 +268,28 @@ fn csla_parity_ffn_cpu_epoch_straddle() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csla_parity_ffn_gpu() {
-    parity_case("csla_layerwise_ffn.nsl", true, true, "ffn_gpu", &[], 6);
+    parity_case("csla_layerwise_ffn.nsl", true, true, "ffn_gpu", &[], &[], 6);
 }
 
-/// GPU packed-GQA composition: the replay must re-install each buffered
-/// micro-batch's packing metadata (thread-local segment_ids/doc_starts
-/// pointers read at @flash_attention launch time) — with a stale registry
-/// every earlier micro-batch's attention backward would be mis-masked, which
-/// the bit-exact byte compare catches.
+/// Packed-GQA composition, CPU: buffered packed-batch dict state
+/// (segment_ids / position_ids / input_ids per micro-batch), the per-b
+/// packing-registry re-install, and the packed EmbeddingBackward reading
+/// buffered input_ids at replay time. CPU because attention-on-CUDA is
+/// refused in D1a (review H2: the fused SDPA dispatch's logsumexp rides an
+/// SSA side-band the replay cannot see) — the GPU arm is the refusal case
+/// in csla_refusals; the D1b tape-carry restores GPU attention parity.
 #[test]
-#[ignore = "requires CUDA GPU"]
-fn csla_parity_packed_gqa_gpu() {
+fn csla_parity_packed_gqa_cpu() {
     parity_case(
         "csla_layerwise_packed_gqa.nsl",
-        true,
-        true,
-        "packed_gpu",
+        false,
+        false,
+        "packed_cpu",
         &[],
+        // CPU compile target: the default "cuda" target emits the fused
+        // SDPA dispatch table even for CPU-placed models, which the H2
+        // refusal (correctly) rejects. Both arms share the target.
+        &["--target", "cpu"],
         8,
     );
 }
@@ -309,6 +337,39 @@ fn csla_refusals() {
         "expected the clap requires error naming checkpoint-blocks, got:\n{}",
         noccr.stderr
     );
+
+    // (b2) attention on a CUDA target (review H2): every SDPA op on GPU
+    // emits the fused dispatch (runtime variant selection) whose saved
+    // logsumexp travels by SSA side-band — csla must refuse at compile time.
+    // CPU targets build an empty variant table, so this arm only runs under
+    // the cuda feature.
+    #[cfg(feature = "cuda")]
+    {
+        let fused_src = program(
+            "csla_layerwise_packed_gqa.nsl",
+            true,
+            &tmp.join("fused.nslm"),
+            &[],
+        );
+        let fused = run_program(
+            &fused_src,
+            "refuse_fused_sdpa",
+            true,
+            true,
+            &["--checkpoint-blocks", "--layerwise-accum"],
+        );
+        assert!(
+            !fused.success,
+            "SDPA attention on CUDA + --layerwise-accum must refuse"
+        );
+        assert!(
+            fused
+                .stderr
+                .contains("does not yet support attention on CUDA targets"),
+            "expected the fused-SDPA refusal, got:\n{}",
+            fused.stderr
+        );
+    }
 
     // (c) missing --source-ad: codegen admission error. Bypass the shared
     // runner (it always passes --source-ad) with a direct invocation.

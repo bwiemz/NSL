@@ -95,6 +95,29 @@ global L2 over the *complete* window before any update), WGGO per-param mode
 tables, `--optim-state-offload` (the P3 staging path this work obsoletes),
 `--checkpoint-compress` (not bit-exact), and the pipelined train path.
 
+The adversarial review added three refusals for **compile-time SSA
+side-channels** — state that travels by Cranelift `Value` instead of the tape,
+which the replay's freshly-loaded values can never see:
+
+- **CSHA-claimed fused backward** (`csha_forward_saves`, keyed by layer name,
+  consumed + freed once): inside the b-loop this would mean stale saves for
+  b&lt;N-1 plus an N-fold double-free;
+- **fused SDPA dispatch** (`flash_attn_aux` saved-logsumexp, keyed by the
+  forward output's Value + a `u32::MAX`-sentinel owned entry): a replay miss
+  silently substitutes the reference backward for the fused phase-2 kernel
+  whenever the fused forward actually launched. NOTE the dispatch is emitted
+  for EVERY SDPA op on a CUDA target (the variant table covers head_dims
+  {32,64,128} with runtime selection), so in D1a this refusal means
+  **attention models train under `--layerwise-accum` on CPU only**; the
+  packed-GQA parity gate runs on CPU and the GPU arm is a refusal case;
+- **`@fused_lm_ce` / distill** (`fused_ce_fwd_casts` / `fused_kl_ce_bwd_cache`
+  Value-keyed cast caches): a replay miss re-emits fresh casts per window with
+  no free.
+
+D1b (or a follow-up) lifts these by tape-carrying the side-band values
+(routing the LSE and cast tensors through real tape VarIds so the import
+machinery buffers them per micro-batch like everything else).
+
 ## 5. Validation
 
 `crates/nsl-cli/tests/csla_layerwise_gate.rs`, cloning the CCR parity-gate
@@ -107,10 +130,18 @@ on the baseline. Green on 2026-07-17 (RTX 5070 Ti, sm_120, `--target` default,
 | gate | schedule facts exercised | result |
 |---|---|---|
 | `csla_parity_ffn_cpu` | 13 micro-batches, N=2 → 6 windows + partial tail | bit-exact |
+| `csla_parity_ffn_cpu_loss_read_by_adjoint` | `tanh(loss)` → the adjoint reads the loss tensor → loss_slot machinery (b&lt;N-1 skip + conditional per-iteration free) | bit-exact |
 | `csla_parity_ffn_cpu_epoch_straddle` | epochs=2 → 13 windows, one spanning the epoch boundary | bit-exact |
-| `csla_parity_ffn_gpu` | GPU twin | bit-exact |
-| `csla_parity_packed_gqa_gpu` | packed GQA + per-b packing-metadata re-install | bit-exact |
-| `csla_refusals` | grad_clip / missing `--checkpoint-blocks` / missing `--source-ad` | all refuse loudly |
+| `csla_parity_ffn_gpu` | GPU twin (attention-free — SDPA on CUDA is refused in D1a) | bit-exact |
+| `csla_parity_packed_gqa_cpu` | packed GQA on CPU: buffered packed dict state + per-b packing-registry re-install + packed EmbeddingBackward from buffered input_ids | bit-exact |
+| `csla_refusals` | grad_clip / missing `--checkpoint-blocks` / SDPA-on-CUDA (cuda feature) / missing `--source-ad` | all refuse loudly |
+
+Known limitations (review LOW findings, accepted for D1a): `NSL_PHASE_TIMING`
+attributes the backward phase to nothing under the flag (the bwd region it
+brackets is empty; the window backward is untimed); an early `return` out of
+a step body leaks the current window's buffers (exit path only); the flag on
+a program with no train block is a silent no-op, consistent with
+`--checkpoint-blocks`.
 
 Full regression battery unchanged-green with the flag off: 855 CPU tests, CCR
 parity ×4 (incl. production tolerance), 48-step long-run drift, fused-step /

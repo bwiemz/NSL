@@ -1,14 +1,22 @@
 # CSLA Stage-2 (D1a) parity fixture: packed GQA composition.
 #
-# Identical model shape to stage_c_packed_gqa.nsl (fused segment-masked flash
-# eligible on GPU: head_dim=32, seq_len=64, DataLoader packing=true), with
-# grad_clip REMOVED — two-phase clip needs the global L2 norm over the full
-# m_partial window, which --layerwise-accum refuses by design.
+# stage_c_packed_gqa.nsl's shape with grad_clip REMOVED (two-phase clip needs
+# the global L2 norm over the full m_partial window, which --layerwise-accum
+# refuses by design).
 #
-# This is the composition case for the window backward: the replay must
-# re-install each buffered micro-batch's packing metadata (segment_ids /
-# doc_starts device pointers are thread-local per-batch state read at
-# @flash_attention launch time) before running that micro-batch's adjoint.
+# Dual role (review finding H2): on CUDA targets EVERY SDPA op emits the
+# fused dispatch (runtime variant selection over head_dims {32,64,128}) whose
+# forward-saved logsumexp travels by SSA side-band (flash_attn_aux) — the
+# window replay cannot see it, so csla REFUSES attention-on-GPU in D1a. This
+# fixture therefore gates:
+#   - CPU PARITY (empty variant table on CPU targets -> attention decomposes
+#     at compile time -> admitted): packed dict buffering (segment_ids /
+#     position_ids / input_ids per micro-batch), the per-b packing-registry
+#     re-install, and the packed EmbeddingBackward reading buffered
+#     input_ids at replay time;
+#   - the GPU REFUSAL case in csla_refusals (same source, m.to(cuda)).
+# The D1b tape-carry (route the LSE through a real tape VarId) restores GPU
+# attention parity.
 #
 # 2048 tokens / (batch 2 x seq 64) = 16 micro-batches; grad_accumulation=2
 # -> 8 optimizer steps, no trailing partial window.
