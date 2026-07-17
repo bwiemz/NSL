@@ -55,7 +55,16 @@ print("Model on GPU")
 # weights+m/v plus the ~1.2 GiB embed-grad transient chain. Truly
 # no-offload f32 1B training does NOT fit 16 GiB; the fix stack is fp16
 # moments (P0.3, frees ~4.1 GiB) and/or D2 weight streaming. This fixture
-# stays as the reproducible boundary experiment.
+# stays as the reproducible NO-offload boundary experiment.
+#
+# D2a RESULT (same day): adding --optim-state-offload (m/v host-pinned,
+# staged per LAYER through the layerwise update sites) FITS AND TRAINS at
+# the full demo config — batch=2, seq=512, grad_accum=8, 2 windows,
+# losses 11.82 -> 10.88, allocator peak 12.99 GB (m_partial peak 646 MB,
+# activations 8.69 GB now dominant), nvidia-smi peak 15.2 GB:
+#   nsl run --source-ad --checkpoint-blocks --layerwise-accum \
+#       --optim-state-offload <this file, with batch_size=2 seq_len=512
+#       grad_accumulation=8 tokens=16384>
 let tokens = full([2048], 1.0)
 let loader = DataLoader(tokens, batch_size=1, seq_len=256, shuffle=false, drop_last=true)
 

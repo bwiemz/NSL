@@ -187,7 +187,24 @@ seq 512 and batch 1 / seq 512 both OOM in the FIRST window's forward; batch
 1 / seq 256 / accum 2 (with and without `NSL_ASYNC_ALLOC=1`) completes one
 full window + step and then OOMs 384 MiB short in the second window's
 embedding-gradient reduction. The fix stack is orthogonal to CSLA: fp16 moments (P0.3,
-frees ~4.1 GiB) and/or D2 weight streaming. A pre-existing runtime bug
+frees ~4.1 GiB) and/or D2 weight streaming.
+
+**D2a (per-layer m/v streaming) closed the gap the same day**:
+`--optim-state-offload` now composes with the layerwise schedule — m/v
+allocate host-pinned (the P0.2 machinery, reused wholesale) and stage
+through `fase_emit_final_step`'s wrap_offload envelope at the PER-LAYER
+update sites, one layer's staged tensors in flight at a time, drained per
+group update. The D1a refusal narrowed away cleanly: its m_partial half was
+already structurally moot (the accumulator branch checks csla first, so
+host m_partial cannot resurrect). Measured at the full demo config
+(batch 2 / seq 512 / accum 8 — the shape that OOMed in its FIRST forward
+without streaming): **fits and trains** — 2 complete windows, losses
+11.82 → 10.88, allocator peak 12.99 GB (m_partial peak 646 MB, activations
+8.69 GB now the dominant surface), nvidia-smi peak 15.2 GB. Gated by
+`csla_parity_ffn_gpu_mv_streaming` (bit-exact vs the P3 interleaved
+baseline — staging is byte-preserving).
+
+A pre-existing runtime bug
 surfaced on the way: the GPU-OOM CPU-fallback path
 (`cpu_fallback_binary` → `nsl_tensor_to_device`) aborts with "panic in a
 function that cannot unwind" instead of recovering.
