@@ -1,0 +1,25 @@
+# Train-block source-AD forward-input preservation.
+#
+# forward = silu(x @ w): the matmul temp `h` feeding silu is uniquely owned
+# (refcount 1), so before the in-place-suppression guard the forward `silu(h)`
+# mutated it to silu(h) and source-AD trained on silu'(silu(h)) — a silently
+# wrong gradient (tape-AD was always correct). One SGD(lr=1) step; print sum(m.w).
+# The E2E runs this with and without --source-ad and asserts they agree.
+
+model Net:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.w
+        return silu(h)
+
+let m = Net()
+let x = ones([2, 2])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 1.0)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out)
+
+print(sum(m.w))

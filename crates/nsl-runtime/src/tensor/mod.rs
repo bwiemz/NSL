@@ -52,6 +52,48 @@ pub(crate) fn fbip_record_alloc() {
     FBIP_ALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// In-place suppression guard (source-AD primal preservation)
+// ---------------------------------------------------------------------------
+// Tape-AD blocks FBIP in-place mutation while the tape is recording (see
+// `can_mutate_inplace`'s `!autodiff::is_recording()`), so a forward op never
+// overwrites a value the backward still needs. Source-AD builds no tape, so
+// without an equivalent guard a forward op with a uniquely-owned input (e.g.
+// `silu(x)` in `grad(x): sum(silu(x))`) would mutate that input in place —
+// corrupting the saved primal for input-reading adjoints (silu/gelu/relu/abs;
+// output-reading sigmoid/tanh are unaffected since they read the result).
+//
+// This depth counter is raised around the source-AD FORWARD pass only (the
+// adjoint pass leaves it clear so backward FBIP still reclaims memory). It is a
+// counter, not a bool, so nested grad blocks compose. Thread-local to match the
+// tape and the single-threaded execution of a compiled grad block.
+thread_local! {
+    static INPLACE_SUPPRESS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True while FBIP in-place mutation is suppressed (source-AD forward pass).
+///
+/// Note: the guard is intentionally cleared before the adjoint pass, so CCR
+/// activation *recompute* during backward runs unsuppressed. That is safe in the
+/// common case (recomputed inputs are model params / refcount > 1), but a future
+/// `--checkpoint-blocks` path that recomputes a uniquely-owned input feeding an
+/// input-reading activation would need the guard raised around the recompute too.
+#[inline]
+pub(crate) fn inplace_suppressed() -> bool {
+    INPLACE_SUPPRESS_DEPTH.with(|c| c.get() > 0)
+}
+
+/// Enter (`on != 0`) or leave (`on == 0`) the in-place-suppression scope.
+/// Emitted by source-AD around its forward primal lowering. Paired inc/dec so
+/// nested grad blocks compose; the leave saturates at zero.
+#[no_mangle]
+pub extern "C" fn nsl_set_inplace_suppressed(on: i64) {
+    INPLACE_SUPPRESS_DEPTH.with(|c| {
+        let d = c.get();
+        c.set(if on != 0 { d + 1 } else { d.saturating_sub(1) });
+    });
+}
+
 /// Print FBIP statistics. Called at program exit when NSL_FBIP_TRACE=1.
 #[no_mangle]
 pub extern "C" fn nsl_fbip_report() {
@@ -690,6 +732,7 @@ impl NslTensor {
             && self.is_contiguous()
             && self.device == 0
             && !autodiff::is_recording()
+            && !inplace_suppressed()
     }
 
     /// Returns true if this GPU tensor can be safely mutated in-place (FBIP).
@@ -702,6 +745,7 @@ impl NslTensor {
             && self.data_owner == 0
             && self.device > 0
             && !autodiff::is_recording()
+            && !inplace_suppressed()
     }
 
     /// Returns true if two tensors have identical shapes.

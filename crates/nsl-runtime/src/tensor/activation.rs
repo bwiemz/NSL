@@ -882,24 +882,38 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     let xt = unsafe { &*(x_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
-    // Elementwise backward: the incoming adjoint always shares the saved input's
-    // shape and placement. Assert both (parity with `gpu_backward_binary`'s
-    // length check; the CPU path is flat-indexed so a shorter grad would OOB).
-    // NOTE: a scalar sum/mean-seed grad broadcasting against x[n] (e.g.
-    // `sum(silu(x))`) trips this assert — the broadcast-grad fallback that
-    // sigmoid/tanh backward carry is deferred to p4 slice 4, which fixes it
-    // together with the source-AD forward in-place-mutation bug that corrupts
-    // silu/gelu's saved input (both input-saving activations).
-    assert_eq!(
-        gt.len, xt.len,
-        "silu_backward: grad len {} != x len {}",
-        gt.len, xt.len
+    // Only f64/f32 are handled (both the fused kernel and the decomposed
+    // fallback branch f32-vs-f64). Reject f16/bf16 loudly rather than let a
+    // `data_f64()`/`data_f32()` accessor over-read a narrower buffer.
+    assert!(
+        (xt.dtype == 0 || xt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
+        "silu_backward: unsupported dtype (x={}, grad={}); f16/bf16 activation backward is not implemented",
+        xt.dtype, gt.dtype
     );
-    debug_assert_eq!(
-        gt.device, xt.device,
-        "silu_backward: grad/x device mismatch ({} vs {})",
-        gt.device, xt.device
-    );
+    // Broadcast/mismatched-grad fallback: when the incoming adjoint does not
+    // share `x`'s shape/device/dtype — e.g. a scalar sum/mean seed [1]
+    // broadcasting against x[n], as in `sum(silu(x))` — reproduce the six-op
+    // sequence the compiler emitted before fusion (whose final `nsl_tensor_mul`
+    // broadcasts grad and whose sub/mul/add promote across dtype), numerically
+    // equivalent to the pre-fusion path. The common mid-network case (grad
+    // shape/device/dtype == x) takes the single fused launch below. Mirrors the
+    // sigmoid/tanh backward fallbacks (p4 slice 3).
+    if !gt.shape_eq(xt) || gt.device != xt.device || gt.dtype != xt.dtype {
+        // Dtype-matched `1.0` so the chain stays single-dtype (no f64→f32
+        // downcast of the gradient). CPU f64 → f64, everything else → f32.
+        let one = crate::tensor::nsl_tensor_scalar(1.0, if xt.dtype == 0 { 0 } else { 1 });
+        // sigmoid(x) without consuming x (bump so it can't take the FBIP path).
+        NslTensor::from_ptr(x_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        let s = nsl_tensor_sigmoid(x_ptr);
+        NslTensor::from_ptr(x_ptr).refcount.fetch_sub(1, Ordering::SeqCst);
+        let t1 = crate::tensor::nsl_tensor_sub(one, s, 0); // 1 - s
+        let t2 = crate::tensor::nsl_tensor_mul(x_ptr, t1, 0); // x*(1-s)
+        let t3 = crate::tensor::nsl_tensor_add(one, t2, 0); // 1 + t2
+        let t4 = crate::tensor::nsl_tensor_mul(s, t3, 0); // s*t3
+        let out = crate::tensor::nsl_tensor_mul(grad_ptr, t4, 0); // grad*t4 (broadcast)
+        for p in [one, s, t1, t2, t3, t4] { nsl_tensor_free(p); }
+        return out;
+    }
     let x_dev = xt.device;
     if x_dev > 0 {
         #[cfg(feature = "cuda")]
@@ -982,14 +996,19 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
 pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     let yt = unsafe { &*(y_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    assert!(
+        (yt.dtype == 0 || yt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
+        "sigmoid_backward: unsupported dtype (y={}, grad={}); f16/bf16 activation backward is not implemented",
+        yt.dtype, gt.dtype
+    );
     // Broadcast/mismatched-grad fallback (scalar sum/mean seed vs y[n],
     // cross-device, or mixed dtype): reproduce the three-op sequence the compiler
-    // emitted pre-fusion (same f32 `1.0` constant), whose final `nsl_tensor_mul`
+    // emitted pre-fusion (dtype-matched `1.0` constant), whose final `nsl_tensor_mul`
     // broadcasts grad and whose sub/mul promote across dtype — numerically
     // equivalent to the pre-fusion path. The dtype guard also keeps the fast
     // path's flat, single-dtype CPU loop from reading `grad` with `y`'s accessor.
     if !gt.shape_eq(yt) || gt.device != yt.device || gt.dtype != yt.dtype {
-        let one = crate::tensor::nsl_tensor_scalar(1.0, 1);
+        let one = crate::tensor::nsl_tensor_scalar(1.0, if yt.dtype == 0 { 0 } else { 1 });
         let t1 = crate::tensor::nsl_tensor_sub(one, y_ptr, 0); // 1 - y
         let t2 = crate::tensor::nsl_tensor_mul(y_ptr, t1, 0); // y*(1-y)
         let out = crate::tensor::nsl_tensor_mul(grad_ptr, t2, 0); // grad*t2 (broadcast)
@@ -1066,14 +1085,19 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
 pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     let yt = unsafe { &*(y_ptr as *const NslTensor) };
     let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    assert!(
+        (yt.dtype == 0 || yt.dtype == 1) && (gt.dtype == 0 || gt.dtype == 1),
+        "tanh_backward: unsupported dtype (y={}, grad={}); f16/bf16 activation backward is not implemented",
+        yt.dtype, gt.dtype
+    );
     // Broadcast/mismatched-grad fallback (scalar sum/mean seed vs y[n],
     // cross-device, or mixed dtype): reproduce the three-op sequence the compiler
-    // emitted pre-fusion (same f32 `1.0` constant), whose final `nsl_tensor_mul`
+    // emitted pre-fusion (dtype-matched `1.0` constant), whose final `nsl_tensor_mul`
     // broadcasts grad and whose sub/mul promote across dtype — numerically
     // equivalent to the pre-fusion path. The dtype guard also keeps the fast
     // path's flat, single-dtype CPU loop from reading `grad` with `y`'s accessor.
     if !gt.shape_eq(yt) || gt.device != yt.device || gt.dtype != yt.dtype {
-        let one = crate::tensor::nsl_tensor_scalar(1.0, 1);
+        let one = crate::tensor::nsl_tensor_scalar(1.0, if yt.dtype == 0 { 0 } else { 1 });
         let y_sq = crate::tensor::nsl_tensor_mul(y_ptr, y_ptr, 0); // y*y
         let t = crate::tensor::nsl_tensor_sub(one, y_sq, 0); // 1 - y*y
         let out = crate::tensor::nsl_tensor_mul(grad_ptr, t, 0); // grad*t (broadcast)
@@ -1612,6 +1636,68 @@ mod silu_backward_tests {
             assert_eq!(r[i].to_bits(), f[i].to_bits(), "gpu f32 mismatch at {i}: {} vs {}", r[i], f[i]);
         }
         for p in [xr, gr, ref_out, xf, gf, fused] { nsl_tensor_free(p); }
+    }
+
+    /// A scalar `grad` (a `sum`/`mean` seed) must broadcast against x[n] via the
+    /// decomposed fallback rather than panic (the crash reverted in slice 3,
+    /// restored in slice 4). Output is x-shaped and each element equals
+    /// grad0 * silu'(x[i]).
+    #[test]
+    fn silu_backward_scalar_grad_broadcasts() {
+        let xs = [-2.0, -0.5, 0.0, 1.0, 3.0];
+        let c = 1.5_f64;
+        let (x, grad) = (make_f64(&xs), make_f64(&[c]));
+        let out = nsl_tensor_silu_backward(grad, x);
+        assert_eq!(NslTensor::from_ptr(out).len, xs.len() as i64, "output must be x-shaped");
+        let ot = NslTensor::from_ptr(out);
+        for (i, &xv) in xs.iter().enumerate() {
+            let s = 1.0 / (1.0 + (-xv).exp());
+            let expected = c * s * (1.0 + xv * (1.0 - s));
+            let got = unsafe { *ot.data_f64().add(i) };
+            assert!((got - expected).abs() < 1e-5, "at {i}: {got} vs {expected}");
+        }
+        for p in [x, grad, out] { nsl_tensor_free(p); }
+    }
+
+    /// The source-AD in-place-suppression guard: with it raised, a forward
+    /// activation on a uniquely-owned input must allocate a fresh output and
+    /// leave the input intact (so the adjoint's saved primal survives) — exactly
+    /// what tape-AD gets for free from `is_recording()`. With it clear, the
+    /// unique-owner FBIP path mutates in place (returns the same pointer).
+    #[test]
+    fn inplace_suppress_preserves_forward_input() {
+        use crate::tensor::{inplace_suppressed, nsl_set_inplace_suppressed};
+        let xs = [-1.0f32, 0.0, 1.0, 2.0];
+
+        // Suppressed: silu must NOT reuse x; x stays == its original values.
+        let x = make_f32(&xs);
+        assert!(!inplace_suppressed());
+        nsl_set_inplace_suppressed(1);
+        assert!(inplace_suppressed());
+        let y = nsl_tensor_silu(x);
+        nsl_set_inplace_suppressed(0);
+        assert!(!inplace_suppressed(), "guard must pop back to clear");
+        assert_ne!(x, y, "suppressed: silu must allocate a fresh output, not reuse x");
+        let xt = NslTensor::from_ptr(x);
+        for (i, &v) in xs.iter().enumerate() {
+            assert_eq!(unsafe { *xt.data_f32().add(i) }, v, "x mutated at {i} despite suppression");
+        }
+        // y really is silu(x).
+        let yt = NslTensor::from_ptr(y);
+        for (i, &v) in xs.iter().enumerate() {
+            let want = v * (1.0_f32 / (1.0_f32 + (-v).exp()));
+            assert!((unsafe { *yt.data_f32().add(i) } - want).abs() < 1e-6);
+        }
+        for p in [x, y] { nsl_tensor_free(p); }
+
+        // Not suppressed + uniquely owned: FBIP mutates in place (same pointer).
+        let x2 = make_f32(&xs);
+        let y2 = nsl_tensor_silu(x2);
+        assert_eq!(x2, y2, "unsuppressed unique-owner silu should reuse the buffer in place");
+        // x2 == y2 is ONE allocation whose refcount FBIP bumped to 2 (two logical
+        // owners: the input handle and the result handle) — free both to reach 0.
+        nsl_tensor_free(x2);
+        nsl_tensor_free(y2);
     }
 }
 
