@@ -854,19 +854,22 @@ impl AdjointGenerator {
             }
 
             // --- Sigmoid backward: grad * σ(x) * (1 - σ(x)), where y = σ(x) ---
+            // Fused (Milestone C · p4 slice 3): the three-op expansion (Sub, Mul,
+            // Mul → three kernels + two intermediates) collapses to a single
+            // `nsl_tensor_sigmoid_backward(grad, y)` launch, BIT-EXACT with the
+            // decomposed path — see `SIGMOID_BACKWARD_SRCAD_F32_PTX`.
             AdjointExpr::SigmoidBackward(y_bar, y) => {
-                let one = self.emit_constant(1.0);
-                let one_minus_y = self.emit_op(PrimalOp::Sub, vec![one, y]);
-                let sig_deriv = self.emit_op(PrimalOp::Mul, vec![y, one_minus_y]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, sig_deriv])
+                self.emit_op(PrimalOp::Passthrough("sigmoid_backward".into()), vec![y_bar, y])
             }
 
             // --- Tanh backward: grad * (1 - tanh²(x)), where y = tanh(x) ---
+            // Fused (Milestone C · p4 slice 3): the three-op expansion (Mul, Sub,
+            // Mul) collapses to a single `nsl_tensor_tanh_backward(grad, y)`
+            // launch, BIT-EXACT with the decomposed path (LOAD-BEARING `.rn`
+            // blocks the y*y→1-y*y fma-contraction) — see
+            // `TANH_BACKWARD_SRCAD_F32_PTX`.
             AdjointExpr::TanhBackward(y_bar, y) => {
-                let y_sq = self.emit_op(PrimalOp::Mul, vec![y, y]);
-                let one = self.emit_constant(1.0);
-                let one_minus_y_sq = self.emit_op(PrimalOp::Sub, vec![one, y_sq]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, one_minus_y_sq])
+                self.emit_op(PrimalOp::Passthrough("tanh_backward".into()), vec![y_bar, y])
             }
 
             // --- Log backward: grad / x (correct as-is) ---

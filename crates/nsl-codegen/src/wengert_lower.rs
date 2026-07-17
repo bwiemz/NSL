@@ -3091,6 +3091,28 @@ fn lower_single_op(
                         &[inputs[0], inputs[1]],
                     )
                 }
+                "sigmoid_backward" => {
+                    // inputs = [grad, y] — p4 slice 3 fused Sigmoid backward:
+                    // grad * y*(1-y) (y = σ output), one launch, bit-exact with
+                    // the three-op source-AD expansion.
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_sigmoid_backward",
+                        &[inputs[0], inputs[1]],
+                    )
+                }
+                "tanh_backward" => {
+                    // inputs = [grad, y] — p4 slice 3 fused Tanh backward:
+                    // grad * (1 - y*y) (y = tanh output), one launch, bit-exact
+                    // with the three-op source-AD expansion.
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_tanh_backward",
+                        &[inputs[0], inputs[1]],
+                    )
+                }
                 "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
                     let rt_name = format!("nsl_tensor_{}", name);
                     call(compiler, builder, &rt_name, &inputs)
