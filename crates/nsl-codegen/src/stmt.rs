@@ -4834,6 +4834,8 @@ impl Compiler<'_> {
         /// layer-major update schedule (D1b).
         struct CslaParam {
             name: String,
+            /// Primal leaf VarId (for the view-of-θ hazard check).
+            primal_vid: crate::wengert::VarId,
             /// Adjoint (gradient) VarId, when the param is read in the
             /// backward; `None` = dead/frozen — no gradient ever
             /// accumulates, but the update still fires (weight decay +
@@ -4866,6 +4868,13 @@ impl Compiler<'_> {
             /// per-param update facts.
             plan: crate::layerwise::LayerwisePlan,
             params: Vec<CslaParam>,
+            /// PRIMAL-side zero-copy views of trainable params (transpose /
+            /// reshape chains rooted at a param leaf): view result vid →
+            /// param leaf vid. These ride the window buffer as slots but
+            /// ALIAS θ's storage — a read after θ's per-layer update would
+            /// see half-updated weights (review D1b-2).
+            primal_view_of:
+                std::collections::HashMap<crate::wengert::VarId, crate::wengert::VarId>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -6549,11 +6558,37 @@ impl Compiler<'_> {
                             let &accum_idx = param_name_to_accum_idx.get(name.as_str())?;
                             Some(CslaParam {
                                 name: name.clone(),
+                                primal_vid: *primal_vid,
                                 adj_vid: gen.adjoint_of(*primal_vid),
                                 accum_idx,
                             })
                         })
                         .collect();
+                    // PRIMAL-side view chains rooted at trainable params
+                    // (tied-head `embed.transpose(0,1)` etc.) — buffered as
+                    // slots but aliasing θ; the window site checks their
+                    // reads against each param's update range.
+                    let trainable_vid_set: std::collections::HashSet<crate::wengert::VarId> =
+                        csla_trainable.iter().map(|(_, v)| *v).collect();
+                    let mut primal_view_of: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::VarId,
+                    > = std::collections::HashMap::new();
+                    for op in &effective_primal.ops {
+                        if matches!(
+                            op.op,
+                            crate::wengert::PrimalOp::Transpose { .. }
+                                | crate::wengert::PrimalOp::Reshape { .. }
+                        ) {
+                            for &input in &op.inputs {
+                                if trainable_vid_set.contains(&input) {
+                                    primal_view_of.insert(op.result, input);
+                                } else if let Some(&p) = primal_view_of.get(&input) {
+                                    primal_view_of.insert(op.result, p);
+                                }
+                            }
+                        }
+                    }
                     csla_loss_buffered = loss_slot.is_some();
                     csla_teardown_slots = Some(
                         slots
@@ -6580,6 +6615,7 @@ impl Compiler<'_> {
                         loss_slot,
                         plan,
                         params: csla_params,
+                        primal_view_of,
                     });
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
@@ -7549,11 +7585,40 @@ impl Compiler<'_> {
                 }
                 imports_per_range[ri].sort_unstable();
             }
+            // Fixpoint-extended last-use POSITIONS (review D1b-3): frees must
+            // key off list-membership-extended last use — a slot or carry
+            // consumed by a list-building op in range R whose LIST is read in
+            // range S>R must survive to S (lists hold raw, un-refcounted
+            // element pointers; freeing at the direct read would dangle
+            // them). Seeding stays direct-read-based (only actual op inputs
+            // need values).
+            let extended_last_pos: std::collections::HashMap<crate::wengert::VarId, usize> = {
+                let mut lu: std::collections::HashMap<crate::wengert::VarId, usize> =
+                    std::collections::HashMap::new();
+                for (idx, op) in pending.adjoint.ops.iter().enumerate() {
+                    for &input in &op.inputs {
+                        lu.insert(input, idx);
+                    }
+                }
+                crate::ccr::extend_last_use_through_lists(&pending.adjoint, &mut lu);
+                lu
+            };
+            let range_of_pos = |pos: usize| -> usize {
+                ranges
+                    .iter()
+                    .position(|r| pos >= r.start && pos < r.end)
+                    .unwrap_or(last_ri)
+            };
+
             // Carried Tensor-typed values with NO FreeTensor consumer get an
-            // explicit free after their last consuming range's replay (the
-            // last-use-frees pass covers most; this is the belt for values
-            // it protected or never saw). List-typed carries are never freed
-            // (matching free_eligible's List exclusion).
+            // explicit free after their (fixpoint-extended) last consuming
+            // range's replay — the belt for values the last-use-frees pass
+            // protected or never saw. Skips at emission time (below) also
+            // exclude hook-freed raw grads (review D1b-1: a range boundary
+            // landing ON a reduce_to_shape grad op makes its raw-grad input a
+            // carry that the hook's extra free already releases — freeing it
+            // again here would be a double free). List-typed carries are
+            // never freed (matching free_eligible's List exclusion).
             let mut carry_explicit_free: Vec<Vec<crate::wengert::VarId>> =
                 vec![Vec::new(); n_ranges];
             for &v in &carry_vids {
@@ -7566,11 +7631,17 @@ impl Compiler<'_> {
                 ) {
                     continue;
                 }
-                carry_explicit_free[carry_last_read[&v]].push(v);
+                let last_pos = extended_last_pos
+                    .get(&v)
+                    .copied()
+                    .unwrap_or(pending.adjoint.ops.len().saturating_sub(1));
+                let ri = range_of_pos(last_pos).max(carry_last_read[&v]);
+                carry_explicit_free[ri].push(v);
             }
             // Primal-slot schedule: which ranges read each buffered slot
-            // (seed only there) and which range is a slot's LAST reader
-            // (free it there, with the loss-slot b<N-1 conditional).
+            // (seed only there — direct reads) and which range is a slot's
+            // fixpoint-extended LAST reader (free it there, with the
+            // loss-slot b<N-1 conditional).
             let mut slot_seed_per_range: Vec<Vec<usize>> = vec![Vec::new(); n_ranges];
             let mut slot_free_per_range: Vec<Vec<usize>> = vec![Vec::new(); n_ranges];
             {
@@ -7580,8 +7651,6 @@ impl Compiler<'_> {
                     .enumerate()
                     .map(|(i, (v, _))| (*v, i))
                     .collect();
-                let mut last_reader: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::new();
                 for (ri, r) in ranges.iter().enumerate() {
                     let mut seen = std::collections::HashSet::new();
                     for op in &pending.adjoint.ops[r.start..r.end] {
@@ -7590,17 +7659,92 @@ impl Compiler<'_> {
                                 if seen.insert(si) {
                                     slot_seed_per_range[ri].push(si);
                                 }
-                                last_reader.insert(si, ri);
                             }
                         }
                     }
                     slot_seed_per_range[ri].sort_unstable();
                 }
-                for (si, ri) in last_reader {
-                    slot_free_per_range[ri].push(si);
+                for (vid, si) in &slot_of {
+                    if let Some(&pos) = extended_last_pos.get(vid) {
+                        slot_free_per_range[range_of_pos(pos)].push(*si);
+                    }
                 }
                 for v in slot_free_per_range.iter_mut() {
                     v.sort_unstable();
+                }
+            }
+
+            // Review D1b-2: zero-copy VIEWS OF θ (transpose/reshape chains
+            // rooted at a trainable param) alias parameter storage, so a
+            // read through one AFTER that param's per-layer update would see
+            // half-updated weights — invisible to the classification, which
+            // tracks only the param's DIRECT reads. Refuse any read of a
+            // view-of-θ in a range strictly after θ's update range. Views of
+            // epilogue-group params (update range = MAX — after every
+            // range) can never trip this: the tied-embedding LM head is the
+            // canonical safe case. Both primal-side view chains (buffered
+            // slots) and adjoint-side view chains are tracked transitively.
+            {
+                let idx_update_range: std::collections::HashMap<i64, usize> = layer_group
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(ri, g)| g.iter().map(move |&i| (i, ri)))
+                    .collect();
+                let update_range_of_vid: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    usize,
+                > = pending
+                    .params
+                    .iter()
+                    .map(|cp| {
+                        (
+                            cp.primal_vid,
+                            idx_update_range
+                                .get(&cp.accum_idx)
+                                .copied()
+                                .unwrap_or(usize::MAX),
+                        )
+                    })
+                    .collect();
+                let mut view_param: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    crate::wengert::VarId,
+                > = pending.primal_view_of.clone();
+                for (ri, r) in ranges.iter().enumerate() {
+                    for op in &pending.adjoint.ops[r.start..r.end] {
+                        for &input in &op.inputs {
+                            if let Some(&p) = view_param.get(&input) {
+                                let ur = update_range_of_vid
+                                    .get(&p)
+                                    .copied()
+                                    .unwrap_or(usize::MAX);
+                                if ri > ur {
+                                    return Err(CodegenError::new(format!(
+                                        "--layerwise-accum: a view of parameter \
+                                         VarId {p} is read in replay range {ri}, \
+                                         after the param's per-layer update in \
+                                         range {ur} — the view aliases θ's storage \
+                                         and would see half-updated weights. This \
+                                         adjoint shape is unsupported; drop \
+                                         --layerwise-accum",
+                                    )));
+                                }
+                            }
+                        }
+                        if matches!(
+                            op.op,
+                            crate::wengert::PrimalOp::Transpose { .. }
+                                | crate::wengert::PrimalOp::Reshape { .. }
+                        ) {
+                            for &input in &op.inputs {
+                                if update_range_of_vid.contains_key(&input) {
+                                    view_param.insert(op.result, input);
+                                } else if let Some(&p) = view_param.get(&input) {
+                                    view_param.insert(op.result, p);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -7886,6 +8030,22 @@ impl Compiler<'_> {
                 for &ev in &exports_per_range[ri] {
                     match grad_lowered.var_map.get(&ev) {
                         Some(&val) => {
+                            // Review D1b-4: only i64-typed values (tensor /
+                            // list pointers, integers) can ride the carry
+                            // list; a scalar f64 crossing a range boundary
+                            // would otherwise be a Cranelift verifier ICE.
+                            // AD rules emit constants adjacent to consumers,
+                            // so this is unreachable today — refuse loudly
+                            // if that ever changes.
+                            let vty = builder.func.dfg.value_type(val);
+                            if vty != cl_types::I64 {
+                                return Err(CodegenError::new(format!(
+                                    "--layerwise-accum: cross-range adjoint value \
+                                     VarId {ev} has non-i64 Cranelift type {vty}; \
+                                     scalar carries are unsupported — drop \
+                                     --layerwise-accum",
+                                )));
+                            }
                             let ic = inner_carry.expect("exports imply carry_outer");
                             let slot_val = builder
                                 .ins()
@@ -7919,8 +8079,17 @@ impl Compiler<'_> {
 
                 // Carried values whose last consumer is this range and that
                 // no FreeTensor marker covers: free their seeded value now.
+                // Review D1b-1 (HIGH): skip anything the replay itself
+                // already freed — the hook's reduce_to_shape extra free
+                // (hook_freed_input_vars) releases a carried RAW grad when a
+                // range boundary lands on the reduce op, and explicit
+                // FreeTensor victims are covered by their markers. Freeing
+                // either again here would be a double free.
                 for &cv in &carry_explicit_free[ri] {
-                    if ghost_carries.contains(&cv) {
+                    if ghost_carries.contains(&cv)
+                        || grad_lowered.hook_freed_input_vars.contains(&cv)
+                        || grad_lowered.explicit_freed_vars.contains(&cv)
+                    {
                         continue;
                     }
                     if let Some(&val) = seed.get(&cv) {
