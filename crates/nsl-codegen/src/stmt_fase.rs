@@ -18,6 +18,18 @@ use cranelift_codegen::ir::{InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::compiler::Compiler;
+
+/// Scalars extracted from a structurally-matched AdamW/Adam `UpdateProgram`
+/// (p9 fused optimizer step admission — see `match_adamw_program`).
+struct FusedAdamwScalars {
+    lr: f64,
+    wd: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+}
 use crate::fase::FasePlan;
 
 /// Emit the Deferred-mode per-micro-batch accumulator update.
@@ -57,6 +69,61 @@ impl Compiler<'_> {
     /// The `Tmp` register is allocated lazily (first write) and freed at the
     /// end of the method.  All other registers map directly to the four
     /// pointer arguments above.
+    /// p9 admission: strict structural match of the FASE-Deferred AdamW/Adam
+    /// `UpdateProgram` (the exact 7-op shape `emit_adamw` produces). Returns
+    /// the recipe scalars when — and only when — the program is that shape;
+    /// any future change to the emitter fails the match and falls back to the
+    /// interpreted path loudly-by-construction (no silent drift).
+    fn match_adamw_program(
+        program: &crate::fase_optimizer::UpdateProgram,
+    ) -> Option<FusedAdamwScalars> {
+        use crate::fase_optimizer::{BcKind, Register, UpdateOp};
+        if program.ops.len() != 7 {
+            return None;
+        }
+        let (beta1, one_minus_beta1) = match &program.ops[0] {
+            UpdateOp::ScalarMulAdd {
+                dst: Register::M,
+                src: Register::M,
+                a,
+                b_src: Some(Register::MPartial),
+                b_scale,
+            } => (*a, *b_scale),
+            _ => return None,
+        };
+        let (beta2, one_minus_beta2) = match &program.ops[1] {
+            UpdateOp::SquaredAccumulate {
+                dst: Register::V,
+                src: Register::V,
+                src_scale,
+                operand: Register::MPartial,
+                scale,
+            } => (*src_scale, *scale),
+            _ => return None,
+        };
+        match &program.ops[2] {
+            UpdateOp::ScalarMulByBc { dst: Register::MHat, src: Register::M, kind: BcKind::Beta1 } => {}
+            _ => return None,
+        }
+        match &program.ops[3] {
+            UpdateOp::ScalarMulByBc { dst: Register::VHat, src: Register::V, kind: BcKind::Beta2 } => {}
+            _ => return None,
+        }
+        let eps = match &program.ops[4] {
+            UpdateOp::SqrtPlusEps { dst: Register::Tmp, src: Register::VHat, eps } => *eps,
+            _ => return None,
+        };
+        match &program.ops[5] {
+            UpdateOp::Div { dst: Register::Tmp, src: Register::MHat, divisor: Register::Tmp } => {}
+            _ => return None,
+        }
+        let (lr, wd) = match &program.ops[6] {
+            UpdateOp::Update { lr, wd, scaled_m: Register::Tmp } => (*lr, *wd),
+            _ => return None,
+        };
+        Some(FusedAdamwScalars { lr, wd, beta1, one_minus_beta1, beta2, one_minus_beta2, eps })
+    }
+
     pub(crate) fn fase_emit_final_step(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -175,6 +242,57 @@ impl Compiler<'_> {
             m_partial_ptr
         };
 
+        // ── p9: fused per-parameter optimizer step ─────────────────────────
+        // When the recipe's program is the exact AdamW/Adam shape (strict
+        // structural match below — anything else falls through to the
+        // interpreter), replace the ~15-launch interpreted execution with ONE
+        // fused kernel launch, BIT-EXACT with it (the kernel mirrors every
+        // op's rounding; see FASE_FUSED_ADAMW_STEP_F32_PTX and the CPU twin in
+        // nsl-runtime/src/fase_step.rs). It runs on the envelope-resolved
+        // working pointers, so the CPDT precision and offload envelopes above/
+        // below compose unchanged, and the shared tail (zero m_partial,
+        // copy-backs) still runs. Kill-switch: NSL_FASE_FUSED_STEP=0, read at
+        // COMPILE time — `nsl run` compiles and executes in one process so
+        // this IS the run-time setting; for `nsl build` the choice is baked
+        // iff the env was set at build time (the NSL_PHASE_TIMING doctrine).
+        // The CPDT reduced-precision cast envelope (wrap_precision) produces
+        // f32 working m/v while theta/m_partial keep the model dtype — on a
+        // CPU run that is a MIXED-dtype set the fused FFI (uniform-dtype by
+        // contract) must not see; the interpreted ops reconcile it. Keep that
+        // envelope on the interpreted path. (Offload envelopes stay uniform —
+        // fused OK.)
+        let fused_scalars = if !wrap_precision
+            && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
+        {
+            match (bc_params, Self::match_adamw_program(&program)) {
+                (Some(bc), Some(s)) => Some((bc, s)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let fused_emitted = if let Some(((bc1_val, bc2_val), s)) = fused_scalars {
+            let lr_v = builder.ins().f64const(s.lr);
+            let b1_v = builder.ins().f64const(s.beta1);
+            let omb1_v = builder.ins().f64const(s.one_minus_beta1);
+            let b2_v = builder.ins().f64const(s.beta2);
+            let omb2_v = builder.ins().f64const(s.one_minus_beta2);
+            let eps_v = builder.ins().f64const(s.eps);
+            let wd_v = builder.ins().f64const(s.wd);
+            self.compile_call_by_name(
+                builder,
+                "nsl_fase_fused_adamw_step",
+                &[
+                    theta_ptr, m_ptr, v_ptr, m_partial_ptr,
+                    lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
+                    bc1_val, bc2_val,
+                ],
+            )?;
+            true
+        } else {
+            false
+        };
+
         // Lazily-allocated scratch tensor for the `Tmp` register.  Allocated
         // on first write, freed at end.
         let mut tmp_val: Option<Value> = None;
@@ -220,6 +338,10 @@ impl Compiler<'_> {
         // Constant used when calling helpers that borrow their argument (flags=0).
         let flags_zero = builder.ins().iconst(cl_types::I8, 0);
 
+        // The interpreted program — skipped entirely when the fused step was
+        // emitted above (scratch Options stay None; the shared tail below is
+        // common to both arms). Loop body indentation deliberately preserved.
+        if !fused_emitted {
         for op in &program.ops {
             match op {
                 // ── Zero ────────────────────────────────────────────────────
@@ -569,6 +691,7 @@ impl Compiler<'_> {
                 }
             }
         }
+        } // end if !fused_emitted
 
         // Zero m_partial for the next accumulation window.
         if wrap_offload {

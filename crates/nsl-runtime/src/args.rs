@@ -63,6 +63,26 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(crate::fused_adapter::nsl_fused_adapter_gpu_launch_count_atexit);
         }
     }
+
+    // p9: fused FASE optimizer-step launch count, enabled when
+    // NSL_FASE_FUSED_COUNTER=1. Lets the differential gate assert the fused
+    // path actually fired (anti-vacuity), mirroring the WRGA counter pattern.
+    // The counter is always live; the env var only gates the report.
+    if std::env::var("NSL_FASE_FUSED_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_fase_fused_step_count_atexit);
+        }
+    }
+}
+
+extern "C" fn nsl_fase_fused_step_count_atexit() {
+    eprintln!(
+        "[fase-fused] optimizer fused-step launches: {}",
+        crate::fase_step::nsl_fase_fused_step_count()
+    );
 }
 
 extern "C" fn nsl_gpu_mem_report_atexit() {

@@ -2253,6 +2253,64 @@ pub(crate) fn gpu_scalar_mul_add_inplace_f32(m_ptr: i64, g_ptr: i64, scale: f32)
     inner::sync_after_kernel();
 }
 
+/// p9: fused per-parameter FASE-Deferred AdamW step — one launch for the whole
+/// m/v/θ update (see `FASE_FUSED_ADAMW_STEP_F32_PTX`). All scalars are already
+/// f32 (converted by the FFI with the same `as f32` every scalar op uses).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step(
+    theta_ptr: i64, m_ptr: i64, v_ptr: i64, mp_ptr: i64, n: usize,
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+) {
+    use crate::tensor::NslTensor;
+    if n == 0 {
+        return;
+    }
+    let th = unsafe { &*(theta_ptr as *const NslTensor) };
+    let m = unsafe { &*(m_ptr as *const NslTensor) };
+    let v = unsafe { &*(v_ptr as *const NslTensor) };
+    let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+    let mut th_data = th.data as u64;
+    let mut m_data = m.data as u64;
+    let mut v_data = v.data as u64;
+    let mut mp_data = mp.data as u64;
+    let mut n_val = n as u64;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let args = [
+        &mut th_data as *mut _ as *mut std::ffi::c_void,
+        &mut m_data as *mut _ as *mut std::ffi::c_void,
+        &mut v_data as *mut _ as *mut std::ffi::c_void,
+        &mut mp_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut b1 as *mut _ as *mut std::ffi::c_void,
+        &mut omb1 as *mut _ as *mut std::ffi::c_void,
+        &mut b2 as *mut _ as *mut std::ffi::c_void,
+        &mut omb2 as *mut _ as *mut std::ffi::c_void,
+        &mut eps as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr_wd as *mut _ as *mut std::ffi::c_void,
+        &mut bc1 as *mut _ as *mut std::ffi::c_void,
+        &mut bc2 as *mut _ as *mut std::ffi::c_void,
+        &mut has_wd_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_STEP_F32_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_step_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_step kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
