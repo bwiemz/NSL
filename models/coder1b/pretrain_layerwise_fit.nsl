@@ -79,6 +79,19 @@ print("Model on GPU")
 # logits chains; @fused_lm_ce tape-carry is the next lever), m_partial
 # 646 MB, embed + epilogue residents. 7B remains blocked on host RAM
 # (f32 masters + m/v > 63 GB; needs P0.3 fp16 host moments).
+#
+# FUSED-CE TAPE-CARRY RESULT (2026-07-18): with the model head restructured
+# for @fused_lm_ce (FLAT logits + a real bias — the matcher needs
+# Add(Matmul(x, T(W)), bias) directly feeding cross_entropy; scratch model,
+# not this file) and dtype="f32", vocab_tile=128, the demo config's peak
+# drops to 7.34 GB (activations 8.69 -> 6.68 GB: the buffered logits
+# chains are gone; the carry buffers one [B*S] f32 LSE per micro-batch).
+# First loss 11.802401542663574 — BIT-IDENTICAL to the composite baseline
+# (forward deterministic); later steps track within atomic-scatter ULP
+# noise (the fused backward's red.global.add.f32 dW/dbias). Carry line:
+# "[csla] fused-ce tape-carry: 1 slots"; counters unchanged 2592/2592.
+# Three pre-existing fused-CE defects were found+fixed on this path's
+# first real e2e engagement — see bugs.md and the research note §7.
 let tokens = full([2048], 1.0)
 let loader = DataLoader(tokens, batch_size=1, seq_len=256, shuffle=false, drop_last=true)
 
