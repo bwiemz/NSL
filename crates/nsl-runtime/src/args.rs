@@ -98,6 +98,24 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(nsl_csla_window_count_atexit);
         }
     }
+
+    // D3 (ZeRO-1): collective counts, enabled when NSL_ZERO_COUNTER=1. The
+    // parity gate asserts EXACT all_reduce/broadcast totals — with
+    // replicated data a no-op reduce is otherwise invisible (identical
+    // grads make sum/ws == g either way).
+    if std::env::var("NSL_ZERO_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_zero_count_atexit);
+        }
+    }
+}
+
+extern "C" fn nsl_zero_count_atexit() {
+    let (rank, ws, all_reduce, broadcast) = crate::zero::zero_counter_snapshot();
+    eprintln!("[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast}");
 }
 
 extern "C" fn nsl_weight_stream_count_atexit() {

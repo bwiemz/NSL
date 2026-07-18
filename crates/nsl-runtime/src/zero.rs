@@ -47,6 +47,33 @@ pub fn partition_params(num_params: usize, world_size: usize) -> Vec<Vec<usize>>
 
 static ZERO_CTX: Mutex<Option<ZeROContext>> = Mutex::new(None);
 
+/// D3 anti-vacuity (review): with replicated data a silently no-op reduce
+/// is invisible to the parity gate (identical grads make sum/ws == g
+/// either way). These count backend collectives that ACTUALLY ran (rc==0,
+/// ws>1 path only); the gate asserts exact totals so a degenerate
+/// identity path or an argv-forwarding regression that drops --devices
+/// cannot pass green. Reported at exit under NSL_ZERO_COUNTER=1.
+pub static ZERO_ALL_REDUCE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static ZERO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read `(rank, world_size, all_reduce_count, broadcast_count)` for the
+/// atexit report. rank/ws are -1 when no context was initialized.
+pub fn zero_counter_snapshot() -> (i64, i64, u64, u64) {
+    let guard = ZERO_CTX.lock().unwrap();
+    let (rank, ws) = guard
+        .as_ref()
+        .map(|c| (c.rank as i64, c.world_size as i64))
+        .unwrap_or((-1, -1));
+    (
+        rank,
+        ws,
+        ZERO_ALL_REDUCE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ZERO_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 struct ZeROContext {
     #[allow(dead_code)]
     stage: ZeROStage,
@@ -228,6 +255,25 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         }
         let tensor = unsafe { &*tensor_ptr };
 
+        // D3 v1 (review): ZeRO-1 SPMD is CPU-only. --devices N spawns N
+        // full processes that all select CUDA device 0 (cuda/mod.rs pins
+        // ordinal 0; the spawner sets no per-rank CUDA_VISIBLE_DEVICES),
+        // so a GPU-resident model would multiply VRAM by N on one card and
+        // the staged reduce path is unvalidated. Refuse rather than pile
+        // ranks onto one GPU. (Runtime, not compile-time: the default
+        // --target is "cuda" even for CPU-placed models, so a target-based
+        // guard would wrongly refuse the CPU SPMD path.)
+        if ctx.world_size > 1 && tensor.device != 0 {
+            eprintln!(
+                "nsl: nsl_zero_reduce_grads: ZeRO-1 SPMD (--zero-stage 1 \
+                 --devices {}) is CPU-only in v1 — a GPU-resident model \
+                 would place all {} ranks on CUDA device 0. Move the model \
+                 to CPU or drop --devices.",
+                ctx.world_size, ctx.world_size
+            );
+            return -5;
+        }
+
         // Refuse loudly instead of silently skipping: a skipped tensor would
         // leave one gradient un-averaged and produce silently-wrong training.
         if tensor.device == 0 && tensor.dtype > 1 {
@@ -269,6 +315,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 );
                 return -1;
             }
+            ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
             continue;
         }
@@ -413,6 +460,18 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         let tensor = unsafe { &*tensor_ptr };
         let owner = (i % ctx.world_size) as i32;
 
+        // D3 v1: CPU-only (see nsl_zero_reduce_grads) — refuse GPU-resident
+        // params rather than pile N ranks onto CUDA device 0.
+        if tensor.device != 0 {
+            eprintln!(
+                "nsl: nsl_zero_sync_params: ZeRO-1 SPMD is CPU-only in v1 — a \
+                 GPU-resident param would place all {} ranks on CUDA device \
+                 0. Move the model to CPU or drop --devices.",
+                ctx.world_size
+            );
+            return -5;
+        }
+
         if tensor.device == 0 {
             if tensor.dtype > 1 {
                 eprintln!(
@@ -436,6 +495,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 );
                 return -1;
             }
+            ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
 

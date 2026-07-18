@@ -243,10 +243,25 @@ impl SimulatedBackend {
         unsafe { self.shm_ptr.add(offset) }
     }
 
+    /// D3 (review): does a per-rank slot of `slot_bytes` fit for ALL ranks?
+    /// Every rank processes the same tensor order and computes the same
+    /// `slot_bytes`, so a failure here is symmetric — all ranks return the
+    /// same error at the same op instead of one panicking in `slot_ptr`
+    /// while peers spin forever on the next barrier.
+    fn slot_fits(&self, slot_bytes: usize) -> bool {
+        DATA_OFFSET + (self.world_size as usize) * slot_bytes <= self.shm_len
+    }
+
     /// Spin-barrier using double-buffered generation counter.
     ///
     /// All ranks increment `arrival`; the last rank to arrive bumps `generation`
     /// and resets `arrival` for the next round.  Other ranks spin on `generation`.
+    ///
+    /// D3 (review): bounded so a dead peer aborts the job loudly instead of
+    /// spinning all survivors at 100% CPU forever. Deadline is
+    /// `NSL_TP_BARRIER_TIMEOUT_SECS` (default 300s) — generous enough for
+    /// slow legitimate steps, finite for a crashed rank. Checked every 64K
+    /// spins so the hot path stays a bare load + spin_loop.
     fn spin_barrier(&self) {
         let hdr = self.header();
         let gen_before = hdr.generation.load(Ordering::Acquire);
@@ -257,9 +272,26 @@ impl SimulatedBackend {
             hdr.arrival.store(0, Ordering::Release);
             hdr.generation.store(gen_before.wrapping_add(1), Ordering::Release);
         } else {
-            // Spin until generation advances.
+            let timeout_secs: u64 = std::env::var("NSL_TP_BARRIER_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            let start = std::time::Instant::now();
+            let mut spins: u64 = 0;
             while hdr.generation.load(Ordering::Acquire) == gen_before {
                 std::hint::spin_loop();
+                spins += 1;
+                if spins & 0xFFFF == 0
+                    && start.elapsed().as_secs() >= timeout_secs
+                {
+                    eprintln!(
+                        "nsl: collective barrier timed out after {timeout_secs}s \
+                         on rank {} — a peer rank likely died. Aborting (set \
+                         NSL_TP_BARRIER_TIMEOUT_SECS to tune).",
+                        self.rank
+                    );
+                    std::process::abort();
+                }
             }
         }
     }
@@ -284,6 +316,15 @@ impl CollectiveBackend for SimulatedBackend {
                 unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes); }
             }
             return 0;
+        }
+        if !self.slot_fits(nbytes) {
+            eprintln!(
+                "nsl: all_reduce_sum: {nbytes}-byte tensor exceeds the per-rank \
+                 shm slot ({} ranks, {} bytes total) — raise the --devices shm \
+                 budget or shard/chunk the tensor",
+                self.world_size, self.shm_len
+            );
+            return -4;
         }
 
         // Write local data into our slot.
@@ -379,6 +420,14 @@ impl CollectiveBackend for SimulatedBackend {
             }
             return 0;
         }
+        if !self.slot_fits(nbytes) {
+            eprintln!(
+                "nsl: reduce_scatter_sum: {nbytes}-byte tensor exceeds the \
+                 per-rank shm slot ({} ranks) — raise the --devices shm budget",
+                self.world_size
+            );
+            return -4;
+        }
 
         let slot = self.slot_ptr(self.rank, nbytes);
         unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes) };
@@ -473,6 +522,14 @@ impl CollectiveBackend for SimulatedBackend {
         // Single-rank fast path: buf already contains the data.
         if self.world_size == 1 {
             return 0;
+        }
+        if !self.slot_fits(nbytes) {
+            eprintln!(
+                "nsl: broadcast: {nbytes}-byte tensor exceeds the per-rank shm \
+                 slot ({} ranks) — raise the --devices shm budget",
+                self.world_size
+            );
+            return -4;
         }
 
         // Root writes data into its slot.

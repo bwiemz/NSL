@@ -4088,6 +4088,23 @@ impl Compiler<'_> {
                      baseline at toy scale). Use --zero-stage 1",
                 )));
             }
+            // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
+            // The all-reduce is emitted BEFORE the Deferred dispatch, but
+            // two-phase clip folds the final micro-batch gradient into
+            // m_partial AFTER it and derives the clip factor from a
+            // RANK-LOCAL norm — so with real (non-replicated) data each rank
+            // would clip differently and the owner's update would diverge.
+            // It only looks bit-exact today because the loader is rank-blind.
+            // Refuse, mirroring the zero x mode-table / zero x layerwise
+            // refusals, rather than ship a latent miscompile.
+            if s >= 1 && grad_clip != f64::MAX {
+                return Err(CodegenError::new(
+                    "--zero-stage is incompatible with grad_clip: the gradient \
+                     all-reduce precedes the two-phase clip, whose norm is \
+                     computed rank-locally, so clipped multi-rank training \
+                     would be silently wrong. Drop grad_clip or --zero-stage",
+                ));
+            }
         }
 
         // ── 3. Resolve model type and build param list ──────────────────
@@ -4190,11 +4207,34 @@ impl Compiler<'_> {
             let ws_val = builder
                 .ins()
                 .iconst(cl_types::I64, self.features.world_size.max(1) as i64);
-            self.compile_call_by_name(builder, "nsl_zero_init", &[stage_val, ws_val])?;
+            // D3 (review): ZeRO init/partition return codes were discarded —
+            // a refused init (-2 NSL_SIMULATED_TP=0, -3 missing shm path)
+            // left ZERO_CTX None, and every owner gate then read
+            // owns_param==-1 and skipped ALL updates: the run trained a
+            // frozen model and exited 0. Assert the rc so a refusal aborts
+            // loudly instead of silently training nothing. (The runtime
+            // FFIs still RETURN the code — unit tests exercise the refusal
+            // paths directly; only the emitted call is made fatal.)
+            let init_rc =
+                self.compile_call_by_name(builder, "nsl_zero_init", &[stage_val, ws_val])?;
+            let zero_i = builder.ins().iconst(cl_types::I64, 0);
+            let init_ok = builder.ins().icmp(IntCC::Equal, init_rc, zero_i);
+            let init_msg = "nsl: --zero-stage init failed (see message above) — \
+                            aborting instead of training an unsynchronized model";
+            self.intern_string(init_msg)?;
+            let init_msg_ptr = self.compile_string_literal(builder, init_msg)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[init_ok, init_msg_ptr])?;
+
             let np_val = builder
                 .ins()
                 .iconst(cl_types::I64, param_paths.len() as i64);
-            self.compile_call_by_name(builder, "nsl_zero_partition", &[np_val])?;
+            let part_rc =
+                self.compile_call_by_name(builder, "nsl_zero_partition", &[np_val])?;
+            let part_ok = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, part_rc, zero_i);
+            let part_msg = "nsl: --zero-stage partition failed — aborting";
+            self.intern_string(part_msg)?;
+            let part_msg_ptr = self.compile_string_literal(builder, part_msg)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[part_ok, part_msg_ptr])?;
         }
         let num_params_val = builder
             .ins()
@@ -9313,14 +9353,23 @@ impl Compiler<'_> {
         let beta2_const = builder.ins().f64const(beta2_value);
         let eps_const = builder.ins().f64const(eps_value);
 
-        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step
+        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step.
+        // The rc is asserted: a mid-run collective failure (capacity -4,
+        // GPU-placement refusal -5, dtype -1) must abort, not continue with
+        // un-reduced gradients (review: discarded rc -> silent wrong train).
         let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
         if zero_enabled {
-            self.compile_call_by_name(
+            let rc = self.compile_call_by_name(
                 builder,
                 "nsl_zero_reduce_grads",
                 &[opt_grads, num_params_val],
             )?;
+            let z = builder.ins().iconst(cl_types::I64, 0);
+            let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+            let m = "nsl: ZeRO gradient reduction failed (see message above) — aborting";
+            self.intern_string(m)?;
+            let mp = self.compile_string_literal(builder, m)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
         }
 
         if let Some(mtb) = mode_table_base {
@@ -9707,11 +9756,17 @@ impl Compiler<'_> {
                 // pre-existing gap where this arm emitted no post-step
                 // ZeRO call at all.
                 if zero_enabled {
-                    self.compile_call_by_name(
+                    let rc = self.compile_call_by_name(
                         builder,
                         "nsl_zero_sync_params",
                         &[param_list, num_params_val],
                     )?;
+                    let z = builder.ins().iconst(cl_types::I64, 0);
+                    let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+                    let m = "nsl: ZeRO param sync failed (see message above) — aborting";
+                    self.intern_string(m)?;
+                    let mp = self.compile_string_literal(builder, m)?;
+                    self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
                 }
                 // Jump to post-optimizer block (merges optimizer and skip paths)
                 if let Some(t0) = phase_opt_t0 {
@@ -9835,11 +9890,17 @@ impl Compiler<'_> {
         // post-step sync (nsl_zero_step retained as a no-op for ABI compat).
         if zero_enabled {
             self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
-            self.compile_call_by_name(
+            let rc = self.compile_call_by_name(
                 builder,
                 "nsl_zero_sync_params",
                 &[param_list, num_params_val],
             )?;
+            let z = builder.ins().iconst(cl_types::I64, 0);
+            let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+            let m = "nsl: ZeRO param sync failed (see message above) — aborting";
+            self.intern_string(m)?;
+            let mp = self.compile_string_literal(builder, m)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
         }
 
         // 7g. Post-optimizer cleanup: zero accum buffers or free direct grads

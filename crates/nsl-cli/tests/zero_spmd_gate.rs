@@ -6,7 +6,9 @@
 //! optimizer updates (round-robin `idx % N`), and a post-step per-param
 //! broadcast from each owner. With replicated data (every rank sees the
 //! same batches — the training loader is rank-blind today) the reduced
-//! gradient is `(N·g)/N == g` bit-exactly for N a power of two, and the
+//! gradient is `(N·g)/N == g` bit-exactly at N=2 (2·g is exact, /2 is
+//! exponent-only; the gate runs N=2 — larger N is only exact up to N=4,
+//! so do not generalize this to arbitrary world sizes), and the
 //! sharded update of each param is the same arithmetic the single-rank
 //! baseline runs — so the rank-0 loss stream must be BIT-IDENTICAL to the
 //! unsharded baseline. That equivalence exercises the whole pipeline:
@@ -74,6 +76,10 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // Anti-vacuity: emit the [zero] collective-count line (ws==1 runs
+        // report all_reduce=0 broadcast=0; multi-rank runs report the real
+        // totals — a no-op reduce or a dropped --devices can't stay green).
+        .env("NSL_ZERO_COUNTER", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn nsl run");
@@ -180,6 +186,34 @@ fn zero_stage1_two_rank_parity() {
         "2-rank ZeRO-1 rank-0 loss stream diverged from the single-rank \
          baseline (replicated data must be bit-exact)\nSPMD stderr:\n{}",
         spmd.stderr
+    );
+
+    // Anti-vacuity: the collectives ACTUALLY ran. Replicated-data parity
+    // alone is satisfied even by a no-op reduce (identical grads → sum/ws
+    // == g); the counter line proves otherwise. Fixture: 8 params,
+    // grad_accum=2, 13 micro-batches → 6 optimizer steps; reduce_grads and
+    // sync_params each loop 8 params per step → 48 all_reduce + 48
+    // broadcast per rank. Rank 0's line must show ws=2 and those exact
+    // totals — a dropped --devices (children compiling world_size=1) or an
+    // identity collective would report 0.
+    let zero_line = spmd
+        .stderr
+        .lines()
+        .find(|l| l.contains("[zero] ws=2 rank=0"))
+        .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line in SPMD stderr:\n{}", spmd.stderr))
+        .to_string();
+    assert!(
+        zero_line.contains("all_reduce=48") && zero_line.contains("broadcast=48"),
+        "ZeRO collective counts wrong (expected all_reduce=48 broadcast=48): {zero_line}"
+    );
+    // Baseline (single process, ws=1) must NOT have run any collective.
+    assert!(
+        base.stderr
+            .lines()
+            .filter(|l| l.contains("[zero]"))
+            .all(|l| l.contains("all_reduce=0") && l.contains("broadcast=0")),
+        "baseline ran collectives:\n{}",
+        base.stderr
     );
     // θ-sync evidence: the saved model (whichever rank wrote last — both
     // hold broadcast-synced params) matches the baseline bit-for-bit.
