@@ -753,6 +753,14 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) layerwise_accum: bool,
 
+        /// With --layerwise-accum: window-scoped WEIGHT eviction (D2b).
+        /// Layer-grouped params drop their device buffers at each window
+        /// boundary (pinned host mirrors keep the bytes), re-upload per
+        /// replay range, write back after their layer's update, and
+        /// restore for the next forwards. Byte-preserving / bit-exact.
+        #[arg(long, requires = "layerwise_accum")]
+        pub(crate) weight_stream: bool,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -1118,6 +1126,14 @@ pub(crate) struct RunArgs {
         /// refuses grad_clip / --optim-state-offload / mode tables loudly.
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) layerwise_accum: bool,
+
+        /// With --layerwise-accum: window-scoped WEIGHT eviction (D2b).
+        /// Layer-grouped params drop their device buffers at each window
+        /// boundary (pinned host mirrors keep the bytes), re-upload per
+        /// replay range, write back after their layer's update, and
+        /// restore for the next forwards. Byte-preserving / bit-exact.
+        #[arg(long, requires = "layerwise_accum")]
+        pub(crate) weight_stream: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

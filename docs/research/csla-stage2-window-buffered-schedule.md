@@ -204,6 +204,28 @@ without streaming): **fits and trains** — 2 complete windows, losses
 `csla_parity_ffn_gpu_mv_streaming` (bit-exact vs the P3 interleaved
 baseline — staging is byte-preserving).
 
+**D2b part 1 (window-scoped weight eviction, `--weight-stream`)** builds the
+streaming foundation: layer-grouped params keep pinned host mirrors
+(side-table keyed by tensor pointer — the `NslTensor` ABI and every pointer
+stay unchanged, so `param_list`/struct fields/the tie guard remain valid);
+at each window boundary their device buffers are freed (pure free — the
+mirror is current by construction), re-uploaded per replay range, written
+back after their layer's update, and restored for the next forwards.
+Measured at 1B (batch 2 / seq 512 / accum 8, with m/v streaming): completes
+bit-clean with EXACTLY the designed transfer arithmetic (576 uploads = 2
+windows × 144 params × {range-head, restore}; 432 evicts = first-window
+post-update 144 + later-window {start, post-update} 288). **Honest result:
+the global allocator peak is UNCHANGED (12.99 GB) at this configuration —
+with m/v streamed, the peak sits in the forward/save phase, where weights
+stay resident by design in the window-scoped scheme.** The window-phase
+footprint does drop (~3.5 GiB of layer weights absent during the replay),
+which mattered exactly when the window phase was the peak (the no-offload
+runs); the global-peak payoff needs the FORWARD-side per-segment streaming —
+the 7B follow-up this machinery exists for (segment-wise primal lowering
+with `var_types` threading; design in the Milestone D memory file). Gated by
+`csla_weight_stream_parity_gpu` (bit-exact ± the flag; upload/evict counters
+as anti-vacuity).
+
 A pre-existing runtime bug
 surfaced on the way: the GPU-OOM CPU-fallback path
 (`cpu_fallback_binary` → `nsl_tensor_to_device`) aborts with "panic in a

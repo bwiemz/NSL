@@ -152,6 +152,7 @@ pub mod awq;
 pub mod fase_bc;
 pub mod fase_step;
 pub mod csla_stat;
+pub mod weight_stream;
 #[allow(deprecated)]
 pub use awq::{
     nsl_awq_write_sidecar,  // deprecated; kept as the rename shim during transition

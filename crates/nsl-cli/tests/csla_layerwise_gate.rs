@@ -93,6 +93,7 @@ fn run_program(source: &str, tag: &str, cuda: bool, deterministic: bool, extra_a
         // scatter for the CPU cases (harmless there, load-bearing on GPU
         // EmbedCpu-style runs).
         .env("NSL_CSLA_COUNTER", "1")
+        .env("NSL_WS_COUNTER", "1")
         .env("NSL_EMBEDDING_BWD_CPU", "1");
     let output = cmd.output().expect("spawn nsl run");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -500,6 +501,76 @@ fn csla_parity_ffn_gpu_mv_streaming() {
         &["--optim-state-offload"],
         6,
         Some("[csla] layer-major schedule: 3 ranges, 6 layer-grouped params, 2 epilogue params"),
+    );
+}
+
+/// D2b window-scoped weight-eviction parity (GPU): layer-grouped params
+/// drop their device buffers at each window boundary (pinned host mirrors),
+/// re-upload per replay range, write back after their layer's update, and
+/// restore for the next forwards. Streaming is byte-preserving, so the two
+/// arms (csla vs csla + --weight-stream) must be BIT-EXACT; the NSL_WS
+/// counter report is the anti-vacuity (uploads and evicts both > 0 — a
+/// silently-inert flag cannot pass).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_weight_stream_parity_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_ws_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("csla.nslm");
+    let save_b = tmp.join("csla_ws.nslm");
+
+    let base = run_program(
+        &program("csla_layerwise_ffn.nsl", true, &save_a, &[]),
+        "ws_a",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(base.success, "csla arm failed:\n{}", base.stderr);
+    let ws = run_program(
+        &program("csla_layerwise_ffn.nsl", true, &save_b, &[]),
+        "ws_b",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum", "--weight-stream"],
+    );
+    assert!(ws.success, "--weight-stream arm failed:\n{}", ws.stderr);
+
+    // Anti-vacuity: the streaming cycle actually ran.
+    let counts = ws
+        .stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("[weight-stream] uploads: "))
+        .expect("NSL_WS_COUNTER report missing");
+    let mut it = counts.split(" evicts: ");
+    let uploads: i64 = it.next().unwrap().trim().parse().unwrap();
+    let evicts: i64 = it.next().unwrap().trim().parse().unwrap();
+    assert!(
+        uploads > 0 && evicts > 0,
+        "weight streaming never cycled (uploads {uploads}, evicts {evicts})"
+    );
+    // Baseline arm must not stream.
+    assert!(
+        base.stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("[weight-stream] uploads: "))
+            .map(|c| c.starts_with('0'))
+            .unwrap_or(true),
+        "baseline arm streamed weights:\n{}",
+        base.stderr
+    );
+
+    // Bit-exact: streaming is byte-preserving end to end (mirror round
+    // trips + post-update writebacks + final restore).
+    assert_eq!(
+        base.loss_stream, ws.loss_stream,
+        "loss stream diverged under --weight-stream"
+    );
+    let bytes_a = std::fs::read(&save_a).expect("csla model_save missing");
+    let bytes_b = std::fs::read(&save_b).expect("ws model_save missing");
+    assert!(
+        bytes_a == bytes_b,
+        "saved model bytes diverged under --weight-stream"
     );
 }
 

@@ -80,6 +80,16 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
     // D1 (CSLA Stage-2): layerwise window-backward count, enabled when
     // NSL_CSLA_COUNTER=1. Lets the differential gate assert the buffered
     // backward phase actually fired (anti-vacuity), same pattern as above.
+    // D2b: weight-stream upload/evict counts, enabled when NSL_WS_COUNTER=1.
+    if std::env::var("NSL_WS_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_weight_stream_count_atexit);
+        }
+    }
+
     if std::env::var("NSL_CSLA_COUNTER").ok().as_deref() == Some("1") {
         extern "C" {
             fn atexit(cb: extern "C" fn()) -> i32;
@@ -88,6 +98,14 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(nsl_csla_window_count_atexit);
         }
     }
+}
+
+extern "C" fn nsl_weight_stream_count_atexit() {
+    eprintln!(
+        "[weight-stream] uploads: {} evicts: {}",
+        crate::weight_stream::WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
 
 extern "C" fn nsl_csla_window_count_atexit() {

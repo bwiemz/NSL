@@ -2757,6 +2757,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // LSE tape-carry gates: fused-SDPA launch counter (0 = base fwd kernel,
     // 1 = Tier-B tile-skip) — NSL-callable as sdpa_fused_launch_count(v).
     ("nsl_sdpa_fused_launch_count", &[types::I64], Some(types::I64)),
+    // D2b weight streaming: pointer-identity host offload of model params
+    // (side-table mirrors; tensor pointers never change).
+    ("nsl_weight_stream_register", &[types::I64], None),
+    ("nsl_weight_stream_upload", &[types::I64], None),
+    ("nsl_weight_stream_evict", &[types::I64, types::I64], None),
+    ("nsl_weight_stream_upload_all", &[], None),
+    ("nsl_weight_stream_teardown", &[], None),
+    ("nsl_weight_stream_upload_count", &[], Some(types::I64)),
     (
         "nsl_tensor_logsoftmax",
         &[types::I64, types::I64],
