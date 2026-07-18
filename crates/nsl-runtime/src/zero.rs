@@ -47,7 +47,6 @@ pub fn partition_params(num_params: usize, world_size: usize) -> Vec<Vec<usize>>
 
 static ZERO_CTX: Mutex<Option<ZeROContext>> = Mutex::new(None);
 
-#[derive(Clone)]
 struct ZeROContext {
     #[allow(dead_code)]
     stage: ZeROStage,
@@ -57,11 +56,27 @@ struct ZeROContext {
     owned_params: Vec<usize>,
     /// Total number of params (set during partition).
     num_params: usize,
+    /// D3: the real collective backend (CPU-shm SimulatedBackend over the
+    /// `--devices N` spawner's shared file). `None` iff world_size == 1
+    /// (single rank: every collective degenerates to identity).
+    backend: Option<crate::tensor_parallel::collective::SimulatedBackend>,
 }
 
-/// Initialize ZeRO optimizer sharding.
-/// `stage`: 1/2/3, `world_size`: number of data-parallel ranks.
-/// Returns 0 on success, -1 if already initialized or invalid stage.
+// SAFETY: the raw shm pointer inside SimulatedBackend is only touched
+// under the ZERO_CTX mutex on the (single-threaded) training path — the
+// same argument as TpContext's Send impl.
+unsafe impl Send for ZeROContext {}
+
+/// Initialize ZeRO optimizer sharding (D3: REAL — builds the CPU-shm
+/// SimulatedBackend from the `--devices N` spawner's env protocol).
+///
+/// `stage`: 1/2/3 (codegen refuses 2/3 before emitting — the guard here
+/// is a belt), `world_size`: compile-time world size baked by codegen.
+/// Env: NSL_LOCAL_RANK (rank, default 0), NSL_TP_SHM_PATH (required when
+/// world_size > 1), NSL_SIMULATED_TP=0 refused loudly (no real transport
+/// exists in this build).
+/// Returns 0 on success, -1 already-initialized/invalid, -2 refused, -3
+/// missing shm path.
 #[no_mangle]
 pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
     let mut guard = ZERO_CTX.lock().unwrap();
@@ -71,18 +86,52 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
     let Some(s) = ZeROStage::from_i64(stage) else {
         return -1;
     };
-    // In single-process mode, rank is always 0.
-    // Multi-process would read NSL_LOCAL_RANK from env.
     let rank = std::env::var("NSL_LOCAL_RANK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    let ws = (world_size.max(1)) as usize;
+
+    let simulated: bool = std::env::var("NSL_SIMULATED_TP")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(true);
+    if !simulated && ws > 1 {
+        eprintln!(
+            "nsl_zero_init: NSL_SIMULATED_TP=0 requests a real collective \
+             backend, but no NCCL/inter-device transport is built into this \
+             runtime — refusing rather than silently simulating."
+        );
+        return -2;
+    }
+
+    let backend = if ws > 1 {
+        let Ok(shm_path) = std::env::var("NSL_TP_SHM_PATH") else {
+            eprintln!(
+                "nsl_zero_init: world_size={ws} but NSL_TP_SHM_PATH is not \
+                 set — run through `nsl run --devices {ws}` (the spawner \
+                 creates the shared-memory file and sets the rank env)"
+            );
+            return -3;
+        };
+        let (shm_ptr, shm_len) = crate::tensor_parallel::ffi::open_shm(&shm_path);
+        Some(crate::tensor_parallel::collective::SimulatedBackend::new(
+            rank as i32,
+            ws as i32,
+            shm_ptr,
+            shm_len,
+        ))
+    } else {
+        None
+    };
+
     *guard = Some(ZeROContext {
         stage: s,
         rank,
-        world_size: world_size as usize,
+        world_size: ws,
         owned_params: Vec::new(),
         num_params: 0,
+        backend,
     });
     0
 }
@@ -154,17 +203,12 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         return 0;
     }
 
-    // Multi-process gradient reduction: iterate over each gradient tensor
-    // and average the values. In a real NCCL backend this would call
-    // all_reduce_sum then divide by world_size. For the simulated single-process
-    // case we just divide by world_size (since the "all-reduce" with 1 rank is identity).
-    //
-    // With actual multi-process support, this would:
-    // 1. For each grad tensor, call backend.all_reduce_sum(grad_data, grad_data, count, dtype, null)
-    // 2. Divide each element by world_size
-    //
-    // For now, with world_size > 1 but single process, we normalize gradients
-    // as if all ranks contributed identical gradients (i.e., divide by world_size).
+    // D3: REAL data-parallel gradient reduction — per tensor:
+    // fixed-order all_reduce_sum across ranks (SimulatedBackend), then
+    // divide by world_size. Every rank must reach every collective in the
+    // same order (the spin-barrier counts arrivals), which holds because
+    // codegen emits ONE reduce call over the same param-ordered list on
+    // every rank.
     let list_ptr = grads_list_ptr as *const crate::list::NslList;
     if list_ptr.is_null() {
         return -1;
@@ -204,7 +248,27 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         }
 
         if tensor.device == 0 {
-            // CPU: device-agnostic in-place scale handles both f64 and f32.
+            // CPU: in-place all-reduce (send==recv is safe — the backend
+            // copies to its slot first), then average.
+            let backend = ctx
+                .backend
+                .as_ref()
+                .expect("world_size > 1 implies a backend");
+            use crate::tensor_parallel::collective::CollectiveBackend;
+            let rc = backend.all_reduce_sum(
+                tensor.data as *const std::ffi::c_void,
+                tensor.data,
+                tensor.len as usize,
+                tensor.dtype as crate::tensor_parallel::collective::DtypeId,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: all_reduce failed rc={rc} at \
+                     index {i}"
+                );
+                return -1;
+            }
             crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
             continue;
         }
@@ -221,17 +285,43 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_raw, 0);
             let cpu = unsafe { &*(cpu_ptr as *const NslTensor) };
             let len = cpu.len as usize;
+            // Convert to a host f32 staging buffer (unscaled), all-reduce
+            // across ranks on the host bytes, THEN average and push back.
             let mut staged = vec![0.0f32; len];
             if cpu.dtype == 1 {
                 let d = cpu.data as *const f32;
                 for (j, slot) in staged.iter_mut().enumerate() {
-                    *slot = unsafe { *d.add(j) } * inv_ws as f32;
+                    *slot = unsafe { *d.add(j) };
                 }
             } else {
                 let d = cpu.data as *const f64;
                 for (j, slot) in staged.iter_mut().enumerate() {
-                    *slot = (unsafe { *d.add(j) } * inv_ws) as f32;
+                    *slot = (unsafe { *d.add(j) }) as f32;
                 }
+            }
+            {
+                let backend = ctx
+                    .backend
+                    .as_ref()
+                    .expect("world_size > 1 implies a backend");
+                use crate::tensor_parallel::collective::CollectiveBackend;
+                let rc = backend.all_reduce_sum(
+                    staged.as_ptr() as *const std::ffi::c_void,
+                    staged.as_mut_ptr() as *mut std::ffi::c_void,
+                    len,
+                    crate::tensor_parallel::collective::DTYPE_F32,
+                    std::ptr::null_mut(),
+                );
+                if rc != 0 {
+                    eprintln!(
+                        "nsl: nsl_zero_reduce_grads: GPU staged all_reduce \
+                         failed rc={rc} at index {i}"
+                    );
+                    return -1;
+                }
+            }
+            for slot in staged.iter_mut() {
+                *slot *= inv_ws as f32;
             }
             crate::cuda::inner::memcpy_htod(
                 tensor.data,
@@ -280,6 +370,125 @@ pub extern "C" fn nsl_zero_step() -> i64 {
     //
     // With simulated single-process, this is a no-op since we update all
     // owned params locally and there are no other ranks to sync with.
+    0
+}
+
+/// D3 (ZeRO-1): synchronize parameters after the sharded optimizer step.
+///
+/// Each rank updated ONLY the params it owns (round-robin `idx % ws`);
+/// this broadcasts every param from its owner so all ranks hold the full
+/// updated model. EVERY rank must call this with the same param-ordered
+/// list (identical collective sequence — the spin-barrier deadlocks
+/// otherwise). CPU f64/f32 broadcast in place; GPU f32 stages through the
+/// host. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) -> i64 {
+    let guard = ZERO_CTX.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else {
+        return -1;
+    };
+    if ctx.world_size <= 1 {
+        return 0;
+    }
+    let list_ptr = params_list_ptr as *const crate::list::NslList;
+    if list_ptr.is_null() {
+        return -1;
+    }
+    let list = unsafe { &*list_ptr };
+    use crate::tensor_parallel::collective::CollectiveBackend;
+    let backend = ctx
+        .backend
+        .as_ref()
+        .expect("world_size > 1 implies a backend");
+
+    for i in 0..num_params as usize {
+        if i >= list.len as usize {
+            break;
+        }
+        let tensor_raw = unsafe { *list.data.add(i) };
+        let tensor_ptr = tensor_raw as *mut NslTensor;
+        if tensor_ptr.is_null() {
+            continue;
+        }
+        let tensor = unsafe { &*tensor_ptr };
+        let owner = (i % ctx.world_size) as i32;
+
+        if tensor.device == 0 {
+            if tensor.dtype > 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: unsupported CPU param dtype \
+                     {} at index {i}",
+                    tensor.dtype
+                );
+                return -1;
+            }
+            let rc = backend.broadcast(
+                tensor.data,
+                tensor.len as usize,
+                tensor.dtype as crate::tensor_parallel::collective::DtypeId,
+                owner,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: broadcast failed rc={rc} at \
+                     index {i}"
+                );
+                return -1;
+            }
+            continue;
+        }
+
+        // GPU f32: stage through the host (same staged pattern as the
+        // reduce above). Non-owners receive into the staging buffer and
+        // push it back to the device.
+        #[cfg(feature = "cuda")]
+        {
+            if tensor.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                     dtype {}; only f32 is supported",
+                    tensor.dtype
+                );
+                return -1;
+            }
+            let len = tensor.len as usize;
+            let mut staged = vec![0.0f32; len];
+            crate::cuda::inner::ensure_context();
+            crate::cuda::inner::memcpy_dtoh(
+                staged.as_mut_ptr() as *mut std::ffi::c_void,
+                tensor.data,
+                len * 4,
+            );
+            let rc = backend.broadcast(
+                staged.as_mut_ptr() as *mut std::ffi::c_void,
+                len,
+                crate::tensor_parallel::collective::DTYPE_F32,
+                owner,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU staged broadcast failed \
+                     rc={rc} at index {i}"
+                );
+                return -1;
+            }
+            crate::cuda::inner::memcpy_htod(
+                tensor.data,
+                staged.as_ptr() as *const std::ffi::c_void,
+                len * 4,
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!(
+                "nsl: nsl_zero_sync_params: GPU param at index {i} requires \
+                 the cuda feature"
+            );
+            return -1;
+        }
+    }
     0
 }
 
@@ -551,27 +760,24 @@ mod tests {
             *guard = None;
         }
 
-        // Init with valid stage
-        assert_eq!(nsl_zero_init(1, 4), 0);
+        // D3: world_size > 1 without the spawner's shm env REFUSES (-3) —
+        // the old context had no backend to build, the real one does.
+        assert_eq!(nsl_zero_init(1, 4), -3);
+
+        // world_size = 1: no backend needed; rank 0 owns everything.
+        assert_eq!(nsl_zero_init(1, 1), 0);
         // Double init fails
-        assert_eq!(nsl_zero_init(1, 2), -1);
+        assert_eq!(nsl_zero_init(1, 1), -1);
 
-        // Partition 10 params across 4 ranks (rank 0 in single-process)
         let owned = nsl_zero_partition(10);
-        // Rank 0 owns params 0, 4, 8 = 3 params
-        assert_eq!(owned, 3);
+        assert_eq!(owned, 10);
+        assert_eq!(nsl_zero_owns_param(0), 1);
+        assert_eq!(nsl_zero_owns_param(9), 1);
 
-        // Check ownership
-        assert_eq!(nsl_zero_owns_param(0), 1);  // owned
-        assert_eq!(nsl_zero_owns_param(4), 1);  // owned
-        assert_eq!(nsl_zero_owns_param(8), 1);  // owned
-        assert_eq!(nsl_zero_owns_param(1), 0);  // not owned
-        assert_eq!(nsl_zero_owns_param(2), 0);  // not owned
-
-        // Reduce and step are no-ops for world_size=1 processes
-        // (even though world_size=4, we're single-process so reduce_grads
-        // divides by world_size for averaging)
+        // Reduce, step, and param sync are identity at world_size 1 (the
+        // ws==1 early return fires before the null-list check).
         assert_eq!(nsl_zero_step(), 0);
+        assert_eq!(nsl_zero_sync_params(0, 0), 0);
 
         // Destroy succeeds
         assert_eq!(nsl_zero_destroy(), 0);

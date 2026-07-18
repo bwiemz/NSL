@@ -74,6 +74,23 @@ pub trait CollectiveBackend {
         stream: StreamHandle,
     ) -> i32;
 
+    /// D3 (ZeRO-2 backward): element-wise sum across ranks, each rank
+    /// keeping only its `count / world_size` slice (rank r receives the
+    /// summed elements `[r*count/ws, (r+1)*count/ws)`). `count` MUST be
+    /// divisible by `world_size` (return -3 otherwise). CONTRACT (pinned
+    /// by the gate): the result is bit-equal to `all_reduce_sum` followed
+    /// by a local slice — implementations must use the same fixed
+    /// reduction order so ZeRO-sharded arithmetic stays bit-exact against
+    /// the unsharded baseline.
+    fn reduce_scatter_sum(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        stream: StreamHandle,
+    ) -> i32;
+
     /// Block until all ranks have reached this point.
     fn barrier(&self) -> i32;
 
@@ -328,6 +345,76 @@ impl CollectiveBackend for SimulatedBackend {
         }
 
         // Second barrier so no rank overwrites its slot before peers finish reading.
+        self.spin_barrier();
+        0
+    }
+
+    fn reduce_scatter_sum(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        _stream: StreamHandle,
+    ) -> i32 {
+        let bw = dtype_byte_width(dtype);
+        if bw == 0 {
+            return -1;
+        }
+        if !count.is_multiple_of(self.world_size.max(1) as usize) {
+            return -3;
+        }
+        let nbytes = count * bw;
+        let per = count / self.world_size as usize;
+
+        if self.world_size == 1 {
+            if !std::ptr::eq(sendbuf, recvbuf) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        sendbuf as *const u8,
+                        recvbuf as *mut u8,
+                        nbytes,
+                    );
+                }
+            }
+            return 0;
+        }
+
+        let slot = self.slot_ptr(self.rank, nbytes);
+        unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes) };
+        self.spin_barrier();
+
+        // The local slice of the SAME fixed rank-order per-element sum
+        // `all_reduce_sum` computes — bit-equal to all-reduce + slice by
+        // construction (the gate pins this contract). Only f32/f64 are
+        // supported (the ZeRO path is full-precision).
+        let base = self.rank as usize * per;
+        match dtype {
+            DTYPE_F32 => {
+                let dst = recvbuf as *mut f32;
+                for i in 0..per {
+                    let mut acc: f32 = 0.0;
+                    for r in 0..self.world_size {
+                        let src = self.slot_ptr(r, nbytes) as *const f32;
+                        acc += unsafe { *src.add(base + i) };
+                    }
+                    unsafe { *dst.add(i) = acc };
+                }
+            }
+            DTYPE_F64 => {
+                let dst = recvbuf as *mut f64;
+                for i in 0..per {
+                    let mut acc: f64 = 0.0;
+                    for r in 0..self.world_size {
+                        let src = self.slot_ptr(r, nbytes) as *const f64;
+                        acc += unsafe { *src.add(base + i) };
+                    }
+                    unsafe { *dst.add(i) = acc };
+                }
+            }
+            _ => return -2,
+        }
+
         self.spin_barrier();
         0
     }
@@ -785,5 +872,152 @@ mod tests {
 
         assert_eq!(data0, [100.0, 200.0, 300.0, 400.0]);
         assert_eq!(data1, [100.0, 200.0, 300.0, 400.0]);
+    }
+
+    // ── D3 (ZeRO): reduce_scatter_sum contract tests ────────────────────
+
+    /// The load-bearing contract: rank r's reduce_scatter output is
+    /// BIT-EQUAL to `all_reduce_sum` followed by slicing
+    /// `[r*count/ws, (r+1)*count/ws)` — the property that keeps
+    /// ZeRO-sharded arithmetic bit-exact against the unsharded baseline.
+    #[test]
+    fn simulated_backend_reduce_scatter_equals_all_reduce_slice() {
+        let world_size = 4usize;
+        let count = 8usize;
+        let slot_bytes = count * dtype_byte_width(DTYPE_F64);
+        let shm_len = DATA_OFFSET + world_size * slot_bytes;
+        let mut shm = vec![0u8; shm_len];
+        let shm_ptr = shm.as_mut_ptr();
+        let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
+        hdr.generation.store(0, Ordering::Release);
+        hdr.arrival.store(0, Ordering::Release);
+
+        let backends: Vec<SimulatedBackend> = (0..world_size)
+            .map(|r| SimulatedBackend::new(r as i32, world_size as i32, shm_ptr, shm_len))
+            .collect();
+        let inputs: Vec<[f64; 8]> = (0..world_size)
+            .map(|r| std::array::from_fn(|i| (r * 8 + i) as f64 * 0.5 + 0.125))
+            .collect();
+
+        // Phase 1: all_reduce on every rank (reference).
+        let mut full: Vec<[f64; 8]> = vec![[0.0; 8]; world_size];
+        std::thread::scope(|s| {
+            for (r, (b, out)) in backends.iter().zip(full.iter_mut()).enumerate() {
+                let input = &inputs[r];
+                s.spawn(move || {
+                    let rc = b.all_reduce_sum(
+                        input.as_ptr() as *const c_void,
+                        out.as_mut_ptr() as *mut c_void,
+                        8,
+                        DTYPE_F64,
+                        ptr::null_mut(),
+                    );
+                    assert_eq!(rc, 0);
+                });
+            }
+        });
+        // Phase 2: reduce_scatter on every rank.
+        let mut scat: Vec<[f64; 2]> = vec![[0.0; 2]; world_size];
+        std::thread::scope(|s| {
+            for (r, (b, out)) in backends.iter().zip(scat.iter_mut()).enumerate() {
+                let input = &inputs[r];
+                s.spawn(move || {
+                    let rc = b.reduce_scatter_sum(
+                        input.as_ptr() as *const c_void,
+                        out.as_mut_ptr() as *mut c_void,
+                        8,
+                        DTYPE_F64,
+                        ptr::null_mut(),
+                    );
+                    assert_eq!(rc, 0);
+                });
+            }
+        });
+        for r in 0..world_size {
+            let per = 2;
+            assert_eq!(
+                scat[r].to_vec(),
+                full[0][r * per..(r + 1) * per].to_vec(),
+                "rank {r} scatter slice != all-reduce slice"
+            );
+        }
+    }
+
+    /// f32 case with order-sensitive values (1e8 + 1 − 1e8 loses the 1.0
+    /// unless summed in the fixed rank order both paths share) — pins the
+    /// fixed reduction order itself, not just the values.
+    #[test]
+    fn simulated_backend_reduce_scatter_fixed_order_f32() {
+        let world_size = 4usize;
+        let count = 4usize;
+        let slot_bytes = count * dtype_byte_width(DTYPE_F32);
+        let shm_len = DATA_OFFSET + world_size * slot_bytes;
+        let mut shm = vec![0u8; shm_len];
+        let shm_ptr = shm.as_mut_ptr();
+        let hdr = unsafe { &*(shm_ptr as *const ShmHeader) };
+        hdr.generation.store(0, Ordering::Release);
+        hdr.arrival.store(0, Ordering::Release);
+
+        let backends: Vec<SimulatedBackend> = (0..world_size)
+            .map(|r| SimulatedBackend::new(r as i32, world_size as i32, shm_ptr, shm_len))
+            .collect();
+        // Element 0 (rank-order contributions): 1e8, 1.0, -1e8, 1.0 —
+        // fixed-order f32 sum = (1e8 + 1.0) − 1e8 + 1.0 = 1.0 exactly
+        // (1e8+1.0 rounds to 1e8). Any other order changes the result.
+        let inputs: Vec<[f32; 4]> = vec![
+            [1e8, 5.0, 0.25, 7.0],
+            [1.0, 5.0, 0.25, 7.0],
+            [-1e8, 5.0, 0.25, 7.0],
+            [1.0, 5.0, 0.25, 7.0],
+        ];
+        let mut scat: Vec<[f32; 1]> = vec![[0.0]; world_size];
+        std::thread::scope(|s| {
+            for (r, (b, out)) in backends.iter().zip(scat.iter_mut()).enumerate() {
+                let input = &inputs[r];
+                s.spawn(move || {
+                    let rc = b.reduce_scatter_sum(
+                        input.as_ptr() as *const c_void,
+                        out.as_mut_ptr() as *mut c_void,
+                        4,
+                        DTYPE_F32,
+                        ptr::null_mut(),
+                    );
+                    assert_eq!(rc, 0);
+                });
+            }
+        });
+        assert_eq!(scat[0][0], 1.0, "fixed rank-order f32 sum drifted");
+        assert_eq!(scat[1][0], 20.0);
+        assert_eq!(scat[2][0], 1.0);
+        assert_eq!(scat[3][0], 28.0);
+    }
+
+    /// Non-divisible count refuses with -3.
+    #[test]
+    fn simulated_backend_reduce_scatter_refuses_indivisible() {
+        let b = SimulatedBackend::new(0, 1, ptr::null_mut(), 0);
+        let input: [f32; 3] = [1.0, 2.0, 3.0];
+        let mut out: [f32; 3] = [0.0; 3];
+        // world_size=1: divisible trivially — exercise via a 2-rank
+        // backend with no shm (never reaches the slot copy on the guard).
+        let b2 = SimulatedBackend::new(0, 2, ptr::null_mut(), 0);
+        let rc = b2.reduce_scatter_sum(
+            input.as_ptr() as *const c_void,
+            out.as_mut_ptr() as *mut c_void,
+            3,
+            DTYPE_F32,
+            ptr::null_mut(),
+        );
+        assert_eq!(rc, -3);
+        // Single-rank fast path still copies.
+        let rc1 = b.reduce_scatter_sum(
+            input.as_ptr() as *const c_void,
+            out.as_mut_ptr() as *mut c_void,
+            3,
+            DTYPE_F32,
+            ptr::null_mut(),
+        );
+        assert_eq!(rc1, 0);
+        assert_eq!(out, [1.0, 2.0, 3.0]);
     }
 }

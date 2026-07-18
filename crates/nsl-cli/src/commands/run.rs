@@ -580,8 +580,15 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 let _ = std::fs::remove_dir(&temp_dir);
 
                 std::process::exit(exit_code);
-            } else if devices > 1 {
-                // Build-then-spawn SPMD: spawn N children, each runs the same program
+            } else if devices > 1 && std::env::var("NSL_LOCAL_RANK").is_err() {
+                // Build-then-spawn SPMD: spawn N children, each runs the same
+                // program. Children re-invoke this same CLI with the FULL
+                // original argv (so compile flags like --source-ad /
+                // --zero-stage / --devices reach them — previously only the
+                // file was forwarded and every child silently recompiled with
+                // default options at world_size=1); NSL_LOCAL_RANK in the
+                // child env is the recursion guard that routes them past this
+                // arm into a normal single-process run with world_size baked.
                 let exe = match std::env::current_exe() {
                     Ok(p) => p,
                     Err(e) => {
@@ -598,7 +605,18 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     std::process::id()
                 ));
                 {
-                    let f = match std::fs::File::create(&shm_path) {
+                    // D3: read+write — `File::create` opens WRITE-ONLY and
+                    // `MmapMut::map_mut` (MAP_SHARED, PROT_READ|WRITE) then
+                    // fails with EACCES. Latent since the harness shipped:
+                    // this arm had never actually executed before the D3
+                    // gate ran it.
+                    let f = match std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&shm_path)
+                    {
                         Ok(f) => f,
                         Err(e) => {
                             eprintln!("[nsl] failed to create shm file: {e}");
@@ -623,8 +641,12 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 let mut children = Vec::new();
                 for rank in 0..devices {
                     let mut cmd = std::process::Command::new(&exe);
-                    cmd.arg("run")
-                        .arg(&file)
+                    // D3: forward the ORIGINAL argv verbatim (skip argv[0]) —
+                    // the child must compile with the same flags, including
+                    // `--devices N` itself so world_size bakes into its
+                    // binary (the NSL_LOCAL_RANK guard above stops it from
+                    // re-spawning). Program args after `--` ride along too.
+                    cmd.args(std::env::args().skip(1))
                         .env("NSL_LOCAL_RANK", rank.to_string())
                         .env("NSL_WORLD_SIZE", devices.to_string())
                         .env("NSL_SIMULATED_TP", "1")
@@ -644,10 +666,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         cmd.env("NSL_GPU_MEM_REPORT", "1");
                     }
 
-                    // Pass through program args
-                    if !args.is_empty() {
-                        cmd.arg("--").args(&args);
-                    }
+                    // (program args after `--` already forwarded via argv)
 
                     // Only rank 0 gets stdout
                     if rank > 0 {
