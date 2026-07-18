@@ -1,0 +1,46 @@
+# CCR block-granular checkpointing x FBIP-capable activation regression
+# fixture. A minimal 2-block residual MLP whose FFN uses `gelu` — the
+# smallest shape that gives `--checkpoint-blocks` a real `blocks.N`
+# segment to recompute AND an input-reading activation backward
+# (GeluBackward needs the pre-activation) inside that segment.
+#
+# See ccr_checkpoint_parity.rs::ccr_activation_parity_on_cpu: this must
+# stay bit-exact between a plain --source-ad run and a
+# --source-ad --checkpoint-blocks run of the SAME program.
+
+model Blk:
+    w_up: Tensor = randn([4, 8]) * 0.1
+    w_down: Tensor = randn([8, 4]) * 0.1
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let pre = h @ self.w_up
+        let act = gelu(pre)
+        let out = act @ self.w_down
+        return h + out
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = randn([4, 4]) * 0.1
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1):
+    optimizer: SGD(lr=0.05)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out * out)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+model_save(m, "CCR_ACT_SAVE_PATH")
