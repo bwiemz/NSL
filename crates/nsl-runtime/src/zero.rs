@@ -58,9 +58,19 @@ pub static ZERO_ALL_REDUCE_COUNT: std::sync::atomic::AtomicU64 =
 pub static ZERO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Read `(rank, world_size, all_reduce_count, broadcast_count)` for the
-/// atexit report. rank/ws are -1 when no context was initialized.
-pub fn zero_counter_snapshot() -> (i64, i64, u64, u64) {
+/// D3 v2 memory-win proof: total optimizer-moment ELEMENTS this rank
+/// actually allocated. v1 allocated full m/v on every rank (owner-gated the
+/// UPDATE only); v2 gates the ALLOCATION on ownership so each rank holds
+/// ~1/world_size of the moment surface. The G3 gate asserts per-rank totals
+/// shrink to ~1/N — a numeric parity gate alone can't see this (owned-only
+/// allocation is invisible to the loss because non-owners never read their
+/// non-owned m/v). Bumped once per owned moment tensor at allocation.
+pub static ZERO_OPTIM_ELEMS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read `(rank, world_size, all_reduce_count, broadcast_count, optim_elems)`
+/// for the atexit report. rank/ws are -1 when no context was initialized.
+pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64) {
     let guard = ZERO_CTX.lock().unwrap();
     let (rank, ws) = guard
         .as_ref()
@@ -71,7 +81,23 @@ pub fn zero_counter_snapshot() -> (i64, i64, u64, u64) {
         ws,
         ZERO_ALL_REDUCE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// D3 v2: record that an owned optimizer-moment tensor of `tensor_ptr` was
+/// allocated, adding its element count to this rank's running total. Emitted
+/// by codegen inside the owner-gated allocation branch (once per m and per v
+/// tensor). A null pointer (the non-owned placeholder) contributes nothing,
+/// so a mis-wired gate that noted non-owned slots would over-count and trip
+/// the G3 gate. Returns the running total (for tests/debug).
+#[no_mangle]
+pub extern "C" fn nsl_zero_note_optim_alloc(tensor_ptr: i64) -> i64 {
+    if tensor_ptr == 0 {
+        return ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed) as i64;
+    }
+    let numel = crate::tensor::NslTensor::from_ptr(tensor_ptr).len.max(0) as u64;
+    (ZERO_OPTIM_ELEMS.fetch_add(numel, std::sync::atomic::Ordering::Relaxed) + numel) as i64
 }
 
 struct ZeROContext {

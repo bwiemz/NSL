@@ -114,8 +114,10 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
 }
 
 extern "C" fn nsl_zero_count_atexit() {
-    let (rank, ws, all_reduce, broadcast) = crate::zero::zero_counter_snapshot();
-    eprintln!("[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast}");
+    let (rank, ws, all_reduce, broadcast, optim_elems) = crate::zero::zero_counter_snapshot();
+    eprintln!(
+        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems}"
+    );
 }
 
 extern "C" fn nsl_weight_stream_count_atexit() {
