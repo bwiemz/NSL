@@ -61,6 +61,29 @@ fn run(save_path: &std::path::Path, checkpoint_blocks: bool, tag: &str) -> (bool
     )
 }
 
+/// The lines between the `LOSS_STREAM_BEGIN`/`LOSS_STREAM_END` markers.
+/// stdout also carries build-toolchain noise ahead of them — on Windows,
+/// MSVC's linker prints `Creating library ...\<pid-and-tempdir-specific
+/// path>.lib and object ...exp` for the compiled .nsl program, which can
+/// never byte-match between two separate runs (different temp dirs/PIDs)
+/// even when the actual program output is identical.
+fn loss_stream(stdout: &str) -> String {
+    let mut out = String::new();
+    let mut in_stream = false;
+    for line in stdout.lines() {
+        match line.trim() {
+            "LOSS_STREAM_BEGIN" => in_stream = true,
+            "LOSS_STREAM_END" => in_stream = false,
+            l if in_stream => {
+                out.push_str(l);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[test]
 fn ccr_activation_parity_on_cpu() {
     let tmp = std::env::temp_dir().join(format!("nsl_ccr_act_saves_{}", std::process::id()));
@@ -84,8 +107,10 @@ fn ccr_activation_parity_on_cpu() {
     );
 
     assert_eq!(
-        stdout_base, stdout_ckpt,
-        "forward loss diverged under --checkpoint-blocks (must be bit-exact)"
+        loss_stream(&stdout_base),
+        loss_stream(&stdout_ckpt),
+        "forward loss diverged under --checkpoint-blocks (must be bit-exact)\n\
+         base stdout:\n{stdout_base}\nckpt stdout:\n{stdout_ckpt}"
     );
 
     let bytes_base = std::fs::read(&save_base).expect("baseline model_save missing");
