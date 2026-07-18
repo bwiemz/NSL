@@ -681,6 +681,19 @@ fn csla_parity_fused_lmce_gpu() {
         &["--checkpoint-blocks"],
     );
     assert!(base.success, "fused baseline arm failed:\n{}", base.stderr);
+    // Determinism probe: the fused backward scatters dW/dbias via
+    // red.global.add.f32 — atomic-order ULP nondeterminism, exactly the
+    // embedding-backward situation. Baseline-vs-itself decides whether
+    // bit-exact comparison is even available on this kernel/driver combo.
+    let base2 = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_a, &[]),
+        "fce_a2",
+        true,
+        true,
+        &["--checkpoint-blocks"],
+    );
+    assert!(base2.success, "fused baseline rerun failed:\n{}", base2.stderr);
+    let backward_deterministic = base.loss_stream == base2.loss_stream;
     let csla = run_program(
         &program("csla_fused_lmce.nsl", true, &save_b, &[]),
         "fce_b",
@@ -717,42 +730,80 @@ fn csla_parity_fused_lmce_gpu() {
         "fused-CE launch counts drifted (base fwd/bwd, csla fwd/bwd)"
     );
 
-    // Semantic anchor (targets-dtype lesson): bit-exact parity alone is
-    // satisfiable by DETERMINISTIC GARBAGE — the original s64-vs-f32
-    // targets overread produced identical wrong losses on both arms and
-    // passed a parity-only gate. A near-uniform head over V=128 must open
-    // at ~ln(128) = 4.852.
-    let first_loss: f64 = base
-        .loss_stream
-        .lines()
-        .next()
-        .and_then(|l| {
-            l.trim()
-                .trim_start_matches("tensor([")
-                .trim_end_matches("])")
-                .parse()
-                .ok()
-        })
-        .expect("empty loss stream");
+    // Semantic anchors (targets-dtype + ghost-adjoint lessons): bit-exact
+    // parity alone is satisfiable by DETERMINISTIC GARBAGE — the s64-vs-f32
+    // targets overread AND the i8-vs-i32 tag-4 misread both produced
+    // identical wrong losses on both arms, and the un-drained fused-LCE
+    // prune left ghost adjoints that silently dropped every param grad
+    // (flat loss, still bit-exact between arms). Two independent anchors:
+    //   1. the first loss must sit in the sane CE band for this init —
+    //      ln(128)=4.852 plus the logit-variance term (~5.65 measured
+    //      against the composite/no-train ground truth);
+    //   2. the model must actually TRAIN: last window loss well below the
+    //      first (weight-decay-only "training" stays flat).
+    let parse = |l: &str| -> Option<f64> {
+        l.trim()
+            .trim_start_matches("tensor([")
+            .trim_end_matches("])")
+            .parse()
+            .ok()
+    };
+    let losses: Vec<f64> = base.loss_stream.lines().filter_map(parse).collect();
+    let first_loss = *losses.first().expect("empty loss stream");
+    let last_loss = *losses.last().expect("empty loss stream");
     assert!(
-        (first_loss - 4.852).abs() < 0.35,
-        "first fused-CE loss {first_loss} far from ln(128)=4.852 — the \
-         kernel is not computing real cross-entropy (targets dtype bridge \
-         regressed?)"
+        (4.5..6.4).contains(&first_loss),
+        "first fused-CE loss {first_loss} outside the sane band around \
+         ln(128)+var — the kernel is not computing real cross-entropy \
+         (targets dtype bridge regressed?)"
+    );
+    assert!(
+        last_loss < first_loss - 0.5,
+        "fused-CE loss failed to descend ({first_loss} -> {last_loss}) — \
+         param grads are being dropped (ghost-adjoint prune regressed?)"
     );
 
-    // Bit-exact: same kernels, same per-micro-batch LSE, same accumulation
-    // order.
-    assert_eq!(
-        base.loss_stream, csla.loss_stream,
-        "loss stream diverged under --layerwise-accum with @fused_lm_ce"
-    );
-    let bytes_a = std::fs::read(&save_a).expect("base model_save missing");
-    let bytes_b = std::fs::read(&save_b).expect("csla model_save missing");
-    assert!(
-        bytes_a == bytes_b,
-        "saved model bytes diverged under --layerwise-accum with @fused_lm_ce"
-    );
+    // Parity: with a deterministic backward, demand bit-exactness (loss
+    // stream + model bytes). With the atomic-scatter backward (the current
+    // kernel), run-to-run ULP noise makes bit-exactness unavailable even
+    // baseline-vs-baseline — fall back to: FIRST loss bit-equal (the
+    // pre-update forward has no atomics; a schedule bug that corrupts
+    // inputs shows up here exactly) + every later step within a tight
+    // relative band (ULP noise compounds to ~1e-6 over 6 steps at lr 2e-3;
+    // a wrong replay shows orders of magnitude more).
+    if backward_deterministic {
+        assert_eq!(
+            base.loss_stream, csla.loss_stream,
+            "loss stream diverged under --layerwise-accum with @fused_lm_ce"
+        );
+        let bytes_a = std::fs::read(&save_a).expect("base model_save missing");
+        let bytes_b = std::fs::read(&save_b).expect("csla model_save missing");
+        assert!(
+            bytes_a == bytes_b,
+            "saved model bytes diverged under --layerwise-accum with @fused_lm_ce"
+        );
+    } else {
+        let csla_losses: Vec<f64> = csla.loss_stream.lines().filter_map(parse).collect();
+        assert_eq!(
+            losses.len(),
+            csla_losses.len(),
+            "loss stream lengths diverged"
+        );
+        assert_eq!(
+            losses.first(),
+            csla_losses.first(),
+            "FIRST fused-CE loss diverged — the replay's forward inputs or \
+             LSE carry are wrong (this is pre-update and atomic-free)"
+        );
+        for (i, (a, b)) in losses.iter().zip(&csla_losses).enumerate() {
+            let rel = (a - b).abs() / a.abs().max(1e-9);
+            assert!(
+                rel < 1e-4,
+                "step {i}: csla loss {b} deviates from baseline {a} \
+                 (rel {rel:.2e}) beyond atomic-ULP noise"
+            );
+        }
+    }
 }
 
 /// The narrowed refusal: @fused_lm_ce with a non-f32 dtype stays refused

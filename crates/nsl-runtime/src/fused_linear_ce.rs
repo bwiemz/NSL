@@ -251,8 +251,15 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
                 let s = unsafe { std::slice::from_raw_parts(t.data as *const f32, n) };
                 s.iter().map(|&v| v.round() as i64).collect()
             }
-            (0, crate::tensor::DTYPE_INT8) => {
-                let s = unsafe { std::slice::from_raw_parts(t.data as *const i8, n) };
+            // Dtype tag 4 on batch tensors is I32, NOT int8: the DataLoader
+            // materializes input_ids/labels as i32 payloads under tag 4
+            // (dataloader.rs `build_simple_batch` — "dtype=4 is i32 in NSL's
+            // type system") and every runtime reader (`read_index`,
+            // `as_f64_owned`, `read_scalar_as_f64`, `data_i32`) decodes tag 4
+            // as *const i32. Reading i8 here garbled real label streams into
+            // [t0,0,0,0,t1,0,0,0,...] — the fused-CE e2e forward divergence.
+            (0, 4) => {
+                let s = unsafe { std::slice::from_raw_parts(t.data as *const i32, n) };
                 s.iter().map(|&v| v as i64).collect()
             }
             (0, crate::tensor::DTYPE_U16_TOKEN) => {
@@ -285,14 +292,13 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
 /// Free a buffer produced by [`nsl_fused_lce_targets_i64_alloc`].
 #[no_mangle]
 pub extern "C" fn nsl_fused_lce_targets_i64_free(dev_ptr: i64) {
-    if dev_ptr == 0 {
-        return;
-    }
     #[cfg(feature = "cuda")]
-    {
+    if dev_ptr != 0 {
         crate::cuda::inner::ensure_context();
         crate::cuda::inner::free_managed(dev_ptr as *mut std::os::raw::c_void);
     }
+    #[cfg(not(feature = "cuda"))]
+    let _ = dev_ptr;
 }
 
 /// Any value outside {0, 1, 2} is treated as F32 (defensive — preserves

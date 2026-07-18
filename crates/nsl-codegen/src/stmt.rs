@@ -5236,6 +5236,17 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
+                // Fused-LCE dead-chain prune (review Finding 1 drain point for
+                // the train path, which never calls `finalize()`): remove the
+                // dead composite `Transpose → Matmul → Add` head chain BEFORE
+                // adjoint generation. Leaving it in the tape makes per-op AD
+                // emit ghost adjoints for the dead chain that poison the
+                // shared accumulation Adds with the live
+                // `FusedLinearCeBackwardExtract` results — the lowerer then
+                // skips those Adds (unresolved ghost input) and every
+                // parameter gradient downstream of the fused loss vanishes.
+                extractor.apply_pending_fused_lce_prunes();
+
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner call itself is pure data-in/data-out — it produces a
                 // plan of globally-optimal per-layer decisions.  Several of
