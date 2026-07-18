@@ -52,7 +52,6 @@ fn program(save_path: &Path) -> String {
 
 struct RunOutput {
     loss_stream: String,
-    stdout: String,
     stderr: String,
     success: bool,
 }
@@ -66,12 +65,19 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
     let prog = tmp.join("zero_gate.nsl");
     std::fs::write(&prog, source).unwrap();
 
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.arg("run")
-        .arg("-q")
-        .arg("--manifest-path")
-        .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad", "--deterministic"])
+    // Invoke the PRE-BUILT `nsl` binary directly (CARGO_BIN_EXE_nsl), never
+    // `cargo run`: shelling out to cargo from inside an integration test
+    // takes the cargo build-directory lock and re-runs an up-to-date check on
+    // every call. Under the default multi-threaded `cargo test` (dozens of
+    // e2e tests each spawning `cargo run`) those calls serialize on that lock,
+    // and on slow CI (Windows) the lock-wait alone can exceed this helper's
+    // per-run watchdog — tripping a false timeout on a run that does no real
+    // work beyond a few training steps. Cargo guarantees the bin is built
+    // before this package's integration tests run, so the path is valid. The
+    // `--devices N` self-spawn re-execs via current_exe()+args().skip(1)
+    // (see run.rs), so it behaves identically to the cargo-run launch.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
+    cmd.args(["run", "--source-ad", "--deterministic"])
         .args(extra_args)
         .arg(&prog)
         .current_dir(&tmp)
@@ -128,7 +134,6 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
     }
     RunOutput {
         loss_stream,
-        stdout,
         stderr,
         success: status.success(),
     }
