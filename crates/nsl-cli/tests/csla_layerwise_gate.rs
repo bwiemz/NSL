@@ -685,15 +685,20 @@ fn csla_parity_fused_lmce_gpu() {
     // red.global.add.f32 — atomic-order ULP nondeterminism, exactly the
     // embedding-backward situation. Baseline-vs-itself decides whether
     // bit-exact comparison is even available on this kernel/driver combo.
+    let save_a2 = tmp.join("fce_base2.nslm");
     let base2 = run_program(
-        &program("csla_fused_lmce.nsl", true, &save_a, &[]),
+        &program("csla_fused_lmce.nsl", true, &save_a2, &[]),
         "fce_a2",
         true,
         true,
         &["--checkpoint-blocks"],
     );
     assert!(base2.success, "fused baseline rerun failed:\n{}", base2.stderr);
-    let backward_deterministic = base.loss_stream == base2.loss_stream;
+    // Probe on streams AND raw model bytes (review D2c-6): the exact
+    // branch compares bytes, so the probe must certify byte-level
+    // determinism, not just the printed (rounded) losses.
+    let backward_deterministic = base.loss_stream == base2.loss_stream
+        && std::fs::read(&save_a).ok() == std::fs::read(&save_a2).ok();
     let csla = run_program(
         &program("csla_fused_lmce.nsl", true, &save_b, &[]),
         "fce_b",
@@ -750,17 +755,23 @@ fn csla_parity_fused_lmce_gpu() {
     };
     let losses: Vec<f64> = base.loss_stream.lines().filter_map(parse).collect();
     let first_loss = *losses.first().expect("empty loss stream");
-    let last_loss = *losses.last().expect("empty loss stream");
+    // Pinned to the composite-derived ground truth for this deterministic
+    // init + data (review D2c-4: the old (4.5, 6.4) band ADMITTED the
+    // measured tag-4-garbled value 5.19 — a band is not a discriminator).
     assert!(
-        (4.5..6.4).contains(&first_loss),
-        "first fused-CE loss {first_loss} outside the sane band around \
-         ln(128)+var — the kernel is not computing real cross-entropy \
-         (targets dtype bridge regressed?)"
+        (first_loss - 5.6485).abs() < 0.02,
+        "first fused-CE loss {first_loss} != composite ground truth 5.6485 \
+         — the kernel is not computing real cross-entropy (targets dtype \
+         bridge regressed?)"
     );
+    // Whole-stream mean separates trained (measured 4.78) from
+    // grads-dropped/frozen (measured 5.36 at lr~0 — per-block data
+    // difficulty makes single-loss descent checks noisy).
+    let mean_loss: f64 = losses.iter().sum::<f64>() / losses.len() as f64;
     assert!(
-        last_loss < first_loss - 0.5,
-        "fused-CE loss failed to descend ({first_loss} -> {last_loss}) — \
-         param grads are being dropped (ghost-adjoint prune regressed?)"
+        mean_loss < 5.1,
+        "fused-CE mean loss {mean_loss} looks frozen (trained ~4.78, \
+         grads-dropped ~5.36) — ghost-adjoint prune regressed?"
     );
 
     // Parity: with a deterministic backward, demand bit-exactness (loss
@@ -833,6 +844,91 @@ fn csla_fused_lmce_non_f32_refused() {
         "wrong refusal:\n{}",
         out.stderr
     );
+}
+
+/// Fused-CE × streaming composition (GPU): the exact 1B production stack —
+/// @fused_lm_ce + --layerwise-accum + --optim-state-offload +
+/// --weight-stream (review D2c-7: previously only the manual 1B run
+/// covered it). Streaming and staging are byte-preserving and the forward
+/// is deterministic, so the FIRST loss must be bit-equal between the
+/// csla arm and the fully-streamed arm; later steps within atomic-ULP
+/// noise. Transfer counters and the placement-pinned schedule line carry
+/// over from the ws gates (same 2-block structure: 6 streamed params).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_fused_lmce_streams_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_fces_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("fces_base.nslm");
+    let save_b = tmp.join("fces_stream.nslm");
+
+    let base = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_a, &[]),
+        "fces_a",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(base.success, "fused csla arm failed:\n{}", base.stderr);
+    let ws = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_b, &[]),
+        "fces_b",
+        true,
+        true,
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--optim-state-offload",
+            "--weight-stream",
+        ],
+    );
+    assert!(ws.success, "fused streamed arm failed:\n{}", ws.stderr);
+
+    assert_eq!(window_phase_count(&ws.stderr), Some(6));
+    assert!(
+        ws.stderr.contains("[csla] fused-ce tape-carry: 1 slots"),
+        "carry inert under the streamed composition:\n{}",
+        ws.stderr
+    );
+    assert_eq!(
+        ws_counts(&ws.stderr),
+        (114, 114, 36),
+        "transfer counts drifted under the fused composition"
+    );
+    assert!(
+        ws.stderr.contains(
+            "[weight-stream] forward streaming: 4 slices, 6 streamed params \
+             (6 touched by the primal); uploads/slice [0,3,3,0] \
+             evicts/slice [0,3,3,0]"
+        ),
+        "forward-streaming schedule line missing under the fused \
+         composition:\n{}",
+        ws.stderr
+    );
+
+    let parse = |l: &str| -> Option<f64> {
+        l.trim()
+            .trim_start_matches("tensor([")
+            .trim_end_matches("])")
+            .parse()
+            .ok()
+    };
+    let a: Vec<f64> = base.loss_stream.lines().filter_map(parse).collect();
+    let b: Vec<f64> = ws.loss_stream.lines().filter_map(parse).collect();
+    assert_eq!(a.len(), b.len(), "loss stream lengths diverged");
+    assert_eq!(
+        base.loss_stream.lines().next(),
+        ws.loss_stream.lines().next(),
+        "FIRST loss diverged under byte-preserving streaming — the fused \
+         forward read different bytes"
+    );
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let rel = (x - y).abs() / x.abs().max(1e-9);
+        assert!(
+            rel < 1e-4,
+            "step {i}: streamed loss {y} deviates from csla {x} (rel {rel:.2e})"
+        );
+    }
 }
 
 /// D2b × D2a composition (GPU): --weight-stream WITH --optim-state-offload —

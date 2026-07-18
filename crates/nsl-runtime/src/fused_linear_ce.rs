@@ -227,6 +227,34 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
     {
         let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
         let n = t.len as usize;
+        // Density guard (review D2c-3): the reads below walk t.data
+        // linearly — a broadcast/expand view (stride 0) or a strided
+        // slice would be silently misread. Every real label path is a
+        // contiguous post-reshape tensor; refuse loudly otherwise.
+        {
+            let shape = unsafe { std::slice::from_raw_parts(t.shape, t.ndim as usize) };
+            let strides =
+                unsafe { std::slice::from_raw_parts(t.strides, t.ndim as usize) };
+            let mut dense_extent: i64 = 1;
+            let mut has_zero_stride = false;
+            for (d, (&dim, &st)) in shape.iter().zip(strides).enumerate() {
+                let _ = d;
+                if dim > 1 && st == 0 {
+                    has_zero_stride = true;
+                }
+                dense_extent += st * (dim - 1).max(0);
+            }
+            if has_zero_stride || dense_extent != t.len {
+                eprintln!(
+                    "nsl_fused_lce_targets_i64_alloc: non-contiguous label \
+                     tensor (dense extent {dense_extent} vs len {}, \
+                     zero-stride={has_zero_stride}) — call .contiguous() \
+                     before the fused loss",
+                    t.len
+                );
+                std::process::abort();
+            }
+        }
         crate::cuda::inner::ensure_context();
         // Labels arrive in whatever form the loader/pipeline produced:
         // GPU f32 (batch dicts moved to device), CPU f64/f32, or narrow

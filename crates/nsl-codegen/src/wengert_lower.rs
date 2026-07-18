@@ -4191,7 +4191,12 @@ fn lower_fused_kl_ce_forward(
     let xt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xt_t])?;
     let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
     let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
-    let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+    // Targets dtype bridge (review D2c-2): the KL-CE kernels share the
+    // linear-CE s64 targets convention; NSL labels are f32/i32 4-byte —
+    // same 2× overread class fixed on the linear-CE sites. Freed after
+    // the FFI below.
+    let tgt_ptr =
+        call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1_out])?;
     let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st_out])?;
@@ -4229,6 +4234,8 @@ fn lower_fused_kl_ce_forward(
             alpha_bits, temp_bits, smem_val,
         ],
     )?;
+    // Release the i64 targets copy (stream-ordered free).
+    call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
 
     // Masked-mean reduction — identical to the fused linear-CE forward so
     // the scalar is bit-compatible with a composite dual path.
@@ -4355,7 +4362,9 @@ fn lower_fused_kl_ce_backward_extract(
         let xt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xt_t])?;
         let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
         let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
-        let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+        // Targets dtype bridge (review D2c-2) — see the forward site.
+        let tgt_ptr =
+            call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
         let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1])?;
         let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st])?;
         let lse_tt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_tt])?;
@@ -4443,6 +4452,8 @@ fn lower_fused_kl_ce_backward_extract(
             ],
         )?;
 
+        // Release the i64 targets copy (stream-ordered free).
+        call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
         // The FFI cuCtxSynchronizes, so the LSE buffers are consumed.
         for tmp in [targets_plus_one, valid_mask, num_valid_t, lse_s1, lse_st, lse_tt] {
             free_tensor_value(compiler, builder, tmp)?;
