@@ -655,6 +655,135 @@ fn csla_weight_stream_parity_gpu() {
     );
 }
 
+/// Fused-CE tape-carry parity (GPU): @fused_lm_ce(dtype=f32) composes with
+/// the layerwise schedule. Both arms carry the decorator (fused-vs-fused —
+/// fused numerics differ from the composite by design), so the diff is the
+/// schedule alone and parity is BIT-EXACT. The carry buffers one [B*S] f32
+/// logsumexp per micro-batch and re-binds `fused_ce_fwd_lse` by the seeded
+/// loss Value per replay; the materialized [B*S, V] logits chain never
+/// exists on either arm. Anti-vacuity: exact launch counters (fwd 13 both
+/// arms; bwd 13 interleaved vs 12 replayed — the trailing partial window
+/// never replays) + the exact carry-slot stderr line; a composite fallback
+/// or an inert carry cannot pass.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_parity_fused_lmce_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_fce_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("fce_base.nslm");
+    let save_b = tmp.join("fce_csla.nslm");
+
+    let base = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_a, &[]),
+        "fce_a",
+        true,
+        true,
+        &["--checkpoint-blocks"],
+    );
+    assert!(base.success, "fused baseline arm failed:\n{}", base.stderr);
+    let csla = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_b, &[]),
+        "fce_b",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(csla.success, "fused csla arm failed:\n{}", csla.stderr);
+
+    // Schedule engaged (not a degenerate all-epilogue shape) + exactly one
+    // carried fused-CE LSE slot.
+    assert_eq!(
+        window_phase_count(&csla.stderr),
+        Some(6),
+        "csla arm window count:\n{}",
+        csla.stderr
+    );
+    assert_eq!(window_phase_count(&base.stderr), Some(0));
+    assert!(
+        csla.stderr.contains("[csla] fused-ce tape-carry: 1 slots"),
+        "fused-CE carry slot line missing or wrong:\n{}",
+        csla.stderr
+    );
+
+    // Launch counters: the fused kernel actually ran, the designed number
+    // of times, on BOTH arms.
+    let fwd_b = marker_i64(&base.stdout, "FUSED_LCE_FWD").expect("base fwd marker");
+    let bwd_b = marker_i64(&base.stdout, "FUSED_LCE_BWD").expect("base bwd marker");
+    let fwd_c = marker_i64(&csla.stdout, "FUSED_LCE_FWD").expect("csla fwd marker");
+    let bwd_c = marker_i64(&csla.stdout, "FUSED_LCE_BWD").expect("csla bwd marker");
+    assert_eq!(
+        (fwd_b, bwd_b, fwd_c, bwd_c),
+        (13, 13, 13, 12),
+        "fused-CE launch counts drifted (base fwd/bwd, csla fwd/bwd)"
+    );
+
+    // Semantic anchor (targets-dtype lesson): bit-exact parity alone is
+    // satisfiable by DETERMINISTIC GARBAGE — the original s64-vs-f32
+    // targets overread produced identical wrong losses on both arms and
+    // passed a parity-only gate. A near-uniform head over V=128 must open
+    // at ~ln(128) = 4.852.
+    let first_loss: f64 = base
+        .loss_stream
+        .lines()
+        .next()
+        .and_then(|l| {
+            l.trim()
+                .trim_start_matches("tensor([")
+                .trim_end_matches("])")
+                .parse()
+                .ok()
+        })
+        .expect("empty loss stream");
+    assert!(
+        (first_loss - 4.852).abs() < 0.35,
+        "first fused-CE loss {first_loss} far from ln(128)=4.852 — the \
+         kernel is not computing real cross-entropy (targets dtype bridge \
+         regressed?)"
+    );
+
+    // Bit-exact: same kernels, same per-micro-batch LSE, same accumulation
+    // order.
+    assert_eq!(
+        base.loss_stream, csla.loss_stream,
+        "loss stream diverged under --layerwise-accum with @fused_lm_ce"
+    );
+    let bytes_a = std::fs::read(&save_a).expect("base model_save missing");
+    let bytes_b = std::fs::read(&save_b).expect("csla model_save missing");
+    assert!(
+        bytes_a == bytes_b,
+        "saved model bytes diverged under --layerwise-accum with @fused_lm_ce"
+    );
+}
+
+/// The narrowed refusal: @fused_lm_ce with a non-f32 dtype stays refused
+/// under the layerwise schedule (step-scoped cast shadow tensors cannot be
+/// carried), with the loud diagnostic — not a silent composite fallback.
+#[test]
+fn csla_fused_lmce_non_f32_refused() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_fce_ref_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("unused.nslm");
+    let out = run_program(
+        &program(
+            "csla_fused_lmce.nsl",
+            false,
+            &save,
+            &[("dtype=\"f32\"", "dtype=\"f16\"")],
+        ),
+        "fce_ref",
+        false,
+        false,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(!out.success, "non-f32 fused-CE under csla must refuse");
+    assert!(
+        out.stderr
+            .contains("supports @fused_lm_ce only with dtype=\"f32\""),
+        "wrong refusal:\n{}",
+        out.stderr
+    );
+}
+
 /// D2b × D2a composition (GPU): --weight-stream WITH --optim-state-offload —
 /// the exact 1B production configuration (the 9.10 GB measurement). The
 /// per-layer update site interleaves the offload envelope's staged-m/v

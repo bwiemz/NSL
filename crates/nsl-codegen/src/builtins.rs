@@ -2757,6 +2757,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // LSE tape-carry gates: fused-SDPA launch counter (0 = base fwd kernel,
     // 1 = Tier-B tile-skip) — NSL-callable as sdpa_fused_launch_count(v).
     ("nsl_sdpa_fused_launch_count", &[types::I64], Some(types::I64)),
+    // Fused-CE tape-carry gates: fused linear-CE launch counter (0 =
+    // forward, 1 = forward_large, 2 = backward) — NSL-callable as
+    // fused_lce_launch_count(k).
+    ("nsl_fused_lce_launch_count", &[types::I64], Some(types::I64)),
+    // Fused-CE targets dtype bridge: the kernels read targets as s64 but
+    // NSL GPU labels are f32 — materialize/free a device i64 copy around
+    // each fused forward/backward FFI.
+    ("nsl_fused_lce_targets_i64_alloc", &[types::I64], Some(types::I64)),
+    ("nsl_fused_lce_targets_i64_free", &[types::I64], None),
     // D2b weight streaming: pointer-identity host offload of model params
     // (side-table mirrors; tensor pointers never change).
     ("nsl_weight_stream_register", &[types::I64], None),

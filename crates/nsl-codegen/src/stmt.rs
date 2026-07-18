@@ -4899,6 +4899,15 @@ impl Compiler<'_> {
             /// were never pushed and their LSEs must still free per
             /// iteration or every fused-fired one leaks for the whole run.
             lse_pushed: std::collections::HashSet<Value>,
+            /// Fused-CE tape-carry: one extra inner-list slot per
+            /// `fused_ce_fwd_lse` entry — `(slot index, the fwd-result
+            /// vids whose SEEDED Values key the replay re-bind)`. The
+            /// replay re-inserts `fused_ce_fwd_lse[seed[vid]] = lse[b]`
+            /// before each consuming range's lowering; the emitted fused
+            /// backward then consumes AND frees the buffered tensor, so
+            /// these slots take no per-b free (teardown sweeps the
+            /// trailing partial window only).
+            fce_slots: Vec<(usize, Vec<crate::wengert::VarId>)>,
             /// D2b part 2: the layer-major schedule, computed ONCE before
             /// the forward lowering so the segment-streamed forward and the
             /// window backward agree on ranges, update grouping, and the
@@ -6981,19 +6990,51 @@ impl Compiler<'_> {
                     // per-batch LSE the baseline did (or the runtime-0
                     // decline sentinel), keeping the fused phase-2 kernel on
                     // the fused path.
-                    // M1 — @fused_lm_ce / distill backward consult Value-keyed
-                    // cast caches (fused_ce_fwd_casts / fused_kl_ce_bwd_cache);
-                    // a replay miss re-emits fresh casts per window with no
-                    // free. Refuse until those are tape-carried.
-                    if self.active_fused_ce_config.is_some()
-                        || self.active_distill_context.is_some()
-                    {
+                    // M1, NARROWED by the fused-CE tape-carry: the f32
+                    // @fused_lm_ce path is now supported — the only real
+                    // side-band is `fused_ce_fwd_lse` (one [B*S] f32 tensor
+                    // per micro-batch), buffered as an extra window slot
+                    // below and re-bound per replay range exactly like the
+                    // flash-attention LSE; the f32 cast-cache MISS path is
+                    // already correct at replay (pass-through of the seeded
+                    // inputs, zero extra emission). Still refused:
+                    //
+                    // - distill blocks: the KL-CE carry would need THREE
+                    //   lse slots per micro-batch plus the frozen teacher's
+                    //   activation buffered per micro-batch — a large new
+                    //   surface with no gate; refuse until designed.
+                    // - @fused_lm_ce(dtype="f16"/"bf16"): the fp16/bf16
+                    //   shadow-cast tensors are step-scoped (freed at
+                    //   function-scope exit); a replay-side re-cast would
+                    //   pile N cast sets per window with no free (the
+                    //   original M1 finding), and buffering w_cast per
+                    //   micro-batch (V×H×2 B) would erase the memory win.
+                    if self.active_distill_context.is_some() {
                         return Err(CodegenError::new(
-                            "--layerwise-accum is incompatible with @fused_lm_ce \
-                             / distill blocks: their backward reads Value-keyed \
-                             forward cast caches the window replay cannot see. \
-                             Drop the decorator or --layerwise-accum",
+                            "--layerwise-accum is incompatible with distill \
+                             blocks: the fused KL-CE backward reads Value-keyed \
+                             forward saves (three LSE buffers + the teacher \
+                             activations) the window replay cannot see. Drop \
+                             the distill block or --layerwise-accum",
                         ));
+                    }
+                    if let Some(cfg) = &self.active_fused_ce_config {
+                        let non_f32 = cfg.enabled
+                            && !matches!(
+                                cfg.dtype,
+                                None | Some(crate::FusedCeDtypeHint::F32)
+                            );
+                        if non_f32 {
+                            return Err(CodegenError::new(
+                                "--layerwise-accum supports @fused_lm_ce only \
+                                 with dtype=\"f32\": the fp16/bf16 forward cast \
+                                 tensors are step-scoped and cannot be carried \
+                                 through the window replay without either \
+                                 leaking N cast sets per window or buffering \
+                                 the V*H weight cast per micro-batch. Use \
+                                 dtype=\"f32\" or drop --layerwise-accum",
+                            ));
+                        }
                     }
 
                     let (saves_outer_var, dicts_var) =
@@ -7109,6 +7150,79 @@ impl Compiler<'_> {
                     // count so the tested path is named, not assumed.
                     eprintln!("[csla] lse tape-carry: {} slots", lse_slots.len());
 
+                    // Fused-CE tape-carry: one extra slot per
+                    // `fused_ce_fwd_lse` entry — the [B*S] f32 logsumexp the
+                    // fused backward consumes, keyed by the fwd-result
+                    // (loss-scalar) Value. Unlike the flash-attention carry
+                    // this one is LIVE under BOTH checkpoint policies:
+                    // FusedLinearCe sits in the CCR epilogue (never a
+                    // recompute victim), so a replay clone can never
+                    // re-establish the side-band locally. Lifecycle also
+                    // differs: the emitted backward CONSUMES AND FREES the
+                    // buffered tensor per (range, b) — the per-b slot-free
+                    // machinery must NOT touch these slots; only the
+                    // trailing-partial-window teardown sweep frees
+                    // unreplayed entries. (The f32 cast cache needs no
+                    // carry: its replay MISS path re-emits pass-through
+                    // inputs — the seeded x/W/bias — with zero extra cost;
+                    // non-f32 dtypes are refused above.)
+                    let mut fce_slots: Vec<(usize, Vec<crate::wengert::VarId>)> = Vec::new();
+                    if !self.fused_ce_fwd_lse.is_empty() {
+                        let slot_vid_set: std::collections::HashSet<crate::wengert::VarId> =
+                            slots.iter().map(|(v, _)| *v).collect();
+                        let mut by_val: std::collections::HashMap<
+                            Value,
+                            Vec<crate::wengert::VarId>,
+                        > = std::collections::HashMap::new();
+                        for (vid, val) in full_vars.iter() {
+                            by_val.entry(*val).or_default().push(*vid);
+                        }
+                        let mut entries: Vec<(Vec<crate::wengert::VarId>, Value)> = self
+                            .fused_ce_fwd_lse
+                            .iter()
+                            .filter_map(|(res_val, lse_val)| {
+                                let mut vids: Vec<crate::wengert::VarId> = by_val
+                                    .get(res_val)?
+                                    .iter()
+                                    .copied()
+                                    .filter(|v| slot_vid_set.contains(v))
+                                    .collect();
+                                if vids.is_empty() {
+                                    return None;
+                                }
+                                vids.sort_unstable();
+                                Some((vids, *lse_val))
+                            })
+                            .collect();
+                        entries.sort_by_key(|(vids, _)| vids[0]);
+                        for (vids, lse_val) in entries {
+                            let idx = slots.len() + lse_slots.len() + fce_slots.len();
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_list_push",
+                                &[inner, lse_val],
+                            )?;
+                            fce_slots.push((idx, vids));
+                        }
+                        // The step body's adjoint is never lowered under
+                        // csla, so its map entries would otherwise linger
+                        // for the whole compile — clear them; the replay
+                        // re-binds fresh entries keyed by SEEDED Values
+                        // per consuming range. Same for the pass-through
+                        // cast entries (the replay's miss path is the
+                        // correct one).
+                        self.fused_ce_fwd_lse.clear();
+                        self.fused_ce_fwd_casts.clear();
+                    }
+                    // Anti-vacuity twin of the LSE line: asserted exactly
+                    // by the fused-CE gates (1 slot = the carry engaged; a
+                    // composite fallback shows 0 and the launch counters
+                    // catch it too).
+                    eprintln!(
+                        "[csla] fused-ce tape-carry: {} slots",
+                        fce_slots.len()
+                    );
+
                     let so = builder.use_var(saves_outer_var);
                     self.compile_call_by_name(builder, "nsl_list_push", &[so, inner])?;
                     if has_dataloader.is_some() {
@@ -7143,6 +7257,16 @@ impl Compiler<'_> {
                                     .iter()
                                     .map(|(idx, _)| (*idx as i64, "nsl_tensor_free_if_valid")),
                             )
+                            // Fused-CE LSE slots: always real tensors (the
+                            // fused forward allocates unconditionally); the
+                            // teardown sweep is their ONLY free on the
+                            // trailing partial window (replayed entries are
+                            // consumed+freed by the emitted backward).
+                            .chain(
+                                fce_slots
+                                    .iter()
+                                    .map(|(idx, _)| (*idx as i64, "nsl_tensor_free")),
+                            )
                             .collect(),
                     );
                     csla_pending = Some(CslaPending {
@@ -7157,6 +7281,7 @@ impl Compiler<'_> {
                         primal_view_of: pre.primal_view_of,
                         lse_slots,
                         lse_pushed: csla_lse_pushed,
+                        fce_slots,
                         schedule: pre.schedule,
                     });
                     None
@@ -8238,6 +8363,46 @@ impl Compiler<'_> {
                 }
             }
 
+            // Fused-CE cluster guard (F3 twin): the three
+            // FusedLinearCeBackwardExtract components of one op share the
+            // Value-keyed `fused_ce_bwd_cache` (component 0 launches and
+            // populates; 1/2 read; 2 evicts) and the LSE is consumed
+            // exactly once — a split across replay ranges would relaunch
+            // the backward kernel per range and hit a consumed-LSE
+            // CodegenError. Structurally the extracts sit together in the
+            // prologue range (the fused op is the CCR epilogue's loss
+            // head); this guard makes any future violation loud.
+            {
+                let mut fce_range: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    usize,
+                > = std::collections::HashMap::new();
+                for (ri, r) in ranges.iter().enumerate() {
+                    for op in &pending.adjoint.ops[r.start..r.end] {
+                        if !matches!(
+                            op.op,
+                            crate::wengert::PrimalOp::FusedLinearCeBackwardExtract { .. }
+                        ) {
+                            continue;
+                        }
+                        let Some(&fr) = op.inputs.get(5) else { continue };
+                        if let Some(&prev) = fce_range.get(&fr) {
+                            if prev != ri {
+                                return Err(CodegenError::new(format!(
+                                    "--layerwise-accum: sibling fused-CE backward \
+                                     extracts for one @fused_lm_ce op are split \
+                                     across replay ranges {prev} and {ri}. This \
+                                     adjoint shape is unsupported; drop \
+                                     --layerwise-accum",
+                                )));
+                            }
+                        } else {
+                            fce_range.insert(fr, ri);
+                        }
+                    }
+                }
+            }
+
             // LSE tape-carry: which range frees each buffered logsumexp —
             // the last (fixpoint-extended) range reading ANY of its fwd-out
             // vids; that range necessarily seeds the vid, so the loaded LSE
@@ -8662,6 +8827,35 @@ impl Compiler<'_> {
                         }
                     }
                     lse_loaded_here.push((k, lse));
+                }
+
+                // Fused-CE tape-carry: re-bind `fused_ce_fwd_lse` to this
+                // micro-batch's buffered logsumexp, keyed by the SEEDED
+                // fwd-result (loss-scalar) Value — BEFORE the slice
+                // lowering emits the fused backward whose first extract
+                // `.remove()`s the entry (a miss is a hard CodegenError).
+                // The emitted backward frees the loaded tensor per (range,
+                // b) itself; no per-b slot free exists for these slots.
+                // The cast cache is deliberately NOT re-bound: the f32
+                // MISS path re-emits pass-through of the extract's own
+                // (seeded) inputs — byte-identical, zero extra emission.
+                for (idx, vids) in pending.fce_slots.iter() {
+                    let targets: Vec<crate::wengert::VarId> = vids
+                        .iter()
+                        .copied()
+                        .filter(|v| seeded_vids_here.contains(v))
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let idx_val = builder.ins().iconst(cl_types::I64, *idx as i64);
+                    let lse =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[inner, idx_val])?;
+                    for v in targets {
+                        if let Some(&res_seed) = seed.get(&v) {
+                            self.fused_ce_fwd_lse.insert(res_seed, lse);
+                        }
+                    }
                 }
 
                 // FASE hook: identical to the baseline's fase_cb — accumulate

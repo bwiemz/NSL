@@ -1,0 +1,95 @@
+# CSLA fused-CE tape-carry parity fixture: blocks-structured FFN LM with a
+# @fused_lm_ce(dtype=f32) loss head.
+#
+# Clone of csla_layerwise_ffn.nsl reshaped for the fused linear-CE matcher:
+#   - vocab bumped to 128 (embed [128, 64]) — the fused emitter's effective
+#     minimum (vocab_tile must be a multiple of 128 and <= vocab_size);
+#   - a REAL lm_bias param ([128] zeros): the auto-substitution matcher
+#     requires the canonical Add(Matmul(x, Transpose(W)), bias) chain — a
+#     bare matmul head is refused. Under the FUSED path dbias arrives
+#     [V]-shaped from FusedLinearCeBackwardExtract, so the composite
+#     broadcast-add bias-grad abort (the reason the base fixture is
+#     bias-free) cannot fire — and if the matcher ever silently declined,
+#     that abort makes the gate fail LOUDLY instead of testing the
+#     composite path by accident (the launch counters below pin it too);
+#   - forward_train returns FLAT [rows, V] logits: any reshape between the
+#     Add and cross_entropy breaks the matcher (no see-through), so the
+#     flatten happens BEFORE the head matmul.
+#
+# Window shape identical to the base fixture: 1664 tokens / (batch 2 x
+# seq 64) = 13 micro-batches, grad_accumulation=2 -> 6 windows + one
+# trailing partial window (the tail's buffered fused-CE LSE slot must be
+# swept by teardown, never replayed).
+#
+# Marker rewrites (exact string match by the harness):
+#   - "# GPU_PLACEMENT" -> "m.to(cuda)" for GPU runs;
+#   - "CSLA_SAVE_PATH"  -> the temp .nslm path;
+#   - "dtype=\"f32\""   -> "dtype=\"f16\"" for the non-f32 refusal case.
+
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_f: Tensor = ones([64])
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyLM:
+    embed: Tensor = randn([128, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+    lm_bias: Tensor = zeros([128])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        let flat_hn = hn.reshape([batch_size * seq_len, 64])
+        return (flat_hn @ self.embed.transpose(0, 1)) + self.lm_bias
+
+let m = TinyLM()
+# GPU_PLACEMENT
+
+# 208 units of 8 tokens (1..7 then 0) = 1664 tokens = 13 exact micro-batches.
+let unit = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let tokens = unit.reshape([1, 8]).expand([208, 8]).contiguous().reshape([1664])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+@fused_lm_ce(enabled=true, dtype="f32", vocab_size=128, hidden_size=64, batch_size=2, seq_len=64, vocab_tile=128)
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let flat_labels = batch.labels.reshape([128])
+        let loss = cross_entropy(logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+# Anti-vacuity (GPU runs): successful fused linear-CE kernel launches.
+# kind 0 = forward (V=128 takes the small single-kernel path), 2 =
+# backward. Forward fires once per micro-batch on BOTH arms (13); the
+# backward fires per interleaved micro-batch on the baseline (13) but per
+# REPLAYED micro-batch under csla (6 windows x 2 = 12 — the trailing
+# partial window never replays).
+print("FUSED_LCE_FWD_BEGIN")
+print(fused_lce_launch_count(0))
+print("FUSED_LCE_FWD_END")
+print("FUSED_LCE_BWD_BEGIN")
+print(fused_lce_launch_count(2))
+print("FUSED_LCE_BWD_END")
+
+model_save(m, "CSLA_SAVE_PATH")

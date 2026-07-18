@@ -149,6 +149,17 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // Fused-CE tape-carry twin: successful fused linear-CE launches
+    // (kind 0 = forward, 1 = forward_large, 2 = backward); -1 on an
+    // unknown kind, 0 when the fused path never engaged.
+    def(
+        "fused_lce_launch_count",
+        Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Int),
+            effect: Effect::Inferred,
+        },
+    );
     def(
         "gpu_surface_at_peak_bytes",
         Type::Function {
