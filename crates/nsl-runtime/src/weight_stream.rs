@@ -73,12 +73,20 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
         return;
     }
     let t = NslTensor::from_ptr(tensor_ptr);
-    if t.device == 0 || t.owns_data == 0 || t.data_owner != 0 {
+    if t.device == 0 {
+        eprintln!(
+            "[weight-stream] FATAL: --weight-stream requires GPU placement — \
+             call m.to(cuda) before the train block (param tensor {tensor_ptr} \
+             is CPU-resident)"
+        );
+        std::process::abort();
+    }
+    if t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0 {
         eprintln!(
             "[weight-stream] refusing to register tensor {tensor_ptr}: \
-             device={} owns_data={} data_owner={} — only plain owning GPU \
-             tensors stream",
-            t.device, t.owns_data, t.data_owner
+             owns_data={} data_owner={} slab_managed={} — only plain owning \
+             non-slab GPU tensors stream",
+            t.owns_data, t.data_owner, t.slab_managed
         );
         std::process::abort();
     }
@@ -162,7 +170,12 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
     {
         let guard = MIRRORS.lock().unwrap();
         let Some(m) = guard.as_ref().and_then(|g| g.get(&tensor_ptr)) else {
-            return; // not a streamed param — leave resident (e.g. epilogue group)
+            // No call site legitimately evicts an unregistered tensor —
+            // a silent pass here would mask a codegen slip (review D2b-6).
+            eprintln!(
+                "[weight-stream] FATAL: evict of unregistered tensor {tensor_ptr}"
+            );
+            std::process::abort();
         };
         crate::cuda::inner::ensure_context();
         if writeback != 0 {
@@ -215,6 +228,13 @@ pub extern "C" fn nsl_weight_stream_teardown() {
             let t = NslTensor::from_ptr(ptr);
             crate::cuda::inner::ensure_context();
             if t.data.is_null() {
+                // NOTE: deliberately NOT counted in WS_UPLOADS — steady
+                // state is resident at teardown, and the gates' designed
+                // transfer arithmetic (uploads = windows x params x 2)
+                // depends on teardown restores staying out of the count.
+                // Allocations here run under the ambient surface (post-
+                // training accounting only; frees reconcile by recorded
+                // surface).
                 let dev = crate::cuda::inner::alloc_managed(m.bytes);
                 crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
                 t.data = dev;
