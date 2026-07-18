@@ -139,6 +139,40 @@ fn sdpa_fused_count(out: &RunOutput) -> Option<i64> {
     None
 }
 
+/// Parse `[weight-stream] uploads: N evicts: M writeback: W`.
+fn ws_counts(stderr: &str) -> (i64, i64, i64) {
+    let rest = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("[weight-stream] uploads: "))
+        .expect("NSL_WS_COUNTER report missing");
+    let mut it = rest.split(" evicts: ");
+    let uploads: i64 = it.next().unwrap().trim().parse().unwrap();
+    let mut it2 = it.next().unwrap().split(" writeback: ");
+    let evicts: i64 = it2.next().unwrap().trim().parse().unwrap();
+    let writeback: i64 = it2.next().unwrap().trim().parse().unwrap();
+    (uploads, evicts, writeback)
+}
+
+/// Parse the bare integer between `<TAG>_BEGIN` / `<TAG>_END` stdout markers.
+fn marker_i64(stdout: &str, tag: &str) -> Option<i64> {
+    let begin = format!("{tag}_BEGIN");
+    let end = format!("{tag}_END");
+    let mut in_block = false;
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t == begin {
+            in_block = true;
+        } else if t == end {
+            in_block = false;
+        } else if in_block {
+            if let Ok(v) = t.parse::<f64>() {
+                return Some(v as i64);
+            }
+        }
+    }
+    None
+}
+
 /// Parse the `[csla] window backward phases: N` atexit report.
 fn window_phase_count(stderr: &str) -> Option<i64> {
     stderr
@@ -504,13 +538,16 @@ fn csla_parity_ffn_gpu_mv_streaming() {
     );
 }
 
-/// D2b window-scoped weight-eviction parity (GPU): layer-grouped params
-/// drop their device buffers at each window boundary (pinned host mirrors),
-/// re-upload per replay range, write back after their layer's update, and
-/// restore for the next forwards. Streaming is byte-preserving, so the two
-/// arms (csla vs csla + --weight-stream) must be BIT-EXACT; the NSL_WS
-/// counter report is the anti-vacuity (uploads and evicts both > 0 — a
-/// silently-inert flag cannot pass).
+/// D2b whole-loop weight-streaming parity (GPU): layer-grouped params live
+/// in pinned host mirrors and hold device buffers only inside their
+/// brackets — the forward (sliced per CCR segment) uploads each block
+/// before its segment and evicts read-only after its last primal touch;
+/// the window backward re-uploads per replay range and writes back after
+/// that layer's update; teardown restores for model_save. Streaming is
+/// byte-preserving, so the two arms (csla vs csla + --weight-stream) must
+/// be BIT-EXACT; anti-vacuity = exact transfer counters (incl. the
+/// writeback subset), the placement-pinned schedule line, and the
+/// weights-at-peak bracket probe.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csla_weight_stream_parity_gpu() {
@@ -536,18 +573,62 @@ fn csla_weight_stream_parity_gpu() {
     );
     assert!(ws.success, "--weight-stream arm failed:\n{}", ws.stderr);
 
-    // Anti-vacuity: the streaming cycle actually ran.
-    let counts = ws
-        .stderr
-        .lines()
-        .find_map(|l| l.strip_prefix("[weight-stream] uploads: "))
-        .expect("NSL_WS_COUNTER report missing");
-    let mut it = counts.split(" evicts: ");
-    let uploads: i64 = it.next().unwrap().trim().parse().unwrap();
-    let evicts: i64 = it.next().unwrap().trim().parse().unwrap();
+    // Anti-vacuity: the streaming cycle actually ran, with the EXACT part-2
+    // transfer arithmetic. 13 micro-batch forwards × 6 streamed params
+    // (upload before the layer's segment, read-only evict after its last
+    // primal touch) + 6 windows × 6 (range-head upload, post-update
+    // writeback evict) = 114 each; the WRITEBACK subset must be exactly
+    // 6 windows × 6 = 36 — total counts alone cannot pin it, because a
+    // dropped writeback leg is absorbed by the idempotent step-top register
+    // belt at identical totals while training on stale mirrors (review
+    // D2b-2-5). Register and teardown moves are deliberately uncounted
+    // (mirror bootstrap + final restore).
+    let (uploads, evicts, writeback) = ws_counts(&ws.stderr);
+    assert_eq!(
+        (uploads, evicts, writeback),
+        (114, 114, 36),
+        "weight-stream transfer counts drifted from the designed schedule \
+         (13 fwd × 6 + 6 win × 6 = 114 each; 36 writeback)"
+    );
+    // D2b part 2: the forward really was sliced per CCR segment (prologue +
+    // 2 blocks + epilogue) with all 6 layer params on the streaming plan,
+    // AND the brackets sit on the right slices — the per-slice vectors pin
+    // PLACEMENT (review D2b-2-2: counts + parity are invariant under a
+    // widened plan that re-creates full forward residency).
     assert!(
-        uploads > 0 && evicts > 0,
-        "weight streaming never cycled (uploads {uploads}, evicts {evicts})"
+        ws.stderr.contains(
+            "[weight-stream] forward streaming: 4 slices, 6 streamed params \
+             (6 touched by the primal); uploads/slice [0,3,3,0] \
+             evicts/slice [0,3,3,0]"
+        ),
+        "forward-streaming schedule line missing or changed:\n{}",
+        ws.stderr
+    );
+    // Runtime end-to-end bracket probe: WEIGHTS-surface bytes resident AT
+    // the global allocator peak. The baseline holds the FULL model tag-1
+    // (`.to(cuda)` brackets the transfer in SURFACE_WEIGHTS): embed 16,384
+    // + norms + 2×(norm_f + w_up + w_down) = ~148 KB. Tight streaming
+    // brackets keep at most the epilogue residents + ~one block uploaded
+    // (~82 KB → ratio ~0.56); a widened EMISSION (all blocks resident
+    // through the peak) restores ~1.0. Assert ≤ 0.7 with the same
+    // allocator-rounding headroom the m_partial gate uses, plus the
+    // baseline ≥ the streamed total as anti-vacuity (the accounting must
+    // actually see full residency for the ratio to mean anything).
+    let ws_weights_at_peak = marker_i64(&ws.stdout, "WEIGHTS_AT_PEAK")
+        .expect("WEIGHTS_AT_PEAK markers missing (ws arm)");
+    let base_weights_at_peak = marker_i64(&base.stdout, "WEIGHTS_AT_PEAK")
+        .expect("WEIGHTS_AT_PEAK markers missing (baseline arm)");
+    assert!(
+        base_weights_at_peak >= 131_584,
+        "baseline weights-at-peak ({base_weights_at_peak}) below the \
+         streamed total — the surface accounting is not seeing residency"
+    );
+    let ratio = ws_weights_at_peak as f64 / base_weights_at_peak as f64;
+    assert!(
+        ratio <= 0.7,
+        "weights-surface bytes at the global peak did not shrink \
+         (ws {ws_weights_at_peak} vs base {base_weights_at_peak}, ratio \
+         {ratio:.3}) — forward brackets have widened"
     );
     // Baseline arm must not stream.
     assert!(
@@ -571,6 +652,69 @@ fn csla_weight_stream_parity_gpu() {
     assert!(
         bytes_a == bytes_b,
         "saved model bytes diverged under --weight-stream"
+    );
+}
+
+/// D2b × D2a composition (GPU): --weight-stream WITH --optim-state-offload —
+/// the exact 1B production configuration (the 9.10 GB measurement). The
+/// per-layer update site interleaves the offload envelope's staged-m/v
+/// drain with the θ writeback evict; no other gate exercises that
+/// interleaving (review D2b-2-4). Both arms carry --optim-state-offload so
+/// the diff is the streaming flag alone; bit-exact + exact counters.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_weight_stream_offload_parity_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_wso_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("csla_off.nslm");
+    let save_b = tmp.join("csla_off_ws.nslm");
+
+    let base = run_program(
+        &program("csla_layerwise_ffn.nsl", true, &save_a, &[]),
+        "wso_a",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum", "--optim-state-offload"],
+    );
+    assert!(base.success, "csla+offload arm failed:\n{}", base.stderr);
+    let ws = run_program(
+        &program("csla_layerwise_ffn.nsl", true, &save_b, &[]),
+        "wso_b",
+        true,
+        true,
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--optim-state-offload",
+            "--weight-stream",
+        ],
+    );
+    assert!(ws.success, "csla+offload+ws arm failed:\n{}", ws.stderr);
+
+    assert_eq!(
+        ws_counts(&ws.stderr),
+        (114, 114, 36),
+        "transfer counts drifted under the offload composition"
+    );
+    assert!(
+        ws.stderr.contains(
+            "[weight-stream] forward streaming: 4 slices, 6 streamed params \
+             (6 touched by the primal); uploads/slice [0,3,3,0] \
+             evicts/slice [0,3,3,0]"
+        ),
+        "forward-streaming schedule line missing under the offload \
+         composition:\n{}",
+        ws.stderr
+    );
+    assert_eq!(
+        base.loss_stream, ws.loss_stream,
+        "loss stream diverged under --weight-stream + --optim-state-offload"
+    );
+    let bytes_a = std::fs::read(&save_a).expect("csla+offload model_save missing");
+    let bytes_b = std::fs::read(&save_b).expect("csla+offload+ws model_save missing");
+    assert!(
+        bytes_a == bytes_b,
+        "saved model bytes diverged under --weight-stream + --optim-state-offload"
     );
 }
 

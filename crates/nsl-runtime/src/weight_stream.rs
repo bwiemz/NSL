@@ -9,6 +9,16 @@
 //! streaming compromise; at 7B it is 28.7 GiB and the difference between
 //! possible and impossible.
 //!
+//! Part 2 (forward segment streaming) closes the loop: the forward is
+//! lowered per CCR block segment with an upload before each layer's
+//! segment and a read-only evict after its last primal read, so a streamed
+//! parameter holds device memory ONLY inside its brackets for the whole
+//! training loop (registration happens idempotently at step-body top;
+//! teardown restores residency for `model_save`/eval). Consequence: any
+//! OTHER reader of θ during training — a user callback dereferencing
+//! model fields in `on_step`/`on_epoch`, a mid-training `model_save` —
+//! hits an evicted tensor and crashes loudly on the null data pointer.
+//!
 //! Mechanism: a runtime SIDE TABLE mapping tensor pointer → pinned host
 //! mirror. The `NslTensor` ABI (13 fields, `#[repr(C)]`, documented layout)
 //! does NOT change, and the tensor POINTER never changes — `param_list`,
@@ -46,8 +56,14 @@ unsafe impl Send for Mirror {}
 static MIRRORS: Mutex<Option<HashMap<i64, Mirror>>> = Mutex::new(None);
 
 /// Anti-vacuity counters for the gates (uploads / evictions performed).
+/// WS_EVICTS_WB counts the writeback subset separately: the total evict
+/// count alone cannot distinguish the post-update writeback evict from a
+/// read-only one absorbed by the idempotent step-top register belt (review
+/// D2b-2-5) — dropping the writeback leg would leave totals unchanged but
+/// silently train on stale mirrors after the first window.
 pub static WS_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WS_EVICTS_WB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
@@ -58,12 +74,13 @@ pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
 /// host mirror, copy the current device bytes into it, free the device
 /// buffer, and null `t.data` (evicted state).
 ///
-/// IDEMPOTENT ACROSS WINDOWS: on an already-registered RESIDENT tensor this
-/// degenerates to a writeback-free evict — the mirror is current by
-/// construction (post-update evicts write back; forwards never mutate θ;
-/// the window-end restore uploads from that same mirror), so the device
-/// bytes equal the mirror and a pure free suffices. Emitted at every
-/// window start for each layer-grouped param.
+/// IDEMPOTENT: on an already-registered RESIDENT tensor this degenerates
+/// to a writeback-free evict — the mirror is current by construction
+/// (post-update evicts write back; forwards never mutate θ), so the
+/// device bytes equal the mirror and a pure free suffices; on an
+/// already-registered EVICTED tensor it is a no-op. Emitted at step-body
+/// top every micro-batch (part 2: makes the very first forward stream)
+/// and again at each window start as a belt.
 ///
 /// Aborts loudly on CPU tensors, views, or non-owning tensors — the
 /// codegen admission routes only plain owning device params here.
@@ -184,6 +201,9 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
         crate::cuda::inner::free_managed(t.data);
         t.data = std::ptr::null_mut();
         WS_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if writeback != 0 {
+            WS_EVICTS_WB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -194,9 +214,11 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
 }
 
 /// Restore every registered, currently-evicted parameter to device
-/// residency WITHOUT dropping the table — emitted after the window's
-/// epilogue updates so the next iterations' forwards see ordinary resident
-/// weights (the window-scoped eviction cycle).
+/// residency WITHOUT dropping the table. Part 1 emitted this after the
+/// window's epilogue updates (window-scoped cycle); part 2's segment-
+/// streamed forward re-uploads per layer instead, so codegen no longer
+/// emits it — kept as a runtime API for tooling and as the documented
+/// "make everything resident now" escape hatch.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_all() {
     #[cfg(feature = "cuda")]
@@ -228,9 +250,12 @@ pub extern "C" fn nsl_weight_stream_teardown() {
             let t = NslTensor::from_ptr(ptr);
             crate::cuda::inner::ensure_context();
             if t.data.is_null() {
-                // NOTE: deliberately NOT counted in WS_UPLOADS — steady
-                // state is resident at teardown, and the gates' designed
-                // transfer arithmetic (uploads = windows x params x 2)
+                // NOTE: deliberately NOT counted in WS_UPLOADS — under
+                // part-2 whole-loop streaming EVERY streamed param arrives
+                // here evicted (this branch is the steady state, and this
+                // restore is load-bearing for model_save/eval), and the
+                // gates' designed transfer arithmetic (uploads =
+                // fwd_microbatches × streamed + windows × streamed)
                 // depends on teardown restores staying out of the count.
                 // Allocations here run under the ambient surface (post-
                 // training accounting only; frees reconcile by recorded

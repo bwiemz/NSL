@@ -65,6 +65,20 @@ print("Model on GPU")
 #   nsl run --source-ad --checkpoint-blocks --layerwise-accum \
 #       --optim-state-offload <this file, with batch_size=2 seq_len=512
 #       grad_accumulation=8 tokens=16384>
+#
+# D2b PART 2 RESULT (2026-07-17, forward segment streaming): adding
+# --weight-stream to the demo config drops the allocator peak to 9.10 GB
+# (from 12.99 — minus the 16-layer streamed weight stack, 3.89 GB). The
+# forward lowers as 18 per-CCR-segment slices; each of the 144 streamed
+# params uploads before its layer's segment and evicts (read-only) after
+# its last primal touch; the window backward re-uploads per replay range
+# and writes back after each layer's update. Losses 11.80 -> 10.88 (same
+# trajectory), transfer counters EXACT: 2592 uploads = 2592 evicts =
+# 16 forwards x 144 + 2 windows x 144. Remaining surfaces at peak:
+# activations 8.69 GB (~96% — the D1a window buffers' per-micro-batch
+# logits chains; @fused_lm_ce tape-carry is the next lever), m_partial
+# 646 MB, embed + epilogue residents. 7B remains blocked on host RAM
+# (f32 masters + m/v > 63 GB; needs P0.3 fp16 host moments).
 let tokens = full([2048], 1.0)
 let loader = DataLoader(tokens, batch_size=1, seq_len=256, shuffle=false, drop_last=true)
 

@@ -1218,13 +1218,15 @@ pub struct CompileOptions {
     /// loudly on grad_clip, WGGO mode tables, `--optim-state-offload`,
     /// `--checkpoint-compress`, and the pipelined/tape paths.
     pub layerwise_accum: bool,
-    /// D2b (`--weight-stream`, requires `--layerwise-accum`): window-scoped
-    /// weight eviction. Layer-grouped params keep pinned host mirrors; at
-    /// each accumulation-window boundary their device buffers are freed,
-    /// re-uploaded per replay range, written back after that layer's
-    /// update, and restored for the next forwards. Tensor POINTERS never
-    /// change (side-table mechanism), so param_list / struct fields / the
-    /// tie guard stay valid. Byte-preserving — bit-exact.
+    /// D2b (`--weight-stream`, requires `--layerwise-accum`): layer weight
+    /// streaming across the WHOLE training loop. Layer-grouped params keep
+    /// pinned host mirrors; the forward (sliced per CCR segment) uploads
+    /// each layer before its segment and evicts after its last primal
+    /// read, and the window backward re-uploads per replay range and
+    /// writes back after that layer's update. Teardown restores residency
+    /// for model_save/eval. Tensor POINTERS never change (side-table
+    /// mechanism), so param_list / struct fields / the tie guard stay
+    /// valid. Byte-preserving — bit-exact.
     pub weight_stream: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,

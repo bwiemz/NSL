@@ -85,4 +85,15 @@ print("MPARTIAL_PEAK_BEGIN")
 print(gpu_surface_peak_bytes(4))
 print("MPARTIAL_PEAK_END")
 
+# D2b part-2 bracket probe (GPU runs): WEIGHTS-surface bytes resident AT
+# the global allocator peak. `.to(cuda)` brackets the model transfer in
+# SURFACE_WEIGHTS, so the baseline reads full residency (~148 KB) while
+# TIGHT streaming brackets keep only the epilogue residents + ~one block
+# uploaded (~82 KB of which 65,792 B is the block); a widened plan (all
+# uploads before slice 0 / evicts after the last) restores full residency
+# while leaving transfer counts and parity unchanged. 0 on CPU runs.
+print("WEIGHTS_AT_PEAK_BEGIN")
+print(gpu_surface_at_peak_bytes(1))
+print("WEIGHTS_AT_PEAK_END")
+
 model_save(m, "CSLA_SAVE_PATH")

@@ -56,10 +56,10 @@ pub struct LoweredWengert {
 pub fn compile_wengert_ops(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
-    _state: &mut FuncState,
+    state: &mut FuncState,
     wengert: &WengertList,
     primal_vars: &VarMap,
-    mut on_param_grad: Option<(
+    on_param_grad: Option<(
         &std::collections::HashSet<VarId>,
         &mut dyn FnMut(
             &mut Compiler,
@@ -76,7 +76,73 @@ pub fn compile_wengert_ops(
     // Clone var_types so the lowerer can look up types for any VarId and
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
-    for op in &wengert.ops {
+    compile_wengert_ops_range(
+        compiler,
+        builder,
+        state,
+        wengert,
+        0..wengert.ops.len(),
+        &mut var_map,
+        &mut var_types,
+        &mut owned_values,
+        &mut hook_freed_input_vars,
+        &mut explicit_freed_vars,
+        on_param_grad,
+    )?;
+    // PCA Stage C: adopt the fused-SDPA extras (saved-LSE tensors) into the
+    // step's owned set so cleanup frees them. VarId u32::MAX is a sentinel
+    // no real op produces (it never appears in hook_freed_input_vars).
+    for v in compiler.sdpa_extra_owned.drain(..) {
+        owned_values.push((u32::MAX, v, WengertType::Tensor));
+    }
+    Ok(LoweredWengert {
+        var_map,
+        owned_values,
+        hook_freed_input_vars,
+        explicit_freed_vars,
+    })
+}
+
+/// The sequential-fold core of [`compile_wengert_ops`], parameterized over
+/// an op-index range with all fold state threaded in/out.
+///
+/// CSLA D2b part 2 (forward weight streaming) lowers the primal tape as
+/// per-CCR-segment SLICES with upload/evict FFI calls emitted between
+/// them. All slices lower into the same straight-line block chain, so SSA
+/// values flow across slice boundaries for free — but the fold state must
+/// be threaded explicitly: `var_types` carries the local Integer-vs-Tensor
+/// inference (losing it at a boundary would re-default a slice-k integer
+/// result to Tensor in slice k+1 and push a raw integer into
+/// `owned_values` → `nsl_tensor_free` on a non-pointer), and the
+/// owned/freed sets concatenate across slices so cleanup sees exactly what
+/// the monolithic lowering would have produced.
+///
+/// The `sdpa_extra_owned` drain deliberately stays in the WRAPPER (and in
+/// the sliced caller, after its last slice): extras accrue on the compiler
+/// across the whole lowering regardless of slicing.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_wengert_ops_range(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    _state: &mut FuncState,
+    wengert: &WengertList,
+    range: std::ops::Range<usize>,
+    var_map: &mut VarMap,
+    var_types: &mut HashMap<VarId, WengertType>,
+    owned_values: &mut Vec<(VarId, Value, WengertType)>,
+    hook_freed_input_vars: &mut std::collections::HashSet<VarId>,
+    explicit_freed_vars: &mut std::collections::HashSet<VarId>,
+    mut on_param_grad: Option<(
+        &std::collections::HashSet<VarId>,
+        &mut dyn FnMut(
+            &mut Compiler,
+            VarId,
+            Value,
+            &mut FunctionBuilder,
+        ) -> Result<(), CodegenError>,
+    )>,
+) -> Result<(), CodegenError> {
+    for op in &wengert.ops[range] {
         // Skip ops whose inputs can't be resolved (ghost VarIds from
         // get_or_create_adjoint that never received a gradient).
         // These produce dead adjoint paths for non-differentiable ops.
@@ -131,7 +197,7 @@ pub fn compile_wengert_ops(
             var_types.insert(op.result, WengertType::Integer);
             continue;
         }
-        let result_val = lower_single_op(compiler, builder, op, &var_map, &var_types)?;
+        let result_val = lower_single_op(compiler, builder, op, var_map, var_types)?;
         var_map.insert(op.result, result_val);
         // FASE hook: consume parameter gradients immediately during lowering.
         if let Some(ref mut hook) = on_param_grad {
@@ -201,18 +267,74 @@ pub fn compile_wengert_ops(
         }
         var_types.insert(op.result, result_type);
     }
-    // PCA Stage C: adopt the fused-SDPA extras (saved-LSE tensors) into the
-    // step's owned set so cleanup frees them. VarId u32::MAX is a sentinel
-    // no real op produces (it never appears in hook_freed_input_vars).
-    for v in compiler.sdpa_extra_owned.drain(..) {
-        owned_values.push((u32::MAX, v, WengertType::Tensor));
+    Ok(())
+}
+
+/// CSLA D2b part 2: a PURE replica of the ownership/type fold
+/// [`compile_wengert_ops_range`] performs over a PRIMAL tape — no IR
+/// emission, no `Value`s. Lets stmt.rs run `CcrPlan::restrict_to_owned`
+/// BEFORE the forward lowering: the segment-streamed forward needs the
+/// post-restriction plan (and the final adjoint derived from it) at
+/// emission time, but the restriction historically consumed the lowering's
+/// own owned classification. stmt.rs asserts post-lowering that the actual
+/// classification matches this prediction — divergence is a compiler bug
+/// and fails the compile loudly rather than mis-planning silently.
+///
+/// Replicated decisions, in order: ghost-skip (an op with an unresolved
+/// input produces nothing — resolution seeds from `seed_resolved`, the
+/// primal_vars key set), `FreeTensor` interception (result becomes a
+/// resolved Integer, nothing owned — absent from real primal tapes but
+/// modeled for faithfulness), the Add/Sub/Mul/Div both-Integer fold,
+/// `Constant` extractor-type preservation, `should_cleanup_result`.
+/// The FASE hook never fires on primal tapes (stmt.rs passes None), so no
+/// hook interaction is modeled. The `sdpa_extra_owned` u32::MAX sentinel
+/// entries are compiler-side extras, not tape results — callers exclude
+/// them when comparing.
+pub fn infer_primal_owned(
+    wengert: &WengertList,
+    seed_resolved: &std::collections::HashSet<VarId>,
+) -> HashMap<VarId, WengertType> {
+    let mut resolved = seed_resolved.clone();
+    let mut var_types = wengert.var_types.clone();
+    let mut owned: HashMap<VarId, WengertType> = HashMap::new();
+    for op in &wengert.ops {
+        if !op.inputs.iter().all(|vid| resolved.contains(vid)) {
+            continue;
+        }
+        if matches!(op.op, PrimalOp::FreeTensor) {
+            resolved.insert(op.result);
+            var_types.insert(op.result, WengertType::Integer);
+            continue;
+        }
+        let result_type = match &op.op {
+            PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+                let a_ty = var_types
+                    .get(&op.inputs[0])
+                    .copied()
+                    .unwrap_or(WengertType::Tensor);
+                let b_ty = var_types
+                    .get(&op.inputs[1])
+                    .copied()
+                    .unwrap_or(WengertType::Tensor);
+                if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
+                    WengertType::Integer
+                } else {
+                    WengertType::Tensor
+                }
+            }
+            PrimalOp::Constant(_) => var_types
+                .get(&op.result)
+                .copied()
+                .unwrap_or(type_for_op(&op.op)),
+            _ => type_for_op(&op.op),
+        };
+        resolved.insert(op.result);
+        if should_cleanup_result(&op.op, result_type) {
+            owned.insert(op.result, result_type);
+        }
+        var_types.insert(op.result, result_type);
     }
-    Ok(LoweredWengert {
-        var_map,
-        owned_values,
-        hook_freed_input_vars,
-        explicit_freed_vars,
-    })
+    owned
 }
 
 /// Resolve all input VarIds for a WengertOp to their Cranelift Values.
