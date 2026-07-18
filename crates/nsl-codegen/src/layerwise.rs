@@ -353,6 +353,25 @@ pub fn forward_slices(
     Ok(slices)
 }
 
+/// CSLA D2b: params that must stay RESIDENT under weight streaming — any
+/// param rooting a transitive primal VIEW chain (`view_of`: view result vid
+/// → rooting param vid) whose view lands in the buffered-import set. A
+/// buffered view slot caches a data pointer into θ's storage; evicting θ
+/// frees that storage and the later upload allocates a NEW device buffer,
+/// so the slot would read recycled memory — silent corruption (review
+/// D2b-1). Exclusion is always safe: the param merely stays resident.
+pub fn ws_view_rooted_params(
+    imports: &[VarId],
+    view_of: &HashMap<VarId, VarId>,
+) -> HashSet<VarId> {
+    let import_set: HashSet<VarId> = imports.iter().copied().collect();
+    view_of
+        .iter()
+        .filter(|(view_vid, _)| import_set.contains(view_vid))
+        .map(|(_, param_vid)| *param_vid)
+        .collect()
+}
+
 /// CSLA D2b part 2: per-parameter forward touch range over a view closure.
 ///
 /// For each streamed param VarId, the (first, last) SLICE index whose ops
@@ -758,6 +777,35 @@ mod tests {
         assert_eq!(touch.get(&10), Some(&(0, 1)));
         assert_eq!(touch.get(&11), Some(&(1, 1)));
         assert_eq!(touch.get(&12), None);
+    }
+
+    #[test]
+    fn view_rooted_param_with_buffered_view_is_excluded() {
+        // Param 10's transpose (vid 200) is adjoint-read (buffered as a
+        // window slot) -> 10 must stay resident. Param 11's view (201) is
+        // NOT buffered -> 11 streams. A view of a non-param (300 -> 99
+        // where 99 is in view_of but the import is absent) contributes
+        // nothing.
+        let imports = vec![200, 500];
+        let view_of: HashMap<VarId, VarId> =
+            [(200, 10), (201, 11), (300, 99)].into_iter().collect();
+        let rooted = ws_view_rooted_params(&imports, &view_of);
+        assert!(rooted.contains(&10));
+        assert!(!rooted.contains(&11));
+        assert!(!rooted.contains(&99));
+        assert_eq!(rooted.len(), 1);
+    }
+
+    #[test]
+    fn view_rooted_transitive_chain_via_caller_map() {
+        // The caller's view_of map is already TRANSITIVE (view-of-view maps
+        // to the ROOT param): a buffered second-order view must exclude the
+        // root exactly like a first-order one.
+        let imports = vec![210];
+        let view_of: HashMap<VarId, VarId> =
+            [(200, 10), (210, 10)].into_iter().collect(); // 210 = view of 200
+        let rooted = ws_view_rooted_params(&imports, &view_of);
+        assert_eq!(rooted, [10].into_iter().collect());
     }
 
     #[test]

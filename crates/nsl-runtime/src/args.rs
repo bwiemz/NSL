@@ -102,9 +102,10 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
 
 extern "C" fn nsl_weight_stream_count_atexit() {
     eprintln!(
-        "[weight-stream] uploads: {} evicts: {}",
+        "[weight-stream] uploads: {} evicts: {} writeback: {}",
         crate::weight_stream::WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_EVICTS_WB.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 

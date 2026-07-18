@@ -6502,16 +6502,14 @@ impl Compiler<'_> {
                             // (always safe, merely unstreamed). The import
                             // list is the slot superset (ghost imports never
                             // become slots but also never root tensor views).
-                            let import_set: std::collections::HashSet<
-                                crate::wengert::VarId,
-                            > = imports.iter().copied().collect();
-                            let view_rooted: std::collections::HashSet<
-                                crate::wengert::VarId,
-                            > = primal_view_of
-                                .iter()
-                                .filter(|(view_vid, _)| import_set.contains(view_vid))
-                                .map(|(_, param_vid)| *param_vid)
-                                .collect();
+                            // Pure helper — unit-tested in layerwise.rs
+                            // (review D2b-2-3: the exclusion never fires on
+                            // the gate fixtures, so the logic is pinned at
+                            // the unit level).
+                            let view_rooted = crate::layerwise::ws_view_rooted_params(
+                                &imports,
+                                &primal_view_of,
+                            );
                             let unstreamable_idxs: std::collections::HashSet<i64> =
                                 csla_params
                                     .iter()
@@ -6592,13 +6590,28 @@ impl Compiler<'_> {
                             }
                             // Anti-vacuity: gates assert this exact line so a
                             // degenerate no-slice or no-touch plan can't pass
-                            // as streaming.
+                            // as streaming. The per-slice vectors pin bracket
+                            // PLACEMENT, not just cardinality (review D2b-2-2:
+                            // a plan widened by touch over-extension — e.g. all
+                            // uploads in slice 0, all evicts in the last —
+                            // produces the same counts and bit-exact parity
+                            // while silently reverting to full forward
+                            // residency).
+                            let per_slice = |v: &[Vec<i64>]| -> String {
+                                v.iter()
+                                    .map(|s| s.len().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            };
                             eprintln!(
                                 "[weight-stream] forward streaming: {} slices, \
-                                 {} streamed params ({} touched by the primal)",
+                                 {} streamed params ({} touched by the primal); \
+                                 uploads/slice [{}] evicts/slice [{}]",
                                 slices.len(),
                                 ws_all.len(),
                                 touch.len(),
+                                per_slice(&upload_per_slice),
+                                per_slice(&evict_per_slice),
                             );
                             ws_streamed_sorted = ws_all.clone();
                             Some(WsForwardPlan {
@@ -10107,11 +10120,13 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_free", &[dl])?;
         }
 
-        // D2b: restore any evicted weights and release the pinned mirrors so
-        // post-training code (model_save, eval) sees ordinary device
-        // tensors. Steady state between windows is already resident; this
-        // covers a partial-tail exit mid... (params stay resident during the
-        // tail, so this is belt-and-braces + the mirror release).
+        // D2b part 2: LOAD-BEARING — under whole-loop streaming every
+        // streamed param exits the training loop EVICTED (the forward
+        // evicts after its last primal touch each micro-batch and there is
+        // no post-epilogue restore), so this teardown is the SOLE restore
+        // of device residency for model_save/eval, plus the pinned-mirror
+        // release. Removing or reordering it after any θ reader crashes on
+        // null data pointers.
         if csla_active && self.compile_options.weight_stream {
             self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
         }

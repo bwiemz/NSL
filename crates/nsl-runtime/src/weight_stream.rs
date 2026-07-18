@@ -56,8 +56,14 @@ unsafe impl Send for Mirror {}
 static MIRRORS: Mutex<Option<HashMap<i64, Mirror>>> = Mutex::new(None);
 
 /// Anti-vacuity counters for the gates (uploads / evictions performed).
+/// WS_EVICTS_WB counts the writeback subset separately: the total evict
+/// count alone cannot distinguish the post-update writeback evict from a
+/// read-only one absorbed by the idempotent step-top register belt (review
+/// D2b-2-5) — dropping the writeback leg would leave totals unchanged but
+/// silently train on stale mirrors after the first window.
 pub static WS_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WS_EVICTS_WB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
@@ -195,6 +201,9 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
         crate::cuda::inner::free_managed(t.data);
         t.data = std::ptr::null_mut();
         WS_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if writeback != 0 {
+            WS_EVICTS_WB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -241,9 +250,12 @@ pub extern "C" fn nsl_weight_stream_teardown() {
             let t = NslTensor::from_ptr(ptr);
             crate::cuda::inner::ensure_context();
             if t.data.is_null() {
-                // NOTE: deliberately NOT counted in WS_UPLOADS — steady
-                // state is resident at teardown, and the gates' designed
-                // transfer arithmetic (uploads = windows x params x 2)
+                // NOTE: deliberately NOT counted in WS_UPLOADS — under
+                // part-2 whole-loop streaming EVERY streamed param arrives
+                // here evicted (this branch is the steady state, and this
+                // restore is load-bearing for model_save/eval), and the
+                // gates' designed transfer arithmetic (uploads =
+                // fwd_microbatches × streamed + windows × streamed)
                 // depends on teardown restores staying out of the count.
                 // Allocations here run under the ambient surface (post-
                 // training accounting only; frees reconcile by recorded
