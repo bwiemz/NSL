@@ -4871,10 +4871,9 @@ impl Compiler<'_> {
             /// on_step/on_epoch after the backward phase; it is freed by the
             /// conditional at the per-iteration loss-free site instead).
             loss_slot: Option<usize>,
-            /// D1b: the layerwise schedule (computed on the FINAL adjoint,
-            /// so its indices match the replay slices exactly) and the
-            /// per-param update facts.
-            plan: crate::layerwise::LayerwisePlan,
+            /// D1b: the per-param update facts (the layerwise plan itself
+            /// is consumed by the pre-forward schedule derivation and no
+            /// longer travels here — `schedule` below is its product).
             params: Vec<CslaParam>,
             /// PRIMAL-side zero-copy views of trainable params (transpose /
             /// reshape chains rooted at a param leaf): view result vid →
@@ -4900,6 +4899,30 @@ impl Compiler<'_> {
             /// were never pushed and their LSEs must still free per
             /// iteration or every fused-fired one leaks for the whole run.
             lse_pushed: std::collections::HashSet<Value>,
+            /// D2b part 2: the layer-major schedule, computed ONCE before
+            /// the forward lowering so the segment-streamed forward and the
+            /// window backward agree on ranges, update grouping, and the
+            /// streamed-param set BY CONSTRUCTION (two independent
+            /// derivations could disagree on which params the forward must
+            /// re-upload — a null-data crash at best).
+            schedule: CslaSchedule,
+        }
+        /// D2b part 2: the shared layer-major schedule (see
+        /// `CslaPending.schedule`).
+        struct CslaSchedule {
+            /// Positional partition of the FINAL adjoint into replay
+            /// ranges (prologue, one per layer in backward order; the last
+            /// range swallows the embedding-backward epilogue ops).
+            ranges: Vec<crate::layerwise::ReplayRange>,
+            /// Per-range accum/param_list indices updating right after
+            /// that range's replay.
+            layer_group: Vec<Vec<i64>>,
+            /// Epilogue group: every param_paths slot not claimed by a
+            /// range (globals / tied / cross-layer / dead params).
+            global_group: Vec<i64>,
+            /// Weight-streamed params (`--weight-stream`): layer-grouped
+            /// minus view-rooted, sorted. Empty when streaming is off.
+            ws_streamed: Vec<i64>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -6040,59 +6063,38 @@ impl Compiler<'_> {
                     None
                 };
 
-                // NSL_PHASE_TIMING (deferral-closure 2026-07-14): per-micro-batch
-                // forward/backward wall-clock split, printed by the runtime as
-                // "[phase] fwd=... bwd=..." lines. Env is read at COMPILE time —
-                // `nsl run` compiles and executes in one process so this IS the
-                // run-time setting; for `nsl build` the instrumentation is baked
-                // in iff the env was set at build time. Source-AD path only (the
-                // tape path's backward is a single opaque nsl_tape_backward call).
-                let phase_timing =
-                    std::env::var("NSL_PHASE_TIMING").ok().as_deref() == Some("1");
-                let phase_t0 = if phase_timing {
-                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
-                    Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
-                } else {
-                    None
-                };
-
-                // Preserve primal inputs for the adjoint: block forward FBIP from
-                // overwriting a uniquely-owned activation input (e.g. the matmul
-                // temp feeding `silu(x@W)`, refcount 1) that an input-reading
-                // backward still needs. Dropped before the adjoint lowering below.
-                // See `emit_inplace_suppress`.
-                self.emit_inplace_suppress(builder, true)?;
-                let full_lowered = crate::wengert_lower::compile_wengert_ops(
-                    self,
-                    builder,
-                    state,
-                    &effective_primal,
-                    &primal_vars,
-                    None, // FASE on_param_grad hook — wired in Task 3
-                )?;
-                self.emit_inplace_suppress(builder, false)?;
-                let full_vars = &full_lowered.var_map;
-
-                let loss_val = *full_vars.get(&loss_var_id).ok_or_else(|| {
-                    CodegenError::new("source AD: loss VarId not found in compiled forward graph")
-                })?;
+                // ── D2b part 2: the pre-forward pure pipeline ───────────
+                // Everything from here to the forward lowering is PURE
+                // analysis (no IR emission). Historically the adjoint
+                // pipeline ran after the forward because
+                // `restrict_to_owned` consumed the lowering's own owned
+                // classification; the segment-streamed forward needs the
+                // FINAL adjoint's layer schedule at emission time, so the
+                // restriction now consumes a pure replica of the
+                // ownership fold (`infer_primal_owned`) and the lowering
+                // asserts it classified identically afterwards.
+                let inferred_owned: Option<
+                    std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::WengertType,
+                    >,
+                > = ccr_plan.as_ref().map(|_| {
+                    let seed: std::collections::HashSet<crate::wengert::VarId> =
+                        primal_vars.keys().copied().collect();
+                    crate::wengert_lower::infer_primal_owned(&effective_primal, &seed)
+                });
 
                 // CCR P1.a: restrict the recompute set to what the primal
-                // lowering itself classified as owned Tensors — the tape's
+                // lowering will classify as owned Tensors — the tape's
                 // type default over-claims for scalar arithmetic (raw f64
                 // SSA values), which must neither be cloned nor freed; the
                 // adjoint keeps consuming the original scalar values.
                 let mut ccr_plan = ccr_plan;
                 if let Some(plan) = &mut ccr_plan {
-                    let owned: std::collections::HashMap<
-                        crate::wengert::VarId,
-                        crate::wengert::WengertType,
-                    > = full_lowered
-                        .owned_values
-                        .iter()
-                        .map(|(vid, _, ty)| (*vid, *ty))
-                        .collect();
-                    if !plan.restrict_to_owned(&owned) {
+                    let owned = inferred_owned
+                        .as_ref()
+                        .expect("inferred_owned computed whenever a plan exists");
+                    if !plan.restrict_to_owned(owned) {
                         eprintln!(
                             "[ccr] nothing recomputable after the owned-tensor \
                              restriction; running without checkpointing"
@@ -6153,33 +6155,6 @@ impl Compiler<'_> {
                     ));
                 }
 
-                // CCR P1.a: free the checkpointed block interiors NOW —
-                // the forward is done and the backward will recompute them.
-                // Lowered as a tiny FreeTensor-only list seeded with the
-                // primal var_map; `explicit_freed_vars` flows into the
-                // bulk-free exclusion below so nothing double-frees.
-                // (Refcounted runtime: views holding a reference keep the
-                // storage alive, so this is a decrement, not a hard free.)
-                let ccr_freed_primal: std::collections::HashSet<crate::wengert::VarId> =
-                    if let Some(plan) = &ccr_plan {
-                        let free_list = crate::ccr::build_early_free_list(plan);
-                        let freed_lowered = crate::wengert_lower::compile_wengert_ops(
-                            self, builder, state, &free_list, full_vars, None,
-                        )?;
-                        freed_lowered.explicit_freed_vars
-                    } else {
-                        Default::default()
-                    };
-
-                // NSL_PHASE_TIMING: end of forward+loss (all primal ops are
-                // emitted above; adjoint GENERATION below is compile-time only).
-                let phase_t1 = if phase_timing {
-                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
-                    Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
-                } else {
-                    None
-                };
-
                 // 6. Generate adjoint backward graph from the (possibly
                 //    pruned) primal list.
                 let start_var = extractor.next_var_id().max(ccr_fresh);
@@ -6191,6 +6166,12 @@ impl Compiler<'_> {
                     gen.set_csha_claims(claims);
                 }
                 let mut adjoint = gen.generate(&effective_primal);
+                // D2b part 2: hand the claims BACK for the forward lowering
+                // below (the fused-SDPA claim dispatch reads them); the
+                // compiler slot is cleared again right after the forward, so
+                // the ADJOINT lowering still never sees claims — the same
+                // invariant the old post-forward `take()` enforced.
+                self.csha_backward_claims = gen.take_csha_claims();
                 // T7.1: surface any CSHA fallback diagnostics.
                 for diag in gen.csha_diagnostics() {
                     eprintln!("[nsl] {diag}");
@@ -6272,73 +6253,6 @@ impl Compiler<'_> {
                     }
                 }
 
-                // ── Build FASE consume-per-param hook (Task 3) ──
-                //
-                // When fase_deferred && source_ad_enabled, we wire a callback
-                // into the adjoint lowering that immediately accumulates each
-                // parameter gradient into m_partial and frees it.  This keeps
-                // only one parameter gradient live at a time instead of N.
-                //
-                // Ordering note: `param_paths` (built from
-                // enumerate_model_tensor_paths) drives both param_list
-                // construction (line ~3247) and accum_list construction
-                // (line ~3346).  Both iterate param_paths in the same order,
-                // so param_paths[i] == accum_list[i] == param_list[i].
-                // We index accum_list by looking up the parameter name in
-                // a compile-time param_name→idx map built from param_paths.
-                // (fase_hook_active is defined at the outer scope above.)
-                let mut param_adj_set: std::collections::HashSet<crate::wengert::VarId> =
-                    std::collections::HashSet::new();
-                // Maps adjoint VarId → (param_name, primal_cranelift_value, accum_idx)
-                // The primal_cranelift_value is used for a runtime pointer-scan against
-                // param_list so we find the correct accum_list slot even when
-                // trainable params are a subset of named_param_var_ids.
-                struct ParamHookEntry {
-                    primal_val: Value,
-                    // i64 index into accum_list (== param_list index for this param)
-                    accum_idx: i64,
-                }
-                let mut adj_vid_to_hook_entry: std::collections::HashMap<
-                    crate::wengert::VarId,
-                    ParamHookEntry,
-                > = std::collections::HashMap::new();
-
-                if fase_hook_active {
-                    // Build a compile-time name→index map from param_paths
-                    // (param_paths[i] corresponds to accum_list[i]).
-                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
-                        param_paths
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| (p.as_str(), i as i64))
-                            .collect();
-
-                    for (param_name, primal_vid) in extractor.named_param_var_ids() {
-                        if !self.is_trainable_param_name(param_name) {
-                            continue;
-                        }
-                        let Some(&accum_idx) = param_name_to_accum_idx.get(param_name.as_str())
-                        else {
-                            // Not a tensor param — skip (scalar configs, etc.)
-                            continue;
-                        };
-                        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
-                            continue;
-                        };
-                        let Some(&primal_val) = full_vars.get(primal_vid) else {
-                            continue;
-                        };
-                        param_adj_set.insert(adj_vid);
-                        adj_vid_to_hook_entry.insert(
-                            adj_vid,
-                            ParamHookEntry {
-                                primal_val,
-                                accum_idx,
-                            },
-                        );
-                    }
-                }
-
                 // 6d. CCR: adjoint-region last-use freeing. The 500M/seq1024
                 // per-surface OOM decomposition showed adjoint intermediates
                 // (dx-chain temporaries) are the binding activation wall —
@@ -6407,6 +6321,592 @@ impl Compiler<'_> {
                         4, // GPU f32 training dtype width
                     );
                     eprintln!("[arena]\n{}", arena.render_report("  "));
+                }
+
+                // ── D2b part 2: CSLA schedule precompute (pre-forward) ──
+                // The layerwise plan, per-param facts, replay ranges, and
+                // update grouping — computed HERE (on the final adjoint) so
+                // the segment-streamed forward below and the window backward
+                // consume the same schedule. `CslaPre` flows into the save
+                // phase; `WsForwardPlan` drives the sliced forward emission.
+                struct CslaPre {
+                    params: Vec<CslaParam>,
+                    primal_view_of: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::VarId,
+                    >,
+                    imports: Vec<crate::wengert::VarId>,
+                    schedule: CslaSchedule,
+                }
+                struct WsForwardPlan {
+                    /// Half-open primal-op slices (prologue, per-segment,
+                    /// epilogue) — a partition of the tape.
+                    slices: Vec<(usize, usize)>,
+                    /// Streamed param_list indices registered (= evicted)
+                    /// at step-body top, every iteration (idempotent).
+                    register_idxs: Vec<i64>,
+                    /// Per-slice param_list indices uploaded before /
+                    /// evicted after that slice's ops.
+                    upload_per_slice: Vec<Vec<i64>>,
+                    evict_per_slice: Vec<Vec<i64>>,
+                }
+                let (csla_pre, ws_fwd_plan): (Option<CslaPre>, Option<WsForwardPlan>) =
+                    if csla_active {
+                        let csla_trainable: Vec<(String, crate::wengert::VarId)> = extractor
+                            .named_param_var_ids()
+                            .iter()
+                            .filter(|(name, _)| self.is_trainable_param_name(name))
+                            .map(|(n, v)| (n.clone(), *v))
+                            .collect();
+                        let plan_lw =
+                            crate::layerwise::analyze(&adjoint, &csla_trainable, &|_| None);
+                        let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
+                            param_paths
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| (p.as_str(), i as i64))
+                                .collect();
+                        let csla_params: Vec<CslaParam> = csla_trainable
+                            .iter()
+                            .filter_map(|(name, primal_vid)| {
+                                let &accum_idx = param_name_to_accum_idx.get(name.as_str())?;
+                                Some(CslaParam {
+                                    name: name.clone(),
+                                    primal_vid: *primal_vid,
+                                    adj_vid: gen.adjoint_of(*primal_vid),
+                                    accum_idx,
+                                })
+                            })
+                            .collect();
+                        // PRIMAL-side view chains rooted at trainable params
+                        // (tied-head `embed.transpose(0,1)` etc.) — buffered
+                        // as slots but aliasing θ; the window site checks
+                        // their reads against each param's update range, and
+                        // the forward streamer keys eviction off their last
+                        // read too.
+                        let trainable_vid_set: std::collections::HashSet<
+                            crate::wengert::VarId,
+                        > = csla_trainable.iter().map(|(_, v)| *v).collect();
+                        let mut primal_view_of: std::collections::HashMap<
+                            crate::wengert::VarId,
+                            crate::wengert::VarId,
+                        > = std::collections::HashMap::new();
+                        for op in &effective_primal.ops {
+                            if matches!(
+                                op.op,
+                                crate::wengert::PrimalOp::Transpose { .. }
+                                    | crate::wengert::PrimalOp::Reshape { .. }
+                            ) {
+                                for &input in &op.inputs {
+                                    if trainable_vid_set.contains(&input) {
+                                        primal_view_of.insert(op.result, input);
+                                    } else if let Some(&p) = primal_view_of.get(&input) {
+                                        primal_view_of.insert(op.result, p);
+                                    }
+                                }
+                            }
+                        }
+                        let imports = crate::layerwise::adjoint_primal_imports(
+                            &effective_primal,
+                            &adjoint,
+                        );
+
+                        // ── D1b schedule derivation (moved from the window
+                        // site — indices are FINAL-adjoint positions) ──
+                        let adjoint_len = adjoint.ops.len();
+                        let mut ranges =
+                            crate::layerwise::partition_ranges(&plan_lw, adjoint_len);
+                        if ranges.is_empty() {
+                            // Degenerate (empty adjoint): one empty prologue
+                            // so the update groups still fire.
+                            ranges.push(crate::layerwise::ReplayRange {
+                                start: 0,
+                                end: adjoint_len,
+                                layer: None,
+                            });
+                        }
+                        let n_ranges = ranges.len();
+                        // Adjoint op position by result vid — for grad-op
+                        // containment.
+                        let adj_pos: std::collections::HashMap<
+                            crate::wengert::VarId,
+                            usize,
+                        > = adjoint
+                            .ops
+                            .iter()
+                            .enumerate()
+                            .map(|(i, op)| (op.result, i))
+                            .collect();
+                        // Update groups. A layer's param updates right after
+                        // its range's replay iff its gradient op sits
+                        // positionally INSIDE that range (positional
+                        // attribution slop demotes it to the epilogue group
+                        // — always correct, merely later). Dead params (no
+                        // adjoint) update with their layer on a zero
+                        // accumulator. Every param_paths slot lands in
+                        // exactly one group.
+                        let mut layer_group: Vec<Vec<i64>> = vec![Vec::new(); n_ranges];
+                        let mut grouped: std::collections::HashSet<i64> = Default::default();
+                        {
+                            let param_by_name: std::collections::HashMap<&str, &CslaParam> =
+                                csla_params.iter().map(|p| (p.name.as_str(), p)).collect();
+                            for (ri, range) in ranges.iter().enumerate() {
+                                let Some(li) = range.layer else { continue };
+                                for pinfo in &plan_lw.layers[li].params {
+                                    let Some(cp) = param_by_name.get(pinfo.name.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let in_range =
+                                        match cp.adj_vid.and_then(|a| adj_pos.get(&a)) {
+                                            Some(&pos) => {
+                                                pos >= range.start && pos < range.end
+                                            }
+                                            None => true,
+                                        };
+                                    if in_range && grouped.insert(cp.accum_idx) {
+                                        layer_group[ri].push(cp.accum_idx);
+                                    }
+                                }
+                                layer_group[ri].sort_unstable();
+                            }
+                        }
+                        let global_group: Vec<i64> = (0..param_paths.len() as i64)
+                            .filter(|i| !grouped.contains(i))
+                            .collect();
+                        // Compile-time schedule line — the gates' anti-vacuity
+                        // anchor for the LAYER-MAJOR shape itself (the runtime
+                        // window counter can't distinguish a degenerate
+                        // all-epilogue schedule from the real k-range one).
+                        eprintln!(
+                            "[csla] layer-major schedule: {} ranges, {} layer-grouped params, \
+                             {} epilogue params",
+                            n_ranges,
+                            grouped.len(),
+                            global_group.len(),
+                        );
+
+                        // ── Weight-stream admission (moved from the window
+                        // site) + the part-2 forward streaming plan ──
+                        let ws_active = self.compile_options.weight_stream;
+                        let mut ws_streamed_sorted: Vec<i64> = Vec::new();
+                        let ws_plan = if ws_active {
+                            // Review D2b-1 (HIGH): a buffered primal VIEW of a
+                            // streamed param (e.g. transpose(w) saved for the
+                            // matmul adjoint) caches a data pointer into θ's
+                            // storage — eviction frees that storage and the
+                            // later upload allocates a NEW buffer, so the view
+                            // slot would read recycled memory: silent
+                            // corruption. Any param rooting a view chain that
+                            // lands in the buffered-import set stays RESIDENT
+                            // (always safe, merely unstreamed). The import
+                            // list is the slot superset (ghost imports never
+                            // become slots but also never root tensor views).
+                            let import_set: std::collections::HashSet<
+                                crate::wengert::VarId,
+                            > = imports.iter().copied().collect();
+                            let view_rooted: std::collections::HashSet<
+                                crate::wengert::VarId,
+                            > = primal_view_of
+                                .iter()
+                                .filter(|(view_vid, _)| import_set.contains(view_vid))
+                                .map(|(_, param_vid)| *param_vid)
+                                .collect();
+                            let unstreamable_idxs: std::collections::HashSet<i64> =
+                                csla_params
+                                    .iter()
+                                    .filter(|cp| view_rooted.contains(&cp.primal_vid))
+                                    .map(|cp| cp.accum_idx)
+                                    .collect();
+                            if !unstreamable_idxs.is_empty() {
+                                eprintln!(
+                                    "[weight-stream] {} param(s) stay resident: a buffered \
+                                     view of their storage rides the window slots",
+                                    unstreamable_idxs.len()
+                                );
+                            }
+                            let mut ws_all: Vec<i64> = layer_group
+                                .iter()
+                                .flatten()
+                                .copied()
+                                .filter(|i| !unstreamable_idxs.contains(i))
+                                .collect();
+                            ws_all.sort_unstable();
+                            // Part 2: slice the forward per CCR segment and
+                            // key each streamed param's upload/evict off its
+                            // first/last primal touch (view-closure-extended).
+                            let plan_ref = ccr_plan
+                                .as_ref()
+                                .expect("csla refusal above guarantees a plan");
+                            let seg_bounds: Vec<(usize, usize)> = plan_ref
+                                .segments
+                                .iter()
+                                .map(|s| (s.start, s.end))
+                                .collect();
+                            let slices = crate::layerwise::forward_slices(
+                                &seg_bounds,
+                                effective_primal.ops.len(),
+                            )
+                            .map_err(|e| {
+                                CodegenError::new(format!(
+                                    "--weight-stream: cannot slice the forward per \
+                                     CCR segment: {e}"
+                                ))
+                            })?;
+                            let ws_idx_set: std::collections::HashSet<i64> =
+                                ws_all.iter().copied().collect();
+                            let streamed_vids: std::collections::HashSet<
+                                crate::wengert::VarId,
+                            > = csla_params
+                                .iter()
+                                .filter(|cp| ws_idx_set.contains(&cp.accum_idx))
+                                .map(|cp| cp.primal_vid)
+                                .collect();
+                            let touch = crate::layerwise::forward_touch_slices(
+                                &effective_primal,
+                                &slices,
+                                &streamed_vids,
+                                &primal_view_of,
+                            );
+                            let vid_to_idx: std::collections::HashMap<
+                                crate::wengert::VarId,
+                                i64,
+                            > = csla_params
+                                .iter()
+                                .map(|cp| (cp.primal_vid, cp.accum_idx))
+                                .collect();
+                            let mut upload_per_slice: Vec<Vec<i64>> =
+                                vec![Vec::new(); slices.len()];
+                            let mut evict_per_slice: Vec<Vec<i64>> =
+                                vec![Vec::new(); slices.len()];
+                            for (vid, (first, last)) in &touch {
+                                let idx = vid_to_idx[vid];
+                                upload_per_slice[*first].push(idx);
+                                evict_per_slice[*last].push(idx);
+                            }
+                            for v in upload_per_slice.iter_mut() {
+                                v.sort_unstable();
+                            }
+                            for v in evict_per_slice.iter_mut() {
+                                v.sort_unstable();
+                            }
+                            // Anti-vacuity: gates assert this exact line so a
+                            // degenerate no-slice or no-touch plan can't pass
+                            // as streaming.
+                            eprintln!(
+                                "[weight-stream] forward streaming: {} slices, \
+                                 {} streamed params ({} touched by the primal)",
+                                slices.len(),
+                                ws_all.len(),
+                                touch.len(),
+                            );
+                            ws_streamed_sorted = ws_all.clone();
+                            Some(WsForwardPlan {
+                                slices,
+                                register_idxs: ws_all,
+                                upload_per_slice,
+                                evict_per_slice,
+                            })
+                        } else {
+                            None
+                        };
+                        (
+                            Some(CslaPre {
+                                params: csla_params,
+                                primal_view_of,
+                                imports,
+                                schedule: CslaSchedule {
+                                    ranges,
+                                    layer_group,
+                                    global_group,
+                                    ws_streamed: ws_streamed_sorted,
+                                },
+                            }),
+                            ws_plan,
+                        )
+                    } else {
+                        (None, None)
+                    };
+
+                // NSL_PHASE_TIMING (deferral-closure 2026-07-14): per-micro-batch
+                // forward/backward wall-clock split, printed by the runtime as
+                // "[phase] fwd=... bwd=..." lines. Env is read at COMPILE time —
+                // `nsl run` compiles and executes in one process so this IS the
+                // run-time setting; for `nsl build` the instrumentation is baked
+                // in iff the env was set at build time. Source-AD path only (the
+                // tape path's backward is a single opaque nsl_tape_backward call).
+                let phase_timing =
+                    std::env::var("NSL_PHASE_TIMING").ok().as_deref() == Some("1");
+                let phase_t0 = if phase_timing {
+                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                    Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
+                } else {
+                    None
+                };
+
+                // Preserve primal inputs for the adjoint: block forward FBIP from
+                // overwriting a uniquely-owned activation input (e.g. the matmul
+                // temp feeding `silu(x@W)`, refcount 1) that an input-reading
+                // backward still needs. Dropped before the adjoint lowering below.
+                // See `emit_inplace_suppress`.
+                // D2b part 2: register the streamed params BEFORE the
+                // forward — every iteration, idempotent. Iteration 1
+                // mirrors + evicts (the model arrived resident from
+                // `.to(cuda)`); later iterations no-op (the params are
+                // already evicted — the previous forward/window evicted
+                // them). This is what makes window-1 forwards stream too:
+                // without it the first window's forward peak would still be
+                // the full-residency wall the flag exists to remove.
+                if let Some(wsplan) = &ws_fwd_plan {
+                    for &idx in &wsplan.register_idxs {
+                        let iv = builder.ins().iconst(cl_types::I64, idx);
+                        let pw = self
+                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_weight_stream_register",
+                            &[pw],
+                        )?;
+                    }
+                }
+                self.emit_inplace_suppress(builder, true)?;
+                let full_lowered = if let Some(wsplan) = &ws_fwd_plan {
+                    // Segment-streamed forward: lower the primal per CCR
+                    // slice with upload/evict FFI calls between slices. All
+                    // slices share one straight-line block chain, so SSA
+                    // values flow across boundaries; the fold state
+                    // (var_map/var_types/owned/freed) threads through
+                    // `compile_wengert_ops_range` so the result is
+                    // byte-identical to the monolithic lowering — streaming
+                    // only interleaves resident-set changes for θ.
+                    let mut var_map = primal_vars.clone();
+                    let mut var_types = effective_primal.var_types.clone();
+                    let mut owned_values = Vec::new();
+                    let mut hook_freed_input_vars = std::collections::HashSet::new();
+                    let mut explicit_freed_vars = std::collections::HashSet::new();
+                    for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
+                        if !wsplan.upload_per_slice[si].is_empty() {
+                            // Upload this slice's first-touch params under
+                            // the Weights surface (allocation accounting).
+                            let prev_surf = self.compile_call_by_name(
+                                builder,
+                                "nsl_gpu_get_alloc_surface",
+                                &[],
+                            )?;
+                            let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_gpu_set_alloc_surface",
+                                &[wsurf],
+                            )?;
+                            for &idx in &wsplan.upload_per_slice[si] {
+                                let iv = builder.ins().iconst(cl_types::I64, idx);
+                                let pw = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_list_get",
+                                    &[param_list, iv],
+                                )?;
+                                self.compile_call_by_name(
+                                    builder,
+                                    "nsl_weight_stream_upload",
+                                    &[pw],
+                                )?;
+                            }
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_gpu_set_alloc_surface",
+                                &[prev_surf],
+                            )?;
+                        }
+                        crate::wengert_lower::compile_wengert_ops_range(
+                            self,
+                            builder,
+                            state,
+                            &effective_primal,
+                            s..e,
+                            &mut var_map,
+                            &mut var_types,
+                            &mut owned_values,
+                            &mut hook_freed_input_vars,
+                            &mut explicit_freed_vars,
+                            None,
+                        )?;
+                        // Evict this slice's last-touch params — read-only
+                        // (writeback=0): forwards never mutate θ, the mirror
+                        // is current by construction.
+                        for &idx in &wsplan.evict_per_slice[si] {
+                            let iv = builder.ins().iconst(cl_types::I64, idx);
+                            let pw = self.compile_call_by_name(
+                                builder,
+                                "nsl_list_get",
+                                &[param_list, iv],
+                            )?;
+                            let wb = builder.ins().iconst(cl_types::I64, 0);
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_weight_stream_evict",
+                                &[pw, wb],
+                            )?;
+                        }
+                    }
+                    // Same sdpa-extras adoption the monolithic wrapper does.
+                    for v in self.sdpa_extra_owned.drain(..) {
+                        owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));
+                    }
+                    crate::wengert_lower::LoweredWengert {
+                        var_map,
+                        owned_values,
+                        hook_freed_input_vars,
+                        explicit_freed_vars,
+                    }
+                } else {
+                    crate::wengert_lower::compile_wengert_ops(
+                        self,
+                        builder,
+                        state,
+                        &effective_primal,
+                        &primal_vars,
+                        None, // FASE on_param_grad hook — wired in Task 3
+                    )?
+                };
+                self.emit_inplace_suppress(builder, false)?;
+                // D2b part 2: the adjoint generator consumed the claims
+                // pre-forward and handed them back for the forward's fused
+                // dispatch — clear them NOW so the adjoint/window lowering
+                // never sees claims (the old post-forward `take()` contract).
+                self.csha_backward_claims = None;
+                let full_vars = &full_lowered.var_map;
+
+                // D2b part 2: the plan restriction above consumed
+                // `infer_primal_owned`'s PREDICTION of this lowering's
+                // ownership classification — verify the prediction. A
+                // mismatch means the pure replica and the real fold
+                // diverged: fail the compile loudly rather than run with a
+                // mis-restricted recompute set. (u32::MAX entries are
+                // compiler-side sdpa extras, not tape results.)
+                if let Some(inferred) = &inferred_owned {
+                    let actual: std::collections::HashMap<
+                        crate::wengert::VarId,
+                        crate::wengert::WengertType,
+                    > = full_lowered
+                        .owned_values
+                        .iter()
+                        .filter(|(vid, _, _)| *vid != u32::MAX)
+                        .map(|(vid, _, ty)| (*vid, *ty))
+                        .collect();
+                    if &actual != inferred {
+                        return Err(CodegenError::new(format!(
+                            "internal: infer_primal_owned diverged from the primal \
+                             lowering's ownership classification ({} inferred vs {} \
+                             actual entries) — the CCR plan restriction ran on wrong \
+                             data; this is a compiler bug",
+                            inferred.len(),
+                            actual.len(),
+                        )));
+                    }
+                }
+
+                let loss_val = *full_vars.get(&loss_var_id).ok_or_else(|| {
+                    CodegenError::new("source AD: loss VarId not found in compiled forward graph")
+                })?;
+
+                // CCR P1.a: free the checkpointed block interiors NOW —
+                // the forward is done and the backward will recompute them.
+                // Lowered as a tiny FreeTensor-only list seeded with the
+                // primal var_map; `explicit_freed_vars` flows into the
+                // bulk-free exclusion below so nothing double-frees.
+                // (Refcounted runtime: views holding a reference keep the
+                // storage alive, so this is a decrement, not a hard free.)
+                let ccr_freed_primal: std::collections::HashSet<crate::wengert::VarId> =
+                    if let Some(plan) = &ccr_plan {
+                        let free_list = crate::ccr::build_early_free_list(plan);
+                        let freed_lowered = crate::wengert_lower::compile_wengert_ops(
+                            self, builder, state, &free_list, full_vars, None,
+                        )?;
+                        freed_lowered.explicit_freed_vars
+                    } else {
+                        Default::default()
+                    };
+
+                // NSL_PHASE_TIMING: end of forward+loss (all primal ops are
+                // emitted above; adjoint GENERATION below is compile-time only).
+                let phase_t1 = if phase_timing {
+                    self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
+                    Some(self.compile_call_by_name(builder, "nsl_clock", &[])?)
+                } else {
+                    None
+                };
+
+                // (D2b part 2: adjoint generation, the eliminate passes,
+                // the CCR splice, and the last-use-free insertion all moved
+                // ABOVE the forward lowering — the pre-forward pure
+                // pipeline. `gen` and `adjoint` flow down from there.)
+
+                // ── Build FASE consume-per-param hook (Task 3) ──
+                //
+                // When fase_deferred && source_ad_enabled, we wire a callback
+                // into the adjoint lowering that immediately accumulates each
+                // parameter gradient into m_partial and frees it.  This keeps
+                // only one parameter gradient live at a time instead of N.
+                //
+                // Ordering note: `param_paths` (built from
+                // enumerate_model_tensor_paths) drives both param_list
+                // construction (line ~3247) and accum_list construction
+                // (line ~3346).  Both iterate param_paths in the same order,
+                // so param_paths[i] == accum_list[i] == param_list[i].
+                // We index accum_list by looking up the parameter name in
+                // a compile-time param_name→idx map built from param_paths.
+                // (fase_hook_active is defined at the outer scope above.)
+                let mut param_adj_set: std::collections::HashSet<crate::wengert::VarId> =
+                    std::collections::HashSet::new();
+                // Maps adjoint VarId → (param_name, primal_cranelift_value, accum_idx)
+                // The primal_cranelift_value is used for a runtime pointer-scan against
+                // param_list so we find the correct accum_list slot even when
+                // trainable params are a subset of named_param_var_ids.
+                struct ParamHookEntry {
+                    primal_val: Value,
+                    // i64 index into accum_list (== param_list index for this param)
+                    accum_idx: i64,
+                }
+                let mut adj_vid_to_hook_entry: std::collections::HashMap<
+                    crate::wengert::VarId,
+                    ParamHookEntry,
+                > = std::collections::HashMap::new();
+
+                if fase_hook_active {
+                    // Build a compile-time name→index map from param_paths
+                    // (param_paths[i] corresponds to accum_list[i]).
+                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
+                        param_paths
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| (p.as_str(), i as i64))
+                            .collect();
+
+                    for (param_name, primal_vid) in extractor.named_param_var_ids() {
+                        if !self.is_trainable_param_name(param_name) {
+                            continue;
+                        }
+                        let Some(&accum_idx) = param_name_to_accum_idx.get(param_name.as_str())
+                        else {
+                            // Not a tensor param — skip (scalar configs, etc.)
+                            continue;
+                        };
+                        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
+                            continue;
+                        };
+                        let Some(&primal_val) = full_vars.get(primal_vid) else {
+                            continue;
+                        };
+                        param_adj_set.insert(adj_vid);
+                        adj_vid_to_hook_entry.insert(
+                            adj_vid,
+                            ParamHookEntry {
+                                primal_val,
+                                accum_idx,
+                            },
+                        );
+                    }
                 }
 
                 // 7. Lower ADJOINT Wengert list using full_vars, which now
@@ -6485,8 +6985,12 @@ impl Compiler<'_> {
 
                     let (saves_outer_var, dicts_var) =
                         csla_buffers.expect("csla_buffers allocated when csla_active");
-                    let imports =
-                        crate::layerwise::adjoint_primal_imports(&effective_primal, &adjoint);
+                    // D2b part 2: the plan / params / view chains / imports /
+                    // layer-major schedule were all computed in the
+                    // pre-forward pure pipeline (the forward streamer needed
+                    // them at emission time) — consume, don't recompute.
+                    let pre = csla_pre.expect("csla_pre computed when csla_active");
+                    let imports = pre.imports;
                     let owned_map: std::collections::HashMap<
                         crate::wengert::VarId,
                         crate::wengert::WengertType,
@@ -6604,63 +7108,6 @@ impl Compiler<'_> {
                             .iter()
                             .map(|(vid, e)| (*vid, e.accum_idx))
                             .collect();
-                    // D1b: the layerwise schedule over the FINAL adjoint (its
-                    // op indices are exactly the replay slice indices) + the
-                    // per-param update facts. `params` covers every trainable
-                    // tensor param the extractor saw that has an accum slot;
-                    // param_paths slots NOT covered (unused-in-forward params)
-                    // fall into the epilogue update group at the window site.
-                    let csla_trainable: Vec<(String, crate::wengert::VarId)> = extractor
-                        .named_param_var_ids()
-                        .iter()
-                        .filter(|(name, _)| self.is_trainable_param_name(name))
-                        .map(|(n, v)| (n.clone(), *v))
-                        .collect();
-                    let plan =
-                        crate::layerwise::analyze(&adjoint, &csla_trainable, &|_| None);
-                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
-                        param_paths
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| (p.as_str(), i as i64))
-                            .collect();
-                    let csla_params: Vec<CslaParam> = csla_trainable
-                        .iter()
-                        .filter_map(|(name, primal_vid)| {
-                            let &accum_idx = param_name_to_accum_idx.get(name.as_str())?;
-                            Some(CslaParam {
-                                name: name.clone(),
-                                primal_vid: *primal_vid,
-                                adj_vid: gen.adjoint_of(*primal_vid),
-                                accum_idx,
-                            })
-                        })
-                        .collect();
-                    // PRIMAL-side view chains rooted at trainable params
-                    // (tied-head `embed.transpose(0,1)` etc.) — buffered as
-                    // slots but aliasing θ; the window site checks their
-                    // reads against each param's update range.
-                    let trainable_vid_set: std::collections::HashSet<crate::wengert::VarId> =
-                        csla_trainable.iter().map(|(_, v)| *v).collect();
-                    let mut primal_view_of: std::collections::HashMap<
-                        crate::wengert::VarId,
-                        crate::wengert::VarId,
-                    > = std::collections::HashMap::new();
-                    for op in &effective_primal.ops {
-                        if matches!(
-                            op.op,
-                            crate::wengert::PrimalOp::Transpose { .. }
-                                | crate::wengert::PrimalOp::Reshape { .. }
-                        ) {
-                            for &input in &op.inputs {
-                                if trainable_vid_set.contains(&input) {
-                                    primal_view_of.insert(op.result, input);
-                                } else if let Some(&p) = primal_view_of.get(&input) {
-                                    primal_view_of.insert(op.result, p);
-                                }
-                            }
-                        }
-                    }
                     csla_loss_buffered = loss_slot.is_some();
                     csla_teardown_slots = Some(
                         slots
@@ -6693,11 +7140,11 @@ impl Compiler<'_> {
                         hook_accum_idx,
                         accum_scale: fase_plan.recipe.accum_scale,
                         loss_slot,
-                        plan,
-                        params: csla_params,
-                        primal_view_of,
+                        params: pre.params,
+                        primal_view_of: pre.primal_view_of,
                         lse_slots,
                         lse_pushed: csla_lse_pushed,
+                        schedule: pre.schedule,
                     });
                     None
                 } else if fase_hook_active && !param_adj_set.is_empty() {
@@ -7562,79 +8009,18 @@ impl Compiler<'_> {
             let accum_val = accum_list
                 .ok_or_else(|| CodegenError::new("csla requires accum_list"))?;
 
-            // ── D1b compile-time schedule derivation ────────────────────
-            // Positional partition of the FINAL adjoint into replay ranges
-            // (prologue, one per layer in backward order; the last range
-            // swallows the embedding-backward epilogue ops).
-            let adjoint_len = pending.adjoint.ops.len();
-            let mut ranges = crate::layerwise::partition_ranges(&pending.plan, adjoint_len);
-            if ranges.is_empty() {
-                // Degenerate (empty adjoint): one empty prologue so the
-                // update groups still fire.
-                ranges.push(crate::layerwise::ReplayRange {
-                    start: 0,
-                    end: adjoint_len,
-                    layer: None,
-                });
-            }
+            // ── D1b schedule (precomputed) ──────────────────────────────
+            // D2b part 2: ranges / grouping / streamed set were derived
+            // ONCE in the pre-forward pure pipeline (the segment-streamed
+            // forward consumed them at emission time) and travel here via
+            // `pending.schedule` — one derivation, both sides agree by
+            // construction. The `[csla] layer-major schedule:` line prints
+            // at the derivation site.
+            let ranges = &pending.schedule.ranges;
+            let layer_group = &pending.schedule.layer_group;
+            let global_group = &pending.schedule.global_group;
             let n_ranges = ranges.len();
             let last_ri = n_ranges - 1;
-
-            // Adjoint op position by result vid — for grad-op containment
-            // and the carry analysis.
-            let adj_pos: std::collections::HashMap<crate::wengert::VarId, usize> = pending
-                .adjoint
-                .ops
-                .iter()
-                .enumerate()
-                .map(|(i, op)| (op.result, i))
-                .collect();
-
-            // Update groups. A layer's param updates right after its range's
-            // replay iff its gradient op sits positionally INSIDE that range
-            // (positional attribution slop demotes it to the epilogue group
-            // — always correct, merely later; its window-lived accumulator
-            // then covers a grad op in ANY range). Dead params (no adjoint)
-            // update with their layer on a zero accumulator — weight decay
-            // and moment decay still mutate θ, exactly like the baseline's
-            // unconditional 0..num_params loop. Every param_paths slot lands
-            // in exactly one group.
-            let mut layer_group: Vec<Vec<i64>> = vec![Vec::new(); n_ranges];
-            let mut grouped: std::collections::HashSet<i64> = Default::default();
-            {
-                let param_by_name: std::collections::HashMap<&str, &CslaParam> =
-                    pending.params.iter().map(|p| (p.name.as_str(), p)).collect();
-                for (ri, range) in ranges.iter().enumerate() {
-                    let Some(li) = range.layer else { continue };
-                    for pinfo in &pending.plan.layers[li].params {
-                        let Some(cp) = param_by_name.get(pinfo.name.as_str()) else {
-                            continue;
-                        };
-                        let in_range = match cp.adj_vid.and_then(|a| adj_pos.get(&a)) {
-                            Some(&pos) => pos >= range.start && pos < range.end,
-                            None => true,
-                        };
-                        if in_range && grouped.insert(cp.accum_idx) {
-                            layer_group[ri].push(cp.accum_idx);
-                        }
-                    }
-                    layer_group[ri].sort_unstable();
-                }
-            }
-            let global_group: Vec<i64> = (0..param_paths.len() as i64)
-                .filter(|i| !grouped.contains(i))
-                .collect();
-            // Compile-time schedule line — the gates' anti-vacuity anchor
-            // for the LAYER-MAJOR shape itself (the runtime window counter
-            // can't distinguish a degenerate all-epilogue schedule from the
-            // real k-range one).
-            eprintln!(
-                "[csla] layer-major schedule: {} ranges, {} layer-grouped params, \
-                 {} epilogue params",
-                n_ranges,
-                grouped.len(),
-                global_group.len(),
-            );
 
             // Carry analysis: adjoint values produced in one range and read
             // in a later one (the boundary adjoints d(residual-after-L) plus
@@ -8044,60 +8430,27 @@ impl Compiler<'_> {
             let len_msg_ptr = self.compile_string_literal(builder, &len_msg)?;
             self.compile_call_by_name(builder, "nsl_assert", &[len_ok, len_msg_ptr])?;
 
-            // D2b window-scoped weight eviction: drop every layer-grouped
-            // param's device buffer for the duration of the window backward
-            // (idempotent register: first window mirrors + evicts; later
-            // windows pure-free — the mirror is current by construction:
-            // post-update evicts write back, forwards never mutate θ, and
-            // the window-end restore uploads from that same mirror). Each
-            // layer re-uploads at its range head and evicts+writes-back
-            // after its update; epilogue params never stream.
+            // D2b weight eviction, part 2 (whole-loop streaming): the
+            // forward already registered + evicted every streamed param at
+            // step-body top and re-uploads per segment, so this window
+            // opens with them evicted. The register loop stays as an
+            // idempotent belt (a register on an evicted registered tensor
+            // is a no-op) — it keeps the window arm self-sufficient if the
+            // forward emission ever changes. The streamed SET comes from
+            // the shared pre-forward schedule (view-rooted params already
+            // excluded there — review D2b-1); each layer re-uploads at its
+            // range head and evicts+writes-back after its update; epilogue
+            // params never stream.
             let ws_active = self.compile_options.weight_stream;
-            let mut ws_streamed: std::collections::HashSet<i64> = Default::default();
+            let ws_streamed: std::collections::HashSet<i64> =
+                pending.schedule.ws_streamed.iter().copied().collect();
             if ws_active {
-                // Review D2b-1 (HIGH): a buffered primal VIEW of a streamed
-                // param (e.g. transpose(w) saved for the matmul adjoint)
-                // caches a data pointer into θ's storage — eviction frees
-                // that storage and the later upload allocates a NEW buffer,
-                // so the view slot would read recycled memory: silent
-                // corruption. Any param rooting a view chain that lands in
-                // the slot set stays RESIDENT (always safe, merely
-                // unstreamed).
-                let slot_vids: std::collections::HashSet<crate::wengert::VarId> =
-                    pending.slots.iter().map(|(v, _)| *v).collect();
-                let view_rooted: std::collections::HashSet<crate::wengert::VarId> = pending
-                    .primal_view_of
-                    .iter()
-                    .filter(|(view_vid, _)| slot_vids.contains(view_vid))
-                    .map(|(_, param_vid)| *param_vid)
-                    .collect();
-                let unstreamable_idxs: std::collections::HashSet<i64> = pending
-                    .params
-                    .iter()
-                    .filter(|cp| view_rooted.contains(&cp.primal_vid))
-                    .map(|cp| cp.accum_idx)
-                    .collect();
-                if !unstreamable_idxs.is_empty() {
-                    eprintln!(
-                        "[weight-stream] {} param(s) stay resident: a buffered \
-                         view of their storage rides the window slots",
-                        unstreamable_idxs.len()
-                    );
-                }
-                let mut ws_all: Vec<i64> = layer_group
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .filter(|i| !unstreamable_idxs.contains(i))
-                    .collect();
-                ws_all.sort_unstable();
-                for &idx in &ws_all {
+                for &idx in &pending.schedule.ws_streamed {
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }
-                ws_streamed = ws_all.into_iter().collect();
             }
 
             // Bias correction — the same expression the (now-bypassed)
@@ -8135,7 +8488,7 @@ impl Compiler<'_> {
 
             // Global/epilogue accumulators live for the whole window (their
             // grads may come from any range).
-            emit_csla_accum_alloc(self, builder, param_list, accum_val, &global_group)?;
+            emit_csla_accum_alloc(self, builder, param_list, accum_val, global_group)?;
 
             // Cross-range adjoint carry: one inner list per micro-batch,
             // slot-indexed, created by the first range's replay loop.
@@ -8561,19 +8914,14 @@ impl Compiler<'_> {
                 (bc1_inv, bc2_inv),
                 wrap_precision,
                 self.compile_options.optim_state_offload,
-                &global_group,
+                global_group,
             )?;
-            // D2b: restore residency for the next iterations' forwards (the
-            // forward reads every layer every micro-batch; forward-side
-            // streaming is the 7B follow-up).
-            if ws_active {
-                let prev_surf =
-                    self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
-                let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
-                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
-                self.compile_call_by_name(builder, "nsl_weight_stream_upload_all", &[])?;
-                self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev_surf])?;
-            }
+            // D2b part 2: NO post-epilogue restore. The next iterations'
+            // forwards re-upload each layer right before its own segment
+            // (and evict it after its last primal touch), so streamed
+            // params stay off-device between their brackets for the WHOLE
+            // training loop — the forward-side residency wall this part
+            // removes. Teardown still restores for model_save/eval.
 
             // Window cleanup: drop the shells and start fresh lists for the
             // next window (carry inner shells died with the last range).

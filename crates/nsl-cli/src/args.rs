@@ -753,11 +753,13 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) layerwise_accum: bool,
 
-        /// With --layerwise-accum: window-scoped WEIGHT eviction (D2b).
-        /// Layer-grouped params drop their device buffers at each window
-        /// boundary (pinned host mirrors keep the bytes), re-upload per
-        /// replay range, write back after their layer's update, and
-        /// restore for the next forwards. Byte-preserving / bit-exact.
+        /// With --layerwise-accum: layer WEIGHT streaming (D2b). Layer-
+        /// grouped params live in pinned host mirrors and hold a device
+        /// buffer ONLY inside their brackets: the forward uploads each
+        /// layer right before its CCR segment and evicts it after its last
+        /// primal read; the window backward re-uploads per replay range
+        /// and writes back after that layer's update. Teardown restores
+        /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 
@@ -1127,11 +1129,13 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) layerwise_accum: bool,
 
-        /// With --layerwise-accum: window-scoped WEIGHT eviction (D2b).
-        /// Layer-grouped params drop their device buffers at each window
-        /// boundary (pinned host mirrors keep the bytes), re-upload per
-        /// replay range, write back after their layer's update, and
-        /// restore for the next forwards. Byte-preserving / bit-exact.
+        /// With --layerwise-accum: layer WEIGHT streaming (D2b). Layer-
+        /// grouped params live in pinned host mirrors and hold a device
+        /// buffer ONLY inside their brackets: the forward uploads each
+        /// layer right before its CCR segment and evicts it after its last
+        /// primal read; the window backward re-uploads per replay range
+        /// and writes back after that layer's update. Teardown restores
+        /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 

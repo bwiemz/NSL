@@ -536,7 +536,13 @@ fn csla_weight_stream_parity_gpu() {
     );
     assert!(ws.success, "--weight-stream arm failed:\n{}", ws.stderr);
 
-    // Anti-vacuity: the streaming cycle actually ran.
+    // Anti-vacuity: the streaming cycle actually ran, with the EXACT part-2
+    // transfer arithmetic. 13 micro-batch forwards × 6 streamed params
+    // (upload before the layer's segment, read-only evict after its last
+    // primal touch) + 6 windows × 6 (range-head upload, post-update
+    // writeback evict) = 114 each. Register and teardown moves are
+    // deliberately uncounted (mirror bootstrap + final restore), so a
+    // drifting emission schedule shows up as a count change here.
     let counts = ws
         .stderr
         .lines()
@@ -545,9 +551,22 @@ fn csla_weight_stream_parity_gpu() {
     let mut it = counts.split(" evicts: ");
     let uploads: i64 = it.next().unwrap().trim().parse().unwrap();
     let evicts: i64 = it.next().unwrap().trim().parse().unwrap();
+    assert_eq!(
+        (uploads, evicts),
+        (114, 114),
+        "weight-stream transfer counts drifted from the designed schedule \
+         (13 fwd × 6 + 6 win × 6 = 114 each)"
+    );
+    // D2b part 2: the forward really was sliced per CCR segment (prologue +
+    // 2 blocks + epilogue) with all 6 layer params on the streaming plan —
+    // a monolithic fallback or an empty touch plan cannot pass.
     assert!(
-        uploads > 0 && evicts > 0,
-        "weight streaming never cycled (uploads {uploads}, evicts {evicts})"
+        ws.stderr.contains(
+            "[weight-stream] forward streaming: 4 slices, 6 streamed params \
+             (6 touched by the primal)"
+        ),
+        "forward-streaming schedule line missing or changed:\n{}",
+        ws.stderr
     );
     // Baseline arm must not stream.
     assert!(

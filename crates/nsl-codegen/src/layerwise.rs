@@ -319,6 +319,85 @@ pub fn partition_ranges(plan: &LayerwisePlan, adjoint_len: usize) -> Vec<ReplayR
     ranges
 }
 
+/// CSLA D2b part 2: forward slice boundaries from the CCR block segments.
+///
+/// Returns half-open op-index slices over the primal tape — an optional
+/// prologue `[0, seg0.start)`, one slice per segment, and an optional
+/// epilogue `[last.end, primal_len)` — that PARTITION `[0, primal_len)`.
+/// The segment-streamed forward lowers each slice separately with weight
+/// upload/evict calls between them, so a coverage gap or overlap would
+/// skip or double-emit real forward ops: errors are hard refusals, never
+/// a silent fallback.
+pub fn forward_slices(
+    segments: &[(usize, usize)],
+    primal_len: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut slices = Vec::with_capacity(segments.len() + 2);
+    let mut cursor = 0usize;
+    for (i, &(start, end)) in segments.iter().enumerate() {
+        if start < cursor || end < start || end > primal_len {
+            return Err(format!(
+                "segment {i} [{start}, {end}) is out of order or out of \
+                 bounds (cursor {cursor}, primal len {primal_len})"
+            ));
+        }
+        if start > cursor {
+            slices.push((cursor, start));
+        }
+        slices.push((start, end));
+        cursor = end;
+    }
+    if cursor < primal_len {
+        slices.push((cursor, primal_len));
+    }
+    Ok(slices)
+}
+
+/// CSLA D2b part 2: per-parameter forward touch range over a view closure.
+///
+/// For each streamed param VarId, the (first, last) SLICE index whose ops
+/// read the param directly OR through a transitive primal view of it
+/// (`view_of`: view VarId → rooting param VarId — transpose/reshape
+/// chains; a view's data pointer aliases θ's storage, so the param must
+/// stay device-resident until the view's last read, not merely its own).
+/// Params never read in the primal are absent (the window backward is
+/// their only device consumer).
+pub fn forward_touch_slices(
+    primal: &WengertList,
+    slices: &[(usize, usize)],
+    param_vids: &HashSet<VarId>,
+    view_of: &HashMap<VarId, VarId>,
+) -> HashMap<VarId, (usize, usize)> {
+    let slice_of_pos = |pos: usize| -> usize {
+        slices
+            .iter()
+            .position(|&(s, e)| pos >= s && pos < e)
+            .unwrap_or(slices.len().saturating_sub(1))
+    };
+    let mut touch: HashMap<VarId, (usize, usize)> = HashMap::new();
+    for (idx, op) in primal.ops.iter().enumerate() {
+        for input in &op.inputs {
+            let root = if param_vids.contains(input) {
+                *input
+            } else {
+                match view_of.get(input) {
+                    Some(p) if param_vids.contains(p) => *p,
+                    _ => continue,
+                }
+            };
+            let si = slice_of_pos(idx);
+            touch
+                .entry(root)
+                .and_modify(|(f, l)| {
+                    *f = (*f).min(si);
+                    *l = (*l).max(si);
+                })
+                .or_insert((si, si));
+        }
+    }
+    touch
+}
+
 impl LayerwisePlan {
     /// A human-readable schedule + projection for `nsl check --training-report`.
     pub fn render_report(&self, indent: &str) -> String {
@@ -621,5 +700,75 @@ mod tests {
         let ranges = partition_ranges(&plan, adj.ops.len());
         assert_eq!(ranges.len(), 1);
         assert_eq!((ranges[0].start, ranges[0].end, ranges[0].layer), (0, 2, None));
+    }
+
+    // ── D2b part 2: forward slice helpers ──────────────────────────────
+
+    #[test]
+    fn forward_slices_partitions_with_prologue_and_epilogue() {
+        let slices = forward_slices(&[(3, 7), (7, 12)], 15).unwrap();
+        assert_eq!(slices, vec![(0, 3), (3, 7), (7, 12), (12, 15)]);
+        let covered: usize = slices.iter().map(|&(s, e)| e - s).sum();
+        assert_eq!(covered, 15);
+    }
+
+    #[test]
+    fn forward_slices_no_prologue_no_epilogue() {
+        let slices = forward_slices(&[(0, 5), (5, 9)], 9).unwrap();
+        assert_eq!(slices, vec![(0, 5), (5, 9)]);
+    }
+
+    #[test]
+    fn forward_slices_gap_between_segments_becomes_a_slice() {
+        // Non-adjacent segments (an inter-segment gap) still partition —
+        // the gap lowers as its own unstreamed slice.
+        let slices = forward_slices(&[(2, 4), (6, 8)], 10).unwrap();
+        assert_eq!(slices, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
+    }
+
+    #[test]
+    fn forward_slices_refuses_overlap_and_out_of_bounds() {
+        assert!(forward_slices(&[(3, 7), (5, 9)], 12).is_err());
+        assert!(forward_slices(&[(0, 20)], 12).is_err());
+        assert!(forward_slices(&[(4, 2)], 12).is_err());
+    }
+
+    #[test]
+    fn forward_slices_empty_segments_is_one_slice() {
+        assert_eq!(forward_slices(&[], 6).unwrap(), vec![(0, 6)]);
+    }
+
+    #[test]
+    fn touch_slices_direct_reads_and_view_closure() {
+        // Ops 0..2 = slice 0, ops 2..5 = slice 1, ops 5..6 = slice 2.
+        // Param 10 read directly in slice 0 and via view 200 in slice 1;
+        // param 11 read only in slice 1; param 12 never read.
+        let primal = adjoint(vec![
+            read_op(0, vec![10]),     // slice 0: direct read of 10
+            read_op(1, vec![7]),      //          unrelated
+            read_op(2, vec![11]),     // slice 1: direct read of 11
+            read_op(3, vec![200]),    //          view-of-10 read
+            read_op(4, vec![7]),      //          unrelated
+            read_op(5, vec![7]),      // slice 2: unrelated
+        ]);
+        let slices = vec![(0, 2), (2, 5), (5, 6)];
+        let params: HashSet<VarId> = [10, 11, 12].into_iter().collect();
+        let views: HashMap<VarId, VarId> = [(200, 10)].into_iter().collect();
+        let touch = forward_touch_slices(&primal, &slices, &params, &views);
+        assert_eq!(touch.get(&10), Some(&(0, 1)));
+        assert_eq!(touch.get(&11), Some(&(1, 1)));
+        assert_eq!(touch.get(&12), None);
+    }
+
+    #[test]
+    fn touch_slices_view_of_unstreamed_param_is_ignored() {
+        // A view rooted at a param OUTSIDE the streamed set contributes
+        // nothing (that param stays resident; no touch entry needed).
+        let primal = adjoint(vec![read_op(0, vec![300])]);
+        let slices = vec![(0, 1)];
+        let params: HashSet<VarId> = [10].into_iter().collect();
+        let views: HashMap<VarId, VarId> = [(300, 99)].into_iter().collect();
+        let touch = forward_touch_slices(&primal, &slices, &params, &views);
+        assert!(touch.is_empty());
     }
 }

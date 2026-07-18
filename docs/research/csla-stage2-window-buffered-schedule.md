@@ -221,10 +221,60 @@ stay resident by design in the window-scoped scheme.** The window-phase
 footprint does drop (~3.5 GiB of layer weights absent during the replay),
 which mattered exactly when the window phase was the peak (the no-offload
 runs); the global-peak payoff needs the FORWARD-side per-segment streaming —
-the 7B follow-up this machinery exists for (segment-wise primal lowering
-with `var_types` threading; design in the Milestone D memory file). Gated by
-`csla_weight_stream_parity_gpu` (bit-exact ± the flag; upload/evict counters
-as anti-vacuity).
+delivered by part 2 below. Gated by `csla_weight_stream_parity_gpu`
+(bit-exact ± the flag; upload/evict counters as anti-vacuity).
+
+**D2b part 2 (forward segment streaming) removed the forward-side wall.**
+The same flag now streams across the WHOLE loop: the primal tape is lowered
+as slices (prologue, one per CCR `BlockSegment`, epilogue — a verified
+partition; `layerwise::forward_slices` refuses non-contiguous segment maps),
+with each streamed layer uploaded right before its first-touch slice and
+read-only-evicted after its last primal touch, where "touch" is extended
+through transpose/reshape VIEW chains rooted at the param (a view's data
+pointer aliases θ — evicting at the param's own last read would dangle it).
+Registration moved to step-body top (idempotent), so the VERY FIRST forward
+streams — without that, window-1's forward peak would still be the
+full-residency wall. Two structural changes made this emittable:
+
+- *The pre-forward pure pipeline.* Adjoint generation, the eliminate
+  passes, the CCR splice, and last-use-free insertion are all pure tape
+  transforms, but historically ran after the forward lowering because
+  `CcrPlan::restrict_to_owned` consumed the lowering's owned classification.
+  It now consumes `wengert_lower::infer_primal_owned` — a pure replica of
+  the ownership/type fold (ghost-skip, FreeTensor interception, the
+  Integer fold, `should_cleanup_result`) — and the real lowering ASSERTS
+  it classified identically (divergence = loud compile error, never a
+  mis-restricted plan). CSHA claims are handed to the generator and back
+  (`take_csha_claims`) so the forward's fused claim dispatch still sees
+  them while the adjoint lowering still never does; the forward reads only
+  chain metadata, never the `backward_emitted` cells generation flips.
+- *One schedule, both sides.* Ranges, update grouping, and the streamed
+  set are derived ONCE pre-forward (`CslaSchedule`, carried on the pending
+  context) and consumed by both the sliced forward and the window backward
+  — two independent derivations could disagree on which params the forward
+  must re-upload, which is a null-data crash at best. The window's
+  post-epilogue `upload_all` restore is GONE; teardown still restores for
+  `model_save`/eval. Consequence (documented posture): any other reader of
+  θ mid-training — a callback dereferencing model fields, a mid-loop
+  `model_save` — crashes loudly on the null data pointer.
+
+The forward slices share one straight-line block chain, so SSA flows across
+boundaries; the fold state (`var_map`/`var_types`/owned/freed sets) threads
+through `compile_wengert_ops_range` — losing `var_types` at a boundary
+would re-default a slice-k integer result to Tensor in slice k+1 and free a
+raw integer (the one real hazard the design flagged).
+
+Measured at 1B (batch 2 / seq 512 / accum 8, m/v + weight streaming):
+**allocator peak 9.10 GB — down from 12.99 GB** (−3.89 GB = the 16-layer
+streamed stack; 18 slices, 144 streamed params), losses 11.80 → 10.88
+matching part 1's trajectory, transfer counts EXACTLY the designed
+arithmetic (2592 = 16 forwards × 144 + 2 windows × 144, uploads = evicts).
+Activations (8.69 GB, dominated by the D1a window buffers' per-micro-batch
+logits chains) are now ~96 % of the peak — the `@fused_lm_ce` cast-cache
+tape-carry is the next lever, then 7B (whose host-RAM wall needs fp16 host
+moments). The FFN gate pins the schedule end-to-end: exact
+`[weight-stream] forward streaming: 4 slices, 6 streamed params` line and
+exact 114/114 counters (13 forwards × 6 + 6 windows × 6).
 
 A pre-existing runtime bug
 surfaced on the way: the GPU-OOM CPU-fallback path

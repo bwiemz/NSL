@@ -152,6 +152,19 @@ impl AdjointGenerator {
         self.csha_claims = Some(claims);
     }
 
+    /// CSLA D2b part 2: hand the claims back after `generate()`. The
+    /// hoisted pipeline runs adjoint generation BEFORE the forward
+    /// lowering, but the forward's fused-SDPA claim dispatch still needs
+    /// the table (`compiler.csha_backward_claims`); the compiler restores
+    /// it from here and clears its slot after the forward, preserving the
+    /// old invariant that the ADJOINT lowering never sees claims. The
+    /// forward reads only `op_to_chain` / `chain_marks` metadata — never
+    /// the `backward_emitted` cells generation flipped — so the ordering
+    /// change is invisible to it.
+    pub fn take_csha_claims(&mut self) -> Option<CshaBackwardClaims> {
+        self.csha_claims.take()
+    }
+
     /// T7.1: return diagnostics collected during the reverse walk for
     /// CSHA chains that fell back to per-op AD.
     pub fn csha_diagnostics(&self) -> &[String] {
