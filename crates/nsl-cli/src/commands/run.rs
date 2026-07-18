@@ -625,6 +625,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     };
                     if let Err(e) = f.set_len(shm_size as u64) {
                         eprintln!("[nsl] failed to set shm size: {e}");
+                        let _ = std::fs::remove_file(&shm_path);
                         std::process::exit(1);
                     }
                     // Zero the header by mapping and dropping
@@ -632,13 +633,14 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         Ok(m) => m,
                         Err(e) => {
                             eprintln!("[nsl] failed to mmap shm file: {e}");
+                            let _ = std::fs::remove_file(&shm_path);
                             std::process::exit(1);
                         }
                     };
                     drop(mmap);
                 }
 
-                let mut children = Vec::new();
+                let mut children: Vec<(_, std::process::Child)> = Vec::new();
                 for rank in 0..devices {
                     let mut cmd = std::process::Command::new(&exe);
                     // D3: forward the ORIGINAL argv verbatim (skip argv[0]) —
@@ -678,6 +680,17 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("[nsl] failed to spawn rank {rank}: {e}");
+                            // Reap the ranks already spawned before bailing:
+                            // otherwise they orphan and spin on the shm barrier
+                            // waiting for peers that never arrive (a core each
+                            // until the 300s barrier-timeout abort), and the
+                            // parent-owned shm file leaks. Kill + reap + unlink,
+                            // THEN exit.
+                            for (_r, c) in children.iter_mut() {
+                                let _ = c.kill();
+                                let _ = c.wait();
+                            }
+                            let _ = std::fs::remove_file(&shm_path);
                             std::process::exit(1);
                         }
                     };

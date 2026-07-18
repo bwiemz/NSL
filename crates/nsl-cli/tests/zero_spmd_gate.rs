@@ -21,13 +21,19 @@
 //! deterministic CPU FFN LM with 8 params (uneven round-robin at N=2:
 //! ranks own 4/4; at N=3: 3/3/2).
 //!
-//! Hazards handled here: the SimulatedBackend spin-barrier has NO timeout
-//! (a crashed rank hangs peers) — every SPMD invocation runs under a
-//! watchdog that kills the process tree on expiry.
+//! Hazards handled here: a rank that hangs OFF the shm spin-barrier (a
+//! compile/link stall, an in-process TP_CTX deadlock) is not caught by the
+//! backend's own 300s barrier-timeout abort, so every SPMD invocation also
+//! runs under this per-run watchdog. NOTE the watchdog only reaps the top
+//! `nsl` process — its rank children and the binaries they exec are orphaned,
+//! and they inherit our stdout/stderr pipe write-ends, so on a timeout we must
+//! NOT join the drain threads (they would never see EOF); we snapshot what was
+//! captured and panic. A red test is the goal; a hung join would defeat it.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -54,6 +60,26 @@ struct RunOutput {
     loss_stream: String,
     stderr: String,
     success: bool,
+}
+
+/// Drain a child pipe on its own thread into a shared byte buffer. Bytes are
+/// appended incrementally (never `read_to_string`, which drops the ENTIRE
+/// capture on the first non-UTF-8 byte — a localized Windows linker diagnostic
+/// would then false-red the `[zero]` counter search), so the watchdog can read
+/// the partial capture WITHOUT joining the thread.
+fn spawn_drain<R: Read + Send + 'static>(
+    mut pipe: R,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
 }
 
 /// Run `nsl run` with a watchdog (SPMD spin-barriers hang forever on a
@@ -85,30 +111,25 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
     let mut child = cmd.spawn().expect("spawn nsl run");
 
     // Drain stdout AND stderr on dedicated threads, concurrently with the
-    // watchdog wait. A single `nsl run` emits several KB to stderr just at
-    // compile time (WGGO notes, the system linker's relocation warnings, the
-    // `[nsl] deterministic mode` banner) plus the `[zero]` atexit line. If we
-    // waited on the child and only read the pipes afterwards (the obvious
-    // shape), a child that filled the OS pipe buffer would block on write
-    // forever — try_wait never sees it exit, and the watchdog fires a false
-    // "hang". Linux pipes are 1 MiB so it slips under the limit; Windows
-    // anonymous pipes are far smaller and link.exe is chattier, so that path
-    // deadlocked at exactly the 600 s watchdog while Linux stayed green. Reader
-    // threads (what Command::output does internally) make the write side never
-    // block; kill() on timeout closes the pipes so the readers hit EOF and the
-    // joins below return the partial capture for the panic message.
-    let mut out_pipe = child.stdout.take().expect("child stdout piped");
-    let mut err_pipe = child.stderr.take().expect("child stderr piped");
-    let out_reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        out_pipe.read_to_string(&mut s).ok();
-        s
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        err_pipe.read_to_string(&mut s).ok();
-        s
-    });
+    // watchdog. A single `nsl run` emits several KB to stderr at compile time
+    // alone (WGGO notes, the system linker's relocation warnings, the `[nsl]
+    // deterministic mode` banner) plus the `[zero]` atexit line. Reading the
+    // pipes only after the child exits would let a child that fills the OS pipe
+    // buffer block on write forever — try_wait never sees it exit and the
+    // watchdog fires a false "hang" (Linux pipes are 1 MiB and slip under it;
+    // Windows anonymous pipes are far smaller and link.exe is chattier, so that
+    // path deadlocked at exactly the 600 s watchdog while Linux stayed green).
+    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let out_reader = spawn_drain(
+        child.stdout.take().expect("child stdout piped"),
+        out_buf.clone(),
+    );
+    let err_reader = spawn_drain(
+        child.stderr.take().expect("child stderr piped"),
+        err_buf.clone(),
+    );
+    let snapshot = |buf: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let status = loop {
@@ -118,19 +139,31 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let so = out_reader.join().unwrap_or_default();
-                    let se = err_reader.join().unwrap_or_default();
+                    // Do NOT join the drain threads here: child.kill() reaps only
+                    // the top `nsl` process, but its rank children and the
+                    // binaries they exec are orphaned and keep OUR pipe
+                    // write-ends open, so the readers never hit EOF and a join
+                    // would hang forever — defeating the whole watchdog. Snapshot
+                    // the partial capture and panic; the leaked drain threads die
+                    // when the test process exits.
                     panic!(
                         "nsl run '{tag}' exceeded {timeout_secs}s — SPMD rank hang?\n\
-                         --- captured stdout ---\n{so}\n--- captured stderr ---\n{se}"
+                         --- captured stdout ---\n{}\n--- captured stderr ---\n{}",
+                        snapshot(&out_buf),
+                        snapshot(&err_buf),
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
     };
-    let stdout = out_reader.join().expect("stdout reader thread panicked");
-    let stderr = err_reader.join().expect("stderr reader thread panicked");
+    // The child exited normally: it only returns after all its rank children
+    // (and the binaries they exec) have been waited on, so every write-end is
+    // closed and the readers have hit EOF — joining cannot block here.
+    let _ = out_reader.join();
+    let _ = err_reader.join();
+    let stdout = snapshot(&out_buf);
+    let stderr = snapshot(&err_buf);
 
     let mut loss_stream = String::new();
     let mut in_stream = false;
