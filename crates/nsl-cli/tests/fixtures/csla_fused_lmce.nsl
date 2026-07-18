@@ -1,29 +1,30 @@
-# CSLA Stage-2 (D1a) parity fixture: blocks-structured FFN LM, packing-free.
+# CSLA fused-CE tape-carry parity fixture: blocks-structured FFN LM with a
+# @fused_lm_ce(dtype=f32) loss head.
 #
-# A miniature 2-block residual-FFN language model (embedding + tied LM head +
-# rmsnorm — deliberately attention-free so the gate isolates the
-# window-buffered schedule from flash/packing machinery; the packed-GQA
-# composition has its own fixture, csla_layerwise_packed_gqa.nsl).
+# Clone of csla_layerwise_ffn.nsl reshaped for the fused linear-CE matcher:
+#   - vocab bumped to 128 (embed [128, 64]) — the fused emitter's effective
+#     minimum (vocab_tile must be a multiple of 128 and <= vocab_size);
+#   - a REAL lm_bias param ([128] zeros): the auto-substitution matcher
+#     requires the canonical Add(Matmul(x, Transpose(W)), bias) chain — a
+#     bare matmul head is refused. Under the FUSED path dbias arrives
+#     [V]-shaped from FusedLinearCeBackwardExtract, so the composite
+#     broadcast-add bias-grad abort (the reason the base fixture is
+#     bias-free) cannot fire — and if the matcher ever silently declined,
+#     that abort makes the gate fail LOUDLY instead of testing the
+#     composite path by accident (the launch counters below pin it too);
+#   - forward_train returns FLAT [rows, V] logits: any reshape between the
+#     Add and cross_entropy breaks the matcher (no see-through), so the
+#     flatten happens BEFORE the head matmul.
 #
-# Sized for the D1a window semantics:
-#   - 1664 tokens / (batch 2 x seq 64) = 13 micro-batches per epoch;
-#   - grad_accumulation=2 -> epochs=1 gives 6 optimizer steps + ONE trailing
-#     partial window (exercises the teardown sweep: buffered saves + batch
-#     dict of the tail must be swept, and the tail must not step — exactly
-#     like the baseline's discarded m_partial);
-#   - the harness rewrites "epochs=1" -> "epochs=2" for the straddle case:
-#     window 7 then spans the epoch boundary (micro-batches 13 + 14), which
-#     the global step counter's modulo handles identically to the baseline.
+# Window shape identical to the base fixture: 1664 tokens / (batch 2 x
+# seq 64) = 13 micro-batches, grad_accumulation=2 -> 6 windows + one
+# trailing partial window (the tail's buffered fused-CE LSE slot must be
+# swept by teardown, never replayed).
 #
 # Marker rewrites (exact string match by the harness):
 #   - "# GPU_PLACEMENT" -> "m.to(cuda)" for GPU runs;
 #   - "CSLA_SAVE_PATH"  -> the temp .nslm path;
-#   - "epochs=1"        -> "epochs=2" for the epoch-straddle case;
-#   - "grad_accumulation=2)" -> "grad_accumulation=2, grad_clip=1.0)" for the
-#     refusal test.
-#
-# No bias params anywhere: broadcast-add bias grads hit the pre-existing
-# FASE-accumulate shape abort (tensor/mod.rs len assert) on BOTH arms.
+#   - "dtype=\"f32\""   -> "dtype=\"f16\"" for the non-f32 refusal case.
 
 from nsl.nn.losses import cross_entropy
 
@@ -37,9 +38,10 @@ model Blk:
         return h + f
 
 model TinyLM:
-    embed: Tensor = randn([64, 64]) * 0.1
+    embed: Tensor = randn([128, 64]) * 0.1
     blocks: [Blk; 2] = Blk()
     norm_out: Tensor = ones([64])
+    lm_bias: Tensor = zeros([128])
 
     fn forward_train(self, input_ids: Tensor) -> Tensor:
         let ids_shape = input_ids.shape
@@ -51,7 +53,8 @@ model TinyLM:
         for block in self.blocks:
             h = block.forward(h)
         let hn = rmsnorm(h, self.norm_out, 0.00001)
-        return hn @ self.embed.transpose(0, 1)
+        let flat_hn = hn.reshape([batch_size * seq_len, 64])
+        return (flat_hn @ self.embed.transpose(0, 1)) + self.lm_bias
 
 let m = TinyLM()
 # GPU_PLACEMENT
@@ -90,37 +93,30 @@ let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_la
 
 print("LOSS_STREAM_BEGIN")
 
+@fused_lm_ce(enabled=true, dtype="f32", vocab_size=128, hidden_size=64, batch_size=2, seq_len=64, vocab_tile=128)
 train(model=m, epochs=1, grad_accumulation=2):
     optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
     step(batch):
         let logits = m.forward_train(batch.input_ids)
-        let ls = logits.shape
-        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
-        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
-        let loss = cross_entropy(flat_logits, flat_labels)
+        let flat_labels = batch.labels.reshape([128])
+        let loss = cross_entropy(logits, flat_labels)
     callbacks:
         on_step(step, loss):
             print(loss)
 
 print("LOSS_STREAM_END")
 
-# D1b memory-win probe (GPU runs): peak bytes ever allocated under the
-# MPartial surface (tag 4). Baseline allocates the FULL m_partial window
-# up front; the layerwise schedule's peak is max(one layer) + epilogue
-# globals. 0 on CPU runs (no GPU allocator) — the surface gate is GPU-only.
-print("MPARTIAL_PEAK_BEGIN")
-print(gpu_surface_peak_bytes(4))
-print("MPARTIAL_PEAK_END")
-
-# D2b part-2 bracket probe (GPU runs): WEIGHTS-surface bytes resident AT
-# the global allocator peak. `.to(cuda)` brackets the model transfer in
-# SURFACE_WEIGHTS, so the baseline reads full residency (~148 KB) while
-# TIGHT streaming brackets keep only the epilogue residents + ~one block
-# uploaded (~82 KB of which 65,792 B is the block); a widened plan (all
-# uploads before slice 0 / evicts after the last) restores full residency
-# while leaving transfer counts and parity unchanged. 0 on CPU runs.
-print("WEIGHTS_AT_PEAK_BEGIN")
-print(gpu_surface_at_peak_bytes(1))
-print("WEIGHTS_AT_PEAK_END")
+# Anti-vacuity (GPU runs): successful fused linear-CE kernel launches.
+# kind 0 = forward (V=128 takes the small single-kernel path), 2 =
+# backward. Forward fires once per micro-batch on BOTH arms (13); the
+# backward fires per interleaved micro-batch on the baseline (13) but per
+# REPLAYED micro-batch under csla (6 windows x 2 = 12 — the trailing
+# partial window never replays).
+print("FUSED_LCE_FWD_BEGIN")
+print(fused_lce_launch_count(0))
+print("FUSED_LCE_FWD_END")
+print("FUSED_LCE_BWD_BEGIN")
+print(fused_lce_launch_count(2))
+print("FUSED_LCE_BWD_END")
 
 model_save(m, "CSLA_SAVE_PATH")

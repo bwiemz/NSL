@@ -407,6 +407,12 @@ impl Compiler<'_> {
             let variant = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_sdpa_fused_launch_count", &[variant]);
         }
+        // Fused-CE tape-carry twin: kind 0 = forward, 1 = forward_large,
+        // 2 = backward.
+        if func_name == "fused_lce_launch_count" && args.len() == 1 {
+            let kind = self.compile_expr(builder, state, &args[0].value)?;
+            return self.compile_call_by_name(builder, "nsl_fused_lce_launch_count", &[kind]);
+        }
         if matches!(func_name.as_str(), "gpu_surface_peak_bytes" | "gpu_surface_at_peak_bytes")
             && args.len() == 1
         {

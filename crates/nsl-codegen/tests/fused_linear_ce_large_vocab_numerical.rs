@@ -304,6 +304,22 @@ fn large_vocab_forward_at_production_scale_v49152() {
 
 #[test]
 #[ignore]
+fn large_vocab_forward_at_production_hidden_v49152_h2048() {
+    // The 1B coder model's REAL head shape: V=49152, H=2048 — the H
+    // dimension the suite never covered (the fused-CE csla measurement
+    // surfaced a systematic +0.38 first-loss offset vs the composite path
+    // at exactly this shape). Rows kept at 32 so the CPU f64 reference
+    // (32 * 49152 dots of length 2048 ≈ 3.2e9 muls) stays tolerable.
+    run_scale(&ScaleParams {
+        b: 1, s: 32, v: 49152, h: 2048, vocab_tile: 128,
+        name: "v49152_h2048",
+        loss_rel_tol: 5e-3,
+        lse_abs_tol: 2e-2,
+    });
+}
+
+#[test]
+#[ignore]
 fn large_vocab_forward_at_intermediate_scale_v16384() {
     // Intermediate: V=16384, H=64, B=1, S=32 (small to keep CPU ref fast).
     run_scale(&ScaleParams {

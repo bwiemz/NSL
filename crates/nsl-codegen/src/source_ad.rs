@@ -4594,11 +4594,36 @@ impl<'a> WengertExtractor<'a> {
         }
         // Review Finding 1: run all pending fused-LCE prunes against
         // the COMPLETED tape so the consumer-scan sees every op.
-        let prunes = std::mem::take(&mut self.pending_fused_lce_prunes);
-        for m in &prunes {
-            Self::prune_fused_lce_dead_chain(&mut self.list, m);
-        }
+        self.apply_pending_fused_lce_prunes();
         Some(self.list)
+    }
+
+    /// Drain queued fused-LCE dead-chain prunes against the completed tape.
+    ///
+    /// The train-block codegen path borrows the tape via `wengert_list()`
+    /// and never calls `finalize()`, so without an explicit drain the dead
+    /// composite `Transpose → Matmul → Add` chain stays in the tape. That
+    /// is NOT benign dead weight: `AdjointGenerator::generate` walks every
+    /// op and `get_or_create_adjoint` fabricates ghost adjoints for the
+    /// dead chain, and `accumulate_adjoint` then merges those ghosts into
+    /// the SAME accumulation `Add`s as the live
+    /// `FusedLinearCeBackwardExtract` results. The wengert lowerer skips
+    /// any op with an unresolved (ghost) input, so the merged `Add`s — and
+    /// with them EVERY parameter gradient downstream of the fused loss
+    /// (lm_head W via the transpose chain, x via reshape → rmsnorm →
+    /// embedding_backward) — silently vanish: the model "trains" on
+    /// weight decay alone. Call this after `set_output` and BEFORE any
+    /// consumer of `wengert_list()` (adjoint generation, WGGO, lowering).
+    ///
+    /// Returns the number of ops removed (0 when no fused substitution
+    /// fired — the common non-decorated path).
+    pub fn apply_pending_fused_lce_prunes(&mut self) -> usize {
+        let prunes = std::mem::take(&mut self.pending_fused_lce_prunes);
+        let mut removed = 0usize;
+        for m in &prunes {
+            removed += Self::prune_fused_lce_dead_chain(&mut self.list, m);
+        }
+        removed
     }
 
     /// Check if the computation graph is static (no dynamic control flow).

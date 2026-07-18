@@ -3661,7 +3661,15 @@ fn lower_fused_linear_ce_forward(
     let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t_for_ffi])?;
     let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t_for_ffi])?;
     let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t_for_ffi])?;
-    let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+    // Targets dtype bridge: the kernels read targets as s64; NSL labels
+    // are f32 GPU tensors. Materialize a device i64 copy for the launch
+    // and free it right after (the free is stream-ordered — safe against
+    // the async kernel). Passing the f32 data pointer straight through
+    // overread the buffer 2× — deterministic-garbage classes on small
+    // shapes, CUDA_ERROR_ILLEGAL_ADDRESS at v49152 (first real e2e
+    // engagement of the fused path).
+    let tgt_ptr =
+        call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
 
@@ -3768,6 +3776,9 @@ fn lower_fused_linear_ce_forward(
             ],
         )?;
     }
+    // Release the i64 targets copy (stream-ordered free — safe against
+    // the async kernel launch above).
+    call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
 
     // Per-row losses are in `loss_out`. Apply the same masked-mean
     // reduction the composite `CrossEntropyLoss` lowering uses so the
@@ -3990,7 +4001,10 @@ fn lower_fused_linear_ce_backward_extract(
         let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t_for_ffi])?;
         let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t_for_ffi])?;
         let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t_for_ffi])?;
-        let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+        // Targets dtype bridge — same s64-vs-f32 contract fix as the
+        // forward (see the forward-side comment); freed after the FFI.
+        let tgt_ptr =
+            call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
         let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
         let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
         let dw_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dw_out])?;
@@ -4074,6 +4088,8 @@ fn lower_fused_linear_ce_backward_extract(
             ],
         )?;
 
+        // Release the i64 targets copy (stream-ordered free).
+        call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
         // Free temporaries; lse_out's storage is consumed by the FFI then
         // freed here (the kernel has already finished reading it because
         // the FFI calls cuCtxSynchronize).
@@ -4175,7 +4191,12 @@ fn lower_fused_kl_ce_forward(
     let xt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xt_t])?;
     let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
     let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
-    let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+    // Targets dtype bridge (review D2c-2): the KL-CE kernels share the
+    // linear-CE s64 targets convention; NSL labels are f32/i32 4-byte —
+    // same 2× overread class fixed on the linear-CE sites. Freed after
+    // the FFI below.
+    let tgt_ptr =
+        call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1_out])?;
     let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st_out])?;
@@ -4213,6 +4234,8 @@ fn lower_fused_kl_ce_forward(
             alpha_bits, temp_bits, smem_val,
         ],
     )?;
+    // Release the i64 targets copy (stream-ordered free).
+    call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
 
     // Masked-mean reduction — identical to the fused linear-CE forward so
     // the scalar is bit-compatible with a composite dual path.
@@ -4339,7 +4362,9 @@ fn lower_fused_kl_ce_backward_extract(
         let xt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[xt_t])?;
         let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
         let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
-        let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+        // Targets dtype bridge (review D2c-2) — see the forward site.
+        let tgt_ptr =
+            call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
         let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1])?;
         let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st])?;
         let lse_tt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_tt])?;
@@ -4427,6 +4452,8 @@ fn lower_fused_kl_ce_backward_extract(
             ],
         )?;
 
+        // Release the i64 targets copy (stream-ordered free).
+        call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
         // The FFI cuCtxSynchronizes, so the LSE buffers are consumed.
         for tmp in [targets_plus_one, valid_mask, num_valid_t, lse_s1, lse_st, lse_tt] {
             free_tensor_value(compiler, builder, tmp)?;

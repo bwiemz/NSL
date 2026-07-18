@@ -356,3 +356,64 @@ Key mechanics:
 The D1a b-loop, buffer lists, seed-override mechanism, packing re-install
 (now per range — any range may hold attention backward ops), partial-tail
 semantics, refusals, and the parity harness all carry over unchanged.
+
+## 7. The fused-CE tape-carry (the buffered-logits lever)
+
+The D2b-part-2 measurement left activations at ~96 % of the 1B peak,
+dominated by the D1a window buffers' per-micro-batch logits chains: the
+composite `CrossEntropyLoss` adjoint reads the `[B·S, V]` logits, so CSLA
+buffered ~96 MiB per micro-batch at 1B. `@fused_lm_ce` computes CE without
+ever materializing logits — but was refused under `--layerwise-accum`
+(M1: Value-keyed forward caches invisible to the replay).
+
+**The carry** mirrors the flash-LSE pattern with three deltas. The only
+real side-band is `fused_ce_fwd_lse` — one `[B·S]` f32 logsumexp per
+micro-batch (2 KiB at 1B vs the 96 MiB logits chain, a ~24× shrink of the
+buffered loss chain) — pushed as an extra window slot and re-bound by the
+SEEDED loss-scalar Value before each consuming range's lowering. Unlike
+the flash carry it is LIVE under BOTH checkpoint policies (the fused op is
+CCR-epilogue — never a recompute victim, so no clone can re-establish the
+side-band). And the buffered tensor's lifecycle inverts: the emitted
+backward CONSUMES AND FREES it per (range, b), so these slots take no
+per-b free — only the trailing-partial-window teardown sweep. The f32
+cast-cache needs no carry at all: its replay MISS path re-emits
+pass-through of the seeded inputs. Distill and non-f32 dtypes stay
+refused loudly (three LSE slots + teacher activations / step-scoped cast
+shadows respectively).
+
+**Three pre-existing defects fell out of the first real e2e engagement**
+(no `nsl run` test had ever engaged the fused kernel — all e2e coverage
+was composite, all numerical coverage direct-FFI with hand-built inputs):
+
+1. *Targets dtype contract*: every fused kernel loads targets with
+   `ld.global.s64` (the direct-FFI harness convention) but NSL GPU labels
+   are f32 — a 2× overread, latent in pool slack on small shapes and a
+   hard `CUDA_ERROR_ILLEGAL_ADDRESS` at V=49152. Fixed with a lowering-
+   side bridge (`nsl_fused_lce_targets_i64_alloc/free`) that materializes
+   a device i64 copy per launch.
+2. *Tag-4 is i32*: the bridge's first cut decoded tag-4 CPU labels as
+   int8 (`DTYPE_INT8 = 4`) — but DataLoader batches carry i32 payloads
+   under tag 4. Deterministically garbled labels
+   (`[t0,0,0,0,t1,0,0,0,…]`, lost −100 sentinels).
+3. *Ghost-adjoint poisoning*: the train path never drained
+   `pending_fused_lce_prunes` (only `finalize()` did, which the train
+   path never calls) — the dead composite `Transpose→Matmul→Add` chain
+   stayed on the tape, per-op AD fabricated ghost adjoints that merged
+   into the SAME accumulation Adds as the live extract results, and the
+   lowerer's unresolved-input skip silently dropped EVERY parameter
+   gradient. The model "trained" on weight decay alone — with a FLAT loss
+   that was still bit-exact between csla arms: parity gates alone cannot
+   see this class. Fixed by draining the prunes right after `set_output`.
+
+**Gate design lessons** now baked into `csla_parity_fused_lmce_gpu`:
+parity-only comparison is satisfiable by deterministic garbage (defects
+1–3 all passed it), so the gate adds a first-loss sane-band anchor
+(ln V + logit-variance), a loss-DESCENT assert (the direct detector for
+grads-dropped), exact launch counters (13 fwd both arms; 12 vs 13 bwd —
+the trailing partial window never replays), and the exact
+`[csla] fused-ce tape-carry: 1 slots` line. Because the fused backward
+scatters dW/dbias with `red.global.add.f32`, run-to-run ULP
+nondeterminism makes bit-exactness unavailable even baseline-vs-baseline;
+the gate probes determinism (baseline twice) and falls back to
+first-loss-bit-equal + per-step rel ≤ 1e-4 — the CSLA machinery itself
+remains bit-exact (every other gate in the suite proves it exactly).

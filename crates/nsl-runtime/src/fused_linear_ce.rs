@@ -177,6 +177,158 @@ fn warn_on_legacy_env_once() {
 /// Threading actual fp16/bf16 from user code (so the @fused_lm_ce decorator
 /// drives `dtype_tag` end-to-end) is a v4-2 follow-on.
 ///
+/// CSLA fused-CE tape-carry anti-vacuity: successful launch counts per
+/// entry point (0 = forward small, 1 = forward large, 2 = backward). A
+/// gate comparing csla-vs-baseline loss streams is vacuous if the fused
+/// kernel silently never engaged (composite fallback) — these counters
+/// prove which path ran and how many times.
+static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Test/diagnostic probe: successful fused linear-CE launches for `kind`
+/// (0 = forward, 1 = forward_large, 2 = backward). Other kinds return -1.
+#[no_mangle]
+pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
+    match kind {
+        0..=2 => FUSED_LCE_LAUNCH_COUNTS[kind as usize]
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        _ => -1,
+    }
+}
+
+/// Targets dtype bridge for the fused linear-CE kernels.
+///
+/// The kernels read targets with `ld.global.s64` — the direct-FFI test
+/// harness convention (hand-allocated i64 buffers). NSL GPU tensors are
+/// f32, so passing an NSL label tensor's data pointer straight through
+/// OVERREADS the buffer by 2× (latent in pool slack on small shapes —
+/// deterministic garbage classes; a hard CUDA_ERROR_ILLEGAL_ADDRESS once
+/// the read crosses the allocation, as the v49152 finalize kernel did on
+/// the first real `nsl run` engagement). This helper materializes a
+/// device i64 copy: DtoH the f32 labels, round to i64 on the host
+/// (labels are whole numbers; negatives like ignore_index round
+/// exactly), HtoD into a fresh rows×8 buffer. Rows are ≤ a few thousand
+/// per step — the roundtrip is microseconds and keeps the validated
+/// kernels + their byte-identity snapshots untouched.
+///
+/// Returns the raw device pointer (NOT an NslTensor — the 8-byte stride
+/// would corrupt f32 byte-size accounting); release it with
+/// [`nsl_fused_lce_targets_i64_free`] after the kernel FFI returns.
+#[no_mangle]
+pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
+    if tensor_ptr == 0 {
+        eprintln!("nsl_fused_lce_targets_i64_alloc: null tensor");
+        std::process::abort();
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
+        let n = t.len as usize;
+        // Density guard (review D2c-3): the reads below walk t.data
+        // linearly — a broadcast/expand view (stride 0) or a strided
+        // slice would be silently misread. Every real label path is a
+        // contiguous post-reshape tensor; refuse loudly otherwise.
+        {
+            let shape = unsafe { std::slice::from_raw_parts(t.shape, t.ndim as usize) };
+            let strides =
+                unsafe { std::slice::from_raw_parts(t.strides, t.ndim as usize) };
+            let mut dense_extent: i64 = 1;
+            let mut has_zero_stride = false;
+            for (d, (&dim, &st)) in shape.iter().zip(strides).enumerate() {
+                let _ = d;
+                if dim > 1 && st == 0 {
+                    has_zero_stride = true;
+                }
+                dense_extent += st * (dim - 1).max(0);
+            }
+            if has_zero_stride || dense_extent != t.len {
+                eprintln!(
+                    "nsl_fused_lce_targets_i64_alloc: non-contiguous label \
+                     tensor (dense extent {dense_extent} vs len {}, \
+                     zero-stride={has_zero_stride}) — call .contiguous() \
+                     before the fused loss",
+                    t.len
+                );
+                std::process::abort();
+            }
+        }
+        crate::cuda::inner::ensure_context();
+        // Labels arrive in whatever form the loader/pipeline produced:
+        // GPU f32 (batch dicts moved to device), CPU f64/f32, or narrow
+        // CPU integer forms (int8 / u16 token streams). All are whole
+        // numbers (class indices; ignore_index negatives round exactly).
+        // Contiguity holds on every label path (post-reshape).
+        let host_i64: Vec<i64> = match (t.device, t.dtype) {
+            (1, crate::tensor::DTYPE_F32) => {
+                let mut host_f32 = vec![0f32; n];
+                crate::cuda::inner::memcpy_dtoh(
+                    host_f32.as_mut_ptr() as *mut std::os::raw::c_void,
+                    t.data,
+                    n * 4,
+                );
+                host_f32.iter().map(|&v| v.round() as i64).collect()
+            }
+            (0, crate::tensor::DTYPE_F64) => {
+                let s = unsafe { std::slice::from_raw_parts(t.data as *const f64, n) };
+                s.iter().map(|&v| v.round() as i64).collect()
+            }
+            (0, crate::tensor::DTYPE_F32) => {
+                let s = unsafe { std::slice::from_raw_parts(t.data as *const f32, n) };
+                s.iter().map(|&v| v.round() as i64).collect()
+            }
+            // Dtype tag 4 on batch tensors is I32, NOT int8: the DataLoader
+            // materializes input_ids/labels as i32 payloads under tag 4
+            // (dataloader.rs `build_simple_batch` — "dtype=4 is i32 in NSL's
+            // type system") and every runtime reader (`read_index`,
+            // `as_f64_owned`, `read_scalar_as_f64`, `data_i32`) decodes tag 4
+            // as *const i32. Reading i8 here garbled real label streams into
+            // [t0,0,0,0,t1,0,0,0,...] — the fused-CE e2e forward divergence.
+            (0, 4) => {
+                let s = unsafe { std::slice::from_raw_parts(t.data as *const i32, n) };
+                s.iter().map(|&v| v as i64).collect()
+            }
+            (0, crate::tensor::DTYPE_U16_TOKEN) => {
+                let s = unsafe { std::slice::from_raw_parts(t.data as *const u16, n) };
+                s.iter().map(|&v| v as i64).collect()
+            }
+            (dev, dt) => {
+                eprintln!(
+                    "nsl_fused_lce_targets_i64_alloc: unsupported label tensor \
+                     form (device={dev} dtype={dt})"
+                );
+                std::process::abort();
+            }
+        };
+        let dev = crate::cuda::inner::alloc_managed(n * 8);
+        crate::cuda::inner::memcpy_htod(
+            dev,
+            host_i64.as_ptr() as *const std::os::raw::c_void,
+            n * 8,
+        );
+        dev as i64
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        eprintln!("nsl_fused_lce_targets_i64_alloc: compiled without cuda feature");
+        std::process::abort();
+    }
+}
+
+/// Free a buffer produced by [`nsl_fused_lce_targets_i64_alloc`].
+#[no_mangle]
+pub extern "C" fn nsl_fused_lce_targets_i64_free(dev_ptr: i64) {
+    #[cfg(feature = "cuda")]
+    if dev_ptr != 0 {
+        crate::cuda::inner::ensure_context();
+        crate::cuda::inner::free_managed(dev_ptr as *mut std::os::raw::c_void);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = dev_ptr;
+}
+
 /// Any value outside {0, 1, 2} is treated as F32 (defensive — preserves
 /// forward-compat with un-recompiled callers).
 #[no_mangle]
@@ -236,6 +388,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
         // (a NULL-stream barrier that self-synchronizes), so no eager sync here.
         #[cfg(feature = "cuda")]
         crate::cuda::inner::sync_after_kernel();
+        FUSED_LCE_LAUNCH_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -337,6 +490,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
             return -(rc as i64);
         }
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
+        FUSED_LCE_LAUNCH_COUNTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         0
     }
     #[cfg(not(feature = "cuda"))]
@@ -440,6 +594,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
         }
         #[cfg(feature = "cuda")]
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
+        FUSED_LCE_LAUNCH_COUNTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         0
     }
     #[cfg(not(feature = "cuda"))]

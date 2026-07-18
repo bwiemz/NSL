@@ -768,6 +768,14 @@ fn plan_train_block(
             return None;
         }
 
+        // Fused-LCE dead-chain drain (review D2c-1): the in-place path
+        // drains right after set_output, so this prepass tape must drain
+        // too or the graph fingerprints structurally never match on any
+        // @fused_lm_ce-substituted model (the 3 dead Transpose/Matmul/Add
+        // ops change the hash) — rejecting every pre-solved plan AND
+        // cost-modeling a dead V×H matmul into the plan itself.
+        extractor.apply_pending_fused_lce_prunes();
+
         let mut analysis_config = crate::wggo_weight_analysis::AnalysisConfig::default();
         if let Some(f) = compiler.compile_options.wggo.prune_fraction {
             analysis_config.default_prune_fraction = f.clamp(0.0, 0.9);

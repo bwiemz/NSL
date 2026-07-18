@@ -655,6 +655,282 @@ fn csla_weight_stream_parity_gpu() {
     );
 }
 
+/// Fused-CE tape-carry parity (GPU): @fused_lm_ce(dtype=f32) composes with
+/// the layerwise schedule. Both arms carry the decorator (fused-vs-fused —
+/// fused numerics differ from the composite by design), so the diff is the
+/// schedule alone and parity is BIT-EXACT. The carry buffers one [B*S] f32
+/// logsumexp per micro-batch and re-binds `fused_ce_fwd_lse` by the seeded
+/// loss Value per replay; the materialized [B*S, V] logits chain never
+/// exists on either arm. Anti-vacuity: exact launch counters (fwd 13 both
+/// arms; bwd 13 interleaved vs 12 replayed — the trailing partial window
+/// never replays) + the exact carry-slot stderr line; a composite fallback
+/// or an inert carry cannot pass.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_parity_fused_lmce_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_fce_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("fce_base.nslm");
+    let save_b = tmp.join("fce_csla.nslm");
+
+    let base = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_a, &[]),
+        "fce_a",
+        true,
+        true,
+        &["--checkpoint-blocks"],
+    );
+    assert!(base.success, "fused baseline arm failed:\n{}", base.stderr);
+    // Determinism probe: the fused backward scatters dW/dbias via
+    // red.global.add.f32 — atomic-order ULP nondeterminism, exactly the
+    // embedding-backward situation. Baseline-vs-itself decides whether
+    // bit-exact comparison is even available on this kernel/driver combo.
+    let save_a2 = tmp.join("fce_base2.nslm");
+    let base2 = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_a2, &[]),
+        "fce_a2",
+        true,
+        true,
+        &["--checkpoint-blocks"],
+    );
+    assert!(base2.success, "fused baseline rerun failed:\n{}", base2.stderr);
+    // Probe on streams AND raw model bytes (review D2c-6): the exact
+    // branch compares bytes, so the probe must certify byte-level
+    // determinism, not just the printed (rounded) losses.
+    let backward_deterministic = base.loss_stream == base2.loss_stream
+        && std::fs::read(&save_a).ok() == std::fs::read(&save_a2).ok();
+    let csla = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_b, &[]),
+        "fce_b",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(csla.success, "fused csla arm failed:\n{}", csla.stderr);
+
+    // Schedule engaged (not a degenerate all-epilogue shape) + exactly one
+    // carried fused-CE LSE slot.
+    assert_eq!(
+        window_phase_count(&csla.stderr),
+        Some(6),
+        "csla arm window count:\n{}",
+        csla.stderr
+    );
+    assert_eq!(window_phase_count(&base.stderr), Some(0));
+    assert!(
+        csla.stderr.contains("[csla] fused-ce tape-carry: 1 slots"),
+        "fused-CE carry slot line missing or wrong:\n{}",
+        csla.stderr
+    );
+
+    // Launch counters: the fused kernel actually ran, the designed number
+    // of times, on BOTH arms.
+    let fwd_b = marker_i64(&base.stdout, "FUSED_LCE_FWD").expect("base fwd marker");
+    let bwd_b = marker_i64(&base.stdout, "FUSED_LCE_BWD").expect("base bwd marker");
+    let fwd_c = marker_i64(&csla.stdout, "FUSED_LCE_FWD").expect("csla fwd marker");
+    let bwd_c = marker_i64(&csla.stdout, "FUSED_LCE_BWD").expect("csla bwd marker");
+    assert_eq!(
+        (fwd_b, bwd_b, fwd_c, bwd_c),
+        (13, 13, 13, 12),
+        "fused-CE launch counts drifted (base fwd/bwd, csla fwd/bwd)"
+    );
+
+    // Semantic anchors (targets-dtype + ghost-adjoint lessons): bit-exact
+    // parity alone is satisfiable by DETERMINISTIC GARBAGE — the s64-vs-f32
+    // targets overread AND the i8-vs-i32 tag-4 misread both produced
+    // identical wrong losses on both arms, and the un-drained fused-LCE
+    // prune left ghost adjoints that silently dropped every param grad
+    // (flat loss, still bit-exact between arms). Two independent anchors:
+    //   1. the first loss must sit in the sane CE band for this init —
+    //      ln(128)=4.852 plus the logit-variance term (~5.65 measured
+    //      against the composite/no-train ground truth);
+    //   2. the model must actually TRAIN: last window loss well below the
+    //      first (weight-decay-only "training" stays flat).
+    let parse = |l: &str| -> Option<f64> {
+        l.trim()
+            .trim_start_matches("tensor([")
+            .trim_end_matches("])")
+            .parse()
+            .ok()
+    };
+    let losses: Vec<f64> = base.loss_stream.lines().filter_map(parse).collect();
+    let first_loss = *losses.first().expect("empty loss stream");
+    // Pinned to the composite-derived ground truth for this deterministic
+    // init + data (review D2c-4: the old (4.5, 6.4) band ADMITTED the
+    // measured tag-4-garbled value 5.19 — a band is not a discriminator).
+    assert!(
+        (first_loss - 5.6485).abs() < 0.02,
+        "first fused-CE loss {first_loss} != composite ground truth 5.6485 \
+         — the kernel is not computing real cross-entropy (targets dtype \
+         bridge regressed?)"
+    );
+    // Whole-stream mean separates trained (measured 4.78) from
+    // grads-dropped/frozen (measured 5.36 at lr~0 — per-block data
+    // difficulty makes single-loss descent checks noisy).
+    let mean_loss: f64 = losses.iter().sum::<f64>() / losses.len() as f64;
+    assert!(
+        mean_loss < 5.1,
+        "fused-CE mean loss {mean_loss} looks frozen (trained ~4.78, \
+         grads-dropped ~5.36) — ghost-adjoint prune regressed?"
+    );
+
+    // Parity: with a deterministic backward, demand bit-exactness (loss
+    // stream + model bytes). With the atomic-scatter backward (the current
+    // kernel), run-to-run ULP noise makes bit-exactness unavailable even
+    // baseline-vs-baseline — fall back to: FIRST loss bit-equal (the
+    // pre-update forward has no atomics; a schedule bug that corrupts
+    // inputs shows up here exactly) + every later step within a tight
+    // relative band (ULP noise compounds to ~1e-6 over 6 steps at lr 2e-3;
+    // a wrong replay shows orders of magnitude more).
+    if backward_deterministic {
+        assert_eq!(
+            base.loss_stream, csla.loss_stream,
+            "loss stream diverged under --layerwise-accum with @fused_lm_ce"
+        );
+        let bytes_a = std::fs::read(&save_a).expect("base model_save missing");
+        let bytes_b = std::fs::read(&save_b).expect("csla model_save missing");
+        assert!(
+            bytes_a == bytes_b,
+            "saved model bytes diverged under --layerwise-accum with @fused_lm_ce"
+        );
+    } else {
+        let csla_losses: Vec<f64> = csla.loss_stream.lines().filter_map(parse).collect();
+        assert_eq!(
+            losses.len(),
+            csla_losses.len(),
+            "loss stream lengths diverged"
+        );
+        assert_eq!(
+            losses.first(),
+            csla_losses.first(),
+            "FIRST fused-CE loss diverged — the replay's forward inputs or \
+             LSE carry are wrong (this is pre-update and atomic-free)"
+        );
+        for (i, (a, b)) in losses.iter().zip(&csla_losses).enumerate() {
+            let rel = (a - b).abs() / a.abs().max(1e-9);
+            assert!(
+                rel < 1e-4,
+                "step {i}: csla loss {b} deviates from baseline {a} \
+                 (rel {rel:.2e}) beyond atomic-ULP noise"
+            );
+        }
+    }
+}
+
+/// The narrowed refusal: @fused_lm_ce with a non-f32 dtype stays refused
+/// under the layerwise schedule (step-scoped cast shadow tensors cannot be
+/// carried), with the loud diagnostic — not a silent composite fallback.
+#[test]
+fn csla_fused_lmce_non_f32_refused() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_fce_ref_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("unused.nslm");
+    let out = run_program(
+        &program(
+            "csla_fused_lmce.nsl",
+            false,
+            &save,
+            &[("dtype=\"f32\"", "dtype=\"f16\"")],
+        ),
+        "fce_ref",
+        false,
+        false,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(!out.success, "non-f32 fused-CE under csla must refuse");
+    assert!(
+        out.stderr
+            .contains("supports @fused_lm_ce only with dtype=\"f32\""),
+        "wrong refusal:\n{}",
+        out.stderr
+    );
+}
+
+/// Fused-CE × streaming composition (GPU): the exact 1B production stack —
+/// @fused_lm_ce + --layerwise-accum + --optim-state-offload +
+/// --weight-stream (review D2c-7: previously only the manual 1B run
+/// covered it). Streaming and staging are byte-preserving and the forward
+/// is deterministic, so the FIRST loss must be bit-equal between the
+/// csla arm and the fully-streamed arm; later steps within atomic-ULP
+/// noise. Transfer counters and the placement-pinned schedule line carry
+/// over from the ws gates (same 2-block structure: 6 streamed params).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_fused_lmce_streams_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_fces_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("fces_base.nslm");
+    let save_b = tmp.join("fces_stream.nslm");
+
+    let base = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_a, &[]),
+        "fces_a",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(base.success, "fused csla arm failed:\n{}", base.stderr);
+    let ws = run_program(
+        &program("csla_fused_lmce.nsl", true, &save_b, &[]),
+        "fces_b",
+        true,
+        true,
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--optim-state-offload",
+            "--weight-stream",
+        ],
+    );
+    assert!(ws.success, "fused streamed arm failed:\n{}", ws.stderr);
+
+    assert_eq!(window_phase_count(&ws.stderr), Some(6));
+    assert!(
+        ws.stderr.contains("[csla] fused-ce tape-carry: 1 slots"),
+        "carry inert under the streamed composition:\n{}",
+        ws.stderr
+    );
+    assert_eq!(
+        ws_counts(&ws.stderr),
+        (114, 114, 36),
+        "transfer counts drifted under the fused composition"
+    );
+    assert!(
+        ws.stderr.contains(
+            "[weight-stream] forward streaming: 4 slices, 6 streamed params \
+             (6 touched by the primal); uploads/slice [0,3,3,0] \
+             evicts/slice [0,3,3,0]"
+        ),
+        "forward-streaming schedule line missing under the fused \
+         composition:\n{}",
+        ws.stderr
+    );
+
+    let parse = |l: &str| -> Option<f64> {
+        l.trim()
+            .trim_start_matches("tensor([")
+            .trim_end_matches("])")
+            .parse()
+            .ok()
+    };
+    let a: Vec<f64> = base.loss_stream.lines().filter_map(parse).collect();
+    let b: Vec<f64> = ws.loss_stream.lines().filter_map(parse).collect();
+    assert_eq!(a.len(), b.len(), "loss stream lengths diverged");
+    assert_eq!(
+        base.loss_stream.lines().next(),
+        ws.loss_stream.lines().next(),
+        "FIRST loss diverged under byte-preserving streaming — the fused \
+         forward read different bytes"
+    );
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let rel = (x - y).abs() / x.abs().max(1e-9);
+        assert!(
+            rel < 1e-4,
+            "step {i}: streamed loss {y} deviates from csla {x} (rel {rel:.2e})"
+        );
+    }
+}
+
 /// D2b × D2a composition (GPU): --weight-stream WITH --optim-state-offload —
 /// the exact 1B production configuration (the 9.10 GB measurement). The
 /// per-layer update site interleaves the offload envelope's staged-m/v
