@@ -65,17 +65,11 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
     let prog = tmp.join("zero_gate.nsl");
     std::fs::write(&prog, source).unwrap();
 
-    // Invoke the PRE-BUILT `nsl` binary directly (CARGO_BIN_EXE_nsl), never
-    // `cargo run`: shelling out to cargo from inside an integration test
-    // takes the cargo build-directory lock and re-runs an up-to-date check on
-    // every call. Under the default multi-threaded `cargo test` (dozens of
-    // e2e tests each spawning `cargo run`) those calls serialize on that lock,
-    // and on slow CI (Windows) the lock-wait alone can exceed this helper's
-    // per-run watchdog — tripping a false timeout on a run that does no real
-    // work beyond a few training steps. Cargo guarantees the bin is built
-    // before this package's integration tests run, so the path is valid. The
-    // `--devices N` self-spawn re-execs via current_exe()+args().skip(1)
-    // (see run.rs), so it behaves identically to the cargo-run launch.
+    // Invoke the PRE-BUILT `nsl` binary directly (CARGO_BIN_EXE_nsl) rather
+    // than `cargo run` — no build-directory lock, no per-call up-to-date
+    // check. Cargo builds this package's bins before its integration tests, so
+    // the path is valid; the `--devices N` self-spawn re-execs via
+    // current_exe()+args().skip(1) (see run.rs), so it behaves identically.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
     cmd.args(["run", "--source-ad", "--deterministic"])
         .args(extra_args)
@@ -90,6 +84,32 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn nsl run");
 
+    // Drain stdout AND stderr on dedicated threads, concurrently with the
+    // watchdog wait. A single `nsl run` emits several KB to stderr just at
+    // compile time (WGGO notes, the system linker's relocation warnings, the
+    // `[nsl] deterministic mode` banner) plus the `[zero]` atexit line. If we
+    // waited on the child and only read the pipes afterwards (the obvious
+    // shape), a child that filled the OS pipe buffer would block on write
+    // forever — try_wait never sees it exit, and the watchdog fires a false
+    // "hang". Linux pipes are 1 MiB so it slips under the limit; Windows
+    // anonymous pipes are far smaller and link.exe is chattier, so that path
+    // deadlocked at exactly the 600 s watchdog while Linux stayed green. Reader
+    // threads (what Command::output does internally) make the write side never
+    // block; kill() on timeout closes the pipes so the readers hit EOF and the
+    // joins below return the partial capture for the panic message.
+    let mut out_pipe = child.stdout.take().expect("child stdout piped");
+    let mut err_pipe = child.stderr.take().expect("child stderr piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        out_pipe.read_to_string(&mut s).ok();
+        s
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        err_pipe.read_to_string(&mut s).ok();
+        s
+    });
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let status = loop {
         match child.try_wait().expect("try_wait") {
@@ -98,26 +118,19 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("nsl run '{tag}' exceeded {timeout_secs}s — SPMD rank hang?");
+                    let so = out_reader.join().unwrap_or_default();
+                    let se = err_reader.join().unwrap_or_default();
+                    panic!(
+                        "nsl run '{tag}' exceeded {timeout_secs}s — SPMD rank hang?\n\
+                         --- captured stdout ---\n{so}\n--- captured stderr ---\n{se}"
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .ok();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .ok();
+    let stdout = out_reader.join().expect("stdout reader thread panicked");
+    let stderr = err_reader.join().expect("stderr reader thread panicked");
 
     let mut loss_stream = String::new();
     let mut in_stream = false;
