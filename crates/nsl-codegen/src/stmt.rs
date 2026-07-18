@@ -4074,6 +4074,39 @@ impl Compiler<'_> {
             }
         }
 
+        // D3 v1: only ZeRO-1 (optimizer-state sharding: owner-gated updates
+        // + post-step parameter broadcast over the CPU-shm SimulatedBackend)
+        // is lowered. Grad sharding (stage 2: per-shard reduce-scatter into
+        // sharded accumulators) and param sharding (stage 3: JIT all-gather
+        // in the forward) need sharded BUFFERS, not just sharded compute —
+        // refuse loudly rather than silently running stage-1 semantics.
+        if let Some(s) = self.features.zero_stage {
+            if s >= 2 {
+                return Err(CodegenError::new(format!(
+                    "--zero-stage {s} is not lowered yet: v1 implements stage 1 \
+                     (optimizer-state sharding, validated vs the single-rank \
+                     baseline at toy scale). Use --zero-stage 1",
+                )));
+            }
+            // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
+            // The all-reduce is emitted BEFORE the Deferred dispatch, but
+            // two-phase clip folds the final micro-batch gradient into
+            // m_partial AFTER it and derives the clip factor from a
+            // RANK-LOCAL norm — so with real (non-replicated) data each rank
+            // would clip differently and the owner's update would diverge.
+            // It only looks bit-exact today because the loader is rank-blind.
+            // Refuse, mirroring the zero x mode-table / zero x layerwise
+            // refusals, rather than ship a latent miscompile.
+            if s >= 1 && grad_clip != f64::MAX {
+                return Err(CodegenError::new(
+                    "--zero-stage is incompatible with grad_clip: the gradient \
+                     all-reduce precedes the two-phase clip, whose norm is \
+                     computed rank-locally, so clipped multi-rank training \
+                     would be silently wrong. Drop grad_clip or --zero-stage",
+                ));
+            }
+        }
+
         // ── 3. Resolve model type and build param list ──────────────────
         // Get the model pointer from state
         let (model_var, _) = *state.variables.get(&model_sym).ok_or_else(|| {
@@ -4158,6 +4191,51 @@ impl Compiler<'_> {
         }
         // End of the Weights bracket — restore the caller's surface.
         self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
+
+        // D3 (ZeRO-1): initialize the real sharding context ONCE at train
+        // setup — the missing M43b emitter. The runtime builds the CPU-shm
+        // SimulatedBackend from the `--devices N` spawner's env protocol
+        // (rank + shm path); world_size is the compile-time value baked
+        // here, and round-robin ownership (idx % ws) is established before
+        // any optimizer machinery runs. world_size == 1 degenerates to
+        // no-op collectives and rank-0 owning everything — identical to
+        // the unsharded baseline by construction.
+        if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+            let stage_val = builder
+                .ins()
+                .iconst(cl_types::I64, self.features.zero_stage.unwrap_or(1) as i64);
+            let ws_val = builder
+                .ins()
+                .iconst(cl_types::I64, self.features.world_size.max(1) as i64);
+            // D3 (review): ZeRO init/partition return codes were discarded —
+            // a refused init (-2 NSL_SIMULATED_TP=0, -3 missing shm path)
+            // left ZERO_CTX None, and every owner gate then read
+            // owns_param==-1 and skipped ALL updates: the run trained a
+            // frozen model and exited 0. Assert the rc so a refusal aborts
+            // loudly instead of silently training nothing. (The runtime
+            // FFIs still RETURN the code — unit tests exercise the refusal
+            // paths directly; only the emitted call is made fatal.)
+            let init_rc =
+                self.compile_call_by_name(builder, "nsl_zero_init", &[stage_val, ws_val])?;
+            let zero_i = builder.ins().iconst(cl_types::I64, 0);
+            let init_ok = builder.ins().icmp(IntCC::Equal, init_rc, zero_i);
+            let init_msg = "nsl: --zero-stage init failed (see message above) — \
+                            aborting instead of training an unsynchronized model";
+            self.intern_string(init_msg)?;
+            let init_msg_ptr = self.compile_string_literal(builder, init_msg)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[init_ok, init_msg_ptr])?;
+
+            let np_val = builder
+                .ins()
+                .iconst(cl_types::I64, param_paths.len() as i64);
+            let part_rc =
+                self.compile_call_by_name(builder, "nsl_zero_partition", &[np_val])?;
+            let part_ok = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, part_rc, zero_i);
+            let part_msg = "nsl: --zero-stage partition failed — aborting";
+            self.intern_string(part_msg)?;
+            let part_msg_ptr = self.compile_string_literal(builder, part_msg)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[part_ok, part_msg_ptr])?;
+        }
         let num_params_val = builder
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
@@ -9275,17 +9353,37 @@ impl Compiler<'_> {
         let beta2_const = builder.ins().f64const(beta2_value);
         let eps_const = builder.ins().f64const(eps_value);
 
-        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step
+        // M43b: ZeRO Stage 1+ — all-reduce gradients before optimizer step.
+        // The rc is asserted: a mid-run collective failure (capacity -4,
+        // GPU-placement refusal -5, dtype -1) must abort, not continue with
+        // un-reduced gradients (review: discarded rc -> silent wrong train).
         let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
         if zero_enabled {
-            self.compile_call_by_name(
+            let rc = self.compile_call_by_name(
                 builder,
                 "nsl_zero_reduce_grads",
                 &[opt_grads, num_params_val],
             )?;
+            let z = builder.ins().iconst(cl_types::I64, 0);
+            let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+            let m = "nsl: ZeRO gradient reduction failed (see message above) — aborting";
+            self.intern_string(m)?;
+            let mp = self.compile_string_literal(builder, m)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
         }
 
         if let Some(mtb) = mode_table_base {
+            // D3 v1: the unified mode-table dispatch has its own per-param
+            // update kernel selection — owner-gating inside it is untested
+            // territory. Refuse the composition loudly.
+            if zero_enabled {
+                return Err(CodegenError::new(
+                    "--zero-stage is not supported with a WGGO per-param mode \
+                     table yet: the sharded update gate is lowered only for \
+                     the monolithic Deferred and FullBuffer optimizer arms. \
+                     Drop --wggo mode overrides or --zero-stage",
+                ));
+            }
             self.emit_unified_optim_step_dispatch(
                 builder,
                 state,
@@ -9479,6 +9577,34 @@ impl Compiler<'_> {
 
                     let pb_mpart =
                         self.compile_call_by_name(builder, "nsl_list_get", &[accum, pb_i])?;
+                    // D3 (ZeRO-1): only the owner rank updates this param.
+                    // Non-owners must still ZERO m_partial (the update
+                    // normally does it) or the next window accumulates onto
+                    // stale gradients.
+                    let pb_zero_blocks = if zero_enabled {
+                        let owns = self
+                            .compile_call_by_name(builder, "nsl_zero_owns_param", &[pb_i])?;
+                        let one_i = builder.ins().iconst(cl_types::I64, 1);
+                        let owned = builder.ins().icmp(IntCC::Equal, owns, one_i);
+                        let pb_do = builder.create_block();
+                        let pb_skip = builder.create_block();
+                        let pb_join = builder.create_block();
+                        builder.ins().brif(owned, pb_do, &[], pb_skip, &[]);
+                        builder.switch_to_block(pb_skip);
+                        builder.seal_block(pb_skip);
+                        let zf = builder.ins().f64const(0.0);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_mul_scalar_inplace",
+                            &[pb_mpart, zf],
+                        )?;
+                        builder.ins().jump(pb_join, &[]);
+                        builder.switch_to_block(pb_do);
+                        builder.seal_block(pb_do);
+                        Some(pb_join)
+                    } else {
+                        None
+                    };
                     self.compile_call_by_name(
                         builder,
                         "nsl_tensor_mul_scalar_inplace",
@@ -9515,6 +9641,11 @@ impl Compiler<'_> {
                         wrap_precision,
                         self.compile_options.optim_state_offload,
                     )?;
+                    if let Some(pb_join) = pb_zero_blocks {
+                        builder.ins().jump(pb_join, &[]);
+                        builder.switch_to_block(pb_join);
+                        builder.seal_block(pb_join);
+                    }
                     let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
                     builder.ins().jump(pb_hdr, &[]);
@@ -9546,6 +9677,34 @@ impl Compiler<'_> {
                     builder.ins().brif(fs_cont, fs_body, &[], fs_exit, &[]);
                     builder.switch_to_block(fs_body);
                     builder.seal_block(fs_body);
+                    // D3 (ZeRO-1): owner-gated update; non-owners zero
+                    // m_partial (see the clip-path comment).
+                    let fs_zero_blocks = if zero_enabled {
+                        let mp = self
+                            .compile_call_by_name(builder, "nsl_list_get", &[accum, fs_i])?;
+                        let owns = self
+                            .compile_call_by_name(builder, "nsl_zero_owns_param", &[fs_i])?;
+                        let one_i = builder.ins().iconst(cl_types::I64, 1);
+                        let owned = builder.ins().icmp(IntCC::Equal, owns, one_i);
+                        let fs_do = builder.create_block();
+                        let fs_skip = builder.create_block();
+                        let fs_join = builder.create_block();
+                        builder.ins().brif(owned, fs_do, &[], fs_skip, &[]);
+                        builder.switch_to_block(fs_skip);
+                        builder.seal_block(fs_skip);
+                        let zf = builder.ins().f64const(0.0);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_mul_scalar_inplace",
+                            &[mp, zf],
+                        )?;
+                        builder.ins().jump(fs_join, &[]);
+                        builder.switch_to_block(fs_do);
+                        builder.seal_block(fs_do);
+                        Some(fs_join)
+                    } else {
+                        None
+                    };
                     let theta =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fs_i])?;
                     let m =
@@ -9571,6 +9730,11 @@ impl Compiler<'_> {
                         self.compile_options.optim_state_offload,
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
+                    if let Some(fs_join) = fs_zero_blocks {
+                        builder.ins().jump(fs_join, &[]);
+                        builder.switch_to_block(fs_join);
+                        builder.seal_block(fs_join);
+                    }
                     let fs_one = builder.ins().iconst(cl_types::I64, 1);
                     let fs_next = builder.ins().iadd(fs_i, fs_one);
                     builder.def_var(fs_i_var, fs_next);
@@ -9586,6 +9750,24 @@ impl Compiler<'_> {
                     }
                 }
 
+                // D3 (ZeRO-1): broadcast every param from its owner so
+                // all ranks hold the full updated model — the post-step
+                // sync both Deferred sub-arms converge on. Fixes the
+                // pre-existing gap where this arm emitted no post-step
+                // ZeRO call at all.
+                if zero_enabled {
+                    let rc = self.compile_call_by_name(
+                        builder,
+                        "nsl_zero_sync_params",
+                        &[param_list, num_params_val],
+                    )?;
+                    let z = builder.ins().iconst(cl_types::I64, 0);
+                    let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+                    let m = "nsl: ZeRO param sync failed (see message above) — aborting";
+                    self.intern_string(m)?;
+                    let mp = self.compile_string_literal(builder, m)?;
+                    self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
+                }
                 // Jump to post-optimizer block (merges optimizer and skip paths)
                 if let Some(t0) = phase_opt_t0 {
                 self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;
@@ -9624,6 +9806,24 @@ impl Compiler<'_> {
             builder.switch_to_block(opt_body);
             builder.seal_block(opt_body);
             state.current_block = Some(opt_body);
+
+            // D3 (ZeRO-1): owner-gated update. FullBuffer accum cleanup
+            // (7g below) zeroes every accum slot unconditionally, so the
+            // skip path needs no manual m_partial zero here.
+            let opt_zero_blocks = if zero_enabled {
+                let owns =
+                    self.compile_call_by_name(builder, "nsl_zero_owns_param", &[idx])?;
+                let one_i = builder.ins().iconst(cl_types::I64, 1);
+                let owned = builder.ins().icmp(IntCC::Equal, owns, one_i);
+                let z_do = builder.create_block();
+                let z_join = builder.create_block();
+                builder.ins().brif(owned, z_do, &[], z_join, &[]);
+                builder.switch_to_block(z_do);
+                builder.seal_block(z_do);
+                Some(z_join)
+            } else {
+                None
+            };
 
             // Get param, gradient, state buffers via runtime list indexing
             let param_val =
@@ -9664,6 +9864,11 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
             )?;
 
+            if let Some(z_join) = opt_zero_blocks {
+                builder.ins().jump(z_join, &[]);
+                builder.switch_to_block(z_join);
+                builder.seal_block(z_join);
+            }
             let one_opt = builder.ins().iconst(cl_types::I64, 1);
             let next_opt = builder.ins().iadd(idx, one_opt);
             builder.def_var(opt_i_var, next_opt);
@@ -9681,9 +9886,21 @@ impl Compiler<'_> {
             }
         }
 
-        // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
+        // D3 (ZeRO-1): broadcast every param from its owner — the real
+        // post-step sync (nsl_zero_step retained as a no-op for ABI compat).
         if zero_enabled {
             self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
+            let rc = self.compile_call_by_name(
+                builder,
+                "nsl_zero_sync_params",
+                &[param_list, num_params_val],
+            )?;
+            let z = builder.ins().iconst(cl_types::I64, 0);
+            let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+            let m = "nsl: ZeRO param sync failed (see message above) — aborting";
+            self.intern_string(m)?;
+            let mp = self.compile_string_literal(builder, m)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
         }
 
         // 7g. Post-optimizer cleanup: zero accum buffers or free direct grads

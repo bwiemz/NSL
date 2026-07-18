@@ -65,6 +65,17 @@ jobs:
         if: runner.os != 'macOS'
         run: cargo test -p nsl-cli --test e2e -- --test-threads=1
 
+      # D3 (ZeRO-1): the multi-rank SPMD parity gate is #[ignore]d (spawns
+      # processes) so `cargo test` skips it — run it explicitly. It is the
+      # only executable proof of deadlock-free lockstep, owner gating, the
+      # collective counts, and the --devices argv forwarding. Each SPMD
+      # invocation carries a 900 s watchdog, so a hung rank turns red, not
+      # into a hung job (Linux/Windows only — the macOS lane is non-blocking
+      # elsewhere and process spawning is slowest there).
+      - name: ZeRO SPMD parity gate (Linux/Windows)
+        if: runner.os != 'macOS'
+        run: cargo test -p nsl-cli --test zero_spmd_gate -- --include-ignored --test-threads=1
+
       - name: E2E smoke tests (macOS, non-blocking)
         if: runner.os == 'macOS'
         continue-on-error: true

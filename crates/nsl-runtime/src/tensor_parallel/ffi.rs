@@ -30,7 +30,7 @@ unsafe impl Send for TpContext {}
 
 /// Open a file-backed shared memory region via `memmap2` and leak the mapping
 /// so it lives for the process lifetime.
-fn open_shm(path: &str) -> (*mut u8, usize) {
+pub(crate) fn open_shm(path: &str) -> (*mut u8, usize) {
     use std::fs::OpenOptions;
     let file = OpenOptions::new()
         .read(true)
@@ -71,10 +71,24 @@ pub extern "C" fn nsl_tp_init() -> i64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    let _simulated: bool = std::env::var("NSL_SIMULATED_TP")
+    // D3 (review G4): a non-simulated backend request must refuse LOUDLY —
+    // no NCCL (or any real inter-device transport) exists in this build,
+    // and silently substituting the CPU-shm SimulatedBackend would let a
+    // "multi-GPU" run report success while exchanging host bytes only.
+    let simulated: bool = std::env::var("NSL_SIMULATED_TP")
         .ok()
         .map(|v| v == "1")
         .unwrap_or(true);
+    if !simulated && world_size > 1 {
+        eprintln!(
+            "nsl_tp_init: NSL_SIMULATED_TP=0 requests a real collective \
+             backend, but no NCCL/inter-device transport is built into \
+             this runtime — refusing rather than silently simulating. \
+             Unset NSL_SIMULATED_TP (or set it to 1) to run on the \
+             CPU-shm SimulatedBackend."
+        );
+        return -2;
+    }
 
     // For world_size > 1 with simulated backend, open the shared memory file.
     let (shm_ptr, shm_len) = if world_size > 1 {
