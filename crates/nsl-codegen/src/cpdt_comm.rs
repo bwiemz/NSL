@@ -1,13 +1,24 @@
 //! CPDT — per-layer communication schedule.
 //!
-//! Given a [`ZeroConfig`], emit an ordered list of async
-//! allgather/reducescatter launches and matching waits so that every
-//! layer's parameter gather overlaps with the previous layer's compute.
+//! Given a [`ZeroConfig`], build an ordered list of allgather/reducescatter
+//! ops describing where a per-layer, compute-overlapped collective schedule
+//! WOULD place each gather/reduce.
 //!
-//! The schedule is a compile-time constant — the downstream Cranelift
-//! backend emits `nsl_cpdt_allgather` / `nsl_cpdt_reducescatter` runtime
-//! calls in exactly this order.  No Python-level `register_comm_hook`
-//! dispatch, no dynamic collective insertion.
+//! ADVISORY / COST-MODEL ARTIFACT — NOT lowered to collectives (as of D3 v3).
+//! The schedule is a compile-time constant consumed only by
+//! `CpdtPlan::render_report` (op/async counts) and serialized plan dumps; the
+//! Cranelift backend does NOT emit `nsl_cpdt_allgather` / `nsl_cpdt_reducescatter`
+//! from it. The REAL D3 ZeRO-1 collectives are a separate mechanism: codegen
+//! gates on `--zero-stage` and emits whole-list `nsl_zero_reduce_grads` +
+//! `nsl_zero_sync_params` (see stmt.rs / zero.rs), which the runtime executes
+//! SYNCHRONOUSLY over a CPU-shm SimulatedBackend one param at a time.
+//!
+//! Wiring this schedule's `async_` / `order` / overlap semantics into execution
+//! is deferred — it requires a real async transport (NCCL, or a background comm
+//! thread + CUDA streams). On the current synchronous backend, emitting per-op
+//! collectives from the schedule would be numerically identical, offer zero
+//! overlap, and only multiply spin-barrier rendezvous points (more deadlock
+//! surface for no gain). See MEMORY: multi-device NCCL/IPC is DEFERRED.
 
 use serde::Serialize;
 

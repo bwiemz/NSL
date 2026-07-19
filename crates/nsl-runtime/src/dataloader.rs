@@ -10,7 +10,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
+
+/// Default cross-rank shuffle seed for data-parallel (world_size > 1). All
+/// ranks MUST derive the identical global permutation each epoch, so the seed
+/// is a fixed constant (XORed with the epoch), never entropy — otherwise the
+/// strided per-rank shard partition would be neither disjoint nor complete.
+const DEFAULT_DP_SHUFFLE_SEED: u64 = 0x1970_D31A_10AD_5EED;
 
 use crate::cpu::create_tensor_with_shape_rs_dtype;
 use crate::dict::{nsl_dict_free_tensor_values, nsl_dict_new, nsl_dict_set_str};
@@ -45,6 +53,21 @@ struct DataLoaderConfig {
     /// keys off `segment_ids`, and the decomposed fallback derives the mask
     /// on demand (`nsl_packed_mask_from_segment_ids`).
     emit_attention_mask: bool,
+    /// D3 v3: data-parallel world size baked by codegen (from
+    /// `self.features.world_size` when `--zero-stage >= 1`). `> 1` turns on
+    /// rank-aware sharding: rank `r` (from `NSL_LOCAL_RANK`) consumes the
+    /// global batches at slots where `slot % world_size == r`, so all-reduced
+    /// gradients average over the true global batch instead of replicated
+    /// data. Default 1 = rank-blind (unchanged single-rank behavior).
+    world_size: usize,
+    /// D3 v3: opt-in rank-aware sharding. Only when `true` (and world_size > 1)
+    /// does the loader hand each rank a disjoint 1/world_size shard. Default
+    /// false = every rank sees the full data (replicated). The TRAINING loader
+    /// under data-parallel sets this; eval/validation loaders must NOT (they
+    /// have no gradient all-reduce to recombine a shard).
+    shard_by_rank: bool,
+    /// Cross-rank shuffle seed (only load-bearing when sharding is active).
+    seed: u64,
 }
 
 impl DataLoaderConfig {
@@ -65,6 +88,9 @@ impl DataLoaderConfig {
             packing: v["packing"].as_bool().unwrap_or(false),
             pack_separator: v["pack_separator"].as_i64().unwrap_or(0),
             emit_attention_mask: v["emit_attention_mask"].as_bool().unwrap_or(false),
+            world_size: v["world_size"].as_u64().unwrap_or(1).max(1) as usize,
+            shard_by_rank: v["shard_by_rank"].as_bool().unwrap_or(false),
+            seed: v["seed"].as_u64().unwrap_or(DEFAULT_DP_SHUFFLE_SEED),
         }
     }
 }
@@ -91,7 +117,21 @@ struct DataLoader {
     expected_batch_id: Arc<AtomicUsize>,
     condvar: Arc<Condvar>,
     worker_handles: Vec<JoinHandle<()>>,
+    /// D3 v3: batches THIS rank yields per epoch = global_total_batches /
+    /// world_size (FLOOR). Every rank yields exactly this many so all ranks
+    /// reach the same number of gradient all-reduce/broadcast collectives —
+    /// an unequal count would hang the ZeRO spin-barrier. Used by next_batch
+    /// termination and the worker slot space.
     total_batches: usize,
+    /// D3 v3: total batches across ALL ranks (the un-sharded count). The full
+    /// global order is built from this, then strided to this rank's shard.
+    global_total_batches: usize,
+    /// D3 v3: this rank's DP index (from NSL_LOCAL_RANK; 0 when rank-blind).
+    rank: usize,
+    /// D3 v3: epoch counter, advanced by reset(), folded into the shuffle seed
+    /// so each epoch's global permutation differs but stays identical across
+    /// ranks (lockstep resets in SPMD).
+    epoch: Arc<AtomicUsize>,
     _shuffle_offsets: Vec<usize>,
 }
 
@@ -159,15 +199,68 @@ impl DataLoader {
             std::process::abort();
         }
         let tokens_per_batch = config.batch_size * config.seq_len;
-        let total_batches = if tokens_per_batch > 0 {
-            if config.drop_last {
-                data_len / tokens_per_batch
-            } else {
-                data_len.div_ceil(tokens_per_batch)
-            }
-        } else {
+
+        // D3 v3: rank-aware data-parallel sharding is OPT-IN via `shard_by_rank`
+        // (default off) and only meaningful across multiple ranks. It must NOT
+        // auto-activate on every DataLoader: an eval/validation loader is not
+        // wrapped by the gradient all-reduce, so sharding it would make each
+        // rank report metrics over only 1/world_size of the data. The training
+        // loader opts in explicitly (`DataLoader(..., shard_by_rank=true)`).
+        let world_size = config.world_size.max(1);
+        let sharding = world_size > 1 && config.shard_by_rank;
+
+        // rank comes from NSL_LOCAL_RANK (set by the `nsl run --devices N`
+        // spawner), mirroring zero.rs.
+        let local_rank_env = std::env::var("NSL_LOCAL_RANK").ok();
+        // Refuse loudly if sharding is requested but this process was NOT
+        // launched by the --devices spawner (NSL_LOCAL_RANK unset): sharding a
+        // lone process would silently train on only its 1/world_size slice.
+        if sharding && local_rank_env.is_none() {
+            eprintln!(
+                "nsl: DataLoader(shard_by_rank=true) with world_size={world_size} but \
+                 NSL_LOCAL_RANK is unset — run under `nsl run --devices {world_size} \
+                 --zero-stage N`. Refusing to shard a single process (would train on \
+                 only 1/{world_size} of the data)."
+            );
+            std::process::abort();
+        }
+        let rank = local_rank_env
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(world_size - 1);
+
+        // Under sharding, drop the ragged partial tail (FLOOR, regardless of
+        // drop_last) so no batch_id points at a short slice: a PACKED partial
+        // tail makes a worker skip a claimed delivery slot, yielding an unequal
+        // per-rank count that hangs the ZeRO spin-barrier. Dropping the tail is
+        // standard DDP behavior (re-randomized across epochs via the shuffle).
+        let global_total_batches = if tokens_per_batch == 0 {
             0
+        } else if config.drop_last || sharding {
+            data_len / tokens_per_batch
+        } else {
+            data_len.div_ceil(tokens_per_batch)
         };
+
+        // Per-rank count is the FLOOR so every rank yields the SAME number of
+        // batches (equal collective count → no spin-barrier deadlock).
+        let total_batches = if sharding {
+            global_total_batches / world_size
+        } else {
+            global_total_batches
+        };
+
+        // Refuse loudly if the corpus can't give every rank ≥1 batch (floor
+        // would be 0 → a silent no-op, frozen-model, exit-0 run — the M43b
+        // anti-pattern).
+        if sharding && total_batches == 0 {
+            eprintln!(
+                "nsl: DataLoader can't shard {global_total_batches} batches across \
+                 {world_size} ranks (< 1 per rank). Reduce --devices, batch_size, or \
+                 seq_len, or provide more data."
+            );
+            std::process::abort();
+        }
 
         DataLoader {
             data_tensor_ptr,
@@ -187,6 +280,9 @@ impl DataLoader {
             condvar: Arc::new(Condvar::new()),
             worker_handles: Vec::new(),
             total_batches,
+            global_total_batches,
+            rank,
+            epoch: Arc::new(AtomicUsize::new(0)),
             _shuffle_offsets: Vec::new(),
         }
     }
@@ -196,10 +292,40 @@ impl DataLoader {
         self.cursor.store(0, Ordering::Relaxed);
         self.expected_batch_id.store(0, Ordering::Relaxed);
 
-        let mut batch_order: Vec<usize> = (0..self.total_batches).collect();
+        // D3 v3: build the GLOBAL batch order first, then (only when sharding
+        // is opted in) stride to this rank's shard. When NOT sharding this
+        // reduces exactly to the original `(0..total_batches)` + entropy
+        // shuffle — byte-identical, whether world_size is 1 OR a replicated
+        // multi-rank loader (shard_by_rank=false).
+        let sharding = self.config.world_size > 1 && self.config.shard_by_rank;
+        let mut batch_order: Vec<usize> = (0..self.global_total_batches).collect();
         if self.config.shuffle {
-            let mut rng = rand::rng();
-            batch_order.shuffle(&mut rng);
+            if sharding {
+                // Cross-rank-consistent deterministic shuffle: EVERY rank must
+                // produce the identical global permutation for this epoch, or
+                // the strided partition is neither disjoint nor complete. Key
+                // by (seed, epoch) so epochs differ but ranks agree.
+                let epoch = self.epoch.load(Ordering::Relaxed) as u64;
+                let mut rng = StdRng::seed_from_u64(self.config.seed ^ epoch);
+                batch_order.shuffle(&mut rng);
+            } else {
+                // Not sharding: preserve the original entropy-seeded shuffle.
+                let mut rng = rand::rng();
+                batch_order.shuffle(&mut rng);
+            }
+        }
+        // Strided per-rank shard: rank r takes global slots where slot % ws == r,
+        // capped to total_batches (floor) so every rank yields an equal count.
+        if sharding {
+            let rank = self.rank;
+            let ws = self.config.world_size;
+            batch_order = batch_order
+                .into_iter()
+                .enumerate()
+                .filter(|(slot, _)| slot % ws == rank)
+                .map(|(_, b)| b)
+                .take(self.total_batches)
+                .collect();
         }
         self._shuffle_offsets = batch_order.clone();
         let batch_order = Arc::new(batch_order);
@@ -504,6 +630,12 @@ pub extern "C" fn nsl_dataloader_reset(dl_ptr: i64) {
 
     dl.cursor.store(0, Ordering::Relaxed);
     dl.expected_batch_id.store(0, Ordering::Relaxed);
+    // D3 v3: advance the epoch BEFORE restarting workers so each epoch's global
+    // permutation differs (fed into the seeded shuffle). SPMD ranks reset in
+    // lockstep (the train block emits nsl_dataloader_reset at every epoch
+    // boundary on all ranks), so their epoch counters — and thus permutations
+    // — stay identical, keeping the strided shard partition disjoint+complete.
+    dl.epoch.fetch_add(1, Ordering::Relaxed);
     dl.start_workers();
 }
 

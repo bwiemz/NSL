@@ -56,6 +56,33 @@ fn program(save_path: &Path) -> String {
     )
 }
 
+/// D3 v3: the EVEN-micro-batch (12) rank-aware DP fixture. `grad_accum` picks
+/// the arm: 2 = single-process baseline (consecutive pairs); 1 = per-rank DP
+/// (each rank contributes one micro-batch per step, averaged by the all-reduce).
+fn program_rank_aware(save_path: &Path, grad_accum: u32) -> String {
+    let src = std::fs::read_to_string(
+        repo_root().join("crates/nsl-cli/tests/fixtures/csla_rank_aware_dp.nsl"),
+    )
+    .expect("rank-aware DP fixture missing");
+    let src = src.replace(
+        "CSLA_SAVE_PATH",
+        &save_path.display().to_string().replace('\\', "/"),
+    );
+    if grad_accum == 1 {
+        src.replace("grad_accumulation=2", "grad_accumulation=1")
+    } else {
+        src
+    }
+}
+
+/// Parse the newline-joined LOSS_STREAM body into per-micro-batch loss values.
+fn parse_losses(stream: &str) -> Vec<f64> {
+    stream
+        .lines()
+        .filter_map(|l| l.trim().parse::<f64>().ok())
+        .collect()
+}
+
 struct RunOutput {
     loss_stream: String,
     stderr: String,
@@ -209,10 +236,14 @@ fn zero_stage1_single_rank_is_identity() {
     assert!(ba == bb, "model bytes diverged at world_size 1");
 }
 
-/// The real thing: 2 SPMD ranks over the shm backend, replicated data.
-/// Rank 0's loss stream must be bit-identical to the single-rank baseline
-/// — wrong reduce order, a missed broadcast, or stale non-owner state
-/// diverges within one step.
+/// 2 SPMD ranks over the shm backend with REPLICATED data (the default —
+/// `shard_by_rank` is opt-in and this fixture does not set it, so every rank
+/// sees the full batch set). Rank 0's loss stream must be bit-identical to the
+/// single-rank baseline: `(N·g)/N == g` exactly. This is the TIGHT check —
+/// unlike the tolerance-based rank-aware gate it catches a global gradient-scale
+/// error (a missing/wrong `÷world_size` in the all-reduce), which AdamW's
+/// scale-invariance hides from a loss-parity comparison. `zero_stage1_rank_aware_dp_parity`
+/// below is its complement: the SAME machinery under REAL (sharded) data.
 #[test]
 #[ignore = "spawns multiple processes; run explicitly"]
 fn zero_stage1_two_rank_parity() {
@@ -239,14 +270,11 @@ fn zero_stage1_two_rank_parity() {
         spmd.stderr
     );
 
-    // Anti-vacuity: the collectives ACTUALLY ran. Replicated-data parity
-    // alone is satisfied even by a no-op reduce (identical grads → sum/ws
-    // == g); the counter line proves otherwise. Fixture: 8 params,
-    // grad_accum=2, 13 micro-batches → 6 optimizer steps; reduce_grads and
-    // sync_params each loop 8 params per step → 48 all_reduce + 48
-    // broadcast per rank. Rank 0's line must show ws=2 and those exact
-    // totals — a dropped --devices (children compiling world_size=1) or an
-    // identity collective would report 0.
+    // Anti-vacuity: the collectives ACTUALLY ran. Replicated-data parity alone
+    // is satisfied even by a no-op reduce (identical grads → sum/ws == g); the
+    // counter line proves otherwise. Fixture: 8 params, grad_accum=2, 13
+    // micro-batches → 6 optimizer steps; reduce_grads and sync_params each loop
+    // 8 params per step → 48 all_reduce + 48 broadcast per rank.
     let zero_line = spmd
         .stderr
         .lines()
@@ -266,8 +294,7 @@ fn zero_stage1_two_rank_parity() {
         "baseline ran collectives:\n{}",
         base.stderr
     );
-    // θ-sync evidence: the saved model (whichever rank wrote last — both
-    // hold broadcast-synced params) matches the baseline bit-for-bit.
+    // θ-sync evidence: the saved model matches the baseline bit-for-bit.
     let ba = std::fs::read(&save_a).expect("baseline save missing");
     let bb = std::fs::read(&save_b).expect("spmd save missing");
     assert!(
@@ -348,6 +375,107 @@ fn zero_stage1_optim_state_is_sharded() {
     assert!(
         r1 > 0 && r1 < full,
         "rank 1 optim state is not a strict shard: r1={r1} full={full}"
+    );
+}
+
+/// D3 v3 (RANK-AWARE DATA-PARALLEL): the loader now hands each rank a DISJOINT
+/// data shard (rank r takes global micro-batches where idx % world_size == r),
+/// so the ZeRO all-reduce averages gradients over the TRUE global batch instead
+/// of replicated data. This is the first gate where the two ranks see DIFFERENT
+/// data, so — unlike G1 — it is NOT bit-exact against the single-rank baseline
+/// (real DP is numerically EQUIVALENT, not bit-identical: f32 reassociation
+/// across the FASE Passthrough(accum=1) vs Deferred(accum=2) path boundary and
+/// separate-process gradients leave ~1 f32 ULP of drift). We validate the
+/// equivalence within tolerance instead.
+///
+/// Construction (proven bit-close in practice, ~1e-7 rel): baseline = 1 process,
+/// grad_accumulation=2 → each optimizer step aggregates the consecutive pair
+/// {2k, 2k+1}. DP = 2 ranks, grad_accumulation=1 → rank0 sees {0,2,4,6,8,10},
+/// rank1 sees {1,3,5,7,9,11}; each step all-reduce-MEANS the two ranks'
+/// single-micro-batch gradients — the SAME pair {2k, 2k+1} the baseline
+/// averages. So rank0's k-th micro-batch loss L(θ_k, mb_{2k}) tracks the
+/// baseline's (2k)-th loss.
+#[test]
+#[ignore = "spawns multiple processes; run explicitly"]
+fn zero_stage1_rank_aware_dp_parity() {
+    let tmp = std::env::temp_dir().join(format!("nsl_zero_ra_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_base = tmp.join("ra_base.nslm");
+    let save_dp = tmp.join("ra_dp.nslm");
+
+    // Baseline: single process, grad_accum=2, rank-blind loader → 12
+    // micro-batch losses (6 consecutive pairs, no trailing tail: 12 batches).
+    let base = run_nsl(&program_rank_aware(&save_base, 2), "ra_base", &[], 600);
+    assert!(base.success, "baseline failed:\n{}", base.stderr);
+    let base_losses = parse_losses(&base.loss_stream);
+    assert_eq!(
+        base_losses.len(),
+        12,
+        "baseline should emit 12 micro-batch losses:\n{}",
+        base.loss_stream
+    );
+
+    // Real DP: 2 ranks, grad_accum=1, rank-aware strided loader. rank0 (the
+    // only rank whose stdout reaches us) processes ITS shard {0,2,4,6,8,10} →
+    // 6 losses. Rank-blindness would instead give rank0 all 12 → 12 losses.
+    let dp = run_nsl(
+        &program_rank_aware(&save_dp, 1),
+        "ra_dp",
+        &["--zero-stage", "1", "--devices", "2"],
+        900,
+    );
+    assert!(dp.success, "2-rank DP run failed:\n{}", dp.stderr);
+    let dp_losses = parse_losses(&dp.loss_stream);
+    assert_eq!(
+        dp_losses.len(),
+        6,
+        "rank0 should emit 6 losses (its shard) not 12 (rank-blind):\n{}",
+        dp.loss_stream
+    );
+
+    // Sharding + gradient-average correctness: rank0's k-th loss tracks the
+    // baseline's (2k)-th loss within f32 tolerance. A wrong shard or wrong
+    // averaging diverges by O(0.1+) (the distinct micro-batches differ by
+    // whole loss units), far above this bound.
+    for k in 0..6 {
+        let got = dp_losses[k];
+        let want = base_losses[2 * k];
+        let rel = (got - want).abs() / want.abs().max(1.0);
+        assert!(
+            rel < 1e-3,
+            "rank0 loss[{k}]={got} != baseline even-index[{}]={want} (rel {rel:.3e}) \
+             — data shard or gradient averaging is wrong",
+            2 * k
+        );
+    }
+
+    // Anti-vacuity #1: rank0 did NOT see the ODD micro-batches. If the loader
+    // were still rank-blind, rank0's 2nd loss would track baseline's 2nd
+    // (micro-batch 1); the strided shard makes it baseline's 3rd (micro-batch
+    // 2), which is a whole loss unit away.
+    assert!(
+        (dp_losses[1] - base_losses[1]).abs() > 0.1,
+        "rank0 loss[1]={} too close to baseline loss[1]={} — loader did NOT shard \
+         (still rank-blind?)",
+        dp_losses[1],
+        base_losses[1]
+    );
+
+    // Anti-vacuity #2: the collectives actually ran — 6 optimizer steps × 8
+    // params = 48 all_reduce + 48 broadcast per rank; both ranks present.
+    let z0 = dp
+        .stderr
+        .lines()
+        .find(|l| l.contains("[zero] ws=2 rank=0"))
+        .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line:\n{}", dp.stderr));
+    assert!(
+        z0.contains("all_reduce=48") && z0.contains("broadcast=48"),
+        "wrong collective counts (expected 48/48): {z0}"
+    );
+    assert!(
+        dp.stderr.contains("[zero] ws=2 rank=1"),
+        "rank1 [zero] line missing — second rank did not run:\n{}",
+        dp.stderr
     );
 }
 
