@@ -33,6 +33,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             pretrain_optimized,
             debug_training,
             grad_integrity,
+            training_reference,
             nan_analysis,
             distribute: _distribute,
             zero_stage,
@@ -352,7 +353,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 }
             };
 
-            let compile_opts = nsl_codegen::CompileOptions {
+            let mut compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
                 world_size: devices.max(1) as usize, // --devices drives WGGO ZeRO + TP world_size
@@ -409,6 +410,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 weight_stream,
                 debug_training,
                 grad_integrity,
+                training_reference,
                 shared_lib,
                 emit_export_table: shared_lib,
                 wrga_inputs: None,
@@ -486,6 +488,10 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 // CLI initializes to None and lets entry_points.rs do it.
                 calibration_grad_retention: None,
             };
+            // P1.7: force the field-controlled optimizations off for the
+            // reference training path (decorator/pattern-driven ones are gated
+            // in codegen on compile_opts.training_reference).
+            crate::meta_flags::apply_training_reference(&mut compile_opts);
 
             // Validate WGGO mode string early so users get a clear error
             // instead of a silent no-op.

@@ -24,6 +24,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             pretrain_optimized,
             debug_training,
             grad_integrity,
+            training_reference,
             trace_ops,
             deterministic,
             distribute: _distribute,
@@ -339,7 +340,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     }
                 }
             }
-            let compile_opts = nsl_codegen::CompileOptions {
+            let mut compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
                 autotune_fresh: false,
                 // Clamp like `nsl build` (build/options.rs) — `--devices 0` must not
@@ -385,6 +386,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 weight_stream,
                 debug_training,
                 grad_integrity,
+                training_reference,
                 shared_lib: false,
                 emit_export_table: false,
                 wrga_inputs: None,
@@ -480,6 +482,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // doesn't drive calibration, so this stays None.
                 calibration_grad_retention: None,
             };
+            // P1.7: force the field-controlled optimizations off for the
+            // reference training path (decorator/pattern-driven ones are gated
+            // in codegen on compile_opts.training_reference).
+            crate::meta_flags::apply_training_reference(&mut compile_opts);
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
             if prefill_workers > 1 || decode_workers > 1 {

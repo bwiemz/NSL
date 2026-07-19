@@ -1118,6 +1118,18 @@ pub struct CompileOptions {
     /// `NSL_GRAD_INTEGRITY=1`, which the flag sets). Unlike `debug_training`
     /// it changes NO optimization decisions — it only observes gradients.
     pub grad_integrity: bool,
+    /// P1.7: permanent reference-training mode (`--training-reference`). Forces
+    /// the SIMPLEST correct training path so an optimized stack can be compared
+    /// against an independent baseline (stronger than comparing two optimized
+    /// paths that may share the same bug). Disables: CCR, CSLA, weight
+    /// streaming, optimizer-state offload, WGGO, CPDT/reduced-precision moments,
+    /// CSHA, kernel `@fuse` fusion (the field-controlled ones, forced off at the
+    /// CLI) plus FBIP in-place, the fused FASE optimizer step, and the fused-CE
+    /// (`@fused_lm_ce`) / fused-KL-CE substitution and `@checkpoint` decorators
+    /// (gated in codegen on this field). The source-AD fused activation
+    /// backward is retained — it is bit-exact-equivalent to the unfused form
+    /// (FASE≡AdamW gates) and is not a distinct-numerics surface.
+    pub training_reference: bool,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     /// Also controls PIC codegen (`is_pic`), which every object linked into
     /// the shared library needs — including non-entry modules on the
@@ -1336,6 +1348,7 @@ impl Default for CompileOptions {
             zero_stage: None,
             debug_training: false,
             grad_integrity: false,
+            training_reference: false,
             shared_lib: false,
             emit_export_table: false,
             wrga_inputs: None,

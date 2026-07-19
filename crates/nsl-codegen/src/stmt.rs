@@ -5135,7 +5135,11 @@ impl Compiler<'_> {
                 None => (None, None, None),
             };
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-                .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone())
+                .with_checkpoint_policies(if self.compile_options.training_reference {
+                    Default::default() // P1.7: ignore @checkpoint decorators in the reference path
+                } else {
+                    self.compile_options.checkpoint_policies.clone()
+                })
                 .with_fused_ce_config(fused_ce_cfg)
                 .with_fused_kl_ce_config(fused_kl_ce_cfg, distill_alpha, distill_temp);
 
@@ -6174,11 +6178,15 @@ impl Compiler<'_> {
                 // (the generator `take()`s it later) so claimed segments
                 // can be exempted — the claim table is keyed by primal
                 // OpId, which a recompute clone cannot satisfy.
-                let ccr_selective_decorated = self
-                    .compile_options
-                    .checkpoint_policies
-                    .values()
-                    .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
+                // P1.7 --training-reference: ignore @checkpoint decorators so a
+                // decorated program still runs the un-checkpointed reference
+                // path (the --checkpoint-blocks flag is already forced off).
+                let ccr_selective_decorated = !self.compile_options.training_reference
+                    && self
+                        .compile_options
+                        .checkpoint_policies
+                        .values()
+                        .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
                 let mut effective_primal = effective_primal;
                 let mut ccr_compress_map: std::collections::HashMap<
                     crate::wengert::VarId,
@@ -11862,7 +11870,11 @@ impl Compiler<'_> {
         // @checkpoint(policy=...) policies into the extractor. Empty map
         // = byte-identity preserved.
         let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-            .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone());
+            .with_checkpoint_policies(if self.compile_options.training_reference {
+                    Default::default() // P1.7: ignore @checkpoint decorators in the reference path
+                } else {
+                    self.compile_options.checkpoint_policies.clone()
+                });
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
         extractor.set_model_field_types(self.models.model_field_types.clone());
         // WRGA B.3.2 Option 3: plumb synth overrides so the extractor

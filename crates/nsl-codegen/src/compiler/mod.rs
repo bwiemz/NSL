@@ -1106,11 +1106,18 @@ impl<'a> Compiler<'a> {
         stmt_id: nsl_ast::NodeId,
     ) -> Option<crate::FusedCeDecoratorConfig> {
         let saved = self.active_fused_ce_config.clone();
-        self.active_fused_ce_config = self
-            .fused_ce_configs
-            .iter()
-            .find(|c| c.train_block_stmt_id == stmt_id)
-            .cloned();
+        // P1.7 --training-reference: never activate a fused-CE (@fused_lm_ce)
+        // config, so the substitution never fires and the composite
+        // cross-entropy path runs — an independent baseline for the fused-CE
+        // numerics.
+        self.active_fused_ce_config = if self.compile_options.training_reference {
+            None
+        } else {
+            self.fused_ce_configs
+                .iter()
+                .find(|c| c.train_block_stmt_id == stmt_id)
+                .cloned()
+        };
         saved
     }
 
