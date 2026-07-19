@@ -220,7 +220,27 @@ pub struct NslTensor {
 
 pub const NSL_TENSOR_DATA_OFFSET: usize = std::mem::offset_of!(NslTensor, data);
 
-// Built-in dtype IDs (match existing u8 values)
+// ---------------------------------------------------------------------------
+// Canonical built-in dtype IDs — the `NslTensor.dtype` (u16) wire tags.
+//
+// THIS is the single source of truth for the runtime tensor dtype tag space.
+// Other modules that must speak these tags (tensor_parallel::collective,
+// codegen::cpdt_precision_exec, dlpack, ...) are pinned to these values by
+// compile-time `assert!`s; the golden `dtype_abi_lock` test below fails loudly
+// if any tag moves. Add new tags at the next free slot — DO NOT reuse a value.
+//
+// TWO OVERLOADS TO KNOW ABOUT (P0.4 dtype/ABI cleanup — documented, not yet
+// disentangled; a rename needs careful loader→loss hot-path validation):
+//   * Tag 4 is DTYPE_INT8 HERE, but the DataLoader / CPU tensor factory also
+//     use 4 to mean i32 token IDs (cpu.rs, dataloader.rs, and the *i32 readers
+//     in this file). `dtype_element_size(4)` returns the i32 width (4 B) because
+//     the only tag-4 tensors that reach the generic path are DataLoader i32;
+//     packed int8 uses int8_blockwise with its own accounting. A DataLoader i32
+//     tensor exported through the C API would be mislabeled int8 — do not do it.
+//   * The C API (`c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi}`) uses the
+//     INVERTED 0=f32 / 1=f64 convention; those two functions are the ONLY place
+//     that inversion may be expressed. See the `dtype_abi_lock` test.
+// ---------------------------------------------------------------------------
 pub const DTYPE_F64: u16 = 0;
 pub const DTYPE_F32: u16 = 1;
 pub const DTYPE_FP16: u16 = 2;
@@ -4073,6 +4093,50 @@ pub fn test_tensor_tape_id(ptr: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P0.4 dtype/ABI cleanup: GOLDEN LOCK on the canonical dtype tag table.
+    /// A future fused kernel that renumbers or reuses a tag fails HERE instead
+    /// of silently colliding on the wire. Also pins the byte widths, the tag-4
+    /// i32/int8 overload, and the C-API 0/1 inversion round-trip.
+    #[test]
+    fn dtype_abi_lock() {
+        // The canonical table — do not renumber; append at the next free slot.
+        assert_eq!(DTYPE_F64, 0);
+        assert_eq!(DTYPE_F32, 1);
+        assert_eq!(DTYPE_FP16, 2);
+        assert_eq!(DTYPE_BF16, 3);
+        assert_eq!(DTYPE_INT8, 4);
+        assert_eq!(DTYPE_FP8E4M3, 5);
+        assert_eq!(DTYPE_FP8E5M2, 6);
+        assert_eq!(DTYPE_U16_TOKEN, 7);
+        assert_eq!(DTYPE_U16_SEGMENT, 8);
+        assert_eq!(DTYPE_CUSTOM_START, 256);
+
+        // Byte widths (int8/u16-token/segment are stored 1/2/2 bytes; tag 4 also
+        // means DataLoader i32 on the generic path — 4 bytes — see the const
+        // block doc).
+        assert_eq!(dtype_element_size(DTYPE_F64), 8);
+        assert_eq!(dtype_element_size(DTYPE_F32), 4);
+        assert_eq!(dtype_element_size(DTYPE_FP16), 2);
+        assert_eq!(dtype_element_size(DTYPE_BF16), 2);
+        assert_eq!(dtype_element_size(DTYPE_U16_TOKEN), 2);
+        assert_eq!(dtype_element_size(4), 4); // DataLoader i32 (overloaded tag)
+
+        // The C-API convention is INVERTED (0=f32, 1=f64) and round-trips only
+        // through the two dedicated conversion functions.
+        use crate::c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi};
+        assert_eq!(nsl_dtype_to_capi(DTYPE_F32), 0, "NSL f32(1) -> C-API 0");
+        assert_eq!(nsl_dtype_to_capi(DTYPE_F64), 1, "NSL f64(0) -> C-API 1");
+        assert_eq!(capi_dtype_to_nsl(0), DTYPE_F32);
+        assert_eq!(capi_dtype_to_nsl(1), DTYPE_F64);
+        for tag in [DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8] {
+            assert_eq!(
+                capi_dtype_to_nsl(nsl_dtype_to_capi(tag)),
+                tag,
+                "C-API dtype round-trip must be identity for tag {tag}"
+            );
+        }
+    }
 
     #[test]
     fn test_set_element() {

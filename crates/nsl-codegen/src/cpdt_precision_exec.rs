@@ -12,6 +12,16 @@ pub const DTYPE_F32: u16 = 1;
 pub const DTYPE_FP16: u16 = 2;
 pub const DTYPE_INT8: u16 = 4;
 
+// P0.4 dtype/ABI cleanup: this codegen-side mirror emits runtime dtype tags, so
+// its values MUST match the runtime's canonical `DTYPE_*`. Pin them at compile
+// time (nsl-codegen depends on nsl-runtime) so a runtime tag change cannot
+// silently desync the emitted optimizer-state storage dtype.
+const _: () = {
+    assert!(DTYPE_F32 == nsl_runtime::tensor::DTYPE_F32);
+    assert!(DTYPE_FP16 == nsl_runtime::tensor::DTYPE_FP16);
+    assert!(DTYPE_INT8 == nsl_runtime::tensor::DTYPE_INT8);
+};
+
 /// v1 clamp: map an optimizer-state precision to FP16 storage (Part II's FASE
 /// wrapping handles only F32/FP16). This is the Part II FP16 PATH — the runtime
 /// has INT8 blockwise ops now (§3.2 / Sprint 4), and the FASE-side cast wrapping
