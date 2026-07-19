@@ -547,6 +547,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     // Debug training: gradient checksum (--debug-training)
     ("nsl_debug_grad_checksum", &[types::I64, types::I64], None),
+    // P0.3 gradient-integrity gate (--grad-integrity)
+    ("nsl_grad_integrity_arm", &[], None),
+    ("nsl_grad_integrity_check", &[types::I64, types::I64], None),
+    ("nsl_grad_integrity_step_begin", &[types::I64], None),
+    ("nsl_grad_integrity_note", &[types::I64, types::I64], None),
+    ("nsl_grad_integrity_step_end", &[], None),
     // Prefetch tensor to GPU asynchronously
     ("nsl_tensor_prefetch", &[types::I64, types::I64], None),
     // M36: GPU memory slab (compile-time planned device memory arena)

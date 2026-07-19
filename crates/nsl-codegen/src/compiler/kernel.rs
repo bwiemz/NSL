@@ -874,11 +874,15 @@ impl Compiler<'_> {
         // pipeline gains per-fn context — today the CSHA training PTX
         // emission is module-scoped (one training_config per module
         // owning the @train block).
-        let checkpoint_full_active = self
-            .compile_options
-            .checkpoint_policies
-            .values()
-            .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Full));
+        // P1.7 --training-reference: ignore @checkpoint decorators so the
+        // flash-attention kernels are not staged for recompute (keeps the
+        // reference path free of the checkpoint-preset forward staging).
+        let checkpoint_full_active = !self.compile_options.training_reference
+            && self
+                .compile_options
+                .checkpoint_policies
+                .values()
+                .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Full));
         let training_checkpoint = if checkpoint_full_active {
             Some(crate::flash_attention::CheckpointExtras::full())
         } else {

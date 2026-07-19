@@ -149,8 +149,10 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // NOT actually checkpointed. The estimate is clamped to the
     // no-checkpoint sum so the optimism is bounded; a per-layer coverage
     // blend needs a layer->function map that AppliedPlan does not carry.
-    model.activation_checkpointing =
-        !compiler.compile_options.checkpoint_policies.is_empty();
+    // P1.7 --training-reference: report no checkpointing in the memory estimate,
+    // matching codegen (which ignores @checkpoint decorators in that mode).
+    model.activation_checkpointing = !compiler.compile_options.training_reference
+        && !compiler.compile_options.checkpoint_policies.is_empty();
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
     // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
@@ -4341,6 +4343,26 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
 
+        // P0.3: arm the gradient-integrity exit report once, at train setup
+        // (before the epoch/step loop), so --grad-integrity works with no env
+        // var. The per-step check/note calls below feed the accumulator.
+        if self.compile_options.grad_integrity {
+            self.compile_call_by_name(builder, "nsl_grad_integrity_arm", &[])?;
+            // v1 does not wire the gate into the CSLA (--layerwise-accum)
+            // windowed-replay backward, so it would report checks=0 there —
+            // silently. Warn loudly rather than let a gate pass vacuously
+            // (deferral-must-refuse). The FullBuffer and FASE-interleaved paths
+            // are covered.
+            if self.compile_options.layerwise_accum {
+                eprintln!(
+                    "[grad-integrity] WARNING: --grad-integrity is not wired into the \
+                     --layerwise-accum (CSLA) windowed backward yet — the report will \
+                     show checks=0. Drop --layerwise-accum to check gradients, or treat \
+                     checks=0 as 'not measured', not 'no problems'."
+                );
+            }
+        }
+
         // CPDT precision-adaptive optimizer execution (v1): build per-param
         // storage dtype lists aligned with param_list, when active. Inactive ->
         // None (the existing FP32 path runs verbatim, zero behavior change).
@@ -5119,7 +5141,15 @@ impl Compiler<'_> {
             let (fused_kl_ce_cfg, distill_alpha, distill_temp) = match &self.active_distill_context
             {
                 Some(d) => (
-                    d.fused_kl_ce.clone(),
+                    // P1.7: --training-reference disables the fused KL-CE
+                    // substitution so the composite KL-CE baseline runs instead
+                    // (mirrors the @fused_lm_ce gate on active_fused_ce_config).
+                    // The composite distill loss (alpha/temperature) still runs.
+                    if self.compile_options.training_reference {
+                        None
+                    } else {
+                        d.fused_kl_ce.clone()
+                    },
                     // Only EXPLICIT loss-section values participate in the
                     // call-site literal cross-check; defaults must not veto.
                     d.loss_alpha_explicit,
@@ -5128,7 +5158,11 @@ impl Compiler<'_> {
                 None => (None, None, None),
             };
             let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-                .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone())
+                .with_checkpoint_policies(if self.compile_options.training_reference {
+                    Default::default() // P1.7: ignore @checkpoint decorators in the reference path
+                } else {
+                    self.compile_options.checkpoint_policies.clone()
+                })
                 .with_fused_ce_config(fused_ce_cfg)
                 .with_fused_kl_ce_config(fused_kl_ce_cfg, distill_alpha, distill_temp);
 
@@ -6167,11 +6201,15 @@ impl Compiler<'_> {
                 // (the generator `take()`s it later) so claimed segments
                 // can be exempted — the claim table is keyed by primal
                 // OpId, which a recompute clone cannot satisfy.
-                let ccr_selective_decorated = self
-                    .compile_options
-                    .checkpoint_policies
-                    .values()
-                    .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
+                // P1.7 --training-reference: ignore @checkpoint decorators so a
+                // decorated program still runs the un-checkpointed reference
+                // path (the --checkpoint-blocks flag is already forced off).
+                let ccr_selective_decorated = !self.compile_options.training_reference
+                    && self
+                        .compile_options
+                        .checkpoint_policies
+                        .values()
+                        .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
                 let mut effective_primal = effective_primal;
                 let mut ccr_compress_map: std::collections::HashMap<
                     crate::wengert::VarId,
@@ -6358,17 +6396,22 @@ impl Compiler<'_> {
                 // by any parameter gradient. This removes ghost VarId chains
                 // from non-differentiable ops (shape, subscript, list) that
                 // would cascade skip in the lowerer.
-                {
+                //
+                // `adjoint_needed` (the trainable parameter-gradient adjoint
+                // VarIds) is hoisted here so the P0.2 gradient-integrity guard
+                // below can reuse it to classify LIVE vs dead/ghost adjoint ops
+                // over the FINAL (post-CCR) op list.
+                let adjoint_needed: std::collections::HashSet<crate::wengert::VarId> = {
                     let named_params = extractor.named_param_var_ids();
-                    let needed: std::collections::HashSet<crate::wengert::VarId> = named_params
+                    named_params
                         .iter()
                         .filter(|(name, _)| self.is_trainable_param_name(name))
                         .filter_map(|(_, vid)| gen.adjoint_of(*vid))
-                        .collect();
-                    if !needed.is_empty() {
-                        adjoint.ops =
-                            crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
-                    }
+                        .collect()
+                };
+                if !adjoint_needed.is_empty() {
+                    adjoint.ops =
+                        crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &adjoint_needed);
                 }
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
@@ -6466,6 +6509,23 @@ impl Compiler<'_> {
                         eprintln!("[ccr] adjoint last-use frees inserted: {n}");
                     }
                 }
+
+                // 6d.5 P0.2 gradient-integrity guard: compute the LIVE adjoint
+                // result-VarId set over the FINAL adjoint (post dead-grad
+                // elimination, post-CCR splice + last-use frees). Armed on the
+                // compiler around each non-CSLA adjoint-lowering call below so a
+                // live gradient op that cannot resolve an input becomes a hard
+                // compile error instead of a silently-dropped gradient (#396).
+                // `None` when there are no trainable-parameter gradients.
+                let grad_live_set: Option<std::collections::HashSet<crate::wengert::VarId>> =
+                    if adjoint_needed.is_empty() {
+                        None
+                    } else {
+                        Some(crate::source_ad::reachable_result_vars(
+                            &adjoint.ops,
+                            &adjoint_needed,
+                        ))
+                    };
 
                 // 6e. Milestone C·p2: transient-memory arena projection.
                 // Reuses the M36 interference/BFD engine (transient_arena.rs)
@@ -7477,18 +7537,43 @@ impl Compiler<'_> {
                         let m_partial =
                             c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
                         let off = c.compile_options.optim_state_offload;
+                        // P0.3: note this parameter's gradient BEFORE accumulate
+                        // frees/consumes it. accum_idx == the param_paths index.
+                        if c.compile_options.grad_integrity {
+                            c.compile_call_by_name(
+                                b,
+                                "nsl_grad_integrity_note",
+                                &[grad_ptr, idx_val],
+                            )?;
+                        }
                         c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, off)?;
                         c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
                         Ok(())
                     };
-                    match crate::wengert_lower::compile_wengert_ops(
+                    // P0.3: bracket the FASE backward with a grad-integrity step
+                    // (the hook notes each parameter's gradient between these).
+                    let gi = self.compile_options.grad_integrity;
+                    if gi {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_grad_integrity_step_begin",
+                            &[num_params_val],
+                        )?;
+                    }
+                    // P0.2: arm the gradient-integrity guard for the FASE
+                    // adjoint lowering, then disarm before the match so it
+                    // never leaks into a later (forward / free-list) lowering.
+                    self.grad_live_results = grad_live_set.clone();
+                    let fase_lowered = crate::wengert_lower::compile_wengert_ops(
                         self,
                         builder,
                         state,
                         &adjoint,
                         full_vars,
                         Some((&param_adj_set, &mut fase_cb)),
-                    ) {
+                    );
+                    self.grad_live_results = None;
+                    let fase_out = match fase_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
@@ -7498,12 +7583,23 @@ impl Compiler<'_> {
                             );
                             return Err(e);
                         }
+                    };
+                    if gi {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_grad_integrity_step_end",
+                            &[],
+                        )?;
                     }
+                    fase_out
                 } else {
-                    match crate::wengert_lower::compile_wengert_ops(
+                    self.grad_live_results = grad_live_set.clone();
+                    let full_lowered = crate::wengert_lower::compile_wengert_ops(
                         self, builder, state, &adjoint, full_vars,
                         None,
-                    ) {
+                    );
+                    self.grad_live_results = None;
+                    match full_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
@@ -7958,6 +8054,18 @@ impl Compiler<'_> {
             self.compile_call_by_name(
                 builder,
                 "nsl_debug_grad_checksum",
+                &[grads_list, num_params_val],
+            )?;
+        }
+
+        // 7e1b'. P0.3 gradient-integrity gate (FullBuffer / composite path):
+        // scan the materialized grads list once per step. Skipped when the
+        // FASE hook is active (grads_list is a null sentinel) — that path is
+        // instrumented per-parameter inside the hook (step_begin/note/step_end).
+        if self.compile_options.grad_integrity && !fase_hook_active {
+            self.compile_call_by_name(
+                builder,
+                "nsl_grad_integrity_check",
                 &[grads_list, num_params_val],
             )?;
         }
@@ -11785,7 +11893,11 @@ impl Compiler<'_> {
         // @checkpoint(policy=...) policies into the extractor. Empty map
         // = byte-identity preserved.
         let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
-            .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone());
+            .with_checkpoint_policies(if self.compile_options.training_reference {
+                    Default::default() // P1.7: ignore @checkpoint decorators in the reference path
+                } else {
+                    self.compile_options.checkpoint_policies.clone()
+                });
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
         extractor.set_model_field_types(self.models.model_field_types.clone());
         // WRGA B.3.2 Option 3: plumb synth overrides so the extractor
@@ -11919,10 +12031,17 @@ impl Compiler<'_> {
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
 
             if !adjoint.ops.is_empty() {
-                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+                // P0.2: arm the gradient-integrity guard for the `grad` block's
+                // adjoint (a live op that cannot resolve an input silently
+                // drops the gradient — see #396), then disarm before the match.
+                self.grad_live_results =
+                    Some(crate::source_ad::reachable_result_vars(&adjoint.ops, &needed));
+                let grad_block_lowered = crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, &adjoint, full_vars,
                     None, // FASE on_param_grad hook — wired in Task 3
-                ) {
+                );
+                self.grad_live_results = None;
+                let grad_lowered = match grad_block_lowered {
                     Ok(gv) => gv,
                     Err(e) => {
                         eprintln!(

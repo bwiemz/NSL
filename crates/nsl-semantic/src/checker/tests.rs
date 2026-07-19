@@ -1352,6 +1352,41 @@ let coder = load_model()
 }
 
 #[test]
+fn adapter_rank_above_16_is_rejected() {
+    // rank > 16 was previously accepted here and then SILENTLY dropped at
+    // codegen (the adapter never fused). It must be a validation error.
+    let src = r#"
+@adapter(type=lora, target=["m.w"], rank=32)
+let m = MyModel()
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("rank must be <= 16")),
+        "expected rank-too-large error, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn adapter_rank_exactly_16_is_accepted() {
+    let src = r#"
+@adapter(type=lora, target=["m.w"], rank=16)
+let m = MyModel()
+"#;
+    let res = analyze_source(src);
+    assert!(
+        !res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("rank must be")),
+        "rank=16 is the boundary and must be accepted, got: {:?}",
+        res.diagnostics
+    );
+    assert_eq!(res.adapter_configs[0].rank, Some(16));
+}
+
+#[test]
 fn adapter_alpha_is_captured() {
     let src = r#"
 @adapter(type=lora, target=["m.w"], rank=4, alpha=8)

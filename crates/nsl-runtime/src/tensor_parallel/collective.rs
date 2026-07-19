@@ -16,6 +16,20 @@ pub const DTYPE_BF16: DtypeId = 3;
 pub const DTYPE_I8: DtypeId = 4;
 pub const DTYPE_FP8: DtypeId = 5;
 
+// P0.4 dtype/ABI cleanup: this module historically re-declared the runtime
+// dtype tags by copy. Pin them to the canonical `crate::tensor::DTYPE_*` so any
+// future divergence is a COMPILE error, not a silent wire mismatch. (The names
+// differ by convention — F16/I8/FP8 here vs FP16/INT8/FP8E4M3 there — but the
+// numeric tags MUST agree.)
+const _: () = {
+    assert!(DTYPE_F64 == crate::tensor::DTYPE_F64);
+    assert!(DTYPE_F32 == crate::tensor::DTYPE_F32);
+    assert!(DTYPE_F16 == crate::tensor::DTYPE_FP16);
+    assert!(DTYPE_BF16 == crate::tensor::DTYPE_BF16);
+    assert!(DTYPE_I8 == crate::tensor::DTYPE_INT8);
+    assert!(DTYPE_FP8 == crate::tensor::DTYPE_FP8E4M3);
+};
+
 /// Returns the byte width for a built-in dtype, or 0 for unknown.
 pub fn dtype_byte_width(dtype: DtypeId) -> usize {
     match dtype {

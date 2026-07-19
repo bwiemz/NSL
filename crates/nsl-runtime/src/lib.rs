@@ -152,6 +152,7 @@ pub mod awq;
 pub mod fase_bc;
 pub mod fase_step;
 pub mod csla_stat;
+pub mod grad_integrity;
 pub mod weight_stream;
 #[allow(deprecated)]
 pub use awq::{

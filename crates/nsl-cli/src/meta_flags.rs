@@ -50,9 +50,124 @@ pub(crate) fn expand_pretrain_optimized(
     }
 }
 
+/// P1.7 `--training-reference`: force the field-controlled optimizations OFF on
+/// an already-built `CompileOptions`, so the emitted training path is the
+/// simplest correct baseline. The remaining optimizations that are decorator- or
+/// pattern-driven (FBIP, the fused FASE step, fused-CE substitution, @checkpoint
+/// decorators) are gated in codegen on `opts.training_reference`.
+///
+/// Loud-override semantics (mirrors `--pretrain-optimized`): anything actually
+/// turned off is listed once on stderr, so a user who also passed e.g.
+/// `--checkpoint-blocks` sees exactly what the reference mode overrode rather
+/// than silently getting a different path than they asked for.
+pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
+    if !opts.training_reference {
+        return;
+    }
+    let mut disabled: Vec<&str> = Vec::new();
+    macro_rules! off_bool {
+        ($field:ident, $name:literal) => {
+            if opts.$field {
+                opts.$field = false;
+                disabled.push($name);
+            }
+        };
+    }
+    off_bool!(checkpoint_blocks, "--checkpoint-blocks (CCR)");
+    off_bool!(checkpoint_selective, "--checkpoint-selective (CCR)");
+    off_bool!(layerwise_accum, "--layerwise-accum (CSLA)");
+    off_bool!(weight_stream, "--weight-stream");
+    off_bool!(optim_state_offload, "--optim-state-offload");
+    if opts.checkpoint_budget_mib.is_some() {
+        opts.checkpoint_budget_mib = None;
+        disabled.push("--checkpoint-budget-mib (CCR)");
+    }
+    if opts.checkpoint_compress.is_some() {
+        opts.checkpoint_compress = None;
+        disabled.push("--checkpoint-compress (CCR)");
+    }
+    if !opts.disable_fusion {
+        opts.disable_fusion = true;
+        disabled.push("kernel @fuse fusion");
+    }
+    // WGGO + reduced-precision moments.
+    if opts.wggo.mode.as_deref() != Some("off") {
+        opts.wggo.mode = Some("off".to_string());
+        disabled.push("WGGO transformations");
+    }
+    if opts.wggo.moment_precision {
+        opts.wggo.moment_precision = false;
+        disabled.push("WGGO reduced-precision moments");
+    }
+    if opts.wggo.memory_budget_bytes.is_some() {
+        opts.wggo.memory_budget_bytes = None;
+        disabled.push("--wggo-memory-budget");
+    }
+    // CPDT precision-adaptive path (independent moment-precision lowering).
+    if opts.cpdt.mode != nsl_codegen::cpdt::CpdtMode::Off {
+        opts.cpdt.mode = nsl_codegen::cpdt::CpdtMode::Off;
+        disabled.push("CPDT precision-adaptive training");
+    }
+    // CSHA attention fusion. `csha.mode = "off"` is the load-bearing gate
+    // (forces disabled_by_flag in codegen, covering @csha decorators too); the
+    // decorator config maps are populated LATER in the pipeline, so clearing
+    // them here would be a no-op — the mode gate is what actually disables them.
+    if opts.csha.mode.as_deref() != Some("off") {
+        opts.csha.mode = Some("off".to_string());
+        disabled.push("CSHA attention fusion (mode + @csha)");
+    }
+
+    eprintln!(
+        "note: --training-reference forces the simplest correct training path. \
+         Disabled: {}. Also disabled in codegen: FBIP in-place, the fused FASE \
+         optimizer step, and @fused_lm_ce / @fused_kl_ce / @checkpoint decorators.",
+        if disabled.is_empty() {
+            "(nothing was on)".to_string()
+        } else {
+            disabled.join(", ")
+        }
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_reference_forces_field_opts_off() {
+        let mut opts = nsl_codegen::CompileOptions {
+            training_reference: true,
+            checkpoint_blocks: true,
+            layerwise_accum: true,
+            weight_stream: true,
+            optim_state_offload: true,
+            disable_fusion: false,
+            ..Default::default()
+        };
+        opts.wggo.mode = Some("greedy".to_string());
+        opts.wggo.moment_precision = true;
+        apply_training_reference(&mut opts);
+        assert!(!opts.checkpoint_blocks);
+        assert!(!opts.layerwise_accum);
+        assert!(!opts.weight_stream);
+        assert!(!opts.optim_state_offload);
+        assert!(opts.disable_fusion, "kernel fusion disabled");
+        assert_eq!(opts.wggo.mode.as_deref(), Some("off"));
+        assert!(!opts.wggo.moment_precision);
+        assert_eq!(opts.cpdt.mode, nsl_codegen::cpdt::CpdtMode::Off);
+        assert_eq!(opts.csha.mode.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn training_reference_noop_when_flag_absent() {
+        let mut opts = nsl_codegen::CompileOptions {
+            training_reference: false,
+            checkpoint_blocks: true,
+            ..Default::default()
+        };
+        apply_training_reference(&mut opts);
+        assert!(opts.checkpoint_blocks, "no override without the flag");
+    }
 
     #[test]
     fn fills_unset_members() {

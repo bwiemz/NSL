@@ -133,8 +133,14 @@ impl Compiler<'_> {
             state.current_function_name = Some(name.clone());
 
             // FBIP Phase 2: Pre-compute use counts for single-use optimizations
-            // (clone elision, in-place op emission).
-            state.use_counts = Some(crate::use_count::analyze_use_counts(&fn_def.body));
+            // (clone elision, in-place op emission). P1.7 --training-reference
+            // disables FBIP entirely (no in-place op emission) — leaving
+            // use_counts None takes the plain, out-of-place path.
+            state.use_counts = if self.compile_options.training_reference {
+                None
+            } else {
+                Some(crate::use_count::analyze_use_counts(&fn_def.body))
+            };
 
             // M38b: Set up ownership lowering for this function.
             // When --linear-types is active and the semantic pass produced ownership

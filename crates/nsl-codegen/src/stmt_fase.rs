@@ -262,6 +262,7 @@ impl Compiler<'_> {
         // envelope on the interpreted path. (Offload envelopes stay uniform —
         // fused OK.)
         let fused_scalars = if !wrap_precision
+            && !self.compile_options.training_reference
             && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
         {
             match (bc_params, Self::match_adamw_program(&program)) {

@@ -1483,6 +1483,44 @@ pub fn eliminate_dead_gradients(
         .collect()
 }
 
+/// Compute the set of op `result` VarIds that are LIVE — structurally
+/// reachable, backward through `op.inputs`, from at least one `needed`
+/// parameter-gradient VarId.
+///
+/// This is the same reverse reachability walk that [`eliminate_dead_gradients`]
+/// performs, but it returns the *result VarIds* of the live ops rather than a
+/// filtered op list. The gradient-integrity guard (P0.2) uses it to classify,
+/// in the Wengert lowerer, whether an op with an unresolved input is LIVE (its
+/// result contributes to a real parameter gradient → a hard compile error, a
+/// silently-dropped gradient) or dead/ghost (safe to skip). It is computed over
+/// the FINAL adjoint op list (post dead-gradient elimination, post-CCR splice
+/// and last-use frees) so recompute clones are classified correctly.
+///
+/// Note: this over-approximates true value-liveness — an op that structurally
+/// feeds `needed` but evaluates to a genuine zero is still reported live. On
+/// the paths that use this guard (FASE / FullBuffer / grad-block), an op that
+/// structurally reaches a needed gradient yet cannot resolve an input is the
+/// #396 defect (a dropped gradient), which is exactly what we want to surface.
+pub fn reachable_result_vars(
+    ops: &[WengertOp],
+    needed: &HashSet<VarId>,
+) -> HashSet<VarId> {
+    let mut live_ops: HashSet<usize> = HashSet::new();
+    let mut reachable: HashSet<VarId> = HashSet::new();
+    let mut worklist: Vec<VarId> = needed.iter().copied().collect();
+
+    while let Some(var) = worklist.pop() {
+        for (i, op) in ops.iter().enumerate() {
+            if op.result == var && !live_ops.contains(&i) {
+                live_ops.insert(i);
+                reachable.insert(op.result);
+                worklist.extend(op.inputs.iter().copied());
+            }
+        }
+    }
+    reachable
+}
+
 /// Task 4: WRGA backward-live filter.
 ///
 /// Drop adjoint ops whose **primal** dependency is not in `backward_live`.
@@ -1567,6 +1605,32 @@ mod backward_live_tests {
         let adjoint_vars: HashMap<VarId, VarId> = HashMap::new();
         let kept = eliminate_by_backward_live(&ops, &live, &adjoint_vars);
         assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn reachable_result_vars_walks_backward_from_needed() {
+        // op0 (result 100) is the needed parameter gradient = Add(50, 60).
+        // op1 (result 50) and op2 (result 60) feed it → live. op3 (result 999)
+        // is an unrelated dead op → NOT reachable. The walk descends into
+        // inputs 1 and 2 but they have no producer, so they never appear as
+        // reachable *result* vars.
+        let ops = vec![
+            mk(0, 100, PrimalOp::Add, vec![50, 60]),
+            mk(1, 50, PrimalOp::Mul, vec![1]),
+            mk(2, 60, PrimalOp::Neg, vec![2]),
+            mk(3, 999, PrimalOp::Relu, vec![]),
+        ];
+        let needed: HashSet<VarId> = HashSet::from([100]);
+        let reachable = super::reachable_result_vars(&ops, &needed);
+        assert_eq!(reachable, HashSet::from([100, 50, 60]));
+        assert!(!reachable.contains(&999), "dead op must not be reachable");
+    }
+
+    #[test]
+    fn reachable_result_vars_empty_needed_is_empty() {
+        let ops = vec![mk(0, 10, PrimalOp::Neg, vec![1])];
+        let reachable = super::reachable_result_vars(&ops, &HashSet::new());
+        assert!(reachable.is_empty());
     }
 }
 

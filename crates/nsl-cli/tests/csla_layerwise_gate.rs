@@ -149,8 +149,41 @@ fn ws_counts(stderr: &str) -> (i64, i64, i64) {
     let uploads: i64 = it.next().unwrap().trim().parse().unwrap();
     let mut it2 = it.next().unwrap().split(" writeback: ");
     let evicts: i64 = it2.next().unwrap().trim().parse().unwrap();
-    let writeback: i64 = it2.next().unwrap().trim().parse().unwrap();
+    // The line now carries trailing " registered: N ptr_moves: M" fields, so
+    // take only the first whitespace-delimited token as the writeback count.
+    let writeback: i64 = it2
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
     (uploads, evicts, writeback)
+}
+
+/// Parse the `registered: R` and `ptr_moves: M` suffix of the weight-stream
+/// counter line (added by the P0.1 view gate: per-param pointer-movement
+/// evidence — a registered param had its device storage freed+reallocated; a
+/// view-rooted excluded param never registers, so its pointer stays put).
+fn ws_ptr_counts(stderr: &str) -> (i64, i64) {
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("[weight-stream] uploads: "))
+        .expect("NSL_WS_COUNTER report missing");
+    let reg = line
+        .split("registered: ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .expect("registered count missing");
+    let moves = line
+        .split("ptr_moves: ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .expect("ptr_moves count missing");
+    (reg, moves)
 }
 
 /// Parse the bare integer between `<TAG>_BEGIN` / `<TAG>_END` stdout markers.
@@ -652,6 +685,102 @@ fn csla_weight_stream_parity_gpu() {
     assert!(
         bytes_a == bytes_b,
         "saved model bytes diverged under --weight-stream"
+    );
+}
+
+/// P0.1 weight-streaming PASSTHROUGH-VIEW gate (GPU): the #397 fix extended the
+/// view-of-θ residency exclusion from AD-internal struct variants to the
+/// user-facing view METHODS (.reshape / .contiguous / .expand / ...), which
+/// lower to `PrimalOp::Passthrough`. The fixture buffers the tied LM-head view
+/// of `embed` through a reshape -> contiguous -> reshape -> transpose chain, so
+/// the primal_view_of walk MUST traverse Passthrough nodes to reach `embed` and
+/// keep it resident. If it did not, evicting `embed` would free its storage,
+/// the later upload would reallocate elsewhere, and the buffered head view would
+/// read recycled memory.
+///
+/// The gate verifies all three signals the review asked for, not just loss:
+///   - MODEL BYTES: bit-exact vs the non-streaming baseline (a recycled-memory
+///     read would corrupt the saved model);
+///   - POINTER MOVEMENT: the 6 streamed layer params register and reallocate
+///     (registered == 6, ptr_moves > 0), while the view-rooted `embed` NEVER
+///     registers (so its device pointer never moves);
+///   - TRANSFER COUNTERS: the exact designed upload/evict/writeback schedule.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn csla_weight_stream_passthrough_view_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_wsview_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("view_base.nslm");
+    let save_b = tmp.join("view_ws.nslm");
+
+    let base = run_program(
+        &program("csla_weight_stream_view_methods.nsl", true, &save_a, &[]),
+        "wsview_a",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(base.success, "baseline arm failed:\n{}", base.stderr);
+    let ws = run_program(
+        &program("csla_weight_stream_view_methods.nsl", true, &save_b, &[]),
+        "wsview_b",
+        true,
+        true,
+        &["--checkpoint-blocks", "--layerwise-accum", "--weight-stream"],
+    );
+    assert!(ws.success, "--weight-stream arm failed:\n{}", ws.stderr);
+
+    // The view-of-θ exclusion fired: at least one param (the tied `embed`)
+    // stays resident because a buffered Passthrough view aliases its storage.
+    assert!(
+        ws.stderr.contains("param(s) stay resident"),
+        "view-of-θ exclusion line missing — the Passthrough view chain did not \
+         keep `embed` resident:\n{}",
+        ws.stderr
+    );
+
+    // Transfer counters: same designed schedule as the plain FFN fixture
+    // (13 fwd × 6 + 6 win × 6 = 114; 36 writeback).
+    let (uploads, evicts, writeback) = ws_counts(&ws.stderr);
+    assert_eq!(
+        (uploads, evicts, writeback),
+        (114, 114, 36),
+        "weight-stream transfer counts drifted from the designed schedule"
+    );
+
+    // Pointer movement: exactly the 6 streamed LAYER params register (their
+    // storage is freed on evict), and they reallocate to fresh addresses. The
+    // view-rooted `embed` is EXCLUDED, so it never registers — registered
+    // counts only the streamed params.
+    let (registered, ptr_moves) = ws_ptr_counts(&ws.stderr);
+    assert_eq!(
+        registered, 6,
+        "expected exactly the 6 streamed layer params to register (embed excluded)"
+    );
+    assert!(
+        ptr_moves > 0,
+        "streamed params must actually move (evict frees, upload reallocs) — \
+         got ptr_moves={ptr_moves}"
+    );
+    // Baseline must not stream at all.
+    let (base_reg, _) = ws_ptr_counts(&base.stderr);
+    assert_eq!(base_reg, 0, "baseline arm registered params for streaming");
+
+    // Model bytes: bit-exact end to end. Streaming is byte-preserving ONLY if
+    // the buffered head view never read recycled `embed` memory — this is the
+    // correctness payoff of keeping `embed` resident through the Passthrough
+    // view chain.
+    assert_eq!(
+        base.loss_stream, ws.loss_stream,
+        "loss stream diverged under --weight-stream (recycled-memory read?)"
+    );
+    let bytes_a = std::fs::read(&save_a).expect("baseline model_save missing");
+    let bytes_b = std::fs::read(&save_b).expect("ws model_save missing");
+    assert!(
+        bytes_a == bytes_b,
+        "saved model bytes diverged under --weight-stream — the buffered \
+         Passthrough view of `embed` likely read recycled storage (the #397 \
+         exclusion regressed)"
     );
 }
 

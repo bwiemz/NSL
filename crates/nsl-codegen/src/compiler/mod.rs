@@ -578,6 +578,17 @@ pub struct Compiler<'a> {
     /// into `owned_values` at the end of `compile_wengert_ops` so the
     /// step's cleanup frees them (free(0) is a no-op for declined runs).
     pub sdpa_extra_owned: Vec<Value>,
+    /// Gradient-integrity guard (P0.2): when `Some(set)`, the Wengert lowerer
+    /// treats any op whose `result` VarId is in `set` (i.e. LIVE — structurally
+    /// reachable from a needed parameter gradient) but which has an unresolved
+    /// input as a hard `CodegenError` instead of a silent skip. Ops NOT in the
+    /// set (proven dead / ghost) may still be skipped. Set immediately around
+    /// each adjoint-lowering call in `compile_train_block` (FASE / FullBuffer /
+    /// grad-block) and cleared afterward, so it is `None` for every forward /
+    /// free-list / calibration lowering. See PR #396: a live accumulation `Add`
+    /// referencing a ghost adjoint used to be silently dropped, zeroing all
+    /// parameter gradients with no diagnostic.
+    pub grad_live_results: Option<std::collections::HashSet<crate::wengert::VarId>>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
     /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
@@ -1020,6 +1031,7 @@ impl<'a> Compiler<'a> {
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             sdpa_extra_owned: Vec::new(),
+            grad_live_results: None,
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),
@@ -1094,11 +1106,18 @@ impl<'a> Compiler<'a> {
         stmt_id: nsl_ast::NodeId,
     ) -> Option<crate::FusedCeDecoratorConfig> {
         let saved = self.active_fused_ce_config.clone();
-        self.active_fused_ce_config = self
-            .fused_ce_configs
-            .iter()
-            .find(|c| c.train_block_stmt_id == stmt_id)
-            .cloned();
+        // P1.7 --training-reference: never activate a fused-CE (@fused_lm_ce)
+        // config, so the substitution never fires and the composite
+        // cross-entropy path runs — an independent baseline for the fused-CE
+        // numerics.
+        self.active_fused_ce_config = if self.compile_options.training_reference {
+            None
+        } else {
+            self.fused_ce_configs
+                .iter()
+                .find(|c| c.train_block_stmt_id == stmt_id)
+                .cloned()
+        };
         saved
     }
 

@@ -1,0 +1,27 @@
+# P0.2 regression fixture: a linear layer WITH a bias, under FASE-Deferred
+# (grad_accumulation>=2, AdamW, source-AD). The bias's gradient adjoint is the
+# shared intermediate `dout` that also feeds the weight-gradient matmul; the
+# FASE optimizer hook consumes+frees it early, so on main the weight gradient
+# is SILENTLY dropped. The P0.2 guard must turn this into a hard compile error.
+from nsl.nn.losses import mse_loss
+
+# The bias is [4, 1] (same shape as x@w) so there is no broadcast reduce — the
+# bias gradient IS `dout` exactly. That keeps the ONLY defect the shared-
+# intermediate drop of the WEIGHT gradient (no incidental shape mismatch), so
+# the escape hatch demonstrates a clean "compiles + runs, weight grad dropped".
+model Linear:
+    w: Tensor = ones([2, 1])
+    b: Tensor = zeros([4, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.w) + self.b
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model=m, epochs=12, grad_accumulation=4):
+    optimizer: AdamW(lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
