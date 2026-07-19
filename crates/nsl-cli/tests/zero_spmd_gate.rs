@@ -277,6 +277,80 @@ fn zero_stage1_two_rank_parity() {
     );
 }
 
+/// Extract `optim_elems=N` from the `[zero] ws=W rank=R ...` atexit line.
+fn optim_elems(stderr: &str, ws: u64, rank: u64) -> u64 {
+    let needle = format!("[zero] ws={ws} rank={rank}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("no '{needle}' line in stderr:\n{stderr}"));
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix("optim_elems="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no optim_elems= field in line: {line}"))
+}
+
+/// G3 (D3 v2 — the MEMORY WIN): `--zero-stage 1` shards the optimizer-state
+/// ALLOCATION, not just the update. v1 allocated full m/v on every rank
+/// (owner-gated the update only, so zero bytes were saved); v2 gates the
+/// allocation on ownership (owner = idx % world_size), so each rank holds a
+/// STRICT SUBSET of the moment surface and the two together cover the whole.
+///
+/// This is invisible to the loss-parity gate (non-owners never read their
+/// non-owned m/v, so results are identical either way) — only the per-rank
+/// `optim_elems` counter proves the allocation actually shrank. Round-robin
+/// by param index (rank0 {0,2,4,6} / rank1 {1,3,5,7}) with unequally-sized
+/// params means the split is not exactly half, so the invariant is
+/// r0+r1==full (complete, nothing lost) AND 0<r0<full AND 0<r1<full (a real
+/// shrink on both ranks, neither holding everything).
+#[test]
+#[ignore = "spawns multiple processes; run explicitly"]
+fn zero_stage1_optim_state_is_sharded() {
+    let tmp = std::env::temp_dir().join(format!("nsl_zero_shard_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_full = tmp.join("full.nslm");
+    let save_spmd = tmp.join("spmd.nslm");
+
+    // ws=1 --zero-stage 1: rank 0 owns every param → allocates the FULL
+    // moment surface (2 moments × sum of all param elements).
+    let full_run = run_nsl(&program(&save_full), "shard_full", &["--zero-stage", "1"], 600);
+    assert!(full_run.success, "ws=1 zero run failed:\n{}", full_run.stderr);
+    let full = optim_elems(&full_run.stderr, 1, 0);
+    assert!(
+        full > 0,
+        "ws=1 --zero-stage 1 should allocate the full moment surface, got 0:\n{}",
+        full_run.stderr
+    );
+
+    // --devices 2 --zero-stage 1: each rank allocates ONLY its owned shard.
+    let spmd = run_nsl(
+        &program(&save_spmd),
+        "shard_2r",
+        &["--zero-stage", "1", "--devices", "2"],
+        900,
+    );
+    assert!(spmd.success, "2-rank zero run failed:\n{}", spmd.stderr);
+    let r0 = optim_elems(&spmd.stderr, 2, 0);
+    let r1 = optim_elems(&spmd.stderr, 2, 1);
+
+    // Complete partition: every param's m/v is allocated by exactly one rank.
+    assert_eq!(
+        r0 + r1,
+        full,
+        "sharded optim elems must sum to the full surface (r0={r0} r1={r1} full={full})\n{}",
+        spmd.stderr
+    );
+    // Real shrink on BOTH ranks: each strictly less than full, neither empty.
+    assert!(
+        r0 > 0 && r0 < full,
+        "rank 0 optim state is not a strict shard: r0={r0} full={full}"
+    );
+    assert!(
+        r1 > 0 && r1 < full,
+        "rank 1 optim state is not a strict shard: r1={r1} full={full}"
+    );
+}
+
 /// Loud refusals: stage 2/3 unlowered; a real (non-simulated) backend
 /// request has no transport to satisfy it.
 #[test]

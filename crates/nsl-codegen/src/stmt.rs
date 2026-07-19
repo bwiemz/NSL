@@ -3624,6 +3624,93 @@ impl Compiler<'_> {
         result
     }
 
+    /// Emit a `zeros_like` allocation for ONE optimizer-moment buffer (m or
+    /// v), honoring the offload / CPDT-precision variants. `precision_list` is
+    /// the per-param dtype-code list for THIS moment when a precision plan is
+    /// active (`None` = verbatim f32). Factored out of the optimizer-state
+    /// init loop so the D3-v2 owner-gated (ZeRO-1 shard) path can reuse the
+    /// exact same allocation logic inside its owned branch.
+    fn emit_moment_zeros_like(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_i: Value,
+        idx: Value,
+        precision_list: Option<Value>,
+        offload: bool,
+    ) -> Result<Value, CodegenError> {
+        let buf = if offload {
+            if let Some(code_list) = precision_list {
+                // P0.3 composition: HOST-resident state at the planned
+                // reduced-precision dtype.
+                let code = self.compile_call_by_name(builder, "nsl_list_get", &[code_list, idx])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_zeros_like_host_dtype",
+                    &[param_i, code],
+                )?
+            } else {
+                // Offload-only: HOST-resident f32 state.
+                self.compile_call_by_name(builder, "nsl_tensor_zeros_like_host_f32", &[param_i])?
+            }
+        } else if let Some(code_list) = precision_list {
+            let code = self.compile_call_by_name(builder, "nsl_list_get", &[code_list, idx])?;
+            self.compile_call_by_name(builder, "nsl_tensor_zeros_like_dtype", &[param_i, code])?
+        } else {
+            self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+        };
+        Ok(buf)
+    }
+
+    /// D3 v2 (ZeRO-1): emit an owner-gated optimizer-moment allocation. When
+    /// this rank owns `idx` (owner = idx % world_size, decided at RUNTIME by
+    /// nsl_zero_owns_param — the same predicate the update gate uses) it
+    /// allocates the real zeros_like buffer and records its element count
+    /// (nsl_zero_note_optim_alloc → the G3 memory-shrink gate); otherwise it
+    /// allocates NOTHING and yields a null (0) placeholder. Returns the value
+    /// to push into the moment list — real or null — keeping the list
+    /// length==num_params and global-index-addressable. Non-owned nulls are
+    /// never dereferenced (m/v are read only inside the owner-gated update
+    /// branch; the free loop is null-safe).
+    fn emit_owner_gated_moment(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        param_i: Value,
+        idx: Value,
+        precision_list: Option<Value>,
+        offload: bool,
+    ) -> Result<Value, CodegenError> {
+        let owns = self.compile_call_by_name(builder, "nsl_zero_owns_param", &[idx])?;
+        let one = builder.ins().iconst(cl_types::I64, 1);
+        let owned = builder.ins().icmp(IntCC::Equal, owns, one);
+        let alloc_b = builder.create_block();
+        let skip_b = builder.create_block();
+        let merge_b = builder.create_block();
+        builder.append_block_param(merge_b, cl_types::I64);
+        builder.ins().brif(owned, alloc_b, &[], skip_b, &[]);
+
+        // Owned: allocate the real moment buffer and record its elements.
+        builder.switch_to_block(alloc_b);
+        builder.seal_block(alloc_b);
+        state.current_block = Some(alloc_b);
+        let real = self.emit_moment_zeros_like(builder, param_i, idx, precision_list, offload)?;
+        self.compile_call_by_name(builder, "nsl_zero_note_optim_alloc", &[real])?;
+        builder.ins().jump(merge_b, &[real]);
+
+        // Non-owner: allocate nothing — push a null (0) placeholder.
+        builder.switch_to_block(skip_b);
+        builder.seal_block(skip_b);
+        state.current_block = Some(skip_b);
+        let null = builder.ins().iconst(cl_types::I64, 0);
+        builder.ins().jump(merge_b, &[null]);
+
+        // Merge — both predecessors connected, safe to seal.
+        builder.switch_to_block(merge_b);
+        builder.seal_block(merge_b);
+        state.current_block = Some(merge_b);
+        Ok(builder.block_params(merge_b)[0])
+    }
+
     fn compile_train_block(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -3642,6 +3729,20 @@ impl Compiler<'_> {
                     "--layerwise-accum is not supported on the pipelined train \
                      path (@pipeline): the window-buffered schedule was built \
                      for the single-device source-AD emission. Drop one",
+                ));
+            }
+            // D3: @pipeline + --zero-stage is NOT lowered — the pipelined path
+            // emits none of ZeRO's init/partition/grad-all-reduce/owner-gated
+            // update/param-broadcast, so each rank would train INDEPENDENTLY
+            // (silently replicated, no sharding). Refuse loudly rather than
+            // appear to support it (deferral-must-refuse); combining pipeline
+            // parallel with ZeRO-1 is future work.
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--zero-stage is not supported on the pipelined train path \
+                     (@pipeline): ZeRO collectives and owner-gated optimizer \
+                     sharding are not lowered there, so ranks would train \
+                     independently with no gradient reduction. Drop one",
                 ));
             }
             return self.compile_train_block_pipelined(
@@ -4513,78 +4614,46 @@ impl Compiler<'_> {
             state.current_block = Some(init_body);
 
             let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
-            // P0.1: first-moment buffers under the OptimM surface. The
-            // offload variant allocates HOST tensors — those never reach the
-            // GPU caching allocator, so the tag is inert there (correct:
-            // host state is not VRAM).
+
+            // D3 v2 (ZeRO-1): shard the optimizer-state ALLOCATION. v1
+            // owner-gated only the UPDATE, so every rank still allocated FULL
+            // m/v (no memory win). Now, when zero is enabled, a non-owner of
+            // param `idx` (owner = idx % world_size) allocates NOTHING for its
+            // moment buffers and pushes a null (0) placeholder — the lists stay
+            // length==num_params and global-index-addressable, and the
+            // owner-gated update branch is the ONLY reader of m/v, so nulls are
+            // never dereferenced (the end-of-train free loop is null-safe:
+            // nsl_tensor_free(0) is a no-op). The per-step collectives iterate
+            // the grad/param lists, NEVER m/v, so allocation gating cannot
+            // perturb the identical-collective-sequence spin-barrier invariant.
+            // `zero_enabled` is recomputed locally: the outer binding is
+            // introduced far below (near the optimizer loop), out of scope here.
+            let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
+            let offload = self.compile_options.optim_state_offload;
+            // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
+            // so projecting each moment's dtype-code list by value is fine.
+            let m_list = cpdt_precision_dtypes.map(|(m, _)| m);
+
+            // P0.1: first-moment buffers under the OptimM surface. The offload
+            // variant allocates HOST tensors — inert GPU tag (host state is not
+            // VRAM).
             let surface_optim_m = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_M);
             self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_m])?;
-            // CPDT precision-adaptive: allocate optimizer state at the planned
-            // storage dtype when active; otherwise use the verbatim FP32 path.
-            // `cpdt_precision_dtypes` is `Option<(Value, Value)>` and `Value:
-            // Copy`, so matching by value inside the loop is fine.
-            let buf1 = if self.compile_options.optim_state_offload {
-                if let Some((m_list, _)) = cpdt_precision_dtypes {
-                    // P0.3 composition: HOST-resident state at the planned
-                    // reduced-precision dtype (same per-param dtype list the
-                    // device zeros_like_dtype path uses).
-                    let m_code =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_zeros_like_host_dtype",
-                        &[param_i, m_code],
-                    )?
-                } else {
-                    // Offload-only: HOST-resident f32 state (see the gate above).
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_zeros_like_host_f32",
-                        &[param_i],
-                    )?
-                }
-            } else if let Some((m_list, _)) = cpdt_precision_dtypes {
-                let m_code = self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_tensor_zeros_like_dtype",
-                    &[param_i, m_code],
-                )?
+            let buf1 = if zero_enabled {
+                self.emit_owner_gated_moment(builder, state, param_i, idx, m_list, offload)?
             } else {
-                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+                self.emit_moment_zeros_like(builder, param_i, idx, m_list, offload)?
             };
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
                 // P0.1: second-moment buffers under the OptimV surface.
                 let surface_optim_v = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_V);
                 self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_v])?;
-                let buf2 = if self.compile_options.optim_state_offload {
-                    if let Some((_, v_list)) = cpdt_precision_dtypes {
-                        // P0.3 composition (see buf1).
-                        let v_code =
-                            self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_tensor_zeros_like_host_dtype",
-                            &[param_i, v_code],
-                        )?
-                    } else {
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_tensor_zeros_like_host_f32",
-                            &[param_i],
-                        )?
-                    }
-                } else if let Some((_, v_list)) = cpdt_precision_dtypes {
-                    let v_code =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_zeros_like_dtype",
-                        &[param_i, v_code],
-                    )?
+                let v_list = cpdt_precision_dtypes.map(|(_, v)| v);
+                let buf2 = if zero_enabled {
+                    self.emit_owner_gated_moment(builder, state, param_i, idx, v_list, offload)?
                 } else {
-                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+                    self.emit_moment_zeros_like(builder, param_i, idx, v_list, offload)?
                 };
                 self.compile_call_by_name(builder, "nsl_list_push", &[state_list_2, buf2])?;
             }
