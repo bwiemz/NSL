@@ -375,11 +375,26 @@ pub fn compile_wengert_ops_range(
                     // This is also correct on the non-identity path (fresh clone):
                     // the raw_grad has rc=1, this free drops it to 0 (freed), and
                     // the cleanup pass skips it via hook_freed_input_vars.
+                    //
+                    // BUT the raw grad `d_out` is the SAME shared-intermediate
+                    // hazard one level up: for a broadcast bias, `d_out` reaches
+                    // the reduce AND the weight matmul. Gate the extra-free on
+                    // `d_out` itself not being read by a later op — otherwise
+                    // this frees it out from under the matmul (a silent UAF the
+                    // P0.2 guard can't see, since `d_out` stays "resolved"). When
+                    // deferred, `d_out` is left in var_map + owned_values and
+                    // end-of-backward cleanup frees it exactly once.
                     if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape") {
                         if let Some(&input_vid) = op.inputs.first() {
-                            if let Some(&input_val) = var_map.get(&input_vid) {
-                                call(compiler, builder, "nsl_tensor_free", &[input_val])?;
-                                hook_freed_input_vars.insert(input_vid);
+                            let raw_still_needed = last_input_use
+                                .as_ref()
+                                .and_then(|m| m.get(&input_vid))
+                                .is_some_and(|&last| last > abs_i);
+                            if !raw_still_needed {
+                                if let Some(&input_val) = var_map.get(&input_vid) {
+                                    call(compiler, builder, "nsl_tensor_free", &[input_val])?;
+                                    hook_freed_input_vars.insert(input_vid);
+                                }
                             }
                         }
                     }
