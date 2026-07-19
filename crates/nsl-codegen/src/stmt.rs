@@ -6920,6 +6920,8 @@ impl Compiler<'_> {
                     let mut owned_values = Vec::new();
                     let mut hook_freed_input_vars = std::collections::HashSet::new();
                     let mut explicit_freed_vars = std::collections::HashSet::new();
+                    // No FASE hook on this forward-streaming path — stays empty.
+                    let mut hook_freed_param_vars = std::collections::HashSet::new();
                     for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
                         if !wsplan.upload_per_slice[si].is_empty() {
                             // Upload this slice's first-touch params under
@@ -6965,6 +6967,7 @@ impl Compiler<'_> {
                             &mut owned_values,
                             &mut hook_freed_input_vars,
                             &mut explicit_freed_vars,
+                            &mut hook_freed_param_vars,
                             None,
                         )?;
                         // Evict this slice's last-touch params — read-only
@@ -6994,6 +6997,7 @@ impl Compiler<'_> {
                         owned_values,
                         hook_freed_input_vars,
                         explicit_freed_vars,
+                        hook_freed_param_vars,
                     }
                 } else {
                     crate::wengert_lower::compile_wengert_ops(
@@ -7515,6 +7519,7 @@ impl Compiler<'_> {
                     let mut fase_cb = |c: &mut Compiler,
                                        var_id: crate::wengert::VarId,
                                        grad_ptr: Value,
+                                       still_needed: bool,
                                        b: &mut cranelift_frontend::FunctionBuilder|
                      -> Result<(), CodegenError> {
                         let Some(entry) = hook_map.get(&var_id) else {
@@ -7547,7 +7552,17 @@ impl Compiler<'_> {
                             )?;
                         }
                         c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, off)?;
-                        c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                        // Free the raw gradient now ONLY if no later adjoint op
+                        // still reads it. When this param's grad adjoint is a
+                        // shared intermediate (a bias whose grad == d_out, which
+                        // the weight-grad matmul also consumes), the free is
+                        // DEFERRED to end-of-backward cleanup — freeing here
+                        // would drop the weight gradient (silently, pre-#396).
+                        // `fase_emit_accumulate` leaves grad_ptr intact (rc
+                        // unchanged), so the later op reads live data.
+                        if !still_needed {
+                            c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                        }
                         Ok(())
                     };
                     // P0.3: bracket the FASE backward with a grad-integrity step
@@ -7633,7 +7648,13 @@ impl Compiler<'_> {
                 let mut freed_adjoint_vars = std::collections::HashSet::new();
                 if let Some(gl) = &grad_lowered {
                     if fase_hook_active {
-                        freed_adjoint_vars.extend(param_adj_set.iter().copied());
+                        // Exactly the param grads the hook actually freed — NOT
+                        // the whole param_adj_set. A param whose grad adjoint is
+                        // a shared intermediate (bias-grad == d_out) was
+                        // accumulated but its free was DEFERRED; it is absent
+                        // here on purpose so the end-of-backward bulk free
+                        // releases it exactly once (it is in owned_values).
+                        freed_adjoint_vars.extend(gl.hook_freed_param_vars.iter().copied());
                         // Also skip raw_grad VarIds that were freed early by the
                         // reduce_to_shape identity path in wengert_lower.  When
                         // shapes match, reduce_to_shape returns the input with a
@@ -9129,6 +9150,7 @@ impl Compiler<'_> {
                 let mut fase_cb = |c: &mut Compiler,
                                    var_id: crate::wengert::VarId,
                                    grad_ptr: Value,
+                                   still_needed: bool,
                                    b: &mut cranelift_frontend::FunctionBuilder|
                  -> Result<(), CodegenError> {
                     let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
@@ -9139,7 +9161,15 @@ impl Compiler<'_> {
                     let m_partial =
                         c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
                     c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, false)?;
-                    c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                    // Defer the free when this param grad is a shared
+                    // intermediate a later in-slice op still reads (bias-grad
+                    // == d_out feeding the weight matmul). wengert_lower keeps
+                    // it in var_map + owned_values; end-of-range cleanup frees
+                    // it. Exports are distinct activation adjoints, never param
+                    // grads, so this never strands a cross-range carry.
+                    if !still_needed {
+                        c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                    }
                     Ok(())
                 };
                 let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
@@ -9203,8 +9233,14 @@ impl Compiler<'_> {
                 // hook-consumed gradients, explicit FreeTensor victims, and
                 // the exports (they outlive this range; their frees are the
                 // consuming ranges' markers or the explicit list below).
+                //
+                // Seed from exactly the param grads the hook FREED — not the
+                // whole param_adj_set. A param grad that is a shared
+                // intermediate (bias-grad == d_out, read later in-slice) was
+                // accumulated but its free was DEFERRED; it is absent here on
+                // purpose so free_wengert_owned_values releases it once.
                 let mut freed_adjoint_vars: std::collections::HashSet<crate::wengert::VarId> =
-                    pending.param_adj_set.iter().copied().collect();
+                    grad_lowered.hook_freed_param_vars.iter().copied().collect();
                 freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
                 freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
                 freed_adjoint_vars.extend(exports_per_range[ri].iter().copied());

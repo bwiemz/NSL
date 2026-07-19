@@ -1578,11 +1578,20 @@ fn emit_model_backward_bridge(
         let mut grad_cb = |c: &mut crate::compiler::Compiler<'_>,
                            var_id: crate::wengert::VarId,
                            grad_val: cranelift_codegen::ir::Value,
+                           still_needed: bool,
                            fb: &mut FunctionBuilder|
          -> Result<(), crate::error::CodegenError> {
+            // `still_needed`: this param grad is a shared intermediate that a
+            // later adjoint op still reads. wengert_lower keeps it live in
+            // var_map; the callback must NOT free it (freeing would be a
+            // use-after-free for the later op + a double-free at that op's
+            // own cleanup). Rare for calibration targets — weight grads are
+            // leaves — but honored to keep the wengert_lower contract intact.
             let Some(&(offset, nbytes)) = arena_map.get(&var_id) else {
-                // Not in our target set — free and skip.
-                c.compile_call_by_name(fb, "nsl_tensor_free", &[grad_val])?;
+                // Not in our target set — free and skip (unless still needed).
+                if !still_needed {
+                    c.compile_call_by_name(fb, "nsl_tensor_free", &[grad_val])?;
+                }
                 return Ok(());
             };
             // Emit symbol_value here (not once outside the callback) so that
@@ -1608,8 +1617,12 @@ fn emit_model_backward_bridge(
                 src_ptr,
                 nbytes as u64,
             );
-            // Free the gradient tensor (callback owns it).
-            c.compile_call_by_name(fb, "nsl_tensor_free", &[grad_val])?;
+            // Free the gradient tensor (callback owns it) — but only if no
+            // later adjoint op still reads it (the memcpy above is a pure read,
+            // so deferring the free is safe).
+            if !still_needed {
+                c.compile_call_by_name(fb, "nsl_tensor_free", &[grad_val])?;
+            }
             Ok(())
         };
 

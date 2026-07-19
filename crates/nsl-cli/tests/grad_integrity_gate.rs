@@ -8,11 +8,14 @@
 //!   - FASE-Deferred (grad_accumulation >= 2, AdamW, source-AD): gradients are
 //!     consumed during backward lowering, so the gate is fed per-parameter.
 //!
-//! The last test pins the P0.2 guard: a linear layer WITH a bias under
-//! FASE-Deferred silently dropped its weight gradient on main (the bias grad is
-//! a shared intermediate the optimizer hook frees before the weight matmul
-//! reads it). The guard must now make that a hard compile error, and the
-//! documented escape hatch must downgrade it to a warning.
+//! The last test pins the ROOT FIX of the shared-intermediate drop: a linear
+//! layer WITH a bias under FASE-Deferred silently dropped its weight gradient on
+//! main (the bias grad IS `d_out`, which the weight matmul also reads, but the
+//! optimizer hook freed it early). The fix defers that free when a later adjoint
+//! op still reads the tensor, so the program now compiles and BOTH parameters
+//! receive a correct, finite, nonzero gradient. (The P0.2 guard's own coverage
+//! — that a genuinely-unresolvable live adjoint is still a hard compile error —
+//! lives in tests/grad_integrity_unresolved_input.rs.)
 
 use std::process::Command;
 
@@ -32,10 +35,19 @@ struct Run {
 }
 
 fn run(fixture: &str, extra_args: &[&str], envs: &[(&str, &str)]) -> Run {
+    run_ad(fixture, true, extra_args, envs)
+}
+
+/// `source_ad = false` runs the tape-AD reference path (no `--source-ad`), which
+/// never engages the FASE consume-hook — the independent oracle for the fix.
+fn run_ad(fixture: &str, source_ad: bool, extra_args: &[&str], envs: &[(&str, &str)]) -> Run {
     let root = repo_root();
     let path = root.join("crates/nsl-cli/tests/fixtures").join(fixture);
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"]);
+    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run"]);
+    if source_ad {
+        cmd.arg("--source-ad");
+    }
     cmd.args(extra_args);
     cmd.arg(&path)
         .current_dir(&root)
@@ -49,6 +61,14 @@ fn run(fixture: &str, extra_args: &[&str], envs: &[(&str, &str)]) -> Run {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+/// Extract the text between `<marker>_BEGIN` and `<marker>_END` lines.
+fn between<'a>(stdout: &'a str, marker: &str) -> &'a str {
+    let begin = format!("{marker}_BEGIN");
+    let end = format!("{marker}_END");
+    let s = stdout.split_once(&begin).map(|(_, r)| r).unwrap_or("");
+    s.split_once(&end).map(|(l, _)| l.trim()).unwrap_or("")
 }
 
 /// Parse the `[grad-integrity]` block from stderr into
@@ -116,40 +136,55 @@ fn grad_integrity_fase_deferred_feeds_per_param() {
 }
 
 #[test]
-fn p02_guard_fires_on_bias_fase_gradient_drop() {
-    // Default: the P0.2 guard must reject this program (a silently-dropped
-    // weight gradient becomes a hard compile error).
-    let r = run("grad_integrity_bias_fase_drop.nsl", &[], &[]);
-    assert!(!r.ok, "the bias/FASE gradient-drop program must NOT compile");
+fn bias_fase_shared_grad_now_resolves_correctly() {
+    // ROOT FIX: the bias/FASE shared-intermediate program (the bias grad IS
+    // `d_out`, also read by the weight matmul) used to drop the weight gradient
+    // silently, then — after P0.2 — became a hard compile error. The deferred-
+    // free fix makes it compile AND both params receive correct gradients.
+    let r = run("grad_integrity_bias_fase_drop.nsl", &["--grad-integrity"], &[]);
     assert!(
-        r.stderr.contains("live gradient op has an unresolved input"),
-        "must fail with the P0.2 diagnostic, got:\n{}",
+        r.ok,
+        "the shared-intermediate bias/FASE program must now compile and run:\n\
+         stdout:\n{}\nstderr:\n{}",
+        r.stdout, r.stderr
+    );
+    // The P0.2 guard must NOT fire — the tensor is kept live, not dropped.
+    assert!(
+        !r.stderr.contains("live gradient op has an unresolved input"),
+        "the fix must resolve the shared intermediate, not trip the guard:\n{}",
         r.stderr
     );
-    assert!(
-        r.stderr.contains("producer chain"),
-        "diagnostic must include the producer chain:\n{}",
-        r.stderr
-    );
+    let (checks, expected, gradient, finite, nonzero, missing) = parse_integrity(&r.stderr)
+        .unwrap_or_else(|| panic!("no [grad-integrity] block:\n{}", r.stderr));
+    assert!(checks >= 1, "the FASE feed path must finalize at least one step");
+    // Linear: w (weight) + b (bias) = 2 trainable params, BOTH must get grads.
+    assert_eq!(expected, 2, "expected 2 trainable params (w, b)");
+    assert_eq!(gradient, 2, "both params must receive a gradient (weight NOT dropped)");
+    assert_eq!(finite, 2, "both gradients must be finite");
+    assert_eq!(nonzero, 2, "both gradients must be nonzero (the weight actually moves)");
+    assert_eq!(missing, 0, "no param may be missing a gradient");
+}
 
-    // Escape hatch: downgrade to a loud warning and let codegen proceed
-    // (legacy skip). We assert codegen got PAST the guard — the warning is
-    // present and the guard's hard `codegen error` is gone — rather than the
-    // whole run, since the legacy skip still trains with the weight gradient
-    // dropped (that is the pre-existing bug the guard exists to surface).
-    let r2 = run(
-        "grad_integrity_bias_fase_drop.nsl",
-        &[],
-        &[("NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT", "1")],
-    );
+#[test]
+fn fase_bias_shared_grad_is_bit_exact_with_tape_ad() {
+    // The strongest correctness check for the fix: the deferred gradient must be
+    // the RIGHT value, not just nonzero. source-AD+FASE (the fixed consume-hook
+    // path) must produce bit-identical final weights to tape-AD (which never
+    // uses the hook). Any residual drop/corruption of the shared intermediate
+    // would diverge the two.
+    let fase = run_ad("fase_bias_shared_grad_parity.nsl", true, &[], &[]);
+    let tape = run_ad("fase_bias_shared_grad_parity.nsl", false, &[], &[]);
+    assert!(fase.ok, "source-AD+FASE run failed:\n{}", fase.stderr);
+    assert!(tape.ok, "tape-AD run failed:\n{}", tape.stderr);
+
+    let (fw, fb) = (between(&fase.stdout, "FINAL_W"), between(&fase.stdout, "FINAL_B"));
+    let (tw, tb) = (between(&tape.stdout, "FINAL_W"), between(&tape.stdout, "FINAL_B"));
+    assert!(!fw.is_empty() && !fb.is_empty(), "FASE run printed no weights:\n{}", fase.stdout);
+    // The weight moved off its init (1.0) — the fix restored a real update.
     assert!(
-        r2.stderr.contains("NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT=1"),
-        "the escape hatch must emit a loud warning:\n{}",
-        r2.stderr
+        fw.contains("0.99"),
+        "the weight must actually move under FASE (was frozen with the bug): {fw}"
     );
-    assert!(
-        !r2.stderr.contains("codegen error: [source-ad] live gradient op"),
-        "the escape hatch must downgrade the hard error (codegen proceeds):\n{}",
-        r2.stderr
-    );
+    assert_eq!(fw, tw, "final weight must be bit-exact: FASE={fw} tape={tw}");
+    assert_eq!(fb, tb, "final bias must be bit-exact: FASE={fb} tape={tb}");
 }

@@ -37,6 +37,16 @@ pub struct LoweredWengert {
     /// `hook_freed_input_vars` only in provenance (explicit tape markers vs
     /// the FASE hook's identity-path extra free).
     pub explicit_freed_vars: std::collections::HashSet<VarId>,
+    /// FASE hook: the param-gradient result VarIds the hook ACTUALLY freed
+    /// during lowering (accumulated into m_partial + `nsl_tensor_free`).
+    /// stmt.rs adds exactly these to `freed_adjoint_vars` so the bulk free
+    /// skips them.  A param grad whose adjoint is ALSO read by a later op
+    /// (a bias whose grad == d_out, which the weight-grad matmul consumes)
+    /// is deliberately EXCLUDED here: the hook accumulated it but deferred
+    /// the free, so end-of-backward cleanup (via `owned_values`) must free
+    /// it exactly once. Using this precise set instead of the whole
+    /// `param_adj_set` is what makes the shared-intermediate case correct.
+    pub hook_freed_param_vars: std::collections::HashSet<VarId>,
 }
 
 /// Build a human-readable "producer chain" for one or more unresolved input
@@ -116,6 +126,7 @@ pub fn compile_wengert_ops(
             &mut Compiler,
             VarId,
             Value,
+            bool,
             &mut FunctionBuilder,
         ) -> Result<(), CodegenError>,
     )>,
@@ -124,6 +135,7 @@ pub fn compile_wengert_ops(
     let mut owned_values = Vec::new();
     let mut hook_freed_input_vars = std::collections::HashSet::new();
     let mut explicit_freed_vars = std::collections::HashSet::new();
+    let mut hook_freed_param_vars = std::collections::HashSet::new();
     // Clone var_types so the lowerer can look up types for any VarId and
     // also tag newly-created adjoint VarIds.
     let mut var_types = wengert.var_types.clone();
@@ -138,6 +150,7 @@ pub fn compile_wengert_ops(
         &mut owned_values,
         &mut hook_freed_input_vars,
         &mut explicit_freed_vars,
+        &mut hook_freed_param_vars,
         on_param_grad,
     )?;
     // PCA Stage C: adopt the fused-SDPA extras (saved-LSE tensors) into the
@@ -151,6 +164,7 @@ pub fn compile_wengert_ops(
         owned_values,
         hook_freed_input_vars,
         explicit_freed_vars,
+        hook_freed_param_vars,
     })
 }
 
@@ -183,17 +197,36 @@ pub fn compile_wengert_ops_range(
     owned_values: &mut Vec<(VarId, Value, WengertType)>,
     hook_freed_input_vars: &mut std::collections::HashSet<VarId>,
     explicit_freed_vars: &mut std::collections::HashSet<VarId>,
+    hook_freed_param_vars: &mut std::collections::HashSet<VarId>,
     mut on_param_grad: Option<(
         &std::collections::HashSet<VarId>,
         &mut dyn FnMut(
             &mut Compiler,
             VarId,
             Value,
+            bool,
             &mut FunctionBuilder,
         ) -> Result<(), CodegenError>,
     )>,
 ) -> Result<(), CodegenError> {
-    for op in &wengert.ops[range] {
+    // FASE hook only: the last op index (over the WHOLE tape) at which each
+    // VarId is read as an input. Lets the hook decide, when it fires on a
+    // parameter gradient, whether that tensor is STILL needed by a later
+    // adjoint op — the shared-intermediate case (a bias whose grad == d_out,
+    // also consumed by the weight-grad matmul). Computed once, O(inputs);
+    // skipped entirely when no hook is present (CSLA/forward/free-list).
+    let last_input_use: Option<HashMap<VarId, usize>> = on_param_grad.as_ref().map(|_| {
+        let mut m = HashMap::new();
+        for (i, op) in wengert.ops.iter().enumerate() {
+            for &inp in &op.inputs {
+                m.insert(inp, i); // later index overwrites earlier → keeps the max
+            }
+        }
+        m
+    });
+    let range_start = range.start;
+    for (rel_i, op) in wengert.ops[range].iter().enumerate() {
+        let abs_i = range_start + rel_i;
         // Skip ops whose inputs can't be resolved (ghost VarIds from
         // get_or_create_adjoint that never received a gradient).
         // These produce dead adjoint paths for non-differentiable ops.
@@ -302,31 +335,52 @@ pub fn compile_wengert_ops_range(
         if let Some(ref mut hook) = on_param_grad {
             let (param_set, cb) = hook;
             if param_set.contains(&op.result) {
-                cb(compiler, op.result, result_val, builder)?;
-                // Callback owns/freed the tensor — remove from var_map so
-                // downstream code can't accidentally re-use it.
-                var_map.remove(&op.result);
+                // Is this param-gradient tensor read by any LATER op? If so,
+                // it is a shared intermediate (e.g. a bias whose gradient IS
+                // d_out — same shape, no reduce — which the weight-gradient
+                // matmul also consumes). The hook must accumulate it into
+                // m_partial (a pure read) but NOT free it yet, or the later
+                // op reads freed memory and its whole gradient chain is
+                // dropped (the #396-class silent-drop the P0.2 guard catches).
+                // Deferred tensors stay in var_map and fall through to the
+                // owned_values push below, so end-of-backward cleanup frees
+                // them exactly once.
+                let still_needed = last_input_use
+                    .as_ref()
+                    .and_then(|m| m.get(&op.result))
+                    .is_some_and(|&last| last > abs_i);
+                cb(compiler, op.result, result_val, still_needed, builder)?;
+                // still_needed: the callback accumulated but deferred the free.
+                // Leave the tensor in var_map for the later op, and do NOT
+                // record it as hook-freed — it falls through to the
+                // owned_values push below so end-of-backward cleanup frees it.
+                if !still_needed {
+                    // Callback owns/freed the tensor — remove from var_map so
+                    // downstream code can't accidentally re-use it.
+                    var_map.remove(&op.result);
+                    hook_freed_param_vars.insert(op.result);
 
-                // If the hook fired on a reduce_to_shape op, emit an extra
-                // nsl_tensor_free for the raw-grad input (inputs[0]).
-                //
-                // Why this is needed: nsl_tensor_reduce_to_shape increments
-                // the input's refcount and returns the same pointer when the
-                // src and target shapes match (the identity path).  The hook
-                // callback already called nsl_tensor_free(result_val), which
-                // drops refcount from 2→1 — not an actual free.  We need one
-                // more free here to bring it to 0 so the raw grad is released
-                // immediately, not held until end-of-adjoint cleanup (which
-                // is what causes the N×grad_size peak-memory regression).
-                //
-                // This is also correct on the non-identity path (fresh clone):
-                // the raw_grad has rc=1, this free drops it to 0 (freed), and
-                // the cleanup pass skips it via hook_freed_input_vars.
-                if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape") {
-                    if let Some(&input_vid) = op.inputs.first() {
-                        if let Some(&input_val) = var_map.get(&input_vid) {
-                            call(compiler, builder, "nsl_tensor_free", &[input_val])?;
-                            hook_freed_input_vars.insert(input_vid);
+                    // If the hook fired on a reduce_to_shape op, emit an extra
+                    // nsl_tensor_free for the raw-grad input (inputs[0]).
+                    //
+                    // Why this is needed: nsl_tensor_reduce_to_shape increments
+                    // the input's refcount and returns the same pointer when the
+                    // src and target shapes match (the identity path).  The hook
+                    // callback already called nsl_tensor_free(result_val), which
+                    // drops refcount from 2→1 — not an actual free.  We need one
+                    // more free here to bring it to 0 so the raw grad is released
+                    // immediately, not held until end-of-adjoint cleanup (which
+                    // is what causes the N×grad_size peak-memory regression).
+                    //
+                    // This is also correct on the non-identity path (fresh clone):
+                    // the raw_grad has rc=1, this free drops it to 0 (freed), and
+                    // the cleanup pass skips it via hook_freed_input_vars.
+                    if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape") {
+                        if let Some(&input_vid) = op.inputs.first() {
+                            if let Some(&input_val) = var_map.get(&input_vid) {
+                                call(compiler, builder, "nsl_tensor_free", &[input_val])?;
+                                hook_freed_input_vars.insert(input_vid);
+                            }
                         }
                     }
                 }
@@ -4813,6 +4867,9 @@ mod tests {
                     &mut crate::compiler::Compiler,
                     VarId,
                     Value,
+                    // `still_needed`: false → hook frees the grad; true → a
+                    // later adjoint op still reads it, so the free is deferred.
+                    bool,
                     &mut FunctionBuilder,
                 ) -> Result<(), crate::CodegenError>,
             )>,
