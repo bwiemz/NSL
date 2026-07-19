@@ -6447,6 +6447,39 @@ impl Compiler<'_> {
                     gen.set_csha_claims(claims);
                 }
                 let mut adjoint = gen.generate(&effective_primal);
+                // Item 9 profiling (`NSL_PROFILE_ADJOINT=1`): a launch-count
+                // histogram of the generated backward ops. Norm/activation
+                // adjoints decompose into many small bandwidth-bound ops
+                // (RMSNorm dgamma alone = mean/Sqrt/Div/Mul/reduce); this shows
+                // which op classes dominate the launch count — the fusion
+                // targets. Pre-CCR: recompute clones are forward ops, so this is
+                // the true backward-op composition.
+                if std::env::var("NSL_PROFILE_ADJOINT").is_ok() {
+                    use std::collections::BTreeMap;
+                    let mut hist: BTreeMap<String, usize> = BTreeMap::new();
+                    for op in &adjoint.ops {
+                        let key = match &op.op {
+                            crate::wengert::PrimalOp::Passthrough(n) => {
+                                format!("Passthrough({n})")
+                            }
+                            other => format!("{other:?}")
+                                .split(['(', ' ', '{'])
+                                .next()
+                                .unwrap_or("?")
+                                .to_string(),
+                        };
+                        *hist.entry(key).or_default() += 1;
+                    }
+                    eprintln!(
+                        "[adjoint-profile] {} generated backward ops:",
+                        adjoint.ops.len()
+                    );
+                    let mut rows: Vec<_> = hist.into_iter().collect();
+                    rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    for (k, c) in rows {
+                        eprintln!("[adjoint-profile]   {c:>5}  {k}");
+                    }
+                }
                 // D2b part 2: hand the claims BACK for the forward lowering
                 // below (the fused-SDPA claim dispatch reads them); the
                 // compiler slot is cleared again right after the forward, so

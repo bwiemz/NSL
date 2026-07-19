@@ -1097,6 +1097,33 @@ impl AdjointGenerator {
                 )
             }
 
+            // --- RMSNorm INPUT backward (correct, NO mean-subtract) ---
+            // y = gamma * x / rms, rms = sqrt(mean(x²)+eps) over the last dim.
+            //   dx_j = g_j·ȳ_j/rms − x_j·mean_k(ȳ_k·g_k·x_k)/rms³
+            // (mean = Σ/N, so mean(ȳ·g·x)/rms³ == Σ(ȳ·g·x)/(N·rms³).) All
+            // reductions are keepdim over the last dim so the [.,1] results
+            // broadcast against the full-shape tensors — no Broadcast op needed.
+            AdjointExpr::RmsNormInputBackward(y_bar, x, gamma, eps_val) => {
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x, x]);
+                let mean_sq =
+                    self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x_sq]);
+                let eps = self.emit_constant(eps_val);
+                let ms_eps = self.emit_op(PrimalOp::Add, vec![mean_sq, eps]);
+                let rms = self.emit_op(PrimalOp::Sqrt, vec![ms_eps]);
+                // g·ȳ (gamma [D] broadcasts against ȳ [.,D], as in the forward).
+                let gyb = self.emit_op(PrimalOp::Mul, vec![y_bar, gamma]);
+                let term1 = self.emit_op(PrimalOp::Div, vec![gyb, rms]);
+                // mean_k(ȳ_k·g_k·x_k) over the last dim.
+                let ygx = self.emit_op(PrimalOp::Mul, vec![gyb, x]);
+                let mean_ygx =
+                    self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![ygx]);
+                let rms_sq = self.emit_op(PrimalOp::Mul, vec![rms, rms]);
+                let rms_cubed = self.emit_op(PrimalOp::Mul, vec![rms_sq, rms]);
+                let coeff = self.emit_op(PrimalOp::Div, vec![mean_ygx, rms_cubed]);
+                let term2 = self.emit_op(PrimalOp::Mul, vec![x, coeff]);
+                self.emit_op(PrimalOp::Sub, vec![term1, term2])
+            }
+
             // --- LayerNorm / BatchNorm gamma backward: grad * x_hat ---
             // Recomputes x_hat = (x - mean) / std from input to get the correct
             // normalized values (NOT the output, which is gamma * x_hat + beta).
