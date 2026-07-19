@@ -6235,12 +6235,88 @@ impl Compiler<'_> {
                         crate::ccr::CcrPolicy::Block
                     };
                     let compress_requested = self.compile_options.checkpoint_compress.is_some();
+                    // Item 8: resolve the periodic-checkpoint stride. `Fixed(k)`
+                    // passes straight through (ccr::plan logs the coalescing);
+                    // `Auto` searches strides against the projected activation
+                    // peak — with the CSLA accumulation window G applied to the
+                    // saved boundaries — and the checkpoint byte budget.
+                    let resolved_stride = match self.compile_options.checkpoint_stride {
+                        crate::CheckpointStride::Fixed(k) => k,
+                        crate::CheckpointStride::Auto => {
+                            let sizes = crate::profiling::captures::size_hints_from_var_nodes(
+                                extractor.var_nodes(),
+                                self.type_map,
+                            );
+                            let window = if csla_active {
+                                (grad_accumulation_steps.max(1)) as u64
+                            } else {
+                                1
+                            };
+                            let budget_bytes = self
+                                .compile_options
+                                .checkpoint_budget_mib
+                                .map(|m| m.saturating_mul(1024 * 1024));
+                            match crate::ccr::select_stride(
+                                &effective_primal,
+                                claimed_ids.as_ref(),
+                                policy,
+                                &sizes,
+                                window,
+                                budget_bytes,
+                                crate::ccr::DEFAULT_STRIDE_CANDIDATES,
+                            ) {
+                                Some(choice) => {
+                                    let log: Vec<String> = choice
+                                        .considered
+                                        .iter()
+                                        .map(|(k, pb)| {
+                                            format!("k={k}:{}MiB", pb / (1024 * 1024))
+                                        })
+                                        .collect();
+                                    eprintln!(
+                                        "[ccr] --checkpoint-stride auto: chose stride {} \
+                                         (projected activation peak {} MiB{}, window G={window}); \
+                                         candidates [{}]",
+                                        choice.stride,
+                                        choice.peak_bytes / (1024 * 1024),
+                                        if choice.fits_budget {
+                                            ""
+                                        } else {
+                                            ", NO stride fits the budget — using min-peak"
+                                        },
+                                        log.join(", ")
+                                    );
+                                    choice.stride
+                                }
+                                None => {
+                                    eprintln!(
+                                        "[ccr] --checkpoint-stride auto: no candidate produced a \
+                                         plan; using stride 1"
+                                    );
+                                    1
+                                }
+                            }
+                        }
+                    };
                     let plan = crate::ccr::plan(
                         &effective_primal,
                         claimed_ids.as_ref(),
                         policy,
                         compress_requested,
+                        resolved_stride,
                     );
+                    // Item 8: one coalescing note for the FINAL stride (the Auto
+                    // search above ran plan() per candidate silently).
+                    if resolved_stride > 1 {
+                        if let Some(p) = &plan {
+                            eprintln!(
+                                "[ccr] periodic checkpointing: stride {resolved_stride} → \
+                                 {} CCR super-segment(s) (saving every {resolved_stride}th block \
+                                 boundary, recomputing each span — bit-exact)",
+                                p.segments.len()
+                            );
+                        }
+                    }
                     if let (Some(p), Some(dtype)) =
                         (&plan, self.compile_options.checkpoint_compress.as_deref())
                     {

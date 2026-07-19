@@ -1065,6 +1065,22 @@ pub struct WrgaCheckContext {
         Option<std::sync::Arc<std::sync::Mutex<Option<crate::wrga::WrgaPlan>>>>,
 }
 
+/// Periodic-checkpointing stride request (Item 8, `--checkpoint-stride`).
+/// `Fixed(k)` coalesces every `k` block anchors into one CCR super-segment;
+/// `Auto` lets the activation-budget scheduler pick `k`. `Fixed(1)` (the
+/// default) is the classic per-block behavior — no coalescing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointStride {
+    Fixed(usize),
+    Auto,
+}
+
+impl Default for CheckpointStride {
+    fn default() -> Self {
+        CheckpointStride::Fixed(1)
+    }
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1219,6 +1235,16 @@ pub struct CompileOptions {
     /// buffer Deferred never materializes) is added when parameter sizes
     /// are statically known. None = pure policy decision, no arbitration.
     pub checkpoint_budget_mib: Option<u64>,
+    /// Item 8 (`--checkpoint-stride N|auto`): periodic checkpointing. With
+    /// `Fixed(k)`, CCR coalesces every `k` transformer-block anchors into one
+    /// super-segment — saving only every k-th block boundary and recomputing
+    /// the k-block span. Trades recompute for a k× smaller saved-boundary
+    /// surface (the activation surface CSLA buffers across the accumulation
+    /// window). `Auto` searches strides with `ccr::project_activation_peak`
+    /// and picks the smallest projected peak within `checkpoint_budget_mib`
+    /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
+    /// Bit-exact regardless of stride (recompute replays the same kernels).
+    pub checkpoint_stride: CheckpointStride,
     /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
     /// Selective policy's saved matmul-class interiors to half precision
     /// between forward and backward (cast-on-save, dequant-on-load via the
@@ -1370,6 +1396,7 @@ impl Default for CompileOptions {
             checkpoint_blocks: false,
             checkpoint_selective: false,
             checkpoint_budget_mib: None,
+            checkpoint_stride: CheckpointStride::default(),
             checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,

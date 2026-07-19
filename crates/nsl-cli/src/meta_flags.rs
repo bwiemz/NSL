@@ -22,6 +22,46 @@
 //! the `[pca] wggo-override-*` verdicts instead; CPDT needs a cluster spec
 //! (`--cpdt-num-gpus`) and stays opt-in.
 
+/// Parse `--checkpoint-stride` (`"auto"` or a positive integer) into a
+/// [`nsl_codegen::CheckpointStride`]. Clap guarantees the flag's presence and
+/// `requires = "checkpoint_blocks"`; this is the value-domain check. Invalid or
+/// zero values fall back to `Fixed(1)` (per-block) with a stderr note rather
+/// than aborting the build.
+pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride {
+    use nsl_codegen::CheckpointStride;
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return CheckpointStride::Auto;
+    }
+    match t.parse::<usize>() {
+        Ok(n) if n >= 1 => CheckpointStride::Fixed(n),
+        _ => {
+            eprintln!(
+                "note: --checkpoint-stride '{s}' is not 'auto' or a positive \
+                 integer; using stride 1 (per-block checkpointing)"
+            );
+            CheckpointStride::Fixed(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod stride_tests {
+    use super::parse_checkpoint_stride;
+    use nsl_codegen::CheckpointStride;
+
+    #[test]
+    fn parses_auto_and_integers_and_falls_back() {
+        assert_eq!(parse_checkpoint_stride("auto"), CheckpointStride::Auto);
+        assert_eq!(parse_checkpoint_stride("AUTO"), CheckpointStride::Auto);
+        assert_eq!(parse_checkpoint_stride("1"), CheckpointStride::Fixed(1));
+        assert_eq!(parse_checkpoint_stride("4"), CheckpointStride::Fixed(4));
+        // 0 and garbage fall back to Fixed(1).
+        assert_eq!(parse_checkpoint_stride("0"), CheckpointStride::Fixed(1));
+        assert_eq!(parse_checkpoint_stride("nope"), CheckpointStride::Fixed(1));
+    }
+}
+
 pub(crate) fn expand_pretrain_optimized(
     pretrain_optimized: bool,
     wggo: &mut Option<String>,
@@ -81,6 +121,10 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     if opts.checkpoint_budget_mib.is_some() {
         opts.checkpoint_budget_mib = None;
         disabled.push("--checkpoint-budget-mib (CCR)");
+    }
+    if opts.checkpoint_stride != nsl_codegen::CheckpointStride::Fixed(1) {
+        opts.checkpoint_stride = nsl_codegen::CheckpointStride::Fixed(1);
+        disabled.push("--checkpoint-stride (periodic checkpointing)");
     }
     if opts.checkpoint_compress.is_some() {
         opts.checkpoint_compress = None;
