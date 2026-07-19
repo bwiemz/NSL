@@ -345,6 +345,24 @@ fn link_gcc_multi(
     Ok(())
 }
 
+/// Is a failed link.exe invocation a TRANSIENT output-file lock (retryable)
+/// rather than a real link error? On Windows, `link.exe` reports LNK1104
+/// "cannot open file '<path>'" both for a missing INPUT library (a real,
+/// persistent error) and for an OUTPUT file it cannot write (a transient
+/// lock — Defender's real-time scan grabs a handle on the freshly-created
+/// .exe, or the failed GCC attempt on the SAME output path left a lingering
+/// handle). We only retry when the LNK1104 names the OUTPUT file, so a
+/// genuinely-missing input lib still fails fast.
+fn is_transient_link_failure(link_output: &str, out_file_name: &str) -> bool {
+    if !link_output.contains("LNK1104") {
+        return false;
+    }
+    // A missing input lib is "cannot open file 'foo.lib'"; the transient case
+    // is the output binary itself. Match on the output file name (present in
+    // the LNK1104 line) — if we somehow can't identify it, don't retry.
+    !out_file_name.is_empty() && link_output.contains(out_file_name)
+}
+
 /// Link using MSVC toolchain (link.exe).
 fn link_msvc_multi(
     obj_paths: &[PathBuf],
@@ -353,64 +371,116 @@ fn link_msvc_multi(
 ) -> Result<(), CodegenError> {
     let msvc = find_msvc()?;
 
-    let mut cmd = Command::new(&msvc.link);
-    cmd.arg("/nologo")
-        .arg(format!("/OUT:{}", output_path.display()))
-        // 64MB stack — tape-based AD on deep models (8+ transformer blocks)
-        // creates deep call chains that overflow the default 1MB stack.
-        .arg("/STACK:67108864");
-    for obj_path in obj_paths {
-        cmd.arg(obj_path);
-    }
-    cmd.arg(runtime_lib);
+    // CUDA libs are resolved once (env + dir probe) and reused across retries.
+    let cuda_lib_dir = std::env::var("CUDA_PATH")
+        .ok()
+        .map(|p| PathBuf::from(p).join("lib").join("x64"))
+        .filter(|d| d.is_dir());
 
-    // Add library paths
-    for lib_path in &msvc.lib_paths {
-        cmd.arg(format!("/LIBPATH:{}", lib_path.display()));
-    }
-
-    // Required system libraries for the Rust static lib
-    cmd.args([
-        "msvcrt.lib",
-        "legacy_stdio_definitions.lib",
-        "kernel32.lib",
-        "advapi32.lib",
-        "bcrypt.lib",
-        "ntdll.lib",
-        "userenv.lib",
-        "ws2_32.lib",
-        "synchronization.lib",
-        "shell32.lib",
-        "ole32.lib",
-        "/NODEFAULTLIB:LIBCMT",
-        // Disable Control Flow Guard — Cranelift object files don't have CFG
-        // metadata, so the linker's guard checks trigger false positives.
-        "/GUARD:NO",
-    ]);
-
-    // Link CUDA driver + cuBLAS libraries if available (needed when runtime
-    // has cuda feature).  cublas.lib added 2026-04-21 for the nsl_matmul_f32
-    // cublasSgemm swap.
-    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
-        let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
-        if cuda_lib.is_dir() {
+    // Build a fresh Command each attempt (Command is not reusable after run).
+    let build_cmd = || -> Command {
+        let mut cmd = Command::new(&msvc.link);
+        cmd.arg("/nologo")
+            .arg(format!("/OUT:{}", output_path.display()))
+            // 64MB stack — tape-based AD on deep models (8+ transformer blocks)
+            // creates deep call chains that overflow the default 1MB stack.
+            .arg("/STACK:67108864");
+        for obj_path in obj_paths {
+            cmd.arg(obj_path);
+        }
+        cmd.arg(runtime_lib);
+        // Add library paths
+        for lib_path in &msvc.lib_paths {
+            cmd.arg(format!("/LIBPATH:{}", lib_path.display()));
+        }
+        // Required system libraries for the Rust static lib
+        cmd.args([
+            "msvcrt.lib",
+            "legacy_stdio_definitions.lib",
+            "kernel32.lib",
+            "advapi32.lib",
+            "bcrypt.lib",
+            "ntdll.lib",
+            "userenv.lib",
+            "ws2_32.lib",
+            "synchronization.lib",
+            "shell32.lib",
+            "ole32.lib",
+            "/NODEFAULTLIB:LIBCMT",
+            // Disable Control Flow Guard — Cranelift object files don't have CFG
+            // metadata, so the linker's guard checks trigger false positives.
+            "/GUARD:NO",
+        ]);
+        // Link CUDA driver + cuBLAS libraries if available (needed when runtime
+        // has cuda feature).  cublas.lib added 2026-04-21 for the nsl_matmul_f32
+        // cublasSgemm swap.
+        if let Some(ref cuda_lib) = cuda_lib_dir {
             cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
             cmd.arg("cuda.lib");
             cmd.arg("cublas.lib");
         }
+        cmd
+    };
+
+    // Retry on a transient LNK1104 output-file lock. This is the chronic AWQ
+    // calibration-binary flake on Windows CI: link_multi tries GCC first, which
+    // fails for this binary and leaves a partial calibration.exe, then this
+    // MSVC fallback hits LNK1104 because Defender (or the lingering GCC handle)
+    // still holds the output. It clears within a moment — so capture output,
+    // drop the locked file, back off, and retry rather than fail the build.
+    let out_file_name = output_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    const MAX_ATTEMPTS: u32 = 4;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let out = build_cmd()
+            .output()
+            .map_err(|e| CodegenError::new(format!("failed to run link.exe: {e}")))?;
+        if out.status.success() {
+            // .status() used to STREAM link.exe's output; .output() captures it,
+            // so re-emit on the happy path to preserve linker warnings
+            // (LNK4098 defaultlib conflict, LNK4099 missing PDB, …) that would
+            // otherwise be silently swallowed. Route stdout→stdout, stderr→stderr.
+            if !out.stdout.is_empty() {
+                print!("{}", String::from_utf8_lossy(&out.stdout));
+            }
+            if !out.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            }
+            return Ok(());
+        }
+        let diag = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let transient = is_transient_link_failure(&diag, out_file_name);
+        if transient && attempt < MAX_ATTEMPTS {
+            // Drop the locked/partial output so the retry writes cleanly, then
+            // back off (exponential: 200/400/800ms) to let the AV scan or the
+            // lingering handle release.
+            let _ = std::fs::remove_file(output_path);
+            std::thread::sleep(std::time::Duration::from_millis(200 * (1u64 << (attempt - 1))));
+            continue;
+        }
+        // Terminal: either a real (non-transient) failure, or a transient lock
+        // that never cleared across all attempts — name which so the operator
+        // isn't left with the generic message in the exact case the retry
+        // exists to explain.
+        return Err(CodegenError::new(if transient {
+            format!(
+                "link.exe failed after {attempt} attempts — a transient LNK1104 \
+                 output-file lock on '{out_file_name}' did not clear (Defender \
+                 real-time scan or a lingering handle):\n{diag}"
+            )
+        } else {
+            format!("link.exe failed (exit: {}):\n{diag}", out.status)
+        }));
     }
-
-    let status = cmd
-        .status()
-        .map_err(|e| CodegenError::new(format!("failed to run link.exe: {e}")))?;
-
-    if !status.success() {
-        return Err(CodegenError::new(format!(
-            "link.exe failed (exit: {status})"
-        )));
-    }
-
-    Ok(())
+    // The final iteration (attempt == MAX_ATTEMPTS) never `continue`s, so the
+    // loop always returns from its body — this is unreachable.
+    unreachable!("MSVC link retry loop returns on every path")
 }
 
 struct MsvcPaths {
@@ -593,6 +663,37 @@ mod tests {
     use super::*;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn transient_lnk1104_on_output_is_retryable() {
+        // The chronic AWQ flake: LNK1104 naming the OUTPUT binary (Defender /
+        // lingering GCC handle) — retry.
+        let diag = "LINK : fatal error LNK1104: cannot open file \
+             'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\nsl-calibration-1224-178\\calibration.exe'";
+        assert!(is_transient_link_failure(diag, "calibration.exe"));
+    }
+
+    #[test]
+    fn lnk1104_on_input_lib_is_not_retryable() {
+        // A genuinely-missing input library must fail fast, not spin retries.
+        let diag = "LINK : fatal error LNK1104: cannot open file 'cublas.lib'";
+        assert!(!is_transient_link_failure(diag, "calibration.exe"));
+    }
+
+    #[test]
+    fn non_lnk1104_failure_is_not_retryable() {
+        // Unresolved-symbol errors etc. are real and persistent.
+        let diag = "model.obj : error LNK2019: unresolved external symbol nsl_calib_model_forward";
+        assert!(!is_transient_link_failure(diag, "calibration.exe"));
+    }
+
+    #[test]
+    fn unidentifiable_output_name_does_not_retry() {
+        // Defensive: with no output name we cannot tell output-lock from
+        // missing-input, so we do NOT spin retries.
+        let diag = "LINK : fatal error LNK1104: cannot open file 'whatever.exe'";
+        assert!(!is_transient_link_failure(diag, ""));
+    }
 
     fn top_level_runtime_name_for_target(target_os: &str, target_env: &str) -> &'static str {
         if target_os == "windows" && target_env == "msvc" {
