@@ -108,14 +108,13 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
         opts.cpdt.mode = nsl_codegen::cpdt::CpdtMode::Off;
         disabled.push("CPDT precision-adaptive training");
     }
-    // CSHA attention fusion (mode + decorators).
+    // CSHA attention fusion. `csha.mode = "off"` is the load-bearing gate
+    // (forces disabled_by_flag in codegen, covering @csha decorators too); the
+    // decorator config maps are populated LATER in the pipeline, so clearing
+    // them here would be a no-op — the mode gate is what actually disables them.
     if opts.csha.mode.as_deref() != Some("off") {
         opts.csha.mode = Some("off".to_string());
-        disabled.push("CSHA attention fusion");
-    }
-    if !opts.csha_configs.is_empty() {
-        opts.csha_configs.clear();
-        disabled.push("@csha decorators");
+        disabled.push("CSHA attention fusion (mode + @csha)");
     }
 
     eprintln!(

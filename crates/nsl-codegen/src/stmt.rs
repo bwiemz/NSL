@@ -149,8 +149,10 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // NOT actually checkpointed. The estimate is clamped to the
     // no-checkpoint sum so the optimism is bounded; a per-layer coverage
     // blend needs a layer->function map that AppliedPlan does not carry.
-    model.activation_checkpointing =
-        !compiler.compile_options.checkpoint_policies.is_empty();
+    // P1.7 --training-reference: report no checkpointing in the memory estimate,
+    // matching codegen (which ignores @checkpoint decorators in that mode).
+    model.activation_checkpointing = !compiler.compile_options.training_reference
+        && !compiler.compile_options.checkpoint_policies.is_empty();
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
     // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
@@ -4346,6 +4348,19 @@ impl Compiler<'_> {
         // var. The per-step check/note calls below feed the accumulator.
         if self.compile_options.grad_integrity {
             self.compile_call_by_name(builder, "nsl_grad_integrity_arm", &[])?;
+            // v1 does not wire the gate into the CSLA (--layerwise-accum)
+            // windowed-replay backward, so it would report checks=0 there —
+            // silently. Warn loudly rather than let a gate pass vacuously
+            // (deferral-must-refuse). The FullBuffer and FASE-interleaved paths
+            // are covered.
+            if self.compile_options.layerwise_accum {
+                eprintln!(
+                    "[grad-integrity] WARNING: --grad-integrity is not wired into the \
+                     --layerwise-accum (CSLA) windowed backward yet — the report will \
+                     show checks=0. Drop --layerwise-accum to check gradients, or treat \
+                     checks=0 as 'not measured', not 'no problems'."
+                );
+            }
         }
 
         // CPDT precision-adaptive optimizer execution (v1): build per-param
@@ -5126,7 +5141,15 @@ impl Compiler<'_> {
             let (fused_kl_ce_cfg, distill_alpha, distill_temp) = match &self.active_distill_context
             {
                 Some(d) => (
-                    d.fused_kl_ce.clone(),
+                    // P1.7: --training-reference disables the fused KL-CE
+                    // substitution so the composite KL-CE baseline runs instead
+                    // (mirrors the @fused_lm_ce gate on active_fused_ce_config).
+                    // The composite distill loss (alpha/temperature) still runs.
+                    if self.compile_options.training_reference {
+                        None
+                    } else {
+                        d.fused_kl_ce.clone()
+                    },
                     // Only EXPLICIT loss-section values participate in the
                     // call-site literal cross-check; defaults must not veto.
                     d.loss_alpha_explicit,
