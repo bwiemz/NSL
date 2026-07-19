@@ -305,7 +305,16 @@ pub fn render(rt: &RealTimeline, max_rows: usize) -> String {
     let n = rt.entries.len();
     let stride = n.div_ceil(max_rows.max(1)).max(1);
     for (i, e) in rt.entries.iter().enumerate() {
-        if e.phase.is_none() && i % stride != 0 && i != n - 1 {
+        // Always keep phase-marker rows, the last row, AND the peak-usage row.
+        // The peak bar is the single most salient point of the timeline (and
+        // the value the annotation below reports); the stride sampler used to
+        // truncate it away for any mid-backward peak, so the printed chart
+        // never showed the moment it was warning about.
+        if e.phase.is_none()
+            && i % stride != 0
+            && i != n - 1
+            && e.program_point != rt.peak_pp
+        {
             continue;
         }
         let filled = if rt.peak_bytes == 0 {
@@ -455,6 +464,40 @@ mod tests {
         if !rt.what_if.is_empty() {
             assert!(text.contains("peak drops to"));
         }
+    }
+
+    #[test]
+    fn render_keeps_peak_row_even_when_sampled_out() {
+        // 20 program points; the peak is at pp=7, which is NOT a multiple of
+        // the stride when max_rows is small — the old sampler dropped it while
+        // still printing "Peak: ... at pp=7". The peak bar row must survive.
+        let entries: Vec<MemoryTimelineEntry> = (0..20u32)
+            .map(|pp| MemoryTimelineEntry {
+                program_point: pp,
+                live_bytes: if pp == 7 { 10_000_000 } else { 1_000_000 },
+                phase: None,
+            })
+            .collect();
+        let rt = RealTimeline {
+            entries,
+            peak_bytes: 10_000_000,
+            peak_pp: 7,
+            forward_ops: 10,
+            backward_ops: 10,
+            sized_vars: 20,
+            unsized_vars: 0,
+            what_if: vec![],
+        };
+        // max_rows=4 → stride=5 → sampled program points are 0,5,10,15,19;
+        // pp=7 would be dropped without the peak-keep.
+        let text = render(&rt, 4);
+        let peak_row_present = text
+            .lines()
+            .any(|l| l.trim_start().starts_with("7 ") || l.trim_start().starts_with("7\t"));
+        assert!(
+            peak_row_present || text.contains("\n    7 "),
+            "the peak-usage row (pp=7) must be kept even when sampled out:\n{text}"
+        );
     }
 
     #[test]

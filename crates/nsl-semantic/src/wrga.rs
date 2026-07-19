@@ -16,6 +16,13 @@ use nsl_ast::types::TypeExprKind;
 use nsl_ast::{Module, Span, Symbol};
 use nsl_errors::Diagnostic;
 
+/// Maximum `@adapter(rank=...)` accepted by the WRGA B.3 single-pass fused
+/// epilogue (see `nsl-codegen::wrga_adapter_inject` / `wrga_prescan`, which
+/// reject `rank > 16`, and `wrga_spectral::RANK_GRID` whose top entry is 16).
+/// Kept in sync by value here because `nsl-semantic` does not depend on
+/// `nsl-codegen`.
+const WRGA_MAX_ADAPTER_RANK: i64 = 16;
+
 /// Validated `@wrga(...)` configuration.
 #[derive(Debug, Clone)]
 pub struct WrgaConfig {
@@ -373,6 +380,20 @@ pub fn validate_adapter_decorator(
                         diagnostics.push(
                             Diagnostic::error("@adapter: rank must be positive".to_string())
                                 .with_label(arg.span, "rank <= 0"),
+                        );
+                    } else if *n > WRGA_MAX_ADAPTER_RANK {
+                        // The WRGA B.3 single-pass fused epilogue supports rank
+                        // <= 16 (wrga_adapter_inject.rs / wrga_prescan.rs). A
+                        // larger rank was previously accepted here and then
+                        // SILENTLY dropped at codegen (input_dim/output_dim
+                        // zeroed → the adapter never fused, only a stderr line).
+                        // Surface it as a validation error instead.
+                        diagnostics.push(
+                            Diagnostic::error(format!(
+                                "@adapter: rank must be <= {WRGA_MAX_ADAPTER_RANK} (the WRGA \
+                                 single-pass fused-epilogue limit); got {n}"
+                            ))
+                            .with_label(arg.span, "rank > 16"),
                         );
                     } else {
                         rank = Some(*n);
