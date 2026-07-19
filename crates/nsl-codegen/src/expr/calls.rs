@@ -2905,6 +2905,24 @@ impl Compiler<'_> {
                 config.insert("drop_last".to_string(), serde_json::Value::Bool(true));
             }
 
+            // D3 v3 (ZeRO-1 data-parallel): bake the DP world_size so the
+            // runtime loader shards data per rank (rank r takes the global
+            // batches at slots where slot % world_size == r), making the ZeRO
+            // all-reduce average over the true global batch instead of
+            // replicated data. Gated on --zero-stage >= 1 (where that all-reduce
+            // is emitted); otherwise the loader stays rank-blind (world_size
+            // defaults to 1 = unchanged single-rank behavior). Baking from
+            // self.features.world_size keeps it the SINGLE source of truth with
+            // nsl_zero_init's baked world_size (stmt.rs) — a runtime env-read
+            // could disagree with the compiled ZeRO world_size and deadlock.
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                let ws = self.features.world_size.max(1) as u64;
+                config.insert(
+                    "world_size".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(ws)),
+                );
+            }
+
             // Packing is accepted; the runtime builds packed batches with
             // segment_ids/doc_starts/position_ids metadata. The dense
             // [b,s,s] attention_mask is OPT-IN via the

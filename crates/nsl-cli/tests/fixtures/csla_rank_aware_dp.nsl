@@ -1,0 +1,102 @@
+# D3 v3 rank-aware data-parallel parity fixture.
+#
+# Same attention-free 2-block FFN LM as csla_layerwise_ffn.nsl (8 params:
+# embed + 2 blocks x {norm_f,w_up,w_down} + norm_out), but with an EVEN
+# micro-batch count so a 2-rank strided data shard is clean (6/6, no trailing
+# partial):
+#   - 1536 tokens / (batch 2 x seq 64) = 12 micro-batches per epoch;
+#   - grad_accumulation=2, epochs=1 -> exactly 6 optimizer steps over the
+#     consecutive pairs {(0,1),(2,3),...,(10,11)}, NO dropped tail.
+#
+# The DP-parity gate rewrites "grad_accumulation=2" -> "grad_accumulation=1"
+# and runs it under `--zero-stage 1 --devices 2`: the rank-aware loader hands
+# rank0 micro-batches {0,2,4,6,8,10} and rank1 {1,3,5,7,9,11}; the ZeRO
+# all-reduce means the two ranks' single-micro-batch gradients each step, which
+# is BIT-EXACT to the baseline's grad_accum=2 mean of the same pair (0.5*g_a +
+# 0.5*g_b == 0.5*(g_a + g_b) for two terms). So rank0's per-micro-batch loss
+# stream equals the baseline's EVEN-indexed losses, and the final model bytes
+# match. See crates/nsl-cli/tests/zero_spmd_gate.rs.
+#
+# Marker rewrites (exact string match by the harness):
+#   - "CSLA_SAVE_PATH"        -> the temp .nslm path;
+#   - "grad_accumulation=2"   -> "grad_accumulation=1" for the DP arm.
+#
+# No bias params (broadcast-add bias grads hit the FASE-accumulate shape abort).
+
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_f: Tensor = ones([64])
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyLM:
+    embed: Tensor = randn([64, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = TinyLM()
+
+# 12 DISTINCT micro-batch blocks of 128 tokens (content values (1..7)+k per
+# block, trailing 0 kept) — distinct blocks so a wrong data shard shows up as a
+# diverged loss rather than silently matching.
+let u0 = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let b0 = u0.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u1 = tensor_cat([arange(7) + full([7], 2.0), zeros([1])], 0)
+let b1 = u1.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u2 = tensor_cat([arange(7) + full([7], 3.0), zeros([1])], 0)
+let b2 = u2.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u3 = tensor_cat([arange(7) + full([7], 4.0), zeros([1])], 0)
+let b3 = u3.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u4 = tensor_cat([arange(7) + full([7], 5.0), zeros([1])], 0)
+let b4 = u4.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u5 = tensor_cat([arange(7) + full([7], 6.0), zeros([1])], 0)
+let b5 = u5.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u6 = tensor_cat([arange(7) + full([7], 7.0), zeros([1])], 0)
+let b6 = u6.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u7 = tensor_cat([arange(7) + full([7], 8.0), zeros([1])], 0)
+let b7 = u7.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u8 = tensor_cat([arange(7) + full([7], 9.0), zeros([1])], 0)
+let b8 = u8.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u9 = tensor_cat([arange(7) + full([7], 10.0), zeros([1])], 0)
+let b9 = u9.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u10 = tensor_cat([arange(7) + full([7], 11.0), zeros([1])], 0)
+let b10 = u10.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u11 = tensor_cat([arange(7) + full([7], 12.0), zeros([1])], 0)
+let b11 = u11.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let tokens = tensor_cat([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11], 0).reshape([1536])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true, shard_by_rank=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+model_save(m, "CSLA_SAVE_PATH")
