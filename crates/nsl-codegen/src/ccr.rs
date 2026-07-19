@@ -874,6 +874,30 @@ pub fn apply_to_adjoint(
     }
     splices.sort_by_key(|s| std::cmp::Reverse(s.1));
 
+    // Marker op that calls `nsl_set_inplace_suppressed(on)` and yields a
+    // null placeholder result (see `PrimalOp::PrologueRecompute` for the
+    // same pattern) — never read by another op, so it needs no real type
+    // bookkeeping beyond a fresh, unique VarId.
+    let suppress_marker = |on: bool, fresh: &mut VarId| -> WengertOp {
+        let result = *fresh;
+        *fresh += 1;
+        WengertOp {
+            id: 0, // renumbered below
+            result,
+            op: PrimalOp::Passthrough(
+                if on {
+                    "ccr_inplace_suppress_on"
+                } else {
+                    "ccr_inplace_suppress_off"
+                }
+                .to_string(),
+            ),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        }
+    };
+
     for (si, at) in splices {
         let seg = &plan.segments[si];
         let vset: HashSet<VarId> = plan.per_segment_recompute[si].iter().copied().collect();
@@ -906,6 +930,18 @@ pub fn apply_to_adjoint(
                     .var_names
                     .insert(remap[&op.result], format!("{name}.ccr_recompute"));
             }
+        }
+        // The adjoint is lowered with in-place suppression OFF (adjoint
+        // temps are typically single-use). A recompute clone re-executes
+        // an original FORWARD op though — e.g. `silu(x)` — and forward
+        // ops rely on suppression being ON so an FBIP-capable unary
+        // doesn't mutate a still-needed input (like `x`, which the
+        // adjoint's own un-recomputed ops may still read for the real
+        // backward formula) in place. Bracket the clones so they replay
+        // under the same in-place semantics the original forward used.
+        if !clones.is_empty() {
+            clones.insert(0, suppress_marker(true, fresh));
+            clones.push(suppress_marker(false, fresh));
         }
         adjoint.ops.splice(at..at, clones);
     }

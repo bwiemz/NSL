@@ -3021,6 +3021,19 @@ fn lower_single_op(
                 "ccr_cast_fp16" => call(compiler, builder, "nsl_tensor_to_fp16", &[inputs[0]]),
                 "ccr_cast_bf16" => call(compiler, builder, "nsl_tensor_to_bf16", &[inputs[0]]),
                 "ccr_cast_f32" => call(compiler, builder, "nsl_tensor_to_f32", &[inputs[0]]),
+                // CCR recompute-clone bracket: a recompute clone replays an
+                // original FORWARD op (e.g. `silu(x)`) but is spliced into
+                // the adjoint, which lowers with in-place suppression OFF.
+                // Without this bracket an FBIP-capable clone can mutate a
+                // still-needed input in place (e.g. `x`, later read by the
+                // real backward formula) — see ccr::apply_to_adjoint. Takes
+                // no tensor operand; yields a null placeholder result like
+                // `PrimalOp::PrologueRecompute`.
+                "ccr_inplace_suppress_on" | "ccr_inplace_suppress_off" => {
+                    let on = name == "ccr_inplace_suppress_on";
+                    let v = builder.ins().iconst(cl_types::I64, i64::from(on));
+                    call(compiler, builder, "nsl_set_inplace_suppressed", &[v])
+                }
                 "shape" => call(compiler, builder, "nsl_tensor_shape", &[inputs[0]]),
                 "ndim" => call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]]),
                 "reshape" => {

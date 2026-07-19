@@ -59,6 +59,30 @@ pub fn type_for_op(op: &PrimalOp) -> WengertType {
     }
 }
 
+/// Does this `PrimalOp` produce a tensor that (zero-copy) aliases one of
+/// its inputs' storage — a "view"? CSLA weight-streaming's `view_of`
+/// chain (stmt.rs) uses this to keep a param resident whenever a view of
+/// it is still live, since evicting the param would free the storage the
+/// view's data pointer aliases.
+///
+/// `Transpose`/`Reshape` are the AD-internal struct variants (the latter
+/// only synthesized for backward-pass shape restoration). User-facing
+/// `.reshape()`/`.contiguous()`/`.expand()`/`.squeeze()`/`.unsqueeze()`
+/// calls compile to `Passthrough` and are runtime view ops too (see
+/// `nsl_tensor_{reshape,contiguous,expand,squeeze,unsqueeze}` — reshape is
+/// zero-copy for a contiguous source, contiguous returns the same pointer
+/// when already contiguous, expand/unsqueeze always alias).
+pub fn is_view_producing_op(op: &PrimalOp) -> bool {
+    match op {
+        PrimalOp::Transpose { .. } | PrimalOp::Reshape { .. } => true,
+        PrimalOp::Passthrough(name) => matches!(
+            name.as_str(),
+            "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze"
+        ),
+        _ => false,
+    }
+}
+
 /// A single operation in the primal (forward) computation trace.
 #[derive(Debug, Clone)]
 pub struct WengertOp {
@@ -594,6 +618,36 @@ mod tests {
             saved_for_backward: false,
             checkpointed: false,
         }
+    }
+
+    #[test]
+    fn view_producing_op_covers_struct_and_passthrough_view_methods() {
+        // Struct-variant AD ops.
+        assert!(is_view_producing_op(&PrimalOp::Transpose {
+            dim0: 0,
+            dim1: 1
+        }));
+        assert!(is_view_producing_op(&PrimalOp::Reshape { target_ndim: 2 }));
+
+        // User-facing `.method()` calls compile to Passthrough, not the
+        // struct variants above (source_ad.rs) — CSLA weight-streaming's
+        // view_of chain (stmt.rs) relies on this to keep a streamed param
+        // resident whenever one of these still-live views aliases it.
+        for name in ["reshape", "contiguous", "expand", "squeeze", "unsqueeze"] {
+            assert!(
+                is_view_producing_op(&PrimalOp::Passthrough(name.into())),
+                "{name} must be treated as view-producing"
+            );
+        }
+
+        // Non-aliasing passthroughs and ordinary ops must NOT be treated
+        // as views (over-inclusion would just pin params resident
+        // needlessly, but these are useful negative cases regardless).
+        for name in ["item", "shape", "ndim", "int", "float"] {
+            assert!(!is_view_producing_op(&PrimalOp::Passthrough(name.into())));
+        }
+        assert!(!is_view_producing_op(&PrimalOp::Relu));
+        assert!(!is_view_producing_op(&PrimalOp::Matmul));
     }
 
     #[test]

@@ -6559,11 +6559,7 @@ impl Compiler<'_> {
                             crate::wengert::VarId,
                         > = std::collections::HashMap::new();
                         for op in &effective_primal.ops {
-                            if matches!(
-                                op.op,
-                                crate::wengert::PrimalOp::Transpose { .. }
-                                    | crate::wengert::PrimalOp::Reshape { .. }
-                            ) {
+                            if crate::wengert::is_view_producing_op(&op.op) {
                                 for &input in &op.inputs {
                                     if trainable_vid_set.contains(&input) {
                                         primal_view_of.insert(op.result, input);
@@ -8634,11 +8630,7 @@ impl Compiler<'_> {
                                 }
                             }
                         }
-                        if matches!(
-                            op.op,
-                            crate::wengert::PrimalOp::Transpose { .. }
-                                | crate::wengert::PrimalOp::Reshape { .. }
-                        ) {
+                        if crate::wengert::is_view_producing_op(&op.op) {
                             for &input in &op.inputs {
                                 if update_range_of_vid.contains_key(&input) {
                                     view_param.insert(op.result, input);
