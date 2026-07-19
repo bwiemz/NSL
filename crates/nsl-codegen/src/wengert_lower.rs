@@ -39,6 +39,57 @@ pub struct LoweredWengert {
     pub explicit_freed_vars: std::collections::HashSet<VarId>,
 }
 
+/// Build a human-readable "producer chain" for one or more unresolved input
+/// VarIds: walk backward through the ops that were supposed to produce each
+/// missing value (via [`WengertList::find_producer`]) so the diagnostic shows
+/// WHY the value never materialized — a leaf ghost adjoint that never received
+/// a gradient, or a producer that was itself skipped because ITS input was
+/// unresolved (a cascade). Bounded in depth and de-duplicated so it stays a
+/// short, readable trace even on large tapes.
+fn describe_producer_chain(
+    wengert: &WengertList,
+    missing: &[VarId],
+    var_map: &VarMap,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut stack: Vec<(VarId, usize)> = missing.iter().map(|&v| (v, 0)).collect();
+    while let Some((vid, depth)) = stack.pop() {
+        if depth > 8 || !seen.insert(vid) {
+            continue;
+        }
+        let indent = "  ".repeat(depth + 1);
+        match wengert.find_producer(vid) {
+            Some(prod) => {
+                let unresolved: Vec<VarId> = prod
+                    .inputs
+                    .iter()
+                    .copied()
+                    .filter(|v| !var_map.contains_key(v))
+                    .collect();
+                lines.push(format!(
+                    "{indent}VarId {vid} <- {:?} (inputs {:?}; still-unresolved {:?})",
+                    prod.op, prod.inputs, unresolved
+                ));
+                for v in unresolved {
+                    stack.push((v, depth + 1));
+                }
+            }
+            None => {
+                lines.push(format!(
+                    "{indent}VarId {vid} <- (no producer op — leaf ghost adjoint, \
+                     never populated by accumulate_adjoint)"
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
+        "  (empty)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Lower a WengertList to Cranelift IR by dispatching each PrimalOp to its runtime FFI call.
 ///
 /// `primal_vars` maps VarIds from the forward pass to their Cranelift Values (i64 tensor pointers).
@@ -148,14 +199,49 @@ pub fn compile_wengert_ops_range(
         // These produce dead adjoint paths for non-differentiable ops.
         let all_inputs_resolved = op.inputs.iter().all(|vid| var_map.contains_key(vid));
         if !all_inputs_resolved {
+            let missing: Vec<VarId> = op
+                .inputs
+                .iter()
+                .copied()
+                .filter(|vid| !var_map.contains_key(vid))
+                .collect();
+            // P0.2 gradient-integrity guard: a LIVE gradient op — one whose
+            // result is structurally reachable from a needed parameter
+            // gradient (`compiler.grad_live_results`) — with an unresolved
+            // input is a HARD ERROR. Silently skipping it (the pre-#396
+            // behavior) leaves its result unmapped, which cascades: every
+            // consumer is skipped too, and a real parameter gradient is
+            // dropped with no crash and no diagnostic. Dead / ghost ops
+            // (result NOT reachable from any needed grad) are still safely
+            // skipped, as are FreeTensor markers (their placeholder result is
+            // never a gradient). The guard is only armed around adjoint
+            // lowering (FASE / FullBuffer / grad-block); it is `None` for
+            // forward, free-list, and calibration lowerings, and for the CSLA
+            // windowed replay (whose cross-range ghost-carry accounting owns
+            // its own unresolved-boundary semantics).
+            let is_live = compiler
+                .grad_live_results
+                .as_ref()
+                .is_some_and(|live| live.contains(&op.result));
+            if is_live && !matches!(op.op, PrimalOp::FreeTensor) {
+                let chain = describe_producer_chain(wengert, &missing, var_map);
+                return Err(CodegenError::new(format!(
+                    "[source-ad] live gradient op has an unresolved input — a \
+                     parameter gradient would be silently dropped.\n  \
+                     operation: {:?}\n  result VarId: {}\n  unresolved input(s): {:?}\n  \
+                     producer chain:\n{}\n\
+                     This op is structurally reachable from a needed parameter \
+                     gradient, so skipping it (the pre-#396 behavior) would zero a \
+                     real gradient. It usually means a dead/fused forward chain left \
+                     ghost adjoints merged into a live accumulation Add — e.g. a \
+                     missing `apply_pending_fused_lce_prunes` drain after a @fused_lm_ce \
+                     substitution.",
+                    op.op, op.result, missing, chain
+                )));
+            }
             // Ghost VarId — skip this op. Its result stays unmapped,
             // which propagates the "no gradient" signal downstream.
             if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-                let missing: Vec<_> = op
-                    .inputs
-                    .iter()
-                    .filter(|vid| !var_map.contains_key(vid))
-                    .collect();
                 eprintln!(
                     "[wengert-skip] VarId {} ({:?}) — missing inputs: {:?}",
                     op.result, op.op, missing
@@ -4518,6 +4604,32 @@ mod tests {
         // With VarId present — we'd need a real Value, so skip the success case
         // in this unit test. Integration tests cover the full lowering path.
         let _ = var_map; // suppress unused warning
+    }
+
+    #[test]
+    fn describe_producer_chain_traces_cascade_and_leaf_ghost() {
+        // A live Add(11, 12): input 11 is produced by a Mul whose own input 13
+        // is unresolved (a cascade); input 12 has no producer at all (a leaf
+        // ghost adjoint). The chain must name both, plus the deeper VarId 13.
+        let wengert = WengertList {
+            ops: vec![
+                make_op(0, 10, PrimalOp::Add, vec![11, 12]),
+                make_op(1, 11, PrimalOp::Mul, vec![13]),
+            ],
+            output: 10,
+            var_names: std::collections::HashMap::new(),
+            var_types: std::collections::HashMap::new(),
+        };
+        // Empty var_map ⇒ every input is unresolved (no Cranelift Values needed).
+        let var_map = VarMap::new();
+        let chain = describe_producer_chain(&wengert, &[11, 12], &var_map);
+        assert!(chain.contains("VarId 11"), "chain missing VarId 11:\n{chain}");
+        assert!(chain.contains("VarId 12"), "chain missing VarId 12:\n{chain}");
+        assert!(chain.contains("VarId 13"), "chain missing cascade VarId 13:\n{chain}");
+        assert!(
+            chain.contains("leaf ghost"),
+            "chain must flag the unproduced leaf ghost:\n{chain}"
+        );
     }
 
     #[test]

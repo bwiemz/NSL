@@ -578,6 +578,17 @@ pub struct Compiler<'a> {
     /// into `owned_values` at the end of `compile_wengert_ops` so the
     /// step's cleanup frees them (free(0) is a no-op for declined runs).
     pub sdpa_extra_owned: Vec<Value>,
+    /// Gradient-integrity guard (P0.2): when `Some(set)`, the Wengert lowerer
+    /// treats any op whose `result` VarId is in `set` (i.e. LIVE — structurally
+    /// reachable from a needed parameter gradient) but which has an unresolved
+    /// input as a hard `CodegenError` instead of a silent skip. Ops NOT in the
+    /// set (proven dead / ghost) may still be skipped. Set immediately around
+    /// each adjoint-lowering call in `compile_train_block` (FASE / FullBuffer /
+    /// grad-block) and cleared afterward, so it is `None` for every forward /
+    /// free-list / calibration lowering. See PR #396: a live accumulation `Add`
+    /// referencing a ghost adjoint used to be silently dropped, zeroing all
+    /// parameter gradients with no diagnostic.
+    pub grad_live_results: Option<std::collections::HashSet<crate::wengert::VarId>>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
     /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
@@ -1020,6 +1031,7 @@ impl<'a> Compiler<'a> {
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             sdpa_extra_owned: Vec::new(),
+            grad_live_results: None,
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),

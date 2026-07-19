@@ -6358,17 +6358,22 @@ impl Compiler<'_> {
                 // by any parameter gradient. This removes ghost VarId chains
                 // from non-differentiable ops (shape, subscript, list) that
                 // would cascade skip in the lowerer.
-                {
+                //
+                // `adjoint_needed` (the trainable parameter-gradient adjoint
+                // VarIds) is hoisted here so the P0.2 gradient-integrity guard
+                // below can reuse it to classify LIVE vs dead/ghost adjoint ops
+                // over the FINAL (post-CCR) op list.
+                let adjoint_needed: std::collections::HashSet<crate::wengert::VarId> = {
                     let named_params = extractor.named_param_var_ids();
-                    let needed: std::collections::HashSet<crate::wengert::VarId> = named_params
+                    named_params
                         .iter()
                         .filter(|(name, _)| self.is_trainable_param_name(name))
                         .filter_map(|(_, vid)| gen.adjoint_of(*vid))
-                        .collect();
-                    if !needed.is_empty() {
-                        adjoint.ops =
-                            crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
-                    }
+                        .collect()
+                };
+                if !adjoint_needed.is_empty() {
+                    adjoint.ops =
+                        crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &adjoint_needed);
                 }
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
@@ -6466,6 +6471,23 @@ impl Compiler<'_> {
                         eprintln!("[ccr] adjoint last-use frees inserted: {n}");
                     }
                 }
+
+                // 6d.5 P0.2 gradient-integrity guard: compute the LIVE adjoint
+                // result-VarId set over the FINAL adjoint (post dead-grad
+                // elimination, post-CCR splice + last-use frees). Armed on the
+                // compiler around each non-CSLA adjoint-lowering call below so a
+                // live gradient op that cannot resolve an input becomes a hard
+                // compile error instead of a silently-dropped gradient (#396).
+                // `None` when there are no trainable-parameter gradients.
+                let grad_live_set: Option<std::collections::HashSet<crate::wengert::VarId>> =
+                    if adjoint_needed.is_empty() {
+                        None
+                    } else {
+                        Some(crate::source_ad::reachable_result_vars(
+                            &adjoint.ops,
+                            &adjoint_needed,
+                        ))
+                    };
 
                 // 6e. Milestone C·p2: transient-memory arena projection.
                 // Reuses the M36 interference/BFD engine (transient_arena.rs)
@@ -7481,14 +7503,20 @@ impl Compiler<'_> {
                         c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
                         Ok(())
                     };
-                    match crate::wengert_lower::compile_wengert_ops(
+                    // P0.2: arm the gradient-integrity guard for the FASE
+                    // adjoint lowering, then disarm before the match so it
+                    // never leaks into a later (forward / free-list) lowering.
+                    self.grad_live_results = grad_live_set.clone();
+                    let fase_lowered = crate::wengert_lower::compile_wengert_ops(
                         self,
                         builder,
                         state,
                         &adjoint,
                         full_vars,
                         Some((&param_adj_set, &mut fase_cb)),
-                    ) {
+                    );
+                    self.grad_live_results = None;
+                    match fase_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
@@ -7500,10 +7528,13 @@ impl Compiler<'_> {
                         }
                     }
                 } else {
-                    match crate::wengert_lower::compile_wengert_ops(
+                    self.grad_live_results = grad_live_set.clone();
+                    let full_lowered = crate::wengert_lower::compile_wengert_ops(
                         self, builder, state, &adjoint, full_vars,
                         None,
-                    ) {
+                    );
+                    self.grad_live_results = None;
+                    match full_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
@@ -11919,10 +11950,17 @@ impl Compiler<'_> {
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
 
             if !adjoint.ops.is_empty() {
-                let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
+                // P0.2: arm the gradient-integrity guard for the `grad` block's
+                // adjoint (a live op that cannot resolve an input silently
+                // drops the gradient — see #396), then disarm before the match.
+                self.grad_live_results =
+                    Some(crate::source_ad::reachable_result_vars(&adjoint.ops, &needed));
+                let grad_block_lowered = crate::wengert_lower::compile_wengert_ops(
                     self, builder, state, &adjoint, full_vars,
                     None, // FASE on_param_grad hook — wired in Task 3
-                ) {
+                );
+                self.grad_live_results = None;
+                let grad_lowered = match grad_block_lowered {
                     Ok(gv) => gv,
                     Err(e) => {
                         eprintln!(
