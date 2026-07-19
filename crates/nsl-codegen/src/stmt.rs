@@ -6247,6 +6247,18 @@ impl Compiler<'_> {
                                 extractor.var_nodes(),
                                 self.type_map,
                             );
+                            // Review MEDIUM: with fully symbolic shapes the size
+                            // map is empty → every candidate projects to peak 0
+                            // and the search silently returns stride 1. Say so,
+                            // rather than printing a decision that looks real.
+                            if sizes.is_empty() {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride auto: no static tensor sizes \
+                                     available (symbolic shapes) — cannot project the \
+                                     activation peak; using stride 1. Pass an explicit \
+                                     --checkpoint-stride N to force periodic checkpointing."
+                                );
+                            }
                             let window = if csla_active {
                                 (grad_accumulation_steps.max(1)) as u64
                             } else {

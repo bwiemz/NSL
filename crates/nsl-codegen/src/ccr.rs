@@ -702,10 +702,26 @@ pub fn project_activation_peak(
         vars.iter()
             .fold(0u64, |a, v| a.saturating_add(sizes.get(v).copied().unwrap_or(0)))
     };
-    let saved_boundary_bytes = plan
-        .segments
-        .iter()
-        .fold(0u64, |a, seg| a.saturating_add(sum(&seg.escaping)));
+    // Saved surface = escaping boundaries PLUS force-saved interiors. Under the
+    // Selective policy a segment's matmul-class interiors are kept resident
+    // (never recomputed) — they land in `interior` but NOT in
+    // `per_segment_recompute`, and they are the LARGEST per-block tensors.
+    // Counting only `escaping` here understated the budget in the unsafe
+    // direction (a stride reported as fitting when the resident set is far
+    // larger). `interior \ recompute` recovers exactly the force-saved set
+    // (matmul saves, CSHA-claimed chains, Dropout, non-tensor scalars — the
+    // last contribute 0 via `sizes`, an honest no-op).
+    let mut saved_boundary_bytes = 0u64;
+    for (seg, seg_rc) in plan.segments.iter().zip(&plan.per_segment_recompute) {
+        saved_boundary_bytes = saved_boundary_bytes.saturating_add(sum(&seg.escaping));
+        let recompute: std::collections::HashSet<VarId> = seg_rc.iter().copied().collect();
+        for &v in &seg.interior {
+            if !recompute.contains(&v) {
+                saved_boundary_bytes =
+                    saved_boundary_bytes.saturating_add(sizes.get(&v).copied().unwrap_or(0));
+            }
+        }
+    }
     let max_recompute_bytes = plan
         .per_segment_recompute
         .iter()
@@ -1362,6 +1378,53 @@ mod tests {
         assert!(ap2.peak_bytes(4) < ap1.peak_bytes(4), "G=4: 1100 < 1700");
         // With G=1 they tie here (200+300 == 400+100).
         assert_eq!(ap1.peak_bytes(1), ap2.peak_bytes(1));
+    }
+
+    #[test]
+    fn activation_peak_counts_selective_saved_matmuls() {
+        // HIGH review fix: under Selective, matmul-class interiors are kept
+        // resident (never recomputed). They must be counted in the saved
+        // surface, or the budget projection understates memory in the unsafe
+        // direction (claims a stride fits when it doesn't).
+        //
+        // Two-block tape, each block = Matmul (Selective-saved) → Gelu
+        // (recomputed) → Add-residual (escapes):
+        let mut var_names = HashMap::new();
+        var_names.insert(1, "m.blocks.0.w".to_string());
+        var_names.insert(2, "m.blocks.1.w".to_string());
+        var_names.insert(9, "m.head.w".to_string());
+        let primal = WengertList {
+            ops: vec![
+                op(0, 0, PrimalOp::Input("x".into()), vec![]),
+                op(1, 1, PrimalOp::Param("m.blocks.0.w".into()), vec![]),
+                op(2, 2, PrimalOp::Param("m.blocks.1.w".into()), vec![]),
+                op(3, 3, PrimalOp::Matmul, vec![0, 1]), // block0 mm (Selective-saved)
+                op(4, 4, PrimalOp::Gelu, vec![3]),      // block0 act (recomputed)
+                op(5, 5, PrimalOp::Add, vec![4, 0]),    // block0 out (escapes)
+                op(6, 6, PrimalOp::Matmul, vec![5, 2]), // block1 mm
+                op(7, 7, PrimalOp::Gelu, vec![6]),      // block1 act
+                op(8, 8, PrimalOp::Add, vec![7, 5]),    // block1 out
+                op(9, 9, PrimalOp::Param("m.head.w".into()), vec![]),
+                op(10, 10, PrimalOp::Matmul, vec![8, 9]), // epilogue
+            ],
+            output: 10,
+            var_names,
+            var_types: HashMap::new(),
+        };
+        let sizes: HashMap<VarId, u64> =
+            primal.ops.iter().map(|o| (o.result, 100u64)).collect();
+        let block = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let sel = plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
+        let ap_block = project_activation_peak(&block, &sizes);
+        let ap_sel = project_activation_peak(&sel, &sizes);
+        // Block recomputes matmuls + gelus (0 saved beyond boundaries);
+        // Selective keeps the 2 matmuls resident → saved includes them.
+        assert_eq!(ap_block.saved_boundary_bytes, 200, "2 escaping boundaries");
+        assert_eq!(ap_sel.saved_boundary_bytes, 400, "2 boundaries + 2 saved matmuls");
+        assert!(
+            ap_sel.saved_boundary_bytes > ap_block.saved_boundary_bytes,
+            "Selective's resident matmuls must not be invisible to the projection"
+        );
     }
 
     #[test]

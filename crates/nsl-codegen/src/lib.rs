@@ -1244,6 +1244,13 @@ pub struct CompileOptions {
     /// and picks the smallest projected peak within `checkpoint_budget_mib`
     /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
     /// Bit-exact regardless of stride (recompute replays the same kernels).
+    ///
+    /// NOTE: under `Auto`, `checkpoint_budget_mib` is consulted twice with two
+    /// meanings — first as a peak-concurrent-activation budget to pick the
+    /// stride (`select_stride`), then as a saved-interior-bytes budget by the
+    /// per-tensor knapsack (`ccr::apply_budget`). Both keep the plan valid (the
+    /// number is a soft target, not a hard cap), so the dual use is safe but
+    /// deliberate; unifying them is future work (the full DP scheduler).
     pub checkpoint_stride: CheckpointStride,
     /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
     /// Selective policy's saved matmul-class interiors to half precision
