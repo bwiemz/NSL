@@ -1112,6 +1112,12 @@ pub struct CompileOptions {
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
+    /// P0.3: gradient-integrity gate. Emits a per-step check that every
+    /// trainable parameter received a finite, mostly-nonzero gradient, and
+    /// prints the `[grad-integrity]` worst-case snapshot at exit (under
+    /// `NSL_GRAD_INTEGRITY=1`, which the flag sets). Unlike `debug_training`
+    /// it changes NO optimization decisions — it only observes gradients.
+    pub grad_integrity: bool,
     /// M62a: Build as a shared library (.so/.dylib/.dll) instead of an executable.
     /// Also controls PIC codegen (`is_pic`), which every object linked into
     /// the shared library needs — including non-entry modules on the
@@ -1329,6 +1335,7 @@ impl Default for CompileOptions {
             zk: ZkOptions::default(),
             zero_stage: None,
             debug_training: false,
+            grad_integrity: false,
             shared_lib: false,
             emit_export_table: false,
             wrga_inputs: None,

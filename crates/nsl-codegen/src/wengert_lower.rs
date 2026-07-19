@@ -225,19 +225,32 @@ pub fn compile_wengert_ops_range(
                 .is_some_and(|live| live.contains(&op.result));
             if is_live && !matches!(op.op, PrimalOp::FreeTensor) {
                 let chain = describe_producer_chain(wengert, &missing, var_map);
-                return Err(CodegenError::new(format!(
+                let diag = format!(
                     "[source-ad] live gradient op has an unresolved input — a \
                      parameter gradient would be silently dropped.\n  \
                      operation: {:?}\n  result VarId: {}\n  unresolved input(s): {:?}\n  \
                      producer chain:\n{}\n\
                      This op is structurally reachable from a needed parameter \
                      gradient, so skipping it (the pre-#396 behavior) would zero a \
-                     real gradient. It usually means a dead/fused forward chain left \
-                     ghost adjoints merged into a live accumulation Add — e.g. a \
+                     real gradient. Two known causes: (1) a dead/fused forward chain \
+                     left ghost adjoints merged into a live accumulation Add — e.g. a \
                      missing `apply_pending_fused_lce_prunes` drain after a @fused_lm_ce \
-                     substitution.",
+                     substitution; (2) under FASE-Deferred, a parameter whose gradient \
+                     adjoint is ALSO a shared intermediate feeding another parameter's \
+                     gradient (e.g. a bias added right before a weight matmul) is \
+                     consumed+freed by the optimizer hook before that later op reads it.",
                     op.op, op.result, missing, chain
-                )));
+                );
+                // Escape hatch (migration only): downgrade to a loud warning and
+                // fall through to the legacy skip. The DEFAULT is the hard error
+                // the reviewer asked for; this exists so a build blocked by a
+                // pre-existing latent drop can proceed while the root cause is
+                // fixed, without silently pretending nothing is wrong.
+                if std::env::var("NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT").as_deref() == Ok("1") {
+                    eprintln!("[source-ad] WARNING (NSL_ALLOW_UNRESOLVED_LIVE_ADJOINT=1): {diag}");
+                } else {
+                    return Err(CodegenError::new(diag));
+                }
             }
             // Ghost VarId — skip this op. Its result stays unmapped,
             // which propagates the "no gradient" signal downstream.

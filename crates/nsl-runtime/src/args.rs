@@ -111,6 +111,17 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
             atexit(nsl_zero_count_atexit);
         }
     }
+
+    // P0.3: gradient-integrity report. The --grad-integrity flag arms this
+    // directly from the emitted train setup (nsl_grad_integrity_arm), so it
+    // works with no env var; NSL_GRAD_INTEGRITY=1 also arms it here (the arm is
+    // Once-guarded, so the two paths never double-register). Prints the
+    // worst-case-over-steps snapshot so a gate can prove every trainable
+    // parameter received a finite, mostly-nonzero gradient on EVERY step —
+    // catching the #396 silent-drop at runtime.
+    if std::env::var("NSL_GRAD_INTEGRITY").ok().as_deref() == Some("1") {
+        crate::grad_integrity::nsl_grad_integrity_arm();
+    }
 }
 
 extern "C" fn nsl_zero_count_atexit() {

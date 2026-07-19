@@ -1,0 +1,31 @@
+# P0.3 grad-integrity fixture (FullBuffer path — no grad accumulation, so the
+# grads list is materialized and scanned by nsl_grad_integrity_check). A
+# 2-block residual MLP with a gelu FFN = 4 trainable tensor params, all of
+# which must receive a finite, nonzero gradient every step.
+model Blk:
+    w_up: Tensor = randn([4, 8]) * 0.1
+    w_down: Tensor = randn([8, 4]) * 0.1
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let pre = h @ self.w_up
+        let act = gelu(pre)
+        let out = act @ self.w_down
+        return h + out
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = randn([4, 4]) * 0.1
+
+train(model=m, epochs=3):
+    optimizer: SGD(lr=0.05)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out * out)

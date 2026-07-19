@@ -4341,6 +4341,13 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
 
+        // P0.3: arm the gradient-integrity exit report once, at train setup
+        // (before the epoch/step loop), so --grad-integrity works with no env
+        // var. The per-step check/note calls below feed the accumulator.
+        if self.compile_options.grad_integrity {
+            self.compile_call_by_name(builder, "nsl_grad_integrity_arm", &[])?;
+        }
+
         // CPDT precision-adaptive optimizer execution (v1): build per-param
         // storage dtype lists aligned with param_list, when active. Inactive ->
         // None (the existing FP32 path runs verbatim, zero behavior change).
@@ -7499,10 +7506,29 @@ impl Compiler<'_> {
                         let m_partial =
                             c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
                         let off = c.compile_options.optim_state_offload;
+                        // P0.3: note this parameter's gradient BEFORE accumulate
+                        // frees/consumes it. accum_idx == the param_paths index.
+                        if c.compile_options.grad_integrity {
+                            c.compile_call_by_name(
+                                b,
+                                "nsl_grad_integrity_note",
+                                &[grad_ptr, idx_val],
+                            )?;
+                        }
                         c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, off)?;
                         c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
                         Ok(())
                     };
+                    // P0.3: bracket the FASE backward with a grad-integrity step
+                    // (the hook notes each parameter's gradient between these).
+                    let gi = self.compile_options.grad_integrity;
+                    if gi {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_grad_integrity_step_begin",
+                            &[num_params_val],
+                        )?;
+                    }
                     // P0.2: arm the gradient-integrity guard for the FASE
                     // adjoint lowering, then disarm before the match so it
                     // never leaks into a later (forward / free-list) lowering.
@@ -7516,7 +7542,7 @@ impl Compiler<'_> {
                         Some((&param_adj_set, &mut fase_cb)),
                     );
                     self.grad_live_results = None;
-                    match fase_lowered {
+                    let fase_out = match fase_lowered {
                         Ok(gv) => Some(gv),
                         Err(e) => {
                             eprintln!(
@@ -7526,7 +7552,15 @@ impl Compiler<'_> {
                             );
                             return Err(e);
                         }
+                    };
+                    if gi {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_grad_integrity_step_end",
+                            &[],
+                        )?;
                     }
+                    fase_out
                 } else {
                     self.grad_live_results = grad_live_set.clone();
                     let full_lowered = crate::wengert_lower::compile_wengert_ops(
@@ -7989,6 +8023,18 @@ impl Compiler<'_> {
             self.compile_call_by_name(
                 builder,
                 "nsl_debug_grad_checksum",
+                &[grads_list, num_params_val],
+            )?;
+        }
+
+        // 7e1b'. P0.3 gradient-integrity gate (FullBuffer / composite path):
+        // scan the materialized grads list once per step. Skipped when the
+        // FASE hook is active (grads_list is a null sentinel) — that path is
+        // instrumented per-parameter inside the hook (step_begin/note/step_end).
+        if self.compile_options.grad_integrity && !fase_hook_active {
+            self.compile_call_by_name(
+                builder,
+                "nsl_grad_integrity_check",
                 &[grads_list, num_params_val],
             )?;
         }

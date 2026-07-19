@@ -539,6 +539,12 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) debug_training: bool,
 
+        /// P0.3: gradient-integrity gate — assert every trainable parameter
+        /// gets a finite, mostly-nonzero gradient each step; prints the
+        /// [grad-integrity] snapshot at exit. Observes only (no opt changes).
+        #[arg(long)]
+        pub(crate) grad_integrity: bool,
+
         /// M45: Run compile-time NaN/Inf risk analysis before codegen
         #[arg(long)]
         pub(crate) nan_analysis: bool,
@@ -916,6 +922,12 @@ pub(crate) struct RunArgs {
         /// Debug training: disable fusion + FBIP, emit gradient checksums
         #[arg(long)]
         pub(crate) debug_training: bool,
+
+        /// P0.3: gradient-integrity gate — assert every trainable parameter
+        /// gets a finite, mostly-nonzero gradient each step; prints the
+        /// [grad-integrity] snapshot at exit. Observes only (no opt changes).
+        #[arg(long)]
+        pub(crate) grad_integrity: bool,
 
         /// M45: Enable tensor operation tracing (writes .nsl.trace binary)
         #[arg(long)]
