@@ -46,6 +46,13 @@ use crate::tensor::NslTensor;
 struct Mirror {
     host: *mut u8,
     bytes: usize,
+    /// The device pointer this param last held (0 = currently evicted). Used
+    /// to count actual pointer MOVES: an upload that hands back a different
+    /// device address than the param held before is concrete evidence the
+    /// storage was freed and reallocated (the exact hazard the #397 view-of-θ
+    /// exclusion protects a live buffered view from). A view-rooted param is
+    /// never registered, so its pointer never moves.
+    last_dev: i64,
 }
 // Raw pointers in the table are only touched under the lock on the
 // (single-threaded) training path.
@@ -64,10 +71,28 @@ static MIRRORS: Mutex<Option<HashMap<i64, Mirror>>> = Mutex::new(None);
 pub static WS_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_EVICTS_WB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Distinct parameters that entered the streaming table (were evicted at least
+/// once → their original device storage was freed). A view-rooted param that
+/// the #397 exclusion keeps resident is NEVER registered, so it never appears
+/// here — this is the per-param pointer-STABILITY signal the view gate asserts.
+pub static WS_REGISTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Uploads that returned a device address DIFFERENT from the one the param
+/// last held — concrete "the pointer moved" evidence for streamed params.
+pub static WS_PTR_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
     WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_registered_count() -> i64 {
+    WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_ptr_moves() -> i64 {
+    WS_PTR_MOVES.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
 /// Register a GPU-resident f32 parameter for streaming: allocate a pinned
@@ -127,7 +152,11 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
         let mut guard = MIRRORS.lock().unwrap();
         guard
             .get_or_insert_with(HashMap::new)
-            .insert(tensor_ptr, Mirror { host, bytes });
+            .insert(tensor_ptr, Mirror { host, bytes, last_dev: 0 });
+        // First registration = this param's original device storage was freed
+        // (its pointer is now invalid). A view-rooted param excluded by #397
+        // never reaches here.
+        WS_REGISTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -150,8 +179,8 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
     }
     #[cfg(feature = "cuda")]
     {
-        let guard = MIRRORS.lock().unwrap();
-        let Some(m) = guard.as_ref().and_then(|g| g.get(&tensor_ptr)) else {
+        let mut guard = MIRRORS.lock().unwrap();
+        let Some(m) = guard.as_mut().and_then(|g| g.get_mut(&tensor_ptr)) else {
             eprintln!(
                 "[weight-stream] FATAL: upload of unregistered tensor {tensor_ptr}"
             );
@@ -161,6 +190,13 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
         let dev = crate::cuda::inner::alloc_managed(m.bytes);
         crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
         t.data = dev;
+        // Pointer-move accounting: a fresh allocation at a different address
+        // than the param last held is concrete evidence the storage moved.
+        let dev_i = dev as i64;
+        if m.last_dev != 0 && m.last_dev != dev_i {
+            WS_PTR_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        m.last_dev = dev_i;
         WS_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(feature = "cuda"))]

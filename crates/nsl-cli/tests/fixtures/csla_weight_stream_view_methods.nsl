@@ -1,0 +1,111 @@
+# P0.1 weight-streaming passthrough-view gate fixture.
+#
+# The #397 fix extended the CSLA weight-stream "view-of-theta" exclusion from
+# the AD-internal struct variants (Transpose/Reshape) to the USER-FACING view
+# METHODS, which compile to PrimalOp::Passthrough: .reshape() / .contiguous() /
+# .expand() / .squeeze() / .unsqueeze(). A buffered view produced by any of
+# these on a streamed parameter aliases that parameter's device storage, so
+# evicting the parameter (free + realloc-elsewhere) would leave the buffered
+# view reading recycled memory. The fix keeps such parameters RESIDENT.
+#
+# This fixture makes:
+#   - w_up  view-rooted via a reshape -> expand -> reshape CHAIN (covers the
+#     reshape AND expand Passthrough view methods);
+#   - w_down view-rooted via .contiguous() (an already-contiguous contiguous
+#     view);
+#   - norm_f a PLAIN streamed parameter (no view) so the gate proves ordinary
+#     params still stream while the view-rooted ones are excluded.
+#
+# Same 2-block / 1664-token / grad_accumulation=2 shape as csla_layerwise_ffn.
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_f: Tensor = ones([64])
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        # w_up: reshape -> expand (identity) -> reshape chain of Passthrough
+        # views; the final view is the matmul RHS, so dx backward buffers it.
+        let wu = self.w_up.reshape([1, 64, 128]).expand([1, 64, 128]).reshape([64, 128])
+        # w_down: already-contiguous contiguous view (also matmul RHS).
+        let wd = self.w_down.contiguous()
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ wu) @ wd
+        return h + f
+
+model TinyLM:
+    embed: Tensor = randn([64, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        # Tied LM head: the buffered matmul-RHS view of `embed` now runs through
+        # Passthrough view methods (reshape -> contiguous) BEFORE the transpose.
+        # This is the epilogue (not recomputed by CCR), so the view is buffered
+        # across the window and aliases `embed`'s storage — the exact hazard the
+        # #397 fix guards. Pre-#397 the primal_view_of walk stopped at the
+        # Passthrough reshape/contiguous and never reached `embed`, so `embed`
+        # was NOT excluded and the buffered view read recycled memory.
+        # Shape-changing reshape ([64,64]->[4096]->[64,64]) so the chain cannot
+        # be elided to a bare transpose — the primal_view_of walk MUST traverse
+        # the Passthrough reshape/contiguous nodes to reach `embed`.
+        let head = self.embed.reshape([4096]).contiguous().reshape([64, 64]).transpose(0, 1)
+        return hn @ head
+
+let m = TinyLM()
+# GPU_PLACEMENT
+
+let u0 = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let b0 = u0.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u1 = tensor_cat([arange(7) + full([7], 2.0), zeros([1])], 0)
+let b1 = u1.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u2 = tensor_cat([arange(7) + full([7], 3.0), zeros([1])], 0)
+let b2 = u2.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u3 = tensor_cat([arange(7) + full([7], 4.0), zeros([1])], 0)
+let b3 = u3.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u4 = tensor_cat([arange(7) + full([7], 5.0), zeros([1])], 0)
+let b4 = u4.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u5 = tensor_cat([arange(7) + full([7], 6.0), zeros([1])], 0)
+let b5 = u5.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u6 = tensor_cat([arange(7) + full([7], 7.0), zeros([1])], 0)
+let b6 = u6.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u7 = tensor_cat([arange(7) + full([7], 8.0), zeros([1])], 0)
+let b7 = u7.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u8 = tensor_cat([arange(7) + full([7], 9.0), zeros([1])], 0)
+let b8 = u8.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u9 = tensor_cat([arange(7) + full([7], 10.0), zeros([1])], 0)
+let b9 = u9.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u10 = tensor_cat([arange(7) + full([7], 11.0), zeros([1])], 0)
+let b10 = u10.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u11 = tensor_cat([arange(7) + full([7], 12.0), zeros([1])], 0)
+let b11 = u11.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u12 = tensor_cat([arange(7) + full([7], 13.0), zeros([1])], 0)
+let b12 = u12.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let tokens = tensor_cat([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12], 0).reshape([1664])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+model_save(m, "CSLA_SAVE_PATH")
