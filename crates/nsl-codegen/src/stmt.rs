@@ -4289,6 +4289,16 @@ impl Compiler<'_> {
         let mut beta1_value: f64 = 0.9;
         let mut beta2_value: f64 = 0.999;
         let mut eps_value: f64 = 1e-8;
+        // P5 Muon: Newton-Schulz iteration depth (spec default 5).
+        let mut ns_steps_value: f64 = 5.0;
+        // P5 Muon (review M6): the generic defaults above are wrong for
+        // Muon — spec/10 promises Muon(lr=0.02, momentum=0.95,
+        // nesterov=true), and momentum=0.0 silently degrades the Muon arm
+        // to orthogonalized plain GD. Track which knobs the user actually
+        // set so bare Muon() gets its spec defaults after parsing.
+        let mut lr_set = false;
+        let mut momentum_set = false;
+        let mut nesterov_set = false;
         let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
         let mut callbacks: Vec<&nsl_ast::block::CallbackDef> = Vec::new();
         let mut scheduler_name = String::new();
@@ -4309,13 +4319,16 @@ impl Compiler<'_> {
                                     "lr" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             lr_value = *f;
+                                            lr_set = true;
                                         } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
                                             lr_value = *n as f64;
+                                            lr_set = true;
                                         }
                                     }
                                     "momentum" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             momentum_value = *f;
+                                            momentum_set = true;
                                         }
                                     }
                                     "dampening" => {
@@ -4331,6 +4344,7 @@ impl Compiler<'_> {
                                     "nesterov" => {
                                         if let ExprKind::BoolLiteral(b) = &arg.value.kind {
                                             nesterov_value = *b;
+                                            nesterov_set = true;
                                         }
                                     }
                                     "beta1" => {
@@ -4346,6 +4360,13 @@ impl Compiler<'_> {
                                     "eps" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             eps_value = *f;
+                                        }
+                                    }
+                                    "ns_steps" => {
+                                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                            ns_steps_value = *n as f64;
+                                        } else if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            ns_steps_value = *f;
                                         }
                                     }
                                     _ => {}
@@ -4426,6 +4447,22 @@ impl Compiler<'_> {
             return Err(CodegenError::new(
                 "train block requires an optimizer section",
             ));
+        }
+
+        // P5 Muon (review M6): apply the SPEC defaults for knobs the user
+        // left unset — Muon(lr=0.02, momentum=0.95, nesterov=true). The
+        // generic defaults (lr=0.01, momentum=0.0, nesterov=false) would
+        // silently degrade a bare Muon() to orthogonalized momentum-free GD.
+        if optimizer_name == "muon" {
+            if !lr_set {
+                lr_value = 0.02;
+            }
+            if !momentum_set {
+                momentum_value = 0.95;
+            }
+            if !nesterov_set {
+                nesterov_value = true;
+            }
         }
 
         let (step_body, step_param_sym) =
@@ -4965,7 +5002,24 @@ impl Compiler<'_> {
         // FullBuffer per param. When None (no WGGO active), the loops use
         // today's monolithic `fase_deferred` branch (byte-identical to
         // pre-Phase-2 codegen).
-        let mode_table_base: Option<cranelift_codegen::ir::Value> = {
+        let mode_table_base: Option<cranelift_codegen::ir::Value> = if optimizer_name == "muon" {
+            // P5 Muon (review M5): FaseOptimizer::Unknown plans FullBuffer-
+            // global, but plan_with_overrides still materializes an
+            // all-FullBuffer per-layer table when WGGO overrides exist —
+            // which would route Muon through the unified dispatch, where
+            // the mixed-step routing flags are not threaded. The table is
+            // semantically empty for Muon (every byte FullBuffer), so skip
+            // it and keep Muon on the monolithic loop. Say so loudly.
+            if self.wggo_overrides.is_some() {
+                eprintln!(
+                    "[muon] note: WGGO per-layer FASE overrides do not apply to \
+                     the mixed Muon/AdamW optimizer (it has no Deferred mode) — \
+                     ignoring the mode table; training uses the standard \
+                     per-param step."
+                );
+            }
+            None
+        } else {
             let modes = crate::fase_codegen_table::build_param_mode_table(
                 &param_paths,
                 &model_var_name,
@@ -4999,14 +5053,17 @@ impl Compiler<'_> {
 
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
-        //   SGD/Lion/Muon: 1 (velocity/momentum)
+        //   SGD/Lion: 1 (velocity/momentum)
         //   Adam/AdamW/SOAP: 2 (first moment m, second moment v)
+        //   Muon (mixed Muon/AdamW): 2 — m is the Muon momentum buffer on
+        //   rank-2 hidden weights and the AdamW first moment on routed
+        //   params; v is the AdamW second moment (unread on the Muon route).
         //
         // State buffers are now NslLists (sized at runtime from param count)
         // instead of compile-time Vec<Value>, because the number of actual
         // tensor parameters is only known at runtime after recursive collection.
         let num_state_buffers = match optimizer_name.as_str() {
-            "adam" | "adamw" | "soap" => 2,
+            "adam" | "adamw" | "soap" | "muon" => 2,
             _ => 1,
         };
 
@@ -5133,6 +5190,44 @@ impl Compiler<'_> {
             // End of the OptimM/OptimV bracket — restore the caller's surface.
             self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
         }
+
+        // ── 4b. P5 Muon: compile-time name-based routing flags ──────────
+        // Mixed Muon/AdamW routes embeddings and the LM head to AdamW BY
+        // NAME (codegen knows the param paths; the runtime step fn only
+        // sees tensors). Flags ride in an i64 NslList parallel to
+        // param_list (1 = force-AdamW); the rank-2 structural check happens
+        // at runtime inside muon_step. The routing table prints loudly so
+        // a misrouted param is never silent.
+        let muon_route_list = if optimizer_name == "muon" {
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let mut adamw_routed: Vec<String> = Vec::new();
+            for path in &param_paths {
+                let lower = path.to_lowercase();
+                let excluded = ["embed", "lm_head", "unembed", "wte", "wpe", "vocab"]
+                    .iter()
+                    .any(|k| lower.contains(k));
+                if excluded {
+                    adamw_routed.push(path.clone());
+                }
+                let flag = builder.ins().iconst(cl_types::I64, excluded as i64);
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
+            }
+            eprintln!(
+                "[muon] mixed Muon/AdamW routing over {} params: {} name-routed \
+                 to AdamW ({}); remaining params take Muon if rank-2 at \
+                 runtime, AdamW otherwise (biases/norms/scalars).",
+                param_paths.len(),
+                adamw_routed.len(),
+                if adamw_routed.is_empty() {
+                    "none".to_string()
+                } else {
+                    adamw_routed.join(", ")
+                },
+            );
+            Some(list)
+        } else {
+            None
+        };
 
         // ── 5. Initialize lr and step_count variables ───────────────────
         let lr_var = state.new_variable();
@@ -10712,11 +10807,13 @@ impl Compiler<'_> {
                         builder.ins().brif(owned, pb_do, &[], pb_skip, &[]);
                         builder.switch_to_block(pb_skip);
                         builder.seal_block(pb_skip);
-                        let zf = builder.ins().f64const(0.0);
+                        // L8 hygiene: a true zero-fill, NOT mul-by-0.0 — if
+                        // a diverging window left Inf/NaN in m_partial,
+                        // x*0.0 is NaN and the buffer never recovers.
                         self.compile_call_by_name(
                             builder,
-                            "nsl_tensor_mul_scalar_inplace",
-                            &[pb_mpart, zf],
+                            "nsl_tensor_zero_inplace",
+                            &[pb_mpart],
                         )?;
                         builder.ins().jump(pb_join, &[]);
                         builder.switch_to_block(pb_do);
@@ -10812,11 +10909,12 @@ impl Compiler<'_> {
                         builder.ins().brif(owned, fs_do, &[], fs_skip, &[]);
                         builder.switch_to_block(fs_skip);
                         builder.seal_block(fs_skip);
-                        let zf = builder.ins().f64const(0.0);
+                        // L8 hygiene: true zero-fill (see the clip-path
+                        // comment — mul-by-0.0 keeps NaN/Inf alive).
                         self.compile_call_by_name(
                             builder,
-                            "nsl_tensor_mul_scalar_inplace",
-                            &[mp, zf],
+                            "nsl_tensor_zero_inplace",
+                            &[mp],
                         )?;
                         builder.ins().jump(fs_join, &[]);
                         builder.switch_to_block(fs_do);
@@ -10956,6 +11054,17 @@ impl Compiler<'_> {
             } else {
                 s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
             };
+            // P5 Muon: per-param routing flag (compile-time name exclusion,
+            // see 4b) + Newton-Schulz depth.
+            let muon_extra = if let Some(route_list) = muon_route_list {
+                let flag_i =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+                let flag_f = builder.ins().fcvt_from_sint(cl_types::F64, flag_i);
+                let ns_steps_const = builder.ins().f64const(ns_steps_value);
+                Some((flag_f, ns_steps_const))
+            } else {
+                None
+            };
             // FullBuffer-global path (no mode table, no WGGO). The CPDT
             // PrecisionPlan gate (`precision_active`'s 4th condition
             // requires `fase_deferred=true`) suppresses cpdt_precision_dtypes
@@ -10982,6 +11091,7 @@ impl Compiler<'_> {
                 false,
                 None,
                 self.compile_options.optim_state_offload,
+                muon_extra,
             )?;
 
             if let Some(z_join) = opt_zero_blocks {
@@ -12353,6 +12463,15 @@ impl Compiler<'_> {
                  blocks yet; remove the flag or use the non-pipelined path.",
             ));
         }
+        // P5 Muon: the mixed Muon/AdamW step (routing flags + Newton-Schulz
+        // args) is wired into the non-pipelined emitter only. Refuse loudly
+        // rather than emit a stale-arity call into the upgraded stdlib fn.
+        if optimizer_name == "muon" {
+            return Err(CodegenError::new(
+                "the mixed Muon/AdamW optimizer is not wired into @pipeline \
+                 train blocks yet — drop @pipeline or use adamw/sgd/lion/soap",
+            ));
+        }
         let num_state_buffers = match optimizer_name.as_str() {
             "adam" | "adamw" | "soap" => 2,
             _ => 1,
@@ -12638,19 +12757,17 @@ impl Compiler<'_> {
                     )?;
                 }
                 "muon" => {
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            lr,
-                            momentum_const,
-                            weight_decay_const,
-                            nesterov_const,
-                        ],
-                    )?;
+                    // Muon refuses at the top of this emitter (mixed
+                    // Muon/AdamW is not wired for @pipeline). Keep this arm
+                    // an ERROR, not a call: the old 7-arg call shape no
+                    // longer matches the 14-param mixed stdlib fn, and a
+                    // silently re-enabled arm would pass garbage into
+                    // adamw_route/betas/t.
+                    return Err(CodegenError::new(
+                        "internal: muon reached the pipelined optimizer arm \
+                         despite the @pipeline refusal — mixed Muon/AdamW is \
+                         not wired for pipelined train blocks",
+                    ));
                 }
                 "soap" => {
                     let s2 =

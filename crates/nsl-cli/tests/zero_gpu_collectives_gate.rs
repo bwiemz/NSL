@@ -144,11 +144,9 @@ fn sim_gpu_stage2_reduce_scatter_bit_exact() {
     let base = run_gpu("s2base", &[]);
     assert!(base.success, "GPU baseline failed:\n{}", base.stderr);
 
-    let tmpargs = ["--devices", "2", "--collectives", "sim-gpu", "--zero-stage", "2"];
-    // run_gpu passes --zero-stage 1 already; override by appending — clap
-    // rejects duplicates, so use the dedicated runner below instead.
-    let _ = tmpargs;
-    let spmd = run_gpu_stage2("s2spmd");
+    // run_gpu passes --zero-stage 1 already; clap rejects duplicates, so
+    // stage-2 runs use the dedicated runner below.
+    let spmd = run_gpu_stage2("s2spmd", &[]);
     assert!(spmd.success, "2-rank stage-2 sim-gpu run failed:\n{}", spmd.stderr);
     assert_eq!(
         spmd.loss, base.loss,
@@ -170,7 +168,7 @@ fn sim_gpu_stage2_reduce_scatter_bit_exact() {
     }
 }
 
-fn run_gpu_stage2(tag: &str) -> RunOut {
+fn run_gpu_stage2(tag: &str, envs: &[(&str, &str)]) -> RunOut {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_zgpu_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -183,26 +181,28 @@ fn run_gpu_stage2(tag: &str) -> RunOut {
     .replace("CSLA_SAVE_PATH", &save.display().to_string());
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
-        .args([
-            "run",
-            "--source-ad",
-            "--deterministic",
-            "--zero-stage",
-            "2",
-            "--devices",
-            "2",
-            "--collectives",
-            "sim-gpu",
-        ])
-        .arg(&prog)
-        .current_dir(&tmp)
-        .env("NSL_STDLIB_PATH", root.join("stdlib"))
-        .env("NSL_ZERO_COUNTER", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn nsl run");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
+    cmd.args([
+        "run",
+        "--source-ad",
+        "--deterministic",
+        "--zero-stage",
+        "2",
+        "--devices",
+        "2",
+        "--collectives",
+        "sim-gpu",
+    ])
+    .arg(&prog)
+    .current_dir(&tmp)
+    .env("NSL_STDLIB_PATH", root.join("stdlib"))
+    .env("NSL_ZERO_COUNTER", "1")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn nsl run");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let loss = stdout
@@ -214,6 +214,47 @@ fn run_gpu_stage2(tag: &str) -> RunOut {
         success: out.status.success(),
         loss,
         stderr,
+    }
+}
+
+/// M3 (stage-2 shm wall) on the DEVICE path: a sub-MB bucket cap forces
+/// padded sub-groups + intra-tensor byte-range chunks through the CUDA-aware
+/// scatter (device pack, staging-buffer average, offset unpack). Must stay
+/// BIT-EXACT vs the single-rank GPU baseline with a multiplied scatter count.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn sim_gpu_stage2_chunked_subgroups_bit_exact() {
+    let base = run_gpu("s2chbase", &[]);
+    assert!(base.success, "GPU baseline failed:\n{}", base.stderr);
+
+    let spmd = run_gpu_stage2("s2chspmd", &[("NSL_ZERO_BUCKET_MB", "0.02")]);
+    assert!(
+        spmd.success,
+        "2-rank chunked stage-2 sim-gpu run failed:\n{}",
+        spmd.stderr
+    );
+    assert_eq!(
+        spmd.loss, base.loss,
+        "chunked GPU stage-2 diverged from the single-rank GPU baseline\n{}",
+        spmd.stderr
+    );
+    for rank in 0..2 {
+        let line = spmd
+            .stderr
+            .lines()
+            .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
+            .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
+        let scatters: u64 = line
+            .split("reduce_scatter=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no reduce_scatter= on [zero] line: {line}"));
+        assert!(
+            scatters > 12 && line.contains("all_reduce=0 "),
+            "GPU chunking must multiply the scatter count past the unchunked \
+             12 (got {scatters}) with no grad all_reduce: {line}"
+        );
     }
 }
 

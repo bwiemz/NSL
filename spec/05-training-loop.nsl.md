@@ -47,7 +47,7 @@ dist_strategy   ::= 'ddp' | 'fsdp' | 'pipeline' | 'tensor_parallel' | 'zero3'
 | `AdamW`   | `AdamW(lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)`   | Adam with decoupled weight decay         |
 | `SGD`     | `SGD(lr=0.01, momentum=0.9, nesterov=false)`                         | Stochastic gradient descent              |
 | `Lion`    | `Lion(lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0)`                | Google Brain's Lion optimizer            |
-| `Muon`    | `Muon(lr=0.02, momentum=0.95, nesterov=true, ns_steps=5)`           | Muon optimizer with Nesterov momentum    |
+| `Muon`    | `Muon(lr=0.02, momentum=0.95, nesterov=true, ns_steps=5)`           | Mixed Muon/AdamW: Newton-Schulz orthogonalized momentum on rank-2 hidden weights; AdamW (beta1/beta2/eps args) on embeddings, the LM head and non-rank-2 params |
 | `SOAP`    | `SOAP(lr=1e-3, betas=(0.95, 0.95), shampoo_beta=0.95)`              | SOAP preconditioned optimizer            |
 
 ## Built-in Schedulers

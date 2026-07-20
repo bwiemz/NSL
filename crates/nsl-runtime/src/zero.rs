@@ -415,6 +415,13 @@ pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
     ctx.owned_params = my_params;
     ctx.num_params = num_params as usize;
 
+    // L6: round-robin plans depend only on (num_params, ws) — hash them
+    // anyway so a ws/param-count divergence still refuses.
+    let sizes = vec![0u64; num_params.max(0) as usize];
+    if !verify_plan_across_ranks(ctx, &sizes) {
+        return -1;
+    }
+
     count
 }
 
@@ -455,7 +462,114 @@ pub extern "C" fn nsl_zero_partition_bytes(params_list_ptr: i64, num_params: i64
     ctx.owned_params = my_params;
     ctx.num_params = sizes.len();
 
+    // L6 belt: refuse loudly if any rank derived a different plan (the
+    // emitted call site asserts rc >= 0, so -1 aborts the run).
+    if !verify_plan_across_ranks(ctx, &sizes) {
+        return -1;
+    }
+
     count
+}
+
+/// L6 belt: verify every rank computed the IDENTICAL partition plan.
+///
+/// The plan is derived rank-locally (no communication) from param byte
+/// sizes; if param enumeration or placement ever diverged across ranks
+/// (mixed CPU/GPU placement, a rank-dependent model edit), the owner gates
+/// would silently train a TORN model — each rank updating a different
+/// param set against different moments. Rank 0 broadcasts an FNV-1a hash
+/// of (stage, ws, num_params, sizes, owner_of); every rank compares.
+/// Deterministic call point: both partition FFIs run once at train setup
+/// on every rank, so the broadcast is symmetric.
+fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
+    use crate::tensor_parallel::collective::CollectiveBackend;
+    if ctx.world_size <= 1 {
+        return true;
+    }
+    // Unit tests build contexts without a backend; the SPMD spawner always
+    // provides the host backend at ws>1.
+    let Some(host) = ctx.host_backend.as_ref() else {
+        return true;
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(ctx.stage as u64);
+    mix(ctx.world_size as u64);
+    // Review M1: the bucket cap SHAPES the per-step collective sequence
+    // (sub-group count, chunking) — a per-rank NSL_ZERO_BUCKET_MB
+    // divergence would pass a sizes/owners-only hash and then deadlock the
+    // spin-barrier (rank A issues 12 scatters/step, rank B issues 6).
+    // Hash it with everything else that determines the sequence.
+    mix(zero_bucket_cap_bytes() as u64);
+    mix(sizes.len() as u64);
+    for &s in sizes {
+        mix(s);
+    }
+    for &o in &ctx.owner_of {
+        mix(o as u64);
+    }
+    let local = h;
+    let mut buf = local.to_le_bytes();
+    let rc = host.broadcast(
+        buf.as_mut_ptr() as *mut std::ffi::c_void,
+        buf.len(),
+        crate::tensor_parallel::collective::DTYPE_I8,
+        0,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        eprintln!(
+            "nsl: zero plan verification broadcast failed rc={rc} on rank {}",
+            ctx.rank
+        );
+        return false;
+    }
+    let root = u64::from_le_bytes(buf);
+    let matched = root == local;
+    if !matched {
+        eprintln!(
+            "nsl: ZeRO partition plan MISMATCH on rank {}: local hash \
+             {local:#018x} != rank-0 hash {root:#018x} — ranks disagree on \
+             param sizes, ownership or bucket config; refusing to train a \
+             torn model",
+            ctx.rank
+        );
+    }
+    // Review L2 (symmetric refusal): without this, only the MISMATCHING
+    // ranks refuse — rank 0 trivially matches itself, proceeds, and hangs
+    // at the next collective. All-reduce a match flag so every rank
+    // (including the root) refuses together.
+    let mut flag: f64 = if matched { 1.0 } else { 0.0 };
+    let rc = host.all_reduce_sum(
+        &flag as *const f64 as *const std::ffi::c_void,
+        &mut flag as *mut f64 as *mut std::ffi::c_void,
+        1,
+        crate::tensor_parallel::collective::DTYPE_F64,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        eprintln!(
+            "nsl: zero plan verification all_reduce failed rc={rc} on rank {}",
+            ctx.rank
+        );
+        return false;
+    }
+    if flag < ctx.world_size as f64 {
+        if matched {
+            eprintln!(
+                "nsl: ZeRO partition plan MISMATCH reported by a peer rank — \
+                 refusing on rank {} too (symmetric shutdown)",
+                ctx.rank
+            );
+        }
+        return false;
+    }
+    true
 }
 
 /// Check if this rank owns the given parameter index.
@@ -501,13 +615,15 @@ fn host_or_main(ctx: &ZeROContext) -> &dyn crate::tensor_parallel::collective::C
     }
 }
 
-/// Bucket byte cap (0 disables bucketing).
+/// Bucket byte cap (0 disables bucketing). Fractional MB accepted — the
+/// stage-2 chunking gates use sub-MB caps to force multi-sub-group and
+/// intra-tensor chunk coverage on small fixtures.
 fn zero_bucket_cap_bytes() -> usize {
     std::env::var("NSL_ZERO_BUCKET_MB")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(25)
-        .saturating_mul(1024 * 1024)
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|mb| (mb.max(0.0) * 1024.0 * 1024.0) as usize)
+        .unwrap_or(25 * 1024 * 1024)
 }
 
 /// Anti-vacuity: Σ tensors that traveled inside a bucketed collective.
@@ -519,7 +635,8 @@ pub static ZERO_BUCKET_MEMBERS: std::sync::atomic::AtomicU64 =
 pub static ZERO_REDUCE_SCATTER_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// One eligible tensor for bucketing.
+/// One eligible tensor (or, on the stage-2 scatter path ONLY, one byte-range
+/// CHUNK of a tensor) for bucketing.
 #[derive(Clone, Copy)]
 struct BucketItem {
     /// Param index (owner lookup for stage-2 segmenting / owner broadcasts).
@@ -527,6 +644,11 @@ struct BucketItem {
     raw: i64,
     len: usize,
     bytes: usize,
+    /// Byte offset into the tensor's data. Nonzero only for stage-2 scatter
+    /// chunks — the all-reduce/broadcast bucket paths always carry whole
+    /// tensors (their GPU scale step is per-tensor and would double-scale
+    /// a chunked one).
+    off: usize,
 }
 
 /// Group `items` (already same dtype/device/owner class) into ≤cap buckets,
@@ -657,6 +779,73 @@ fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i
     0
 }
 
+/// M3 (stage-2 shm wall): split one (dtype, device) gradient group into
+/// sub-groups whose PADDED scatter buffer (`max owner segment × ws`) stays
+/// ≤ `cap`. An unbucketed 1B-scale group blows past the 64MB CPU-shm slot
+/// (loud -4, but a wall). Tensors larger than `cap / ws` are additionally
+/// CHUNKED by byte range (chunks keep the tensor's `idx`, hence its owner),
+/// so even a single 64MB embedding gradient scatters in bounded pieces.
+/// Deterministic: chunking and grouping depend only on the param plan, so
+/// every rank builds identical sub-groups with no communication. Bit-exact:
+/// the reduction is element-wise in fixed rank order regardless of which
+/// sub-group an element rides in.
+fn split_scatter_subgroups(
+    ctx: &ZeROContext,
+    items: &[BucketItem],
+    cap: usize,
+    esz: usize,
+) -> Vec<Vec<BucketItem>> {
+    let ws = ctx.world_size;
+    // Largest single chunk that still fits a padded sub-group on its own:
+    // cap/ws, floored to an element boundary (minimum one element).
+    let item_cap = std::cmp::max(esz, cap / ws / esz * esz);
+    let mut chunks: Vec<BucketItem> = Vec::new();
+    for &it in items {
+        if it.bytes <= item_cap {
+            chunks.push(it);
+            continue;
+        }
+        let mut off = 0usize;
+        while off < it.bytes {
+            let take = item_cap.min(it.bytes - off);
+            chunks.push(BucketItem {
+                idx: it.idx,
+                raw: it.raw,
+                len: take / esz,
+                bytes: take,
+                off: it.off + off,
+            });
+            off += take;
+        }
+    }
+    // Greedy grouping under the padded-size cap.
+    let mut out: Vec<Vec<BucketItem>> = Vec::new();
+    let mut cur: Vec<BucketItem> = Vec::new();
+    let mut seg = vec![0usize; ws];
+    for c in chunks {
+        let owner = ctx.owner_of.get(c.idx).copied().unwrap_or(0) as usize;
+        let owner = owner.min(ws - 1);
+        let new_max = seg
+            .iter()
+            .enumerate()
+            .map(|(r, &b)| if r == owner { b + c.bytes } else { b })
+            .max()
+            .unwrap_or(0);
+        if !cur.is_empty() && new_max * ws > cap {
+            out.push(std::mem::take(&mut cur));
+            seg.iter_mut().for_each(|b| *b = 0);
+            seg[owner] = c.bytes;
+        } else {
+            seg[owner] += c.bytes;
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// P4 item 16 (ZeRO-2): owner-segmented reduce_scatter over one (dtype,
 /// device) group. Layout: `[rank0's owned grads .. pad | rank1's .. pad | …]`
 /// with every rank segment padded to the max segment size, so the existing
@@ -692,7 +881,7 @@ fn reduce_scatter_group_cpu(
         for b in seg {
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    (b.raw as *const NslTensor).read().data as *const u8,
+                    ((b.raw as *const NslTensor).read().data as *const u8).add(b.off),
                     flat.as_mut_ptr().add(off),
                     b.bytes,
                 )
@@ -733,7 +922,7 @@ fn reduce_scatter_group_cpu(
         unsafe {
             std::ptr::copy_nonoverlapping(
                 out.as_ptr().add(off),
-                (b.raw as *const NslTensor).read().data as *mut u8,
+                ((b.raw as *const NslTensor).read().data as *mut u8).add(b.off),
                 b.bytes,
             )
         };
@@ -768,7 +957,7 @@ fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64
             let t = unsafe { &*(b.raw as *const NslTensor) };
             crate::cuda::inner::memcpy_dtod(
                 unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
-                t.data as *const std::ffi::c_void,
+                unsafe { (t.data as *const u8).add(b.off) } as *const std::ffi::c_void,
                 b.bytes,
             );
             off += b.bytes;
@@ -790,16 +979,24 @@ fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64
     ZERO_REDUCE_SCATTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ZERO_BUCKET_MEMBERS.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let my = ctx.rank.min(ws - 1);
+    // Average on the STAGING buffer, then unpack — per-chunk correctness
+    // (a per-tensor scale after unpack would double-scale a tensor whose
+    // chunks landed in different sub-groups) and one kernel per group
+    // instead of one per tensor. Same values × same f32 scalar → bit-exact
+    // with the old order.
+    let my_elems = seg_bytes[my] / 4;
+    if my_elems > 0 {
+        crate::cuda::gpu_scale_raw_f32(out, my_elems, inv_ws as f32);
+    }
     let mut off = 0usize;
     for b in &segs[my] {
         let t = unsafe { &*(b.raw as *const NslTensor) };
         crate::cuda::inner::memcpy_dtod(
-            t.data,
+            unsafe { (t.data as *mut u8).add(b.off) } as *mut std::ffi::c_void,
             unsafe { (out as *const u8).add(off) } as *const std::ffi::c_void,
             b.bytes,
         );
         off += b.bytes;
-        crate::tensor::nsl_tensor_mul_scalar_inplace(b.raw, inv_ws);
     }
     crate::cuda::inner::free_managed(dev);
     crate::cuda::inner::free_managed(out);
@@ -998,6 +1195,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 raw,
                 len: t.len as usize,
                 bytes: t.data_byte_size(),
+                off: 0,
             };
             match (t.device, t.dtype) {
                 (0, 0) => cpu_f64.push(item),
@@ -1011,17 +1209,24 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         // gradients (summed + averaged); non-owned grad tensors keep local
         // values that nothing reads (the optimizer update is owner-gated).
         if ctx.stage != ZeROStage::Stage1 {
+            // M3: cap the padded scatter buffer (large groups sub-group,
+            // giant tensors chunk) so 1B-scale gradients never hit the
+            // 64MB CPU-shm slot wall.
             for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
-                if !items.is_empty() && reduce_scatter_group_cpu(ctx, items, dtype, inv_ws) != 0
-                {
-                    eprintln!("nsl: nsl_zero_reduce_grads: reduce_scatter failed");
-                    return -1;
+                let esz = if dtype == 0 { 8 } else { 4 };
+                for sub in split_scatter_subgroups(ctx, items, cap, esz) {
+                    if reduce_scatter_group_cpu(ctx, &sub, dtype, inv_ws) != 0 {
+                        eprintln!("nsl: nsl_zero_reduce_grads: reduce_scatter failed");
+                        return -1;
+                    }
                 }
             }
             #[cfg(feature = "cuda")]
-            if !gpu_f32.is_empty() && reduce_scatter_group_gpu(ctx, &gpu_f32, inv_ws) != 0 {
-                eprintln!("nsl: nsl_zero_reduce_grads: device reduce_scatter failed");
-                return -1;
+            for sub in split_scatter_subgroups(ctx, &gpu_f32, cap, 4) {
+                if reduce_scatter_group_gpu(ctx, &sub, inv_ws) != 0 {
+                    eprintln!("nsl: nsl_zero_reduce_grads: device reduce_scatter failed");
+                    return -1;
+                }
             }
             #[cfg(not(feature = "cuda"))]
             if !gpu_f32.is_empty() {
@@ -1334,6 +1539,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                     raw,
                     len: t.len as usize,
                     bytes: t.data_byte_size(),
+                    off: 0,
                 });
         }
         for ((owner, dtype, is_gpu), items) in &groups {
@@ -2139,5 +2345,108 @@ mod tests {
         assert_eq!(nsl_zero_step(), 0);
 
         assert_eq!(nsl_zero_destroy(), 0);
+    }
+
+    /// Backend-less context for the pure sub-group splitter (it reads only
+    /// world_size + owner_of).
+    fn splitter_ctx(ws: usize, owner_of: Vec<i32>) -> ZeROContext {
+        ZeROContext {
+            stage: ZeROStage::Stage2,
+            rank: 0,
+            world_size: ws,
+            owned_params: Vec::new(),
+            owner_of,
+            num_params: 0,
+            backend: None,
+            cuda_aware: false,
+            host_backend: None,
+        }
+    }
+
+    fn item(idx: usize, bytes: usize) -> BucketItem {
+        BucketItem {
+            idx,
+            raw: 0,
+            len: bytes / 8,
+            bytes,
+            off: 0,
+        }
+    }
+
+    /// Padded size of one sub-group under `ctx`'s owner map.
+    fn padded_bytes(ctx: &ZeROContext, sub: &[BucketItem]) -> usize {
+        let mut seg = vec![0usize; ctx.world_size];
+        for b in sub {
+            seg[ctx.owner_of[b.idx] as usize] += b.bytes;
+        }
+        seg.iter().copied().max().unwrap_or(0) * ctx.world_size
+    }
+
+    #[test]
+    fn test_scatter_subgroups_small_group_stays_whole() {
+        let ctx = splitter_ctx(2, vec![0, 1, 0, 1]);
+        let items: Vec<_> = (0..4).map(|i| item(i, 1024)).collect();
+        let subs = split_scatter_subgroups(&ctx, &items, 25 * 1024 * 1024, 8);
+        assert_eq!(subs.len(), 1, "small group must not split");
+        assert_eq!(subs[0].len(), 4);
+        assert!(subs[0].iter().all(|b| b.off == 0), "no chunking expected");
+    }
+
+    #[test]
+    fn test_scatter_subgroups_padded_cap_respected() {
+        // 8 params × 8KB, alternating owners, cap 32KB: each sub-group's
+        // padded buffer (max seg × ws) must stay ≤ cap.
+        let ctx = splitter_ctx(2, vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        let items: Vec<_> = (0..8).map(|i| item(i, 8 * 1024)).collect();
+        let cap = 32 * 1024;
+        let subs = split_scatter_subgroups(&ctx, &items, cap, 8);
+        assert!(subs.len() > 1, "cap must force multiple sub-groups");
+        let mut seen = 0usize;
+        for sub in &subs {
+            assert!(!sub.is_empty());
+            assert!(
+                padded_bytes(&ctx, sub) <= cap,
+                "padded sub-group exceeds cap"
+            );
+            seen += sub.len();
+        }
+        assert_eq!(seen, 8, "every member exactly once");
+    }
+
+    #[test]
+    fn test_scatter_subgroups_chunks_giant_tensor() {
+        // M3's real case: ONE tensor larger than cap/ws (the 1B embedding
+        // gradient). It must chunk into contiguous byte ranges that cover
+        // the tensor exactly, each fitting a padded sub-group.
+        let ctx = splitter_ctx(2, vec![0, 1]);
+        let big = 100 * 1024; // owner 0
+        let small = 4 * 1024; // owner 1
+        let items = vec![item(0, big), item(1, small)];
+        let cap = 16 * 1024; // item_cap = 8KB
+        let subs = split_scatter_subgroups(&ctx, &items, cap, 8);
+        let chunks: Vec<_> = subs.iter().flatten().filter(|b| b.idx == 0).collect();
+        assert!(chunks.len() > 1, "giant tensor must chunk");
+        // Contiguous cover: sorted-by-off chunks tile [0, big).
+        let mut offs: Vec<(usize, usize)> = chunks.iter().map(|b| (b.off, b.bytes)).collect();
+        offs.sort_unstable();
+        let mut expect = 0usize;
+        for (off, bytes) in &offs {
+            assert_eq!(*off, expect, "chunk ranges must tile contiguously");
+            assert_eq!(bytes % 8, 0, "chunks must stay element-aligned");
+            expect = off + bytes;
+        }
+        assert_eq!(expect, big, "chunks must cover the whole tensor");
+        for sub in &subs {
+            assert!(padded_bytes(&ctx, sub) <= cap);
+        }
+        // Determinism: identical inputs → identical plan (ranks never talk).
+        let again = split_scatter_subgroups(&ctx, &items, cap, 8);
+        assert_eq!(subs.len(), again.len());
+        for (a, b) in subs.iter().zip(&again) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                assert_eq!((x.idx, x.off, x.bytes), (y.idx, y.off, y.bytes));
+            }
+        }
     }
 }

@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — P5: full-precision mixed Muon/AdamW optimizer
+
+- `Muon(...)` in train blocks is now the REAL Muon (Jordan et al., 2024):
+  rank-2 hidden weight matrices take the quintic Newton-Schulz
+  orthogonalized-momentum update (`ns_steps`, default 5) scaled by
+  `sqrt(max(1, rows/cols))`; embeddings and the LM head (name-routed:
+  embed/lm_head/unembed/wte/wpe/vocab in the param path) plus all
+  non-rank-2 params (biases, norms) take a standard AdamW step
+  (`beta1`/`beta2`/`eps`/`weight_decay`). Previously `muon` was plain
+  momentum-SGD with decoupled weight decay — out of spec.
+- Muon is now two-state (m = Muon momentum / AdamW first moment; v = AdamW
+  second moment). The routing table prints at train start (`[muon]` line).
+- The Newton-Schulz chain is pinned against an independent f64 reference
+  (wide + tall branches), the all-AdamW-routed case is bit-exact vs
+  `AdamW(...)`, and GPU training is gated (device f32 end-to-end).
+- `@pipeline` train blocks refuse `Muon` loudly (not wired there yet).
+
+### Fixed — ZeRO deferred hardening (post-#404)
+
+- Stage-2 reduce_scatter groups now split into padded sub-groups capped at
+  `NSL_ZERO_BUCKET_MB` (fractional MB accepted), and tensors larger than
+  cap/ws are chunked by byte range — a 1B-scale gradient group (or a single
+  64MB embedding grad) no longer hits the 64MB CPU-shm slot wall.
+- Cross-rank partition-plan verification: every rank hashes
+  (stage, ws, param sizes, owners) and compares against rank 0 at partition
+  time — a divergent plan refuses loudly instead of training a torn model.
+- Non-owner `m_partial` cleanup uses a true zero-fill instead of `x *= 0.0`
+  (which preserved NaN/Inf forever after a diverging window).
+- `cuda_device_name()` probes the device the process will actually bind
+  (NSL_CUDA_DEVICE / spawner striping), not unconditionally ordinal 0.
+- `NcclBackend` tracks `ncclCommAbort` and skips `ncclCommDestroy` in Drop
+  after an abort (destroying an aborted communicator is undefined).
+
 ### Added — Architecture hardening (stable/experimental boundaries, ABI versioning)
 
 - `STATUS.md` — single source of truth tiering every subsystem as Stable / Beta /

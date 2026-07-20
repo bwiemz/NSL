@@ -112,6 +112,19 @@ fn spawn_drain<R: Read + Send + 'static>(
 /// Run `nsl run` with a watchdog (SPMD spin-barriers hang forever on a
 /// dead rank; a hung gate is worse than a red one).
 fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> RunOutput {
+    run_nsl_with_env(source, tag, extra_args, &[], timeout_secs)
+}
+
+/// `run_nsl` + extra child env vars (per-process, NOT `std::env::set_var` —
+/// gates run on parallel test threads and a global var would leak across
+/// them). Rank children inherit the spawner's env.
+fn run_nsl_with_env(
+    source: &str,
+    tag: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+    timeout_secs: u64,
+) -> RunOutput {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_zero_gate_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -135,6 +148,9 @@ fn run_nsl(source: &str, tag: &str, extra_args: &[&str], timeout_secs: u64) -> R
         .env("NSL_ZERO_COUNTER", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let mut child = cmd.spawn().expect("spawn nsl run");
 
     // Drain stdout AND stderr on dedicated threads, concurrently with the
@@ -596,4 +612,58 @@ fn zero_stage2_two_rank_parity_reduce_scatter() {
     let base_bytes = std::fs::read(&save_a).expect("baseline .nslm");
     let s2_bytes = std::fs::read(&save_b).expect("stage-2 .nslm");
     assert_eq!(base_bytes, s2_bytes, "stage-2 model bytes diverged");
+}
+
+/// M3 (stage-2 shm wall): a sub-MB bucket cap forces the stage-2 scatter to
+/// SPLIT the gradient group into padded sub-groups and to CHUNK tensors
+/// larger than cap/ws by byte range — the mechanism that keeps a 1B-scale
+/// (or single-embedding-sized) group under the 64MB CPU-shm slot. Loss
+/// stream AND model bytes must stay bit-identical to the single-rank
+/// baseline, and the scatter count must EXCEED the unchunked 6 (anti-
+/// vacuity: sub-grouping really happened).
+#[test]
+#[ignore = "spawns 3 nsl processes; ~2 min. Run: cargo test --test zero_spmd_gate -- --ignored"]
+fn zero_stage2_chunked_subgroups_parity() {
+    let tmp = std::env::temp_dir().join(format!("nsl_zero_s2ch_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("base.nslm");
+    let save_b = tmp.join("s2ch.nslm");
+
+    let base = run_nsl(&program(&save_a), "s2ch_base", &[], 600);
+    assert!(base.success, "baseline failed:\n{}", base.stderr);
+    let spmd = run_nsl_with_env(
+        &program(&save_b),
+        "s2ch_spmd",
+        &["--zero-stage", "2", "--devices", "2"],
+        &[("NSL_ZERO_BUCKET_MB", "0.02")],
+        900,
+    );
+    assert!(spmd.success, "2-rank chunked stage-2 run failed:\n{}", spmd.stderr);
+    assert!(!base.loss_stream.is_empty(), "empty baseline loss stream");
+    assert_eq!(
+        base.loss_stream, spmd.loss_stream,
+        "chunked stage-2 loss stream diverged from the single-rank baseline\n{}",
+        spmd.stderr
+    );
+    for rank in 0..2 {
+        let line = spmd
+            .stderr
+            .lines()
+            .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
+            .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
+        let scatters: u64 = line
+            .split("reduce_scatter=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no reduce_scatter= on [zero] line: {line}"));
+        assert!(
+            scatters > 6 && line.contains("all_reduce=0 "),
+            "chunking must MULTIPLY the scatter count past the unchunked 6 \
+             (got {scatters}) with no grad all_reduce: {line}"
+        );
+    }
+    let base_bytes = std::fs::read(&save_a).expect("baseline .nslm");
+    let s2_bytes = std::fs::read(&save_b).expect("chunked stage-2 .nslm");
+    assert_eq!(base_bytes, s2_bytes, "chunked stage-2 model bytes diverged");
 }

@@ -1,9 +1,77 @@
-fn muon_step(param: Tensor, gradient: Tensor, velocity: Tensor, lr: float, momentum: float, weight_decay: float, nesterov: bool):
-    copy_data(velocity, momentum * velocity + gradient)
-    let update = velocity
-    if nesterov:
-        update = gradient + momentum * velocity
-    if weight_decay > 0.0:
-        copy_data(param, param * (1.0 - lr * weight_decay) - lr * update)
+# NSL Standard Library — nsl.optim.muon
+#
+# Muon (MomentUm Orthogonalized by Newton-Schulz; Jordan et al., 2024) with
+# MIXED AdamW routing — the practical deployment recipe: the orthogonalized-
+# momentum update applies ONLY to rank-2 hidden weight matrices; embeddings
+# and the LM head (flagged by codegen, which knows the param paths) plus any
+# tensor whose runtime rank != 2 (biases, norms, scalars) take a standard
+# AdamW step instead.
+#
+# State buffers (both allocated for every param by codegen):
+#   m — Muon momentum buffer on the Muon route; AdamW first moment otherwise
+#   v — AdamW second moment; UNREAD on the Muon route (full-precision v1;
+#       the one-buffer/8-bit Muon-state items shrink this later)
+#
+# Full precision: the Newton-Schulz iteration runs in the tensor's native
+# dtype (CPU f64 / GPU f32) — no bf16 shortcut.
+
+# Quintic Newton-Schulz iteration approximating the semi-orthogonal factor
+# UV^T of g's SVD. Coefficients (3.4445, -4.7750, 2.0315) are Jordan et
+# al.'s slope-maximizing tuning: singular values converge into a band
+# around 1 rather than exactly 1 (5 steps is the reference depth). The
+# tall case orthogonalizes the transpose so the Gram matrix stays at the
+# smaller dimension.
+fn muon_orthogonalize(g: Tensor, ns_steps: float) -> Tensor:
+    let s = g.shape
+    let rows = s[0]
+    let cols = s[1]
+    let x = g
+    if rows > cols:
+        x = g.transpose(0, 1)
+    let n = sqrt(sum(x * x).item()) + 0.0000001
+    x = x * (1.0 / n)
+    let i = 0.0
+    while i < ns_steps:
+        let a = x @ x.transpose(0, 1)
+        let b = -4.7750 * a + 2.0315 * (a @ a)
+        x = 3.4445 * x + b @ x
+        i = i + 1.0
+    if rows > cols:
+        x = x.transpose(0, 1)
+    return x
+
+fn muon_step(param: Tensor, gradient: Tensor, m: Tensor, v: Tensor, adamw_route: float, lr: float, momentum: float, beta1: float, beta2: float, eps: float, weight_decay: float, nesterov: bool, ns_steps: float, t: float):
+    let s = param.shape
+    if adamw_route > 0.5 or len(s) != 2:
+        # AdamW arm — kept textually identical to nsl.optim.adamw so a
+        # name-routed or non-rank-2 param under Muon is BIT-EXACT with the
+        # same param under AdamW at the same hyperparameters.
+        copy_data(m, beta1 * m + (1.0 - beta1) * gradient)
+        copy_data(v, beta2 * v + (1.0 - beta2) * gradient * gradient)
+        let m_hat = m * (1.0 / (1.0 - beta1 ** t))
+        let v_hat = v * (1.0 / (1.0 - beta2 ** t))
+        let step_update = lr * m_hat / (sqrt(v_hat) + eps)
+        if weight_decay > 0.0:
+            copy_data(param, param * (1.0 - lr * weight_decay) - step_update)
+        else:
+            copy_data(param, param - step_update)
     else:
-        copy_data(param, param - lr * update)
+        # Muon arm: SGD-momentum accumulate, orthogonalize the (optionally
+        # Nesterov-boosted) direction, scale by sqrt(max(1, rows/cols)) so
+        # the per-row RMS of the update matches square matrices, decoupled
+        # weight decay.
+        copy_data(m, momentum * m + gradient)
+        let update = m
+        if nesterov:
+            update = gradient + momentum * m
+        let o = muon_orthogonalize(update, ns_steps)
+        let rows = float(s[0])
+        let cols = float(s[1])
+        let ratio = rows / cols
+        if ratio < 1.0:
+            ratio = 1.0
+        let scale = sqrt(ratio)
+        if weight_decay > 0.0:
+            copy_data(param, param * (1.0 - lr * weight_decay) - (lr * scale) * o)
+        else:
+            copy_data(param, param - (lr * scale) * o)

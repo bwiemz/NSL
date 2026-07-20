@@ -874,9 +874,10 @@ impl Compiler<'_> {
     /// Each optimizer has a distinct arg shape; the `match` arms preserve
     /// the original ordering verbatim.
     ///
-    /// `s2` is always passed; SGD/Lion/Muon arms ignore it. Caller must
-    /// load `s2` from `state_list_2` for num_state_buffers >= 2, or pass
-    /// `s1` as a placeholder otherwise.
+    /// `s2` is always passed; SGD/Lion arms ignore it (Muon is two-state
+    /// since the P5 mixed Muon/AdamW upgrade). Caller must load `s2` from
+    /// `state_list_2` for num_state_buffers >= 2, or pass `s1` as a
+    /// placeholder otherwise.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_stdlib_optim_call(
         &mut self,
@@ -904,7 +905,7 @@ impl Compiler<'_> {
         // tensors. When false, the wrap branch emits zero new IR — the
         // call-pattern is byte-identical to pre-S5. The `s1 != s2` guard
         // mirrors `fase_emit_final_step`: single-state optimizers
-        // (SGD/Lion/Muon) alias s2 to s1, and double-casting that alias
+        // (SGD/Lion) alias s2 to s1, and double-casting that alias
         // would corrupt the buffer on cast_into-back.
         wrap_precision: bool,
         // Bias-correction step index override (f64). The legacy monolithic
@@ -924,6 +925,12 @@ impl Compiler<'_> {
         // reduced-precision state staged through the combined cross-device
         // cast envelope (see fase_emit_final_step).
         wrap_offload: bool,
+        // P5 Muon: (adamw_route_flag f64, ns_steps f64) for the mixed
+        // Muon/AdamW step. Required when optimizer_name == "muon"; None for
+        // every other optimizer (and for call sites muon cannot reach —
+        // muon FASE-plans as FullBuffer, so the unified mode-table dispatch
+        // never sees it).
+        muon_extra: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
     ) -> Result<(), crate::error::CodegenError> {
         // P0.3 combined envelope: offload + reduced-precision moments.
         let offload_combined = wrap_precision && wrap_offload;
@@ -940,7 +947,7 @@ impl Compiler<'_> {
             let ws2 = if wrap_s2 {
                 self.compile_call_by_name(builder, "nsl_tensor_cast", &[s2, f32_code])?
             } else {
-                // SGD/Lion/Muon: s2 is an alias for s1. Aliasing ws2 to ws1
+                // SGD/Lion: s2 is an alias for s1. Aliasing ws2 to ws1
                 // preserves the invariant that the FFI sees the same
                 // pointer in both slots (the helper ignores s2 anyway for
                 // these optimizers).
@@ -1028,12 +1035,31 @@ impl Compiler<'_> {
                 )?;
             }
             "muon" => {
+                // P5 mixed Muon/AdamW: muon_step(param, gradient, m, v,
+                // adamw_route, lr, momentum, beta1, beta2, eps,
+                // weight_decay, nesterov, ns_steps, t).
+                let (route_flag, ns_steps) = muon_extra.ok_or_else(|| {
+                    crate::error::CodegenError::new(
+                        "internal: muon optimizer call emitted without routing \
+                         flags (muon_extra) — this call site is not wired for \
+                         the mixed Muon/AdamW step",
+                    )
+                })?;
+                let t_float = if let Some(t) = t_override {
+                    t
+                } else {
+                    let t_val = builder.use_var(step_count_var);
+                    let one = builder.ins().iconst(cl_types::I64, 1);
+                    let t_plus_one = builder.ins().iadd(t_val, one);
+                    builder.ins().fcvt_from_sint(cl_types::F64, t_plus_one)
+                };
                 self.compile_call_by_name(
                     builder,
                     opt_fn,
                     &[
-                        param_val, grad_val, s1,
-                        lr, momentum_const, weight_decay_const, nesterov_const,
+                        param_val, grad_val, s1, s2, route_flag,
+                        lr, momentum_const, beta1_const, beta2_const, eps_const,
+                        weight_decay_const, nesterov_const, ns_steps, t_float,
                     ],
                 )?;
             }
@@ -1403,6 +1429,9 @@ impl Compiler<'_> {
             cpdt_precision_dtypes.is_some(),
             fullbuf_t_override,
             self.compile_options.optim_state_offload,
+            // Muon FASE-plans as FullBuffer with NO mode table, so the
+            // unified dispatch never routes it here.
+            None,
         )?;
         // The Deferred arm's fase_emit_final_step zeroes m_partial via its
         // recipe epilogue; the stdlib call does not. Zero this param's
