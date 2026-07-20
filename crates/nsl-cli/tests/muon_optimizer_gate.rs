@@ -277,7 +277,9 @@ fn muon_all_adamw_routes_bit_exact() {
                 "OPTIMIZER_LINE",
                 "AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
             ),
-            ("MUON_SAVE_PATH", &save_a.display().to_string()),
+            // Forward slashes: Windows backslashes parse as NSL string
+            // escapes (\U, \R...) inside the fixture source.
+            ("MUON_SAVE_PATH", &save_a.display().to_string().replace('\\', "/")),
         ],
         &[],
     );
@@ -293,7 +295,7 @@ fn muon_all_adamw_routes_bit_exact() {
                 "Muon(lr=0.002, momentum=0.95, nesterov=true, ns_steps=5, \
                  weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
             ),
-            ("MUON_SAVE_PATH", &save_m.display().to_string()),
+            ("MUON_SAVE_PATH", &save_m.display().to_string().replace('\\', "/")),
         ],
         &[],
     );
