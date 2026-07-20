@@ -136,6 +136,87 @@ fn sim_gpu_two_rank_parity_bit_exact() {
     assert!(r0 < full && r1 < full, "both ranks must actually shard");
 }
 
+/// P4 item 16 (ZeRO-2) on GPU: partitioned gradients via device
+/// reduce_scatter, still bit-exact against the single-rank GPU baseline.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn sim_gpu_stage2_reduce_scatter_bit_exact() {
+    let base = run_gpu("s2base", &[]);
+    assert!(base.success, "GPU baseline failed:\n{}", base.stderr);
+
+    let tmpargs = ["--devices", "2", "--collectives", "sim-gpu", "--zero-stage", "2"];
+    // run_gpu passes --zero-stage 1 already; override by appending — clap
+    // rejects duplicates, so use the dedicated runner below instead.
+    let _ = tmpargs;
+    let spmd = run_gpu_stage2("s2spmd");
+    assert!(spmd.success, "2-rank stage-2 sim-gpu run failed:\n{}", spmd.stderr);
+    assert_eq!(
+        spmd.loss, base.loss,
+        "GPU stage-2 diverged from the single-rank GPU baseline\n{}",
+        spmd.stderr
+    );
+    for rank in 0..2 {
+        let line = spmd
+            .stderr
+            .lines()
+            .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
+            .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
+        // 6 steps × (1 CPU f64 group + 1 GPU f32 group) = 12 scatters; no
+        // gradient may travel through an all_reduce.
+        assert!(
+            line.contains("reduce_scatter=12") && line.contains("all_reduce=0"),
+            "stage-2 GPU collective counts wrong: {line}"
+        );
+    }
+}
+
+fn run_gpu_stage2(tag: &str) -> RunOut {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_zgpu_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save = tmp.join("out.nslm");
+    let src = std::fs::read_to_string(
+        root.join("crates/nsl-cli/tests/fixtures/csla_layerwise_ffn.nsl"),
+    )
+    .unwrap()
+    .replace("# GPU_PLACEMENT", "m.to(cuda)")
+    .replace("CSLA_SAVE_PATH", &save.display().to_string());
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args([
+            "run",
+            "--source-ad",
+            "--deterministic",
+            "--zero-stage",
+            "2",
+            "--devices",
+            "2",
+            "--collectives",
+            "sim-gpu",
+        ])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_ZERO_COUNTER", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn nsl run");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let loss = stdout
+        .split_once("LOSS_STREAM_BEGIN")
+        .and_then(|(_, r)| r.split_once("LOSS_STREAM_END"))
+        .map(|(v, _)| v.trim().to_string())
+        .unwrap_or_default();
+    RunOut {
+        success: out.status.success(),
+        loss,
+        stderr,
+    }
+}
+
 /// The real NCCL transport, ws=2. On a multi-GPU box: full parity. On a
 /// single-GPU box NCCL refuses multiple ranks per device — the run must
 /// fail FAST with the documented symmetric ncclInvalidUsage refusal on

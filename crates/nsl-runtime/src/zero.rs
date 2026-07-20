@@ -148,7 +148,6 @@ pub extern "C" fn nsl_zero_note_optim_alloc(tensor_ptr: i64) -> i64 {
 }
 
 struct ZeROContext {
-    #[allow(dead_code)]
     stage: ZeROStage,
     rank: usize,
     world_size: usize,
@@ -473,9 +472,16 @@ fn zero_bucket_cap_bytes() -> usize {
 pub static ZERO_BUCKET_MEMBERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// P4 item 16 (ZeRO-2): reduce_scatter collectives that actually ran — the
+/// stage-2 gate asserts this is nonzero AND all_reduce stays 0 for grads.
+pub static ZERO_REDUCE_SCATTER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// One eligible tensor for bucketing.
 #[derive(Clone, Copy)]
 struct BucketItem {
+    /// Param index (owner lookup for stage-2 segmenting / owner broadcasts).
+    idx: usize,
     raw: i64,
     len: usize,
     bytes: usize,
@@ -606,6 +612,155 @@ fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i
         crate::tensor::nsl_tensor_mul_scalar_inplace(b.raw, inv_ws);
     }
     crate::cuda::inner::free_managed(dev);
+    0
+}
+
+/// P4 item 16 (ZeRO-2): owner-segmented reduce_scatter over one (dtype,
+/// device) group. Layout: `[rank0's owned grads .. pad | rank1's .. pad | …]`
+/// with every rank segment padded to the max segment size, so the existing
+/// `reduce_scatter_sum` (count divisible by ws, rank r receives slice r)
+/// delivers each rank EXACTLY its owned gradients, summed — gradient
+/// partitioning with (N-1)/N the traffic of an all-reduce. Non-owned grad
+/// tensors keep their LOCAL (unsummed) values; only the owner-gated
+/// optimizer reads gradients, and it reads owned slots only.
+fn reduce_scatter_group_cpu(
+    ctx: &ZeROContext,
+    items: &[BucketItem],
+    dtype: u16,
+    inv_ws: f64,
+) -> i64 {
+    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let ws = ctx.world_size;
+    let esz = if dtype == 0 { 8 } else { 4 };
+    // Per-rank owned member lists (ascending param order preserved).
+    let mut segs: Vec<Vec<BucketItem>> = vec![Vec::new(); ws];
+    for &it in items {
+        let owner = ctx.owner_of.get(it.idx).copied().unwrap_or(0) as usize;
+        segs[owner.min(ws - 1)].push(it);
+    }
+    let seg_bytes: Vec<usize> = segs.iter().map(|s| s.iter().map(|b| b.bytes).sum()).collect();
+    let max_seg = seg_bytes.iter().copied().max().unwrap_or(0);
+    if max_seg == 0 {
+        return 0;
+    }
+    let total = max_seg * ws;
+    let mut flat = vec![0u8; total];
+    for (r, seg) in segs.iter().enumerate() {
+        let mut off = r * max_seg;
+        for b in seg {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (b.raw as *const NslTensor).read().data as *const u8,
+                    flat.as_mut_ptr().add(off),
+                    b.bytes,
+                )
+            };
+            off += b.bytes;
+        }
+    }
+    let mut out = vec![0u8; max_seg];
+    let rc = backend.reduce_scatter_sum(
+        flat.as_ptr() as *const std::ffi::c_void,
+        out.as_mut_ptr() as *mut std::ffi::c_void,
+        total / esz,
+        dtype as crate::tensor_parallel::collective::DtypeId,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return -1;
+    }
+    ZERO_REDUCE_SCATTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // Average + unpack THIS rank's owned segment.
+    let my = ctx.rank.min(ws - 1);
+    let my_elems = seg_bytes[my] / esz;
+    if dtype == 0 {
+        let p = out.as_mut_ptr() as *mut f64;
+        for j in 0..my_elems {
+            unsafe { *p.add(j) *= inv_ws };
+        }
+    } else {
+        let p = out.as_mut_ptr() as *mut f32;
+        let sc = inv_ws as f32;
+        for j in 0..my_elems {
+            unsafe { *p.add(j) *= sc };
+        }
+    }
+    let mut off = 0usize;
+    for b in &segs[my] {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out.as_ptr().add(off),
+                (b.raw as *const NslTensor).read().data as *mut u8,
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    0
+}
+
+/// GPU (CUDA-aware) sibling of [`reduce_scatter_group_cpu`]: same
+/// owner-segmented padded layout through device buffers.
+#[cfg(feature = "cuda")]
+fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64) -> i64 {
+    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let ws = ctx.world_size;
+    let mut segs: Vec<Vec<BucketItem>> = vec![Vec::new(); ws];
+    for &it in items {
+        let owner = ctx.owner_of.get(it.idx).copied().unwrap_or(0) as usize;
+        segs[owner.min(ws - 1)].push(it);
+    }
+    let seg_bytes: Vec<usize> = segs.iter().map(|s| s.iter().map(|b| b.bytes).sum()).collect();
+    let max_seg = seg_bytes.iter().copied().max().unwrap_or(0);
+    if max_seg == 0 {
+        return 0;
+    }
+    let total = max_seg * ws;
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(total);
+    crate::cuda::inner::memset_d8(dev, total);
+    for (r, seg) in segs.iter().enumerate() {
+        let mut off = r * max_seg;
+        for b in seg {
+            let t = unsafe { &*(b.raw as *const NslTensor) };
+            crate::cuda::inner::memcpy_dtod(
+                unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
+                t.data as *const std::ffi::c_void,
+                b.bytes,
+            );
+            off += b.bytes;
+        }
+    }
+    let out = crate::cuda::inner::alloc_managed(max_seg);
+    let rc = backend.reduce_scatter_sum(
+        dev as *const std::ffi::c_void,
+        out,
+        total / 4,
+        crate::tensor_parallel::collective::DTYPE_F32,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        crate::cuda::inner::free_managed(dev);
+        crate::cuda::inner::free_managed(out);
+        return -1;
+    }
+    ZERO_REDUCE_SCATTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let my = ctx.rank.min(ws - 1);
+    let mut off = 0usize;
+    for b in &segs[my] {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            t.data,
+            unsafe { (out as *const u8).add(off) } as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+        crate::tensor::nsl_tensor_mul_scalar_inplace(b.raw, inv_ws);
+    }
+    crate::cuda::inner::free_managed(dev);
+    crate::cuda::inner::free_managed(out);
     0
 }
 
@@ -788,6 +943,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 return -1;
             }
             let item = BucketItem {
+                idx: i,
                 raw,
                 len: t.len as usize,
                 bytes: t.data_byte_size(),
@@ -798,6 +954,32 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 _ => gpu_f32.push(item),
             }
         }
+        // P4 item 16 (ZeRO-2+): gradient PARTITIONING — one owner-segmented
+        // reduce_scatter per (dtype, device) group instead of all-reducing
+        // every gradient everywhere. Each rank receives only its owned
+        // gradients (summed + averaged); non-owned grad tensors keep local
+        // values that nothing reads (the optimizer update is owner-gated).
+        if ctx.stage != ZeROStage::Stage1 {
+            for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
+                if !items.is_empty() && reduce_scatter_group_cpu(ctx, items, dtype, inv_ws) != 0
+                {
+                    eprintln!("nsl: nsl_zero_reduce_grads: reduce_scatter failed");
+                    return -1;
+                }
+            }
+            #[cfg(feature = "cuda")]
+            if !gpu_f32.is_empty() && reduce_scatter_group_gpu(ctx, &gpu_f32, inv_ws) != 0 {
+                eprintln!("nsl: nsl_zero_reduce_grads: device reduce_scatter failed");
+                return -1;
+            }
+            #[cfg(not(feature = "cuda"))]
+            if !gpu_f32.is_empty() {
+                eprintln!("nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
+                return -1;
+            }
+            return 0;
+        }
+
         for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
             for bucket in split_buckets(items, cap) {
                 if reduce_bucket_cpu(ctx, &bucket, dtype, inv_ws) != 0 {
@@ -1099,6 +1281,7 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
                 .entry((owner, t.dtype, t.device != 0))
                 .or_default()
                 .push(BucketItem {
+                    idx: i,
                     raw,
                     len: t.len as usize,
                     bytes: t.data_byte_size(),

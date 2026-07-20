@@ -490,11 +490,60 @@ fn zero_refusals() {
     std::fs::create_dir_all(&tmp).unwrap();
     let save = tmp.join("unused.nslm");
 
-    let s2 = run_nsl(&program(&save), "ref_s2", &["--zero-stage", "2"], 600);
-    assert!(!s2.success, "--zero-stage 2 must refuse");
+    let s3 = run_nsl(&program(&save), "ref_s3", &["--zero-stage", "3"], 600);
+    assert!(!s3.success, "--zero-stage 3 must refuse");
     assert!(
-        s2.stderr.contains("not lowered yet"),
-        "wrong stage-2 refusal:\n{}",
-        s2.stderr
+        s3.stderr.contains("not lowered yet"),
+        "wrong stage-3 refusal:\n{}",
+        s3.stderr
     );
+}
+
+/// P4 item 16 (ZeRO-2): gradient partitioning. Same replicated-data parity
+/// contract as stage 1 — the loss stream must be bit-identical to the
+/// single-rank baseline — but grads move through owner-segmented
+/// reduce_scatter collectives (each rank receives only its OWNED summed
+/// gradients), so the [zero] line must show reduce_scatter>0 with
+/// all_reduce=0 (no grad was all-reduced).
+#[test]
+#[ignore = "spawns 3 nsl processes; ~2 min. Run: cargo test --test zero_spmd_gate -- --ignored"]
+fn zero_stage2_two_rank_parity_reduce_scatter() {
+    let tmp = std::env::temp_dir().join(format!("nsl_zero_s2_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("base.nslm");
+    let save_b = tmp.join("s2.nslm");
+
+    let base = run_nsl(&program(&save_a), "s2_base", &[], 600);
+    assert!(base.success, "baseline failed:\n{}", base.stderr);
+    let spmd = run_nsl(
+        &program(&save_b),
+        "s2_spmd",
+        &["--zero-stage", "2", "--devices", "2"],
+        900,
+    );
+    assert!(spmd.success, "2-rank stage-2 run failed:\n{}", spmd.stderr);
+    assert!(!base.loss_stream.is_empty(), "empty baseline loss stream");
+    assert_eq!(
+        base.loss_stream, spmd.loss_stream,
+        "stage-2 rank-0 loss stream diverged from the single-rank baseline\n{}",
+        spmd.stderr
+    );
+    for rank in 0..2 {
+        let line = spmd
+            .stderr
+            .lines()
+            .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
+            .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
+        assert!(
+            line.contains("reduce_scatter=6")
+                && line.contains("all_reduce=0")
+                && line.contains("broadcast=12"),
+            "stage-2 collective counts wrong (want 6 scatters, 0 all_reduce, \
+             12 owner broadcasts): {line}"
+        );
+    }
+    // Same model bytes as baseline (θ fully synced despite partitioned grads).
+    let base_bytes = std::fs::read(&save_a).expect("baseline .nslm");
+    let s2_bytes = std::fs::read(&save_b).expect("stage-2 .nslm");
+    assert_eq!(base_bytes, s2_bytes, "stage-2 model bytes diverged");
 }

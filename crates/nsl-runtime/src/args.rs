@@ -133,8 +133,9 @@ extern "C" fn nsl_zero_count_atexit() {
     // (observed: "[zero] ws=2[zero] ws= rank=0 ..." — the SPMD gates then
     // flake on the missing line). Format first, write once: a single
     // write_all under PIPE_BUF is atomic on POSIX pipes.
+    let rs = crate::zero::ZERO_REDUCE_SCATTER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let line = format!(
-        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members}\n"
+        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members} reduce_scatter={rs}\n"
     );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(line.as_bytes());

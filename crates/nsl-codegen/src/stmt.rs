@@ -4606,11 +4606,20 @@ impl Compiler<'_> {
         // in the forward) need sharded BUFFERS, not just sharded compute —
         // refuse loudly rather than silently running stage-1 semantics.
         if let Some(s) = self.features.zero_stage {
-            if s >= 2 {
+            // P4 item 16: stage 2 (gradient partitioning via owner-segmented
+            // reduce_scatter) is lowered — same emission points as stage 1;
+            // the runtime dispatches on the baked stage. Stage 3 (parameter
+            // partitioning + just-in-time all-gather) still refuses: params
+            // freed between steps would break mid-loop model_save/callbacks
+            // and eval reads, which need the residency machinery generalized
+            // from the weight-stream Item-12 guard first.
+            if s >= 3 {
                 return Err(CodegenError::new(format!(
-                    "--zero-stage {s} is not lowered yet: v1 implements stage 1 \
-                     (optimizer-state sharding, validated vs the single-rank \
-                     baseline at toy scale). Use --zero-stage 1",
+                    "--zero-stage {s} is not lowered yet: stages 1 (optimizer \
+                     sharding) and 2 (gradient partitioning) are implemented. \
+                     Stage 3 parameter partitioning needs the callback/\
+                     model_save residency guard generalized to sharded params \
+                     — use --zero-stage 2",
                 )));
             }
             // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
