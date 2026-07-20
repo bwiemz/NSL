@@ -99,6 +99,25 @@ fn loss_only_callback_no_scoped_upload() {
 }
 
 #[test]
+fn aliased_model_field_callback_flags_writeback() {
+    // Binding a model field to a local (`let w = m.norm_out`) aliases the
+    // resident streamed buffer; a later in-place mutation through `w` would
+    // never have `model_sym` as its root, so the analysis conservatively
+    // treats any model-rooted binding as a possible write (writeback=1 is
+    // always safe). This guards the silent dropped-weight-update hazard.
+    let src = fixture_src("csla_ws_callback_model_read.nsl").replace(
+        "print(m.norm_out.sum())",
+        "let wloc = m.norm_out\n            print(wloc.sum())",
+    );
+    let (ok, stderr) = build_only(&src, "alias");
+    assert!(ok, "compile failed:\n{stderr}");
+    assert!(
+        stderr.contains(DIAG) && stderr.contains("(with writeback)"),
+        "a model-field alias must be bracketed with writeback; stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn inplace_mutator_callback_flags_writeback() {
     // A callback that mutates θ in place (`copy_data(m.norm_out, ..)`) must be
     // bracketed WITH writeback so the change survives the next window upload.

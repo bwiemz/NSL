@@ -3804,6 +3804,20 @@ impl Compiler<'_> {
                 self.walk_expr_model_touch(value, model_sym, acc);
             }
             S::VarDecl { value: Some(v), .. } => {
+                // Binding a model-derived value to a local (`let w = m.field`)
+                // creates an ALIAS onto the resident streamed buffer; a later
+                // `copy_data(w, ..)` would mutate θ through it without the root
+                // ever being `model_sym`. We can't cheaply track the alias, so
+                // conservatively treat any model-rooted binding as a possible
+                // write (writeback=1 is always safe — for an unmutated param
+                // device==mirror, so the extra DtoH is byte-identical).
+                if Self::expr_root_ident(v) == Some(model_sym) {
+                    acc.touches = true;
+                    acc.may_write = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = self.model_access_path(v);
+                    }
+                }
                 self.walk_expr_model_touch(v, model_sym, acc)
             }
             S::Expr(e) | S::Return(Some(e)) | S::Yield(Some(e)) => {
@@ -3842,6 +3856,26 @@ impl Compiler<'_> {
                 for s in &body.stmts {
                     self.walk_stmt_model_touch(s, model_sym, acc);
                 }
+            }
+            // A model read inside any of these still dereferences evicted θ —
+            // walk them too, or the residency bracket is silently skipped and
+            // the #395 crash returns (e.g. `@no_grad: print(m.x.sum())`).
+            S::WhileLet { expr, body, .. } => {
+                self.walk_expr_model_touch(expr, model_sym, acc);
+                for s in &body.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+            }
+            S::Match { subject, arms } => {
+                self.walk_expr_model_touch(subject, model_sym, acc);
+                for arm in arms {
+                    for s in &arm.body.stmts {
+                        self.walk_stmt_model_touch(s, model_sym, acc);
+                    }
+                }
+            }
+            S::Decorated { stmt, .. } => {
+                self.walk_stmt_model_touch(stmt, model_sym, acc);
             }
             _ => {}
         }
@@ -3887,10 +3921,23 @@ impl Compiler<'_> {
                     }
                     _ => None,
                 };
-                if callee_name.as_deref().is_some_and(Self::is_inplace_mutator) {
+                let is_mutator = callee_name.as_deref().is_some_and(Self::is_inplace_mutator);
+                // A FREE-FN call passing a model-rooted param to a callee that
+                // is not a known read-only sink could mutate that param in
+                // place (`my_ema(m.field, ..)`), so treat it conservatively as
+                // a write. `print`/`model_save` provably don't mutate their
+                // tensor args. Method calls are covered by the mutator check
+                // above (functional methods return fresh tensors).
+                let is_free_fn = matches!(&callee.kind, E::Ident(_));
+                let is_readonly_sink = callee_name
+                    .as_deref()
+                    .is_some_and(|n| matches!(n, "print" | "model_save"));
+                let unknown_free_fn_write =
+                    is_free_fn && !is_readonly_sink && !Self::is_inplace_mutator(callee_name.as_deref().unwrap_or(""));
+                if is_mutator || unknown_free_fn_write {
                     // Dest is the model-rooted operand: the receiver for the
-                    // method form (`m.x.add_inplace(..)`), the first arg for
-                    // the free-fn form (`copy_data(m.x, ..)`).
+                    // method form (`m.x.add_inplace(..)`), an arg for the
+                    // free-fn form (`copy_data(m.x, ..)` / `my_ema(m.x, ..)`).
                     let receiver_model = matches!(&callee.kind, E::MemberAccess { object, .. }
                         if Self::expr_root_ident(object) == Some(model_sym));
                     let arg_model = args
