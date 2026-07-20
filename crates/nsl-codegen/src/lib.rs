@@ -1286,6 +1286,13 @@ pub struct CompileOptions {
     /// mechanism), so param_list / struct fields / the tie guard stay
     /// valid. Byte-preserving — bit-exact.
     pub weight_stream: bool,
+    /// Item 10 (`--stream-arena`, requires `--weight-stream`): batch each
+    /// layer's per-param host<->device transfers into ONE contiguous transfer
+    /// through a stable, reused device staging arena. Cuts CUDA calls, lands
+    /// one large PCIe transaction per layer, keeps device addresses stable
+    /// across steps, and bounds fragmentation. Bit-exact with the per-param
+    /// path (same mirror bytes, same order).
+    pub stream_arena: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1415,6 +1422,7 @@ impl Default for CompileOptions {
             checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,
+            stream_arena: false,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),

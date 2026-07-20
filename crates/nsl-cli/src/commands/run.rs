@@ -65,6 +65,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             checkpoint_compress,
             layerwise_accum,
             weight_stream,
+            stream_arena,
             weights,
     } = args;
 
@@ -388,6 +389,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 checkpoint_compress,
                 layerwise_accum,
                 weight_stream,
+                stream_arena,
                 debug_training,
                 grad_integrity,
                 training_reference,

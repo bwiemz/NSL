@@ -3889,12 +3889,10 @@ impl Compiler<'_> {
     ) {
         use nsl_ast::expr::ExprKind as E;
         match &e.kind {
-            E::Ident(s) => {
-                if *s == model_sym {
-                    acc.touches = true;
-                    if acc.first_path.is_none() {
-                        acc.first_path = Some(self.resolve_sym(*s).to_string());
-                    }
+            E::Ident(s) if *s == model_sym => {
+                acc.touches = true;
+                if acc.first_path.is_none() {
+                    acc.first_path = Some(self.resolve_sym(*s).to_string());
                 }
             }
             E::MemberAccess { object, .. } => {
@@ -4046,6 +4044,54 @@ impl Compiler<'_> {
                 .iconst(cl_types::I64, if may_write { 1 } else { 0 });
             self.compile_call_by_name(builder, "nsl_weight_stream_reevict_all", &[wb])?;
         }
+        Ok(())
+    }
+
+    /// Item 10: emit a contiguous layer-pack UPLOAD. Builds an `NslList` of
+    /// the pack's param tensor pointers (from their `param_list` indices) and
+    /// hands it to the runtime, which stages the whole pack into ONE device
+    /// arena transfer. The list build is a few cheap CPU calls; the win is the
+    /// single HtoD it replaces N of.
+    fn emit_ws_pack_upload(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_list: Value,
+        idxs: &[i64],
+    ) -> Result<(), CodegenError> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let pwlist = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for &idx in idxs {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[pwlist, pw])?;
+        }
+        self.compile_call_by_name(builder, "nsl_weight_stream_upload_pack", &[pwlist])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
+        Ok(())
+    }
+
+    /// Item 10: emit a contiguous layer-pack EVICT (one DtoH when writeback).
+    fn emit_ws_pack_evict(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_list: Value,
+        idxs: &[i64],
+        writeback: i64,
+    ) -> Result<(), CodegenError> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let pwlist = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for &idx in idxs {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[pwlist, pw])?;
+        }
+        let wb = builder.ins().iconst(cl_types::I64, writeback);
+        self.compile_call_by_name(builder, "nsl_weight_stream_evict_pack", &[pwlist, wb])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
         Ok(())
     }
 
@@ -7032,9 +7078,16 @@ impl Compiler<'_> {
                     /// at step-body top, every iteration (idempotent).
                     register_idxs: Vec<i64>,
                     /// Per-slice param_list indices uploaded before /
-                    /// evicted after that slice's ops.
+                    /// evicted after that slice's ops (per-param mode).
                     upload_per_slice: Vec<Vec<i64>>,
                     evict_per_slice: Vec<Vec<i64>>,
+                    /// Item 10 (arena mode): one contiguous pack per streamed
+                    /// LAYER group as `(first_slice, last_slice, idxs)`. The
+                    /// whole group uploads at `first_slice` and evicts at
+                    /// `last_slice` — a matched set, so it holds exactly one
+                    /// arena slot for its residency (coarser than per-param
+                    /// touch, but batched into one HtoD / DtoH each way).
+                    arena_packs: Vec<(usize, usize, Vec<i64>)>,
                 }
                 let (csla_pre, ws_fwd_plan): (Option<CslaPre>, Option<WsForwardPlan>) =
                     if csla_active {
@@ -7295,12 +7348,51 @@ impl Compiler<'_> {
                                 per_slice(&upload_per_slice),
                                 per_slice(&evict_per_slice),
                             );
+                            // Item 10: coarsen the per-param touch into one
+                            // contiguous pack per streamed LAYER group (the
+                            // group's forward bracket = [min first-touch, max
+                            // last-touch] over its touched members). Matched
+                            // upload/evict sets → one arena slot per pack.
+                            let idx_touch: std::collections::HashMap<i64, (usize, usize)> = touch
+                                .iter()
+                                .map(|(vid, fl)| (vid_to_idx[vid], *fl))
+                                .collect();
+                            let mut arena_packs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
+                            for group in &layer_group {
+                                let mut members: Vec<i64> = Vec::new();
+                                let mut first = usize::MAX;
+                                let mut last = 0usize;
+                                for &idx in group {
+                                    if let Some(&(f, l)) = idx_touch.get(&idx) {
+                                        members.push(idx);
+                                        first = first.min(f);
+                                        last = last.max(l);
+                                    }
+                                }
+                                if !members.is_empty() {
+                                    members.sort_unstable();
+                                    arena_packs.push((first, last, members));
+                                }
+                            }
+                            if self.compile_options.stream_arena {
+                                eprintln!(
+                                    "[weight-stream] arena mode: {} contiguous layer packs \
+                                     (sizes [{}])",
+                                    arena_packs.len(),
+                                    arena_packs
+                                        .iter()
+                                        .map(|(_, _, m)| m.len().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                );
+                            }
                             ws_streamed_sorted = ws_all.clone();
                             Some(WsForwardPlan {
                                 slices,
                                 register_idxs: ws_all,
                                 upload_per_slice,
                                 evict_per_slice,
+                                arena_packs,
                             })
                         } else {
                             None
@@ -7381,10 +7473,29 @@ impl Compiler<'_> {
                     let mut explicit_freed_vars = std::collections::HashSet::new();
                     // No FASE hook on this forward-streaming path — stays empty.
                     let mut hook_freed_param_vars = std::collections::HashSet::new();
+                    let arena_mode = self.compile_options.stream_arena;
                     for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
-                        if !wsplan.upload_per_slice[si].is_empty() {
-                            // Upload this slice's first-touch params under
-                            // the Weights surface (allocation accounting).
+                        // Item 10: in arena mode a whole layer pack uploads at
+                        // its bracket-start slice (ONE contiguous transfer);
+                        // otherwise the per-param first-touch set.
+                        let arena_uploads: Vec<Vec<i64>> = if arena_mode {
+                            wsplan
+                                .arena_packs
+                                .iter()
+                                .filter(|(f, _, _)| *f == si)
+                                .map(|(_, _, idxs)| idxs.clone())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let has_upload = if arena_mode {
+                            !arena_uploads.is_empty()
+                        } else {
+                            !wsplan.upload_per_slice[si].is_empty()
+                        };
+                        if has_upload {
+                            // Upload under the Weights surface (allocation
+                            // accounting).
                             let prev_surf = self.compile_call_by_name(
                                 builder,
                                 "nsl_gpu_get_alloc_surface",
@@ -7396,18 +7507,24 @@ impl Compiler<'_> {
                                 "nsl_gpu_set_alloc_surface",
                                 &[wsurf],
                             )?;
-                            for &idx in &wsplan.upload_per_slice[si] {
-                                let iv = builder.ins().iconst(cl_types::I64, idx);
-                                let pw = self.compile_call_by_name(
-                                    builder,
-                                    "nsl_list_get",
-                                    &[param_list, iv],
-                                )?;
-                                self.compile_call_by_name(
-                                    builder,
-                                    "nsl_weight_stream_upload",
-                                    &[pw],
-                                )?;
+                            if arena_mode {
+                                for idxs in &arena_uploads {
+                                    self.emit_ws_pack_upload(builder, param_list, idxs)?;
+                                }
+                            } else {
+                                for &idx in &wsplan.upload_per_slice[si] {
+                                    let iv = builder.ins().iconst(cl_types::I64, idx);
+                                    let pw = self.compile_call_by_name(
+                                        builder,
+                                        "nsl_list_get",
+                                        &[param_list, iv],
+                                    )?;
+                                    self.compile_call_by_name(
+                                        builder,
+                                        "nsl_weight_stream_upload",
+                                        &[pw],
+                                    )?;
+                                }
                             }
                             self.compile_call_by_name(
                                 builder,
@@ -7429,22 +7546,34 @@ impl Compiler<'_> {
                             &mut hook_freed_param_vars,
                             None,
                         )?;
-                        // Evict this slice's last-touch params — read-only
+                        // Evict this slice's last-touch params/packs — read-only
                         // (writeback=0): forwards never mutate θ, the mirror
                         // is current by construction.
-                        for &idx in &wsplan.evict_per_slice[si] {
-                            let iv = builder.ins().iconst(cl_types::I64, idx);
-                            let pw = self.compile_call_by_name(
-                                builder,
-                                "nsl_list_get",
-                                &[param_list, iv],
-                            )?;
-                            let wb = builder.ins().iconst(cl_types::I64, 0);
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_weight_stream_evict",
-                                &[pw, wb],
-                            )?;
+                        if arena_mode {
+                            let evicts: Vec<Vec<i64>> = wsplan
+                                .arena_packs
+                                .iter()
+                                .filter(|(_, l, _)| *l == si)
+                                .map(|(_, _, idxs)| idxs.clone())
+                                .collect();
+                            for idxs in &evicts {
+                                self.emit_ws_pack_evict(builder, param_list, idxs, 0)?;
+                            }
+                        } else {
+                            for &idx in &wsplan.evict_per_slice[si] {
+                                let iv = builder.ins().iconst(cl_types::I64, idx);
+                                let pw = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_list_get",
+                                    &[param_list, iv],
+                                )?;
+                                let wb = builder.ins().iconst(cl_types::I64, 0);
+                                self.compile_call_by_name(
+                                    builder,
+                                    "nsl_weight_stream_evict",
+                                    &[pw, wb],
+                                )?;
+                            }
                         }
                     }
                     // Same sdpa-extras adoption the monolithic wrapper does.
@@ -9437,11 +9566,20 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
                     let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
-                    for &idx in &ws_range {
-                        let iv = builder.ins().iconst(cl_types::I64, idx);
-                        let pw = self
-                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                        self.compile_call_by_name(builder, "nsl_weight_stream_upload", &[pw])?;
+                    if self.compile_options.stream_arena {
+                        // Item 10: this layer group is one contiguous pack.
+                        self.emit_ws_pack_upload(builder, param_list, &ws_range)?;
+                    } else {
+                        for &idx in &ws_range {
+                            let iv = builder.ins().iconst(cl_types::I64, idx);
+                            let pw = self
+                                .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_weight_stream_upload",
+                                &[pw],
+                            )?;
+                        }
                     }
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev_surf])?;
                 }
@@ -9849,12 +9987,21 @@ impl Compiler<'_> {
                 // D2b: this layer's θ is final for the window — write back
                 // to the mirror and drop the device buffer.
                 if ws_active {
-                    for &idx in &ws_range {
-                        let iv = builder.ins().iconst(cl_types::I64, idx);
-                        let pw = self
-                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                        let wb = builder.ins().iconst(cl_types::I64, 1);
-                        self.compile_call_by_name(builder, "nsl_weight_stream_evict", &[pw, wb])?;
+                    if self.compile_options.stream_arena {
+                        // Item 10: one DtoH writeback for the whole layer pack.
+                        self.emit_ws_pack_evict(builder, param_list, &ws_range, 1)?;
+                    } else {
+                        for &idx in &ws_range {
+                            let iv = builder.ins().iconst(cl_types::I64, idx);
+                            let pw = self
+                                .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                            let wb = builder.ins().iconst(cl_types::I64, 1);
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_weight_stream_evict",
+                                &[pw, wb],
+                            )?;
+                        }
                     }
                 }
             }

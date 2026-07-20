@@ -53,6 +53,14 @@ struct Mirror {
     /// exclusion protects a live buffered view from). A view-rooted param is
     /// never registered, so its pointer never moves.
     last_dev: i64,
+    /// Item 10 (layer arenas): when this param is resident inside a shared
+    /// device arena slot rather than its own `alloc_managed` buffer, the slot
+    /// index (else -1). `arena_off` is its byte offset within that slot.
+    /// Evicting an arena-resident param releases a reference on the slot
+    /// instead of `free_managed`-ing an interior pointer (which is not a valid
+    /// allocation base).
+    arena_slot: i64,
+    arena_off: usize,
 }
 // Raw pointers in the table are only touched under the lock on the
 // (single-threaded) training path.
@@ -79,6 +87,12 @@ pub static WS_REGISTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// Uploads that returned a device address DIFFERENT from the one the param
 /// last held — concrete "the pointer moved" evidence for streamed params.
 pub static WS_PTR_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Item 10 (layer arenas): contiguous-layer-pack transfers. Each
+/// `upload_pack` / `evict_pack` is ONE HtoD / DtoH covering a whole layer's
+/// params, so these stay far below the param-granular `WS_UPLOADS`/`WS_EVICTS`
+/// (which still count per-param) — the compile-time-verified batching win.
+pub static WS_PACK_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WS_PACK_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
@@ -123,15 +137,6 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
         );
         std::process::abort();
     }
-    if t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0 {
-        eprintln!(
-            "[weight-stream] refusing to register tensor {tensor_ptr}: \
-             owns_data={} data_owner={} slab_managed={} — only plain owning \
-             non-slab GPU tensors stream",
-            t.owns_data, t.data_owner, t.slab_managed
-        );
-        std::process::abort();
-    }
     #[cfg(feature = "cuda")]
     {
         {
@@ -139,9 +144,25 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
             if guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr)) {
                 drop(guard);
                 // Already registered: window-start re-evict, mirror current.
+                // The admission check below runs ONLY on first registration —
+                // once streaming, a param's `owns_data` legitimately flips to 0
+                // while it is a non-owning view inside an arena slot (Item 10),
+                // so re-checking it here would abort every step after the first.
                 nsl_weight_stream_evict(tensor_ptr, 0);
                 return;
             }
+        }
+        // First-registration admission: only plain owning non-slab GPU tensors
+        // may enter the streaming table (a view/slab param would corrupt on
+        // free-and-reupload — the #397 hazard).
+        if t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0 {
+            eprintln!(
+                "[weight-stream] refusing to register tensor {tensor_ptr}: \
+                 owns_data={} data_owner={} slab_managed={} — only plain owning \
+                 non-slab GPU tensors stream",
+                t.owns_data, t.data_owner, t.slab_managed
+            );
+            std::process::abort();
         }
         let bytes = t.data_byte_size();
         let host = crate::tensor::alloc_host_state_buffer(bytes);
@@ -150,9 +171,16 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
         crate::cuda::inner::free_managed(t.data);
         t.data = std::ptr::null_mut();
         let mut guard = MIRRORS.lock().unwrap();
-        guard
-            .get_or_insert_with(HashMap::new)
-            .insert(tensor_ptr, Mirror { host, bytes, last_dev: 0 });
+        guard.get_or_insert_with(HashMap::new).insert(
+            tensor_ptr,
+            Mirror {
+                host,
+                bytes,
+                last_dev: 0,
+                arena_slot: -1,
+                arena_off: 0,
+            },
+        );
         // First registration = this param's original device storage was freed
         // (its pointer is now invalid). A view-rooted param excluded by #397
         // never reaches here.
@@ -221,8 +249,8 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
     }
     #[cfg(feature = "cuda")]
     {
-        let guard = MIRRORS.lock().unwrap();
-        let Some(m) = guard.as_ref().and_then(|g| g.get(&tensor_ptr)) else {
+        let mut guard = MIRRORS.lock().unwrap();
+        let Some(m) = guard.as_mut().and_then(|g| g.get_mut(&tensor_ptr)) else {
             // No call site legitimately evicts an unregistered tensor —
             // a silent pass here would mask a codegen slip (review D2b-6).
             eprintln!(
@@ -232,9 +260,20 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
         };
         crate::cuda::inner::ensure_context();
         if writeback != 0 {
+            // Reading the arena INTERIOR pointer for a DtoH is valid; only
+            // FREEING an interior pointer would be illegal.
             crate::cuda::inner::memcpy_dtoh(m.host as *mut c_void, t.data, m.bytes);
         }
-        crate::cuda::inner::free_managed(t.data);
+        if m.arena_slot >= 0 {
+            // Item 10: arena-resident — release a reference on the shared slot
+            // rather than free_managed-ing an interior pointer. The slot's
+            // device/host buffers are pooled for reuse, not freed here.
+            let slot = m.arena_slot as usize;
+            m.arena_slot = -1;
+            arena_release_ref(slot);
+        } else {
+            crate::cuda::inner::free_managed(t.data);
+        }
         t.data = std::ptr::null_mut();
         WS_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if writeback != 0 {
@@ -272,6 +311,261 @@ pub extern "C" fn nsl_weight_stream_upload_all() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Item 10 — layer arenas: stable device staging slots + contiguous layer-pack
+// transfers. Instead of one `alloc_managed`/`memcpy` per parameter (hundreds
+// per step), a whole layer's params are staged into one contiguous PINNED
+// host buffer and moved with ONE HtoD into a reused device slot; each param's
+// `t.data` then points at its offset inside the slot (a non-owning view). This
+// cuts CUDA calls, lands one large PCIe transaction, keeps device addresses
+// stable across steps (CUDA-Graph-friendly), and bounds fragmentation. The
+// host mirror (from `register`) stays the source of truth, so registration and
+// teardown are shared with the per-param path — only residency changes.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One reusable staging slot: a device buffer + a matching pinned host buffer.
+/// A slot holds exactly one resident layer pack at a time (`live` = params in
+/// it); when `live` hits 0 the buffers stay allocated for the next pack.
+#[cfg(feature = "cuda")]
+struct ArenaSlot {
+    dev: *mut c_void,
+    host_stage: *mut u8,
+    cap: usize,
+    live: usize,
+}
+#[cfg(feature = "cuda")]
+unsafe impl Send for ArenaSlot {}
+
+#[cfg(feature = "cuda")]
+static ARENA_POOL: Mutex<Vec<ArenaSlot>> = Mutex::new(Vec::new());
+
+/// Per-param device sub-buffer alignment inside a slot. cudaMalloc bases are
+/// ≥256-byte aligned; a mid-slot offset must be too so kernels that assume a
+/// vectorized/aligned base on `t.data` stay correct. 512 is a safe multiple.
+#[cfg(feature = "cuda")]
+const ARENA_ALIGN: usize = 512;
+
+#[cfg(feature = "cuda")]
+fn align_up(x: usize, a: usize) -> usize {
+    x.div_ceil(a) * a
+}
+
+/// Reserve a slot with capacity ≥ `bytes`, marking it holding `live` params.
+/// Reuses a free slot (stable address) or grows the pool by one. Returns the
+/// slot index and its (device, pinned-host) buffers. Caller holds MIRRORS;
+/// lock order is MIRRORS → ARENA_POOL → allocator (never reversed).
+#[cfg(feature = "cuda")]
+fn arena_acquire(bytes: usize, live: usize) -> (usize, *mut c_void, *mut u8) {
+    let mut pool = ARENA_POOL.lock().unwrap();
+    if let Some(idx) = pool.iter().position(|s| s.live == 0 && s.cap >= bytes) {
+        pool[idx].live = live;
+        return (idx, pool[idx].dev, pool[idx].host_stage);
+    }
+    // Round up so slightly-different pack sizes can reuse the same slot.
+    let cap = align_up(bytes.max(ARENA_ALIGN), 256 * 1024);
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(cap);
+    let host_stage = crate::tensor::alloc_host_state_buffer(cap);
+    pool.push(ArenaSlot {
+        dev,
+        host_stage,
+        cap,
+        live,
+    });
+    (pool.len() - 1, dev, host_stage)
+}
+
+/// Buffers of an in-use slot (device, pinned-host).
+#[cfg(feature = "cuda")]
+fn arena_slot_bufs(slot: usize) -> (*mut c_void, *mut u8) {
+    let pool = ARENA_POOL.lock().unwrap();
+    let s = &pool[slot];
+    (s.dev, s.host_stage)
+}
+
+/// Drop `count` references from a slot; buffers persist for reuse.
+#[cfg(feature = "cuda")]
+fn arena_release_pack(slot: usize, count: usize) {
+    let mut pool = ARENA_POOL.lock().unwrap();
+    if let Some(s) = pool.get_mut(slot) {
+        s.live = s.live.saturating_sub(count);
+    }
+}
+
+/// Drop ONE reference (the defensive single-param `evict` path).
+#[cfg(feature = "cuda")]
+fn arena_release_ref(slot: usize) {
+    arena_release_pack(slot, 1);
+}
+
+/// Free every slot's device + pinned-host buffer and clear the pool. Called
+/// from teardown after all params are restored to owned buffers.
+#[cfg(feature = "cuda")]
+fn arena_teardown() {
+    let mut pool = ARENA_POOL.lock().unwrap();
+    for s in pool.drain(..) {
+        crate::cuda::inner::ensure_context();
+        crate::cuda::inner::free_managed(s.dev);
+        if crate::cuda::inner::is_pinned(s.host_stage as *mut c_void) {
+            crate::cuda::inner::free_pinned(s.host_stage as *mut c_void);
+        } else {
+            unsafe { crate::memory::checked_free(s.host_stage, s.cap) };
+        }
+    }
+}
+
+/// Upload a whole layer pack in ONE HtoD. `pw_list_ptr` is an `NslList` of the
+/// pack's parameter tensor pointers (built by codegen from a CSLA layer
+/// group). All must be registered and currently evicted. After this returns
+/// each param's `t.data` points inside a shared, reused device slot (a
+/// non-owning view) and the pack shares one slot for its whole residency.
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
+    if pw_list_ptr == 0 {
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let list = crate::list::NslList::from_ptr(pw_list_ptr);
+        let n = list.len as usize;
+        if n == 0 {
+            return;
+        }
+        crate::cuda::inner::ensure_context();
+        let mut guard = MIRRORS.lock().unwrap();
+        let table = guard
+            .as_mut()
+            .expect("[weight-stream] upload_pack before any register");
+
+        // Aligned offsets within the pack + total bytes.
+        let mut layout: Vec<(i64, usize, usize)> = Vec::with_capacity(n); // (ptr, off, bytes)
+        let mut total = 0usize;
+        for i in 0..n {
+            let ptr = unsafe { *list.data.add(i) };
+            let Some(m) = table.get(&ptr) else {
+                eprintln!("[weight-stream] FATAL: upload_pack of unregistered tensor {ptr}");
+                std::process::abort();
+            };
+            let off = align_up(total, ARENA_ALIGN);
+            layout.push((ptr, off, m.bytes));
+            total = off + m.bytes;
+        }
+
+        let (slot_idx, dev, host_stage) = arena_acquire(total, n);
+
+        // Gather each mirror into the contiguous pinned host buffer, then ONE
+        // HtoD for the whole pack.
+        for &(ptr, off, bytes) in &layout {
+            let host = table.get(&ptr).unwrap().host;
+            unsafe { std::ptr::copy_nonoverlapping(host, host_stage.add(off), bytes) };
+        }
+        crate::cuda::inner::memcpy_htod(dev, host_stage as *const c_void, total);
+
+        // Point each param at its arena offset (non-owning view).
+        for &(ptr, off, _bytes) in &layout {
+            let t = NslTensor::from_ptr(ptr);
+            let interior = unsafe { (dev as *mut u8).add(off) } as *mut c_void;
+            t.data = interior;
+            // A view into the arena: a stray `nsl_tensor_free` must NOT free an
+            // interior pointer. Restored to owned (=1) at teardown.
+            t.owns_data = 0;
+            let m = table.get_mut(&ptr).unwrap();
+            let dev_i = interior as i64;
+            if m.last_dev != 0 && m.last_dev != dev_i {
+                WS_PTR_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            m.last_dev = dev_i;
+            m.arena_slot = slot_idx as i64;
+            m.arena_off = off;
+            WS_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        WS_PACK_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = pw_list_ptr;
+    }
+}
+
+/// Evict a whole layer pack in ONE DtoH (when `writeback != 0`). Params not
+/// currently arena-resident are skipped (keeps the belt idempotent). All
+/// resident members must share one slot (codegen invariant — they were
+/// uploaded together).
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64) {
+    if pw_list_ptr == 0 {
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let list = crate::list::NslList::from_ptr(pw_list_ptr);
+        let n = list.len as usize;
+        if n == 0 {
+            return;
+        }
+        crate::cuda::inner::ensure_context();
+        let mut guard = MIRRORS.lock().unwrap();
+        let table = guard
+            .as_mut()
+            .expect("[weight-stream] evict_pack before any register");
+
+        let mut slot: i64 = -1;
+        let mut regions: Vec<(i64, usize, usize)> = Vec::with_capacity(n); // (ptr, off, bytes)
+        for i in 0..n {
+            let ptr = unsafe { *list.data.add(i) };
+            let Some(m) = table.get(&ptr) else {
+                eprintln!("[weight-stream] FATAL: evict_pack of unregistered tensor {ptr}");
+                std::process::abort();
+            };
+            if m.arena_slot < 0 {
+                continue; // already evicted / not arena-resident
+            }
+            if slot < 0 {
+                slot = m.arena_slot;
+            } else if slot != m.arena_slot {
+                eprintln!(
+                    "[weight-stream] FATAL: evict_pack members span slots {slot} and {} \
+                     — pack upload/evict grouping mismatch",
+                    m.arena_slot
+                );
+                std::process::abort();
+            }
+            regions.push((ptr, m.arena_off, m.bytes));
+        }
+        if regions.is_empty() {
+            return;
+        }
+        let (dev, host_stage) = arena_slot_bufs(slot as usize);
+
+        if writeback != 0 {
+            // ONE DtoH of the occupied span, then scatter to per-param mirrors
+            // (interior gaps between aligned regions are copied but ignored).
+            let span = regions.iter().map(|&(_, o, b)| o + b).max().unwrap_or(0);
+            crate::cuda::inner::memcpy_dtoh(host_stage as *mut c_void, dev as *const c_void, span);
+            for &(ptr, off, bytes) in &regions {
+                let host = table.get(&ptr).unwrap().host;
+                unsafe { std::ptr::copy_nonoverlapping(host_stage.add(off), host, bytes) };
+            }
+        }
+        for &(ptr, _off, _bytes) in &regions {
+            let t = NslTensor::from_ptr(ptr);
+            t.data = std::ptr::null_mut();
+            let m = table.get_mut(&ptr).unwrap();
+            m.arena_slot = -1;
+            WS_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if writeback != 0 {
+                WS_EVICTS_WB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        arena_release_pack(slot as usize, regions.len());
+        WS_PACK_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = writeback;
+    }
+}
+
 /// Is `tensor_ptr` a currently-registered streamed parameter? Used by
 /// `nsl_model_save` to materialize an evicted param from its mirror for the
 /// duration of the serialization read (Item 12: mid-loop model_save no
@@ -284,7 +578,7 @@ pub extern "C" fn nsl_weight_stream_is_registered(tensor_ptr: i64) -> i64 {
     #[cfg(feature = "cuda")]
     {
         let guard = MIRRORS.lock().unwrap();
-        return guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr)) as i64;
+        guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr)) as i64
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -341,7 +635,20 @@ pub extern "C" fn nsl_weight_stream_teardown() {
         for (ptr, m) in table {
             let t = NslTensor::from_ptr(ptr);
             crate::cuda::inner::ensure_context();
-            if t.data.is_null() {
+            if m.arena_slot >= 0 {
+                // Item 10: still resident in a shared arena slot (defensive —
+                // the loop evicts every pack after its update, so this is rare).
+                // Copy its bytes into a fresh OWNED device buffer (DtoD) and
+                // restore the ownership flag so post-training code sees an
+                // ordinary tensor. NOT counted in WS_UPLOADS (post-training).
+                let (dev_base, _hs) = arena_slot_bufs(m.arena_slot as usize);
+                let interior =
+                    unsafe { (dev_base as *const u8).add(m.arena_off) } as *const c_void;
+                let owned = crate::cuda::inner::alloc_managed(m.bytes);
+                crate::cuda::inner::memcpy_dtod(owned, interior, m.bytes);
+                t.data = owned;
+                t.owns_data = 1;
+            } else if t.data.is_null() {
                 // NOTE: deliberately NOT counted in WS_UPLOADS — under
                 // part-2 whole-loop streaming EVERY streamed param arrives
                 // here evicted (this branch is the steady state, and this
@@ -355,6 +662,9 @@ pub extern "C" fn nsl_weight_stream_teardown() {
                 let dev = crate::cuda::inner::alloc_managed(m.bytes);
                 crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
                 t.data = dev;
+                // Arena-mode evicts leave owns_data=0 (set at upload_pack);
+                // restore it so the tensor owns its fresh buffer.
+                t.owns_data = 1;
             }
             // Mirror free: pinned buffers go back to the driver, pageable
             // fallbacks to the heap (same routing as free_host_tensor_data).
@@ -364,5 +674,7 @@ pub extern "C" fn nsl_weight_stream_teardown() {
             }
             unsafe { crate::memory::checked_free(m.host, m.bytes) };
         }
+        // Free the arena slots now that every param owns its buffer again.
+        arena_teardown();
     }
 }

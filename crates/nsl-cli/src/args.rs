@@ -793,6 +793,14 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 
+        /// Item 10 (requires --weight-stream): batch each layer's per-param
+        /// transfers into ONE contiguous host<->device transfer through a
+        /// stable, reused device staging arena. Fewer CUDA calls, one large
+        /// PCIe transaction per layer, stable device addresses, less
+        /// fragmentation. Bit-exact with the per-param path.
+        #[arg(long, requires = "weight_stream")]
+        pub(crate) stream_arena: bool,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -1198,6 +1206,12 @@ pub(crate) struct RunArgs {
         /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
+
+        /// Item 10 (requires --weight-stream): batch each layer's per-param
+        /// transfers into ONE contiguous host<->device transfer through a
+        /// stable, reused device staging arena. Bit-exact with per-param.
+        #[arg(long, requires = "weight_stream")]
+        pub(crate) stream_arena: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
