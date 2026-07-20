@@ -127,7 +127,7 @@ pub(crate) mod inner {
     /// comes from the driver so a 2-rank run on a 1-GPU box binds both
     /// ranks to device 0 (useful for CPU-collective + GPU-compute testing;
     /// NCCL itself decides whether it accepts that topology).
-    unsafe fn select_device_ordinal() -> i32 {
+    pub(crate) unsafe fn select_device_ordinal() -> i32 {
         if let Some(k) = std::env::var("NSL_CUDA_DEVICE")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
@@ -2518,6 +2518,40 @@ pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_n
     inner::sync_after_kernel();
 }
 
+/// In-place scale of a RAW contiguous device f32 buffer (no NslTensor
+/// wrapper) — the ZeRO stage-2 scatter averages its staging buffer before
+/// unpacking, so byte-range CHUNKS of a tensor scale exactly once. Same
+/// kernel as `nsl_tensor_mul_scalar_inplace`'s device path (bit-exact).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_scale_raw_f32(dev: *mut std::ffi::c_void, n: usize, scalar: f32) {
+    let mut a_data = dev as u64;
+    let mut c_data = dev as u64; // output = input buffer
+    let mut s_val = scalar;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut s_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::MUL_SCALAR_F32_PTX.as_ptr(),
+        "nsl_mul_scalar_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU raw f32 scale kernel failed: {}",
+        result as u32
+    );
+    inner::sync_after_kernel();
+}
+
 /// FASE fused scaled-add (Milestone C · p4): `m[i] = m[i] + g[i] * scale`,
 /// in place into `m`. `m` and `g` must be contiguous device f32 buffers of the
 /// same length `n`. Bit-exact with `gpu_scalar_op_inplace(g, scale, MUL_SCALAR)`
@@ -3171,8 +3205,13 @@ pub fn cuda_device_name() -> Option<String> {
         if cuDeviceGetCount(&mut count) != CUresult::CUDA_SUCCESS || count == 0 {
             return None;
         }
+        // Name the device this process will actually BIND (NSL_CUDA_DEVICE /
+        // spawner striping), not unconditionally ordinal 0 — on a mixed-GPU
+        // node the planner would otherwise calibrate rank 1 against rank 0's
+        // card. A bad override fails rc-checked into the None fallback.
+        let ordinal = inner::select_device_ordinal();
         let mut device: CUdevice = 0;
-        if cuDeviceGet(&mut device, 0) != CUresult::CUDA_SUCCESS {
+        if cuDeviceGet(&mut device, ordinal) != CUresult::CUDA_SUCCESS {
             return None;
         }
         let mut buf = [0i8; 128];

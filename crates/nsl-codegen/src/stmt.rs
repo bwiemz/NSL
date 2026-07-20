@@ -10712,11 +10712,13 @@ impl Compiler<'_> {
                         builder.ins().brif(owned, pb_do, &[], pb_skip, &[]);
                         builder.switch_to_block(pb_skip);
                         builder.seal_block(pb_skip);
-                        let zf = builder.ins().f64const(0.0);
+                        // L8 hygiene: a true zero-fill, NOT mul-by-0.0 — if
+                        // a diverging window left Inf/NaN in m_partial,
+                        // x*0.0 is NaN and the buffer never recovers.
                         self.compile_call_by_name(
                             builder,
-                            "nsl_tensor_mul_scalar_inplace",
-                            &[pb_mpart, zf],
+                            "nsl_tensor_zero_inplace",
+                            &[pb_mpart],
                         )?;
                         builder.ins().jump(pb_join, &[]);
                         builder.switch_to_block(pb_do);
@@ -10812,11 +10814,12 @@ impl Compiler<'_> {
                         builder.ins().brif(owned, fs_do, &[], fs_skip, &[]);
                         builder.switch_to_block(fs_skip);
                         builder.seal_block(fs_skip);
-                        let zf = builder.ins().f64const(0.0);
+                        // L8 hygiene: true zero-fill (see the clip-path
+                        // comment — mul-by-0.0 keeps NaN/Inf alive).
                         self.compile_call_by_name(
                             builder,
-                            "nsl_tensor_mul_scalar_inplace",
-                            &[mp, zf],
+                            "nsl_tensor_zero_inplace",
+                            &[mp],
                         )?;
                         builder.ins().jump(fs_join, &[]);
                         builder.switch_to_block(fs_do);

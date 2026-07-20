@@ -842,6 +842,11 @@ pub struct NcclBackend {
     /// fallbacks for send/recv). Shares the spawner's shm mapping.
     host: SimulatedBackend,
     comm: cudarc::nccl::sys::ncclComm_t,
+    /// Set once `ncclCommAbort` has run: Drop must then SKIP
+    /// `ncclCommDestroy` — destroying an aborted communicator is undefined
+    /// (NCCL documents abort as the terminal call for that comm) and can
+    /// block or crash during process teardown.
+    aborted: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: the ncclComm_t is only used from the (single-threaded) training
@@ -921,7 +926,21 @@ impl NcclBackend {
                  single-GPU machine NCCL may refuse multiple ranks per device"
             ));
         }
-        Ok(Self { host, comm })
+        Ok(Self {
+            host,
+            comm,
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Abort the communicator exactly once and remember it for Drop.
+    fn abort_comm(&self) {
+        if !self
+            .aborted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            unsafe { cudarc::nccl::sys::ncclCommAbort(self.comm) };
+        }
     }
 
     fn nccl_dtype(dtype: DtypeId) -> Option<cudarc::nccl::sys::ncclDataType_t> {
@@ -946,7 +965,7 @@ impl NcclBackend {
                 "nsl: {what} failed on rank {}: {rc:?} — aborting the communicator",
                 self.host.rank()
             );
-            unsafe { nccl::ncclCommAbort(self.comm) };
+            self.abort_comm();
             return -1;
         }
         let secs = nccl_timeout_secs();
@@ -956,7 +975,7 @@ impl NcclBackend {
                  died mid-collective. Aborting (set NSL_NCCL_TIMEOUT_SECS to tune).",
                 self.host.rank()
             );
-            unsafe { nccl::ncclCommAbort(self.comm) };
+            self.abort_comm();
             std::process::abort();
         }
         // Surface async (background-thread) NCCL errors loudly too.
@@ -967,7 +986,7 @@ impl NcclBackend {
                 "nsl: {what}: async NCCL error on rank {}: {aerr:?} — aborting",
                 self.host.rank()
             );
-            unsafe { nccl::ncclCommAbort(self.comm) };
+            self.abort_comm();
             return -1;
         }
         0
@@ -982,7 +1001,9 @@ impl NcclBackend {
 #[cfg(feature = "nccl")]
 impl Drop for NcclBackend {
     fn drop(&mut self) {
-        if !self.comm.is_null() {
+        if !self.comm.is_null()
+            && !self.aborted.load(std::sync::atomic::Ordering::Acquire)
+        {
             unsafe { cudarc::nccl::sys::ncclCommDestroy(self.comm) };
         }
     }
