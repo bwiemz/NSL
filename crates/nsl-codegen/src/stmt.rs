@@ -4291,6 +4291,14 @@ impl Compiler<'_> {
         let mut eps_value: f64 = 1e-8;
         // P5 Muon: Newton-Schulz iteration depth (spec default 5).
         let mut ns_steps_value: f64 = 5.0;
+        // P5 Muon (review M6): the generic defaults above are wrong for
+        // Muon — spec/10 promises Muon(lr=0.02, momentum=0.95,
+        // nesterov=true), and momentum=0.0 silently degrades the Muon arm
+        // to orthogonalized plain GD. Track which knobs the user actually
+        // set so bare Muon() gets its spec defaults after parsing.
+        let mut lr_set = false;
+        let mut momentum_set = false;
+        let mut nesterov_set = false;
         let mut step_body: Option<(&nsl_ast::stmt::Block, nsl_ast::Symbol)> = None;
         let mut callbacks: Vec<&nsl_ast::block::CallbackDef> = Vec::new();
         let mut scheduler_name = String::new();
@@ -4311,13 +4319,16 @@ impl Compiler<'_> {
                                     "lr" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             lr_value = *f;
+                                            lr_set = true;
                                         } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
                                             lr_value = *n as f64;
+                                            lr_set = true;
                                         }
                                     }
                                     "momentum" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             momentum_value = *f;
+                                            momentum_set = true;
                                         }
                                     }
                                     "dampening" => {
@@ -4333,6 +4344,7 @@ impl Compiler<'_> {
                                     "nesterov" => {
                                         if let ExprKind::BoolLiteral(b) = &arg.value.kind {
                                             nesterov_value = *b;
+                                            nesterov_set = true;
                                         }
                                     }
                                     "beta1" => {
@@ -4435,6 +4447,22 @@ impl Compiler<'_> {
             return Err(CodegenError::new(
                 "train block requires an optimizer section",
             ));
+        }
+
+        // P5 Muon (review M6): apply the SPEC defaults for knobs the user
+        // left unset — Muon(lr=0.02, momentum=0.95, nesterov=true). The
+        // generic defaults (lr=0.01, momentum=0.0, nesterov=false) would
+        // silently degrade a bare Muon() to orthogonalized momentum-free GD.
+        if optimizer_name == "muon" {
+            if !lr_set {
+                lr_value = 0.02;
+            }
+            if !momentum_set {
+                momentum_value = 0.95;
+            }
+            if !nesterov_set {
+                nesterov_value = true;
+            }
         }
 
         let (step_body, step_param_sym) =
@@ -4974,7 +5002,24 @@ impl Compiler<'_> {
         // FullBuffer per param. When None (no WGGO active), the loops use
         // today's monolithic `fase_deferred` branch (byte-identical to
         // pre-Phase-2 codegen).
-        let mode_table_base: Option<cranelift_codegen::ir::Value> = {
+        let mode_table_base: Option<cranelift_codegen::ir::Value> = if optimizer_name == "muon" {
+            // P5 Muon (review M5): FaseOptimizer::Unknown plans FullBuffer-
+            // global, but plan_with_overrides still materializes an
+            // all-FullBuffer per-layer table when WGGO overrides exist —
+            // which would route Muon through the unified dispatch, where
+            // the mixed-step routing flags are not threaded. The table is
+            // semantically empty for Muon (every byte FullBuffer), so skip
+            // it and keep Muon on the monolithic loop. Say so loudly.
+            if self.wggo_overrides.is_some() {
+                eprintln!(
+                    "[muon] note: WGGO per-layer FASE overrides do not apply to \
+                     the mixed Muon/AdamW optimizer (it has no Deferred mode) — \
+                     ignoring the mode table; training uses the standard \
+                     per-param step."
+                );
+            }
+            None
+        } else {
             let modes = crate::fase_codegen_table::build_param_mode_table(
                 &param_paths,
                 &model_var_name,
@@ -12712,19 +12757,17 @@ impl Compiler<'_> {
                     )?;
                 }
                 "muon" => {
-                    self.compile_call_by_name(
-                        builder,
-                        &opt_fn,
-                        &[
-                            param_val,
-                            grad_val,
-                            s1,
-                            lr,
-                            momentum_const,
-                            weight_decay_const,
-                            nesterov_const,
-                        ],
-                    )?;
+                    // Muon refuses at the top of this emitter (mixed
+                    // Muon/AdamW is not wired for @pipeline). Keep this arm
+                    // an ERROR, not a call: the old 7-arg call shape no
+                    // longer matches the 14-param mixed stdlib fn, and a
+                    // silently re-enabled arm would pass garbage into
+                    // adamw_route/betas/t.
+                    return Err(CodegenError::new(
+                        "internal: muon reached the pipelined optimizer arm \
+                         despite the @pipeline refusal — mixed Muon/AdamW is \
+                         not wired for pipelined train blocks",
+                    ));
                 }
                 "soap" => {
                     let s2 =

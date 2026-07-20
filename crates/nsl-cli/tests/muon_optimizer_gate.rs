@@ -217,6 +217,46 @@ fn muon_orthogonalize_matches_reference() {
             got[1]
         );
     }
+
+    // Review L9 — full Muon-arm step pin: 2 steps on a tall 4x3 param with
+    // constant grad (momentum accumulate, nesterov combine on the UPDATED
+    // buffer, sqrt(rows/cols) scale, decoupled weight decay). Mirrors the
+    // fixture's STEP block exactly.
+    let (rows, cols) = (4usize, 3usize);
+    let mut p: Vec<f64> = (0..12).map(|i| (i as f64 * 1.3 + 0.5).sqrt() - 1.2).collect();
+    let g: Vec<f64> = (0..12).map(|i| (i as f64 * 0.9 + 0.9).sqrt() - 1.0).collect();
+    let mut m = vec![0.0f64; 12];
+    let (lr, momentum, wd) = (0.02f64, 0.95f64, 0.01f64);
+    let scale = (rows as f64 / cols as f64).sqrt();
+    for _ in 0..2 {
+        for i in 0..12 {
+            m[i] = momentum * m[i] + g[i];
+        }
+        let upd: Vec<f64> = (0..12).map(|i| g[i] + momentum * m[i]).collect();
+        let o = ns_reference(&upd, rows, cols, 5);
+        for i in 0..12 {
+            p[i] = p[i] * (1.0 - lr * wd) - (lr * scale) * o[i];
+        }
+    }
+    let got = stats_block(&out.stdout, "STEP_BEGIN", "STEP_END");
+    assert_eq!(got.len(), 3, "STEP: expected 3 stats:\n{}", out.stdout);
+    let want = [
+        p.iter().sum::<f64>(),
+        p.iter().map(|v| v * v).sum::<f64>(),
+        m.iter().sum::<f64>(),
+    ];
+    for (name, w, h) in [
+        ("sum(p)", want[0], got[0]),
+        ("fro2(p)", want[1], got[1]),
+        ("sum(m)", want[2], got[2]),
+    ] {
+        // 1e-4: f32 tensor creation noise compounds over 2 steps; a wrong
+        // sign/coefficient/order moves these at O(1e-2)+.
+        assert!(
+            (w - h).abs() < 1e-4,
+            "STEP {name}: reference {w} vs NSL {h}"
+        );
+    }
 }
 
 /// All-AdamW-routed model (embed by name, norm by rank): Muon at AdamW

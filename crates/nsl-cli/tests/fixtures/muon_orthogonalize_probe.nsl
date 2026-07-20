@@ -8,6 +8,7 @@
 # Also probes the tall case (rows > cols) through the transpose branch.
 
 from nsl.optim.muon import muon_orthogonalize
+from nsl.optim.muon import muon_step
 
 # Wide: 4x6 (rows <= cols, no transpose)
 let g = (sqrt(arange(24) * 1.7 + full([24], 0.3)) - full([24], 1.5)).reshape([4, 6])
@@ -28,3 +29,20 @@ print(sum(ot * ot).item())
 let rt = ot.transpose(0, 1) @ ot
 print(sum(rt * rt).item())
 print("TALL_END")
+
+# Full Muon-arm step pin (review L9): two muon_step calls on a tall 4x3
+# param with a CONSTANT gradient exercise the momentum accumulate, the
+# nesterov combine (uses the UPDATED buffer), the sqrt(rows/cols) scale
+# and the decoupled weight decay — a sign or order error in any of them
+# moves these stats at O(1e-2)+.
+let p = (sqrt(arange(12) * 1.3 + full([12], 0.5)) - full([12], 1.2)).reshape([4, 3])
+let gr = (sqrt(arange(12) * 0.9 + full([12], 0.9)) - full([12], 1.0)).reshape([4, 3])
+let mbuf = zeros([4, 3])
+let vbuf = zeros([4, 3])
+muon_step(p, gr, mbuf, vbuf, 0.0, 0.02, 0.95, 0.9, 0.999, 0.00000001, 0.01, true, 5.0, 1.0)
+muon_step(p, gr, mbuf, vbuf, 0.0, 0.02, 0.95, 0.9, 0.999, 0.00000001, 0.01, true, 5.0, 2.0)
+print("STEP_BEGIN")
+print(sum(p).item())
+print(sum(p * p).item())
+print(sum(mbuf).item())
+print("STEP_END")

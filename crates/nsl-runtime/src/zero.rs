@@ -500,6 +500,12 @@ fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
     };
     mix(ctx.stage as u64);
     mix(ctx.world_size as u64);
+    // Review M1: the bucket cap SHAPES the per-step collective sequence
+    // (sub-group count, chunking) — a per-rank NSL_ZERO_BUCKET_MB
+    // divergence would pass a sizes/owners-only hash and then deadlock the
+    // spin-barrier (rank A issues 12 scatters/step, rank B issues 6).
+    // Hash it with everything else that determines the sequence.
+    mix(zero_bucket_cap_bytes() as u64);
     mix(sizes.len() as u64);
     for &s in sizes {
         mix(s);
@@ -524,13 +530,43 @@ fn verify_plan_across_ranks(ctx: &ZeROContext, sizes: &[u64]) -> bool {
         return false;
     }
     let root = u64::from_le_bytes(buf);
-    if root != local {
+    let matched = root == local;
+    if !matched {
         eprintln!(
             "nsl: ZeRO partition plan MISMATCH on rank {}: local hash \
              {local:#018x} != rank-0 hash {root:#018x} — ranks disagree on \
-             param sizes or ownership; refusing to train a torn model",
+             param sizes, ownership or bucket config; refusing to train a \
+             torn model",
             ctx.rank
         );
+    }
+    // Review L2 (symmetric refusal): without this, only the MISMATCHING
+    // ranks refuse — rank 0 trivially matches itself, proceeds, and hangs
+    // at the next collective. All-reduce a match flag so every rank
+    // (including the root) refuses together.
+    let mut flag: f64 = if matched { 1.0 } else { 0.0 };
+    let rc = host.all_reduce_sum(
+        &flag as *const f64 as *const std::ffi::c_void,
+        &mut flag as *mut f64 as *mut std::ffi::c_void,
+        1,
+        crate::tensor_parallel::collective::DTYPE_F64,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        eprintln!(
+            "nsl: zero plan verification all_reduce failed rc={rc} on rank {}",
+            ctx.rank
+        );
+        return false;
+    }
+    if flag < ctx.world_size as f64 {
+        if matched {
+            eprintln!(
+                "nsl: ZeRO partition plan MISMATCH reported by a peer rank — \
+                 refusing on rank {} too (symmetric shutdown)",
+                ctx.rank
+            );
+        }
         return false;
     }
     true

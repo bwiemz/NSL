@@ -118,6 +118,10 @@ fn Muon(params: ParamGroup, lr: f64 = 0.02, momentum: f64 = 0.95,
     ## param path: embed/lm_head/unembed/wte/wpe/vocab) and all non-rank-2
     ## params (biases, norms) take a standard AdamW step with beta1/beta2/
     ## eps. The routing table prints at train start ([muon] line).
+    ## CAUTION: name matching is by SUBSTRING — a hidden weight whose path
+    ## contains a keyword (e.g. "embed_proj") routes to AdamW, and an
+    ## embedding named outside the list (e.g. "tok_table") routes to Muon.
+    ## Check the printed [muon] table when param names are unconventional.
 
 # 5. Cosine annealing scheduler
 fn CosineScheduler(optimizer: Optimizer, T_max: int,
