@@ -86,6 +86,28 @@ pub extern "C" fn nsl_model_save(
     let pad_buf = [0u8; 64];
     write_or_abort(&mut file, &pad_buf[..padding], "write padding");
 
+    // Item 12: a mid-loop `model_save` under `--weight-stream` sees streamed
+    // params EVICTED — `t.data == null` while `t.device` stays set, so the
+    // GPU staging branch below would `nsl_tensor_to_device` a null source and
+    // crash loudly (#395's documented hazard). Materialize each
+    // evicted-but-registered param from its pinned host mirror for the
+    // duration of the serialization read, then restore the evicted state.
+    // This makes `model_save` safe wherever it is called — a callback, mid
+    // training loop, or teardown — without the caller forcing residency
+    // first. The header loop above only reads intact metadata (shape / len /
+    // dtype), so residency is needed for the DATA loop alone.
+    let mut materialized: Vec<i64> = Vec::new();
+    for i in 0..tensors.len as usize {
+        let tensor_ptr = unsafe { *tensors.data.add(i) };
+        let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor.data.is_null()
+            && crate::weight_stream::nsl_weight_stream_is_registered(tensor_ptr) != 0
+        {
+            crate::weight_stream::nsl_weight_stream_upload(tensor_ptr);
+            materialized.push(tensor_ptr);
+        }
+    }
+
     // Raw tensor data (little-endian, dtype-aware).
     // GPU tensors are transferred to CPU before reading data.
     for i in 0..tensors.len as usize {
@@ -140,6 +162,14 @@ pub extern "C" fn nsl_model_save(
             };
             write_or_abort(&mut file, data_slice, "write tensor data");
         }
+    }
+
+    // Restore the streamed (evicted) state for every param materialized
+    // above — read-only, so no writeback (model_save never mutates θ). If we
+    // materialized nothing (no streaming, or all params already resident)
+    // this is an empty loop.
+    for &ptr in &materialized {
+        crate::weight_stream::nsl_weight_stream_evict(ptr, 0);
     }
 }
 

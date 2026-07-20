@@ -24,6 +24,22 @@ enum SourceAdParamDiagnosticKind {
     IgnoredNonTensor,
 }
 
+/// Item 12: result of analyzing whether a train-loop callback body touches
+/// the streamed model θ (see `Compiler::analyze_callback_model_touch`).
+#[derive(Default, Debug)]
+struct CallbackModelTouch {
+    /// The callback references the model (a field read, a method call, an
+    /// `Ident` passed to `model_save`/a helper, …). Requires a scoped upload
+    /// under `--weight-stream` or its reads launch on evicted (null) data.
+    touches: bool,
+    /// The callback may MUTATE θ (an assignment rooted at the model, or a
+    /// method call on the model/one of its fields). Drives writeback=1 on the
+    /// closing re-evict so the mutation survives the next window's upload.
+    may_write: bool,
+    /// First model-rooted access path seen, for the compile-time diagnostic.
+    first_path: Option<String>,
+}
+
 fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
@@ -3711,6 +3727,279 @@ impl Compiler<'_> {
         builder.seal_block(merge_b);
         state.current_block = Some(merge_b);
         Ok(builder.block_params(merge_b)[0])
+    }
+
+    /// Item 12: how a train-loop callback body touches the streamed model θ.
+    /// Under `--weight-stream` params are EVICTED (`t.data == null`) when a
+    /// callback runs, so a model-field read launches on a null pointer (the
+    /// #395 crash). This drives a scoped `upload_all` / `reevict_all` bracket
+    /// around any body that references the model, turning the runtime crash
+    /// into a compile-time-inserted residency window.
+    fn analyze_callback_model_touch(
+        &self,
+        block: &nsl_ast::stmt::Block,
+        model_sym: nsl_ast::Symbol,
+    ) -> CallbackModelTouch {
+        let mut acc = CallbackModelTouch::default();
+        for stmt in &block.stmts {
+            self.walk_stmt_model_touch(stmt, model_sym, &mut acc);
+        }
+        acc
+    }
+
+    /// NSL in-place tensor mutators — the only calls that write a param
+    /// through a receiver/dest operand (`copy_data(dest, src)`,
+    /// `zero_inplace(t)`, the `nsl_tensor_{op}_inplace` family). Everything
+    /// else is functional (returns a fresh tensor).
+    fn is_inplace_mutator(name: &str) -> bool {
+        matches!(name, "copy_data" | "copy_") || name.ends_with("_inplace")
+    }
+
+    /// Root identifier of an lvalue/access chain (`model.enc.w[0]` -> `model`).
+    fn expr_root_ident(e: &nsl_ast::expr::Expr) -> Option<nsl_ast::Symbol> {
+        use nsl_ast::expr::ExprKind as E;
+        match &e.kind {
+            E::Ident(s) => Some(*s),
+            E::MemberAccess { object, .. } => Self::expr_root_ident(object),
+            E::Subscript { object, .. } => Self::expr_root_ident(object),
+            E::Paren(inner) => Self::expr_root_ident(inner),
+            _ => None,
+        }
+    }
+
+    /// Dotted path of a model-rooted member chain, for the diagnostic
+    /// (`model.encoder.weight`). Best-effort — falls back to the model name.
+    fn model_access_path(&self, e: &nsl_ast::expr::Expr) -> Option<String> {
+        use nsl_ast::expr::ExprKind as E;
+        match &e.kind {
+            E::Ident(s) => Some(self.resolve_sym(*s).to_string()),
+            E::MemberAccess { object, member } => {
+                let base = self.model_access_path(object)?;
+                Some(format!("{base}.{}", self.resolve_sym(*member)))
+            }
+            E::Subscript { object, .. } => self.model_access_path(object),
+            E::Paren(inner) => self.model_access_path(inner),
+            _ => None,
+        }
+    }
+
+    fn walk_stmt_model_touch(
+        &self,
+        stmt: &nsl_ast::stmt::Stmt,
+        model_sym: nsl_ast::Symbol,
+        acc: &mut CallbackModelTouch,
+    ) {
+        use nsl_ast::stmt::StmtKind as S;
+        match &stmt.kind {
+            S::Assign { target, value, .. } => {
+                // A write whose lvalue is rooted at the model mutates θ.
+                if Self::expr_root_ident(target) == Some(model_sym) {
+                    acc.touches = true;
+                    acc.may_write = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = self.model_access_path(target);
+                    }
+                }
+                self.walk_expr_model_touch(target, model_sym, acc);
+                self.walk_expr_model_touch(value, model_sym, acc);
+            }
+            S::VarDecl { value: Some(v), .. } => {
+                self.walk_expr_model_touch(v, model_sym, acc)
+            }
+            S::Expr(e) | S::Return(Some(e)) | S::Yield(Some(e)) => {
+                self.walk_expr_model_touch(e, model_sym, acc)
+            }
+            S::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
+                self.walk_expr_model_touch(condition, model_sym, acc);
+                for s in &then_block.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+                for (c, b) in elif_clauses {
+                    self.walk_expr_model_touch(c, model_sym, acc);
+                    for s in &b.stmts {
+                        self.walk_stmt_model_touch(s, model_sym, acc);
+                    }
+                }
+                if let Some(b) = else_block {
+                    for s in &b.stmts {
+                        self.walk_stmt_model_touch(s, model_sym, acc);
+                    }
+                }
+            }
+            S::For { iterable, body, .. } => {
+                self.walk_expr_model_touch(iterable, model_sym, acc);
+                for s in &body.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+            }
+            S::While { condition, body } => {
+                self.walk_expr_model_touch(condition, model_sym, acc);
+                for s in &body.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_expr_model_touch(
+        &self,
+        e: &nsl_ast::expr::Expr,
+        model_sym: nsl_ast::Symbol,
+        acc: &mut CallbackModelTouch,
+    ) {
+        use nsl_ast::expr::ExprKind as E;
+        match &e.kind {
+            E::Ident(s) => {
+                if *s == model_sym {
+                    acc.touches = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = Some(self.resolve_sym(*s).to_string());
+                    }
+                }
+            }
+            E::MemberAccess { object, .. } => {
+                if Self::expr_root_ident(e) == Some(model_sym) {
+                    acc.touches = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = self.model_access_path(e);
+                    }
+                }
+                self.walk_expr_model_touch(object, model_sym, acc);
+            }
+            E::Call { callee, args } => {
+                // Only a genuine IN-PLACE mutator (`copy_data(m.x, ..)`,
+                // `m.x.add_inplace(..)`, any `*_inplace`) writes θ. Functional
+                // methods (`.sum()`, `.transpose()`, `.mean()`) return new
+                // tensors and never mutate the receiver, so they are read-only
+                // — flagging them would force a needless full-model writeback
+                // on every logging callback. The callee name is the free-fn
+                // ident or the method member.
+                let callee_name = match &callee.kind {
+                    E::Ident(s) => Some(self.resolve_sym(*s).to_string()),
+                    E::MemberAccess { member, .. } => {
+                        Some(self.resolve_sym(*member).to_string())
+                    }
+                    _ => None,
+                };
+                if callee_name.as_deref().is_some_and(Self::is_inplace_mutator) {
+                    // Dest is the model-rooted operand: the receiver for the
+                    // method form (`m.x.add_inplace(..)`), the first arg for
+                    // the free-fn form (`copy_data(m.x, ..)`).
+                    let receiver_model = matches!(&callee.kind, E::MemberAccess { object, .. }
+                        if Self::expr_root_ident(object) == Some(model_sym));
+                    let arg_model = args
+                        .iter()
+                        .any(|a| Self::expr_root_ident(&a.value) == Some(model_sym));
+                    if receiver_model || arg_model {
+                        acc.touches = true;
+                        acc.may_write = true;
+                        if acc.first_path.is_none() {
+                            acc.first_path = args
+                                .iter()
+                                .find_map(|a| {
+                                    (Self::expr_root_ident(&a.value) == Some(model_sym))
+                                        .then(|| self.model_access_path(&a.value))
+                                        .flatten()
+                                })
+                                .or_else(|| match &callee.kind {
+                                    E::MemberAccess { object, .. } => {
+                                        self.model_access_path(object)
+                                    }
+                                    _ => None,
+                                });
+                        }
+                    }
+                }
+                self.walk_expr_model_touch(callee, model_sym, acc);
+                for a in args {
+                    self.walk_expr_model_touch(&a.value, model_sym, acc);
+                }
+            }
+            E::BinaryOp { left, right, .. } => {
+                self.walk_expr_model_touch(left, model_sym, acc);
+                self.walk_expr_model_touch(right, model_sym, acc);
+            }
+            E::UnaryOp { operand, .. } | E::Paren(operand) | E::Await(operand) => {
+                self.walk_expr_model_touch(operand, model_sym, acc)
+            }
+            E::Pipe { left, right } => {
+                self.walk_expr_model_touch(left, model_sym, acc);
+                self.walk_expr_model_touch(right, model_sym, acc);
+            }
+            E::Subscript { object, .. } => {
+                self.walk_expr_model_touch(object, model_sym, acc)
+            }
+            E::ListLiteral(xs) | E::TupleLiteral(xs) => {
+                for x in xs {
+                    self.walk_expr_model_touch(x, model_sym, acc);
+                }
+            }
+            E::FString(parts) => {
+                for p in parts {
+                    if let nsl_ast::expr::FStringPart::Expr(x) = p {
+                        self.walk_expr_model_touch(x, model_sym, acc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Item 12 — open bracket: if `--weight-stream` is active and the
+    /// callback body references model θ, make every streamed param resident
+    /// (`upload_all`) so the body's reads don't launch on evicted (null)
+    /// data. Returns `Some(may_write)` when a bracket was opened — the caller
+    /// passes it to `emit_callback_residency_close`. Returns `None` (no-op)
+    /// when streaming is off or the callback never touches the model, so the
+    /// steady-state transfer arithmetic the CSLA gates assert is unchanged.
+    fn emit_callback_residency_open(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        body: &nsl_ast::stmt::Block,
+        model_sym: nsl_ast::Symbol,
+        cb_name: &str,
+    ) -> Result<Option<bool>, CodegenError> {
+        if !self.compile_options.weight_stream {
+            return Ok(None);
+        }
+        let touch = self.analyze_callback_model_touch(body, model_sym);
+        if !touch.touches {
+            return Ok(None);
+        }
+        eprintln!(
+            "[weight-stream] callback '{}' reads model state ({}); inserting a \
+             scoped upload/re-evict bracket ({} writeback) so its reads see \
+             resident \u{3b8} instead of crashing on evicted (null) data",
+            cb_name,
+            touch.first_path.as_deref().unwrap_or("model"),
+            if touch.may_write { "with" } else { "without" },
+        );
+        self.compile_call_by_name(builder, "nsl_weight_stream_upload_all", &[])?;
+        Ok(Some(touch.may_write))
+    }
+
+    /// Item 12 — close bracket: restore the streamed (evicted) invariant after
+    /// a guarded callback body. `writeback=1` when the body might have mutated
+    /// θ so the change survives the next window's upload; `0` for a read-only
+    /// body (logging, `model_save`).
+    fn emit_callback_residency_close(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        guard: Option<bool>,
+    ) -> Result<(), CodegenError> {
+        if let Some(may_write) = guard {
+            let wb = builder
+                .ins()
+                .iconst(cl_types::I64, if may_write { 1 } else { 0 });
+            self.compile_call_by_name(builder, "nsl_weight_stream_reevict_all", &[wb])?;
+        }
+        Ok(())
     }
 
     fn compile_train_block(
@@ -10511,10 +10800,16 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // Item 12: open a scoped residency window if this callback
+                // touches model θ under weight streaming (else the reads
+                // launch on evicted, null data).
+                let ws_guard =
+                    self.emit_callback_residency_open(builder, &cb.body, model_sym, &cb_name)?;
                 // Compile callback body
                 for stmt in &cb.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
+                self.emit_callback_residency_close(builder, ws_guard)?;
             }
         }
 
@@ -10681,9 +10976,15 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // Item 12: same scoped-residency guard as on_step — an
+                // on_epoch callback that logs / saves model state runs with
+                // every streamed param evicted.
+                let ws_guard =
+                    self.emit_callback_residency_open(builder, &cb.body, model_sym, &cb_name)?;
                 for stmt in &cb.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
+                self.emit_callback_residency_close(builder, ws_guard)?;
             }
         }
 

@@ -272,6 +272,62 @@ pub extern "C" fn nsl_weight_stream_upload_all() {
     }
 }
 
+/// Is `tensor_ptr` a currently-registered streamed parameter? Used by
+/// `nsl_model_save` to materialize an evicted param from its mirror for the
+/// duration of the serialization read (Item 12: mid-loop model_save no
+/// longer crashes on a null data pointer).
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_is_registered(tensor_ptr: i64) -> i64 {
+    if tensor_ptr == 0 {
+        return 0;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let guard = MIRRORS.lock().unwrap();
+        return guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr)) as i64;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
+/// Re-evict every registered, currently-RESIDENT parameter, restoring the
+/// streamed (evicted) invariant after a scoped `upload_all`. This is the
+/// close bracket of the Item 12 callback guard: a callback that touches
+/// model θ under `--weight-stream` runs between `upload_all` (open) and this
+/// (close), so its field reads see resident data and its writes are captured.
+///
+/// `writeback`: pass 1 when the guarded callback might MUTATE θ (any assign
+/// to a model field, or a method call on one) — the device bytes are copied
+/// back to the mirror so the mutation survives the next window's upload; pass
+/// 0 for a read-only callback (logging, `model_save`) to skip the DtoH. The
+/// codegen picks this from a compile-time read-only analysis of the body.
+///
+/// Idempotent: an already-evicted param is skipped by `evict`. Emitted only
+/// when a callback actually references the model, so the steady-state
+/// transfer arithmetic the gates assert is untouched.
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
+    #[cfg(feature = "cuda")]
+    {
+        let keys: Vec<i64> = {
+            let guard = MIRRORS.lock().unwrap();
+            guard
+                .as_ref()
+                .map(|g| g.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        for ptr in keys {
+            nsl_weight_stream_evict(ptr, writeback);
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = writeback;
+    }
+}
+
 /// Restore every registered parameter to device residency (final upload +
 /// table drop). Emitted at train-block teardown so post-training code
 /// (model_save, eval) sees ordinary device tensors, and the pinned mirrors

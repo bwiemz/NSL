@@ -2790,6 +2790,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_weight_stream_upload", &[types::I64], None),
     ("nsl_weight_stream_evict", &[types::I64, types::I64], None),
     ("nsl_weight_stream_upload_all", &[], None),
+    // Item 12: re-evict everything after a scoped `upload_all` around a
+    // model-touching callback. Arg = writeback (1 if the callback may mutate).
+    ("nsl_weight_stream_reevict_all", &[types::I64], None),
     ("nsl_weight_stream_teardown", &[], None),
     ("nsl_weight_stream_upload_count", &[], Some(types::I64)),
     (
