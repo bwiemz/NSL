@@ -19,20 +19,22 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 fn run(source_ad: bool) -> String {
+    run_args(if source_ad { &["--source-ad"] } else { &[] })
+}
+
+fn run_args(extra: &[&str]) -> String {
     let root = repo_root();
     let path = root.join("crates/nsl-cli/tests/fixtures/rmsnorm_dx_parity.nsl");
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run"]);
-    if source_ad {
-        cmd.arg("--source-ad");
-    }
+    cmd.args(extra);
     cmd.arg(&path)
         .current_dir(&root)
         .env("NSL_STDLIB_PATH", root.join("stdlib"));
     let out = cmd.output().expect("spawn nsl run");
     assert!(
         out.status.success(),
-        "run failed (source_ad={source_ad}):\n{}",
+        "run failed (args={extra:?}):\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -67,6 +69,29 @@ fn source_ad_rmsnorm_dx_matches_tape_ad() {
             (a - b).abs() < 2e-3,
             "w[{i}] source-AD={a} vs tape-AD={b} (|Δ|={})",
             (a - b).abs()
+        );
+    }
+}
+
+#[test]
+fn fused_rmsnorm_dx_matches_decomposition_and_tape_ad() {
+    // Item 9 fusion: `--fuse-rmsnorm-backward` lowers the RMSNorm dx to a single
+    // fused op. On the CPU path it uses the same f64 formula as tape-AD, so it
+    // must match tape-AD (and the decomposition) to an f32 tolerance.
+    let fused = parse_w(&run_args(&["--source-ad", "--fuse-rmsnorm-backward"]));
+    let decomp = parse_w(&run(true));
+    let tape = parse_w(&run(false));
+    assert_eq!(fused.len(), 16, "fused produced {} values", fused.len());
+    for (i, ((f, d), t)) in fused.iter().zip(&decomp).zip(&tape).enumerate() {
+        assert!(
+            (f - t).abs() < 2e-3,
+            "w[{i}] fused={f} vs tape-AD={t} (|Δ|={})",
+            (f - t).abs()
+        );
+        assert!(
+            (f - d).abs() < 2e-3,
+            "w[{i}] fused={f} vs decomposition={d} (|Δ|={})",
+            (f - d).abs()
         );
     }
 }

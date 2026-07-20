@@ -6458,6 +6458,8 @@ impl Compiler<'_> {
                 if let Some(claims) = self.csha_backward_claims.take() {
                     gen.set_csha_claims(claims);
                 }
+                // Item 9: opt-in fused RMSNorm input-gradient lowering.
+                gen.set_fuse_rmsnorm_backward(self.compile_options.fuse_rmsnorm_backward);
                 let mut adjoint = gen.generate(&effective_primal);
                 // Item 9 profiling (`NSL_PROFILE_ADJOINT=1`): a launch-count
                 // histogram of the generated backward ops. Norm/activation

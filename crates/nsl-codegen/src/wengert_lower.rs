@@ -3344,6 +3344,20 @@ fn lower_single_op(
                     let key = compiler.compile_string_literal(builder, field)?;
                     call(compiler, builder, "nsl_dict_get_str", &[inputs[0], key])
                 }
+                _ if name.starts_with("rmsnorm_dx_backward:") => {
+                    // Item 9 fused RMSNorm input gradient. inputs = [dy, x, gamma];
+                    // eps is bit-encoded in the name suffix (exact round-trip).
+                    let bits: u64 = name["rmsnorm_dx_backward:".len()..]
+                        .parse()
+                        .unwrap_or(0);
+                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_rmsnorm_dx_backward",
+                        &[inputs[0], inputs[1], inputs[2], e],
+                    )
+                }
                 "embedding_backward" => {
                     // inputs = [grad, indices, weight]
                     // Creates zeros_like(weight) then scatter-adds grad rows

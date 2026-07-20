@@ -646,6 +646,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::F64],
         Some(types::I64),
     ),
+    // Item 9: fused RMSNorm input-gradient (dy, x, gamma, eps) -> dx.
+    (
+        "nsl_rmsnorm_dx_backward",
+        &[types::I64, types::I64, types::I64, types::F64],
+        Some(types::I64),
+    ),
     // Source AD: reduce gradient to match parameter shape (matmul broadcast backward)
     (
         "nsl_tensor_reduce_to_shape",

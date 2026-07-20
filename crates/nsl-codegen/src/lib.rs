@@ -1252,6 +1252,13 @@ pub struct CompileOptions {
     /// number is a soft target, not a hard cap), so the dual use is safe but
     /// deliberate; unifying them is future work (the full DP scheduler).
     pub checkpoint_stride: CheckpointStride,
+    /// Item 9 (`--fuse-rmsnorm-backward`): lower the source-AD RMSNorm INPUT
+    /// gradient to a single fused `nsl_rmsnorm_dx_backward` op (native GPU kernel
+    /// / CPU reference) instead of the ~11-op decomposition — fewer launches,
+    /// temporaries, and HBM traffic. Off by default; the fused kernel matches
+    /// the decomposition to an f32 tolerance (approx rsqrt/div), so it is an
+    /// opt-in speedup, not a bit-exact substitution.
+    pub fuse_rmsnorm_backward: bool,
     /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
     /// Selective policy's saved matmul-class interiors to half precision
     /// between forward and backward (cast-on-save, dequant-on-load via the
@@ -1404,6 +1411,7 @@ impl Default for CompileOptions {
             checkpoint_selective: false,
             checkpoint_budget_mib: None,
             checkpoint_stride: CheckpointStride::default(),
+            fuse_rmsnorm_backward: false,
             checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,
