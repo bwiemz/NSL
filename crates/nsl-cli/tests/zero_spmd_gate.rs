@@ -274,7 +274,7 @@ fn zero_stage1_two_rank_parity() {
     // is satisfied even by a no-op reduce (identical grads → sum/ws == g); the
     // counter line proves otherwise. Fixture: 8 params, grad_accum=2, 13
     // micro-batches → 6 optimizer steps; reduce_grads and sync_params each loop
-    // 8 params per step → 48 all_reduce + 48 broadcast per rank.
+    // 8 params per step → 6 bucketed all_reduce + 12 owner-bucketed broadcast per rank.
     let zero_line = spmd
         .stderr
         .lines()
@@ -282,8 +282,11 @@ fn zero_stage1_two_rank_parity() {
         .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line in SPMD stderr:\n{}", spmd.stderr))
         .to_string();
     assert!(
-        zero_line.contains("all_reduce=48") && zero_line.contains("broadcast=48"),
-        "ZeRO collective counts wrong (expected all_reduce=48 broadcast=48): {zero_line}"
+        zero_line.contains("all_reduce=6")
+            && zero_line.contains("broadcast=12")
+            && zero_line.contains("bucket_members=96"),
+        "ZeRO collective counts wrong (expected 6 grad buckets, 12 owner \
+         broadcasts, 96 bucketed members): {zero_line}"
     );
     // Baseline (single process, ws=1) must NOT have run any collective.
     assert!(
@@ -462,14 +465,14 @@ fn zero_stage1_rank_aware_dp_parity() {
     );
 
     // Anti-vacuity #2: the collectives actually ran — 6 optimizer steps × 8
-    // params = 48 all_reduce + 48 broadcast per rank; both ranks present.
+    // params = 6 bucketed all_reduce + 12 owner-bucketed broadcast per rank; both ranks present.
     let z0 = dp
         .stderr
         .lines()
         .find(|l| l.contains("[zero] ws=2 rank=0"))
         .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line:\n{}", dp.stderr));
     assert!(
-        z0.contains("all_reduce=48") && z0.contains("broadcast=48"),
+        z0.contains("all_reduce=6") && z0.contains("broadcast=12"),
         "wrong collective counts (expected 48/48): {z0}"
     );
     assert!(

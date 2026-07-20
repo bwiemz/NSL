@@ -116,7 +116,7 @@ pub static ZERO_OPTIM_ELEMS: std::sync::atomic::AtomicU64 =
 
 /// Read `(rank, world_size, all_reduce_count, broadcast_count, optim_elems)`
 /// for the atexit report. rank/ws are -1 when no context was initialized.
-pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64) {
+pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64, u64) {
     let guard = ZERO_CTX.lock().unwrap();
     let (rank, ws) = guard
         .as_ref()
@@ -128,6 +128,7 @@ pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64) {
         ZERO_ALL_REDUCE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed),
+        ZERO_BUCKET_MEMBERS.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -445,6 +446,258 @@ pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P4 item 15: bucketed collectives.
+// ---------------------------------------------------------------------------
+//
+// One collective per small parameter wastes latency (shm: 2 spin-barriers
+// per tensor; NCCL: a launch + watchdog'd stream sync per tensor). Instead,
+// same-(dtype, device) gradients are FLATTENED in param-index order — which
+// is model/layer order, so buckets align with CSLA layer ranges — into
+// buckets capped at NSL_ZERO_BUCKET_MB (default 25; 0 = per-tensor), and one
+// collective moves each bucket. Param sync buckets additionally by OWNER so
+// each bucket broadcasts from its owning rank. Bit-exactness is preserved:
+// the backend reduces element-wise in the same fixed rank order, and the
+// scale-by-1/ws is applied to the same values.
+
+/// Bucket byte cap (0 disables bucketing).
+fn zero_bucket_cap_bytes() -> usize {
+    std::env::var("NSL_ZERO_BUCKET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(25)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Anti-vacuity: Σ tensors that traveled inside a bucketed collective.
+pub static ZERO_BUCKET_MEMBERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One eligible tensor for bucketing.
+#[derive(Clone, Copy)]
+struct BucketItem {
+    raw: i64,
+    len: usize,
+    bytes: usize,
+}
+
+/// Group `items` (already same dtype/device/owner class) into ≤cap buckets,
+/// preserving order; every bucket holds ≥1 member.
+fn split_buckets(items: &[BucketItem], cap: usize) -> Vec<Vec<BucketItem>> {
+    let mut out: Vec<Vec<BucketItem>> = Vec::new();
+    let mut cur: Vec<BucketItem> = Vec::new();
+    let mut cur_bytes = 0usize;
+    for &it in items {
+        if !cur.is_empty() && cur_bytes + it.bytes > cap {
+            out.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur_bytes += it.bytes;
+        cur.push(it);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// CPU bucket all-reduce + average: pack → ONE collective → scale flat →
+/// unpack. `dtype` is 0 (f64) or 1 (f32).
+fn reduce_bucket_cpu(
+    ctx: &ZeROContext,
+    bucket: &[BucketItem],
+    dtype: u16,
+    inv_ws: f64,
+) -> i64 {
+    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    let mut flat = vec![0u8; total_bytes];
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (b.raw as *const NslTensor).read().data as *const u8,
+                flat.as_mut_ptr().add(off),
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    let rc = backend.all_reduce_sum(
+        flat.as_ptr() as *const std::ffi::c_void,
+        flat.as_mut_ptr() as *mut std::ffi::c_void,
+        total_elems,
+        dtype as crate::tensor_parallel::collective::DtypeId,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return -1;
+    }
+    ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if dtype == 0 {
+        let p = flat.as_mut_ptr() as *mut f64;
+        for j in 0..total_elems {
+            unsafe { *p.add(j) *= inv_ws };
+        }
+    } else {
+        let p = flat.as_mut_ptr() as *mut f32;
+        let s = inv_ws as f32;
+        for j in 0..total_elems {
+            unsafe { *p.add(j) *= s };
+        }
+    }
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                flat.as_ptr().add(off),
+                (b.raw as *const NslTensor).read().data as *mut u8,
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    0
+}
+
+/// GPU (CUDA-aware) bucket all-reduce + average: DtoD pack into a device
+/// bucket → ONE device collective → DtoD unpack → per-tensor on-device scale.
+#[cfg(feature = "cuda")]
+fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i64 {
+    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(total_bytes);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
+            t.data as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+    }
+    let rc = backend.all_reduce_sum(
+        dev as *const std::ffi::c_void,
+        dev,
+        total_elems,
+        crate::tensor_parallel::collective::DTYPE_F32,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        crate::cuda::inner::free_managed(dev);
+        return -1;
+    }
+    ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            t.data,
+            unsafe { (dev as *const u8).add(off) } as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+        crate::tensor::nsl_tensor_mul_scalar_inplace(b.raw, inv_ws);
+    }
+    crate::cuda::inner::free_managed(dev);
+    0
+}
+
+/// CPU bucket broadcast from `owner`: every rank packs its current bytes,
+/// ONE collective, every rank unpacks (the root re-reads its own bytes).
+fn broadcast_bucket_cpu(ctx: &ZeROContext, bucket: &[BucketItem], dtype: u16, owner: i32) -> i64 {
+    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    let mut flat = vec![0u8; total_bytes];
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (b.raw as *const NslTensor).read().data as *const u8,
+                flat.as_mut_ptr().add(off),
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    let rc = backend.broadcast(
+        flat.as_mut_ptr() as *mut std::ffi::c_void,
+        total_elems,
+        dtype as crate::tensor_parallel::collective::DtypeId,
+        owner,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return -1;
+    }
+    ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                flat.as_ptr().add(off),
+                (b.raw as *const NslTensor).read().data as *mut u8,
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    0
+}
+
+/// GPU (CUDA-aware) bucket broadcast from `owner` via a device bucket.
+#[cfg(feature = "cuda")]
+fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) -> i64 {
+    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(total_bytes);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
+            t.data as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+    }
+    let rc = backend.broadcast(
+        dev,
+        total_elems,
+        crate::tensor_parallel::collective::DTYPE_F32,
+        owner,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        crate::cuda::inner::free_managed(dev);
+        return -1;
+    }
+    ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            t.data,
+            unsafe { (dev as *const u8).add(off) } as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+    }
+    crate::cuda::inner::free_managed(dev);
+    0
+}
+
 /// Reduce gradients across all DP ranks.
 ///
 /// For Stage 1 (optimizer state sharding), all gradients are all-reduced so
@@ -490,6 +743,84 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
 
     let ws = ctx.world_size as f64;
     let inv_ws = 1.0 / ws;
+
+    // P4 item 15: bucketed fast path — flatten same-(dtype, device) grads in
+    // param-index (= layer) order and run ONE collective per ≤cap bucket.
+    let cap = zero_bucket_cap_bytes();
+    if cap > 0 {
+        let mut cpu_f64: Vec<BucketItem> = Vec::new();
+        let mut cpu_f32: Vec<BucketItem> = Vec::new();
+        let mut gpu_f32: Vec<BucketItem> = Vec::new();
+        for i in 0..num_params as usize {
+            if i >= list.len as usize {
+                break;
+            }
+            let raw = unsafe { *list.data.add(i) };
+            if raw == 0 {
+                continue;
+            }
+            let t = unsafe { &*(raw as *const NslTensor) };
+            if t.device != 0 && !ctx.cuda_aware {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs \
+                     real collectives — run with --collectives nccl \
+                     (nccl-featured build), or move the model to CPU / drop \
+                     --devices.",
+                );
+                return -5;
+            }
+            if t.device == 0 && t.dtype > 1 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} \
+                     at index {}; only f64 (0) and f32 (1) gradients are \
+                     supported",
+                    t.dtype, i
+                );
+                return -1;
+            }
+            if t.device > 0 && t.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
+                     dtype {}; only the canonical GPU f32 (dtype 1) is \
+                     supported",
+                    i, t.dtype
+                );
+                return -1;
+            }
+            let item = BucketItem {
+                raw,
+                len: t.len as usize,
+                bytes: t.data_byte_size(),
+            };
+            match (t.device, t.dtype) {
+                (0, 0) => cpu_f64.push(item),
+                (0, _) => cpu_f32.push(item),
+                _ => gpu_f32.push(item),
+            }
+        }
+        for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
+            for bucket in split_buckets(items, cap) {
+                if reduce_bucket_cpu(ctx, &bucket, dtype, inv_ws) != 0 {
+                    eprintln!("nsl: nsl_zero_reduce_grads: bucketed all_reduce failed");
+                    return -1;
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        for bucket in split_buckets(&gpu_f32, cap) {
+            if reduce_bucket_gpu(ctx, &bucket, inv_ws) != 0 {
+                eprintln!("nsl: nsl_zero_reduce_grads: bucketed device all_reduce failed");
+                return -1;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        if !gpu_f32.is_empty() {
+            eprintln!("nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
+            return -1;
+        }
+        return 0;
+    }
+
     for i in 0..num_params as usize {
         if i >= list.len as usize {
             break;
@@ -717,6 +1048,88 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         .backend
         .as_ref()
         .expect("world_size > 1 implies a backend");
+
+    // P4 item 15: bucketed fast path — group params by (OWNER, dtype, device)
+    // and broadcast each ≤cap bucket from its owning rank in one collective.
+    let cap = zero_bucket_cap_bytes();
+    if cap > 0 {
+        use std::collections::BTreeMap;
+        // (owner, dtype, is_gpu) → items, in ascending param order.
+        let mut groups: BTreeMap<(i32, u16, bool), Vec<BucketItem>> = BTreeMap::new();
+        for i in 0..num_params as usize {
+            if i >= list.len as usize {
+                break;
+            }
+            let raw = unsafe { *list.data.add(i) };
+            if raw == 0 {
+                continue;
+            }
+            let t = unsafe { &*(raw as *const NslTensor) };
+            let owner = ctx
+                .owner_of
+                .get(i)
+                .copied()
+                .unwrap_or((i % ctx.world_size) as i32);
+            if t.device != 0 && !ctx.cuda_aware {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs \
+                     real collectives — run with --collectives nccl \
+                     (nccl-featured build), or move the model to CPU / drop \
+                     --devices.",
+                );
+                return -5;
+            }
+            if t.device == 0 && t.dtype > 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: unsupported CPU param dtype {} \
+                     at index {i}",
+                    t.dtype
+                );
+                return -1;
+            }
+            if t.device > 0 && t.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                     dtype {}; only f32 is supported",
+                    t.dtype
+                );
+                return -1;
+            }
+            groups
+                .entry((owner, t.dtype, t.device != 0))
+                .or_default()
+                .push(BucketItem {
+                    raw,
+                    len: t.len as usize,
+                    bytes: t.data_byte_size(),
+                });
+        }
+        for ((owner, dtype, is_gpu), items) in &groups {
+            for bucket in split_buckets(items, cap) {
+                let rc = if *is_gpu {
+                    #[cfg(feature = "cuda")]
+                    {
+                        broadcast_bucket_gpu(ctx, &bucket, *owner)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        eprintln!(
+                            "nsl: nsl_zero_sync_params: GPU params require the \
+                             cuda feature"
+                        );
+                        -1
+                    }
+                } else {
+                    broadcast_bucket_cpu(ctx, &bucket, *dtype, *owner)
+                };
+                if rc != 0 {
+                    eprintln!("nsl: nsl_zero_sync_params: bucketed broadcast failed");
+                    return -1;
+                }
+            }
+        }
+        return 0;
+    }
 
     for i in 0..num_params as usize {
         if i >= list.len as usize {

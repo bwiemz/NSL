@@ -101,8 +101,12 @@ fn sim_gpu_two_rank_parity_bit_exact() {
         spmd.stderr
     );
 
-    // Anti-vacuity: device-pointer collectives actually ran on both ranks
-    // (8 params x 6 steps = 48 each), and the moment shards are real.
+    // Anti-vacuity: bucketed collectives actually ran on both ranks. On the
+    // GPU fixture each step reduces TWO buckets (not every gradient lands
+    // on-device — one CPU f64 group rides alongside the GPU f32 bucket) and
+    // syncs THREE owner groups (2 GPU owner buckets + the CPU group), so 6
+    // steps give all_reduce=12, broadcast=18, with all 96 tensor-memberships
+    // covered by buckets.
     for rank in 0..2 {
         let line = spmd
             .stderr
@@ -110,7 +114,9 @@ fn sim_gpu_two_rank_parity_bit_exact() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
         assert!(
-            line.contains("all_reduce=48") && line.contains("broadcast=48"),
+            line.contains("all_reduce=12")
+                && line.contains("broadcast=18")
+                && line.contains("bucket_members=96"),
             "wrong collective counts: {line}"
         );
     }
@@ -159,7 +165,7 @@ fn nccl_two_rank_parity_or_documented_refusal() {
                 .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
                 .unwrap_or_else(|| panic!("no [zero] line for rank {rank}"));
             assert!(
-                line.contains("all_reduce=48") && line.contains("broadcast=48"),
+                line.contains("all_reduce=12") && line.contains("broadcast=18"),
                 "wrong collective counts: {line}"
             );
         }
