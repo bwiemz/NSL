@@ -366,10 +366,28 @@ fn align_up(x: usize, a: usize) -> usize {
 /// Reuses a free slot (stable address) or grows the pool by one. Returns the
 /// slot index and its (device, pinned-host) buffers. Caller holds MIRRORS;
 /// lock order is MIRRORS → ARENA_POOL → allocator (never reversed).
+///
+/// LOAD-BEARING (Item 11 review MEDIUM): reusing a slot is safe ONLY because
+/// the prior occupant left via a SYNCHRONOUS writeback `evict_pack`, whose
+/// `cuMemcpyDtoH_v2` two-way-syncs the compute/legacy stream and thereby
+/// drains any prefetch HtoD the compute stream had waited on — so the slot's
+/// `host_stage`/`dev` are quiescent (no write-after-read on host_stage, no
+/// in-flight DMA into dev) before reuse. A free slot must therefore have NO
+/// un-awaited prefetch event; we assert it so a future regression (async
+/// evict, writeback=0 reuse, prefetch depth > 1) fails LOUDLY instead of
+/// silently reading a half-overwritten host buffer.
 #[cfg(feature = "cuda")]
 fn arena_acquire(bytes: usize, live: usize) -> (usize, *mut c_void, *mut u8) {
     let mut pool = ARENA_POOL.lock().unwrap();
     if let Some(idx) = pool.iter().position(|s| s.live == 0 && s.cap >= bytes) {
+        if pool[idx].pending_event != 0 {
+            eprintln!(
+                "[weight-stream] FATAL: reusing arena slot {idx} with an un-awaited prefetch \
+                 event — a prefetch was recycled before its await drained (async-evict / \
+                 depth>1 regression). This would read a half-overwritten host_stage."
+            );
+            std::process::abort();
+        }
         pool[idx].live = live;
         return (idx, pool[idx].dev, pool[idx].host_stage);
     }
@@ -551,7 +569,19 @@ pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
             let guard = MIRRORS.lock().unwrap();
             match guard.as_ref().and_then(|g| g.get(&first)) {
                 Some(m) if m.arena_slot >= 0 => m.arena_slot as usize,
-                _ => return,
+                // Registered but NOT arena-resident: the codegen awaited a pack
+                // the runtime never made resident — a prefetch/await desync
+                // (Item 11 review LOW). Fail loudly rather than leak the event
+                // and leave the HtoD unordered (a silent race).
+                Some(_) => {
+                    eprintln!(
+                        "[weight-stream] FATAL: await_pack of a registered but non-resident \
+                         pack (first param {first}) — prefetch/await grouping desync"
+                    );
+                    std::process::abort();
+                }
+                // Not registered → not a streamed pack; benign no-op.
+                None => return,
             }
         };
         let ev = arena_take_pending_event(slot);

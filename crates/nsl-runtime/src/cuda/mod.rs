@@ -1150,10 +1150,14 @@ pub(crate) mod inner {
     /// the consumer discharges it with `compute_stream_wait_event` before any
     /// kernel reads `dst_device`. `src_host` must be pinned for true async DMA.
     ///
-    /// CADENCE assume/guarantee: ASSUME `dst_device` has no other pending
-    /// writer (the caller only prefetches into a slot freed by a SYNC evict);
-    /// GUARANTEE the returned event, waited on the compute stream, orders this
-    /// copy before every later compute-stream read of `dst_device`.
+    /// CADENCE assume/guarantee: ASSUME (1) `dst_device` has no other pending
+    /// writer and (2) `src_host` is not re-written until this copy completes —
+    /// both hold because the caller only prefetches into an arena slot freed by
+    /// a SYNCHRONOUS writeback evict, whose DtoH drains this HtoD before the
+    /// slot's `dst_device`/`src_host` (host_stage) can be reused (see
+    /// `weight_stream::arena_acquire`'s LOAD-BEARING note). GUARANTEE the
+    /// returned event, waited on the compute stream, orders this copy before
+    /// every later compute-stream read of `dst_device`.
     #[must_use]
     pub(crate) fn prefetch_htod_on_transfer(
         dst_device: *mut c_void,
