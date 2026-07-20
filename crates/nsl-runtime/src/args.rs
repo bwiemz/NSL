@@ -126,9 +126,17 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
 
 extern "C" fn nsl_zero_count_atexit() {
     let (rank, ws, all_reduce, broadcast, optim_elems) = crate::zero::zero_counter_snapshot();
-    eprintln!(
-        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems}"
+    // EVERY rank prints this line to the SAME inherited stderr pipe, often
+    // exiting simultaneously. `eprintln!` issues one write(2) per format
+    // fragment, so concurrent ranks can TEAR each other's lines mid-string
+    // (observed: "[zero] ws=2[zero] ws= rank=0 ..." — the SPMD gates then
+    // flake on the missing line). Format first, write once: a single
+    // write_all under PIPE_BUF is atomic on POSIX pipes.
+    let line = format!(
+        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems}\n"
     );
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 extern "C" fn nsl_weight_stream_count_atexit() {

@@ -33,12 +33,58 @@ impl ZeROStage {
 /// Partition parameters across data-parallel ranks using round-robin.
 /// Returns a vec of vec where `partitions[rank]` contains the parameter indices
 /// assigned to that rank.
+///
+/// Index-blind fallback: with real models the parameter BYTE sizes span four
+/// orders of magnitude (embedding vs bias), so round-robin can pile the heavy
+/// tensors onto one rank — prefer [`partition_params_balanced`], which the
+/// codegen-emitted `nsl_zero_partition_bytes` uses.
 pub fn partition_params(num_params: usize, world_size: usize) -> Vec<Vec<usize>> {
     let mut partitions = vec![Vec::new(); world_size];
     for i in 0..num_params {
         partitions[i % world_size].push(i);
     }
     partitions
+}
+
+/// P4 item 13: BYTE-BALANCED ownership. Greedy LPT (longest-processing-time):
+/// visit params by (bytes DESC, index ASC) and assign each to the currently
+/// lightest rank (ties → lowest rank). Classic bound: max rank load ≤ 4/3 of
+/// optimal, and in practice transformer param sets balance to within one
+/// small tensor. DETERMINISTIC: every rank derives the identical plan from
+/// the identical (sizes, world_size) inputs — the total order above has no
+/// ties left undecided, so ownership, broadcast roots, and the owner-gated
+/// optimizer allocation agree across the clique with no communication.
+pub fn partition_params_balanced(sizes: &[u64], world_size: usize) -> Vec<Vec<usize>> {
+    let ws = world_size.max(1);
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]).then(a.cmp(&b)));
+    let mut partitions = vec![Vec::new(); ws];
+    let mut load = vec![0u64; ws];
+    for idx in order {
+        let lightest = (0..ws).min_by_key(|&r| (load[r], r)).unwrap();
+        load[lightest] += sizes[idx];
+        partitions[lightest].push(idx);
+    }
+    // Keep each rank's list in ascending param order (stable iteration for
+    // the owner-gated update loops and debuggability).
+    for p in &mut partitions {
+        p.sort_unstable();
+    }
+    partitions
+}
+
+/// Flatten a partition into an owner lookup: `owner_of[i]` = the rank that
+/// owns param `i`. Every index is covered exactly once by construction.
+pub fn owners_from_partition(partitions: &[Vec<usize>], num_params: usize) -> Vec<i32> {
+    let mut owner_of = vec![0i32; num_params];
+    for (rank, part) in partitions.iter().enumerate() {
+        for &idx in part {
+            if idx < num_params {
+                owner_of[idx] = rank as i32;
+            }
+        }
+    }
+    owner_of
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +153,11 @@ struct ZeROContext {
     world_size: usize,
     /// Which parameter indices this rank owns (populated by nsl_zero_partition).
     owned_params: Vec<usize>,
+    /// P4 item 13: param index → owning rank, for EVERY param. The broadcast
+    /// root in `nsl_zero_sync_params` MUST come from here (not `i % ws`) so
+    /// the sync roots always agree with the ownership plan, whichever
+    /// partitioner produced it.
+    owner_of: Vec<i32>,
     /// Total number of params (set during partition).
     num_params: usize,
     /// D3: the real collective backend (CPU-shm SimulatedBackend over the
@@ -183,13 +234,15 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         rank,
         world_size: ws,
         owned_params: Vec::new(),
+        owner_of: Vec::new(),
         num_params: 0,
         backend,
     });
     0
 }
 
-/// Partition parameters for ZeRO. Uses round-robin partitioning.
+/// Partition parameters for ZeRO. Uses round-robin partitioning (index-blind
+/// fallback — codegen emits `nsl_zero_partition_bytes` instead).
 /// Returns the number of parameters this rank owns, or -1 on error.
 #[no_mangle]
 pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
@@ -203,8 +256,49 @@ pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
     let my_params = partitions[my_rank].clone();
     let count = my_params.len() as i64;
 
+    ctx.owner_of = owners_from_partition(&partitions, num_params as usize);
     ctx.owned_params = my_params;
     ctx.num_params = num_params as usize;
+
+    count
+}
+
+/// P4 item 13: BYTE-BALANCED partition. Reads each parameter's byte size from
+/// the runtime param list (identical on every rank — the plan needs no
+/// communication) and assigns ownership by greedy LPT so per-rank optimizer
+/// work and moment memory track ~1/N in BYTES, not tensor count. A null list
+/// slot contributes size 0 (still assigned an owner, for total coverage).
+/// Returns the number of parameters this rank owns, or -1 on error.
+#[no_mangle]
+pub extern "C" fn nsl_zero_partition_bytes(params_list_ptr: i64, num_params: i64) -> i64 {
+    let mut guard = ZERO_CTX.lock().unwrap();
+    let Some(ctx) = guard.as_mut() else {
+        return -1;
+    };
+    let list_ptr = params_list_ptr as *const crate::list::NslList;
+    if list_ptr.is_null() {
+        return -1;
+    }
+    let list = unsafe { &*list_ptr };
+    let n = (num_params.max(0) as usize).min(list.len as usize);
+
+    let mut sizes = vec![0u64; num_params.max(0) as usize];
+    for (i, size) in sizes.iter_mut().enumerate().take(n) {
+        let tensor_raw = unsafe { *list.data.add(i) };
+        if tensor_raw != 0 {
+            let t = unsafe { &*(tensor_raw as *const NslTensor) };
+            *size = t.data_byte_size() as u64;
+        }
+    }
+
+    let partitions = partition_params_balanced(&sizes, ctx.world_size);
+    let my_rank = ctx.rank.min(partitions.len() - 1);
+    let my_params = partitions[my_rank].clone();
+    let count = my_params.len() as i64;
+
+    ctx.owner_of = owners_from_partition(&partitions, sizes.len());
+    ctx.owned_params = my_params;
+    ctx.num_params = sizes.len();
 
     count
 }
@@ -484,7 +578,14 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
             continue;
         }
         let tensor = unsafe { &*tensor_ptr };
-        let owner = (i % ctx.world_size) as i32;
+        // P4 item 13: the broadcast root comes from the ownership PLAN. The
+        // index-modulo fallback only covers a param the partitioner never saw
+        // (it should not happen — partition runs before any sync).
+        let owner = ctx
+            .owner_of
+            .get(i)
+            .copied()
+            .unwrap_or((i % ctx.world_size) as i32);
 
         // D3 v1: CPU-only (see nsl_zero_reduce_grads) — refuse GPU-resident
         // params rather than pile N ranks onto CUDA device 0.
@@ -835,6 +936,99 @@ mod tests {
         // All params accounted for
         let total: usize = parts.iter().map(|p| p.len()).sum();
         assert_eq!(total, 10);
+    }
+
+    // ── P4 item 13: byte-balanced ownership ──────────────────────────────
+
+    #[test]
+    fn test_partition_balanced_complete_and_disjoint() {
+        let sizes: Vec<u64> = vec![7, 1, 1, 1, 3, 3, 9, 2];
+        let parts = partition_params_balanced(&sizes, 3);
+        let mut seen = vec![false; sizes.len()];
+        for p in &parts {
+            for &i in p {
+                assert!(!seen[i], "param {i} assigned twice");
+                seen[i] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every param must have an owner");
+    }
+
+    #[test]
+    fn test_partition_balanced_beats_round_robin_on_skew() {
+        // Transformer-shaped skew: one huge embedding, a few big matrices,
+        // many tiny biases/norms. Round-robin by index piles the heavies
+        // onto low ranks; LPT balances byte loads.
+        let sizes: Vec<u64> = vec![4_000_000, 250_000, 250_000, 4_096, 4_096, 4_096, 4_096, 4_096];
+        let ws = 2;
+        let load = |parts: &Vec<Vec<usize>>| -> Vec<u64> {
+            parts
+                .iter()
+                .map(|p| p.iter().map(|&i| sizes[i]).sum())
+                .collect()
+        };
+        let rr = load(&{
+            let mut v = vec![Vec::new(); ws];
+            for i in 0..sizes.len() {
+                v[i % ws].push(i);
+            }
+            v
+        });
+        let lpt = load(&partition_params_balanced(&sizes, ws));
+        let spread = |l: &Vec<u64>| l.iter().max().unwrap() - l.iter().min().unwrap();
+        assert!(
+            spread(&lpt) < spread(&rr),
+            "LPT spread {:?} must beat round-robin spread {:?}",
+            lpt,
+            rr
+        );
+        // LPT bound sanity: max load ≤ max(largest single tensor, 4/3 × ideal)
+        // — no partition can undercut the biggest indivisible tensor, and away
+        // from that floor LPT is within 4/3 of the perfect split.
+        let total: u64 = sizes.iter().sum();
+        let largest = *sizes.iter().max().unwrap();
+        let bound = largest.max(total.div_ceil(ws as u64) * 4 / 3);
+        assert!(*lpt.iter().max().unwrap() <= bound);
+    }
+
+    #[test]
+    fn test_partition_balanced_deterministic_and_sorted() {
+        let sizes: Vec<u64> = vec![5, 5, 5, 5, 8, 8, 1];
+        let a = partition_params_balanced(&sizes, 4);
+        let b = partition_params_balanced(&sizes, 4);
+        assert_eq!(a, b, "identical inputs must give the identical plan");
+        for p in &a {
+            let mut s = p.clone();
+            s.sort_unstable();
+            assert_eq!(*p, s, "per-rank index lists are ascending");
+        }
+    }
+
+    #[test]
+    fn test_partition_balanced_edge_cases() {
+        // ws=1 owns everything, in order.
+        assert_eq!(partition_params_balanced(&[3, 1, 2], 1), vec![vec![0, 1, 2]]);
+        // More ranks than params: some ranks legitimately own nothing.
+        let parts = partition_params_balanced(&[10, 20], 4);
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        assert_eq!(total, 2);
+        assert_eq!(parts.len(), 4);
+        // Zero-size params still get owners (coverage over balance).
+        let parts = partition_params_balanced(&[0, 0, 0], 2);
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_owners_from_partition_matches_membership() {
+        let sizes: Vec<u64> = vec![7, 1, 9, 2, 2];
+        let parts = partition_params_balanced(&sizes, 2);
+        let owners = owners_from_partition(&parts, sizes.len());
+        for (rank, part) in parts.iter().enumerate() {
+            for &i in part {
+                assert_eq!(owners[i], rank as i32);
+            }
+        }
     }
 
     #[test]

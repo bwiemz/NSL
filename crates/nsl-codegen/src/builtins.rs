@@ -2503,6 +2503,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // --- M43: ZeRO optimizer (ABI-fixed: match runtime signatures exactly) ---
     ("nsl_zero_init", &[types::I64, types::I64], Some(types::I64)), // (stage, world_size)
     ("nsl_zero_partition", &[types::I64], Some(types::I64)),        // (num_params)
+    ("nsl_zero_partition_bytes", &[types::I64, types::I64], Some(types::I64)), // (param_list, num_params)
     (
         "nsl_zero_reduce_grads",
         &[types::I64, types::I64],
