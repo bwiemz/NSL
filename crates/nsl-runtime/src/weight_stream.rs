@@ -490,8 +490,10 @@ pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
 /// transfer stream (overlapping current compute) and records a completion
 /// event in the slot; `t.data` is set immediately but MUST NOT be read until
 /// `nsl_weight_stream_await_pack` discharges the event onto the compute
-/// stream. Prefetches only into a slot freed by a SYNCHRONOUS evict, so the
-/// destination has no other pending writer.
+/// stream. The destination slot has no other pending writer: `arena_acquire`
+/// only hands out quiescent slots — a synchronous evict two-way-synced its
+/// DtoH, and an ASYNC one leaves the slot `wb_pending` (excluded from reuse)
+/// until its drain.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_prefetch_pack(pw_list_ptr: i64) {
     #[cfg(feature = "cuda")]
@@ -770,7 +772,11 @@ unsafe impl Send for PendingWb {}
 #[cfg(feature = "cuda")]
 static PENDING_WB: Mutex<Vec<PendingWb>> = Mutex::new(Vec::new());
 /// Lock-free emptiness probe so the hot upload paths skip the queue lock
-/// entirely when async writeback is off or idle.
+/// entirely when async writeback is off or idle. SINGLE-THREAD contract
+/// (same as the whole module — see the Mirror Send comment): a concurrent
+/// caller could observe 0 while another thread is mid-publish and skip a
+/// required drain. The training path is single-threaded; a future
+/// multi-threaded caller must replace this probe with the queue lock.
 #[cfg(feature = "cuda")]
 static WB_QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// At most this many async writebacks may be in flight; issuing another
@@ -848,8 +854,12 @@ pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
         }
         crate::cuda::inner::ensure_context();
 
-        // Cap the in-flight depth BEFORE taking MIRRORS (drain locks
-        // PENDING_WB then ARENA_POOL; never nest under MIRRORS the other way).
+        // Cap the in-flight depth before taking MIRRORS. Lock ORDER (acyclic,
+        // verified by review): MIRRORS → PENDING_WB and MIRRORS → ARENA_POOL
+        // are both allowed (upload_pack_inner drains while holding MIRRORS;
+        // the queue push below runs under MIRRORS); the drain itself releases
+        // PENDING_WB before taking ARENA_POOL; NOTHING ever takes MIRRORS
+        // while holding either of the other two.
         if WB_QUEUED.load(std::sync::atomic::Ordering::Acquire) >= WB_MAX_INFLIGHT {
             let oldest_slot = {
                 let q = PENDING_WB.lock().unwrap();

@@ -49,6 +49,13 @@ struct CallbackModelTouch {
 /// each prefetch edge is priced per-range compute μs vs pack-byte transfer μs.
 const WS_PCIE_FIXED_LAT_US: f64 = 10.0;
 
+/// Fallback for UNPRICED packs (a member's shape is not statically concrete —
+/// e.g. a bare `Tensor` field annotation): the v1 structural heuristic, which
+/// the GPU bit-exactness gates shipped and validated under. A priced edge is
+/// calibrated-safe; an unpriced edge is merely heuristic (review M3: never
+/// treat a 0-byte pricing as a real transfer estimate).
+const WS_PREFETCH_MIN_OPS_PER_RANGE: usize = 4;
+
 fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
@@ -4746,8 +4753,16 @@ impl Compiler<'_> {
             let np_val = builder
                 .ins()
                 .iconst(cl_types::I64, param_paths.len() as i64);
-            let part_rc =
-                self.compile_call_by_name(builder, "nsl_zero_partition", &[np_val])?;
+            // P4 item 13: BYTE-balanced ownership — the runtime reads each
+            // param's byte size from param_list (identical on every rank) and
+            // partitions by greedy LPT, so per-rank optimizer work and moment
+            // memory track ~1/N in bytes rather than tensor count. Replaces
+            // the index round-robin `nsl_zero_partition`.
+            let part_rc = self.compile_call_by_name(
+                builder,
+                "nsl_zero_partition_bytes",
+                &[param_list, np_val],
+            )?;
             let part_ok = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, part_rc, zero_i);
             let part_msg = "nsl: --zero-stage partition failed — aborting";
             self.intern_string(part_msg)?;
@@ -7135,8 +7150,28 @@ impl Compiler<'_> {
                             .filter(|(name, _)| self.is_trainable_param_name(name))
                             .map(|(n, v)| (n.clone(), *v))
                             .collect();
+                        // Item 11 calibration (review M3 follow-through): wire
+                        // REAL element counts into the layerwise plan — this
+                        // call site passed `|_| None` since D1, leaving every
+                        // ParamInfo::elems empty and the prefetch gate's pack
+                        // pricing blind. Static param shapes resolve here;
+                        // symbolic ones stay None and decline their edges.
+                        let elem_hints = crate::profiling::captures::elem_hints_from_var_nodes(
+                            extractor.var_nodes(),
+                            self.type_map,
+                        );
+                        let vid_by_pname: std::collections::HashMap<&str, crate::wengert::VarId> =
+                            csla_trainable
+                                .iter()
+                                .map(|(n, v)| (n.as_str(), *v))
+                                .collect();
                         let plan_lw =
-                            crate::layerwise::analyze(&adjoint, &csla_trainable, &|_| None);
+                            crate::layerwise::analyze(&adjoint, &csla_trainable, &|name| {
+                                vid_by_pname
+                                    .get(name)
+                                    .and_then(|v| elem_hints.get(v))
+                                    .copied()
+                            });
                         let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
                             param_paths
                                 .iter()
@@ -7443,16 +7478,27 @@ impl Compiler<'_> {
                             None
                         };
                         // Item 11 calibration: Σ static elems of each range's
-                        // STREAMED params (the pack the gate prices).
+                        // STREAMED params (the pack the gate prices). A member
+                        // with SYMBOLIC shape (elems recorded as 0) poisons the
+                        // whole range to 0 = "unpriceable" — a partial sum
+                        // would UNDERSTATE the transfer and wrongly activate
+                        // an overlap edge (review M3); the gate declines
+                        // unpriceable packs instead.
                         let ws_set: std::collections::HashSet<i64> =
                             ws_streamed_sorted.iter().copied().collect();
                         let range_pack_elems: Vec<u64> = layer_group
                             .iter()
                             .map(|g| {
-                                g.iter()
+                                let members: Vec<u64> = g
+                                    .iter()
                                     .filter(|i| ws_set.contains(i))
                                     .map(|i| elems_by_accum.get(i).copied().unwrap_or(0))
-                                    .sum()
+                                    .collect();
+                                if members.contains(&0) {
+                                    0
+                                } else {
+                                    members.iter().sum()
+                                }
                             })
                             .collect();
                         (
@@ -9641,13 +9687,27 @@ impl Compiler<'_> {
                     pack_bytes(ri) as f64 / (gpu_spec.peak_bandwidth_gbs.max(1.0) * 1e3);
                 accum_window * launch_floor.max(hbm_floor)
             };
-            // Edge ri → ri+1 is calibrated-on iff ri's compute covers ri+1's
-            // transfer (and both ends actually stream).
+            // Edge ri → ri+1 activates iff ri's compute covers ri+1's
+            // transfer (and both ends actually stream). Review M3: a pack
+            // containing a symbolic-shape param prices at 0 bytes, which
+            // would UNDERSTATE the transfer — the unsafe direction. An
+            // unpriced pack instead falls back to the v1 structural
+            // heuristic (avg ops/range), the behavior the GPU gates shipped
+            // under; a PRICED edge uses the calibrated μs comparison and is
+            // calibrated-safe.
+            let avg_ops_per_range = pending.adjoint.ops.len() / ranges.len().max(1);
             let edge_on: Vec<bool> = (0..ranges.len())
                 .map(|ri| {
-                    ri + 1 < ranges.len()
-                        && layer_group[ri + 1].iter().any(|i| ws_streamed.contains(i))
-                        && compute_lb_us(ri) >= transfer_us(ri + 1)
+                    let next_streams = ri + 1 < ranges.len()
+                        && layer_group[ri + 1].iter().any(|i| ws_streamed.contains(i));
+                    if !next_streams {
+                        return false;
+                    }
+                    if pack_bytes(ri + 1) > 0 {
+                        compute_lb_us(ri) >= transfer_us(ri + 1)
+                    } else {
+                        avg_ops_per_range >= WS_PREFETCH_MIN_OPS_PER_RANGE
+                    }
                 })
                 .collect();
             let prefetch_active = self.compile_options.stream_prefetch
@@ -9658,13 +9718,24 @@ impl Compiler<'_> {
             if self.compile_options.stream_prefetch {
                 let edges: Vec<String> = (0..ranges.len().saturating_sub(1))
                     .map(|ri| {
-                        format!(
-                            "L{ri}->L{}: compute>={:.1}us transfer~{:.1}us {}",
-                            ri + 1,
-                            compute_lb_us(ri),
-                            transfer_us(ri + 1),
-                            if edge_on[ri] { "ON" } else { "off" }
-                        )
+                        if pack_bytes(ri + 1) > 0 {
+                            format!(
+                                "L{ri}->L{}: compute>={:.1}us transfer~{:.1}us {}",
+                                ri + 1,
+                                compute_lb_us(ri),
+                                transfer_us(ri + 1),
+                                if edge_on[ri] { "ON" } else { "off" }
+                            )
+                        } else {
+                            format!(
+                                "L{ri}->L{}: unpriced pack, ops-heuristic (avg {} vs \
+                                 min {}) {}",
+                                ri + 1,
+                                avg_ops_per_range,
+                                WS_PREFETCH_MIN_OPS_PER_RANGE,
+                                if edge_on[ri] { "ON" } else { "off" }
+                            )
+                        }
                     })
                     .collect();
                 eprintln!(

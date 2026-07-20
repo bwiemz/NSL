@@ -396,7 +396,15 @@ impl DataLoader {
                             emit_attention_mask,
                         ) {
                             Some(batch) => packed_batch_to_dict(&batch),
-                            None => continue,
+                            // Ragged packed tail: this CLAIMED work_index would
+                            // otherwise become a permanent HOLE in the reorder
+                            // sequence — under shuffle the tail id can land at
+                            // an EARLY slot, the consumer parks on the hole,
+                            // workers fill the buffer and park on the full
+                            // gate: a wakeup-independent deadlock (review H1).
+                            // Insert a 0 sentinel so the consumer skips the
+                            // slot instead of waiting on it forever.
+                            None => 0,
                         }
                     } else {
                         build_simple_batch(
@@ -428,15 +436,28 @@ impl DataLoader {
                     // Broadcast so the consumer always re-evaluates after an insert.
                     condvar.notify_all();
                 }
+                // Review M1: a worker can exit WITHOUT a final insert (cursor
+                // exhaustion, stop). The consumer's is_finished() escape only
+                // runs while awake — wake it unconditionally so the last
+                // worker's exit is never a lost signal.
+                condvar.notify_all();
             });
             self.worker_handles.push(handle);
         }
     }
 
     fn stop_workers(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-        // Wake all threads during shutdown so they can see the stop_flag
-        self.condvar.notify_all();
+        // Review M2: store the flag and notify while HOLDING the buffer mutex.
+        // Without it, a worker can evaluate the full-gate predicate (sees
+        // stop=false), lose the CPU, miss this notify, and park after it fired
+        // — join below then blocks forever. Holding the mutex orders the
+        // store+notify against the worker's check-then-wait, which happens
+        // under the same mutex.
+        {
+            let _buf = self.reorder_buffer.lock().unwrap();
+            self.stop_flag.store(true, Ordering::Release);
+            self.condvar.notify_all();
+        }
         for handle in self.worker_handles.drain(..) {
             let _ = handle.join();
         }
@@ -587,7 +608,7 @@ pub extern "C" fn nsl_dataloader_start(dl_ptr: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
     let dl = unsafe { &mut *(dl_ptr as *mut DataLoader) };
-    let expected = dl.expected_batch_id.load(Ordering::Relaxed);
+    let mut expected = dl.expected_batch_id.load(Ordering::Relaxed);
 
     if expected >= dl.total_batches {
         return 0;
@@ -598,6 +619,19 @@ pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
         let mut buf = dl.reorder_buffer.lock().unwrap();
         loop {
             if let Some(ptr) = buf.remove(&expected) {
+                if ptr == 0 {
+                    // Ragged-packed-tail sentinel (see the worker's pack_batch
+                    // None arm): the slot exists but yields no batch. Skip it,
+                    // wake any full-gated producer (the buffer just shrank),
+                    // and keep waiting for the next slot.
+                    dl.expected_batch_id.fetch_add(1, Ordering::Relaxed);
+                    expected += 1;
+                    dl.condvar.notify_all();
+                    if expected >= dl.total_batches {
+                        return 0;
+                    }
+                    continue;
+                }
                 break ptr;
             }
             if dl.stop_flag.load(Ordering::Acquire) {
@@ -606,10 +640,10 @@ pub extern "C" fn nsl_dataloader_next_batch(dl_ptr: i64) -> i64 {
             // If all workers finished, do one final check — a worker may have
             // inserted the batch between our remove() and this is_finished() check.
             if dl.worker_handles.iter().all(|h| h.is_finished()) {
-                if let Some(ptr) = buf.remove(&expected) {
-                    break ptr;
+                match buf.remove(&expected) {
+                    Some(0) | None => return 0,
+                    Some(ptr) => break ptr,
                 }
-                return 0;
             }
             buf = dl.condvar.wait(buf).unwrap();
         }
@@ -707,6 +741,53 @@ mod tests {
             r#"{{"batch_size":{},"seq_len":{},"num_workers":{},"packing":{},"shuffle":false,"prefetch":2,"pin_memory":false,"drop_last":false,"pack_separator":0}}"#,
             batch_size, seq_len, num_workers, packing
         )
+    }
+
+    /// Review H1: a ragged packed tail must not become a permanent HOLE in
+    /// the reorder sequence. The claimed work_index whose pack_batch returns
+    /// None now inserts a 0 sentinel the consumer skips — before the fix this
+    /// config (packing, non-divisible token count, shuffle-free tail) could
+    /// deadlock the consumer against full-gated workers, or silently drop
+    /// trailing batches after an early hole under shuffle.
+    #[test]
+    fn test_dataloader_packed_ragged_tail_terminates() {
+        // 4 docs of 5 tokens (incl. separator 0) + 3 stray tokens = 23 tokens.
+        // batch 1x8: ceil(23/8) = 3 slots; the tail slot cannot pack a full
+        // batch and returns None.
+        let mut data: Vec<f64> = Vec::new();
+        for d in 0..4 {
+            for t in 0..4 {
+                data.push((d * 10 + t + 1) as f64);
+            }
+            data.push(0.0);
+        }
+        data.extend([91.0, 92.0, 93.0]);
+        let data_tensor = tensor_from_f64_slice(&data);
+        let config_json = make_config_json(1, 8, 2, true);
+
+        let dl_ptr = nsl_dataloader_create(
+            data_tensor,
+            0,
+            config_json.as_ptr() as i64,
+            config_json.len() as i64,
+        );
+        nsl_dataloader_start(dl_ptr);
+
+        // Must terminate (no consumer/worker deadlock) and yield ≥1 real
+        // batch; the ragged tail contributes a skipped sentinel, not a hang.
+        let mut real_batches = 0;
+        loop {
+            let batch = nsl_dataloader_next_batch(dl_ptr);
+            if batch == 0 {
+                break;
+            }
+            nsl_dict_free(batch);
+            real_batches += 1;
+        }
+        assert!(real_batches >= 1, "expected at least one packed batch");
+
+        nsl_dataloader_stop(dl_ptr);
+        nsl_dataloader_free(dl_ptr);
     }
 
     #[test]
