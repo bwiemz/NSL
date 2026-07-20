@@ -418,9 +418,15 @@ impl DataLoader {
                         let mut buf = reorder_buffer.lock().unwrap();
                         buf.insert(work_index, dict_ptr);
                     }
-                    // Only the main thread waits on this condvar — notify_one avoids
-                    // thundering-herd wakeups of worker threads
-                    condvar.notify_one();
+                    // TWO waiter classes share this condvar: the consumer (waiting
+                    // for `expected` to appear) and workers (waiting for buffer
+                    // space at the prefetch gate). notify_one can hand this signal
+                    // to a full-gated worker, which rechecks its predicate and goes
+                    // back to sleep — the consumer then waits forever on a batch
+                    // that is already in the buffer while every worker is parked on
+                    // the full gate (observed as a multi-hour hang on Windows CI).
+                    // Broadcast so the consumer always re-evaluates after an insert.
+                    condvar.notify_all();
                 }
             });
             self.worker_handles.push(handle);

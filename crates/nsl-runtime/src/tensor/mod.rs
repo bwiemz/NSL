@@ -2864,15 +2864,15 @@ pub extern "C" fn nsl_rmsnorm_dx_backward(
         let mut sum_sq = 0.0_f64;
         let mut sum_dwx = 0.0_f64;
         for j in 0..n {
-            let xj = rd(&x, base + j);
+            let xj = rd(x, base + j);
             sum_sq += xj * xj;
-            sum_dwx += rd(&dy, base + j) * rd(&gamma, j) * xj;
+            sum_dwx += rd(dy, base + j) * rd(gamma, j) * xj;
         }
         let rms = (sum_sq / nf + eps).sqrt().max(1e-12);
         let rms_cubed = rms * rms * rms;
         for j in 0..n {
-            let xj = rd(&x, base + j);
-            let d = rd(&gamma, j) * rd(&dy, base + j) / rms - xj * sum_dwx / (nf * rms_cubed);
+            let xj = rd(x, base + j);
+            let d = rd(gamma, j) * rd(dy, base + j) / rms - xj * sum_dwx / (nf * rms_cubed);
             write_dx(base + j, d);
         }
     }
