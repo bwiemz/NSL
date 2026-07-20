@@ -114,9 +114,9 @@ fn sim_gpu_two_rank_parity_bit_exact() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
         assert!(
-            line.contains("all_reduce=12")
-                && line.contains("broadcast=18")
-                && line.contains("bucket_members=96"),
+            line.contains("all_reduce=12 ")
+                && line.contains("broadcast=18 ")
+                && line.contains("bucket_members=96 "),
             "wrong collective counts: {line}"
         );
     }
@@ -164,7 +164,7 @@ fn sim_gpu_stage2_reduce_scatter_bit_exact() {
         // 6 steps × (1 CPU f64 group + 1 GPU f32 group) = 12 scatters; no
         // gradient may travel through an all_reduce.
         assert!(
-            line.contains("reduce_scatter=12") && line.contains("all_reduce=0"),
+            line.trim_end().ends_with("reduce_scatter=12") && line.contains("all_reduce=0 "),
             "stage-2 GPU collective counts wrong: {line}"
         );
     }
@@ -246,7 +246,7 @@ fn nccl_two_rank_parity_or_documented_refusal() {
                 .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
                 .unwrap_or_else(|| panic!("no [zero] line for rank {rank}"));
             assert!(
-                line.contains("all_reduce=12") && line.contains("broadcast=18"),
+                line.contains("all_reduce=12 ") && line.contains("broadcast=18 "),
                 "wrong collective counts: {line}"
             );
         }

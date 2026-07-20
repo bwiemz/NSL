@@ -134,6 +134,14 @@ pub(crate) mod inner {
         {
             return k.max(0);
         }
+        // Review M5: stripe ONLY under the SPMD spawner protocol (shm path
+        // set). The M41 disaggregated-inference spawner also sets
+        // NSL_LOCAL_RANK, and its prefill/decode workers must keep the
+        // historical device-0 binding (their ranks are per-ROLE, not a
+        // device clique).
+        if std::env::var("NSL_TP_SHM_PATH").is_err() {
+            return 0;
+        }
         let Some(rank) = std::env::var("NSL_LOCAL_RANK")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())

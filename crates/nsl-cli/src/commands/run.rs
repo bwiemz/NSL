@@ -85,9 +85,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             process::exit(1);
         }
     }
-    if collectives != "sim" {
-        std::env::set_var("NSL_COLLECTIVES", &collectives);
-    }
+    // Unconditional: `--collectives sim` must also override an inherited
+    // NSL_COLLECTIVES from a parent environment (review L9).
+    std::env::set_var("NSL_COLLECTIVES", &collectives);
 
     // Meta-flag expansion (roadmap 3.3) — see the twin call in build/options.rs.
     let mut wggo = wggo;

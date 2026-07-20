@@ -282,9 +282,9 @@ fn zero_stage1_two_rank_parity() {
         .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line in SPMD stderr:\n{}", spmd.stderr))
         .to_string();
     assert!(
-        zero_line.contains("all_reduce=6")
-            && zero_line.contains("broadcast=12")
-            && zero_line.contains("bucket_members=96"),
+        zero_line.contains("all_reduce=6 ")
+            && zero_line.contains("broadcast=12 ")
+            && zero_line.contains("bucket_members=96 "),
         "ZeRO collective counts wrong (expected 6 grad buckets, 12 owner \
          broadcasts, 96 bucketed members): {zero_line}"
     );
@@ -472,7 +472,7 @@ fn zero_stage1_rank_aware_dp_parity() {
         .find(|l| l.contains("[zero] ws=2 rank=0"))
         .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line:\n{}", dp.stderr));
     assert!(
-        z0.contains("all_reduce=6") && z0.contains("broadcast=12"),
+        z0.contains("all_reduce=6 ") && z0.contains("broadcast=12 "),
         "wrong collective counts (expected 48/48): {z0}"
     );
     assert!(
@@ -480,6 +480,56 @@ fn zero_stage1_rank_aware_dp_parity() {
         "rank1 [zero] line missing — second rank did not run:\n{}",
         dp.stderr
     );
+}
+
+/// P4 item 16 review M4: stage-2 under DISTINCT per-rank data. Replicated
+/// data cannot distinguish a real reduce_scatter from a no-op local unpack
+/// ((g+g)/2 == g); the strided shard makes the cross-rank sum load-bearing,
+/// exactly like the stage-1 rank-aware leg.
+#[test]
+#[ignore = "spawns 3 nsl processes; ~2 min. Run: cargo test --test zero_spmd_gate -- --ignored"]
+fn zero_stage2_rank_aware_dp_parity() {
+    let tmp = std::env::temp_dir().join(format!("nsl_zero_s2ra_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_base = tmp.join("base.nslm");
+    let save_dp = tmp.join("dp.nslm");
+
+    let base = run_nsl(&program_rank_aware(&save_base, 2), "s2ra_base", &[], 600);
+    assert!(base.success, "baseline failed:\n{}", base.stderr);
+    let dp = run_nsl(
+        &program_rank_aware(&save_dp, 1),
+        "s2ra_dp",
+        &["--zero-stage", "2", "--devices", "2"],
+        900,
+    );
+    assert!(dp.success, "stage-2 rank-aware run failed:\n{}", dp.stderr);
+
+    let base_losses = parse_losses(&base.loss_stream);
+    let dp_losses = parse_losses(&dp.loss_stream);
+    assert!(base_losses.len() >= 12, "baseline too short");
+    assert!(dp_losses.len() >= 6, "dp stream too short");
+    for k in 0..6 {
+        let got = dp_losses[k];
+        let want = base_losses[2 * k];
+        let rel = (got - want).abs() / want.abs().max(1.0);
+        assert!(
+            rel < 1e-3,
+            "stage-2 rank0 loss[{k}]={got} != baseline even-index[{}]={want} \
+             (rel {rel:.3e}) — cross-rank gradient sum is wrong",
+            2 * k
+        );
+    }
+    for rank in 0..2 {
+        let line = dp
+            .stderr
+            .lines()
+            .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
+            .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", dp.stderr));
+        assert!(
+            line.trim_end().ends_with("reduce_scatter=6") && line.contains("all_reduce=0 "),
+            "stage-2 collective counts wrong: {line}"
+        );
+    }
 }
 
 /// Loud refusals: stage 2/3 unlowered; a real (non-simulated) backend
@@ -535,9 +585,9 @@ fn zero_stage2_two_rank_parity_reduce_scatter() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
         assert!(
-            line.contains("reduce_scatter=6")
-                && line.contains("all_reduce=0")
-                && line.contains("broadcast=12"),
+            line.trim_end().ends_with("reduce_scatter=6")
+                && line.contains("all_reduce=0 ")
+                && line.contains("broadcast=12 "),
             "stage-2 collective counts wrong (want 6 scatters, 0 all_reduce, \
              12 owner broadcasts): {line}"
         );

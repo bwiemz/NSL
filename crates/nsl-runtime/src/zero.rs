@@ -168,6 +168,13 @@ struct ZeROContext {
     /// True when `backend` takes DEVICE pointers (NCCL): GPU-resident grads
     /// and params are passed directly, no host staging, no -5 refusal.
     cuda_aware: bool,
+    /// Review H1: CPU-RESIDENT tensor groups always use this host (CPU-shm)
+    /// backend — a CUDA-aware `backend` (NCCL) must never receive heap
+    /// pointers (ncclInvalidArgument abort on real multi-GPU hardware; even
+    /// GPU models carry a CPU grad group). Shares the same shm mapping, so
+    /// barrier generations stay consistent (all ranks run the identical
+    /// collective sequence in lockstep).
+    host_backend: Option<crate::tensor_parallel::collective::SimulatedBackend>,
 }
 
 // SAFETY: the raw shm pointer inside SimulatedBackend is only touched
@@ -254,6 +261,14 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let ws = (world_size.max(1)) as usize;
+    // Review L7: a clamped out-of-range rank would silently alias the last
+    // rank (duplicate segment claims, overlapping shm writes). Refuse.
+    if rank >= ws {
+        eprintln!(
+            "nsl_zero_init: NSL_LOCAL_RANK={rank} out of range for              world_size={ws} — refusing"
+        );
+        return -1;
+    }
 
     let simulated: bool = std::env::var("NSL_SIMULATED_TP")
         .ok()
@@ -354,6 +369,19 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         (None, false)
     };
 
+    let host_backend = if ws > 1 {
+        std::env::var("NSL_TP_SHM_PATH").ok().map(|p| {
+            let (shm_ptr, shm_len) = crate::tensor_parallel::ffi::open_shm(&p);
+            crate::tensor_parallel::collective::SimulatedBackend::new(
+                rank as i32,
+                ws as i32,
+                shm_ptr,
+                shm_len,
+            )
+        })
+    } else {
+        None
+    };
     *guard = Some(ZeROContext {
         stage: s,
         rank,
@@ -363,6 +391,7 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         num_params: 0,
         backend,
         cuda_aware,
+        host_backend,
     });
     0
 }
@@ -459,6 +488,19 @@ pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
 // the backend reduces element-wise in the same fixed rank order, and the
 // scale-by-1/ws is applied to the same values.
 
+/// Review H1: the backend for HOST-buffer collectives — the CPU-shm backend
+/// when one exists (always, at ws>1), else the main backend (ws==1 never
+/// gets here). CUDA-aware main backends must never see heap pointers.
+fn host_or_main(ctx: &ZeROContext) -> &dyn crate::tensor_parallel::collective::CollectiveBackend {
+    match &ctx.host_backend {
+        Some(h) => h,
+        None => ctx
+            .backend
+            .as_deref()
+            .expect("ws > 1 implies a backend"),
+    }
+}
+
 /// Bucket byte cap (0 disables bucketing).
 fn zero_bucket_cap_bytes() -> usize {
     std::env::var("NSL_ZERO_BUCKET_MB")
@@ -515,7 +557,7 @@ fn reduce_bucket_cpu(
     dtype: u16,
     inv_ws: f64,
 ) -> i64 {
-    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let backend = host_or_main(ctx);
     let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
     let total_elems: usize = bucket.iter().map(|b| b.len).sum();
     let mut flat = vec![0u8; total_bytes];
@@ -572,7 +614,7 @@ fn reduce_bucket_cpu(
 /// bucket → ONE device collective → DtoD unpack → per-tensor on-device scale.
 #[cfg(feature = "cuda")]
 fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i64 {
-    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let backend = ctx.backend.as_deref().expect("ws > 1 implies a backend");
     let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
     let total_elems: usize = bucket.iter().map(|b| b.len).sum();
     crate::cuda::inner::ensure_context();
@@ -629,7 +671,7 @@ fn reduce_scatter_group_cpu(
     dtype: u16,
     inv_ws: f64,
 ) -> i64 {
-    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let backend = host_or_main(ctx);
     let ws = ctx.world_size;
     let esz = if dtype == 0 { 8 } else { 4 };
     // Per-rank owned member lists (ascending param order preserved).
@@ -704,7 +746,7 @@ fn reduce_scatter_group_cpu(
 /// owner-segmented padded layout through device buffers.
 #[cfg(feature = "cuda")]
 fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64) -> i64 {
-    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let backend = ctx.backend.as_deref().expect("ws > 1 implies a backend");
     let ws = ctx.world_size;
     let mut segs: Vec<Vec<BucketItem>> = vec![Vec::new(); ws];
     for &it in items {
@@ -767,7 +809,7 @@ fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64
 /// CPU bucket broadcast from `owner`: every rank packs its current bytes,
 /// ONE collective, every rank unpacks (the root re-reads its own bytes).
 fn broadcast_bucket_cpu(ctx: &ZeROContext, bucket: &[BucketItem], dtype: u16, owner: i32) -> i64 {
-    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let backend = host_or_main(ctx);
     let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
     let total_elems: usize = bucket.iter().map(|b| b.len).sum();
     let mut flat = vec![0u8; total_bytes];
@@ -811,7 +853,7 @@ fn broadcast_bucket_cpu(ctx: &ZeROContext, bucket: &[BucketItem], dtype: u16, ow
 /// GPU (CUDA-aware) bucket broadcast from `owner` via a device bucket.
 #[cfg(feature = "cuda")]
 fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) -> i64 {
-    let backend = ctx.backend.as_ref().expect("ws > 1 implies a backend");
+    let backend = ctx.backend.as_deref().expect("ws > 1 implies a backend");
     let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
     let total_elems: usize = bucket.iter().map(|b| b.len).sum();
     crate::cuda::inner::ensure_context();
@@ -902,6 +944,15 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
     // P4 item 15: bucketed fast path — flatten same-(dtype, device) grads in
     // param-index (= layer) order and run ONE collective per ≤cap bucket.
     let cap = zero_bucket_cap_bytes();
+    // Review M2: stage-2 gradient partitioning lives INSIDE the bucketed
+    // path; a cap of 0 would silently fall through to the all-reduce loop,
+    // voiding the reduce_scatter contract and its counters. Refuse loudly.
+    if cap == 0 && ctx.stage != ZeROStage::Stage1 {
+        eprintln!(
+            "nsl: nsl_zero_reduce_grads: --zero-stage 2 requires bucketed              collectives — do not set NSL_ZERO_BUCKET_MB=0 with stage >= 2"
+        );
+        return -1;
+    }
     if cap > 0 {
         let mut cpu_f64: Vec<BucketItem> = Vec::new();
         let mut cpu_f32: Vec<BucketItem> = Vec::new();
@@ -1052,11 +1103,9 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
 
         if tensor.device == 0 {
             // CPU: in-place all-reduce (send==recv is safe — the backend
-            // copies to its slot first), then average.
-            let backend = ctx
-                .backend
-                .as_ref()
-                .expect("world_size > 1 implies a backend");
+            // copies to its slot first), then average. Review H1: host
+            // buffers go to the host backend.
+            let backend = host_or_main(ctx);
             let rc = backend.all_reduce_sum(
                 tensor.data as *const std::ffi::c_void,
                 tensor.data,
