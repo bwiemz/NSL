@@ -128,6 +128,12 @@ pub struct AdjointGenerator {
     /// different-geometry conv nodes that share an upstream `grad` VarId from
     /// colliding on a mismatched output shape.
     conv_grad_materialize_cache: HashMap<ConvGradMaterializeKey, VarId>,
+    /// Item 9 (`--fuse-rmsnorm-backward`): when set, `RmsNormInputBackward`
+    /// lowers to a SINGLE fused `nsl_rmsnorm_dx_backward` op (native GPU kernel /
+    /// CPU reference) instead of the ~11-op decomposition. Off by default so the
+    /// bit-close decomposition stays the reference; the fused kernel matches it
+    /// to an f32 tolerance (approx rsqrt/div), so this is an opt-in speedup.
+    fuse_rmsnorm_backward: bool,
 }
 
 impl AdjointGenerator {
@@ -141,7 +147,13 @@ impl AdjointGenerator {
             csha_diagnostics: Vec::new(),
             csha_fused_events: Vec::new(),
             conv_grad_materialize_cache: HashMap::new(),
+            fuse_rmsnorm_backward: false,
         }
+    }
+
+    /// Item 9: enable the fused RMSNorm dx op. Call before `generate()`.
+    pub fn set_fuse_rmsnorm_backward(&mut self, on: bool) {
+        self.fuse_rmsnorm_backward = on;
     }
 
     /// T7.1: attach CSHA backward claims to this generator.  Must be
@@ -1095,6 +1107,46 @@ impl AdjointGenerator {
                     PrimalOp::Passthrough("reduce_to_shape".into()),
                     vec![grad_x_hat, weight],
                 )
+            }
+
+            // --- RMSNorm INPUT backward (correct, NO mean-subtract) ---
+            // y = gamma * x / rms, rms = sqrt(mean(x²)+eps) over the last dim.
+            //   dx_j = g_j·ȳ_j/rms − x_j·mean_k(ȳ_k·g_k·x_k)/rms³
+            // (mean = Σ/N, so mean(ȳ·g·x)/rms³ == Σ(ȳ·g·x)/(N·rms³).) All
+            // reductions are keepdim over the last dim so the [.,1] results
+            // broadcast against the full-shape tensors — no Broadcast op needed.
+            AdjointExpr::RmsNormInputBackward(y_bar, x, gamma, eps_val) => {
+                // Item 9: fused single-op path (native GPU kernel / CPU ref),
+                // opt-in — collapses the ~11-op decomposition below into one
+                // `nsl_rmsnorm_dx_backward` launch. eps rides bit-exact in the
+                // passthrough name (wengert_lower parses it back to f64).
+                if self.fuse_rmsnorm_backward {
+                    return self.emit_op(
+                        PrimalOp::Passthrough(format!(
+                            "rmsnorm_dx_backward:{}",
+                            eps_val.to_bits()
+                        )),
+                        vec![y_bar, x, gamma],
+                    );
+                }
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x, x]);
+                let mean_sq =
+                    self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x_sq]);
+                let eps = self.emit_constant(eps_val);
+                let ms_eps = self.emit_op(PrimalOp::Add, vec![mean_sq, eps]);
+                let rms = self.emit_op(PrimalOp::Sqrt, vec![ms_eps]);
+                // g·ȳ (gamma [D] broadcasts against ȳ [.,D], as in the forward).
+                let gyb = self.emit_op(PrimalOp::Mul, vec![y_bar, gamma]);
+                let term1 = self.emit_op(PrimalOp::Div, vec![gyb, rms]);
+                // mean_k(ȳ_k·g_k·x_k) over the last dim.
+                let ygx = self.emit_op(PrimalOp::Mul, vec![gyb, x]);
+                let mean_ygx =
+                    self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![ygx]);
+                let rms_sq = self.emit_op(PrimalOp::Mul, vec![rms, rms]);
+                let rms_cubed = self.emit_op(PrimalOp::Mul, vec![rms_sq, rms]);
+                let coeff = self.emit_op(PrimalOp::Div, vec![mean_ygx, rms_cubed]);
+                let term2 = self.emit_op(PrimalOp::Mul, vec![x, coeff]);
+                self.emit_op(PrimalOp::Sub, vec![term1, term2])
             }
 
             // --- LayerNorm / BatchNorm gamma backward: grad * x_hat ---

@@ -1,14 +1,15 @@
-# P0.2 regression fixture: a linear layer WITH a bias, under FASE-Deferred
+# Root-fix regression fixture: a linear layer WITH a bias, under FASE-Deferred
 # (grad_accumulation>=2, AdamW, source-AD). The bias's gradient adjoint is the
-# shared intermediate `dout` that also feeds the weight-gradient matmul; the
-# FASE optimizer hook consumes+frees it early, so on main the weight gradient
-# is SILENTLY dropped. The P0.2 guard must turn this into a hard compile error.
+# shared intermediate `dout` that also feeds the weight-gradient matmul. On main
+# the FASE optimizer hook consumed+freed it early, SILENTLY dropping the weight
+# gradient; P0.2 turned that into a hard compile error. The deferred-free fix
+# keeps the tensor live until the matmul reads it, so this now compiles and BOTH
+# params get correct gradients (verified bit-exact against tape-AD).
 from nsl.nn.losses import mse_loss
 
 # The bias is [4, 1] (same shape as x@w) so there is no broadcast reduce — the
 # bias gradient IS `dout` exactly. That keeps the ONLY defect the shared-
-# intermediate drop of the WEIGHT gradient (no incidental shape mismatch), so
-# the escape hatch demonstrates a clean "compiles + runs, weight grad dropped".
+# intermediate drop of the WEIGHT gradient (no incidental shape mismatch).
 model Linear:
     w: Tensor = ones([2, 1])
     b: Tensor = zeros([4, 1])

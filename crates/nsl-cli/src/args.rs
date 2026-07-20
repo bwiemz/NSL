@@ -747,6 +747,24 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_budget_mib: Option<u64>,
 
+        /// With --checkpoint-blocks: periodic checkpointing (Item 8). `N`
+        /// (an integer >= 1) coalesces every N transformer-block anchors into
+        /// one CCR super-segment — saving only every N-th block boundary and
+        /// recomputing the N-block span, for a ~N x smaller saved-boundary
+        /// surface (the activation surface CSLA buffers across the accumulation
+        /// window). `auto` searches strides against --checkpoint-budget-mib and
+        /// picks the smallest projected activation peak that fits. `1` (default)
+        /// = classic per-block. Bit-exact at any stride.
+        #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
+        pub(crate) checkpoint_stride: String,
+
+        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
+        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
+        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        #[arg(long, requires = "source_ad")]
+        pub(crate) fuse_rmsnorm_backward: bool,
+
         /// With --checkpoint-selective: compress the saved matmul-class
         /// activations to half precision between forward and backward
         /// (fp16 or bf16). Not bit-exact — backward reads rounded
@@ -1134,6 +1152,24 @@ pub(crate) struct RunArgs {
         /// added automatically when parameter sizes are statically known.
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_budget_mib: Option<u64>,
+
+        /// With --checkpoint-blocks: periodic checkpointing (Item 8). `N`
+        /// (an integer >= 1) coalesces every N transformer-block anchors into
+        /// one CCR super-segment — saving only every N-th block boundary and
+        /// recomputing the N-block span, for a ~N x smaller saved-boundary
+        /// surface (the activation surface CSLA buffers across the accumulation
+        /// window). `auto` searches strides against --checkpoint-budget-mib and
+        /// picks the smallest projected activation peak that fits. `1` (default)
+        /// = classic per-block. Bit-exact at any stride.
+        #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
+        pub(crate) checkpoint_stride: String,
+
+        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
+        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
+        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        #[arg(long, requires = "source_ad")]
+        pub(crate) fuse_rmsnorm_backward: bool,
 
         /// With --checkpoint-selective: compress the saved matmul-class
         /// activations to half precision between forward and backward

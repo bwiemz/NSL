@@ -1,0 +1,32 @@
+# Numeric-parity fixture for the FASE shared-intermediate fix. A linear+bias
+# model under FASE-Deferred (grad_accumulation=4, AdamW, source-AD) whose bias
+# gradient IS `d_out` — also consumed by the weight matmul. The fix defers the
+# hook's free of that shared tensor. Prints the final trained weights so the
+# gate can assert source-AD+FASE is bit-identical to the tape-AD reference
+# (which never uses the consume-hook), proving the deferred grad is CORRECT and
+# not merely nonzero.
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+    b: Tensor = zeros([4, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.w) + self.b
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+train(model=m, epochs=12, grad_accumulation=4):
+    optimizer: AdamW(lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+print("FINAL_W_BEGIN")
+print(m.w)
+print("FINAL_W_END")
+print("FINAL_B_BEGIN")
+print(m.b)
+print("FINAL_B_END")

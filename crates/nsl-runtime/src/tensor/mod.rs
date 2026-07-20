@@ -2800,6 +2800,85 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
     out_ptr
 }
 
+/// Fused RMSNorm INPUT-gradient (dx) — one FFI in place of the ~11-op source-AD
+/// decomposition. Computes the CORRECT RMSNorm dx (NO mean-subtract):
+///   dx_j = g_j·ȳ_j/rms − x_j·Σ_k(ȳ_k·g_k·x_k)/(N·rms³),  rms=√(mean(x²)+eps)
+/// recomputing rms internally (no saved-rms dependency). GPU uses the native
+/// `nsl_rmsnorm_dx_bwd_f32` kernel (one block per row, one fused reduction);
+/// CPU is the f64 reference. Emitted by source-AD's `RmsNormInputBackward` when
+/// `--fuse-rmsnorm-backward` is set; equals the decomposition to f32 tolerance.
+#[no_mangle]
+pub extern "C" fn nsl_rmsnorm_dx_backward(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    eps: f64,
+) -> i64 {
+    let x = NslTensor::from_ptr(x_ptr);
+
+    #[cfg(feature = "cuda")]
+    if x.device > 0 {
+        // Native GPU kernel — contiguous f32 on the input's device.
+        let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
+        let dy_c = nsl_tensor_contiguous(dy_dev);
+        let x_c = nsl_tensor_contiguous(x_ptr);
+        let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
+        let g_c = nsl_tensor_contiguous(g_dev);
+        let dx = crate::cuda::gpu_rmsnorm_dx_backward_f32(dy_c, x_c, g_c, eps as f32);
+        // Both `nsl_tensor_to_device` and `nsl_tensor_contiguous` return an
+        // OWNED ref — refcount++ even on a same-device / already-contiguous
+        // no-op (they return the SAME pointer). So each acquire needs exactly
+        // one free, UNCONDITIONALLY: guarding the to_device free on
+        // `dev != ptr` leaks the no-op's extra ref (unbounded GPU growth on the
+        // per-step `dy`). Mirrors the tensor/mod.rs:~1793 refcount-balance idiom.
+        nsl_tensor_free(dy_dev);
+        nsl_tensor_free(dy_c);
+        nsl_tensor_free(x_c);
+        nsl_tensor_free(g_dev);
+        nsl_tensor_free(g_c);
+        return dx;
+    }
+
+    // CPU reference (f64 accumulation).
+    let dy = NslTensor::from_ptr(dy_ptr);
+    let gamma = NslTensor::from_ptr(gamma_ptr);
+    let ndim = x.ndim as usize;
+    let n = unsafe { *x.shape.add(ndim - 1) } as usize;
+    let total = x.len as usize;
+    let num_rows = total / n;
+    let nf = n as f64;
+
+    let rd = |t: &NslTensor, i: usize| -> f64 {
+        if t.dtype == 1 { unsafe { *t.data_f32().add(i) as f64 } } else { unsafe { *t.data_f64().add(i) } }
+    };
+    let shape: Vec<i64> = (0..ndim).map(|i| unsafe { *x.shape.add(i) }).collect();
+    let dx_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&shape, x.dtype);
+    let dx = NslTensor::from_ptr(dx_ptr);
+    let write_dx = |i: usize, v: f64| {
+        if x.dtype == 1 { unsafe { *dx.data_f32().add(i) = v as f32 } }
+        else { unsafe { *dx.data_f64().add(i) = v } }
+    };
+
+    for row in 0..num_rows {
+        let base = row * n;
+        let mut sum_sq = 0.0_f64;
+        let mut sum_dwx = 0.0_f64;
+        for j in 0..n {
+            let xj = rd(&x, base + j);
+            sum_sq += xj * xj;
+            sum_dwx += rd(&dy, base + j) * rd(&gamma, j) * xj;
+        }
+        let rms = (sum_sq / nf + eps).sqrt().max(1e-12);
+        let rms_cubed = rms * rms * rms;
+        for j in 0..n {
+            let xj = rd(&x, base + j);
+            let d = rd(&gamma, j) * rd(&dy, base + j) / rms - xj * sum_dwx / (nf * rms_cubed);
+            write_dx(base + j, d);
+        }
+    }
+    dx_ptr
+}
+
 // === Dropout ===
 
 #[no_mangle]

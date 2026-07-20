@@ -428,6 +428,7 @@ pub fn plan(
     csha_claimed_ops: Option<&HashSet<u32>>,
     policy: CcrPolicy,
     compress_saves: bool,
+    stride: usize,
 ) -> Option<CcrPlan> {
     // ---- 1. Param vars per block key --------------------------------
     let mut param_block: HashMap<VarId, String> = HashMap::new();
@@ -504,6 +505,24 @@ pub fn plan(
                 }
             }
         }
+    }
+
+    // ---- 3b. Periodic checkpointing: coalesce every `stride` block anchors
+    //          into ONE super-segment. Saving only every k-th block boundary
+    //          (and recomputing the whole k-block span on the backward pass)
+    //          trades more recompute for a k× smaller saved-boundary surface —
+    //          exactly the activation surface CSLA buffers across the
+    //          accumulation window (peak ≈ G·(N/k)·B_boundary + k·I_interior,
+    //          minimized near k*=√(G·N·B/I)). stride==1 is the classic
+    //          per-block behavior (no coalescing). `epilogue_start` was
+    //          computed from the FULL anchor set above, so the last kept
+    //          super-segment correctly spans through the final real block.
+    // NB: no stderr note here — `plan` is called once per candidate during the
+    // `Auto` stride search, so the user-facing coalescing note is emitted by the
+    // caller for the FINAL chosen stride only (see stmt.rs).
+    let stride = stride.max(1);
+    if stride > 1 && anchors.len() > 1 {
+        anchors = anchors.iter().step_by(stride).cloned().collect();
     }
 
     // ---- 4. Build segments + escape analysis ------------------------
@@ -636,6 +655,161 @@ pub fn plan(
         compress,
     })
 }
+
+/// Compile-time projection of the peak concurrent ACTIVATION bytes a CCR plan
+/// implies, split into the two terms that trade off against the checkpoint
+/// stride. This is the peak-concurrent-activation model the scheduler was
+/// missing (WGGO's model is resident bytes; the runtime surfaces are measured,
+/// not predictive).
+///
+///   - `saved_boundary_bytes`: Σ over segments of the escaping (checkpointed)
+///     activations — these stay resident for the whole backward. Under CSLA
+///     they are buffered per accumulation micro-batch, so [`ActivationPeak::peak_bytes`]
+///     multiplies this term by the window `G`.
+///   - `max_recompute_bytes`: the largest single segment's recompute transient,
+///     materialized one super-segment at a time during backward.
+///
+/// Peak ≈ `G·saved_boundary_bytes + max_recompute_bytes`. A larger stride
+/// shrinks the first term (fewer boundaries) and grows the second (bigger
+/// spans) — the classic sub-linear-memory tradeoff, minimized near
+/// `k*=√(G·N·B/I)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActivationPeak {
+    pub saved_boundary_bytes: u64,
+    pub max_recompute_bytes: u64,
+    pub num_segments: usize,
+}
+
+impl ActivationPeak {
+    /// Projected peak with the CSLA accumulation window `G` applied to the saved
+    /// boundaries (pass `G = grad_accumulation`, or `1` when CSLA is inactive).
+    pub fn peak_bytes(&self, window: u64) -> u64 {
+        self.saved_boundary_bytes
+            .saturating_mul(window.max(1))
+            .saturating_add(self.max_recompute_bytes)
+    }
+}
+
+/// Project [`ActivationPeak`] for a plan given per-VarId byte sizes (from
+/// `profiling::captures::size_hints_from_var_nodes`). Unsized vars contribute 0
+/// — an honest under-count of the unknown, matching the budget knapsack's
+/// treatment. Pure and cheap: safe to call once per candidate stride.
+pub fn project_activation_peak(
+    plan: &CcrPlan,
+    sizes: &HashMap<VarId, u64>,
+) -> ActivationPeak {
+    let sum = |vars: &[VarId]| -> u64 {
+        vars.iter()
+            .fold(0u64, |a, v| a.saturating_add(sizes.get(v).copied().unwrap_or(0)))
+    };
+    // Saved surface = escaping boundaries PLUS force-saved interiors. Under the
+    // Selective policy a segment's matmul-class interiors are kept resident
+    // (never recomputed) — they land in `interior` but NOT in
+    // `per_segment_recompute`, and they are the LARGEST per-block tensors.
+    // Counting only `escaping` here understated the budget in the unsafe
+    // direction (a stride reported as fitting when the resident set is far
+    // larger). `interior \ recompute` recovers exactly the force-saved set
+    // (matmul saves, CSHA-claimed chains, Dropout, non-tensor scalars — the
+    // last contribute 0 via `sizes`, an honest no-op).
+    let mut saved_boundary_bytes = 0u64;
+    for (seg, seg_rc) in plan.segments.iter().zip(&plan.per_segment_recompute) {
+        saved_boundary_bytes = saved_boundary_bytes.saturating_add(sum(&seg.escaping));
+        let recompute: std::collections::HashSet<VarId> = seg_rc.iter().copied().collect();
+        for &v in &seg.interior {
+            if !recompute.contains(&v) {
+                saved_boundary_bytes =
+                    saved_boundary_bytes.saturating_add(sizes.get(&v).copied().unwrap_or(0));
+            }
+        }
+    }
+    let max_recompute_bytes = plan
+        .per_segment_recompute
+        .iter()
+        .map(|seg| sum(seg))
+        .max()
+        .unwrap_or(0);
+    ActivationPeak {
+        saved_boundary_bytes,
+        max_recompute_bytes,
+        num_segments: plan.segments.len(),
+    }
+}
+
+/// The stride chosen by an `Auto` activation-budget search, with the
+/// per-candidate projected peaks for a reproducible decision log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrideChoice {
+    pub stride: usize,
+    pub peak_bytes: u64,
+    /// Whether the chosen stride's projected peak is within the budget (always
+    /// true when no budget was given).
+    pub fits_budget: bool,
+    /// `(stride, projected_peak_bytes)` for every candidate that produced a
+    /// plan, ascending by stride — the audit trail behind the choice.
+    pub considered: Vec<(usize, u64)>,
+}
+
+/// Search `candidates` for the periodic-checkpoint stride that minimizes step
+/// time subject to a peak-activation budget. Projected peak is U-shaped in
+/// stride (`G·(N/k)·B` falls, `k·I` rises), so the feasible set is an interval:
+/// among strides whose projected peak fits `budget_bytes` we take the SMALLEST
+/// (least recompute → fastest); if none fit — or no budget was given — we take
+/// the stride with the smallest projected peak. `window` is the CSLA
+/// accumulation factor `G` applied to the saved boundaries (1 when CSLA is off).
+/// Returns `None` only if NO candidate produced a plan (caller keeps stride 1).
+pub fn select_stride(
+    primal: &WengertList,
+    csha_claimed_ops: Option<&HashSet<u32>>,
+    policy: CcrPolicy,
+    sizes: &HashMap<VarId, u64>,
+    window: u64,
+    budget_bytes: Option<u64>,
+    candidates: &[usize],
+) -> Option<StrideChoice> {
+    let mut considered: Vec<(usize, u64)> = Vec::new();
+    let mut seen_peaks: HashSet<u64> = HashSet::new();
+    for &k in candidates {
+        if let Some(p) = plan(primal, csha_claimed_ops, policy, false, k) {
+            let pb = project_activation_peak(&p, sizes).peak_bytes(window);
+            // Collapse strides with an identical projected peak (e.g. any stride
+            // >= block count → one super-segment), keeping the FIRST (smallest,
+            // since `candidates` is ascending → least recompute for that peak).
+            if seen_peaks.insert(pb) {
+                considered.push((k, pb));
+            }
+        }
+    }
+    if considered.is_empty() {
+        return None;
+    }
+    considered.sort_by_key(|&(k, _)| k);
+    let (stride, peak_bytes, fits_budget) = match budget_bytes {
+        // First fit in stride-ascending order = smallest stride that fits.
+        Some(budget) => match considered.iter().find(|&&(_, pb)| pb <= budget) {
+            Some(&(k, pb)) => (k, pb, true),
+            None => {
+                let &(k, pb) = considered.iter().min_by_key(|&&(_, pb)| pb).unwrap();
+                (k, pb, false)
+            }
+        },
+        None => {
+            let &(k, pb) = considered.iter().min_by_key(|&&(_, pb)| pb).unwrap();
+            (k, pb, true)
+        }
+    };
+    Some(StrideChoice {
+        stride,
+        peak_bytes,
+        fits_budget,
+        considered,
+    })
+}
+
+/// The default stride candidate ladder for the `Auto` search: 1,2,3,4,6,8,…
+/// A stride larger than the block count collapses to a single super-segment,
+/// so `select_stride` de-dups those; this ladder just needs to bracket the
+/// √(G·N·B/I) optimum for realistic block counts.
+pub const DEFAULT_STRIDE_CANDIDATES: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
 
 /// Build the tiny post-forward early-free list: one `FreeTensor` per
 /// recompute victim. Lowered by stmt.rs immediately after the primal with
@@ -1117,10 +1291,168 @@ mod tests {
         }
     }
 
+    /// Four-block residual tape (blocks.0..3 + head epilogue) for periodic
+    /// checkpointing. Each block: interior Matmul(prev_out, w_b), output
+    /// Add(interior, prev_out).
+    fn toy_primal_4blocks() -> WengertList {
+        let mut var_names = HashMap::new();
+        for b in 0..4 {
+            var_names.insert(1 + b, format!("m.blocks.{b}.w"));
+        }
+        var_names.insert(13, "m.head.w".to_string());
+        let mut ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("m.blocks.0.w".into()), vec![]),
+            op(2, 2, PrimalOp::Param("m.blocks.1.w".into()), vec![]),
+            op(3, 3, PrimalOp::Param("m.blocks.2.w".into()), vec![]),
+            op(4, 4, PrimalOp::Param("m.blocks.3.w".into()), vec![]),
+        ];
+        // Block b: interior = Matmul(prev_out, w_{b}); output = Add(interior, prev_out).
+        let mut prev_out: VarId = 0; // x
+        let mut next = 5u32;
+        for b in 0..4u32 {
+            let w = 1 + b;
+            let interior = next;
+            ops.push(op(next, interior, PrimalOp::Matmul, vec![prev_out, w]));
+            next += 1;
+            let out = next;
+            ops.push(op(next, out, PrimalOp::Add, vec![interior, prev_out]));
+            next += 1;
+            prev_out = out;
+        }
+        // Epilogue: head.w then Matmul(last_out, head.w).
+        ops.push(op(next, next, PrimalOp::Param("m.head.w".into()), vec![]));
+        let head = next;
+        next += 1;
+        ops.push(op(next, next, PrimalOp::Matmul, vec![prev_out, head]));
+        let output = next;
+        WengertList {
+            ops,
+            output,
+            var_names,
+            var_types: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn periodic_stride_coalesces_and_saves_fewer_boundaries() {
+        let primal = toy_primal_4blocks();
+        // Stride 1: 4 segments, 4 escaping block boundaries (v6,v8,v10,v12).
+        let p1 = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        assert_eq!(p1.segments.len(), 4, "stride 1 = one segment per block");
+        let saved1: usize = p1.segments.iter().map(|s| s.escaping.len()).sum();
+        // Stride 2: 2 super-segments; the intermediate block boundary (v6, v10)
+        // becomes RECOMPUTE, only the super-boundaries (v8, v12) are saved.
+        let p2 = plan(&primal, None, CcrPolicy::Block, false, 2).unwrap();
+        assert_eq!(p2.segments.len(), 2, "stride 2 coalesces 4 blocks → 2");
+        let saved2: usize = p2.segments.iter().map(|s| s.escaping.len()).sum();
+        assert!(
+            saved2 < saved1,
+            "periodic saving keeps fewer boundaries: {saved2} < {saved1}"
+        );
+        // v6 (block-0 output) escapes under stride 1 but is recomputed under 2.
+        assert!(!p1.recompute.contains(&6), "v6 saved at stride 1");
+        assert!(p2.recompute.contains(&6), "v6 recomputed at stride 2");
+        // Stride 4 collapses to a single super-segment.
+        let p4 = plan(&primal, None, CcrPolicy::Block, false, 4).unwrap();
+        assert_eq!(p4.segments.len(), 1, "stride 4 → one segment for 4 blocks");
+    }
+
+    #[test]
+    fn activation_peak_splits_saved_and_recompute() {
+        let primal = toy_primal_4blocks();
+        // Every tensor 100 bytes.
+        let sizes: HashMap<VarId, u64> =
+            primal.ops.iter().map(|o| (o.result, 100u64)).collect();
+        let p1 = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let ap1 = project_activation_peak(&p1, &sizes);
+        // 4 boundaries saved; each segment recomputes 1 interior.
+        assert_eq!(ap1.saved_boundary_bytes, 400);
+        assert_eq!(ap1.max_recompute_bytes, 100);
+        let p2 = plan(&primal, None, CcrPolicy::Block, false, 2).unwrap();
+        let ap2 = project_activation_peak(&p2, &sizes);
+        // 2 boundaries saved; each super-segment recomputes 3 interiors.
+        assert_eq!(ap2.saved_boundary_bytes, 200);
+        assert_eq!(ap2.max_recompute_bytes, 300);
+        // With window G=4 the boundary surface dominates → stride 2 wins.
+        assert!(ap2.peak_bytes(4) < ap1.peak_bytes(4), "G=4: 1100 < 1700");
+        // With G=1 they tie here (200+300 == 400+100).
+        assert_eq!(ap1.peak_bytes(1), ap2.peak_bytes(1));
+    }
+
+    #[test]
+    fn activation_peak_counts_selective_saved_matmuls() {
+        // HIGH review fix: under Selective, matmul-class interiors are kept
+        // resident (never recomputed). They must be counted in the saved
+        // surface, or the budget projection understates memory in the unsafe
+        // direction (claims a stride fits when it doesn't).
+        //
+        // Two-block tape, each block = Matmul (Selective-saved) → Gelu
+        // (recomputed) → Add-residual (escapes):
+        let mut var_names = HashMap::new();
+        var_names.insert(1, "m.blocks.0.w".to_string());
+        var_names.insert(2, "m.blocks.1.w".to_string());
+        var_names.insert(9, "m.head.w".to_string());
+        let primal = WengertList {
+            ops: vec![
+                op(0, 0, PrimalOp::Input("x".into()), vec![]),
+                op(1, 1, PrimalOp::Param("m.blocks.0.w".into()), vec![]),
+                op(2, 2, PrimalOp::Param("m.blocks.1.w".into()), vec![]),
+                op(3, 3, PrimalOp::Matmul, vec![0, 1]), // block0 mm (Selective-saved)
+                op(4, 4, PrimalOp::Gelu, vec![3]),      // block0 act (recomputed)
+                op(5, 5, PrimalOp::Add, vec![4, 0]),    // block0 out (escapes)
+                op(6, 6, PrimalOp::Matmul, vec![5, 2]), // block1 mm
+                op(7, 7, PrimalOp::Gelu, vec![6]),      // block1 act
+                op(8, 8, PrimalOp::Add, vec![7, 5]),    // block1 out
+                op(9, 9, PrimalOp::Param("m.head.w".into()), vec![]),
+                op(10, 10, PrimalOp::Matmul, vec![8, 9]), // epilogue
+            ],
+            output: 10,
+            var_names,
+            var_types: HashMap::new(),
+        };
+        let sizes: HashMap<VarId, u64> =
+            primal.ops.iter().map(|o| (o.result, 100u64)).collect();
+        let block = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let sel = plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
+        let ap_block = project_activation_peak(&block, &sizes);
+        let ap_sel = project_activation_peak(&sel, &sizes);
+        // Block recomputes matmuls + gelus (0 saved beyond boundaries);
+        // Selective keeps the 2 matmuls resident → saved includes them.
+        assert_eq!(ap_block.saved_boundary_bytes, 200, "2 escaping boundaries");
+        assert_eq!(ap_sel.saved_boundary_bytes, 400, "2 boundaries + 2 saved matmuls");
+        assert!(
+            ap_sel.saved_boundary_bytes > ap_block.saved_boundary_bytes,
+            "Selective's resident matmuls must not be invisible to the projection"
+        );
+    }
+
+    #[test]
+    fn select_stride_prefers_smallest_that_fits_then_min_peak() {
+        let primal = toy_primal_4blocks();
+        let sizes: HashMap<VarId, u64> =
+            primal.ops.iter().map(|o| (o.result, 100u64)).collect();
+        let cands = [1usize, 2, 4];
+        // No budget, window G=4 → min projected peak (stride 2 = 1100).
+        let c = select_stride(&primal, None, CcrPolicy::Block, &sizes, 4, None, &cands).unwrap();
+        assert_eq!(c.stride, 2, "min-peak stride under G=4");
+        assert_eq!(c.peak_bytes, 1100);
+        assert!(c.fits_budget);
+        // Generous budget where stride 1 already fits → pick 1 (least recompute).
+        let c1 = select_stride(&primal, None, CcrPolicy::Block, &sizes, 4, Some(5000), &cands)
+            .unwrap();
+        assert_eq!(c1.stride, 1, "smallest stride that fits");
+        // Budget below every peak → best-effort min-peak, fits_budget=false.
+        let c0 = select_stride(&primal, None, CcrPolicy::Block, &sizes, 4, Some(10), &cands)
+            .unwrap();
+        assert!(!c0.fits_budget);
+        assert_eq!(c0.stride, 2, "min-peak when nothing fits");
+    }
+
     #[test]
     fn segments_and_interiors() {
         let primal = toy_primal();
-        let plan = plan(&primal, None, CcrPolicy::Block, false).expect("two blocks segment");
+        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).expect("two blocks segment");
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].layer_key, "blocks.0");
         // v3 is interior to block 0 (only consumed by v4 inside the block);
@@ -1135,7 +1467,7 @@ mod tests {
     #[test]
     fn adjoint_splice_remaps_and_frees() {
         let primal = toy_primal();
-        let plan = plan(&primal, None, CcrPolicy::Block, false).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
         // Toy adjoint touching both interiors: block-1 grads first (reverse
         // order), then block-0 grads.
         let mut adjoint = WengertList {
@@ -1191,7 +1523,7 @@ mod tests {
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        assert!(plan(&primal, None, CcrPolicy::Block, false).is_none());
+        assert!(plan(&primal, None, CcrPolicy::Block, false, 1).is_none());
     }
 
     #[test]
@@ -1199,7 +1531,7 @@ mod tests {
         let mut primal = toy_primal();
         // Replace block-0's interior Matmul with a Dropout.
         primal.ops[3] = op(3, 3, PrimalOp::Dropout { p: 0.1 }, vec![0]);
-        let plan = plan(&primal, None, CcrPolicy::Block, false).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
         assert!(!plan.recompute.contains(&3), "dropout must not be replayed");
     }
 
@@ -1211,7 +1543,7 @@ mod tests {
         // residual add consumes the Relu instead.
         primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
-        let plan = plan(&primal, None, CcrPolicy::Selective, false).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
         assert!(!plan.recompute.contains(&3), "matmul output must stay saved");
         assert!(plan.recompute.contains(&9), "relu is replayable");
     }
@@ -1221,7 +1553,7 @@ mod tests {
         let mut primal = toy_primal();
         primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
-        let plan = plan(&primal, None, CcrPolicy::Selective, true).unwrap();
+        let plan = plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
         assert!(
             plan.compress.contains(&3) && plan.compress.contains(&5),
             "both blocks' matmul outputs compressible: {:?}",
@@ -1270,7 +1602,7 @@ mod tests {
         let primal = toy_primal();
         let mut claimed = HashSet::new();
         claimed.insert(3u32); // op id 3 = block 0's Matmul
-        let plan = plan(&primal, Some(&claimed), CcrPolicy::Block, false).unwrap();
+        let plan = plan(&primal, Some(&claimed), CcrPolicy::Block, false, 1).unwrap();
         assert!(!plan.recompute.contains(&3), "claimed segment exempt");
         assert!(plan.recompute.contains(&5), "unclaimed segment intact");
     }

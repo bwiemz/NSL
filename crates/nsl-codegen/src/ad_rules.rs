@@ -145,6 +145,14 @@ pub enum AdjointExpr {
     /// RMSNorm's forward definition `y = gamma * x / rms`.
     /// args: (grad, input, eps, weight)
     RmsNormGammaBackward(VarId, VarId, f64, VarId),
+    /// INPUT gradient for RMSNorm — the correct dx that does NOT mean-subtract
+    /// (RMSNorm's forward is `y = gamma * x / rms`, `rms = sqrt(mean(x²)+eps)`,
+    /// with no per-row mean removal). Reusing `LayerNormBackward` here — as the
+    /// code did before — computes the LayerNorm dx (which centers x), giving
+    /// WRONG input gradients for RMSNorm and matching neither tape-AD nor the
+    /// math. Formula: `dx_j = g_j·ȳ_j/rms − x_j·mean_k(ȳ_k·g_k·x_k)/rms³`.
+    /// args: (grad, input, gamma, eps)
+    RmsNormInputBackward(VarId, VarId, VarId, f64),
 
     // Regularization
     /// Dropout backward: grad * mask / (1-p).  args: (grad, mask)
@@ -458,18 +466,31 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // RMSNorm(input, weight) -> output  (no bias, eps is compile-time constant)
         PrimalOp::RMSNorm { eps } => {
             let input = op.inputs[0];
-            let mut adjoints = vec![InputAdjoint {
-                input_var: input,
-                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result, *eps),
-            }];
-            // weight gradient: grad * (x / rms) — RMSNorm does NOT mean-subtract.
-            // Using `NormGammaBackward` here would compute x_hat = (x-mean)/std
-            // (the LayerNorm formulation) which yields dgamma=0 for any
-            // constant row (e.g. all-ones input), masking real gradients.
+            let mut adjoints = Vec::new();
+            // INPUT gradient. RMSNorm does NOT mean-subtract, so the correct dx
+            // needs gamma and the RMSNorm rms. When gamma is present use the
+            // dedicated `RmsNormInputBackward`; only if a (rare) gamma-less
+            // RMSNorm appears do we fall back to the old `LayerNormBackward`
+            // path (documented as approximate for that degenerate case).
             if op.inputs.len() > 1 {
+                adjoints.push(InputAdjoint {
+                    input_var: input,
+                    expr: AdjointExpr::RmsNormInputBackward(output_bar, input, op.inputs[1], *eps),
+                });
+                // weight gradient: grad * (x / rms) — RMSNorm does NOT
+                // mean-subtract. Using `NormGammaBackward` here would compute
+                // x_hat = (x-mean)/std (the LayerNorm formulation), yielding
+                // dgamma=0 for any constant row, masking real gradients.
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
                     expr: AdjointExpr::RmsNormGammaBackward(output_bar, input, *eps, op.inputs[1]),
+                });
+            } else {
+                adjoints.push(InputAdjoint {
+                    input_var: input,
+                    expr: AdjointExpr::LayerNormBackward(
+                        output_bar, input, op.result, op.result, *eps,
+                    ),
                 });
             }
             adjoints

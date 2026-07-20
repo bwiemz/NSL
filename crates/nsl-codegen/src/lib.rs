@@ -1065,6 +1065,22 @@ pub struct WrgaCheckContext {
         Option<std::sync::Arc<std::sync::Mutex<Option<crate::wrga::WrgaPlan>>>>,
 }
 
+/// Periodic-checkpointing stride request (Item 8, `--checkpoint-stride`).
+/// `Fixed(k)` coalesces every `k` block anchors into one CCR super-segment;
+/// `Auto` lets the activation-budget scheduler pick `k`. `Fixed(1)` (the
+/// default) is the classic per-block behavior — no coalescing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointStride {
+    Fixed(usize),
+    Auto,
+}
+
+impl Default for CheckpointStride {
+    fn default() -> Self {
+        CheckpointStride::Fixed(1)
+    }
+}
+
 /// Compiler configuration flags passed from CLI.
 #[derive(Clone)]
 pub struct CompileOptions {
@@ -1219,6 +1235,30 @@ pub struct CompileOptions {
     /// buffer Deferred never materializes) is added when parameter sizes
     /// are statically known. None = pure policy decision, no arbitration.
     pub checkpoint_budget_mib: Option<u64>,
+    /// Item 8 (`--checkpoint-stride N|auto`): periodic checkpointing. With
+    /// `Fixed(k)`, CCR coalesces every `k` transformer-block anchors into one
+    /// super-segment — saving only every k-th block boundary and recomputing
+    /// the k-block span. Trades recompute for a k× smaller saved-boundary
+    /// surface (the activation surface CSLA buffers across the accumulation
+    /// window). `Auto` searches strides with `ccr::project_activation_peak`
+    /// and picks the smallest projected peak within `checkpoint_budget_mib`
+    /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
+    /// Bit-exact regardless of stride (recompute replays the same kernels).
+    ///
+    /// NOTE: under `Auto`, `checkpoint_budget_mib` is consulted twice with two
+    /// meanings — first as a peak-concurrent-activation budget to pick the
+    /// stride (`select_stride`), then as a saved-interior-bytes budget by the
+    /// per-tensor knapsack (`ccr::apply_budget`). Both keep the plan valid (the
+    /// number is a soft target, not a hard cap), so the dual use is safe but
+    /// deliberate; unifying them is future work (the full DP scheduler).
+    pub checkpoint_stride: CheckpointStride,
+    /// Item 9 (`--fuse-rmsnorm-backward`): lower the source-AD RMSNorm INPUT
+    /// gradient to a single fused `nsl_rmsnorm_dx_backward` op (native GPU kernel
+    /// / CPU reference) instead of the ~11-op decomposition — fewer launches,
+    /// temporaries, and HBM traffic. Off by default; the fused kernel matches
+    /// the decomposition to an f32 tolerance (approx rsqrt/div), so it is an
+    /// opt-in speedup, not a bit-exact substitution.
+    pub fuse_rmsnorm_backward: bool,
     /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
     /// Selective policy's saved matmul-class interiors to half precision
     /// between forward and backward (cast-on-save, dequant-on-load via the
@@ -1370,6 +1410,8 @@ impl Default for CompileOptions {
             checkpoint_blocks: false,
             checkpoint_selective: false,
             checkpoint_budget_mib: None,
+            checkpoint_stride: CheckpointStride::default(),
+            fuse_rmsnorm_backward: false,
             checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,

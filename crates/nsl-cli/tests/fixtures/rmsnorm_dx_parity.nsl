@@ -1,0 +1,29 @@
+# RMSNorm input-gradient (dx) correctness fixture. The gradient of an upstream
+# trainable weight `w` flows back THROUGH rmsnorm, so a wrong RMSNorm dx moves
+# `w` in the wrong direction. Source-AD used to reuse the LayerNorm dx (which
+# mean-subtracts) for RMSNorm — wrong. This fixture prints the final `w` so the
+# gate can assert source-AD now matches the tape-AD reference (tolerance, f32).
+# Non-uniform w/x so the LayerNorm-vs-RMSNorm difference is not masked.
+from nsl.nn.losses import mse_loss
+
+model M:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.05
+    g: Tensor = ones([4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.w
+        return rmsnorm(h, self.g, 0.00001)
+
+let m = M()
+let x = (arange(8).reshape([2, 4])) * 0.1 + full([2, 4], 0.1)
+let y = zeros([2, 4])
+
+train(model=m, epochs=6, grad_accumulation=1):
+    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")

@@ -6235,12 +6235,100 @@ impl Compiler<'_> {
                         crate::ccr::CcrPolicy::Block
                     };
                     let compress_requested = self.compile_options.checkpoint_compress.is_some();
+                    // Item 8: resolve the periodic-checkpoint stride. `Fixed(k)`
+                    // passes straight through (ccr::plan logs the coalescing);
+                    // `Auto` searches strides against the projected activation
+                    // peak — with the CSLA accumulation window G applied to the
+                    // saved boundaries — and the checkpoint byte budget.
+                    let resolved_stride = match self.compile_options.checkpoint_stride {
+                        crate::CheckpointStride::Fixed(k) => k,
+                        crate::CheckpointStride::Auto => {
+                            let sizes = crate::profiling::captures::size_hints_from_var_nodes(
+                                extractor.var_nodes(),
+                                self.type_map,
+                            );
+                            // Review MEDIUM: with fully symbolic shapes the size
+                            // map is empty → every candidate projects to peak 0
+                            // and the search silently returns stride 1. Say so,
+                            // rather than printing a decision that looks real.
+                            if sizes.is_empty() {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride auto: no static tensor sizes \
+                                     available (symbolic shapes) — cannot project the \
+                                     activation peak; using stride 1. Pass an explicit \
+                                     --checkpoint-stride N to force periodic checkpointing."
+                                );
+                            }
+                            let window = if csla_active {
+                                (grad_accumulation_steps.max(1)) as u64
+                            } else {
+                                1
+                            };
+                            let budget_bytes = self
+                                .compile_options
+                                .checkpoint_budget_mib
+                                .map(|m| m.saturating_mul(1024 * 1024));
+                            match crate::ccr::select_stride(
+                                &effective_primal,
+                                claimed_ids.as_ref(),
+                                policy,
+                                &sizes,
+                                window,
+                                budget_bytes,
+                                crate::ccr::DEFAULT_STRIDE_CANDIDATES,
+                            ) {
+                                Some(choice) => {
+                                    let log: Vec<String> = choice
+                                        .considered
+                                        .iter()
+                                        .map(|(k, pb)| {
+                                            format!("k={k}:{}MiB", pb / (1024 * 1024))
+                                        })
+                                        .collect();
+                                    eprintln!(
+                                        "[ccr] --checkpoint-stride auto: chose stride {} \
+                                         (projected activation peak {} MiB{}, window G={window}); \
+                                         candidates [{}]",
+                                        choice.stride,
+                                        choice.peak_bytes / (1024 * 1024),
+                                        if choice.fits_budget {
+                                            ""
+                                        } else {
+                                            ", NO stride fits the budget — using min-peak"
+                                        },
+                                        log.join(", ")
+                                    );
+                                    choice.stride
+                                }
+                                None => {
+                                    eprintln!(
+                                        "[ccr] --checkpoint-stride auto: no candidate produced a \
+                                         plan; using stride 1"
+                                    );
+                                    1
+                                }
+                            }
+                        }
+                    };
                     let plan = crate::ccr::plan(
                         &effective_primal,
                         claimed_ids.as_ref(),
                         policy,
                         compress_requested,
+                        resolved_stride,
                     );
+                    // Item 8: one coalescing note for the FINAL stride (the Auto
+                    // search above ran plan() per candidate silently).
+                    if resolved_stride > 1 {
+                        if let Some(p) = &plan {
+                            eprintln!(
+                                "[ccr] periodic checkpointing: stride {resolved_stride} → \
+                                 {} CCR super-segment(s) (saving every {resolved_stride}th block \
+                                 boundary, recomputing each span — bit-exact)",
+                                p.segments.len()
+                            );
+                        }
+                    }
                     if let (Some(p), Some(dtype)) =
                         (&plan, self.compile_options.checkpoint_compress.as_deref())
                     {
@@ -6370,7 +6458,42 @@ impl Compiler<'_> {
                 if let Some(claims) = self.csha_backward_claims.take() {
                     gen.set_csha_claims(claims);
                 }
+                // Item 9: opt-in fused RMSNorm input-gradient lowering.
+                gen.set_fuse_rmsnorm_backward(self.compile_options.fuse_rmsnorm_backward);
                 let mut adjoint = gen.generate(&effective_primal);
+                // Item 9 profiling (`NSL_PROFILE_ADJOINT=1`): a launch-count
+                // histogram of the generated backward ops. Norm/activation
+                // adjoints decompose into many small bandwidth-bound ops
+                // (RMSNorm dgamma alone = mean/Sqrt/Div/Mul/reduce); this shows
+                // which op classes dominate the launch count — the fusion
+                // targets. Pre-CCR: recompute clones are forward ops, so this is
+                // the true backward-op composition.
+                if std::env::var("NSL_PROFILE_ADJOINT").is_ok() {
+                    use std::collections::BTreeMap;
+                    let mut hist: BTreeMap<String, usize> = BTreeMap::new();
+                    for op in &adjoint.ops {
+                        let key = match &op.op {
+                            crate::wengert::PrimalOp::Passthrough(n) => {
+                                format!("Passthrough({n})")
+                            }
+                            other => format!("{other:?}")
+                                .split(['(', ' ', '{'])
+                                .next()
+                                .unwrap_or("?")
+                                .to_string(),
+                        };
+                        *hist.entry(key).or_default() += 1;
+                    }
+                    eprintln!(
+                        "[adjoint-profile] {} generated backward ops:",
+                        adjoint.ops.len()
+                    );
+                    let mut rows: Vec<_> = hist.into_iter().collect();
+                    rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    for (k, c) in rows {
+                        eprintln!("[adjoint-profile]   {c:>5}  {k}");
+                    }
+                }
                 // D2b part 2: hand the claims BACK for the forward lowering
                 // below (the fused-SDPA claim dispatch reads them); the
                 // compiler slot is cleared again right after the forward, so
@@ -6920,6 +7043,8 @@ impl Compiler<'_> {
                     let mut owned_values = Vec::new();
                     let mut hook_freed_input_vars = std::collections::HashSet::new();
                     let mut explicit_freed_vars = std::collections::HashSet::new();
+                    // No FASE hook on this forward-streaming path — stays empty.
+                    let mut hook_freed_param_vars = std::collections::HashSet::new();
                     for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
                         if !wsplan.upload_per_slice[si].is_empty() {
                             // Upload this slice's first-touch params under
@@ -6965,6 +7090,7 @@ impl Compiler<'_> {
                             &mut owned_values,
                             &mut hook_freed_input_vars,
                             &mut explicit_freed_vars,
+                            &mut hook_freed_param_vars,
                             None,
                         )?;
                         // Evict this slice's last-touch params — read-only
@@ -6994,6 +7120,7 @@ impl Compiler<'_> {
                         owned_values,
                         hook_freed_input_vars,
                         explicit_freed_vars,
+                        hook_freed_param_vars,
                     }
                 } else {
                     crate::wengert_lower::compile_wengert_ops(
@@ -7515,6 +7642,7 @@ impl Compiler<'_> {
                     let mut fase_cb = |c: &mut Compiler,
                                        var_id: crate::wengert::VarId,
                                        grad_ptr: Value,
+                                       still_needed: bool,
                                        b: &mut cranelift_frontend::FunctionBuilder|
                      -> Result<(), CodegenError> {
                         let Some(entry) = hook_map.get(&var_id) else {
@@ -7547,7 +7675,17 @@ impl Compiler<'_> {
                             )?;
                         }
                         c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, off)?;
-                        c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                        // Free the raw gradient now ONLY if no later adjoint op
+                        // still reads it. When this param's grad adjoint is a
+                        // shared intermediate (a bias whose grad == d_out, which
+                        // the weight-grad matmul also consumes), the free is
+                        // DEFERRED to end-of-backward cleanup — freeing here
+                        // would drop the weight gradient (silently, pre-#396).
+                        // `fase_emit_accumulate` leaves grad_ptr intact (rc
+                        // unchanged), so the later op reads live data.
+                        if !still_needed {
+                            c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                        }
                         Ok(())
                     };
                     // P0.3: bracket the FASE backward with a grad-integrity step
@@ -7633,7 +7771,13 @@ impl Compiler<'_> {
                 let mut freed_adjoint_vars = std::collections::HashSet::new();
                 if let Some(gl) = &grad_lowered {
                     if fase_hook_active {
-                        freed_adjoint_vars.extend(param_adj_set.iter().copied());
+                        // Exactly the param grads the hook actually freed — NOT
+                        // the whole param_adj_set. A param whose grad adjoint is
+                        // a shared intermediate (bias-grad == d_out) was
+                        // accumulated but its free was DEFERRED; it is absent
+                        // here on purpose so the end-of-backward bulk free
+                        // releases it exactly once (it is in owned_values).
+                        freed_adjoint_vars.extend(gl.hook_freed_param_vars.iter().copied());
                         // Also skip raw_grad VarIds that were freed early by the
                         // reduce_to_shape identity path in wengert_lower.  When
                         // shapes match, reduce_to_shape returns the input with a
@@ -9129,6 +9273,7 @@ impl Compiler<'_> {
                 let mut fase_cb = |c: &mut Compiler,
                                    var_id: crate::wengert::VarId,
                                    grad_ptr: Value,
+                                   still_needed: bool,
                                    b: &mut cranelift_frontend::FunctionBuilder|
                  -> Result<(), CodegenError> {
                     let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
@@ -9139,7 +9284,15 @@ impl Compiler<'_> {
                     let m_partial =
                         c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
                     c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, false)?;
-                    c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                    // Defer the free when this param grad is a shared
+                    // intermediate a later in-slice op still reads (bias-grad
+                    // == d_out feeding the weight matmul). wengert_lower keeps
+                    // it in var_map + owned_values; end-of-range cleanup frees
+                    // it. Exports are distinct activation adjoints, never param
+                    // grads, so this never strands a cross-range carry.
+                    if !still_needed {
+                        c.compile_call_by_name(b, "nsl_tensor_free", &[grad_ptr])?;
+                    }
                     Ok(())
                 };
                 let grad_lowered = match crate::wengert_lower::compile_wengert_ops(
@@ -9203,8 +9356,14 @@ impl Compiler<'_> {
                 // hook-consumed gradients, explicit FreeTensor victims, and
                 // the exports (they outlive this range; their frees are the
                 // consuming ranges' markers or the explicit list below).
+                //
+                // Seed from exactly the param grads the hook FREED — not the
+                // whole param_adj_set. A param grad that is a shared
+                // intermediate (bias-grad == d_out, read later in-slice) was
+                // accumulated but its free was DEFERRED; it is absent here on
+                // purpose so free_wengert_owned_values releases it once.
                 let mut freed_adjoint_vars: std::collections::HashSet<crate::wengert::VarId> =
-                    pending.param_adj_set.iter().copied().collect();
+                    grad_lowered.hook_freed_param_vars.iter().copied().collect();
                 freed_adjoint_vars.extend(grad_lowered.hook_freed_input_vars.iter().copied());
                 freed_adjoint_vars.extend(grad_lowered.explicit_freed_vars.iter().copied());
                 freed_adjoint_vars.extend(exports_per_range[ri].iter().copied());
