@@ -45,6 +45,7 @@ rand = { version = "0.9", optional = true }
 # FPGA) follow the same entry-point pattern as the gating is extended.
 default = ["experimental-wrga", "experimental-cpdt"]
 cuda = ["nsl-runtime/cuda", "dep:cudarc"]
+nccl = ["cuda", "nsl-runtime/nccl"]
 test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
 calibrate = ["dep:rand"]

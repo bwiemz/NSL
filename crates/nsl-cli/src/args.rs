@@ -935,6 +935,14 @@ pub(crate) struct RunArgs {
         #[arg(long, default_value = "1")]
         pub(crate) devices: u32,
 
+        /// P4 item 14: collective backend for multi-rank runs — "sim"
+        /// (CPU-shm reference, default), "sim-gpu" (CUDA-aware TEST backend —
+        /// device-pointer API staged through the CPU-shm reduce; validates the
+        /// GPU plumbing on one GPU), or "nccl" (real CUDA-aware
+        /// collectives; requires an nccl-featured build with libnccl).
+        #[arg(long, default_value = "sim")]
+        pub(crate) collectives: String,
+
         /// M41: Number of prefill workers for disaggregated inference
         #[arg(long, default_value = "1")]
         pub(crate) prefill_workers: u32,

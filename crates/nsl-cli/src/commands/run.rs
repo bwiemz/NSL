@@ -15,6 +15,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             profile_kernels,
             profile,
             devices,
+            collectives,
             prefill_workers,
             decode_workers,
             target,
@@ -70,6 +71,23 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             stream_async_writeback,
             weights,
     } = args;
+
+    // P4 item 14: validate the collective backend up front (fail before
+    // spawning ranks) and export it for the runtime — nsl_zero_init reads
+    // NSL_COLLECTIVES whether this process is the spawner, a spawned rank,
+    // or a manually-launched rank (NSL_LOCAL_RANK set by hand).
+    match collectives.as_str() {
+        "sim" | "sim-gpu" | "nccl" => {}
+        other => {
+            eprintln!(
+                "error: --collectives must be 'sim', 'sim-gpu', or 'nccl' (got '{other}')"
+            );
+            process::exit(1);
+        }
+    }
+    if collectives != "sim" {
+        std::env::set_var("NSL_COLLECTIVES", &collectives);
+    }
 
     // Meta-flag expansion (roadmap 3.3) — see the twin call in build/options.rs.
     let mut wggo = wggo;
@@ -670,7 +688,10 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         .env("NSL_LOCAL_RANK", rank.to_string())
                         .env("NSL_WORLD_SIZE", devices.to_string())
                         .env("NSL_SIMULATED_TP", "1")
-                        .env("NSL_TP_SHM_PATH", shm_path.to_str().unwrap_or(""));
+                        .env("NSL_TP_SHM_PATH", shm_path.to_str().unwrap_or(""))
+                        // P4 item 14: the runtime's nsl_zero_init reads this to
+                        // pick the collective backend (sim CPU-shm vs NCCL).
+                        .env("NSL_COLLECTIVES", &collectives);
 
                     // Forward profiling flags
                     if profile_memory || profile {

@@ -160,16 +160,75 @@ struct ZeROContext {
     owner_of: Vec<i32>,
     /// Total number of params (set during partition).
     num_params: usize,
-    /// D3: the real collective backend (CPU-shm SimulatedBackend over the
-    /// `--devices N` spawner's shared file). `None` iff world_size == 1
-    /// (single rank: every collective degenerates to identity).
-    backend: Option<crate::tensor_parallel::collective::SimulatedBackend>,
+    /// D3: the real collective backend. `None` iff world_size == 1 (single
+    /// rank: every collective degenerates to identity). P4 item 14: either
+    /// the CPU-shm SimulatedBackend (default) or, with NSL_COLLECTIVES=nccl
+    /// on an nccl-featured build, the CUDA-aware NcclBackend.
+    backend: Option<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>>,
+    /// True when `backend` takes DEVICE pointers (NCCL): GPU-resident grads
+    /// and params are passed directly, no host staging, no -5 refusal.
+    cuda_aware: bool,
 }
 
 // SAFETY: the raw shm pointer inside SimulatedBackend is only touched
 // under the ZERO_CTX mutex on the (single-threaded) training path — the
 // same argument as TpContext's Send impl.
 unsafe impl Send for ZeROContext {}
+
+/// P4 item 14: construct the NCCL backend (nccl-featured builds only; the
+/// stub refuses with the rebuild hint).
+#[cfg(feature = "nccl")]
+fn make_nccl_backend(
+    rank: usize,
+    ws: usize,
+    shm_ptr: *mut u8,
+    shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    crate::tensor_parallel::collective::NcclBackend::new(rank as i32, ws as i32, shm_ptr, shm_len)
+        .map(|b| Box::new(b) as Box<dyn crate::tensor_parallel::collective::CollectiveBackend>)
+}
+
+#[cfg(not(feature = "nccl"))]
+fn make_nccl_backend(
+    _rank: usize,
+    _ws: usize,
+    _shm_ptr: *mut u8,
+    _shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    Err("this runtime was built WITHOUT the nccl feature — rebuild with \
+         `--features nccl` (libnccl.so on the linker/loader path), or drop \
+         --collectives nccl"
+        .to_string())
+}
+
+/// P4 item 14: the CUDA-aware TEST backend (device-pointer API staged through
+/// the CPU-shm reduce) — validates the ZeRO GPU plumbing on one GPU.
+#[cfg(feature = "cuda")]
+fn make_sim_gpu_backend(
+    rank: usize,
+    ws: usize,
+    shm_ptr: *mut u8,
+    shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    Ok(Box::new(
+        crate::tensor_parallel::collective::GpuStagedBackend::new(
+            rank as i32,
+            ws as i32,
+            shm_ptr,
+            shm_len,
+        ),
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn make_sim_gpu_backend(
+    _rank: usize,
+    _ws: usize,
+    _shm_ptr: *mut u8,
+    _shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    Err("--collectives sim-gpu needs a cuda-featured build".to_string())
+}
 
 /// Initialize ZeRO optimizer sharding (D3: REAL — builds the CPU-shm
 /// SimulatedBackend from the `--devices N` spawner's env protocol).
@@ -209,7 +268,34 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         return -2;
     }
 
-    let backend = if ws > 1 {
+    // P4 item 14: collective-backend selection. Default = the CPU-shm
+    // SimulatedBackend; NSL_COLLECTIVES=nccl requests real CUDA-aware NCCL
+    // collectives (set by `nsl run --collectives nccl`, requires an
+    // nccl-featured build). Anything else refuses loudly.
+    let requested = std::env::var("NSL_COLLECTIVES").unwrap_or_else(|_| "sim".to_string());
+    #[derive(PartialEq)]
+    enum WantBackend {
+        Sim,
+        SimGpu,
+        Nccl,
+    }
+    let want = match requested.as_str() {
+        "sim" | "" => WantBackend::Sim,
+        "sim-gpu" => WantBackend::SimGpu,
+        "nccl" => WantBackend::Nccl,
+        other => {
+            eprintln!(
+                "nsl_zero_init: unknown NSL_COLLECTIVES backend '{other}' \
+                 (expected 'sim', 'sim-gpu', or 'nccl')"
+            );
+            return -2;
+        }
+    };
+
+    let (backend, cuda_aware): (
+        Option<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>>,
+        bool,
+    ) = if ws > 1 {
         let Ok(shm_path) = std::env::var("NSL_TP_SHM_PATH") else {
             eprintln!(
                 "nsl_zero_init: world_size={ws} but NSL_TP_SHM_PATH is not \
@@ -219,14 +305,53 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
             return -3;
         };
         let (shm_ptr, shm_len) = crate::tensor_parallel::ffi::open_shm(&shm_path);
-        Some(crate::tensor_parallel::collective::SimulatedBackend::new(
-            rank as i32,
-            ws as i32,
-            shm_ptr,
-            shm_len,
-        ))
+        match want {
+            WantBackend::Nccl => match make_nccl_backend(rank, ws, shm_ptr, shm_len) {
+                Ok(b) => {
+                    eprintln!(
+                        "[zero] rank {rank}: NCCL communicator up \
+                         (ws={ws}, CUDA-aware collectives)"
+                    );
+                    (Some(b), true)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "nsl_zero_init: NCCL backend init failed on rank {rank}: {e}"
+                    );
+                    return -2;
+                }
+            },
+            WantBackend::SimGpu => match make_sim_gpu_backend(rank, ws, shm_ptr, shm_len) {
+                Ok(b) => {
+                    eprintln!(
+                        "[zero] rank {rank}: sim-gpu staged collectives up \
+                         (ws={ws}, CUDA-aware TEST backend)"
+                    );
+                    (Some(b), true)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "nsl_zero_init: sim-gpu backend init failed on rank {rank}: {e}"
+                    );
+                    return -2;
+                }
+            },
+            WantBackend::Sim => (
+                Some(Box::new(
+                    crate::tensor_parallel::collective::SimulatedBackend::new(
+                        rank as i32,
+                        ws as i32,
+                        shm_ptr,
+                        shm_len,
+                    ),
+                )
+                    as Box<dyn crate::tensor_parallel::collective::CollectiveBackend>),
+                false,
+            ),
+        }
     } else {
-        None
+        // Single rank: NCCL would be a 1-rank identity clique — skip it.
+        (None, false)
     };
 
     *guard = Some(ZeROContext {
@@ -237,6 +362,7 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         owner_of: Vec::new(),
         num_params: 0,
         backend,
+        cuda_aware,
     });
     0
 }
@@ -375,21 +501,19 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         }
         let tensor = unsafe { &*tensor_ptr };
 
-        // D3 v1 (review): ZeRO-1 SPMD is CPU-only. --devices N spawns N
-        // full processes that all select CUDA device 0 (cuda/mod.rs pins
-        // ordinal 0; the spawner sets no per-rank CUDA_VISIBLE_DEVICES),
-        // so a GPU-resident model would multiply VRAM by N on one card and
-        // the staged reduce path is unvalidated. Refuse rather than pile
-        // ranks onto one GPU. (Runtime, not compile-time: the default
-        // --target is "cuda" even for CPU-placed models, so a target-based
-        // guard would wrongly refuse the CPU SPMD path.)
-        if ctx.world_size > 1 && tensor.device != 0 {
+        // P4 item 14: GPU-resident SPMD requires the CUDA-aware backend.
+        // Under the CPU-shm SimulatedBackend the old v1 refusal stands: N
+        // ranks would pile onto few devices with a host-staged reduce that
+        // multiplies VRAM and PCIe traffic. With NCCL (--collectives nccl)
+        // grads stay on-device and rank→device binding stripes the ranks
+        // (cuda::select_device_ordinal). (Runtime, not compile-time: the
+        // default --target is "cuda" even for CPU-placed models, so a
+        // target-based guard would wrongly refuse the CPU SPMD path.)
+        if ctx.world_size > 1 && tensor.device != 0 && !ctx.cuda_aware {
             eprintln!(
-                "nsl: nsl_zero_reduce_grads: ZeRO-1 SPMD (--zero-stage 1 \
-                 --devices {}) is CPU-only in v1 — a GPU-resident model \
-                 would place all {} ranks on CUDA device 0. Move the model \
-                 to CPU or drop --devices.",
-                ctx.world_size, ctx.world_size
+                "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs real \
+                 collectives — run with --collectives nccl (nccl-featured \
+                 build), or move the model to CPU / drop --devices.",
             );
             return -5;
         }
@@ -420,7 +544,6 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 .backend
                 .as_ref()
                 .expect("world_size > 1 implies a backend");
-            use crate::tensor_parallel::collective::CollectiveBackend;
             let rc = backend.all_reduce_sum(
                 tensor.data as *const std::ffi::c_void,
                 tensor.data,
@@ -436,6 +559,35 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 return -1;
             }
             ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
+            continue;
+        }
+
+        // P4 item 14: CUDA-aware backend — the collective consumes the DEVICE
+        // pointer directly (in-place sum), then the average runs as a native
+        // on-device scale. No host staging, no PCIe round-trip.
+        #[cfg(feature = "cuda")]
+        if ctx.cuda_aware {
+            let backend = ctx
+                .backend
+                .as_ref()
+                .expect("world_size > 1 implies a backend");
+            let rc = backend.all_reduce_sum(
+                tensor.data as *const std::ffi::c_void,
+                tensor.data,
+                tensor.len as usize,
+                crate::tensor_parallel::collective::DTYPE_F32,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: device all_reduce failed \
+                     rc={rc} at index {i}"
+                );
+                return -1;
+            }
+            ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // GPU f32 contiguous: native in-place scale kernel.
             crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
             continue;
         }
@@ -471,8 +623,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                     .backend
                     .as_ref()
                     .expect("world_size > 1 implies a backend");
-                use crate::tensor_parallel::collective::CollectiveBackend;
-                let rc = backend.all_reduce_sum(
+                    let rc = backend.all_reduce_sum(
                     staged.as_ptr() as *const std::ffi::c_void,
                     staged.as_mut_ptr() as *mut std::ffi::c_void,
                     len,
@@ -562,7 +713,6 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         return -1;
     }
     let list = unsafe { &*list_ptr };
-    use crate::tensor_parallel::collective::CollectiveBackend;
     let backend = ctx
         .backend
         .as_ref()
@@ -587,16 +737,43 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
             .copied()
             .unwrap_or((i % ctx.world_size) as i32);
 
-        // D3 v1: CPU-only (see nsl_zero_reduce_grads) — refuse GPU-resident
-        // params rather than pile N ranks onto CUDA device 0.
-        if tensor.device != 0 {
+        // P4 item 14: GPU-resident params need the CUDA-aware backend (see
+        // the matching guard in nsl_zero_reduce_grads).
+        if tensor.device != 0 && !ctx.cuda_aware {
             eprintln!(
-                "nsl: nsl_zero_sync_params: ZeRO-1 SPMD is CPU-only in v1 — a \
-                 GPU-resident param would place all {} ranks on CUDA device \
-                 0. Move the model to CPU or drop --devices.",
-                ctx.world_size
+                "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs real \
+                 collectives — run with --collectives nccl (nccl-featured \
+                 build), or move the model to CPU / drop --devices.",
             );
             return -5;
+        }
+        // CUDA-aware: broadcast the DEVICE pointer straight from the owner.
+        #[cfg(feature = "cuda")]
+        if tensor.device != 0 && ctx.cuda_aware {
+            if tensor.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                     dtype {}; only f32 is supported",
+                    tensor.dtype
+                );
+                return -1;
+            }
+            let rc = backend.broadcast(
+                tensor.data,
+                tensor.len as usize,
+                crate::tensor_parallel::collective::DTYPE_F32,
+                owner,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: device broadcast failed rc={rc} \
+                     at index {i}"
+                );
+                return -1;
+            }
+            ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
         }
 
         if tensor.device == 0 {

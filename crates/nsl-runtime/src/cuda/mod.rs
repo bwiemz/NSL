@@ -118,6 +118,39 @@ pub(crate) mod inner {
         CUDA_STATE.get().is_some()
     }
 
+    /// P4 item 14: pick this process's CUDA device ordinal.
+    ///
+    /// Priority: explicit `NSL_CUDA_DEVICE=k` override, else — under the
+    /// SPMD spawner (`NSL_LOCAL_RANK` set) — `rank % device_count` so an
+    /// N-rank run on an M-GPU node stripes ranks across devices, else 0
+    /// (the historical single-process behavior, unchanged). `device_count`
+    /// comes from the driver so a 2-rank run on a 1-GPU box binds both
+    /// ranks to device 0 (useful for CPU-collective + GPU-compute testing;
+    /// NCCL itself decides whether it accepts that topology).
+    unsafe fn select_device_ordinal() -> i32 {
+        if let Some(k) = std::env::var("NSL_CUDA_DEVICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            return k.max(0);
+        }
+        let Some(rank) = std::env::var("NSL_LOCAL_RANK")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        else {
+            return 0;
+        };
+        let mut count: i32 = 0;
+        if cuDeviceGetCount(&mut count) != CUresult::CUDA_SUCCESS || count <= 0 {
+            return 0;
+        }
+        let ordinal = rank.max(0) % count;
+        if ordinal != 0 {
+            eprintln!("[nsl] rank {rank}: binding CUDA device {ordinal} (of {count})");
+        }
+        ordinal
+    }
+
     fn state() -> &'static Mutex<CudaState> {
         CUDA_STATE.get_or_init(|| {
             unsafe {
@@ -128,12 +161,13 @@ pub(crate) mod inner {
                     "cuInit failed: {:?}",
                     result
                 );
+                let ordinal = select_device_ordinal();
                 let mut device: CUdevice = 0;
-                let result = cuDeviceGet(&mut device, 0);
+                let result = cuDeviceGet(&mut device, ordinal);
                 assert_eq!(
                     result,
                     CUresult::CUDA_SUCCESS,
-                    "cuDeviceGet failed: {:?}",
+                    "cuDeviceGet (ordinal {ordinal}) failed: {:?}",
                     result
                 );
                 let mut context: CUcontext = std::ptr::null_mut();
@@ -1270,6 +1304,38 @@ pub(crate) mod inner {
                 r
             );
             cuEventDestroy_v2(ev as CUevent);
+        }
+    }
+
+    /// P4 item 14: watchdog-bounded synchronization of the calling thread's
+    /// COMPUTE stream. Polls `cuStreamQuery` until the stream drains or
+    /// `timeout_secs` elapses — the per-collective watchdog for NCCL ops
+    /// (a dead peer leaves the collective enqueued forever; a bounded wait
+    /// turns that hang into a loud symmetric abort). Returns true on drain,
+    /// false on timeout. Any error other than NOT_READY aborts (the stream
+    /// carries training work — a poisoned stream must not train on).
+    pub(crate) fn sync_compute_stream_with_deadline(timeout_secs: u64, what: &str) -> bool {
+        ensure_context();
+        let stream = current_stream();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let rc = unsafe { cuStreamQuery(stream) };
+            match rc {
+                CUresult::CUDA_SUCCESS => return true,
+                CUresult::CUDA_ERROR_NOT_READY => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => {
+                    eprintln!(
+                        "nsl: {what}: cuStreamQuery failed with {other:?} while waiting \
+                         on a collective — aborting"
+                    );
+                    std::process::abort();
+                }
+            }
         }
     }
 
