@@ -2503,6 +2503,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // --- M43: ZeRO optimizer (ABI-fixed: match runtime signatures exactly) ---
     ("nsl_zero_init", &[types::I64, types::I64], Some(types::I64)), // (stage, world_size)
     ("nsl_zero_partition", &[types::I64], Some(types::I64)),        // (num_params)
+    ("nsl_zero_partition_bytes", &[types::I64, types::I64], Some(types::I64)), // (param_list, num_params)
     (
         "nsl_zero_reduce_grads",
         &[types::I64, types::I64],
@@ -2790,6 +2791,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_weight_stream_upload", &[types::I64], None),
     ("nsl_weight_stream_evict", &[types::I64, types::I64], None),
     ("nsl_weight_stream_upload_all", &[], None),
+    // Item 12: re-evict everything after a scoped `upload_all` around a
+    // model-touching callback. Arg = writeback (1 if the callback may mutate).
+    ("nsl_weight_stream_reevict_all", &[types::I64], None),
+    // Item 10: contiguous layer-pack transfers. Arg = NslList of the pack's
+    // param tensor pointers; evict also takes writeback.
+    ("nsl_weight_stream_upload_pack", &[types::I64], None),
+    ("nsl_weight_stream_evict_pack", &[types::I64, types::I64], None),
+    // Item 11: async double-buffer prefetch + event-ordered await.
+    ("nsl_weight_stream_prefetch_pack", &[types::I64], None),
+    ("nsl_weight_stream_evict_pack_async", &[types::I64], None),
+    ("nsl_weight_stream_await_pack", &[types::I64], None),
     ("nsl_weight_stream_teardown", &[], None),
     ("nsl_weight_stream_upload_count", &[], Some(types::I64)),
     (

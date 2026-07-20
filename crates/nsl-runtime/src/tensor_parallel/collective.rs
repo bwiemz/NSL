@@ -635,6 +635,505 @@ impl CollectiveBackend for SimulatedBackend {
 }
 
 // ---------------------------------------------------------------------------
+// P4 item 14: GpuStagedBackend — the CUDA-aware TEST backend.
+// ---------------------------------------------------------------------------
+//
+// Same contract as NcclBackend (buffers are DEVICE pointers) but the data
+// plane stages through the CPU-shm SimulatedBackend: DtoH → host collective →
+// HtoD. Exists so the ZeRO CUDA-aware plumbing (device-pointer collectives,
+// on-device averaging, broadcast roots, GPU parity) is validatable on a
+// SINGLE-GPU machine, where NCCL refuses multiple ranks per device
+// (ncclInvalidUsage — verified empirically on NCCL 2.30). Selected with
+// `--collectives sim-gpu`; NCCL remains the real multi-GPU transport.
+
+#[cfg(feature = "cuda")]
+pub struct GpuStagedBackend {
+    host: SimulatedBackend,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for GpuStagedBackend {}
+
+#[cfg(feature = "cuda")]
+impl GpuStagedBackend {
+    pub fn new(rank: i32, world_size: i32, shm_ptr: *mut u8, shm_len: usize) -> Self {
+        Self {
+            host: SimulatedBackend::new(rank, world_size, shm_ptr, shm_len),
+        }
+    }
+
+    fn dtoh(dev: *const c_void, bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; bytes];
+        crate::cuda::inner::ensure_context();
+        crate::cuda::inner::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, dev, bytes);
+        buf
+    }
+
+    fn htod(dev: *mut c_void, buf: &[u8]) {
+        crate::cuda::inner::memcpy_htod(dev, buf.as_ptr() as *const c_void, buf.len());
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CollectiveBackend for GpuStagedBackend {
+    fn all_reduce_sum(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        stream: StreamHandle,
+    ) -> i32 {
+        let bytes = count * dtype_byte_width(dtype);
+        if bytes == 0 {
+            return -1;
+        }
+        let mut staged = Self::dtoh(sendbuf, bytes);
+        let rc = self.host.all_reduce_sum(
+            staged.as_ptr() as *const c_void,
+            staged.as_mut_ptr() as *mut c_void,
+            count,
+            dtype,
+            stream,
+        );
+        if rc != 0 {
+            return rc;
+        }
+        Self::htod(recvbuf, &staged);
+        0
+    }
+
+    fn all_gather(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        send_count: usize,
+        dtype: DtypeId,
+        stream: StreamHandle,
+    ) -> i32 {
+        let bw = dtype_byte_width(dtype);
+        let bytes = send_count * bw;
+        if bytes == 0 {
+            return -1;
+        }
+        let staged = Self::dtoh(sendbuf, bytes);
+        let ws = self.host.world_size() as usize;
+        let mut gathered = vec![0u8; bytes * ws];
+        let rc = self.host.all_gather(
+            staged.as_ptr() as *const c_void,
+            gathered.as_mut_ptr() as *mut c_void,
+            send_count,
+            dtype,
+            stream,
+        );
+        if rc != 0 {
+            return rc;
+        }
+        Self::htod(recvbuf, &gathered);
+        0
+    }
+
+    fn broadcast(
+        &self,
+        buf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        root_rank: i32,
+        stream: StreamHandle,
+    ) -> i32 {
+        let bytes = count * dtype_byte_width(dtype);
+        if bytes == 0 {
+            return -1;
+        }
+        let mut staged = Self::dtoh(buf, bytes);
+        let rc = self.host.broadcast(
+            staged.as_mut_ptr() as *mut c_void,
+            count,
+            dtype,
+            root_rank,
+            stream,
+        );
+        if rc != 0 {
+            return rc;
+        }
+        Self::htod(buf, &staged);
+        0
+    }
+
+    fn reduce_scatter_sum(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        stream: StreamHandle,
+    ) -> i32 {
+        let bw = dtype_byte_width(dtype);
+        let ws = self.host.world_size() as usize;
+        if bw == 0 {
+            return -1;
+        }
+        if count % ws != 0 {
+            return -3;
+        }
+        let staged = Self::dtoh(sendbuf, count * bw);
+        let mut out = vec![0u8; (count / ws) * bw];
+        let rc = self.host.reduce_scatter_sum(
+            staged.as_ptr() as *const c_void,
+            out.as_mut_ptr() as *mut c_void,
+            count,
+            dtype,
+            stream,
+        );
+        if rc != 0 {
+            return rc;
+        }
+        Self::htod(recvbuf, &out);
+        0
+    }
+
+    fn barrier(&self) -> i32 {
+        self.host.barrier()
+    }
+
+    fn send(&self, sendbuf: *const c_void, count: usize, dtype_bytes: usize, dst_rank: i32) -> i32 {
+        self.host.send(sendbuf, count, dtype_bytes, dst_rank)
+    }
+
+    fn recv(&self, recvbuf: *mut c_void, count: usize, dtype_bytes: usize, src_rank: i32) -> i32 {
+        self.host.recv(recvbuf, count, dtype_bytes, src_rank)
+    }
+
+    fn rank(&self) -> i32 {
+        self.host.rank()
+    }
+
+    fn world_size(&self) -> i32 {
+        self.host.world_size()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4 item 14: NcclBackend — real CUDA-aware collectives over NCCL.
+// ---------------------------------------------------------------------------
+//
+// Buffers are DEVICE pointers (unlike SimulatedBackend's host buffers).
+// Bootstrap rides the spawner's existing shm file: rank 0 mints the
+// ncclUniqueId and distributes it with the host backend's `broadcast`
+// (inheriting its spin-barrier timeout/abort semantics), then every rank
+// calls ncclCommInitRank under a watchdog thread. Each collective is issued
+// on the calling thread's COMPUTE stream and then drained with a
+// deadline-polled cuStreamQuery — a dead peer turns into a loud, symmetric
+// abort on every surviving rank instead of an unbounded hang. Timeout env:
+// NSL_NCCL_TIMEOUT_SECS (default 300, same convention as the shm barrier).
+
+/// NCCL collective timeout (seconds).
+#[cfg(feature = "nccl")]
+fn nccl_timeout_secs() -> u64 {
+    std::env::var("NSL_NCCL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
+
+#[cfg(feature = "nccl")]
+pub struct NcclBackend {
+    /// Host-side bootstrap + barrier companion (uniqueId exchange, host
+    /// fallbacks for send/recv). Shares the spawner's shm mapping.
+    host: SimulatedBackend,
+    comm: cudarc::nccl::sys::ncclComm_t,
+}
+
+// SAFETY: the ncclComm_t is only used from the (single-threaded) training
+// path under the owning context's mutex — same argument as SimulatedBackend.
+#[cfg(feature = "nccl")]
+unsafe impl Send for NcclBackend {}
+
+#[cfg(feature = "nccl")]
+impl NcclBackend {
+    /// Build the communicator clique. Every rank must call this in lockstep
+    /// (the shm broadcast + ncclCommInitRank are collective). Returns a
+    /// descriptive error string on any NCCL failure — the caller refuses
+    /// loudly rather than training unsynchronized.
+    pub fn new(
+        rank: i32,
+        world_size: i32,
+        shm_ptr: *mut u8,
+        shm_len: usize,
+    ) -> Result<Self, String> {
+        use cudarc::nccl::sys as nccl;
+        let host = SimulatedBackend::new(rank, world_size, shm_ptr, shm_len);
+
+        // Bind this rank's device BEFORE any NCCL call (rank-striped in
+        // cuda::select_device_ordinal; on a single-GPU box every rank binds
+        // device 0 and NCCL itself decides whether it accepts the topology).
+        crate::cuda::inner::ensure_context();
+
+        // Rank 0 mints the id; the host shm broadcast distributes it.
+        let mut id = nccl::ncclUniqueId { internal: [0; 128] };
+        if rank == 0 {
+            let rc = unsafe { nccl::ncclGetUniqueId(&mut id) };
+            if rc != nccl::ncclResult_t::ncclSuccess {
+                return Err(format!("ncclGetUniqueId failed: {rc:?}"));
+            }
+        }
+        let brc = host.broadcast(
+            id.internal.as_mut_ptr() as *mut c_void,
+            id.internal.len(),
+            DTYPE_I8,
+            0,
+            std::ptr::null_mut(),
+        );
+        if brc != 0 {
+            return Err(format!("uniqueId shm broadcast failed rc={brc}"));
+        }
+
+        // Init under a watchdog: ncclCommInitRank blocks until the whole
+        // clique arrives — if a peer died after the broadcast above, this
+        // would hang forever without the deadline.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let done = done.clone();
+            let secs = nccl_timeout_secs();
+            std::thread::spawn(move || {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "nsl: ncclCommInitRank timed out after {secs}s on rank {rank} \
+                             — a peer rank likely died before joining the clique. \
+                             Aborting (set NSL_NCCL_TIMEOUT_SECS to tune)."
+                        );
+                        std::process::abort();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        let mut comm: nccl::ncclComm_t = std::ptr::null_mut();
+        let rc = unsafe { nccl::ncclCommInitRank(&mut comm, world_size, id, rank) };
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let _ = watchdog.join();
+        if rc != nccl::ncclResult_t::ncclSuccess {
+            return Err(format!(
+                "ncclCommInitRank(rank {rank}/{world_size}) failed: {rc:?} — on a \
+                 single-GPU machine NCCL may refuse multiple ranks per device"
+            ));
+        }
+        Ok(Self { host, comm })
+    }
+
+    fn nccl_dtype(dtype: DtypeId) -> Option<cudarc::nccl::sys::ncclDataType_t> {
+        use cudarc::nccl::sys::ncclDataType_t as T;
+        match dtype {
+            DTYPE_F64 => Some(T::ncclFloat64),
+            DTYPE_F32 => Some(T::ncclFloat32),
+            DTYPE_F16 => Some(T::ncclFloat16),
+            DTYPE_BF16 => Some(T::ncclBfloat16),
+            _ => None,
+        }
+    }
+
+    /// Issue-side error check + watchdog-bounded completion. On failure or
+    /// timeout: abort the communicator and the process — SYMMETRIC error
+    /// propagation (peers observe our death through their own watchdogs, so
+    /// no rank trains on while the clique is broken).
+    fn finish(&self, rc: cudarc::nccl::sys::ncclResult_t, what: &str) -> i32 {
+        use cudarc::nccl::sys as nccl;
+        if rc != nccl::ncclResult_t::ncclSuccess {
+            eprintln!(
+                "nsl: {what} failed on rank {}: {rc:?} — aborting the communicator",
+                self.host.rank()
+            );
+            unsafe { nccl::ncclCommAbort(self.comm) };
+            return -1;
+        }
+        let secs = nccl_timeout_secs();
+        if !crate::cuda::inner::sync_compute_stream_with_deadline(secs, what) {
+            eprintln!(
+                "nsl: {what} timed out after {secs}s on rank {} — a peer rank likely \
+                 died mid-collective. Aborting (set NSL_NCCL_TIMEOUT_SECS to tune).",
+                self.host.rank()
+            );
+            unsafe { nccl::ncclCommAbort(self.comm) };
+            std::process::abort();
+        }
+        // Surface async (background-thread) NCCL errors loudly too.
+        let mut aerr = nccl::ncclResult_t::ncclSuccess;
+        unsafe { nccl::ncclCommGetAsyncError(self.comm, &mut aerr) };
+        if aerr != nccl::ncclResult_t::ncclSuccess {
+            eprintln!(
+                "nsl: {what}: async NCCL error on rank {}: {aerr:?} — aborting",
+                self.host.rank()
+            );
+            unsafe { nccl::ncclCommAbort(self.comm) };
+            return -1;
+        }
+        0
+    }
+
+    fn compute_stream(&self) -> cudarc::nccl::sys::cudaStream_t {
+        // CUstream (driver) and cudaStream_t (runtime) are the same object.
+        crate::cuda::inner::current_stream() as cudarc::nccl::sys::cudaStream_t
+    }
+}
+
+#[cfg(feature = "nccl")]
+impl Drop for NcclBackend {
+    fn drop(&mut self) {
+        if !self.comm.is_null() {
+            unsafe { cudarc::nccl::sys::ncclCommDestroy(self.comm) };
+        }
+    }
+}
+
+#[cfg(feature = "nccl")]
+impl CollectiveBackend for NcclBackend {
+    fn all_reduce_sum(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        _stream: StreamHandle,
+    ) -> i32 {
+        use cudarc::nccl::sys as nccl;
+        let Some(dt) = Self::nccl_dtype(dtype) else {
+            return -2;
+        };
+        if self.host.world_size() == 1 {
+            if sendbuf as *const u8 != recvbuf as *const u8 {
+                let n = count * dtype_byte_width(dtype);
+                crate::cuda::inner::memcpy_dtod(recvbuf, sendbuf, n);
+            }
+            return 0;
+        }
+        let rc = unsafe {
+            nccl::ncclAllReduce(
+                sendbuf,
+                recvbuf,
+                count,
+                dt,
+                nccl::ncclRedOp_t::ncclSum,
+                self.comm,
+                self.compute_stream(),
+            )
+        };
+        self.finish(rc, "nccl all_reduce_sum")
+    }
+
+    fn all_gather(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        send_count: usize,
+        dtype: DtypeId,
+        _stream: StreamHandle,
+    ) -> i32 {
+        use cudarc::nccl::sys as nccl;
+        let Some(dt) = Self::nccl_dtype(dtype) else {
+            return -2;
+        };
+        if self.host.world_size() == 1 {
+            if sendbuf as *const u8 != recvbuf as *const u8 {
+                let n = send_count * dtype_byte_width(dtype);
+                crate::cuda::inner::memcpy_dtod(recvbuf, sendbuf, n);
+            }
+            return 0;
+        }
+        let rc = unsafe {
+            nccl::ncclAllGather(sendbuf, recvbuf, send_count, dt, self.comm, self.compute_stream())
+        };
+        self.finish(rc, "nccl all_gather")
+    }
+
+    fn broadcast(
+        &self,
+        buf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        root_rank: i32,
+        _stream: StreamHandle,
+    ) -> i32 {
+        use cudarc::nccl::sys as nccl;
+        let Some(dt) = Self::nccl_dtype(dtype) else {
+            return -2;
+        };
+        if self.host.world_size() == 1 {
+            return 0;
+        }
+        let rc = unsafe {
+            nccl::ncclBroadcast(buf, buf, count, dt, root_rank, self.comm, self.compute_stream())
+        };
+        self.finish(rc, "nccl broadcast")
+    }
+
+    fn reduce_scatter_sum(
+        &self,
+        sendbuf: *const c_void,
+        recvbuf: *mut c_void,
+        count: usize,
+        dtype: DtypeId,
+        _stream: StreamHandle,
+    ) -> i32 {
+        use cudarc::nccl::sys as nccl;
+        let Some(dt) = Self::nccl_dtype(dtype) else {
+            return -2;
+        };
+        let ws = self.host.world_size() as usize;
+        if count % ws != 0 {
+            return -3;
+        }
+        if ws == 1 {
+            if sendbuf as *const u8 != recvbuf as *const u8 {
+                let n = count * dtype_byte_width(dtype);
+                crate::cuda::inner::memcpy_dtod(recvbuf, sendbuf, n);
+            }
+            return 0;
+        }
+        // NOTE: NCCL's ring reduction order is deterministic per topology but
+        // NOT the SimulatedBackend's fixed rank order — the bit-exact
+        // reduce==all-reduce-slice CONTRACT is per-backend, not cross-backend.
+        let rc = unsafe {
+            nccl::ncclReduceScatter(
+                sendbuf,
+                recvbuf,
+                count / ws,
+                dt,
+                nccl::ncclRedOp_t::ncclSum,
+                self.comm,
+                self.compute_stream(),
+            )
+        };
+        self.finish(rc, "nccl reduce_scatter_sum")
+    }
+
+    fn barrier(&self) -> i32 {
+        // Host-level barrier suffices for the control plane (data-plane
+        // ordering is by stream); it also inherits the shm timeout/abort.
+        self.host.barrier()
+    }
+
+    fn send(&self, sendbuf: *const c_void, count: usize, dtype_bytes: usize, dst_rank: i32) -> i32 {
+        // Host-buffer point-to-point stays on the shm path (TP control use).
+        self.host.send(sendbuf, count, dtype_bytes, dst_rank)
+    }
+
+    fn recv(&self, recvbuf: *mut c_void, count: usize, dtype_bytes: usize, src_rank: i32) -> i32 {
+        self.host.recv(recvbuf, count, dtype_bytes, src_rank)
+    }
+
+    fn rank(&self) -> i32 {
+        self.host.rank()
+    }
+
+    fn world_size(&self) -> i32 {
+        self.host.world_size()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

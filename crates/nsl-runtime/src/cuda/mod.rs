@@ -118,6 +118,47 @@ pub(crate) mod inner {
         CUDA_STATE.get().is_some()
     }
 
+    /// P4 item 14: pick this process's CUDA device ordinal.
+    ///
+    /// Priority: explicit `NSL_CUDA_DEVICE=k` override, else — under the
+    /// SPMD spawner (`NSL_LOCAL_RANK` set) — `rank % device_count` so an
+    /// N-rank run on an M-GPU node stripes ranks across devices, else 0
+    /// (the historical single-process behavior, unchanged). `device_count`
+    /// comes from the driver so a 2-rank run on a 1-GPU box binds both
+    /// ranks to device 0 (useful for CPU-collective + GPU-compute testing;
+    /// NCCL itself decides whether it accepts that topology).
+    unsafe fn select_device_ordinal() -> i32 {
+        if let Some(k) = std::env::var("NSL_CUDA_DEVICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            return k.max(0);
+        }
+        // Review M5: stripe ONLY under the SPMD spawner protocol (shm path
+        // set). The M41 disaggregated-inference spawner also sets
+        // NSL_LOCAL_RANK, and its prefill/decode workers must keep the
+        // historical device-0 binding (their ranks are per-ROLE, not a
+        // device clique).
+        if std::env::var("NSL_TP_SHM_PATH").is_err() {
+            return 0;
+        }
+        let Some(rank) = std::env::var("NSL_LOCAL_RANK")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        else {
+            return 0;
+        };
+        let mut count: i32 = 0;
+        if cuDeviceGetCount(&mut count) != CUresult::CUDA_SUCCESS || count <= 0 {
+            return 0;
+        }
+        let ordinal = rank.max(0) % count;
+        if ordinal != 0 {
+            eprintln!("[nsl] rank {rank}: binding CUDA device {ordinal} (of {count})");
+        }
+        ordinal
+    }
+
     fn state() -> &'static Mutex<CudaState> {
         CUDA_STATE.get_or_init(|| {
             unsafe {
@@ -128,12 +169,13 @@ pub(crate) mod inner {
                     "cuInit failed: {:?}",
                     result
                 );
+                let ordinal = select_device_ordinal();
                 let mut device: CUdevice = 0;
-                let result = cuDeviceGet(&mut device, 0);
+                let result = cuDeviceGet(&mut device, ordinal);
                 assert_eq!(
                     result,
                     CUresult::CUDA_SUCCESS,
-                    "cuDeviceGet failed: {:?}",
+                    "cuDeviceGet (ordinal {ordinal}) failed: {:?}",
                     result
                 );
                 let mut context: CUcontext = std::ptr::null_mut();
@@ -1138,6 +1180,170 @@ pub(crate) mod inner {
                 size_bytes,
                 result
             );
+        }
+    }
+
+    /// Item 11: issue an HtoD PREFETCH on the transfer stream that does NOT
+    /// wait on prior compute (unlike `memcpy_htod_async`, whose copy is
+    /// ordered after the compute that produced its source). A prefetch's
+    /// source is a stable pinned host buffer already filled on the host, so
+    /// the copy can start immediately and run CONCURRENTLY with compute. The
+    /// returned event is recorded on the transfer stream right after the copy;
+    /// the consumer discharges it with `compute_stream_wait_event` before any
+    /// kernel reads `dst_device`. `src_host` must be pinned for true async DMA.
+    ///
+    /// CADENCE assume/guarantee: ASSUME (1) `dst_device` has no other pending
+    /// writer and (2) `src_host` is not re-written until this copy completes —
+    /// both hold because the caller only prefetches into an arena slot freed by
+    /// a SYNCHRONOUS writeback evict, whose DtoH drains this HtoD before the
+    /// slot's `dst_device`/`src_host` (host_stage) can be reused (see
+    /// `weight_stream::arena_acquire`'s LOAD-BEARING note). GUARANTEE the
+    /// returned event, waited on the compute stream, orders this copy before
+    /// every later compute-stream read of `dst_device`.
+    #[must_use]
+    pub(crate) fn prefetch_htod_on_transfer(
+        dst_device: *mut c_void,
+        src_host: *const c_void,
+        size_bytes: usize,
+    ) -> u64 {
+        ensure_context();
+        let stream = transfer_stream();
+        unsafe {
+            let result =
+                cuMemcpyHtoDAsync_v2(dst_device as CUdeviceptr, src_host, size_bytes, stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyHtoDAsync_v2 (prefetch, {} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+            let mut ev: CUevent = std::ptr::null_mut();
+            // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest).
+            let r = cuEventCreate(&mut ev, 0x2);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (prefetch) failed: {:?}", r);
+            let r = cuEventRecord(ev, stream);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (prefetch) failed: {:?}", r);
+            ev as u64
+        }
+    }
+
+    /// Item 11 (writeback half): issue a DtoH WRITEBACK on the transfer
+    /// stream, ordered AFTER all previously-launched compute (the per-layer
+    /// update kernels that produced `src_device`), and return a completion
+    /// event recorded right after the copy. Unlike the synchronous
+    /// `memcpy_dtoh`, this returns immediately — the next layer's compute
+    /// proceeds while the evicted pack drains to the host.
+    ///
+    /// CADENCE assume/guarantee: ASSUME (1) `src_device` (the arena slot) is
+    /// not re-written until this copy completes and (2) `dst_host` (the
+    /// slot's pinned stage) is not read or re-written until then — both hold
+    /// because the slot is marked writeback-pending and `arena_acquire`
+    /// refuses to reuse it until the caller drains the returned event (see
+    /// `weight_stream::drain_pending_writebacks`). GUARANTEE: once the event
+    /// is host-synchronized, `dst_host` holds the post-update bytes and the
+    /// mirror scatter may proceed on the CPU.
+    #[must_use]
+    pub(crate) fn writeback_dtoh_on_transfer(
+        dst_host: *mut c_void,
+        src_device: *const c_void,
+        size_bytes: usize,
+    ) -> u64 {
+        ensure_context();
+        let stream = transfer_stream();
+        unsafe {
+            // Order the copy after the update kernels on the compute stream.
+            transfer_stream_wait_null_stream(stream);
+            let result =
+                cuMemcpyDtoHAsync_v2(dst_host, src_device as CUdeviceptr, size_bytes, stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyDtoHAsync_v2 (writeback, {} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+            let mut ev: CUevent = std::ptr::null_mut();
+            // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest).
+            let r = cuEventCreate(&mut ev, 0x2);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (writeback) failed: {:?}", r);
+            let r = cuEventRecord(ev, stream);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (writeback) failed: {:?}", r);
+            ev as u64
+        }
+    }
+
+    /// Host-block until `ev` completes, then destroy it. The drain step of an
+    /// async writeback: after this returns the DtoH has landed in the pinned
+    /// stage and the CPU may scatter it into the per-param mirrors.
+    pub(crate) fn event_synchronize(ev: u64) {
+        if ev == 0 {
+            return;
+        }
+        ensure_context();
+        unsafe {
+            let r = cuEventSynchronize(ev as CUevent);
+            assert_eq!(
+                r,
+                CUresult::CUDA_SUCCESS,
+                "cuEventSynchronize (writeback drain) failed: {:?}",
+                r
+            );
+            cuEventDestroy_v2(ev as CUevent);
+        }
+    }
+
+    /// Item 11: make the COMPUTE stream wait for a prefetch event, then
+    /// destroy it. After this returns, every kernel launched on the compute
+    /// stream is ordered after the prefetch HtoD — the guarantee half of the
+    /// transfer certificate. Destroying immediately is safe: `cuEventDestroy`
+    /// defers the actual free until the recorded work and the wait complete.
+    pub(crate) fn compute_stream_wait_event(ev: u64) {
+        if ev == 0 {
+            return;
+        }
+        ensure_context();
+        unsafe {
+            let r = cuStreamWaitEvent(current_stream(), ev as CUevent, 0);
+            assert_eq!(
+                r,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamWaitEvent (prefetch await) failed: {:?}",
+                r
+            );
+            cuEventDestroy_v2(ev as CUevent);
+        }
+    }
+
+    /// P4 item 14: watchdog-bounded synchronization of the calling thread's
+    /// COMPUTE stream. Polls `cuStreamQuery` until the stream drains or
+    /// `timeout_secs` elapses — the per-collective watchdog for NCCL ops
+    /// (a dead peer leaves the collective enqueued forever; a bounded wait
+    /// turns that hang into a loud symmetric abort). Returns true on drain,
+    /// false on timeout. Any error other than NOT_READY aborts (the stream
+    /// carries training work — a poisoned stream must not train on).
+    pub(crate) fn sync_compute_stream_with_deadline(timeout_secs: u64, what: &str) -> bool {
+        ensure_context();
+        let stream = current_stream();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let rc = unsafe { cuStreamQuery(stream) };
+            match rc {
+                CUresult::CUDA_SUCCESS => return true,
+                CUresult::CUDA_ERROR_NOT_READY => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                other => {
+                    eprintln!(
+                        "nsl: {what}: cuStreamQuery failed with {other:?} while waiting \
+                         on a collective — aborting"
+                    );
+                    std::process::abort();
+                }
+            }
         }
     }
 

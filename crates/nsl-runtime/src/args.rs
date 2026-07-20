@@ -125,20 +125,38 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
 }
 
 extern "C" fn nsl_zero_count_atexit() {
-    let (rank, ws, all_reduce, broadcast, optim_elems) = crate::zero::zero_counter_snapshot();
-    eprintln!(
-        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems}"
+    let (rank, ws, all_reduce, broadcast, optim_elems, bucket_members) =
+        crate::zero::zero_counter_snapshot();
+    // EVERY rank prints this line to the SAME inherited stderr pipe, often
+    // exiting simultaneously. `eprintln!` issues one write(2) per format
+    // fragment, so concurrent ranks can TEAR each other's lines mid-string
+    // (observed: "[zero] ws=2[zero] ws= rank=0 ..." — the SPMD gates then
+    // flake on the missing line). Format first, write once: a single
+    // write_all under PIPE_BUF is atomic on POSIX pipes.
+    let rs = crate::zero::ZERO_REDUCE_SCATTER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let line = format!(
+        "[zero] ws={ws} rank={rank} all_reduce={all_reduce} broadcast={broadcast} optim_elems={optim_elems} bucket_members={bucket_members} reduce_scatter={rs}\n"
     );
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 extern "C" fn nsl_weight_stream_count_atexit() {
+    // Item 10: pack_uploads/pack_evicts count contiguous-layer-pack transfers
+    // (arena mode). In per-param mode both are 0; in arena mode they are far
+    // below uploads/evicts — the batching evidence the arena gate asserts.
     eprintln!(
-        "[weight-stream] uploads: {} evicts: {} writeback: {} registered: {} ptr_moves: {}",
+        "[weight-stream] uploads: {} evicts: {} writeback: {} registered: {} ptr_moves: {} \
+         pack_uploads: {} pack_evicts: {} prefetches: {} async_wb: {}",
         crate::weight_stream::WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS_WB.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_PTR_MOVES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_PACK_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_PACK_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_PREFETCHES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_ASYNC_WB.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 

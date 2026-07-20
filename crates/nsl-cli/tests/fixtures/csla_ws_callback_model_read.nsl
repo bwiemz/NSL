@@ -1,0 +1,80 @@
+# Item 12 fixture: a train-loop callback that READS model θ under weight
+# streaming. With `--layerwise-accum --weight-stream`, every streamed param is
+# EVICTED (null device pointer) when the callback runs — so `m.norm_out.sum()`
+# below launches a reduction on a null pointer and crashes loudly (#395).
+#
+# The Item 12 compile pass detects the model reference and brackets the
+# callback body with a scoped `upload_all` / `reevict_all`, so the read sees
+# resident θ. The mid-loop `model_save(m, ...)` inside the callback is the
+# second documented hazard (checkpoint.rs also materializes evicted params
+# from their mirrors as a runtime belt).
+#
+# Marker rewrites (by the gate harness):
+#   - "# GPU_PLACEMENT" -> "m.to(cuda)" for GPU runs;
+#   - "CKPT_PATH"       -> a temp .nslm path.
+
+from nsl.nn.losses import cross_entropy
+
+model Blk:
+    norm_f: Tensor = ones([64])
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyLM:
+    embed: Tensor = randn([64, 64]) * 0.1
+    blocks: [Blk; 2] = Blk()
+    norm_out: Tensor = ones([64])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            h = block.forward(h)
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = TinyLM()
+# GPU_PLACEMENT
+
+let u0 = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let b0 = u0.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u1 = tensor_cat([arange(7) + full([7], 2.0), zeros([1])], 0)
+let b1 = u1.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u2 = tensor_cat([arange(7) + full([7], 3.0), zeros([1])], 0)
+let b2 = u2.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u3 = tensor_cat([arange(7) + full([7], 4.0), zeros([1])], 0)
+let b3 = u3.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let tokens = tensor_cat([b0, b1, b2, b3], 0).reshape([512])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+            # Direct model-field read: crashes on evicted θ without Item 12.
+            print("NORMSUM_BEGIN")
+            print(m.norm_out.sum())
+            print("NORMSUM_END")
+            # Mid-loop checkpoint: the second documented hazard.
+            model_save(m, "CKPT_PATH")
+
+print("LOSS_STREAM_END")
+
+model_save(m, "CKPT_PATH")

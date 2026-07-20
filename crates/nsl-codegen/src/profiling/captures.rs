@@ -81,6 +81,45 @@ pub fn size_hints_from_var_nodes(
     out
 }
 
+/// Sibling of [`size_hints_from_var_nodes`] returning ELEMENT counts instead
+/// of bytes — same concreteness rules. The CSLA layerwise planner feeds these
+/// into `ParamInfo::elems`, where the Item 11 prefetch calibration converts
+/// them at the GPU's f32 width (the transfer is always the device copy).
+pub fn elem_hints_from_var_nodes(
+    var_nodes: &HashMap<VarId, nsl_ast::NodeId>,
+    type_map: &nsl_semantic::checker::TypeMap,
+) -> HashMap<VarId, u64> {
+    use nsl_semantic::types::Type;
+    let mut out = HashMap::new();
+    for (&var, node) in var_nodes {
+        let ty = match type_map.get(node) {
+            Some(t) => t,
+            None => continue,
+        };
+        let shape = match ty {
+            Type::Tensor { shape, .. } => shape,
+            Type::Param { shape, .. } => shape,
+            Type::Buffer { shape, .. } => shape,
+            _ => continue,
+        };
+        let mut elems: u64 = 1;
+        let mut concrete = !shape.dims.is_empty();
+        for dim in &shape.dims {
+            match concrete_dim(dim) {
+                Some(n) if n > 0 => elems = elems.saturating_mul(n as u64),
+                _ => {
+                    concrete = false;
+                    break;
+                }
+            }
+        }
+        if concrete {
+            out.insert(var, elems);
+        }
+    }
+    out
+}
+
 fn concrete_dim(dim: &nsl_semantic::types::Dim) -> Option<i64> {
     use nsl_semantic::types::Dim;
     match dim {

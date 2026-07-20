@@ -40,6 +40,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 [features]
 default = []
 cuda = ["nsl-codegen/cuda"]
+nccl = ["cuda", "nsl-codegen/nccl"]
 test-hooks = ["nsl-codegen/test-hooks"]
 # M62b Spec C — passthrough feature so `cargo build -p nsl-cli --features onnx-rt-op`
 # enables nsl-runtime's ONNX Runtime custom-op surface (`RegisterCustomOps`) in the

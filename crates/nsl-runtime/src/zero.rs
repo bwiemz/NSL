@@ -33,12 +33,58 @@ impl ZeROStage {
 /// Partition parameters across data-parallel ranks using round-robin.
 /// Returns a vec of vec where `partitions[rank]` contains the parameter indices
 /// assigned to that rank.
+///
+/// Index-blind fallback: with real models the parameter BYTE sizes span four
+/// orders of magnitude (embedding vs bias), so round-robin can pile the heavy
+/// tensors onto one rank — prefer [`partition_params_balanced`], which the
+/// codegen-emitted `nsl_zero_partition_bytes` uses.
 pub fn partition_params(num_params: usize, world_size: usize) -> Vec<Vec<usize>> {
     let mut partitions = vec![Vec::new(); world_size];
     for i in 0..num_params {
         partitions[i % world_size].push(i);
     }
     partitions
+}
+
+/// P4 item 13: BYTE-BALANCED ownership. Greedy LPT (longest-processing-time):
+/// visit params by (bytes DESC, index ASC) and assign each to the currently
+/// lightest rank (ties → lowest rank). Classic bound: max rank load ≤ 4/3 of
+/// optimal, and in practice transformer param sets balance to within one
+/// small tensor. DETERMINISTIC: every rank derives the identical plan from
+/// the identical (sizes, world_size) inputs — the total order above has no
+/// ties left undecided, so ownership, broadcast roots, and the owner-gated
+/// optimizer allocation agree across the clique with no communication.
+pub fn partition_params_balanced(sizes: &[u64], world_size: usize) -> Vec<Vec<usize>> {
+    let ws = world_size.max(1);
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]).then(a.cmp(&b)));
+    let mut partitions = vec![Vec::new(); ws];
+    let mut load = vec![0u64; ws];
+    for idx in order {
+        let lightest = (0..ws).min_by_key(|&r| (load[r], r)).unwrap();
+        load[lightest] += sizes[idx];
+        partitions[lightest].push(idx);
+    }
+    // Keep each rank's list in ascending param order (stable iteration for
+    // the owner-gated update loops and debuggability).
+    for p in &mut partitions {
+        p.sort_unstable();
+    }
+    partitions
+}
+
+/// Flatten a partition into an owner lookup: `owner_of[i]` = the rank that
+/// owns param `i`. Every index is covered exactly once by construction.
+pub fn owners_from_partition(partitions: &[Vec<usize>], num_params: usize) -> Vec<i32> {
+    let mut owner_of = vec![0i32; num_params];
+    for (rank, part) in partitions.iter().enumerate() {
+        for &idx in part {
+            if idx < num_params {
+                owner_of[idx] = rank as i32;
+            }
+        }
+    }
+    owner_of
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +116,7 @@ pub static ZERO_OPTIM_ELEMS: std::sync::atomic::AtomicU64 =
 
 /// Read `(rank, world_size, all_reduce_count, broadcast_count, optim_elems)`
 /// for the atexit report. rank/ws are -1 when no context was initialized.
-pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64) {
+pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64, u64) {
     let guard = ZERO_CTX.lock().unwrap();
     let (rank, ws) = guard
         .as_ref()
@@ -82,6 +128,7 @@ pub fn zero_counter_snapshot() -> (i64, i64, u64, u64, u64) {
         ZERO_ALL_REDUCE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         ZERO_OPTIM_ELEMS.load(std::sync::atomic::Ordering::Relaxed),
+        ZERO_BUCKET_MEMBERS.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -101,24 +148,94 @@ pub extern "C" fn nsl_zero_note_optim_alloc(tensor_ptr: i64) -> i64 {
 }
 
 struct ZeROContext {
-    #[allow(dead_code)]
     stage: ZeROStage,
     rank: usize,
     world_size: usize,
     /// Which parameter indices this rank owns (populated by nsl_zero_partition).
     owned_params: Vec<usize>,
+    /// P4 item 13: param index → owning rank, for EVERY param. The broadcast
+    /// root in `nsl_zero_sync_params` MUST come from here (not `i % ws`) so
+    /// the sync roots always agree with the ownership plan, whichever
+    /// partitioner produced it.
+    owner_of: Vec<i32>,
     /// Total number of params (set during partition).
     num_params: usize,
-    /// D3: the real collective backend (CPU-shm SimulatedBackend over the
-    /// `--devices N` spawner's shared file). `None` iff world_size == 1
-    /// (single rank: every collective degenerates to identity).
-    backend: Option<crate::tensor_parallel::collective::SimulatedBackend>,
+    /// D3: the real collective backend. `None` iff world_size == 1 (single
+    /// rank: every collective degenerates to identity). P4 item 14: either
+    /// the CPU-shm SimulatedBackend (default) or, with NSL_COLLECTIVES=nccl
+    /// on an nccl-featured build, the CUDA-aware NcclBackend.
+    backend: Option<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>>,
+    /// True when `backend` takes DEVICE pointers (NCCL): GPU-resident grads
+    /// and params are passed directly, no host staging, no -5 refusal.
+    cuda_aware: bool,
+    /// Review H1: CPU-RESIDENT tensor groups always use this host (CPU-shm)
+    /// backend — a CUDA-aware `backend` (NCCL) must never receive heap
+    /// pointers (ncclInvalidArgument abort on real multi-GPU hardware; even
+    /// GPU models carry a CPU grad group). Shares the same shm mapping, so
+    /// barrier generations stay consistent (all ranks run the identical
+    /// collective sequence in lockstep).
+    host_backend: Option<crate::tensor_parallel::collective::SimulatedBackend>,
 }
 
 // SAFETY: the raw shm pointer inside SimulatedBackend is only touched
 // under the ZERO_CTX mutex on the (single-threaded) training path — the
 // same argument as TpContext's Send impl.
 unsafe impl Send for ZeROContext {}
+
+/// P4 item 14: construct the NCCL backend (nccl-featured builds only; the
+/// stub refuses with the rebuild hint).
+#[cfg(feature = "nccl")]
+fn make_nccl_backend(
+    rank: usize,
+    ws: usize,
+    shm_ptr: *mut u8,
+    shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    crate::tensor_parallel::collective::NcclBackend::new(rank as i32, ws as i32, shm_ptr, shm_len)
+        .map(|b| Box::new(b) as Box<dyn crate::tensor_parallel::collective::CollectiveBackend>)
+}
+
+#[cfg(not(feature = "nccl"))]
+fn make_nccl_backend(
+    _rank: usize,
+    _ws: usize,
+    _shm_ptr: *mut u8,
+    _shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    Err("this runtime was built WITHOUT the nccl feature — rebuild with \
+         `--features nccl` (libnccl.so on the linker/loader path), or drop \
+         --collectives nccl"
+        .to_string())
+}
+
+/// P4 item 14: the CUDA-aware TEST backend (device-pointer API staged through
+/// the CPU-shm reduce) — validates the ZeRO GPU plumbing on one GPU.
+#[cfg(feature = "cuda")]
+fn make_sim_gpu_backend(
+    rank: usize,
+    ws: usize,
+    shm_ptr: *mut u8,
+    shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    Ok(Box::new(
+        crate::tensor_parallel::collective::GpuStagedBackend::new(
+            rank as i32,
+            ws as i32,
+            shm_ptr,
+            shm_len,
+        ),
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn make_sim_gpu_backend(
+    _rank: usize,
+    _ws: usize,
+    _shm_ptr: *mut u8,
+    _shm_len: usize,
+) -> Result<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>, String> {
+    Err("--collectives sim-gpu needs a cuda-featured build".to_string())
+}
 
 /// Initialize ZeRO optimizer sharding (D3: REAL — builds the CPU-shm
 /// SimulatedBackend from the `--devices N` spawner's env protocol).
@@ -144,6 +261,14 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let ws = (world_size.max(1)) as usize;
+    // Review L7: a clamped out-of-range rank would silently alias the last
+    // rank (duplicate segment claims, overlapping shm writes). Refuse.
+    if rank >= ws {
+        eprintln!(
+            "nsl_zero_init: NSL_LOCAL_RANK={rank} out of range for              world_size={ws} — refusing"
+        );
+        return -1;
+    }
 
     let simulated: bool = std::env::var("NSL_SIMULATED_TP")
         .ok()
@@ -158,7 +283,34 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
         return -2;
     }
 
-    let backend = if ws > 1 {
+    // P4 item 14: collective-backend selection. Default = the CPU-shm
+    // SimulatedBackend; NSL_COLLECTIVES=nccl requests real CUDA-aware NCCL
+    // collectives (set by `nsl run --collectives nccl`, requires an
+    // nccl-featured build). Anything else refuses loudly.
+    let requested = std::env::var("NSL_COLLECTIVES").unwrap_or_else(|_| "sim".to_string());
+    #[derive(PartialEq)]
+    enum WantBackend {
+        Sim,
+        SimGpu,
+        Nccl,
+    }
+    let want = match requested.as_str() {
+        "sim" | "" => WantBackend::Sim,
+        "sim-gpu" => WantBackend::SimGpu,
+        "nccl" => WantBackend::Nccl,
+        other => {
+            eprintln!(
+                "nsl_zero_init: unknown NSL_COLLECTIVES backend '{other}' \
+                 (expected 'sim', 'sim-gpu', or 'nccl')"
+            );
+            return -2;
+        }
+    };
+
+    let (backend, cuda_aware): (
+        Option<Box<dyn crate::tensor_parallel::collective::CollectiveBackend>>,
+        bool,
+    ) = if ws > 1 {
         let Ok(shm_path) = std::env::var("NSL_TP_SHM_PATH") else {
             eprintln!(
                 "nsl_zero_init: world_size={ws} but NSL_TP_SHM_PATH is not \
@@ -168,28 +320,84 @@ pub extern "C" fn nsl_zero_init(stage: i64, world_size: i64) -> i64 {
             return -3;
         };
         let (shm_ptr, shm_len) = crate::tensor_parallel::ffi::open_shm(&shm_path);
-        Some(crate::tensor_parallel::collective::SimulatedBackend::new(
-            rank as i32,
-            ws as i32,
-            shm_ptr,
-            shm_len,
-        ))
+        match want {
+            WantBackend::Nccl => match make_nccl_backend(rank, ws, shm_ptr, shm_len) {
+                Ok(b) => {
+                    eprintln!(
+                        "[zero] rank {rank}: NCCL communicator up \
+                         (ws={ws}, CUDA-aware collectives)"
+                    );
+                    (Some(b), true)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "nsl_zero_init: NCCL backend init failed on rank {rank}: {e}"
+                    );
+                    return -2;
+                }
+            },
+            WantBackend::SimGpu => match make_sim_gpu_backend(rank, ws, shm_ptr, shm_len) {
+                Ok(b) => {
+                    eprintln!(
+                        "[zero] rank {rank}: sim-gpu staged collectives up \
+                         (ws={ws}, CUDA-aware TEST backend)"
+                    );
+                    (Some(b), true)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "nsl_zero_init: sim-gpu backend init failed on rank {rank}: {e}"
+                    );
+                    return -2;
+                }
+            },
+            WantBackend::Sim => (
+                Some(Box::new(
+                    crate::tensor_parallel::collective::SimulatedBackend::new(
+                        rank as i32,
+                        ws as i32,
+                        shm_ptr,
+                        shm_len,
+                    ),
+                )
+                    as Box<dyn crate::tensor_parallel::collective::CollectiveBackend>),
+                false,
+            ),
+        }
+    } else {
+        // Single rank: NCCL would be a 1-rank identity clique — skip it.
+        (None, false)
+    };
+
+    let host_backend = if ws > 1 {
+        std::env::var("NSL_TP_SHM_PATH").ok().map(|p| {
+            let (shm_ptr, shm_len) = crate::tensor_parallel::ffi::open_shm(&p);
+            crate::tensor_parallel::collective::SimulatedBackend::new(
+                rank as i32,
+                ws as i32,
+                shm_ptr,
+                shm_len,
+            )
+        })
     } else {
         None
     };
-
     *guard = Some(ZeROContext {
         stage: s,
         rank,
         world_size: ws,
         owned_params: Vec::new(),
+        owner_of: Vec::new(),
         num_params: 0,
         backend,
+        cuda_aware,
+        host_backend,
     });
     0
 }
 
-/// Partition parameters for ZeRO. Uses round-robin partitioning.
+/// Partition parameters for ZeRO. Uses round-robin partitioning (index-blind
+/// fallback — codegen emits `nsl_zero_partition_bytes` instead).
 /// Returns the number of parameters this rank owns, or -1 on error.
 #[no_mangle]
 pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
@@ -203,8 +411,49 @@ pub extern "C" fn nsl_zero_partition(num_params: i64) -> i64 {
     let my_params = partitions[my_rank].clone();
     let count = my_params.len() as i64;
 
+    ctx.owner_of = owners_from_partition(&partitions, num_params as usize);
     ctx.owned_params = my_params;
     ctx.num_params = num_params as usize;
+
+    count
+}
+
+/// P4 item 13: BYTE-BALANCED partition. Reads each parameter's byte size from
+/// the runtime param list (identical on every rank — the plan needs no
+/// communication) and assigns ownership by greedy LPT so per-rank optimizer
+/// work and moment memory track ~1/N in BYTES, not tensor count. A null list
+/// slot contributes size 0 (still assigned an owner, for total coverage).
+/// Returns the number of parameters this rank owns, or -1 on error.
+#[no_mangle]
+pub extern "C" fn nsl_zero_partition_bytes(params_list_ptr: i64, num_params: i64) -> i64 {
+    let mut guard = ZERO_CTX.lock().unwrap();
+    let Some(ctx) = guard.as_mut() else {
+        return -1;
+    };
+    let list_ptr = params_list_ptr as *const crate::list::NslList;
+    if list_ptr.is_null() {
+        return -1;
+    }
+    let list = unsafe { &*list_ptr };
+    let n = (num_params.max(0) as usize).min(list.len as usize);
+
+    let mut sizes = vec![0u64; num_params.max(0) as usize];
+    for (i, size) in sizes.iter_mut().enumerate().take(n) {
+        let tensor_raw = unsafe { *list.data.add(i) };
+        if tensor_raw != 0 {
+            let t = unsafe { &*(tensor_raw as *const NslTensor) };
+            *size = t.data_byte_size() as u64;
+        }
+    }
+
+    let partitions = partition_params_balanced(&sizes, ctx.world_size);
+    let my_rank = ctx.rank.min(partitions.len() - 1);
+    let my_params = partitions[my_rank].clone();
+    let count = my_params.len() as i64;
+
+    ctx.owner_of = owners_from_partition(&partitions, sizes.len());
+    ctx.owned_params = my_params;
+    ctx.num_params = sizes.len();
 
     count
 }
@@ -223,6 +472,427 @@ pub extern "C" fn nsl_zero_owns_param(param_idx: i64) -> i64 {
     } else {
         0
     }
+}
+
+// ---------------------------------------------------------------------------
+// P4 item 15: bucketed collectives.
+// ---------------------------------------------------------------------------
+//
+// One collective per small parameter wastes latency (shm: 2 spin-barriers
+// per tensor; NCCL: a launch + watchdog'd stream sync per tensor). Instead,
+// same-(dtype, device) gradients are FLATTENED in param-index order — which
+// is model/layer order, so buckets align with CSLA layer ranges — into
+// buckets capped at NSL_ZERO_BUCKET_MB (default 25; 0 = per-tensor), and one
+// collective moves each bucket. Param sync buckets additionally by OWNER so
+// each bucket broadcasts from its owning rank. Bit-exactness is preserved:
+// the backend reduces element-wise in the same fixed rank order, and the
+// scale-by-1/ws is applied to the same values.
+
+/// Review H1: the backend for HOST-buffer collectives — the CPU-shm backend
+/// when one exists (always, at ws>1), else the main backend (ws==1 never
+/// gets here). CUDA-aware main backends must never see heap pointers.
+fn host_or_main(ctx: &ZeROContext) -> &dyn crate::tensor_parallel::collective::CollectiveBackend {
+    match &ctx.host_backend {
+        Some(h) => h,
+        None => ctx
+            .backend
+            .as_deref()
+            .expect("ws > 1 implies a backend"),
+    }
+}
+
+/// Bucket byte cap (0 disables bucketing).
+fn zero_bucket_cap_bytes() -> usize {
+    std::env::var("NSL_ZERO_BUCKET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(25)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Anti-vacuity: Σ tensors that traveled inside a bucketed collective.
+pub static ZERO_BUCKET_MEMBERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// P4 item 16 (ZeRO-2): reduce_scatter collectives that actually ran — the
+/// stage-2 gate asserts this is nonzero AND all_reduce stays 0 for grads.
+pub static ZERO_REDUCE_SCATTER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One eligible tensor for bucketing.
+#[derive(Clone, Copy)]
+struct BucketItem {
+    /// Param index (owner lookup for stage-2 segmenting / owner broadcasts).
+    idx: usize,
+    raw: i64,
+    len: usize,
+    bytes: usize,
+}
+
+/// Group `items` (already same dtype/device/owner class) into ≤cap buckets,
+/// preserving order; every bucket holds ≥1 member.
+fn split_buckets(items: &[BucketItem], cap: usize) -> Vec<Vec<BucketItem>> {
+    let mut out: Vec<Vec<BucketItem>> = Vec::new();
+    let mut cur: Vec<BucketItem> = Vec::new();
+    let mut cur_bytes = 0usize;
+    for &it in items {
+        if !cur.is_empty() && cur_bytes + it.bytes > cap {
+            out.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur_bytes += it.bytes;
+        cur.push(it);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// CPU bucket all-reduce + average: pack → ONE collective → scale flat →
+/// unpack. `dtype` is 0 (f64) or 1 (f32).
+fn reduce_bucket_cpu(
+    ctx: &ZeROContext,
+    bucket: &[BucketItem],
+    dtype: u16,
+    inv_ws: f64,
+) -> i64 {
+    let backend = host_or_main(ctx);
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    let mut flat = vec![0u8; total_bytes];
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (b.raw as *const NslTensor).read().data as *const u8,
+                flat.as_mut_ptr().add(off),
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    let rc = backend.all_reduce_sum(
+        flat.as_ptr() as *const std::ffi::c_void,
+        flat.as_mut_ptr() as *mut std::ffi::c_void,
+        total_elems,
+        dtype as crate::tensor_parallel::collective::DtypeId,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return -1;
+    }
+    ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if dtype == 0 {
+        let p = flat.as_mut_ptr() as *mut f64;
+        for j in 0..total_elems {
+            unsafe { *p.add(j) *= inv_ws };
+        }
+    } else {
+        let p = flat.as_mut_ptr() as *mut f32;
+        let s = inv_ws as f32;
+        for j in 0..total_elems {
+            unsafe { *p.add(j) *= s };
+        }
+    }
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                flat.as_ptr().add(off),
+                (b.raw as *const NslTensor).read().data as *mut u8,
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    0
+}
+
+/// GPU (CUDA-aware) bucket all-reduce + average: DtoD pack into a device
+/// bucket → ONE device collective → DtoD unpack → per-tensor on-device scale.
+#[cfg(feature = "cuda")]
+fn reduce_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], inv_ws: f64) -> i64 {
+    let backend = ctx.backend.as_deref().expect("ws > 1 implies a backend");
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(total_bytes);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
+            t.data as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+    }
+    let rc = backend.all_reduce_sum(
+        dev as *const std::ffi::c_void,
+        dev,
+        total_elems,
+        crate::tensor_parallel::collective::DTYPE_F32,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        crate::cuda::inner::free_managed(dev);
+        return -1;
+    }
+    ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            t.data,
+            unsafe { (dev as *const u8).add(off) } as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+        crate::tensor::nsl_tensor_mul_scalar_inplace(b.raw, inv_ws);
+    }
+    crate::cuda::inner::free_managed(dev);
+    0
+}
+
+/// P4 item 16 (ZeRO-2): owner-segmented reduce_scatter over one (dtype,
+/// device) group. Layout: `[rank0's owned grads .. pad | rank1's .. pad | …]`
+/// with every rank segment padded to the max segment size, so the existing
+/// `reduce_scatter_sum` (count divisible by ws, rank r receives slice r)
+/// delivers each rank EXACTLY its owned gradients, summed — gradient
+/// partitioning with (N-1)/N the traffic of an all-reduce. Non-owned grad
+/// tensors keep their LOCAL (unsummed) values; only the owner-gated
+/// optimizer reads gradients, and it reads owned slots only.
+fn reduce_scatter_group_cpu(
+    ctx: &ZeROContext,
+    items: &[BucketItem],
+    dtype: u16,
+    inv_ws: f64,
+) -> i64 {
+    let backend = host_or_main(ctx);
+    let ws = ctx.world_size;
+    let esz = if dtype == 0 { 8 } else { 4 };
+    // Per-rank owned member lists (ascending param order preserved).
+    let mut segs: Vec<Vec<BucketItem>> = vec![Vec::new(); ws];
+    for &it in items {
+        let owner = ctx.owner_of.get(it.idx).copied().unwrap_or(0) as usize;
+        segs[owner.min(ws - 1)].push(it);
+    }
+    let seg_bytes: Vec<usize> = segs.iter().map(|s| s.iter().map(|b| b.bytes).sum()).collect();
+    let max_seg = seg_bytes.iter().copied().max().unwrap_or(0);
+    if max_seg == 0 {
+        return 0;
+    }
+    let total = max_seg * ws;
+    let mut flat = vec![0u8; total];
+    for (r, seg) in segs.iter().enumerate() {
+        let mut off = r * max_seg;
+        for b in seg {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (b.raw as *const NslTensor).read().data as *const u8,
+                    flat.as_mut_ptr().add(off),
+                    b.bytes,
+                )
+            };
+            off += b.bytes;
+        }
+    }
+    let mut out = vec![0u8; max_seg];
+    let rc = backend.reduce_scatter_sum(
+        flat.as_ptr() as *const std::ffi::c_void,
+        out.as_mut_ptr() as *mut std::ffi::c_void,
+        total / esz,
+        dtype as crate::tensor_parallel::collective::DtypeId,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return -1;
+    }
+    ZERO_REDUCE_SCATTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // Average + unpack THIS rank's owned segment.
+    let my = ctx.rank.min(ws - 1);
+    let my_elems = seg_bytes[my] / esz;
+    if dtype == 0 {
+        let p = out.as_mut_ptr() as *mut f64;
+        for j in 0..my_elems {
+            unsafe { *p.add(j) *= inv_ws };
+        }
+    } else {
+        let p = out.as_mut_ptr() as *mut f32;
+        let sc = inv_ws as f32;
+        for j in 0..my_elems {
+            unsafe { *p.add(j) *= sc };
+        }
+    }
+    let mut off = 0usize;
+    for b in &segs[my] {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out.as_ptr().add(off),
+                (b.raw as *const NslTensor).read().data as *mut u8,
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    0
+}
+
+/// GPU (CUDA-aware) sibling of [`reduce_scatter_group_cpu`]: same
+/// owner-segmented padded layout through device buffers.
+#[cfg(feature = "cuda")]
+fn reduce_scatter_group_gpu(ctx: &ZeROContext, items: &[BucketItem], inv_ws: f64) -> i64 {
+    let backend = ctx.backend.as_deref().expect("ws > 1 implies a backend");
+    let ws = ctx.world_size;
+    let mut segs: Vec<Vec<BucketItem>> = vec![Vec::new(); ws];
+    for &it in items {
+        let owner = ctx.owner_of.get(it.idx).copied().unwrap_or(0) as usize;
+        segs[owner.min(ws - 1)].push(it);
+    }
+    let seg_bytes: Vec<usize> = segs.iter().map(|s| s.iter().map(|b| b.bytes).sum()).collect();
+    let max_seg = seg_bytes.iter().copied().max().unwrap_or(0);
+    if max_seg == 0 {
+        return 0;
+    }
+    let total = max_seg * ws;
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(total);
+    crate::cuda::inner::memset_d8(dev, total);
+    for (r, seg) in segs.iter().enumerate() {
+        let mut off = r * max_seg;
+        for b in seg {
+            let t = unsafe { &*(b.raw as *const NslTensor) };
+            crate::cuda::inner::memcpy_dtod(
+                unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
+                t.data as *const std::ffi::c_void,
+                b.bytes,
+            );
+            off += b.bytes;
+        }
+    }
+    let out = crate::cuda::inner::alloc_managed(max_seg);
+    let rc = backend.reduce_scatter_sum(
+        dev as *const std::ffi::c_void,
+        out,
+        total / 4,
+        crate::tensor_parallel::collective::DTYPE_F32,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        crate::cuda::inner::free_managed(dev);
+        crate::cuda::inner::free_managed(out);
+        return -1;
+    }
+    ZERO_REDUCE_SCATTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let my = ctx.rank.min(ws - 1);
+    let mut off = 0usize;
+    for b in &segs[my] {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            t.data,
+            unsafe { (out as *const u8).add(off) } as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+        crate::tensor::nsl_tensor_mul_scalar_inplace(b.raw, inv_ws);
+    }
+    crate::cuda::inner::free_managed(dev);
+    crate::cuda::inner::free_managed(out);
+    0
+}
+
+/// CPU bucket broadcast from `owner`: every rank packs its current bytes,
+/// ONE collective, every rank unpacks (the root re-reads its own bytes).
+fn broadcast_bucket_cpu(ctx: &ZeROContext, bucket: &[BucketItem], dtype: u16, owner: i32) -> i64 {
+    let backend = host_or_main(ctx);
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    let mut flat = vec![0u8; total_bytes];
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (b.raw as *const NslTensor).read().data as *const u8,
+                flat.as_mut_ptr().add(off),
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    let rc = backend.broadcast(
+        flat.as_mut_ptr() as *mut std::ffi::c_void,
+        total_elems,
+        dtype as crate::tensor_parallel::collective::DtypeId,
+        owner,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return -1;
+    }
+    ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut off = 0usize;
+    for b in bucket {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                flat.as_ptr().add(off),
+                (b.raw as *const NslTensor).read().data as *mut u8,
+                b.bytes,
+            )
+        };
+        off += b.bytes;
+    }
+    0
+}
+
+/// GPU (CUDA-aware) bucket broadcast from `owner` via a device bucket.
+#[cfg(feature = "cuda")]
+fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) -> i64 {
+    let backend = ctx.backend.as_deref().expect("ws > 1 implies a backend");
+    let total_bytes: usize = bucket.iter().map(|b| b.bytes).sum();
+    let total_elems: usize = bucket.iter().map(|b| b.len).sum();
+    crate::cuda::inner::ensure_context();
+    let dev = crate::cuda::inner::alloc_managed(total_bytes);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            unsafe { (dev as *mut u8).add(off) } as *mut std::ffi::c_void,
+            t.data as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+    }
+    let rc = backend.broadcast(
+        dev,
+        total_elems,
+        crate::tensor_parallel::collective::DTYPE_F32,
+        owner,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        crate::cuda::inner::free_managed(dev);
+        return -1;
+    }
+    ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ZERO_BUCKET_MEMBERS.fetch_add(bucket.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut off = 0usize;
+    for b in bucket {
+        let t = unsafe { &*(b.raw as *const NslTensor) };
+        crate::cuda::inner::memcpy_dtod(
+            t.data,
+            unsafe { (dev as *const u8).add(off) } as *const std::ffi::c_void,
+            b.bytes,
+        );
+        off += b.bytes;
+    }
+    crate::cuda::inner::free_managed(dev);
+    0
 }
 
 /// Reduce gradients across all DP ranks.
@@ -270,6 +940,120 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
 
     let ws = ctx.world_size as f64;
     let inv_ws = 1.0 / ws;
+
+    // P4 item 15: bucketed fast path — flatten same-(dtype, device) grads in
+    // param-index (= layer) order and run ONE collective per ≤cap bucket.
+    let cap = zero_bucket_cap_bytes();
+    // Review M2: stage-2 gradient partitioning lives INSIDE the bucketed
+    // path; a cap of 0 would silently fall through to the all-reduce loop,
+    // voiding the reduce_scatter contract and its counters. Refuse loudly.
+    if cap == 0 && ctx.stage != ZeROStage::Stage1 {
+        eprintln!(
+            "nsl: nsl_zero_reduce_grads: --zero-stage 2 requires bucketed              collectives — do not set NSL_ZERO_BUCKET_MB=0 with stage >= 2"
+        );
+        return -1;
+    }
+    if cap > 0 {
+        let mut cpu_f64: Vec<BucketItem> = Vec::new();
+        let mut cpu_f32: Vec<BucketItem> = Vec::new();
+        let mut gpu_f32: Vec<BucketItem> = Vec::new();
+        for i in 0..num_params as usize {
+            if i >= list.len as usize {
+                break;
+            }
+            let raw = unsafe { *list.data.add(i) };
+            if raw == 0 {
+                continue;
+            }
+            let t = unsafe { &*(raw as *const NslTensor) };
+            if t.device != 0 && !ctx.cuda_aware {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs \
+                     real collectives — run with --collectives nccl \
+                     (nccl-featured build), or move the model to CPU / drop \
+                     --devices.",
+                );
+                return -5;
+            }
+            if t.device == 0 && t.dtype > 1 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: unsupported gradient dtype {} \
+                     at index {}; only f64 (0) and f32 (1) gradients are \
+                     supported",
+                    t.dtype, i
+                );
+                return -1;
+            }
+            if t.device > 0 && t.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: GPU gradient at index {} has \
+                     dtype {}; only the canonical GPU f32 (dtype 1) is \
+                     supported",
+                    i, t.dtype
+                );
+                return -1;
+            }
+            let item = BucketItem {
+                idx: i,
+                raw,
+                len: t.len as usize,
+                bytes: t.data_byte_size(),
+            };
+            match (t.device, t.dtype) {
+                (0, 0) => cpu_f64.push(item),
+                (0, _) => cpu_f32.push(item),
+                _ => gpu_f32.push(item),
+            }
+        }
+        // P4 item 16 (ZeRO-2+): gradient PARTITIONING — one owner-segmented
+        // reduce_scatter per (dtype, device) group instead of all-reducing
+        // every gradient everywhere. Each rank receives only its owned
+        // gradients (summed + averaged); non-owned grad tensors keep local
+        // values that nothing reads (the optimizer update is owner-gated).
+        if ctx.stage != ZeROStage::Stage1 {
+            for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
+                if !items.is_empty() && reduce_scatter_group_cpu(ctx, items, dtype, inv_ws) != 0
+                {
+                    eprintln!("nsl: nsl_zero_reduce_grads: reduce_scatter failed");
+                    return -1;
+                }
+            }
+            #[cfg(feature = "cuda")]
+            if !gpu_f32.is_empty() && reduce_scatter_group_gpu(ctx, &gpu_f32, inv_ws) != 0 {
+                eprintln!("nsl: nsl_zero_reduce_grads: device reduce_scatter failed");
+                return -1;
+            }
+            #[cfg(not(feature = "cuda"))]
+            if !gpu_f32.is_empty() {
+                eprintln!("nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
+                return -1;
+            }
+            return 0;
+        }
+
+        for (items, dtype) in [(&cpu_f64, 0u16), (&cpu_f32, 1u16)] {
+            for bucket in split_buckets(items, cap) {
+                if reduce_bucket_cpu(ctx, &bucket, dtype, inv_ws) != 0 {
+                    eprintln!("nsl: nsl_zero_reduce_grads: bucketed all_reduce failed");
+                    return -1;
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        for bucket in split_buckets(&gpu_f32, cap) {
+            if reduce_bucket_gpu(ctx, &bucket, inv_ws) != 0 {
+                eprintln!("nsl: nsl_zero_reduce_grads: bucketed device all_reduce failed");
+                return -1;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        if !gpu_f32.is_empty() {
+            eprintln!("nsl: nsl_zero_reduce_grads: GPU gradients require the cuda feature");
+            return -1;
+        }
+        return 0;
+    }
+
     for i in 0..num_params as usize {
         if i >= list.len as usize {
             break;
@@ -281,21 +1065,19 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
         }
         let tensor = unsafe { &*tensor_ptr };
 
-        // D3 v1 (review): ZeRO-1 SPMD is CPU-only. --devices N spawns N
-        // full processes that all select CUDA device 0 (cuda/mod.rs pins
-        // ordinal 0; the spawner sets no per-rank CUDA_VISIBLE_DEVICES),
-        // so a GPU-resident model would multiply VRAM by N on one card and
-        // the staged reduce path is unvalidated. Refuse rather than pile
-        // ranks onto one GPU. (Runtime, not compile-time: the default
-        // --target is "cuda" even for CPU-placed models, so a target-based
-        // guard would wrongly refuse the CPU SPMD path.)
-        if ctx.world_size > 1 && tensor.device != 0 {
+        // P4 item 14: GPU-resident SPMD requires the CUDA-aware backend.
+        // Under the CPU-shm SimulatedBackend the old v1 refusal stands: N
+        // ranks would pile onto few devices with a host-staged reduce that
+        // multiplies VRAM and PCIe traffic. With NCCL (--collectives nccl)
+        // grads stay on-device and rank→device binding stripes the ranks
+        // (cuda::select_device_ordinal). (Runtime, not compile-time: the
+        // default --target is "cuda" even for CPU-placed models, so a
+        // target-based guard would wrongly refuse the CPU SPMD path.)
+        if ctx.world_size > 1 && tensor.device != 0 && !ctx.cuda_aware {
             eprintln!(
-                "nsl: nsl_zero_reduce_grads: ZeRO-1 SPMD (--zero-stage 1 \
-                 --devices {}) is CPU-only in v1 — a GPU-resident model \
-                 would place all {} ranks on CUDA device 0. Move the model \
-                 to CPU or drop --devices.",
-                ctx.world_size, ctx.world_size
+                "nsl: nsl_zero_reduce_grads: GPU-resident ZeRO SPMD needs real \
+                 collectives — run with --collectives nccl (nccl-featured \
+                 build), or move the model to CPU / drop --devices.",
             );
             return -5;
         }
@@ -321,12 +1103,9 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
 
         if tensor.device == 0 {
             // CPU: in-place all-reduce (send==recv is safe — the backend
-            // copies to its slot first), then average.
-            let backend = ctx
-                .backend
-                .as_ref()
-                .expect("world_size > 1 implies a backend");
-            use crate::tensor_parallel::collective::CollectiveBackend;
+            // copies to its slot first), then average. Review H1: host
+            // buffers go to the host backend.
+            let backend = host_or_main(ctx);
             let rc = backend.all_reduce_sum(
                 tensor.data as *const std::ffi::c_void,
                 tensor.data,
@@ -342,6 +1121,35 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                 return -1;
             }
             ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
+            continue;
+        }
+
+        // P4 item 14: CUDA-aware backend — the collective consumes the DEVICE
+        // pointer directly (in-place sum), then the average runs as a native
+        // on-device scale. No host staging, no PCIe round-trip.
+        #[cfg(feature = "cuda")]
+        if ctx.cuda_aware {
+            let backend = ctx
+                .backend
+                .as_ref()
+                .expect("world_size > 1 implies a backend");
+            let rc = backend.all_reduce_sum(
+                tensor.data as *const std::ffi::c_void,
+                tensor.data,
+                tensor.len as usize,
+                crate::tensor_parallel::collective::DTYPE_F32,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_reduce_grads: device all_reduce failed \
+                     rc={rc} at index {i}"
+                );
+                return -1;
+            }
+            ZERO_ALL_REDUCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // GPU f32 contiguous: native in-place scale kernel.
             crate::tensor::nsl_tensor_mul_scalar_inplace(tensor_raw, inv_ws);
             continue;
         }
@@ -377,8 +1185,7 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                     .backend
                     .as_ref()
                     .expect("world_size > 1 implies a backend");
-                use crate::tensor_parallel::collective::CollectiveBackend;
-                let rc = backend.all_reduce_sum(
+                    let rc = backend.all_reduce_sum(
                     staged.as_ptr() as *const std::ffi::c_void,
                     staged.as_mut_ptr() as *mut std::ffi::c_void,
                     len,
@@ -468,11 +1275,93 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
         return -1;
     }
     let list = unsafe { &*list_ptr };
-    use crate::tensor_parallel::collective::CollectiveBackend;
     let backend = ctx
         .backend
         .as_ref()
         .expect("world_size > 1 implies a backend");
+
+    // P4 item 15: bucketed fast path — group params by (OWNER, dtype, device)
+    // and broadcast each ≤cap bucket from its owning rank in one collective.
+    let cap = zero_bucket_cap_bytes();
+    if cap > 0 {
+        use std::collections::BTreeMap;
+        // (owner, dtype, is_gpu) → items, in ascending param order.
+        let mut groups: BTreeMap<(i32, u16, bool), Vec<BucketItem>> = BTreeMap::new();
+        for i in 0..num_params as usize {
+            if i >= list.len as usize {
+                break;
+            }
+            let raw = unsafe { *list.data.add(i) };
+            if raw == 0 {
+                continue;
+            }
+            let t = unsafe { &*(raw as *const NslTensor) };
+            let owner = ctx
+                .owner_of
+                .get(i)
+                .copied()
+                .unwrap_or((i % ctx.world_size) as i32);
+            if t.device != 0 && !ctx.cuda_aware {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs \
+                     real collectives — run with --collectives nccl \
+                     (nccl-featured build), or move the model to CPU / drop \
+                     --devices.",
+                );
+                return -5;
+            }
+            if t.device == 0 && t.dtype > 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: unsupported CPU param dtype {} \
+                     at index {i}",
+                    t.dtype
+                );
+                return -1;
+            }
+            if t.device > 0 && t.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                     dtype {}; only f32 is supported",
+                    t.dtype
+                );
+                return -1;
+            }
+            groups
+                .entry((owner, t.dtype, t.device != 0))
+                .or_default()
+                .push(BucketItem {
+                    idx: i,
+                    raw,
+                    len: t.len as usize,
+                    bytes: t.data_byte_size(),
+                });
+        }
+        for ((owner, dtype, is_gpu), items) in &groups {
+            for bucket in split_buckets(items, cap) {
+                let rc = if *is_gpu {
+                    #[cfg(feature = "cuda")]
+                    {
+                        broadcast_bucket_gpu(ctx, &bucket, *owner)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        eprintln!(
+                            "nsl: nsl_zero_sync_params: GPU params require the \
+                             cuda feature"
+                        );
+                        -1
+                    }
+                } else {
+                    broadcast_bucket_cpu(ctx, &bucket, *dtype, *owner)
+                };
+                if rc != 0 {
+                    eprintln!("nsl: nsl_zero_sync_params: bucketed broadcast failed");
+                    return -1;
+                }
+            }
+        }
+        return 0;
+    }
 
     for i in 0..num_params as usize {
         if i >= list.len as usize {
@@ -484,18 +1373,52 @@ pub extern "C" fn nsl_zero_sync_params(params_list_ptr: i64, num_params: i64) ->
             continue;
         }
         let tensor = unsafe { &*tensor_ptr };
-        let owner = (i % ctx.world_size) as i32;
+        // P4 item 13: the broadcast root comes from the ownership PLAN. The
+        // index-modulo fallback only covers a param the partitioner never saw
+        // (it should not happen — partition runs before any sync).
+        let owner = ctx
+            .owner_of
+            .get(i)
+            .copied()
+            .unwrap_or((i % ctx.world_size) as i32);
 
-        // D3 v1: CPU-only (see nsl_zero_reduce_grads) — refuse GPU-resident
-        // params rather than pile N ranks onto CUDA device 0.
-        if tensor.device != 0 {
+        // P4 item 14: GPU-resident params need the CUDA-aware backend (see
+        // the matching guard in nsl_zero_reduce_grads).
+        if tensor.device != 0 && !ctx.cuda_aware {
             eprintln!(
-                "nsl: nsl_zero_sync_params: ZeRO-1 SPMD is CPU-only in v1 — a \
-                 GPU-resident param would place all {} ranks on CUDA device \
-                 0. Move the model to CPU or drop --devices.",
-                ctx.world_size
+                "nsl: nsl_zero_sync_params: GPU-resident ZeRO SPMD needs real \
+                 collectives — run with --collectives nccl (nccl-featured \
+                 build), or move the model to CPU / drop --devices.",
             );
             return -5;
+        }
+        // CUDA-aware: broadcast the DEVICE pointer straight from the owner.
+        #[cfg(feature = "cuda")]
+        if tensor.device != 0 && ctx.cuda_aware {
+            if tensor.dtype != 1 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: GPU param at index {i} has \
+                     dtype {}; only f32 is supported",
+                    tensor.dtype
+                );
+                return -1;
+            }
+            let rc = backend.broadcast(
+                tensor.data,
+                tensor.len as usize,
+                crate::tensor_parallel::collective::DTYPE_F32,
+                owner,
+                std::ptr::null_mut(),
+            );
+            if rc != 0 {
+                eprintln!(
+                    "nsl: nsl_zero_sync_params: device broadcast failed rc={rc} \
+                     at index {i}"
+                );
+                return -1;
+            }
+            ZERO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
         }
 
         if tensor.device == 0 {
@@ -835,6 +1758,99 @@ mod tests {
         // All params accounted for
         let total: usize = parts.iter().map(|p| p.len()).sum();
         assert_eq!(total, 10);
+    }
+
+    // ── P4 item 13: byte-balanced ownership ──────────────────────────────
+
+    #[test]
+    fn test_partition_balanced_complete_and_disjoint() {
+        let sizes: Vec<u64> = vec![7, 1, 1, 1, 3, 3, 9, 2];
+        let parts = partition_params_balanced(&sizes, 3);
+        let mut seen = vec![false; sizes.len()];
+        for p in &parts {
+            for &i in p {
+                assert!(!seen[i], "param {i} assigned twice");
+                seen[i] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every param must have an owner");
+    }
+
+    #[test]
+    fn test_partition_balanced_beats_round_robin_on_skew() {
+        // Transformer-shaped skew: one huge embedding, a few big matrices,
+        // many tiny biases/norms. Round-robin by index piles the heavies
+        // onto low ranks; LPT balances byte loads.
+        let sizes: Vec<u64> = vec![4_000_000, 250_000, 250_000, 4_096, 4_096, 4_096, 4_096, 4_096];
+        let ws = 2;
+        let load = |parts: &Vec<Vec<usize>>| -> Vec<u64> {
+            parts
+                .iter()
+                .map(|p| p.iter().map(|&i| sizes[i]).sum())
+                .collect()
+        };
+        let rr = load(&{
+            let mut v = vec![Vec::new(); ws];
+            for i in 0..sizes.len() {
+                v[i % ws].push(i);
+            }
+            v
+        });
+        let lpt = load(&partition_params_balanced(&sizes, ws));
+        let spread = |l: &Vec<u64>| l.iter().max().unwrap() - l.iter().min().unwrap();
+        assert!(
+            spread(&lpt) < spread(&rr),
+            "LPT spread {:?} must beat round-robin spread {:?}",
+            lpt,
+            rr
+        );
+        // LPT bound sanity: max load ≤ max(largest single tensor, 4/3 × ideal)
+        // — no partition can undercut the biggest indivisible tensor, and away
+        // from that floor LPT is within 4/3 of the perfect split.
+        let total: u64 = sizes.iter().sum();
+        let largest = *sizes.iter().max().unwrap();
+        let bound = largest.max(total.div_ceil(ws as u64) * 4 / 3);
+        assert!(*lpt.iter().max().unwrap() <= bound);
+    }
+
+    #[test]
+    fn test_partition_balanced_deterministic_and_sorted() {
+        let sizes: Vec<u64> = vec![5, 5, 5, 5, 8, 8, 1];
+        let a = partition_params_balanced(&sizes, 4);
+        let b = partition_params_balanced(&sizes, 4);
+        assert_eq!(a, b, "identical inputs must give the identical plan");
+        for p in &a {
+            let mut s = p.clone();
+            s.sort_unstable();
+            assert_eq!(*p, s, "per-rank index lists are ascending");
+        }
+    }
+
+    #[test]
+    fn test_partition_balanced_edge_cases() {
+        // ws=1 owns everything, in order.
+        assert_eq!(partition_params_balanced(&[3, 1, 2], 1), vec![vec![0, 1, 2]]);
+        // More ranks than params: some ranks legitimately own nothing.
+        let parts = partition_params_balanced(&[10, 20], 4);
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        assert_eq!(total, 2);
+        assert_eq!(parts.len(), 4);
+        // Zero-size params still get owners (coverage over balance).
+        let parts = partition_params_balanced(&[0, 0, 0], 2);
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_owners_from_partition_matches_membership() {
+        let sizes: Vec<u64> = vec![7, 1, 9, 2, 2];
+        let parts = partition_params_balanced(&sizes, 2);
+        let owners = owners_from_partition(&parts, sizes.len());
+        for (rank, part) in parts.iter().enumerate() {
+            for &i in part {
+                assert_eq!(owners[i], rank as i32);
+            }
+        }
     }
 
     #[test]

@@ -331,6 +331,7 @@ fn link_gcc_multi(
             cmd.arg("-lcublas");
         }
     }
+    add_nccl_link_args(&mut cmd);
 
     let status = cmd
         .status()
@@ -943,6 +944,7 @@ fn link_shared_gcc(
             cmd.arg("-lcublas");
         }
     }
+    add_nccl_link_args(&mut cmd);
 
     // Item #5: re-export test-hooks peak FFIs so dlopen can resolve them.
     // -u forces the symbol to be pulled in from the staticlib;
@@ -1110,3 +1112,18 @@ pub fn default_output_path(input: &Path) -> PathBuf {
     }
     out
 }
+
+/// P4 item 14 (nccl feature): compiled programs embed libnsl_runtime.a whose
+/// NCCL symbols must resolve at the final link. NSL_NCCL_LIB_DIR points at a
+/// non-system libnccl (e.g. a local package extraction); the rpath entry lets
+/// the produced binary load it at run time without LD_LIBRARY_PATH.
+#[cfg(feature = "nccl")]
+fn add_nccl_link_args(cmd: &mut std::process::Command) {
+    if let Ok(dir) = std::env::var("NSL_NCCL_LIB_DIR") {
+        cmd.arg(format!("-L{dir}"));
+        cmd.arg(format!("-Wl,-rpath,{dir}"));
+    }
+    cmd.arg("-lnccl");
+}
+#[cfg(not(feature = "nccl"))]
+fn add_nccl_link_args(_cmd: &mut std::process::Command) {}

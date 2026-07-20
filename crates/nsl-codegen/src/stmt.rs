@@ -24,6 +24,38 @@ enum SourceAdParamDiagnosticKind {
     IgnoredNonTensor,
 }
 
+/// Item 12: result of analyzing whether a train-loop callback body touches
+/// the streamed model θ (see `Compiler::analyze_callback_model_touch`).
+#[derive(Default, Debug)]
+struct CallbackModelTouch {
+    /// The callback references the model (a field read, a method call, an
+    /// `Ident` passed to `model_save`/a helper, …). Requires a scoped upload
+    /// under `--weight-stream` or its reads launch on evicted (null) data.
+    touches: bool,
+    /// The callback may MUTATE θ (an assignment rooted at the model, or a
+    /// method call on the model/one of its fields). Drives writeback=1 on the
+    /// closing re-evict so the mutation survives the next window's upload.
+    may_write: bool,
+    /// First model-rooted access path seen, for the compile-time diagnostic.
+    first_path: Option<String>,
+}
+
+/// Item 11 calibration: fixed DMA issue+completion latency (μs) added to every
+/// pack-transfer estimate — small PCIe copies are latency-bound, not
+/// bandwidth-bound, so a bytes/BW model alone would price a 4 KiB pack at
+/// ~0.1 μs and activate overlap that cannot pay. Combined with the target
+/// `GpuSpec`'s `pcie_bandwidth_gbps` / `kernel_launch_overhead_ns` /
+/// `peak_bandwidth_gbs`, this closes the deferred WGGO-ILP cost integration:
+/// each prefetch edge is priced per-range compute μs vs pack-byte transfer μs.
+const WS_PCIE_FIXED_LAT_US: f64 = 10.0;
+
+/// Fallback for UNPRICED packs (a member's shape is not statically concrete —
+/// e.g. a bare `Tensor` field annotation): the v1 structural heuristic, which
+/// the GPU bit-exactness gates shipped and validated under. A priced edge is
+/// calibrated-safe; an unpriced edge is merely heuristic (review M3: never
+/// treat a 0-byte pricing as a real transfer estimate).
+const WS_PREFETCH_MIN_OPS_PER_RANGE: usize = 4;
+
 fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
@@ -3713,6 +3745,396 @@ impl Compiler<'_> {
         Ok(builder.block_params(merge_b)[0])
     }
 
+    /// Item 12: how a train-loop callback body touches the streamed model θ.
+    /// Under `--weight-stream` params are EVICTED (`t.data == null`) when a
+    /// callback runs, so a model-field read launches on a null pointer (the
+    /// #395 crash). This drives a scoped `upload_all` / `reevict_all` bracket
+    /// around any body that references the model, turning the runtime crash
+    /// into a compile-time-inserted residency window.
+    fn analyze_callback_model_touch(
+        &self,
+        block: &nsl_ast::stmt::Block,
+        model_sym: nsl_ast::Symbol,
+    ) -> CallbackModelTouch {
+        let mut acc = CallbackModelTouch::default();
+        for stmt in &block.stmts {
+            self.walk_stmt_model_touch(stmt, model_sym, &mut acc);
+        }
+        acc
+    }
+
+    /// NSL in-place tensor mutators — the only calls that write a param
+    /// through a receiver/dest operand (`copy_data(dest, src)`,
+    /// `zero_inplace(t)`, the `nsl_tensor_{op}_inplace` family). Everything
+    /// else is functional (returns a fresh tensor).
+    fn is_inplace_mutator(name: &str) -> bool {
+        matches!(name, "copy_data" | "copy_") || name.ends_with("_inplace")
+    }
+
+    /// Root identifier of an lvalue/access chain (`model.enc.w[0]` -> `model`).
+    fn expr_root_ident(e: &nsl_ast::expr::Expr) -> Option<nsl_ast::Symbol> {
+        use nsl_ast::expr::ExprKind as E;
+        match &e.kind {
+            E::Ident(s) => Some(*s),
+            E::MemberAccess { object, .. } => Self::expr_root_ident(object),
+            E::Subscript { object, .. } => Self::expr_root_ident(object),
+            E::Paren(inner) => Self::expr_root_ident(inner),
+            _ => None,
+        }
+    }
+
+    /// Dotted path of a model-rooted member chain, for the diagnostic
+    /// (`model.encoder.weight`). Best-effort — falls back to the model name.
+    fn model_access_path(&self, e: &nsl_ast::expr::Expr) -> Option<String> {
+        use nsl_ast::expr::ExprKind as E;
+        match &e.kind {
+            E::Ident(s) => Some(self.resolve_sym(*s).to_string()),
+            E::MemberAccess { object, member } => {
+                let base = self.model_access_path(object)?;
+                Some(format!("{base}.{}", self.resolve_sym(*member)))
+            }
+            E::Subscript { object, .. } => self.model_access_path(object),
+            E::Paren(inner) => self.model_access_path(inner),
+            _ => None,
+        }
+    }
+
+    fn walk_stmt_model_touch(
+        &self,
+        stmt: &nsl_ast::stmt::Stmt,
+        model_sym: nsl_ast::Symbol,
+        acc: &mut CallbackModelTouch,
+    ) {
+        use nsl_ast::stmt::StmtKind as S;
+        match &stmt.kind {
+            S::Assign { target, value, .. } => {
+                // A write whose lvalue is rooted at the model mutates θ.
+                if Self::expr_root_ident(target) == Some(model_sym) {
+                    acc.touches = true;
+                    acc.may_write = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = self.model_access_path(target);
+                    }
+                }
+                self.walk_expr_model_touch(target, model_sym, acc);
+                self.walk_expr_model_touch(value, model_sym, acc);
+            }
+            S::VarDecl { value: Some(v), .. } => {
+                // Binding a model-derived value to a local (`let w = m.field`)
+                // creates an ALIAS onto the resident streamed buffer; a later
+                // `copy_data(w, ..)` would mutate θ through it without the root
+                // ever being `model_sym`. We can't cheaply track the alias, so
+                // conservatively treat any model-rooted binding as a possible
+                // write (writeback=1 is always safe — for an unmutated param
+                // device==mirror, so the extra DtoH is byte-identical).
+                if Self::expr_root_ident(v) == Some(model_sym) {
+                    acc.touches = true;
+                    acc.may_write = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = self.model_access_path(v);
+                    }
+                }
+                self.walk_expr_model_touch(v, model_sym, acc)
+            }
+            S::Expr(e) | S::Return(Some(e)) | S::Yield(Some(e)) => {
+                self.walk_expr_model_touch(e, model_sym, acc)
+            }
+            S::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
+                self.walk_expr_model_touch(condition, model_sym, acc);
+                for s in &then_block.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+                for (c, b) in elif_clauses {
+                    self.walk_expr_model_touch(c, model_sym, acc);
+                    for s in &b.stmts {
+                        self.walk_stmt_model_touch(s, model_sym, acc);
+                    }
+                }
+                if let Some(b) = else_block {
+                    for s in &b.stmts {
+                        self.walk_stmt_model_touch(s, model_sym, acc);
+                    }
+                }
+            }
+            S::For { iterable, body, .. } => {
+                self.walk_expr_model_touch(iterable, model_sym, acc);
+                for s in &body.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+            }
+            S::While { condition, body } => {
+                self.walk_expr_model_touch(condition, model_sym, acc);
+                for s in &body.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+            }
+            // A model read inside any of these still dereferences evicted θ —
+            // walk them too, or the residency bracket is silently skipped and
+            // the #395 crash returns (e.g. `@no_grad: print(m.x.sum())`).
+            S::WhileLet { expr, body, .. } => {
+                self.walk_expr_model_touch(expr, model_sym, acc);
+                for s in &body.stmts {
+                    self.walk_stmt_model_touch(s, model_sym, acc);
+                }
+            }
+            S::Match { subject, arms } => {
+                self.walk_expr_model_touch(subject, model_sym, acc);
+                for arm in arms {
+                    for s in &arm.body.stmts {
+                        self.walk_stmt_model_touch(s, model_sym, acc);
+                    }
+                }
+            }
+            S::Decorated { stmt, .. } => {
+                self.walk_stmt_model_touch(stmt, model_sym, acc);
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_expr_model_touch(
+        &self,
+        e: &nsl_ast::expr::Expr,
+        model_sym: nsl_ast::Symbol,
+        acc: &mut CallbackModelTouch,
+    ) {
+        use nsl_ast::expr::ExprKind as E;
+        match &e.kind {
+            E::Ident(s) if *s == model_sym => {
+                acc.touches = true;
+                if acc.first_path.is_none() {
+                    acc.first_path = Some(self.resolve_sym(*s).to_string());
+                }
+            }
+            E::MemberAccess { object, .. } => {
+                if Self::expr_root_ident(e) == Some(model_sym) {
+                    acc.touches = true;
+                    if acc.first_path.is_none() {
+                        acc.first_path = self.model_access_path(e);
+                    }
+                }
+                self.walk_expr_model_touch(object, model_sym, acc);
+            }
+            E::Call { callee, args } => {
+                // Only a genuine IN-PLACE mutator (`copy_data(m.x, ..)`,
+                // `m.x.add_inplace(..)`, any `*_inplace`) writes θ. Functional
+                // methods (`.sum()`, `.transpose()`, `.mean()`) return new
+                // tensors and never mutate the receiver, so they are read-only
+                // — flagging them would force a needless full-model writeback
+                // on every logging callback. The callee name is the free-fn
+                // ident or the method member.
+                let callee_name = match &callee.kind {
+                    E::Ident(s) => Some(self.resolve_sym(*s).to_string()),
+                    E::MemberAccess { member, .. } => {
+                        Some(self.resolve_sym(*member).to_string())
+                    }
+                    _ => None,
+                };
+                let is_mutator = callee_name.as_deref().is_some_and(Self::is_inplace_mutator);
+                // A FREE-FN call passing a model-rooted param to a callee that
+                // is not a known read-only sink could mutate that param in
+                // place (`my_ema(m.field, ..)`), so treat it conservatively as
+                // a write. `print`/`model_save` provably don't mutate their
+                // tensor args. Method calls are covered by the mutator check
+                // above (functional methods return fresh tensors).
+                let is_free_fn = matches!(&callee.kind, E::Ident(_));
+                let is_readonly_sink = callee_name
+                    .as_deref()
+                    .is_some_and(|n| matches!(n, "print" | "model_save"));
+                let unknown_free_fn_write =
+                    is_free_fn && !is_readonly_sink && !Self::is_inplace_mutator(callee_name.as_deref().unwrap_or(""));
+                if is_mutator || unknown_free_fn_write {
+                    // Dest is the model-rooted operand: the receiver for the
+                    // method form (`m.x.add_inplace(..)`), an arg for the
+                    // free-fn form (`copy_data(m.x, ..)` / `my_ema(m.x, ..)`).
+                    let receiver_model = matches!(&callee.kind, E::MemberAccess { object, .. }
+                        if Self::expr_root_ident(object) == Some(model_sym));
+                    let arg_model = args
+                        .iter()
+                        .any(|a| Self::expr_root_ident(&a.value) == Some(model_sym));
+                    if receiver_model || arg_model {
+                        acc.touches = true;
+                        acc.may_write = true;
+                        if acc.first_path.is_none() {
+                            acc.first_path = args
+                                .iter()
+                                .find_map(|a| {
+                                    (Self::expr_root_ident(&a.value) == Some(model_sym))
+                                        .then(|| self.model_access_path(&a.value))
+                                        .flatten()
+                                })
+                                .or_else(|| match &callee.kind {
+                                    E::MemberAccess { object, .. } => {
+                                        self.model_access_path(object)
+                                    }
+                                    _ => None,
+                                });
+                        }
+                    }
+                }
+                self.walk_expr_model_touch(callee, model_sym, acc);
+                for a in args {
+                    self.walk_expr_model_touch(&a.value, model_sym, acc);
+                }
+            }
+            E::BinaryOp { left, right, .. } => {
+                self.walk_expr_model_touch(left, model_sym, acc);
+                self.walk_expr_model_touch(right, model_sym, acc);
+            }
+            E::UnaryOp { operand, .. } | E::Paren(operand) | E::Await(operand) => {
+                self.walk_expr_model_touch(operand, model_sym, acc)
+            }
+            E::Pipe { left, right } => {
+                self.walk_expr_model_touch(left, model_sym, acc);
+                self.walk_expr_model_touch(right, model_sym, acc);
+            }
+            E::Subscript { object, .. } => {
+                self.walk_expr_model_touch(object, model_sym, acc)
+            }
+            E::ListLiteral(xs) | E::TupleLiteral(xs) => {
+                for x in xs {
+                    self.walk_expr_model_touch(x, model_sym, acc);
+                }
+            }
+            E::FString(parts) => {
+                for p in parts {
+                    if let nsl_ast::expr::FStringPart::Expr(x) = p {
+                        self.walk_expr_model_touch(x, model_sym, acc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Item 12 — open bracket: if `--weight-stream` is active and the
+    /// callback body references model θ, make every streamed param resident
+    /// (`upload_all`) so the body's reads don't launch on evicted (null)
+    /// data. Returns `Some(may_write)` when a bracket was opened — the caller
+    /// passes it to `emit_callback_residency_close`. Returns `None` (no-op)
+    /// when streaming is off or the callback never touches the model, so the
+    /// steady-state transfer arithmetic the CSLA gates assert is unchanged.
+    fn emit_callback_residency_open(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        body: &nsl_ast::stmt::Block,
+        model_sym: nsl_ast::Symbol,
+        cb_name: &str,
+    ) -> Result<Option<bool>, CodegenError> {
+        if !self.compile_options.weight_stream {
+            return Ok(None);
+        }
+        let touch = self.analyze_callback_model_touch(body, model_sym);
+        if !touch.touches {
+            return Ok(None);
+        }
+        eprintln!(
+            "[weight-stream] callback '{}' reads model state ({}); inserting a \
+             scoped upload/re-evict bracket ({} writeback) so its reads see \
+             resident \u{3b8} instead of crashing on evicted (null) data",
+            cb_name,
+            touch.first_path.as_deref().unwrap_or("model"),
+            if touch.may_write { "with" } else { "without" },
+        );
+        self.compile_call_by_name(builder, "nsl_weight_stream_upload_all", &[])?;
+        Ok(Some(touch.may_write))
+    }
+
+    /// Item 12 — close bracket: restore the streamed (evicted) invariant after
+    /// a guarded callback body. `writeback=1` when the body might have mutated
+    /// θ so the change survives the next window's upload; `0` for a read-only
+    /// body (logging, `model_save`).
+    fn emit_callback_residency_close(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        guard: Option<bool>,
+    ) -> Result<(), CodegenError> {
+        if let Some(may_write) = guard {
+            let wb = builder
+                .ins()
+                .iconst(cl_types::I64, if may_write { 1 } else { 0 });
+            self.compile_call_by_name(builder, "nsl_weight_stream_reevict_all", &[wb])?;
+        }
+        Ok(())
+    }
+
+    /// Item 10: emit a contiguous layer-pack UPLOAD. Builds an `NslList` of
+    /// the pack's param tensor pointers (from their `param_list` indices) and
+    /// hands it to the runtime, which stages the whole pack into ONE device
+    /// arena transfer. The list build is a few cheap CPU calls; the win is the
+    /// single HtoD it replaces N of.
+    fn emit_ws_pack_upload(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_list: Value,
+        idxs: &[i64],
+    ) -> Result<(), CodegenError> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let pwlist = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for &idx in idxs {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[pwlist, pw])?;
+        }
+        self.compile_call_by_name(builder, "nsl_weight_stream_upload_pack", &[pwlist])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
+        Ok(())
+    }
+
+    /// Item 10: emit a contiguous layer-pack EVICT (one DtoH when writeback).
+    fn emit_ws_pack_evict(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_list: Value,
+        idxs: &[i64],
+        writeback: i64,
+    ) -> Result<(), CodegenError> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let pwlist = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for &idx in idxs {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[pwlist, pw])?;
+        }
+        let wb = builder.ins().iconst(cl_types::I64, writeback);
+        self.compile_call_by_name(builder, "nsl_weight_stream_evict_pack", &[pwlist, wb])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
+        Ok(())
+    }
+
+    /// Item 11: emit an ASYNC pack transfer (`fn_name` is upload_pack's async
+    /// sibling `nsl_weight_stream_prefetch_pack`, or the `nsl_weight_stream_
+    /// await_pack` consumer). Shares the pw-list build with the sync helpers.
+    fn emit_ws_pack_single(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_list: Value,
+        idxs: &[i64],
+        fn_name: &str,
+    ) -> Result<(), CodegenError> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let pwlist = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for &idx in idxs {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[pwlist, pw])?;
+        }
+        self.compile_call_by_name(builder, fn_name, &[pwlist])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
+        Ok(())
+    }
+
     fn compile_train_block(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -4184,11 +4606,20 @@ impl Compiler<'_> {
         // in the forward) need sharded BUFFERS, not just sharded compute —
         // refuse loudly rather than silently running stage-1 semantics.
         if let Some(s) = self.features.zero_stage {
-            if s >= 2 {
+            // P4 item 16: stage 2 (gradient partitioning via owner-segmented
+            // reduce_scatter) is lowered — same emission points as stage 1;
+            // the runtime dispatches on the baked stage. Stage 3 (parameter
+            // partitioning + just-in-time all-gather) still refuses: params
+            // freed between steps would break mid-loop model_save/callbacks
+            // and eval reads, which need the residency machinery generalized
+            // from the weight-stream Item-12 guard first.
+            if s >= 3 {
                 return Err(CodegenError::new(format!(
-                    "--zero-stage {s} is not lowered yet: v1 implements stage 1 \
-                     (optimizer-state sharding, validated vs the single-rank \
-                     baseline at toy scale). Use --zero-stage 1",
+                    "--zero-stage {s} is not lowered yet: stages 1 (optimizer \
+                     sharding) and 2 (gradient partitioning) are implemented. \
+                     Stage 3 parameter partitioning needs the callback/\
+                     model_save residency guard generalized to sharded params \
+                     — use --zero-stage 2",
                 )));
             }
             // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
@@ -4331,8 +4762,16 @@ impl Compiler<'_> {
             let np_val = builder
                 .ins()
                 .iconst(cl_types::I64, param_paths.len() as i64);
-            let part_rc =
-                self.compile_call_by_name(builder, "nsl_zero_partition", &[np_val])?;
+            // P4 item 13: BYTE-balanced ownership — the runtime reads each
+            // param's byte size from param_list (identical on every rank) and
+            // partitions by greedy LPT, so per-rank optimizer work and moment
+            // memory track ~1/N in bytes rather than tensor count. Replaces
+            // the index round-robin `nsl_zero_partition`.
+            let part_rc = self.compile_call_by_name(
+                builder,
+                "nsl_zero_partition_bytes",
+                &[param_list, np_val],
+            )?;
             let part_ok = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, part_rc, zero_i);
             let part_msg = "nsl: --zero-stage partition failed — aborting";
             self.intern_string(part_msg)?;
@@ -5101,6 +5540,11 @@ impl Compiler<'_> {
             /// Weight-streamed params (`--weight-stream`): layer-grouped
             /// minus view-rooted, sorted. Empty when streaming is off.
             ws_streamed: Vec<i64>,
+            /// Per-range Σ elements of its STREAMED params (0 where shapes
+            /// were symbolic). Item 11 calibration: pack bytes = elems × 4
+            /// (GPU f32) drive the prefetch overlap gate's transfer-time
+            /// estimate against the target GpuSpec.
+            range_pack_elems: Vec<u64>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -6696,9 +7140,16 @@ impl Compiler<'_> {
                     /// at step-body top, every iteration (idempotent).
                     register_idxs: Vec<i64>,
                     /// Per-slice param_list indices uploaded before /
-                    /// evicted after that slice's ops.
+                    /// evicted after that slice's ops (per-param mode).
                     upload_per_slice: Vec<Vec<i64>>,
                     evict_per_slice: Vec<Vec<i64>>,
+                    /// Item 10 (arena mode): one contiguous pack per streamed
+                    /// LAYER group as `(first_slice, last_slice, idxs)`. The
+                    /// whole group uploads at `first_slice` and evicts at
+                    /// `last_slice` — a matched set, so it holds exactly one
+                    /// arena slot for its residency (coarser than per-param
+                    /// touch, but batched into one HtoD / DtoH each way).
+                    arena_packs: Vec<(usize, usize, Vec<i64>)>,
                 }
                 let (csla_pre, ws_fwd_plan): (Option<CslaPre>, Option<WsForwardPlan>) =
                     if csla_active {
@@ -6708,8 +7159,28 @@ impl Compiler<'_> {
                             .filter(|(name, _)| self.is_trainable_param_name(name))
                             .map(|(n, v)| (n.clone(), *v))
                             .collect();
+                        // Item 11 calibration (review M3 follow-through): wire
+                        // REAL element counts into the layerwise plan — this
+                        // call site passed `|_| None` since D1, leaving every
+                        // ParamInfo::elems empty and the prefetch gate's pack
+                        // pricing blind. Static param shapes resolve here;
+                        // symbolic ones stay None and decline their edges.
+                        let elem_hints = crate::profiling::captures::elem_hints_from_var_nodes(
+                            extractor.var_nodes(),
+                            self.type_map,
+                        );
+                        let vid_by_pname: std::collections::HashMap<&str, crate::wengert::VarId> =
+                            csla_trainable
+                                .iter()
+                                .map(|(n, v)| (n.as_str(), *v))
+                                .collect();
                         let plan_lw =
-                            crate::layerwise::analyze(&adjoint, &csla_trainable, &|_| None);
+                            crate::layerwise::analyze(&adjoint, &csla_trainable, &|name| {
+                                vid_by_pname
+                                    .get(name)
+                                    .and_then(|v| elem_hints.get(v))
+                                    .copied()
+                            });
                         let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
                             param_paths
                                 .iter()
@@ -6793,6 +7264,11 @@ impl Compiler<'_> {
                         // exactly one group.
                         let mut layer_group: Vec<Vec<i64>> = vec![Vec::new(); n_ranges];
                         let mut grouped: std::collections::HashSet<i64> = Default::default();
+                        // Item 11 calibration: static element count per grouped
+                        // param (0 = symbolic shape), keyed by accum_idx — the
+                        // prefetch gate's pack-byte source.
+                        let mut elems_by_accum: std::collections::HashMap<i64, u64> =
+                            Default::default();
                         {
                             let param_by_name: std::collections::HashMap<&str, &CslaParam> =
                                 csla_params.iter().map(|p| (p.name.as_str(), p)).collect();
@@ -6812,6 +7288,8 @@ impl Compiler<'_> {
                                         };
                                     if in_range && grouped.insert(cp.accum_idx) {
                                         layer_group[ri].push(cp.accum_idx);
+                                        elems_by_accum
+                                            .insert(cp.accum_idx, pinfo.elems.unwrap_or(0));
                                     }
                                 }
                                 layer_group[ri].sort_unstable();
@@ -6959,16 +7437,79 @@ impl Compiler<'_> {
                                 per_slice(&upload_per_slice),
                                 per_slice(&evict_per_slice),
                             );
+                            // Item 10: coarsen the per-param touch into one
+                            // contiguous pack per streamed LAYER group (the
+                            // group's forward bracket = [min first-touch, max
+                            // last-touch] over its touched members). Matched
+                            // upload/evict sets → one arena slot per pack.
+                            let idx_touch: std::collections::HashMap<i64, (usize, usize)> = touch
+                                .iter()
+                                .map(|(vid, fl)| (vid_to_idx[vid], *fl))
+                                .collect();
+                            let mut arena_packs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
+                            for group in &layer_group {
+                                let mut members: Vec<i64> = Vec::new();
+                                let mut first = usize::MAX;
+                                let mut last = 0usize;
+                                for &idx in group {
+                                    if let Some(&(f, l)) = idx_touch.get(&idx) {
+                                        members.push(idx);
+                                        first = first.min(f);
+                                        last = last.max(l);
+                                    }
+                                }
+                                if !members.is_empty() {
+                                    members.sort_unstable();
+                                    arena_packs.push((first, last, members));
+                                }
+                            }
+                            if self.compile_options.stream_arena {
+                                eprintln!(
+                                    "[weight-stream] arena mode: {} contiguous layer packs \
+                                     (sizes [{}])",
+                                    arena_packs.len(),
+                                    arena_packs
+                                        .iter()
+                                        .map(|(_, _, m)| m.len().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                );
+                            }
                             ws_streamed_sorted = ws_all.clone();
                             Some(WsForwardPlan {
                                 slices,
                                 register_idxs: ws_all,
                                 upload_per_slice,
                                 evict_per_slice,
+                                arena_packs,
                             })
                         } else {
                             None
                         };
+                        // Item 11 calibration: Σ static elems of each range's
+                        // STREAMED params (the pack the gate prices). A member
+                        // with SYMBOLIC shape (elems recorded as 0) poisons the
+                        // whole range to 0 = "unpriceable" — a partial sum
+                        // would UNDERSTATE the transfer and wrongly activate
+                        // an overlap edge (review M3); the gate declines
+                        // unpriceable packs instead.
+                        let ws_set: std::collections::HashSet<i64> =
+                            ws_streamed_sorted.iter().copied().collect();
+                        let range_pack_elems: Vec<u64> = layer_group
+                            .iter()
+                            .map(|g| {
+                                let members: Vec<u64> = g
+                                    .iter()
+                                    .filter(|i| ws_set.contains(i))
+                                    .map(|i| elems_by_accum.get(i).copied().unwrap_or(0))
+                                    .collect();
+                                if members.contains(&0) {
+                                    0
+                                } else {
+                                    members.iter().sum()
+                                }
+                            })
+                            .collect();
                         (
                             Some(CslaPre {
                                 params: csla_params,
@@ -6979,6 +7520,7 @@ impl Compiler<'_> {
                                     layer_group,
                                     global_group,
                                     ws_streamed: ws_streamed_sorted,
+                                    range_pack_elems,
                                 },
                             }),
                             ws_plan,
@@ -7045,10 +7587,29 @@ impl Compiler<'_> {
                     let mut explicit_freed_vars = std::collections::HashSet::new();
                     // No FASE hook on this forward-streaming path — stays empty.
                     let mut hook_freed_param_vars = std::collections::HashSet::new();
+                    let arena_mode = self.compile_options.stream_arena;
                     for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
-                        if !wsplan.upload_per_slice[si].is_empty() {
-                            // Upload this slice's first-touch params under
-                            // the Weights surface (allocation accounting).
+                        // Item 10: in arena mode a whole layer pack uploads at
+                        // its bracket-start slice (ONE contiguous transfer);
+                        // otherwise the per-param first-touch set.
+                        let arena_uploads: Vec<Vec<i64>> = if arena_mode {
+                            wsplan
+                                .arena_packs
+                                .iter()
+                                .filter(|(f, _, _)| *f == si)
+                                .map(|(_, _, idxs)| idxs.clone())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let has_upload = if arena_mode {
+                            !arena_uploads.is_empty()
+                        } else {
+                            !wsplan.upload_per_slice[si].is_empty()
+                        };
+                        if has_upload {
+                            // Upload under the Weights surface (allocation
+                            // accounting).
                             let prev_surf = self.compile_call_by_name(
                                 builder,
                                 "nsl_gpu_get_alloc_surface",
@@ -7060,18 +7621,24 @@ impl Compiler<'_> {
                                 "nsl_gpu_set_alloc_surface",
                                 &[wsurf],
                             )?;
-                            for &idx in &wsplan.upload_per_slice[si] {
-                                let iv = builder.ins().iconst(cl_types::I64, idx);
-                                let pw = self.compile_call_by_name(
-                                    builder,
-                                    "nsl_list_get",
-                                    &[param_list, iv],
-                                )?;
-                                self.compile_call_by_name(
-                                    builder,
-                                    "nsl_weight_stream_upload",
-                                    &[pw],
-                                )?;
+                            if arena_mode {
+                                for idxs in &arena_uploads {
+                                    self.emit_ws_pack_upload(builder, param_list, idxs)?;
+                                }
+                            } else {
+                                for &idx in &wsplan.upload_per_slice[si] {
+                                    let iv = builder.ins().iconst(cl_types::I64, idx);
+                                    let pw = self.compile_call_by_name(
+                                        builder,
+                                        "nsl_list_get",
+                                        &[param_list, iv],
+                                    )?;
+                                    self.compile_call_by_name(
+                                        builder,
+                                        "nsl_weight_stream_upload",
+                                        &[pw],
+                                    )?;
+                                }
                             }
                             self.compile_call_by_name(
                                 builder,
@@ -7093,22 +7660,34 @@ impl Compiler<'_> {
                             &mut hook_freed_param_vars,
                             None,
                         )?;
-                        // Evict this slice's last-touch params — read-only
+                        // Evict this slice's last-touch params/packs — read-only
                         // (writeback=0): forwards never mutate θ, the mirror
                         // is current by construction.
-                        for &idx in &wsplan.evict_per_slice[si] {
-                            let iv = builder.ins().iconst(cl_types::I64, idx);
-                            let pw = self.compile_call_by_name(
-                                builder,
-                                "nsl_list_get",
-                                &[param_list, iv],
-                            )?;
-                            let wb = builder.ins().iconst(cl_types::I64, 0);
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_weight_stream_evict",
-                                &[pw, wb],
-                            )?;
+                        if arena_mode {
+                            let evicts: Vec<Vec<i64>> = wsplan
+                                .arena_packs
+                                .iter()
+                                .filter(|(_, l, _)| *l == si)
+                                .map(|(_, _, idxs)| idxs.clone())
+                                .collect();
+                            for idxs in &evicts {
+                                self.emit_ws_pack_evict(builder, param_list, idxs, 0)?;
+                            }
+                        } else {
+                            for &idx in &wsplan.evict_per_slice[si] {
+                                let iv = builder.ins().iconst(cl_types::I64, idx);
+                                let pw = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_list_get",
+                                    &[param_list, iv],
+                                )?;
+                                let wb = builder.ins().iconst(cl_types::I64, 0);
+                                self.compile_call_by_name(
+                                    builder,
+                                    "nsl_weight_stream_evict",
+                                    &[pw, wb],
+                                )?;
+                            }
                         }
                     }
                     // Same sdpa-extras adoption the monolithic wrapper does.
@@ -9084,6 +9663,124 @@ impl Compiler<'_> {
             let mut ghost_carries: std::collections::HashSet<crate::wengert::VarId> =
                 Default::default();
 
+            // ── Item 11: double-buffer prefetch calibration + certificate ──
+            // Streamed layer groups eligible as a prefetch target.
+            let streamed_range_count = (0..ranges.len())
+                .filter(|&ri| layer_group[ri].iter().any(|i| ws_streamed.contains(i)))
+                .count();
+            // WGGO-calibrated activation, PER EDGE (issue during ri, consume
+            // at ri+1): overlap pays iff range ri's compute can hide range
+            // ri+1's pack transfer. Both sides in μs from the target GpuSpec:
+            //   transfer(ri+1) = DMA fixed latency + pack_bytes / PCIe BW
+            //   compute_lb(ri) = accum_window × max(launch floor, HBM floor)
+            // where the launch floor is ops × kernel_launch_overhead (every
+            // adjoint op is ≥ one launch) and the HBM floor is the range's own
+            // pack read once per replay. Both compute terms are LOWER bounds
+            // (no FLOP term — adjoint shapes are not static), so a discharged
+            // edge is calibrated-safe while a declined edge may merely be
+            // unproven — the right polarity for a perf heuristic.
+            let gpu_spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                .unwrap_or_else(crate::gpu_specs::default_gpu);
+            let accum_window = grad_accumulation_steps.max(1) as f64;
+            let pack_bytes =
+                |ri: usize| pending.schedule.range_pack_elems.get(ri).copied().unwrap_or(0) * 4;
+            let transfer_us = |ri: usize| {
+                WS_PCIE_FIXED_LAT_US
+                    + pack_bytes(ri) as f64 / (gpu_spec.pcie_bandwidth_gbps.max(1.0) * 1e3)
+            };
+            let compute_lb_us = |ri: usize| {
+                let launch_floor = (ranges[ri].end - ranges[ri].start) as f64
+                    * gpu_spec.kernel_launch_overhead_ns as f64
+                    / 1e3;
+                let hbm_floor =
+                    pack_bytes(ri) as f64 / (gpu_spec.peak_bandwidth_gbs.max(1.0) * 1e3);
+                accum_window * launch_floor.max(hbm_floor)
+            };
+            // Edge ri → ri+1 activates iff ri's compute covers ri+1's
+            // transfer (and both ends actually stream). Review M3: a pack
+            // containing a symbolic-shape param prices at 0 bytes, which
+            // would UNDERSTATE the transfer — the unsafe direction. An
+            // unpriced pack instead falls back to the v1 structural
+            // heuristic (avg ops/range), the behavior the GPU gates shipped
+            // under; a PRICED edge uses the calibrated μs comparison and is
+            // calibrated-safe.
+            let avg_ops_per_range = pending.adjoint.ops.len() / ranges.len().max(1);
+            let edge_on: Vec<bool> = (0..ranges.len())
+                .map(|ri| {
+                    let next_streams = ri + 1 < ranges.len()
+                        && layer_group[ri + 1].iter().any(|i| ws_streamed.contains(i));
+                    if !next_streams {
+                        return false;
+                    }
+                    if pack_bytes(ri + 1) > 0 {
+                        compute_lb_us(ri) >= transfer_us(ri + 1)
+                    } else {
+                        avg_ops_per_range >= WS_PREFETCH_MIN_OPS_PER_RANGE
+                    }
+                })
+                .collect();
+            let prefetch_active = self.compile_options.stream_prefetch
+                && self.compile_options.stream_arena
+                && ws_active
+                && streamed_range_count >= 2
+                && edge_on.iter().any(|&e| e);
+            if self.compile_options.stream_prefetch {
+                let edges: Vec<String> = (0..ranges.len().saturating_sub(1))
+                    .map(|ri| {
+                        if pack_bytes(ri + 1) > 0 {
+                            format!(
+                                "L{ri}->L{}: compute>={:.1}us transfer~{:.1}us {}",
+                                ri + 1,
+                                compute_lb_us(ri),
+                                transfer_us(ri + 1),
+                                if edge_on[ri] { "ON" } else { "off" }
+                            )
+                        } else {
+                            format!(
+                                "L{ri}->L{}: unpriced pack, ops-heuristic (avg {} vs \
+                                 min {}) {}",
+                                ri + 1,
+                                avg_ops_per_range,
+                                WS_PREFETCH_MIN_OPS_PER_RANGE,
+                                if edge_on[ri] { "ON" } else { "off" }
+                            )
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "[weight-stream] prefetch double-buffer: {} \
+                     (streamed_ranges={streamed_range_count}, gpu={}, accum_window={}, \
+                     edges [{}])",
+                    if prefetch_active {
+                        "ACTIVE — prefetch layer L+1 while computing L, event-ordered"
+                    } else {
+                        "DECLINED (compute too small to hide the transfer; synchronous arena)"
+                    },
+                    gpu_spec.name,
+                    accum_window,
+                    edges.join("; "),
+                );
+            }
+            if self.compile_options.stream_async_writeback {
+                eprintln!(
+                    "[weight-stream] async writeback: {}",
+                    if ws_active && streamed_range_count > 0 {
+                        "ACTIVE — pack evict DtoH on the transfer stream, mirror \
+                         scatter deferred to drain points"
+                    } else {
+                        "no streamed ranges (no effect)"
+                    },
+                );
+            }
+            // CADENCE-style transfer certificate: each entry is a discharged
+            // (issue_range, consume_range, pack_size) obligation — a prefetch
+            // issued during `issue_range`'s compute and awaited (event) at
+            // `consume_range`'s head before any read.
+            let mut transfer_cert: Vec<(usize, usize, usize)> = Vec::new();
+            // Whether the CURRENT range's weights were prefetched by the
+            // previous iteration (→ await instead of a sync upload).
+            let mut ri_was_prefetched = false;
+
             for (ri, range) in ranges.iter().enumerate() {
                 // This layer's accumulators exist only from here to its
                 // update below — the m_partial surface the schedule shrinks.
@@ -9101,13 +9798,67 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
                     let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
-                    for &idx in &ws_range {
-                        let iv = builder.ins().iconst(cl_types::I64, idx);
-                        let pw = self
-                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                        self.compile_call_by_name(builder, "nsl_weight_stream_upload", &[pw])?;
+                    if self.compile_options.stream_arena {
+                        if prefetch_active && ri_was_prefetched {
+                            // Item 11: weights already streaming in (prefetched
+                            // during the previous range's compute). Just wait
+                            // on the transfer event before reading them.
+                            self.emit_ws_pack_single(
+                                builder,
+                                param_list,
+                                &ws_range,
+                                "nsl_weight_stream_await_pack",
+                            )?;
+                        } else {
+                            // Item 10: this layer group is one contiguous pack.
+                            self.emit_ws_pack_upload(builder, param_list, &ws_range)?;
+                        }
+                    } else {
+                        for &idx in &ws_range {
+                            let iv = builder.ins().iconst(cl_types::I64, idx);
+                            let pw = self
+                                .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_weight_stream_upload",
+                                &[pw],
+                            )?;
+                        }
                     }
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev_surf])?;
+                }
+
+                // Item 11: prefetch the NEXT streamed layer group so its HtoD
+                // overlaps THIS range's compute (the b-loop below). Async on
+                // the transfer stream; the next range's head awaits its event.
+                // Per-edge: only where the calibration proved THIS range's
+                // compute covers the NEXT pack's transfer.
+                ri_was_prefetched = false;
+                if prefetch_active && ri + 1 < ranges.len() && edge_on[ri] {
+                    let ws_next: Vec<i64> = layer_group[ri + 1]
+                        .iter()
+                        .copied()
+                        .filter(|i| ws_streamed.contains(i))
+                        .collect();
+                    if !ws_next.is_empty() {
+                        let prev_surf = self
+                            .compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                        let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
+                        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
+                        self.emit_ws_pack_single(
+                            builder,
+                            param_list,
+                            &ws_next,
+                            "nsl_weight_stream_prefetch_pack",
+                        )?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_gpu_set_alloc_surface",
+                            &[prev_surf],
+                        )?;
+                        transfer_cert.push((ri, ri + 1, ws_next.len()));
+                        ri_was_prefetched = true;
+                    }
                 }
 
                 let slice = crate::wengert::WengertList {
@@ -9513,14 +10264,55 @@ impl Compiler<'_> {
                 // D2b: this layer's θ is final for the window — write back
                 // to the mirror and drop the device buffer.
                 if ws_active {
-                    for &idx in &ws_range {
-                        let iv = builder.ins().iconst(cl_types::I64, idx);
-                        let pw = self
-                            .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                        let wb = builder.ins().iconst(cl_types::I64, 1);
-                        self.compile_call_by_name(builder, "nsl_weight_stream_evict", &[pw, wb])?;
+                    if self.compile_options.stream_async_writeback
+                        && self.compile_options.stream_arena
+                    {
+                        // Item 11 (writeback half): issue the pack's DtoH on
+                        // the transfer stream and move on — the next range's
+                        // compute overlaps this layer's writeback. The mirror
+                        // scatter lands at the runtime's drain points (queue
+                        // cap / affected re-upload / teardown).
+                        self.emit_ws_pack_single(
+                            builder,
+                            param_list,
+                            &ws_range,
+                            "nsl_weight_stream_evict_pack_async",
+                        )?;
+                    } else if self.compile_options.stream_arena {
+                        // Item 10: one DtoH writeback for the whole layer pack.
+                        self.emit_ws_pack_evict(builder, param_list, &ws_range, 1)?;
+                    } else {
+                        for &idx in &ws_range {
+                            let iv = builder.ins().iconst(cl_types::I64, idx);
+                            let pw = self
+                                .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                            let wb = builder.ins().iconst(cl_types::I64, 1);
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_weight_stream_evict",
+                                &[pw, wb],
+                            )?;
+                        }
                     }
                 }
+            }
+
+            // Item 11: emit the discharged transfer certificate. Each prefetch
+            // issued during range Li's compute is provably awaited (a CUDA
+            // event on the compute stream) at range Li+1's head before any
+            // read — the CADENCE assume/guarantee obligation, discharged.
+            if prefetch_active {
+                let total: usize = transfer_cert.iter().map(|(_, _, n)| n).sum();
+                eprintln!(
+                    "[weight-stream] transfer certificate: {} prefetch obligations discharged \
+                     ({total} params double-buffered); chain [{}]",
+                    transfer_cert.len(),
+                    transfer_cert
+                        .iter()
+                        .map(|(i, c, n)| format!("L{i}->L{c}:{n}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
 
             // Epilogue: globals (embedding / final norm / LM head), tied and
@@ -10511,10 +11303,16 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // Item 12: open a scoped residency window if this callback
+                // touches model θ under weight streaming (else the reads
+                // launch on evicted, null data).
+                let ws_guard =
+                    self.emit_callback_residency_open(builder, &cb.body, model_sym, &cb_name)?;
                 // Compile callback body
                 for stmt in &cb.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
+                self.emit_callback_residency_close(builder, ws_guard)?;
             }
         }
 
@@ -10681,9 +11479,15 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // Item 12: same scoped-residency guard as on_step — an
+                // on_epoch callback that logs / saves model state runs with
+                // every streamed param evicted.
+                let ws_guard =
+                    self.emit_callback_residency_open(builder, &cb.body, model_sym, &cb_name)?;
                 for stmt in &cb.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
+                self.emit_callback_residency_close(builder, ws_guard)?;
             }
         }
 

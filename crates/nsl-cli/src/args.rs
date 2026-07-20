@@ -793,6 +793,29 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 
+        /// Item 10 (requires --weight-stream): batch each layer's per-param
+        /// transfers into ONE contiguous host<->device transfer through a
+        /// stable, reused device staging arena. Fewer CUDA calls, one large
+        /// PCIe transaction per layer, stable device addresses, less
+        /// fragmentation. Bit-exact with the per-param path.
+        #[arg(long, requires = "weight_stream")]
+        pub(crate) stream_arena: bool,
+
+        /// Item 11 (requires --stream-arena): double-buffer the backward
+        /// weight stream — prefetch each layer's pack (async HtoD) while the
+        /// previous layer computes, guarded by a per-pack CUDA event. WGGO
+        /// activates the overlap only where compute hides the transfer.
+        /// Bit-exact with the synchronous arena path.
+        #[arg(long, requires = "stream_arena")]
+        pub(crate) stream_prefetch: bool,
+
+        /// Item 11 writeback half (requires --stream-arena): issue each layer
+        /// pack's post-update DtoH on the transfer stream instead of blocking
+        /// — the next layer's compute overlaps the writeback; the mirror
+        /// scatter lands at the runtime's drain points. Bit-exact.
+        #[arg(long, requires = "stream_arena")]
+        pub(crate) stream_async_writeback: bool,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -911,6 +934,14 @@ pub(crate) struct RunArgs {
         /// Number of GPUs for tensor parallelism (spawns N processes)
         #[arg(long, default_value = "1")]
         pub(crate) devices: u32,
+
+        /// P4 item 14: collective backend for multi-rank runs — "sim"
+        /// (CPU-shm reference, default), "sim-gpu" (CUDA-aware TEST backend —
+        /// device-pointer API staged through the CPU-shm reduce; validates the
+        /// GPU plumbing on one GPU), or "nccl" (real CUDA-aware
+        /// collectives; requires an nccl-featured build with libnccl).
+        #[arg(long, default_value = "sim")]
+        pub(crate) collectives: String,
 
         /// M41: Number of prefill workers for disaggregated inference
         #[arg(long, default_value = "1")]
@@ -1198,6 +1229,22 @@ pub(crate) struct RunArgs {
         /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
+
+        /// Item 10 (requires --weight-stream): batch each layer's per-param
+        /// transfers into ONE contiguous host<->device transfer through a
+        /// stable, reused device staging arena. Bit-exact with per-param.
+        #[arg(long, requires = "weight_stream")]
+        pub(crate) stream_arena: bool,
+
+        /// Item 11 (requires --stream-arena): double-buffer the backward
+        /// weight stream with async prefetch + per-pack CUDA events. Bit-exact.
+        #[arg(long, requires = "stream_arena")]
+        pub(crate) stream_prefetch: bool,
+
+        /// Item 11 writeback half (requires --stream-arena): async pack
+        /// writeback DtoH on the transfer stream; scatter at drain points.
+        #[arg(long, requires = "stream_arena")]
+        pub(crate) stream_async_writeback: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

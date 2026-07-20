@@ -39,6 +39,9 @@ bindgen = "0.69"
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# P4 item 14: real NCCL collectives (requires libnccl.so at link+run time;
+# point RUSTFLAGS -L / LD_LIBRARY_PATH at it when not system-installed).
+nccl = ["cuda", "cudarc/nccl-02030"]
 interop = ["dep:hf-hub", "dep:prost", "dep:regex-lite"]
 test-hooks = []
 # M62b Spec C — ONNX Runtime custom op integration. Off by default.
