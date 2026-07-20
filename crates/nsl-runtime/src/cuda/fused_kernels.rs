@@ -1349,6 +1349,9 @@ DX_RDONE:\n\
     div.approx.f32 %f11, %f2, %f10;\n\
     add.f32 %f11, %f11, %f1;\n\
     rsqrt.approx.f32 %f11, %f11;\n\
+    // Clamp rms_inv <= 1e12 (i.e. rms >= 1e-12), matching the CPU/tape-AD\n\
+    // underflow guard so eps=0 + a near-zero row cannot inject +Inf/NaN.\n\
+    min.f32 %f11, %f11, 0f5368D4A5;\n\
     st.shared.f32 [ssq], %f11;\n\
     st.shared.f32 [sdwx], %f3;\n\
 DX_SKIP:\n\

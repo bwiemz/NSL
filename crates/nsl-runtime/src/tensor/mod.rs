@@ -2825,10 +2825,16 @@ pub extern "C" fn nsl_rmsnorm_dx_backward(
         let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
         let g_c = nsl_tensor_contiguous(g_dev);
         let dx = crate::cuda::gpu_rmsnorm_dx_backward_f32(dy_c, x_c, g_c, eps as f32);
-        if dy_dev != dy_ptr { nsl_tensor_free(dy_dev); }
+        // Both `nsl_tensor_to_device` and `nsl_tensor_contiguous` return an
+        // OWNED ref — refcount++ even on a same-device / already-contiguous
+        // no-op (they return the SAME pointer). So each acquire needs exactly
+        // one free, UNCONDITIONALLY: guarding the to_device free on
+        // `dev != ptr` leaks the no-op's extra ref (unbounded GPU growth on the
+        // per-step `dy`). Mirrors the tensor/mod.rs:~1793 refcount-balance idiom.
+        nsl_tensor_free(dy_dev);
         nsl_tensor_free(dy_c);
         nsl_tensor_free(x_c);
-        if g_dev != gamma_ptr { nsl_tensor_free(g_dev); }
+        nsl_tensor_free(g_dev);
         nsl_tensor_free(g_c);
         return dx;
     }
