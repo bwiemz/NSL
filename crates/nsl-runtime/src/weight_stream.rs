@@ -96,6 +96,10 @@ pub static WS_PACK_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Item 11: pack uploads issued ASYNCHRONOUSLY as prefetches (a subset of
 /// `WS_PACK_UPLOADS`) — the overlap evidence the double-buffer gate asserts.
 pub static WS_PREFETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Item 11 (writeback half): pack evicts whose DtoH was issued ASYNCHRONOUSLY
+/// on the transfer stream (a subset of `WS_PACK_EVICTS`) — the overlap
+/// evidence the async-writeback gate asserts.
+pub static WS_ASYNC_WB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
@@ -210,6 +214,9 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
     }
     #[cfg(feature = "cuda")]
     {
+        // Item 11 (writeback half): if this param's post-update bytes are
+        // still in flight to its mirror, land them before reading it.
+        drain_writebacks_for_params(&[tensor_ptr]);
         let mut guard = MIRRORS.lock().unwrap();
         let Some(m) = guard.as_mut().and_then(|g| g.get_mut(&tensor_ptr)) else {
             eprintln!(
@@ -344,6 +351,11 @@ struct ArenaSlot {
     /// stream and not yet awaited (0 = none). `await_pack` discharges it onto
     /// the compute stream before any kernel reads this slot.
     pending_event: u64,
+    /// Item 11 (writeback half): true while an async DtoH out of this slot is
+    /// in flight (its entry sits in `PENDING_WB`). The slot's `dev` (copy
+    /// source) and `host_stage` (copy destination) are both busy until the
+    /// drain, so `arena_acquire` must not hand the slot to a new pack.
+    wb_pending: bool,
 }
 #[cfg(feature = "cuda")]
 unsafe impl Send for ArenaSlot {}
@@ -367,19 +379,24 @@ fn align_up(x: usize, a: usize) -> usize {
 /// slot index and its (device, pinned-host) buffers. Caller holds MIRRORS;
 /// lock order is MIRRORS → ARENA_POOL → allocator (never reversed).
 ///
-/// LOAD-BEARING (Item 11 review MEDIUM): reusing a slot is safe ONLY because
-/// the prior occupant left via a SYNCHRONOUS writeback `evict_pack`, whose
-/// `cuMemcpyDtoH_v2` two-way-syncs the compute/legacy stream and thereby
-/// drains any prefetch HtoD the compute stream had waited on — so the slot's
-/// `host_stage`/`dev` are quiescent (no write-after-read on host_stage, no
-/// in-flight DMA into dev) before reuse. A free slot must therefore have NO
-/// un-awaited prefetch event; we assert it so a future regression (async
-/// evict, writeback=0 reuse, prefetch depth > 1) fails LOUDLY instead of
+/// LOAD-BEARING (Item 11 review MEDIUM): reusing a slot is safe ONLY when it
+/// is quiescent — no in-flight DMA into `dev`, no pending read of `dev`, no
+/// pending write into or read of `host_stage`. A SYNCHRONOUS writeback
+/// `evict_pack` guarantees this via `cuMemcpyDtoH_v2`'s two-way legacy-stream
+/// sync. An ASYNC writeback (`evict_pack_async`) instead marks the slot
+/// `wb_pending` until its drain scatters the stage into the mirrors — such a
+/// slot is simply not a reuse candidate here (the pool grows by one instead;
+/// steady state is bounded by the writeback-queue cap). A free candidate must
+/// additionally have NO un-awaited prefetch event; we assert it so a future
+/// regression (writeback=0 reuse, prefetch depth > 1) fails LOUDLY instead of
 /// silently reading a half-overwritten host buffer.
 #[cfg(feature = "cuda")]
 fn arena_acquire(bytes: usize, live: usize) -> (usize, *mut c_void, *mut u8) {
     let mut pool = ARENA_POOL.lock().unwrap();
-    if let Some(idx) = pool.iter().position(|s| s.live == 0 && s.cap >= bytes) {
+    if let Some(idx) = pool
+        .iter()
+        .position(|s| s.live == 0 && !s.wb_pending && s.cap >= bytes)
+    {
         if pool[idx].pending_event != 0 {
             eprintln!(
                 "[weight-stream] FATAL: reusing arena slot {idx} with an un-awaited prefetch \
@@ -402,6 +419,7 @@ fn arena_acquire(bytes: usize, live: usize) -> (usize, *mut c_void, *mut u8) {
         cap,
         live,
         pending_event: 0,
+        wb_pending: false,
     });
     (pool.len() - 1, dev, host_stage)
 }
@@ -433,6 +451,10 @@ fn arena_release_ref(slot: usize) {
 /// from teardown after all params are restored to owned buffers.
 #[cfg(feature = "cuda")]
 fn arena_teardown() {
+    // Item 11 (writeback half): land any queued async writeback BEFORE the
+    // slots' host_stage buffers are freed — an undrained entry here would
+    // lose the final updates (teardown drains earlier too; this is the belt).
+    drain_all_writebacks();
     // Item 11: ensure no prefetch HtoD is still in flight into a slot before
     // its device buffer is freed (codegen awaits every pack before its
     // compute, so this is belt-and-suspenders for the async path).
@@ -508,6 +530,15 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
         let off = align_up(total, ARENA_ALIGN);
         layout.push((ptr, off, m.bytes));
         total = off + m.bytes;
+    }
+
+    // Item 11 (writeback half): the gather below reads each param's MIRROR —
+    // land any in-flight async writeback of these params first. Steady-state
+    // CSLA rotation never intersects (a pack's writeback drains via the queue
+    // cap long before its next upload), so this preserves the overlap.
+    {
+        let ptrs: Vec<i64> = layout.iter().map(|&(p, ..)| p).collect();
+        drain_writebacks_for_params(&ptrs);
     }
 
     let (slot_idx, dev, host_stage) = arena_acquire(total, n);
@@ -706,6 +737,212 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Item 11 (writeback half) — async pack writeback. The synchronous
+// `evict_pack` blocks the host (and two-way-syncs the compute stream) on one
+// DtoH per layer; under `--stream-async-writeback` the backward tail issues
+// that DtoH on the transfer stream instead and defers the mirror scatter to a
+// DRAIN, so layer L-1's writeback overlaps layer L's compute — the third leg
+// of Item 11's schedule (compute L / prefetch L+1 / write back L-1).
+//
+// Invariant: between issue and drain, the pack's params are EVICTED
+// (data=null) and their MIRRORS ARE STALE. Every mirror reader therefore
+// drains first: re-upload of an affected param (intersection drain — absent
+// in steady-state CSLA rotation, so the overlap survives), the queue cap
+// (bounds slots tied up in flight), and teardown (before mirrors are
+// restored/freed). The slot itself is guarded by `wb_pending` in
+// `arena_acquire`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One in-flight async pack writeback: the completion event of its DtoH into
+/// `host_stage`, plus the scatter list (param ptr for intersection tests,
+/// mirror destination, stage offset, byte count).
+#[cfg(feature = "cuda")]
+struct PendingWb {
+    slot: usize,
+    event: u64,
+    host_stage: *mut u8,
+    regions: Vec<(i64, *mut u8, usize, usize)>, // (param ptr, mirror host, off, bytes)
+}
+#[cfg(feature = "cuda")]
+unsafe impl Send for PendingWb {}
+
+#[cfg(feature = "cuda")]
+static PENDING_WB: Mutex<Vec<PendingWb>> = Mutex::new(Vec::new());
+/// Lock-free emptiness probe so the hot upload paths skip the queue lock
+/// entirely when async writeback is off or idle.
+#[cfg(feature = "cuda")]
+static WB_QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// At most this many async writebacks may be in flight; issuing another
+/// drains the oldest first. Two matches the double-buffer depth (the slot
+/// writing back + the slot computing + the slot prefetching coexist).
+#[cfg(feature = "cuda")]
+const WB_MAX_INFLIGHT: usize = 2;
+
+/// Drain (host-sync + mirror-scatter + slot-release) every queued writeback
+/// selected by `pred`. The event sync orders the scatter after the DtoH; the
+/// scatter itself is plain CPU memcpy into the per-param mirrors captured at
+/// issue time (no table lookups — the mirrors outlive the queue because
+/// teardown drains everything first).
+#[cfg(feature = "cuda")]
+fn drain_pending_writebacks(mut pred: impl FnMut(&PendingWb) -> bool) {
+    if WB_QUEUED.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let taken: Vec<PendingWb> = {
+        let mut q = PENDING_WB.lock().unwrap();
+        let mut taken = Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            if pred(&q[i]) {
+                taken.push(q.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        WB_QUEUED.store(q.len(), std::sync::atomic::Ordering::Release);
+        taken
+    };
+    for wb in taken {
+        crate::cuda::inner::event_synchronize(wb.event);
+        for &(_ptr, mirror, off, bytes) in &wb.regions {
+            unsafe { std::ptr::copy_nonoverlapping(wb.host_stage.add(off), mirror, bytes) };
+        }
+        let mut pool = ARENA_POOL.lock().unwrap();
+        if let Some(s) = pool.get_mut(wb.slot) {
+            s.wb_pending = false;
+        }
+    }
+}
+
+/// Drain writebacks that involve ANY of the given param pointers — the
+/// mirror-freshness guard on a re-upload of an affected pack.
+#[cfg(feature = "cuda")]
+fn drain_writebacks_for_params(ptrs: &[i64]) {
+    drain_pending_writebacks(|wb| wb.regions.iter().any(|&(p, ..)| ptrs.contains(&p)));
+}
+
+/// Drain everything (teardown / oldest-first cap uses a one-shot variant).
+#[cfg(feature = "cuda")]
+fn drain_all_writebacks() {
+    drain_pending_writebacks(|_| true);
+}
+
+/// Item 11 (writeback half): evict a whole layer pack with its writeback DtoH
+/// issued ASYNCHRONOUSLY on the transfer stream (ordered after the update
+/// kernels via a compute-stream event). Returns immediately; the mirror
+/// scatter is deferred to the next drain point. Semantically identical to
+/// `evict_pack(pw, 1)` — same bytes land in the same mirrors — only the
+/// timing differs, which the bit-exact gate proves.
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
+    if pw_list_ptr == 0 {
+        return;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let list = crate::list::NslList::from_ptr(pw_list_ptr);
+        let n = list.len as usize;
+        if n == 0 {
+            return;
+        }
+        crate::cuda::inner::ensure_context();
+
+        // Cap the in-flight depth BEFORE taking MIRRORS (drain locks
+        // PENDING_WB then ARENA_POOL; never nest under MIRRORS the other way).
+        if WB_QUEUED.load(std::sync::atomic::Ordering::Acquire) >= WB_MAX_INFLIGHT {
+            let oldest_slot = {
+                let q = PENDING_WB.lock().unwrap();
+                q.first().map(|wb| wb.slot)
+            };
+            if let Some(slot) = oldest_slot {
+                drain_pending_writebacks(|wb| wb.slot == slot);
+            }
+        }
+
+        let mut guard = MIRRORS.lock().unwrap();
+        let table = guard
+            .as_mut()
+            .expect("[weight-stream] evict_pack_async before any register");
+
+        let mut slot: i64 = -1;
+        let mut regions: Vec<(i64, *mut u8, usize, usize)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let ptr = unsafe { *list.data.add(i) };
+            let Some(m) = table.get(&ptr) else {
+                eprintln!("[weight-stream] FATAL: evict_pack_async of unregistered tensor {ptr}");
+                std::process::abort();
+            };
+            if m.arena_slot < 0 {
+                if !NslTensor::from_ptr(ptr).data.is_null() {
+                    eprintln!(
+                        "[weight-stream] FATAL: evict_pack_async member {ptr} is resident via \
+                         a non-arena buffer (arena_slot=-1, data!=null) — pack grouping mismatch"
+                    );
+                    std::process::abort();
+                }
+                continue;
+            }
+            if slot < 0 {
+                slot = m.arena_slot;
+            } else if slot != m.arena_slot {
+                eprintln!(
+                    "[weight-stream] FATAL: evict_pack_async members span slots {slot} and {} \
+                     — pack upload/evict grouping mismatch",
+                    m.arena_slot
+                );
+                std::process::abort();
+            }
+            regions.push((ptr, m.host, m.arena_off, m.bytes));
+        }
+        if regions.is_empty() {
+            return;
+        }
+        let (dev, host_stage) = arena_slot_bufs(slot as usize);
+
+        // ONE async DtoH of the occupied span; the scatter waits for the drain.
+        let span = regions.iter().map(|&(_, _, o, b)| o + b).max().unwrap_or(0);
+        let ev = crate::cuda::inner::writeback_dtoh_on_transfer(
+            host_stage as *mut c_void,
+            dev as *const c_void,
+            span,
+        );
+
+        for &(ptr, _mirror, _off, _bytes) in &regions {
+            let t = NslTensor::from_ptr(ptr);
+            t.data = std::ptr::null_mut();
+            let m = table.get_mut(&ptr).unwrap();
+            m.arena_slot = -1;
+            WS_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WS_EVICTS_WB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let count = regions.len();
+        {
+            let mut pool = ARENA_POOL.lock().unwrap();
+            if let Some(s) = pool.get_mut(slot as usize) {
+                s.live = s.live.saturating_sub(count);
+                s.wb_pending = true;
+            }
+        }
+        {
+            let mut q = PENDING_WB.lock().unwrap();
+            q.push(PendingWb {
+                slot: slot as usize,
+                event: ev,
+                host_stage,
+                regions,
+            });
+            WB_QUEUED.store(q.len(), std::sync::atomic::Ordering::Release);
+        }
+        WS_PACK_EVICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WS_ASYNC_WB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = pw_list_ptr;
+    }
+}
+
 /// Is `tensor_ptr` a currently-registered streamed parameter? Used by
 /// `nsl_model_save` to materialize an evicted param from its mirror for the
 /// duration of the serialization read (Item 12: mid-loop model_save no
@@ -770,6 +1007,10 @@ pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
 pub extern "C" fn nsl_weight_stream_teardown() {
     #[cfg(feature = "cuda")]
     {
+        // Item 11 (writeback half): the restore loop below reads every mirror
+        // — land all in-flight async writebacks first so the final per-layer
+        // updates are in the mirrors before they become the source of truth.
+        drain_all_writebacks();
         let mut guard = MIRRORS.lock().unwrap();
         let Some(table) = guard.take() else { return };
         for (ptr, m) in table {

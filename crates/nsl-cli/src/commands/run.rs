@@ -67,6 +67,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             weight_stream,
             stream_arena,
             stream_prefetch,
+            stream_async_writeback,
             weights,
     } = args;
 
@@ -392,6 +393,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 weight_stream,
                 stream_arena,
                 stream_prefetch,
+                stream_async_writeback,
                 debug_training,
                 grad_integrity,
                 training_reference,

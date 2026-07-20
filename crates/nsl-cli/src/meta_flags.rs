@@ -119,6 +119,7 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     off_bool!(weight_stream, "--weight-stream");
     off_bool!(stream_arena, "--stream-arena");
     off_bool!(stream_prefetch, "--stream-prefetch");
+    off_bool!(stream_async_writeback, "--stream-async-writeback");
     off_bool!(optim_state_offload, "--optim-state-offload");
     if opts.checkpoint_budget_mib.is_some() {
         opts.checkpoint_budget_mib = None;
@@ -188,6 +189,7 @@ mod tests {
             weight_stream: true,
             stream_arena: true,
             stream_prefetch: true,
+            stream_async_writeback: true,
             optim_state_offload: true,
             disable_fusion: false,
             ..Default::default()
@@ -200,6 +202,7 @@ mod tests {
         assert!(!opts.weight_stream);
         assert!(!opts.stream_arena);
         assert!(!opts.stream_prefetch);
+        assert!(!opts.stream_async_writeback);
         assert!(!opts.optim_state_offload);
         assert!(opts.disable_fusion, "kernel fusion disabled");
         assert_eq!(opts.wggo.mode.as_deref(), Some("off"));

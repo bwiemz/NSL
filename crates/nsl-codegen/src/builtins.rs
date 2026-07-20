@@ -2799,6 +2799,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_weight_stream_evict_pack", &[types::I64, types::I64], None),
     // Item 11: async double-buffer prefetch + event-ordered await.
     ("nsl_weight_stream_prefetch_pack", &[types::I64], None),
+    ("nsl_weight_stream_evict_pack_async", &[types::I64], None),
     ("nsl_weight_stream_await_pack", &[types::I64], None),
     ("nsl_weight_stream_teardown", &[], None),
     ("nsl_weight_stream_upload_count", &[], Some(types::I64)),

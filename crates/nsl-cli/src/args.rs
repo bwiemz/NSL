@@ -809,6 +809,13 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_prefetch: bool,
 
+        /// Item 11 writeback half (requires --stream-arena): issue each layer
+        /// pack's post-update DtoH on the transfer stream instead of blocking
+        /// — the next layer's compute overlaps the writeback; the mirror
+        /// scatter lands at the runtime's drain points. Bit-exact.
+        #[arg(long, requires = "stream_arena")]
+        pub(crate) stream_async_writeback: bool,
+
         /// Number of devices in the target cluster (compile-time
         /// `world_size`).  Drives WGGO's ZeRO sharding budget and the
         /// tensor-parallel `world_size` baked into the artifact.  Unlike the
@@ -1225,6 +1232,11 @@ pub(crate) struct RunArgs {
         /// weight stream with async prefetch + per-pack CUDA events. Bit-exact.
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_prefetch: bool,
+
+        /// Item 11 writeback half (requires --stream-arena): async pack
+        /// writeback DtoH on the transfer stream; scatter at drain points.
+        #[arg(long, requires = "stream_arena")]
+        pub(crate) stream_async_writeback: bool,
 
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.

@@ -137,7 +137,7 @@ extern "C" fn nsl_weight_stream_count_atexit() {
     // below uploads/evicts — the batching evidence the arena gate asserts.
     eprintln!(
         "[weight-stream] uploads: {} evicts: {} writeback: {} registered: {} ptr_moves: {} \
-         pack_uploads: {} pack_evicts: {} prefetches: {}",
+         pack_uploads: {} pack_evicts: {} prefetches: {} async_wb: {}",
         crate::weight_stream::WS_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_EVICTS_WB.load(std::sync::atomic::Ordering::Relaxed),
@@ -146,6 +146,7 @@ extern "C" fn nsl_weight_stream_count_atexit() {
         crate::weight_stream::WS_PACK_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_PACK_EVICTS.load(std::sync::atomic::Ordering::Relaxed),
         crate::weight_stream::WS_PREFETCHES.load(std::sync::atomic::Ordering::Relaxed),
+        crate::weight_stream::WS_ASYNC_WB.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 

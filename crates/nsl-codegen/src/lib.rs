@@ -1301,6 +1301,13 @@ pub struct CompileOptions {
     /// activates the overlap only where estimated compute hides the transfer;
     /// otherwise it falls back to the synchronous arena upload. Bit-exact.
     pub stream_prefetch: bool,
+    /// Item 11 writeback half (`--stream-async-writeback`, requires
+    /// `--stream-arena`): issue each layer pack's post-update DtoH on the
+    /// transfer stream instead of blocking, deferring the mirror scatter to
+    /// the runtime's drain points (writeback-queue cap / affected re-upload /
+    /// teardown). Completes the double-buffer schedule: compute L, prefetch
+    /// L+1, write back L-1. Bit-exact (same bytes, different timing).
+    pub stream_async_writeback: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1432,6 +1439,7 @@ impl Default for CompileOptions {
             weight_stream: false,
             stream_arena: false,
             stream_prefetch: false,
+            stream_async_writeback: false,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),

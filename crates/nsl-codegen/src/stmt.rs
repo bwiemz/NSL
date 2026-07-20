@@ -40,13 +40,14 @@ struct CallbackModelTouch {
     first_path: Option<String>,
 }
 
-/// Item 11 calibration: the smallest average per-replay-range op count for
-/// which the double-buffer prefetch is activated. A range that lowers to only
-/// a handful of ops finishes faster than one weight-pack HtoD, so overlapping
-/// them cannot hide the transfer — WGGO declines and keeps the synchronous
-/// arena upload. First-order; the full WGGO-ILP cost integration (per-range
-/// compute μs vs pack-byte transfer μs) is the documented follow-on.
-const WS_PREFETCH_MIN_OPS_PER_RANGE: usize = 4;
+/// Item 11 calibration: fixed DMA issue+completion latency (μs) added to every
+/// pack-transfer estimate — small PCIe copies are latency-bound, not
+/// bandwidth-bound, so a bytes/BW model alone would price a 4 KiB pack at
+/// ~0.1 μs and activate overlap that cannot pay. Combined with the target
+/// `GpuSpec`'s `pcie_bandwidth_gbps` / `kernel_launch_overhead_ns` /
+/// `peak_bandwidth_gbs`, this closes the deferred WGGO-ILP cost integration:
+/// each prefetch edge is priced per-range compute μs vs pack-byte transfer μs.
+const WS_PCIE_FIXED_LAT_US: f64 = 10.0;
 
 fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
@@ -5515,6 +5516,11 @@ impl Compiler<'_> {
             /// Weight-streamed params (`--weight-stream`): layer-grouped
             /// minus view-rooted, sorted. Empty when streaming is off.
             ws_streamed: Vec<i64>,
+            /// Per-range Σ elements of its STREAMED params (0 where shapes
+            /// were symbolic). Item 11 calibration: pack bytes = elems × 4
+            /// (GPU f32) drive the prefetch overlap gate's transfer-time
+            /// estimate against the target GpuSpec.
+            range_pack_elems: Vec<u64>,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -7214,6 +7220,11 @@ impl Compiler<'_> {
                         // exactly one group.
                         let mut layer_group: Vec<Vec<i64>> = vec![Vec::new(); n_ranges];
                         let mut grouped: std::collections::HashSet<i64> = Default::default();
+                        // Item 11 calibration: static element count per grouped
+                        // param (0 = symbolic shape), keyed by accum_idx — the
+                        // prefetch gate's pack-byte source.
+                        let mut elems_by_accum: std::collections::HashMap<i64, u64> =
+                            Default::default();
                         {
                             let param_by_name: std::collections::HashMap<&str, &CslaParam> =
                                 csla_params.iter().map(|p| (p.name.as_str(), p)).collect();
@@ -7233,6 +7244,8 @@ impl Compiler<'_> {
                                         };
                                     if in_range && grouped.insert(cp.accum_idx) {
                                         layer_group[ri].push(cp.accum_idx);
+                                        elems_by_accum
+                                            .insert(cp.accum_idx, pinfo.elems.unwrap_or(0));
                                     }
                                 }
                                 layer_group[ri].sort_unstable();
@@ -7429,6 +7442,19 @@ impl Compiler<'_> {
                         } else {
                             None
                         };
+                        // Item 11 calibration: Σ static elems of each range's
+                        // STREAMED params (the pack the gate prices).
+                        let ws_set: std::collections::HashSet<i64> =
+                            ws_streamed_sorted.iter().copied().collect();
+                        let range_pack_elems: Vec<u64> = layer_group
+                            .iter()
+                            .map(|g| {
+                                g.iter()
+                                    .filter(|i| ws_set.contains(i))
+                                    .map(|i| elems_by_accum.get(i).copied().unwrap_or(0))
+                                    .sum()
+                            })
+                            .collect();
                         (
                             Some(CslaPre {
                                 params: csla_params,
@@ -7439,6 +7465,7 @@ impl Compiler<'_> {
                                     layer_group,
                                     global_group,
                                     ws_streamed: ws_streamed_sorted,
+                                    range_pack_elems,
                                 },
                             }),
                             ws_plan,
@@ -9586,22 +9613,82 @@ impl Compiler<'_> {
             let streamed_range_count = (0..ranges.len())
                 .filter(|&ri| layer_group[ri].iter().any(|i| ws_streamed.contains(i)))
                 .count();
-            let avg_ops_per_range = pending.adjoint.ops.len() / ranges.len().max(1);
-            // WGGO's calibrated activation condition (first-order).
+            // WGGO-calibrated activation, PER EDGE (issue during ri, consume
+            // at ri+1): overlap pays iff range ri's compute can hide range
+            // ri+1's pack transfer. Both sides in μs from the target GpuSpec:
+            //   transfer(ri+1) = DMA fixed latency + pack_bytes / PCIe BW
+            //   compute_lb(ri) = accum_window × max(launch floor, HBM floor)
+            // where the launch floor is ops × kernel_launch_overhead (every
+            // adjoint op is ≥ one launch) and the HBM floor is the range's own
+            // pack read once per replay. Both compute terms are LOWER bounds
+            // (no FLOP term — adjoint shapes are not static), so a discharged
+            // edge is calibrated-safe while a declined edge may merely be
+            // unproven — the right polarity for a perf heuristic.
+            let gpu_spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                .unwrap_or_else(crate::gpu_specs::default_gpu);
+            let accum_window = grad_accumulation_steps.max(1) as f64;
+            let pack_bytes =
+                |ri: usize| pending.schedule.range_pack_elems.get(ri).copied().unwrap_or(0) * 4;
+            let transfer_us = |ri: usize| {
+                WS_PCIE_FIXED_LAT_US
+                    + pack_bytes(ri) as f64 / (gpu_spec.pcie_bandwidth_gbps.max(1.0) * 1e3)
+            };
+            let compute_lb_us = |ri: usize| {
+                let launch_floor = (ranges[ri].end - ranges[ri].start) as f64
+                    * gpu_spec.kernel_launch_overhead_ns as f64
+                    / 1e3;
+                let hbm_floor =
+                    pack_bytes(ri) as f64 / (gpu_spec.peak_bandwidth_gbs.max(1.0) * 1e3);
+                accum_window * launch_floor.max(hbm_floor)
+            };
+            // Edge ri → ri+1 is calibrated-on iff ri's compute covers ri+1's
+            // transfer (and both ends actually stream).
+            let edge_on: Vec<bool> = (0..ranges.len())
+                .map(|ri| {
+                    ri + 1 < ranges.len()
+                        && layer_group[ri + 1].iter().any(|i| ws_streamed.contains(i))
+                        && compute_lb_us(ri) >= transfer_us(ri + 1)
+                })
+                .collect();
             let prefetch_active = self.compile_options.stream_prefetch
                 && self.compile_options.stream_arena
                 && ws_active
                 && streamed_range_count >= 2
-                && avg_ops_per_range >= WS_PREFETCH_MIN_OPS_PER_RANGE;
+                && edge_on.iter().any(|&e| e);
             if self.compile_options.stream_prefetch {
+                let edges: Vec<String> = (0..ranges.len().saturating_sub(1))
+                    .map(|ri| {
+                        format!(
+                            "L{ri}->L{}: compute>={:.1}us transfer~{:.1}us {}",
+                            ri + 1,
+                            compute_lb_us(ri),
+                            transfer_us(ri + 1),
+                            if edge_on[ri] { "ON" } else { "off" }
+                        )
+                    })
+                    .collect();
                 eprintln!(
                     "[weight-stream] prefetch double-buffer: {} \
-                     (streamed_ranges={streamed_range_count}, avg_ops/range={avg_ops_per_range}, \
-                     calibration_min={WS_PREFETCH_MIN_OPS_PER_RANGE})",
+                     (streamed_ranges={streamed_range_count}, gpu={}, accum_window={}, \
+                     edges [{}])",
                     if prefetch_active {
                         "ACTIVE — prefetch layer L+1 while computing L, event-ordered"
                     } else {
                         "DECLINED (compute too small to hide the transfer; synchronous arena)"
+                    },
+                    gpu_spec.name,
+                    accum_window,
+                    edges.join("; "),
+                );
+            }
+            if self.compile_options.stream_async_writeback {
+                eprintln!(
+                    "[weight-stream] async writeback: {}",
+                    if ws_active && streamed_range_count > 0 {
+                        "ACTIVE — pack evict DtoH on the transfer stream, mirror \
+                         scatter deferred to drain points"
+                    } else {
+                        "no streamed ranges (no effect)"
                     },
                 );
             }
@@ -9664,8 +9751,10 @@ impl Compiler<'_> {
                 // Item 11: prefetch the NEXT streamed layer group so its HtoD
                 // overlaps THIS range's compute (the b-loop below). Async on
                 // the transfer stream; the next range's head awaits its event.
+                // Per-edge: only where the calibration proved THIS range's
+                // compute covers the NEXT pack's transfer.
                 ri_was_prefetched = false;
-                if prefetch_active && ri + 1 < ranges.len() {
+                if prefetch_active && ri + 1 < ranges.len() && edge_on[ri] {
                     let ws_next: Vec<i64> = layer_group[ri + 1]
                         .iter()
                         .copied()
@@ -10095,7 +10184,21 @@ impl Compiler<'_> {
                 // D2b: this layer's θ is final for the window — write back
                 // to the mirror and drop the device buffer.
                 if ws_active {
-                    if self.compile_options.stream_arena {
+                    if self.compile_options.stream_async_writeback
+                        && self.compile_options.stream_arena
+                    {
+                        // Item 11 (writeback half): issue the pack's DtoH on
+                        // the transfer stream and move on — the next range's
+                        // compute overlaps this layer's writeback. The mirror
+                        // scatter lands at the runtime's drain points (queue
+                        // cap / affected re-upload / teardown).
+                        self.emit_ws_pack_single(
+                            builder,
+                            param_list,
+                            &ws_range,
+                            "nsl_weight_stream_evict_pack_async",
+                        )?;
+                    } else if self.compile_options.stream_arena {
                         // Item 10: one DtoH writeback for the whole layer pack.
                         self.emit_ws_pack_evict(builder, param_list, &ws_range, 1)?;
                     } else {

@@ -1186,6 +1186,71 @@ pub(crate) mod inner {
         }
     }
 
+    /// Item 11 (writeback half): issue a DtoH WRITEBACK on the transfer
+    /// stream, ordered AFTER all previously-launched compute (the per-layer
+    /// update kernels that produced `src_device`), and return a completion
+    /// event recorded right after the copy. Unlike the synchronous
+    /// `memcpy_dtoh`, this returns immediately — the next layer's compute
+    /// proceeds while the evicted pack drains to the host.
+    ///
+    /// CADENCE assume/guarantee: ASSUME (1) `src_device` (the arena slot) is
+    /// not re-written until this copy completes and (2) `dst_host` (the
+    /// slot's pinned stage) is not read or re-written until then — both hold
+    /// because the slot is marked writeback-pending and `arena_acquire`
+    /// refuses to reuse it until the caller drains the returned event (see
+    /// `weight_stream::drain_pending_writebacks`). GUARANTEE: once the event
+    /// is host-synchronized, `dst_host` holds the post-update bytes and the
+    /// mirror scatter may proceed on the CPU.
+    #[must_use]
+    pub(crate) fn writeback_dtoh_on_transfer(
+        dst_host: *mut c_void,
+        src_device: *const c_void,
+        size_bytes: usize,
+    ) -> u64 {
+        ensure_context();
+        let stream = transfer_stream();
+        unsafe {
+            // Order the copy after the update kernels on the compute stream.
+            transfer_stream_wait_null_stream(stream);
+            let result =
+                cuMemcpyDtoHAsync_v2(dst_host, src_device as CUdeviceptr, size_bytes, stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyDtoHAsync_v2 (writeback, {} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+            let mut ev: CUevent = std::ptr::null_mut();
+            // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest).
+            let r = cuEventCreate(&mut ev, 0x2);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (writeback) failed: {:?}", r);
+            let r = cuEventRecord(ev, stream);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (writeback) failed: {:?}", r);
+            ev as u64
+        }
+    }
+
+    /// Host-block until `ev` completes, then destroy it. The drain step of an
+    /// async writeback: after this returns the DtoH has landed in the pinned
+    /// stage and the CPU may scatter it into the per-param mirrors.
+    pub(crate) fn event_synchronize(ev: u64) {
+        if ev == 0 {
+            return;
+        }
+        ensure_context();
+        unsafe {
+            let r = cuEventSynchronize(ev as CUevent);
+            assert_eq!(
+                r,
+                CUresult::CUDA_SUCCESS,
+                "cuEventSynchronize (writeback drain) failed: {:?}",
+                r
+            );
+            cuEventDestroy_v2(ev as CUevent);
+        }
+    }
+
     /// Item 11: make the COMPUTE stream wait for a prefetch event, then
     /// destroy it. After this returns, every kernel launched on the compute
     /// stream is ordered after the prefetch HtoD — the guarantee half of the
