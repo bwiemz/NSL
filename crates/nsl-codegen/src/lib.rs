@@ -1293,6 +1293,14 @@ pub struct CompileOptions {
     /// across steps, and bounds fragmentation. Bit-exact with the per-param
     /// path (same mirror bytes, same order).
     pub stream_arena: bool,
+    /// Item 11 (`--stream-prefetch`, requires `--stream-arena`): double-buffer
+    /// the backward weight stream. Each layer's pack is prefetched (async HtoD
+    /// on the transfer stream) while the PREVIOUS layer computes, and the
+    /// compute stream waits on a per-pack CUDA event before reading it — the
+    /// CADENCE-style assume/guarantee transfer certificate. WGGO's calibration
+    /// activates the overlap only where estimated compute hides the transfer;
+    /// otherwise it falls back to the synchronous arena upload. Bit-exact.
+    pub stream_prefetch: bool,
     /// Dev Tools Phase 5, Task 7: enable `@inspect` decorator emission.
     pub inspect_enabled: bool,
     /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -1423,6 +1431,7 @@ impl Default for CompileOptions {
             layerwise_accum: false,
             weight_stream: false,
             stream_arena: false,
+            stream_prefetch: false,
             inspect_enabled: false,
             csha: CshaOptions::default(),
             csha_configs: HashMap::new(),

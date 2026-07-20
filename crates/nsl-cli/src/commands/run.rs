@@ -66,6 +66,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             layerwise_accum,
             weight_stream,
             stream_arena,
+            stream_prefetch,
             weights,
     } = args;
 
@@ -390,6 +391,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 layerwise_accum,
                 weight_stream,
                 stream_arena,
+                stream_prefetch,
                 debug_training,
                 grad_integrity,
                 training_reference,

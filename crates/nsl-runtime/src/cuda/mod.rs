@@ -1141,6 +1141,69 @@ pub(crate) mod inner {
         }
     }
 
+    /// Item 11: issue an HtoD PREFETCH on the transfer stream that does NOT
+    /// wait on prior compute (unlike `memcpy_htod_async`, whose copy is
+    /// ordered after the compute that produced its source). A prefetch's
+    /// source is a stable pinned host buffer already filled on the host, so
+    /// the copy can start immediately and run CONCURRENTLY with compute. The
+    /// returned event is recorded on the transfer stream right after the copy;
+    /// the consumer discharges it with `compute_stream_wait_event` before any
+    /// kernel reads `dst_device`. `src_host` must be pinned for true async DMA.
+    ///
+    /// CADENCE assume/guarantee: ASSUME `dst_device` has no other pending
+    /// writer (the caller only prefetches into a slot freed by a SYNC evict);
+    /// GUARANTEE the returned event, waited on the compute stream, orders this
+    /// copy before every later compute-stream read of `dst_device`.
+    #[must_use]
+    pub(crate) fn prefetch_htod_on_transfer(
+        dst_device: *mut c_void,
+        src_host: *const c_void,
+        size_bytes: usize,
+    ) -> u64 {
+        ensure_context();
+        let stream = transfer_stream();
+        unsafe {
+            let result =
+                cuMemcpyHtoDAsync_v2(dst_device as CUdeviceptr, src_host, size_bytes, stream);
+            assert_eq!(
+                result,
+                CUresult::CUDA_SUCCESS,
+                "cuMemcpyHtoDAsync_v2 (prefetch, {} bytes) failed: {:?}",
+                size_bytes,
+                result
+            );
+            let mut ev: CUevent = std::ptr::null_mut();
+            // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest).
+            let r = cuEventCreate(&mut ev, 0x2);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventCreate (prefetch) failed: {:?}", r);
+            let r = cuEventRecord(ev, stream);
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "cuEventRecord (prefetch) failed: {:?}", r);
+            ev as u64
+        }
+    }
+
+    /// Item 11: make the COMPUTE stream wait for a prefetch event, then
+    /// destroy it. After this returns, every kernel launched on the compute
+    /// stream is ordered after the prefetch HtoD — the guarantee half of the
+    /// transfer certificate. Destroying immediately is safe: `cuEventDestroy`
+    /// defers the actual free until the recorded work and the wait complete.
+    pub(crate) fn compute_stream_wait_event(ev: u64) {
+        if ev == 0 {
+            return;
+        }
+        ensure_context();
+        unsafe {
+            let r = cuStreamWaitEvent(current_stream(), ev as CUevent, 0);
+            assert_eq!(
+                r,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamWaitEvent (prefetch await) failed: {:?}",
+                r
+            );
+            cuEventDestroy_v2(ev as CUevent);
+        }
+    }
+
     /// Synchronize the calling thread's transfer stream. No-op when the
     /// stream was never created on this thread (does NOT force-initialize
     /// CUDA — safe to call unconditionally from the offload drain).

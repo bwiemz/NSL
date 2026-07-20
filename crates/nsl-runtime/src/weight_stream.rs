@@ -93,6 +93,9 @@ pub static WS_PTR_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// (which still count per-param) — the compile-time-verified batching win.
 pub static WS_PACK_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WS_PACK_EVICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Item 11: pack uploads issued ASYNCHRONOUSLY as prefetches (a subset of
+/// `WS_PACK_UPLOADS`) — the overlap evidence the double-buffer gate asserts.
+pub static WS_PREFETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_count() -> i64 {
@@ -218,6 +221,11 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
         let dev = crate::cuda::inner::alloc_managed(m.bytes);
         crate::cuda::inner::memcpy_htod(dev, m.host as *const c_void, m.bytes);
         t.data = dev;
+        // This is a plain OWNED buffer (not an arena view): restore owns_data
+        // so a param that was last arena-resident (owns_data=0) is a
+        // well-formed owned tensor again — the mirror-buffer flag must always
+        // match reality (review Item-10 finding C).
+        t.owns_data = 1;
         // Pointer-move accounting: a fresh allocation at a different address
         // than the param last held is concrete evidence the storage moved.
         let dev_i = dev as i64;
@@ -332,6 +340,10 @@ struct ArenaSlot {
     host_stage: *mut u8,
     cap: usize,
     live: usize,
+    /// Item 11: a prefetch HtoD's completion event, recorded on the transfer
+    /// stream and not yet awaited (0 = none). `await_pack` discharges it onto
+    /// the compute stream before any kernel reads this slot.
+    pending_event: u64,
 }
 #[cfg(feature = "cuda")]
 unsafe impl Send for ArenaSlot {}
@@ -371,6 +383,7 @@ fn arena_acquire(bytes: usize, live: usize) -> (usize, *mut c_void, *mut u8) {
         host_stage,
         cap,
         live,
+        pending_event: 0,
     });
     (pool.len() - 1, dev, host_stage)
 }
@@ -402,6 +415,10 @@ fn arena_release_ref(slot: usize) {
 /// from teardown after all params are restored to owned buffers.
 #[cfg(feature = "cuda")]
 fn arena_teardown() {
+    // Item 11: ensure no prefetch HtoD is still in flight into a slot before
+    // its device buffer is freed (codegen awaits every pack before its
+    // compute, so this is belt-and-suspenders for the async path).
+    crate::cuda::inner::transfer_stream_synchronize();
     let mut pool = ARENA_POOL.lock().unwrap();
     for s in pool.drain(..) {
         crate::cuda::inner::ensure_context();
@@ -421,69 +438,149 @@ fn arena_teardown() {
 /// non-owning view) and the pack shares one slot for its whole residency.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
+    #[cfg(feature = "cuda")]
+    upload_pack_inner(pw_list_ptr, false);
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = pw_list_ptr;
+    }
+}
+
+/// Item 11: async sibling of `upload_pack`. Issues the pack's HtoD on the
+/// transfer stream (overlapping current compute) and records a completion
+/// event in the slot; `t.data` is set immediately but MUST NOT be read until
+/// `nsl_weight_stream_await_pack` discharges the event onto the compute
+/// stream. Prefetches only into a slot freed by a SYNCHRONOUS evict, so the
+/// destination has no other pending writer.
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_prefetch_pack(pw_list_ptr: i64) {
+    #[cfg(feature = "cuda")]
+    upload_pack_inner(pw_list_ptr, true);
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = pw_list_ptr;
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
+    if pw_list_ptr == 0 {
+        return;
+    }
+    let list = crate::list::NslList::from_ptr(pw_list_ptr);
+    let n = list.len as usize;
+    if n == 0 {
+        return;
+    }
+    crate::cuda::inner::ensure_context();
+    let mut guard = MIRRORS.lock().unwrap();
+    let table = guard
+        .as_mut()
+        .expect("[weight-stream] upload_pack before any register");
+
+    // Aligned offsets within the pack + total bytes.
+    let mut layout: Vec<(i64, usize, usize)> = Vec::with_capacity(n); // (ptr, off, bytes)
+    let mut total = 0usize;
+    for i in 0..n {
+        let ptr = unsafe { *list.data.add(i) };
+        let Some(m) = table.get(&ptr) else {
+            eprintln!("[weight-stream] FATAL: upload_pack of unregistered tensor {ptr}");
+            std::process::abort();
+        };
+        let off = align_up(total, ARENA_ALIGN);
+        layout.push((ptr, off, m.bytes));
+        total = off + m.bytes;
+    }
+
+    let (slot_idx, dev, host_stage) = arena_acquire(total, n);
+
+    // Gather each mirror into the contiguous pinned host buffer, then ONE HtoD
+    // for the whole pack — synchronous for `upload_pack`, async (overlapping
+    // compute) for `prefetch_pack`.
+    for &(ptr, off, bytes) in &layout {
+        let host = table.get(&ptr).unwrap().host;
+        unsafe { std::ptr::copy_nonoverlapping(host, host_stage.add(off), bytes) };
+    }
+    if prefetch {
+        let ev =
+            crate::cuda::inner::prefetch_htod_on_transfer(dev, host_stage as *const c_void, total);
+        arena_set_pending_event(slot_idx, ev);
+        WS_PREFETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::cuda::inner::memcpy_htod(dev, host_stage as *const c_void, total);
+    }
+
+    // Point each param at its arena offset (non-owning view).
+    for &(ptr, off, _bytes) in &layout {
+        let t = NslTensor::from_ptr(ptr);
+        let interior = unsafe { (dev as *mut u8).add(off) } as *mut c_void;
+        t.data = interior;
+        // A view into the arena: a stray `nsl_tensor_free` must NOT free an
+        // interior pointer. Restored to owned (=1) at teardown.
+        t.owns_data = 0;
+        let m = table.get_mut(&ptr).unwrap();
+        let dev_i = interior as i64;
+        if m.last_dev != 0 && m.last_dev != dev_i {
+            WS_PTR_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        m.last_dev = dev_i;
+        m.arena_slot = slot_idx as i64;
+        m.arena_off = off;
+        WS_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    WS_PACK_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Item 11: discharge a pack's pending prefetch event onto the compute stream
+/// so every subsequent kernel that reads the pack is ordered after its HtoD.
+/// A no-op if the pack was uploaded synchronously (no pending event) or is not
+/// arena-resident. The pack's members share one slot; the event lives on it.
+#[no_mangle]
+pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
     if pw_list_ptr == 0 {
         return;
     }
     #[cfg(feature = "cuda")]
     {
         let list = crate::list::NslList::from_ptr(pw_list_ptr);
-        let n = list.len as usize;
-        if n == 0 {
+        if list.len == 0 {
             return;
         }
-        crate::cuda::inner::ensure_context();
-        let mut guard = MIRRORS.lock().unwrap();
-        let table = guard
-            .as_mut()
-            .expect("[weight-stream] upload_pack before any register");
-
-        // Aligned offsets within the pack + total bytes.
-        let mut layout: Vec<(i64, usize, usize)> = Vec::with_capacity(n); // (ptr, off, bytes)
-        let mut total = 0usize;
-        for i in 0..n {
-            let ptr = unsafe { *list.data.add(i) };
-            let Some(m) = table.get(&ptr) else {
-                eprintln!("[weight-stream] FATAL: upload_pack of unregistered tensor {ptr}");
-                std::process::abort();
-            };
-            let off = align_up(total, ARENA_ALIGN);
-            layout.push((ptr, off, m.bytes));
-            total = off + m.bytes;
-        }
-
-        let (slot_idx, dev, host_stage) = arena_acquire(total, n);
-
-        // Gather each mirror into the contiguous pinned host buffer, then ONE
-        // HtoD for the whole pack.
-        for &(ptr, off, bytes) in &layout {
-            let host = table.get(&ptr).unwrap().host;
-            unsafe { std::ptr::copy_nonoverlapping(host, host_stage.add(off), bytes) };
-        }
-        crate::cuda::inner::memcpy_htod(dev, host_stage as *const c_void, total);
-
-        // Point each param at its arena offset (non-owning view).
-        for &(ptr, off, _bytes) in &layout {
-            let t = NslTensor::from_ptr(ptr);
-            let interior = unsafe { (dev as *mut u8).add(off) } as *mut c_void;
-            t.data = interior;
-            // A view into the arena: a stray `nsl_tensor_free` must NOT free an
-            // interior pointer. Restored to owned (=1) at teardown.
-            t.owns_data = 0;
-            let m = table.get_mut(&ptr).unwrap();
-            let dev_i = interior as i64;
-            if m.last_dev != 0 && m.last_dev != dev_i {
-                WS_PTR_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let first = unsafe { *list.data };
+        let slot = {
+            let guard = MIRRORS.lock().unwrap();
+            match guard.as_ref().and_then(|g| g.get(&first)) {
+                Some(m) if m.arena_slot >= 0 => m.arena_slot as usize,
+                _ => return,
             }
-            m.last_dev = dev_i;
-            m.arena_slot = slot_idx as i64;
-            m.arena_off = off;
-            WS_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let ev = arena_take_pending_event(slot);
+        if ev != 0 {
+            crate::cuda::inner::compute_stream_wait_event(ev);
         }
-        WS_PACK_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(feature = "cuda"))]
     {
         let _ = pw_list_ptr;
+    }
+}
+
+/// Record a slot's pending prefetch event.
+#[cfg(feature = "cuda")]
+fn arena_set_pending_event(slot: usize, ev: u64) {
+    let mut pool = ARENA_POOL.lock().unwrap();
+    if let Some(s) = pool.get_mut(slot) {
+        s.pending_event = ev;
+    }
+}
+
+/// Take (and clear) a slot's pending prefetch event.
+#[cfg(feature = "cuda")]
+fn arena_take_pending_event(slot: usize) -> u64 {
+    let mut pool = ARENA_POOL.lock().unwrap();
+    match pool.get_mut(slot) {
+        Some(s) => std::mem::replace(&mut s.pending_event, 0),
+        None => 0,
     }
 }
 
@@ -518,7 +615,20 @@ pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64)
                 std::process::abort();
             };
             if m.arena_slot < 0 {
-                continue; // already evicted / not arena-resident
+                // Legitimately evicted (idempotent belt) → skip. But a member
+                // that is RESIDENT via a non-arena owned buffer (data != null
+                // while arena_slot < 0) is a codegen slip that would silently
+                // leak it and skip its writeback — abort loudly instead
+                // (review Item-10 finding B; matters now that --stream-prefetch
+                // and the callback guard mint per-param owned buffers).
+                if !NslTensor::from_ptr(ptr).data.is_null() {
+                    eprintln!(
+                        "[weight-stream] FATAL: evict_pack member {ptr} is resident via a \
+                         non-arena buffer (arena_slot=-1, data!=null) — pack grouping mismatch"
+                    );
+                    std::process::abort();
+                }
+                continue;
             }
             if slot < 0 {
                 slot = m.arena_slot;

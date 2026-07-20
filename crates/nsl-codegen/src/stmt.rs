@@ -40,6 +40,14 @@ struct CallbackModelTouch {
     first_path: Option<String>,
 }
 
+/// Item 11 calibration: the smallest average per-replay-range op count for
+/// which the double-buffer prefetch is activated. A range that lowers to only
+/// a handful of ops finishes faster than one weight-pack HtoD, so overlapping
+/// them cannot hide the transfer — WGGO declines and keeps the synchronous
+/// arena upload. First-order; the full WGGO-ILP cost integration (per-range
+/// compute μs vs pack-byte transfer μs) is the documented follow-on.
+const WS_PREFETCH_MIN_OPS_PER_RANGE: usize = 4;
+
 fn is_trainable_param_leaf_name(param_name: &str) -> bool {
     let leaf_name = param_name.rsplit('.').next().unwrap_or(param_name);
     !leaf_name.starts_with('_') && leaf_name != "inv_freq"
@@ -4091,6 +4099,30 @@ impl Compiler<'_> {
         }
         let wb = builder.ins().iconst(cl_types::I64, writeback);
         self.compile_call_by_name(builder, "nsl_weight_stream_evict_pack", &[pwlist, wb])?;
+        self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
+        Ok(())
+    }
+
+    /// Item 11: emit an ASYNC pack transfer (`fn_name` is upload_pack's async
+    /// sibling `nsl_weight_stream_prefetch_pack`, or the `nsl_weight_stream_
+    /// await_pack` consumer). Shares the pw-list build with the sync helpers.
+    fn emit_ws_pack_single(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        param_list: Value,
+        idxs: &[i64],
+        fn_name: &str,
+    ) -> Result<(), CodegenError> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let pwlist = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for &idx in idxs {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_list_push", &[pwlist, pw])?;
+        }
+        self.compile_call_by_name(builder, fn_name, &[pwlist])?;
         self.compile_call_by_name(builder, "nsl_list_free", &[pwlist])?;
         Ok(())
     }
@@ -9549,6 +9581,39 @@ impl Compiler<'_> {
             let mut ghost_carries: std::collections::HashSet<crate::wengert::VarId> =
                 Default::default();
 
+            // ── Item 11: double-buffer prefetch calibration + certificate ──
+            // Streamed layer groups eligible as a prefetch target.
+            let streamed_range_count = (0..ranges.len())
+                .filter(|&ri| layer_group[ri].iter().any(|i| ws_streamed.contains(i)))
+                .count();
+            let avg_ops_per_range = pending.adjoint.ops.len() / ranges.len().max(1);
+            // WGGO's calibrated activation condition (first-order).
+            let prefetch_active = self.compile_options.stream_prefetch
+                && self.compile_options.stream_arena
+                && ws_active
+                && streamed_range_count >= 2
+                && avg_ops_per_range >= WS_PREFETCH_MIN_OPS_PER_RANGE;
+            if self.compile_options.stream_prefetch {
+                eprintln!(
+                    "[weight-stream] prefetch double-buffer: {} \
+                     (streamed_ranges={streamed_range_count}, avg_ops/range={avg_ops_per_range}, \
+                     calibration_min={WS_PREFETCH_MIN_OPS_PER_RANGE})",
+                    if prefetch_active {
+                        "ACTIVE — prefetch layer L+1 while computing L, event-ordered"
+                    } else {
+                        "DECLINED (compute too small to hide the transfer; synchronous arena)"
+                    },
+                );
+            }
+            // CADENCE-style transfer certificate: each entry is a discharged
+            // (issue_range, consume_range, pack_size) obligation — a prefetch
+            // issued during `issue_range`'s compute and awaited (event) at
+            // `consume_range`'s head before any read.
+            let mut transfer_cert: Vec<(usize, usize, usize)> = Vec::new();
+            // Whether the CURRENT range's weights were prefetched by the
+            // previous iteration (→ await instead of a sync upload).
+            let mut ri_was_prefetched = false;
+
             for (ri, range) in ranges.iter().enumerate() {
                 // This layer's accumulators exist only from here to its
                 // update below — the m_partial surface the schedule shrinks.
@@ -9567,8 +9632,20 @@ impl Compiler<'_> {
                     let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
                     if self.compile_options.stream_arena {
-                        // Item 10: this layer group is one contiguous pack.
-                        self.emit_ws_pack_upload(builder, param_list, &ws_range)?;
+                        if prefetch_active && ri_was_prefetched {
+                            // Item 11: weights already streaming in (prefetched
+                            // during the previous range's compute). Just wait
+                            // on the transfer event before reading them.
+                            self.emit_ws_pack_single(
+                                builder,
+                                param_list,
+                                &ws_range,
+                                "nsl_weight_stream_await_pack",
+                            )?;
+                        } else {
+                            // Item 10: this layer group is one contiguous pack.
+                            self.emit_ws_pack_upload(builder, param_list, &ws_range)?;
+                        }
                     } else {
                         for &idx in &ws_range {
                             let iv = builder.ins().iconst(cl_types::I64, idx);
@@ -9582,6 +9659,37 @@ impl Compiler<'_> {
                         }
                     }
                     self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[prev_surf])?;
+                }
+
+                // Item 11: prefetch the NEXT streamed layer group so its HtoD
+                // overlaps THIS range's compute (the b-loop below). Async on
+                // the transfer stream; the next range's head awaits its event.
+                ri_was_prefetched = false;
+                if prefetch_active && ri + 1 < ranges.len() {
+                    let ws_next: Vec<i64> = layer_group[ri + 1]
+                        .iter()
+                        .copied()
+                        .filter(|i| ws_streamed.contains(i))
+                        .collect();
+                    if !ws_next.is_empty() {
+                        let prev_surf = self
+                            .compile_call_by_name(builder, "nsl_gpu_get_alloc_surface", &[])?;
+                        let wsurf = builder.ins().iconst(cl_types::I8, 1); // SURFACE_WEIGHTS
+                        self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[wsurf])?;
+                        self.emit_ws_pack_single(
+                            builder,
+                            param_list,
+                            &ws_next,
+                            "nsl_weight_stream_prefetch_pack",
+                        )?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_gpu_set_alloc_surface",
+                            &[prev_surf],
+                        )?;
+                        transfer_cert.push((ri, ri + 1, ws_next.len()));
+                        ri_was_prefetched = true;
+                    }
                 }
 
                 let slice = crate::wengert::WengertList {
@@ -10004,6 +10112,24 @@ impl Compiler<'_> {
                         }
                     }
                 }
+            }
+
+            // Item 11: emit the discharged transfer certificate. Each prefetch
+            // issued during range Li's compute is provably awaited (a CUDA
+            // event on the compute stream) at range Li+1's head before any
+            // read — the CADENCE assume/guarantee obligation, discharged.
+            if prefetch_active {
+                let total: usize = transfer_cert.iter().map(|(_, _, n)| n).sum();
+                eprintln!(
+                    "[weight-stream] transfer certificate: {} prefetch obligations discharged \
+                     ({total} params double-buffered); chain [{}]",
+                    transfer_cert.len(),
+                    transfer_cert
+                        .iter()
+                        .map(|(i, c, n)| format!("L{i}->L{c}:{n}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
 
             // Epilogue: globals (embedding / final norm / LM head), tied and
