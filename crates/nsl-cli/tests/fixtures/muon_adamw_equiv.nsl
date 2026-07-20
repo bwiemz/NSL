@@ -1,0 +1,55 @@
+# P5 Muon: mixed-routing equivalence fixture. Every param routes to the
+# AdamW arm — `embed` (rank-2) by NAME, `norm_out` (rank-1) structurally —
+# so training with Muon(...) at AdamW hyperparameters must be BIT-IDENTICAL
+# to training with AdamW(...): loss stream and saved model bytes.
+#
+# Marker rewrites (exact string match by the harness):
+#   - "OPTIMIZER_LINE" is replaced with the optimizer under test;
+#   - "MUON_SAVE_PATH" -> the temp .nslm path.
+
+from nsl.nn.losses import cross_entropy
+
+model EmbedLM:
+    embed: Tensor = randn([32, 32]) * 0.1
+    norm_out: Tensor = ones([32])
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let h = emb.reshape([batch_size, seq_len, 32])
+        let hn = rmsnorm(h, self.norm_out, 0.00001)
+        return hn @ self.embed.transpose(0, 1)
+
+let m = EmbedLM()
+
+let u0 = tensor_cat([arange(7) + full([7], 1.0), zeros([1])], 0)
+let b0 = u0.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u1 = tensor_cat([arange(7) + full([7], 2.0), zeros([1])], 0)
+let b1 = u1.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u2 = tensor_cat([arange(7) + full([7], 3.0), zeros([1])], 0)
+let b2 = u2.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let u3 = tensor_cat([arange(7) + full([7], 4.0), zeros([1])], 0)
+let b3 = u3.reshape([1, 8]).expand([16, 8]).contiguous().reshape([1, 128])
+let tokens = tensor_cat([b0, b1, b2, b3], 0).reshape([512])
+let loader = DataLoader(tokens, batch_size=2, seq_len=64, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=2):
+    optimizer: OPTIMIZER_LINE
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+
+model_save(m, "MUON_SAVE_PATH")

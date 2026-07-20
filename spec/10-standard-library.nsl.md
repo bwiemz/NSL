@@ -106,10 +106,18 @@ fn Lion(params: ParamGroup, lr: f64 = 1e-4,
         betas: (f64, f64) = (0.9, 0.99), weight_decay: f64 = 0.0) -> LionOptimizer
     ## Evolved sign momentum optimizer (Chen et al., 2023)
 
-# 4. Muon optimizer
+# 4. Muon optimizer (mixed Muon/AdamW)
 fn Muon(params: ParamGroup, lr: f64 = 0.02, momentum: f64 = 0.95,
-        nesterov: bool = true, ns_steps: int = 5) -> MuonOptimizer
-    ## Muon optimizer with orthogonalized momentum (Jordan et al., 2024)
+        nesterov: bool = true, ns_steps: int = 5,
+        beta1: f64 = 0.9, beta2: f64 = 0.999, eps: f64 = 1e-8,
+        weight_decay: f64 = 0.0) -> MuonOptimizer
+    ## Muon optimizer with orthogonalized momentum (Jordan et al., 2024).
+    ## MIXED routing: rank-2 hidden weight matrices take the quintic
+    ## Newton-Schulz orthogonalized-momentum update scaled by
+    ## sqrt(max(1, rows/cols)); embeddings and the LM head (matched by
+    ## param path: embed/lm_head/unembed/wte/wpe/vocab) and all non-rank-2
+    ## params (biases, norms) take a standard AdamW step with beta1/beta2/
+    ## eps. The routing table prints at train start ([muon] line).
 
 # 5. Cosine annealing scheduler
 fn CosineScheduler(optimizer: Optimizer, T_max: int,

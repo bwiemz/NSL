@@ -1,0 +1,30 @@
+# P5 Muon: Newton-Schulz probe. Prints three scalar statistics of
+# muon_orthogonalize's output on a fixed, full-rank, NON-degenerate input
+# (sqrt ramp shifted to signed values — sqrt is IEEE-exact so the Rust
+# reference matches bit-for-bit; a constant/linear probe would be low-rank
+# and could pass vacuously). The gate pins the stats against an independent
+# f64 reference implementation in Rust.
+#
+# Also probes the tall case (rows > cols) through the transpose branch.
+
+from nsl.optim.muon import muon_orthogonalize
+
+# Wide: 4x6 (rows <= cols, no transpose)
+let g = (sqrt(arange(24) * 1.7 + full([24], 0.3)) - full([24], 1.5)).reshape([4, 6])
+let o = muon_orthogonalize(g, 5.0)
+print("WIDE_BEGIN")
+print(sum(o).item())
+print(sum(o * o).item())
+let r = o @ o.transpose(0, 1)
+print(sum(r * r).item())
+print("WIDE_END")
+
+# Tall: 6x4 (transpose branch)
+let gt = (sqrt(arange(24) * 2.3 + full([24], 0.7)) - full([24], 2.0)).reshape([6, 4])
+let ot = muon_orthogonalize(gt, 5.0)
+print("TALL_BEGIN")
+print(sum(ot).item())
+print(sum(ot * ot).item())
+let rt = ot.transpose(0, 1) @ ot
+print(sum(rt * rt).item())
+print("TALL_END")
