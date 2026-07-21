@@ -32,6 +32,12 @@ fn repo_root() -> PathBuf {
 }
 
 fn run_nsl(source: &str, tag: &str, wggo: Option<&str>) -> String {
+    run_nsl_env(source, tag, wggo, &[])
+}
+
+/// `run_nsl` + extra child env (per-process — tests run on parallel
+/// threads, so no `std::env::set_var`).
+fn run_nsl_env(source: &str, tag: &str, wggo: Option<&str>, envs: &[(&str, &str)]) -> String {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_wggo_prepass_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -48,6 +54,9 @@ fn run_nsl(source: &str, tag: &str, wggo: Option<&str>) -> String {
     cmd.arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let output = cmd.output().expect("spawn nsl run");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     std::fs::remove_dir_all(&tmp).ok();
@@ -265,4 +274,67 @@ fn no_wggo_no_prepass() {
             "`{needle}` appeared without --wggo:\n{stderr}"
         );
     }
+}
+
+/// AdamW + grad_accumulation >= 2: a per-param FASE mode table IS emitted
+/// from the pre-plan's overrides. When the in-place replan diverges on
+/// fase_fused (forced via the test knob), the compile must HARD-REFUSE —
+/// P0 item 1: never execute a mode table that encodes a stale plan.
+const ADAMW_ACCUM_BLOCK: &str = r#"from nsl.nn.losses import mse_loss
+
+model TinyMlp:
+    w: Tensor = ones([16, 16])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = TinyMlp()
+let x = ones([4, 16])
+let y = zeros([4, 16])
+
+train(model = m, epochs = 1, grad_accumulation = 2):
+    optimizer: AdamW(lr = 0.001)
+    step(batch):
+        let out = m.forward(x)
+        let loss = mse_loss(out, y)
+"#;
+
+#[test]
+fn stale_mode_table_hard_refuses() {
+    let stderr = run_nsl_env(
+        ADAMW_ACCUM_BLOCK,
+        "stale_refuse",
+        Some("greedy"),
+        &[("NSL_WGGO_FORCE_STALE_TABLE", "1")],
+    );
+    assert!(
+        stderr.contains("refusing to execute a stale mode table"),
+        "expected the stale-mode-table hard refusal:\n{stderr}"
+    );
+}
+
+/// Same forced divergence but NO mode table (SGD → no per-param FASE
+/// table): nothing stale can execute, so the compile proceeds with the
+/// loud note instead of refusing.
+#[test]
+fn stale_divergence_without_table_notes_and_proceeds() {
+    let stderr = run_nsl_env(
+        ONE_BLOCK,
+        "stale_note",
+        Some("greedy"),
+        &[("NSL_WGGO_FORCE_STALE_TABLE", "1")],
+    );
+    assert!(
+        !stderr.contains("refusing to execute a stale mode table"),
+        "SGD (no mode table) must not hard-refuse:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("no per-param FASE mode table was emitted"),
+        "expected the no-table divergence note:\n{stderr}"
+    );
+    // The run itself proceeds: the WGGO summary still prints.
+    assert!(
+        stderr.contains("[wggo] wggo[greedy]"),
+        "compile did not proceed to the WGGO summary:\n{stderr}"
+    );
 }

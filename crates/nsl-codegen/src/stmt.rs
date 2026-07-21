@@ -6005,9 +6005,12 @@ impl Compiler<'_> {
                         // that wggo_prune may rewrite — indices must refer to
                         // THIS graph). On mismatch, reject loudly and solve
                         // in place; if the fresh plan then disagrees with the
-                        // pre-plan on any FASE-relevant decision, warn — the
+                        // pre-plan on any FASE-relevant decision AND a
                         // per-param mode table was already emitted from the
-                        // pre-plan's overrides earlier in this function.
+                        // pre-plan's overrides earlier in this function,
+                        // HARD-REFUSE (P0 item 1): executing the stale table
+                        // would train with FASE modes that do not match the
+                        // final plan every downstream consumer sees.
                         let preplan = self
                             .wggo_preplans
                             .iter()
@@ -6053,33 +6056,52 @@ impl Compiler<'_> {
                                 self.features.dataset_packing_stats.clone(),
                             ),
                         };
-                        if preplan_was_rejected {
-                            if let (Some(pre), Some(fresh)) = (preplan, plan.as_ref()) {
-                                let fresh_overrides =
-                                    crate::wggo_overrides::WggoOverrides::from_applied(
-                                        &fresh.applied,
-                                    );
-                                let fase_diverged = pre.overrides.per_layer.len()
-                                    != fresh_overrides.per_layer.len()
-                                    || pre
-                                        .overrides
-                                        .per_layer
-                                        .iter()
-                                        .zip(fresh_overrides.per_layer.iter())
-                                        .any(|(a, b)| {
-                                            a.layer_name != b.layer_name
-                                                || a.fase_fused != b.fase_fused
-                                        });
-                                if fase_diverged {
-                                    eprintln!(
-                                        "[wggo] WARNING: the FASE per-param mode table was \
-                                         built from the rejected pre-plan and the in-place \
-                                         plan disagrees on fase_fused — per-param FASE \
-                                         modes for this train block may not match the \
-                                         final plan (rerun with --wggo off to rule the \
-                                         table out when debugging)"
-                                    );
+                        // Test-only knob: simulate a rejected pre-plan whose
+                        // in-place replan diverges on FASE decisions, so the
+                        // refusal wiring is gate-testable without engineering
+                        // a real graph-fingerprint drift. Strict value match
+                        // ("1"), same convention as NSL_FASE_FUSED_OVERRIDE.
+                        let forced_stale = std::env::var("NSL_WGGO_FORCE_STALE_TABLE")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        if preplan_was_rejected || forced_stale {
+                            let fase_diverged = match (preplan, plan.as_ref()) {
+                                (Some(pre), Some(fresh)) => {
+                                    crate::wggo_overrides::fase_overrides_diverge(
+                                        &pre.overrides,
+                                        &crate::wggo_overrides::WggoOverrides::from_applied(
+                                            &fresh.applied,
+                                        ),
+                                    )
                                 }
+                                _ => false,
+                            } || forced_stale;
+                            if fase_diverged {
+                                if mode_table_base.is_some() {
+                                    return Err(CodegenError::new(
+                                        "the FASE per-param mode table for this train \
+                                         block was emitted from a WGGO pre-plan whose \
+                                         graph fingerprint no longer matches, and the \
+                                         in-place replan DISAGREES on per-layer \
+                                         fase_fused — refusing to execute a stale mode \
+                                         table (the accumulation/optimizer dispatch \
+                                         would not match the final WGGO plan). \
+                                         Recompile so the pre-plan regenerates against \
+                                         the current graph, or drop --wggo for this \
+                                         block.",
+                                    ));
+                                }
+                                // No mode table was emitted (Passthrough /
+                                // FullBuffer-global / muon): nothing stale
+                                // executes — downstream consumers get the
+                                // fresh plan. Note it loudly anyway.
+                                eprintln!(
+                                    "[wggo] note: the rejected pre-plan and the \
+                                     in-place replan disagree on fase_fused, but no \
+                                     per-param FASE mode table was emitted for this \
+                                     train block — the fresh plan governs all \
+                                     downstream consumers"
+                                );
                             }
                         }
                         if let Some(plan) = plan {

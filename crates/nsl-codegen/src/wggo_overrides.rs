@@ -105,6 +105,20 @@ pub struct WggoOverrides {
     pub per_layer: Vec<PerLayerOverride>,
 }
 
+/// P0 stale-mode-table guard: do two override sets disagree on any
+/// FASE-RELEVANT decision — layer count, layer identity, or the per-layer
+/// `fase_fused` pattern? The per-param FASE mode table is emitted from the
+/// pre-plan's overrides BEFORE the in-place replanning site; when a
+/// rejected pre-plan's replacement diverges here, the already-emitted
+/// table would execute modes that do not match the final plan.
+pub fn fase_overrides_diverge(a: &WggoOverrides, b: &WggoOverrides) -> bool {
+    a.per_layer.len() != b.per_layer.len()
+        || a.per_layer
+            .iter()
+            .zip(b.per_layer.iter())
+            .any(|(x, y)| x.layer_name != y.layer_name || x.fase_fused != y.fase_fused)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PerLayerOverride {
     pub layer_index: u32,
@@ -802,5 +816,34 @@ mod tests {
         let _mem = OverrideRejectReason::ShardFactorOverriddenByMemory {
             recommended: 2, applied: 8,
         };
+    }
+
+    #[test]
+    fn fase_divergence_detects_only_fase_relevant_changes() {
+        let base = WggoOverrides::from_applied(&sample_applied());
+        // Identical → no divergence.
+        assert!(!fase_overrides_diverge(&base, &base.clone()));
+
+        // fase_fused flip → diverges.
+        let mut flipped = base.clone();
+        flipped.per_layer[0].fase_fused = !flipped.per_layer[0].fase_fused;
+        assert!(fase_overrides_diverge(&base, &flipped));
+
+        // Layer identity change → diverges (indices would map to the
+        // wrong params).
+        let mut renamed = base.clone();
+        renamed.per_layer[0].layer_name = "blocks.8".to_string();
+        assert!(fase_overrides_diverge(&base, &renamed));
+
+        // Layer count change → diverges.
+        let mut extra = base.clone();
+        extra.per_layer.push(base.per_layer[0].clone());
+        assert!(fase_overrides_diverge(&base, &extra));
+
+        // NON-FASE field change (CSHA heads) → NOT a divergence: the mode
+        // table never encodes it, so refusing would be overly strict.
+        let mut heads = base.clone();
+        heads.per_layer[0].active_heads += 1;
+        assert!(!fase_overrides_diverge(&base, &heads));
     }
 }
