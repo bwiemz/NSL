@@ -8961,34 +8961,53 @@ impl Compiler<'_> {
 
             // (b) Per-parameter gradient norms (unrolled over compile-time
             //     param_paths; grads_list / param_list are indexed by idx).
-            for (i, path) in param_paths.iter().enumerate() {
-                let path_data_id = self.intern_string(path)?;
-                let gv = self.module.declare_data_in_func(path_data_id, builder.func);
-                let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
-                let path_len = builder
-                    .ins()
-                    .iconst(cl_types::I64, path.len() as i64);
-                let layer_idx = parse_layer_idx_for_health(path);
-                let layer_idx_val = builder
-                    .ins()
-                    .iconst(cl_types::I32, layer_idx as i64);
+            //
+            // P0 cert campaign FIX: under the FASE-Deferred source-AD hook
+            // (AdamW/Adam + grad_accumulation >= 2) the hook accumulates
+            // each gradient into m_partial and FREES it during the
+            // backward — grads_list entries DANGLE here, and the l2_norm
+            // read segfaulted every `--monitor` run at 500M/1B scale
+            // (SIGSEGV in emitted code, silently reported as exit 1). Skip
+            // per-micro-batch grad norms on that path and say so loudly;
+            // loss, weight-norm and flush recording still run.
+            if !fase_hook_active {
+                for (i, path) in param_paths.iter().enumerate() {
+                    let path_data_id = self.intern_string(path)?;
+                    let gv = self.module.declare_data_in_func(path_data_id, builder.func);
+                    let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+                    let path_len = builder
+                        .ins()
+                        .iconst(cl_types::I64, path.len() as i64);
+                    let layer_idx = parse_layer_idx_for_health(path);
+                    let layer_idx_val = builder
+                        .ins()
+                        .iconst(cl_types::I32, layer_idx as i64);
 
-                let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
-                let grad = self.compile_call_by_name(
-                    builder,
-                    "nsl_list_get",
-                    &[grads_list, idx_val],
-                )?;
-                let gnorm = self.compile_call_by_name(
-                    builder,
-                    "nsl_tensor_l2_norm",
-                    &[grad],
-                )?;
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_health_record_grad_norm",
-                    &[path_ptr, path_len, layer_idx_val, gnorm],
-                )?;
+                    let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
+                    let grad = self.compile_call_by_name(
+                        builder,
+                        "nsl_list_get",
+                        &[grads_list, idx_val],
+                    )?;
+                    let gnorm = self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_l2_norm",
+                        &[grad],
+                    )?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_health_record_grad_norm",
+                        &[path_ptr, path_len, layer_idx_val, gnorm],
+                    )?;
+                }
+            } else {
+                eprintln!(
+                    "[health] note: per-parameter gradient norms are not \
+                     recorded under the FASE-Deferred hook (per-batch grads \
+                     are consumed into m_partial during the backward) — the \
+                     health snapshot's grad_norm fields will be absent. \
+                     Loss and weight-norm recording are unaffected."
+                );
             }
 
             // (c) Per-parameter weight norms — gated by step % 100 == 0

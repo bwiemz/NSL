@@ -122,6 +122,8 @@ class RunResult:
     ok: bool
     wall_s: float
     compile_s: float | None
+    init_s: float | None = None
+    stream_wall_s: float | None = None
     losses: list[tuple[int, float]] = field(default_factory=list)
     step_walls: list[float] = field(default_factory=list)
     fwd_s: float = 0.0
@@ -243,7 +245,9 @@ def run_arm(
 
     res = RunResult(name=name, ok=ok, wall_s=wall, compile_s=None, vm_hwm_kb=vm_hwm)
 
-    # Compile time: first runtime stderr banner or first stdout line.
+    # Compile time: the deterministic banner fires at compiled-program
+    # start, so banner-t0 = compile+link. CERT_MODEL_READY - banner = model
+    # init (randn on CPU + HtoD + streaming registration).
     prog_start: float | None = None
     for t, s in err_lines:
         if "[nsl] deterministic" in s or "deterministic RNG seed" in s:
@@ -253,6 +257,20 @@ def run_arm(
         prog_start = out_lines[0][0]
     if prog_start is not None:
         res.compile_s = prog_start - t0
+    for t, s in out_lines:
+        if s.strip() == "CERT_MODEL_READY" and prog_start is not None:
+            res.init_s = t - prog_start
+            break
+    # Loss-stream wall (steady training window, excludes compile/init/
+    # teardown) for the throughput headline.
+    t_begin = t_end = None
+    for t, s in out_lines:
+        if s.strip() == "LOSS_STREAM_BEGIN":
+            t_begin = t
+        elif s.strip() == "LOSS_STREAM_END":
+            t_end = t
+    if t_begin is not None and t_end is not None:
+        res.stream_wall_s = t_end - t_begin
 
     # Losses + step walls: on_step prints step then loss on separate lines.
     in_stream = False
@@ -362,32 +380,42 @@ def tokens_per_step_for(batch: int, seq: int, accum: int) -> int:
     return batch * seq * accum
 
 
-def summarize(res: RunResult, tokens_per_step: int) -> str:
-    steady = res.step_walls[1:] if len(res.step_walls) > 1 else res.step_walls
-    mean_step = sum(steady) / len(steady) if steady else float("nan")
-    tps = tokens_per_step / mean_step if steady and mean_step > 0 else float("nan")
+def summarize(res: RunResult, tokens_per_loss_line: int) -> str:
+    """One markdown row. `tokens_per_loss_line` = batch*seq (on_step fires
+    per MICRO-batch; under CSLA the window backward lands on accumulation-
+    boundary micro-batches, so per-line walls are bimodal). The tok/s
+    headline is trained-tokens / loss-stream wall — cadence-independent.
+    """
     first = res.losses[0][1] if res.losses else float("nan")
     last = res.losses[-1][1] if res.losses else float("nan")
+    total_tokens = len(res.losses) * tokens_per_loss_line
+    tps = (
+        total_tokens / res.stream_wall_s
+        if res.stream_wall_s and res.stream_wall_s > 0
+        else float("nan")
+    )
     ws = res.ws_counters
     return (
         f"| {res.name} | {'ok' if res.ok else 'FAIL'} | {len(res.losses)} "
-        f"| {first:.4f} | {last:.4f} | {mean_step:.2f} | {tps:.0f} "
+        f"| {first:.4f} | {last:.4f} | {res.stream_wall_s or 0:.0f} | {tps:.0f} "
         f"| {res.fwd_s:.1f}/{res.bwd_s:.1f}/{res.opt_s:.1f} "
         f"| {(res.peak_alloc_bytes or 0) / 1e9:.2f} "
         f"| {(res.smi_peak_mib or 0) / 1024:.2f} "
         f"| {res.util_mean_pct or 0:.0f} "
         f"| {res.pcie_rx_peak or 0:.0f}/{res.pcie_tx_peak or 0:.0f} "
         f"| {(res.vm_hwm_kb or 0) / 1e6:.1f} "
-        f"| {res.compile_s or 0:.0f} "
+        f"| {res.compile_s or 0:.1f}+{res.init_s or 0:.0f} "
         f"| {ws.get('uploads', 0)}/{ws.get('evicts', 0)}"
+        f"/{ws.get('pack_uploads', 0)}/{ws.get('pack_evicts', 0)}"
         f"/{ws.get('prefetches', 0)}/{ws.get('async_wb', 0)} |"
     )
 
 
 HEADER = (
-    "| arm | status | steps | first loss | last loss | s/step | tok/s "
-    "| fwd/bwd/opt s | alloc peak GB | smi peak GB | util % | PCIe rx/tx MB/s "
-    "| host HWM GB | compile s | up/ev/pf/awb |\n"
+    "| arm | status | micro-batches | first loss | last loss | train wall s "
+    "| tok/s | fwd/bwd/opt s | alloc peak GB | smi peak GB | util % "
+    "| PCIe rx/tx MB/s | host HWM GB | compile+init s "
+    "| up/ev/pup/pev/pf/awb |\n"
     "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
 )
 
@@ -409,18 +437,22 @@ def cmd_bench(steps: int) -> None:
             [*base, "--stream-arena", "--stream-prefetch", "--stream-async-writeback"],
         ),
         (
-            "E_ckpt_stride",
+            "E_ckpt_stride_auto",
             [
                 *base, "--stream-arena", "--stream-prefetch",
                 "--stream-async-writeback", "--checkpoint-stride", "auto",
             ],
         ),
         (
-            "F_fused_rmsnorm",
+            # NOTE: `auto` falls back to stride 1 at 1B (symbolic shapes —
+            # nothing to price), and explicit stride >= 2 REFUSES under
+            # --layerwise-accum (SDPA side-bands cannot cross replay
+            # ranges), so the stride lever is measured as documented-inert
+            # on this stack; E == D functionally.
+            "F_fused_rmsnorm_all",
             [
                 *base, "--stream-arena", "--stream-prefetch",
-                "--stream-async-writeback", "--checkpoint-stride", "auto",
-                "--fuse-rmsnorm-backward",
+                "--stream-async-writeback", "--fuse-rmsnorm-backward",
             ],
         ),
     ]
@@ -435,7 +467,7 @@ def cmd_bench(steps: int) -> None:
             flags,
             env,
         )
-        row = summarize(res, tokens_per_step_for(2, 512, 8))
+        row = summarize(res, 2 * 512)
         print(row)
         rows.append(row)
     print("\n## Pipeline bench (1B, demo config, RTX 5070 Ti)\n")
@@ -486,7 +518,12 @@ def cmd_certify(scale: str, steps: int, seeds: list[int]) -> None:
     gen_tokens(tok, steps * tokens_per_step_for(batch, seq, accum))
 
     env = {"NSL_WS_COUNTER": "1"}
+    # 500M/1B run FASE-Deferred (accum=8): per-param grad norms are skipped
+    # by design there (see monitor_fase_gate.rs) — add --grad-integrity so
+    # gradient coverage is still certified at those scales.
     monitor = ["--monitor", "--health-interval", "25"]
+    if scale in ("500m", "1b"):
+        monitor = [*monitor, "--grad-integrity"]
     rows = []
     for seed in seeds:
         name = f"cert_{scale}_s{seed}"
@@ -494,7 +531,7 @@ def cmd_certify(scale: str, steps: int, seeds: list[int]) -> None:
         res = run_arm(
             name, program, tok, [*flags, "--seed", str(seed), *monitor], env
         )
-        rows.append(summarize(res, tokens_per_step_for(batch, seq, accum)))
+        rows.append(summarize(res, batch * seq))
         print(rows[-1])
     if scale == "50m":
         # wd=0 integrity arm: full gradient coverage under --grad-integrity.
@@ -508,7 +545,7 @@ def cmd_certify(scale: str, steps: int, seeds: list[int]) -> None:
             env,
             rewrites=[("weight_decay=0.1", "weight_decay=0.0")],
         )
-        rows.append(summarize(res, tokens_per_step_for(batch, seq, accum)))
+        rows.append(summarize(res, batch * seq))
         print(rows[-1])
         if res.grad_integrity:
             print(f"grad-integrity: {res.grad_integrity}")
@@ -523,7 +560,7 @@ def cmd_certify(scale: str, steps: int, seeds: list[int]) -> None:
             [*flags, "--seed", "1", "--training-reference"],
             env,
         )
-        rows.append(summarize(res, tokens_per_step_for(batch, seq, accum)))
+        rows.append(summarize(res, batch * seq))
         print(rows[-1])
     print(f"\n## Certification {scale}\n")
     print(HEADER)
