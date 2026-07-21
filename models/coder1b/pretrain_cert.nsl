@@ -1,0 +1,51 @@
+# models/coder1b/pretrain_cert.nsl
+#
+# P0 certification + pipeline-benchmark program — 1B on the post-#405
+# streaming stack, demo config (batch=2, seq=512, grad_accum=8). Step
+# count = tokens / 8192. NO grad_clip (two-phase clip is refused under
+# --layerwise-accum).
+#
+# Arms are selected by CLI flags (see models/benchmarks/run_pipeline_bench.py):
+#   A  --source-ad --checkpoint-blocks --layerwise-accum --optim-state-offload --weight-stream
+#   B  A + --stream-arena
+#   C  B + --stream-prefetch
+#   D  C + --stream-async-writeback
+#   E  D + --checkpoint-stride auto
+#   F  E + --fuse-rmsnorm-backward
+#   G  all (== F)
+#
+# Harness markers: CERT_TOKENS_PATH.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+print("CERT_MODEL_READY")
+
+let tokens = load_mmap("CERT_TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=8):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("PEAK_TOTAL_BYTES")
+print(gpu_peak_bytes())
+print("PEAK_ACTIVATIONS_BYTES")
+print(gpu_surface_peak_bytes(6))
+print("PEAK_MPARTIAL_BYTES")
+print(gpu_surface_peak_bytes(4))
+print("CERT_COMPLETE")

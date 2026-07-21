@@ -38,6 +38,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             distribute: _distribute,
             zero_stage,
             deterministic: _deterministic,
+            seed,
             dead_weight_threshold,
             sparse_threshold,
             no_constant_fold,
@@ -373,6 +374,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 trace_ops: false,
                 nan_analysis,
                 deterministic: _deterministic,
+                rng_seed: seed,
                 // M52: When --standalone, weights are handled by standalone pipeline;
                 // otherwise pass through the four-case-resolved weight file from
                 // above (AST auto-detect + --weights flag decision table).

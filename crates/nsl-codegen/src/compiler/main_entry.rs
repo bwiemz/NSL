@@ -94,11 +94,19 @@ impl Compiler<'_> {
             // runtime registry so `NSL_WRGA_FUSED_CUDA=1` can launch them.
             self.emit_fused_ptx_registration(&mut builder)?;
 
-            // M46: Set global deterministic mode flag + seed RNG at program start
+            // M46: Set global deterministic mode flag + seed RNG at program
+            // start. P0 certification: --seed overrides the historical 42
+            // and also seeds NON-deterministic runs (distinct reproducible
+            // inits for multi-seed campaigns; device bit-reproducibility
+            // still requires --deterministic).
             if self.compile_options.deterministic {
                 let one = builder.ins().iconst(cl_types::I64, 1);
                 self.compile_call_by_name(&mut builder, "nsl_set_deterministic", &[one])?;
-                let seed = builder.ins().iconst(cl_types::I64, 42);
+                let seed_val = self.compile_options.rng_seed.unwrap_or(42);
+                let seed = builder.ins().iconst(cl_types::I64, seed_val as i64);
+                self.compile_call_by_name(&mut builder, "nsl_rng_seed", &[seed])?;
+            } else if let Some(seed_val) = self.compile_options.rng_seed {
+                let seed = builder.ins().iconst(cl_types::I64, seed_val as i64);
                 self.compile_call_by_name(&mut builder, "nsl_rng_seed", &[seed])?;
             }
 
