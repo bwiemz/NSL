@@ -1968,10 +1968,8 @@ pub enum ParameterResidency {
 }
 
 struct Zero3Entry {
-    /// param_list index — recorded for diagnostics; the owner (derived
-    /// from it at note time) is what the hot paths read. Only referenced
-    /// on cuda builds today, hence the allow.
-    #[allow(dead_code)]
+    /// param_list index — the cross-rank collective ordering key for
+    /// gather_all/release_all (heap pointers are per-process).
     idx: usize,
     owner: i32,
     state: ParameterResidency,
@@ -2090,6 +2088,9 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
         std::process::abort();
     }
     if e.owner as usize == rank {
+        // Window-start reset (mirrors the non-owner re-evict below): a
+        // stale GatheredTemporary from the previous window drops back to
+        // ShardedResident so this window's first gather broadcasts.
         e.state = ParameterResidency::ShardedResident;
         return;
     }
@@ -2112,8 +2113,12 @@ pub(crate) fn zero3_register(tensor_ptr: i64) {
 
 /// JIT gather (weight-stream `upload` redirect): symmetric on every rank —
 /// the owner contributes its live data as the broadcast source; non-owners
-/// allocate a fresh device buffer and receive into it
-/// (GatheredTemporary). Idempotent when already materialized.
+/// allocate a fresh device buffer and receive into it. BOTH sides then
+/// mark GatheredTemporary (for the owner it means "this window's gather
+/// happened", data unchanged) so the idempotent early-return fires on the
+/// SAME calls on every rank — an owner-only repeat broadcast would pair
+/// with the other ranks' NEXT collective in the positional spin-barrier
+/// (silent corruption / barrier timeout; review finding 1).
 pub(crate) fn zero3_gather(tensor_ptr: i64) {
     let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
     let (owner, is_owner) = {
@@ -2144,9 +2149,17 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
             t.data = crate::cuda::inner::alloc_managed(bytes);
         }
     }
+    #[cfg(not(feature = "cuda"))]
+    let _ = is_owner;
     let rc = {
         let guard = ZERO_CTX.lock().unwrap();
-        let Some(ctx) = guard.as_ref() else { return };
+        let Some(ctx) = guard.as_ref() else {
+            // A gather after ZeRO teardown would hand back UNINITIALIZED
+            // device bytes on non-owners with no error — refuse loudly
+            // (deferral-must-refuse; review finding 5).
+            eprintln!("[zero3] FATAL: gather with no ZeRO context (post-destroy?)");
+            std::process::abort();
+        };
         if ctx.world_size <= 1 {
             0
         } else {
@@ -2187,9 +2200,7 @@ pub(crate) fn zero3_gather(tensor_ptr: i64) {
     }
     let mut tbl = ZERO3_TABLE.lock().unwrap();
     if let Some(e) = tbl.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) {
-        if !is_owner {
-            e.state = ParameterResidency::GatheredTemporary;
-        }
+        e.state = ParameterResidency::GatheredTemporary;
     }
     ZERO3_GATHERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2214,6 +2225,15 @@ pub(crate) fn zero3_release(tensor_ptr: i64) {
         e.owner as usize == rank
     };
     if is_owner {
+        // Data stays (authoritative replica); the state transition mirrors
+        // the non-owner's so the NEXT gather broadcasts symmetrically.
+        let mut tbl = ZERO3_TABLE.lock().unwrap();
+        if let Some(e) = tbl.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) {
+            if e.state == ParameterResidency::GatheredTemporary {
+                e.state = ParameterResidency::ShardedResident;
+            }
+        }
+        ZERO3_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     if !t.data.is_null() {
@@ -2297,20 +2317,24 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
 /// callbacks / model_save / teardown. Symmetric across ranks (identical
 /// table iteration order via sorted keys).
 pub(crate) fn zero3_gather_all() {
-    let mut keys: Vec<i64> = {
+    // Order by PARAM INDEX, not tensor pointer: the iteration order is the
+    // cross-rank collective schedule, and heap addresses are per-process
+    // (review finding 2 — pointer order only matched by allocation-
+    // determinism accident).
+    let mut keys: Vec<(usize, i64)> = {
         let guard = ZERO3_TABLE.lock().unwrap();
         guard
             .as_ref()
             .map(|t| {
                 t.iter()
                     .filter(|(_, e)| e.state != ParameterResidency::Replicated)
-                    .map(|(k, _)| *k)
+                    .map(|(k, e)| (e.idx, *k))
                     .collect()
             })
             .unwrap_or_default()
     };
     keys.sort_unstable();
-    for k in keys {
+    for (_, k) in keys {
         zero3_gather(k);
     }
 }
@@ -2318,20 +2342,20 @@ pub(crate) fn zero3_gather_all() {
 /// Release every gathered temporary — the close bracket (Replicated and
 /// owner replicas are untouched by construction).
 pub(crate) fn zero3_release_all() {
-    let mut keys: Vec<i64> = {
+    let mut keys: Vec<(usize, i64)> = {
         let guard = ZERO3_TABLE.lock().unwrap();
         guard
             .as_ref()
             .map(|t| {
                 t.iter()
                     .filter(|(_, e)| e.state == ParameterResidency::GatheredTemporary)
-                    .map(|(k, _)| *k)
+                    .map(|(k, e)| (e.idx, *k))
                     .collect()
             })
             .unwrap_or_default()
     };
     keys.sort_unstable();
-    for k in keys {
+    for (_, k) in keys {
         zero3_release(k);
     }
 }

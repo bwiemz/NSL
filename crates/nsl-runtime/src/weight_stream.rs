@@ -212,6 +212,9 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
 /// codegen must only stream registered params.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
+    if tensor_ptr == 0 {
+        return;
+    }
     if crate::zero::zero3_active() {
         crate::zero::zero3_gather(tensor_ptr);
         return;
@@ -266,6 +269,9 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
 /// Idempotent when already evicted.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
+    if tensor_ptr == 0 {
+        return;
+    }
     if crate::zero::zero3_active() {
         // ZeRO-3 has no mirror: writeback is meaningless (the owner's
         // replica IS the source of truth); non-owners just free.
@@ -549,8 +555,10 @@ pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
 pub extern "C" fn nsl_weight_stream_prefetch_pack(pw_list_ptr: i64) {
     // ZeRO-3: the "prefetch" IS the gather, issued at the overlap point the
     // schedule chose (item 14's ordering); the later upload_pack for the
-    // same pack is an idempotent no-op. Synchronous under the sim backends;
-    // NCCL-stream async is the documented follow-up.
+    // same pack early-returns SYMMETRICALLY on every rank (both owner and
+    // non-owners are GatheredTemporary after this — see zero3_gather).
+    // Synchronous under the sim backends; NCCL-stream async is the
+    // documented follow-up.
     if crate::zero::zero3_active() {
         zero3_pack_each(pw_list_ptr, true);
         return;

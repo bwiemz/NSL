@@ -116,6 +116,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   fails Cranelift verification: "declared type of variable varN doesn't
   match type of value vM". Both worked around by inlining + avoiding
   scalar locals in `models/benchmarks/muon50m/shape_probe.nsl`.
+- Subscripting a model fixed-array field from a CALLBACK body
+  (`m.blocks[0].w_up` in `on_step`) compiles but SIGSEGVs the emitted
+  program; the `for pb in m.blocks:` iteration form works (used by the
+  zero3 callback gate).
 
 ### Added — P5: full-precision mixed Muon/AdamW optimizer
 

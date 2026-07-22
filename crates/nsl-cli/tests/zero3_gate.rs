@@ -284,11 +284,17 @@ fn zero3_muon_overlap_and_callback_touch_gpu() {
             "Muon(lr=0.002, momentum=0.95, nesterov=true, ns_steps=5, \
              weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)",
         );
-        // Mid-training model-θ read from the callback: sums a sharded param
-        // — evicted on non-owners unless the residency bracket gathers.
+        // Mid-training model-θ read from the callback: sums GENUINELY
+        // SHARDED params (review finding 3: `embed` is tied/view-rooted and
+        // stays Replicated — probing it never exercises the crash guard).
+        // The blocks' w_up are layer-grouped and streamed: evicted on
+        // non-owners (and, mid-window, on every rank) unless the residency
+        // bracket gathers. Iteration form — `m.blocks[0]` subscripting
+        // miscompiles in callbacks (pre-existing, crashes the emitted
+        // program).
         s.replace(
             "on_step(step, loss):",
-            "on_step(step, loss):\n            print(sum(m.embed).item())",
+            "on_step(step, loss):\n            for pb in m.blocks:\n                print(sum(pb.w_up).item())",
         )
     };
 
