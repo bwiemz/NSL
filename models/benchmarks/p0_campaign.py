@@ -517,6 +517,10 @@ def cmd_certify(scale: str, steps: int, seeds: list[int]) -> None:
         raise SystemExit(f"unknown scale {scale}")
     gen_tokens(tok, steps * tokens_per_step_for(batch, seq, accum))
 
+    # Timeout sized to measured per-micro-batch walls (50M ~1.2s at accum=1,
+    # 500M ~6.2s, 1B ~10.4s at accum=8) with headroom.
+    per_micro_s = {"50m": 1.2, "500m": 6.2, "1b": 10.4}[scale]
+    timeout_s = int(steps * accum * per_micro_s * 1.6) + 900
     env = {"NSL_WS_COUNTER": "1"}
     # 500M/1B run FASE-Deferred (accum=8): per-param grad norms are skipped
     # by design there (see monitor_fase_gate.rs) — add --grad-integrity so
@@ -529,7 +533,8 @@ def cmd_certify(scale: str, steps: int, seeds: list[int]) -> None:
         name = f"cert_{scale}_s{seed}"
         print(f"=== {name}")
         res = run_arm(
-            name, program, tok, [*flags, "--seed", str(seed), *monitor], env
+            name, program, tok, [*flags, "--seed", str(seed), *monitor], env,
+            timeout_s=timeout_s,
         )
         rows.append(summarize(res, batch * seq))
         print(rows[-1])
