@@ -3964,6 +3964,17 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
 
     inner::set_oom_context("muon_frobenius_scale_f32");
     let a = unsafe { &*(a_ptr as *const NslTensor) };
+    // Review finding: the kernels index the buffer as f32 — a quantized /
+    // custom-dtype tensor (1 byte/elem) reached via the direct builtin
+    // would be read len*4 bytes OOB. Refuse anything but f32 loudly (the
+    // CPU arm has the equivalent dtype match).
+    if a.dtype != 1 {
+        eprintln!(
+            "nsl: muon_orthogonalize GPU path requires an f32 tensor (got dtype {})",
+            a.dtype
+        );
+        std::process::abort();
+    }
     // Flat row-major kernels — materialize strided views first (same
     // stride-blindness class as the tied-embedding matmul bug).
     if !a.is_contiguous() {

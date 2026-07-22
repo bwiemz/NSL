@@ -4334,10 +4334,38 @@ impl Compiler<'_> {
                                         }
                                     }
                                     "adamw_lr" => {
-                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            adamw_lr_value = Some(*f);
-                                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                                            adamw_lr_value = Some(*n as f64);
+                                        // Review finding: a non-literal or
+                                        // non-positive adamw_lr silently
+                                        // falling back to `lr` would train
+                                        // the embedding/head at Muon's
+                                        // ~2e-2 — the exact divergence
+                                        // class the knob exists to prevent.
+                                        // Same strictness as ns_steps.
+                                        match &arg.value.kind {
+                                            ExprKind::FloatLiteral(f) if *f > 0.0 => {
+                                                adamw_lr_value = Some(*f);
+                                            }
+                                            ExprKind::IntLiteral(n) if *n > 0 => {
+                                                adamw_lr_value = Some(*n as f64);
+                                            }
+                                            ExprKind::FloatLiteral(f) => {
+                                                return Err(CodegenError::new(format!(
+                                                    "adamw_lr must be positive (got {f})"
+                                                )));
+                                            }
+                                            ExprKind::IntLiteral(n) => {
+                                                return Err(CodegenError::new(format!(
+                                                    "adamw_lr must be positive (got {n})"
+                                                )));
+                                            }
+                                            _ => {
+                                                return Err(CodegenError::new(
+                                                    "adamw_lr must be a positive numeric \
+                                                     literal (e.g. adamw_lr = 3e-4); \
+                                                     computed expressions are not \
+                                                     supported here",
+                                                ));
+                                            }
                                         }
                                     }
                                     "momentum" => {
@@ -4507,6 +4535,16 @@ impl Compiler<'_> {
             }
             if !nesterov_set {
                 nesterov_value = true;
+            }
+            // adamw_lr is threaded as the ratio adamw_lr/lr of the scheduled
+            // lr — lr <= 0 would make that inf/NaN at every AdamW-routed
+            // update (review finding).
+            if adamw_lr_value.is_some() && lr_value <= 0.0 {
+                return Err(CodegenError::new(format!(
+                    "Muon adamw_lr requires a positive lr (got lr={lr_value}): \
+                     the AdamW arm's rate is applied as the fixed ratio \
+                     adamw_lr/lr of the scheduled lr"
+                )));
             }
         }
 

@@ -87,6 +87,13 @@ pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i6
         eprintln!("nsl: muon_orthogonalize ns_steps must be a positive integer (got {ns_steps})");
         std::process::abort();
     }
+    if g.len == 0 {
+        // Review finding: a [N, 0] tensor would reach the GPU launch with
+        // grid=0 (CUDA_ERROR_INVALID_VALUE abort) and has no orthogonal
+        // factor anyway — refuse coherently on both devices.
+        eprintln!("nsl: muon_orthogonalize requires a non-empty rank-2 tensor");
+        std::process::abort();
+    }
     let steps = ns_steps as i64;
     let (rows, cols) = unsafe { (*g.shape, *g.shape.add(1)) };
     let tall = rows > cols;
