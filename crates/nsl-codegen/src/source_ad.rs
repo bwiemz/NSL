@@ -1525,6 +1525,79 @@ impl AdjointGenerator {
 // ---------------------------------------------------------------------------
 
 /// Prune backward ops whose results are never needed by any parameter gradient.
+/// P5 item 20 slice B: fuse the SwiGLU gate-gradient pair.
+///
+/// For `f = silu(g) * u` the adjoint contains
+///     t  = Mul(y_bar, u)                  (gate-branch upstream grad)
+///     dg = Passthrough("silu_backward")(t, g)
+/// When `t` has exactly ONE reader (that silu_backward), rewrite to
+///     dg = Passthrough("swiglu_gate_backward")(y_bar, u, g)
+/// and drop the Mul — one launch and one full-size temporary saved per
+/// SwiGLU per micro-step. BIT-EXACT: the fused kernel computes
+/// `t = mul.rn(y_bar, u)` exactly as the standalone Mul kernel rounds it,
+/// then runs the identical silu-backward sequence (see
+/// `SWIGLU_GATE_BACKWARD_F32_PTX` / the FFI's CPU arm).
+///
+/// Returns the number of pairs fused. Op ids are renumbered positionally
+/// (they are positional-only at every call site — the CCR splice does the
+/// same).
+pub fn fuse_swiglu_gate_backward(ops: &mut Vec<crate::wengert::WengertOp>) -> usize {
+    use crate::wengert::PrimalOp;
+    use std::collections::HashMap;
+
+    let mut reads: HashMap<crate::wengert::VarId, usize> = HashMap::new();
+    let mut producer: HashMap<crate::wengert::VarId, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for inp in &op.inputs {
+            *reads.entry(*inp).or_default() += 1;
+        }
+        producer.insert(op.result, i);
+    }
+
+    let mut remove: Vec<usize> = Vec::new();
+    for i in 0..ops.len() {
+        let is_silu_bwd = matches!(
+            &ops[i].op,
+            PrimalOp::Passthrough(name) if name == "silu_backward"
+        );
+        if !is_silu_bwd || ops[i].inputs.len() != 2 {
+            continue;
+        }
+        let ds = ops[i].inputs[0];
+        let g = ops[i].inputs[1];
+        if reads.get(&ds).copied() != Some(1) {
+            continue; // the product is read elsewhere — keep it materialized
+        }
+        let Some(&j) = producer.get(&ds) else { continue };
+        if j >= i || remove.contains(&j) {
+            continue;
+        }
+        if !matches!(ops[j].op, PrimalOp::Mul) || ops[j].inputs.len() != 2 {
+            continue;
+        }
+        let y_bar = ops[j].inputs[0];
+        let u = ops[j].inputs[1];
+        ops[i].op = PrimalOp::Passthrough("swiglu_gate_backward".into());
+        ops[i].inputs = vec![y_bar, u, g];
+        remove.push(j);
+    }
+    if remove.is_empty() {
+        return 0;
+    }
+    let fused = remove.len();
+    let removed: std::collections::HashSet<usize> = remove.into_iter().collect();
+    let mut idx = 0;
+    ops.retain(|_| {
+        let keep = !removed.contains(&idx);
+        idx += 1;
+        keep
+    });
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.id = i as u32;
+    }
+    fused
+}
+
 pub fn eliminate_dead_gradients(
     adjoint_ops: &[WengertOp],
     needed_vars: &HashSet<VarId>,
@@ -4809,6 +4882,56 @@ impl<'a> WengertExtractor<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn swiglu_peephole_fuses_single_reader_pair() {
+        use crate::wengert::{PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        // t = Mul(yb=10, u=11); dg = silu_backward(t, g=12)
+        let mut ops = vec![
+            op(0, 100, PrimalOp::Mul, vec![10, 11]),
+            op(1, 101, PrimalOp::Passthrough("silu_backward".into()), vec![100, 12]),
+        ];
+        let fused = super::fuse_swiglu_gate_backward(&mut ops);
+        assert_eq!(fused, 1);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0].op,
+            PrimalOp::Passthrough(n) if n == "swiglu_gate_backward"
+        ));
+        assert_eq!(ops[0].inputs, vec![10, 11, 12]);
+        assert_eq!(ops[0].id, 0, "ids renumbered positionally");
+    }
+
+    #[test]
+    fn swiglu_peephole_keeps_multi_reader_product() {
+        use crate::wengert::{PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        // t read by silu_backward AND a later Add — must stay materialized.
+        let mut ops = vec![
+            op(0, 100, PrimalOp::Mul, vec![10, 11]),
+            op(1, 101, PrimalOp::Passthrough("silu_backward".into()), vec![100, 12]),
+            op(2, 102, PrimalOp::Add, vec![100, 101]),
+        ];
+        let fused = super::fuse_swiglu_gate_backward(&mut ops);
+        assert_eq!(fused, 0);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(&ops[1].op, PrimalOp::Passthrough(n) if n == "silu_backward"));
+    }
+
     use super::*;
     use crate::wengert::{PrimalOp, WengertList, WengertOp};
 

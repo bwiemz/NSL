@@ -3430,6 +3430,15 @@ fn lower_single_op(
                         &[inputs[0], inputs[1], inputs[2]],
                     )
                 }
+                "swiglu_gate_backward" => {
+                    // P5 item 20 slice B. inputs = [y_bar, up, gate_input].
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_swiglu_gate_backward",
+                        &[inputs[0], inputs[1], inputs[2]],
+                    )
+                }
                 "silu_backward" => {
                     // inputs = [grad, x] — p4 slice 2 fused SiLU backward:
                     // grad * σ(x)*(1 + x*(1-σ(x))), one launch, bit-exact with

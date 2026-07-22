@@ -7557,6 +7557,9 @@ impl Compiler<'_> {
                     adjoint.ops =
                         crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &adjoint_needed);
                 }
+                // P5 item 20 slice B: fuse SwiGLU gate-gradient pairs
+                // (bit-exact — see fuse_swiglu_gate_backward).
+                crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops);
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
                 // schedule when NSL_CSLA_REPORT=1. Pure analysis over the final
@@ -13863,6 +13866,9 @@ impl Compiler<'_> {
         if let Some(target_adj_var) = gen.adjoint_of(target_var_id) {
             let needed = std::collections::HashSet::from([target_adj_var]);
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
+            // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied
+            // on the train path).
+            crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops);
 
             if !adjoint.ops.is_empty() {
                 // P0.2: arm the gradient-integrity guard for the `grad` block's

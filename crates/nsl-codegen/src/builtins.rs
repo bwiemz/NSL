@@ -2765,6 +2765,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    // P5 item 20 slice B: fused SwiGLU gate backward (y_bar, up, gate_in) -> dgate.
+    (
+        "nsl_tensor_swiglu_gate_backward",
+        &[types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
     // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
     (
         "nsl_tensor_sigmoid_backward",
