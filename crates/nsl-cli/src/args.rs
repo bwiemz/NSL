@@ -818,6 +818,18 @@ pub(crate) struct BuildArgs {
               value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
         pub(crate) muon_state_dtype: String,
 
+        /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
+        /// Each source-AD lowering (forward slice, backward layer range,
+        /// recompute segment) records its launch sequence, captures it as a
+        /// CUDA graph once stable across steps, and replays it with
+        /// per-launch verification + eager self-repair on any divergence.
+        /// Requires --source-ad; refuses ZeRO, @pipeline, --cuda-sync and
+        /// the kernel profiler. Bit-exact (same kernels, same order, same
+        /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
+        /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        #[arg(long)]
+        pub(crate) cuda_graphs: bool,
+
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
         /// stable, reused device staging arena. Fewer CUDA calls, one large
@@ -1281,6 +1293,18 @@ pub(crate) struct RunArgs {
         #[arg(long, value_name = "DTYPE", default_value = "f32",
               value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
         pub(crate) muon_state_dtype: String,
+
+        /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
+        /// Each source-AD lowering (forward slice, backward layer range,
+        /// recompute segment) records its launch sequence, captures it as a
+        /// CUDA graph once stable across steps, and replays it with
+        /// per-launch verification + eager self-repair on any divergence.
+        /// Requires --source-ad; refuses ZeRO, @pipeline, --cuda-sync and
+        /// the kernel profiler. Bit-exact (same kernels, same order, same
+        /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
+        /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        #[arg(long)]
+        pub(crate) cuda_graphs: bool,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a

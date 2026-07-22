@@ -4183,12 +4183,43 @@ impl Compiler<'_> {
                     "--muon-state-dtype bf16 is not supported on the pipelined                      train path (@pipeline): the CSLA state envelope is not                      lowered there. Drop one",
                 ));
             }
+            // P5 item 19: the pipelined path lowers its stages outside the
+            // region-marker emission — the flag would silently train eager
+            // while the user believes graphs are active.
+            if self.compile_options.cuda_graphs {
+                return Err(CodegenError::new(
+                    "--cuda-graphs is not supported on the pipelined train \
+                     path (@pipeline): capture regions are not emitted \
+                     there. Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
                 train,
                 train_block_stmt_id,
             );
+        }
+
+        // P5 item 19 (`--cuda-graphs`): opportunistic per-region capture.
+        // Regions only exist in Wengert lowerings (source-AD); the tape
+        // path would silently ignore the flag. Multi-rank collectives wait
+        // on their own streams mid-backward — unvalidated with capture.
+        if self.compile_options.cuda_graphs {
+            if !self.features.source_ad_enabled {
+                return Err(CodegenError::new(
+                    "--cuda-graphs requires --source-ad: capture regions \
+                     bracket the source-AD Wengert lowerings; the tape path \
+                     has none and would silently train eager",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--cuda-graphs does not compose with --zero-stage yet \
+                     (collective waits inside the backward are incompatible \
+                     with stream capture). Drop one of the flags",
+                ));
+            }
         }
 
         // CFTP v10 (item 3): install the fused-CE config for THIS train
@@ -4279,6 +4310,19 @@ impl Compiler<'_> {
                     _ => {} // ignore unknown config for forward compat
                 }
             }
+        }
+
+        // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
+        // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
+        // legacy NULL stream). The accumulation window rides along — each
+        // micro-batch phase within a window has its own self-consistent
+        // allocator state, so the runtime captures one graph per
+        // (region, phase) instead of requiring a phase-free digest.
+        if self.compile_options.cuda_graphs {
+            let win = builder
+                .ins()
+                .iconst(cl_types::I64, grad_accumulation_steps.max(1));
+            self.compile_call_by_name(builder, "nsl_cuda_graphs_enable", &[win])?;
         }
 
         // CPKD: a distill block delegates here with an empty config — the
@@ -12229,7 +12273,15 @@ impl Compiler<'_> {
 
         // Drain GPU caching allocator — only releases Transient segments,
         // which are now fully free since forward/backward intermediates were freed.
-        self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
+        //
+        // P5 item 19: under --cuda-graphs the per-step drain is SKIPPED —
+        // physically releasing transient segments each step (a) makes every
+        // transient address churn, so no region ever digest-stabilizes, and
+        // (b) would unmap memory that already-captured graphs reference.
+        // Retained segments are exactly the steady-state working set.
+        if !self.compile_options.cuda_graphs {
+            self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
+        }
 
         // Debug: GPU memory after step cleanup
         {
@@ -12489,6 +12541,12 @@ impl Compiler<'_> {
         // null data pointers.
         if csla_active && self.compile_options.weight_stream {
             self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
+        }
+
+        // P5 item 19: capture/replay counter banner (anti-vacuity evidence
+        // for the gates; harmless no-op when the runtime declined to arm).
+        if self.compile_options.cuda_graphs {
+            self.compile_call_by_name(builder, "nsl_cuda_graphs_report", &[])?;
         }
 
         state.variables = saved_variables;

@@ -224,6 +224,21 @@ pub fn compile_wengert_ops_range(
         }
         m
     });
+    // P5 item 19 (`--cuda-graphs`): bracket this contiguous lowering as one
+    // capture region. Each static invocation claims a fresh id, so a
+    // region's identity is its code location — the same emitted code runs
+    // every step, letting the runtime accumulate digest history per region.
+    // Weight-stream transfers and optimizer updates are emitted by the
+    // CALLERS around this function, so they land outside the region.
+    let graph_region_id = if compiler.compile_options.cuda_graphs {
+        let id = compiler.next_cuda_graph_region_id;
+        compiler.next_cuda_graph_region_id += 1;
+        let idv = builder.ins().iconst(cl_types::I64, id);
+        call(compiler, builder, "nsl_cuda_graph_region_begin", &[idv])?;
+        Some(id)
+    } else {
+        None
+    };
     let range_start = range.start;
     for (rel_i, op) in wengert.ops[range].iter().enumerate() {
         let abs_i = range_start + rel_i;
@@ -434,6 +449,10 @@ pub fn compile_wengert_ops_range(
             owned_values.push((op.result, result_val, result_type));
         }
         var_types.insert(op.result, result_type);
+    }
+    if let Some(id) = graph_region_id {
+        let idv = builder.ins().iconst(cl_types::I64, id);
+        call(compiler, builder, "nsl_cuda_graph_region_end", &[idv])?;
     }
     Ok(())
 }

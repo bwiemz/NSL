@@ -540,6 +540,10 @@ pub struct Compiler<'a> {
     pub compile_options: crate::CompileOptions,
     pub dump_ir: bool,
     func_index: u32,
+    /// P5 item 19: next `--cuda-graphs` region id. Every static
+    /// `compile_wengert_ops_range` invocation claims one id, so a region's
+    /// identity is its code location — stable across steps and epochs.
+    pub next_cuda_graph_region_id: i64,
 
     // ── Function registry ────────────────────────────────────────────
     pub registry: FunctionRegistry,
@@ -1030,6 +1034,7 @@ impl<'a> Compiler<'a> {
             compile_options: options.clone(),
             dump_ir: false,
             func_index: 0,
+            next_cuda_graph_region_id: 0,
             registry: FunctionRegistry::new(),
             types: TypeRegistry::new(),
             models: ModelMetadata::new(),

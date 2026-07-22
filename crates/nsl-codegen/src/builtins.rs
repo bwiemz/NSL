@@ -2521,6 +2521,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
     ("nsl_zero3_enable", &[], Some(types::I64)),
     ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    // P5 item 19: opportunistic per-region CUDA graph capture/replay
+    ("nsl_cuda_graphs_enable", &[types::I64], None), // (accum_window)
+    ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)
+    ("nsl_cuda_graph_region_end", &[types::I64], None), // (region_id)
+    ("nsl_cuda_graphs_report", &[], None),
     // P4 item 17: SR-BF16 authoritative weights
     ("nsl_sr_bf16_enable", &[], None),
     ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)

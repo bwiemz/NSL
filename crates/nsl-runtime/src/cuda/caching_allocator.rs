@@ -315,10 +315,10 @@ impl DriverAlloc for CudaDriverAlloc {
     }
 
     fn memset_zero(&self, ptr: *mut c_void, size: usize) {
-        use cudarc::driver::sys::*;
-        unsafe {
-            cuMemsetD8_v2(ptr as CUdeviceptr, 0, size);
-        }
+        // Route through the graph-aware wrapper: a zero-fill issued inside a
+        // cuda-graph region must be captured/verified like any other GPU op
+        // (a raw sync memset would invalidate an in-progress capture).
+        super::inner::memset_d8(ptr, size);
     }
 }
 

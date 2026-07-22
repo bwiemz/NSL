@@ -16,6 +16,8 @@ pub(crate) mod tier_b1_prepass;
 #[cfg(feature = "cuda")]
 pub(crate) mod caching_allocator;
 
+pub(crate) mod graph_capture;
+
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
@@ -260,6 +262,11 @@ pub(crate) mod inner {
     /// Releases fully-free segments back to the CUDA driver.
     /// Returns total bytes freed.
     fn pool_drain() -> usize {
+        // cuda-graphs: physically unmapping cached blocks while a captured
+        // region is mid-replay would leave the pending graph launch pointing
+        // at freed memory — taint first (repairs the skipped prefix and
+        // downgrades the region to eager, so no graph launch follows).
+        super::graph_capture::taint("allocator pool drain");
         // Flush stream-ordered deferred frees first: `pool_drain` is the
         // "reclaim everything reclaimable" path (OOM recovery / explicit cache
         // empty), so raw frees still waiting on a completion event are forced
@@ -811,6 +818,30 @@ pub(crate) mod inner {
     /// that share a lifetime (all consumed by the same preceding kernels).
     /// A single event guards the whole group.
     pub(crate) fn defer_free_device_batch(ptrs: &[*mut c_void]) {
+        // cuda-graphs: inside a region the completion event must NOT be
+        // recorded yet — during replay the consuming kernels are not on the
+        // stream until the region-end graph launch, so an event recorded now
+        // would complete early and free live memory. Queue host-side; the
+        // region end records through `defer_free_device_record`.
+        if super::graph_capture::in_region() {
+            for p in ptrs.iter().filter(|p| !p.is_null()) {
+                super::graph_capture::queue_deferred_free(*p);
+            }
+            return;
+        }
+        defer_free_device_batch_record(ptrs);
+    }
+
+    /// Region-end flush entry: the original (event-recording) deferred-free
+    /// path, called once the region's work is actually on the stream.
+    pub(crate) fn defer_free_device_record(ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        defer_free_device_batch_record(&[ptr]);
+    }
+
+    fn defer_free_device_batch_record(ptrs: &[*mut c_void]) {
         let live: Vec<usize> = ptrs
             .iter()
             .filter(|p| !p.is_null())
@@ -860,6 +891,13 @@ pub(crate) mod inner {
     /// `cuEventQuery` returns an error, treated as "not ready" below, which only
     /// defers reclaim (never a use-after-free).
     pub(crate) fn drain_completed_frees() {
+        // cuda-graphs: `cuEventQuery` is illegal while the compute stream is
+        // capturing, and during replay the polled work may not be issued yet
+        // — skip the opportunistic poll inside a region (the region end and
+        // every out-of-region defer poll again).
+        if super::graph_capture::in_region() {
+            return;
+        }
         // Collect completed entries under the lock, then free outside it:
         // `free_device` takes the CACHING_ALLOCATOR lock, and holding
         // DEFERRED_FREES across that call would nest two locks.
@@ -1004,6 +1042,11 @@ pub(crate) mod inner {
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
         ensure_context();
+        // cuda-graphs: uploads inside a region are pseudo-ops — the payload
+        // flows through a graph-owned pinned staging buffer (see `on_htod`).
+        if !super::graph_capture::on_htod(dst_device, src_host, size_bytes) {
+            return;
+        }
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
             let ctx = current_oom_context();
@@ -1025,6 +1068,7 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from device memory to host memory.
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        super::graph_capture::taint("sync DtoH readback");
         ensure_context();
         unsafe {
             let result = cuMemcpyDtoH_v2(dst_host, src_device as CUdeviceptr, size_bytes);
@@ -1041,6 +1085,10 @@ pub(crate) mod inner {
     /// Copy `size_bytes` bytes from one device pointer to another.
     pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
         ensure_context();
+        // cuda-graphs: device-to-device copies are pseudo-ops (no host data).
+        if !super::graph_capture::on_dtod(dst_device, src_device, size_bytes) {
+            return;
+        }
         unsafe {
             let result = cuMemcpyDtoD_v2(dst_device as CUdeviceptr, src_device as CUdeviceptr, size_bytes);
             assert_eq!(
@@ -1115,6 +1163,7 @@ pub(crate) mod inner {
     /// there is also ordered after any interleaved NULL-stream memcpys, so
     /// this wait covers everything the old NULL-stream record covered.
     unsafe fn transfer_stream_wait_null_stream(stream: CUstream) {
+        super::graph_capture::taint("transfer-stream event wait");
         let mut ev: CUevent = std::ptr::null_mut();
         // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest event flavor).
         let r = cuEventCreate(&mut ev, 0x2);
@@ -1351,6 +1400,7 @@ pub(crate) mod inner {
     /// stream was never created on this thread (does NOT force-initialize
     /// CUDA — safe to call unconditionally from the offload drain).
     pub(crate) fn transfer_stream_synchronize() {
+        super::graph_capture::taint("transfer-stream synchronize");
         TRANSFER_STREAM.with(|s| {
             let cur = s.get();
             if cur == 0 {
@@ -1369,9 +1419,34 @@ pub(crate) mod inner {
         })
     }
 
-    /// Zero-fill device memory.
+    /// Zero-fill device memory. Graph-aware: recorded as a pseudo-op inside
+    /// a capture region (async on the compute stream so the driver records a
+    /// memset node — ordering-neutral vs the sync form thanks to
+    /// blocking-stream semantics), verified/skipped during replay.
     pub(crate) fn memset_d8(device_ptr: *mut c_void, size_bytes: usize) {
         ensure_context();
+        match super::graph_capture::on_memset(device_ptr as usize, size_bytes) {
+            super::graph_capture::MemsetAction::Skip => return,
+            super::graph_capture::MemsetAction::AsyncOnComputeStream => {
+                unsafe {
+                    let result = cuMemsetD8Async(
+                        device_ptr as CUdeviceptr,
+                        0,
+                        size_bytes,
+                        current_stream(),
+                    );
+                    assert_eq!(
+                        result,
+                        CUresult::CUDA_SUCCESS,
+                        "cuMemsetD8Async({} bytes) failed: {:?}",
+                        size_bytes,
+                        result
+                    );
+                }
+                return;
+            }
+            super::graph_capture::MemsetAction::Sync => {}
+        }
         unsafe {
             let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, 0, size_bytes);
             assert_eq!(
@@ -1517,6 +1592,7 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_event_record_on_current_stream(event: u64) -> CUresult {
+        super::graph_capture::taint("event record on compute stream");
         cuEventRecord(event as CUevent, current_stream())
     }
 
@@ -1529,6 +1605,7 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_ctx_synchronize() {
+        super::graph_capture::taint("explicit ctx synchronize");
         cuCtxSynchronize();
     }
 
@@ -1684,6 +1761,20 @@ pub(crate) mod inner {
         debug_assert!(block[0] * block[1] * block[2] <= 1024,
             "kernel_launch: block size {} exceeds max 1024 threads",
             block[0] * block[1] * block[2]);
+
+        // cuda-graphs (P5 item 19): record/verify this launch against the
+        // active region. `false` = verified against the captured sequence —
+        // the region-end graph launch performs it; skip the real launch.
+        if !super::graph_capture::on_kernel(
+            func as usize,
+            [grid[0] as u32, grid[1] as u32, grid[2] as u32],
+            [block[0] as u32, block[1] as u32, block[2] as u32],
+            shared_mem_bytes,
+            args,
+            name_ptr,
+        ) {
+            return CUresult::CUDA_SUCCESS;
+        }
 
         // Launch kernel (no lock held) — on the per-thread compute stream
         // (p8 PR-A; ordering-neutral vs the old NULL-stream launch, see
@@ -2008,6 +2099,19 @@ pub(crate) mod cublas_inner {
             m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
             "sgemm dims must fit in i32"
         );
+        // cuda-graphs (P5 item 19): the gemm is a pseudo-op — recorded during
+        // record/capture passes, verified-and-skipped during replay (the
+        // region-end graph launch carries the captured cuBLAS kernels).
+        if !super::graph_capture::on_sgemm(
+            a_dev as usize,
+            b_dev as usize,
+            c_dev as usize,
+            m,
+            n,
+            k,
+        ) {
+            return Ok(());
+        }
         let handle = cublas_handle();
         // p8 PR-A: bind the gemm to the per-thread compute stream so cuBLAS
         // kernels ride the same stream as every other kernel (ordering-neutral
