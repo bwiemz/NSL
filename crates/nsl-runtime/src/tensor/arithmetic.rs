@@ -593,10 +593,10 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
-    // Skip for dtype=4 (i32) — needs type conversion to float, can't mutate in-place.
+    // Skip for i32 — needs type conversion to float, can't mutate in-place.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if t.dtype != 4 && relinq_a {
+        if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
                 let d = t.data as *mut u16;
@@ -634,8 +634,8 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
 
     // Output dtype: i32 inputs produce f32 (used for label arithmetic in cross_entropy)
-    let out_dtype: u16 = if a.dtype == 4 { 1 } else { a.dtype };
-    let data: *mut c_void = if a.dtype == 4 {
+    let out_dtype: u16 = if a.dtype == crate::tensor::DTYPE_I32 { 1 } else { a.dtype };
+    let data: *mut c_void = if a.dtype == crate::tensor::DTYPE_I32 {
         // i32 → f32 with scalar add
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let src = a.data as *const i32;

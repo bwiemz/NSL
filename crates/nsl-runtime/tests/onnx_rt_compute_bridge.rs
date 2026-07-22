@@ -2,8 +2,9 @@
 //!
 //! The full mock `OrtKernelContext` end-to-end test is deferred to T6 (real
 //! ORT in the gated CI job). Here we just verify the dtype mapping uses the
-//! `NslTensorDesc` C-API convention (0=f32, 1=f64, ...), NOT the inverted
-//! `NslTensor` internal convention (0=f64, 1=f32). See `c_api/mod.rs:29-40`.
+//! canonical NSL tag space (0=f64, 1=f32, 2=f16, 3=bf16, 4=i8, 9=i32 —
+//! P4 item 16 unified `NslTensorDesc.dtype` with `NslTensor.dtype`), and
+//! that ORT types with no canonical tag (int64, uint8) are refused.
 
 #![cfg(feature = "onnx-rt-op")]
 
@@ -12,13 +13,13 @@ use nsl_runtime::onnx_rt_op::{kernel, vendored::ONNXTensorElementDataType};
 #[test]
 fn ort_dtype_maps_to_nsl_dtype_for_f32() {
     let dtype = kernel::ort_element_type_to_nsl_dtype(ONNXTensorElementDataType::FLOAT);
-    assert_eq!(dtype, 0); // C-API convention: 0=f32
+    assert_eq!(dtype, 1); // canonical tag: 1=f32
 }
 
 #[test]
 fn ort_dtype_maps_to_nsl_dtype_for_f64() {
     let dtype = kernel::ort_element_type_to_nsl_dtype(ONNXTensorElementDataType::DOUBLE);
-    assert_eq!(dtype, 1); // C-API convention: 1=f64
+    assert_eq!(dtype, 0); // canonical tag: 0=f64
 }
 
 #[test]
@@ -36,25 +37,28 @@ fn ort_dtype_maps_to_nsl_dtype_for_bf16() {
 #[test]
 fn ort_dtype_maps_to_nsl_dtype_for_i32() {
     let dtype = kernel::ort_element_type_to_nsl_dtype(ONNXTensorElementDataType::INT32);
-    assert_eq!(dtype, 4);
+    assert_eq!(dtype, 9); // canonical DTYPE_I32
 }
 
 #[test]
 fn ort_dtype_maps_to_nsl_dtype_for_i64() {
+    // int64 has no canonical NSL tag — refused (P4 item 16; previously it
+    // was silently mislabeled f64 downstream at capi_dtype_to_nsl).
     let dtype = kernel::ort_element_type_to_nsl_dtype(ONNXTensorElementDataType::INT64);
-    assert_eq!(dtype, 5);
+    assert_eq!(dtype, -1);
 }
 
 #[test]
 fn ort_dtype_maps_to_nsl_dtype_for_i8() {
     let dtype = kernel::ort_element_type_to_nsl_dtype(ONNXTensorElementDataType::INT8);
-    assert_eq!(dtype, 6);
+    assert_eq!(dtype, 4); // canonical DTYPE_INT8
 }
 
 #[test]
 fn ort_dtype_maps_to_nsl_dtype_for_u8() {
+    // uint8 has no canonical NSL tag — refused (P4 item 16).
     let dtype = kernel::ort_element_type_to_nsl_dtype(ONNXTensorElementDataType::UINT8);
-    assert_eq!(dtype, 7);
+    assert_eq!(dtype, -1);
 }
 
 #[test]

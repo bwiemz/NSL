@@ -29,12 +29,14 @@
 //!
 //! ## dtype convention
 //!
-//! `ort_element_type_to_nsl_dtype` returns the **C-API** convention
-//! (`0=f32, 1=f64, 2=f16, 3=bf16, 4=i32, 5=i64, 6=i8, 7=u8`) because the
-//! result populates `NslTensorDesc.dtype`. This is INVERTED from the
-//! `NslTensor` internal convention (`0=f64, 1=f32, ...`). See
-//! `c_api/mod.rs:29-40` for the canonical table and conversion helpers
-//! (`capi_dtype_to_nsl` / `nsl_dtype_to_capi`).
+//! `ort_element_type_to_nsl_dtype` returns the canonical NSL dtype tag
+//! (`0=f64, 1=f32, 2=f16, 3=bf16, 4=i8, 9=i32`) because the result
+//! populates `NslTensorDesc.dtype`, which — since the P4 item-16 dtype/ABI
+//! migration — uses the canonical tag space verbatim. ORT element types
+//! with no canonical NSL tag (int64, uint8) map to the `-1` unsupported
+//! sentinel: `GetInputType` advertises only FLOAT, so they never reach a
+//! real compute path, and refusing beats the historical silent
+//! mislabel-as-f64 those tags received at `capi_dtype_to_nsl`.
 
 use std::os::raw::{c_char, c_void};
 
@@ -221,26 +223,23 @@ unsafe fn ort_alloc_output_desc(
     }
 }
 
-/// Map ORT element type → `NslTensorDesc.dtype` (C-API convention).
+/// Map ORT element type → `NslTensorDesc.dtype` (canonical NSL tag space).
 ///
-/// Convention (from `c_api/mod.rs:34`): `0=f32, 1=f64, 2=f16, 3=bf16,
-/// 4=i32, 5=i64, 6=i8, 7=u8`. Unsupported / unrecognized inputs return
-/// `-1` so callers can detect the failure (the value never escapes back
-/// into `NslTensorDesc.dtype` for a real compute path because T4's
-/// `GetInputType` advertises only types we support).
+/// Unsupported / unrecognized inputs return `-1` so callers can detect the
+/// failure (the value never escapes back into `NslTensorDesc.dtype` for a
+/// real compute path because T4's `GetInputType` advertises only types we
+/// support). int64/uint8 have no canonical NSL tag and are unsupported.
 ///
 /// Returns `i32` (matching `NslTensorDesc.dtype`'s declared type) rather
 /// than `u8` so the unsupported sentinel can be negative.
 pub fn ort_element_type_to_nsl_dtype(t: ONNXTensorElementDataType) -> i32 {
     match t {
-        ONNXTensorElementDataType::FLOAT => 0,    // f32  → NslTensorDesc 0
-        ONNXTensorElementDataType::DOUBLE => 1,   // f64  → 1
+        ONNXTensorElementDataType::FLOAT => 1,    // f32  → canonical 1
+        ONNXTensorElementDataType::DOUBLE => 0,   // f64  → 0
         ONNXTensorElementDataType::FLOAT16 => 2,  // f16  → 2
         ONNXTensorElementDataType::BFLOAT16 => 3, // bf16 → 3
-        ONNXTensorElementDataType::INT32 => 4,    // i32  → 4
-        ONNXTensorElementDataType::INT64 => 5,    // i64  → 5
-        ONNXTensorElementDataType::INT8 => 6,     // i8   → 6
-        ONNXTensorElementDataType::UINT8 => 7,    // u8   → 7
-        _ => -1,                                  // unsupported
+        ONNXTensorElementDataType::INT32 => 9,    // i32  → DTYPE_I32
+        ONNXTensorElementDataType::INT8 => 4,     // i8   → DTYPE_INT8
+        _ => -1,                                  // unsupported (incl. i64/u8)
     }
 }

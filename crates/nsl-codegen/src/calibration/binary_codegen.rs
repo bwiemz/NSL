@@ -1086,6 +1086,9 @@ fn emit_calibration_forward_wrapper(
         let zero_i64 = b.ins().iconst(cl_types::I64, 0);
         let zero_i32 = b.ins().iconst(cl_types::I32, 0);
         let ndim_i32 = b.ins().iconst(cl_types::I32, input_ndim as i64);
+        // dtype at offset 28: canonical tag 1 = f32 (P4 item 16 — the C API
+        // uses the canonical NSL tag space; calibration batches are raw f32).
+        let dtype_f32 = b.ins().iconst(cl_types::I32, 1);
 
         let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
         let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);
@@ -1094,7 +1097,7 @@ fn emit_calibration_forward_wrapper(
         b.ins().store(MemFlags::trusted(), shape_ptr, desc_addr, 8);
         b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 16);
         b.ins().store(MemFlags::trusted(), ndim_i32, desc_addr, 24);
-        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 28);
+        b.ins().store(MemFlags::trusted(), dtype_f32, desc_addr, 28);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
         b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 40);
@@ -1782,8 +1785,8 @@ fn emit_calibration_backward_wrapper(
         //   offset  8: shape_ptr (i64)
         //   offset 16: strides_ptr (i64, 0 = row-major default)
         //   offset 24: ndim (i32)
-        //   offset 28: dtype (i32) — C API convention: 0=f32, 1=f64 (opposite of NSL internal!)
-        //                            calibration batches are f32, so dtype=0 here.
+        //   offset 28: dtype (i32) — canonical NSL tag space (P4 item 16):
+        //                            calibration batches are f32, so dtype=1.
         //   offset 32: device_type (i32, 0 = CPU)
         //   offset 36: device_id   (i32, 0 for CPU)
         //   offset 40: tape_id     (i64, 0 — calibration has no autodiff context)
@@ -1796,11 +1799,11 @@ fn emit_calibration_backward_wrapper(
         let zero_i64 = b.ins().iconst(cl_types::I64, 0);
         let zero_i32 = b.ins().iconst(cl_types::I32, 0);
         let ndim_i32 = b.ins().iconst(cl_types::I32, input_ndim as i64);
-        // dtype=0 (C API f32) — mirrors the forward wrapper (binary_codegen.rs offset 28).
-        // NslTensorDesc.dtype follows the C API convention where 0=f32, NOT the NSL
-        // internal convention (where 0=f64). nsl_desc_to_tensor calls capi_dtype_to_nsl
-        // which maps 0 → NSL 1 (f32). Calibration batches are always raw f32.
-        let dtype_f32 = b.ins().iconst(cl_types::I32, 0);
+        // dtype=1 (canonical f32) — mirrors the forward wrapper (offset 28).
+        // P4 item 16: NslTensorDesc.dtype uses the canonical NSL tag space
+        // (1 = f32); nsl_desc_to_tensor validates and passes it through.
+        // Calibration batches are always raw f32.
+        let dtype_f32 = b.ins().iconst(cl_types::I32, 1);
 
         let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
         let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);

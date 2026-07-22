@@ -24,7 +24,7 @@ use crate::cpu::create_tensor_with_shape_rs_dtype;
 use crate::dict::{nsl_dict_free_tensor_values, nsl_dict_new, nsl_dict_set_str};
 use crate::packing::{pack_batch, packed_batch_to_dict};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
+use crate::tensor::{DTYPE_I32, DTYPE_U16_TOKEN, NslTensor};
 
 #[inline]
 fn supports_flat_value_dtype(dtype: u16) -> bool {
@@ -536,7 +536,7 @@ fn build_simple_batch(
     // Generating a [batch, seq, seq] mask here wastes 134MB/batch at batch=32,
     // seq=1024 — pure PCIe/memory bandwidth waste for a static pattern.
 
-    // Create tensors and dict using i32 (dtype=4) for token IDs.
+    // Create tensors and dict using DTYPE_I32 for token IDs.
     // Token IDs are integers that only need 32 bits (vocab < 2^31).
     // Using i32 instead of f32 halves bandwidth vs f64 and avoids
     // precision loss for large token IDs (f32 mantissa is only 24 bits).
@@ -544,15 +544,14 @@ fn build_simple_batch(
     let b = batch_size as i64;
     let s = seq_len as i64;
 
-    // dtype=4 is i32 in NSL's type system
-    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 4);
+    let ids_ptr = create_tensor_with_shape_rs_dtype(&[b, s], DTYPE_I32);
     let ids_tensor = NslTensor::from_ptr(ids_ptr);
     let ids_data = ids_tensor.data as *mut i32;
     for (i, &v) in input_ids.iter().enumerate() {
         unsafe { *ids_data.add(i) = v as i32 };
     }
 
-    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 4);
+    let lbl_ptr = create_tensor_with_shape_rs_dtype(&[b, s], DTYPE_I32);
     let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
     let lbl_data = lbl_tensor.data as *mut i32;
     for (i, &v) in labels_vec.iter().enumerate() {
@@ -848,8 +847,8 @@ mod tests {
         let tensor_ptr = crate::dict::nsl_dict_get_str(batch, k);
         let tensor = NslTensor::from_ptr(tensor_ptr);
 
-        // Token IDs are stored as i32 (dtype=4)
-        assert_eq!(tensor.dtype, 4, "input_ids should be i32 dtype");
+        // Token IDs are stored as i32 (DTYPE_I32)
+        assert_eq!(tensor.dtype, DTYPE_I32, "input_ids should be i32 dtype");
         let ids_data = tensor.data as *const i32;
         for i in 0..4 {
             let val = unsafe { *ids_data.add(i) } as i64;
@@ -889,7 +888,7 @@ mod tests {
         let tensor_ptr = crate::dict::nsl_dict_get_str(batch, k);
         let tensor = NslTensor::from_ptr(tensor_ptr);
 
-        assert_eq!(tensor.dtype, 4, "labels should be i32 dtype");
+        assert_eq!(tensor.dtype, DTYPE_I32, "labels should be i32 dtype");
         let labels_data = tensor.data as *const i32;
         let expected = [11, -100, -100, -100];
         for (i, value) in expected.iter().enumerate() {
@@ -944,7 +943,7 @@ mod tests {
         let k_ids = nsl_str_from_rust("input_ids");
         let ids_ptr = crate::dict::nsl_dict_get_str(batch, k_ids);
         let ids_tensor = NslTensor::from_ptr(ids_ptr);
-        assert_eq!(ids_tensor.dtype, 4, "input_ids should be materialized as i32 tokens");
+        assert_eq!(ids_tensor.dtype, DTYPE_I32, "input_ids should be materialized as i32 tokens");
 
         let ids_data = ids_tensor.data as *const i32;
         let expected_ids = [100, 200, 50256, 42];

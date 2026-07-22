@@ -279,14 +279,11 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
                 let s = unsafe { std::slice::from_raw_parts(t.data as *const f32, n) };
                 s.iter().map(|&v| v.round() as i64).collect()
             }
-            // Dtype tag 4 on batch tensors is I32, NOT int8: the DataLoader
-            // materializes input_ids/labels as i32 payloads under tag 4
-            // (dataloader.rs `build_simple_batch` — "dtype=4 is i32 in NSL's
-            // type system") and every runtime reader (`read_index`,
-            // `as_f64_owned`, `read_scalar_as_f64`, `data_i32`) decodes tag 4
-            // as *const i32. Reading i8 here garbled real label streams into
-            // [t0,0,0,0,t1,0,0,0,...] — the fused-CE e2e forward divergence.
-            (0, 4) => {
+            // DataLoader batch tensors carry DTYPE_I32 (i32 payloads). The
+            // historical tag-4 i32/int8 overload — which once garbled real
+            // label streams into [t0,0,0,0,t1,0,0,0,...] when read as i8 —
+            // was removed by the P4 item-16 dtype migration.
+            (0, crate::tensor::DTYPE_I32) => {
                 let s = unsafe { std::slice::from_raw_parts(t.data as *const i32, n) };
                 s.iter().map(|&v| v as i64).collect()
             }

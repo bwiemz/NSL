@@ -3437,7 +3437,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 
     // Select kernel based on indices dtype: i32 indices use ld.global.s32,
     // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::EMBEDDING_I32IDX_PTX, b"nsl_embedding_i32idx\0")
     } else {
         (fused_kernels::EMBEDDING_F32_PTX, b"nsl_embedding_f32\0")
@@ -3471,7 +3471,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 ///
 /// `grad` must be a GPU f32 contiguous `[seq_len, embed_dim]` tensor;
 /// `indices` a GPU tensor of `seq_len` token ids (f32 dtype=1 or i32
-/// dtype=4, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
+/// DTYPE_I32, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
 /// and negative ids are skipped in-kernel, matching the CPU reference.
 /// Returns a published GPU `[vocab, embed]` NslTensor, or 0 when the
 /// index dtype has no kernel (caller falls back to the host scatter).
@@ -3501,7 +3501,7 @@ pub(crate) fn gpu_embedding_backward(
     // sets this; NSL_EMBEDDING_BWD_CPU handled by the caller (host scatter).
     let deterministic = crate::deterministic_ops::is_deterministic();
     let (ptx, kernel_name): (&str, &[u8]) = match (deterministic, indices.dtype) {
-        (true, 4) => (
+        (true, crate::tensor::DTYPE_I32) => (
             fused_kernels::EMBEDDING_BWD_DET_I32IDX_PTX,
             b"nsl_embedding_bwd_det_i32idx\0",
         ),
@@ -3509,7 +3509,7 @@ pub(crate) fn gpu_embedding_backward(
             fused_kernels::EMBEDDING_BWD_DET_F32_PTX,
             b"nsl_embedding_bwd_det_f32\0",
         ),
-        (false, 4) => (
+        (false, crate::tensor::DTYPE_I32) => (
             fused_kernels::EMBEDDING_BWD_I32IDX_PTX,
             b"nsl_embedding_bwd_i32idx\0",
         ),
@@ -4862,7 +4862,7 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     let grid_y = ((inner_dim as i64) + block_y - 1) / block_y;
 
     // Select kernel based on indices dtype: i32 uses ld.global.s32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::GATHER_I32IDX_PTX, b"nsl_gather_i32idx\0")
     } else {
         (GATHER_F32_PTX, b"nsl_gather_f32\0")

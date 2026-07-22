@@ -458,7 +458,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     // FBIP: mutate in-place when uniquely owned (skip for i32 — needs dtype conversion)
     {
         let t = unsafe { &mut *(tensor_ptr as *mut NslTensor) };
-        if t.dtype != 4 && t.can_mutate_inplace() {
+        if t.dtype != super::DTYPE_I32 && t.can_mutate_inplace() {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -482,8 +482,8 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     let strides = NslTensor::compute_strides(shape, ndim);
 
     // Output dtype: i32 inputs produce f32 output (clamp converts int→float)
-    let out_dtype = if a.dtype == 4 { 1u16 } else { a.dtype };
-    let data: *mut c_void = if a.dtype == 4 {
+    let out_dtype = if a.dtype == super::DTYPE_I32 { 1u16 } else { a.dtype };
+    let data: *mut c_void = if a.dtype == super::DTYPE_I32 {
         // i32 → f32 with clamping (used for token ID masking in cross_entropy)
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let (mn, mx) = (min_val as f32, max_val as f32);

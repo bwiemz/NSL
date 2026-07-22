@@ -1865,17 +1865,16 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
         0 => 8usize, // f64
         1 => 4,      // f32
         2 | 3 => 2,  // f16/bf16
-        4..=6 => 1, // i8/fp8
+        4..=6 => 1,  // i8/fp8
+        9 => 4,      // i32 (DTYPE_I32)
         _ => 8,      // default to f64 width
     };
     let total_bytes = n * byte_width;
 
     if tensor.device != 0 {
-        // GPU grad buffers are always f32 (`zeros_like(param)` on GPU). The
-        // byte_width table above reflects CPU storage widths — e.g. dtype 4
-        // is 1 byte on CPU but allocated 4 bytes/elem on GPU by
-        // nsl_tensor_to_device — so any non-f32 GPU buffer would be silently
-        // under-zeroed. Refuse instead (mirrors nsl_zero_reduce_grads).
+        // GPU grad buffers are always f32 (`zeros_like(param)` on GPU); any
+        // non-f32 GPU buffer here means a wiring bug upstream. Refuse instead
+        // of guessing widths (mirrors nsl_zero_reduce_grads).
         if tensor.dtype != 1 {
             eprintln!(
                 "nsl: nsl_grad_zero: GPU grad buffer must be f32 (dtype 1), \

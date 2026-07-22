@@ -74,7 +74,7 @@ fn forward_and_named_call_produce_identical_outputs() {
         shape: shape.as_mut_ptr(),
         strides: std::ptr::null_mut(),
         ndim: 1,
-        dtype: 0,
+        dtype: 1, // canonical f32
         device_type: 0,
         device_id: 0,
         tape_id: 0,
@@ -87,7 +87,7 @@ fn forward_and_named_call_produce_identical_outputs() {
         shape: shape_a.as_mut_ptr(),
         strides: std::ptr::null_mut(),
         ndim: 1,
-        dtype: 0,
+        dtype: 1, // canonical f32
         device_type: 0,
         device_id: 0,
         tape_id: 0,
@@ -107,7 +107,7 @@ fn forward_and_named_call_produce_identical_outputs() {
         shape: shape_b.as_mut_ptr(),
         strides: std::ptr::null_mut(),
         ndim: 1,
-        dtype: 0,
+        dtype: 1, // canonical f32
         device_type: 0,
         device_id: 0,
         tape_id: 0,

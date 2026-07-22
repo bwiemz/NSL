@@ -1731,7 +1731,7 @@ mod tests {
             unsafe { *logits_t.data_f32().add(index) = *value; }
         }
 
-        let targets = create_tensor_with_shape_rs_dtype(&[2], 4);
+        let targets = create_tensor_with_shape_rs_dtype(&[2], crate::tensor::DTYPE_I32);
         let targets_t = NslTensor::from_ptr(targets);
         unsafe {
             *targets_t.data_i32().add(0) = 0;

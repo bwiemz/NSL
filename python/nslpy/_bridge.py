@@ -20,9 +20,10 @@ from typing import Any, Callable, Optional, Sequence
 # Layout matches `#[repr(C)] struct NslTensorDesc` in
 # `crates/nsl-runtime/src/c_api.rs` byte-for-byte.
 #
-# C API dtype encoding (NOT the internal NslTensor encoding!):
-#   0 = f32,  1 = f64,  2 = f16,  3 = bf16,
-#   4 = int32, 5 = int64, 6 = int8, 7 = uint8
+# Dtype encoding: the canonical NSL tag space (P4 item 16 unified the C API
+# with `NslTensor.dtype` — there is no separate inverted C-API convention):
+#   0 = f64,  1 = f32,  2 = f16,  3 = bf16,
+#   4 = int8, 9 = int32
 # ---------------------------------------------------------------------------
 
 class NslTensorDesc(ctypes.Structure):
@@ -42,7 +43,7 @@ class NslTensorDesc(ctypes.Structure):
     ]
 
 
-_DTYPE_F32 = 0
+_DTYPE_F32 = 1
 
 
 def _f32_desc_from_floats(values: Sequence[float]):

@@ -35,7 +35,7 @@ Each field serves a specific role:
 - **`ndim`** / **`len`** — rank and total element count.
 - **`refcount`** — atomic reference counter. When it reaches zero the allocator frees `data` (if `owns_data == 1` and `slab_managed == 0`) and the struct itself.
 - **`device`** — `0` means CPU; values `1+` are CUDA device IDs (matching the ordinals returned by `cuDeviceGet`).
-- **`dtype`** — built-in codes are `0`=f64, `1`=f32, `2`=fp16, `3`=bf16, `4`=int8, `5`=fp8e4m3, `6`=fp8e5m2, `7`=u16 token, `8`=u16 segment. Custom dtypes from `datatype` blocks start at `256`.
+- **`dtype`** — built-in codes are `0`=f64, `1`=f32, `2`=fp16, `3`=bf16, `4`=int8, `5`=fp8e4m3, `6`=fp8e5m2, `7`=u16 token, `8`=u16 segment, `9`=i32 (DataLoader token IDs). Custom dtypes from `datatype` blocks start at `256`. The C API (`NslTensorDesc.dtype`) uses this same canonical tag space verbatim — the historical inverted 0=f32/1=f64 C-API convention and the tag-4 i32/int8 overload were both removed in the P4 item-16 dtype/ABI migration (pinned by the `dtype_abi_lock` test).
 - **`owns_data`** — `1` means the struct is responsible for freeing `data`; `0` means the memory is borrowed (e.g. from a view, mmap, or external allocation).
 - **`data_owner`** — non-zero means this tensor is a view; the value is a raw `i64` pointer to the NslTensor that actually allocated the buffer. When a view is freed, the owner's refcount is decremented.
 - **`slab_managed`** — when `1`, `data` is an interior pointer into a persistent GPU slab. The free path skips `cuMemFree_v2` for this block; the slab is released once at program exit via `nsl_slab_destroy`.
