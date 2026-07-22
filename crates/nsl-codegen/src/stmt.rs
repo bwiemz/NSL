@@ -5178,6 +5178,69 @@ impl Compiler<'_> {
                      the CPDT precision plan, or use --zero-stage 2",
                 ));
             }
+            // P4 item 17: SR-BF16 authoritative weights. The fused SR step
+            // is the ONLY sanctioned theta writer — refuse every composition
+            // that could route any parameter's update through a non-SR path
+            // (stdlib dispatch, interpreted envelope, owner-gated collective
+            // update), or that assumes f32 authoritative storage.
+            if self.features.param_dtype_bf16sr {
+                if optimizer_name != "adamw" && optimizer_name != "adam" {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr supports only AdamW/Adam in v1 \
+                         (the fused SR step; Muon SR-state is the item-18 \
+                         ladder). Drop the flag or switch optimizers",
+                    ));
+                }
+                if !self.compile_options.weight_stream {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires --weight-stream: the \
+                         bf16 authoritative mirrors ride the streaming \
+                         residency schedule (transient f32 working views)",
+                    ));
+                }
+                if self.features.zero_stage.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         --zero-stage yet (the ZeRO gather/reduce paths pin \
+                         f32 device storage). Drop one of the flags",
+                    ));
+                }
+                if self.compile_options.optim_state_offload {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         --optim-state-offload (m/v must be plain device f32 \
+                         for the fused SR step)",
+                    ));
+                }
+                if dtype_data.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         reduced-precision optimizer moments (drop \
+                         --wggo-moment-precision / the CPDT precision plan)",
+                    ));
+                }
+                if self.compile_options.training_reference {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires the fused optimizer \
+                         step, which --training-reference disables",
+                    ));
+                }
+                if !fase_deferred {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires the FASE-Deferred \
+                         plan (the FullBuffer stdlib dispatch would update \
+                         theta without stochastic rounding). Train with \
+                         gradient accumulation / --source-ad",
+                    ));
+                }
+                if self.wggo_overrides.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with WGGO \
+                         per-layer FASE overrides yet (a FullBuffer-routed \
+                         param would bypass the SR step). Drop the WGGO plan",
+                    ));
+                }
+            }
             if let Some((m_codes, v_codes)) = dtype_data {
                 let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -7964,10 +8027,20 @@ impl Compiler<'_> {
                 // without it the first window's forward peak would still be
                 // the full-residency wall the flag exists to remove.
                 if let Some(wsplan) = &ws_fwd_plan {
+                    if self.features.param_dtype_bf16sr {
+                        self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
+                    }
                     for &idx in &wsplan.register_idxs {
                         let iv = builder.ins().iconst(cl_types::I64, idx);
                         let pw = self
                             .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                        if self.features.param_dtype_bf16sr {
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_sr_bf16_note_param",
+                                &[pw, iv],
+                            )?;
+                        }
                         self.compile_call_by_name(
                             builder,
                             "nsl_weight_stream_register",
@@ -9971,6 +10044,8 @@ impl Compiler<'_> {
                 // owner gate while resident/tied params update on every rank
                 // from the identical reduced gradients.
                 zero3: Option<&std::collections::HashSet<i64>>,
+                // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
+                sr_step: Option<Value>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
                 if zero3.is_some() {
@@ -10080,6 +10155,7 @@ impl Compiler<'_> {
                             Some(bc),
                             wrap_precision,
                             wrap_offload,
+                            sr_step,
                         )?;
                     }
                     if let Some((_do_b, join_b)) = z3_gate {
@@ -10151,10 +10227,23 @@ impl Compiler<'_> {
             let zero3_streamed: Option<std::collections::HashSet<i64>> =
                 (self.features.zero_stage == Some(3)).then(|| ws_streamed.clone());
             if ws_active {
+                // P4 item 17: activate the bf16 mirror backend and assign
+                // each streamed param its stable SR counter block BEFORE the
+                // first registration (register aborts on an un-noted param).
+                if self.features.param_dtype_bf16sr {
+                    self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
+                }
                 for &idx in &pending.schedule.ws_streamed {
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                    if self.features.param_dtype_bf16sr {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_sr_bf16_note_param",
+                            &[pw, iv],
+                        )?;
+                    }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }
             }
@@ -10851,6 +10940,7 @@ impl Compiler<'_> {
                     self.compile_options.optim_state_offload,
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
+                    Some(opt_step),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -10924,6 +11014,7 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
+                Some(opt_step),
                 global_group,
             )?;
             // D2b part 2: NO post-epilogue restore. The next iterations'
@@ -11362,6 +11453,7 @@ impl Compiler<'_> {
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
+                        Some(opt_step),
                     )?;
                     if let Some(pb_join) = pb_zero_blocks {
                         builder.ins().jump(pb_join, &[]);
@@ -11451,6 +11543,7 @@ impl Compiler<'_> {
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
+                        Some(opt_step),
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     if let Some(fs_join) = fs_zero_blocks {

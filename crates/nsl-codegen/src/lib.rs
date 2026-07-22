@@ -1133,6 +1133,11 @@ pub struct CompileOptions {
     pub zk: ZkOptions,
     /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
     pub zero_stage: Option<u8>,
+    /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
+    /// storage with counter-based stochastic rounding on the fused AdamW
+    /// update — no FP32 master copy. Rides the weight-stream residency
+    /// schedule (bf16 device mirrors, transient f32 working views).
+    pub param_dtype_bf16sr: bool,
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
@@ -1417,6 +1422,7 @@ impl Default for CompileOptions {
             ownership_info: HashMap::new(),
             zk: ZkOptions::default(),
             zero_stage: None,
+            param_dtype_bf16sr: false,
             debug_training: false,
             grad_integrity: false,
             training_reference: false,

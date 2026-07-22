@@ -798,6 +798,17 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 
+        /// P4 item 17: authoritative parameter storage dtype for training.
+        /// `bf16-sr` stores every streamed parameter as a device-resident
+        /// BF16 buffer (no FP32 master copy) and applies the fused AdamW
+        /// update with compiler-owned counter-based stochastic rounding
+        /// (deterministic in --seed, the step, and the parameter/element
+        /// index). Requires --weight-stream + the fused AdamW step; refuses
+        /// Muon, ZeRO, offload, and reduced-precision-moment compositions.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16-sr"])]
+        pub(crate) param_dtype: String,
+
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
         /// stable, reused device staging arena. Fewer CUDA calls, one large
@@ -1241,6 +1252,17 @@ pub(crate) struct RunArgs {
         /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
+
+        /// P4 item 17: authoritative parameter storage dtype for training.
+        /// `bf16-sr` stores every streamed parameter as a device-resident
+        /// BF16 buffer (no FP32 master copy) and applies the fused AdamW
+        /// update with compiler-owned counter-based stochastic rounding
+        /// (deterministic in --seed, the step, and the parameter/element
+        /// index). Requires --weight-stream + the fused AdamW step; refuses
+        /// Muon, ZeRO, offload, and reduced-precision-moment compositions.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16-sr"])]
+        pub(crate) param_dtype: String,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
