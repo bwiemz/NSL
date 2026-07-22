@@ -1106,6 +1106,13 @@ pub struct CompileOptions {
     pub nan_analysis: bool,
     /// M46: Enable deterministic mode.
     pub deterministic: bool,
+    /// P0 certification: RNG seed for `randn`/`rand`/stochastic ops.
+    /// `None` keeps the historical behavior (seed 42 under
+    /// --deterministic, unseeded otherwise). `Some(s)` seeds the RNG at
+    /// program start regardless of --deterministic (multi-seed training
+    /// campaigns need distinct reproducible inits; bit-reproducibility of
+    /// the DEVICE path still requires --deterministic).
+    pub rng_seed: Option<u64>,
     /// M52: Path to safetensors weight file for weight-aware compilation
     pub weight_file: Option<std::path::PathBuf>,
     /// M52: Weight-aware compilation configuration
@@ -1399,6 +1406,7 @@ impl Default for CompileOptions {
             trace_ops: false,
             nan_analysis: false,
             deterministic: false,
+            rng_seed: None,
             weight_file: None,
             weight_config: weight_aware::WeightAwareConfig::default(),
             weight_analysis: false,

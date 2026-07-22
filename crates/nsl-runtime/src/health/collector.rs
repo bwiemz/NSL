@@ -14,6 +14,10 @@ pub struct HealthSnapshot {
     pub loss_ema_slope: Option<f64>,
     pub grad_norm_total: Option<f64>,
     pub per_layer_grad_norm: HashMap<u32, f64>,
+    /// P0 certification: global parameter L2 norm — sqrt of the sum of
+    /// squared per-tensor weight norms recorded this window. The direct
+    /// "parameter norm curve" signal (pct_delta below is relative-only).
+    pub weight_norm_total: Option<f64>,
     pub per_tensor_weight_pct_delta: HashMap<String, f64>,
     pub nan_inf_count_window: u64,
     pub steps_in_window: u64,
@@ -132,6 +136,13 @@ impl HealthCollector {
             })
             .collect();
 
+        let weight_norm_total = if self.weight_current.is_empty() {
+            None
+        } else {
+            let sumsq: f64 = self.weight_current.values().map(|n| n * n).sum();
+            Some(sumsq.sqrt())
+        };
+
         HealthSnapshot {
             step: self.step,
             max_steps: None,
@@ -140,6 +151,7 @@ impl HealthCollector {
             loss_ema_slope: slope,
             grad_norm_total,
             per_layer_grad_norm: self.grad_norm_per_layer.clone(),
+            weight_norm_total,
             per_tensor_weight_pct_delta,
             nan_inf_count_window: self.nan_inf_count,
             steps_in_window: self.loss_history.len() as u64,

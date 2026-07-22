@@ -28,6 +28,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             training_reference,
             trace_ops,
             deterministic,
+            seed,
             distribute: _distribute,
             zero_stage,
             wcet,
@@ -379,6 +380,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 trace_ops,
                 nan_analysis: false,
                 deterministic,
+                rng_seed: seed,
                 // CPDT: pass through the four-case-resolved weight file so the
                 // weight-aware tier assignment runs during train-block codegen.
                 weight_file: resolved_weight_file.clone(),

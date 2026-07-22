@@ -567,6 +567,11 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) deterministic: bool,
 
+        /// P0 certification: RNG seed for randn/rand/stochastic ops (see
+        /// `run --seed`).
+        #[arg(long)]
+        pub(crate) seed: Option<u64>,
+
         /// M52: Dead weight threshold (default: 1e-6). Weights with |value| < threshold are zeroed.
         #[arg(long, default_value_t = 1e-6)]
         pub(crate) dead_weight_threshold: f64,
@@ -997,6 +1002,13 @@ pub(crate) struct RunArgs {
         /// M46: Enable deterministic mode (compile-time non-determinism detection)
         #[arg(long)]
         pub(crate) deterministic: bool,
+
+        /// P0 certification: RNG seed for randn/rand/stochastic ops.
+        /// Overrides the historical 42 under --deterministic and also seeds
+        /// non-deterministic runs (distinct reproducible inits for
+        /// multi-seed campaigns).
+        #[arg(long)]
+        pub(crate) seed: Option<u64>,
 
         /// M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4")
         #[arg(long)]

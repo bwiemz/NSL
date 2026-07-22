@@ -1,0 +1,40 @@
+# models/coder50m/pretrain_cert.nsl
+#
+# P0 certification arm — 50M baseline on the post-#403 stack (corrected
+# source-AD RMSNorm dx + root-fixed FASE bias handling). Fixed-lr AdamW
+# (no scheduler: curves comparable across seeds/arms), synthetic learnable
+# token stream (models/benchmarks/gen_tokens.py), loss printed EVERY step;
+# grad-norm / param-norm curves ride the --monitor --health-interval
+# JSON snapshots.
+#
+# Harness markers (exact string rewrites):
+#   CERT_TOKENS_PATH   -> the u16 tokens.bin path
+#   weight_decay=0.1   -> weight_decay=0.0 for the wd=0 integrity arm
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+let m = NSLCoder()
+m.to(cuda)
+print("CERT_MODEL_READY")
+
+let tokens = load_mmap("CERT_TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_clip=1.0):
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("CERT_COMPLETE")

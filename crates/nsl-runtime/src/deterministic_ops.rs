@@ -38,10 +38,17 @@ pub fn is_deterministic() -> bool {
 }
 
 /// Seed all RNG sources for reproducibility.
-/// Called from compiled main() when --deterministic is active.
+/// Called from compiled main() when --deterministic and/or --seed is active.
 #[no_mangle]
 pub extern "C" fn nsl_rng_seed(seed: i64) -> i64 {
     RNG_SEED.store(seed as u64, Ordering::SeqCst);
+    // P0 certification (--seed): the SAMPLING thread-local RNG feeds
+    // randn/rand model init, but it was only reseedable via
+    // nsl_manual_seed — "seed all RNG sources" silently excluded the one
+    // that determines the initial weights, so every --seed produced the
+    // SAME init. Reseed it here (program start runs on the thread that
+    // executes model init).
+    crate::sampling::nsl_manual_seed(seed);
     eprintln!("[nsl] deterministic RNG seed set to {seed}");
     0
 }
