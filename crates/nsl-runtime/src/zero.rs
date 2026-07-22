@@ -1924,6 +1924,448 @@ pub extern "C" fn nsl_grad_all_reduce(_grad_ptr: i64, _num_elems: i64) -> i64 {
     0
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// P3 ZeRO-3 (items 12-14): TENSOR-GRANULAR parameter sharding.
+//
+// Each parameter tensor is OWNED by exactly one rank (the same
+// byte-balanced owner map stages 1/2 use). At rest, the owner keeps the
+// full tensor device-resident and every other rank holds NOTHING
+// (`data == null`) — the per-rank at-rest footprint is ~1/ws of total
+// parameter bytes. Just-in-time materialization rides the CSLA
+// layer-major schedule through the weight-stream residency machinery:
+// codegen's per-layer upload/evict sites redirect here (no host mirrors —
+// the fill primitive is a collective broadcast from the owner, the spill
+// primitive a plain free). Item 14's ordering falls out of the schedule:
+// layer L's backward completes (source AD knows exactly when) → L's
+// gradient slots all-reduce → owner updates → release → the NEXT range
+// head gathers its layer. With the CPU-shm / sim-gpu backends every
+// collective is synchronous, so the ordering is validated bit-exactly;
+// true comm/compute overlap needs the NCCL backend's streams (documented
+// follow-up, not reachable on a 1-GPU box).
+//
+// Granularity note: this is the per-PARAMETER FSDP variant (owner =
+// singleton group per tensor), not elementwise 1/ws sharding of every
+// tensor. It reuses the stage-1/2 owner maps, keeps `muon_step` (which
+// needs whole matrices) compatible, and needs no gather in the optimizer.
+// Elementwise sharding would ride `CollectiveBackend::all_gather` later.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Item 12: the residency of THIS RANK's replica of a parameter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i64)]
+pub enum ParameterResidency {
+    /// Not sharded — full replica on every rank (view-rooted / tied /
+    /// epilogue params; also everything when ZeRO-3 is off). Updated
+    /// identically on all ranks from all-reduced gradients.
+    Replicated = 0,
+    /// This rank OWNS the tensor: its full data is the authoritative shard.
+    ShardedResident = 1,
+    /// Non-owner holding a temporary gathered (broadcast) copy for the
+    /// current layer window; released after the layer's last use.
+    GatheredTemporary = 2,
+    /// Non-owner at rest: no local bytes (`data == null`).
+    Evicted = 3,
+}
+
+struct Zero3Entry {
+    /// param_list index — recorded for diagnostics; the owner (derived
+    /// from it at note time) is what the hot paths read. Only referenced
+    /// on cuda builds today, hence the allow.
+    #[allow(dead_code)]
+    idx: usize,
+    owner: i32,
+    state: ParameterResidency,
+}
+
+static ZERO3_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ZERO3_TABLE: Mutex<Option<std::collections::HashMap<i64, Zero3Entry>>> = Mutex::new(None);
+static ZERO3_GATHERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ZERO3_RELEASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Codegen calls this once per train block when `--zero-stage 3` is baked.
+#[no_mangle]
+pub extern "C" fn nsl_zero3_enable() -> i64 {
+    ZERO3_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut guard = ZERO3_TABLE.lock().unwrap();
+    guard.get_or_insert_with(std::collections::HashMap::new);
+    eprintln!(
+        "[zero3] tensor-granular parameter sharding enabled: owners keep \
+         their params device-resident, non-owners hold nothing at rest and \
+         gather per layer window (optimizer state stays replicated in v1)"
+    );
+    0
+}
+
+/// True while a train block runs under `--zero-stage 3` — the
+/// weight-stream entry points branch on this.
+pub(crate) fn zero3_active() -> bool {
+    ZERO3_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Map a parameter tensor pointer to its param-list index (owners come
+/// from the stage-1/2 partition). Emitted right after
+/// `nsl_zero_partition_bytes` for every param.
+#[no_mangle]
+pub extern "C" fn nsl_zero3_note_param(tensor_ptr: i64, idx: i64) -> i64 {
+    if tensor_ptr == 0 || idx < 0 {
+        return -1;
+    }
+    let owner = {
+        let guard = ZERO_CTX.lock().unwrap();
+        let Some(ctx) = guard.as_ref() else {
+            eprintln!("nsl_zero3_note_param: ZeRO context not initialized");
+            return -1;
+        };
+        ctx.owner_of
+            .get(idx as usize)
+            .copied()
+            .unwrap_or((idx as usize % ctx.world_size.max(1)) as i32)
+    };
+    let mut guard = ZERO3_TABLE.lock().unwrap();
+    guard.get_or_insert_with(std::collections::HashMap::new).insert(
+        tensor_ptr,
+        Zero3Entry {
+            idx: idx as usize,
+            owner,
+            state: ParameterResidency::Replicated,
+        },
+    );
+    0
+}
+
+/// Item 12 introspection (tests/diagnostics): residency of this rank's
+/// replica as the enum's i64 value; -1 = untracked pointer.
+#[no_mangle]
+pub extern "C" fn nsl_zero3_residency(tensor_ptr: i64) -> i64 {
+    let guard = ZERO3_TABLE.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|t| t.get(&tensor_ptr))
+        .map(|e| e.state as i64)
+        .unwrap_or(-1)
+}
+
+/// Gather / release counters (gate anti-vacuity probes).
+#[no_mangle]
+pub extern "C" fn nsl_zero3_gather_count() -> i64 {
+    ZERO3_GATHERS.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+#[no_mangle]
+pub extern "C" fn nsl_zero3_release_count() -> i64 {
+    ZERO3_RELEASES.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// First registration under ZeRO-3 (weight-stream `register` redirect):
+/// the owner keeps its device data (ShardedResident); every other rank
+/// frees its replica (Evicted). Re-registration at window start re-evicts
+/// non-owners (idempotent for the owner). No host mirror is ever created.
+// Referenced from weight_stream's cuda-gated register redirect only.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn zero3_register(tensor_ptr: i64) {
+    let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
+    let rank = {
+        let guard = ZERO_CTX.lock().unwrap();
+        guard.as_ref().map(|c| c.rank).unwrap_or(0)
+    };
+    let mut guard = ZERO3_TABLE.lock().unwrap();
+    let table = guard.get_or_insert_with(std::collections::HashMap::new);
+    let Some(e) = table.get_mut(&tensor_ptr) else {
+        eprintln!(
+            "[zero3] FATAL: register of an un-noted param tensor {tensor_ptr} \
+             — codegen must emit nsl_zero3_note_param for every param"
+        );
+        std::process::abort();
+    };
+    // First-registration admission (parity with weight-stream's #397 guard):
+    // only plain owning non-slab tensors may shard — a view/slab param would
+    // corrupt on free-and-regather.
+    if e.state == ParameterResidency::Replicated
+        && (t.owns_data == 0 || t.data_owner != 0 || t.slab_managed != 0)
+    {
+        eprintln!(
+            "[zero3] refusing to shard tensor {tensor_ptr}: owns_data={} \
+             data_owner={} slab_managed={} — only plain owning tensors shard",
+            t.owns_data, t.data_owner, t.slab_managed
+        );
+        std::process::abort();
+    }
+    if e.owner as usize == rank {
+        e.state = ParameterResidency::ShardedResident;
+        return;
+    }
+    match e.state {
+        ParameterResidency::Replicated | ParameterResidency::GatheredTemporary => {
+            if !t.data.is_null() {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::inner::ensure_context();
+                    crate::cuda::inner::free_managed(t.data);
+                }
+                t.data = std::ptr::null_mut();
+            }
+            e.state = ParameterResidency::Evicted;
+        }
+        ParameterResidency::Evicted => {}
+        ParameterResidency::ShardedResident => unreachable!("owner handled above"),
+    }
+}
+
+/// JIT gather (weight-stream `upload` redirect): symmetric on every rank —
+/// the owner contributes its live data as the broadcast source; non-owners
+/// allocate a fresh device buffer and receive into it
+/// (GatheredTemporary). Idempotent when already materialized.
+pub(crate) fn zero3_gather(tensor_ptr: i64) {
+    let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
+    let (owner, is_owner) = {
+        let tbl = ZERO3_TABLE.lock().unwrap();
+        let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
+            eprintln!("[zero3] FATAL: gather of untracked tensor {tensor_ptr}");
+            std::process::abort();
+        };
+        if e.state == ParameterResidency::GatheredTemporary {
+            return; // already materialized this window
+        }
+        if e.state == ParameterResidency::Replicated {
+            // Never registered (resident / view-rooted / tied): the local
+            // replica is always current — gathering would be a wasted
+            // collective AND flip the state so a bracket-end release could
+            // free a replica that must stay live.
+            return;
+        }
+        let guard = ZERO_CTX.lock().unwrap();
+        let rank = guard.as_ref().map(|c| c.rank).unwrap_or(0);
+        (e.owner, e.owner as usize == rank)
+    };
+    #[cfg(feature = "cuda")]
+    {
+        if !is_owner && t.data.is_null() {
+            crate::cuda::inner::ensure_context();
+            let bytes = t.data_byte_size();
+            t.data = crate::cuda::inner::alloc_managed(bytes);
+        }
+    }
+    let rc = {
+        let guard = ZERO_CTX.lock().unwrap();
+        let Some(ctx) = guard.as_ref() else { return };
+        if ctx.world_size <= 1 {
+            0
+        } else {
+            let backend = ctx
+                .backend
+                .as_ref()
+                .expect("world_size > 1 implies a backend");
+            if t.device != 0 && !ctx.cuda_aware {
+                eprintln!(
+                    "[zero3] FATAL: GPU-resident ZeRO-3 needs a CUDA-aware \
+                     collective backend (sim-gpu or nccl)"
+                );
+                std::process::abort();
+            }
+            if t.device != 0 && t.dtype != 1 {
+                eprintln!(
+                    "[zero3] FATAL: GPU param dtype {} unsupported (f32 only)",
+                    t.dtype
+                );
+                std::process::abort();
+            }
+            backend.broadcast(
+                t.data,
+                t.len as usize,
+                if t.device != 0 {
+                    crate::tensor_parallel::collective::DTYPE_F32
+                } else {
+                    t.dtype as crate::tensor_parallel::collective::DtypeId
+                },
+                owner,
+                std::ptr::null_mut(),
+            )
+        }
+    };
+    if rc != 0 {
+        eprintln!("[zero3] FATAL: gather broadcast failed rc={rc}");
+        std::process::abort();
+    }
+    let mut tbl = ZERO3_TABLE.lock().unwrap();
+    if let Some(e) = tbl.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) {
+        if !is_owner {
+            e.state = ParameterResidency::GatheredTemporary;
+        }
+    }
+    ZERO3_GATHERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Release (weight-stream `evict` redirect): the owner keeps its
+/// authoritative data (writeback is meaningless — there is no mirror);
+/// non-owners free their gathered copy. Safe on an already-evicted param.
+pub(crate) fn zero3_release(tensor_ptr: i64) {
+    let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
+    let is_owner = {
+        let tbl = ZERO3_TABLE.lock().unwrap();
+        let Some(e) = tbl.as_ref().and_then(|m| m.get(&tensor_ptr)) else {
+            eprintln!("[zero3] FATAL: release of untracked tensor {tensor_ptr}");
+            std::process::abort();
+        };
+        if e.state == ParameterResidency::Replicated {
+            // Resident replica — must never be freed by a bracket end.
+            return;
+        }
+        let guard = ZERO_CTX.lock().unwrap();
+        let rank = guard.as_ref().map(|c| c.rank).unwrap_or(0);
+        e.owner as usize == rank
+    };
+    if is_owner {
+        return;
+    }
+    if !t.data.is_null() {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::inner::ensure_context();
+            crate::cuda::inner::free_managed(t.data);
+        }
+        t.data = std::ptr::null_mut();
+    }
+    let mut tbl = ZERO3_TABLE.lock().unwrap();
+    if let Some(e) = tbl.as_mut().and_then(|m| m.get_mut(&tensor_ptr)) {
+        e.state = ParameterResidency::Evicted;
+    }
+    ZERO3_RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Item 14: all-reduce ONE layer-group gradient slot across ranks, at the
+/// point where source AD has just completed that layer's backward. Every
+/// rank calls this in the identical compile-time order (the spin-barrier
+/// invariant). The slot is the layer's m_partial accumulator tensor.
+#[no_mangle]
+pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
+    let guard = ZERO_CTX.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else {
+        return -1;
+    };
+    if ctx.world_size <= 1 {
+        return 0;
+    }
+    let list = unsafe { &*(list_ptr as *const crate::list::NslList) };
+    if idx < 0 || idx >= list.len {
+        return -1;
+    }
+    let raw = unsafe { *list.data.add(idx as usize) };
+    if raw == 0 {
+        return 0; // null slot (already consumed) — nothing to reduce
+    }
+    let t = unsafe { &*(raw as *const crate::tensor::NslTensor) };
+    let backend = ctx
+        .backend
+        .as_ref()
+        .expect("world_size > 1 implies a backend");
+    if t.device != 0 && !ctx.cuda_aware {
+        eprintln!(
+            "[zero3] FATAL: GPU-resident gradient all-reduce needs a \
+             CUDA-aware collective backend (sim-gpu or nccl)"
+        );
+        std::process::abort();
+    }
+    if t.device != 0 && t.dtype != 1 {
+        eprintln!("[zero3] FATAL: GPU grad dtype {} unsupported", t.dtype);
+        std::process::abort();
+    }
+    let rc = backend.all_reduce_sum(
+        t.data as *const std::ffi::c_void,
+        t.data,
+        t.len as usize,
+        if t.device != 0 {
+            crate::tensor_parallel::collective::DTYPE_F32
+        } else {
+            t.dtype as crate::tensor_parallel::collective::DtypeId
+        },
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        eprintln!("[zero3] gradient all-reduce failed rc={rc} for slot {idx}");
+        return -1;
+    }
+    // Gradient AVERAGING — the same sum-then-divide convention as
+    // nsl_zero_reduce_grads, so a rank-blind loader stays bit-exact with
+    // the single-rank baseline ((g+g)/2 == g in IEEE for pow-2 world
+    // sizes; identical semantics otherwise).
+    let inv_ws = 1.0 / ctx.world_size as f64;
+    drop(guard);
+    crate::tensor::nsl_tensor_mul_scalar_inplace(raw, inv_ws);
+    0
+}
+
+/// Gather every REGISTERED (non-Replicated) param — the open bracket for
+/// callbacks / model_save / teardown. Symmetric across ranks (identical
+/// table iteration order via sorted keys).
+pub(crate) fn zero3_gather_all() {
+    let mut keys: Vec<i64> = {
+        let guard = ZERO3_TABLE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|t| {
+                t.iter()
+                    .filter(|(_, e)| e.state != ParameterResidency::Replicated)
+                    .map(|(k, _)| *k)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    keys.sort_unstable();
+    for k in keys {
+        zero3_gather(k);
+    }
+}
+
+/// Release every gathered temporary — the close bracket (Replicated and
+/// owner replicas are untouched by construction).
+pub(crate) fn zero3_release_all() {
+    let mut keys: Vec<i64> = {
+        let guard = ZERO3_TABLE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|t| {
+                t.iter()
+                    .filter(|(_, e)| e.state == ParameterResidency::GatheredTemporary)
+                    .map(|(k, _)| *k)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    keys.sort_unstable();
+    for k in keys {
+        zero3_release(k);
+    }
+}
+
+/// Whether this pointer is a REGISTERED (sharded) zero3 param.
+pub(crate) fn zero3_is_registered(tensor_ptr: i64) -> bool {
+    let guard = ZERO3_TABLE.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|t| t.get(&tensor_ptr))
+        .is_some_and(|e| e.state != ParameterResidency::Replicated)
+}
+
+/// Teardown: leave every replica FULL and CURRENT (the model_save /
+/// eval-read end state, matching stages 1/2), then deactivate so
+/// subsequent code paths see plain tensors.
+#[no_mangle]
+pub extern "C" fn nsl_zero3_teardown() -> i64 {
+    if zero3_active() {
+        zero3_gather_all();
+        // Anti-vacuity line for the gates: a zero3 run whose schedule never
+        // gathered/released anything is a broken schedule, not a pass.
+        eprintln!(
+            "[zero3] teardown: full residency restored (gathers={} releases={})",
+            ZERO3_GATHERS.load(std::sync::atomic::Ordering::Relaxed),
+            ZERO3_RELEASES.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+    ZERO3_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut guard = ZERO3_TABLE.lock().unwrap();
+    *guard = None;
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

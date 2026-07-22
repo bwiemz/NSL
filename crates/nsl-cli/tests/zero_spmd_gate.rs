@@ -548,8 +548,10 @@ fn zero_stage2_rank_aware_dp_parity() {
     }
 }
 
-/// Loud refusals: stage 2/3 unlowered; a real (non-simulated) backend
-/// request has no transport to satisfy it.
+/// Loud refusals. P3 update: stage 3 IS lowered now (on the layerwise
+/// residency schedule) — bare `--zero-stage 3` refuses with the required
+/// flag list instead of "not lowered" (full stage-3 coverage lives in
+/// zero3_gate.rs).
 #[test]
 fn zero_refusals() {
     let tmp = std::env::temp_dir().join(format!("nsl_zero_ref_{}", std::process::id()));
@@ -557,9 +559,10 @@ fn zero_refusals() {
     let save = tmp.join("unused.nslm");
 
     let s3 = run_nsl(&program(&save), "ref_s3", &["--zero-stage", "3"], 600);
-    assert!(!s3.success, "--zero-stage 3 must refuse");
+    assert!(!s3.success, "--zero-stage 3 without the csla flags must refuse");
     assert!(
-        s3.stderr.contains("not lowered yet"),
+        s3.stderr
+            .contains("--zero-stage 3 requires --layerwise-accum --weight-stream"),
         "wrong stage-3 refusal:\n{}",
         s3.stderr
     );

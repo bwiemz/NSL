@@ -2518,6 +2518,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_zero_sync_params", &[types::I64, types::I64], Some(types::I64)), // (param_list, num_params)
     ("nsl_zero_destroy", &[], Some(types::I64)),
     ("nsl_zero_owns_param", &[types::I64], Some(types::I64)), // (param_idx) -> 1 if owned
+    // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
+    ("nsl_zero3_enable", &[], Some(types::I64)),
+    ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    ("nsl_zero3_reduce_grad_slot", &[types::I64, types::I64], Some(types::I64)), // (list, idx)
     // D3 v2: record an owned optimizer-moment allocation's element count so the
     // G3 gate can prove per-rank optimizer state shrank to ~1/world_size.
     ("nsl_zero_note_optim_alloc", &[types::I64], Some(types::I64)), // (tensor_ptr) -> running elems

@@ -4734,12 +4734,20 @@ impl Compiler<'_> {
                      the layerwise gate is bit-exact and compressed saves are not",
                 ));
             }
-            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+            // P3 ZeRO-3: stage 3 is BUILT ON the layerwise schedule (its
+            // per-layer group updates host the gradient all-reduce + the
+            // owner-gated step, and its upload/evict sites drive the JIT
+            // gather/release) — only stages 1/2 keep the M43 incompatibility:
+            // their hooks read every accum slot after the backward, but the
+            // layerwise schedule frees per-layer accumulators before the
+            // (bypassed) optimizer gate.
+            if self.features.zero_stage.filter(|&s| (1..=2).contains(&s)).is_some() {
                 return Err(CodegenError::new(
-                    "--layerwise-accum is incompatible with --zero-stage: the M43 \
-                     ZeRO hooks read every accum slot after the backward, but the \
-                     layerwise schedule's per-layer accumulators are freed before \
-                     the optimizer gate. Drop one",
+                    "--layerwise-accum is incompatible with --zero-stage 1/2: the \
+                     M43 ZeRO hooks read every accum slot after the backward, but \
+                     the layerwise schedule's per-layer accumulators are freed \
+                     before the optimizer gate. Drop one (or use --zero-stage 3, \
+                     which composes with the layerwise schedule)",
                 ));
             }
         }
@@ -4753,19 +4761,38 @@ impl Compiler<'_> {
         if let Some(s) = self.features.zero_stage {
             // P4 item 16: stage 2 (gradient partitioning via owner-segmented
             // reduce_scatter) is lowered — same emission points as stage 1;
-            // the runtime dispatches on the baked stage. Stage 3 (parameter
-            // partitioning + just-in-time all-gather) still refuses: params
-            // freed between steps would break mid-loop model_save/callbacks
-            // and eval reads, which need the residency machinery generalized
-            // from the weight-stream Item-12 guard first.
-            if s >= 3 {
+            // the runtime dispatches on the baked stage.
+            //
+            // P3 ZeRO-3 (items 12-14): stage 3 (tensor-granular parameter
+            // partitioning + JIT gather) is lowered ON the layerwise
+            // schedule: it requires --layerwise-accum + --weight-stream so
+            // the per-layer residency sites exist (in zero3 mode their
+            // backend is the collective broadcast, not host mirrors), and
+            // the per-layer group updates host the gradient all-reduce +
+            // owner-gated step. Anything else refuses.
+            if s >= 4 {
                 return Err(CodegenError::new(format!(
-                    "--zero-stage {s} is not lowered yet: stages 1 (optimizer \
-                     sharding) and 2 (gradient partitioning) are implemented. \
-                     Stage 3 parameter partitioning needs the callback/\
-                     model_save residency guard generalized to sharded params \
-                     — use --zero-stage 2",
+                    "--zero-stage {s} does not exist: stages are 1 (optimizer \
+                     sharding), 2 (+ gradient partitioning), 3 (+ parameter \
+                     partitioning)",
                 )));
+            }
+            if s == 3 && !(csla_active && self.compile_options.weight_stream) {
+                return Err(CodegenError::new(
+                    "--zero-stage 3 requires --layerwise-accum --weight-stream \
+                     (+ --checkpoint-blocks --source-ad): parameter sharding \
+                     rides the layer-major residency schedule — its per-layer \
+                     upload/evict sites become the JIT gather/release and its \
+                     group updates host the owner-gated step. Add those flags \
+                     or use --zero-stage 2",
+                ));
+            }
+            if s == 3 && self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--zero-stage 3 with --optim-state-offload is not lowered: \
+                     host-resident moments x owner-gated sharded updates is an \
+                     untested composition (deferral-must-refuse). Drop one",
+                ));
             }
             // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
             // The all-reduce is emitted BEFORE the Deferred dispatch, but
@@ -4922,6 +4949,45 @@ impl Compiler<'_> {
             self.intern_string(part_msg)?;
             let part_msg_ptr = self.compile_string_literal(builder, part_msg)?;
             self.compile_call_by_name(builder, "nsl_assert", &[part_ok, part_msg_ptr])?;
+
+            // P3 ZeRO-3 (item 12): activate the tensor-granular residency
+            // table and map every param pointer to its index (owners come
+            // from the byte-balanced partition above). The weight-stream
+            // registration/upload/evict sites the layerwise schedule emits
+            // then redirect to the zero3 broadcast-fill backend at runtime.
+            if self.features.zero_stage == Some(3) {
+                self.compile_call_by_name(builder, "nsl_zero3_enable", &[])?;
+                let z3_i_var = state.new_variable();
+                builder.declare_var(z3_i_var, cl_types::I64);
+                let z3_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(z3_i_var, z3_zero);
+                let z3_hdr = builder.create_block();
+                let z3_body = builder.create_block();
+                let z3_exit = builder.create_block();
+                builder.ins().jump(z3_hdr, &[]);
+                builder.switch_to_block(z3_hdr);
+                state.current_block = Some(z3_hdr);
+                let z3_i = builder.use_var(z3_i_var);
+                let z3_n = builder
+                    .ins()
+                    .iconst(cl_types::I64, param_paths.len() as i64);
+                let z3_c = builder.ins().icmp(IntCC::SignedLessThan, z3_i, z3_n);
+                builder.ins().brif(z3_c, z3_body, &[], z3_exit, &[]);
+                builder.switch_to_block(z3_body);
+                builder.seal_block(z3_body);
+                state.current_block = Some(z3_body);
+                let z3_p =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[param_list, z3_i])?;
+                self.compile_call_by_name(builder, "nsl_zero3_note_param", &[z3_p, z3_i])?;
+                let z3_one = builder.ins().iconst(cl_types::I64, 1);
+                let z3_next = builder.ins().iadd(z3_i, z3_one);
+                builder.def_var(z3_i_var, z3_next);
+                builder.ins().jump(z3_hdr, &[]);
+                builder.seal_block(z3_hdr);
+                builder.switch_to_block(z3_exit);
+                builder.seal_block(z3_exit);
+                state.current_block = Some(z3_exit);
+            }
         }
         let num_params_val = builder
             .ins()
@@ -5100,6 +5166,16 @@ impl Compiler<'_> {
                      has no dequant->step->quant cast envelope. Drop \
                      --wggo-moment-precision / the CPDT precision plan, or use \
                      AdamW",
+                ));
+            }
+            // P3 ZeRO-3: the owner-gated group updates don't thread the
+            // precision envelope — refuse rather than feed FP16 moments to
+            // an unwrapped update (deferral-must-refuse).
+            if dtype_data.is_some() && self.features.zero_stage == Some(3) {
+                return Err(CodegenError::new(
+                    "--zero-stage 3 does not support reduced-precision \
+                     optimizer moments yet. Drop --wggo-moment-precision / \
+                     the CPDT precision plan, or use --zero-stage 2",
                 ));
             }
             if let Some((m_codes, v_codes)) = dtype_data {
@@ -5333,7 +5409,16 @@ impl Compiler<'_> {
             // perturb the identical-collective-sequence spin-barrier invariant.
             // `zero_enabled` is recomputed locally: the outer binding is
             // introduced far below (near the optimizer loop), out of scope here.
-            let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
+            // P3 ZeRO-3: stage 3 keeps optimizer state REPLICATED in v1
+            // (resident/tied params update on every rank from all-reduced
+            // gradients and need m/v everywhere; owner-only m/v for the
+            // sharded set is a follow-up) — owner-gated moment allocation is
+            // stages 1/2 only, and a loud note records the choice.
+            let zero_enabled = self
+                .features
+                .zero_stage
+                .filter(|&s| (1..=2).contains(&s))
+                .is_some();
             let offload = self.compile_options.optim_state_offload;
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
             // so projecting each moment's dtype-code list by value is fine.
@@ -9879,8 +9964,31 @@ impl Compiler<'_> {
                 wrap_precision: bool,
                 wrap_offload: bool,
                 muon: Option<&MuonCslaCtx>,
+                // P3 ZeRO-3: Some(streamed idx set) under --zero-stage 3.
+                // The group's gradient slots all-reduce FIRST (this is item
+                // 14's ordering — source AD just completed this layer's
+                // backward), then SHARDED (streamed) params update behind an
+                // owner gate while resident/tied params update on every rank
+                // from the identical reduced gradients.
+                zero3: Option<&std::collections::HashSet<i64>>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
+                if zero3.is_some() {
+                    for &i in idxs {
+                        let iv = builder.ins().iconst(cl_types::I64, i);
+                        let rc = c.compile_call_by_name(
+                            builder,
+                            "nsl_zero3_reduce_grad_slot",
+                            &[accum_val, iv],
+                        )?;
+                        let z = builder.ins().iconst(cl_types::I64, 0);
+                        let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+                        let msg = "nsl: zero3 layer gradient all-reduce failed — aborting";
+                        c.intern_string(msg)?;
+                        let mp = c.compile_string_literal(builder, msg)?;
+                        c.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
+                    }
+                }
                 for &i in idxs {
                     let iv = builder.ins().iconst(cl_types::I64, i);
                     let theta =
@@ -9894,6 +10002,26 @@ impl Compiler<'_> {
                     } else {
                         m
                     };
+                    // P3 ZeRO-3: owner-gate the update of a SHARDED param —
+                    // non-owners' gathered copies are released right after
+                    // this group and refetched (post-update) from the owner
+                    // next window, so skipping their update is the sharded
+                    // semantic, not a divergence.
+                    let z3_gate: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Block)> =
+                        if zero3.is_some_and(|s| s.contains(&i)) {
+                            let owns =
+                                c.compile_call_by_name(builder, "nsl_zero_owns_param", &[iv])?;
+                            let one = builder.ins().iconst(cl_types::I64, 1);
+                            let owned = builder.ins().icmp(IntCC::Equal, owns, one);
+                            let do_b = builder.create_block();
+                            let join_b = builder.create_block();
+                            builder.ins().brif(owned, do_b, &[], join_b, &[]);
+                            builder.switch_to_block(do_b);
+                            builder.seal_block(do_b);
+                            Some((do_b, join_b))
+                        } else {
+                            None
+                        };
                     if let Some(mc) = muon {
                         // Muon separate-accumulator mode: m_partial holds the
                         // RAW window gradient sum (accum_scale forced to 1.0),
@@ -9954,10 +10082,16 @@ impl Compiler<'_> {
                             wrap_offload,
                         )?;
                     }
+                    if let Some((_do_b, join_b)) = z3_gate {
+                        builder.ins().jump(join_b, &[]);
+                        builder.switch_to_block(join_b);
+                        builder.seal_block(join_b);
+                    }
                     // The baseline zeroes m_partial for reuse; the layerwise
                     // schedule frees it — next window allocates fresh zeros.
                     // (muon_step borrows the gradient, so freeing here is the
-                    // muon arm's zeroing equivalent too.)
+                    // muon arm's zeroing equivalent too. Under zero3 the free
+                    // runs on every rank — owner and skipped non-owner alike.)
                     c.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial])?;
                     let z = builder.ins().iconst(cl_types::I64, 0);
                     c.compile_call_by_name(builder, "nsl_list_set", &[accum_val, iv, z])?;
@@ -10011,6 +10145,11 @@ impl Compiler<'_> {
             let ws_active = self.compile_options.weight_stream;
             let ws_streamed: std::collections::HashSet<i64> =
                 pending.schedule.ws_streamed.iter().copied().collect();
+            // P3 ZeRO-3: the sharded set == the streamed set (view-rooted /
+            // resident params stay Replicated). Passed into every group
+            // update for the per-layer reduce + owner gating.
+            let zero3_streamed: Option<std::collections::HashSet<i64>> =
+                (self.features.zero_stage == Some(3)).then(|| ws_streamed.clone());
             if ws_active {
                 for &idx in &pending.schedule.ws_streamed {
                     let iv = builder.ins().iconst(cl_types::I64, idx);
@@ -10711,6 +10850,7 @@ impl Compiler<'_> {
                     wrap_precision,
                     self.compile_options.optim_state_offload,
                     muon_csla_ctx.as_ref(),
+                    zero3_streamed.as_ref(),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -10783,6 +10923,7 @@ impl Compiler<'_> {
                 wrap_precision,
                 self.compile_options.optim_state_offload,
                 muon_csla_ctx.as_ref(),
+                zero3_streamed.as_ref(),
                 global_group,
             )?;
             // D2b part 2: NO post-epilogue restore. The next iterations'
@@ -10930,8 +11071,14 @@ impl Compiler<'_> {
         // The rc is asserted: a mid-run collective failure (capacity -4,
         // GPU-placement refusal -5, dtype -1) must abort, not continue with
         // un-reduced gradients (review: discarded rc -> silent wrong train).
+        // P3 ZeRO-3: stage 3 reduces PER LAYER GROUP inside the (csla)
+        // window backward — the monolithic all-param reduce here would run
+        // on the window's already-nulled accum slots, so it is stages 1/2
+        // only.
         let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
-        if zero_enabled {
+        let zero_monolithic =
+            self.features.zero_stage.filter(|&s| (1..=2).contains(&s)).is_some();
+        if zero_monolithic {
             let rc = self.compile_call_by_name(
                 builder,
                 "nsl_zero_reduce_grads",

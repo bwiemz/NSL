@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — P3: ZeRO-3 tensor-granular parameter sharding (items 12-14)
+
+- **`--zero-stage 3` is lowered** on the layerwise residency schedule
+  (requires `--layerwise-accum --weight-stream --checkpoint-blocks
+  --source-ad`; anything else refuses with the flag list). Each parameter
+  tensor is OWNED by one rank (the stage-1/2 byte-balanced partition);
+  at rest the owner keeps it device-resident and every other rank holds
+  NOTHING — per-rank at-rest parameter memory is ~1/ws. This is the
+  per-parameter FSDP granularity (owner = singleton group per tensor):
+  it reuses the existing owner maps, composes with Muon (whole matrices
+  stay whole), and needs no gather in the optimizer. Elementwise 1/ws
+  sharding via `all_gather` is the documented follow-up.
+- **Item 12 — `ParameterResidency`** (`Replicated | ShardedResident |
+  GatheredTemporary | Evicted`) tracked per replica in the runtime.
+  Callbacks that touch θ ride the existing residency bracket
+  (`upload_all`/`reevict_all` redirect to gather/release), `model_save`
+  reads full replicas via the teardown restore, and tied/view-rooted
+  params stay `Replicated` through the same view-rooted exclusion the
+  weight streamer uses (updated identically on every rank from
+  all-reduced gradients).
+- **Item 13 — JIT gather per layer**: the weight-stream upload/evict
+  sites (per-segment forward brackets, window range heads, packs,
+  prefetch, async evict) redirect to a collective broadcast-fill /
+  free-release backend when zero3 is active — GPU-only, no host mirrors
+  involved. Registration evicts non-owner replicas on the first window.
+- **Item 14 — comm ordering from source-AD readiness**: each layer
+  group's gradient slots all-reduce (sum ÷ ws, the stage-1/2 averaging
+  convention) at its group update — the exact point the layerwise
+  schedule knows that layer's backward completed — then the owner
+  updates and non-owners release; the next range head (or the prefetch
+  edge, when `--stream-prefetch` is on) gathers the following layer.
+  Under the sim/sim-gpu backends collectives are synchronous, so the
+  ordering is validated bit-exactly; true comm/compute overlap on a
+  dedicated stream is NCCL-gated follow-up (not reachable on a 1-GPU
+  box).
+- Constraints (loud refusals): stage 3 × `--optim-state-offload`,
+  stage 3 × reduced-precision moments, stage ≥ 4. Optimizer state stays
+  REPLICATED in v1 (the enable note says so).
+- Gates (`zero3_gate.rs`): 2-rank sim-gpu training is BIT-IDENTICAL to
+  the single-rank baseline (rank-0 loss stream + saved model bytes),
+  with gather/release counters asserted non-vacuous; the same parity
+  holds for Muon × zero3 × arena/prefetch/async-writeback × a callback
+  that reads a sharded param mid-training; refusal coverage for the
+  unsupported combos.
+
 ### Changed — P1: Muon validation + performance (items 5-11)
 
 - **Parameter-ROLE routing replaces the name-substring exclusion list**
