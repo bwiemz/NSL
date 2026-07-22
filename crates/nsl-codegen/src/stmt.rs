@@ -4291,6 +4291,14 @@ impl Compiler<'_> {
         let mut eps_value: f64 = 1e-8;
         // P5 Muon: Newton-Schulz iteration depth (spec default 5).
         let mut ns_steps_value: f64 = 5.0;
+        // P1 Muon item 5: separate learning rate for the AdamW arm of the
+        // mixed Muon/AdamW step (embeddings/head/vectors). Muon's hidden-
+        // matrix lr (~0.02) is 1-2 orders of magnitude above a sane AdamW
+        // lr — sharing one lr either blows up the embedding or starves the
+        // hidden matrices. None → the AdamW arm follows `lr` exactly
+        // (pre-knob behavior, bit-exact). Threaded as a RATIO of lr so a
+        // scheduler modulates both arms coherently.
+        let mut adamw_lr_value: Option<f64> = None;
         // P5 Muon (review M6): the generic defaults above are wrong for
         // Muon — spec/10 promises Muon(lr=0.02, momentum=0.95,
         // nesterov=true), and momentum=0.0 silently degrades the Muon arm
@@ -4323,6 +4331,13 @@ impl Compiler<'_> {
                                         } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
                                             lr_value = *n as f64;
                                             lr_set = true;
+                                        }
+                                    }
+                                    "adamw_lr" => {
+                                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
+                                            adamw_lr_value = Some(*f);
+                                        } else if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                            adamw_lr_value = Some(*n as f64);
                                         }
                                     }
                                     "momentum" => {
@@ -4363,10 +4378,40 @@ impl Compiler<'_> {
                                         }
                                     }
                                     "ns_steps" => {
-                                        if let ExprKind::IntLiteral(n) = &arg.value.kind {
-                                            ns_steps_value = *n as f64;
-                                        } else if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                                            ns_steps_value = *f;
+                                        // P1 item 7: ns_steps is the Newton-Schulz
+                                        // iteration COUNT — a positive integer by
+                                        // construction (spec/10: `ns_steps: int = 5`).
+                                        // A float would silently truncate in the
+                                        // stdlib `while i < ns_steps` loop and a
+                                        // non-positive value would skip
+                                        // orthogonalization entirely (plain
+                                        // momentum-SGD masquerading as Muon), so
+                                        // both refuse instead of degrading.
+                                        match &arg.value.kind {
+                                            ExprKind::IntLiteral(n) if *n >= 1 => {
+                                                ns_steps_value = *n as f64;
+                                            }
+                                            ExprKind::IntLiteral(n) => {
+                                                return Err(CodegenError::new(format!(
+                                                    "ns_steps must be a positive integer \
+                                                     (got {n}); ns_steps=0 or negative \
+                                                     would skip Newton-Schulz \
+                                                     orthogonalization entirely"
+                                                )));
+                                            }
+                                            ExprKind::FloatLiteral(f) => {
+                                                return Err(CodegenError::new(format!(
+                                                    "ns_steps must be a positive integer \
+                                                     (got float {f}); the Newton-Schulz \
+                                                     iteration count cannot be fractional"
+                                                )));
+                                            }
+                                            _ => {
+                                                return Err(CodegenError::new(
+                                                    "ns_steps must be a positive integer \
+                                                     literal (e.g. ns_steps = 5)",
+                                                ));
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -4564,6 +4609,30 @@ impl Compiler<'_> {
         // global norm is uniform across modes, and Phase B applies the
         // shared clip factor in both dispatch arms.
         // See docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md.
+        //
+        // P1 Muon item 11: under the layerwise schedule, muon runs a
+        // Deferred-SHAPED "separate-accumulator" plan — the window backward
+        // accumulates RAW gradient sums into m_partial (accum_scale forced
+        // to 1.0, the FullBuffer convention, so the boundary muon_step
+        // consumes bit-identical input to the non-CSLA path) and the
+        // per-layer group updates dispatch the stdlib muon_step instead of
+        // a fused elementwise recipe (see emit_csla_group_update's muon
+        // arm). Off the layerwise path muon keeps its FullBuffer plan —
+        // this override is CSLA-scoped on purpose. The exact one-buffer
+        // "classical Muon" accumulation (folding the window sum into the
+        // momentum buffer itself) is intentionally NOT this mode; it would
+        // ship as a separately named mode when it lands.
+        let mut fase_plan = fase_plan;
+        if optimizer_name == "muon" && self.compile_options.layerwise_accum {
+            fase_plan.mode = crate::fase::FaseMode::Deferred;
+            fase_plan.recipe.accum_scale = 1.0;
+            fase_plan.rationale = format!(
+                "{} (muon x layerwise-accum: Deferred-shaped raw-sum window \
+                 accumulation, stdlib muon_step at group updates)",
+                fase_plan.rationale
+            );
+        }
+        let fase_plan = fase_plan;
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
         // ── CSLA Stage-2 (`--layerwise-accum`) admission ────────────────
@@ -4595,9 +4664,10 @@ impl Compiler<'_> {
             }
             if !fase_deferred {
                 return Err(CodegenError::new(format!(
-                    "--layerwise-accum requires a FASE-Deferred plan (AdamW/Adam + \
-                     grad_accumulation >= 2); this train block resolved to \
-                     {:?}. Use AdamW or Adam, or drop --layerwise-accum",
+                    "--layerwise-accum requires a FASE-Deferred plan (AdamW/Adam \
+                     + grad_accumulation >= 2, or Muon's separate-accumulator \
+                     window mode); this train block resolved to {:?}. Use \
+                     AdamW, Adam, or Muon, or drop --layerwise-accum",
                     fase_plan.mode
                 )));
             }
@@ -4979,6 +5049,21 @@ impl Compiler<'_> {
                     MPA::Inactive => None,
                 }
             };
+            // P1 Muon item 11: muon's group update runs the stdlib muon_step
+            // (no dequant->step->quant envelope), so reduced-precision
+            // moments would feed FP16 buffers to an unwrapped update —
+            // refuse instead of corrupting. (Reachable only via muon x
+            // --layerwise-accum, where the plan is Deferred-shaped; off
+            // CSLA, muon's FullBuffer plan already suppressed this.)
+            if dtype_data.is_some() && optimizer_name == "muon" {
+                return Err(CodegenError::new(
+                    "muon does not support reduced-precision optimizer moments: \
+                     the mixed Muon/AdamW step is the stdlib muon_step, which \
+                     has no dequant->step->quant cast envelope. Drop \
+                     --wggo-moment-precision / the CPDT precision plan, or use \
+                     AdamW",
+                ));
+            }
             if let Some((m_codes, v_codes)) = dtype_data {
                 let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -5051,13 +5136,68 @@ impl Compiler<'_> {
             ));
         }
 
+        // ── 4a. P1 Muon item 6: parameter-ROLE routing flags ────────────
+        // Mixed Muon/AdamW routes by parameter ROLE — explicit @param_role
+        // decorator > embedding_lookup-usage inference > declared rank >
+        // default hidden (see muon_roles.rs). The name-substring exclusion
+        // list is gone. Flags ride in an i64 NslList parallel to param_list
+        // (1 = force-AdamW); the rank-2 structural check remains the runtime
+        // backstop inside muon_step. Built BEFORE the optimizer state
+        // buffers so the v (second-moment) allocation can skip Muon-routed
+        // params (item 9). The routing table prints loudly so a misrouted
+        // param is never silent.
+        let muon_route_list = if optimizer_name == "muon" {
+            let table = self.classify_muon_param_roles(&model_type_name, &param_paths);
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            for e in &table.entries {
+                let flag = builder.ins().iconst(cl_types::I64, e.adamw as i64);
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
+            }
+            let adamw_count = table.entries.iter().filter(|e| e.adamw).count();
+            eprintln!(
+                "[muon] role-based Muon/AdamW routing over {} params ({} \
+                 AdamW-routed, {} Muon):",
+                table.entries.len(),
+                adamw_count,
+                table.entries.len() - adamw_count,
+            );
+            for e in &table.entries {
+                eprintln!(
+                    "[muon]   {} role={} ({}) -> {}",
+                    e.path,
+                    e.role,
+                    e.source,
+                    if e.adamw {
+                        "AdamW"
+                    } else {
+                        "Muon (if rank-2 at runtime)"
+                    },
+                );
+            }
+            if !table.entries.iter().any(|e| e.role == "head") {
+                eprintln!(
+                    "[muon] note: no param has role 'head' — correct for \
+                     weight-tied models (the tied embedding covers it); if \
+                     this model has an UNTIED lm_head, annotate it with \
+                     @param_role(\"head\")."
+                );
+            }
+            for w in &table.warnings {
+                eprintln!("[muon] warning: {w}");
+            }
+            Some(list)
+        } else {
+            None
+        };
+
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Number of state buffers per param depends on optimizer:
         //   SGD/Lion: 1 (velocity/momentum)
         //   Adam/AdamW/SOAP: 2 (first moment m, second moment v)
         //   Muon (mixed Muon/AdamW): 2 — m is the Muon momentum buffer on
         //   rank-2 hidden weights and the AdamW first moment on routed
-        //   params; v is the AdamW second moment (unread on the Muon route).
+        //   params; v is the AdamW second moment, allocated ONLY where the
+        //   AdamW arm reads it (item 9; Muon-routed params carry a null).
         //
         // State buffers are now NslLists (sized at runtime from param count)
         // instead of compile-time Vec<Value>, because the number of actual
@@ -5094,6 +5234,15 @@ impl Compiler<'_> {
                      step stages state to the device and copies it back (2 PCIe \
                      round-trips of total state per step). VRAM saved: \
                      {num_state_buffers}x parameter bytes."
+                );
+            }
+            if optimizer_name == "muon" {
+                eprintln!(
+                    "[muon] note: v is fully allocated (host-resident) under \
+                     --optim-state-offload — the offload stage-in envelope \
+                     touches both moments unconditionally, so the \
+                     Muon-route v skip (item 9) applies only to the \
+                     resident path."
                 );
             }
         }
@@ -5168,7 +5317,61 @@ impl Compiler<'_> {
                 let surface_optim_v = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_V);
                 self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_v])?;
                 let v_list = cpdt_precision_dtypes.map(|(_, v)| v);
-                let buf2 = if zero_enabled {
+                // P1 Muon item 9: v (the AdamW second moment) is UNREAD on
+                // the Muon route — allocate it only where the AdamW arm can
+                // execute (role flag set OR runtime rank != 2, the EXACT
+                // condition muon_step routes on) and push a null placeholder
+                // otherwise. The state list stays length==num_params; the
+                // AdamW arm is the only v reader and the end-of-train free
+                // loop is null-safe (nsl_tensor_free(0) is a no-op) — the
+                // same discipline as ZeRO's non-owner nulls. DISABLED under
+                // offload / CPDT precision plans: their stage-in envelopes
+                // touch s2 unconditionally, and offloaded v is host-resident
+                // (no VRAM to win back) — a loud note records the choice.
+                let muon_cond_v = optimizer_name == "muon"
+                    && !offload
+                    && cpdt_precision_dtypes.is_none();
+                let buf2 = if muon_cond_v {
+                    let route_list = muon_route_list
+                        .expect("muon route list is built before state buffers (4a)");
+                    let flag_i = self
+                        .compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+                    let ndim_v =
+                        self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_i])?;
+                    let two_c = builder.ins().iconst(cl_types::I64, 2);
+                    let zero_c = builder.ins().iconst(cl_types::I64, 0);
+                    let flag_set = builder.ins().icmp(IntCC::NotEqual, flag_i, zero_c);
+                    let rank_not2 = builder.ins().icmp(IntCC::NotEqual, ndim_v, two_c);
+                    let needs_v = builder.ins().bor(flag_set, rank_not2);
+                    let alloc_b = builder.create_block();
+                    let skip_b = builder.create_block();
+                    let merge_b = builder.create_block();
+                    builder.append_block_param(merge_b, cl_types::I64);
+                    builder.ins().brif(needs_v, alloc_b, &[], skip_b, &[]);
+
+                    builder.switch_to_block(alloc_b);
+                    builder.seal_block(alloc_b);
+                    state.current_block = Some(alloc_b);
+                    let real = if zero_enabled {
+                        self.emit_owner_gated_moment(
+                            builder, state, param_i, idx, v_list, offload,
+                        )?
+                    } else {
+                        self.emit_moment_zeros_like(builder, param_i, idx, v_list, offload)?
+                    };
+                    builder.ins().jump(merge_b, &[real]);
+
+                    builder.switch_to_block(skip_b);
+                    builder.seal_block(skip_b);
+                    state.current_block = Some(skip_b);
+                    let null_v = builder.ins().iconst(cl_types::I64, 0);
+                    builder.ins().jump(merge_b, &[null_v]);
+
+                    builder.switch_to_block(merge_b);
+                    builder.seal_block(merge_b);
+                    state.current_block = Some(merge_b);
+                    builder.block_params(merge_b)[0]
+                } else if zero_enabled {
                     self.emit_owner_gated_moment(builder, state, param_i, idx, v_list, offload)?
                 } else {
                     self.emit_moment_zeros_like(builder, param_i, idx, v_list, offload)?
@@ -5190,44 +5393,6 @@ impl Compiler<'_> {
             // End of the OptimM/OptimV bracket — restore the caller's surface.
             self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
         }
-
-        // ── 4b. P5 Muon: compile-time name-based routing flags ──────────
-        // Mixed Muon/AdamW routes embeddings and the LM head to AdamW BY
-        // NAME (codegen knows the param paths; the runtime step fn only
-        // sees tensors). Flags ride in an i64 NslList parallel to
-        // param_list (1 = force-AdamW); the rank-2 structural check happens
-        // at runtime inside muon_step. The routing table prints loudly so
-        // a misrouted param is never silent.
-        let muon_route_list = if optimizer_name == "muon" {
-            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-            let mut adamw_routed: Vec<String> = Vec::new();
-            for path in &param_paths {
-                let lower = path.to_lowercase();
-                let excluded = ["embed", "lm_head", "unembed", "wte", "wpe", "vocab"]
-                    .iter()
-                    .any(|k| lower.contains(k));
-                if excluded {
-                    adamw_routed.push(path.clone());
-                }
-                let flag = builder.ins().iconst(cl_types::I64, excluded as i64);
-                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
-            }
-            eprintln!(
-                "[muon] mixed Muon/AdamW routing over {} params: {} name-routed \
-                 to AdamW ({}); remaining params take Muon if rank-2 at \
-                 runtime, AdamW otherwise (biases/norms/scalars).",
-                param_paths.len(),
-                adamw_routed.len(),
-                if adamw_routed.is_empty() {
-                    "none".to_string()
-                } else {
-                    adamw_routed.join(", ")
-                },
-            );
-            Some(list)
-        } else {
-            None
-        };
 
         // ── 5. Initialize lr and step_count variables ───────────────────
         let lr_var = state.new_variable();
@@ -9638,6 +9803,31 @@ impl Compiler<'_> {
                 Ok(())
             }
             #[allow(clippy::too_many_arguments)]
+            /// P1 Muon item 11: everything the muon group-update arm needs,
+            /// prebuilt once per window (all Values live in the window's
+            /// bwd_block, which dominates every group-update call site).
+            struct MuonCslaCtx {
+                route_list: Value,
+                opt_fn: String,
+                ns_steps: f64,
+                lr: Value,
+                /// AdamW-arm lr = lr x fixed ratio (see the adamw_lr knob).
+                adamw_lr: Value,
+                momentum: Value,
+                dampening: Value,
+                weight_decay: Value,
+                nesterov: Value,
+                beta1: Value,
+                beta2: Value,
+                eps: Value,
+                /// (step_count + 1) as f64 — the micro-batch counter t the
+                /// non-CSLA FullBuffer muon boundary step uses (historical
+                /// bias-correction semantic, preserved for bit-exactness).
+                t: Value,
+                step_var: Variable,
+            }
+
+            #[allow(clippy::too_many_arguments)]
             fn emit_csla_group_update(
                 c: &mut Compiler,
                 builder: &mut FunctionBuilder,
@@ -9650,6 +9840,7 @@ impl Compiler<'_> {
                 bc: (Value, Value),
                 wrap_precision: bool,
                 wrap_offload: bool,
+                muon: Option<&MuonCslaCtx>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
                 for &i in idxs {
@@ -9665,27 +9856,70 @@ impl Compiler<'_> {
                     } else {
                         m
                     };
-                    // D2a: wrap_offload stages host-pinned m/v to θ's device
-                    // for the update and streams them back asynchronously —
-                    // the whole point of the layer-major schedule is that
-                    // only ONE layer's m/v are staged at a time. The
-                    // envelope's m_partial leg degenerates safely here (the
-                    // accumulator is device-resident, so its "stage" is a
-                    // same-device refcount bump and the tail's zero is
-                    // wasted-but-correct before our free below).
-                    c.fase_emit_final_step(
-                        builder,
-                        theta,
-                        m,
-                        m_partial,
-                        v,
-                        recipe,
-                        Some(bc),
-                        wrap_precision,
-                        wrap_offload,
-                    )?;
+                    if let Some(mc) = muon {
+                        // Muon separate-accumulator mode: m_partial holds the
+                        // RAW window gradient sum (accum_scale forced to 1.0),
+                        // exactly what the non-CSLA FullBuffer path hands
+                        // muon_step as `gradient` — the stdlib step then does
+                        // its own momentum/orthogonalize (Muon route) or
+                        // AdamW math (routed params; v may be a null slot on
+                        // the Muon route, never read there). Bias correction
+                        // happens inside muon_step from t, so the window's
+                        // precomputed bc pair is unused here.
+                        let flag_i = c.compile_call_by_name(
+                            builder,
+                            "nsl_list_get",
+                            &[mc.route_list, iv],
+                        )?;
+                        let flag_f = builder.ins().fcvt_from_sint(cl_types::F64, flag_i);
+                        let ns_c = builder.ins().f64const(mc.ns_steps);
+                        c.emit_stdlib_optim_call(
+                            builder,
+                            "muon",
+                            &mc.opt_fn,
+                            theta,
+                            m_partial,
+                            m,
+                            v,
+                            mc.lr,
+                            mc.momentum,
+                            mc.dampening,
+                            mc.weight_decay,
+                            mc.nesterov,
+                            mc.beta1,
+                            mc.beta2,
+                            mc.eps,
+                            mc.step_var,
+                            wrap_precision,
+                            Some(mc.t),
+                            wrap_offload,
+                            Some((flag_f, ns_c, mc.adamw_lr)),
+                        )?;
+                    } else {
+                        // D2a: wrap_offload stages host-pinned m/v to θ's device
+                        // for the update and streams them back asynchronously —
+                        // the whole point of the layer-major schedule is that
+                        // only ONE layer's m/v are staged at a time. The
+                        // envelope's m_partial leg degenerates safely here (the
+                        // accumulator is device-resident, so its "stage" is a
+                        // same-device refcount bump and the tail's zero is
+                        // wasted-but-correct before our free below).
+                        c.fase_emit_final_step(
+                            builder,
+                            theta,
+                            m,
+                            m_partial,
+                            v,
+                            recipe,
+                            Some(bc),
+                            wrap_precision,
+                            wrap_offload,
+                        )?;
+                    }
                     // The baseline zeroes m_partial for reuse; the layerwise
                     // schedule frees it — next window allocates fresh zeros.
+                    // (muon_step borrows the gradient, so freeing here is the
+                    // muon arm's zeroing equivalent too.)
                     c.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial])?;
                     let z = builder.ins().iconst(cl_types::I64, 0);
                     c.compile_call_by_name(builder, "nsl_list_set", &[accum_val, iv, z])?;
@@ -9780,6 +10014,49 @@ impl Compiler<'_> {
                 ));
             }
             let two_state = num_state_buffers >= 2;
+
+            // P1 Muon item 11: prebuild the muon group-update context —
+            // hyperparameter constants, the routing-flag list from 4a, and
+            // the micro-batch counter t (the non-CSLA FullBuffer semantic).
+            let muon_csla_ctx: Option<MuonCslaCtx> = if optimizer_name == "muon" {
+                let route_list = muon_route_list
+                    .expect("muon route list is built before state buffers (4a)");
+                let mangled = "nsl_optim_muon__muon_step";
+                let opt_fn = if self.registry.functions.contains_key(mangled)
+                    || self.registry.runtime_fns.contains_key(mangled)
+                {
+                    mangled.to_string()
+                } else if self.registry.functions.contains_key("muon_step") {
+                    "muon_step".to_string()
+                } else {
+                    mangled.to_string()
+                };
+                let t_f = builder.ins().fcvt_from_sint(cl_types::F64, sc_plus_one);
+                let lr_now = builder.use_var(lr_var);
+                let ratio = adamw_lr_value.map(|a| a / lr_value).unwrap_or(1.0);
+                let ratio_const = builder.ins().f64const(ratio);
+                let adamw_lr_now = builder.ins().fmul(lr_now, ratio_const);
+                Some(MuonCslaCtx {
+                    route_list,
+                    opt_fn,
+                    ns_steps: ns_steps_value,
+                    lr: lr_now,
+                    adamw_lr: adamw_lr_now,
+                    momentum: builder.ins().f64const(momentum_value),
+                    dampening: builder.ins().f64const(dampening_value),
+                    weight_decay: builder.ins().f64const(weight_decay_value),
+                    nesterov: builder
+                        .ins()
+                        .iconst(cl_types::I8, if nesterov_value { 1 } else { 0 }),
+                    beta1: builder.ins().f64const(beta1_value),
+                    beta2: builder.ins().f64const(beta2_value),
+                    eps: builder.ins().f64const(eps_value),
+                    t: t_f,
+                    step_var: step_count_var,
+                })
+            } else {
+                None
+            };
 
             // Global/epilogue accumulators live for the whole window (their
             // grads may come from any range).
@@ -10395,6 +10672,7 @@ impl Compiler<'_> {
                     (bc1_inv, bc2_inv),
                     wrap_precision,
                     self.compile_options.optim_state_offload,
+                    muon_csla_ctx.as_ref(),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -10466,6 +10744,7 @@ impl Compiler<'_> {
                 (bc1_inv, bc2_inv),
                 wrap_precision,
                 self.compile_options.optim_state_offload,
+                muon_csla_ctx.as_ref(),
                 global_group,
             )?;
             // D2b part 2: NO post-epilogue restore. The next iterations'
@@ -11095,14 +11374,18 @@ impl Compiler<'_> {
             } else {
                 s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
             };
-            // P5 Muon: per-param routing flag (compile-time name exclusion,
-            // see 4b) + Newton-Schulz depth.
+            // P5 Muon: per-param routing flag (parameter-role classification,
+            // see 4a / muon_roles.rs) + Newton-Schulz depth + the AdamW-arm
+            // lr as a fixed ratio of the (possibly scheduled) lr.
             let muon_extra = if let Some(route_list) = muon_route_list {
                 let flag_i =
                     self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
                 let flag_f = builder.ins().fcvt_from_sint(cl_types::F64, flag_i);
                 let ns_steps_const = builder.ins().f64const(ns_steps_value);
-                Some((flag_f, ns_steps_const))
+                let ratio = adamw_lr_value.map(|a| a / lr_value).unwrap_or(1.0);
+                let ratio_const = builder.ins().f64const(ratio);
+                let adamw_lr = builder.ins().fmul(lr, ratio_const);
+                Some((flag_f, ns_steps_const, adamw_lr))
             } else {
                 None
             };

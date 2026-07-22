@@ -190,6 +190,13 @@ pub struct ModelMetadata {
     /// Distinct from `model_tensor_field_shapes`, which stores 2-D
     /// shapes as strings for the WRGA adapter injector only.
     pub model_field_ranks: HashMap<String, HashMap<String, usize>>,
+    /// P1 Muon item 6: explicit `@param_role("embedding"|"head"|"hidden")`
+    /// decorators on model tensor fields, keyed `model_name -> field_name
+    /// -> role`. The authoritative override for mixed Muon/AdamW routing
+    /// (embedding/head route to AdamW, hidden to Muon); undecorated fields
+    /// fall back to structural inference (`muon_roles.rs`). Populated by
+    /// `collection.rs`; an unknown role string is a hard compile error.
+    pub model_field_roles: HashMap<String, HashMap<String, String>>,
     /// M62 Task 5: impl FuncId + signature for @export model methods.
     /// Key: (model_name, method_name). Consumed by Task 6 when compiling
     /// the impl body so it can reference the declared FuncId.
@@ -230,6 +237,7 @@ impl ModelMetadata {
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
             model_field_ranks: HashMap::new(),
+            model_field_roles: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
             agent_var_types: HashMap::new(),
             agent_auto_device_params: HashMap::new(),

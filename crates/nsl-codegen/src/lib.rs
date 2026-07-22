@@ -151,6 +151,7 @@ pub mod cpdt_zero;
 pub mod moe;
 pub mod moe_hf_pack;
 pub mod moe_kernels;
+pub mod muon_roles;
 pub mod pipeline;
 pub mod tensor_parallel;
 

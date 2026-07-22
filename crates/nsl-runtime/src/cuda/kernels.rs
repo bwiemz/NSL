@@ -296,6 +296,52 @@ pub(crate) const MUL_SCALAR_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
+// P1 Muon items 8+10: scale by the inverse Frobenius norm read from a DEVICE
+// buffer — out[i] = x[i] / (sqrt(stats[3]) + 1e-7). `stats` is the 4-slot
+// output of `nsl_tensor_stats_f32` (slot 3 = raw sum-of-squares); reading it
+// on-device is what removes the per-param `.item()` DtoH sync from the Muon
+// Newton-Schulz pre-normalization. Each thread recomputes the scalar inv
+// (sqrt + div, 2 extra ops) — cheaper than a separate 1-thread prep kernel.
+// 0f33D6BF95 = 1e-7f (the stdlib muon_orthogonalize epsilon), 0f3F800000 = 1.0f.
+pub(crate) const MUON_SCALE_INV_FROB_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_muon_scale_inv_frob_f32(\n\
+    .param .u64 x, .param .u64 c, .param .u64 stats, .param .u64 n\n\
+) {\n\
+    .reg .u32 %r<4>;\n\
+    .reg .u64 %rd<9>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .pred %p1;\n\
+    ld.param.u64 %rd1, [x];\n\
+    ld.param.u64 %rd2, [c];\n\
+    ld.param.u64 %rd3, [stats];\n\
+    ld.param.u64 %rd4, [n];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mul.lo.u32 %r3, %r1, %r2;\n\
+    mov.u32 %r1, %tid.x;\n\
+    add.u32 %r3, %r3, %r1;\n\
+    cvt.u64.u32 %rd5, %r3;\n\
+    setp.ge.u64 %p1, %rd5, %rd4;\n\
+    @%p1 bra DONE;\n\
+    add.u64 %rd6, %rd3, 12;\n\
+    ld.global.f32 %f1, [%rd6];\n\
+    sqrt.rn.f32 %f1, %f1;\n\
+    add.rn.f32 %f1, %f1, 0f33D6BF95;\n\
+    mov.f32 %f2, 0f3F800000;\n\
+    div.rn.f32 %f1, %f2, %f1;\n\
+    shl.b64 %rd7, %rd5, 2;\n\
+    add.u64 %rd8, %rd1, %rd7;\n\
+    ld.global.f32 %f3, [%rd8];\n\
+    mul.rn.f32 %f3, %f3, %f1;\n\
+    add.u64 %rd8, %rd2, %rd7;\n\
+    st.global.f32 [%rd8], %f3;\n\
+DONE: ret;\n\
+}\0";
+
 // Fused scaled-add (FASE accumulate epilogue, Milestone C · p4):
 //   m[i] = m[i] + (g[i] * s)      (m read-write, g read-only, s a host f32)
 // Bit-exact replacement for `nsl_mul_scalar_f32` then `nsl_add_f32`, saving one
@@ -1431,6 +1477,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("NEG_F32_PTX", NEG_F32_PTX),
     ("RELU_F32_PTX", RELU_F32_PTX),
     ("MUL_SCALAR_F32_PTX", MUL_SCALAR_F32_PTX),
+    ("MUON_SCALE_INV_FROB_F32_PTX", MUON_SCALE_INV_FROB_F32_PTX),
     ("SCALAR_MUL_ADD_INPLACE_F32_PTX", SCALAR_MUL_ADD_INPLACE_F32_PTX),
     ("ADD_SCALAR_F32_PTX", ADD_SCALAR_F32_PTX),
     ("EXP_F32_PTX", EXP_F32_PTX),

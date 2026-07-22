@@ -3948,6 +3948,100 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     f64::from(raw[3])
 }
 
+/// P1 Muon items 8+10: Frobenius-normalize an f32 tensor ENTIRELY on-device —
+/// out = x / (sqrt(Σx²) + 1e-7) with the Σx² produced by the stats kernel
+/// into a persistent 16-byte device scratch buffer and consumed directly by
+/// `nsl_muon_scale_inv_frob_f32`. NO cuCtxSynchronize, NO DtoH copy: this is
+/// the removal of the per-param `.item()` sync from the Muon Newton-Schulz
+/// pre-normalization (the two launches serialize on the compute stream).
+/// The scratch buffer is thread-local and process-lifetime (item 10's
+/// preallocated scratch): one 16-byte allocation per training thread, ever.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::TENSOR_STATS_F32_PTX;
+    use kernels::MUON_SCALE_INV_FROB_F32_PTX;
+
+    inner::set_oom_context("muon_frobenius_scale_f32");
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    // Flat row-major kernels — materialize strided views first (same
+    // stride-blindness class as the tied-embedding matmul bug).
+    if !a.is_contiguous() {
+        let a_c = crate::tensor::nsl_tensor_contiguous(a_ptr);
+        let result = gpu_muon_frobenius_scale_f32(a_c);
+        crate::tensor::nsl_tensor_free(a_c);
+        return result;
+    }
+    let n = a.len as usize;
+
+    thread_local! {
+        static MUON_STATS_BUF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let stats_buf = MUON_STATS_BUF.with(|c| {
+        if c.get() == 0 {
+            c.set(inner::alloc_managed(16) as u64);
+        }
+        c.get()
+    });
+
+    // Launch 1: stats reduction (slot 3 = raw Σx²) into the device scratch.
+    let mut in_data = a.data as u64;
+    let mut stats_val = stats_buf;
+    let mut n_val = n as u64;
+    let stats_args: [*mut std::ffi::c_void; 3] = [
+        &mut in_data as *mut _ as *mut std::ffi::c_void,
+        &mut stats_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let result = inner::kernel_launch(
+        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        [1, 1, 1], [256, 1, 1], &stats_args, 256 * 4 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
+
+    // Launch 2: elementwise scale reading the norm from device memory.
+    let out_data = inner::alloc_managed(n * 4);
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        a.ndim,
+        a.len,
+        a.device,
+        1,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut x_data = a.data as u64;
+    let mut c_data = out_t.data as u64;
+    let mut stats_val2 = stats_buf;
+    let mut n_val2 = n as u64;
+    let scale_args: [*mut std::ffi::c_void; 4] = [
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut stats_val2 as *mut _ as *mut std::ffi::c_void,
+        &mut n_val2 as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        MUON_SCALE_INV_FROB_F32_PTX.as_ptr(),
+        b"nsl_muon_scale_inv_frob_f32\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &scale_args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU muon_scale_inv_frob kernel failed: {:?}", result
+    );
+    inner::sync_after_kernel();
+    out_ptr as i64
+}
+
 // ---------------------------------------------------------------------------
 // M42b: KV-cache GPU dequantization
 // ---------------------------------------------------------------------------

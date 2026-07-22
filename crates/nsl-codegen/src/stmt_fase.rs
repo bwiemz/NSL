@@ -925,12 +925,20 @@ impl Compiler<'_> {
         // reduced-precision state staged through the combined cross-device
         // cast envelope (see fase_emit_final_step).
         wrap_offload: bool,
-        // P5 Muon: (adamw_route_flag f64, ns_steps f64) for the mixed
-        // Muon/AdamW step. Required when optimizer_name == "muon"; None for
-        // every other optimizer (and for call sites muon cannot reach —
-        // muon FASE-plans as FullBuffer, so the unified mode-table dispatch
-        // never sees it).
-        muon_extra: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
+        // P5 Muon: (adamw_route_flag f64, ns_steps f64, adamw_lr f64) for
+        // the mixed Muon/AdamW step. Required when optimizer_name == "muon";
+        // None for every other optimizer (and for call sites muon cannot
+        // reach — the unified mode-table dispatch never sees muon because
+        // its mode table is suppressed). Muon reaches this from the
+        // monolithic FullBuffer loop and, under --layerwise-accum, from the
+        // CSLA group updates (item 11: Deferred-shaped raw-sum window
+        // accumulation). adamw_lr is lr x a fixed ratio (1.0 when the knob
+        // is unset — bit-exact with the pre-knob single-lr behavior).
+        muon_extra: Option<(
+            cranelift_codegen::ir::Value,
+            cranelift_codegen::ir::Value,
+            cranelift_codegen::ir::Value,
+        )>,
     ) -> Result<(), crate::error::CodegenError> {
         // P0.3 combined envelope: offload + reduced-precision moments.
         let offload_combined = wrap_precision && wrap_offload;
@@ -1036,9 +1044,9 @@ impl Compiler<'_> {
             }
             "muon" => {
                 // P5 mixed Muon/AdamW: muon_step(param, gradient, m, v,
-                // adamw_route, lr, momentum, beta1, beta2, eps,
+                // adamw_route, lr, adamw_lr, momentum, beta1, beta2, eps,
                 // weight_decay, nesterov, ns_steps, t).
-                let (route_flag, ns_steps) = muon_extra.ok_or_else(|| {
+                let (route_flag, ns_steps, adamw_lr) = muon_extra.ok_or_else(|| {
                     crate::error::CodegenError::new(
                         "internal: muon optimizer call emitted without routing \
                          flags (muon_extra) — this call site is not wired for \
@@ -1058,8 +1066,8 @@ impl Compiler<'_> {
                     opt_fn,
                     &[
                         param_val, grad_val, s1, s2, route_flag,
-                        lr, momentum_const, beta1_const, beta2_const, eps_const,
-                        weight_decay_const, nesterov_const, ns_steps, t_float,
+                        lr, adamw_lr, momentum_const, beta1_const, beta2_const,
+                        eps_const, weight_decay_const, nesterov_const, ns_steps, t_float,
                     ],
                 )?;
             }
