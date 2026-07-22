@@ -763,10 +763,12 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
-        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
-        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
-        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
-        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
+        /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
+        /// of the ~11-op / 7-op decompositions — fewer launches, no
+        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup);
+        /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
@@ -1239,10 +1241,12 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
-        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
-        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
-        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
-        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
+        /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
+        /// of the ~11-op / 7-op decompositions — fewer launches, no
+        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup);
+        /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 

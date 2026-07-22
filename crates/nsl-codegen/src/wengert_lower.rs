@@ -3363,6 +3363,20 @@ fn lower_single_op(
                     let key = compiler.compile_string_literal(builder, field)?;
                     call(compiler, builder, "nsl_dict_get_str", &[inputs[0], key])
                 }
+                _ if name.starts_with("rmsnorm_dgamma_backward:") => {
+                    // P5 item 20 slice A: fused RMSNorm gamma gradient.
+                    // inputs = [dy, x, gamma]; eps bit-encoded in the name.
+                    let bits: u64 = name["rmsnorm_dgamma_backward:".len()..]
+                        .parse()
+                        .unwrap_or(0);
+                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_rmsnorm_dgamma_backward",
+                        &[inputs[0], inputs[1], inputs[2], e],
+                    )
+                }
                 _ if name.starts_with("rmsnorm_dx_backward:") => {
                     // Item 9 fused RMSNorm input gradient. inputs = [dy, x, gamma];
                     // eps is bit-encoded in the name suffix (exact round-trip).

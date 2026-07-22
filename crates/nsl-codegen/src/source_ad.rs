@@ -1088,6 +1088,20 @@ impl AdjointGenerator {
             // gradient.  That bug surfaced as "w_norm delta = 0" in the
             // end-to-end CSHA GPU smoke on 2026-04-16.
             AdjointExpr::RmsNormGammaBackward(y_bar, x, eps_val, weight) => {
+                // P5 item 20 slice A: fused single-op path (two deterministic
+                // GPU launches inside the FFI, no [rows, cols] temporaries),
+                // opt-in behind the same flag as the dx fusion. eps rides
+                // bit-exact in the passthrough name; `weight` supplies the
+                // output shape.
+                if self.fuse_rmsnorm_backward {
+                    return self.emit_op(
+                        PrimalOp::Passthrough(format!(
+                            "rmsnorm_dgamma_backward:{}",
+                            eps_val.to_bits()
+                        )),
+                        vec![y_bar, x, weight],
+                    );
+                }
                 // Recompute rms = sqrt(mean(x^2) + eps) over the last dim,
                 // keepdim so it broadcasts against x.
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x, x]);
