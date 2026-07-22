@@ -4169,6 +4169,20 @@ impl Compiler<'_> {
                      independently with no gradient reduction. Drop one",
                 ));
             }
+            // P4 items 17/18: neither precision ladder is lowered on the
+            // pipelined path — without these refusals a @pipeline program
+            // would compile cleanly and train plain f32 while the user
+            // believes they are validating bf16 (deferral-must-refuse).
+            if self.features.param_dtype_bf16sr {
+                return Err(CodegenError::new(
+                    "--param-dtype bf16-sr is not supported on the pipelined                      train path (@pipeline): the bf16 mirror schedule and the                      fused SR step are not lowered there. Drop one",
+                ));
+            }
+            if self.features.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-state-dtype bf16 is not supported on the pipelined                      train path (@pipeline): the CSLA state envelope is not                      lowered there. Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,

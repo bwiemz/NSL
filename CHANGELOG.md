@@ -6,6 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed — P4 item 16: dtype ABI migration (both tag collisions removed)
+
+- **`DTYPE_I32 = 9`**: i32 token tensors carry their own canonical tag.
+  Tag 4 means `DTYPE_INT8` alone, with its true 1-byte width in
+  `dtype_element_size`. Every producer/consumer migrated in lockstep:
+  DataLoader batches, the CPU tensor factory, the `*i32` runtime readers,
+  the GPU i32-index kernel dispatch (embedding fwd/bwd, gather), the
+  fused-CE label decoder, the elementwise promote paths, and the
+  collective byte-width table (which gains `I32=4`, closing a latent
+  1-byte mis-size for i32 tensors through collectives). No on-disk format
+  stores numeric tags, so the migration is disk-safe.
+- **The C API speaks the canonical tag space verbatim** (`NslTensorDesc.
+  dtype`: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, ..., 9=i32). The
+  historical inverted 0=f32/1=f64 convention is GONE; `capi_dtype_to_nsl`
+  / `nsl_dtype_to_capi` remain only as validating identity chokepoints
+  that abort on unknown tags instead of the old silent fall-back-to-f64
+  (which mislabeled the never-mapped C-API int64/uint8 slots). Updated in
+  lockstep: calibration-wrapper codegen immediates, the ONNX-RT element
+  map (int64/uint8 now refused — they never reached a real compute path),
+  the dispatch element-size table, the generated C header, and the Python
+  ctypes mirrors. **Breaking for external C/ctypes callers** that baked
+  the old convention; the `dtype_abi_lock` golden test pins the new one.
+
+### Added — P4 item 17: SR-BF16 authoritative weights (`--param-dtype bf16-sr`)
+
+- Every STREAMED parameter's authoritative copy is a device-resident
+  BF16 buffer — 2 bytes/param, **no FP32 master copy, no host mirror**.
+  Rides the weight-stream residency schedule: upload = device-side
+  bf16→f32 widen into a transient working view (no PCIe), evict = free
+  (no writeback — the fused SR optimizer step IS the persistence),
+  teardown re-materializes plain f32 tensors for model_save/eval.
+  Un-streamed params (view-rooted/tied — the set ZeRO-3 keeps
+  Replicated) keep f32 authority through the plain fused step.
+- The update is a fused AdamW PTX kernel with the f32 kernel's exact
+  rounding sequence plus a stochastic-rounding tail: `splitmix64(seed ^
+  step·SALT, param_idx≪40 + elem)` → 16-bit dither added to the f32
+  result bits before bf16 truncation. **Compiler-owned counters**: the
+  stream is a pure function of (`--seed`, step, param, element) —
+  deterministic across reruns, ranks, and launch order. Explicit edge
+  policy: rounding-induced overflow saturates to ±max-normal; arithmetic
+  Inf propagates; NaN forced to quiet NaN; underflow gradual.
+- FP32 gradients/reductions everywhere (m/v/m_partial stay f32).
+  Refusals: requires `--weight-stream` + the FASE-Deferred fused
+  AdamW/Adam shape; refuses Muon, ZeRO, offload, reduced-precision
+  moments, WGGO per-layer overrides, `--training-reference`.
+- Gates: exhaustive-dither exact-unbiasedness unit tests; GPU rounding
+  tail bit-identical to the CPU reference over 65k adversarial values;
+  e2e training with bit-identical same-seed reruns, seed-sensitive
+  streams, and per-step tracking of the f32 baseline.
+
+### Added — P4 item 18 rung 2: compressed Muon state (`--muon-state-dtype bf16`)
+
+- Ladder order: f32 (default) → **bf16 momentum + f32 working buffer**
+  (this rung) → blockwise 8-bit → 4-bit structural (later rungs refuse
+  loudly with the ladder order in the message).
+- `bf16` halves Muon first-moment memory: m allocates BF16; each CSLA
+  group update dequants to f32, runs the unchanged stdlib `muon_step`,
+  and quant-stores back with counter-based SR (salted separately from
+  the item-17 weight stream). SR — not RTE — because the momentum EMA's
+  `(1−β)·g` increment routinely falls below a bf16 ulp. `v` stays f32.
+  Muon-only; requires `--layerwise-accum`; refuses ZeRO and offload.
+
 ### Added — P3: ZeRO-3 tensor-granular parameter sharding (items 12-14)
 
 - **`--zero-stage 3` is lowered** on the layerwise residency schedule

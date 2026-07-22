@@ -651,7 +651,7 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let go = if grad_out.len == 1 {
         match grad_out.dtype {
             1 => (unsafe { *grad_out.data_f32() }) as f64,
-            4 => unsafe { *(grad_out.data as *const i32) as f64 },
+            crate::tensor::DTYPE_I32 => unsafe { *(grad_out.data as *const i32) as f64 },
             _ => unsafe { *grad_out.data_f64() },
         }
     } else {

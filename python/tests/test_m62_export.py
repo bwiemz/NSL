@@ -119,7 +119,7 @@ def _make_f32_desc(values):
         shape=shape,
         strides=None,
         ndim=1,
-        dtype=1
+        dtype=1,
         device_type=0,  # 0 = CPU
         device_id=0,
     )
