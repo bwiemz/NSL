@@ -1,0 +1,72 @@
+# P1 Muon item 7: shape-class + ns_steps orthogonality probe (GPU).
+#
+# For every production shape class of the coder architecture, run the
+# planned Newton-Schulz primitive at ns_steps in {3, 4, 5} on a fixed
+# FULL-RANK random input (seeded randn — a smooth ramp is near-rank-1 and
+# reports err ~= 1 vacuously; the CSHA cycle-18 degenerate-probe lesson)
+# and report, per (shape, ns):
+#   err        = ||gram_small(O) - I||_F / sqrt(k)  (gram over the SMALL
+#                dimension) — distance of realized singular values from 1
+#   rms        = per-element RMS of the orthogonalized output
+#   scaled_rms = sqrt(max(1, rows/cols)) * rms — the aspect-ratio scaling
+#                convention muon_step applies
+#
+# STRUCTURE NOTE (campaign-found compiler bugs, both pre-existing):
+# everything is INLINED at top level with no float `let` bindings in the
+# loop body — (a) returning from a fn whose body binds several scalar
+# locals after tensor ops SIGSEGVs the emitted program, and (b) a float
+# `let` after tensor `let`s inside a top-level `while` body fails
+# Cranelift verification ("declared type of variable ... doesn't match").
+# See CHANGELOG "Known issues".
+#
+# DATA_DIR marker -> muon_data (eye_256.bin / eye_512.bin f32 identities).
+#
+# Run: nsl run --deterministic --seed 1 <this file after DATA_DIR rewrite>
+
+let eye256 = load_mmap("DATA_DIR/eye_256.bin", 1).reshape([256, 256]).to(cuda)
+let eye512 = load_mmap("DATA_DIR/eye_512.bin", 1).reshape([512, 512]).to(cuda)
+print("PROBE_BEGIN")
+let ns = 3.0
+while ns < 5.5:
+    print("attn_qo_512x512")
+    print(ns)
+    let g_qo = randn([512, 512]).to(cuda)
+    let o_qo = muon_orthogonalize_fast(g_qo, ns)
+    let d_qo = o_qo @ o_qo.transpose(0, 1) - eye512
+    print(sqrt(sum(d_qo * d_qo).item()) / sqrt(512.0))
+    print(sqrt(sum(o_qo * o_qo).item() / 262144.0))
+    print(1.0 * sqrt(sum(o_qo * o_qo).item() / 262144.0))
+    print("attn_kv_512x256_tall")
+    print(ns)
+    let g_kv = randn([512, 256]).to(cuda)
+    let o_kv = muon_orthogonalize_fast(g_kv, ns)
+    let d_kv = o_kv.transpose(0, 1) @ o_kv - eye256
+    print(sqrt(sum(d_kv * d_kv).item()) / sqrt(256.0))
+    print(sqrt(sum(o_kv * o_kv).item() / 131072.0))
+    print(1.4142135623730951 * sqrt(sum(o_kv * o_kv).item() / 131072.0))
+    print("ffn_up_512x1408_wide")
+    print(ns)
+    let g_up = randn([512, 1408]).to(cuda)
+    let o_up = muon_orthogonalize_fast(g_up, ns)
+    let d_up = o_up @ o_up.transpose(0, 1) - eye512
+    print(sqrt(sum(d_up * d_up).item()) / sqrt(512.0))
+    print(sqrt(sum(o_up * o_up).item() / 720896.0))
+    print(1.0 * sqrt(sum(o_up * o_up).item() / 720896.0))
+    print("ffn_down_1408x512_tall")
+    print(ns)
+    let g_dn = randn([1408, 512]).to(cuda)
+    let o_dn = muon_orthogonalize_fast(g_dn, ns)
+    let d_dn = o_dn.transpose(0, 1) @ o_dn - eye512
+    print(sqrt(sum(d_dn * d_dn).item()) / sqrt(512.0))
+    print(sqrt(sum(o_dn * o_dn).item() / 720896.0))
+    print(1.6583123951777 * sqrt(sum(o_dn * o_dn).item() / 720896.0))
+    print("vocabblk_256x512_wide")
+    print(ns)
+    let g_vb = randn([256, 512]).to(cuda)
+    let o_vb = muon_orthogonalize_fast(g_vb, ns)
+    let d_vb = o_vb @ o_vb.transpose(0, 1) - eye256
+    print(sqrt(sum(d_vb * d_vb).item()) / sqrt(256.0))
+    print(sqrt(sum(o_vb * o_vb).item() / 131072.0))
+    print(1.0 * sqrt(sum(o_vb * o_vb).item() / 131072.0))
+    ns = ns + 1.0
+print("PROBE_END")
