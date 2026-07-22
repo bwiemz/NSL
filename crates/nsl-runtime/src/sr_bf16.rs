@@ -132,7 +132,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-#[cfg(feature = "cuda")]
 use crate::tensor::NslTensor;
 
 // Fields are read only on the CUDA paths; the table TYPE (and thus the
@@ -468,6 +467,92 @@ pub extern "C" fn nsl_sr_bf16_step_adamw(
         );
         eprintln!("[sr-bf16] nsl_sr_bf16_step_adamw requires the cuda feature");
         std::process::abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4 item 18 rung 2: compressed Muon state — BF16 momentum, FP32 working
+// ---------------------------------------------------------------------------
+
+/// Distinct salt for the Muon STATE dither stream so it never correlates
+/// with the WEIGHT stream (item 17) at equal (seed, step, param, element).
+pub const SR_MUON_STATE_SALT: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+
+/// Anti-vacuity counter: SR stores of the bf16 momentum.
+pub static MUON_STATE_SR_STORES: AtomicU64 = AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn nsl_muon_state_sr_count() -> i64 {
+    MUON_STATE_SR_STORES.load(Ordering::Relaxed) as i64
+}
+
+/// Quant-store the post-step FP32 working momentum back into its BF16
+/// authoritative buffer with counter-based stochastic rounding
+/// (`--muon-state-dtype bf16`). SR — not RTE — because the momentum EMA's
+/// per-step increment `(1-β)·g` routinely falls below a bf16 ulp of m;
+/// nearest-rounding would drop it systematically, SR preserves it in
+/// expectation. Same mixer as the weight stream, decorrelated by
+/// `SR_MUON_STATE_SALT`.
+#[no_mangle]
+pub extern "C" fn nsl_muon_state_sr_store(
+    src_f32_ptr: i64,
+    dst_bf16_ptr: i64,
+    step: i64,
+    param_idx: i64,
+) {
+    let src = unsafe { &*(src_f32_ptr as *const NslTensor) };
+    let dst = unsafe { &*(dst_bf16_ptr as *const NslTensor) };
+    assert!(
+        src.device == dst.device,
+        "[muon-state] SR store device mismatch (src dev={}, dst dev={})",
+        src.device, dst.device
+    );
+    assert!(
+        src.dtype == crate::tensor::DTYPE_F32 && dst.dtype == crate::tensor::DTYPE_BF16,
+        "[muon-state] SR store expects f32 -> bf16 (got {} -> {})",
+        src.dtype, dst.dtype
+    );
+    assert!(
+        src.len == dst.len && src.is_contiguous() && dst.is_contiguous(),
+        "[muon-state] SR store shape/layout mismatch (src len={}, dst len={})",
+        src.len, dst.len
+    );
+    let len = src.len as usize;
+    assert!(
+        (len as u64) < (1u64 << SR_PARAM_SHIFT),
+        "[muon-state] parameter exceeds the per-param SR counter block"
+    );
+    let seed = crate::deterministic_ops::get_rng_seed() ^ SR_MUON_STATE_SALT;
+    let key = seed ^ (step as u64).wrapping_mul(SR_STEP_SALT);
+    let ctr_base = (param_idx as u64) << SR_PARAM_SHIFT;
+    if src.device > 0 {
+        #[cfg(feature = "cuda")]
+        crate::cuda::gpu_sr_bf16_round_probe(
+            src.data as u64, dst.data as u64, len, key, ctr_base,
+        );
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!("[muon-state] GPU SR store requires the cuda feature");
+            std::process::abort();
+        }
+    } else {
+        // CPU-resident params (e.g. rank-1 norm vectors a model kept on the
+        // host) take the reference implementation — BIT-IDENTICAL to the
+        // PTX tail by construction (pure integer math, same counters), so
+        // device placement never changes the trained bits.
+        let s = src.data as *const f32;
+        let d = dst.data as *mut u16;
+        for i in 0..len {
+            let x = unsafe { *s.add(i) };
+            let bits = sr_bf16_round(x, sr_mix64(key, ctr_base + i as u64) as u16);
+            unsafe { *d.add(i) = bits };
+        }
+    }
+    if MUON_STATE_SR_STORES.fetch_add(1, Ordering::Relaxed) == 0 {
+        eprintln!(
+            "[muon-state] bf16 momentum active: f32 working buffer + \
+             counter-based SR store (item 18 rung 2)"
+        );
     }
 }
 

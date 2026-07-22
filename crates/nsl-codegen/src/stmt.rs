@@ -5241,6 +5241,42 @@ impl Compiler<'_> {
                     ));
                 }
             }
+            // P4 item 18 rung 2: BF16 Muon momentum (f32 working buffer +
+            // counter-based SR store). The envelope lives in the CSLA muon
+            // group update — refuse every path that would read/write the
+            // bf16 m buffer without it.
+            if self.features.muon_state_bf16 {
+                if optimizer_name != "muon" {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 applies to the Muon \
+                         optimizer only (AdamW reduced-precision moments are \
+                         --wggo-moment-precision / the CPDT plan). Drop the \
+                         flag or switch to Muon",
+                    ));
+                }
+                if !self.compile_options.layerwise_accum {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 requires --layerwise-accum: \
+                         the dequant->step->SR-quant envelope lives in the \
+                         CSLA group update (the FullBuffer stdlib dispatch \
+                         would touch the bf16 momentum unwrapped)",
+                    ));
+                }
+                if self.features.zero_stage.is_some() {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 does not compose with \
+                         --zero-stage yet (shard-allocated moments bypass \
+                         the envelope). Drop one of the flags",
+                    ));
+                }
+                if self.compile_options.optim_state_offload {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 does not compose with \
+                         --optim-state-offload (host-resident momentum would \
+                         bypass the device SR store). Drop one of the flags",
+                    ));
+                }
+            }
             if let Some((m_codes, v_codes)) = dtype_data {
                 let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -5424,6 +5460,21 @@ impl Compiler<'_> {
             }
         }
 
+        // P4 item 18 rung 2: per-param dtype-code list forcing every
+        // first-moment buffer to BF16 storage (code 3). Reuses the CPDT
+        // precision alloc plumbing; v stays f32 (null-sloted per param on
+        // the Muon route, and the AdamW arm's v is untouched by rung 2).
+        let muon_state_m_codes: Option<Value> = if self.features.muon_state_bf16 {
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let bf16_code = builder.ins().iconst(cl_types::I64, 3);
+            for _ in 0..param_paths.len() {
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, bf16_code])?;
+            }
+            Some(list)
+        } else {
+            None
+        };
+
         let state_list_1 = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         let state_list_2 = if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_new", &[])?
@@ -5485,7 +5536,7 @@ impl Compiler<'_> {
             let offload = self.compile_options.optim_state_offload;
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
             // so projecting each moment's dtype-code list by value is fine.
-            let m_list = cpdt_precision_dtypes.map(|(m, _)| m);
+            let m_list = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
 
             // P0.1: first-moment buffers under the OptimM surface. The offload
             // variant allocates HOST tensors — inert GPU tag (host state is not
@@ -10114,13 +10165,30 @@ impl Compiler<'_> {
                         )?;
                         let flag_f = builder.ins().fcvt_from_sint(cl_types::F64, flag_i);
                         let ns_c = builder.ins().f64const(mc.ns_steps);
+                        // P4 item 18 rung 2: dequant the bf16 momentum into
+                        // an f32 working buffer for the step; SR-quant it
+                        // back after (nsl_muon_state_sr_store) and free the
+                        // working copy. m is never null (unlike v), so no
+                        // runtime null branch is needed.
+                        let m_bf16_env: Option<(Value, Value)> = if c.features.muon_state_bf16 {
+                            let f32_code = builder.ins().iconst(cl_types::I64, 1);
+                            let m_work = c.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_cast",
+                                &[m, f32_code],
+                            )?;
+                            Some((m_work, m))
+                        } else {
+                            None
+                        };
+                        let m_step = m_bf16_env.map_or(m, |(w, _)| w);
                         c.emit_stdlib_optim_call(
                             builder,
                             "muon",
                             &mc.opt_fn,
                             theta,
                             m_partial,
-                            m,
+                            m_step,
                             v,
                             mc.lr,
                             mc.momentum,
@@ -10136,6 +10204,18 @@ impl Compiler<'_> {
                             wrap_offload,
                             Some((flag_f, ns_c, mc.adamw_lr)),
                         )?;
+                        if let Some((m_work, m_bf)) = m_bf16_env {
+                            let step_v = sr_step.ok_or_else(|| CodegenError::new(
+                                "muon-state bf16 envelope reached without an \
+                                 opt_step value — dispatcher must thread sr_step",
+                            ))?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_muon_state_sr_store",
+                                &[m_work, m_bf, step_v, iv],
+                            )?;
+                            c.compile_call_by_name(builder, "nsl_tensor_free", &[m_work])?;
+                        }
                     } else {
                         // D2a: wrap_offload stages host-pinned m/v to θ's device
                         // for the update and streams them back asynchronously —

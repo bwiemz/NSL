@@ -2524,6 +2524,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P4 item 17: SR-BF16 authoritative weights
     ("nsl_sr_bf16_enable", &[], None),
     ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)
+    // P4 item 18 rung 2: (src_f32, dst_bf16, step, param_idx)
+    ("nsl_muon_state_sr_store", &[types::I64, types::I64, types::I64, types::I64], None),
     (
         "nsl_sr_bf16_step_adamw",
         &[

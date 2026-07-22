@@ -1138,6 +1138,11 @@ pub struct CompileOptions {
     /// update — no FP32 master copy. Rides the weight-stream residency
     /// schedule (bf16 device mirrors, transient f32 working views).
     pub param_dtype_bf16sr: bool,
+    /// P4 item 18 rung 2 (`--muon-state-dtype bf16`): Muon first-moment
+    /// buffers stored in BF16 with an FP32 working buffer per update and a
+    /// counter-based SR quant-store (v stays f32 — it is null-sloted per
+    /// param on the Muon route).
+    pub muon_state_bf16: bool,
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
@@ -1423,6 +1428,7 @@ impl Default for CompileOptions {
             zk: ZkOptions::default(),
             zero_stage: None,
             param_dtype_bf16sr: false,
+            muon_state_bf16: false,
             debug_training: false,
             grad_integrity: false,
             training_reference: false,

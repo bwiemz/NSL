@@ -809,6 +809,15 @@ pub(crate) struct BuildArgs {
               value_parser = ["f32", "bf16-sr"])]
         pub(crate) param_dtype: String,
 
+        /// P4 item 18: Muon optimizer-state storage ladder. `bf16` stores
+        /// the first-moment (momentum) buffers in BF16 with an FP32 working
+        /// buffer per update and a counter-based stochastically-rounded
+        /// store (v stays f32). `int8-blockwise` and `int4-structural` are
+        /// later ladder rungs — currently refused.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
+        pub(crate) muon_state_dtype: String,
+
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
         /// stable, reused device staging arena. Fewer CUDA calls, one large
@@ -1263,6 +1272,15 @@ pub(crate) struct RunArgs {
         #[arg(long, value_name = "DTYPE", default_value = "f32",
               value_parser = ["f32", "bf16-sr"])]
         pub(crate) param_dtype: String,
+
+        /// P4 item 18: Muon optimizer-state storage ladder. `bf16` stores
+        /// the first-moment (momentum) buffers in BF16 with an FP32 working
+        /// buffer per update and a counter-based stochastically-rounded
+        /// store (v stays f32). `int8-blockwise` and `int4-structural` are
+        /// later ladder rungs — currently refused.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
+        pub(crate) muon_state_dtype: String,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a

@@ -78,6 +78,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             layerwise_accum,
             weight_stream,
             param_dtype,
+            muon_state_dtype,
             stream_arena,
             stream_prefetch,
             stream_async_writeback,
@@ -419,6 +420,18 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 layerwise_accum,
                 weight_stream,
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
+                muon_state_bf16: match muon_state_dtype.as_str() {
+                    "f32" => false,
+                    "bf16" => true,
+                    other => {
+                        eprintln!(
+                            "error: --muon-state-dtype {other}: ladder rung not \
+                             implemented yet (P4 item 18 order: f32 -> bf16 -> \
+                             blockwise 8-bit -> 4-bit experimental). Use f32 or bf16"
+                        );
+                        std::process::exit(1);
+                    }
+                },
                 stream_arena,
                 stream_prefetch,
                 stream_async_writeback,
