@@ -1,0 +1,92 @@
+# models/coder500m/model.nsl
+# NSL-Coder-500M — Full Transformer Architecture
+#
+# Architecture: 24-layer decoder-only transformer with GQA + SwiGLU + RoPE
+#   - Grouped Query Attention (20 Q heads, 10 KV heads, 64 head_dim)
+#   - SwiGLU feedforward network with dropout (d_ff=3520)
+#   - RMSNorm pre-normalization
+#   - Weight-tied embedding/LM head
+#   - Xavier weight initialization
+#   - ~505M parameters
+#
+# Scaled from coder50m: d_model 512→1280, n_layers 8→24.
+
+from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+
+# ─── Architecture constants (inlined from config.nsl) ───
+const VOCAB_SIZE = 256
+const D_MODEL = 1280
+const N_LAYERS = 24
+const N_HEADS = 20
+const N_KV_HEADS = 10
+const HEAD_DIM = 64
+const D_FF = 3520
+const MAX_SEQ_LEN = 1024
+const DROPOUT = 0.1
+
+# ─── SwiGLU Feedforward ───
+# d_down scaled by 1/sqrt(2*N_LAYERS) = 1/sqrt(48) for residual stability
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
+    w_up: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
+    # Down projection scaled by 1/sqrt(2*N_LAYERS) for residual stream stability
+    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], 48.0)).item())
+    _dropout_p: Tensor = full([1], dropout_p)
+
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
+        let gate = silu(x @ self.w_gate)
+        let up = x @ self.w_up
+        let out = (gate * up) @ self.w_down
+        return dropout(out, self._dropout_p.item(), training)
+
+# ─── Pre-norm Transformer Block ───
+# x -> RMSNorm -> GQA -> residual -> RMSNorm -> SwiGLU -> residual
+
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
+    ffn_norm: RMSNorm = RMSNorm(d_model)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x), training)
+        return h + self.ffn.forward(self.ffn_norm.forward(h), training)
+
+# ─── NSL-Coder-500M ───
+# Full model: Embedding -> 24 x TransformerBlock -> RMSNorm -> LM Head (weight-tied)
+# Embedding init: small normal (0.02 std) — standard for token embeddings
+
+model NSLCoder:
+    embed: Tensor = randn([256, 1280]) * full([1], 0.02)
+    blocks: [TransformerBlock; 24] = TransformerBlock(1280, 20, 10, 64, 3520, 0.1)
+    norm: RMSNorm = RMSNorm(1280)
+
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        # Inference: input may be 1D [seq] or 2D [batch, seq]
+        let s = input_ids.shape
+        let ndim = input_ids.ndim
+        if ndim == 1:
+            let ids_2d = input_ids.reshape([1, s[0]])
+            return self.forward_train(ids_2d, false)
+        return self.forward_train(input_ids, false)
+
+    fn forward_core(self, emb_3d: Tensor, training: bool) -> Tensor:
+        # Differentiable core: blocks → norm → LM head
+        # All ops here are extractable by source AD
+        let x = emb_3d
+        for block in self.blocks:
+            x = block.forward(x, training)
+        x = self.norm.forward(x)
+        # Weight-tied LM head: reuse embedding matrix
+        return x @ self.embed.transpose(0, 1)
+
+    fn forward_train(self, input_ids: Tensor, training: bool) -> Tensor:
+        # Shape manipulation (non-differentiable) then differentiable core
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let emb_3d = emb.reshape([batch_size, seq_len, 1280])
+        return self.forward_core(emb_3d, training)

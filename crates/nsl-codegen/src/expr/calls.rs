@@ -1141,6 +1141,26 @@ impl Compiler<'_> {
                 &[input_val, kernel_h, kernel_w, stride_val, padding_val],
             );
         }
+        // muon_orthogonalize_fast(g, ns_steps) -> tensor
+        // P1 Muon items 8+10: the planned runtime Newton-Schulz primitive.
+        // The stdlib muon_step calls this; the NSL-level muon_orthogonalize
+        // in muon.nsl stays as the pinned reference implementation.
+        if func_name == "muon_orthogonalize_fast"
+            && !self.registry.functions.contains_key(&func_name)
+        {
+            if args.len() != 2 {
+                return Err(CodegenError::new(
+                    "muon_orthogonalize_fast() takes exactly 2 arguments (g, ns_steps)",
+                ));
+            }
+            let g_val = self.compile_expr(builder, state, &args[0].value)?;
+            let steps_val = self.compile_expr(builder, state, &args[1].value)?;
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_muon_orthogonalize",
+                &[g_val, steps_val],
+            );
+        }
         // embedding_lookup(weight, indices) -> tensor
         if func_name == "embedding_lookup" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {

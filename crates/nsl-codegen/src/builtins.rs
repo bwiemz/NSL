@@ -217,6 +217,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::I64),
     ),
     ("nsl_tensor_ndim", &[types::I64], Some(types::I64)),
+    // P1 Muon items 8+10: planned Newton-Schulz orthogonalization primitive
+    // (no .item() sync; device-resident norm; materialized tall/wide).
+    ("nsl_tensor_muon_orthogonalize", &[types::I64, types::F64], Some(types::I64)),
     // PCA Stage C: non-aborting shape probe (0 for out-of-range dims).
     ("nsl_tensor_dim_or_zero", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_len", &[types::I64], Some(types::I64)),

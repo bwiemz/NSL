@@ -107,21 +107,42 @@ fn Lion(params: ParamGroup, lr: f64 = 1e-4,
     ## Evolved sign momentum optimizer (Chen et al., 2023)
 
 # 4. Muon optimizer (mixed Muon/AdamW)
-fn Muon(params: ParamGroup, lr: f64 = 0.02, momentum: f64 = 0.95,
-        nesterov: bool = true, ns_steps: int = 5,
+fn Muon(params: ParamGroup, lr: f64 = 0.02, adamw_lr: f64 = lr,
+        momentum: f64 = 0.95, nesterov: bool = true, ns_steps: int = 5,
         beta1: f64 = 0.9, beta2: f64 = 0.999, eps: f64 = 1e-8,
         weight_decay: f64 = 0.0) -> MuonOptimizer
     ## Muon optimizer with orthogonalized momentum (Jordan et al., 2024).
-    ## MIXED routing: rank-2 hidden weight matrices take the quintic
-    ## Newton-Schulz orthogonalized-momentum update scaled by
-    ## sqrt(max(1, rows/cols)); embeddings and the LM head (matched by
-    ## param path: embed/lm_head/unembed/wte/wpe/vocab) and all non-rank-2
-    ## params (biases, norms) take a standard AdamW step with beta1/beta2/
-    ## eps. The routing table prints at train start ([muon] line).
-    ## CAUTION: name matching is by SUBSTRING — a hidden weight whose path
-    ## contains a keyword (e.g. "embed_proj") routes to AdamW, and an
-    ## embedding named outside the list (e.g. "tok_table") routes to Muon.
-    ## Check the printed [muon] table when param names are unconventional.
+    ## MIXED routing by parameter ROLE: rank-2 hidden weight matrices take
+    ## the quintic Newton-Schulz orthogonalized-momentum update scaled by
+    ## sqrt(max(1, rows/cols)); embeddings, the LM head, and all non-rank-2
+    ## params (biases, norms) take a standard AdamW step at `adamw_lr`
+    ## (production configs should set adamw_lr ~ 3e-4: the two arms live
+    ## 1-2 orders of magnitude apart; unset, it follows `lr` exactly).
+    ## A scheduler modulates both arms proportionally.
+    ##
+    ## Roles are determined per parameter, in priority order:
+    ##   1. explicit `@param_role("embedding"|"head"|"hidden")` decorator
+    ##      on the model tensor field (invalid values refuse at compile);
+    ##   2. structural inference — a field used as the table argument of
+    ##      `embedding_lookup(self.field, ids)` in any model method is
+    ##      role `embedding` (weight-tied LM heads are the same tensor,
+    ##      so tying needs no separate annotation);
+    ##   3. declared tensor rank != 2 -> role `vector`;
+    ##   4. default `hidden` (the Muon route).
+    ## An UNTIED lm_head cannot be inferred structurally — annotate it
+    ## with @param_role("head") (the routing table prints a loud note
+    ## when no head role is present). The full per-param routing table
+    ## prints at train start ([muon] lines).
+    ##
+    ## ns_steps must be a positive integer literal — floats, zero, and
+    ## negative values are compile errors.
+    ##
+    ## `--layerwise-accum` composes via the separate-accumulator window
+    ## mode: raw gradient sums accumulate per layer during the window
+    ## backward and the per-layer group updates run this same muon_step —
+    ## bit-identical to the non-layerwise run at equal config. (An exact
+    ## one-buffer "classical Muon" accumulation would be a separately
+    ## named mode; it is not this.)
 
 # 5. Cosine annealing scheduler
 fn CosineScheduler(optimizer: Optimizer, T_max: int,

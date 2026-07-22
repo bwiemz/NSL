@@ -1,0 +1,60 @@
+# P1 Muon item 5: 500M-class confirmation arm (byte-level vocab 256).
+# coder500m architecture on the same real-code byte stream as the 50M
+# comparison. Requires the memory-reduction flags to fit 16 GiB:
+#
+#   nsl run --source-ad --deterministic --seed N \
+#       --checkpoint-blocks --optim-state-offload <this file>
+#
+# NOTE: on_step fires per MICRO-batch (grad_accumulation=8) — val evals
+# every 400 micro-batches = every 50 optimizer steps, on the SMALL
+# (4 x 1024) val windows to keep the eval forward inside the 16 GiB
+# streaming envelope.
+#
+# Markers: OPTIMIZER_LINE, TOKENS_PATH, DATA_DIR.
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+print("Initializing model...")
+let m = NSLCoder()
+m.to(cuda)
+print("MODEL_READY")
+
+let tokens = load_mmap("TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
+
+let val_nsl_in = load_mmap("DATA_DIR/val_nsl_small_in.bin", 1).reshape([2, 1024]).to(cuda)
+let val_nsl_lab = load_mmap("DATA_DIR/val_nsl_small_lab.bin", 1).reshape([2, 1024]).to(cuda)
+let val_rs_in = load_mmap("DATA_DIR/val_rust_small_in.bin", 1).reshape([2, 1024]).to(cuda)
+let val_rs_lab = load_mmap("DATA_DIR/val_rust_small_lab.bin", 1).reshape([2, 1024]).to(cuda)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0):
+    optimizer: OPTIMIZER_LINE
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+            if step % 400 == 0:
+                let vlog = m.forward_train(val_nsl_in, false)
+                let vls = vlog.shape
+                let vflat = vlog.reshape([vls[0] * vls[1], vls[2]])
+                let vloss = cross_entropy(vflat, val_nsl_lab.reshape([vls[0] * vls[1]]))
+                print("VAL_NSL")
+                print(vloss)
+                let rlog = m.forward_train(val_rs_in, false)
+                let rls = rlog.shape
+                let rflat = rlog.reshape([rls[0] * rls[1], rls[2]])
+                let rloss = cross_entropy(rflat, val_rs_lab.reshape([rls[0] * rls[1]]))
+                print("VAL_RS")
+                print(rloss)
+
+print("LOSS_STREAM_END")
+print("DONE")

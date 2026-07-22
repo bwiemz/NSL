@@ -591,6 +591,48 @@ impl Compiler<'_> {
                                     self.features.moe_configs.insert(layer_key, info);
                                 }
                             }
+                            // P1 Muon item 6: @param_role("embedding"|"head"|"hidden")
+                            // — explicit optimizer-routing role for a model
+                            // tensor field. Invalid or missing role string is
+                            // INVALID-VALUE-FATAL (same policy as @moe): a
+                            // typo'd role silently falling back to structural
+                            // inference would misroute the param without a
+                            // trace.
+                            if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "param_role"
+                            {
+                                let role = deco
+                                    .args
+                                    .as_ref()
+                                    .and_then(|args| args.first())
+                                    .and_then(|a| match &a.value.kind {
+                                        nsl_ast::expr::ExprKind::StringLiteral(s) => {
+                                            Some(s.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .ok_or_else(|| {
+                                        crate::error::CodegenError::new(
+                                            "@param_role requires a string argument: \
+                                             @param_role(\"embedding\"), \
+                                             @param_role(\"head\"), or \
+                                             @param_role(\"hidden\")",
+                                        )
+                                    })?;
+                                if !matches!(role.as_str(), "embedding" | "head" | "hidden") {
+                                    return Err(crate::error::CodegenError::new(format!(
+                                        "@param_role(\"{role}\") is not a recognized \
+                                         parameter role; expected \"embedding\", \
+                                         \"head\", or \"hidden\""
+                                    )));
+                                }
+                                let model_name = self.resolve_sym(md.name).to_string();
+                                let layer_name_str = self.resolve_sym(*field_sym).to_string();
+                                self.models
+                                    .model_field_roles
+                                    .entry(model_name)
+                                    .or_default()
+                                    .insert(layer_name_str, role);
+                            }
                             // M34: @context_parallel decorator extraction
                             if deco.name.len() == 1
                                 && self.resolve_sym(deco.name[0]) == "context_parallel"

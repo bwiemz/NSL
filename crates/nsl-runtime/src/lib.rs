@@ -151,6 +151,7 @@ pub mod fp8;
 pub mod awq;
 pub mod fase_bc;
 pub mod fase_step;
+pub mod muon;
 pub mod csla_stat;
 pub mod grad_integrity;
 pub mod weight_stream;

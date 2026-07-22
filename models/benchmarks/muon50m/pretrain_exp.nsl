@@ -1,0 +1,72 @@
+# P1 Muon item 5: Muon-vs-AdamW experiment program.
+# coder50m architecture at byte-level vocab (256) on REAL code (repo Rust +
+# NSL + cargo-registry sources), fixed data order, held-out per-domain
+# validation sets (dropout off).
+#
+# Val protocol: the inference-path forward LEAKS its device intermediates
+# (~2.3 GB per [2,1024] forward at this architecture — pre-existing, found
+# by this campaign; the source-AD training path is unaffected), so the
+# periodic curve uses TINY [2,256] windows (~60 MB/eval leaked, bounded
+# over a 3000-step run) and the headline number is ONE full [2,1024] eval
+# at the final step.
+#
+# Marker rewrites (exact string match by muon_campaign.py):
+#   OPTIMIZER_LINE  -> optimizer under test
+#   TOKENS_PATH     -> per-arm train token file (prefix of the master stream)
+#   DATA_DIR        -> the muon_data directory (val sets)
+#   FINAL_STEP      -> the arm's step count (final big-eval trigger)
+
+from model import NSLCoder
+from nsl.nn.losses import cross_entropy
+
+print("Initializing model...")
+let m = NSLCoder()
+m.to(cuda)
+print("MODEL_READY")
+
+let tokens = load_mmap("TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, drop_last=true)
+
+let vt_nsl_in = load_mmap("DATA_DIR/val_nsl_tiny_in.bin", 1).reshape([2, 256]).to(cuda)
+let vt_nsl_lab = load_mmap("DATA_DIR/val_nsl_tiny_lab.bin", 1).reshape([2, 256]).to(cuda)
+let vt_rs_in = load_mmap("DATA_DIR/val_rust_tiny_in.bin", 1).reshape([2, 256]).to(cuda)
+let vt_rs_lab = load_mmap("DATA_DIR/val_rust_tiny_lab.bin", 1).reshape([2, 256]).to(cuda)
+let vb_nsl_in = load_mmap("DATA_DIR/val_nsl_small_in.bin", 1).reshape([2, 1024]).to(cuda)
+let vb_nsl_lab = load_mmap("DATA_DIR/val_nsl_small_lab.bin", 1).reshape([2, 1024]).to(cuda)
+let vb_rs_in = load_mmap("DATA_DIR/val_rust_small_in.bin", 1).reshape([2, 1024]).to(cuda)
+let vb_rs_lab = load_mmap("DATA_DIR/val_rust_small_lab.bin", 1).reshape([2, 1024]).to(cuda)
+
+@no_grad
+fn eval_ce(m: NSLCoder, vin: Tensor, vlab: Tensor) -> Tensor:
+    let vlog = m.forward_train(vin, false)
+    let vls = vlog.shape
+    let vflat = vlog.reshape([vls[0] * vls[1], vls[2]])
+    return cross_entropy(vflat, vlab.reshape([vls[0] * vls[1]]))
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_clip=1.0):
+    optimizer: OPTIMIZER_LINE
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(step)
+            print(loss)
+            if step % 200 == 0:
+                print("VAL_NSL")
+                print(eval_ce(m, vt_nsl_in, vt_nsl_lab))
+                print("VAL_RS")
+                print(eval_ce(m, vt_rs_in, vt_rs_lab))
+            if step == FINAL_STEP:
+                print("VALBIG_NSL")
+                print(eval_ce(m, vb_nsl_in, vb_nsl_lab))
+                print("VALBIG_RS")
+                print(eval_ce(m, vb_rs_in, vb_rs_lab))
+
+print("LOSS_STREAM_END")
+print("DONE")

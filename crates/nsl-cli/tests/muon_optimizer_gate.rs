@@ -305,12 +305,19 @@ fn muon_all_adamw_routes_bit_exact() {
         "all-AdamW-routed Muon diverged from AdamW\nstderr:\n{}",
         muon.stderr
     );
-    // The routing table must show embed was routed by NAME (not silently
-    // Muon'd and coincidentally equal).
+    // The routing table must show embed was routed by ROLE — inferred from
+    // its embedding_lookup usage (not silently Muon'd and coincidentally
+    // equal).
+    let embed_line = muon
+        .stderr
+        .lines()
+        .find(|l| l.contains("[muon]") && l.contains("m.embed"))
+        .expect("m.embed missing from routing table");
     assert!(
-        muon.stderr.contains("[muon]") && muon.stderr.contains("m.embed"),
-        "routing table missing:\n{}",
-        muon.stderr
+        embed_line.contains("role=embedding")
+            && embed_line.contains("embedding_lookup usage")
+            && embed_line.contains("AdamW"),
+        "unexpected embed routing: {embed_line}"
     );
     let a = std::fs::read(&save_a).expect("adamw .nslm");
     let b = std::fs::read(&save_m).expect("muon .nslm");
@@ -360,16 +367,26 @@ fn muon_mixed_trains_and_differs_from_adamw() {
         adamw.losses, muon.losses,
         "muon stream identical to adamw — orthogonalized update vacuous"
     );
-    // w_up/w_down are rank-2 and NOT name-excluded: only m.embed may appear
-    // in the name-routed list.
-    let route_line = muon
+    // w_up/w_down are rank-2 hidden weights: role=hidden -> Muon; the tied
+    // embedding is role=embedding (usage-inferred) -> AdamW.
+    let table: Vec<&str> = muon
         .stderr
         .lines()
-        .find(|l| l.contains("[muon]"))
-        .expect("routing table missing");
+        .filter(|l| l.contains("[muon]"))
+        .collect();
     assert!(
-        route_line.contains("1 name-routed") && route_line.contains("m.embed"),
-        "unexpected routing: {route_line}"
+        table
+            .iter()
+            .any(|l| l.contains("m.embed") && l.contains("role=embedding")),
+        "embed not embedding-routed:\n{}",
+        table.join("\n")
+    );
+    assert!(
+        table
+            .iter()
+            .any(|l| l.contains("w_up") && l.contains("role=hidden") && l.contains("Muon")),
+        "w_up not Muon-routed:\n{}",
+        table.join("\n")
     );
 }
 

@@ -6,6 +6,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed — P1: Muon validation + performance (items 5-11)
+
+- **Parameter-ROLE routing replaces the name-substring exclusion list**
+  (item 6). Mixed Muon/AdamW routing is now decided per parameter:
+  explicit `@param_role("embedding"|"head"|"hidden")` field decorator
+  (invalid values are compile errors) > structural inference (the table
+  argument of `embedding_lookup(self.field, ids)` is role `embedding`;
+  weight-tied heads are the same tensor) > declared rank != 2 (`vector`)
+  > default `hidden`. A hidden weight named `embed_proj` now correctly
+  takes Muon; an embedding named `tok_table` now correctly takes AdamW —
+  both silently misrouted before. The routing table prints every param's
+  role + provenance; untied-head models get a loud annotate-me note.
+- **`adamw_lr` knob on `Muon(...)`** (item 5 prerequisite): the AdamW arm
+  (embeddings/head/vectors) gets its own learning rate, threaded as a
+  fixed ratio of `lr` so schedulers modulate both arms proportionally.
+  Unset, it follows `lr` exactly (bit-exact with the old single-lr step).
+- **`ns_steps` is validated** (item 7): floats, zero, and negatives are
+  compile errors instead of silently degrading the NS iteration.
+- **`.item()` removed from the Muon step / planned NS primitive**
+  (items 8+10): `muon_step` now calls `muon_orthogonalize_fast`, a
+  runtime primitive (`nsl_tensor_muon_orthogonalize`) that runs the
+  quintic Newton-Schulz chain from Rust — on GPU the Frobenius
+  pre-normalization is computed and consumed entirely on-device (stats
+  kernel into a persistent 16-byte scratch + a scale kernel that reads
+  it; no DtoH sync per rank-2 param per step), tall/wide handled by
+  materialized transposes at entry/exit, intermediates recycled through
+  the caching allocator. The NSL-level `muon_orthogonalize` stays in
+  `nsl.optim.muon` as the pinned reference (CPU f64 gate: sum-sq diff
+  < 1e-18; GPU gate bounds the f32 norm-path drift). Deferred:
+  batched small-matrix NS, stochastic-rounded direct updates.
+- **v (AdamW second moment) allocates only where the AdamW arm reads it**
+  (item 9): Muon-routed params carry a null slot (exactly the runtime
+  condition `muon_step` routes on); ZeRO owner-gating composes. Under
+  `--optim-state-offload` / CPDT moment-precision plans v stays fully
+  allocated (their stage-in envelopes touch both moments) with a loud
+  note; reduced-precision moments + muon refuse outright.
+- **Muon composes with `--layerwise-accum`** (item 11, the
+  separate-accumulator full-quality mode): the window backward
+  accumulates RAW per-layer gradient sums (Deferred-shaped plan,
+  accum_scale forced to 1.0 — the FullBuffer convention) and the
+  per-layer group updates dispatch the stdlib `muon_step` (bias
+  correction from the micro-batch counter, as the non-layerwise path
+  does). Gated BIT-IDENTICAL to the non-layerwise Muon run on CPU and
+  GPU (loss stream + saved model bytes). The exact one-buffer
+  "classical Muon" accumulation is intentionally NOT this mode and
+  would ship separately named.
+
+### Known issues — found by the P1 Muon campaign (not fixed here)
+
+- The plain-call inference path (`m.forward(...)` from functions,
+  callbacks, or top-level code — NOT the source-AD-extracted train step)
+  LEAKS its device intermediates: a [2, 1024] coder50m forward leaves
+  ~2.3 GB of un-freed GPU tensors per call (the non-flash GQA attention
+  scores dominate), and `@no_grad` does not change it — the temps are
+  simply never freed. Repeated in-training validation forwards OOM'd
+  after 3 calls until the campaign switched to [2, 256] eval windows.
+  Needs a bounded-lifetime fix for function-body tensor temps.
+- Returning from a user fn whose body mixes tensor ops with several
+  scalar (`.item()`-derived) `let` locals SIGSEGVs the emitted program
+  shortly after the call returns (JIT frames, masked as exit 1 by
+  `execute_temp_build`; repro: `shape_probe`'s original fn-based form).
+- A float `let` after tensor `let`s inside a top-level `while` body
+  fails Cranelift verification: "declared type of variable varN doesn't
+  match type of value vM". Both worked around by inlining + avoiding
+  scalar locals in `models/benchmarks/muon50m/shape_probe.nsl`.
+
 ### Added — P5: full-precision mixed Muon/AdamW optimizer
 
 - `Muon(...)` in train blocks is now the REAL Muon (Jordan et al., 2024):

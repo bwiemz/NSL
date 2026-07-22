@@ -400,6 +400,17 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // muon_orthogonalize_fast(g, ns_steps) -> tensor — P1 Muon items 8+10:
+    // the planned runtime Newton-Schulz primitive (see nsl-runtime muon.rs).
+    def(
+        "muon_orthogonalize_fast",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Float],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // layernorm(input, weight, bias, eps) -> tensor
     def(
         "layernorm",
