@@ -2646,6 +2646,145 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     inner::sync_after_kernel();
 }
 
+/// P4 item 17: fused AdamW step against a BF16 AUTHORITATIVE theta with
+/// counter-based stochastic rounding. `theta_dev` is the RAW device pointer
+/// of the bf16 mirror (2 bytes/elem, not an NslTensor); m/v/mp are the f32
+/// moment/accumulator tensors. `sr_key` = seed ^ (step * SR_STEP_SALT),
+/// `sr_ctr_base` = stable param index << SR_PARAM_SHIFT — precomputed by the
+/// caller so the kernel stays a pure function of its counters.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_bf16sr(
+    theta_dev: u64, m_ptr: i64, v_ptr: i64, mp_ptr: i64, n: usize,
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+    sr_key: u64, sr_ctr_base: u64,
+) {
+    use crate::tensor::NslTensor;
+    if n == 0 {
+        return;
+    }
+    let m = unsafe { &*(m_ptr as *const NslTensor) };
+    let v = unsafe { &*(v_ptr as *const NslTensor) };
+    let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+    let mut th_data = theta_dev;
+    let mut m_data = m.data as u64;
+    let mut v_data = v.data as u64;
+    let mut mp_data = mp.data as u64;
+    let mut n_val = n as u64;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
+    let args = [
+        &mut th_data as *mut _ as *mut std::ffi::c_void,
+        &mut m_data as *mut _ as *mut std::ffi::c_void,
+        &mut v_data as *mut _ as *mut std::ffi::c_void,
+        &mut mp_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut b1 as *mut _ as *mut std::ffi::c_void,
+        &mut omb1 as *mut _ as *mut std::ffi::c_void,
+        &mut b2 as *mut _ as *mut std::ffi::c_void,
+        &mut omb2 as *mut _ as *mut std::ffi::c_void,
+        &mut eps as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr_wd as *mut _ as *mut std::ffi::c_void,
+        &mut bc1 as *mut _ as *mut std::ffi::c_void,
+        &mut bc2 as *mut _ as *mut std::ffi::c_void,
+        &mut has_wd_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_STEP_BF16SR_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_step_bf16sr\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_step_bf16sr kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
+/// P4 item 17: SR-BF16 rounding-tail probe over raw device buffers — parity
+/// gate hook only (see `SR_BF16_ROUND_PROBE_PTX`).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sr_bf16_round_probe(
+    src_f32_dev: u64, dst_bf16_dev: u64, n: usize, sr_key: u64, sr_ctr_base: u64,
+) {
+    if n == 0 {
+        return;
+    }
+    let mut src = src_f32_dev;
+    let mut dst = dst_bf16_dev;
+    let mut n_val = n as u64;
+    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
+    let args = [
+        &mut src as *mut _ as *mut std::ffi::c_void,
+        &mut dst as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::SR_BF16_ROUND_PROBE_PTX.as_ptr(),
+        b"nsl_sr_bf16_round_probe\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU sr_bf16_round_probe kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
+/// P4 item 17: raw-buffer precision casts between a bf16 mirror and an f32
+/// working view (grid-stride kernels from `precision_cast_kernels`). Both
+/// pointers are raw device allocations; `n` is the element count.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cast_raw_f32_to_bf16(src_f32_dev: u64, dst_bf16_dev: u64, n: usize) {
+    gpu_cast_raw(
+        precision_cast_kernels::PTX_F32_TO_BF16.as_ptr(),
+        precision_cast_kernels::KNAME_F32_TO_BF16.as_ptr(),
+        src_f32_dev, dst_bf16_dev, n,
+    );
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cast_raw_bf16_to_f32(src_bf16_dev: u64, dst_f32_dev: u64, n: usize) {
+    gpu_cast_raw(
+        precision_cast_kernels::PTX_BF16_TO_F32.as_ptr(),
+        precision_cast_kernels::KNAME_BF16_TO_F32.as_ptr(),
+        src_bf16_dev, dst_f32_dev, n,
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_cast_raw(ptx: *const u8, kname: *const u8, src: u64, dst: u64, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut src_val = src;
+    let mut dst_val = dst;
+    let mut n_val = n as u64;
+    let args = [
+        &mut src_val as *mut _ as *mut std::ffi::c_void,
+        &mut dst_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = (((n as i64) + block - 1) / block).min(4096);
+    let result = inner::kernel_launch(ptx, kname, [grid, 1, 1], [block, 1, 1], &args, 0);
+    assert_eq!(result as u32, 0, "GPU raw precision cast failed: {}", result as u32);
+    inner::sync_after_kernel();
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
@@ -3437,7 +3576,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 
     // Select kernel based on indices dtype: i32 indices use ld.global.s32,
     // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::EMBEDDING_I32IDX_PTX, b"nsl_embedding_i32idx\0")
     } else {
         (fused_kernels::EMBEDDING_F32_PTX, b"nsl_embedding_f32\0")
@@ -3471,7 +3610,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 ///
 /// `grad` must be a GPU f32 contiguous `[seq_len, embed_dim]` tensor;
 /// `indices` a GPU tensor of `seq_len` token ids (f32 dtype=1 or i32
-/// dtype=4, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
+/// DTYPE_I32, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
 /// and negative ids are skipped in-kernel, matching the CPU reference.
 /// Returns a published GPU `[vocab, embed]` NslTensor, or 0 when the
 /// index dtype has no kernel (caller falls back to the host scatter).
@@ -3501,7 +3640,7 @@ pub(crate) fn gpu_embedding_backward(
     // sets this; NSL_EMBEDDING_BWD_CPU handled by the caller (host scatter).
     let deterministic = crate::deterministic_ops::is_deterministic();
     let (ptx, kernel_name): (&str, &[u8]) = match (deterministic, indices.dtype) {
-        (true, 4) => (
+        (true, crate::tensor::DTYPE_I32) => (
             fused_kernels::EMBEDDING_BWD_DET_I32IDX_PTX,
             b"nsl_embedding_bwd_det_i32idx\0",
         ),
@@ -3509,7 +3648,7 @@ pub(crate) fn gpu_embedding_backward(
             fused_kernels::EMBEDDING_BWD_DET_F32_PTX,
             b"nsl_embedding_bwd_det_f32\0",
         ),
-        (false, 4) => (
+        (false, crate::tensor::DTYPE_I32) => (
             fused_kernels::EMBEDDING_BWD_I32IDX_PTX,
             b"nsl_embedding_bwd_i32idx\0",
         ),
@@ -4862,7 +5001,7 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     let grid_y = ((inner_dim as i64) + block_y - 1) / block_y;
 
     // Select kernel based on indices dtype: i32 uses ld.global.s32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::GATHER_I32IDX_PTX, b"nsl_gather_i32idx\0")
     } else {
         (GATHER_F32_PTX, b"nsl_gather_f32\0")

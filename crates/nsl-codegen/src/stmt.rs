@@ -4169,6 +4169,20 @@ impl Compiler<'_> {
                      independently with no gradient reduction. Drop one",
                 ));
             }
+            // P4 items 17/18: neither precision ladder is lowered on the
+            // pipelined path — without these refusals a @pipeline program
+            // would compile cleanly and train plain f32 while the user
+            // believes they are validating bf16 (deferral-must-refuse).
+            if self.features.param_dtype_bf16sr {
+                return Err(CodegenError::new(
+                    "--param-dtype bf16-sr is not supported on the pipelined                      train path (@pipeline): the bf16 mirror schedule and the                      fused SR step are not lowered there. Drop one",
+                ));
+            }
+            if self.features.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-state-dtype bf16 is not supported on the pipelined                      train path (@pipeline): the CSLA state envelope is not                      lowered there. Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
@@ -5178,6 +5192,105 @@ impl Compiler<'_> {
                      the CPDT precision plan, or use --zero-stage 2",
                 ));
             }
+            // P4 item 17: SR-BF16 authoritative weights. The fused SR step
+            // is the ONLY sanctioned theta writer — refuse every composition
+            // that could route any parameter's update through a non-SR path
+            // (stdlib dispatch, interpreted envelope, owner-gated collective
+            // update), or that assumes f32 authoritative storage.
+            if self.features.param_dtype_bf16sr {
+                if optimizer_name != "adamw" && optimizer_name != "adam" {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr supports only AdamW/Adam in v1 \
+                         (the fused SR step; Muon SR-state is the item-18 \
+                         ladder). Drop the flag or switch optimizers",
+                    ));
+                }
+                if !self.compile_options.weight_stream {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires --weight-stream: the \
+                         bf16 authoritative mirrors ride the streaming \
+                         residency schedule (transient f32 working views)",
+                    ));
+                }
+                if self.features.zero_stage.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         --zero-stage yet (the ZeRO gather/reduce paths pin \
+                         f32 device storage). Drop one of the flags",
+                    ));
+                }
+                if self.compile_options.optim_state_offload {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         --optim-state-offload (m/v must be plain device f32 \
+                         for the fused SR step)",
+                    ));
+                }
+                if dtype_data.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         reduced-precision optimizer moments (drop \
+                         --wggo-moment-precision / the CPDT precision plan)",
+                    ));
+                }
+                if self.compile_options.training_reference {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires the fused optimizer \
+                         step, which --training-reference disables",
+                    ));
+                }
+                if !fase_deferred {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires the FASE-Deferred \
+                         plan (the FullBuffer stdlib dispatch would update \
+                         theta without stochastic rounding). Train with \
+                         gradient accumulation / --source-ad",
+                    ));
+                }
+                if self.wggo_overrides.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with WGGO \
+                         per-layer FASE overrides yet (a FullBuffer-routed \
+                         param would bypass the SR step). Drop the WGGO plan",
+                    ));
+                }
+            }
+            // P4 item 18 rung 2: BF16 Muon momentum (f32 working buffer +
+            // counter-based SR store). The envelope lives in the CSLA muon
+            // group update — refuse every path that would read/write the
+            // bf16 m buffer without it.
+            if self.features.muon_state_bf16 {
+                if optimizer_name != "muon" {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 applies to the Muon \
+                         optimizer only (AdamW reduced-precision moments are \
+                         --wggo-moment-precision / the CPDT plan). Drop the \
+                         flag or switch to Muon",
+                    ));
+                }
+                if !self.compile_options.layerwise_accum {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 requires --layerwise-accum: \
+                         the dequant->step->SR-quant envelope lives in the \
+                         CSLA group update (the FullBuffer stdlib dispatch \
+                         would touch the bf16 momentum unwrapped)",
+                    ));
+                }
+                if self.features.zero_stage.is_some() {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 does not compose with \
+                         --zero-stage yet (shard-allocated moments bypass \
+                         the envelope). Drop one of the flags",
+                    ));
+                }
+                if self.compile_options.optim_state_offload {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 does not compose with \
+                         --optim-state-offload (host-resident momentum would \
+                         bypass the device SR store). Drop one of the flags",
+                    ));
+                }
+            }
             if let Some((m_codes, v_codes)) = dtype_data {
                 let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
                 let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -5361,6 +5474,21 @@ impl Compiler<'_> {
             }
         }
 
+        // P4 item 18 rung 2: per-param dtype-code list forcing every
+        // first-moment buffer to BF16 storage (code 3). Reuses the CPDT
+        // precision alloc plumbing; v stays f32 (null-sloted per param on
+        // the Muon route, and the AdamW arm's v is untouched by rung 2).
+        let muon_state_m_codes: Option<Value> = if self.features.muon_state_bf16 {
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let bf16_code = builder.ins().iconst(cl_types::I64, 3);
+            for _ in 0..param_paths.len() {
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, bf16_code])?;
+            }
+            Some(list)
+        } else {
+            None
+        };
+
         let state_list_1 = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         let state_list_2 = if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_new", &[])?
@@ -5422,7 +5550,7 @@ impl Compiler<'_> {
             let offload = self.compile_options.optim_state_offload;
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
             // so projecting each moment's dtype-code list by value is fine.
-            let m_list = cpdt_precision_dtypes.map(|(m, _)| m);
+            let m_list = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
 
             // P0.1: first-moment buffers under the OptimM surface. The offload
             // variant allocates HOST tensors — inert GPU tag (host state is not
@@ -7964,10 +8092,20 @@ impl Compiler<'_> {
                 // without it the first window's forward peak would still be
                 // the full-residency wall the flag exists to remove.
                 if let Some(wsplan) = &ws_fwd_plan {
+                    if self.features.param_dtype_bf16sr {
+                        self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
+                    }
                     for &idx in &wsplan.register_idxs {
                         let iv = builder.ins().iconst(cl_types::I64, idx);
                         let pw = self
                             .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                        if self.features.param_dtype_bf16sr {
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_sr_bf16_note_param",
+                                &[pw, iv],
+                            )?;
+                        }
                         self.compile_call_by_name(
                             builder,
                             "nsl_weight_stream_register",
@@ -9971,6 +10109,8 @@ impl Compiler<'_> {
                 // owner gate while resident/tied params update on every rank
                 // from the identical reduced gradients.
                 zero3: Option<&std::collections::HashSet<i64>>,
+                // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
+                sr_step: Option<Value>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
                 if zero3.is_some() {
@@ -10039,13 +10179,30 @@ impl Compiler<'_> {
                         )?;
                         let flag_f = builder.ins().fcvt_from_sint(cl_types::F64, flag_i);
                         let ns_c = builder.ins().f64const(mc.ns_steps);
+                        // P4 item 18 rung 2: dequant the bf16 momentum into
+                        // an f32 working buffer for the step; SR-quant it
+                        // back after (nsl_muon_state_sr_store) and free the
+                        // working copy. m is never null (unlike v), so no
+                        // runtime null branch is needed.
+                        let m_bf16_env: Option<(Value, Value)> = if c.features.muon_state_bf16 {
+                            let f32_code = builder.ins().iconst(cl_types::I64, 1);
+                            let m_work = c.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_cast",
+                                &[m, f32_code],
+                            )?;
+                            Some((m_work, m))
+                        } else {
+                            None
+                        };
+                        let m_step = m_bf16_env.map_or(m, |(w, _)| w);
                         c.emit_stdlib_optim_call(
                             builder,
                             "muon",
                             &mc.opt_fn,
                             theta,
                             m_partial,
-                            m,
+                            m_step,
                             v,
                             mc.lr,
                             mc.momentum,
@@ -10061,6 +10218,18 @@ impl Compiler<'_> {
                             wrap_offload,
                             Some((flag_f, ns_c, mc.adamw_lr)),
                         )?;
+                        if let Some((m_work, m_bf)) = m_bf16_env {
+                            let step_v = sr_step.ok_or_else(|| CodegenError::new(
+                                "muon-state bf16 envelope reached without an \
+                                 opt_step value — dispatcher must thread sr_step",
+                            ))?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_muon_state_sr_store",
+                                &[m_work, m_bf, step_v, iv],
+                            )?;
+                            c.compile_call_by_name(builder, "nsl_tensor_free", &[m_work])?;
+                        }
                     } else {
                         // D2a: wrap_offload stages host-pinned m/v to θ's device
                         // for the update and streams them back asynchronously —
@@ -10080,6 +10249,7 @@ impl Compiler<'_> {
                             Some(bc),
                             wrap_precision,
                             wrap_offload,
+                            sr_step,
                         )?;
                     }
                     if let Some((_do_b, join_b)) = z3_gate {
@@ -10151,10 +10321,23 @@ impl Compiler<'_> {
             let zero3_streamed: Option<std::collections::HashSet<i64>> =
                 (self.features.zero_stage == Some(3)).then(|| ws_streamed.clone());
             if ws_active {
+                // P4 item 17: activate the bf16 mirror backend and assign
+                // each streamed param its stable SR counter block BEFORE the
+                // first registration (register aborts on an un-noted param).
+                if self.features.param_dtype_bf16sr {
+                    self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
+                }
                 for &idx in &pending.schedule.ws_streamed {
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                    if self.features.param_dtype_bf16sr {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_sr_bf16_note_param",
+                            &[pw, iv],
+                        )?;
+                    }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }
             }
@@ -10851,6 +11034,7 @@ impl Compiler<'_> {
                     self.compile_options.optim_state_offload,
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
+                    Some(opt_step),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -10924,6 +11108,7 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
+                Some(opt_step),
                 global_group,
             )?;
             // D2b part 2: NO post-epilogue restore. The next iterations'
@@ -11362,6 +11547,7 @@ impl Compiler<'_> {
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
+                        Some(opt_step),
                     )?;
                     if let Some(pb_join) = pb_zero_blocks {
                         builder.ins().jump(pb_join, &[]);
@@ -11451,6 +11637,7 @@ impl Compiler<'_> {
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
+                        Some(opt_step),
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     if let Some(fs_join) = fs_zero_blocks {

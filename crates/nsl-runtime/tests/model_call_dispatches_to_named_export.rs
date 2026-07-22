@@ -81,7 +81,7 @@ fn call_routes_to_named_export_and_produces_output() {
         shape: input_shape.as_mut_ptr(),
         strides: std::ptr::null_mut(),
         ndim: 1,
-        dtype: 0,
+        dtype: 1, // canonical f32
         device_type: 0,
         device_id: 0,
         tape_id: 0,
@@ -93,7 +93,7 @@ fn call_routes_to_named_export_and_produces_output() {
         shape: output_shape.as_mut_ptr(),
         strides: std::ptr::null_mut(),
         ndim: 1,
-        dtype: 0,
+        dtype: 1, // canonical f32
         device_type: 0,
         device_id: 0,
         tape_id: 0,

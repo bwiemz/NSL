@@ -21,9 +21,12 @@ pub mod exports;
 
 /// Tensor descriptor matching the C header from the M62 spec.
 ///
-/// Note: The C API uses dtype convention 0=f32, 1=f64 — this is **different**
-/// from NSL's internal convention (0=f64, 1=f32). The conversion functions
-/// `capi_dtype_to_nsl` and `nsl_dtype_to_capi` handle the mapping.
+/// Note: The C API speaks the CANONICAL runtime dtype tag space verbatim
+/// (`crate::tensor::DTYPE_*`: 0=f64, 1=f32, 2=fp16, 3=bf16, 4=int8,
+/// 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=i32). The historical
+/// inverted 0=f32/1=f64 convention was removed in the P4 item-16 dtype/ABI
+/// migration; `capi_dtype_to_nsl` and `nsl_dtype_to_capi` survive only as
+/// validating identity chokepoints (the `dtype_abi_lock` test pins this).
 ///
 /// Layout (48 bytes, 8-byte aligned):
 ///   offset  0: data         (*mut c_void, 8)
@@ -60,7 +63,8 @@ pub struct NslTensorDesc {
     pub shape: *mut i64,
     pub strides: *mut i64,
     pub ndim: i32,
-    /// C API dtype: 0=f32, 1=f64, 2=f16, 3=bf16, 4=int32, 5=int64, 6=int8, 7=uint8
+    /// Canonical NSL dtype tag: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8,
+    /// 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32.
     pub dtype: i32,
     /// 0=CPU, 1=CUDA
     pub device_type: i32,
@@ -73,31 +77,39 @@ pub struct NslTensorDesc {
 }
 
 // ---------------------------------------------------------------------------
-// Dtype mapping between C API and NSL internal
+// Dtype validation at the C API boundary
 // ---------------------------------------------------------------------------
+//
+// P4 item 16: the C API uses the canonical runtime tag space verbatim, so
+// these two functions are VALIDATING IDENTITY maps, not conversions. They are
+// kept (rather than deleted) so the boundary crossing stays an explicit,
+// greppable chokepoint — and so an unknown tag fails loudly here instead of
+// the historical silent fall-back-to-f64, which mislabeled every unmapped
+// dtype (e.g. the old C-API int64/uint8 slots) as f64.
 
-/// Convert C API dtype (0=f32, 1=f64) to NSL internal dtype (0=f64, 1=f32).
+/// Validate a C API dtype tag and return it as the canonical internal tag.
 pub fn capi_dtype_to_nsl(capi_dtype: i32) -> u16 {
-    match capi_dtype {
-        0 => 1, // C API f32 -> NSL 1 (f32)
-        1 => 0, // C API f64 -> NSL 0 (f64)
-        2 => 2, // f16
-        3 => 3, // bf16
-        6 => 4, // int8
-        _ => 0, // fallback to f64
+    if !(0..=9).contains(&capi_dtype) {
+        eprintln!(
+            "nsl: C API dtype tag {capi_dtype} is not a canonical NSL dtype \
+             (valid: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, 5=fp8e4m3, \
+             6=fp8e5m2, 7=u16-token, 8=u16-segment, 9=int32)"
+        );
+        std::process::abort();
     }
+    capi_dtype as u16
 }
 
-/// Convert NSL internal dtype (0=f64, 1=f32) to C API dtype (0=f32, 1=f64).
+/// Validate a canonical internal dtype tag for export through the C API.
 pub fn nsl_dtype_to_capi(nsl_dtype: u16) -> i32 {
-    match nsl_dtype {
-        0 => 1, // NSL f64 -> C API 1 (f64)
-        1 => 0, // NSL f32 -> C API 0 (f32)
-        2 => 2, // f16
-        3 => 3, // bf16
-        4 => 6, // int8
-        _ => 1, // fallback to f64
+    if nsl_dtype > 9 && nsl_dtype < crate::tensor::DTYPE_CUSTOM_START {
+        eprintln!(
+            "nsl: internal dtype tag {nsl_dtype} has no C API representation \
+             (canonical built-in tags are 0..=9)"
+        );
+        std::process::abort();
     }
+    nsl_dtype as i32
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,16 +1033,19 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
     let src = unsafe { &*(src_desc_ptr as *const NslTensorDesc) };
     let dst = unsafe { &mut *(dst_desc_ptr as *mut NslTensorDesc) };
 
-    // Bytes per element, indexed by C-ABI dtype (see NslTensorDesc::dtype).
+    // Bytes per element, indexed by canonical dtype tag (see
+    // NslTensorDesc::dtype — same space as crate::tensor::DTYPE_*).
     let elem_bytes: usize = match src.dtype {
-        0 => 4, // f32
-        1 => 8, // f64
+        0 => 8, // f64
+        1 => 4, // f32
         2 => 2, // f16
         3 => 2, // bf16
-        4 => 4, // int32
-        5 => 8, // int64
-        6 => 1, // int8
-        7 => 1, // uint8
+        4 => 1, // int8
+        5 => 1, // fp8e4m3
+        6 => 1, // fp8e5m2
+        7 => 2, // u16 token
+        8 => 2, // u16 segment
+        9 => 4, // int32
         _ => {
             set_error(format!(
                 "nsl_dispatch_apply_result: unrecognized dtype {}\0",
@@ -1294,13 +1309,11 @@ mod tests {
 
     #[test]
     fn test_dtype_mapping() {
-        assert_eq!(capi_dtype_to_nsl(0), 1);
-        assert_eq!(capi_dtype_to_nsl(1), 0);
-        assert_eq!(nsl_dtype_to_capi(0), 1);
-        assert_eq!(nsl_dtype_to_capi(1), 0);
-
-        for capi_d in [0, 1, 2, 3, 6] {
+        // P4 item 16: the C API tag space IS the canonical tag space — both
+        // chokepoints are validating identity maps.
+        for capi_d in 0..=9 {
             let nsl_d = capi_dtype_to_nsl(capi_d);
+            assert_eq!(nsl_d as i32, capi_d, "C API tag must equal canonical tag");
             let back = nsl_dtype_to_capi(nsl_d);
             assert_eq!(back, capi_d, "Roundtrip failed for C API dtype {capi_d}");
         }
@@ -1316,7 +1329,7 @@ mod tests {
             shape: shape.as_mut_ptr(),
             strides: std::ptr::null_mut(),
             ndim: 2,
-            dtype: 0, // C API f32
+            dtype: 1, // canonical f32
             device_type: 0,
             device_id: 0,
             tape_id: 0,
@@ -1341,7 +1354,7 @@ mod tests {
         };
         nsl_tensor_to_desc(tensor_ptr, &mut out_desc);
         assert_eq!(out_desc.ndim, 2);
-        assert_eq!(out_desc.dtype, 0); // back to C API f32
+        assert_eq!(out_desc.dtype, 1); // canonical f32, unchanged
         assert_eq!(out_desc.tape_id, 0); // wrapper has no tape_id assigned
 
         crate::tensor::nsl_tensor_free(tensor_ptr);

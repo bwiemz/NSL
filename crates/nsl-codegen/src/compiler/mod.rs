@@ -403,6 +403,10 @@ pub struct FeatureConfigs {
     pub parallelism_config: Option<crate::pipeline::ParallelismConfig>,
     /// M43: ZeRO optimizer sharding stage.
     pub zero_stage: Option<u8>,
+    /// P4 item 17: SR-BF16 authoritative weights (`--param-dtype bf16-sr`).
+    pub param_dtype_bf16sr: bool,
+    /// P4 item 18 rung 2: BF16 Muon momentum (`--muon-state-dtype bf16`).
+    pub muon_state_bf16: bool,
 
     // ── Inference Features (M32, M33, M42, M44) ──────────────────────
     /// M32: MoE layer configs — "ModelName.layer_name" → MoeInfo
@@ -497,6 +501,8 @@ impl FeatureConfigs {
             pipeline_config: None,
             parallelism_config: None,
             zero_stage: options.zero_stage,
+            param_dtype_bf16sr: options.param_dtype_bf16sr,
+            muon_state_bf16: options.muon_state_bf16,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
             kv_compress_policies: HashMap::new(),

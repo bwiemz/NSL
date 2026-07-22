@@ -20,7 +20,7 @@ struct Desc {
     shape: *mut i64,
     strides: *mut i64,
     ndim: i32,
-    /// C-API dtype convention: 0 = f32, 1 = f64 (inverted from NslTensor.dtype).
+    /// Canonical NSL dtype tag (unified C API, P4 item 16): 0 = f64, 1 = f32.
     dtype: i32,
     device_type: i32,
     device_id: i32,
@@ -45,8 +45,8 @@ impl Desc {
 /// Read element `i` of a returned desc as f64, honoring its dtype tag.
 unsafe fn desc_elem(desc: &Desc, i: usize) -> f64 {
     match desc.dtype {
-        0 => *(desc.data as *const f32).add(i) as f64,
-        1 => *(desc.data as *const f64).add(i),
+        1 => *(desc.data as *const f32).add(i) as f64,
+        0 => *(desc.data as *const f64).add(i),
         other => panic!("unexpected desc dtype {other}"),
     }
 }
@@ -124,7 +124,7 @@ fn addpair(pair: (Tensor<[4], f32>, Tensor<[4], f32>)) -> Tensor<[4], f32>:
         shape: shape.as_mut_ptr(),
         strides: strides.as_mut_ptr(),
         ndim: 1,
-        dtype: 0, // f32 (C-API convention)
+        dtype: 1, // f32 (canonical tag)
         device_type: 0,
         device_id: 0,
         tape_id: 0,
@@ -171,7 +171,7 @@ fn addpair(pair: (Tensor<[4], f32>, Tensor<[4], f32>)) -> Tensor<[4], f32>:
         shape: shape_b.as_mut_ptr(),
         strides: strides_b.as_mut_ptr(),
         ndim: 1,
-        dtype: 0,
+        dtype: 1,
         device_type: 0,
         device_id: 0,
         tape_id: 0,

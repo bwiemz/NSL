@@ -2521,6 +2521,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
     ("nsl_zero3_enable", &[], Some(types::I64)),
     ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    // P4 item 17: SR-BF16 authoritative weights
+    ("nsl_sr_bf16_enable", &[], None),
+    ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)
+    // P4 item 18 rung 2: (src_f32, dst_bf16, step, param_idx)
+    ("nsl_muon_state_sr_store", &[types::I64, types::I64, types::I64, types::I64], None),
+    (
+        "nsl_sr_bf16_step_adamw",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // theta, m, v, mp
+            types::F64, types::F64, types::F64, types::F64, types::F64, // lr, b1, omb1, b2, omb2
+            types::F64, types::F64, types::F64, types::F64, // eps, wd, bc1_inv, bc2_inv
+            types::I64, // step
+        ],
+        None,
+    ),
     ("nsl_zero3_reduce_grad_slot", &[types::I64, types::I64], Some(types::I64)), // (list, idx)
     // D3 v2: record an owned optimizer-moment allocation's element count so the
     // G3 gate can prove per-rank optimizer state shrank to ~1/world_size.

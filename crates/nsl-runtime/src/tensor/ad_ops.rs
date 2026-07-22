@@ -651,7 +651,7 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let go = if grad_out.len == 1 {
         match grad_out.dtype {
             1 => (unsafe { *grad_out.data_f32() }) as f64,
-            4 => unsafe { *(grad_out.data as *const i32) as f64 },
+            crate::tensor::DTYPE_I32 => unsafe { *(grad_out.data as *const i32) as f64 },
             _ => unsafe { *grad_out.data_f64() },
         }
     } else {
@@ -1731,7 +1731,7 @@ mod tests {
             unsafe { *logits_t.data_f32().add(index) = *value; }
         }
 
-        let targets = create_tensor_with_shape_rs_dtype(&[2], 4);
+        let targets = create_tensor_with_shape_rs_dtype(&[2], crate::tensor::DTYPE_I32);
         let targets_t = NslTensor::from_ptr(targets);
         unsafe {
             *targets_t.data_i32().add(0) = 0;

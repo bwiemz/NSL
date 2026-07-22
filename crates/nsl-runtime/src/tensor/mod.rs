@@ -229,17 +229,16 @@ pub const NSL_TENSOR_DATA_OFFSET: usize = std::mem::offset_of!(NslTensor, data);
 // compile-time `assert!`s; the golden `dtype_abi_lock` test below fails loudly
 // if any tag moves. Add new tags at the next free slot — DO NOT reuse a value.
 //
-// TWO OVERLOADS TO KNOW ABOUT (P0.4 dtype/ABI cleanup — documented, not yet
-// disentangled; a rename needs careful loader→loss hot-path validation):
-//   * Tag 4 is DTYPE_INT8 HERE, but the DataLoader / CPU tensor factory also
-//     use 4 to mean i32 token IDs (cpu.rs, dataloader.rs, and the *i32 readers
-//     in this file). `dtype_element_size(4)` returns the i32 width (4 B) because
-//     the only tag-4 tensors that reach the generic path are DataLoader i32;
-//     packed int8 uses int8_blockwise with its own accounting. A DataLoader i32
-//     tensor exported through the C API would be mislabeled int8 — do not do it.
-//   * The C API (`c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi}`) uses the
-//     INVERTED 0=f32 / 1=f64 convention; those two functions are the ONLY place
-//     that inversion may be expressed. See the `dtype_abi_lock` test.
+// P0.4 dtype/ABI cleanup (P4 item 16): both historical tag collisions are
+// RESOLVED —
+//   * i32 token tensors now carry their own tag, `DTYPE_I32` (9). Tag 4 means
+//     DTYPE_INT8 and nothing else. The DataLoader, the CPU tensor factory,
+//     the *i32 readers in this file, and the i32-index GPU kernels all key on
+//     DTYPE_I32. `dtype_element_size(DTYPE_INT8)` is the true int8 width (1 B).
+//   * The C API (`NslTensorDesc.dtype`) uses THIS canonical tag space verbatim
+//     — no inverted 0=f32/1=f64 convention. `c_api::{capi_dtype_to_nsl,
+//     nsl_dtype_to_capi}` survive only as validating identity chokepoints.
+// See the `dtype_abi_lock` test, which pins both properties.
 // ---------------------------------------------------------------------------
 pub const DTYPE_F64: u16 = 0;
 pub const DTYPE_F32: u16 = 1;
@@ -250,6 +249,7 @@ pub const DTYPE_FP8E4M3: u16 = 5;
 pub const DTYPE_FP8E5M2: u16 = 6;
 pub const DTYPE_U16_TOKEN: u16 = 7;
 pub const DTYPE_U16_SEGMENT: u16 = 8;
+pub const DTYPE_I32: u16 = 9;
 
 // Custom dtype IDs start at 256
 pub const DTYPE_CUSTOM_START: u16 = 256;
@@ -277,8 +277,9 @@ pub(crate) fn dtype_element_size(dtype: u16) -> usize {
     match dtype {
         DTYPE_F64 => std::mem::size_of::<f64>(),
         DTYPE_F32 => std::mem::size_of::<f32>(),
-        DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN => std::mem::size_of::<u16>(),
-        4 => std::mem::size_of::<i32>(),  // i32 token IDs
+        DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN | DTYPE_U16_SEGMENT => std::mem::size_of::<u16>(),
+        DTYPE_INT8 => std::mem::size_of::<i8>(),
+        DTYPE_I32 => std::mem::size_of::<i32>(),  // i32 token IDs
         id if id >= DTYPE_CUSTOM_START => {
             get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
         }
@@ -579,7 +580,7 @@ impl NslTensor {
                     out.push(unsafe { *p.add(i) as f64 });
                 }
             }
-            4 => {
+            DTYPE_I32 => {
                 let p = self.data as *const i32;
                 for i in 0..len {
                     out.push(unsafe { *p.add(i) as f64 });
@@ -596,14 +597,17 @@ impl NslTensor {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_i32(&self) -> *mut i32 {
-        assert_eq!(self.dtype, 4, "data_i32() called on non-i32 tensor (dtype={})", self.dtype);
+        assert_eq!(
+            self.dtype, DTYPE_I32,
+            "data_i32() called on non-i32 tensor (dtype={})", self.dtype,
+        );
         self.data as *mut i32
     }
 
     #[inline]
     pub(crate) fn read_scalar_as_f64(&self, offset: usize) -> f64 {
         match self.dtype {
-            4 => unsafe { *(self.data as *const i32).add(offset) as f64 },
+            DTYPE_I32 => unsafe { *(self.data as *const i32).add(offset) as f64 },
             DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(offset) as f64 },
             DTYPE_FP16 => {
                 let bits = unsafe { *(self.data as *const u16).add(offset) };
@@ -645,7 +649,7 @@ impl NslTensor {
         );
 
         match self.dtype {
-            4 => unsafe { *(self.data as *mut i32).add(offset) = value as i32 },
+            DTYPE_I32 => unsafe { *(self.data as *mut i32).add(offset) = value as i32 },
             DTYPE_U16_TOKEN => {
                 assert!(
                     value.is_finite()
@@ -671,13 +675,13 @@ impl NslTensor {
     }
 
     /// Read element at index `i` as an integer index value.
-    /// Handles dtype 0 (f64), 1 (f32), 4 (i32), and internal u16 token buffers.
+    /// Handles f64, f32, DTYPE_I32, and internal u16 token buffers.
     /// Used by embedding_lookup, gather, and their backward passes.
     #[inline]
     pub(crate) fn read_index(&self, i: usize) -> i64 {
         match self.dtype {
             DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(i) as i64 },
-            4 => unsafe { *(self.data as *const i32).add(i) as i64 },
+            DTYPE_I32 => unsafe { *(self.data as *const i32).add(i) as i64 },
             1 => unsafe { *(self.data as *const f32).add(i) as i64 },
             0 => unsafe { *(self.data as *const f64).add(i) as i64 },
             _ => panic!("read_index() unsupported for dtype {}", self.dtype),
@@ -1021,7 +1025,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
         {
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
             match tensor.dtype {
-                4 => {
+                DTYPE_I32 => {
                     let mut val: i32 = 0;
                     crate::cuda::inner::memcpy_dtoh(
                         &mut val as *mut i32 as *mut std::ffi::c_void,
@@ -1121,7 +1125,7 @@ fn print_tensor_recursive(
             if i > 0 { print!(", "); }
             let val = match dtype {
                 DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(i * stride) as f64 },
-                4 => unsafe { *(data as *const i32).add(i * stride) as f64 },
+                DTYPE_I32 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
                 0 => unsafe { *(data as *const f64).add(i * stride) },
                 d if d >= DTYPE_CUSTOM_START => {
@@ -3427,7 +3431,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                     transfer_src.ndim,
                     transfer_src.len,
                     target,
-                    4,
+                    DTYPE_I32,
                     1,
                     0,
                 ));
@@ -3599,7 +3603,7 @@ pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
         if device > 0 && !_t.data.is_null() {
             let elem_size = match _t.dtype {
                 1 => std::mem::size_of::<f32>(),
-                4 => std::mem::size_of::<i32>(),
+                DTYPE_I32 => std::mem::size_of::<i32>(),
                 _ => std::mem::size_of::<f64>(),
             };
             let size_bytes = _t.len as usize * elem_size;
@@ -4175,8 +4179,10 @@ mod tests {
 
     /// P0.4 dtype/ABI cleanup: GOLDEN LOCK on the canonical dtype tag table.
     /// A future fused kernel that renumbers or reuses a tag fails HERE instead
-    /// of silently colliding on the wire. Also pins the byte widths, the tag-4
-    /// i32/int8 overload, and the C-API 0/1 inversion round-trip.
+    /// of silently colliding on the wire. Also pins the byte widths and that
+    /// the C API speaks the SAME canonical tag space (P4 item 16 removed the
+    /// historical 0=f32/1=f64 inversion and the tag-4 i32/int8 overload —
+    /// neither may be reintroduced).
     #[test]
     fn dtype_abi_lock() {
         // The canonical table — do not renumber; append at the next free slot.
@@ -4189,31 +4195,31 @@ mod tests {
         assert_eq!(DTYPE_FP8E5M2, 6);
         assert_eq!(DTYPE_U16_TOKEN, 7);
         assert_eq!(DTYPE_U16_SEGMENT, 8);
+        assert_eq!(DTYPE_I32, 9);
         assert_eq!(DTYPE_CUSTOM_START, 256);
 
-        // Byte widths (int8/u16-token/segment are stored 1/2/2 bytes; tag 4 also
-        // means DataLoader i32 on the generic path — 4 bytes — see the const
-        // block doc).
+        // Byte widths. Tag 4 (int8) is 1 byte — the historical tag-4-as-i32
+        // overload is gone; i32 token tensors carry DTYPE_I32 (9).
         assert_eq!(dtype_element_size(DTYPE_F64), 8);
         assert_eq!(dtype_element_size(DTYPE_F32), 4);
         assert_eq!(dtype_element_size(DTYPE_FP16), 2);
         assert_eq!(dtype_element_size(DTYPE_BF16), 2);
         assert_eq!(dtype_element_size(DTYPE_U16_TOKEN), 2);
-        assert_eq!(dtype_element_size(4), 4); // DataLoader i32 (overloaded tag)
+        assert_eq!(dtype_element_size(DTYPE_U16_SEGMENT), 2);
+        assert_eq!(dtype_element_size(DTYPE_INT8), 1);
+        assert_eq!(dtype_element_size(DTYPE_I32), 4);
 
-        // The C-API convention is INVERTED (0=f32, 1=f64) and round-trips only
-        // through the two dedicated conversion functions.
+        // The C API uses the canonical tag space verbatim: the conversion
+        // chokepoints are validating IDENTITY functions. Any reintroduced
+        // inversion fails here.
         use crate::c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi};
-        assert_eq!(nsl_dtype_to_capi(DTYPE_F32), 0, "NSL f32(1) -> C-API 0");
-        assert_eq!(nsl_dtype_to_capi(DTYPE_F64), 1, "NSL f64(0) -> C-API 1");
-        assert_eq!(capi_dtype_to_nsl(0), DTYPE_F32);
-        assert_eq!(capi_dtype_to_nsl(1), DTYPE_F64);
-        for tag in [DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8] {
-            assert_eq!(
-                capi_dtype_to_nsl(nsl_dtype_to_capi(tag)),
-                tag,
-                "C-API dtype round-trip must be identity for tag {tag}"
-            );
+        for tag in [
+            DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8,
+            DTYPE_FP8E4M3, DTYPE_FP8E5M2, DTYPE_U16_TOKEN, DTYPE_U16_SEGMENT,
+            DTYPE_I32,
+        ] {
+            assert_eq!(nsl_dtype_to_capi(tag), tag as i32, "C-API tag must equal canonical tag {tag}");
+            assert_eq!(capi_dtype_to_nsl(tag as i32), tag, "canonical tag must round-trip {tag}");
         }
     }
 

@@ -145,6 +145,9 @@ impl Compiler<'_> {
         // single-purpose envelopes (nsl_tensor_cast_into asserts
         // co-residency, so chaining cannot work).
         wrap_offload: bool,
+        // P4 item 17: Some(opt_step i64 Value) when `--param-dtype bf16-sr`
+        // is active — the SR counter stream is keyed on it. None otherwise.
+        sr_step: Option<Value>,
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
 
@@ -272,6 +275,29 @@ impl Compiler<'_> {
         } else {
             None
         };
+        // P4 item 17: under bf16-sr the ONLY sanctioned theta mutation is the
+        // fused SR step against the bf16 mirror. The interpreted fallback
+        // would write the transient f32 working view and silently diverge
+        // from the authoritative mirror on the next widen — refuse instead
+        // of corrupting (deferral-must-refuse).
+        let bf16sr = self.features.param_dtype_bf16sr;
+        if bf16sr && fused_scalars.is_none() {
+            return Err(crate::error::CodegenError::new(
+                "--param-dtype bf16-sr requires the fused AdamW/Adam update \
+                 shape (strict structural match) — this optimizer program \
+                 would fall to the interpreted path, which cannot write the \
+                 bf16 authoritative mirror. Use AdamW/Adam without \
+                 NSL_FASE_FUSED_STEP=0 / --training-reference, or drop \
+                 --param-dtype bf16-sr",
+            ));
+        }
+        if bf16sr && (wrap_precision || wrap_offload) {
+            return Err(crate::error::CodegenError::new(
+                "--param-dtype bf16-sr does not compose with reduced-precision \
+                 moment plans or --optim-state-offload (m/v must be plain \
+                 device f32 for the fused SR step)",
+            ));
+        }
         let fused_emitted = if let Some(((bc1_val, bc2_val), s)) = fused_scalars {
             let lr_v = builder.ins().f64const(s.lr);
             let b1_v = builder.ins().f64const(s.beta1);
@@ -280,15 +306,31 @@ impl Compiler<'_> {
             let omb2_v = builder.ins().f64const(s.one_minus_beta2);
             let eps_v = builder.ins().f64const(s.eps);
             let wd_v = builder.ins().f64const(s.wd);
-            self.compile_call_by_name(
-                builder,
-                "nsl_fase_fused_adamw_step",
-                &[
-                    theta_ptr, m_ptr, v_ptr, m_partial_ptr,
-                    lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
-                    bc1_val, bc2_val,
-                ],
-            )?;
+            if bf16sr {
+                let step_v = sr_step.ok_or_else(|| crate::error::CodegenError::new(
+                    "bf16-sr final step reached without an opt_step value — \
+                     dispatcher must thread sr_step",
+                ))?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_sr_bf16_step_adamw",
+                    &[
+                        theta_ptr, m_ptr, v_ptr, m_partial_ptr,
+                        lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
+                        bc1_val, bc2_val, step_v,
+                    ],
+                )?;
+            } else {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_fase_fused_adamw_step",
+                    &[
+                        theta_ptr, m_ptr, v_ptr, m_partial_ptr,
+                        lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
+                        bc1_val, bc2_val,
+                    ],
+                )?;
+            }
             true
         } else {
             false
@@ -1388,6 +1430,7 @@ impl Compiler<'_> {
                 Some((bc1_inv, bc2_inv)),
                 cpdt_precision_dtypes.is_some(),
                 self.compile_options.optim_state_offload,
+                Some(opt_step),
             )?;
         }
         builder.ins().jump(iter_join, &[]);
