@@ -959,10 +959,20 @@ impl Compiler<'_> {
                 CodegenError::new(format!("no layout for model '{model_name}' in .to(device)"))
             })?;
 
-        // Transfer direct tensor fields of this model
+        // Transfer direct tensor fields of this model.
+        //
+        // SLOT COUNT, NOT FIELD COUNT (P5 root fix): the runtime walks
+        // 8-byte slots, and an inline fixed-size model array (`[Blk; N]`)
+        // is ONE field spanning N slots — passing `fields.len()` made every
+        // field declared after such an array land beyond the walked range
+        // and silently stay CPU-resident (the "ones([64]) norm param still
+        // on CPU after m.to(cuda)" gotcha), costing a hidden per-step PCIe
+        // upload via reconcile_device on every use. `total_size / 8` is the
+        // same convention nsl_collect_model_params has always used; the
+        // runtime's magic-probe safely skips the non-tensor slots.
         let num_fields = builder
             .ins()
-            .iconst(cl_types::I64, layout.fields.len() as i64);
+            .iconst(cl_types::I64, (layout.total_size / 8) as i64);
         self.compile_call_by_name(
             builder,
             "nsl_model_to_device",
