@@ -2871,7 +2871,7 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
         let base = row * n;
         let mut sum_sq = 0.0_f64;
         for j in 0..n {
-            let v = rd(&x, base + j);
+            let v = rd(x, base + j);
             sum_sq += v * v;
         }
         *r = 1.0 / (sum_sq / nf + eps).sqrt();
@@ -2880,7 +2880,7 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
         let mut acc = 0.0_f64;
         for (row, r) in rinv.iter().enumerate() {
             let i = row * n + j;
-            acc += rd(&dy, i) * rd(&x, i) * r;
+            acc += rd(dy, i) * rd(x, i) * r;
         }
         if gamma.dtype == 1 {
             unsafe { *dg.data_f32().add(j) = acc as f32 };
