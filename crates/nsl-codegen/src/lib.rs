@@ -1145,6 +1145,23 @@ pub struct CompileOptions {
     /// update — no FP32 master copy. Rides the weight-stream residency
     /// schedule (bf16 device mirrors, transient f32 working views).
     pub param_dtype_bf16sr: bool,
+    /// Muon perf campaign (`--muon-batch-ns`): shape-grouped batched
+    /// Newton-Schulz for all Muon-routed rank-2 params — one
+    /// `nsl_muon_step_batch` call per optimizer step (strided-batched
+    /// tensor-core GEMMs over persistent workspaces) instead of ~15 GEMM
+    /// launches per matrix. GPU-only, tolerance-equivalent (NOT bit-exact)
+    /// vs the sequential primitive; the AdamW-routed arm keeps the stdlib
+    /// path bit-for-bit. Refuses layerwise-accum / offload / ZeRO.
+    pub muon_batch_ns: bool,
+    /// Muon perf campaign (`--muon-resident-momentum`): under
+    /// `--optim-state-offload`, keep the Muon-routed rank-2 params' first
+    /// moment DEVICE-resident (and skip its per-step PCIe stage-in/
+    /// writeback envelope, plus the pointless v round-trip on that route).
+    /// AdamW state (embeddings/head/vectors) stays offloaded. Muon-routed
+    /// momentum is the single per-step optimizer-state round trip the mixed
+    /// recipe pays; this removes it for the cost of one f32 momentum
+    /// surface in VRAM.
+    pub muon_resident_momentum: bool,
     /// P4 item 18 rung 2 (`--muon-state-dtype bf16`): Muon first-moment
     /// buffers stored in BF16 with an FP32 working buffer per update and a
     /// counter-based SR quant-store (v stays f32 — it is null-sloted per
@@ -1443,6 +1460,8 @@ impl Default for CompileOptions {
             zk: ZkOptions::default(),
             zero_stage: None,
             param_dtype_bf16sr: false,
+            muon_batch_ns: false,
+            muon_resident_momentum: false,
             muon_state_bf16: false,
             cuda_graphs: false,
             debug_training: false,

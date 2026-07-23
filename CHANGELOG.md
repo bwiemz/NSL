@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — Muon perf campaign: batched Newton-Schulz + resident momentum + internal profiler
+
+- **`--muon-batch-ns`** (default off, GPU-only): every Muon-routed rank-2
+  param is updated by ONE batched runtime call per optimizer step
+  (`nsl_muon_step_batch`): momentum update + Frobenius normalization +
+  quintic Newton-Schulz + parameter update, shape-grouped and executed as
+  strided-batched tensor-core **TF32** GEMMs (`cublasGemmStridedBatchedEx`,
+  `CUBLAS_COMPUTE_32F_FAST_TF32`) over persistent per-shape workspaces with
+  device pointer-table addressing. Design wins folded in: no physical
+  transposes anywhere (tall matrices transpose on the fly in the pack/update
+  kernels; the Gram product runs as a `transa=T` GEMM), the polynomial
+  combine folds `ns_a*x + b@x` into one GEMM via a diagonal add
+  (`(ns_a*I + B) @ x`), and every square NS intermediate is symmetric so the
+  row/column-major operand swaps cancel. Workspace bounded by
+  `NSL_MUON_BATCH_MB` (default 256 MiB) with budget chunking;
+  `NSL_MUON_BATCH_TF32=0` forces strict FP32. Measured on the coder500m
+  Muon-routed load (168 matrices, ns=5): **341 ms vs 795 ms sequential
+  (2.3x)**; ~2,520 GEMM launches/step collapse to ~110 batched calls.
+  The AdamW-routed arm keeps the stdlib path bit-for-bit; the momentum
+  update is bit-exact vs the stdlib arm; NS output is tolerance-equivalent
+  (TF32 + batched reduction order), pinned by differential gates. Refuses
+  `--layerwise-accum`, `--optim-state-offload`, `--zero-stage`,
+  `--muon-state-dtype bf16`, and non-muon optimizers loudly.
+- **`--muon-resident-momentum`** (default off): under `--optim-state-offload`,
+  Muon-routed rank-2 params keep their first moment DEVICE-resident and skip
+  the per-step PCIe stage-in/writeback envelope entirely (plus the pointless
+  v round-trip on that route). AdamW state (embeddings/head/vectors) stays
+  offloaded. Bit-identical to plain offload (gated). This removes the mixed
+  recipe's only per-step optimizer-state round trip — the 500M campaign's
+  main non-GEMM pathology.
+- **`NSL_MUON_PROF`** internal profiler (perf item 2): 13 timestamp regions
+  across the whole Muon path (momentum stage-in/update, Frobenius reduce,
+  normalize scale, entry/exit transpose, Gram/Gram-square/poly GEMMs, param
+  update, momentum writeback) with two modes — `1` synced attribution, `2`
+  enqueue-only (the difference isolates launch/dispatch overhead from
+  execution). `[muon-prof]` table at exit; `nsl_muon_prof_report()` on
+  demand. First profile findings: the sequential NS load is ~0.8 s/step at
+  500M scale (NOT the 66.8 s/micro pathology — that was staging/offload);
+  within NS, the Gram GEMM dominates (~40%) and the per-matrix
+  single-block Frobenius reduction costs ~1 ms/call.
+- Batched-path building blocks: 5 new PTX kernels (ptxas-gated) —
+  pointer-table momentum update, deterministic per-matrix sum-square
+  reduction (same order as the sequential stats kernel — bit-identical
+  sums), transposing pack/scale, diagonal-folded polynomial combine, fused
+  transposing unpack + parameter update; `sgemm_strided_batched_raw` cuBLAS
+  wrapper with per-call compute-type control.
+- Fixed en route: `nsl_cpdt_allgather_add` relinquish-flag orientation (see
+  the FBIP leak fix); NOTE `[nsl-matmul]`'s "TF32 (default)" banner —
+  `CUBLAS_DEFAULT_MATH` does NOT enable TF32 tensor cores for f32 GEMMs on
+  cuBLAS >= 11, so the runtime's standard matmuls run FP32 CUDA cores; the
+  batch engine requests TF32 per call. A global re-evaluation is a separate
+  (numerics-affecting) decision, deliberately not made here.
+- Deferred (documented): CSLA x batch composition (per-layer groups /
+  deferred-epilogue batching), WGGO-driven workspace budget, cublasLt
+  autotuned plans, batched SYRK (no strided-batched SYRK exists in cuBLAS —
+  symmetry is exploited for mapping, not half-flop Grams).
+
 ### Added — P5 item 19: opportunistic per-region CUDA graph capture (`--cuda-graphs`)
 
 - Every source-AD Wengert lowering (forward CCR slice, CSLA backward layer

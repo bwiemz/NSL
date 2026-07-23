@@ -1006,18 +1006,87 @@ impl Compiler<'_> {
         // identical to the cast envelope above).
         let offload_only = wrap_offload && !offload_combined;
         let offload_s2 = offload_only && orig_s1 != orig_s2;
+        // Muon perf campaign (`--muon-resident-momentum`): on the Muon route
+        // (flag < 0.5 AND runtime rank 2 — the EXACT condition the moment
+        // allocation used to place m on the device) the whole staging
+        // envelope is skipped: m is already device-resident and the muon
+        // arm never reads v. The condition value is computed once and
+        // reused at the copy-back below (it dominates that code).
+        let muon_resident_cond = if offload_only
+            && self.compile_options.muon_resident_momentum
+            && optimizer_name == "muon"
+        {
+            use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+            let (flag_f, _, _) = muon_extra.ok_or_else(|| {
+                crate::error::CodegenError::new(
+                    "muon_extra is required for muon (resident-momentum envelope)",
+                )
+            })?;
+            let half = builder.ins().f64const(0.5);
+            let is_muon = builder.ins().fcmp(FloatCC::LessThan, flag_f, half);
+            let ndim =
+                self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_val])?;
+            let two_c = builder.ins().iconst(cl_types::I64, 2);
+            let is_r2 = builder.ins().icmp(IntCC::Equal, ndim, two_c);
+            Some(builder.ins().band(is_muon, is_r2))
+        } else {
+            None
+        };
         let (s1, s2) = if offload_only {
-            let ws1 = self.compile_call_by_name(
-                builder, "nsl_tensor_to_device_like", &[s1, param_val],
-            )?;
-            let ws2 = if offload_s2 {
-                self.compile_call_by_name(
-                    builder, "nsl_tensor_to_device_like", &[s2, param_val],
-                )?
+            if let Some(resident) = muon_resident_cond {
+                use cranelift_codegen::ir::InstBuilder as _;
+                let stage_b = builder.create_block();
+                let merge_b = builder.create_block();
+                builder.append_block_param(merge_b, cl_types::I64);
+                builder.append_block_param(merge_b, cl_types::I64);
+                // Resident: pass the device m (and the host v, unread on
+                // this route) straight through.
+                builder.ins().brif(resident, merge_b, &[s1, s2], stage_b, &[]);
+
+                builder.switch_to_block(stage_b);
+                builder.seal_block(stage_b);
+                let prof_in = builder.ins().iconst(cl_types::I64, 0); // MomentumStageIn
+                self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_in])?;
+                let ws1 = self.compile_call_by_name(
+                    builder, "nsl_tensor_to_device_like", &[s1, param_val],
+                )?;
+                let ws2 = if offload_s2 {
+                    self.compile_call_by_name(
+                        builder, "nsl_tensor_to_device_like", &[s2, param_val],
+                    )?
+                } else {
+                    ws1
+                };
+                self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_in])?;
+                builder.ins().jump(merge_b, &[ws1, ws2]);
+
+                builder.switch_to_block(merge_b);
+                builder.seal_block(merge_b);
+                let ps = builder.block_params(merge_b);
+                (ps[0], ps[1])
             } else {
-                ws1
-            };
-            (ws1, ws2)
+                let prof = if optimizer_name == "muon" {
+                    let prof_in = builder.ins().iconst(cl_types::I64, 0); // MomentumStageIn
+                    self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_in])?;
+                    Some(prof_in)
+                } else {
+                    None
+                };
+                let ws1 = self.compile_call_by_name(
+                    builder, "nsl_tensor_to_device_like", &[s1, param_val],
+                )?;
+                let ws2 = if offload_s2 {
+                    self.compile_call_by_name(
+                        builder, "nsl_tensor_to_device_like", &[s2, param_val],
+                    )?
+                } else {
+                    ws1
+                };
+                if let Some(prof_in) = prof {
+                    self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_in])?;
+                }
+                (ws1, ws2)
+            }
         } else {
             (s1, s2)
         };
@@ -1161,9 +1230,42 @@ impl Compiler<'_> {
         // copy_data_async CONSUMES the staged tensor (async DtoH on pinned
         // hosts, drain-deferred free; sync copy + inline free otherwise).
         if offload_only {
-            self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
-            if offload_s2 {
-                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+            if let Some(resident) = muon_resident_cond {
+                // Resident Muon momentum: the update ran in place on the
+                // device m — nothing was staged, nothing to write back.
+                use cranelift_codegen::ir::InstBuilder as _;
+                let wb_b = builder.create_block();
+                let done_b = builder.create_block();
+                builder.ins().brif(resident, done_b, &[], wb_b, &[]);
+
+                builder.switch_to_block(wb_b);
+                builder.seal_block(wb_b);
+                let prof_wb = builder.ins().iconst(cl_types::I64, 10); // MomentumWriteback
+                self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_wb])?;
+                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
+                if offload_s2 {
+                    self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+                }
+                self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_wb])?;
+                builder.ins().jump(done_b, &[]);
+
+                builder.switch_to_block(done_b);
+                builder.seal_block(done_b);
+            } else {
+                let prof = if optimizer_name == "muon" {
+                    let prof_wb = builder.ins().iconst(cl_types::I64, 10); // MomentumWriteback
+                    self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_wb])?;
+                    Some(prof_wb)
+                } else {
+                    None
+                };
+                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
+                if offload_s2 {
+                    self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+                }
+                if let Some(prof_wb) = prof {
+                    self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_wb])?;
+                }
             }
         }
         // Combined copy-back (P0.3): quant-cast to the host dtype + DtoH;

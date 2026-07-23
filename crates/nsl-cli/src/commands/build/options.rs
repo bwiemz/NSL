@@ -79,6 +79,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             weight_stream,
             param_dtype,
             muon_state_dtype,
+            muon_batch_ns,
+            muon_resident_momentum,
             cuda_graphs,
             stream_arena,
             stream_prefetch,
@@ -422,6 +424,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 weight_stream,
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
                 cuda_graphs,
+                muon_batch_ns,
+                muon_resident_momentum,
                 muon_state_bf16: match muon_state_dtype.as_str() {
                     "f32" => false,
                     "bf16" => true,
