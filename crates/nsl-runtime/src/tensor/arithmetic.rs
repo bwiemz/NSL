@@ -723,9 +723,11 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
+    // Skip for i32 — the dtype arms below would flat-index it as f64 (8-byte
+    // writes into a 4-byte-element buffer). Same guard as nsl_tensor_add_scalar.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if relinq_a {
+        if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
                 // f16 in-place scalar mul: widen to f32, multiply, narrow back.

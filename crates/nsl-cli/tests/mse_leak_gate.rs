@@ -73,7 +73,13 @@ fn mse_loss_source_ad_live_blocks_exactly_flat() {
         "fixture silently fell off the source-AD path:\n{stderr}"
     );
 
-    // Collect live_blocks per step from the end-of-step reports.
+    // Collect live_blocks per step. Note (review): the runtime emits TWO
+    // [gpu-mem] reports per micro-step — one pre-increment at step start and
+    // one post-increment after cleanup — so a given step label mixes "end of
+    // k-1" and "start of k". Both are allocator-quiescent points with equal
+    // counts in steady state, which is exactly what exact-flatness asserts;
+    // if the step-counter increment ever moves relative to those calls,
+    // revisit this parse.
     let mut per_step: Vec<(i64, i64)> = Vec::new();
     for line in stderr.lines() {
         let Some(rest) = line.strip_prefix("[gpu-mem] step=") else {
