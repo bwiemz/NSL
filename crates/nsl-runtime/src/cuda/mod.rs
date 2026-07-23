@@ -2854,6 +2854,156 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     inner::sync_after_kernel();
 }
 
+/// Fusion-queue item 1: MULTI-TENSOR fused AdamW step — one launch for k
+/// parameters via device pointer tables. `ptrs` slices carry raw DEVICE
+/// DATA pointers (already resolved from NslTensors by the FFI); `lens` the
+/// per-param element counts. Tables are staged through a persistent pinned
+/// block on the COMPUTE stream (the muon_batch discipline: sync before the
+/// host rewrite; enqueue uploads on current_stream so the kernel is
+/// stream-ordered after them).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_multi(
+    t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64], lens: &[u32],
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+) {
+    let k = t_ptrs.len();
+    if k == 0 {
+        return;
+    }
+    assert!(
+        k == m_ptrs.len() && k == v_ptrs.len() && k == mp_ptrs.len() && k == lens.len(),
+        "multi adamw: table length mismatch"
+    );
+    assert!(k <= 65535, "multi adamw: grid.y cap exceeded ({k})");
+
+    struct MultiWs {
+        cap: usize,
+        stage: u64,   // pinned host: 4*cap u64 + cap u32
+        tabs: [u64; 4], // device u64 tables
+        ntab: u64,    // device u32 table
+    }
+    thread_local! {
+        static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+
+    inner::set_oom_context("fase_fused_adamw_multi");
+    let ws: &mut MultiWs = WS.with(|c| {
+        let cur = c.get();
+        let need_new = cur.is_null() || unsafe { (*cur).cap } < k;
+        if need_new {
+            unsafe {
+                inner::ensure_context();
+                // Quiesce before releasing/rewriting anything a prior step
+                // may still be reading.
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+                if !cur.is_null() {
+                    let old = Box::from_raw(cur);
+                    for t in old.tabs {
+                        inner::free_managed(t as *mut c_void);
+                    }
+                    inner::free_managed(old.ntab as *mut c_void);
+                    cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
+                }
+                let mut stage: *mut c_void = std::ptr::null_mut();
+                let bytes = 4 * k * 8 + k * 4;
+                let r = cudarc::driver::sys::cuMemAllocHost_v2(&mut stage, bytes.max(8));
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi adamw: pinned staging alloc failed"
+                );
+                let tabs = [
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                ];
+                let ntab = inner::alloc_managed(k * 4) as u64;
+                let fresh = Box::into_raw(Box::new(MultiWs { cap: k, stage: stage as u64, tabs, ntab }));
+                c.set(fresh);
+            }
+        } else {
+            // Same-cap reuse: the previous optimizer step's uploads read this
+            // pinned block — quiesce before the host rewrite below.
+            unsafe {
+                inner::ensure_context();
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            }
+        }
+        unsafe { &mut *c.get() }
+    });
+
+    unsafe {
+        let base = ws.stage as *mut u64;
+        std::ptr::copy_nonoverlapping(t_ptrs.as_ptr(), base, k);
+        std::ptr::copy_nonoverlapping(m_ptrs.as_ptr(), base.add(ws.cap), k);
+        std::ptr::copy_nonoverlapping(v_ptrs.as_ptr(), base.add(2 * ws.cap), k);
+        std::ptr::copy_nonoverlapping(mp_ptrs.as_ptr(), base.add(3 * ws.cap), k);
+        let nbase = (ws.stage as usize + 4 * ws.cap * 8) as *mut u32;
+        std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
+        let up = |dst: u64, src_off: usize, bytes: usize| {
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst,
+                (ws.stage as usize + src_off) as *const c_void,
+                bytes,
+                inner::current_stream(),
+            );
+            assert_eq!(
+                r,
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                "multi adamw: table upload failed"
+            );
+        };
+        for (idx, tab) in ws.tabs.iter().enumerate() {
+            up(*tab, idx * ws.cap * 8, k * 8);
+        }
+        up(ws.ntab, 4 * ws.cap * 8, k * 4);
+    }
+
+    let max_n = *lens.iter().max().unwrap() as i64;
+    let mut a0 = ws.tabs[0];
+    let mut a1 = ws.tabs[1];
+    let mut a2 = ws.tabs[2];
+    let mut a3 = ws.tabs[3];
+    let mut a4 = ws.ntab;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let args = [
+        &mut a0 as *mut _ as *mut c_void,
+        &mut a1 as *mut _ as *mut c_void,
+        &mut a2 as *mut _ as *mut c_void,
+        &mut a3 as *mut _ as *mut c_void,
+        &mut a4 as *mut _ as *mut c_void,
+        &mut b1 as *mut _ as *mut c_void,
+        &mut omb1 as *mut _ as *mut c_void,
+        &mut b2 as *mut _ as *mut c_void,
+        &mut omb2 as *mut _ as *mut c_void,
+        &mut eps as *mut _ as *mut c_void,
+        &mut neg_lr as *mut _ as *mut c_void,
+        &mut neg_lr_wd as *mut _ as *mut c_void,
+        &mut bc1 as *mut _ as *mut c_void,
+        &mut bc2 as *mut _ as *mut c_void,
+        &mut has_wd_val as *mut _ as *mut c_void,
+    ];
+    let block = 256i64;
+    let grid_x = (max_n + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
+        [grid_x, k as i64, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_multi kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
 /// P4 item 17: fused AdamW step against a BF16 AUTHORITATIVE theta with
 /// counter-based stochastic rounding. `theta_dev` is the RAW device pointer
 /// of the bf16 mirror (2 bytes/elem, not an NslTensor); m/v/mp are the f32

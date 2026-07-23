@@ -21,14 +21,14 @@ use crate::compiler::Compiler;
 
 /// Scalars extracted from a structurally-matched AdamW/Adam `UpdateProgram`
 /// (p9 fused optimizer step admission — see `match_adamw_program`).
-struct FusedAdamwScalars {
-    lr: f64,
-    wd: f64,
-    beta1: f64,
-    one_minus_beta1: f64,
-    beta2: f64,
-    one_minus_beta2: f64,
-    eps: f64,
+pub(crate) struct FusedAdamwScalars {
+    pub(crate) lr: f64,
+    pub(crate) wd: f64,
+    pub(crate) beta1: f64,
+    pub(crate) one_minus_beta1: f64,
+    pub(crate) beta2: f64,
+    pub(crate) one_minus_beta2: f64,
+    pub(crate) eps: f64,
 }
 use crate::fase::FasePlan;
 
@@ -74,7 +74,7 @@ impl Compiler<'_> {
     /// the recipe scalars when — and only when — the program is that shape;
     /// any future change to the emitter fails the match and falls back to the
     /// interpreted path loudly-by-construction (no silent drift).
-    fn match_adamw_program(
+    pub(crate) fn match_adamw_program(
         program: &crate::fase_optimizer::UpdateProgram,
     ) -> Option<FusedAdamwScalars> {
         use crate::fase_optimizer::{BcKind, Register, UpdateOp};

@@ -243,6 +243,27 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_muon_prof_begin", &[types::I64], None),
     ("nsl_muon_prof_end", &[types::I64], None),
     ("nsl_muon_prof_report", &[], None),
+    // Fusion item 1: multi-tensor fused AdamW final step over the whole
+    // param/m/v/m_partial lists (one pointer-table launch, bit-identical).
+    (
+        "nsl_fase_fused_adamw_step_multi",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+        ],
+        None,
+    ),
     // PCA Stage C: non-aborting shape probe (0 for out-of-range dims).
     ("nsl_tensor_dim_or_zero", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_len", &[types::I64], Some(types::I64)),
