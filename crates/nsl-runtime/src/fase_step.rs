@@ -268,11 +268,12 @@ mod tests {
         nsl_tensor_free(t1);
         // SquaredAccumulate: v = β₂·v + (1-β₂)·mp²
         let sq = nsl_tensor_mul(mp, mp, 0);
-        let ssq = nsl_tensor_mul_scalar(sq, omb2, 0b0000_0001); // relinquish sq
+        // Relinquish transfers our sq ref into the callee; ssq carries the
+        // single live ref (same choreography as the emitted IR).
+        let ssq = nsl_tensor_mul_scalar(sq, omb2, 0b0000_0001);
         nsl_tensor_mul_scalar_inplace(v, b2);
         nsl_tensor_add_inplace(v, ssq);
         nsl_tensor_free(ssq);
-        nsl_tensor_free(sq);
         // ScalarMulByBc ×2
         let mh = nsl_tensor_mul_scalar(m, bc1, 0);
         let vh = nsl_tensor_mul_scalar(v, bc2, 0);
@@ -280,8 +281,7 @@ mod tests {
         let vh_copy = nsl_tensor_add_scalar(vh, 0.0, 0);
         let sqrt_val = nsl_tensor_sqrt(vh_copy);
         nsl_tensor_free(vh_copy);
-        let tmp = nsl_tensor_add_scalar(sqrt_val, eps, 0b0000_0001);
-        nsl_tensor_free(sqrt_val);
+        let tmp = nsl_tensor_add_scalar(sqrt_val, eps, 0b0000_0001); // consumes sqrt_val
         // Div: u = m̂ / tmp
         let u = nsl_tensor_div(mh, tmp, 0);
         nsl_tensor_free(tmp);

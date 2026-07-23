@@ -1803,6 +1803,28 @@ mod tests {
         nsl_tensor_free(grad);
     }
 
+    // Regression guard for the (pred - target) per-step leak: the internal
+    // sub -> mul_scalar(RELINQUISH_A) chain reuses the diff buffer in place,
+    // and the in-place relinquish path must NOT hand back an extra ref —
+    // callers free the returned grad exactly once. Under the bug the result
+    // arrived with refcount 2 and the diff block was stranded every training
+    // step (live_blocks +1/step under mse_loss + --source-ad).
+    #[test]
+    fn test_mse_backward_result_owns_single_ref() {
+        let pred = make_1d_f32(&[1.0, 2.0, 3.0]);
+        let target = make_1d_f32(&[0.5, 1.5, 2.5]);
+        let grad_out = nsl_tensor_scalar(1.0, 1);
+        let grad = nsl_mse_backward(grad_out, pred, target);
+        let rc = NslTensor::from_ptr(grad)
+            .refcount
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(rc, 1, "mse grad must carry exactly one ref (leak if more)");
+        nsl_tensor_free(pred);
+        nsl_tensor_free(target);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(grad);
+    }
+
     // L1 backward: d/d(pred_i) = grad_output * sign(pred_i - target_i) / N
     // Regression guard for the /N factor (same pattern as MSE). Also covers
     // the three sign branches: positive, negative, and zero.

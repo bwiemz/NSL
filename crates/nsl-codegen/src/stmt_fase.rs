@@ -520,15 +520,11 @@ impl Compiler<'_> {
                         )?;
                     }
                     self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dst_ptr, scaled_sq])?;
-                    // FBIP relinq contract: when mul_scalar reuses the input
-                    // buffer in-place, it bumps refcount so the input ptr is
-                    // still valid post-call. The caller must free BOTH the
-                    // input (sq) and the output (scaled_sq) — under FBIP they
-                    // are the same pointer with rc=2; the two frees drop it
-                    // to 0. Without the second free, every SquaredAccumulate
-                    // leaks one operand-sized tensor per call.
+                    // FBIP relinq contract: relinquishing sq transferred our ref
+                    // into the callee — the returned scaled_sq carries the single
+                    // live ref whether or not the buffer was reused in place.
+                    // Freeing sq again here would double-free on the reuse path.
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_sq])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[sq])?;
                 }
 
                 // ── SqrtPlusEps: dst = sqrt(src) + eps ─────────────────────
@@ -585,11 +581,10 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, eps_result])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[eps_result])?;
                     }
-                    // FBIP relinq contract: caller must also free the input we
-                    // relinquished to add_scalar. Under FBIP, sqrt_val and
-                    // eps_result share the same buffer with rc=2; the eps_result
-                    // free above drops to 1, this one drops to 0.
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[sqrt_val])?;
+                    // FBIP relinq contract: relinquishing sqrt_val transferred our
+                    // ref into add_scalar — eps_result carries the single live ref
+                    // (freed above, or owned by tmp_val). A second free of
+                    // sqrt_val here would dangle tmp_val on the reuse path.
                 }
 
                 // ── Div: dst = src / divisor ─────────────────────────────────

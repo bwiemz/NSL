@@ -11,7 +11,7 @@
 //! the caller.
 
 use crate::tensor::arithmetic::{nsl_tensor_add, nsl_tensor_mul_scalar};
-use crate::tensor::fbip_flags::RELINQUISH_A;
+use crate::tensor::fbip_flags::RELINQUISH_B;
 use crate::tensor::nsl_tensor_free;
 
 // ---------------------------------------------------------------------------
@@ -108,8 +108,11 @@ pub extern "C" fn nsl_cpdt_allgather_add(
     if gathered == 0 {
         return 0;
     }
-    // Sum with residual; RELINQUISH_A frees `gathered` inside the add.
-    nsl_tensor_add(residual_ptr, gathered, RELINQUISH_A)
+    // Sum with residual; RELINQUISH_B frees `gathered` inside the add while
+    // leaving the caller's `residual` untouched. (Was RELINQUISH_A, which
+    // consumed/mutated the residual and leaked `gathered` — the flag names
+    // the operand POSITION, and residual is operand A here.)
+    nsl_tensor_add(residual_ptr, gathered, RELINQUISH_B)
 }
 
 /// Free a tensor returned by any of the `nsl_cpdt_*` functions.
