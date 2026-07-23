@@ -7703,7 +7703,7 @@ impl Compiler<'_> {
                 }
                 // P5 item 20 slice B: fuse SwiGLU gate-gradient pairs
                 // (bit-exact — see fuse_swiglu_gate_backward).
-                crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops);
+                crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
                 // schedule when NSL_CSLA_REPORT=1. Pure analysis over the final
@@ -12421,14 +12421,11 @@ impl Compiler<'_> {
         // Drain GPU caching allocator — only releases Transient segments,
         // which are now fully free since forward/backward intermediates were freed.
         //
-        // P5 item 19: under --cuda-graphs the per-step drain is SKIPPED —
-        // physically releasing transient segments each step (a) makes every
-        // transient address churn, so no region ever digest-stabilizes, and
-        // (b) would unmap memory that already-captured graphs reference.
-        // Retained segments are exactly the steady-state working set.
-        if !self.compile_options.cuda_graphs {
-            self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
-        }
+        // P5 item 19: the runtime skips this drain while cuda-graph capture is
+        // ARMED (per-step segment release would churn every transient address
+        // and unmap memory captured graphs reference) — checked at runtime,
+        // not compile time, so a declined enable() keeps the drain (review L5).
+        self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
 
         // Debug: GPU memory after step cleanup
         {
@@ -14012,7 +14009,7 @@ impl Compiler<'_> {
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
             // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied
             // on the train path).
-            crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops);
+            crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &needed);
 
             if !adjoint.ops.is_empty() {
                 // P0.2: arm the gradient-integrity guard for the `grad` block's

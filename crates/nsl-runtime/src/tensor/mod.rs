@@ -2822,6 +2822,9 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
     gamma_ptr: i64,
     eps: f64,
 ) -> i64 {
+    // Read only by the cuda device-dispatch below; the CPU arm re-binds `x`
+    // from its contiguous copy.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let x = NslTensor::from_ptr(x_ptr);
 
     #[cfg(feature = "cuda")]
@@ -2843,8 +2846,13 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
         return dg;
     }
 
-    // CPU reference (f64 accumulation, row-major order).
-    let dy = NslTensor::from_ptr(dy_ptr);
+    // CPU reference (f64 accumulation, row-major order). Contiguous copies
+    // first — the flat indexing below is meaningless on strided views
+    // (review L4); both acquires are owned refs, freed at the end.
+    let dy_c = nsl_tensor_contiguous(dy_ptr);
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let dy = NslTensor::from_ptr(dy_c);
+    let x = NslTensor::from_ptr(x_c);
     let gamma = NslTensor::from_ptr(gamma_ptr);
     let ndim = x.ndim as usize;
     let n = unsafe { *x.shape.add(ndim - 1) } as usize;
@@ -2888,6 +2896,8 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
             unsafe { *dg.data_f64().add(j) = acc };
         }
     }
+    nsl_tensor_free(dy_c);
+    nsl_tensor_free(x_c);
     dg_ptr
 }
 
@@ -5382,6 +5392,14 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_drain_cache() {
+    // P5 item 19: while cuda-graph capture is armed, the per-step transient
+    // drain would churn every transient address (no region could ever
+    // digest-stabilize) AND physically unmap memory that already-captured
+    // graphs reference — skip it. OOM recovery still drains via pool_drain,
+    // which taints any active region first.
+    if crate::cuda::graph_capture::cuda_graphs_armed() {
+        return;
+    }
     // Probe gate (2026-04-23): NSL_SKIP_GPU_DRAIN=1 bypasses this workaround
     // so we can observe whether ELTLS frees intermediates at last use.
     if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() != Some("1") {

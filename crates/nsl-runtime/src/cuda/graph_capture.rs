@@ -213,6 +213,11 @@ mod imp {
             exec: usize, // CUgraphExec
             seq: Vec<GpuOp>,
             attempts: u32,
+            /// CUevent recorded after every launch of `exec` (0 = none yet).
+            /// Fences two hazards: refreshing an HtoD staging buffer, and
+            /// dropping the seq (freeing pinned staging), while a previous
+            /// launch of this graph may still be reading them (review H1/H2).
+            launch_event: usize,
         },
         Eager,
     }
@@ -236,6 +241,8 @@ mod imp {
         seq: Vec<GpuOp>,
         /// CUgraphExec while Skipping (0 otherwise).
         exec: usize,
+        /// The exec's launch-fence event while Skipping (0 otherwise).
+        launch_event: usize,
         /// Record-state bookkeeping carried through the pass.
         prev_digest: Option<u64>,
         streak: u32,
@@ -489,6 +496,23 @@ mod imp {
         }
     }
 
+    /// Wait for the last launch of a region's graph to retire (no-op when it
+    /// never launched). MUST be called before refreshing any HtoD staging
+    /// buffer of that graph and before dropping its seq — the graph's memcpy
+    /// nodes DMA-read our pinned staging at execution time (review H1/H2).
+    fn sync_launch_event(ev: usize) {
+        if ev != 0 {
+            let r = unsafe { cuEventSynchronize(ev as CUevent) };
+            debug_assert_eq!(r, CUresult::CUDA_SUCCESS, "launch-event sync failed: {r:?}");
+        }
+    }
+
+    fn destroy_launch_event(ev: usize) {
+        if ev != 0 {
+            unsafe { cuEventDestroy_v2(ev as CUevent) };
+        }
+    }
+
     fn fail_state(attempts: u32) -> RegionState {
         if attempts + 1 >= MAX_CAPTURE_ATTEMPTS {
             EAGER_REGIONS.fetch_add(1, Ordering::Relaxed);
@@ -556,6 +580,7 @@ mod imp {
                         mode: Mode::Capturing,
                         seq: Vec::new(),
                         exec: 0,
+                        launch_event: 0,
                         prev_digest,
                         streak,
                         attempts,
@@ -570,6 +595,7 @@ mod imp {
                         mode: Mode::Recording { tainted: false },
                         seq: Vec::new(),
                         exec: 0,
+                        launch_event: 0,
                         prev_digest,
                         streak,
                         attempts,
@@ -579,19 +605,30 @@ mod imp {
                     }
                 }
             }
-            RegionState::Captured { exec, seq, attempts } => Active {
-                id,
-                phase,
-                mode: Mode::Skipping { idx: 0 },
-                seq,
-                exec,
-                prev_digest: None,
-                streak: 0,
-                attempts,
-                prev_seq: None,
-                post: None,
-                deferred: Vec::new(),
-            },
+            RegionState::Captured { exec, seq, attempts, launch_event } => {
+                // H1 fence: the HtoD staging buffers are about to be refreshed
+                // with this step's payloads — wait for the PREVIOUS launch of
+                // this graph (whose memcpy nodes read those buffers) first.
+                if launch_event != 0
+                    && seq.iter().any(|op| matches!(op, GpuOp::HtoD { .. }))
+                {
+                    sync_launch_event(launch_event);
+                }
+                Active {
+                    id,
+                    phase,
+                    mode: Mode::Skipping { idx: 0 },
+                    seq,
+                    exec,
+                    launch_event,
+                    prev_digest: None,
+                    streak: 0,
+                    attempts,
+                    prev_seq: None,
+                    post: None,
+                    deferred: Vec::new(),
+                }
+            }
         };
         ACTIVE.with(|a| *a.borrow_mut() = Some(active));
     }
@@ -621,12 +658,34 @@ mod imp {
             return; // eager region — nothing was activated
         };
         if active.id != id {
-            // Unbalanced markers — fail safe: repair nothing (all modes that
-            // skip work run through matching ids), go eager everywhere.
+            // Unbalanced markers (should be impossible from emitted code) —
+            // fail SAFE, not silent: skipped/recorded work must still execute
+            // before we disable (review M1).
             eprintln!(
                 "[cuda-graph] region_end({id}) does not match active region {} — disabling",
                 active.id
             );
+            match active.mode {
+                Mode::Skipping { idx } => {
+                    sync_launch_event(active.launch_event);
+                    destroy_launch_event(active.launch_event);
+                    unsafe { cuGraphExecDestroy(active.exec as CUgraphExec) };
+                    repair(&active.seq[..idx]);
+                }
+                Mode::Capturing => {
+                    let stream = crate::cuda::inner::current_stream();
+                    let mut graph: CUgraph = std::ptr::null_mut();
+                    let _ = unsafe { cuStreamEndCapture(stream, &mut graph) };
+                    if !graph.is_null() {
+                        unsafe { cuGraphDestroy(graph) };
+                    }
+                    repair(&active.seq);
+                }
+                _ => {}
+            }
+            for ptr in active.deferred.drain(..) {
+                crate::cuda::inner::defer_free_device_record(ptr as *mut c_void);
+            }
             ENABLED.store(false, Ordering::Relaxed);
             return;
         }
@@ -710,10 +769,21 @@ mod imp {
                                         active.seq.len()
                                     );
                                 }
+                                // Launch-fence event (H1/H2): recorded after
+                                // every launch of this exec.
+                                let mut ev: CUevent = std::ptr::null_mut();
+                                let re = unsafe { cuEventCreate(&mut ev, 0x2) };
+                                let launch_event = if re == CUresult::CUDA_SUCCESS {
+                                    unsafe { cuEventRecord(ev, stream) };
+                                    ev as usize
+                                } else {
+                                    0
+                                };
                                 RegionState::Captured {
                                     exec: exec as usize,
                                     seq: std::mem::take(&mut active.seq),
                                     attempts: active.attempts,
+                                    launch_event,
                                 }
                             }
                         }
@@ -724,23 +794,36 @@ mod imp {
                         let stream = crate::cuda::inner::current_stream();
                         let rl = unsafe { cuGraphLaunch(active.exec as CUgraphExec, stream) };
                         if rl != CUresult::CUDA_SUCCESS {
-                            // Launch failed to enqueue — nothing ran; repair.
+                            // Launch failed to enqueue — nothing NEW ran, but
+                            // the previous launch may still be in flight and
+                            // reading the seq's staging buffers (H2).
+                            sync_launch_event(active.launch_event);
+                            destroy_launch_event(active.launch_event);
                             unsafe { cuGraphExecDestroy(active.exec as CUgraphExec) };
                             repair(&active.seq);
                             EAGER_REGIONS.fetch_add(1, Ordering::Relaxed);
                             RegionState::Eager
                         } else {
                             REPLAYS.fetch_add(1, Ordering::Relaxed);
+                            if active.launch_event != 0 {
+                                unsafe {
+                                    cuEventRecord(active.launch_event as CUevent, stream)
+                                };
+                            }
                             RegionState::Captured {
                                 exec: active.exec,
                                 seq: std::mem::take(&mut active.seq),
                                 attempts: active.attempts,
+                                launch_event: active.launch_event,
                             }
                         }
                     } else {
                         // Host issued FEWER ops than captured: the skipped
                         // prefix matched, so re-issue it and drop the graph.
+                        // H2 fence before dropping the seq (pinned staging).
                         MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                        sync_launch_event(active.launch_event);
+                        destroy_launch_event(active.launch_event);
                         unsafe { cuGraphExecDestroy(active.exec as CUgraphExec) };
                         repair(&active.seq[..idx]);
                         fail_state(active.attempts)
@@ -785,6 +868,12 @@ mod imp {
                 std::mem::take(&mut active.seq)
             }
             Mode::Skipping { idx } => {
+                // H2 fence: the previous launch of this graph may still be
+                // reading the pinned staging buffers owned by the seq we are
+                // about to truncate/drop.
+                sync_launch_event(active.launch_event);
+                destroy_launch_event(active.launch_event);
+                active.launch_event = 0;
                 unsafe { cuGraphExecDestroy(active.exec as CUgraphExec) };
                 active.exec = 0;
                 let mut pre = std::mem::take(&mut active.seq);
@@ -879,10 +968,15 @@ mod imp {
             return None;
         }
         let total: usize = sizes.iter().sum();
-        let mut params = Vec::with_capacity(total);
+        let mut params = Vec::with_capacity(total + sizes.len() * 8);
         let mut offsets = Vec::with_capacity(sizes.len());
         for (i, &sz) in sizes.iter().enumerate() {
-            offsets.push(params.len());
+            // 8-byte-align each argument so eager-repair hands cuLaunchKernel
+            // naturally-aligned pointers (review L8; Vec<u8> data is at least
+            // 8-aligned from the global allocator for these sizes).
+            let off = (params.len() + 7) & !7;
+            params.resize(off, 0);
+            offsets.push(off);
             let bytes = unsafe { std::slice::from_raw_parts(args[i] as *const u8, sz) };
             params.extend_from_slice(bytes);
         }
@@ -1261,6 +1355,22 @@ pub extern "C" fn nsl_cuda_graph_region_end(id: i64) {
     imp::region_end(id);
     #[cfg(not(feature = "cuda"))]
     let _ = id;
+}
+
+/// True when the runtime actually ARMED capture this run (as opposed to the
+/// compile flag merely being set — enable() may decline). `nsl_gpu_drain_cache`
+/// consults this: the per-step transient drain must be skipped only when
+/// graphs are live (address stability + captured graphs reference the
+/// retained segments), not merely requested (review L5).
+pub fn cuda_graphs_armed() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        imp::enabled()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
 }
 
 /// Print the capture/replay counter banner (emitted at train-block teardown).

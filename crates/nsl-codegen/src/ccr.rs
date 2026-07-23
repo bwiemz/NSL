@@ -452,6 +452,12 @@ pub fn plan_with_kept_anchors(
     compress_saves: bool,
     keep: &[usize],
 ) -> Option<CcrPlan> {
+    // Release-mode validation (review L2): an empty keep, a keep missing
+    // anchor 0, or a non-ascending keep would silently build a plan whose
+    // leading blocks belong to no segment — refuse instead.
+    if keep.first() != Some(&0) || keep.windows(2).any(|w| w[0] >= w[1]) {
+        return None;
+    }
     plan_impl(
         primal,
         csha_claimed_ops,
@@ -930,9 +936,12 @@ pub struct DpChoice {
 /// recompute) per prefix — cost-optimal prefixes are not always
 /// boundary-minimal, so a scalar DP would discard feasible completions.
 /// Among feasible partitions the cheapest wins; if none fits (or no budget
-/// was given) the minimum-peak partition wins. Returns `None` when no base
-/// plan exists or the block count is degenerate/absurd (caller falls back
-/// to the uniform-stride search).
+/// was given) the minimum-peak partition wins — WITHOUT a budget `dp`
+/// deliberately behaves like a better `auto` (memory-first), matching the
+/// uniform search's established no-budget semantics; pass
+/// `--checkpoint-budget-mib` to get the speed-first objective. Returns
+/// `None` when no base plan exists or the block count is degenerate/absurd
+/// (caller falls back to the uniform-stride search).
 pub fn select_partition_dp(
     primal: &WengertList,
     csha_claimed_ops: Option<&HashSet<u32>>,
@@ -1039,10 +1048,32 @@ pub fn select_partition_dp(
             }
         }
         // Frontier-size guard (n ≤ 256, but keep the worst case bounded).
+        // Keep the 64 cheapest PLUS the min-kept and min-max_rc states
+        // unconditionally — cost-sorted truncation alone would discard
+        // exactly the memory-lean states a tight budget needs (review L1).
+        // Frozen-frontier invariant: extensions only ever target
+        // frontier[e+1] with e >= current i, so parent indices recorded
+        // into frontier[i] are never invalidated by this truncation (it
+        // last touches frontier[i] before iteration i reads it).
         for f in frontier.iter_mut() {
             if f.len() > 64 {
-                f.sort_by_key(|st| st.cost);
-                f.truncate(64);
+                let min_kept = f.iter().enumerate().min_by_key(|(_, st)| st.kept).map(|(i, _)| i);
+                let min_rc = f.iter().enumerate().min_by_key(|(_, st)| st.max_rc).map(|(i, _)| i);
+                let mut keep_idx: Vec<usize> = (0..f.len()).collect();
+                keep_idx.sort_by_key(|&i| f[i].cost);
+                keep_idx.truncate(64);
+                for extra in [min_kept, min_rc].into_iter().flatten() {
+                    if !keep_idx.contains(&extra) {
+                        keep_idx.push(extra);
+                    }
+                }
+                keep_idx.sort_unstable();
+                let mut i = 0;
+                f.retain(|_| {
+                    let k = keep_idx.binary_search(&i).is_ok();
+                    i += 1;
+                    k
+                });
             }
         }
     }

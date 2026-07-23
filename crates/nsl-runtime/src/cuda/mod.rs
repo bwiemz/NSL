@@ -4970,6 +4970,11 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
         "rmsnorm dgamma: gamma len {} != last dim {}",
         g.len, cols
     );
+    assert_eq!(
+        NslTensor::from_ptr(dy_ptr).len,
+        x.len,
+        "rmsnorm dgamma: dy/x length mismatch"
+    );
 
     // Output rides gamma's shape (rank-1 [cols] in every stdlib norm).
     let out_data = inner::alloc_managed(cols as usize * 4);

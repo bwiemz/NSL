@@ -1541,9 +1541,20 @@ impl AdjointGenerator {
 /// Returns the number of pairs fused. Op ids are renumbered positionally
 /// (they are positional-only at every call site — the CCR splice does the
 /// same).
-pub fn fuse_swiglu_gate_backward(ops: &mut Vec<crate::wengert::WengertOp>) -> usize {
+pub fn fuse_swiglu_gate_backward(
+    ops: &mut Vec<crate::wengert::WengertOp>,
+    needed: &std::collections::HashSet<crate::wengert::VarId>,
+) -> usize {
     use crate::wengert::PrimalOp;
     use std::collections::HashMap;
+
+    // Both in-tree call sites run right after eliminate_dead_gradients and
+    // BEFORE the CCR splice, so no FreeTensor markers exist yet — fusing
+    // across a free would hoist a read past it (review L3).
+    debug_assert!(
+        !ops.iter().any(|op| matches!(op.op, PrimalOp::FreeTensor)),
+        "fuse_swiglu_gate_backward must run before free insertion"
+    );
 
     let mut reads: HashMap<crate::wengert::VarId, usize> = HashMap::new();
     let mut producer: HashMap<crate::wengert::VarId, usize> = HashMap::new();
@@ -1567,6 +1578,9 @@ pub fn fuse_swiglu_gate_backward(ops: &mut Vec<crate::wengert::WengertOp>) -> us
         let g = ops[i].inputs[1];
         if reads.get(&ds).copied() != Some(1) {
             continue; // the product is read elsewhere — keep it materialized
+        }
+        if needed.contains(&ds) {
+            continue; // the product IS a needed gradient output — keep it
         }
         let Some(&j) = producer.get(&ds) else { continue };
         if j >= i || remove.contains(&j) {
@@ -4898,7 +4912,7 @@ mod tests {
             op(0, 100, PrimalOp::Mul, vec![10, 11]),
             op(1, 101, PrimalOp::Passthrough("silu_backward".into()), vec![100, 12]),
         ];
-        let fused = super::fuse_swiglu_gate_backward(&mut ops);
+        let fused = super::fuse_swiglu_gate_backward(&mut ops, &Default::default());
         assert_eq!(fused, 1);
         assert_eq!(ops.len(), 1);
         assert!(matches!(
@@ -4926,7 +4940,7 @@ mod tests {
             op(1, 101, PrimalOp::Passthrough("silu_backward".into()), vec![100, 12]),
             op(2, 102, PrimalOp::Add, vec![100, 101]),
         ];
-        let fused = super::fuse_swiglu_gate_backward(&mut ops);
+        let fused = super::fuse_swiglu_gate_backward(&mut ops, &Default::default());
         assert_eq!(fused, 0);
         assert_eq!(ops.len(), 3);
         assert!(matches!(&ops[1].op, PrimalOp::Passthrough(n) if n == "silu_backward"));
