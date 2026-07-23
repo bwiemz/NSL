@@ -833,7 +833,9 @@ mod tests {
         let cpu_lib = profile_dir.join("deps").join(deps_runtime_name(cpu_hash));
         let cuda_lib = profile_dir.join("deps").join(deps_runtime_name(cuda_hash));
         fs::write(&cpu_lib, b"cpu").unwrap();
-        fs::write(&cuda_lib, b"cuda").unwrap();
+        // The archive-content probe requires the marker symbol in a
+        // cuda-featured archive — fake it in the fixture body.
+        fs::write(&cuda_lib, [b"cuda ".as_slice(), CUDA_MARKER_SYMBOL].concat()).unwrap();
 
         let compile_time = profile_dir.join(top_level_runtime_name_for_target(
             current_target_os(),
@@ -947,8 +949,14 @@ mod tests {
             .join("deps")
             .join(deps_runtime_name(fallback_hash));
         let exact_lib = profile_dir.join("deps").join(deps_runtime_name(exact_hash));
-        fs::write(&fallback_lib, b"fallback").unwrap();
-        fs::write(&exact_lib, b"exact").unwrap();
+        // Under cfg(cuda) the content probe must accept both fixtures so the
+        // rustflags preference (not the probe) decides.
+        fs::write(
+            &fallback_lib,
+            [b"fallback ".as_slice(), CUDA_MARKER_SYMBOL].concat(),
+        )
+        .unwrap();
+        fs::write(&exact_lib, [b"exact ".as_slice(), CUDA_MARKER_SYMBOL].concat()).unwrap();
 
         let compile_time = profile_dir.join(top_level_runtime_name_for_target(
             current_target_os(),
