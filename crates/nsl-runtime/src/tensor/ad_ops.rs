@@ -606,6 +606,35 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let logits_c = nsl_tensor_contiguous(logits_ptr);
     let targets_c = nsl_tensor_contiguous(targets_ptr);
     let grad_out_c = nsl_tensor_contiguous(grad_output_ptr);
+    // Fusion item 2: fully device-resident backward — no [N,C] host bounce,
+    // no grad_output readback (loss epilogue stays cuda-graph-capturable).
+    // f32-vs-f64 rounding differs from the CPU bounce at ~1e-6 relative;
+    // NSL_GPU_CE_BACKWARD=0 restores the old path.
+    #[cfg(feature = "cuda")]
+    {
+        static GPU_CE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *GPU_CE.get_or_init(|| {
+            std::env::var("NSL_GPU_CE_BACKWARD").ok().as_deref() != Some("0")
+        });
+        let lg = NslTensor::from_ptr(logits_c);
+        let tg = NslTensor::from_ptr(targets_c);
+        if enabled
+            && lg.device > 0
+            && lg.dtype == 1
+            && lg.ndim >= 2
+            && lg.len <= u32::MAX as i64
+            && tg.device == lg.device
+            && (tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32)
+        {
+            let out = crate::cuda::gpu_cross_entropy_backward_f32(
+                logits_c, targets_c, grad_out_c,
+            );
+            nsl_tensor_free(logits_c);
+            nsl_tensor_free(targets_c);
+            nsl_tensor_free(grad_out_c);
+            return out;
+        }
+    }
     let out_device = NslTensor::from_ptr(logits_c).device;
     let (logits_cpu, logits_needs_free) = if NslTensor::from_ptr(logits_c).device > 0 {
         (nsl_tensor_to_device(logits_c, 0), true)
@@ -1801,6 +1830,66 @@ mod tests {
         nsl_tensor_free(target);
         nsl_tensor_free(grad_out);
         nsl_tensor_free(grad);
+    }
+
+    /// Fusion item 2: the GPU-native CE backward must match the CPU bounce
+    /// path elementwise (f32 kernel vs f64 host math -> tolerance), zero
+    /// ignored rows, honor a device-resident grad_output scalar, and be
+    /// deterministic.
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    #[cfg(feature = "cuda")]
+    fn test_gpu_ce_backward_matches_cpu_bounce() {
+        use crate::tensor::nsl_tensor_to_device;
+        let n = 5usize;
+        let c = 7usize;
+        let vals: Vec<f64> = (0..n * c).map(|i| ((i as f64) * 0.83).sin() * 2.0).collect();
+        let logits = crate::tensor::creation::create_tensor_from_f64_data(
+            &vals,
+            &[n as i64, c as i64],
+        );
+        let tvals = [3.0f64, 0.0, -100.0, 6.0, 2.0];
+        let targets = crate::tensor::creation::create_tensor_from_f64_data(&tvals, &[n as i64]);
+        let go = nsl_tensor_scalar(2.5, 1);
+
+        // CPU reference (all-CPU inputs -> bounce path untouched).
+        let cpu_out = nsl_cross_entropy_backward(go, logits, targets);
+
+        // GPU path (device-resident logits/targets/go).
+        let lg = nsl_tensor_to_device(logits, 1);
+        let tg = nsl_tensor_to_device(targets, 1);
+        let gg = nsl_tensor_to_device(go, 1);
+        let gpu_out = nsl_tensor_to_device(nsl_cross_entropy_backward(gg, lg, tg), 0);
+
+        let co = NslTensor::from_ptr(cpu_out);
+        let go_t = NslTensor::from_ptr(gpu_out);
+        assert_eq!(co.len, (n * c) as i64);
+        assert_eq!(go_t.len, co.len);
+        let read = |t: &NslTensor, i: usize| -> f64 {
+            match t.dtype {
+                1 => f64::from(unsafe { *t.data_f32().add(i) }),
+                _ => unsafe { *t.data_f64().add(i) },
+            }
+        };
+        let mut nonzero = false;
+        for i in 0..(n * c) {
+            let (a, b) = (read(co, i), read(go_t, i));
+            assert!(
+                (a - b).abs() < 1e-5,
+                "elem {i}: cpu {a} vs gpu {b}"
+            );
+            if a.abs() > 1e-9 {
+                nonzero = true;
+            }
+        }
+        assert!(nonzero, "vacuous: all-zero gradient");
+        // Ignored row (target -100) must be exactly zero on the GPU path.
+        for j in 0..c {
+            assert_eq!(read(go_t, 2 * c + j), 0.0, "ignored row leaked at col {j}");
+        }
+        for p in [cpu_out, gpu_out, lg, tg, gg, logits, targets, go] {
+            nsl_tensor_free(p);
+        }
     }
 
     // Regression guard for the (pred - target) per-step leak: the internal

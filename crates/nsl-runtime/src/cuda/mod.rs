@@ -2861,6 +2861,7 @@ pub(crate) fn gpu_fase_fused_adamw_step(
 /// block on the COMPUTE stream (the muon_batch discipline: sync before the
 /// host rewrite; enqueue uploads on current_stream so the kernel is
 /// stream-ordered after them).
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_fase_fused_adamw_step_multi(
     t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64], lens: &[u32],
@@ -4512,6 +4513,124 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
 /// pre-normalization (the two launches serialize on the compute stream).
 /// The scratch buffer is thread-local and process-lifetime (item 10's
 /// preallocated scratch): one 16-byte allocation per training thread, ever.
+/// Fusion-queue item 2: GPU-native cross-entropy backward.
+/// out = (softmax(logits) - onehot(targets)) * grad_output / num_valid,
+/// invalid (target < 0) rows zeroed — the CPU arm's semantics, computed
+/// entirely on device (softmax kernel + valid-count reduction + finish
+/// pass; grad_output read in-kernel when device-resident). No host
+/// readbacks: the loss epilogue stays cuda-graph-capturable.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cross_entropy_backward_f32(
+    logits_ptr: i64,
+    targets_ptr: i64,
+    grad_out_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::{CE_BWD_COUNT_F32_PTX, CE_BWD_FINISH_F32_PTX};
+
+    inner::set_oom_context("ce_backward_f32");
+    let sm = gpu_softmax_f32(logits_ptr);
+    let smt = unsafe { &*(sm as *const NslTensor) };
+    let ndim = smt.ndim as usize;
+    let cols = unsafe { *smt.shape.add(ndim - 1) } as u32;
+    let total = smt.len as u32;
+    let rows = total / cols.max(1);
+
+    thread_local! {
+        static CE_SCRATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let scratch = CE_SCRATCH.with(|c| {
+        if c.get() == 0 {
+            c.set(inner::alloc_managed(16) as u64);
+        }
+        c.get()
+    });
+
+    let tgt = unsafe { &*(targets_ptr as *const NslTensor) };
+    let tgt_i32: u32 = u32::from(tgt.dtype == crate::tensor::DTYPE_I32);
+
+    // K1: valid-target count -> scratch[0] (denom, already max(count,1)).
+    {
+        let mut a0 = tgt.data as u64;
+        let mut a1 = rows;
+        let mut a2 = tgt_i32;
+        let mut a3 = scratch;
+        let args: [*mut std::ffi::c_void; 4] = [
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let r = inner::kernel_launch(
+            CE_BWD_COUNT_F32_PTX.as_ptr(),
+            b"nsl_ce_bwd_count_f32\0".as_ptr(),
+            [1, 1, 1],
+            [256, 1, 1],
+            &args,
+            256 * 4,
+        );
+        assert_eq!(r as u32, 0, "GPU ce_bwd_count kernel failed: {r:?}");
+    }
+
+    // grad_output: device f32 scalar -> read in-kernel; host scalar ->
+    // folded immediate (a host read of a CPU tensor is free); non-scalar
+    // -> 1.0 (CPU-arm semantics).
+    let go = unsafe { &*(grad_out_ptr as *const NslTensor) };
+    let (go_mode, gop, go_imm): (u32, u64, f32) = if go.len == 1 {
+        if go.device > 0 && go.dtype == 1 {
+            (1, go.data as u64, 1.0)
+        } else if go.device == 0 {
+            let v = match go.dtype {
+                1 => unsafe { *(go.data as *const f32) },
+                crate::tensor::DTYPE_I32 => unsafe { *(go.data as *const i32) as f32 },
+                _ => unsafe { *(go.data as *const f64) as f32 },
+            };
+            (0, 0, v)
+        } else {
+            (0, 0, 1.0)
+        }
+    } else {
+        (0, 0, 1.0)
+    };
+
+    // K2: finish pass in place over the softmax buffer.
+    {
+        let mut a0 = smt.data as u64;
+        let mut a1 = tgt.data as u64;
+        let mut a2 = scratch;
+        let mut a3 = gop;
+        let mut a4 = go_imm;
+        let mut a5 = go_mode;
+        let mut a6 = tgt_i32;
+        let mut a7 = total;
+        let mut a8 = cols;
+        let args: [*mut std::ffi::c_void; 9] = [
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+            &mut a4 as *mut _ as *mut std::ffi::c_void,
+            &mut a5 as *mut _ as *mut std::ffi::c_void,
+            &mut a6 as *mut _ as *mut std::ffi::c_void,
+            &mut a7 as *mut _ as *mut std::ffi::c_void,
+            &mut a8 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let block = 256i64;
+        let grid = ((total as i64) + block - 1) / block;
+        let r = inner::kernel_launch(
+            CE_BWD_FINISH_F32_PTX.as_ptr(),
+            b"nsl_ce_bwd_finish_f32\0".as_ptr(),
+            [grid, 1, 1],
+            [block, 1, 1],
+            &args,
+            0,
+        );
+        assert_eq!(r as u32, 0, "GPU ce_bwd_finish kernel failed: {r:?}");
+    }
+    inner::sync_after_kernel();
+    sm
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
