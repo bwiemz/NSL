@@ -832,7 +832,6 @@ pub extern "C" fn nsl_l1_backward(
     }
     let out_device = pred_hdr.device;
     let n = pred_hdr.len as usize;
-    let dtype = pred_hdr.dtype;
 
     // Pull grad_output to CPU to read its scalar value.
     let grad_out_cpu = if NslTensor::from_ptr(grad_output_ptr).device > 0 {
@@ -874,14 +873,20 @@ pub extern "C" fn nsl_l1_backward(
     let pred = NslTensor::from_ptr(pred_cpu);
     let target = NslTensor::from_ptr(target_cpu);
 
-    let elem_size = if dtype == 1 {
+    // Branch on the CPU-RESIDENT dtype, not the original device dtype:
+    // `nsl_tensor_to_device(x, 0)` widens device f32 to CPU f64, so a GPU
+    // f32 pred arrives here as f64 — reading it through data_f32() tripped
+    // the accessor assert (P5 fix). The output tensor is built with the
+    // same CPU dtype; publish converts back for the device as usual.
+    let cpu_dtype = pred.dtype;
+    let elem_size = if cpu_dtype == 1 {
         std::mem::size_of::<f32>()
     } else {
         std::mem::size_of::<f64>()
     };
     let out_data = checked_alloc(n * elem_size);
 
-    if dtype == 1 {
+    if cpu_dtype == 1 {
         let p = pred.data_f32();
         let t = target.data_f32();
         let d = out_data as *mut f32;
@@ -924,7 +929,7 @@ pub extern "C" fn nsl_l1_backward(
         ndim,
         n as i64,
         0,
-        dtype,
+        cpu_dtype,
         1,
         0,
     ));

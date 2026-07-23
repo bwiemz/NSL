@@ -69,6 +69,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             weight_stream,
             param_dtype,
             muon_state_dtype,
+            cuda_graphs,
             stream_arena,
             stream_prefetch,
             stream_async_writeback,
@@ -366,6 +367,26 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     }
                 }
             }
+            // P5 item 19: capture regions cannot tolerate a sync (or a
+            // profiler event pair) after every launch — refuse up front
+            // rather than silently training eager (the runtime enable()
+            // double-checks the env-var forms of both).
+            if cuda_graphs && cuda_sync {
+                eprintln!(
+                    "error: --cuda-graphs does not compose with --cuda-sync \
+                     (eager per-launch synchronization is incompatible with \
+                     stream capture). Drop one of the flags"
+                );
+                std::process::exit(1);
+            }
+            if cuda_graphs && profile_kernels {
+                eprintln!(
+                    "error: --cuda-graphs does not compose with \
+                     --profile-kernels (per-launch profiler events are \
+                     incompatible with graph replay). Drop one of the flags"
+                );
+                std::process::exit(1);
+            }
             let mut compile_opts = nsl_codegen::CompileOptions {
                 no_autotune: false,
                 autotune_fresh: false,
@@ -414,6 +435,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 layerwise_accum,
                 weight_stream,
                 param_dtype_bf16sr: param_dtype == "bf16-sr",
+                cuda_graphs,
                 muon_state_bf16: match muon_state_dtype.as_str() {
                     "f32" => false,
                     "bf16" => true,

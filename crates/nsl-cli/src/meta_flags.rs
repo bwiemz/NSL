@@ -33,12 +33,15 @@ pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride 
     if t.eq_ignore_ascii_case("auto") {
         return CheckpointStride::Auto;
     }
+    if t.eq_ignore_ascii_case("dp") {
+        return CheckpointStride::Dp;
+    }
     match t.parse::<usize>() {
         Ok(n) if n >= 1 => CheckpointStride::Fixed(n),
         _ => {
             eprintln!(
-                "note: --checkpoint-stride '{s}' is not 'auto' or a positive \
-                 integer; using stride 1 (per-block checkpointing)"
+                "note: --checkpoint-stride '{s}' is not 'auto', 'dp' or a \
+                 positive integer; using stride 1 (per-block checkpointing)"
             );
             CheckpointStride::Fixed(1)
         }
@@ -53,6 +56,8 @@ mod stride_tests {
     #[test]
     fn parses_auto_and_integers_and_falls_back() {
         assert_eq!(parse_checkpoint_stride("auto"), CheckpointStride::Auto);
+        assert_eq!(parse_checkpoint_stride("dp"), CheckpointStride::Dp);
+        assert_eq!(parse_checkpoint_stride("DP"), CheckpointStride::Dp);
         assert_eq!(parse_checkpoint_stride("AUTO"), CheckpointStride::Auto);
         assert_eq!(parse_checkpoint_stride("1"), CheckpointStride::Fixed(1));
         assert_eq!(parse_checkpoint_stride("4"), CheckpointStride::Fixed(4));

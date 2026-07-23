@@ -6,6 +6,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — P5 item 19: opportunistic per-region CUDA graph capture (`--cuda-graphs`)
+
+- Every source-AD Wengert lowering (forward CCR slice, CSLA backward layer
+  range, recompute segment) becomes a capture REGION; weight-stream transfers
+  and optimizer updates stay outside. Per (region, accumulation-phase) state
+  machine: record the full pseudo-op sequence (kernel function/dims/param
+  bytes via `cuFuncGetParamInfo`, cuBLAS sgemm, memset, HtoD/DtoD) until two
+  passes prove it static, capture it as a CUDA graph on the compute stream
+  (the capture step still executes via instantiate+launch), then replay:
+  verify-and-skip each issued op, one `cuGraphLaunch` per region end.
+- Self-healing everywhere: mismatches eager-repair the verified prefix from
+  the stored records (bit-identical by construction); sync readbacks and
+  transfer ops taint regions to permanent-eager; deferred frees queue
+  in-region and record their events only after the region's work is on the
+  stream; the allocator pool drain taints first so a pending graph never
+  references unmapped memory. HtoD uploads flow through graph-owned pinned
+  staging buffers refreshed per step (token-id batches stream fresh data
+  through a stable memcpy node).
+- Refuses tape AD, ZeRO, `@pipeline`, `--cuda-sync`, `--profile-kernels`,
+  the legacy NULL stream. `NSL_CUDA_GRAPHS=0` kill-switch,
+  `NSL_CUDA_GRAPH_LOG=1` decision tracing. Gates: capture+replay
+  bit-identical to eager (plain + CSLA shapes, anti-vacuity counters),
+  self-heal bit-identical on a fixture with real per-step host bounces.
+
+### Fixed — root causes surfaced by the capture digests
+
+- **`model.to(device)` missed every field declared after an inline model
+  array** (`[Blk; N]` spans N slots but the walker got `fields.len()`):
+  such params silently stayed CPU-resident — the P4 "`ones([64])` norm param
+  still on CPU" gotcha — costing a hidden per-step PCIe upload + host
+  bounces through `reconcile_device` on every use. Now passes
+  `total_size / 8`, the convention `nsl_collect_model_params` always used.
+- **`nsl_l1_backward` crashed on GPU tensors**: it captured the dtype before
+  the CPU transfer widens f32→f64, then read f64 buffers through
+  `data_f32()`.
+- Known issue (pre-existing, tracked separately): `mse_loss` leaks its
+  `(pred-target)` intermediate every step on the source-AD path; the leak
+  set is expression-structure-dependent (an identity-mul variant leaks six
+  blocks/step, l1 is leak-free). Documented in the cuda-graph gate fixture.
+
+### Added — P5 item 20: more fused backward regions
+
+- **Fused RMSNorm gamma backward** under `--fuse-rmsnorm-backward` (which
+  previously fused only dx): the 7-op decomposition with three
+  `[rows, cols]` temporaries becomes one `nsl_rmsnorm_dgamma_backward` op —
+  a per-row 1/rms kernel into a tiny `[rows]` scratch, then a per-column
+  sequential row-loop kernel. Fixed summation order → bit-deterministic
+  run-to-run; f64 CPU reference. Gates: fused == decomposition == tape-AD on
+  trained w AND gamma (CPU), fused-GPU == CPU tape reference +
+  bit-deterministic reruns.
+- **SwiGLU gate-backward peephole** (always-on, BIT-EXACT): for
+  `f = silu(g) * u` the adjoint pair Mul(dy, up) → silu_backward fuses into
+  one `swiglu_gate_backward` launch when the product has exactly one reader;
+  the kernel rounds `t = mul.rn(dy, up)` exactly like the standalone Mul then
+  runs the identical silu-backward sequence — proven `to_bits`-equal on CPU
+  f64 and GPU f32. Mismatched shapes fall back to the decomposed pair.
+
+### Added — P5 item 21: non-uniform checkpoint partition DP (`--checkpoint-stride dp`)
+
+- A Pareto-frontier dynamic program over NON-uniform block-anchor partitions:
+  per-block escape/force-saved/recompute bytes come from the exact stride-1
+  plan; cost is the GpuSpec-calibrated recompute estimate (launches ×
+  worst-case launch overhead floored by 2×bytes/HBM bandwidth, × the CSLA
+  window), lowered when `--fuse-rmsnorm-backward` is active and credited
+  10 µs/segment under `--stream-prefetch`. Cheapest partition whose projected
+  peak fits `--checkpoint-budget-mib` wins (min-peak otherwise); the DP's
+  projection is re-verified against the true plan before committing, with
+  fallback to the uniform `auto` search. `plan_with_kept_anchors` generalizes
+  the plan machinery to arbitrary anchor subsets — bit-exact for the same
+  reason any stride is. Gates: DP units (incl. dropping a single huge
+  boundary non-uniformly — inexpressible as a uniform stride), dp/dp+budget
+  e2e bit-exact vs stride 1, GPU peak-not-worse.
+
 ### Changed — P4 item 16: dtype ABI migration (both tag collisions removed)
 
 - **`DTYPE_I32 = 9`**: i32 token tensors carry their own canonical tag.

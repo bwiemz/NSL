@@ -982,6 +982,116 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     result
 }
 
+/// P5 item 20 slice B — fused SwiGLU GATE backward:
+///   out = (grad * up) * silu\'(x)
+/// One call replaces the adjoint pair source-AD emits for the gate branch of
+/// `f = silu(x) * up` — a Mul (grad*up) followed by silu_backward — and is
+/// BIT-EXACT with it: t = grad*up rounds exactly like the standalone Mul
+/// kernel, then the identical silu-backward sequence runs on (t, x).
+/// Mismatched shape/device/dtype falls back to the decomposed pair.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_swiglu_gate_backward(
+    grad_ptr: i64,
+    up_ptr: i64,
+    x_ptr: i64,
+) -> i64 {
+    let xt = unsafe { &*(x_ptr as *const NslTensor) };
+    let gt = unsafe { &*(grad_ptr as *const NslTensor) };
+    let ut = unsafe { &*(up_ptr as *const NslTensor) };
+    assert!(
+        (xt.dtype == 0 || xt.dtype == 1)
+            && (gt.dtype == 0 || gt.dtype == 1)
+            && (ut.dtype == 0 || ut.dtype == 1),
+        "swiglu_gate_backward: unsupported dtype (x={}, grad={}, up={})",
+        xt.dtype, gt.dtype, ut.dtype
+    );
+    let uniform = gt.shape_eq(xt)
+        && ut.shape_eq(xt)
+        && gt.device == xt.device
+        && ut.device == xt.device
+        && gt.dtype == xt.dtype
+        && ut.dtype == xt.dtype;
+    if !uniform {
+        // Decomposed pair (broadcasting/mixed cases): exactly what the
+        // compiler emitted before the peephole fused it.
+        let t = crate::tensor::nsl_tensor_mul(grad_ptr, up_ptr, 0);
+        let out = nsl_tensor_silu_backward(t, x_ptr);
+        nsl_tensor_free(t);
+        return out;
+    }
+    if xt.device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            let grad_c = nsl_tensor_contiguous(grad_ptr);
+            let up_c = nsl_tensor_contiguous(up_ptr);
+            let x_c = nsl_tensor_contiguous(x_ptr);
+            let out = crate::cuda::gpu_backward_ternary(
+                grad_c,
+                up_c,
+                x_c,
+                crate::cuda::kernels::SWIGLU_GATE_BACKWARD_F32_PTX,
+                "nsl_swiglu_gate_backward_f32\0",
+            );
+            nsl_tensor_free(grad_c);
+            nsl_tensor_free(up_c);
+            nsl_tensor_free(x_c);
+            return out;
+        }
+        #[cfg(not(feature = "cuda"))]
+        { panic!("CUDA support not compiled"); }
+    }
+    // CPU: t = g*u (one rounding), then the exact silu-backward order.
+    let grad_c = nsl_tensor_contiguous(grad_ptr);
+    let up_c = nsl_tensor_contiguous(up_ptr);
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let g = NslTensor::from_ptr(grad_c);
+    let u = NslTensor::from_ptr(up_c);
+    let a = NslTensor::from_ptr(x_c);
+    let len = a.len;
+    let ndim = a.ndim;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let data: *mut c_void = if a.dtype == 1 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
+        for i in 0..len as usize {
+            let av = unsafe { *a.data_f32().add(i) };
+            let gv = unsafe { *g.data_f32().add(i) };
+            let uv = unsafe { *u.data_f32().add(i) };
+            let t = gv * uv;
+            let s = 1.0_f32 / (1.0_f32 + (-av).exp());
+            let t1 = 1.0_f32 - s;
+            let t2 = av * t1;
+            let t3 = 1.0_f32 + t2;
+            let t4 = s * t3;
+            unsafe { *buf.add(i) = t * t4 };
+        }
+        buf as *mut c_void
+    } else {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+        for i in 0..len as usize {
+            let av = unsafe { *a.data_f64().add(i) };
+            let gv = unsafe { *g.data_f64().add(i) };
+            let uv = unsafe { *u.data_f64().add(i) };
+            let t = gv * uv;
+            let s = 1.0 / (1.0 + (-av).exp());
+            let t1 = 1.0 - s;
+            let t2 = av * t1;
+            let t3 = 1.0 + t2;
+            let t4 = s * t3;
+            unsafe { *buf.add(i) = t * t4 };
+        }
+        buf as *mut c_void
+    };
+    let result = Box::new(NslTensor::new(
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
+    ));
+    let result = NslTensor::publish(result);
+    nsl_tensor_free(grad_c);
+    nsl_tensor_free(up_c);
+    nsl_tensor_free(x_c);
+    result
+}
+
 /// Source-AD SIGMOID backward, fused (Milestone C · p4 slice 3):
 ///   out = grad * σ'(x),  σ'(x) = y*(1 - y),  where y = σ(x) is the saved output.
 ///
@@ -1856,6 +1966,88 @@ mod silu_backward_tests {
         // owners: the input handle and the result handle) — free both to reach 0.
         nsl_tensor_free(x2);
         nsl_tensor_free(y2);
+    }
+}
+
+#[cfg(test)]
+mod swiglu_gate_backward_tests {
+    use super::*;
+    use crate::tensor::NslTensor;
+
+    #[cfg(feature = "cuda")]
+    fn make_f32(data: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 1);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f32().add(i) = *v }; }
+        ptr
+    }
+    fn make_f64(data: &[f64]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 0);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f64().add(i) = *v }; }
+        ptr
+    }
+
+    /// The decomposed pair the peephole replaces: Mul then fused silu bwd.
+    fn decomposed(grad: i64, up: i64, x: i64) -> i64 {
+        let t = crate::tensor::nsl_tensor_mul(grad, up, 0);
+        let out = nsl_tensor_silu_backward(t, x);
+        nsl_tensor_free(t);
+        out
+    }
+
+    #[test]
+    fn swiglu_gate_backward_cpu_f64_bit_exact_vs_pair() {
+        let xs = [-3.0, -1.0, -0.1, 0.0, 0.1, 1.0, 3.0, 7.5, -0.33];
+        let us = [0.5, -2.0, 1.5, 0.9, -0.4, 2.2, -1.1, 0.05, 3.0];
+        let gs = [0.3, -1.1, 2.0, 0.75, -0.5, 1.0, 4.2, -0.01, 3.3];
+        let (x, u, g) = (make_f64(&xs), make_f64(&us), make_f64(&gs));
+        let r = decomposed(g, u, x);
+        let f = nsl_tensor_swiglu_gate_backward(g, u, x);
+        let (rt, ft) = (NslTensor::from_ptr(r), NslTensor::from_ptr(f));
+        for i in 0..xs.len() {
+            let a = unsafe { *rt.data_f64().add(i) };
+            let b = unsafe { *ft.data_f64().add(i) };
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "elem {i}: pair={a} fused={b}"
+            );
+        }
+        for p in [x, u, g, r, f] { nsl_tensor_free(p); }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn swiglu_gate_backward_gpu_f32_bit_exact_vs_pair() {
+        // n = 257 covers a partial final block (the p4 tail convention).
+        let n = 257;
+        let xs: Vec<f32> = (0..n).map(|i| ((i as f32) - 128.0) * 0.05).collect();
+        let us: Vec<f32> = (0..n).map(|i| ((i * 7 % 31) as f32) * 0.1 - 1.5).collect();
+        let gs: Vec<f32> = (0..n).map(|i| ((i * 13 % 17) as f32) * 0.2 - 1.7).collect();
+        let to_gpu = |h: i64| {
+            let d = crate::tensor::nsl_tensor_to_device(h, 1);
+            nsl_tensor_free(h);
+            d
+        };
+        let (x, u, g) = (
+            to_gpu(make_f32(&xs)),
+            to_gpu(make_f32(&us)),
+            to_gpu(make_f32(&gs)),
+        );
+        let r = decomposed(g, u, x);
+        let f = nsl_tensor_swiglu_gate_backward(g, u, x);
+        let rc = crate::tensor::nsl_tensor_to_device(r, 0);
+        let fc = crate::tensor::nsl_tensor_to_device(f, 0);
+        let (rt, ft) = (NslTensor::from_ptr(rc), NslTensor::from_ptr(fc));
+        for i in 0..n {
+            // CPU copies widen f32 -> f64 losslessly, so bit-compare in f64.
+            let a = unsafe { *rt.data_f64().add(i) };
+            let b = unsafe { *ft.data_f64().add(i) };
+            assert_eq!(a.to_bits(), b.to_bits(), "elem {i}: pair={a} fused={b}");
+        }
+        for p in [x, u, g, r, f, rc, fc] { nsl_tensor_free(p); }
     }
 }
 

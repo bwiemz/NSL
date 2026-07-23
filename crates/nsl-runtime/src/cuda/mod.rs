@@ -16,6 +16,8 @@ pub(crate) mod tier_b1_prepass;
 #[cfg(feature = "cuda")]
 pub(crate) mod caching_allocator;
 
+pub(crate) mod graph_capture;
+
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
@@ -260,6 +262,11 @@ pub(crate) mod inner {
     /// Releases fully-free segments back to the CUDA driver.
     /// Returns total bytes freed.
     fn pool_drain() -> usize {
+        // cuda-graphs: physically unmapping cached blocks while a captured
+        // region is mid-replay would leave the pending graph launch pointing
+        // at freed memory — taint first (repairs the skipped prefix and
+        // downgrades the region to eager, so no graph launch follows).
+        super::graph_capture::taint("allocator pool drain");
         // Flush stream-ordered deferred frees first: `pool_drain` is the
         // "reclaim everything reclaimable" path (OOM recovery / explicit cache
         // empty), so raw frees still waiting on a completion event are forced
@@ -811,6 +818,30 @@ pub(crate) mod inner {
     /// that share a lifetime (all consumed by the same preceding kernels).
     /// A single event guards the whole group.
     pub(crate) fn defer_free_device_batch(ptrs: &[*mut c_void]) {
+        // cuda-graphs: inside a region the completion event must NOT be
+        // recorded yet — during replay the consuming kernels are not on the
+        // stream until the region-end graph launch, so an event recorded now
+        // would complete early and free live memory. Queue host-side; the
+        // region end records through `defer_free_device_record`.
+        if super::graph_capture::in_region() {
+            for p in ptrs.iter().filter(|p| !p.is_null()) {
+                super::graph_capture::queue_deferred_free(*p);
+            }
+            return;
+        }
+        defer_free_device_batch_record(ptrs);
+    }
+
+    /// Region-end flush entry: the original (event-recording) deferred-free
+    /// path, called once the region's work is actually on the stream.
+    pub(crate) fn defer_free_device_record(ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        defer_free_device_batch_record(&[ptr]);
+    }
+
+    fn defer_free_device_batch_record(ptrs: &[*mut c_void]) {
         let live: Vec<usize> = ptrs
             .iter()
             .filter(|p| !p.is_null())
@@ -860,6 +891,13 @@ pub(crate) mod inner {
     /// `cuEventQuery` returns an error, treated as "not ready" below, which only
     /// defers reclaim (never a use-after-free).
     pub(crate) fn drain_completed_frees() {
+        // cuda-graphs: `cuEventQuery` is illegal while the compute stream is
+        // capturing, and during replay the polled work may not be issued yet
+        // — skip the opportunistic poll inside a region (the region end and
+        // every out-of-region defer poll again).
+        if super::graph_capture::in_region() {
+            return;
+        }
         // Collect completed entries under the lock, then free outside it:
         // `free_device` takes the CACHING_ALLOCATOR lock, and holding
         // DEFERRED_FREES across that call would nest two locks.
@@ -1004,6 +1042,11 @@ pub(crate) mod inner {
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
         ensure_context();
+        // cuda-graphs: uploads inside a region are pseudo-ops — the payload
+        // flows through a graph-owned pinned staging buffer (see `on_htod`).
+        if !super::graph_capture::on_htod(dst_device, src_host, size_bytes) {
+            return;
+        }
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
             let ctx = current_oom_context();
@@ -1025,6 +1068,7 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from device memory to host memory.
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        super::graph_capture::taint("sync DtoH readback");
         ensure_context();
         unsafe {
             let result = cuMemcpyDtoH_v2(dst_host, src_device as CUdeviceptr, size_bytes);
@@ -1041,6 +1085,10 @@ pub(crate) mod inner {
     /// Copy `size_bytes` bytes from one device pointer to another.
     pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
         ensure_context();
+        // cuda-graphs: device-to-device copies are pseudo-ops (no host data).
+        if !super::graph_capture::on_dtod(dst_device, src_device, size_bytes) {
+            return;
+        }
         unsafe {
             let result = cuMemcpyDtoD_v2(dst_device as CUdeviceptr, src_device as CUdeviceptr, size_bytes);
             assert_eq!(
@@ -1115,6 +1163,7 @@ pub(crate) mod inner {
     /// there is also ordered after any interleaved NULL-stream memcpys, so
     /// this wait covers everything the old NULL-stream record covered.
     unsafe fn transfer_stream_wait_null_stream(stream: CUstream) {
+        super::graph_capture::taint("transfer-stream event wait");
         let mut ev: CUevent = std::ptr::null_mut();
         // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest event flavor).
         let r = cuEventCreate(&mut ev, 0x2);
@@ -1351,6 +1400,7 @@ pub(crate) mod inner {
     /// stream was never created on this thread (does NOT force-initialize
     /// CUDA — safe to call unconditionally from the offload drain).
     pub(crate) fn transfer_stream_synchronize() {
+        super::graph_capture::taint("transfer-stream synchronize");
         TRANSFER_STREAM.with(|s| {
             let cur = s.get();
             if cur == 0 {
@@ -1369,9 +1419,34 @@ pub(crate) mod inner {
         })
     }
 
-    /// Zero-fill device memory.
+    /// Zero-fill device memory. Graph-aware: recorded as a pseudo-op inside
+    /// a capture region (async on the compute stream so the driver records a
+    /// memset node — ordering-neutral vs the sync form thanks to
+    /// blocking-stream semantics), verified/skipped during replay.
     pub(crate) fn memset_d8(device_ptr: *mut c_void, size_bytes: usize) {
         ensure_context();
+        match super::graph_capture::on_memset(device_ptr as usize, size_bytes) {
+            super::graph_capture::MemsetAction::Skip => return,
+            super::graph_capture::MemsetAction::AsyncOnComputeStream => {
+                unsafe {
+                    let result = cuMemsetD8Async(
+                        device_ptr as CUdeviceptr,
+                        0,
+                        size_bytes,
+                        current_stream(),
+                    );
+                    assert_eq!(
+                        result,
+                        CUresult::CUDA_SUCCESS,
+                        "cuMemsetD8Async({} bytes) failed: {:?}",
+                        size_bytes,
+                        result
+                    );
+                }
+                return;
+            }
+            super::graph_capture::MemsetAction::Sync => {}
+        }
         unsafe {
             let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, 0, size_bytes);
             assert_eq!(
@@ -1517,6 +1592,7 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_event_record_on_current_stream(event: u64) -> CUresult {
+        super::graph_capture::taint("event record on compute stream");
         cuEventRecord(event as CUevent, current_stream())
     }
 
@@ -1529,6 +1605,7 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_ctx_synchronize() {
+        super::graph_capture::taint("explicit ctx synchronize");
         cuCtxSynchronize();
     }
 
@@ -1684,6 +1761,20 @@ pub(crate) mod inner {
         debug_assert!(block[0] * block[1] * block[2] <= 1024,
             "kernel_launch: block size {} exceeds max 1024 threads",
             block[0] * block[1] * block[2]);
+
+        // cuda-graphs (P5 item 19): record/verify this launch against the
+        // active region. `false` = verified against the captured sequence —
+        // the region-end graph launch performs it; skip the real launch.
+        if !super::graph_capture::on_kernel(
+            func as usize,
+            [grid[0] as u32, grid[1] as u32, grid[2] as u32],
+            [block[0] as u32, block[1] as u32, block[2] as u32],
+            shared_mem_bytes,
+            args,
+            name_ptr,
+        ) {
+            return CUresult::CUDA_SUCCESS;
+        }
 
         // Launch kernel (no lock held) — on the per-thread compute stream
         // (p8 PR-A; ordering-neutral vs the old NULL-stream launch, see
@@ -2008,6 +2099,19 @@ pub(crate) mod cublas_inner {
             m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
             "sgemm dims must fit in i32"
         );
+        // cuda-graphs (P5 item 19): the gemm is a pseudo-op — recorded during
+        // record/capture passes, verified-and-skipped during replay (the
+        // region-end graph launch carries the captured cuBLAS kernels).
+        if !super::graph_capture::on_sgemm(
+            a_dev as usize,
+            b_dev as usize,
+            c_dev as usize,
+            m,
+            n,
+            k,
+        ) {
+            return Ok(());
+        }
         let handle = cublas_handle();
         // p8 PR-A: bind the gemm to the per-thread compute stream so cuBLAS
         // kernels ride the same stream as every other kernel (ordering-neutral
@@ -3041,6 +3145,65 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
 // === GPU backward op helpers ===
 
 /// GPU backward binary op: takes grad tensor and a saved tensor, produces output of same shape as grad.
+/// P5 item 20 slice B: ternary elementwise backward launch
+/// (grad, up, input) -> out, same conventions as `gpu_backward_binary`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_backward_ternary(
+    a_ptr: i64,
+    b_ptr: i64,
+    c_ptr: i64,
+    ptx: &str,
+    kernel_name: &str,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    inner::set_oom_context(kernel_name.trim_end_matches('\0'));
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let c = unsafe { &*(c_ptr as *const NslTensor) };
+    assert!(
+        a.len == b.len && a.len == c.len,
+        "GPU ternary backward: length mismatch ({}, {}, {})",
+        a.len, b.len, c.len
+    );
+
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4); // f32
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = c.data as u64;
+    let mut o_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU ternary backward kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    inner::sync_after_kernel();
+    out_ptr as i64
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
@@ -4778,6 +4941,107 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
 /// `gamma` must be contiguous f32 on-device; returns a fresh f32 dx tensor of
 /// `x`'s shape. Recomputes rms internally (no saved-rms dependency), matching
 /// the correct RMSNorm dx (no mean-subtract).
+/// P5 item 20 slice A: fused RMSNorm gamma gradient.
+/// dgamma[j] = sum_rows(dy[i,j] * x[i,j] / rms_i), computed as two
+/// deterministic launches (per-row 1/rms into a tiny scratch, then a
+/// per-column sequential row loop) — replaces the 7-op decomposition and
+/// its three [rows, cols] temporaries. Fixed summation order per column,
+/// so bit-deterministic run-to-run.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    eps: f32,
+) -> i64 {
+    inner::set_oom_context("rmsnorm_dgamma_bwd_f32");
+    use crate::tensor::NslTensor;
+    use fused_kernels::{RMSNORM_DGAMMA_F32_PTX, RMSNORM_RINV_ROWS_F32_PTX};
+
+    let x = NslTensor::from_ptr(x_ptr);
+    let ndim = x.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (x.len as u64) / cols;
+
+    let g = NslTensor::from_ptr(gamma_ptr);
+    assert_eq!(
+        g.len as u64, cols,
+        "rmsnorm dgamma: gamma len {} != last dim {}",
+        g.len, cols
+    );
+    assert_eq!(
+        NslTensor::from_ptr(dy_ptr).len,
+        x.len,
+        "rmsnorm dgamma: dy/x length mismatch"
+    );
+
+    // Output rides gamma's shape (rank-1 [cols] in every stdlib norm).
+    let out_data = inner::alloc_managed(cols as usize * 4);
+    let out_shape = NslTensor::copy_shape(g.shape, g.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, g.ndim);
+    // Tiny per-row scratch for 1/rms.
+    let rinv = inner::alloc_managed(rows as usize * 4);
+
+    let dy = NslTensor::from_ptr(dy_ptr);
+    let mut dy_data = dy.data as u64;
+    let mut x_data = x.data as u64;
+    let mut rinv_u64 = rinv as u64;
+    let mut out_u64 = out_data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+
+    let rinv_args: [*mut std::ffi::c_void; 5] = [
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+        &mut eps_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let grid_rows = rows.div_ceil(256) as i64;
+    let result = inner::kernel_launch(
+        RMSNORM_RINV_ROWS_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_rinv_rows_f32\0".as_ptr(),
+        [grid_rows.max(1), 1, 1],
+        [256, 1, 1],
+        &rinv_args,
+        0,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm rinv kernel failed: {:?}", result);
+
+    let dg_args: [*mut std::ffi::c_void; 6] = [
+        &mut dy_data as *mut _ as *mut std::ffi::c_void,
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut out_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let grid_cols = cols.div_ceil(256) as i64;
+    let result = inner::kernel_launch(
+        RMSNORM_DGAMMA_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_dgamma_f32\0".as_ptr(),
+        [grid_cols.max(1), 1, 1],
+        [256, 1, 1],
+        &dg_args,
+        0,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm dgamma kernel failed: {:?}", result);
+    inner::sync_after_kernel();
+
+    // Stream-ordered pool free: the block only re-enters circulation via
+    // this thread's in-order allocator, so the kernel that read it has
+    // retired before any same-stream reuse (the caching allocator never
+    // returns memory to the driver here).
+    inner::free_managed(rinv);
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides, g.ndim, g.len, x.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_rmsnorm_dx_backward_f32(
     dy_ptr: i64,

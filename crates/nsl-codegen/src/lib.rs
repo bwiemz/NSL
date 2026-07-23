@@ -1074,6 +1074,13 @@ pub struct WrgaCheckContext {
 pub enum CheckpointStride {
     Fixed(usize),
     Auto,
+    /// P5 item 21: non-uniform partition chosen by the checkpoint DP
+    /// (`--checkpoint-stride dp`) — minimizes GpuSpec-calibrated recompute
+    /// time subject to the projected activation-peak budget, with the CSLA
+    /// window applied and coarse prefetch-overlap credit. Falls back to the
+    /// `Auto` uniform search when the DP declines or its projection is
+    /// contradicted by the true plan.
+    Dp,
 }
 
 impl Default for CheckpointStride {
@@ -1143,6 +1150,14 @@ pub struct CompileOptions {
     /// counter-based SR quant-store (v stays f32 — it is null-sloted per
     /// param on the Muon route).
     pub muon_state_bf16: bool,
+    /// P5 item 19 (`--cuda-graphs`): opportunistic per-region CUDA graph
+    /// capture/replay. Each Wengert lowering (forward CCR slice, CSLA
+    /// backward layer range, recompute segment) is bracketed with runtime
+    /// region markers; the runtime records the launch sequence, captures it
+    /// as a CUDA graph once it proves stable across steps, and replays it
+    /// with per-launch verification and eager self-repair on any divergence.
+    /// Optimizer updates and weight-stream transfers stay outside regions.
+    pub cuda_graphs: bool,
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
@@ -1429,6 +1444,7 @@ impl Default for CompileOptions {
             zero_stage: None,
             param_dtype_bf16sr: false,
             muon_state_bf16: false,
+            cuda_graphs: false,
             debug_training: false,
             grad_integrity: false,
             training_reference: false,

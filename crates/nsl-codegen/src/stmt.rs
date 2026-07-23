@@ -4183,12 +4183,43 @@ impl Compiler<'_> {
                     "--muon-state-dtype bf16 is not supported on the pipelined                      train path (@pipeline): the CSLA state envelope is not                      lowered there. Drop one",
                 ));
             }
+            // P5 item 19: the pipelined path lowers its stages outside the
+            // region-marker emission — the flag would silently train eager
+            // while the user believes graphs are active.
+            if self.compile_options.cuda_graphs {
+                return Err(CodegenError::new(
+                    "--cuda-graphs is not supported on the pipelined train \
+                     path (@pipeline): capture regions are not emitted \
+                     there. Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
                 train,
                 train_block_stmt_id,
             );
+        }
+
+        // P5 item 19 (`--cuda-graphs`): opportunistic per-region capture.
+        // Regions only exist in Wengert lowerings (source-AD); the tape
+        // path would silently ignore the flag. Multi-rank collectives wait
+        // on their own streams mid-backward — unvalidated with capture.
+        if self.compile_options.cuda_graphs {
+            if !self.features.source_ad_enabled {
+                return Err(CodegenError::new(
+                    "--cuda-graphs requires --source-ad: capture regions \
+                     bracket the source-AD Wengert lowerings; the tape path \
+                     has none and would silently train eager",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--cuda-graphs does not compose with --zero-stage yet \
+                     (collective waits inside the backward are incompatible \
+                     with stream capture). Drop one of the flags",
+                ));
+            }
         }
 
         // CFTP v10 (item 3): install the fused-CE config for THIS train
@@ -4279,6 +4310,19 @@ impl Compiler<'_> {
                     _ => {} // ignore unknown config for forward compat
                 }
             }
+        }
+
+        // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
+        // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
+        // legacy NULL stream). The accumulation window rides along — each
+        // micro-batch phase within a window has its own self-consistent
+        // allocator state, so the runtime captures one graph per
+        // (region, phase) instead of requiring a phase-free digest.
+        if self.compile_options.cuda_graphs {
+            let win = builder
+                .ins()
+                .iconst(cl_types::I64, grad_accumulation_steps.max(1));
+            self.compile_call_by_name(builder, "nsl_cuda_graphs_enable", &[win])?;
         }
 
         // CPKD: a distill block delegates here with an empty config — the
@@ -7217,8 +7261,142 @@ impl Compiler<'_> {
                     // `Auto` searches strides against the projected activation
                     // peak — with the CSLA accumulation window G applied to the
                     // saved boundaries — and the checkpoint byte budget.
+                    // P5 item 21: `dp` resolves to a NON-UNIFORM kept-anchor
+                    // set rather than a stride; carried out-of-band to the
+                    // plan construction below.
+                    let mut dp_kept_anchors: Option<Vec<usize>> = None;
                     let resolved_stride = match self.compile_options.checkpoint_stride {
                         crate::CheckpointStride::Fixed(k) => k,
+                        crate::CheckpointStride::Dp => {
+                            let sizes = crate::profiling::captures::size_hints_from_var_nodes(
+                                extractor.var_nodes(),
+                                self.type_map,
+                            );
+                            let window = if csla_active {
+                                (grad_accumulation_steps.max(1)) as u64
+                            } else {
+                                1
+                            };
+                            let budget_bytes = self
+                                .compile_options
+                                .checkpoint_budget_mib
+                                .map(|m| m.saturating_mul(1024 * 1024));
+                            let spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                                .unwrap_or_else(crate::gpu_specs::default_gpu);
+                            let model = crate::ccr::DpCostModel {
+                                window,
+                                budget_bytes,
+                                launch_overhead_ns: spec.kernel_launch_overhead_ns,
+                                hbm_gbps: spec.peak_bandwidth_gbs,
+                                // #403 measured −37% backward launches from the
+                                // dx fusion alone; gamma fusion (P5 slice A)
+                                // removes the remaining norm decompositions.
+                                bwd_launch_factor: if self.compile_options.fuse_rmsnorm_backward {
+                                    1.3
+                                } else {
+                                    2.0
+                                },
+                                // Conservative overlap credit: only the fixed
+                                // PCIe latency any in-flight prefetch is
+                                // guaranteed to hide (10 us), and only when the
+                                // prefetch machinery is actually on.
+                                overlap_credit_ns: if self.compile_options.stream_prefetch {
+                                    10_000
+                                } else {
+                                    0
+                                },
+                            };
+                            let mut fell_back = true;
+                            if sizes.is_empty() {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride dp: no static tensor sizes \
+                                     available (symbolic shapes) — falling back to the \
+                                     uniform-stride search"
+                                );
+                            } else if let Some(choice) = crate::ccr::select_partition_dp(
+                                &effective_primal,
+                                claimed_ids.as_ref(),
+                                policy,
+                                &sizes,
+                                &model,
+                            ) {
+                                // Verify the DP's projection against the TRUE
+                                // plan before committing (the DP models
+                                // coalesced escapes from stride-1 metrics; the
+                                // real segment analysis is the authority).
+                                if let Some(p) = crate::ccr::plan_with_kept_anchors(
+                                    &effective_primal,
+                                    claimed_ids.as_ref(),
+                                    policy,
+                                    false,
+                                    &choice.keep,
+                                ) {
+                                    let true_peak =
+                                        crate::ccr::project_activation_peak(&p, &sizes)
+                                            .peak_bytes(window);
+                                    let budget_ok = budget_bytes
+                                        .is_none_or(|b| true_peak <= b)
+                                        || !choice.fits_budget;
+                                    if budget_ok {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp: kept {} of {} block \
+                                             anchors {:?} (true peak {} MiB, DP projected {} MiB, \
+                                             est recompute {:.2} ms/step, window G={window}{})",
+                                            choice.keep.len(),
+                                            p.segments.len().max(choice.keep.len()),
+                                            choice.keep,
+                                            true_peak / (1024 * 1024),
+                                            choice.projected_peak_bytes / (1024 * 1024),
+                                            choice.est_recompute_ns as f64 / 1e6,
+                                            if choice.fits_budget {
+                                                ""
+                                            } else {
+                                                ", NO partition fits the budget — min-peak"
+                                            },
+                                        );
+                                        dp_kept_anchors = Some(choice.keep);
+                                        fell_back = false;
+                                    } else {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp: true plan peak \
+                                             {} MiB contradicts the DP projection ({} MiB) \
+                                             over budget — falling back to the uniform search",
+                                            true_peak / (1024 * 1024),
+                                            choice.projected_peak_bytes / (1024 * 1024),
+                                        );
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride dp: DP declined (single block \
+                                     or no plan) — falling back to the uniform-stride search"
+                                );
+                            }
+                            if fell_back {
+                                match crate::ccr::select_stride(
+                                    &effective_primal,
+                                    claimed_ids.as_ref(),
+                                    policy,
+                                    &sizes,
+                                    window,
+                                    budget_bytes,
+                                    crate::ccr::DEFAULT_STRIDE_CANDIDATES,
+                                ) {
+                                    Some(c) => {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp fallback: uniform \
+                                             stride {} (peak {} MiB)",
+                                            c.stride,
+                                            c.peak_bytes / (1024 * 1024)
+                                        );
+                                        c.stride
+                                    }
+                                    None => 1,
+                                }
+                            } else {
+                                1 // unused: dp_kept_anchors drives the plan below
+                            }
+                        }
                         crate::CheckpointStride::Auto => {
                             let sizes = crate::profiling::captures::size_hints_from_var_nodes(
                                 extractor.var_nodes(),
@@ -7287,13 +7465,23 @@ impl Compiler<'_> {
                             }
                         }
                     };
-                    let plan = crate::ccr::plan(
-                        &effective_primal,
-                        claimed_ids.as_ref(),
-                        policy,
-                        compress_requested,
-                        resolved_stride,
-                    );
+                    let plan = if let Some(keep) = &dp_kept_anchors {
+                        crate::ccr::plan_with_kept_anchors(
+                            &effective_primal,
+                            claimed_ids.as_ref(),
+                            policy,
+                            compress_requested,
+                            keep,
+                        )
+                    } else {
+                        crate::ccr::plan(
+                            &effective_primal,
+                            claimed_ids.as_ref(),
+                            policy,
+                            compress_requested,
+                            resolved_stride,
+                        )
+                    };
                     // Item 8: one coalescing note for the FINAL stride (the Auto
                     // search above ran plan() per candidate silently).
                     if resolved_stride > 1 {
@@ -7513,6 +7701,9 @@ impl Compiler<'_> {
                     adjoint.ops =
                         crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &adjoint_needed);
                 }
+                // P5 item 20 slice B: fuse SwiGLU gate-gradient pairs
+                // (bit-exact — see fuse_swiglu_gate_backward).
+                crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
                 // schedule when NSL_CSLA_REPORT=1. Pure analysis over the final
@@ -12229,6 +12420,11 @@ impl Compiler<'_> {
 
         // Drain GPU caching allocator — only releases Transient segments,
         // which are now fully free since forward/backward intermediates were freed.
+        //
+        // P5 item 19: the runtime skips this drain while cuda-graph capture is
+        // ARMED (per-step segment release would churn every transient address
+        // and unmap memory captured graphs reference) — checked at runtime,
+        // not compile time, so a declined enable() keeps the drain (review L5).
         self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
 
         // Debug: GPU memory after step cleanup
@@ -12489,6 +12685,12 @@ impl Compiler<'_> {
         // null data pointers.
         if csla_active && self.compile_options.weight_stream {
             self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
+        }
+
+        // P5 item 19: capture/replay counter banner (anti-vacuity evidence
+        // for the gates; harmless no-op when the runtime declined to arm).
+        if self.compile_options.cuda_graphs {
+            self.compile_call_by_name(builder, "nsl_cuda_graphs_report", &[])?;
         }
 
         state.variables = saved_variables;
@@ -13805,6 +14007,9 @@ impl Compiler<'_> {
         if let Some(target_adj_var) = gen.adjoint_of(target_var_id) {
             let needed = std::collections::HashSet::from([target_adj_var]);
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
+            // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied
+            // on the train path).
+            crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &needed);
 
             if !adjoint.ops.is_empty() {
                 // P0.2: arm the gradient-integrity guard for the `grad` block's

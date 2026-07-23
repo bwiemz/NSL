@@ -2811,6 +2811,96 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 /// `nsl_rmsnorm_dx_bwd_f32` kernel (one block per row, one fused reduction);
 /// CPU is the f64 reference. Emitted by source-AD's `RmsNormInputBackward` when
 /// `--fuse-rmsnorm-backward` is set; equals the decomposition to f32 tolerance.
+/// P5 item 20 slice A — fused RMSNorm GAMMA gradient (`--fuse-rmsnorm-backward`):
+/// dgamma_j = sum_rows(dy_ij * x_ij / rms_i),  rms_i = sqrt(mean(x_i^2) + eps).
+/// GPU: two deterministic launches (see `gpu_rmsnorm_dgamma_backward_f32`).
+/// CPU: f64 reference with the same summation order.
+#[no_mangle]
+pub extern "C" fn nsl_rmsnorm_dgamma_backward(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    eps: f64,
+) -> i64 {
+    // Read only by the cuda device-dispatch below; the CPU arm re-binds `x`
+    // from its contiguous copy.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let x = NslTensor::from_ptr(x_ptr);
+
+    #[cfg(feature = "cuda")]
+    if x.device > 0 {
+        // Same acquire/free discipline as nsl_rmsnorm_dx_backward: every
+        // acquire returns an OWNED ref (even no-op same-device/contiguous),
+        // so each gets exactly one unconditional free.
+        let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
+        let dy_c = nsl_tensor_contiguous(dy_dev);
+        let x_c = nsl_tensor_contiguous(x_ptr);
+        let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
+        let g_c = nsl_tensor_contiguous(g_dev);
+        let dg = crate::cuda::gpu_rmsnorm_dgamma_backward_f32(dy_c, x_c, g_c, eps as f32);
+        nsl_tensor_free(dy_dev);
+        nsl_tensor_free(dy_c);
+        nsl_tensor_free(x_c);
+        nsl_tensor_free(g_dev);
+        nsl_tensor_free(g_c);
+        return dg;
+    }
+
+    // CPU reference (f64 accumulation, row-major order). Contiguous copies
+    // first — the flat indexing below is meaningless on strided views
+    // (review L4); both acquires are owned refs, freed at the end.
+    let dy_c = nsl_tensor_contiguous(dy_ptr);
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let dy = NslTensor::from_ptr(dy_c);
+    let x = NslTensor::from_ptr(x_c);
+    let gamma = NslTensor::from_ptr(gamma_ptr);
+    let ndim = x.ndim as usize;
+    let n = unsafe { *x.shape.add(ndim - 1) } as usize;
+    let total = x.len as usize;
+    let num_rows = total / n;
+    let nf = n as f64;
+    assert_eq!(
+        gamma.len as usize, n,
+        "rmsnorm dgamma: gamma len {} != last dim {}",
+        gamma.len, n
+    );
+
+    let rd = |t: &NslTensor, i: usize| -> f64 {
+        if t.dtype == 1 { unsafe { *t.data_f32().add(i) as f64 } } else { unsafe { *t.data_f64().add(i) } }
+    };
+    let g_shape: Vec<i64> = (0..gamma.ndim as usize)
+        .map(|i| unsafe { *gamma.shape.add(i) })
+        .collect();
+    let dg_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&g_shape, gamma.dtype);
+    let dg = NslTensor::from_ptr(dg_ptr);
+
+    let mut rinv = vec![0.0_f64; num_rows];
+    for (row, r) in rinv.iter_mut().enumerate() {
+        let base = row * n;
+        let mut sum_sq = 0.0_f64;
+        for j in 0..n {
+            let v = rd(x, base + j);
+            sum_sq += v * v;
+        }
+        *r = 1.0 / (sum_sq / nf + eps).sqrt();
+    }
+    for j in 0..n {
+        let mut acc = 0.0_f64;
+        for (row, r) in rinv.iter().enumerate() {
+            let i = row * n + j;
+            acc += rd(dy, i) * rd(x, i) * r;
+        }
+        if gamma.dtype == 1 {
+            unsafe { *dg.data_f32().add(j) = acc as f32 };
+        } else {
+            unsafe { *dg.data_f64().add(j) = acc };
+        }
+    }
+    nsl_tensor_free(dy_c);
+    nsl_tensor_free(x_c);
+    dg_ptr
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_rmsnorm_dx_backward(
     dy_ptr: i64,
@@ -5302,6 +5392,14 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_drain_cache() {
+    // P5 item 19: while cuda-graph capture is armed, the per-step transient
+    // drain would churn every transient address (no region could ever
+    // digest-stabilize) AND physically unmap memory that already-captured
+    // graphs reference — skip it. OOM recovery still drains via pool_drain,
+    // which taints any active region first.
+    if crate::cuda::graph_capture::cuda_graphs_armed() {
+        return;
+    }
     // Probe gate (2026-04-23): NSL_SKIP_GPU_DRAIN=1 bypasses this workaround
     // so we can observe whether ELTLS frees intermediates at last use.
     if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() != Some("1") {

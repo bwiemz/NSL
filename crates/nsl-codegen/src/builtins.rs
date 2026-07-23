@@ -655,6 +655,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::F64],
         Some(types::I64),
     ),
+    // P5 item 20 slice A: fused RMSNorm gamma-gradient (dy, x, gamma, eps) -> dgamma.
+    (
+        "nsl_rmsnorm_dgamma_backward",
+        &[types::I64, types::I64, types::I64, types::F64],
+        Some(types::I64),
+    ),
     // Source AD: reduce gradient to match parameter shape (matmul broadcast backward)
     (
         "nsl_tensor_reduce_to_shape",
@@ -2521,6 +2527,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
     ("nsl_zero3_enable", &[], Some(types::I64)),
     ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    // P5 item 19: opportunistic per-region CUDA graph capture/replay
+    ("nsl_cuda_graphs_enable", &[types::I64], None), // (accum_window)
+    ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)
+    ("nsl_cuda_graph_region_end", &[types::I64], None), // (region_id)
+    ("nsl_cuda_graphs_report", &[], None),
     // P4 item 17: SR-BF16 authoritative weights
     ("nsl_sr_bf16_enable", &[], None),
     ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)
@@ -2752,6 +2763,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_tensor_silu_backward",
         &[types::I64, types::I64],
+        Some(types::I64),
+    ),
+    // P5 item 20 slice B: fused SwiGLU gate backward (y_bar, up, gate_in) -> dgate.
+    (
+        "nsl_tensor_swiglu_gate_backward",
+        &[types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
     // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.

@@ -760,13 +760,21 @@ pub(crate) struct BuildArgs {
         /// window). `auto` searches strides against --checkpoint-budget-mib and
         /// picks the smallest projected activation peak that fits. `1` (default)
         /// = classic per-block. Bit-exact at any stride.
+        /// `N` coalesces every N block anchors; `auto` searches uniform
+        /// strides against the projected activation peak; `dp` (P5 item 21)
+        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
+        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
+        /// window applied, fusion-aware launch costs and a conservative
+        /// prefetch-overlap credit. Any choice is bit-exact.
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
-        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
-        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
-        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
-        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
+        /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
+        /// of the ~11-op / 7-op decompositions — fewer launches, no
+        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup);
+        /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
@@ -817,6 +825,18 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "DTYPE", default_value = "f32",
               value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
         pub(crate) muon_state_dtype: String,
+
+        /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
+        /// Each source-AD lowering (forward slice, backward layer range,
+        /// recompute segment) records its launch sequence, captures it as a
+        /// CUDA graph once stable across steps, and replays it with
+        /// per-launch verification + eager self-repair on any divergence.
+        /// Requires --source-ad; refuses ZeRO, @pipeline, --cuda-sync and
+        /// the kernel profiler. Bit-exact (same kernels, same order, same
+        /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
+        /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        #[arg(long)]
+        pub(crate) cuda_graphs: bool,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
@@ -1224,13 +1244,21 @@ pub(crate) struct RunArgs {
         /// window). `auto` searches strides against --checkpoint-budget-mib and
         /// picks the smallest projected activation peak that fits. `1` (default)
         /// = classic per-block. Bit-exact at any stride.
+        /// `N` coalesces every N block anchors; `auto` searches uniform
+        /// strides against the projected activation peak; `dp` (P5 item 21)
+        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
+        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
+        /// window applied, fusion-aware launch costs and a conservative
+        /// prefetch-overlap credit. Any choice is bit-exact.
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
-        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
-        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
-        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
-        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
+        /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
+        /// of the ~11-op / 7-op decompositions — fewer launches, no
+        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup);
+        /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
@@ -1281,6 +1309,18 @@ pub(crate) struct RunArgs {
         #[arg(long, value_name = "DTYPE", default_value = "f32",
               value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
         pub(crate) muon_state_dtype: String,
+
+        /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
+        /// Each source-AD lowering (forward slice, backward layer range,
+        /// recompute segment) records its launch sequence, captures it as a
+        /// CUDA graph once stable across steps, and replays it with
+        /// per-launch verification + eager self-repair on any divergence.
+        /// Requires --source-ad; refuses ZeRO, @pipeline, --cuda-sync and
+        /// the kernel profiler. Bit-exact (same kernels, same order, same
+        /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
+        /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        #[arg(long)]
+        pub(crate) cuda_graphs: bool,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
