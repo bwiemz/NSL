@@ -140,6 +140,14 @@ impl Compiler<'_> {
             if !crate::types::is_block_filled(&builder, current) {
                 // Stop and free any DataLoaders before implicit main() return
                 self.teardown_dataloaders(&mut builder, &mut state);
+                // Top-level `let`-bound tensors: main is a function body like
+                // any other — without this sweep every script-scope tensor
+                // (inputs, the last loop iteration's activations) strands.
+                // Runs after loader teardown (its frees poison batch-derived
+                // boxes, so the sweep's free_if_valid no-ops on them) and
+                // before slab destroy (slab-managed tensors must be freed
+                // while the slab is alive).
+                self.emit_return_local_sweep(&mut builder, &mut state);
                 // M36: Destroy GPU memory slab before exit
                 if slab_ptr_var.is_some() {
                     let _ = self.compile_call_by_name(&mut builder, "nsl_gpu_slab_destroy", &[]);

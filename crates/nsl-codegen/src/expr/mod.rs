@@ -339,10 +339,12 @@ impl Compiler<'_> {
 
     fn expr_result_is_owned_temporary(&self, expr: &Expr) -> bool {
         match &expr.kind {
-            // Only a narrow set of builtin tensor-producing calls need extra
-            // registration here. Broad call tracking interferes with training
-            // lowering because many calls either alias existing buffers or are
-            // already handled by normal statement ownership paths.
+            // Only calls with guaranteed fresh-result semantics are eligible.
+            // Broad call tracking interferes with training lowering because
+            // some calls alias existing buffers (tensor .clone() can elide to
+            // the receiver, .to() can hand back the receiver, model .to()
+            // returns the model itself) or are already handled by normal
+            // statement ownership paths.
             ExprKind::Call { callee, .. } => {
                 if let ExprKind::Ident(sym) = &callee.kind {
                     let name = self.resolve_sym(*sym);
@@ -374,6 +376,43 @@ impl Compiler<'_> {
                             | "mean"
                             | "sum"
                     );
+                }
+                // Method-form calls. `y.sum()` parses as Call with a
+                // MemberAccess callee — the Ident arm above never matched it,
+                // so statement-position method temps were never registered
+                // and stranded one block per call (the inference-loop
+                // `print(y.sum())` leak).
+                if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                    let obj_ty = self.node_type(object.id);
+                    // Tensor methods with fresh-result guarantees only —
+                    // NEVER .clone() (elides to the receiver under FBIP) or
+                    // .to() (may hand back the receiver).
+                    if obj_ty.is_tensor() {
+                        return matches!(
+                            self.resolve_sym(*member),
+                            "sum"
+                                | "mean"
+                                | "exp"
+                                | "log"
+                                | "sqrt"
+                                | "abs"
+                                | "relu"
+                                | "gelu"
+                                | "silu"
+                                | "sigmoid"
+                                | "tanh"
+                                | "softmax"
+                                | "log_softmax"
+                        );
+                    }
+                    // Model methods are compiled NSL functions, whose Return
+                    // arm always hands back an owning reference (Owned
+                    // results transfer; Borrowed/Unknown are retained before
+                    // return). The one exception is .to(device), which
+                    // returns the model value itself.
+                    if matches!(obj_ty, Type::Model { .. }) {
+                        return self.resolve_sym(*member) != "to";
+                    }
                 }
                 false
             }
@@ -407,8 +446,14 @@ impl Compiler<'_> {
     /// Call-like expression lowering bypasses the per-op temporary registration
     /// used by binary tensor ops. Track those owned tensor results here so
     /// anonymous subexpressions participate in statement cleanup.
+    ///
+    /// Uses the full owning-ref predicate: fresh-result builtins, method
+    /// forms, AND compiled NSL functions — a user fn's result in nested or
+    /// statement position (`print(user_fn(x))`, bare `user_fn(x)`) has no
+    /// other owner and stranded before this. The tensor-type filter below
+    /// keeps non-tensor results out of the free list either way.
     fn track_owned_tensor_expr_result(&self, state: &mut FuncState, expr: &Expr, value: Value) {
-        if !self.expr_result_is_owned_temporary(expr) {
+        if !self.expr_call_returns_owning_ref(expr) {
             return;
         }
         let ty = self.node_type(expr.id);

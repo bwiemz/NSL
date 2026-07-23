@@ -3028,6 +3028,11 @@ impl Compiler<'_> {
         {
             let mut arg_vals = Vec::new();
             for arg in args {
+                // Deliberately NOT compile_nested_expr: the callee may
+                // ESCAPE a param (member-assign / nsl_list_push store the
+                // raw pointer with no retain), so freeing a tracked owning
+                // arg at statement end is a use-after-free on the stored
+                // copy. See compile_model_method_call for the same rule.
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
             }
             let result = self.compile_call_by_name(builder, &func_name, &arg_vals)?;
@@ -3171,7 +3176,9 @@ impl Compiler<'_> {
         }
 
         let arg = &args[0];
-        let val = self.compile_expr(builder, state, &arg.value)?;
+        // Nested compile so an owning arg result (`print(y.sum())`) is
+        // registered as a temporary and freed at statement end.
+        let val = self.compile_nested_expr(builder, state, &arg.value)?;
         let arg_type = self.node_type(arg.value.id).clone();
 
         let rt_fn = match &arg_type {
