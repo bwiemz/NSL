@@ -220,6 +220,29 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P1 Muon items 8+10: planned Newton-Schulz orthogonalization primitive
     // (no .item() sync; device-resident norm; materialized tall/wide).
     ("nsl_tensor_muon_orthogonalize", &[types::I64, types::F64], Some(types::I64)),
+    // Muon perf campaign: batched momentum + Newton-Schulz + param update
+    // over (params, grads, m, routes) lists; f64 lr/momentum/wd, i64
+    // nesterov flag, f64 ns_steps.
+    (
+        "nsl_muon_step_batch",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::I64,
+            types::F64,
+        ],
+        None,
+    ),
+    // Muon internal profiler (perf-campaign item 2): explicit begin/end
+    // region markers + on-demand report, no-ops unless NSL_MUON_PROF is set.
+    ("nsl_muon_prof_begin", &[types::I64], None),
+    ("nsl_muon_prof_end", &[types::I64], None),
+    ("nsl_muon_prof_report", &[], None),
     // PCA Stage C: non-aborting shape probe (0 for out-of-range dims).
     ("nsl_tensor_dim_or_zero", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_len", &[types::I64], Some(types::I64)),

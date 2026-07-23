@@ -4193,6 +4193,21 @@ impl Compiler<'_> {
                      there. Drop one",
                 ));
             }
+            // Muon perf campaign: the pipelined path never reaches the
+            // batch/resident emission — refuse rather than silently no-op
+            // (the non-pipeline path refuses non-muon optimizers too).
+            if self.compile_options.muon_batch_ns {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns is not supported on the pipelined train \
+                     path (@pipeline). Drop one",
+                ));
+            }
+            if self.compile_options.muon_resident_momentum {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum is not supported on the \
+                     pipelined train path (@pipeline). Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
@@ -4603,6 +4618,88 @@ impl Compiler<'_> {
                      the AdamW arm's rate is applied as the fixed ratio \
                      adamw_lr/lr of the scheduled lr"
                 )));
+            }
+        }
+
+        // Muon perf campaign (`--muon-batch-ns`): the batched engine is
+        // wired into the FullBuffer optimizer loop only. Every path where
+        // it would silently not batch (or corrupt state) refuses loudly.
+        if self.compile_options.muon_batch_ns {
+            if optimizer_name != "muon" {
+                return Err(CodegenError::new(format!(
+                    "--muon-batch-ns requires the muon optimizer (train block \
+                     uses '{optimizer_name}'). Drop the flag"
+                )));
+            }
+            if self.compile_options.layerwise_accum {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --layerwise-accum \
+                     yet: CSLA fires per-layer group updates at window \
+                     boundaries, and cross-layer batching there would change \
+                     the accumulation discipline. Drop one of the flags",
+                ));
+            }
+            if self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with \
+                     --optim-state-offload: the batched kernels update the \
+                     momentum in place on the DEVICE, but offload keeps it \
+                     host-resident. Use --muon-resident-momentum (device m) \
+                     or drop one of the flags",
+                ));
+            }
+            if self.compile_options.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --muon-state-dtype \
+                     bf16: the batched kernels read/write f32 momentum \
+                     directly. Drop one of the flags",
+                ));
+            }
+            if self.compile_options.param_dtype_bf16sr {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --param-dtype \
+                     bf16-sr: the batched kernels read/write f32 params \
+                     directly. Drop one of the flags",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --zero-stage: the \
+                     batch call updates every listed param, but ZeRO shards \
+                     ownership per rank. Drop one of the flags",
+                ));
+            }
+        }
+
+        // Muon perf campaign (`--muon-resident-momentum`): only meaningful
+        // under offload, and only for the muon optimizer's routed params.
+        if self.compile_options.muon_resident_momentum {
+            if optimizer_name != "muon" {
+                return Err(CodegenError::new(format!(
+                    "--muon-resident-momentum requires the muon optimizer \
+                     (train block uses '{optimizer_name}'). Drop the flag"
+                )));
+            }
+            if !self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum is only meaningful with \
+                     --optim-state-offload (without offload the momentum is \
+                     already device-resident). Drop the flag",
+                ));
+            }
+            if self.compile_options.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum does not compose with \
+                     --muon-state-dtype bf16 (the bf16 envelope owns the \
+                     momentum layout). Drop one of the flags",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum does not compose with \
+                     --zero-stage (owner-gated moment allocation). Drop one \
+                     of the flags",
+                ));
             }
         }
 
@@ -5601,7 +5698,52 @@ impl Compiler<'_> {
             // VRAM).
             let surface_optim_m = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_M);
             self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_m])?;
-            let buf1 = if zero_enabled {
+            // Muon perf campaign (`--muon-resident-momentum`): under offload,
+            // Muon-routed rank-2 params keep their momentum DEVICE-resident
+            // (the stdlib-call envelope skips its staging on the exact same
+            // (route==0 && rank==2) condition — the two sites must agree or
+            // a host m would be updated as if device / vice versa). Refused
+            // combos (zero/bf16/non-muon/no-offload) were rejected at parse.
+            let muon_resident_m = optimizer_name == "muon"
+                && offload
+                && self.compile_options.muon_resident_momentum;
+            let buf1 = if muon_resident_m {
+                let route_list = muon_route_list
+                    .expect("muon route list is built before state buffers (4a)");
+                let flag_i =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+                let ndim_m =
+                    self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_i])?;
+                let two_c = builder.ins().iconst(cl_types::I64, 2);
+                let zero_c = builder.ins().iconst(cl_types::I64, 0);
+                let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_c);
+                let is_r2 = builder.ins().icmp(IntCC::Equal, ndim_m, two_c);
+                let resident = builder.ins().band(is_muon, is_r2);
+                let dev_b = builder.create_block();
+                let host_b = builder.create_block();
+                let merge_b = builder.create_block();
+                builder.append_block_param(merge_b, cl_types::I64);
+                builder.ins().brif(resident, dev_b, &[], host_b, &[]);
+
+                builder.switch_to_block(dev_b);
+                builder.seal_block(dev_b);
+                state.current_block = Some(dev_b);
+                let dev_m =
+                    self.emit_moment_zeros_like(builder, param_i, idx, m_list, false)?;
+                builder.ins().jump(merge_b, &[dev_m]);
+
+                builder.switch_to_block(host_b);
+                builder.seal_block(host_b);
+                state.current_block = Some(host_b);
+                let host_m =
+                    self.emit_moment_zeros_like(builder, param_i, idx, m_list, true)?;
+                builder.ins().jump(merge_b, &[host_m]);
+
+                builder.switch_to_block(merge_b);
+                builder.seal_block(merge_b);
+                state.current_block = Some(merge_b);
+                builder.block_params(merge_b)[0]
+            } else if zero_enabled {
                 self.emit_owner_gated_moment(builder, state, param_i, idx, m_list, offload)?
             } else {
                 self.emit_moment_zeros_like(builder, param_i, idx, m_list, offload)?
@@ -11893,6 +12035,45 @@ impl Compiler<'_> {
 
         // 7f. Optimizer step loop: for i in 0..num_params (runtime loop)
         {
+            // Muon perf campaign (`--muon-batch-ns`): ONE batched call
+            // handles every Muon-routed rank-2 param (momentum update +
+            // shape-grouped Newton-Schulz + parameter update, all on
+            // device); the per-param loop below then SKIPS those params and
+            // keeps the stdlib call — bit-for-bit — for the AdamW-routed
+            // and non-rank-2 remainder. Combos that would break this split
+            // (CSLA, offload, ZeRO, bf16 momentum, non-muon) were refused
+            // at parse time above.
+            let muon_batch_active =
+                self.compile_options.muon_batch_ns && optimizer_name == "muon";
+            if muon_batch_active {
+                let route_list = muon_route_list.ok_or_else(|| {
+                    CodegenError::new(
+                        "--muon-batch-ns: muon route list missing (internal)",
+                    )
+                })?;
+                let mom_c = builder.ins().f64const(momentum_value);
+                let wd_c = builder.ins().f64const(weight_decay_value);
+                let nest_c = builder
+                    .ins()
+                    .iconst(cl_types::I64, i64::from(nesterov_value));
+                let ns_c = builder.ins().f64const(ns_steps_value);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_muon_step_batch",
+                    &[
+                        param_list,
+                        opt_grads,
+                        state_list_1,
+                        route_list,
+                        lr,
+                        mom_c,
+                        wd_c,
+                        nest_c,
+                        ns_c,
+                    ],
+                )?;
+            }
+
             let opt_i_var = state.new_variable();
             builder.declare_var(opt_i_var, cl_types::I64);
             let opt_zero = builder.ins().iconst(cl_types::I64, 0);
@@ -11960,6 +12141,31 @@ impl Compiler<'_> {
             } else {
                 None
             };
+            // --muon-batch-ns: params the pre-loop batch call already
+            // updated are skipped here. Eligibility must mirror
+            // nsl_muon_step_batch's filter EXACTLY (route flag 0 AND
+            // runtime rank 2) or a param would be double-stepped/dropped.
+            let batch_skip_join = if muon_batch_active {
+                let route_list = muon_route_list.expect("refused above when None");
+                let flag_i =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+                let ndim =
+                    self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_val])?;
+                let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                let two_i = builder.ins().iconst(cl_types::I64, 2);
+                let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_i);
+                let is_r2 = builder.ins().icmp(IntCC::Equal, ndim, two_i);
+                let both = builder.ins().band(is_muon, is_r2);
+                let do_block = builder.create_block();
+                let join = builder.create_block();
+                builder.ins().brif(both, join, &[], do_block, &[]);
+                builder.switch_to_block(do_block);
+                builder.seal_block(do_block);
+                state.current_block = Some(do_block);
+                Some(join)
+            } else {
+                None
+            };
             // FullBuffer-global path (no mode table, no WGGO). The CPDT
             // PrecisionPlan gate (`precision_active`'s 4th condition
             // requires `fase_deferred=true`) suppresses cpdt_precision_dtypes
@@ -11988,6 +12194,13 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 muon_extra,
             )?;
+
+            if let Some(join) = batch_skip_join {
+                builder.ins().jump(join, &[]);
+                builder.switch_to_block(join);
+                builder.seal_block(join);
+                state.current_block = Some(join);
+            }
 
             if let Some(z_join) = opt_zero_blocks {
                 builder.ins().jump(z_join, &[]);

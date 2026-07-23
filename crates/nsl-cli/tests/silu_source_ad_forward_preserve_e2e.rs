@@ -30,7 +30,7 @@ fn e2e_silu_source_ad_preserves_forward_input() {
     let root = workspace_root();
     let example = root.join("examples/silu_source_ad_grad.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"])
         .arg(&example)
         .current_dir(&root)
         .output()
@@ -74,7 +74,7 @@ fn e2e_silu_source_ad_preserves_forward_input() {
 /// stdout (the model's `sum(m.w)` after one training step).
 fn run_and_parse_sum(root: &std::path::Path, example: &std::path::Path, source_ad: bool) -> f64 {
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run"]);
+    cmd.args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"]);
     if source_ad {
         cmd.arg("--source-ad");
     }
@@ -141,7 +141,7 @@ fn e2e_gelu_source_ad_gradient_correct() {
     let root = workspace_root();
     let example = root.join("examples/gelu_source_ad_grad.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"])
         .arg(&example)
         .current_dir(&root)
         .output()

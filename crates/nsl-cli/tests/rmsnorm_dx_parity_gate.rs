@@ -26,7 +26,7 @@ fn run_args(extra: &[&str]) -> String {
     let root = repo_root();
     let path = root.join("crates/nsl-cli/tests/fixtures/rmsnorm_dx_parity.nsl");
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run"]);
+    cmd.args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"]);
     cmd.args(extra);
     cmd.arg(&path)
         .current_dir(&root)

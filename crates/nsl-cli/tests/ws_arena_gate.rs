@@ -127,7 +127,7 @@ fn run_gpu(fixture: &str, tag: &str, arena: bool) -> GpuRun {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--features", "cuda", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .args(&extra)
         .arg(&prog)
         .current_dir(&tmp)

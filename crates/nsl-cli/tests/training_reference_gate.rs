@@ -29,7 +29,7 @@ fn run(fixture: &str, reference: bool) -> (bool, String, String) {
     let root = repo_root();
     let path = root.join("crates/nsl-cli/tests/fixtures").join(fixture);
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"]);
+    cmd.args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     if reference {
         cmd.arg("--training-reference");
     }

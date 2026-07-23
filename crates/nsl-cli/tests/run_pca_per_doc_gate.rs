@@ -108,7 +108,7 @@ train(model = m, epochs = 1):
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&fixture)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))

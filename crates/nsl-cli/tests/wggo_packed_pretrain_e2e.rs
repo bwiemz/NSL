@@ -36,7 +36,7 @@ fn packed_pretrain_trains_and_consumes_the_wggo_plan() {
     let out = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&fixture)
         .arg("--pretrain-optimized")
         .current_dir(tmp.path())

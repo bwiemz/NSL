@@ -51,7 +51,7 @@ fn async_writeback_diagnostic_reports_active() {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "build"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "build"])
         .args(BASE_FLAGS)
         .arg("--stream-async-writeback")
         .arg(&prog)
@@ -75,7 +75,7 @@ fn async_writeback_requires_stream_arena() {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "build", "--stream-async-writeback", "x.nsl"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "build", "--stream-async-writeback", "x.nsl"])
         .output()
         .expect("spawn nsl build");
     assert!(!output.status.success());
@@ -104,7 +104,7 @@ fn run_gpu(fixture: &str, tag: &str, extra: &[&str]) -> (String, Vec<u8>, i64) {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--features", "cuda", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .args(&flags)
         .arg(&prog)
         .current_dir(&tmp)

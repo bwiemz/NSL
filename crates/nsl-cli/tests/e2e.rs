@@ -100,7 +100,7 @@ fn run_example(name: &str) -> String {
     let root = workspace_root();
     let example_path = root.join(format!("examples/{}.nsl", name));
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -119,7 +119,7 @@ fn run_example_with_run_args(name: &str, run_args: &[&str]) -> String {
     let root = workspace_root();
     let example_path = root.join(format!("examples/{}.nsl", name));
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .args(run_args)
         .arg(&example_path)
         .current_dir(&root)
@@ -233,7 +233,7 @@ fn e2e_m12_grad_source_ad_fallback() {
     let root = workspace_root();
     let example_path = root.join("examples/m12_grad_source_ad_fallback.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -265,7 +265,7 @@ fn e2e_m12_grad_source_ad_unresolved_target_fallback() {
     let root = workspace_root();
     let example_path = root.join("examples/m12_grad_source_ad_unresolved_target_fallback.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -347,7 +347,7 @@ fn e2e_if_expr_missing_else_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_missing_else.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -374,7 +374,7 @@ fn e2e_if_expr_non_value_branch_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_non_value_branch.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -401,7 +401,7 @@ fn e2e_if_expr_branch_type_mismatch_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_branch_type_mismatch.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -428,7 +428,7 @@ fn e2e_if_expr_shadowing_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_shadowing_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -450,7 +450,7 @@ fn e2e_if_expr_lambda_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_lambda_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -482,7 +482,7 @@ fn e2e_tokenizer_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_tokenizer_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -504,7 +504,7 @@ fn e2e_dataset_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_dataset_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -526,7 +526,7 @@ fn e2e_user_defined_generic_instantiation_check() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_generic_instantiation_check.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "check"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -549,7 +549,7 @@ fn e2e_user_defined_generic_instantiation_arity_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_generic_instantiation_arity_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "check"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -571,7 +571,7 @@ fn e2e_trait_definition_check() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_trait_definition_check.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "check"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -594,7 +594,7 @@ fn e2e_trait_definition_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_trait_definition_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "check"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -616,7 +616,7 @@ fn e2e_if_expr_dataloader_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_dataloader_rejected.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -638,7 +638,7 @@ fn e2e_dataloader_loop_exit_values() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_dataloader_loop_exit_values.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -673,7 +673,7 @@ fn e2e_if_expr_linear_types_check() {
     let root = workspace_root();
     let example_path = root.join("examples/m5_if_expr_linear_types_valid.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "check"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "check"])
         .arg(&example_path)
         .arg("--linear-types")
         .current_dir(&root)
@@ -741,7 +741,7 @@ fn e2e_m24_standalone_embedded() {
 
     // 1. Build standalone with embedded weights (default auto mode, small file)
     let build_output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "build", "--standalone"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "build", "--standalone"])
         .arg("-w")
         .arg(&weights_path)
         .arg("-o")
@@ -907,7 +907,7 @@ fn e2e_m25_profiling() {
     let exe_path = tmp.path().join(exe_name);
 
     let build_output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "build", "-o"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "build", "-o"])
         .arg(&exe_path)
         .arg(&example_path)
         .current_dir(&root)
@@ -1119,7 +1119,7 @@ fn e2e_m32_moe_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m32_moe_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1151,7 +1151,7 @@ fn e2e_m33_speculative_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m33_vocab_mismatch.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1178,7 +1178,7 @@ fn e2e_m33_speculative_serve_decode() {
     let root = workspace_root();
     let example_path = root.join("examples/m33_speculative_serve_decode.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .env("NSL_ROLE", "2")
         .current_dir(&root)
@@ -1213,7 +1213,7 @@ fn e2e_m34_cp_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m34_cp_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1245,7 +1245,7 @@ fn e2e_m35_fp8_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m35_fp8_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1280,7 +1280,7 @@ fn e2e_m37_perf_budget_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m37_perf_budget_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1311,7 +1311,7 @@ fn e2e_m38_shared_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m38_shared_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1337,7 +1337,7 @@ fn e2e_m39_vmap_validation_error() {
     let root = workspace_root();
     let example_path = root.join("examples/m39_vmap_validation_error.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()
@@ -1419,7 +1419,7 @@ fn e2e_convert_nslm_to_safetensors() {
     // Run nsl convert
     let root = workspace_root();
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "convert"])
         .arg(&nslm_path)
         .arg(&st_path)
         .current_dir(&root)
@@ -1489,7 +1489,7 @@ fn e2e_convert_safetensors_to_nslm() {
     // Run nsl convert
     let root = workspace_root();
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "convert"])
         .arg(&st_path)
         .arg(&nslm_path)
         .current_dir(&root)
@@ -1548,7 +1548,7 @@ fn e2e_convert_nslm_safetensors_round_trip() {
 
     // Step 1: nslm → safetensors
     let out1 = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "convert"])
         .arg(&nslm_orig)
         .arg(&st_mid)
         .current_dir(&root)
@@ -1562,7 +1562,7 @@ fn e2e_convert_nslm_safetensors_round_trip() {
 
     // Step 2: safetensors → nslm
     let out2 = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "convert"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "convert"])
         .arg(&st_mid)
         .arg(&nslm_final)
         .current_dir(&root)

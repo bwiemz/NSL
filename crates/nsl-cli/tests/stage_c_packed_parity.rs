@@ -101,7 +101,7 @@ fn run_program(source: &str, tag: &str, cuda: bool, extra_env: &[(&str, &str)], 
     }
     cmd.arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"])
         .args(extra_args)
         .arg(&prog)
         .current_dir(&tmp)

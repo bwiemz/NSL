@@ -165,7 +165,13 @@ fn build_fixture(source_ad: bool, out_dir: &Path) -> PathBuf {
         .arg(&cargo_toml)
         .args(["-p", "nsl-cli"])
         .arg("--features")
-        .arg("test-hooks")
+        // Feature-compatibility guard (see fase_numerical_validation.rs):
+        // never replace target/debug/nsl with a non-CUDA binary mid-suite.
+        .arg(if cfg!(feature = "cuda") {
+            "test-hooks,cuda"
+        } else {
+            "test-hooks"
+        })
         .arg("--")
         .arg("build")
         .arg("--shared-lib")

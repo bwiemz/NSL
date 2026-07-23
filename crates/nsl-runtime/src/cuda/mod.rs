@@ -2155,6 +2155,110 @@ pub(crate) mod cublas_inner {
         )
     }
 
+    /// Strided-batched SGEMM in RAW cuBLAS column-major terms (muon batched
+    /// Newton-Schulz). The caller does its own row/column-major mapping —
+    /// the muon batch engine's square operands are all symmetric, which is
+    /// what makes its mappings transpose-free.
+    ///
+    /// Not wired into the cuda-graph pseudo-op stream: the optimizer step
+    /// runs outside captured regions. If a captured region ever reaches
+    /// this, taint it loudly rather than silently diverging the digest.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_strided_batched_raw(
+        transa: bool,
+        transb: bool,
+        m: i64,
+        n: i64,
+        k: i64,
+        a_dev: *const f32,
+        lda: i64,
+        stride_a: i64,
+        b_dev: *const f32,
+        ldb: i64,
+        stride_b: i64,
+        c_dev: *mut f32,
+        ldc: i64,
+        stride_c: i64,
+        batch: i64,
+        tf32: bool,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(m > 0 && n > 0 && k > 0 && batch > 0);
+        debug_assert!(
+            m <= i32::MAX as i64 && n <= i32::MAX as i64 && k <= i32::MAX as i64
+                && batch <= i32::MAX as i64
+        );
+        if super::graph_capture::in_region() {
+            super::graph_capture::taint("batched-sgemm");
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!(
+                    "[nsl] cublasSetStream_v2 failed: {r:?} — batched gemm stays on its previous stream"
+                );
+            }
+        }
+        let op = |t: bool| {
+            if t {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // GemmStridedBatchedEx with an explicit compute type: the process
+        // handle sits in CUBLAS_DEFAULT_MATH (which, despite NSL's "TF32
+        // default" banner, runs f32 gemms on FP32 CUDA cores), so tensor-core
+        // TF32 must be requested per call. The muon batch engine opts in —
+        // Newton-Schulz is a coarse polynomial approximation and its own
+        // gates are tolerance-based; nothing else in the runtime is affected.
+        let compute = if tf32 {
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+        } else {
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+        };
+        let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
+        let status = unsafe {
+            cublas_sys::cublasGemmStridedBatchedEx(
+                handle,
+                op(transa),
+                op(transb),
+                m as i32,
+                n as i32,
+                k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                a_dev as *const std::ffi::c_void,
+                f32t,
+                lda as i32,
+                stride_a,
+                b_dev as *const std::ffi::c_void,
+                f32t,
+                ldb as i32,
+                stride_b,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c_dev as *mut std::ffi::c_void,
+                f32t,
+                ldc as i32,
+                stride_c,
+                batch as i32,
+                compute,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
+            )
+        };
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            // Surface as the same error type the sgemm path produces.
+            return Err(cublas_result::CublasError(status));
+        }
+        Ok(())
+    }
+
 }
 
 // === GPU op helpers ===

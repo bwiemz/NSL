@@ -826,6 +826,27 @@ pub(crate) struct BuildArgs {
               value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
         pub(crate) muon_state_dtype: String,
 
+        /// Muon perf campaign: shape-grouped batched Newton-Schulz for all
+        /// Muon-routed rank-2 hidden matrices — one batched-GEMM pipeline
+        /// per optimizer step (tensor-core TF32 strided-batched GEMMs over
+        /// persistent workspaces) instead of ~15 GEMM launches per matrix.
+        /// GPU-only; tolerance-equivalent to the sequential primitive (the
+        /// AdamW-routed arm stays bit-for-bit stdlib). Refuses
+        /// --layerwise-accum, --optim-state-offload and --zero-stage.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_batch_ns: bool,
+
+        /// Muon perf campaign: with --optim-state-offload, keep Muon-routed
+        /// params' momentum DEVICE-resident (skips its per-step PCIe
+        /// stage-in/writeback; AdamW state for embeddings/head/vectors
+        /// stays offloaded). Removes the mixed recipe's only per-step
+        /// optimizer-state round trip at the cost of one f32 momentum
+        /// surface in VRAM.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_resident_momentum: bool,
+
+
+
         /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
         /// Each source-AD lowering (forward slice, backward layer range,
         /// recompute segment) records its launch sequence, captures it as a
@@ -1309,6 +1330,27 @@ pub(crate) struct RunArgs {
         #[arg(long, value_name = "DTYPE", default_value = "f32",
               value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
         pub(crate) muon_state_dtype: String,
+
+        /// Muon perf campaign: shape-grouped batched Newton-Schulz for all
+        /// Muon-routed rank-2 hidden matrices — one batched-GEMM pipeline
+        /// per optimizer step (tensor-core TF32 strided-batched GEMMs over
+        /// persistent workspaces) instead of ~15 GEMM launches per matrix.
+        /// GPU-only; tolerance-equivalent to the sequential primitive (the
+        /// AdamW-routed arm stays bit-for-bit stdlib). Refuses
+        /// --layerwise-accum, --optim-state-offload and --zero-stage.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_batch_ns: bool,
+
+        /// Muon perf campaign: with --optim-state-offload, keep Muon-routed
+        /// params' momentum DEVICE-resident (skips its per-step PCIe
+        /// stage-in/writeback; AdamW state for embeddings/head/vectors
+        /// stays offloaded). Removes the mixed recipe's only per-step
+        /// optimizer-state round trip at the cost of one f32 momentum
+        /// surface in VRAM.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_resident_momentum: bool,
+
+
 
         /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
         /// Each source-AD lowering (forward slice, backward layer range,
