@@ -291,7 +291,13 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
                     t.device == th.device && t.dtype == 1 && t.is_contiguous() && t.len == th.len
                 })
                 && th.len <= u32::MAX as i64;
-            if uniform_gpu_f32 {
+            // Review A1: two param entries can alias ONE theta storage
+            // (tied weights). The legacy loop updated them sequentially;
+            // concurrent grid.y slices would race last-writer-wins. Route
+            // aliases to the sequential fallback arm (k is small — linear
+            // scan is fine).
+            let theta_aliased = gpu.0.contains(&(th.data as u64));
+            if uniform_gpu_f32 && !theta_aliased {
                 gpu.0.push(th.data as u64);
                 gpu.1.push(m.data as u64);
                 gpu.2.push(v.data as u64);

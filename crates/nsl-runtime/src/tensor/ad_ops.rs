@@ -618,13 +618,23 @@ pub extern "C" fn nsl_cross_entropy_backward(
         });
         let lg = NslTensor::from_ptr(logits_c);
         let tg = NslTensor::from_ptr(targets_c);
+        // Review B1/B2/B3 admission tightening: 2-D only (the CPU arm's
+        // shape[0]/shape[1] math diverges on 3-D — parity means matching
+        // reachable behavior, not extending it); a device-resident
+        // grad_output scalar must be f32 (anything else bounces so its real
+        // value is honored, never silently 1.0); targets must cover rows.
+        let go_hdr = NslTensor::from_ptr(grad_out_c);
+        let go_ok = go_hdr.len != 1 || go_hdr.device == 0 || go_hdr.dtype == 1;
+        let rows = if lg.ndim == 2 { unsafe { *lg.shape } } else { 0 };
         if enabled
             && lg.device > 0
             && lg.dtype == 1
-            && lg.ndim >= 2
+            && lg.ndim == 2
             && lg.len <= u32::MAX as i64
             && tg.device == lg.device
             && (tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32)
+            && tg.len >= rows
+            && go_ok
         {
             let out = crate::cuda::gpu_cross_entropy_backward_f32(
                 logits_c, targets_c, grad_out_c,
@@ -1887,7 +1897,38 @@ mod tests {
         for j in 0..c {
             assert_eq!(read(go_t, 2 * c + j), 0.0, "ignored row leaked at col {j}");
         }
-        for p in [cpu_out, gpu_out, lg, tg, gg, logits, targets, go] {
+        // Review B6: i32 device targets are the PRODUCTION LM path (u16
+        // token buffers land as DTYPE_I32 on transfer) — same target values
+        // through the kernel's s32 arm must match the CPU reference too.
+        let ti = crate::cpu::create_tensor_with_shape_rs_dtype(
+            &[n as i64],
+            crate::tensor::DTYPE_I32,
+        );
+        {
+            let t = NslTensor::from_ptr(ti);
+            let d = t.data as *mut i32;
+            for (i, v) in tvals.iter().enumerate() {
+                unsafe { *d.add(i) = *v as i32 };
+            }
+        }
+        let tgi = nsl_tensor_to_device(ti, 1);
+        assert_eq!(
+            NslTensor::from_ptr(tgi).dtype,
+            crate::tensor::DTYPE_I32,
+            "i32 targets did not survive the transfer — kernel arm untested"
+        );
+        // Host-scalar grad_output exercises the folded-immediate go path.
+        let go_host = nsl_tensor_scalar(2.5, 1);
+        let gpu_out_i = nsl_tensor_to_device(
+            nsl_cross_entropy_backward(go_host, lg, tgi),
+            0,
+        );
+        let goi = NslTensor::from_ptr(gpu_out_i);
+        for i in 0..(n * c) {
+            let (a, b) = (read(co, i), read(goi, i));
+            assert!((a - b).abs() < 1e-5, "i32-arm elem {i}: cpu {a} vs gpu {b}");
+        }
+        for p in [cpu_out, gpu_out, gpu_out_i, lg, tg, tgi, gg, logits, targets, go, go_host, ti] {
             nsl_tensor_free(p);
         }
     }

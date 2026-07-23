@@ -4505,14 +4505,6 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     f64::from(raw[3])
 }
 
-/// P1 Muon items 8+10: Frobenius-normalize an f32 tensor ENTIRELY on-device —
-/// out = x / (sqrt(Σx²) + 1e-7) with the Σx² produced by the stats kernel
-/// into a persistent 16-byte device scratch buffer and consumed directly by
-/// `nsl_muon_scale_inv_frob_f32`. NO cuCtxSynchronize, NO DtoH copy: this is
-/// the removal of the per-param `.item()` sync from the Muon Newton-Schulz
-/// pre-normalization (the two launches serialize on the compute stream).
-/// The scratch buffer is thread-local and process-lifetime (item 10's
-/// preallocated scratch): one 16-byte allocation per training thread, ever.
 /// Fusion-queue item 2: GPU-native cross-entropy backward.
 /// out = (softmax(logits) - onehot(targets)) * grad_output / num_valid,
 /// invalid (target < 0) rows zeroed — the CPU arm's semantics, computed
@@ -4567,7 +4559,7 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
             [1, 1, 1],
             [256, 1, 1],
             &args,
-            256 * 4,
+            0, // smem is STATIC in the kernel (.shared .u32 cnt[256])
         );
         assert_eq!(r as u32, 0, "GPU ce_bwd_count kernel failed: {r:?}");
     }
@@ -4631,6 +4623,14 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
     sm
 }
 
+/// P1 Muon items 8+10: Frobenius-normalize an f32 tensor ENTIRELY on-device —
+/// out = x / (sqrt(Σx²) + 1e-7) with the Σx² produced by the stats kernel
+/// into a persistent 16-byte device scratch buffer and consumed directly by
+/// `nsl_muon_scale_inv_frob_f32`. NO cuCtxSynchronize, NO DtoH copy: this is
+/// the removal of the per-param `.item()` sync from the Muon Newton-Schulz
+/// pre-normalization (the two launches serialize on the compute stream).
+/// The scratch buffer is thread-local and process-lifetime (item 10's
+/// preallocated scratch): one 16-byte allocation per training thread, ever.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
