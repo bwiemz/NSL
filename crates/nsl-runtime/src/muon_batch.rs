@@ -144,10 +144,16 @@ impl GroupWs {
         }
     }
 
+    /// Release the workspace. The buffers came from `alloc_managed` (the
+    /// caching allocator, which hands out split-block INTERIOR pointers), so
+    /// they must go back through `free_managed` — raw `cuMemFree` on an
+    /// interior pointer aborts, and on a segment base it double-frees the
+    /// allocator's tracking (review finding H1). The caller must ensure no
+    /// in-flight device work references the buffers (stream sync).
     fn free(self) {
         for p in [self.y, self.y2, self.a, self.aa, self.norms, self.tab_m, self.tab_g, self.tab_p]
         {
-            crate::cuda::inner::free_device(p as *mut std::ffi::c_void);
+            crate::cuda::inner::free_managed(p as *mut std::ffi::c_void);
         }
         unsafe {
             cudarc::driver::sys::cuMemFreeHost(self.stage as *mut std::ffi::c_void);
@@ -509,7 +515,10 @@ pub extern "C" fn nsl_muon_step_batch(
         let (r, c) = key;
         let (rp, cp) = (r.min(c), r.max(c));
         let per = GroupWs::bytes_per_matrix(rp, cp);
-        let chunk = (budget_bytes() / per).clamp(1, m_ptrs.len());
+        // grid.y carries the matrix index — clamp to the hardware's 65535
+        // cap so tiny-shape mega-groups sub-chunk instead of aborting the
+        // launch (review finding).
+        let chunk = (budget_bytes() / per).clamp(1, m_ptrs.len()).min(65535);
         WS_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             // Grow-only capacity per shape; reallocate when a bigger chunk
@@ -520,6 +529,21 @@ pub extern "C" fn nsl_muon_step_batch(
             };
             if needs_realloc {
                 if let Some(old) = cache.remove(&(rp, cp)) {
+                    // The previous same-oriented-shape group (e.g. [c,r] after
+                    // [r,c]) may still have kernels/GEMMs and staging DMAs in
+                    // flight on these buffers — quiesce the compute stream
+                    // before releasing them (review finding H1).
+                    unsafe {
+                        crate::cuda::inner::ensure_context();
+                        let r = cudarc::driver::sys::cuStreamSynchronize(
+                            crate::cuda::inner::current_stream(),
+                        );
+                        assert_eq!(
+                            r,
+                            cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                            "muon_batch: stream sync before workspace realloc failed"
+                        );
+                    }
                     old.free();
                 }
                 cache.insert((rp, cp), GroupWs::alloc(rp, cp, chunk));
@@ -777,6 +801,69 @@ mod tests {
     #[ignore = "requires CUDA GPU"]
     fn batch_nesterov_runs_and_is_deterministic() {
         run_case(true);
+    }
+
+    /// Review H1 regression: two groups sharing one ORIENTED workspace key
+    /// with UNEQUAL counts ([4,12] x2 then [12,4] x5) force the grow-realloc
+    /// branch while the first group's work may still be in flight. Under the
+    /// bug this freed caching-allocator interior pointers through raw
+    /// cuMemFree with no sync (abort or silent corruption); now it must
+    /// quiesce, free through free_managed, and still match the sequential
+    /// path.
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn workspace_grow_realloc_same_oriented_key() {
+        let (lr, mu, wd, ns) = (0.02f64, 0.9f64, 0.0f64, 5.0f64);
+        let mut batch: Vec<(i64, i64, i64)> = Vec::new();
+        let mut seq: Vec<(i64, i64, i64)> = Vec::new();
+        let spec: Vec<(i64, i64)> = std::iter::repeat_n((4i64, 12i64), 2)
+            .chain(std::iter::repeat_n((12, 4), 5))
+            .collect();
+        for (j, &(r, c)) in spec.iter().enumerate() {
+            let seed = 40.0 + j as f64;
+            batch.push((
+                tests::make_gpu_f32(r, c, seed),
+                tests::make_gpu_f32(r, c, seed + 0.3),
+                tests::make_gpu_f32(r, c, seed + 0.6),
+            ));
+            seq.push((
+                tests::make_gpu_f32(r, c, seed),
+                tests::make_gpu_f32(r, c, seed + 0.3),
+                tests::make_gpu_f32(r, c, seed + 0.6),
+            ));
+        }
+        let params = crate::list::nsl_list_new();
+        let grads = crate::list::nsl_list_new();
+        let ms = crate::list::nsl_list_new();
+        let routes = crate::list::nsl_list_new();
+        for &(p, g, m) in &batch {
+            crate::list::nsl_list_push(params, p);
+            crate::list::nsl_list_push(grads, g);
+            crate::list::nsl_list_push(ms, m);
+            crate::list::nsl_list_push(routes, 0);
+        }
+        nsl_muon_step_batch(params, grads, ms, routes, lr, mu, wd, 0, ns);
+        unsafe {
+            crate::cuda::inner::ensure_context();
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
+        for &(p, g, m) in &seq {
+            tests::sequential_muon_arm(p, g, m, lr, mu, wd, ns);
+        }
+        for (i, (&(pb, _, _), &(ps, _, _))) in batch.iter().zip(seq.iter()).enumerate() {
+            let (vb, vs) = (tests::read_gpu_f32(pb), tests::read_gpu_f32(ps));
+            for (e, (a, b)) in vb.iter().zip(&vs).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "grow-realloc divergence: matrix {i} elem {e}: {a} vs {b}"
+                );
+            }
+        }
+        for &(p, g, m) in batch.iter().chain(seq.iter()) {
+            crate::tensor::nsl_tensor_free(p);
+            crate::tensor::nsl_tensor_free(g);
+            crate::tensor::nsl_tensor_free(m);
+        }
     }
 
     #[test]

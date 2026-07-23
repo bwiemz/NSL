@@ -80,9 +80,6 @@ static CALLS: [AtomicU64; N_REGIONS] = [const { AtomicU64::new(0) }; N_REGIONS];
 /// -1 = not yet read, 0 = off, 1 = synced, 2 = enqueue-only.
 static MODE: AtomicI64 = AtomicI64::new(-1);
 static REPORT_REGISTERED: AtomicBool = AtomicBool::new(false);
-/// Allocator-churn probe: caching-allocator alloc calls observed inside
-/// NS regions (set by the driver snapshotting before/after; see report()).
-static NS_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 pub fn mode() -> i64 {
@@ -154,10 +151,6 @@ impl Drop for Scope {
     }
 }
 
-pub fn record_ns_alloc_delta(delta: usize) {
-    NS_ALLOC_CALLS.fetch_add(delta, Ordering::Relaxed);
-}
-
 extern "C" fn report_at_exit() {
     report();
 }
@@ -201,10 +194,6 @@ pub fn report() {
             (ns / calls.max(1)) as f64 / 1e3,
             share
         );
-    }
-    let allocs = NS_ALLOC_CALLS.load(Ordering::Relaxed);
-    if allocs > 0 {
-        eprintln!("[muon-prof] ns-region allocator calls: {allocs} (steady-state should be ~0 via cache reuse)");
     }
 }
 

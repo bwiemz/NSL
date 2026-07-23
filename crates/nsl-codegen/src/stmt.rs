@@ -4193,6 +4193,21 @@ impl Compiler<'_> {
                      there. Drop one",
                 ));
             }
+            // Muon perf campaign: the pipelined path never reaches the
+            // batch/resident emission — refuse rather than silently no-op
+            // (the non-pipeline path refuses non-muon optimizers too).
+            if self.compile_options.muon_batch_ns {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns is not supported on the pipelined train \
+                     path (@pipeline). Drop one",
+                ));
+            }
+            if self.compile_options.muon_resident_momentum {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum is not supported on the \
+                     pipelined train path (@pipeline). Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
@@ -4637,6 +4652,13 @@ impl Compiler<'_> {
                 return Err(CodegenError::new(
                     "--muon-batch-ns does not compose with --muon-state-dtype \
                      bf16: the batched kernels read/write f32 momentum \
+                     directly. Drop one of the flags",
+                ));
+            }
+            if self.compile_options.param_dtype_bf16sr {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --param-dtype \
+                     bf16-sr: the batched kernels read/write f32 params \
                      directly. Drop one of the flags",
                 ));
             }
