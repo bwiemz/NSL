@@ -804,12 +804,14 @@ impl Compiler<'_> {
                                 builder.declare_var(var, cl_types::F64);
                                 builder.def_var(var, f64_val);
                                 state.variables.insert(param.name, (var, cl_types::F64));
+                                state.param_symbols.insert(param.name);
                             } else {
                                 let cl_type = sig.params[i].value_type;
                                 let var = state.new_variable();
                                 builder.declare_var(var, cl_type);
                                 builder.def_var(var, param_val);
                                 state.variables.insert(param.name, (var, cl_type));
+                                state.param_symbols.insert(param.name);
                             }
                         }
 

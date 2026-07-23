@@ -14,6 +14,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex};
 
+/// Leak-hunt trace: `NSL_DEBUG_MEM_TRACE=1` prints every block handout and
+/// free with its pointer and op context. Diffing A/F events isolates which
+/// specific allocations strand (the per-context summary only gives counts).
+pub(crate) fn mem_trace_on() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("NSL_DEBUG_MEM_TRACE").ok().as_deref() == Some("1"));
+    *ON
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -489,6 +498,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.cumulative_allocs += 1;
         self.note_surface_alloc(block.surface, block.size);
 
+        if mem_trace_on() {
+            eprintln!("[mem-trace] A ptr={:p} size={} ctx={}", block.ptr, block.size, block.context);
+        }
         Some(block.ptr)
     }
 
@@ -567,6 +579,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.cumulative_allocs += 1;
         self.note_surface_alloc(blk.surface, blk.size);
 
+        if mem_trace_on() {
+            eprintln!("[mem-trace] A ptr={:p} size={} ctx={}", blk.ptr, blk.size, blk.context);
+        }
         Some(base_ptr)
     }
 
@@ -634,6 +649,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let old_size = block.size;
         let old_requested = block.requested_size;
         let old_surface = block.surface;
+        if mem_trace_on() {
+            eprintln!("[mem-trace] F ptr={:p} size={} ctx={}", ptr, old_size, block.context);
+        }
         block.allocated = false;
         block.requested_size = 0;
         block.context.clear();

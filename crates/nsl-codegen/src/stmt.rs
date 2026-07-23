@@ -1299,7 +1299,18 @@ impl Compiler<'_> {
                     let val_is_ptr = builder.func.dfg.value_type(val) == cl_types::I64;
                     if val_is_ptr && ret_ty.is_tensor() && !state.flags.in_dtype_method {
                         use crate::ownership_expr::Ownership;
-                        match self.get_ownership(state, val) {
+                        // Upgrade Unknown to Owned when the return expr is a
+                        // call contractually returning an owning ref (see
+                        // expr_call_returns_owning_ref) — the conservative
+                        // retain below would double-own it and strand one
+                        // reference per call.
+                        let mut own = self.get_ownership(state, val);
+                        if matches!(own, Ownership::Unknown)
+                            && self.expr_call_returns_owning_ref(e)
+                        {
+                            own = Ownership::Owned;
+                        }
+                        match own {
                             Ownership::Owned => {
                                 self.consume_ownership(state, val);
                             }
@@ -1334,6 +1345,17 @@ impl Compiler<'_> {
                     self.free_tensor_temporaries(builder, state, Some(val));
                     // M38b: Free linear tensors consumed during the return expression
                     self.free_linear_consumes(builder, state, Some(val));
+                    // Free non-parameter tensor locals (see emit_return_local_sweep).
+                    // Only for tensor-typed returns whose aliasing the retain
+                    // above compensates; aggregate returns (lists/dicts) may
+                    // alias locals without a retain and keep today's behavior.
+                    if val_is_ptr
+                        && ret_ty.is_tensor()
+                        && !state.flags.in_dtype_method
+                        && !state.flags.in_tape_region
+                    {
+                        self.emit_return_local_sweep(builder, state);
+                    }
                     self.cleanup_active_loop_batches(builder, state);
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
@@ -1354,6 +1376,10 @@ impl Compiler<'_> {
                     }
                     builder.ins().return_(&[val]);
                 } else {
+                    // Bare `return`: same local sweep as the implicit path.
+                    if !state.flags.in_dtype_method && !state.flags.in_tape_region {
+                        self.emit_return_local_sweep(builder, state);
+                    }
                     self.cleanup_active_loop_batches(builder, state);
                     // Stop and free any DataLoaders created in this scope
                     self.teardown_dataloaders(builder, state);
@@ -2298,6 +2324,44 @@ impl Compiler<'_> {
     /// Free intermediate tensor temporaries accumulated during expression compilation.
     /// `keep` is the final result value that should NOT be freed (it's owned by a variable).
     /// All other temporaries are intermediates from compound expressions (e.g. `a + b` in `a + b + c`).
+    /// Free all I64-typed non-parameter local variables (potential tensors)
+    /// at a function-return point. Twin of the implicit-return sweep in
+    /// func.rs — until 2026-07 only the fall-off-the-end path had it, so
+    /// every `let`-bound tensor local in a function ending with an explicit
+    /// `return <expr>` leaked its final reference (`mse_loss`'s `diff`, the
+    /// residual-block `f`, the loop-carried `h` — the tape-mode per-step
+    /// leak AND the @no_grad inference leak were this hole).
+    ///
+    /// Safe against the returned value aliasing a swept variable: the
+    /// Return arm retains BorrowedFromVar/Unknown returns before calling
+    /// this, so the variable's own free leaves the returned reference
+    /// intact. `nsl_tensor_free_if_valid` skips non-tensor pointers and
+    /// already-poisoned boxes, so aliased vars double-swept in sequence
+    /// are no-ops on the second hit.
+    pub(crate) fn emit_return_local_sweep(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+    ) {
+        let locals: Vec<_> = state
+            .variables
+            .iter()
+            .filter(|(sym, _)| !state.param_symbols.contains(sym))
+            .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
+            .filter_map(|(_, (var, cl_type))| {
+                if *cl_type == cl_types::I64 {
+                    Some(*var)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in locals {
+            let val = builder.use_var(var);
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[val]);
+        }
+    }
+
     pub(crate) fn free_tensor_temporaries(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -6405,7 +6469,9 @@ impl Compiler<'_> {
 
                 let (grads, loss) =
                     self.compile_tape_backward(builder, state, step_body, param_list)?;
-                (grads, loss, false, std::collections::HashSet::new())
+                // Epilogue owns the loss's last ref on the tape fallback too
+                // (see the pure-tape arm below for the ref accounting).
+                (grads, loss, true, std::collections::HashSet::new())
             } else {
                 // 3. Build initial VarMap: map named input/param VarIds to
                 //    Cranelift Values already present in state.variables.
@@ -9651,7 +9717,13 @@ impl Compiler<'_> {
             // === Tape AD path (runtime backward) ===
             let (grads, loss) =
                 self.compile_tape_backward(builder, state, step_body, param_list)?;
-            (grads, loss, false, std::collections::HashSet::new())
+            // The epilogue owns the loss's last reference on this path too:
+            // the tape region's promote-to-tape-held retain is cancelled by
+            // free_tape_held_tensors, leaving exactly the born reference —
+            // and the step-var sweep skips `loss` (pre-declared for the
+            // callback plumbing, so it sits in vars_before_step). Without
+            // this the tape path stranded one loss tensor per step.
+            (grads, loss, true, std::collections::HashSet::new())
         };
 
         // 7e1b. Debug training: emit gradient checksum to catch silent corruption.
@@ -12559,6 +12631,7 @@ impl Compiler<'_> {
                             let step_val = builder.use_var(step_count_var);
                             builder.def_var(var, step_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
+                            state.param_symbols.insert(param.name);
                         }
                         "loss" => {
                             // loss is already in state.variables, but rebind for callback scope
@@ -12566,6 +12639,7 @@ impl Compiler<'_> {
                             builder.declare_var(var, cl_types::I64);
                             builder.def_var(var, loss_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
+                            state.param_symbols.insert(param.name);
                         }
                         _ => {
                             // Unknown callback param — bind to zero
@@ -12574,6 +12648,7 @@ impl Compiler<'_> {
                             let z = builder.ins().iconst(cl_types::I64, 0);
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
+                            state.param_symbols.insert(param.name);
                         }
                     }
                 }
@@ -12741,6 +12816,7 @@ impl Compiler<'_> {
                             let epoch_val = builder.use_var(epoch_counter_var);
                             builder.def_var(var, epoch_val);
                             state.variables.insert(param.name, (var, cl_types::I64));
+                            state.param_symbols.insert(param.name);
                         }
                         "loss" => {
                             let var = state.new_variable();
@@ -12748,6 +12824,7 @@ impl Compiler<'_> {
                             let epoch_loss = builder.use_var(epoch_loss_var);
                             builder.def_var(var, epoch_loss);
                             state.variables.insert(param.name, (var, cl_types::I64));
+                            state.param_symbols.insert(param.name);
                         }
                         _ => {
                             let var = state.new_variable();
@@ -12755,6 +12832,7 @@ impl Compiler<'_> {
                             let z = builder.ins().iconst(cl_types::I64, 0);
                             builder.def_var(var, z);
                             state.variables.insert(param.name, (var, cl_types::I64));
+                            state.param_symbols.insert(param.name);
                         }
                     }
                 }
@@ -13025,9 +13103,11 @@ impl Compiler<'_> {
             })?
         };
 
-        // Run backward pass
-        let grads_list =
-            self.compile_call_by_name(builder, "nsl_tape_backward", &[loss_val, param_list])?;
+        // Run backward pass — the TRAIN entry arms the disconnection
+        // backstop (all-params-zeros aborts instead of silently training
+        // on weight decay alone). Grad blocks keep plain nsl_tape_backward.
+        let grads_list = self
+            .compile_call_by_name(builder, "nsl_tape_backward_train", &[loss_val, param_list])?;
 
         // Stop tape and restore eval mode
         self.compile_call_by_name(builder, "nsl_tape_stop", &[])?;

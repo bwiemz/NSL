@@ -1016,12 +1016,21 @@ pub extern "C" fn nsl_tensor_logsoftmax(tensor_ptr: i64, dim: i64) -> i64 {
                 }
             }
             // Non-last-dim: CPU redirect
-            let cpu_t = nsl_tensor_to_device(tensor_ptr, 0);
-            let result = nsl_tensor_logsoftmax(cpu_t, dim);
-            let gpu_result = nsl_tensor_to_device(result, tensor.device as i64);
-            nsl_tensor_free(cpu_t);
-            nsl_tensor_free(result);
-            if autodiff::is_recording() {
+            let was_recording = autodiff::is_recording();
+            let gpu_result = {
+                // Pause the tape across the redirect — the recursive CPU call
+                // would otherwise record a second (garbage) node over the
+                // transfer temps AND bump a saved ref on the CPU result that
+                // nothing releases.
+                let _pause = autodiff::TapePause::new();
+                let cpu_t = nsl_tensor_to_device(tensor_ptr, 0);
+                let result = nsl_tensor_logsoftmax(cpu_t, dim);
+                let gpu_result = nsl_tensor_to_device(result, tensor.device as i64);
+                nsl_tensor_free(cpu_t);
+                nsl_tensor_free(result);
+                gpu_result
+            };
+            if was_recording {
                 NslTensor::from_ptr(gpu_result).refcount.fetch_add(1, Ordering::SeqCst);
                 autodiff::maybe_record(autodiff::TapeOp::LogSoftmax {
                     a: tensor_ptr, out: gpu_result, saved_out: gpu_result, dim,

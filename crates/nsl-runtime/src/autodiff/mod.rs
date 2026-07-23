@@ -72,6 +72,11 @@ pub enum TapeOp {
     Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     LogSoftmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
+    /// Metadata-only relabel: backward reshapes the gradient back to the
+    /// input's shape. Without this op every reshape between two recorded ops
+    /// silently DISCONNECTED the tape (views get a fresh tape_id), which is
+    /// how the Q/K/V-projection -> attention chain lost all its param grads.
+    Reshape { a: i64, out: i64, input_shape: Vec<i64> },
     Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
     EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
     LayerNorm { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_mean: i64, saved_inv_std: i64, saved_weight: i64 },
@@ -164,6 +169,9 @@ impl TapeOp {
             }
             TapeOp::Unsqueeze { input, out, .. } | TapeOp::Expand { input, out, .. } => {
                 *input = tape.get_or_assign_id(*input); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::Reshape { a, out, .. } => {
+                *a = tape.get_or_assign_id(*a); *out = tape.get_or_assign_id(*out);
             }
             TapeOp::Cat { inputs, out, .. } | TapeOp::Stack { inputs, out, .. } => {
                 for inp in inputs.iter_mut() { *inp = tape.get_or_assign_id(*inp); }
@@ -316,11 +324,63 @@ pub fn pop_last_op() {
     TAPE.with(|t| { t.borrow_mut().ops.pop(); });
 }
 
+/// Leak-hunt trace (`NSL_DEBUG_MEM_TRACE=1`): one-line summary of a tape op's
+/// identity ids and saved (refcount-bumped) pointers.
+fn tape_op_trace(op: &TapeOp) -> String {
+    match op {
+        TapeOp::Add { a, b, out, .. } => format!("Add a={a} b={b} out={out}"),
+        TapeOp::Sub { a, b, out, .. } => format!("Sub a={a} b={b} out={out}"),
+        TapeOp::Mul { a, b, out, saved_a, saved_b, .. } => {
+            format!("Mul a={a} b={b} out={out} saved_a={saved_a:#x} saved_b={saved_b:#x}")
+        }
+        TapeOp::Div { a, b, out, saved_a, saved_b, .. } => {
+            format!("Div a={a} b={b} out={out} saved_a={saved_a:#x} saved_b={saved_b:#x}")
+        }
+        TapeOp::MatMul { a, b, out, saved_a, saved_b } => {
+            format!("MatMul a={a} b={b} out={out} saved_a={saved_a:#x} saved_b={saved_b:#x}")
+        }
+        TapeOp::SiLU { a, out, saved_a } => format!("SiLU a={a} out={out} saved_a={saved_a:#x}"),
+        TapeOp::MulScalar { a, out, scalar } => format!("MulScalar a={a} out={out} s={scalar}"),
+        TapeOp::AddScalar { a, out } => format!("AddScalar a={a} out={out}"),
+        TapeOp::Neg { a, out } => format!("Neg a={a} out={out}"),
+        TapeOp::SumReduce { a, out, dim, .. } => format!("SumReduce a={a} out={out} dim={dim}"),
+        TapeOp::MeanReduce { a, out, dim, .. } => format!("MeanReduce a={a} out={out} dim={dim}"),
+        TapeOp::Transpose { a, out, .. } => format!("Transpose a={a} out={out}"),
+        TapeOp::Reshape { a, out, .. } => format!("Reshape a={a} out={out}"),
+        _ => format!("(other op discriminant {:?})", std::mem::discriminant(op)),
+    }
+}
+
+/// RAII guard: pause tape recording for a scope. Used by GPU wrappers that
+/// redirect through the CPU implementation of the same op — without the pause
+/// the inner CPU call records a node whose ids are short-lived transfer temps
+/// (a garbage edge that never connects to the live graph); the wrapper records
+/// the real op at its own level against the caller's tensors instead.
+pub(crate) struct TapePause;
+impl TapePause {
+    pub(crate) fn new() -> Self {
+        TAPE.with(|t| t.borrow_mut().pause_depth += 1);
+        TapePause
+    }
+}
+impl Drop for TapePause {
+    fn drop(&mut self) {
+        TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
+    }
+}
+
 /// Records an operation on the tape if recording is active.
 /// Converts identity fields from raw pointers to tape_ids via assign_ids.
 pub fn maybe_record(mut op: TapeOp) {
     if !is_recording() { return; }
-    TAPE.with(|t| { let mut tape = t.borrow_mut(); op.assign_ids(&mut tape); tape.ops.push(op); });
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+        op.assign_ids(&mut tape);
+        if crate::tensor::tensor_trace_on() {
+            eprintln!("[tape-trace] record {}", tape_op_trace(&op));
+        }
+        tape.ops.push(op);
+    });
 }
 
 /// Start recording operations on the tape.
@@ -368,6 +428,9 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
 /// Must be called before clearing ops to prevent refcount leaks.
 pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
     for op in ops.iter() {
+        if crate::tensor::tensor_trace_on() {
+            eprintln!("[tape-trace] release {}", tape_op_trace(op));
+        }
         match op {
             TapeOp::Mul { saved_a, saved_b, .. }
             | TapeOp::Div { saved_a, saved_b, .. }
@@ -424,6 +487,9 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
             }
             TapeOp::Unsqueeze { .. } => {}
             TapeOp::Expand { .. } => {}
+            TapeOp::Reshape { .. } => {
+                // identity-only fields (tape_ids) — nothing saved to free
+            }
             TapeOp::Stack { .. } | TapeOp::Cat { .. } => {
                 // inputs are tape_ids after assign_ids — nothing to free
             }

@@ -42,7 +42,11 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
-                if relinq_a && ta.shape_eq(tb) {
+                // In-place reuse is skipped while recording: the tape needs
+                // out != a for a well-formed chain (relinquish flags never come
+                // from a taped forward today; the guard keeps that a non-event
+                // if a future runtime-internal caller records).
+                if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
                     // Ownership transfer: the caller's relinquished A ref IS the
                     // result ref. Bumping here (as the unary can_mutate_inplace
@@ -62,6 +66,15 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                     return a;
                 }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                // Tape record on the GPU arm — this return path historically
+                // skipped it, so every GPU train step under tape-AD produced a
+                // graph with no Add edges (and, with the whole elementwise
+                // family affected, zero parameter gradients).
+                if autodiff::is_recording() {
+                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
+                }
                 // Out-of-place GPU fallback: honor caller relinquish flags.
                 if relinq_a {
                     nsl_tensor_free(a);
@@ -170,7 +183,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
-                if relinq_a && ta.shape_eq(tb) {
+                if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
@@ -179,6 +192,12 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
                     return a;
                 }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add).
+                if autodiff::is_recording() {
+                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
+                }
                 if relinq_a { nsl_tensor_free(a); }
                 if relinq_b { nsl_tensor_free(b_orig); }
                 if b_transferred { nsl_tensor_free(b); }
@@ -264,7 +283,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
-                if relinq_a && ta.shape_eq(tb) {
+                if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
@@ -273,6 +292,18 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
                     return a;
                 }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add). Saved refs
+                // are bumped BEFORE the relinquish frees below so the tape's
+                // reference keeps a relinquished operand alive for backward.
+                if autodiff::is_recording() {
+                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Mul {
+                        a, b, out: result, saved_a: a, saved_b: b, a_shape, b_shape,
+                    });
+                }
                 if relinq_a { nsl_tensor_free(a); }
                 if relinq_b { nsl_tensor_free(b_orig); }
                 if b_transferred { nsl_tensor_free(b); }
@@ -368,7 +399,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
-                if relinq_a && ta.shape_eq(tb) {
+                if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
@@ -377,6 +408,17 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
                     return a;
                 }
                 let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_mul for the
+                // saved-ref-before-relinquish ordering).
+                if autodiff::is_recording() {
+                    let a_shape = get_shape_vec(NslTensor::from_ptr(a));
+                    let b_shape = get_shape_vec(NslTensor::from_ptr(b));
+                    NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Div {
+                        a, b, out: result, saved_a: a, saved_b: b, a_shape, b_shape,
+                    });
+                }
                 if relinq_a { nsl_tensor_free(a); }
                 if relinq_b { nsl_tensor_free(b_orig); }
                 if b_transferred { nsl_tensor_free(b); }
@@ -472,7 +514,12 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add).
+                if autodiff::is_recording() {
+                    autodiff::maybe_record(autodiff::TapeOp::Neg { a: a_ptr, out: result });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -581,13 +628,17 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                if relinq_a {
+                if relinq_a && !autodiff::is_recording() {
                     crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
                 let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add).
+                if autodiff::is_recording() {
+                    autodiff::maybe_record(autodiff::TapeOp::AddScalar { a: a_ptr, out: result });
+                }
                 if relinq_a { nsl_tensor_free(a_ptr); }
                 return result;
             }
@@ -708,13 +759,17 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                if relinq_a {
+                if relinq_a && !autodiff::is_recording() {
                     crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
                 let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add).
+                if autodiff::is_recording() {
+                    autodiff::maybe_record(autodiff::TapeOp::MulScalar { a: a_ptr, scalar: s, out: result });
+                }
                 if relinq_a { nsl_tensor_free(a_ptr); }
                 return result;
             }
@@ -990,6 +1045,16 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
                 let result = crate::cuda::gpu_matmul_f32(a_c, b_c);
                 nsl_tensor_free(a_c);
                 nsl_tensor_free(b_c);
+                // Tape record on the GPU arm (see nsl_tensor_add). Saved refs
+                // bumped before the relinquish frees so the tape keeps its
+                // operands alive for backward.
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(a_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(b_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::MatMul {
+                        a: a_ptr, b: b_ptr, out: result, saved_a: a_ptr, saved_b: b_ptr,
+                    });
+                }
                 // FBIP-3: matmul always allocates fresh output; honor relinquish flags
                 // by freeing A/B here. No in-place optimization because matmul output
                 // shape differs from input in general ([M,K] @ [K,N] -> [M,N]).

@@ -272,6 +272,11 @@ fn g14_b_recompute_hd128_s4096_bq64_refuses_r5() {
     let mut cfg = build_cycle14_config(128, 4096);
     cfg.block_q = 64;
     cfg.block_kv = 64;
+    // checkpoint(full) + rope_q now refuses UP FRONT (Path B kv-recompute
+    // has a known gross numerical error — deliberate deferral-refusal),
+    // which would preempt the R5 SMEM refusal this test pins. The budget
+    // math under test is orthogonal to RoPE — disable it.
+    cfg.rope_q = false;
     // Re-pin checkpoint after the mutation (no-op for the carrier).
     cfg.checkpoint = Some(CheckpointExtras::full());
     let err = synthesize_backward_with_tier_b(&cfg, None)
@@ -287,7 +292,10 @@ fn g14_b_recompute_hd128_s4096_bq64_refuses_r5() {
 /// PTX forward-compat per Phase A smoke proof).
 #[test]
 fn g14_c_sm80_target_emitted_under_gpu_sm_80() {
-    let cfg = build_cycle14_config(64, 512);
+    let mut cfg = build_cycle14_config(64, 512);
+    // See g14_b: rope_q + checkpoint(full) refuses up front by design;
+    // the sm_80 target-emission invariant needs a successful synthesis.
+    cfg.rope_q = false;
     let ptx = synthesize_backward_with_tier_b(&cfg, None)
         .expect("hd=64 bq=32 must synthesize");
     assert!(

@@ -1232,6 +1232,16 @@ fn free_host_tensor_data(data: *mut c_void, size: usize) {
     unsafe { checked_free(data as *mut u8, size) };
 }
 
+/// Leak-hunt trace twin of the allocator's `NSL_DEBUG_MEM_TRACE`: prints every
+/// tensor free with box ptr, data ptr and pre-decrement refcount, so a leaked
+/// data block can be mapped back to its owning tensor's ref history.
+pub(crate) fn tensor_trace_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("NSL_DEBUG_MEM_TRACE").ok().as_deref() == Some("1")
+    });
+    *ON
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
@@ -1239,6 +1249,15 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     }
     let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data, data_owner, slab_managed) = {
         let tensor = NslTensor::from_ptr(tensor_ptr);
+        if tensor_trace_on() {
+            eprintln!(
+                "[tensor-trace] free t={:#x} data={:p} rc_pre={} dev={}",
+                tensor_ptr,
+                tensor.data,
+                tensor.refcount.load(Ordering::SeqCst),
+                tensor.device
+            );
+        }
         let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
         if prev > 1 {
             return; // still referenced — don't free
@@ -2377,7 +2396,21 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     if weight.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            return crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr);
+            let out_ptr = crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr);
+            // Tape record on the GPU arm — mirrors the CPU record site below
+            // (weight and indices saved with refcount bumps for backward).
+            if autodiff::is_recording() {
+                NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                autodiff::maybe_record(autodiff::TapeOp::EmbeddingLookup {
+                    weight: weight_ptr,
+                    indices: indices_ptr,
+                    out: out_ptr,
+                    saved_weight: weight_ptr,
+                    saved_indices: indices_ptr,
+                });
+            }
+            return out_ptr;
         }
         #[cfg(not(feature = "cuda"))]
         { panic!("CUDA support not compiled"); }
@@ -3414,7 +3447,17 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     if tensor.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            return crate::cuda::gpu_bias_add(tensor_ptr, bias_ptr);
+            let out_ptr = crate::cuda::gpu_bias_add(tensor_ptr, bias_ptr);
+            // Tape record on the GPU arm (identity-only fields, no bumps —
+            // mirrors the CPU record site below).
+            if autodiff::is_recording() {
+                autodiff::maybe_record(autodiff::TapeOp::BiasAdd {
+                    tensor: tensor_ptr,
+                    bias: bias_ptr,
+                    out: out_ptr,
+                });
+            }
+            return out_ptr;
         }
         #[cfg(not(feature = "cuda"))]
         { panic!("CUDA support not compiled"); }

@@ -198,6 +198,20 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         view
     };
 
+    // Tape record (identity-only fields, no refcount bumps): a reshape VIEW
+    // carries tape_id 0, so without this node the recorded graph silently
+    // disconnects at every reshape between two recorded ops — grads never
+    // reach anything upstream. Backward reshapes the grad to input_shape.
+    if autodiff::is_recording() {
+        let input_shape: Vec<i64> =
+            (0..tensor.ndim as usize).map(|i| unsafe { *tensor.shape.add(i) }).collect();
+        autodiff::maybe_record(autodiff::TapeOp::Reshape {
+            a: tensor_ptr,
+            out: result,
+            input_shape,
+        });
+    }
+
     // Tracing (unchanged)
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
@@ -434,24 +448,43 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         first.device
     };
     if source_device > 0 {
-        // Transfer all inputs to CPU
-        let cpu_ptrs: Vec<i64> = (0..num_tensors)
-            .map(|i| super::nsl_tensor_to_device(unsafe { *list.data.add(i) }, 0))
-            .collect();
-        // Build a temporary NslList on the stack via the runtime list API
-        let tmp_list = crate::list::nsl_list_new();
-        for &cp in &cpu_ptrs {
-            crate::list::nsl_list_push(tmp_list, cp);
+        let was_recording = autodiff::is_recording();
+        let gpu_result = {
+            // Pause the tape across the CPU redirect — the recursive CPU call
+            // would otherwise record a node over the transfer temps below.
+            let _pause = autodiff::TapePause::new();
+            // Transfer all inputs to CPU
+            let cpu_ptrs: Vec<i64> = (0..num_tensors)
+                .map(|i| super::nsl_tensor_to_device(unsafe { *list.data.add(i) }, 0))
+                .collect();
+            // Build a temporary NslList on the stack via the runtime list API
+            let tmp_list = crate::list::nsl_list_new();
+            for &cp in &cpu_ptrs {
+                crate::list::nsl_list_push(tmp_list, cp);
+            }
+            let cpu_result = nsl_tensor_stack(tmp_list, dim);
+            let gpu_result = super::nsl_tensor_to_device(cpu_result, source_device as i64);
+            // Free temporaries
+            super::nsl_tensor_free(cpu_result);
+            for &cp in &cpu_ptrs {
+                super::nsl_tensor_free(cp);
+            }
+            // Free temp list (NslList is just a heap allocation)
+            crate::list::nsl_list_free(tmp_list);
+            gpu_result
+        };
+        // Record the real op against the caller's GPU tensors (identity-only,
+        // no refcount bumps — mirrors the CPU record site).
+        if was_recording {
+            let ptrs: Vec<i64> = (0..num_tensors)
+                .map(|i| unsafe { *list.data.add(i) })
+                .collect();
+            autodiff::maybe_record(autodiff::TapeOp::Stack {
+                inputs: ptrs,
+                out: gpu_result,
+                dim,
+            });
         }
-        let cpu_result = nsl_tensor_stack(tmp_list, dim);
-        let gpu_result = super::nsl_tensor_to_device(cpu_result, source_device as i64);
-        // Free temporaries
-        super::nsl_tensor_free(cpu_result);
-        for &cp in &cpu_ptrs {
-            super::nsl_tensor_free(cp);
-        }
-        // Free temp list (NslList is just a heap allocation)
-        crate::list::nsl_list_free(tmp_list);
         return gpu_result;
     }
 
@@ -724,7 +757,10 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
                     else { end as usize };
             let slice_len = e.saturating_sub(s);
             if slice_len == 0 {
-                // Empty slice: fall back to CPU path for correct empty tensor handling
+                // Empty slice: fall back to CPU path for correct empty tensor
+                // handling. Tape paused: an empty slice carries no gradient,
+                // so recording nothing (out becomes a leaf) is correct.
+                let _pause = autodiff::TapePause::new();
                 let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
                 let result = nsl_tensor_slice(cpu_t, dim, start, end);
                 let gpu_result = super::nsl_tensor_to_device(result, t.device as i64);
@@ -732,7 +768,21 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
                 super::nsl_tensor_free(result);
                 return gpu_result;
             }
-            return crate::cuda::gpu_slice_f32_with_shape(tensor_ptr, d, s, slice_len);
+            let result = crate::cuda::gpu_slice_f32_with_shape(tensor_ptr, d, s, slice_len);
+            // Tape record on the GPU arm — mirrors the CPU record site
+            // (identity-only fields, normalized start, raw dim).
+            if autodiff::is_recording() {
+                let input_shape: Vec<i64> =
+                    (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+                autodiff::maybe_record(autodiff::TapeOp::Slice {
+                    a: tensor_ptr,
+                    out: result,
+                    dim,
+                    start: s as i64,
+                    input_shape,
+                });
+            }
+            return result;
         }
         #[cfg(not(feature = "cuda"))]
         { panic!("CUDA support not compiled"); }
@@ -828,20 +878,45 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         first.device
     };
     if source_device > 0 {
-        let cpu_ptrs: Vec<i64> = (0..num_tensors)
-            .map(|i| super::nsl_tensor_to_device(unsafe { *list.data.add(i) }, 0))
-            .collect();
-        let tmp_list = crate::list::nsl_list_new();
-        for &cp in &cpu_ptrs {
-            crate::list::nsl_list_push(tmp_list, cp);
+        let was_recording = autodiff::is_recording();
+        let gpu_result = {
+            // Pause the tape across the CPU redirect (see nsl_tensor_stack).
+            let _pause = autodiff::TapePause::new();
+            let cpu_ptrs: Vec<i64> = (0..num_tensors)
+                .map(|i| super::nsl_tensor_to_device(unsafe { *list.data.add(i) }, 0))
+                .collect();
+            let tmp_list = crate::list::nsl_list_new();
+            for &cp in &cpu_ptrs {
+                crate::list::nsl_list_push(tmp_list, cp);
+            }
+            let cpu_result = nsl_tensor_cat(tmp_list, dim);
+            let gpu_result = super::nsl_tensor_to_device(cpu_result, source_device as i64);
+            super::nsl_tensor_free(cpu_result);
+            for &cp in &cpu_ptrs {
+                super::nsl_tensor_free(cp);
+            }
+            crate::list::nsl_list_free(tmp_list);
+            gpu_result
+        };
+        // Record the real op against the caller's GPU tensors (identity-only;
+        // split sizes read from the originals along the normalized cat dim).
+        if was_recording {
+            let input_ptrs: Vec<i64> = (0..num_tensors)
+                .map(|i| unsafe { *list.data.add(i) })
+                .collect();
+            let first = NslTensor::from_ptr(input_ptrs[0]);
+            let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
+            let split_sizes: Vec<i64> = input_ptrs
+                .iter()
+                .map(|&p| unsafe { *NslTensor::from_ptr(p).shape.add(d) })
+                .collect();
+            autodiff::maybe_record(autodiff::TapeOp::Cat {
+                inputs: input_ptrs,
+                out: gpu_result,
+                dim,
+                split_sizes,
+            });
         }
-        let cpu_result = nsl_tensor_cat(tmp_list, dim);
-        let gpu_result = super::nsl_tensor_to_device(cpu_result, source_device as i64);
-        super::nsl_tensor_free(cpu_result);
-        for &cp in &cpu_ptrs {
-            super::nsl_tensor_free(cp);
-        }
-        crate::list::nsl_list_free(tmp_list);
         return gpu_result;
     }
 
