@@ -2901,6 +2901,56 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
     dg_ptr
 }
 
+/// P5 slice C — fused RMSNorm dx + residual-gradient fold:
+///   out = dx(dy, x, gamma, eps) + res
+/// Replaces the adjoint-accumulate Add that followed the fused dx op.
+/// Bit-exact with (dx then Add): the epilogue performs the same single
+/// rn-rounded add, and IEEE addition is commutative so either accumulate
+/// operand order matches. Mismatched `res` falls back to dx-then-add.
+#[no_mangle]
+pub extern "C" fn nsl_rmsnorm_dx_backward_add(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    res_ptr: i64,
+    eps: f64,
+) -> i64 {
+    let x = NslTensor::from_ptr(x_ptr);
+    let r = NslTensor::from_ptr(res_ptr);
+    // Fallback for any shape/device/dtype mismatch: the exact decomposed
+    // pair the compiler emitted before the fold.
+    if !r.shape_eq(x) || r.device != x.device || r.dtype != x.dtype {
+        let dx = nsl_rmsnorm_dx_backward(dy_ptr, x_ptr, gamma_ptr, eps);
+        let out = nsl_tensor_add(dx, res_ptr, 0);
+        nsl_tensor_free(dx);
+        return out;
+    }
+
+    #[cfg(feature = "cuda")]
+    if x.device > 0 {
+        let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
+        let dy_c = nsl_tensor_contiguous(dy_dev);
+        let x_c = nsl_tensor_contiguous(x_ptr);
+        let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
+        let g_c = nsl_tensor_contiguous(g_dev);
+        let r_c = nsl_tensor_contiguous(res_ptr);
+        let dx = crate::cuda::gpu_rmsnorm_dx_backward_add_f32(dy_c, x_c, g_c, r_c, eps as f32);
+        nsl_tensor_free(dy_dev);
+        nsl_tensor_free(dy_c);
+        nsl_tensor_free(x_c);
+        nsl_tensor_free(g_dev);
+        nsl_tensor_free(g_c);
+        nsl_tensor_free(r_c);
+        return dx;
+    }
+
+    // CPU: exact dx reference then the same single f64 add.
+    let dx = nsl_rmsnorm_dx_backward(dy_ptr, x_ptr, gamma_ptr, eps);
+    let out = nsl_tensor_add(dx, res_ptr, 0);
+    nsl_tensor_free(dx);
+    out
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_rmsnorm_dx_backward(
     dy_ptr: i64,

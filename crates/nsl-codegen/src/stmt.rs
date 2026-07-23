@@ -7704,6 +7704,14 @@ impl Compiler<'_> {
                 // P5 item 20 slice B: fuse SwiGLU gate-gradient pairs
                 // (bit-exact — see fuse_swiglu_gate_backward).
                 crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
+                // P5 slice C: fold residual-gradient accumulates into fused
+                // RMSNorm dx ops (bit-exact; no-op unless
+                // --fuse-rmsnorm-backward emitted them).
+                let norm_res_folds =
+                    crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &adjoint_needed);
+                if norm_res_folds > 0 {
+                    eprintln!("[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
+                }
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
                 // schedule when NSL_CSLA_REPORT=1. Pure analysis over the final
@@ -14010,6 +14018,8 @@ impl Compiler<'_> {
             // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied
             // on the train path).
             crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &needed);
+            // P5 slice C (residual fold — see the train path).
+            crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &needed);
 
             if !adjoint.ops.is_empty() {
                 // P0.2: arm the gradient-integrity guard for the `grad` block's
