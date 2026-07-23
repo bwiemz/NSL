@@ -46,7 +46,7 @@ fn run(rewrite_gpu: bool, cuda: bool, extra: &[&str]) -> Run {
     if cuda {
         cmd.args(["--features", "cuda"]);
     }
-    cmd.args(["-p", "nsl-cli", "--", "run", "--source-ad"]);
+    cmd.args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     cmd.args(extra);
     cmd.arg(&tmp)
         .current_dir(&root)

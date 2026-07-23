@@ -88,7 +88,7 @@ fn run_program(source: &str, tag: &str, cuda: bool, det: Det, extra_args: &[&str
     }
     cmd.arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad"]);
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     if det == Det::Deterministic {
         cmd.arg("--deterministic");
     }

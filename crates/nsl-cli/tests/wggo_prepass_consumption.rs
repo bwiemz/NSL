@@ -47,7 +47,7 @@ fn run_nsl_env(source: &str, tag: &str, wggo: Option<&str>, envs: &[(&str, &str)
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad"]);
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     if let Some(mode) = wggo {
         cmd.args(["--wggo", mode]);
     }
@@ -241,7 +241,7 @@ fn wggo_off_with_calibration_data_is_chatter_free() {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "build", "--source-ad", "--wggo", "off"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "build", "--source-ad", "--wggo", "off"])
         .arg("--calibration-data")
         .arg(&calib)
         .arg(&prog)

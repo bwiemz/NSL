@@ -44,7 +44,7 @@ fn run_ad(fixture: &str, source_ad: bool, extra_args: &[&str], envs: &[(&str, &s
     let root = repo_root();
     let path = root.join("crates/nsl-cli/tests/fixtures").join(fixture);
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run"]);
+    cmd.args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"]);
     if source_ad {
         cmd.arg("--source-ad");
     }

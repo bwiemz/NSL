@@ -19,7 +19,7 @@ fn workspace_root() -> PathBuf {
 /// Run an NSL script. Returns None if the script fails (graceful skip).
 fn nsl_run(script: &Path, extra_args: &[&str]) -> Option<String> {
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(script)
         .args(extra_args)
         .current_dir(workspace_root())

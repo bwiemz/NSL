@@ -22,7 +22,7 @@
 //! is single-threaded per process, and cross-thread interleaving would only
 //! blur shares, not corrupt memory.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Region ids. Keep in sync with `NAMES`.

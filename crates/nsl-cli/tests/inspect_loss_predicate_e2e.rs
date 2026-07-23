@@ -63,7 +63,7 @@ fn run_with_condition(cond: &str) -> usize {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(&manifest)
-        .args(["-p", "nsl-cli", "--", "run", "--inspect"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--inspect"])
         .arg(&file)
         // .nsl-inspect/ is created relative to the process CWD, so run from
         // the temp dir while cargo resolves the workspace via manifest-path

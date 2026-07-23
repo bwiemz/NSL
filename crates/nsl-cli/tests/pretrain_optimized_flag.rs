@@ -36,7 +36,7 @@ fn run_nsl(args: &[&str], program: &str, tag: &str) -> (bool, String, String) {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .args(args)
         .arg(&prog)
         .current_dir(&tmp)

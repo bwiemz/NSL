@@ -31,7 +31,7 @@ fn e2e_lion_optimizer_trains_and_verifies() {
     let root = workspace_root();
     let example_path = root.join("examples/lion_optimizer_sign_e2e.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
         .current_dir(&root)
         .output()

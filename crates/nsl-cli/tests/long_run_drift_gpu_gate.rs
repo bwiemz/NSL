@@ -46,7 +46,7 @@ fn run(tag: &str, checkpoint: bool) -> RunOutput {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "--features", "cuda", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad", "--deterministic"]);
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad", "--deterministic"]);
     if checkpoint {
         cmd.arg("--checkpoint-blocks");
     }
