@@ -478,16 +478,46 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                 let t_c = nsl_tensor_contiguous(tensor_ptr);
                 let result = crate::cuda::gpu_gather_f32(t_c, indices_ptr);
                 super::nsl_tensor_free(t_c);
+                // Tape record on the GPU arm — mirrors the CPU record site
+                // (indices saved with a refcount bump for backward).
+                if autodiff::is_recording() {
+                    let input_shape = get_shape_vec(NslTensor::from_ptr(tensor_ptr));
+                    NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Gather {
+                        a: tensor_ptr,
+                        out: result,
+                        dim,
+                        indices_ptr,
+                        input_shape,
+                    });
+                }
                 return result;
             }
             // Fallback for non-zero dims: CPU redirect
-            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-            let cpu_i = super::nsl_tensor_to_device(indices_ptr, 0);
-            let result = nsl_tensor_gather(cpu_t, dim, cpu_i);
-            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
-            super::nsl_tensor_free(cpu_t);
-            super::nsl_tensor_free(cpu_i);
-            super::nsl_tensor_free(result);
+            let was_recording = autodiff::is_recording();
+            let gpu_result = {
+                // Pause the tape across the CPU redirect (see nsl_tensor_stack).
+                let _pause = autodiff::TapePause::new();
+                let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+                let cpu_i = super::nsl_tensor_to_device(indices_ptr, 0);
+                let result = nsl_tensor_gather(cpu_t, dim, cpu_i);
+                let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+                super::nsl_tensor_free(cpu_t);
+                super::nsl_tensor_free(cpu_i);
+                super::nsl_tensor_free(result);
+                gpu_result
+            };
+            if was_recording {
+                let input_shape = get_shape_vec(NslTensor::from_ptr(tensor_ptr));
+                NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                autodiff::maybe_record(autodiff::TapeOp::Gather {
+                    a: tensor_ptr,
+                    out: gpu_result,
+                    dim,
+                    indices_ptr,
+                    input_shape,
+                });
+            }
             return gpu_result;
         }
     }
@@ -588,15 +618,41 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
                     let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
                     let result = crate::cuda::gpu_softmax_f32(c_ptr);
                     super::nsl_tensor_free(c_ptr);
+                    // Tape record on the GPU arm — mirrors the CPU record site
+                    // (softmax output saved with a refcount bump for backward).
+                    if autodiff::is_recording() {
+                        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+                        autodiff::maybe_record(autodiff::TapeOp::Softmax {
+                            a: tensor_ptr,
+                            out: result,
+                            saved_out: result,
+                            dim,
+                        });
+                    }
                     return result;
                 }
             }
             // Non-last-dim: CPU redirect
-            let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
-            let result = nsl_tensor_softmax(cpu_t, dim);
-            let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
-            super::nsl_tensor_free(cpu_t);
-            super::nsl_tensor_free(result);
+            let was_recording = autodiff::is_recording();
+            let gpu_result = {
+                // Pause the tape across the CPU redirect (see nsl_tensor_stack).
+                let _pause = autodiff::TapePause::new();
+                let cpu_t = super::nsl_tensor_to_device(tensor_ptr, 0);
+                let result = nsl_tensor_softmax(cpu_t, dim);
+                let gpu_result = super::nsl_tensor_to_device(result, tensor.device as i64);
+                super::nsl_tensor_free(cpu_t);
+                super::nsl_tensor_free(result);
+                gpu_result
+            };
+            if was_recording {
+                NslTensor::from_ptr(gpu_result).refcount.fetch_add(1, Ordering::SeqCst);
+                autodiff::maybe_record(autodiff::TapeOp::Softmax {
+                    a: tensor_ptr,
+                    out: gpu_result,
+                    saved_out: gpu_result,
+                    dim,
+                });
+            }
             return gpu_result;
         }
     }

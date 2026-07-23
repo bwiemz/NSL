@@ -503,6 +503,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    (
+        "nsl_tape_backward_train",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     ("nsl_tape_pause", &[], None),
     ("nsl_tape_resume", &[], None),
     // Gradient checkpointing

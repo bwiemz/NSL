@@ -35,6 +35,18 @@ use super::{ones_from_shape, TapeOp, TAPE};
 /// ReLU backward: grad * (input > 0 ? 1 : 0)
 fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Mixed-device guard: reconcile the grad onto the saved tensor's device —
+    // the produced grad must live where the forward graph lives, and both the
+    // GPU FFI below and the CPU loop assume same-device operands.
+    {
+        let saved = NslTensor::from_ptr(input_ptr);
+        if grad.device != saved.device {
+            let g2 = nsl_tensor_to_device(grad_ptr, saved.device as i64);
+            let r = relu_backward(g2, input_ptr);
+            tensor_free(g2);
+            return r;
+        }
+    }
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
         return crate::cuda::gpu_relu_backward(grad_ptr, input_ptr);
@@ -79,6 +91,18 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 /// GELU backward: gelu'(x) = 0.5*(1+tanh(c*(x+0.044715*x^3))) + 0.5*x*sech^2(c*(x+0.044715*x^3))*c*(1+3*0.044715*x^2)
 fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Mixed-device guard: reconcile the grad onto the saved tensor's device —
+    // the produced grad must live where the forward graph lives, and both the
+    // GPU FFI below and the CPU loop assume same-device operands.
+    {
+        let saved = NslTensor::from_ptr(input_ptr);
+        if grad.device != saved.device {
+            let g2 = nsl_tensor_to_device(grad_ptr, saved.device as i64);
+            let r = gelu_backward(g2, input_ptr);
+            tensor_free(g2);
+            return r;
+        }
+    }
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
         return crate::cuda::gpu_gelu_backward(grad_ptr, input_ptr);
@@ -134,6 +158,18 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 /// SiLU backward: sigmoid(x) * (1 + x * (1 - sigmoid(x)))
 fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Mixed-device guard: reconcile the grad onto the saved tensor's device —
+    // the produced grad must live where the forward graph lives, and both the
+    // GPU FFI below and the CPU loop assume same-device operands.
+    {
+        let saved = NslTensor::from_ptr(input_ptr);
+        if grad.device != saved.device {
+            let g2 = nsl_tensor_to_device(grad_ptr, saved.device as i64);
+            let r = silu_backward(g2, input_ptr);
+            tensor_free(g2);
+            return r;
+        }
+    }
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
         return crate::cuda::gpu_silu_backward(grad_ptr, input_ptr);
@@ -182,6 +218,18 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
 /// Sigmoid backward: out * (1 - out)
 fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Mixed-device guard: reconcile the grad onto the saved tensor's device —
+    // the produced grad must live where the forward graph lives, and both the
+    // GPU FFI below and the CPU loop assume same-device operands.
+    {
+        let saved = NslTensor::from_ptr(out_ptr);
+        if grad.device != saved.device {
+            let g2 = nsl_tensor_to_device(grad_ptr, saved.device as i64);
+            let r = sigmoid_backward(g2, out_ptr);
+            tensor_free(g2);
+            return r;
+        }
+    }
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
         return crate::cuda::gpu_sigmoid_backward(grad_ptr, out_ptr);
@@ -226,6 +274,18 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
 /// Tanh backward: 1 - out^2
 fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Mixed-device guard: reconcile the grad onto the saved tensor's device —
+    // the produced grad must live where the forward graph lives, and both the
+    // GPU FFI below and the CPU loop assume same-device operands.
+    {
+        let saved = NslTensor::from_ptr(out_ptr);
+        if grad.device != saved.device {
+            let g2 = nsl_tensor_to_device(grad_ptr, saved.device as i64);
+            let r = tanh_backward(g2, out_ptr);
+            tensor_free(g2);
+            return r;
+        }
+    }
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
         return crate::cuda::gpu_tanh_backward(grad_ptr, out_ptr);
@@ -1189,6 +1249,21 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
 #[no_mangle]
 pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
+    tape_backward_impl(loss_ptr, param_list, false)
+}
+
+/// Train-block entry: identical to `nsl_tape_backward` but with the
+/// disconnection backstop armed — an all-parameters-zeros backward aborts
+/// loudly instead of silently training on weight decay alone. Grad blocks,
+/// fuzz harnesses, and external FFI callers keep the permissive entry above
+/// (asking for the gradient of an unused input is a legitimate zeros answer
+/// there).
+#[no_mangle]
+pub extern "C" fn nsl_tape_backward_train(loss_ptr: i64, param_list: i64) -> i64 {
+    tape_backward_impl(loss_ptr, param_list, true)
+}
+
+fn tape_backward_impl(loss_ptr: i64, param_list: i64, strict: bool) -> i64 {
     let params_nsl = NslList::from_ptr(param_list);
     let param_ptrs: Vec<i64> = (0..params_nsl.len as usize)
         .map(|i| unsafe { *params_nsl.data.add(i) })
@@ -1207,7 +1282,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
         std::mem::take(&mut tape.ops)
     });
 
-    let result = run_backward_core(ops, loss_ptr, &param_ptrs);
+    let result = run_backward_core_strict(ops, loss_ptr, &param_ptrs, strict);
 
     // Resume recording (paired with the `pause_depth += 1` above).
     TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
@@ -1225,9 +1300,25 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 /// `pause_depth += 1` side effect; a later FFI (Spec B T4) will call this
 /// core with ops moved out of a `GradContext` instead.
 pub(crate) fn run_backward_core(
+    ops: Vec<TapeOp>,
+    loss_ptr: i64,
+    param_ptrs: &[i64],
+) -> i64 {
+    run_backward_core_strict(ops, loss_ptr, param_ptrs, false)
+}
+
+/// `run_backward_core` with a disconnection backstop. When `strict` is set
+/// (the train-block entry `nsl_tape_backward`), a backward in which EVERY
+/// parameter falls back to `zeros_like` aborts loudly: the recorded graph
+/// never reached the model, and "training" would silently proceed on weight
+/// decay alone. Historically this was the reality of every GPU tape-AD train
+/// step — no GPU op arm recorded on the tape. Grad blocks pass `strict=false`
+/// (asking for the gradient of an unused input is a legitimate zeros answer).
+pub(crate) fn run_backward_core_strict(
     mut ops: Vec<TapeOp>,
     loss_ptr: i64,
     param_ptrs: &[i64],
+    strict: bool,
 ) -> i64 {
     // grad_map: tensor_ptr -> gradient tensor ptr
     let mut grad_map: HashMap<i64, i64> = HashMap::new();
@@ -1378,10 +1469,24 @@ pub(crate) fn run_backward_core(
                     if *dim == -1 {
                         // Global reduction: g is scalar, broadcast to input shape
                         let scalar_val = tensor_item(g);
-                        let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
+                        let g_tensor = crate::tensor::NslTensor::from_ptr(g);
+                        let g_dtype = g_tensor.dtype;
+                        let g_device = g_tensor.device;
                         let ones = ones_from_shape(input_shape, g_dtype);
-                        let grad_a = tensor_mul_scalar(ones, scalar_val, 0);
+                        let grad_cpu = tensor_mul_scalar(ones, scalar_val, 0);
                         tensor_free(ones);
+                        // ones_from_shape builds on CPU — keep the grad on the
+                        // graph's device or every downstream arm sees a CPU
+                        // grad against GPU saved tensors (host deref of a
+                        // device pointer; see reduce_grad_for_broadcast's
+                        // 2026-07-14 deferral-closure note for the twin bug).
+                        let grad_a = if g_device > 0 {
+                            let up = nsl_tensor_to_device(grad_cpu, g_device as i64);
+                            tensor_free(grad_cpu);
+                            up
+                        } else {
+                            grad_cpu
+                        };
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
                         // Dimensional reduction: broadcast g along reduced dim
@@ -1395,10 +1500,20 @@ pub(crate) fn run_backward_core(
                     if *dim == -1 {
                         // Global reduction
                         let scalar_val = tensor_item(g);
-                        let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
+                        let g_tensor = crate::tensor::NslTensor::from_ptr(g);
+                        let g_dtype = g_tensor.dtype;
+                        let g_device = g_tensor.device;
                         let ones = ones_from_shape(input_shape, g_dtype);
-                        let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64), 0);
+                        let grad_cpu = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64), 0);
                         tensor_free(ones);
+                        // Keep the grad on the graph's device (see SumReduce).
+                        let grad_a = if g_device > 0 {
+                            let up = nsl_tensor_to_device(grad_cpu, g_device as i64);
+                            tensor_free(grad_cpu);
+                            up
+                        } else {
+                            grad_cpu
+                        };
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
                         // Dimensional reduction: broadcast then scale
@@ -1872,17 +1987,37 @@ pub(crate) fn run_backward_core(
 
     // Build result list: look up by tape_id when active, raw ptr fallback
     let result_list = crate::list::nsl_list_new();
+    let mut zeros_fallbacks = 0usize;
     for ptr in param_ptrs {
         let key = { let t = crate::tensor::NslTensor::from_ptr(*ptr); if t.tape_id != 0 { t.tape_id } else { *ptr } };
         if let Some(grad) = grad_map.remove(&key) {
             crate::list::nsl_list_push(result_list, grad);
         } else {
             // No gradient computed for this param — return zeros_like
+            zeros_fallbacks += 1;
             let shape_list = tensor_shape(*ptr);
             let zeros = tensor_zeros(shape_list);
             crate::list::nsl_list_free(shape_list);
             crate::list::nsl_list_push(result_list, zeros);
         }
+    }
+
+    // Disconnection backstop (see run_backward_core_strict doc).
+    if strict
+        && !param_ptrs.is_empty()
+        && zeros_fallbacks == param_ptrs.len()
+        && std::env::var("NSL_TAPE_ALLOW_DISCONNECTED").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "[tape-ad] FATAL: backward produced a gradient for NONE of the {} parameters — \
+             the recorded graph is disconnected from the loss ({} tape ops). Either the loss \
+             does not depend on the model, or a forward op skipped tape recording. Training \
+             would silently degenerate to weight-decay-only updates. Use --source-ad (the \
+             production AD path), or set NSL_TAPE_ALLOW_DISCONNECTED=1 to proceed anyway.",
+            param_ptrs.len(),
+            ops.len(),
+        );
+        std::process::abort();
     }
 
     // Free all remaining intermediate gradient tensors (seed, activation grads, etc.)

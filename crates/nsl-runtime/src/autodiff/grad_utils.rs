@@ -7,6 +7,7 @@ use crate::tensor::{
     nsl_tensor_free as tensor_free,
     nsl_tensor_ones_like as nsl_tensor_ones_like,
     nsl_tensor_sum_dim,
+    nsl_tensor_to_device,
     NslTensor,
 };
 
@@ -298,6 +299,18 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
 /// grad has the reduced shape; we need to expand it along `dim` to match input_shape.
 pub(crate) fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Device bounce: the loop below reads grad data through host pointers.
+    // GPU grads round-trip through the CPU and the result returns to the
+    // grad's device (maxpool2d_backward pattern).
+    if grad.device > 0 {
+        let device = grad.device as i64;
+        let cpu_g = nsl_tensor_to_device(grad_ptr, 0);
+        let cpu_out = broadcast_grad_along_dim(cpu_g, input_shape, dim);
+        let gpu_out = nsl_tensor_to_device(cpu_out, device);
+        tensor_free(cpu_g);
+        tensor_free(cpu_out);
+        return gpu_out;
+    }
     let ndim = input_shape.len();
     let grad_dtype = grad.dtype;
 
@@ -363,6 +376,16 @@ pub(crate) fn scatter_grad_to_argmax(
     argmax: &[usize],
 ) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
+    // Device bounce (see broadcast_grad_along_dim).
+    if grad.device > 0 {
+        let device = grad.device as i64;
+        let cpu_g = nsl_tensor_to_device(grad_ptr, 0);
+        let cpu_out = scatter_grad_to_argmax(cpu_g, input_shape, dim, argmax);
+        let gpu_out = nsl_tensor_to_device(cpu_out, device);
+        tensor_free(cpu_g);
+        tensor_free(cpu_out);
+        return gpu_out;
+    }
     let ndim = input_shape.len();
     let grad_dtype = grad.dtype;
     // Create zero output with input_shape, matching grad dtype

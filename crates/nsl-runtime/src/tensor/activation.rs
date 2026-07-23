@@ -24,7 +24,15 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Exp {
+                        a: tensor_ptr, out: result, saved_out: result,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -110,7 +118,15 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Log {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -196,7 +212,15 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Sqrt {
+                        a: tensor_ptr, out: result, saved_out: result,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -282,7 +306,15 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Abs {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -449,7 +481,15 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_clamp_f32(tensor_ptr, min_val as f32, max_val as f32);
+                let result = crate::cuda::gpu_clamp_f32(tensor_ptr, min_val as f32, max_val as f32);
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Clamp {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr, min_val, max_val,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -598,7 +638,15 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::ReLU {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -692,7 +740,15 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::GELU {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -788,7 +844,15 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::SiLU {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -1442,7 +1506,15 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Sigmoid {
+                        a: tensor_ptr, out: result, saved_out: result,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -1536,7 +1608,15 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Tanh {
+                        a: tensor_ptr, out: result, saved_out: result,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }

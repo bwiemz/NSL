@@ -16,7 +16,15 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIN_F32_PTX, "nsl_sin_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIN_F32_PTX, "nsl_sin_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Sin {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }
@@ -72,7 +80,15 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::COS_F32_PTX, "nsl_cos_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::COS_F32_PTX, "nsl_cos_f32\0");
+                // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
+                if autodiff::is_recording() {
+                    NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    autodiff::maybe_record(autodiff::TapeOp::Cos {
+                        a: tensor_ptr, out: result, saved_a: tensor_ptr,
+                    });
+                }
+                return result;
             }
             #[cfg(not(feature = "cuda"))]
             { panic!("CUDA support not compiled"); }

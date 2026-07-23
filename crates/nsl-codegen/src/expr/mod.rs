@@ -371,12 +371,37 @@ impl Compiler<'_> {
                             | "tanh"
                             | "softmax"
                             | "log_softmax"
+                            | "mean"
+                            | "sum"
                     );
                 }
                 false
             }
             _ => false,
         }
+    }
+
+    /// True when `expr` is a call whose result is guaranteed to be an OWNING
+    /// reference: either a fresh-tensor builtin (allowlist above) or a call
+    /// to a compiled NSL function (`registry.functions` — user code and the
+    /// NSL-level stdlib). A compiled function's Return arm always hands back
+    /// an owning ref (Owned results transfer; Borrowed/Unknown results are
+    /// retained before return), so treating the call result as Unknown and
+    /// retaining AGAIN double-owns it — the caller then frees once and one
+    /// reference strands. That double-own was the last per-step leak on the
+    /// tape path (mse_loss's `return mean(...)`) and a per-call leak for any
+    /// user fn returning another user fn's result.
+    pub(crate) fn expr_call_returns_owning_ref(&self, expr: &Expr) -> bool {
+        if self.expr_result_is_owned_temporary(expr) {
+            return true;
+        }
+        if let ExprKind::Call { callee, .. } = &expr.kind {
+            if let ExprKind::Ident(sym) = &callee.kind {
+                let name = self.resolve_sym(*sym);
+                return self.registry.functions.contains_key(name);
+            }
+        }
+        false
     }
 
     /// Call-like expression lowering bypasses the per-op temporary registration

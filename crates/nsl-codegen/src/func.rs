@@ -172,34 +172,11 @@ impl Compiler<'_> {
                 self.free_tensor_temporaries(&mut builder, &mut state, None);
                 // M38b: Free linear tensors consumed during the function body
                 self.free_linear_consumes(&mut builder, &mut state, None);
-                // Free all I64-typed local variables (potential tensors) that are not
-                // function parameters. Uses nsl_tensor_free_if_valid which safely
-                // ignores non-tensor pointers (scalars, null, small integers).
-                // This handles imported stdlib functions whose NodeIds aren't in the
-                // local type_map — the variable_types would show Unknown, but the
-                // actual values are tensor pointers that must be freed.
-                {
-                    let param_syms: std::collections::HashSet<nsl_ast::Symbol> =
-                        fn_def.params.iter().map(|p| p.name).collect();
-                    let locals: Vec<_> = state.variables.iter()
-                        .filter(|(sym, _)| !param_syms.contains(sym))
-                        .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
-                        .filter_map(|(_, (var, cl_type))| {
-                            // Only I64 values can be tensor pointers
-                            if *cl_type == cl_types::I64 {
-                                Some(*var)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for var in locals {
-                        let val = builder.use_var(var);
-                        let _ = self.compile_call_by_name(
-                            &mut builder, "nsl_tensor_free_if_valid", &[val],
-                        );
-                    }
-                }
+                // Free all I64-typed local variables (potential tensors) that are
+                // not function parameters — shared with the explicit-Return arm
+                // (see emit_return_local_sweep; filters on state.param_symbols,
+                // populated from fn_def.params at function entry above).
+                self.emit_return_local_sweep(&mut builder, &mut state);
                 // Stop and free any DataLoaders before implicit function return
                 self.teardown_dataloaders(&mut builder, &mut state);
                 // @no_grad: resume tape before implicit return

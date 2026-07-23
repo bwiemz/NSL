@@ -395,6 +395,7 @@ impl Compiler<'_> {
                         builder.declare_var(self_var, pointer_type());
                         builder.def_var(self_var, state_ptr_val);
                         state.variables.insert(self_sym, (self_var, pointer_type()));
+                        state.param_symbols.insert(self_sym);
 
                         // Bind remaining params (skip "self" in the AST).
                         let mut cl_param_idx = 1usize;
@@ -413,6 +414,7 @@ impl Compiler<'_> {
                             builder.declare_var(var, cl_type);
                             builder.def_var(var, param_val);
                             state.variables.insert(param.name, (var, cl_type));
+                            state.param_symbols.insert(param.name);
                             cl_param_idx += 1;
                         }
 

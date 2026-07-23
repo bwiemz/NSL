@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — tape-AD on GPU computed ZERO gradients (silent), plus the per-step tensor leaks
+
+- **GPU ops now record on the autodiff tape.** Every GPU arm in the tensor
+  FFIs (add/sub/mul/div/neg/scalar ops/matmul, exp/log/sqrt/abs/clamp/
+  relu/gelu/silu/sigmoid/tanh, sin/cos, stack/slice/cat, gather/softmax,
+  embedding_lookup/bias_add) returned before the CPU path's `maybe_record`,
+  so a train block WITHOUT `--source-ad` on GPU taped almost nothing,
+  every parameter gradient fell back to `zeros_like`, and "training"
+  moved on weight decay alone (~0.02%/step loss drift). Records now mirror
+  the CPU conventions exactly (saved-ref bumps ordered before relinquish
+  frees); CPU-redirect wrappers (stack/cat/gather/softmax/log_softmax)
+  pause the tape across the redirect (`TapePause`) and record the real op
+  against the caller's tensors; FBIP in-place arms are defensively gated
+  on `!is_recording()`. The tape backward is now device-safe: the
+  SumReduce/MeanReduce global arms keep grads on the graph's device,
+  `broadcast_grad_along_dim`/`scatter_grad_to_argmax` bounce through the
+  CPU, and the raw activation-backward helpers reconcile mixed
+  grad/saved devices.
+- **Disconnection backstop:** `nsl_tape_backward` (train entry) now aborts
+  loudly when the backward produces a gradient for NONE of the parameters
+  — the silent zero-grad failure mode is a hard error with an actionable
+  message (`NSL_TAPE_ALLOW_DISCONNECTED=1` escape hatch; grad blocks keep
+  the permissive zeros answer for unused inputs).
+- **Explicit-`return` paths now free function locals.** Only the implicit
+  fall-off-the-end path swept I64 locals; every `let`-bound tensor local
+  in a function ending with `return <expr>` leaked its final reference
+  (`mse_loss`'s `diff`, residual-block `f`s, loop-carried `h`s) — the
+  tape-mode per-step leak AND a large slice of the `@no_grad` inference
+  leak. The sweep is shared (`emit_return_local_sweep`) and
+  `state.param_symbols` is now populated on EVERY function-body compile
+  path (model methods/constructors/export methods, dtype methods, agent
+  fns, train callbacks) so the sweep can never free caller-owned params.
+- **`return <call>(...)` no longer double-owns the result.** Calls to
+  compiled NSL functions (and fresh-tensor builtins, now incl. mean/sum)
+  contractually return an owning reference; the Return arm's conservative
+  Unknown-retain added a second owner and stranded one tensor per call.
+- **Tape-path train epilogue owns the loss** (both the pure-tape arm and
+  the source-AD extraction-failure fallback), closing the last +1/step.
+- Gates: `mse_leak_gate.rs` now runs BOTH paths — source-AD and tape-AD
+  exact-flat live_blocks (post optimizer-state warmup) plus a loss-descent
+  assert on the tape path (live_blocks stays plausible under zero-grad;
+  only the descent assert catches it). Debug tooling added (permanent,
+  env-gated): `NSL_DEBUG_MEM_TRACE=1` traces allocator handout/free with
+  pointer+context, tensor frees with pre-decrement refcount, and tape
+  record/release events.
+
 ### Added — Fusion queue: multi-tensor fused AdamW + GPU-native cross-entropy backward
 
 - **Multi-tensor fused AdamW** (always on for eligible configs;

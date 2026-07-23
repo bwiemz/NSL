@@ -316,11 +316,62 @@ pub fn pop_last_op() {
     TAPE.with(|t| { t.borrow_mut().ops.pop(); });
 }
 
+/// Leak-hunt trace (`NSL_DEBUG_MEM_TRACE=1`): one-line summary of a tape op's
+/// identity ids and saved (refcount-bumped) pointers.
+fn tape_op_trace(op: &TapeOp) -> String {
+    match op {
+        TapeOp::Add { a, b, out, .. } => format!("Add a={a} b={b} out={out}"),
+        TapeOp::Sub { a, b, out, .. } => format!("Sub a={a} b={b} out={out}"),
+        TapeOp::Mul { a, b, out, saved_a, saved_b, .. } => {
+            format!("Mul a={a} b={b} out={out} saved_a={saved_a:#x} saved_b={saved_b:#x}")
+        }
+        TapeOp::Div { a, b, out, saved_a, saved_b, .. } => {
+            format!("Div a={a} b={b} out={out} saved_a={saved_a:#x} saved_b={saved_b:#x}")
+        }
+        TapeOp::MatMul { a, b, out, saved_a, saved_b } => {
+            format!("MatMul a={a} b={b} out={out} saved_a={saved_a:#x} saved_b={saved_b:#x}")
+        }
+        TapeOp::SiLU { a, out, saved_a } => format!("SiLU a={a} out={out} saved_a={saved_a:#x}"),
+        TapeOp::MulScalar { a, out, scalar } => format!("MulScalar a={a} out={out} s={scalar}"),
+        TapeOp::AddScalar { a, out } => format!("AddScalar a={a} out={out}"),
+        TapeOp::Neg { a, out } => format!("Neg a={a} out={out}"),
+        TapeOp::SumReduce { a, out, dim, .. } => format!("SumReduce a={a} out={out} dim={dim}"),
+        TapeOp::MeanReduce { a, out, dim, .. } => format!("MeanReduce a={a} out={out} dim={dim}"),
+        TapeOp::Transpose { a, out, .. } => format!("Transpose a={a} out={out}"),
+        _ => format!("(other op discriminant {:?})", std::mem::discriminant(op)),
+    }
+}
+
+/// RAII guard: pause tape recording for a scope. Used by GPU wrappers that
+/// redirect through the CPU implementation of the same op — without the pause
+/// the inner CPU call records a node whose ids are short-lived transfer temps
+/// (a garbage edge that never connects to the live graph); the wrapper records
+/// the real op at its own level against the caller's tensors instead.
+pub(crate) struct TapePause;
+impl TapePause {
+    pub(crate) fn new() -> Self {
+        TAPE.with(|t| t.borrow_mut().pause_depth += 1);
+        TapePause
+    }
+}
+impl Drop for TapePause {
+    fn drop(&mut self) {
+        TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
+    }
+}
+
 /// Records an operation on the tape if recording is active.
 /// Converts identity fields from raw pointers to tape_ids via assign_ids.
 pub fn maybe_record(mut op: TapeOp) {
     if !is_recording() { return; }
-    TAPE.with(|t| { let mut tape = t.borrow_mut(); op.assign_ids(&mut tape); tape.ops.push(op); });
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+        op.assign_ids(&mut tape);
+        if crate::tensor::tensor_trace_on() {
+            eprintln!("[tape-trace] record {}", tape_op_trace(&op));
+        }
+        tape.ops.push(op);
+    });
 }
 
 /// Start recording operations on the tape.
@@ -368,6 +419,9 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
 /// Must be called before clearing ops to prevent refcount leaks.
 pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
     for op in ops.iter() {
+        if crate::tensor::tensor_trace_on() {
+            eprintln!("[tape-trace] release {}", tape_op_trace(op));
+        }
         match op {
             TapeOp::Mul { saved_a, saved_b, .. }
             | TapeOp::Div { saved_a, saved_b, .. }
