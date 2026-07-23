@@ -1088,6 +1088,20 @@ impl AdjointGenerator {
             // gradient.  That bug surfaced as "w_norm delta = 0" in the
             // end-to-end CSHA GPU smoke on 2026-04-16.
             AdjointExpr::RmsNormGammaBackward(y_bar, x, eps_val, weight) => {
+                // P5 item 20 slice A: fused single-op path (two deterministic
+                // GPU launches inside the FFI, no [rows, cols] temporaries),
+                // opt-in behind the same flag as the dx fusion. eps rides
+                // bit-exact in the passthrough name; `weight` supplies the
+                // output shape.
+                if self.fuse_rmsnorm_backward {
+                    return self.emit_op(
+                        PrimalOp::Passthrough(format!(
+                            "rmsnorm_dgamma_backward:{}",
+                            eps_val.to_bits()
+                        )),
+                        vec![y_bar, x, weight],
+                    );
+                }
                 // Recompute rms = sqrt(mean(x^2) + eps) over the last dim,
                 // keepdim so it broadcasts against x.
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x, x]);
@@ -1511,6 +1525,186 @@ impl AdjointGenerator {
 // ---------------------------------------------------------------------------
 
 /// Prune backward ops whose results are never needed by any parameter gradient.
+/// P5 item 20 slice B: fuse the SwiGLU gate-gradient pair.
+///
+/// For `f = silu(g) * u` the adjoint contains
+///     t  = Mul(y_bar, u)                  (gate-branch upstream grad)
+///     dg = Passthrough("silu_backward")(t, g)
+/// When `t` has exactly ONE reader (that silu_backward), rewrite to
+///     dg = Passthrough("swiglu_gate_backward")(y_bar, u, g)
+/// and drop the Mul — one launch and one full-size temporary saved per
+/// SwiGLU per micro-step. BIT-EXACT: the fused kernel computes
+/// `t = mul.rn(y_bar, u)` exactly as the standalone Mul kernel rounds it,
+/// then runs the identical silu-backward sequence (see
+/// `SWIGLU_GATE_BACKWARD_F32_PTX` / the FFI's CPU arm).
+///
+/// Returns the number of pairs fused. Op ids are renumbered positionally
+/// (they are positional-only at every call site — the CCR splice does the
+/// same).
+/// P5 slice C: fold the residual-gradient accumulate into the fused
+/// RMSNorm dx op.
+///
+/// Residual blocks produce
+///     dxv = Passthrough("rmsnorm_dx_backward:<eps>")(dy, x, gamma)
+///     acc = Add(other, dxv)        (or Add(dxv, other))
+/// When `dxv` has exactly ONE reader (that Add) and is not itself a needed
+/// gradient, rewrite the Add into
+///     acc = Passthrough("rmsnorm_dx_backward_add:<eps>")(dy, x, gamma, other)
+/// and drop the dx op — one launch and one full-size temporary saved per
+/// residual+norm block per micro-step. BIT-EXACT: the kernel's epilogue
+/// performs the same single rn-rounded add the standalone Add kernel did,
+/// and IEEE addition is commutative so both operand orders match.
+///
+/// Only fires when `--fuse-rmsnorm-backward` emitted the dx passthrough.
+/// `NSL_FUSE_NORM_RESIDUAL=0` (compile-time env) disables the fold for
+/// differential gating. Ops are renumbered positionally.
+pub fn fuse_rmsnorm_dx_residual(
+    ops: &mut Vec<crate::wengert::WengertOp>,
+    needed: &std::collections::HashSet<crate::wengert::VarId>,
+) -> usize {
+    use crate::wengert::PrimalOp;
+    use std::collections::HashMap;
+
+    if std::env::var("NSL_FUSE_NORM_RESIDUAL").ok().as_deref() == Some("0") {
+        return 0;
+    }
+    debug_assert!(
+        !ops.iter().any(|op| matches!(op.op, PrimalOp::FreeTensor)),
+        "fuse_rmsnorm_dx_residual must run before free insertion"
+    );
+
+    let mut reads: HashMap<crate::wengert::VarId, usize> = HashMap::new();
+    let mut producer: HashMap<crate::wengert::VarId, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for inp in &op.inputs {
+            *reads.entry(*inp).or_default() += 1;
+        }
+        producer.insert(op.result, i);
+    }
+
+    let is_dx = |op: &crate::wengert::WengertOp| -> Option<String> {
+        if let PrimalOp::Passthrough(name) = &op.op {
+            if let Some(suffix) = name.strip_prefix("rmsnorm_dx_backward:") {
+                if op.inputs.len() == 3 {
+                    return Some(suffix.to_string());
+                }
+            }
+        }
+        None
+    };
+
+    let mut remove: Vec<usize> = Vec::new();
+    for i in 0..ops.len() {
+        if !matches!(ops[i].op, PrimalOp::Add) || ops[i].inputs.len() != 2 {
+            continue;
+        }
+        // Try each operand as the dx product (accumulate emits both orders).
+        let (a, b) = (ops[i].inputs[0], ops[i].inputs[1]);
+        let cand = [(a, b), (b, a)].into_iter().find_map(|(dxv, other)| {
+            if reads.get(&dxv).copied() != Some(1) || needed.contains(&dxv) {
+                return None;
+            }
+            let &j = producer.get(&dxv)?;
+            if j >= i || remove.contains(&j) {
+                return None;
+            }
+            let suffix = is_dx(&ops[j])?;
+            Some((j, other, suffix))
+        });
+        let Some((j, other, suffix)) = cand else { continue };
+        let (dy, xv, gv) = (ops[j].inputs[0], ops[j].inputs[1], ops[j].inputs[2]);
+        ops[i].op = PrimalOp::Passthrough(format!("rmsnorm_dx_backward_add:{suffix}"));
+        ops[i].inputs = vec![dy, xv, gv, other];
+        remove.push(j);
+    }
+    if remove.is_empty() {
+        return 0;
+    }
+    let fused = remove.len();
+    let removed: std::collections::HashSet<usize> = remove.into_iter().collect();
+    let mut idx = 0;
+    ops.retain(|_| {
+        let keep = !removed.contains(&idx);
+        idx += 1;
+        keep
+    });
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.id = i as u32;
+    }
+    fused
+}
+
+pub fn fuse_swiglu_gate_backward(
+    ops: &mut Vec<crate::wengert::WengertOp>,
+    needed: &std::collections::HashSet<crate::wengert::VarId>,
+) -> usize {
+    use crate::wengert::PrimalOp;
+    use std::collections::HashMap;
+
+    // Both in-tree call sites run right after eliminate_dead_gradients and
+    // BEFORE the CCR splice, so no FreeTensor markers exist yet — fusing
+    // across a free would hoist a read past it (review L3).
+    debug_assert!(
+        !ops.iter().any(|op| matches!(op.op, PrimalOp::FreeTensor)),
+        "fuse_swiglu_gate_backward must run before free insertion"
+    );
+
+    let mut reads: HashMap<crate::wengert::VarId, usize> = HashMap::new();
+    let mut producer: HashMap<crate::wengert::VarId, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for inp in &op.inputs {
+            *reads.entry(*inp).or_default() += 1;
+        }
+        producer.insert(op.result, i);
+    }
+
+    let mut remove: Vec<usize> = Vec::new();
+    for i in 0..ops.len() {
+        let is_silu_bwd = matches!(
+            &ops[i].op,
+            PrimalOp::Passthrough(name) if name == "silu_backward"
+        );
+        if !is_silu_bwd || ops[i].inputs.len() != 2 {
+            continue;
+        }
+        let ds = ops[i].inputs[0];
+        let g = ops[i].inputs[1];
+        if reads.get(&ds).copied() != Some(1) {
+            continue; // the product is read elsewhere — keep it materialized
+        }
+        if needed.contains(&ds) {
+            continue; // the product IS a needed gradient output — keep it
+        }
+        let Some(&j) = producer.get(&ds) else { continue };
+        if j >= i || remove.contains(&j) {
+            continue;
+        }
+        if !matches!(ops[j].op, PrimalOp::Mul) || ops[j].inputs.len() != 2 {
+            continue;
+        }
+        let y_bar = ops[j].inputs[0];
+        let u = ops[j].inputs[1];
+        ops[i].op = PrimalOp::Passthrough("swiglu_gate_backward".into());
+        ops[i].inputs = vec![y_bar, u, g];
+        remove.push(j);
+    }
+    if remove.is_empty() {
+        return 0;
+    }
+    let fused = remove.len();
+    let removed: std::collections::HashSet<usize> = remove.into_iter().collect();
+    let mut idx = 0;
+    ops.retain(|_| {
+        let keep = !removed.contains(&idx);
+        idx += 1;
+        keep
+    });
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.id = i as u32;
+    }
+    fused
+}
+
 pub fn eliminate_dead_gradients(
     adjoint_ops: &[WengertOp],
     needed_vars: &HashSet<VarId>,
@@ -4795,6 +4989,107 @@ impl<'a> WengertExtractor<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rmsnorm_residual_fold_fuses_both_operand_orders() {
+        use crate::wengert::{PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        for dx_first in [true, false] {
+            // dxv = rmsnorm_dx_backward(dy=10, x=11, g=12); acc = Add(...)
+            let add_inputs = if dx_first { vec![100, 20] } else { vec![20, 100] };
+            let mut ops = vec![
+                op(0, 100, PrimalOp::Passthrough("rmsnorm_dx_backward:42".into()), vec![10, 11, 12]),
+                op(1, 101, PrimalOp::Add, add_inputs),
+            ];
+            let fused = super::fuse_rmsnorm_dx_residual(&mut ops, &Default::default());
+            assert_eq!(fused, 1, "dx_first={dx_first}");
+            assert_eq!(ops.len(), 1);
+            assert!(matches!(
+                &ops[0].op,
+                PrimalOp::Passthrough(n) if n == "rmsnorm_dx_backward_add:42"
+            ));
+            assert_eq!(ops[0].inputs, vec![10, 11, 12, 20], "dx_first={dx_first}");
+            assert_eq!(ops[0].result, 101, "the Add's result survives");
+        }
+    }
+
+    #[test]
+    fn rmsnorm_residual_fold_keeps_multi_reader_dx() {
+        use crate::wengert::{PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        let mut ops = vec![
+            op(0, 100, PrimalOp::Passthrough("rmsnorm_dx_backward:42".into()), vec![10, 11, 12]),
+            op(1, 101, PrimalOp::Add, vec![100, 20]),
+            op(2, 102, PrimalOp::Mul, vec![100, 101]),
+        ];
+        let fused = super::fuse_rmsnorm_dx_residual(&mut ops, &Default::default());
+        assert_eq!(fused, 0);
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn swiglu_peephole_fuses_single_reader_pair() {
+        use crate::wengert::{PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        // t = Mul(yb=10, u=11); dg = silu_backward(t, g=12)
+        let mut ops = vec![
+            op(0, 100, PrimalOp::Mul, vec![10, 11]),
+            op(1, 101, PrimalOp::Passthrough("silu_backward".into()), vec![100, 12]),
+        ];
+        let fused = super::fuse_swiglu_gate_backward(&mut ops, &Default::default());
+        assert_eq!(fused, 1);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0].op,
+            PrimalOp::Passthrough(n) if n == "swiglu_gate_backward"
+        ));
+        assert_eq!(ops[0].inputs, vec![10, 11, 12]);
+        assert_eq!(ops[0].id, 0, "ids renumbered positionally");
+    }
+
+    #[test]
+    fn swiglu_peephole_keeps_multi_reader_product() {
+        use crate::wengert::{PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id,
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        // t read by silu_backward AND a later Add — must stay materialized.
+        let mut ops = vec![
+            op(0, 100, PrimalOp::Mul, vec![10, 11]),
+            op(1, 101, PrimalOp::Passthrough("silu_backward".into()), vec![100, 12]),
+            op(2, 102, PrimalOp::Add, vec![100, 101]),
+        ];
+        let fused = super::fuse_swiglu_gate_backward(&mut ops, &Default::default());
+        assert_eq!(fused, 0);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(&ops[1].op, PrimalOp::Passthrough(n) if n == "silu_backward"));
+    }
+
     use super::*;
     use crate::wengert::{PrimalOp, WengertList, WengertOp};
 

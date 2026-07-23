@@ -59,7 +59,17 @@ fn nsl_run_with_args(fixture: &Path, workdir: &Path, extra: &[&str]) {
     let mut cmd = std::process::Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "--manifest-path"])
         .arg(&cargo_toml)
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli"]);
+    if cfg!(feature = "cuda") {
+        // Feature-compatibility guard: an unfeatured `cargo run -p nsl-cli`
+        // REBUILDS AND REPLACES target/debug/nsl as a non-CUDA binary while
+        // the workspace suite runs, breaking every concurrently-running test
+        // that spawns that path (phantom "CUDA support not compiled"
+        // failures inside their trained programs). Forward cuda so the
+        // spawned build matches the suite's binary (and is usually a no-op).
+        cmd.args(["--features", "cuda"]);
+    }
+    cmd.args(["--", "run"])
         .arg(fixture)
         .current_dir(workdir)
         .env("NSL_STDLIB_PATH", &stdlib_path);

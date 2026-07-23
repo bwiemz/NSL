@@ -606,6 +606,45 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let logits_c = nsl_tensor_contiguous(logits_ptr);
     let targets_c = nsl_tensor_contiguous(targets_ptr);
     let grad_out_c = nsl_tensor_contiguous(grad_output_ptr);
+    // Fusion item 2: fully device-resident backward — no [N,C] host bounce,
+    // no grad_output readback (loss epilogue stays cuda-graph-capturable).
+    // f32-vs-f64 rounding differs from the CPU bounce at ~1e-6 relative;
+    // NSL_GPU_CE_BACKWARD=0 restores the old path.
+    #[cfg(feature = "cuda")]
+    {
+        static GPU_CE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *GPU_CE.get_or_init(|| {
+            std::env::var("NSL_GPU_CE_BACKWARD").ok().as_deref() != Some("0")
+        });
+        let lg = NslTensor::from_ptr(logits_c);
+        let tg = NslTensor::from_ptr(targets_c);
+        // Review B1/B2/B3 admission tightening: 2-D only (the CPU arm's
+        // shape[0]/shape[1] math diverges on 3-D — parity means matching
+        // reachable behavior, not extending it); a device-resident
+        // grad_output scalar must be f32 (anything else bounces so its real
+        // value is honored, never silently 1.0); targets must cover rows.
+        let go_hdr = NslTensor::from_ptr(grad_out_c);
+        let go_ok = go_hdr.len != 1 || go_hdr.device == 0 || go_hdr.dtype == 1;
+        let rows = if lg.ndim == 2 { unsafe { *lg.shape } } else { 0 };
+        if enabled
+            && lg.device > 0
+            && lg.dtype == 1
+            && lg.ndim == 2
+            && lg.len <= u32::MAX as i64
+            && tg.device == lg.device
+            && (tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32)
+            && tg.len >= rows
+            && go_ok
+        {
+            let out = crate::cuda::gpu_cross_entropy_backward_f32(
+                logits_c, targets_c, grad_out_c,
+            );
+            nsl_tensor_free(logits_c);
+            nsl_tensor_free(targets_c);
+            nsl_tensor_free(grad_out_c);
+            return out;
+        }
+    }
     let out_device = NslTensor::from_ptr(logits_c).device;
     let (logits_cpu, logits_needs_free) = if NslTensor::from_ptr(logits_c).device > 0 {
         (nsl_tensor_to_device(logits_c, 0), true)
@@ -651,7 +690,7 @@ pub extern "C" fn nsl_cross_entropy_backward(
     let go = if grad_out.len == 1 {
         match grad_out.dtype {
             1 => (unsafe { *grad_out.data_f32() }) as f64,
-            4 => unsafe { *(grad_out.data as *const i32) as f64 },
+            crate::tensor::DTYPE_I32 => unsafe { *(grad_out.data as *const i32) as f64 },
             _ => unsafe { *grad_out.data_f64() },
         }
     } else {
@@ -832,7 +871,6 @@ pub extern "C" fn nsl_l1_backward(
     }
     let out_device = pred_hdr.device;
     let n = pred_hdr.len as usize;
-    let dtype = pred_hdr.dtype;
 
     // Pull grad_output to CPU to read its scalar value.
     let grad_out_cpu = if NslTensor::from_ptr(grad_output_ptr).device > 0 {
@@ -874,14 +912,20 @@ pub extern "C" fn nsl_l1_backward(
     let pred = NslTensor::from_ptr(pred_cpu);
     let target = NslTensor::from_ptr(target_cpu);
 
-    let elem_size = if dtype == 1 {
+    // Branch on the CPU-RESIDENT dtype, not the original device dtype:
+    // `nsl_tensor_to_device(x, 0)` widens device f32 to CPU f64, so a GPU
+    // f32 pred arrives here as f64 — reading it through data_f32() tripped
+    // the accessor assert (P5 fix). The output tensor is built with the
+    // same CPU dtype; publish converts back for the device as usual.
+    let cpu_dtype = pred.dtype;
+    let elem_size = if cpu_dtype == 1 {
         std::mem::size_of::<f32>()
     } else {
         std::mem::size_of::<f64>()
     };
     let out_data = checked_alloc(n * elem_size);
 
-    if dtype == 1 {
+    if cpu_dtype == 1 {
         let p = pred.data_f32();
         let t = target.data_f32();
         let d = out_data as *mut f32;
@@ -924,7 +968,7 @@ pub extern "C" fn nsl_l1_backward(
         ndim,
         n as i64,
         0,
-        dtype,
+        cpu_dtype,
         1,
         0,
     ));
@@ -1731,7 +1775,7 @@ mod tests {
             unsafe { *logits_t.data_f32().add(index) = *value; }
         }
 
-        let targets = create_tensor_with_shape_rs_dtype(&[2], 4);
+        let targets = create_tensor_with_shape_rs_dtype(&[2], crate::tensor::DTYPE_I32);
         let targets_t = NslTensor::from_ptr(targets);
         unsafe {
             *targets_t.data_i32().add(0) = 0;
@@ -1792,6 +1836,119 @@ mod tests {
         // N=2, expected = 3 * 2 * (p-t) / 2 = 3 * (p-t) = [15, 15].
         assert!((vals[0] - 15.0).abs() < 1e-6, "vals[0]={}", vals[0]);
         assert!((vals[1] - 15.0).abs() < 1e-6, "vals[1]={}", vals[1]);
+        nsl_tensor_free(pred);
+        nsl_tensor_free(target);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(grad);
+    }
+
+    /// Fusion item 2: the GPU-native CE backward must match the CPU bounce
+    /// path elementwise (f32 kernel vs f64 host math -> tolerance), zero
+    /// ignored rows, honor a device-resident grad_output scalar, and be
+    /// deterministic.
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    #[cfg(feature = "cuda")]
+    fn test_gpu_ce_backward_matches_cpu_bounce() {
+        use crate::tensor::nsl_tensor_to_device;
+        let n = 5usize;
+        let c = 7usize;
+        let vals: Vec<f64> = (0..n * c).map(|i| ((i as f64) * 0.83).sin() * 2.0).collect();
+        let logits = crate::tensor::creation::create_tensor_from_f64_data(
+            &vals,
+            &[n as i64, c as i64],
+        );
+        let tvals = [3.0f64, 0.0, -100.0, 6.0, 2.0];
+        let targets = crate::tensor::creation::create_tensor_from_f64_data(&tvals, &[n as i64]);
+        let go = nsl_tensor_scalar(2.5, 1);
+
+        // CPU reference (all-CPU inputs -> bounce path untouched).
+        let cpu_out = nsl_cross_entropy_backward(go, logits, targets);
+
+        // GPU path (device-resident logits/targets/go).
+        let lg = nsl_tensor_to_device(logits, 1);
+        let tg = nsl_tensor_to_device(targets, 1);
+        let gg = nsl_tensor_to_device(go, 1);
+        let gpu_out = nsl_tensor_to_device(nsl_cross_entropy_backward(gg, lg, tg), 0);
+
+        let co = NslTensor::from_ptr(cpu_out);
+        let go_t = NslTensor::from_ptr(gpu_out);
+        assert_eq!(co.len, (n * c) as i64);
+        assert_eq!(go_t.len, co.len);
+        let read = |t: &NslTensor, i: usize| -> f64 {
+            match t.dtype {
+                1 => f64::from(unsafe { *t.data_f32().add(i) }),
+                _ => unsafe { *t.data_f64().add(i) },
+            }
+        };
+        let mut nonzero = false;
+        for i in 0..(n * c) {
+            let (a, b) = (read(co, i), read(go_t, i));
+            assert!(
+                (a - b).abs() < 1e-5,
+                "elem {i}: cpu {a} vs gpu {b}"
+            );
+            if a.abs() > 1e-9 {
+                nonzero = true;
+            }
+        }
+        assert!(nonzero, "vacuous: all-zero gradient");
+        // Ignored row (target -100) must be exactly zero on the GPU path.
+        for j in 0..c {
+            assert_eq!(read(go_t, 2 * c + j), 0.0, "ignored row leaked at col {j}");
+        }
+        // Review B6: i32 device targets are the PRODUCTION LM path (u16
+        // token buffers land as DTYPE_I32 on transfer) — same target values
+        // through the kernel's s32 arm must match the CPU reference too.
+        let ti = crate::cpu::create_tensor_with_shape_rs_dtype(
+            &[n as i64],
+            crate::tensor::DTYPE_I32,
+        );
+        {
+            let t = NslTensor::from_ptr(ti);
+            let d = t.data as *mut i32;
+            for (i, v) in tvals.iter().enumerate() {
+                unsafe { *d.add(i) = *v as i32 };
+            }
+        }
+        let tgi = nsl_tensor_to_device(ti, 1);
+        assert_eq!(
+            NslTensor::from_ptr(tgi).dtype,
+            crate::tensor::DTYPE_I32,
+            "i32 targets did not survive the transfer — kernel arm untested"
+        );
+        // Host-scalar grad_output exercises the folded-immediate go path.
+        let go_host = nsl_tensor_scalar(2.5, 1);
+        let gpu_out_i = nsl_tensor_to_device(
+            nsl_cross_entropy_backward(go_host, lg, tgi),
+            0,
+        );
+        let goi = NslTensor::from_ptr(gpu_out_i);
+        for i in 0..(n * c) {
+            let (a, b) = (read(co, i), read(goi, i));
+            assert!((a - b).abs() < 1e-5, "i32-arm elem {i}: cpu {a} vs gpu {b}");
+        }
+        for p in [cpu_out, gpu_out, gpu_out_i, lg, tg, tgi, gg, logits, targets, go, go_host, ti] {
+            nsl_tensor_free(p);
+        }
+    }
+
+    // Regression guard for the (pred - target) per-step leak: the internal
+    // sub -> mul_scalar(RELINQUISH_A) chain reuses the diff buffer in place,
+    // and the in-place relinquish path must NOT hand back an extra ref —
+    // callers free the returned grad exactly once. Under the bug the result
+    // arrived with refcount 2 and the diff block was stranded every training
+    // step (live_blocks +1/step under mse_loss + --source-ad).
+    #[test]
+    fn test_mse_backward_result_owns_single_ref() {
+        let pred = make_1d_f32(&[1.0, 2.0, 3.0]);
+        let target = make_1d_f32(&[0.5, 1.5, 2.5]);
+        let grad_out = nsl_tensor_scalar(1.0, 1);
+        let grad = nsl_mse_backward(grad_out, pred, target);
+        let rc = NslTensor::from_ptr(grad)
+            .refcount
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(rc, 1, "mse grad must carry exactly one ref (leak if more)");
         nsl_tensor_free(pred);
         nsl_tensor_free(target);
         nsl_tensor_free(grad_out);

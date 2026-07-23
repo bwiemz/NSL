@@ -1260,6 +1260,266 @@ RMS_DONE: ret;\n\
 /// Matches the correct RMSNorm dx (NO mean-subtract), i.e. tape-AD's
 /// `rmsnorm_backward` dx term and the source-AD `RmsNormInputBackward`
 /// decomposition — validated to tolerance (approx rsqrt/div vs the CPU f64 ref).
+// P5 item 20 slice A — fused RMSNorm GAMMA backward (2 launches, no
+// full-size temps). Kernel 1: one thread per ROW computes
+// rinv[row] = 1 / sqrt(mean(x_row^2) + eps) into a tiny [rows] scratch.
+// Kernel 2: one thread per COLUMN j accumulates
+// dgamma[j] = sum_rows(dy[i,j] * x[i,j] * rinv[i]) with a sequential row
+// loop — a fixed summation order, so the result is bit-deterministic
+// run-to-run (the old 7-op decomposition materialized three [rows, cols]
+// temporaries and reduced through reduce_to_shape).
+pub(crate) const RMSNORM_RINV_ROWS_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_rmsnorm_rinv_rows_f32(\n\
+    .param .u64 x, .param .u64 rinv,\n\
+    .param .u64 rows, .param .u64 cols,\n\
+    .param .f32 eps\n\
+) {\n\
+    .reg .u64 %rd<12>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<10>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [x];\n\
+    ld.param.u64 %rd2, [rinv];\n\
+    ld.param.u64 %rd3, [rows];\n\
+    ld.param.u64 %rd4, [cols];\n\
+    ld.param.f32 %f1, [eps];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd5, %r4;\n\
+    setp.ge.u64 %p1, %rd5, %rd3;\n\
+    @%p1 bra RINV_DONE;\n\
+    // row base = row * cols * 4\n\
+    mul.lo.u64 %rd6, %rd5, %rd4;\n\
+    shl.b64 %rd6, %rd6, 2;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    mov.f32 %f2, 0f00000000;\n\
+    mov.u64 %rd8, 0;\n\
+RINV_ACC:\n\
+    setp.ge.u64 %p2, %rd8, %rd4;\n\
+    @%p2 bra RINV_ACC_DONE;\n\
+    shl.b64 %rd9, %rd8, 2;\n\
+    add.u64 %rd10, %rd7, %rd9;\n\
+    ld.global.f32 %f3, [%rd10];\n\
+    fma.rn.f32 %f2, %f3, %f3, %f2;\n\
+    add.u64 %rd8, %rd8, 1;\n\
+    bra RINV_ACC;\n\
+RINV_ACC_DONE:\n\
+    cvt.rn.f32.u64 %f4, %rd4;\n\
+    div.rn.f32 %f5, %f2, %f4;\n\
+    add.rn.f32 %f6, %f5, %f1;\n\
+    sqrt.rn.f32 %f7, %f6;\n\
+    mov.f32 %f8, 0f3F800000;\n\
+    div.rn.f32 %f9, %f8, %f7;\n\
+    shl.b64 %rd11, %rd5, 2;\n\
+    add.u64 %rd11, %rd2, %rd11;\n\
+    st.global.f32 [%rd11], %f9;\n\
+RINV_DONE:\n\
+    ret;\n\
+}\n\
+\0";
+
+pub(crate) const RMSNORM_DGAMMA_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_rmsnorm_dgamma_f32(\n\
+    .param .u64 dy, .param .u64 x, .param .u64 rinv,\n\
+    .param .u64 dgamma,\n\
+    .param .u64 rows, .param .u64 cols\n\
+) {\n\
+    .reg .u64 %rd<16>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<8>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [dy];\n\
+    ld.param.u64 %rd2, [x];\n\
+    ld.param.u64 %rd3, [rinv];\n\
+    ld.param.u64 %rd4, [dgamma];\n\
+    ld.param.u64 %rd5, [rows];\n\
+    ld.param.u64 %rd6, [cols];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd7, %r4;\n\
+    setp.ge.u64 %p1, %rd7, %rd6;\n\
+    @%p1 bra DG_DONE;\n\
+    // col offset bytes = j * 4; row stride bytes = cols * 4\n\
+    shl.b64 %rd8, %rd7, 2;\n\
+    shl.b64 %rd9, %rd6, 2;\n\
+    add.u64 %rd10, %rd1, %rd8;\n\
+    add.u64 %rd11, %rd2, %rd8;\n\
+    mov.u64 %rd12, 0;\n\
+    mov.f32 %f1, 0f00000000;\n\
+DG_ACC:\n\
+    setp.ge.u64 %p2, %rd12, %rd5;\n\
+    @%p2 bra DG_ACC_DONE;\n\
+    ld.global.f32 %f2, [%rd10];\n\
+    ld.global.f32 %f3, [%rd11];\n\
+    shl.b64 %rd13, %rd12, 2;\n\
+    add.u64 %rd14, %rd3, %rd13;\n\
+    ld.global.f32 %f4, [%rd14];\n\
+    mul.rn.f32 %f5, %f2, %f3;\n\
+    mul.rn.f32 %f6, %f5, %f4;\n\
+    add.rn.f32 %f1, %f1, %f6;\n\
+    add.u64 %rd10, %rd10, %rd9;\n\
+    add.u64 %rd11, %rd11, %rd9;\n\
+    add.u64 %rd12, %rd12, 1;\n\
+    bra DG_ACC;\n\
+DG_ACC_DONE:\n\
+    add.u64 %rd15, %rd4, %rd8;\n\
+    st.global.f32 [%rd15], %f1;\n\
+DG_DONE:\n\
+    ret;\n\
+}\n\
+\0";
+
+// P5 slice C — fused RMSNorm dx WITH residual-gradient fold. Identical to
+// RMSNORM_DX_BWD_F32_PTX plus one epilogue `add.rn` of a same-shape residual
+// gradient before the store — replaces the adjoint-accumulate Add that
+// followed the dx op (bit-exact: IEEE add is commutative, and the standalone
+// Add kernel performs the same single rn-rounded add through global memory).
+pub(crate) const RMSNORM_DX_BWD_ADD_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_rmsnorm_dx_bwd_add_f32(\n\
+    .param .u64 dy, .param .u64 x, .param .u64 gamma,\n\
+    .param .u64 dxout, .param .u64 res,\n\
+    .param .u64 rows, .param .u64 cols,\n\
+    .param .f32 eps\n\
+) {\n\
+    .reg .u64 %rd<24>;\n\
+    .reg .u32 %r<12>;\n\
+    .reg .f32 %f<24>;\n\
+    .reg .pred %p<4>;\n\
+    .shared .f32 ssq[256];\n\
+    .shared .f32 sdwx[256];\n\
+    ld.param.u64 %rd1, [dy];\n\
+    ld.param.u64 %rd2, [x];\n\
+    ld.param.u64 %rd3, [gamma];\n\
+    ld.param.u64 %rd4, [dxout];\n\
+    ld.param.u64 %rd19, [res];\n\
+    ld.param.u64 %rd5, [rows];\n\
+    ld.param.u64 %rd6, [cols];\n\
+    ld.param.f32 %f1, [eps];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    cvt.u64.u32 %rd7, %r1;\n\
+    setp.ge.u64 %p1, %rd7, %rd5;\n\
+    @%p1 bra DX_DONE;\n\
+    mov.u32 %r2, %tid.x;\n\
+    cvt.u64.u32 %rd8, %r2;\n\
+    // row_base_bytes = row * cols * 4\n\
+    mul.lo.u64 %rd9, %rd7, %rd6;\n\
+    shl.b64 %rd9, %rd9, 2;\n\
+    add.u64 %rd10, %rd1, %rd9;\n\
+    add.u64 %rd11, %rd2, %rd9;\n\
+    add.u64 %rd12, %rd4, %rd9;\n\
+    add.u64 %rd20, %rd19, %rd9;\n\
+    // --- Pass 1: local S1=sum(x*x), S2=sum(dy*gamma*x) ---\n\
+    mov.f32 %f2, 0f00000000;\n\
+    mov.f32 %f3, 0f00000000;\n\
+    mov.u64 %rd13, %rd8;\n\
+DX_ACC:\n\
+    setp.ge.u64 %p2, %rd13, %rd6;\n\
+    @%p2 bra DX_ACC_DONE;\n\
+    shl.b64 %rd14, %rd13, 2;\n\
+    add.u64 %rd15, %rd11, %rd14;\n\
+    ld.global.f32 %f4, [%rd15];\n\
+    add.u64 %rd16, %rd10, %rd14;\n\
+    ld.global.f32 %f5, [%rd16];\n\
+    add.u64 %rd17, %rd3, %rd14;\n\
+    ld.global.f32 %f6, [%rd17];\n\
+    fma.rn.f32 %f2, %f4, %f4, %f2;\n\
+    mul.f32 %f7, %f5, %f6;\n\
+    fma.rn.f32 %f3, %f7, %f4, %f3;\n\
+    add.u64 %rd13, %rd13, 256;\n\
+    bra DX_ACC;\n\
+DX_ACC_DONE:\n\
+    mul.lo.u32 %r3, %r2, 4;\n\
+    mov.u32 %r4, ssq;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    st.shared.f32 [%r4], %f2;\n\
+    mov.u32 %r5, sdwx;\n\
+    add.u32 %r5, %r5, %r3;\n\
+    st.shared.f32 [%r5], %f3;\n\
+    bar.sync 0;\n\
+    // Reduce both (thread 0)\n\
+    setp.ne.u32 %p3, %r2, 0;\n\
+    @%p3 bra DX_SKIP;\n\
+    mov.u32 %r6, 1;\n\
+    mov.u32 %r7, %ntid.x;\n\
+DX_RLOOP:\n\
+    setp.ge.u32 %p2, %r6, %r7;\n\
+    @%p2 bra DX_RDONE;\n\
+    mul.lo.u32 %r8, %r6, 4;\n\
+    mov.u32 %r9, ssq;\n\
+    add.u32 %r9, %r9, %r8;\n\
+    ld.shared.f32 %f8, [%r9];\n\
+    add.f32 %f2, %f2, %f8;\n\
+    mov.u32 %r10, sdwx;\n\
+    add.u32 %r10, %r10, %r8;\n\
+    ld.shared.f32 %f9, [%r10];\n\
+    add.f32 %f3, %f3, %f9;\n\
+    add.u32 %r6, %r6, 1;\n\
+    bra DX_RLOOP;\n\
+DX_RDONE:\n\
+    // rms_inv = rsqrt(S1/cols + eps)\n\
+    cvt.rn.f32.u64 %f10, %rd6;\n\
+    div.approx.f32 %f11, %f2, %f10;\n\
+    add.f32 %f11, %f11, %f1;\n\
+    rsqrt.approx.f32 %f11, %f11;\n\
+    // Clamp rms_inv <= 1e12 (i.e. rms >= 1e-12), matching the CPU/tape-AD\n\
+    // underflow guard so eps=0 + a near-zero row cannot inject +Inf/NaN.\n\
+    min.f32 %f11, %f11, 0f5368D4A5;\n\
+    st.shared.f32 [ssq], %f11;\n\
+    st.shared.f32 [sdwx], %f3;\n\
+DX_SKIP:\n\
+    bar.sync 0;\n\
+    ld.shared.f32 %f12, [ssq];\n\
+    ld.shared.f32 %f13, [sdwx];\n\
+    // coeff = S2 * rms_inv^3 / cols\n\
+    mul.f32 %f14, %f12, %f12;\n\
+    mul.f32 %f14, %f14, %f12;\n\
+    mul.f32 %f14, %f14, %f13;\n\
+    cvt.rn.f32.u64 %f15, %rd6;\n\
+    div.approx.f32 %f14, %f14, %f15;\n\
+    // --- Pass 2: dx_j = gamma_j*dy_j*rms_inv - x_j*coeff ---\n\
+    mov.u64 %rd13, %rd8;\n\
+DX_WR:\n\
+    setp.ge.u64 %p2, %rd13, %rd6;\n\
+    @%p2 bra DX_DONE;\n\
+    shl.b64 %rd14, %rd13, 2;\n\
+    add.u64 %rd15, %rd11, %rd14;\n\
+    ld.global.f32 %f16, [%rd15];\n\
+    add.u64 %rd16, %rd10, %rd14;\n\
+    ld.global.f32 %f17, [%rd16];\n\
+    add.u64 %rd17, %rd3, %rd14;\n\
+    ld.global.f32 %f18, [%rd17];\n\
+    mul.f32 %f19, %f18, %f17;\n\
+    mul.f32 %f19, %f19, %f12;\n\
+    mul.f32 %f20, %f16, %f14;\n\
+    sub.f32 %f19, %f19, %f20;\n\
+    add.u64 %rd21, %rd20, %rd14;\n\
+    ld.global.f32 %f21, [%rd21];\n\
+    add.rn.f32 %f19, %f19, %f21;\n\
+    add.u64 %rd18, %rd12, %rd14;\n\
+    st.global.f32 [%rd18], %f19;\n\
+    add.u64 %rd13, %rd13, 256;\n\
+    bra DX_WR;\n\
+DX_DONE: ret;\n\
+}\0";
+
 pub(crate) const RMSNORM_DX_BWD_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_80\n\
@@ -3530,6 +3790,524 @@ DQFP8_STORE:\n\
 DQFP8_DONE: ret;\n\
 }\0";
 
+// ── Muon batched Newton-Schulz kernels (perf-campaign items 1/3/4) ─────────
+//
+// Shape-grouped batched NS: k same-shape rank-2 matrices are processed by a
+// fixed launch sequence over persistent workspaces. Matrices are addressed
+// through DEVICE POINTER TABLES (a u64 array of data pointers uploaded once
+// per group per step) so k tensors at arbitrary addresses batch without
+// repacking. grid.y = matrix index everywhere except the sumsq reduction
+// (one block per matrix, deterministic 256-lane tree — the same stride-256 +
+// tree-128 order as TENSOR_STATS, so per-matrix sums are bit-identical to
+// the sequential frobenius path on identical data).
+
+/// m[i] = mu * m[i] + g[i], elementwise, in place over the pointer table.
+/// Two-rounding mul+add matches the stdlib muon_step momentum update.
+pub(crate) const MUON_BATCH_MOM_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_muon_batch_mom_f32(\n\
+    .param .u64 mtab, .param .u64 gtab, .param .f32 mu, .param .u32 n\n\
+) {\n\
+    .reg .u64 %rd<12>;\n\
+    .reg .u32 %r<8>;\n\
+    .reg .f32 %f<6>;\n\
+    .reg .pred %p<2>;\n\
+    ld.param.u64 %rd1, [mtab];\n\
+    ld.param.u64 %rd2, [gtab];\n\
+    ld.param.f32 %f1, [mu];\n\
+    ld.param.u32 %r1, [n];\n\
+    mov.u32 %r2, %ctaid.x;\n\
+    mov.u32 %r3, %ntid.x;\n\
+    mov.u32 %r4, %tid.x;\n\
+    mul.lo.u32 %r5, %r2, %r3;\n\
+    add.u32 %r5, %r5, %r4;\n\
+    setp.ge.u32 %p1, %r5, %r1;\n\
+    @%p1 bra MBM_EXIT;\n\
+    mov.u32 %r6, %ctaid.y;\n\
+    cvt.u64.u32 %rd3, %r6;\n\
+    shl.b64 %rd4, %rd3, 3;\n\
+    add.u64 %rd5, %rd1, %rd4;\n\
+    ld.global.u64 %rd6, [%rd5];\n\
+    add.u64 %rd5, %rd2, %rd4;\n\
+    ld.global.u64 %rd7, [%rd5];\n\
+    cvt.u64.u32 %rd8, %r5;\n\
+    shl.b64 %rd8, %rd8, 2;\n\
+    add.u64 %rd9, %rd6, %rd8;\n\
+    add.u64 %rd10, %rd7, %rd8;\n\
+    ld.global.f32 %f2, [%rd9];\n\
+    ld.global.f32 %f3, [%rd10];\n\
+    mul.rn.f32 %f4, %f2, %f1;\n\
+    add.rn.f32 %f5, %f4, %f3;\n\
+    st.global.f32 [%rd9], %f5;\n\
+MBM_EXIT:\n\
+    ret;\n\
+}\0";
+
+/// Per-matrix sum of squares of the update direction u into norms[i], where
+/// u = nesterov ? g + mu*m : m (m already momentum-updated). One block per
+/// matrix; deterministic stride-256 accumulate + 128-step shared tree.
+pub(crate) const MUON_BATCH_SUMSQ_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_muon_batch_sumsq_f32(\n\
+    .param .u64 mtab, .param .u64 gtab, .param .f32 mu,\n\
+    .param .u32 nest, .param .u32 n, .param .u64 norms\n\
+) {\n\
+    .reg .u64 %rd<14>;\n\
+    .reg .u32 %r<14>;\n\
+    .reg .f32 %f<10>;\n\
+    .reg .pred %p<4>;\n\
+    .shared .f32 mbss[256];\n\
+    ld.param.u64 %rd1, [mtab];\n\
+    ld.param.u64 %rd2, [gtab];\n\
+    ld.param.f32 %f1, [mu];\n\
+    ld.param.u32 %r1, [nest];\n\
+    ld.param.u32 %r2, [n];\n\
+    ld.param.u64 %rd3, [norms];\n\
+    mov.u32 %r3, %ctaid.x;\n\
+    mov.u32 %r4, %tid.x;\n\
+    cvt.u64.u32 %rd4, %r3;\n\
+    shl.b64 %rd5, %rd4, 3;\n\
+    add.u64 %rd6, %rd1, %rd5;\n\
+    ld.global.u64 %rd7, [%rd6];\n\
+    add.u64 %rd6, %rd2, %rd5;\n\
+    ld.global.u64 %rd8, [%rd6];\n\
+    mov.f32 %f2, 0f00000000;\n\
+    cvt.u64.u32 %rd9, %r4;\n\
+    cvt.u64.u32 %rd10, %r2;\n\
+    setp.ne.u32 %p3, %r1, 0;\n\
+MBS_LOOP:\n\
+    setp.ge.u64 %p1, %rd9, %rd10;\n\
+    @%p1 bra MBS_RED;\n\
+    shl.b64 %rd11, %rd9, 2;\n\
+    add.u64 %rd12, %rd7, %rd11;\n\
+    ld.global.f32 %f3, [%rd12];\n\
+    mov.f32 %f4, %f3;\n\
+    @!%p3 bra MBS_ACC;\n\
+    add.u64 %rd13, %rd8, %rd11;\n\
+    ld.global.f32 %f5, [%rd13];\n\
+    mul.rn.f32 %f6, %f3, %f1;\n\
+    add.rn.f32 %f4, %f5, %f6;\n\
+MBS_ACC:\n\
+    mul.rn.f32 %f7, %f4, %f4;\n\
+    add.rn.f32 %f2, %f2, %f7;\n\
+    add.u64 %rd9, %rd9, 256;\n\
+    bra MBS_LOOP;\n\
+MBS_RED:\n\
+    mul.lo.u32 %r5, %r4, 4;\n\
+    mov.u32 %r6, mbss;\n\
+    add.u32 %r6, %r6, %r5;\n\
+    st.shared.f32 [%r6], %f2;\n\
+    bar.sync 0;\n\
+    mov.u32 %r7, 128;\n\
+MBS_TREE:\n\
+    setp.lt.u32 %p1, %r7, 1;\n\
+    @%p1 bra MBS_DONE;\n\
+    setp.ge.u32 %p2, %r4, %r7;\n\
+    @%p2 bra MBS_SKIP;\n\
+    mov.u32 %r8, mbss;\n\
+    mul.lo.u32 %r9, %r4, 4;\n\
+    add.u32 %r10, %r8, %r9;\n\
+    add.u32 %r11, %r4, %r7;\n\
+    mul.lo.u32 %r11, %r11, 4;\n\
+    add.u32 %r12, %r8, %r11;\n\
+    ld.shared.f32 %f8, [%r10];\n\
+    ld.shared.f32 %f9, [%r12];\n\
+    add.rn.f32 %f8, %f8, %f9;\n\
+    st.shared.f32 [%r10], %f8;\n\
+MBS_SKIP:\n\
+    bar.sync 0;\n\
+    shr.u32 %r7, %r7, 1;\n\
+    bra MBS_TREE;\n\
+MBS_DONE:\n\
+    setp.ne.u32 %p1, %r4, 0;\n\
+    @%p1 bra MBS_EXIT;\n\
+    mov.u32 %r13, mbss;\n\
+    ld.shared.f32 %f2, [%r13];\n\
+    shl.b64 %rd5, %rd4, 2;\n\
+    add.u64 %rd6, %rd3, %rd5;\n\
+    st.global.f32 [%rd6], %f2;\n\
+MBS_EXIT:\n\
+    ret;\n\
+}\0";
+
+/// Pack the normalized update into the wide-layout workspace:
+///   Y[i] = u * (1 / (sqrt(norms[i]) + eps)), u as in the sumsq kernel.
+/// tr=1 transposes on the fly (input [r,c] -> Y [c,r]) so tall matrices
+/// never materialize a separate transpose pass.
+pub(crate) const MUON_BATCH_PACK_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_muon_batch_pack_f32(\n\
+    .param .u64 mtab, .param .u64 gtab, .param .f32 mu, .param .u32 nest,\n\
+    .param .u64 norms, .param .u64 ybase, .param .u32 r, .param .u32 c,\n\
+    .param .u32 tr, .param .f32 eps\n\
+) {\n\
+    .reg .u64 %rd<18>;\n\
+    .reg .u32 %r<16>;\n\
+    .reg .f32 %f<14>;\n\
+    .reg .pred %p<4>;\n\
+    ld.param.u64 %rd1, [mtab];\n\
+    ld.param.u64 %rd2, [gtab];\n\
+    ld.param.f32 %f1, [mu];\n\
+    ld.param.u32 %r1, [nest];\n\
+    ld.param.u64 %rd3, [norms];\n\
+    ld.param.u64 %rd4, [ybase];\n\
+    ld.param.u32 %r2, [r];\n\
+    ld.param.u32 %r3, [c];\n\
+    ld.param.u32 %r4, [tr];\n\
+    ld.param.f32 %f2, [eps];\n\
+    mov.u32 %r5, %ctaid.x;\n\
+    mov.u32 %r6, %ntid.x;\n\
+    mov.u32 %r7, %tid.x;\n\
+    mul.lo.u32 %r8, %r5, %r6;\n\
+    add.u32 %r8, %r8, %r7;\n\
+    mul.lo.u32 %r9, %r2, %r3;\n\
+    setp.ge.u32 %p1, %r8, %r9;\n\
+    @%p1 bra MBP_EXIT;\n\
+    mov.u32 %r10, %ctaid.y;\n\
+    cvt.u64.u32 %rd5, %r10;\n\
+    shl.b64 %rd6, %rd5, 3;\n\
+    add.u64 %rd7, %rd1, %rd6;\n\
+    ld.global.u64 %rd8, [%rd7];\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    ld.global.u64 %rd9, [%rd7];\n\
+    cvt.u64.u32 %rd10, %r8;\n\
+    shl.b64 %rd11, %rd10, 2;\n\
+    add.u64 %rd12, %rd8, %rd11;\n\
+    ld.global.f32 %f3, [%rd12];\n\
+    mov.f32 %f4, %f3;\n\
+    setp.ne.u32 %p2, %r1, 0;\n\
+    @!%p2 bra MBP_NORM;\n\
+    add.u64 %rd13, %rd9, %rd11;\n\
+    ld.global.f32 %f5, [%rd13];\n\
+    mul.rn.f32 %f6, %f3, %f1;\n\
+    add.rn.f32 %f4, %f5, %f6;\n\
+MBP_NORM:\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd3, %rd6;\n\
+    ld.global.f32 %f7, [%rd7];\n\
+    sqrt.rn.f32 %f8, %f7;\n\
+    add.rn.f32 %f8, %f8, %f2;\n\
+    mov.f32 %f9, 0f3F800000;\n\
+    div.rn.f32 %f10, %f9, %f8;\n\
+    mul.rn.f32 %f11, %f4, %f10;\n\
+    // destination index: identity, or on-the-fly transpose col*r + row\n\
+    mov.u32 %r11, %r8;\n\
+    setp.eq.u32 %p3, %r4, 0;\n\
+    @%p3 bra MBP_STORE;\n\
+    div.u32 %r12, %r8, %r3;\n\
+    mul.lo.u32 %r13, %r12, %r3;\n\
+    sub.u32 %r14, %r8, %r13;\n\
+    mul.lo.u32 %r11, %r14, %r2;\n\
+    add.u32 %r11, %r11, %r12;\n\
+MBP_STORE:\n\
+    cvt.u64.u32 %rd14, %r9;\n\
+    mul.lo.u64 %rd15, %rd5, %rd14;\n\
+    cvt.u64.u32 %rd16, %r11;\n\
+    add.u64 %rd15, %rd15, %rd16;\n\
+    shl.b64 %rd15, %rd15, 2;\n\
+    add.u64 %rd17, %rd4, %rd15;\n\
+    st.global.f32 [%rd17], %f11;\n\
+MBP_EXIT:\n\
+    ret;\n\
+}\0";
+
+/// Polynomial combine, in place over the batched Gram workspace:
+///   A[i] := ns_b*A[i] + ns_c*AA[i] + (diagonal ? ns_a : 0)
+/// Folding ns_a into the diagonal turns the reference x = ns_a*x + b@x into
+/// ONE gemm (B' @ x with B' = b + ns_a*I) — same math, fewer passes.
+pub(crate) const MUON_BATCH_POLY_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_muon_batch_poly_f32(\n\
+    .param .u64 abase, .param .u64 aabase, .param .f32 nsa,\n\
+    .param .f32 nsb, .param .f32 nsc, .param .u32 rdim, .param .u32 r2\n\
+) {\n\
+    .reg .u64 %rd<10>;\n\
+    .reg .u32 %r<14>;\n\
+    .reg .f32 %f<10>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [abase];\n\
+    ld.param.u64 %rd2, [aabase];\n\
+    ld.param.f32 %f1, [nsa];\n\
+    ld.param.f32 %f2, [nsb];\n\
+    ld.param.f32 %f3, [nsc];\n\
+    ld.param.u32 %r1, [rdim];\n\
+    ld.param.u32 %r2, [r2];\n\
+    mov.u32 %r3, %ctaid.x;\n\
+    mov.u32 %r4, %ntid.x;\n\
+    mov.u32 %r5, %tid.x;\n\
+    mul.lo.u32 %r6, %r3, %r4;\n\
+    add.u32 %r6, %r6, %r5;\n\
+    setp.ge.u32 %p1, %r6, %r2;\n\
+    @%p1 bra MBY_EXIT;\n\
+    mov.u32 %r7, %ctaid.y;\n\
+    cvt.u64.u32 %rd3, %r7;\n\
+    cvt.u64.u32 %rd4, %r2;\n\
+    mul.lo.u64 %rd5, %rd3, %rd4;\n\
+    cvt.u64.u32 %rd6, %r6;\n\
+    add.u64 %rd5, %rd5, %rd6;\n\
+    shl.b64 %rd5, %rd5, 2;\n\
+    add.u64 %rd7, %rd1, %rd5;\n\
+    add.u64 %rd8, %rd2, %rd5;\n\
+    ld.global.f32 %f4, [%rd7];\n\
+    ld.global.f32 %f5, [%rd8];\n\
+    mul.rn.f32 %f6, %f4, %f2;\n\
+    mul.rn.f32 %f7, %f5, %f3;\n\
+    add.rn.f32 %f8, %f6, %f7;\n\
+    div.u32 %r8, %r6, %r1;\n\
+    mul.lo.u32 %r9, %r8, %r1;\n\
+    sub.u32 %r10, %r6, %r9;\n\
+    setp.eq.u32 %p2, %r8, %r10;\n\
+    @%p2 add.rn.f32 %f8, %f8, %f1;\n\
+    st.global.f32 [%rd7], %f8;\n\
+MBY_EXIT:\n\
+    ret;\n\
+}\0";
+
+/// Fused unpack + parameter update over the pointer table:
+///   p[i] = decay * p[i] - step * o[i],  o read from the wide workspace
+///   (transposed back on the fly when tr=1). decay = 1 - lr*wd, step =
+///   lr * sqrt(max(1, rows/cols)) — both folded on the host.
+pub(crate) const MUON_BATCH_UPDATE_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_muon_batch_update_f32(\n\
+    .param .u64 ptab, .param .u64 ybase, .param .u32 r, .param .u32 c,\n\
+    .param .u32 tr, .param .f32 decay, .param .f32 step\n\
+) {\n\
+    .reg .u64 %rd<16>;\n\
+    .reg .u32 %r<16>;\n\
+    .reg .f32 %f<8>;\n\
+    .reg .pred %p<3>;\n\
+    ld.param.u64 %rd1, [ptab];\n\
+    ld.param.u64 %rd2, [ybase];\n\
+    ld.param.u32 %r1, [r];\n\
+    ld.param.u32 %r2, [c];\n\
+    ld.param.u32 %r3, [tr];\n\
+    ld.param.f32 %f1, [decay];\n\
+    ld.param.f32 %f2, [step];\n\
+    mov.u32 %r4, %ctaid.x;\n\
+    mov.u32 %r5, %ntid.x;\n\
+    mov.u32 %r6, %tid.x;\n\
+    mul.lo.u32 %r7, %r4, %r5;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    mul.lo.u32 %r8, %r1, %r2;\n\
+    setp.ge.u32 %p1, %r7, %r8;\n\
+    @%p1 bra MBU_EXIT;\n\
+    mov.u32 %r9, %ctaid.y;\n\
+    cvt.u64.u32 %rd3, %r9;\n\
+    shl.b64 %rd4, %rd3, 3;\n\
+    add.u64 %rd5, %rd1, %rd4;\n\
+    ld.global.u64 %rd6, [%rd5];\n\
+    // source index in Y: identity, or transpose col*r + row\n\
+    mov.u32 %r10, %r7;\n\
+    setp.eq.u32 %p2, %r3, 0;\n\
+    @%p2 bra MBU_LOAD;\n\
+    div.u32 %r11, %r7, %r2;\n\
+    mul.lo.u32 %r12, %r11, %r2;\n\
+    sub.u32 %r13, %r7, %r12;\n\
+    mul.lo.u32 %r10, %r13, %r1;\n\
+    add.u32 %r10, %r10, %r11;\n\
+MBU_LOAD:\n\
+    cvt.u64.u32 %rd7, %r8;\n\
+    mul.lo.u64 %rd8, %rd3, %rd7;\n\
+    cvt.u64.u32 %rd9, %r10;\n\
+    add.u64 %rd8, %rd8, %rd9;\n\
+    shl.b64 %rd8, %rd8, 2;\n\
+    add.u64 %rd10, %rd2, %rd8;\n\
+    ld.global.f32 %f3, [%rd10];\n\
+    cvt.u64.u32 %rd11, %r7;\n\
+    shl.b64 %rd11, %rd11, 2;\n\
+    add.u64 %rd12, %rd6, %rd11;\n\
+    ld.global.f32 %f4, [%rd12];\n\
+    mul.rn.f32 %f5, %f4, %f1;\n\
+    mul.rn.f32 %f6, %f2, %f3;\n\
+    sub.rn.f32 %f7, %f5, %f6;\n\
+    st.global.f32 [%rd12], %f7;\n\
+MBU_EXIT:\n\
+    ret;\n\
+}\0";
+
+// ── Fusion-queue item 2: GPU-native cross-entropy backward ─────────────────
+//
+// Replaces the per-step [N,C] logits DtoH + CPU softmax + HtoD publish with
+// three on-device launches (existing softmax + these two). grad_output stays
+// on device (read in-kernel) — no host readback anywhere, so the loss
+// epilogue no longer taints cuda-graph capture regions.
+
+/// Count valid (>= 0) targets into scratch[0] as f32 max(count, 1).
+/// One 256-thread block; targets read as f32 or s32 per tgt_i32.
+/// Valid test mirrors the CPU arm's read_index -> i64 >= 0 (truncate first).
+pub(crate) const CE_BWD_COUNT_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_ce_bwd_count_f32(\n\
+    .param .u64 tgt, .param .u32 n, .param .u32 tgt_i32, .param .u64 scratch\n\
+) {\n\
+    .reg .u64 %rd<8>;\n\
+    .reg .u32 %r<12>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .s32 %s<4>;\n\
+    .reg .pred %p<4>;\n\
+    .shared .u32 cnt[256];\n\
+    ld.param.u64 %rd1, [tgt];\n\
+    ld.param.u32 %r1, [n];\n\
+    ld.param.u32 %r2, [tgt_i32];\n\
+    ld.param.u64 %rd2, [scratch];\n\
+    mov.u32 %r3, %tid.x;\n\
+    mov.u32 %r4, 0;\n\
+    mov.u32 %r5, %r3;\n\
+    setp.ne.u32 %p3, %r2, 0;\n\
+CEC_LOOP:\n\
+    setp.ge.u32 %p1, %r5, %r1;\n\
+    @%p1 bra CEC_RED;\n\
+    cvt.u64.u32 %rd3, %r5;\n\
+    shl.b64 %rd4, %rd3, 2;\n\
+    add.u64 %rd5, %rd1, %rd4;\n\
+    @%p3 bra CEC_I32;\n\
+    ld.global.f32 %f1, [%rd5];\n\
+    cvt.rzi.s32.f32 %s1, %f1;\n\
+    bra CEC_TEST;\n\
+CEC_I32:\n\
+    ld.global.s32 %s1, [%rd5];\n\
+CEC_TEST:\n\
+    setp.lt.s32 %p2, %s1, 0;\n\
+    @%p2 bra CEC_NEXT;\n\
+    add.u32 %r4, %r4, 1;\n\
+CEC_NEXT:\n\
+    add.u32 %r5, %r5, 256;\n\
+    bra CEC_LOOP;\n\
+CEC_RED:\n\
+    mul.lo.u32 %r6, %r3, 4;\n\
+    mov.u32 %r7, cnt;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    st.shared.u32 [%r7], %r4;\n\
+    bar.sync 0;\n\
+    mov.u32 %r8, 128;\n\
+CEC_TREE:\n\
+    setp.lt.u32 %p1, %r8, 1;\n\
+    @%p1 bra CEC_DONE;\n\
+    setp.ge.u32 %p2, %r3, %r8;\n\
+    @%p2 bra CEC_SKIP;\n\
+    mov.u32 %r7, cnt;\n\
+    mul.lo.u32 %r6, %r3, 4;\n\
+    add.u32 %r9, %r7, %r6;\n\
+    add.u32 %r10, %r3, %r8;\n\
+    mul.lo.u32 %r10, %r10, 4;\n\
+    add.u32 %r11, %r7, %r10;\n\
+    ld.shared.u32 %r6, [%r9];\n\
+    ld.shared.u32 %r10, [%r11];\n\
+    add.u32 %r6, %r6, %r10;\n\
+    st.shared.u32 [%r9], %r6;\n\
+CEC_SKIP:\n\
+    bar.sync 0;\n\
+    shr.u32 %r8, %r8, 1;\n\
+    bra CEC_TREE;\n\
+CEC_DONE:\n\
+    setp.ne.u32 %p1, %r3, 0;\n\
+    @%p1 bra CEC_EXIT;\n\
+    mov.u32 %r7, cnt;\n\
+    ld.shared.u32 %r6, [%r7];\n\
+    max.u32 %r6, %r6, 1;\n\
+    cvt.rn.f32.u32 %f2, %r6;\n\
+    st.global.f32 [%rd2], %f2;\n\
+CEC_EXIT:\n\
+    ret;\n\
+}\0";
+
+/// Finish pass over the softmax output, in place:
+///   out[i,j] = valid(t_i) ? (out[i,j] - onehot) * go / denom : 0
+/// go read from a device scalar (go_mode=1) or the go_imm immediate
+/// (go_mode=0 -> 1.0-equivalent via imm). denom read from scratch[0].
+pub(crate) const CE_BWD_FINISH_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_ce_bwd_finish_f32(\n\
+    .param .u64 sm, .param .u64 tgt, .param .u64 scratch, .param .u64 gop,\n\
+    .param .f32 go_imm, .param .u32 go_mode, .param .u32 tgt_i32,\n\
+    .param .u32 total, .param .u32 cols\n\
+) {\n\
+    .reg .u64 %rd<10>;\n\
+    .reg .u32 %r<12>;\n\
+    .reg .f32 %f<10>;\n\
+    .reg .s32 %s<4>;\n\
+    .reg .pred %p<6>;\n\
+    ld.param.u64 %rd1, [sm];\n\
+    ld.param.u64 %rd2, [tgt];\n\
+    ld.param.u64 %rd3, [scratch];\n\
+    ld.param.u64 %rd4, [gop];\n\
+    ld.param.f32 %f1, [go_imm];\n\
+    ld.param.u32 %r1, [go_mode];\n\
+    ld.param.u32 %r2, [tgt_i32];\n\
+    ld.param.u32 %r3, [total];\n\
+    ld.param.u32 %r4, [cols];\n\
+    mov.u32 %r5, %ctaid.x;\n\
+    mov.u32 %r6, %ntid.x;\n\
+    mul.lo.u32 %r7, %r5, %r6;\n\
+    mov.u32 %r5, %tid.x;\n\
+    add.u32 %r7, %r7, %r5;\n\
+    setp.ge.u32 %p1, %r7, %r3;\n\
+    @%p1 bra CEF_EXIT;\n\
+    div.u32 %r8, %r7, %r4;\n\
+    mul.lo.u32 %r9, %r8, %r4;\n\
+    sub.u32 %r10, %r7, %r9;\n\
+    cvt.u64.u32 %rd5, %r8;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd7, %rd2, %rd6;\n\
+    setp.ne.u32 %p2, %r2, 0;\n\
+    @%p2 bra CEF_I32;\n\
+    ld.global.f32 %f2, [%rd7];\n\
+    cvt.rzi.s32.f32 %s1, %f2;\n\
+    bra CEF_HAVE;\n\
+CEF_I32:\n\
+    ld.global.s32 %s1, [%rd7];\n\
+CEF_HAVE:\n\
+    cvt.u64.u32 %rd5, %r7;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd8, %rd1, %rd6;\n\
+    setp.lt.s32 %p3, %s1, 0;\n\
+    @!%p3 bra CEF_VALID;\n\
+    mov.f32 %f3, 0f00000000;\n\
+    st.global.f32 [%rd8], %f3;\n\
+    bra CEF_EXIT;\n\
+CEF_VALID:\n\
+    ld.global.f32 %f4, [%rd8];\n\
+    cvt.u32.s32 %r11, %s1;\n\
+    setp.eq.u32 %p4, %r10, %r11;\n\
+    @!%p4 bra CEF_SCALE;\n\
+    mov.f32 %f5, 0f3F800000;\n\
+    sub.rn.f32 %f4, %f4, %f5;\n\
+CEF_SCALE:\n\
+    mov.f32 %f6, %f1;\n\
+    setp.ne.u32 %p5, %r1, 1;\n\
+    @%p5 bra CEF_GO;\n\
+    ld.global.f32 %f6, [%rd4];\n\
+CEF_GO:\n\
+    ld.global.f32 %f7, [%rd3];\n\
+    div.rn.f32 %f8, %f6, %f7;\n\
+    mul.rn.f32 %f4, %f4, %f8;\n\
+    st.global.f32 [%rd8], %f4;\n\
+CEF_EXIT:\n\
+    ret;\n\
+}\0";
+
 /// Every hand-written PTX module in this file, paired with its constant name.
 ///
 /// Consumed by the `ptxas` gate in `super::tests`, which assembles each one.
@@ -3537,6 +4315,13 @@ DQFP8_DONE: ret;\n\
 /// in them is invisible until a kernel launch fails on a real GPU.
 #[cfg(test)]
 pub(crate) const ALL_PTX: &[(&str, &str)] = &[
+    ("MUON_BATCH_MOM_F32_PTX", MUON_BATCH_MOM_F32_PTX),
+    ("MUON_BATCH_SUMSQ_F32_PTX", MUON_BATCH_SUMSQ_F32_PTX),
+    ("MUON_BATCH_PACK_F32_PTX", MUON_BATCH_PACK_F32_PTX),
+    ("MUON_BATCH_POLY_F32_PTX", MUON_BATCH_POLY_F32_PTX),
+    ("MUON_BATCH_UPDATE_F32_PTX", MUON_BATCH_UPDATE_F32_PTX),
+    ("CE_BWD_COUNT_F32_PTX", CE_BWD_COUNT_F32_PTX),
+    ("CE_BWD_FINISH_F32_PTX", CE_BWD_FINISH_F32_PTX),
     ("EMBEDDING_F32_PTX", EMBEDDING_F32_PTX),
     ("EMBEDDING_I32IDX_PTX", EMBEDDING_I32IDX_PTX),
     ("EMBEDDING_BWD_F32_PTX", EMBEDDING_BWD_F32_PTX),
@@ -3551,6 +4336,9 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("GLOBAL_SUM_F32_PTX", GLOBAL_SUM_F32_PTX),
     ("LAYERNORM_F32_PTX", LAYERNORM_F32_PTX),
     ("RMSNORM_F32_PTX", RMSNORM_F32_PTX),
+    ("RMSNORM_RINV_ROWS_F32_PTX", RMSNORM_RINV_ROWS_F32_PTX),
+    ("RMSNORM_DGAMMA_F32_PTX", RMSNORM_DGAMMA_F32_PTX),
+    ("RMSNORM_DX_BWD_ADD_F32_PTX", RMSNORM_DX_BWD_ADD_F32_PTX),
     ("RMSNORM_DX_BWD_F32_PTX", RMSNORM_DX_BWD_F32_PTX),
     ("SCATTER_ADD_F32_PTX", SCATTER_ADD_F32_PTX),
     ("GATHER_F32_PTX", GATHER_F32_PTX),

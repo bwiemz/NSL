@@ -6,6 +6,286 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — Fusion queue: multi-tensor fused AdamW + GPU-native cross-entropy backward
+
+- **Multi-tensor fused AdamW** (always on for eligible configs;
+  `NSL_FASE_MULTI_STEP=0` kill-switch): the non-clip FASE-Deferred
+  optimizer loop (one fused-step launch + one zero per param per step)
+  collapses into ONE `nsl_fase_fused_adamw_step_multi` pointer-table
+  launch over the param/m/v/m_partial lists — grid.y = param index,
+  per-param length table with early-exit blocks, tables staged through
+  persistent pinned memory on the compute stream. The kernel body is
+  byte-for-byte the single-step kernel's sequence, so results are
+  **BIT-IDENTICAL** to N launches; the shared tail's m_partial zeroing is
+  folded into the same kernel. CPU/non-uniform tensors fall back
+  per-param (also bit-identical). Admission mirrors the fused-step
+  conditions exactly and excludes ZeRO / offload / bf16-sr / CPDT
+  precision; the fused-step counter keeps per-param semantics. Gates:
+  GPU and CPU bit-identity (multi on vs off) + marker/kill-switch
+  anti-vacuity.
+- **GPU-native cross-entropy backward** (default on;
+  `NSL_GPU_CE_BACKWARD=0` restores the bounce): `nsl_cross_entropy_backward`
+  no longer copies logits `[N, vocab]`, targets, and grad_output to the
+  host — the whole softmax-minus-onehot gradient runs on device (existing
+  softmax kernel + a valid-count reduction + an in-place finish pass),
+  with grad_output read in-kernel when device-resident. Kills CE
+  training's largest per-step PCIe round trip and removes one of the two
+  taints keeping loss-epilogue cuda-graph regions eager (embedding
+  backward still bounces). Target semantics mirror the CPU arm exactly
+  (truncate-then-compare, `target < 0` rows zeroed, `max(valid, 1)`
+  denominator); f32 kernel vs the old f64 host math differs ~1e-6
+  relative. Gates: GPU-vs-CPU elementwise parity, ignored-row exact-zero,
+  device-scalar grad_output; ptxas covers all new kernels.
+
+### Deferred — wgrad GEMM-accumulate into CSLA buffers (fusion item 3, design banked)
+Writing weight-gradient GEMMs straight into `m_partial` with
+`alpha=accum_scale, beta=1` (eliminating the fresh dW alloc + the
+separate axpy launch) requires a wengert-lowering pattern pass that fuses
+across Transpose -> Matmul -> reduce_to_shape AND re-plumbs the FASE
+hook's ownership bookkeeping (owned_values / explicit_freed /
+still_needed) — grad-integrity-sensitive surgery deliberately not
+attempted as a session add-on. Admission notes for the future slice:
+identity-reduce shapes only, non-still_needed adjoints only, Deferred
+hook path only; two-phase clip composes (it scales m_partial after
+accumulation).
+
+### Added — Muon perf campaign: batched Newton-Schulz + resident momentum + internal profiler
+
+- **`--muon-batch-ns`** (default off, GPU-only): every Muon-routed rank-2
+  param is updated by ONE batched runtime call per optimizer step
+  (`nsl_muon_step_batch`): momentum update + Frobenius normalization +
+  quintic Newton-Schulz + parameter update, shape-grouped and executed as
+  strided-batched tensor-core **TF32** GEMMs (`cublasGemmStridedBatchedEx`,
+  `CUBLAS_COMPUTE_32F_FAST_TF32`) over persistent per-shape workspaces with
+  device pointer-table addressing. Design wins folded in: no physical
+  transposes anywhere (tall matrices transpose on the fly in the pack/update
+  kernels; the Gram product runs as a `transa=T` GEMM), the polynomial
+  combine folds `ns_a*x + b@x` into one GEMM via a diagonal add
+  (`(ns_a*I + B) @ x`), and every square NS intermediate is symmetric so the
+  row/column-major operand swaps cancel. Workspace bounded by
+  `NSL_MUON_BATCH_MB` (default 256 MiB) with budget chunking;
+  `NSL_MUON_BATCH_TF32=0` forces strict FP32. Measured on the coder500m
+  Muon-routed load (168 matrices, ns=5): **341 ms vs 795 ms sequential
+  (2.3x)**; ~2,520 GEMM launches/step collapse to ~110 batched calls.
+  The AdamW-routed arm keeps the stdlib path bit-for-bit; the momentum
+  update is bit-exact vs the stdlib arm; NS output is tolerance-equivalent
+  (TF32 + batched reduction order), pinned by differential gates. Refuses
+  `--layerwise-accum`, `--optim-state-offload`, `--zero-stage`,
+  `--muon-state-dtype bf16`, and non-muon optimizers loudly.
+- **`--muon-resident-momentum`** (default off): under `--optim-state-offload`,
+  Muon-routed rank-2 params keep their first moment DEVICE-resident and skip
+  the per-step PCIe stage-in/writeback envelope entirely (plus the pointless
+  v round-trip on that route). AdamW state (embeddings/head/vectors) stays
+  offloaded. Bit-identical to plain offload (gated). This removes the mixed
+  recipe's only per-step optimizer-state round trip — the 500M campaign's
+  main non-GEMM pathology.
+- **`NSL_MUON_PROF`** internal profiler (perf item 2): 13 timestamp regions
+  across the whole Muon path (momentum stage-in/update, Frobenius reduce,
+  normalize scale, entry/exit transpose, Gram/Gram-square/poly GEMMs, param
+  update, momentum writeback) with two modes — `1` synced attribution, `2`
+  enqueue-only (the difference isolates launch/dispatch overhead from
+  execution). `[muon-prof]` table at exit; `nsl_muon_prof_report()` on
+  demand. First profile findings: the sequential NS load is ~0.8 s/step at
+  500M scale (NOT the 66.8 s/micro pathology — that was staging/offload);
+  within NS, the Gram GEMM dominates (~40%) and the per-matrix
+  single-block Frobenius reduction costs ~1 ms/call.
+- Batched-path building blocks: 5 new PTX kernels (ptxas-gated) —
+  pointer-table momentum update, deterministic per-matrix sum-square
+  reduction (same order as the sequential stats kernel — bit-identical
+  sums), transposing pack/scale, diagonal-folded polynomial combine, fused
+  transposing unpack + parameter update; `sgemm_strided_batched_raw` cuBLAS
+  wrapper with per-call compute-type control.
+- Fixed en route: `nsl_cpdt_allgather_add` relinquish-flag orientation (see
+  the FBIP leak fix); NOTE `[nsl-matmul]`'s "TF32 (default)" banner —
+  `CUBLAS_DEFAULT_MATH` does NOT enable TF32 tensor cores for f32 GEMMs on
+  cuBLAS >= 11, so the runtime's standard matmuls run FP32 CUDA cores; the
+  batch engine requests TF32 per call. A global re-evaluation is a separate
+  (numerics-affecting) decision, deliberately not made here.
+- Deferred (documented): CSLA x batch composition (per-layer groups /
+  deferred-epilogue batching), WGGO-driven workspace budget, cublasLt
+  autotuned plans, batched SYRK (no strided-batched SYRK exists in cuBLAS —
+  symmetry is exploited for mapping, not half-flop Grams).
+
+### Added — P5 item 19: opportunistic per-region CUDA graph capture (`--cuda-graphs`)
+
+- Every source-AD Wengert lowering (forward CCR slice, CSLA backward layer
+  range, recompute segment) becomes a capture REGION; weight-stream transfers
+  and optimizer updates stay outside. Per (region, accumulation-phase) state
+  machine: record the full pseudo-op sequence (kernel function/dims/param
+  bytes via `cuFuncGetParamInfo`, cuBLAS sgemm, memset, HtoD/DtoD) until two
+  passes prove it static, capture it as a CUDA graph on the compute stream
+  (the capture step still executes via instantiate+launch), then replay:
+  verify-and-skip each issued op, one `cuGraphLaunch` per region end.
+- Self-healing everywhere: mismatches eager-repair the verified prefix from
+  the stored records (bit-identical by construction); sync readbacks and
+  transfer ops taint regions to permanent-eager; deferred frees queue
+  in-region and record their events only after the region's work is on the
+  stream; the allocator pool drain taints first so a pending graph never
+  references unmapped memory. HtoD uploads flow through graph-owned pinned
+  staging buffers refreshed per step (token-id batches stream fresh data
+  through a stable memcpy node).
+- Refuses tape AD, ZeRO, `@pipeline`, `--cuda-sync`, `--profile-kernels`,
+  the legacy NULL stream. `NSL_CUDA_GRAPHS=0` kill-switch,
+  `NSL_CUDA_GRAPH_LOG=1` decision tracing. Gates: capture+replay
+  bit-identical to eager (plain + CSLA shapes, anti-vacuity counters),
+  self-heal bit-identical on a fixture with real per-step host bounces.
+
+### Fixed — root causes surfaced by the capture digests
+
+- **`model.to(device)` missed every field declared after an inline model
+  array** (`[Blk; N]` spans N slots but the walker got `fields.len()`):
+  such params silently stayed CPU-resident — the P4 "`ones([64])` norm param
+  still on CPU" gotcha — costing a hidden per-step PCIe upload + host
+  bounces through `reconcile_device` on every use. Now passes
+  `total_size / 8`, the convention `nsl_collect_model_params` always used.
+- **`nsl_l1_backward` crashed on GPU tensors**: it captured the dtype before
+  the CPU transfer widens f32→f64, then read f64 buffers through
+  `data_f32()`.
+- Known issue (pre-existing, tracked separately): `mse_loss` leaks its
+  `(pred-target)` intermediate every step on the source-AD path; the leak
+  set is expression-structure-dependent (an identity-mul variant leaks six
+  blocks/step, l1 is leak-free). Documented in the cuda-graph gate fixture.
+
+### Added — P5 item 20: more fused backward regions
+
+- **Fused RMSNorm gamma backward** under `--fuse-rmsnorm-backward` (which
+  previously fused only dx): the 7-op decomposition with three
+  `[rows, cols]` temporaries becomes one `nsl_rmsnorm_dgamma_backward` op —
+  a per-row 1/rms kernel into a tiny `[rows]` scratch, then a per-column
+  sequential row-loop kernel. Fixed summation order → bit-deterministic
+  run-to-run; f64 CPU reference. Gates: fused == decomposition == tape-AD on
+  trained w AND gamma (CPU), fused-GPU == CPU tape reference +
+  bit-deterministic reruns.
+- **SwiGLU gate-backward peephole** (always-on, BIT-EXACT): for
+  `f = silu(g) * u` the adjoint pair Mul(dy, up) → silu_backward fuses into
+  one `swiglu_gate_backward` launch when the product has exactly one reader;
+  the kernel rounds `t = mul.rn(dy, up)` exactly like the standalone Mul then
+  runs the identical silu-backward sequence — proven `to_bits`-equal on CPU
+  f64 and GPU f32. Mismatched shapes fall back to the decomposed pair.
+
+### Added — P5 item 21: non-uniform checkpoint partition DP (`--checkpoint-stride dp`)
+
+- A Pareto-frontier dynamic program over NON-uniform block-anchor partitions:
+  per-block escape/force-saved/recompute bytes come from the exact stride-1
+  plan; cost is the GpuSpec-calibrated recompute estimate (launches ×
+  worst-case launch overhead floored by 2×bytes/HBM bandwidth, × the CSLA
+  window), lowered when `--fuse-rmsnorm-backward` is active and credited
+  10 µs/segment under `--stream-prefetch`. Cheapest partition whose projected
+  peak fits `--checkpoint-budget-mib` wins (min-peak otherwise); the DP's
+  projection is re-verified against the true plan before committing, with
+  fallback to the uniform `auto` search. `plan_with_kept_anchors` generalizes
+  the plan machinery to arbitrary anchor subsets — bit-exact for the same
+  reason any stride is. Gates: DP units (incl. dropping a single huge
+  boundary non-uniformly — inexpressible as a uniform stride), dp/dp+budget
+  e2e bit-exact vs stride 1, GPU peak-not-worse.
+
+### Changed — P4 item 16: dtype ABI migration (both tag collisions removed)
+
+- **`DTYPE_I32 = 9`**: i32 token tensors carry their own canonical tag.
+  Tag 4 means `DTYPE_INT8` alone, with its true 1-byte width in
+  `dtype_element_size`. Every producer/consumer migrated in lockstep:
+  DataLoader batches, the CPU tensor factory, the `*i32` runtime readers,
+  the GPU i32-index kernel dispatch (embedding fwd/bwd, gather), the
+  fused-CE label decoder, the elementwise promote paths, and the
+  collective byte-width table (which gains `I32=4`, closing a latent
+  1-byte mis-size for i32 tensors through collectives). No on-disk format
+  stores numeric tags, so the migration is disk-safe.
+- **The C API speaks the canonical tag space verbatim** (`NslTensorDesc.
+  dtype`: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, ..., 9=i32). The
+  historical inverted 0=f32/1=f64 convention is GONE; `capi_dtype_to_nsl`
+  / `nsl_dtype_to_capi` remain only as validating identity chokepoints
+  that abort on unknown tags instead of the old silent fall-back-to-f64
+  (which mislabeled the never-mapped C-API int64/uint8 slots). Updated in
+  lockstep: calibration-wrapper codegen immediates, the ONNX-RT element
+  map (int64/uint8 now refused — they never reached a real compute path),
+  the dispatch element-size table, the generated C header, and the Python
+  ctypes mirrors. **Breaking for external C/ctypes callers** that baked
+  the old convention; the `dtype_abi_lock` golden test pins the new one.
+
+### Added — P4 item 17: SR-BF16 authoritative weights (`--param-dtype bf16-sr`)
+
+- Every STREAMED parameter's authoritative copy is a device-resident
+  BF16 buffer — 2 bytes/param, **no FP32 master copy, no host mirror**.
+  Rides the weight-stream residency schedule: upload = device-side
+  bf16→f32 widen into a transient working view (no PCIe), evict = free
+  (no writeback — the fused SR optimizer step IS the persistence),
+  teardown re-materializes plain f32 tensors for model_save/eval.
+  Un-streamed params (view-rooted/tied — the set ZeRO-3 keeps
+  Replicated) keep f32 authority through the plain fused step.
+- The update is a fused AdamW PTX kernel with the f32 kernel's exact
+  rounding sequence plus a stochastic-rounding tail: `splitmix64(seed ^
+  step·SALT, param_idx≪40 + elem)` → 16-bit dither added to the f32
+  result bits before bf16 truncation. **Compiler-owned counters**: the
+  stream is a pure function of (`--seed`, step, param, element) —
+  deterministic across reruns, ranks, and launch order. Explicit edge
+  policy: rounding-induced overflow saturates to ±max-normal; arithmetic
+  Inf propagates; NaN forced to quiet NaN; underflow gradual.
+- FP32 gradients/reductions everywhere (m/v/m_partial stay f32).
+  Refusals: requires `--weight-stream` + the FASE-Deferred fused
+  AdamW/Adam shape; refuses Muon, ZeRO, offload, reduced-precision
+  moments, WGGO per-layer overrides, `--training-reference`.
+- Gates: exhaustive-dither exact-unbiasedness unit tests; GPU rounding
+  tail bit-identical to the CPU reference over 65k adversarial values;
+  e2e training with bit-identical same-seed reruns, seed-sensitive
+  streams, and per-step tracking of the f32 baseline.
+
+### Added — P4 item 18 rung 2: compressed Muon state (`--muon-state-dtype bf16`)
+
+- Ladder order: f32 (default) → **bf16 momentum + f32 working buffer**
+  (this rung) → blockwise 8-bit → 4-bit structural (later rungs refuse
+  loudly with the ladder order in the message).
+- `bf16` halves Muon first-moment memory: m allocates BF16; each CSLA
+  group update dequants to f32, runs the unchanged stdlib `muon_step`,
+  and quant-stores back with counter-based SR (salted separately from
+  the item-17 weight stream). SR — not RTE — because the momentum EMA's
+  `(1−β)·g` increment routinely falls below a bf16 ulp. `v` stays f32.
+  Muon-only; requires `--layerwise-accum`; refuses ZeRO and offload.
+
+### Added — P3: ZeRO-3 tensor-granular parameter sharding (items 12-14)
+
+- **`--zero-stage 3` is lowered** on the layerwise residency schedule
+  (requires `--layerwise-accum --weight-stream --checkpoint-blocks
+  --source-ad`; anything else refuses with the flag list). Each parameter
+  tensor is OWNED by one rank (the stage-1/2 byte-balanced partition);
+  at rest the owner keeps it device-resident and every other rank holds
+  NOTHING — per-rank at-rest parameter memory is ~1/ws. This is the
+  per-parameter FSDP granularity (owner = singleton group per tensor):
+  it reuses the existing owner maps, composes with Muon (whole matrices
+  stay whole), and needs no gather in the optimizer. Elementwise 1/ws
+  sharding via `all_gather` is the documented follow-up.
+- **Item 12 — `ParameterResidency`** (`Replicated | ShardedResident |
+  GatheredTemporary | Evicted`) tracked per replica in the runtime.
+  Callbacks that touch θ ride the existing residency bracket
+  (`upload_all`/`reevict_all` redirect to gather/release), `model_save`
+  reads full replicas via the teardown restore, and tied/view-rooted
+  params stay `Replicated` through the same view-rooted exclusion the
+  weight streamer uses (updated identically on every rank from
+  all-reduced gradients).
+- **Item 13 — JIT gather per layer**: the weight-stream upload/evict
+  sites (per-segment forward brackets, window range heads, packs,
+  prefetch, async evict) redirect to a collective broadcast-fill /
+  free-release backend when zero3 is active — GPU-only, no host mirrors
+  involved. Registration evicts non-owner replicas on the first window.
+- **Item 14 — comm ordering from source-AD readiness**: each layer
+  group's gradient slots all-reduce (sum ÷ ws, the stage-1/2 averaging
+  convention) at its group update — the exact point the layerwise
+  schedule knows that layer's backward completed — then the owner
+  updates and non-owners release; the next range head (or the prefetch
+  edge, when `--stream-prefetch` is on) gathers the following layer.
+  Under the sim/sim-gpu backends collectives are synchronous, so the
+  ordering is validated bit-exactly; true comm/compute overlap on a
+  dedicated stream is NCCL-gated follow-up (not reachable on a 1-GPU
+  box).
+- Constraints (loud refusals): stage 3 × `--optim-state-offload`,
+  stage 3 × reduced-precision moments, stage ≥ 4. Optimizer state stays
+  REPLICATED in v1 (the enable note says so).
+- Gates (`zero3_gate.rs`): 2-rank sim-gpu training is BIT-IDENTICAL to
+  the single-rank baseline (rank-0 loss stream + saved model bytes),
+  with gather/release counters asserted non-vacuous; the same parity
+  holds for Muon × zero3 × arena/prefetch/async-writeback × a callback
+  that reads a sharded param mid-training; refusal coverage for the
+  unsupported combos.
+
 ### Changed — P1: Muon validation + performance (items 5-11)
 
 - **Parameter-ROLE routing replaces the name-substring exclusion list**
@@ -71,6 +351,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   fails Cranelift verification: "declared type of variable varN doesn't
   match type of value vM". Both worked around by inlining + avoiding
   scalar locals in `models/benchmarks/muon50m/shape_probe.nsl`.
+- Subscripting a model fixed-array field from a CALLBACK body
+  (`m.blocks[0].w_up` in `on_step`) compiles but SIGSEGVs the emitted
+  program; the `for pb in m.blocks:` iteration form works (used by the
+  zero3 callback gate).
 
 ### Added — P5: full-precision mixed Muon/AdamW optimizer
 

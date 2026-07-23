@@ -760,13 +760,21 @@ pub(crate) struct BuildArgs {
         /// window). `auto` searches strides against --checkpoint-budget-mib and
         /// picks the smallest projected activation peak that fits. `1` (default)
         /// = classic per-block. Bit-exact at any stride.
+        /// `N` coalesces every N block anchors; `auto` searches uniform
+        /// strides against the projected activation peak; `dp` (P5 item 21)
+        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
+        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
+        /// window applied, fusion-aware launch costs and a conservative
+        /// prefetch-overlap credit. Any choice is bit-exact.
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
-        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
-        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
-        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
-        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
+        /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
+        /// of the ~11-op / 7-op decompositions — fewer launches, no
+        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup);
+        /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
@@ -797,6 +805,59 @@ pub(crate) struct BuildArgs {
         /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
+
+        /// P4 item 17: authoritative parameter storage dtype for training.
+        /// `bf16-sr` stores every streamed parameter as a device-resident
+        /// BF16 buffer (no FP32 master copy) and applies the fused AdamW
+        /// update with compiler-owned counter-based stochastic rounding
+        /// (deterministic in --seed, the step, and the parameter/element
+        /// index). Requires --weight-stream + the fused AdamW step; refuses
+        /// Muon, ZeRO, offload, and reduced-precision-moment compositions.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16-sr"])]
+        pub(crate) param_dtype: String,
+
+        /// P4 item 18: Muon optimizer-state storage ladder. `bf16` stores
+        /// the first-moment (momentum) buffers in BF16 with an FP32 working
+        /// buffer per update and a counter-based stochastically-rounded
+        /// store (v stays f32). `int8-blockwise` and `int4-structural` are
+        /// later ladder rungs — currently refused.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
+        pub(crate) muon_state_dtype: String,
+
+        /// Muon perf campaign: shape-grouped batched Newton-Schulz for all
+        /// Muon-routed rank-2 hidden matrices — one batched-GEMM pipeline
+        /// per optimizer step (tensor-core TF32 strided-batched GEMMs over
+        /// persistent workspaces) instead of ~15 GEMM launches per matrix.
+        /// GPU-only; tolerance-equivalent to the sequential primitive (the
+        /// AdamW-routed arm stays bit-for-bit stdlib). Refuses
+        /// --layerwise-accum, --optim-state-offload and --zero-stage.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_batch_ns: bool,
+
+        /// Muon perf campaign: with --optim-state-offload, keep Muon-routed
+        /// params' momentum DEVICE-resident (skips its per-step PCIe
+        /// stage-in/writeback; AdamW state for embeddings/head/vectors
+        /// stays offloaded). Removes the mixed recipe's only per-step
+        /// optimizer-state round trip at the cost of one f32 momentum
+        /// surface in VRAM.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_resident_momentum: bool,
+
+
+
+        /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
+        /// Each source-AD lowering (forward slice, backward layer range,
+        /// recompute segment) records its launch sequence, captures it as a
+        /// CUDA graph once stable across steps, and replays it with
+        /// per-launch verification + eager self-repair on any divergence.
+        /// Requires --source-ad; refuses ZeRO, @pipeline, --cuda-sync and
+        /// the kernel profiler. Bit-exact (same kernels, same order, same
+        /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
+        /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        #[arg(long)]
+        pub(crate) cuda_graphs: bool,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
@@ -1204,13 +1265,21 @@ pub(crate) struct RunArgs {
         /// window). `auto` searches strides against --checkpoint-budget-mib and
         /// picks the smallest projected activation peak that fits. `1` (default)
         /// = classic per-block. Bit-exact at any stride.
+        /// `N` coalesces every N block anchors; `auto` searches uniform
+        /// strides against the projected activation peak; `dp` (P5 item 21)
+        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
+        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
+        /// window applied, fusion-aware launch costs and a conservative
+        /// prefetch-overlap credit. Any choice is bit-exact.
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
-        /// Item 9: lower the source-AD RMSNorm input gradient to a single fused
-        /// kernel (native GPU / CPU) instead of the ~11-op decomposition —
-        /// fewer launches, temporaries, HBM traffic. Requires --source-ad.
-        /// Matches the decomposition to an f32 tolerance (opt-in speedup).
+        /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
+        /// AND the gamma gradient to fused kernels (native GPU / CPU) instead
+        /// of the ~11-op / 7-op decompositions — fewer launches, no
+        /// [rows, cols] temporaries, less HBM traffic. Requires --source-ad.
+        /// Matches the decomposition to an f32 tolerance (opt-in speedup);
+        /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
@@ -1241,6 +1310,59 @@ pub(crate) struct RunArgs {
         /// residency for model_save/eval. Byte-preserving / bit-exact.
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
+
+        /// P4 item 17: authoritative parameter storage dtype for training.
+        /// `bf16-sr` stores every streamed parameter as a device-resident
+        /// BF16 buffer (no FP32 master copy) and applies the fused AdamW
+        /// update with compiler-owned counter-based stochastic rounding
+        /// (deterministic in --seed, the step, and the parameter/element
+        /// index). Requires --weight-stream + the fused AdamW step; refuses
+        /// Muon, ZeRO, offload, and reduced-precision-moment compositions.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16-sr"])]
+        pub(crate) param_dtype: String,
+
+        /// P4 item 18: Muon optimizer-state storage ladder. `bf16` stores
+        /// the first-moment (momentum) buffers in BF16 with an FP32 working
+        /// buffer per update and a counter-based stochastically-rounded
+        /// store (v stays f32). `int8-blockwise` and `int4-structural` are
+        /// later ladder rungs — currently refused.
+        #[arg(long, value_name = "DTYPE", default_value = "f32",
+              value_parser = ["f32", "bf16", "int8-blockwise", "int4-structural"])]
+        pub(crate) muon_state_dtype: String,
+
+        /// Muon perf campaign: shape-grouped batched Newton-Schulz for all
+        /// Muon-routed rank-2 hidden matrices — one batched-GEMM pipeline
+        /// per optimizer step (tensor-core TF32 strided-batched GEMMs over
+        /// persistent workspaces) instead of ~15 GEMM launches per matrix.
+        /// GPU-only; tolerance-equivalent to the sequential primitive (the
+        /// AdamW-routed arm stays bit-for-bit stdlib). Refuses
+        /// --layerwise-accum, --optim-state-offload and --zero-stage.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_batch_ns: bool,
+
+        /// Muon perf campaign: with --optim-state-offload, keep Muon-routed
+        /// params' momentum DEVICE-resident (skips its per-step PCIe
+        /// stage-in/writeback; AdamW state for embeddings/head/vectors
+        /// stays offloaded). Removes the mixed recipe's only per-step
+        /// optimizer-state round trip at the cost of one f32 momentum
+        /// surface in VRAM.
+        #[arg(long, default_value_t = false)]
+        pub(crate) muon_resident_momentum: bool,
+
+
+
+        /// P5 item 19: opportunistic per-region CUDA graph capture/replay.
+        /// Each source-AD lowering (forward slice, backward layer range,
+        /// recompute segment) records its launch sequence, captures it as a
+        /// CUDA graph once stable across steps, and replays it with
+        /// per-launch verification + eager self-repair on any divergence.
+        /// Requires --source-ad; refuses ZeRO, @pipeline, --cuda-sync and
+        /// the kernel profiler. Bit-exact (same kernels, same order, same
+        /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
+        /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        #[arg(long)]
+        pub(crate) cuda_graphs: bool,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a

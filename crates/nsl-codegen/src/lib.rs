@@ -1074,6 +1074,13 @@ pub struct WrgaCheckContext {
 pub enum CheckpointStride {
     Fixed(usize),
     Auto,
+    /// P5 item 21: non-uniform partition chosen by the checkpoint DP
+    /// (`--checkpoint-stride dp`) — minimizes GpuSpec-calibrated recompute
+    /// time subject to the projected activation-peak budget, with the CSLA
+    /// window applied and coarse prefetch-overlap credit. Falls back to the
+    /// `Auto` uniform search when the DP declines or its projection is
+    /// contradicted by the true plan.
+    Dp,
 }
 
 impl Default for CheckpointStride {
@@ -1133,6 +1140,41 @@ pub struct CompileOptions {
     pub zk: ZkOptions,
     /// M43b: ZeRO optimizer sharding stage (1, 2, or 3)
     pub zero_stage: Option<u8>,
+    /// P4 item 17 (`--param-dtype bf16-sr`): authoritative BF16 parameter
+    /// storage with counter-based stochastic rounding on the fused AdamW
+    /// update — no FP32 master copy. Rides the weight-stream residency
+    /// schedule (bf16 device mirrors, transient f32 working views).
+    pub param_dtype_bf16sr: bool,
+    /// Muon perf campaign (`--muon-batch-ns`): shape-grouped batched
+    /// Newton-Schulz for all Muon-routed rank-2 params — one
+    /// `nsl_muon_step_batch` call per optimizer step (strided-batched
+    /// tensor-core GEMMs over persistent workspaces) instead of ~15 GEMM
+    /// launches per matrix. GPU-only, tolerance-equivalent (NOT bit-exact)
+    /// vs the sequential primitive; the AdamW-routed arm keeps the stdlib
+    /// path bit-for-bit. Refuses layerwise-accum / offload / ZeRO.
+    pub muon_batch_ns: bool,
+    /// Muon perf campaign (`--muon-resident-momentum`): under
+    /// `--optim-state-offload`, keep the Muon-routed rank-2 params' first
+    /// moment DEVICE-resident (and skip its per-step PCIe stage-in/
+    /// writeback envelope, plus the pointless v round-trip on that route).
+    /// AdamW state (embeddings/head/vectors) stays offloaded. Muon-routed
+    /// momentum is the single per-step optimizer-state round trip the mixed
+    /// recipe pays; this removes it for the cost of one f32 momentum
+    /// surface in VRAM.
+    pub muon_resident_momentum: bool,
+    /// P4 item 18 rung 2 (`--muon-state-dtype bf16`): Muon first-moment
+    /// buffers stored in BF16 with an FP32 working buffer per update and a
+    /// counter-based SR quant-store (v stays f32 — it is null-sloted per
+    /// param on the Muon route).
+    pub muon_state_bf16: bool,
+    /// P5 item 19 (`--cuda-graphs`): opportunistic per-region CUDA graph
+    /// capture/replay. Each Wengert lowering (forward CCR slice, CSLA
+    /// backward layer range, recompute segment) is bracketed with runtime
+    /// region markers; the runtime records the launch sequence, captures it
+    /// as a CUDA graph once it proves stable across steps, and replays it
+    /// with per-launch verification and eager self-repair on any divergence.
+    /// Optimizer updates and weight-stream transfers stay outside regions.
+    pub cuda_graphs: bool,
     /// Debug training mode: disables fusion, disables FBIP, and emits
     /// gradient checksum assertions after each backward pass.
     pub debug_training: bool,
@@ -1417,6 +1459,11 @@ impl Default for CompileOptions {
             ownership_info: HashMap::new(),
             zk: ZkOptions::default(),
             zero_stage: None,
+            param_dtype_bf16sr: false,
+            muon_batch_ns: false,
+            muon_resident_momentum: false,
+            muon_state_bf16: false,
+            cuda_graphs: false,
             debug_training: false,
             grad_integrity: false,
             training_reference: false,

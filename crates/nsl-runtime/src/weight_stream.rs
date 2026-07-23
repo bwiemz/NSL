@@ -146,6 +146,18 @@ pub extern "C" fn nsl_weight_stream_register(tensor_ptr: i64) {
     }
     #[cfg(feature = "cuda")]
     {
+        // P3 ZeRO-3: under --zero-stage 3 the residency backend is the
+        // collective broadcast, not host mirrors — the zero3 table owns all
+        // bookkeeping (owner keeps data; non-owners hold nothing at rest).
+        if crate::zero::zero3_active() {
+            crate::zero::zero3_register(tensor_ptr);
+            return;
+        }
+        // P4 item 17: bf16-sr authoritative mirrors own residency instead.
+        if crate::sr_bf16::srbf16_active() {
+            crate::sr_bf16::srbf16_register(tensor_ptr);
+            return;
+        }
         {
             let guard = MIRRORS.lock().unwrap();
             if guard.as_ref().is_some_and(|g| g.contains_key(&tensor_ptr)) {
@@ -208,6 +220,17 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
     }
+    if crate::zero::zero3_active() {
+        crate::zero::zero3_gather(tensor_ptr);
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        crate::sr_bf16::srbf16_upload(tensor_ptr);
+        return;
+    }
+    if tensor_ptr == 0 {
+        return;
+    }
     let t = NslTensor::from_ptr(tensor_ptr);
     if !t.data.is_null() {
         return; // already resident
@@ -255,6 +278,23 @@ pub extern "C" fn nsl_weight_stream_upload(tensor_ptr: i64) {
 /// Idempotent when already evicted.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
+    if tensor_ptr == 0 {
+        return;
+    }
+    if crate::zero::zero3_active() {
+        // ZeRO-3 has no mirror: writeback is meaningless (the owner's
+        // replica IS the source of truth); non-owners just free.
+        let _ = writeback;
+        crate::zero::zero3_release(tensor_ptr);
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        // bf16-sr: writeback is meaningless — the fused SR step already
+        // persisted the update into the bf16 mirror; just free the view.
+        let _ = writeback;
+        crate::sr_bf16::srbf16_evict(tensor_ptr);
+        return;
+    }
     if tensor_ptr == 0 {
         return;
     }
@@ -311,6 +351,18 @@ pub extern "C" fn nsl_weight_stream_evict(tensor_ptr: i64, writeback: i64) {
 /// "make everything resident now" escape hatch.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_all() {
+    if crate::zero::zero3_active() {
+        crate::zero::zero3_gather_all();
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        crate::sr_bf16::srbf16_upload_all();
+        return;
+    }
+    upload_all_mirrors();
+}
+
+fn upload_all_mirrors() {
     #[cfg(feature = "cuda")]
     {
         let keys: Vec<i64> = {
@@ -476,8 +528,58 @@ fn arena_teardown() {
 /// group). All must be registered and currently evicted. After this returns
 /// each param's `t.data` points inside a shared, reused device slot (a
 /// non-owning view) and the pack shares one slot for its whole residency.
+/// P3 ZeRO-3: per-param gather/release over a pack list (the arena pack
+/// batching does not apply to collective fills in v1 — each param
+/// broadcasts individually, in list order, identically on every rank).
+fn zero3_pack_each(pw_list_ptr: i64, gather: bool) {
+    if pw_list_ptr == 0 {
+        return;
+    }
+    let list = crate::list::NslList::from_ptr(pw_list_ptr);
+    for i in 0..list.len as usize {
+        let ptr = unsafe { *list.data.add(i) };
+        if ptr == 0 {
+            continue;
+        }
+        if gather {
+            crate::zero::zero3_gather(ptr);
+        } else {
+            crate::zero::zero3_release(ptr);
+        }
+    }
+}
+
+/// P4 item 17: per-param widen/evict over a pack list (arena batching does
+/// not apply to the bf16 mirror casts in v1 — each param widens into its
+/// own transient buffer, in list order).
+fn srbf16_pack_each(pw_list_ptr: i64, upload: bool) {
+    if pw_list_ptr == 0 {
+        return;
+    }
+    let list = crate::list::NslList::from_ptr(pw_list_ptr);
+    for i in 0..list.len as usize {
+        let ptr = unsafe { *list.data.add(i) };
+        if ptr == 0 {
+            continue;
+        }
+        if upload {
+            crate::sr_bf16::srbf16_upload(ptr);
+        } else {
+            crate::sr_bf16::srbf16_evict(ptr);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
+    if crate::zero::zero3_active() {
+        zero3_pack_each(pw_list_ptr, true);
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        srbf16_pack_each(pw_list_ptr, true);
+        return;
+    }
     #[cfg(feature = "cuda")]
     upload_pack_inner(pw_list_ptr, false);
     #[cfg(not(feature = "cuda"))]
@@ -496,6 +598,21 @@ pub extern "C" fn nsl_weight_stream_upload_pack(pw_list_ptr: i64) {
 /// until its drain.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_prefetch_pack(pw_list_ptr: i64) {
+    // ZeRO-3: the "prefetch" IS the gather, issued at the overlap point the
+    // schedule chose (item 14's ordering); the later upload_pack for the
+    // same pack early-returns SYMMETRICALLY on every rank (both owner and
+    // non-owners are GatheredTemporary after this — see zero3_gather).
+    // Synchronous under the sim backends; NCCL-stream async is the
+    // documented follow-up.
+    if crate::zero::zero3_active() {
+        zero3_pack_each(pw_list_ptr, true);
+        return;
+    }
+    // bf16-sr v1: the prefetch IS a synchronous widen (no transfer stream).
+    if crate::sr_bf16::srbf16_active() {
+        srbf16_pack_each(pw_list_ptr, true);
+        return;
+    }
     #[cfg(feature = "cuda")]
     upload_pack_inner(pw_list_ptr, true);
     #[cfg(not(feature = "cuda"))]
@@ -588,6 +705,12 @@ fn upload_pack_inner(pw_list_ptr: i64, prefetch: bool) {
 /// arena-resident. The pack's members share one slot; the event lives on it.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_await_pack(pw_list_ptr: i64) {
+    if crate::zero::zero3_active() {
+        return; // zero3 gathers are synchronous — nothing to await
+    }
+    if crate::sr_bf16::srbf16_active() {
+        return; // bf16-sr widens are synchronous — nothing to await
+    }
     if pw_list_ptr == 0 {
         return;
     }
@@ -653,6 +776,16 @@ fn arena_take_pending_event(slot: usize) -> u64 {
 /// uploaded together).
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_evict_pack(pw_list_ptr: i64, writeback: i64) {
+    if crate::zero::zero3_active() {
+        let _ = writeback;
+        zero3_pack_each(pw_list_ptr, false);
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        let _ = writeback;
+        srbf16_pack_each(pw_list_ptr, false);
+        return;
+    }
     if pw_list_ptr == 0 {
         return;
     }
@@ -842,6 +975,14 @@ fn drain_all_writebacks() {
 /// timing differs, which the bit-exact gate proves.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_evict_pack_async(pw_list_ptr: i64) {
+    if crate::zero::zero3_active() {
+        zero3_pack_each(pw_list_ptr, false);
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        srbf16_pack_each(pw_list_ptr, false);
+        return;
+    }
     if pw_list_ptr == 0 {
         return;
     }
@@ -962,6 +1103,12 @@ pub extern "C" fn nsl_weight_stream_is_registered(tensor_ptr: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
     }
+    if crate::zero::zero3_active() {
+        return crate::zero::zero3_is_registered(tensor_ptr) as i64;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        return crate::sr_bf16::srbf16_is_registered(tensor_ptr) as i64;
+    }
     #[cfg(feature = "cuda")]
     {
         let guard = MIRRORS.lock().unwrap();
@@ -990,6 +1137,16 @@ pub extern "C" fn nsl_weight_stream_is_registered(tensor_ptr: i64) -> i64 {
 /// transfer arithmetic the gates assert is untouched.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
+    if crate::zero::zero3_active() {
+        let _ = writeback;
+        crate::zero::zero3_release_all();
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        let _ = writeback;
+        crate::sr_bf16::srbf16_evict_all();
+        return;
+    }
     #[cfg(feature = "cuda")]
     {
         let keys: Vec<i64> = {
@@ -1015,6 +1172,21 @@ pub extern "C" fn nsl_weight_stream_reevict_all(writeback: i64) {
 /// are released.
 #[no_mangle]
 pub extern "C" fn nsl_weight_stream_teardown() {
+    if crate::zero::zero3_active() {
+        // Restore full residency everywhere (model_save/eval end state),
+        // then drop the zero3 mode.
+        crate::zero::nsl_zero3_teardown();
+        return;
+    }
+    if crate::sr_bf16::srbf16_active() {
+        // Re-materialize plain f32 tensors, free mirrors, drop the mode.
+        crate::sr_bf16::nsl_sr_bf16_teardown();
+        return;
+    }
+    teardown_mirrors();
+}
+
+fn teardown_mirrors() {
     #[cfg(feature = "cuda")]
     {
         // Item 11 (writeback half): the restore loop below reads every mirror

@@ -98,10 +98,10 @@ use nsl_runtime::inspect::stats_kernel::nsl_tensor_stats;
 use nsl_runtime::list::{nsl_list_free, nsl_list_new, nsl_list_push};
 use nsl_runtime::tensor::{nsl_tensor_free, nsl_tensor_from_static};
 
-/// NslTensor dtype tags (runtime ABI: 0=f64, 1=f32, 4=i32).
+/// NslTensor dtype tags (runtime ABI: 0=f64, 1=f32, 9=i32).
 const DTYPE_F64: i64 = 0;
 const DTYPE_F32: i64 = 1;
-const DTYPE_I32: i64 = 4;
+const DTYPE_I32: i64 = 9;
 
 /// Build a rank-1 CPU tensor over a leaked buffer (`owns_data = 0`; the
 /// per-test leak is tiny and keeps the data alive for the tensor's lifetime).

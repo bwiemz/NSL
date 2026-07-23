@@ -26,7 +26,7 @@ fn e2e_nested_list_comprehensions() {
     let root = workspace_root();
     let example = root.join("examples/nested_list_comprehensions.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example)
         .current_dir(&root)
         .output()

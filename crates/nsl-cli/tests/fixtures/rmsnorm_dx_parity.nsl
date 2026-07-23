@@ -27,3 +27,6 @@ train(model=m, epochs=6, grad_accumulation=1):
 print("W_BEGIN")
 print(m.w)
 print("W_END")
+print("G_BEGIN")
+print(m.g)
+print("G_END")

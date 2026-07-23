@@ -25,7 +25,7 @@ fn e2e_multidim_tensor_subscript() {
     let root = workspace_root();
     let example = root.join("examples/multidim_tensor_subscript.nsl");
     let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--", "run"])
+        .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example)
         .current_dir(&root)
         .output()

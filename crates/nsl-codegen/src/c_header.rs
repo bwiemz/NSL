@@ -238,7 +238,7 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("    int64_t* shape;\n");
     out.push_str("    int64_t* strides;     /* NULL = contiguous */\n");
     out.push_str("    int32_t  ndim;\n");
-    out.push_str("    int32_t  dtype;       /* 0=f32, 1=f64, 2=f16, 3=bf16, 4=i32, 5=i64, 6=i8, 7=u8 */\n");
+    out.push_str("    int32_t  dtype;       /* canonical NSL tags: 0=f64, 1=f32, 2=f16, 3=bf16, 4=i8, 9=i32 */\n");
     out.push_str("    int32_t  device_type; /* 0=CPU, 1=CUDA */\n");
     out.push_str("    int32_t  device_id;\n");
     out.push_str("    int64_t  tape_id;     /* autodiff identity (0 = untracked) */\n");

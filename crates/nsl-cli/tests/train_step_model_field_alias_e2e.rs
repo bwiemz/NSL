@@ -58,7 +58,7 @@ fn e2e_model_field_alias_survives_step_cleanup() {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&file)
         .current_dir(&dir)
         .env("CARGO_TARGET_DIR", root.join("target"))

@@ -46,6 +46,8 @@ const FROB_EPS: f64 = 0.000_000_1;
 /// (materialized square, sequential sum, f64 host sqrt, scalar mul).
 /// There is no sync to remove on CPU, so this path stays reference-shaped.
 fn cpu_frobenius_scale(x_ptr: i64) -> i64 {
+    use crate::muon_prof::{scope, Region};
+    let reduce = scope(Region::FrobeniusReduce);
     let sq = nsl_tensor_mul(x_ptr, x_ptr, 0);
     let s_t = nsl_tensor_sum(sq);
     nsl_tensor_free(sq);
@@ -63,6 +65,8 @@ fn cpu_frobenius_scale(x_ptr: i64) -> i64 {
         v
     };
     nsl_tensor_free(s_t);
+    drop(reduce);
+    let _p = scope(Region::NormalizeScale);
     let inv = 1.0 / (s.sqrt() + FROB_EPS);
     nsl_tensor_mul_scalar(x_ptr, inv, 0)
 }
@@ -98,13 +102,19 @@ pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i6
     let (rows, cols) = unsafe { (*g.shape, *g.shape.add(1)) };
     let tall = rows > cols;
 
+    use crate::muon_prof::{scope, Region};
+    let _total = scope(Region::NsTotal);
+
     // 1. Frobenius pre-normalization on the ORIGINAL orientation (norm is
     //    transpose-invariant; the input is contiguous here or the GPU helper
     //    materializes it). GPU: fully device-resident. CPU: reference math.
+    //    The GPU helper fuses reduce+scale, so both stages land in one
+    //    region there; the CPU path splits them for the profile.
     let x0 = {
         #[cfg(feature = "cuda")]
         {
             if g.device > 0 {
+                let _p = scope(Region::FrobeniusReduce);
                 crate::cuda::gpu_muon_frobenius_scale_f32(g_ptr)
             } else {
                 cpu_frobenius_scale(g_ptr)
@@ -119,6 +129,7 @@ pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i6
     // 2. Tall matrices orthogonalize the transpose so the Gram matrix stays
     //    at the smaller dimension — materialized once at entry.
     let mut x = if tall {
+        let _p = scope(Region::EntryTranspose);
         let v = nsl_tensor_transpose(x0, 0, 1);
         let c = nsl_tensor_contiguous(v);
         nsl_tensor_free(v);
@@ -132,14 +143,23 @@ pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i6
     //    x = NS_A·x + b x. The fused scalar_mul_add_inplace keeps each
     //    combine at one launch and is bit-exact vs mul_scalar + add.
     for _ in 0..steps {
-        let xt = nsl_tensor_transpose(x, 0, 1);
-        let a = nsl_tensor_matmul(x, xt, 0);
-        nsl_tensor_free(xt);
-        let aa = nsl_tensor_matmul(a, a, 0);
-        let b = nsl_tensor_mul_scalar(a, NS_B, 0);
-        nsl_tensor_scalar_mul_add_inplace(b, aa, NS_C);
-        nsl_tensor_free(a);
-        nsl_tensor_free(aa);
+        let a = {
+            let _p = scope(Region::GramGemm);
+            let xt = nsl_tensor_transpose(x, 0, 1);
+            let a = nsl_tensor_matmul(x, xt, 0);
+            nsl_tensor_free(xt);
+            a
+        };
+        let b = {
+            let _p = scope(Region::GramSqGemm);
+            let aa = nsl_tensor_matmul(a, a, 0);
+            let b = nsl_tensor_mul_scalar(a, NS_B, 0);
+            nsl_tensor_scalar_mul_add_inplace(b, aa, NS_C);
+            nsl_tensor_free(a);
+            nsl_tensor_free(aa);
+            b
+        };
+        let _p = scope(Region::PolyGemm);
         let t = nsl_tensor_matmul(b, x, 0);
         nsl_tensor_scalar_mul_add_inplace(t, x, NS_A);
         nsl_tensor_free(b);
@@ -150,6 +170,7 @@ pub extern "C" fn nsl_tensor_muon_orthogonalize(g_ptr: i64, ns_steps: f64) -> i6
     // 4. Restore the original orientation — materialized so the caller
     //    never receives a strided view.
     if tall {
+        let _p = scope(Region::ExitTranspose);
         let v = nsl_tensor_transpose(x, 0, 1);
         let c = nsl_tensor_contiguous(v);
         nsl_tensor_free(v);
@@ -275,5 +296,60 @@ mod tests {
         assert_eq!(read_f64(g, 6), data.to_vec(), "input was clobbered");
         nsl_tensor_free(out);
         nsl_tensor_free(g);
+    }
+
+    /// Perf-campaign item 2 driver: one coder500m optimizer step's worth of
+    /// Newton-Schulz calls on the GPU, per shape class. Run with the
+    /// profiler armed to get the stage breakdown, and without it for the
+    /// undistorted wall time:
+    ///
+    ///   NSL_MUON_PROF=1 cargo test -p nsl-runtime --features cuda --release \
+    ///     --lib -- --ignored profile_ns_500m_step --test-threads=1 --nocapture
+    ///
+    /// coder500m muon-routed rank-2 classes per step (24 layers):
+    ///   wq/wo    [1280,1280] x48   wk/wv  [1280, 640] x48
+    ///   gate/up  [1280,3520] x48   down   [3520,1280] x24
+    #[test]
+    #[ignore = "requires CUDA GPU (profiling driver, not a correctness gate)"]
+    #[cfg(feature = "cuda")]
+    fn profile_ns_500m_step() {
+        use crate::tensor::nsl_tensor_to_device;
+        let classes: [(i64, i64, usize); 4] =
+            [(1280, 1280, 48), (1280, 640, 48), (1280, 3520, 48), (3520, 1280, 24)];
+        let mut inputs = Vec::new();
+        for (rows, cols, _) in classes {
+            let n = (rows * cols) as usize;
+            // Deterministic pseudo-grad data; values are irrelevant to cost.
+            let data: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.618).sin() * 0.01).collect();
+            let cpu = make_f64(rows, cols, &data);
+            let gpu = nsl_tensor_to_device(cpu, 1);
+            nsl_tensor_free(cpu);
+            inputs.push(gpu);
+        }
+        // Warmup: one call per class primes cublas + allocator caches.
+        for &g in &inputs {
+            let o = nsl_tensor_muon_orthogonalize(g, 5.0);
+            nsl_tensor_free(o);
+        }
+        let wall = std::time::Instant::now();
+        for (idx, (_, _, count)) in classes.iter().enumerate() {
+            for _ in 0..*count {
+                let o = nsl_tensor_muon_orthogonalize(inputs[idx], 5.0);
+                nsl_tensor_free(o);
+            }
+        }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            crate::cuda::inner::ensure_context();
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
+        eprintln!(
+            "[muon-prof-driver] one 500M-step NS load (168 calls, ns=5): {:.1} ms wall",
+            wall.elapsed().as_secs_f64() * 1e3
+        );
+        crate::muon_prof::report();
+        for g in inputs {
+            nsl_tensor_free(g);
+        }
     }
 }

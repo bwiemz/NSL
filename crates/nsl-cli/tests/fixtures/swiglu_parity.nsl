@@ -1,0 +1,34 @@
+# P5 item 20 slice B fixture — a real SwiGLU MLP: f = silu(x@Wg) * (x@Wu).
+# The gate-branch adjoint contains the Mul(dy, up) -> silu_backward pair the
+# peephole fuses into one swiglu_gate_backward launch; training must land in
+# the same place as tape-AD (the independent reference) either way.
+from nsl.nn.losses import l1_loss
+
+model SwiGluMLP:
+    w_gate: Tensor = (arange(32).reshape([4, 8])) * 0.02
+    w_up: Tensor = (arange(32).reshape([4, 8])) * 0.01 + full([4, 8], 0.05)
+    w_down: Tensor = (arange(32).reshape([8, 4])) * 0.015
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let g = x @ self.w_gate
+        let u = x @ self.w_up
+        let f = silu(g) * u
+        return f @ self.w_down
+
+let m = SwiGluMLP()
+let x = (arange(8).reshape([2, 4])) * 0.1 + full([2, 4], 0.1)
+let y = zeros([2, 4])
+# GPU_PLACEMENT
+
+train(model=m, epochs=6, grad_accumulation=1):
+    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = l1_loss(pred, y)
+
+print("WG_BEGIN")
+print(m.w_gate)
+print("WG_END")
+print("WU_BEGIN")
+print(m.w_up)
+print("WU_END")

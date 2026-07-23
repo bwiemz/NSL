@@ -21,14 +21,14 @@ use crate::compiler::Compiler;
 
 /// Scalars extracted from a structurally-matched AdamW/Adam `UpdateProgram`
 /// (p9 fused optimizer step admission — see `match_adamw_program`).
-struct FusedAdamwScalars {
-    lr: f64,
-    wd: f64,
-    beta1: f64,
-    one_minus_beta1: f64,
-    beta2: f64,
-    one_minus_beta2: f64,
-    eps: f64,
+pub(crate) struct FusedAdamwScalars {
+    pub(crate) lr: f64,
+    pub(crate) wd: f64,
+    pub(crate) beta1: f64,
+    pub(crate) one_minus_beta1: f64,
+    pub(crate) beta2: f64,
+    pub(crate) one_minus_beta2: f64,
+    pub(crate) eps: f64,
 }
 use crate::fase::FasePlan;
 
@@ -74,7 +74,7 @@ impl Compiler<'_> {
     /// the recipe scalars when — and only when — the program is that shape;
     /// any future change to the emitter fails the match and falls back to the
     /// interpreted path loudly-by-construction (no silent drift).
-    fn match_adamw_program(
+    pub(crate) fn match_adamw_program(
         program: &crate::fase_optimizer::UpdateProgram,
     ) -> Option<FusedAdamwScalars> {
         use crate::fase_optimizer::{BcKind, Register, UpdateOp};
@@ -145,6 +145,9 @@ impl Compiler<'_> {
         // single-purpose envelopes (nsl_tensor_cast_into asserts
         // co-residency, so chaining cannot work).
         wrap_offload: bool,
+        // P4 item 17: Some(opt_step i64 Value) when `--param-dtype bf16-sr`
+        // is active — the SR counter stream is keyed on it. None otherwise.
+        sr_step: Option<Value>,
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
 
@@ -272,6 +275,29 @@ impl Compiler<'_> {
         } else {
             None
         };
+        // P4 item 17: under bf16-sr the ONLY sanctioned theta mutation is the
+        // fused SR step against the bf16 mirror. The interpreted fallback
+        // would write the transient f32 working view and silently diverge
+        // from the authoritative mirror on the next widen — refuse instead
+        // of corrupting (deferral-must-refuse).
+        let bf16sr = self.features.param_dtype_bf16sr;
+        if bf16sr && fused_scalars.is_none() {
+            return Err(crate::error::CodegenError::new(
+                "--param-dtype bf16-sr requires the fused AdamW/Adam update \
+                 shape (strict structural match) — this optimizer program \
+                 would fall to the interpreted path, which cannot write the \
+                 bf16 authoritative mirror. Use AdamW/Adam without \
+                 NSL_FASE_FUSED_STEP=0 / --training-reference, or drop \
+                 --param-dtype bf16-sr",
+            ));
+        }
+        if bf16sr && (wrap_precision || wrap_offload) {
+            return Err(crate::error::CodegenError::new(
+                "--param-dtype bf16-sr does not compose with reduced-precision \
+                 moment plans or --optim-state-offload (m/v must be plain \
+                 device f32 for the fused SR step)",
+            ));
+        }
         let fused_emitted = if let Some(((bc1_val, bc2_val), s)) = fused_scalars {
             let lr_v = builder.ins().f64const(s.lr);
             let b1_v = builder.ins().f64const(s.beta1);
@@ -280,15 +306,31 @@ impl Compiler<'_> {
             let omb2_v = builder.ins().f64const(s.one_minus_beta2);
             let eps_v = builder.ins().f64const(s.eps);
             let wd_v = builder.ins().f64const(s.wd);
-            self.compile_call_by_name(
-                builder,
-                "nsl_fase_fused_adamw_step",
-                &[
-                    theta_ptr, m_ptr, v_ptr, m_partial_ptr,
-                    lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
-                    bc1_val, bc2_val,
-                ],
-            )?;
+            if bf16sr {
+                let step_v = sr_step.ok_or_else(|| crate::error::CodegenError::new(
+                    "bf16-sr final step reached without an opt_step value — \
+                     dispatcher must thread sr_step",
+                ))?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_sr_bf16_step_adamw",
+                    &[
+                        theta_ptr, m_ptr, v_ptr, m_partial_ptr,
+                        lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
+                        bc1_val, bc2_val, step_v,
+                    ],
+                )?;
+            } else {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_fase_fused_adamw_step",
+                    &[
+                        theta_ptr, m_ptr, v_ptr, m_partial_ptr,
+                        lr_v, b1_v, omb1_v, b2_v, omb2_v, eps_v, wd_v,
+                        bc1_val, bc2_val,
+                    ],
+                )?;
+            }
             true
         } else {
             false
@@ -478,15 +520,11 @@ impl Compiler<'_> {
                         )?;
                     }
                     self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dst_ptr, scaled_sq])?;
-                    // FBIP relinq contract: when mul_scalar reuses the input
-                    // buffer in-place, it bumps refcount so the input ptr is
-                    // still valid post-call. The caller must free BOTH the
-                    // input (sq) and the output (scaled_sq) — under FBIP they
-                    // are the same pointer with rc=2; the two frees drop it
-                    // to 0. Without the second free, every SquaredAccumulate
-                    // leaks one operand-sized tensor per call.
+                    // FBIP relinq contract: relinquishing sq transferred our ref
+                    // into the callee — the returned scaled_sq carries the single
+                    // live ref whether or not the buffer was reused in place.
+                    // Freeing sq again here would double-free on the reuse path.
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[scaled_sq])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[sq])?;
                 }
 
                 // ── SqrtPlusEps: dst = sqrt(src) + eps ─────────────────────
@@ -543,11 +581,10 @@ impl Compiler<'_> {
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, eps_result])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[eps_result])?;
                     }
-                    // FBIP relinq contract: caller must also free the input we
-                    // relinquished to add_scalar. Under FBIP, sqrt_val and
-                    // eps_result share the same buffer with rc=2; the eps_result
-                    // free above drops to 1, this one drops to 0.
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[sqrt_val])?;
+                    // FBIP relinq contract: relinquishing sqrt_val transferred our
+                    // ref into add_scalar — eps_result carries the single live ref
+                    // (freed above, or owned by tmp_val). A second free of
+                    // sqrt_val here would dangle tmp_val on the reuse path.
                 }
 
                 // ── Div: dst = src / divisor ─────────────────────────────────
@@ -969,18 +1006,87 @@ impl Compiler<'_> {
         // identical to the cast envelope above).
         let offload_only = wrap_offload && !offload_combined;
         let offload_s2 = offload_only && orig_s1 != orig_s2;
+        // Muon perf campaign (`--muon-resident-momentum`): on the Muon route
+        // (flag < 0.5 AND runtime rank 2 — the EXACT condition the moment
+        // allocation used to place m on the device) the whole staging
+        // envelope is skipped: m is already device-resident and the muon
+        // arm never reads v. The condition value is computed once and
+        // reused at the copy-back below (it dominates that code).
+        let muon_resident_cond = if offload_only
+            && self.compile_options.muon_resident_momentum
+            && optimizer_name == "muon"
+        {
+            use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+            let (flag_f, _, _) = muon_extra.ok_or_else(|| {
+                crate::error::CodegenError::new(
+                    "muon_extra is required for muon (resident-momentum envelope)",
+                )
+            })?;
+            let half = builder.ins().f64const(0.5);
+            let is_muon = builder.ins().fcmp(FloatCC::LessThan, flag_f, half);
+            let ndim =
+                self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_val])?;
+            let two_c = builder.ins().iconst(cl_types::I64, 2);
+            let is_r2 = builder.ins().icmp(IntCC::Equal, ndim, two_c);
+            Some(builder.ins().band(is_muon, is_r2))
+        } else {
+            None
+        };
         let (s1, s2) = if offload_only {
-            let ws1 = self.compile_call_by_name(
-                builder, "nsl_tensor_to_device_like", &[s1, param_val],
-            )?;
-            let ws2 = if offload_s2 {
-                self.compile_call_by_name(
-                    builder, "nsl_tensor_to_device_like", &[s2, param_val],
-                )?
+            if let Some(resident) = muon_resident_cond {
+                use cranelift_codegen::ir::InstBuilder as _;
+                let stage_b = builder.create_block();
+                let merge_b = builder.create_block();
+                builder.append_block_param(merge_b, cl_types::I64);
+                builder.append_block_param(merge_b, cl_types::I64);
+                // Resident: pass the device m (and the host v, unread on
+                // this route) straight through.
+                builder.ins().brif(resident, merge_b, &[s1, s2], stage_b, &[]);
+
+                builder.switch_to_block(stage_b);
+                builder.seal_block(stage_b);
+                let prof_in = builder.ins().iconst(cl_types::I64, 0); // MomentumStageIn
+                self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_in])?;
+                let ws1 = self.compile_call_by_name(
+                    builder, "nsl_tensor_to_device_like", &[s1, param_val],
+                )?;
+                let ws2 = if offload_s2 {
+                    self.compile_call_by_name(
+                        builder, "nsl_tensor_to_device_like", &[s2, param_val],
+                    )?
+                } else {
+                    ws1
+                };
+                self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_in])?;
+                builder.ins().jump(merge_b, &[ws1, ws2]);
+
+                builder.switch_to_block(merge_b);
+                builder.seal_block(merge_b);
+                let ps = builder.block_params(merge_b);
+                (ps[0], ps[1])
             } else {
-                ws1
-            };
-            (ws1, ws2)
+                let prof = if optimizer_name == "muon" {
+                    let prof_in = builder.ins().iconst(cl_types::I64, 0); // MomentumStageIn
+                    self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_in])?;
+                    Some(prof_in)
+                } else {
+                    None
+                };
+                let ws1 = self.compile_call_by_name(
+                    builder, "nsl_tensor_to_device_like", &[s1, param_val],
+                )?;
+                let ws2 = if offload_s2 {
+                    self.compile_call_by_name(
+                        builder, "nsl_tensor_to_device_like", &[s2, param_val],
+                    )?
+                } else {
+                    ws1
+                };
+                if let Some(prof_in) = prof {
+                    self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_in])?;
+                }
+                (ws1, ws2)
+            }
         } else {
             (s1, s2)
         };
@@ -1124,9 +1230,42 @@ impl Compiler<'_> {
         // copy_data_async CONSUMES the staged tensor (async DtoH on pinned
         // hosts, drain-deferred free; sync copy + inline free otherwise).
         if offload_only {
-            self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
-            if offload_s2 {
-                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+            if let Some(resident) = muon_resident_cond {
+                // Resident Muon momentum: the update ran in place on the
+                // device m — nothing was staged, nothing to write back.
+                use cranelift_codegen::ir::InstBuilder as _;
+                let wb_b = builder.create_block();
+                let done_b = builder.create_block();
+                builder.ins().brif(resident, done_b, &[], wb_b, &[]);
+
+                builder.switch_to_block(wb_b);
+                builder.seal_block(wb_b);
+                let prof_wb = builder.ins().iconst(cl_types::I64, 10); // MomentumWriteback
+                self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_wb])?;
+                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
+                if offload_s2 {
+                    self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+                }
+                self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_wb])?;
+                builder.ins().jump(done_b, &[]);
+
+                builder.switch_to_block(done_b);
+                builder.seal_block(done_b);
+            } else {
+                let prof = if optimizer_name == "muon" {
+                    let prof_wb = builder.ins().iconst(cl_types::I64, 10); // MomentumWriteback
+                    self.compile_call_by_name(builder, "nsl_muon_prof_begin", &[prof_wb])?;
+                    Some(prof_wb)
+                } else {
+                    None
+                };
+                self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s1, s1])?;
+                if offload_s2 {
+                    self.compile_call_by_name(builder, "nsl_tensor_copy_data_async", &[orig_s2, s2])?;
+                }
+                if let Some(prof_wb) = prof {
+                    self.compile_call_by_name(builder, "nsl_muon_prof_end", &[prof_wb])?;
+                }
             }
         }
         // Combined copy-back (P0.3): quant-cast to the host dtype + DtoH;
@@ -1388,6 +1527,7 @@ impl Compiler<'_> {
                 Some((bc1_inv, bc2_inv)),
                 cpdt_precision_dtypes.is_some(),
                 self.compile_options.optim_state_offload,
+                Some(opt_step),
             )?;
         }
         builder.ins().jump(iter_join, &[]);

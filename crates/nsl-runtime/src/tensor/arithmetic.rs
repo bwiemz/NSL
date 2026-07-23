@@ -44,7 +44,10 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
-                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    // Ownership transfer: the caller's relinquished A ref IS the
+                    // result ref. Bumping here (as the unary can_mutate_inplace
+                    // family does, where the caller keeps its input handle) makes
+                    // every relinquishing caller leak one ref per call.
                     super::fbip_record_reuse();
                     // FBIP-3: free caller's original B if relinquished.
                     // Free the runtime-owned reconciled copy if we created one.
@@ -108,7 +111,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                 let db = tb.data as *const f64;
                 for i in 0..len { unsafe { *da.add(i) += *db.add(i) }; }
             }
-            ta.refcount.fetch_add(1, Ordering::SeqCst);
+            // Ownership transfer: no refcount bump (see the GPU branch above).
             super::fbip_record_reuse();
             // FBIP-3 double-free-safe: even on the in-place-on-A branch, if B was
             // relinquished the caller's original must still be freed (the critical
@@ -169,7 +172,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
-                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     if relinq_b { nsl_tensor_free(b_orig); }
                     if b_transferred { nsl_tensor_free(b); }
@@ -217,7 +220,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
                 let db = tb.data as *const f64;
                 for i in 0..len { unsafe { *da.add(i) -= *db.add(i) }; }
             }
-            ta.refcount.fetch_add(1, Ordering::SeqCst);
+            // Ownership transfer: no refcount bump.
             super::fbip_record_reuse();
             if relinq_b { nsl_tensor_free(b_orig); }
             if b_transferred { nsl_tensor_free(b); }
@@ -263,7 +266,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
-                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     if relinq_b { nsl_tensor_free(b_orig); }
                     if b_transferred { nsl_tensor_free(b); }
@@ -311,7 +314,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
                 let db = tb.data as *const f64;
                 for i in 0..len { unsafe { *da.add(i) *= *db.add(i) }; }
             }
-            ta.refcount.fetch_add(1, Ordering::SeqCst);
+            // Ownership transfer: no refcount bump.
             super::fbip_record_reuse();
             if relinq_b { nsl_tensor_free(b_orig); }
             if b_transferred { nsl_tensor_free(b); }
@@ -367,7 +370,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
                     crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
-                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     if relinq_b { nsl_tensor_free(b_orig); }
                     if b_transferred { nsl_tensor_free(b); }
@@ -415,7 +418,7 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
                 let db = tb.data as *const f64;
                 for i in 0..len { unsafe { *da.add(i) /= *db.add(i) }; }
             }
-            ta.refcount.fetch_add(1, Ordering::SeqCst);
+            // Ownership transfer: no refcount bump.
             super::fbip_record_reuse();
             if relinq_b { nsl_tensor_free(b_orig); }
             if b_transferred { nsl_tensor_free(b); }
@@ -580,7 +583,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             {
                 if relinq_a {
                     crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
-                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
@@ -593,10 +596,10 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
-    // Skip for dtype=4 (i32) — needs type conversion to float, can't mutate in-place.
+    // Skip for i32 — needs type conversion to float, can't mutate in-place.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if t.dtype != 4 && relinq_a {
+        if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
                 let d = t.data as *mut u16;
@@ -620,7 +623,7 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
                 let d = t.data as *mut f64;
                 for i in 0..len { unsafe { *d.add(i) += s }; }
             }
-            t.refcount.fetch_add(1, Ordering::SeqCst);
+            // Ownership transfer: no refcount bump.
             super::fbip_record_reuse();
             return a_ptr;
         }
@@ -634,8 +637,8 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
 
     // Output dtype: i32 inputs produce f32 (used for label arithmetic in cross_entropy)
-    let out_dtype: u16 = if a.dtype == 4 { 1 } else { a.dtype };
-    let data: *mut c_void = if a.dtype == 4 {
+    let out_dtype: u16 = if a.dtype == crate::tensor::DTYPE_I32 { 1 } else { a.dtype };
+    let data: *mut c_void = if a.dtype == crate::tensor::DTYPE_I32 {
         // i32 → f32 with scalar add
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         let src = a.data as *const i32;
@@ -707,7 +710,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             {
                 if relinq_a {
                     crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
-                    ta.refcount.fetch_add(1, Ordering::SeqCst);
+                    // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
@@ -720,9 +723,11 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
+    // Skip for i32 — the dtype arms below would flat-index it as f64 (8-byte
+    // writes into a 4-byte-element buffer). Same guard as nsl_tensor_add_scalar.
     {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
-        if relinq_a {
+        if t.dtype != crate::tensor::DTYPE_I32 && relinq_a {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
                 // f16 in-place scalar mul: widen to f32, multiply, narrow back.
@@ -747,7 +752,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
                 let d = t.data as *mut f64;
                 for i in 0..len { unsafe { *d.add(i) *= s }; }
             }
-            t.refcount.fetch_add(1, Ordering::SeqCst);
+            // Ownership transfer: no refcount bump.
             super::fbip_record_reuse();
             return a_ptr;
         }

@@ -91,6 +91,9 @@ fn nsl_dtype_to_dl(dtype: u16) -> DLDataType {
         DTYPE_FP16 => DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 16, lanes: 1 },
         DTYPE_BF16 => DLDataType { code: DLDataTypeCode::KDLBfloat as u8, bits: 16, lanes: 1 },
         DTYPE_INT8 => DLDataType { code: DLDataTypeCode::KDLInt as u8, bits: 8, lanes: 1 },
+        crate::tensor::DTYPE_I32 => {
+            DLDataType { code: DLDataTypeCode::KDLInt as u8, bits: 32, lanes: 1 }
+        }
         _ => DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 64, lanes: 1 },
     }
 }
@@ -103,6 +106,7 @@ fn dl_dtype_to_nsl(dt: &DLDataType) -> Option<u16> {
         (c, 16) if c == DLDataTypeCode::KDLFloat as u8 => Some(DTYPE_FP16),
         (c, 16) if c == DLDataTypeCode::KDLBfloat as u8 => Some(DTYPE_BF16),
         (c, 8) if c == DLDataTypeCode::KDLInt as u8 => Some(DTYPE_INT8),
+        (c, 32) if c == DLDataTypeCode::KDLInt as u8 => Some(crate::tensor::DTYPE_I32),
         _ => None,
     }
 }

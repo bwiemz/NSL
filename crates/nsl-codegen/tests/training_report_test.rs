@@ -29,7 +29,17 @@ fn run_check_with_report(
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "--manifest-path"])
         .arg(&cargo_toml)
-        .args(["-p", "nsl-cli", "--", "check"]);
+        .args(["-p", "nsl-cli"]);
+    if cfg!(feature = "cuda") {
+        // Feature-compatibility guard: an unfeatured `cargo run -p nsl-cli`
+        // REBUILDS AND REPLACES target/debug/nsl as a non-CUDA binary while
+        // the workspace suite runs, breaking every concurrently-running test
+        // that spawns that path (phantom "CUDA support not compiled"
+        // failures inside their trained programs). Forward cuda so the
+        // spawned build matches the suite's binary (and is usually a no-op).
+        cmd.args(["--features", "cuda"]);
+    }
+    cmd.args(["--", "check"]);
 
     match format {
         Some(f) => {
@@ -148,10 +158,21 @@ fn no_flag_produces_no_report_stdout() {
     let cargo_toml = root.join("Cargo.toml");
     let stdlib_path = root.join("stdlib");
 
-    let out = Command::new(env!("CARGO"))
-        .args(["run", "-q", "--manifest-path"])
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args(["run", "-q", "--manifest-path"])
         .arg(&cargo_toml)
-        .args(["-p", "nsl-cli", "--", "check"])
+        .args(["-p", "nsl-cli"]);
+    if cfg!(feature = "cuda") {
+        // Feature-compatibility guard: an unfeatured `cargo run -p nsl-cli`
+        // REBUILDS AND REPLACES target/debug/nsl as a non-CUDA binary while
+        // the workspace suite runs, breaking every concurrently-running test
+        // that spawns that path (phantom "CUDA support not compiled"
+        // failures inside their trained programs). Forward cuda so the
+        // spawned build matches the suite's binary (and is usually a no-op).
+        cmd.args(["--features", "cuda"]);
+    }
+    let out = cmd
+        .args(["--", "check"])
         .arg(fixture("training_report_fase_deferred.nsl"))
         .env("NSL_STDLIB_PATH", &stdlib_path)
         .output()

@@ -229,17 +229,16 @@ pub const NSL_TENSOR_DATA_OFFSET: usize = std::mem::offset_of!(NslTensor, data);
 // compile-time `assert!`s; the golden `dtype_abi_lock` test below fails loudly
 // if any tag moves. Add new tags at the next free slot — DO NOT reuse a value.
 //
-// TWO OVERLOADS TO KNOW ABOUT (P0.4 dtype/ABI cleanup — documented, not yet
-// disentangled; a rename needs careful loader→loss hot-path validation):
-//   * Tag 4 is DTYPE_INT8 HERE, but the DataLoader / CPU tensor factory also
-//     use 4 to mean i32 token IDs (cpu.rs, dataloader.rs, and the *i32 readers
-//     in this file). `dtype_element_size(4)` returns the i32 width (4 B) because
-//     the only tag-4 tensors that reach the generic path are DataLoader i32;
-//     packed int8 uses int8_blockwise with its own accounting. A DataLoader i32
-//     tensor exported through the C API would be mislabeled int8 — do not do it.
-//   * The C API (`c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi}`) uses the
-//     INVERTED 0=f32 / 1=f64 convention; those two functions are the ONLY place
-//     that inversion may be expressed. See the `dtype_abi_lock` test.
+// P0.4 dtype/ABI cleanup (P4 item 16): both historical tag collisions are
+// RESOLVED —
+//   * i32 token tensors now carry their own tag, `DTYPE_I32` (9). Tag 4 means
+//     DTYPE_INT8 and nothing else. The DataLoader, the CPU tensor factory,
+//     the *i32 readers in this file, and the i32-index GPU kernels all key on
+//     DTYPE_I32. `dtype_element_size(DTYPE_INT8)` is the true int8 width (1 B).
+//   * The C API (`NslTensorDesc.dtype`) uses THIS canonical tag space verbatim
+//     — no inverted 0=f32/1=f64 convention. `c_api::{capi_dtype_to_nsl,
+//     nsl_dtype_to_capi}` survive only as validating identity chokepoints.
+// See the `dtype_abi_lock` test, which pins both properties.
 // ---------------------------------------------------------------------------
 pub const DTYPE_F64: u16 = 0;
 pub const DTYPE_F32: u16 = 1;
@@ -250,6 +249,7 @@ pub const DTYPE_FP8E4M3: u16 = 5;
 pub const DTYPE_FP8E5M2: u16 = 6;
 pub const DTYPE_U16_TOKEN: u16 = 7;
 pub const DTYPE_U16_SEGMENT: u16 = 8;
+pub const DTYPE_I32: u16 = 9;
 
 // Custom dtype IDs start at 256
 pub const DTYPE_CUSTOM_START: u16 = 256;
@@ -277,8 +277,9 @@ pub(crate) fn dtype_element_size(dtype: u16) -> usize {
     match dtype {
         DTYPE_F64 => std::mem::size_of::<f64>(),
         DTYPE_F32 => std::mem::size_of::<f32>(),
-        DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN => std::mem::size_of::<u16>(),
-        4 => std::mem::size_of::<i32>(),  // i32 token IDs
+        DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN | DTYPE_U16_SEGMENT => std::mem::size_of::<u16>(),
+        DTYPE_INT8 => std::mem::size_of::<i8>(),
+        DTYPE_I32 => std::mem::size_of::<i32>(),  // i32 token IDs
         id if id >= DTYPE_CUSTOM_START => {
             get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
         }
@@ -579,7 +580,7 @@ impl NslTensor {
                     out.push(unsafe { *p.add(i) as f64 });
                 }
             }
-            4 => {
+            DTYPE_I32 => {
                 let p = self.data as *const i32;
                 for i in 0..len {
                     out.push(unsafe { *p.add(i) as f64 });
@@ -596,14 +597,17 @@ impl NslTensor {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_i32(&self) -> *mut i32 {
-        assert_eq!(self.dtype, 4, "data_i32() called on non-i32 tensor (dtype={})", self.dtype);
+        assert_eq!(
+            self.dtype, DTYPE_I32,
+            "data_i32() called on non-i32 tensor (dtype={})", self.dtype,
+        );
         self.data as *mut i32
     }
 
     #[inline]
     pub(crate) fn read_scalar_as_f64(&self, offset: usize) -> f64 {
         match self.dtype {
-            4 => unsafe { *(self.data as *const i32).add(offset) as f64 },
+            DTYPE_I32 => unsafe { *(self.data as *const i32).add(offset) as f64 },
             DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(offset) as f64 },
             DTYPE_FP16 => {
                 let bits = unsafe { *(self.data as *const u16).add(offset) };
@@ -645,7 +649,7 @@ impl NslTensor {
         );
 
         match self.dtype {
-            4 => unsafe { *(self.data as *mut i32).add(offset) = value as i32 },
+            DTYPE_I32 => unsafe { *(self.data as *mut i32).add(offset) = value as i32 },
             DTYPE_U16_TOKEN => {
                 assert!(
                     value.is_finite()
@@ -671,13 +675,13 @@ impl NslTensor {
     }
 
     /// Read element at index `i` as an integer index value.
-    /// Handles dtype 0 (f64), 1 (f32), 4 (i32), and internal u16 token buffers.
+    /// Handles f64, f32, DTYPE_I32, and internal u16 token buffers.
     /// Used by embedding_lookup, gather, and their backward passes.
     #[inline]
     pub(crate) fn read_index(&self, i: usize) -> i64 {
         match self.dtype {
             DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(i) as i64 },
-            4 => unsafe { *(self.data as *const i32).add(i) as i64 },
+            DTYPE_I32 => unsafe { *(self.data as *const i32).add(i) as i64 },
             1 => unsafe { *(self.data as *const f32).add(i) as i64 },
             0 => unsafe { *(self.data as *const f64).add(i) as i64 },
             _ => panic!("read_index() unsupported for dtype {}", self.dtype),
@@ -1021,7 +1025,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
         {
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
             match tensor.dtype {
-                4 => {
+                DTYPE_I32 => {
                     let mut val: i32 = 0;
                     crate::cuda::inner::memcpy_dtoh(
                         &mut val as *mut i32 as *mut std::ffi::c_void,
@@ -1121,7 +1125,7 @@ fn print_tensor_recursive(
             if i > 0 { print!(", "); }
             let val = match dtype {
                 DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(i * stride) as f64 },
-                4 => unsafe { *(data as *const i32).add(i * stride) as f64 },
+                DTYPE_I32 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
                 0 => unsafe { *(data as *const f64).add(i * stride) },
                 d if d >= DTYPE_CUSTOM_START => {
@@ -2807,6 +2811,146 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 /// `nsl_rmsnorm_dx_bwd_f32` kernel (one block per row, one fused reduction);
 /// CPU is the f64 reference. Emitted by source-AD's `RmsNormInputBackward` when
 /// `--fuse-rmsnorm-backward` is set; equals the decomposition to f32 tolerance.
+/// P5 item 20 slice A — fused RMSNorm GAMMA gradient (`--fuse-rmsnorm-backward`):
+/// dgamma_j = sum_rows(dy_ij * x_ij / rms_i),  rms_i = sqrt(mean(x_i^2) + eps).
+/// GPU: two deterministic launches (see `gpu_rmsnorm_dgamma_backward_f32`).
+/// CPU: f64 reference with the same summation order.
+#[no_mangle]
+pub extern "C" fn nsl_rmsnorm_dgamma_backward(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    eps: f64,
+) -> i64 {
+    // Read only by the cuda device-dispatch below; the CPU arm re-binds `x`
+    // from its contiguous copy.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let x = NslTensor::from_ptr(x_ptr);
+
+    #[cfg(feature = "cuda")]
+    if x.device > 0 {
+        // Same acquire/free discipline as nsl_rmsnorm_dx_backward: every
+        // acquire returns an OWNED ref (even no-op same-device/contiguous),
+        // so each gets exactly one unconditional free.
+        let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
+        let dy_c = nsl_tensor_contiguous(dy_dev);
+        let x_c = nsl_tensor_contiguous(x_ptr);
+        let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
+        let g_c = nsl_tensor_contiguous(g_dev);
+        let dg = crate::cuda::gpu_rmsnorm_dgamma_backward_f32(dy_c, x_c, g_c, eps as f32);
+        nsl_tensor_free(dy_dev);
+        nsl_tensor_free(dy_c);
+        nsl_tensor_free(x_c);
+        nsl_tensor_free(g_dev);
+        nsl_tensor_free(g_c);
+        return dg;
+    }
+
+    // CPU reference (f64 accumulation, row-major order). Contiguous copies
+    // first — the flat indexing below is meaningless on strided views
+    // (review L4); both acquires are owned refs, freed at the end.
+    let dy_c = nsl_tensor_contiguous(dy_ptr);
+    let x_c = nsl_tensor_contiguous(x_ptr);
+    let dy = NslTensor::from_ptr(dy_c);
+    let x = NslTensor::from_ptr(x_c);
+    let gamma = NslTensor::from_ptr(gamma_ptr);
+    let ndim = x.ndim as usize;
+    let n = unsafe { *x.shape.add(ndim - 1) } as usize;
+    let total = x.len as usize;
+    let num_rows = total / n;
+    let nf = n as f64;
+    assert_eq!(
+        gamma.len as usize, n,
+        "rmsnorm dgamma: gamma len {} != last dim {}",
+        gamma.len, n
+    );
+
+    let rd = |t: &NslTensor, i: usize| -> f64 {
+        if t.dtype == 1 { unsafe { *t.data_f32().add(i) as f64 } } else { unsafe { *t.data_f64().add(i) } }
+    };
+    let g_shape: Vec<i64> = (0..gamma.ndim as usize)
+        .map(|i| unsafe { *gamma.shape.add(i) })
+        .collect();
+    let dg_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&g_shape, gamma.dtype);
+    let dg = NslTensor::from_ptr(dg_ptr);
+
+    let mut rinv = vec![0.0_f64; num_rows];
+    for (row, r) in rinv.iter_mut().enumerate() {
+        let base = row * n;
+        let mut sum_sq = 0.0_f64;
+        for j in 0..n {
+            let v = rd(x, base + j);
+            sum_sq += v * v;
+        }
+        *r = 1.0 / (sum_sq / nf + eps).sqrt();
+    }
+    for j in 0..n {
+        let mut acc = 0.0_f64;
+        for (row, r) in rinv.iter().enumerate() {
+            let i = row * n + j;
+            acc += rd(dy, i) * rd(x, i) * r;
+        }
+        if gamma.dtype == 1 {
+            unsafe { *dg.data_f32().add(j) = acc as f32 };
+        } else {
+            unsafe { *dg.data_f64().add(j) = acc };
+        }
+    }
+    nsl_tensor_free(dy_c);
+    nsl_tensor_free(x_c);
+    dg_ptr
+}
+
+/// P5 slice C — fused RMSNorm dx + residual-gradient fold:
+///   out = dx(dy, x, gamma, eps) + res
+/// Replaces the adjoint-accumulate Add that followed the fused dx op.
+/// Bit-exact with (dx then Add): the epilogue performs the same single
+/// rn-rounded add, and IEEE addition is commutative so either accumulate
+/// operand order matches. Mismatched `res` falls back to dx-then-add.
+#[no_mangle]
+pub extern "C" fn nsl_rmsnorm_dx_backward_add(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    res_ptr: i64,
+    eps: f64,
+) -> i64 {
+    let x = NslTensor::from_ptr(x_ptr);
+    let r = NslTensor::from_ptr(res_ptr);
+    // Fallback for any shape/device/dtype mismatch: the exact decomposed
+    // pair the compiler emitted before the fold.
+    if !r.shape_eq(x) || r.device != x.device || r.dtype != x.dtype {
+        let dx = nsl_rmsnorm_dx_backward(dy_ptr, x_ptr, gamma_ptr, eps);
+        let out = nsl_tensor_add(dx, res_ptr, 0);
+        nsl_tensor_free(dx);
+        return out;
+    }
+
+    #[cfg(feature = "cuda")]
+    if x.device > 0 {
+        let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
+        let dy_c = nsl_tensor_contiguous(dy_dev);
+        let x_c = nsl_tensor_contiguous(x_ptr);
+        let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
+        let g_c = nsl_tensor_contiguous(g_dev);
+        let r_c = nsl_tensor_contiguous(res_ptr);
+        let dx = crate::cuda::gpu_rmsnorm_dx_backward_add_f32(dy_c, x_c, g_c, r_c, eps as f32);
+        nsl_tensor_free(dy_dev);
+        nsl_tensor_free(dy_c);
+        nsl_tensor_free(x_c);
+        nsl_tensor_free(g_dev);
+        nsl_tensor_free(g_c);
+        nsl_tensor_free(r_c);
+        return dx;
+    }
+
+    // CPU: exact dx reference then the same single f64 add.
+    let dx = nsl_rmsnorm_dx_backward(dy_ptr, x_ptr, gamma_ptr, eps);
+    let out = nsl_tensor_add(dx, res_ptr, 0);
+    nsl_tensor_free(dx);
+    out
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_rmsnorm_dx_backward(
     dy_ptr: i64,
@@ -3427,7 +3571,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                     transfer_src.ndim,
                     transfer_src.len,
                     target,
-                    4,
+                    DTYPE_I32,
                     1,
                     0,
                 ));
@@ -3599,7 +3743,7 @@ pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
         if device > 0 && !_t.data.is_null() {
             let elem_size = match _t.dtype {
                 1 => std::mem::size_of::<f32>(),
-                4 => std::mem::size_of::<i32>(),
+                DTYPE_I32 => std::mem::size_of::<i32>(),
                 _ => std::mem::size_of::<f64>(),
             };
             let size_bytes = _t.len as usize * elem_size;
@@ -4175,8 +4319,10 @@ mod tests {
 
     /// P0.4 dtype/ABI cleanup: GOLDEN LOCK on the canonical dtype tag table.
     /// A future fused kernel that renumbers or reuses a tag fails HERE instead
-    /// of silently colliding on the wire. Also pins the byte widths, the tag-4
-    /// i32/int8 overload, and the C-API 0/1 inversion round-trip.
+    /// of silently colliding on the wire. Also pins the byte widths and that
+    /// the C API speaks the SAME canonical tag space (P4 item 16 removed the
+    /// historical 0=f32/1=f64 inversion and the tag-4 i32/int8 overload —
+    /// neither may be reintroduced).
     #[test]
     fn dtype_abi_lock() {
         // The canonical table — do not renumber; append at the next free slot.
@@ -4189,31 +4335,31 @@ mod tests {
         assert_eq!(DTYPE_FP8E5M2, 6);
         assert_eq!(DTYPE_U16_TOKEN, 7);
         assert_eq!(DTYPE_U16_SEGMENT, 8);
+        assert_eq!(DTYPE_I32, 9);
         assert_eq!(DTYPE_CUSTOM_START, 256);
 
-        // Byte widths (int8/u16-token/segment are stored 1/2/2 bytes; tag 4 also
-        // means DataLoader i32 on the generic path — 4 bytes — see the const
-        // block doc).
+        // Byte widths. Tag 4 (int8) is 1 byte — the historical tag-4-as-i32
+        // overload is gone; i32 token tensors carry DTYPE_I32 (9).
         assert_eq!(dtype_element_size(DTYPE_F64), 8);
         assert_eq!(dtype_element_size(DTYPE_F32), 4);
         assert_eq!(dtype_element_size(DTYPE_FP16), 2);
         assert_eq!(dtype_element_size(DTYPE_BF16), 2);
         assert_eq!(dtype_element_size(DTYPE_U16_TOKEN), 2);
-        assert_eq!(dtype_element_size(4), 4); // DataLoader i32 (overloaded tag)
+        assert_eq!(dtype_element_size(DTYPE_U16_SEGMENT), 2);
+        assert_eq!(dtype_element_size(DTYPE_INT8), 1);
+        assert_eq!(dtype_element_size(DTYPE_I32), 4);
 
-        // The C-API convention is INVERTED (0=f32, 1=f64) and round-trips only
-        // through the two dedicated conversion functions.
+        // The C API uses the canonical tag space verbatim: the conversion
+        // chokepoints are validating IDENTITY functions. Any reintroduced
+        // inversion fails here.
         use crate::c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi};
-        assert_eq!(nsl_dtype_to_capi(DTYPE_F32), 0, "NSL f32(1) -> C-API 0");
-        assert_eq!(nsl_dtype_to_capi(DTYPE_F64), 1, "NSL f64(0) -> C-API 1");
-        assert_eq!(capi_dtype_to_nsl(0), DTYPE_F32);
-        assert_eq!(capi_dtype_to_nsl(1), DTYPE_F64);
-        for tag in [DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8] {
-            assert_eq!(
-                capi_dtype_to_nsl(nsl_dtype_to_capi(tag)),
-                tag,
-                "C-API dtype round-trip must be identity for tag {tag}"
-            );
+        for tag in [
+            DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8,
+            DTYPE_FP8E4M3, DTYPE_FP8E5M2, DTYPE_U16_TOKEN, DTYPE_U16_SEGMENT,
+            DTYPE_I32,
+        ] {
+            assert_eq!(nsl_dtype_to_capi(tag), tag as i32, "C-API tag must equal canonical tag {tag}");
+            assert_eq!(capi_dtype_to_nsl(tag as i32), tag, "canonical tag must round-trip {tag}");
         }
     }
 
@@ -4774,8 +4920,9 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![11.0, 22.0, 33.0]);
-        nsl_tensor_free(a);      // input ref
-        nsl_tensor_free(result); // output ref
+        // RELINQUISH_A transferred the input ref into the result — one free total.
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
+        nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
 
@@ -4806,7 +4953,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![20.0, 30.0, 40.0]);
-        nsl_tensor_free(a);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
@@ -4822,7 +4969,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![5.0, 5.0, 6.0]);
-        nsl_tensor_free(a);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
@@ -4838,7 +4985,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![7.0, 13.0]);
-        nsl_tensor_free(a);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
@@ -4866,7 +5013,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![11.0, 12.0, 13.0]);
-        nsl_tensor_free(ptr);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
     }
 
@@ -4880,7 +5027,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![10.0, 15.0, 20.0]);
-        nsl_tensor_free(ptr);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
     }
 
@@ -5296,6 +5443,14 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_drain_cache() {
+    // P5 item 19: while cuda-graph capture is armed, the per-step transient
+    // drain would churn every transient address (no region could ever
+    // digest-stabilize) AND physically unmap memory that already-captured
+    // graphs reference — skip it. OOM recovery still drains via pool_drain,
+    // which taints any active region first.
+    if crate::cuda::graph_capture::cuda_graphs_armed() {
+        return;
+    }
     // Probe gate (2026-04-23): NSL_SKIP_GPU_DRAIN=1 bypasses this workaround
     // so we can observe whether ELTLS frees intermediates at last use.
     if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() != Some("1") {

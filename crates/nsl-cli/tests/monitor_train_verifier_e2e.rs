@@ -52,7 +52,7 @@ fn e2e_monitor_on_train_program_compiles_and_runs() {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--monitor"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--monitor"])
         .arg(&file)
         .current_dir(&dir)
         .env("CARGO_TARGET_DIR", root.join("target"))

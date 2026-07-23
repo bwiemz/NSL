@@ -36,7 +36,7 @@ fn build_stderr(source: &str, tag: &str, wggo: Option<&str>) -> String {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "build", "--source-ad"]);
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "build", "--source-ad"]);
     if let Some(mode) = wggo {
         cmd.args(["--wggo", mode]);
     }

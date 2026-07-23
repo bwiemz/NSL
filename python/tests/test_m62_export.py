@@ -87,9 +87,9 @@ def test_no_export_functions_no_header(tmp_path_factory):
 # NslTensorDesc ctypes mirror — must match `#[repr(C)] struct NslTensorDesc`
 # in crates/nsl-runtime/src/c_api.rs byte-for-byte.
 #
-# C API dtype encoding (different from NSL internal!):
-#   0 = f32,  1 = f64,  2 = f16,  3 = bf16,
-#   4 = int32, 5 = int64, 6 = int8, 7 = uint8
+# Canonical NSL dtype tags (unified C API, P4 item 16):
+#   0 = f64,  1 = f32,  2 = f16,  3 = bf16,
+#   4 = int8,  9 = int32
 # ---------------------------------------------------------------------------
 
 class NslTensorDesc(ctypes.Structure):
@@ -109,7 +109,7 @@ def _make_f32_desc(values):
     """Build a CPU f32 NslTensorDesc from a list of Python floats.
 
     The fixture `add` function takes ``Tensor<[4], f32>`` inputs.  In the
-    C API dtype encoding, f32 == 0.
+    Canonical NSL dtype tags, f32 == 1.
     """
     n = len(values)
     data = (ctypes.c_float * n)(*values)
@@ -119,7 +119,7 @@ def _make_f32_desc(values):
         shape=shape,
         strides=None,
         ndim=1,
-        dtype=0,        # C API: 0 = f32
+        dtype=1,
         device_type=0,  # 0 = CPU
         device_id=0,
     )

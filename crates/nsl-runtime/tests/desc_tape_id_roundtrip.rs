@@ -84,7 +84,7 @@ fn desc_carries_tape_id_across_roundtrip() {
         shape: shape_buf.as_mut_ptr(),
         strides: std::ptr::null_mut(),
         ndim: 1,
-        dtype: 0, // C-API f32
+        dtype: 1, // canonical f32
         device_type: 0,
         device_id: 0,
         tape_id: 0,

@@ -16,6 +16,8 @@ pub(crate) mod tier_b1_prepass;
 #[cfg(feature = "cuda")]
 pub(crate) mod caching_allocator;
 
+pub(crate) mod graph_capture;
+
 #[cfg(feature = "cuda")]
 pub(crate) mod inner {
     use cudarc::driver::sys::*;
@@ -260,6 +262,11 @@ pub(crate) mod inner {
     /// Releases fully-free segments back to the CUDA driver.
     /// Returns total bytes freed.
     fn pool_drain() -> usize {
+        // cuda-graphs: physically unmapping cached blocks while a captured
+        // region is mid-replay would leave the pending graph launch pointing
+        // at freed memory — taint first (repairs the skipped prefix and
+        // downgrades the region to eager, so no graph launch follows).
+        super::graph_capture::taint("allocator pool drain");
         // Flush stream-ordered deferred frees first: `pool_drain` is the
         // "reclaim everything reclaimable" path (OOM recovery / explicit cache
         // empty), so raw frees still waiting on a completion event are forced
@@ -811,6 +818,30 @@ pub(crate) mod inner {
     /// that share a lifetime (all consumed by the same preceding kernels).
     /// A single event guards the whole group.
     pub(crate) fn defer_free_device_batch(ptrs: &[*mut c_void]) {
+        // cuda-graphs: inside a region the completion event must NOT be
+        // recorded yet — during replay the consuming kernels are not on the
+        // stream until the region-end graph launch, so an event recorded now
+        // would complete early and free live memory. Queue host-side; the
+        // region end records through `defer_free_device_record`.
+        if super::graph_capture::in_region() {
+            for p in ptrs.iter().filter(|p| !p.is_null()) {
+                super::graph_capture::queue_deferred_free(*p);
+            }
+            return;
+        }
+        defer_free_device_batch_record(ptrs);
+    }
+
+    /// Region-end flush entry: the original (event-recording) deferred-free
+    /// path, called once the region's work is actually on the stream.
+    pub(crate) fn defer_free_device_record(ptr: *mut c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        defer_free_device_batch_record(&[ptr]);
+    }
+
+    fn defer_free_device_batch_record(ptrs: &[*mut c_void]) {
         let live: Vec<usize> = ptrs
             .iter()
             .filter(|p| !p.is_null())
@@ -860,6 +891,13 @@ pub(crate) mod inner {
     /// `cuEventQuery` returns an error, treated as "not ready" below, which only
     /// defers reclaim (never a use-after-free).
     pub(crate) fn drain_completed_frees() {
+        // cuda-graphs: `cuEventQuery` is illegal while the compute stream is
+        // capturing, and during replay the polled work may not be issued yet
+        // — skip the opportunistic poll inside a region (the region end and
+        // every out-of-region defer poll again).
+        if super::graph_capture::in_region() {
+            return;
+        }
         // Collect completed entries under the lock, then free outside it:
         // `free_device` takes the CACHING_ALLOCATOR lock, and holding
         // DEFERRED_FREES across that call would nest two locks.
@@ -1004,6 +1042,11 @@ pub(crate) mod inner {
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
         ensure_context();
+        // cuda-graphs: uploads inside a region are pseudo-ops — the payload
+        // flows through a graph-owned pinned staging buffer (see `on_htod`).
+        if !super::graph_capture::on_htod(dst_device, src_host, size_bytes) {
+            return;
+        }
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
             let ctx = current_oom_context();
@@ -1025,6 +1068,7 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from device memory to host memory.
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        super::graph_capture::taint("sync DtoH readback");
         ensure_context();
         unsafe {
             let result = cuMemcpyDtoH_v2(dst_host, src_device as CUdeviceptr, size_bytes);
@@ -1041,6 +1085,10 @@ pub(crate) mod inner {
     /// Copy `size_bytes` bytes from one device pointer to another.
     pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
         ensure_context();
+        // cuda-graphs: device-to-device copies are pseudo-ops (no host data).
+        if !super::graph_capture::on_dtod(dst_device, src_device, size_bytes) {
+            return;
+        }
         unsafe {
             let result = cuMemcpyDtoD_v2(dst_device as CUdeviceptr, src_device as CUdeviceptr, size_bytes);
             assert_eq!(
@@ -1115,6 +1163,7 @@ pub(crate) mod inner {
     /// there is also ordered after any interleaved NULL-stream memcpys, so
     /// this wait covers everything the old NULL-stream record covered.
     unsafe fn transfer_stream_wait_null_stream(stream: CUstream) {
+        super::graph_capture::taint("transfer-stream event wait");
         let mut ev: CUevent = std::ptr::null_mut();
         // 0x2 = CU_EVENT_DISABLE_TIMING (cheapest event flavor).
         let r = cuEventCreate(&mut ev, 0x2);
@@ -1351,6 +1400,7 @@ pub(crate) mod inner {
     /// stream was never created on this thread (does NOT force-initialize
     /// CUDA — safe to call unconditionally from the offload drain).
     pub(crate) fn transfer_stream_synchronize() {
+        super::graph_capture::taint("transfer-stream synchronize");
         TRANSFER_STREAM.with(|s| {
             let cur = s.get();
             if cur == 0 {
@@ -1369,9 +1419,34 @@ pub(crate) mod inner {
         })
     }
 
-    /// Zero-fill device memory.
+    /// Zero-fill device memory. Graph-aware: recorded as a pseudo-op inside
+    /// a capture region (async on the compute stream so the driver records a
+    /// memset node — ordering-neutral vs the sync form thanks to
+    /// blocking-stream semantics), verified/skipped during replay.
     pub(crate) fn memset_d8(device_ptr: *mut c_void, size_bytes: usize) {
         ensure_context();
+        match super::graph_capture::on_memset(device_ptr as usize, size_bytes) {
+            super::graph_capture::MemsetAction::Skip => return,
+            super::graph_capture::MemsetAction::AsyncOnComputeStream => {
+                unsafe {
+                    let result = cuMemsetD8Async(
+                        device_ptr as CUdeviceptr,
+                        0,
+                        size_bytes,
+                        current_stream(),
+                    );
+                    assert_eq!(
+                        result,
+                        CUresult::CUDA_SUCCESS,
+                        "cuMemsetD8Async({} bytes) failed: {:?}",
+                        size_bytes,
+                        result
+                    );
+                }
+                return;
+            }
+            super::graph_capture::MemsetAction::Sync => {}
+        }
         unsafe {
             let result = cuMemsetD8_v2(device_ptr as CUdeviceptr, 0, size_bytes);
             assert_eq!(
@@ -1517,6 +1592,7 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_event_record_on_current_stream(event: u64) -> CUresult {
+        super::graph_capture::taint("event record on compute stream");
         cuEventRecord(event as CUevent, current_stream())
     }
 
@@ -1529,6 +1605,7 @@ pub(crate) mod inner {
     }
 
     pub unsafe fn cu_ctx_synchronize() {
+        super::graph_capture::taint("explicit ctx synchronize");
         cuCtxSynchronize();
     }
 
@@ -1684,6 +1761,20 @@ pub(crate) mod inner {
         debug_assert!(block[0] * block[1] * block[2] <= 1024,
             "kernel_launch: block size {} exceeds max 1024 threads",
             block[0] * block[1] * block[2]);
+
+        // cuda-graphs (P5 item 19): record/verify this launch against the
+        // active region. `false` = verified against the captured sequence —
+        // the region-end graph launch performs it; skip the real launch.
+        if !super::graph_capture::on_kernel(
+            func as usize,
+            [grid[0] as u32, grid[1] as u32, grid[2] as u32],
+            [block[0] as u32, block[1] as u32, block[2] as u32],
+            shared_mem_bytes,
+            args,
+            name_ptr,
+        ) {
+            return CUresult::CUDA_SUCCESS;
+        }
 
         // Launch kernel (no lock held) — on the per-thread compute stream
         // (p8 PR-A; ordering-neutral vs the old NULL-stream launch, see
@@ -2008,6 +2099,19 @@ pub(crate) mod cublas_inner {
             m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
             "sgemm dims must fit in i32"
         );
+        // cuda-graphs (P5 item 19): the gemm is a pseudo-op — recorded during
+        // record/capture passes, verified-and-skipped during replay (the
+        // region-end graph launch carries the captured cuBLAS kernels).
+        if !super::graph_capture::on_sgemm(
+            a_dev as usize,
+            b_dev as usize,
+            c_dev as usize,
+            m,
+            n,
+            k,
+        ) {
+            return Ok(());
+        }
         let handle = cublas_handle();
         // p8 PR-A: bind the gemm to the per-thread compute stream so cuBLAS
         // kernels ride the same stream as every other kernel (ordering-neutral
@@ -2049,6 +2153,110 @@ pub(crate) mod cublas_inner {
             &beta,
             c_dev, n as i32, // C^cublas := C_row, ldc = N
         )
+    }
+
+    /// Strided-batched SGEMM in RAW cuBLAS column-major terms (muon batched
+    /// Newton-Schulz). The caller does its own row/column-major mapping —
+    /// the muon batch engine's square operands are all symmetric, which is
+    /// what makes its mappings transpose-free.
+    ///
+    /// Not wired into the cuda-graph pseudo-op stream: the optimizer step
+    /// runs outside captured regions. If a captured region ever reaches
+    /// this, taint it loudly rather than silently diverging the digest.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_strided_batched_raw(
+        transa: bool,
+        transb: bool,
+        m: i64,
+        n: i64,
+        k: i64,
+        a_dev: *const f32,
+        lda: i64,
+        stride_a: i64,
+        b_dev: *const f32,
+        ldb: i64,
+        stride_b: i64,
+        c_dev: *mut f32,
+        ldc: i64,
+        stride_c: i64,
+        batch: i64,
+        tf32: bool,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(m > 0 && n > 0 && k > 0 && batch > 0);
+        debug_assert!(
+            m <= i32::MAX as i64 && n <= i32::MAX as i64 && k <= i32::MAX as i64
+                && batch <= i32::MAX as i64
+        );
+        if super::graph_capture::in_region() {
+            super::graph_capture::taint("batched-sgemm");
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!(
+                    "[nsl] cublasSetStream_v2 failed: {r:?} — batched gemm stays on its previous stream"
+                );
+            }
+        }
+        let op = |t: bool| {
+            if t {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // GemmStridedBatchedEx with an explicit compute type: the process
+        // handle sits in CUBLAS_DEFAULT_MATH (which, despite NSL's "TF32
+        // default" banner, runs f32 gemms on FP32 CUDA cores), so tensor-core
+        // TF32 must be requested per call. The muon batch engine opts in —
+        // Newton-Schulz is a coarse polynomial approximation and its own
+        // gates are tolerance-based; nothing else in the runtime is affected.
+        let compute = if tf32 {
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+        } else {
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+        };
+        let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
+        let status = unsafe {
+            cublas_sys::cublasGemmStridedBatchedEx(
+                handle,
+                op(transa),
+                op(transb),
+                m as i32,
+                n as i32,
+                k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                a_dev as *const std::ffi::c_void,
+                f32t,
+                lda as i32,
+                stride_a,
+                b_dev as *const std::ffi::c_void,
+                f32t,
+                ldb as i32,
+                stride_b,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c_dev as *mut std::ffi::c_void,
+                f32t,
+                ldc as i32,
+                stride_c,
+                batch as i32,
+                compute,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
+            )
+        };
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            // Surface as the same error type the sgemm path produces.
+            return Err(cublas_result::CublasError(status));
+        }
+        Ok(())
     }
 
 }
@@ -2646,6 +2854,296 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     inner::sync_after_kernel();
 }
 
+/// Fusion-queue item 1: MULTI-TENSOR fused AdamW step — one launch for k
+/// parameters via device pointer tables. `ptrs` slices carry raw DEVICE
+/// DATA pointers (already resolved from NslTensors by the FFI); `lens` the
+/// per-param element counts. Tables are staged through a persistent pinned
+/// block on the COMPUTE stream (the muon_batch discipline: sync before the
+/// host rewrite; enqueue uploads on current_stream so the kernel is
+/// stream-ordered after them).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_multi(
+    t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64], lens: &[u32],
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+) {
+    let k = t_ptrs.len();
+    if k == 0 {
+        return;
+    }
+    assert!(
+        k == m_ptrs.len() && k == v_ptrs.len() && k == mp_ptrs.len() && k == lens.len(),
+        "multi adamw: table length mismatch"
+    );
+    assert!(k <= 65535, "multi adamw: grid.y cap exceeded ({k})");
+
+    struct MultiWs {
+        cap: usize,
+        stage: u64,   // pinned host: 4*cap u64 + cap u32
+        tabs: [u64; 4], // device u64 tables
+        ntab: u64,    // device u32 table
+    }
+    thread_local! {
+        static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+
+    inner::set_oom_context("fase_fused_adamw_multi");
+    let ws: &mut MultiWs = WS.with(|c| {
+        let cur = c.get();
+        let need_new = cur.is_null() || unsafe { (*cur).cap } < k;
+        if need_new {
+            unsafe {
+                inner::ensure_context();
+                // Quiesce before releasing/rewriting anything a prior step
+                // may still be reading.
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+                if !cur.is_null() {
+                    let old = Box::from_raw(cur);
+                    for t in old.tabs {
+                        inner::free_managed(t as *mut c_void);
+                    }
+                    inner::free_managed(old.ntab as *mut c_void);
+                    cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
+                }
+                let mut stage: *mut c_void = std::ptr::null_mut();
+                let bytes = 4 * k * 8 + k * 4;
+                let r = cudarc::driver::sys::cuMemAllocHost_v2(&mut stage, bytes.max(8));
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi adamw: pinned staging alloc failed"
+                );
+                let tabs = [
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                ];
+                let ntab = inner::alloc_managed(k * 4) as u64;
+                let fresh = Box::into_raw(Box::new(MultiWs { cap: k, stage: stage as u64, tabs, ntab }));
+                c.set(fresh);
+            }
+        } else {
+            // Same-cap reuse: the previous optimizer step's uploads read this
+            // pinned block — quiesce before the host rewrite below.
+            unsafe {
+                inner::ensure_context();
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            }
+        }
+        unsafe { &mut *c.get() }
+    });
+
+    unsafe {
+        let base = ws.stage as *mut u64;
+        std::ptr::copy_nonoverlapping(t_ptrs.as_ptr(), base, k);
+        std::ptr::copy_nonoverlapping(m_ptrs.as_ptr(), base.add(ws.cap), k);
+        std::ptr::copy_nonoverlapping(v_ptrs.as_ptr(), base.add(2 * ws.cap), k);
+        std::ptr::copy_nonoverlapping(mp_ptrs.as_ptr(), base.add(3 * ws.cap), k);
+        let nbase = (ws.stage as usize + 4 * ws.cap * 8) as *mut u32;
+        std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
+        let up = |dst: u64, src_off: usize, bytes: usize| {
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst,
+                (ws.stage as usize + src_off) as *const c_void,
+                bytes,
+                inner::current_stream(),
+            );
+            assert_eq!(
+                r,
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                "multi adamw: table upload failed"
+            );
+        };
+        for (idx, tab) in ws.tabs.iter().enumerate() {
+            up(*tab, idx * ws.cap * 8, k * 8);
+        }
+        up(ws.ntab, 4 * ws.cap * 8, k * 4);
+    }
+
+    let max_n = *lens.iter().max().unwrap() as i64;
+    let mut a0 = ws.tabs[0];
+    let mut a1 = ws.tabs[1];
+    let mut a2 = ws.tabs[2];
+    let mut a3 = ws.tabs[3];
+    let mut a4 = ws.ntab;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let args = [
+        &mut a0 as *mut _ as *mut c_void,
+        &mut a1 as *mut _ as *mut c_void,
+        &mut a2 as *mut _ as *mut c_void,
+        &mut a3 as *mut _ as *mut c_void,
+        &mut a4 as *mut _ as *mut c_void,
+        &mut b1 as *mut _ as *mut c_void,
+        &mut omb1 as *mut _ as *mut c_void,
+        &mut b2 as *mut _ as *mut c_void,
+        &mut omb2 as *mut _ as *mut c_void,
+        &mut eps as *mut _ as *mut c_void,
+        &mut neg_lr as *mut _ as *mut c_void,
+        &mut neg_lr_wd as *mut _ as *mut c_void,
+        &mut bc1 as *mut _ as *mut c_void,
+        &mut bc2 as *mut _ as *mut c_void,
+        &mut has_wd_val as *mut _ as *mut c_void,
+    ];
+    let block = 256i64;
+    let grid_x = (max_n + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
+        [grid_x, k as i64, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_multi kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
+/// P4 item 17: fused AdamW step against a BF16 AUTHORITATIVE theta with
+/// counter-based stochastic rounding. `theta_dev` is the RAW device pointer
+/// of the bf16 mirror (2 bytes/elem, not an NslTensor); m/v/mp are the f32
+/// moment/accumulator tensors. `sr_key` = seed ^ (step * SR_STEP_SALT),
+/// `sr_ctr_base` = stable param index << SR_PARAM_SHIFT — precomputed by the
+/// caller so the kernel stays a pure function of its counters.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_bf16sr(
+    theta_dev: u64, m_ptr: i64, v_ptr: i64, mp_ptr: i64, n: usize,
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+    sr_key: u64, sr_ctr_base: u64,
+) {
+    use crate::tensor::NslTensor;
+    if n == 0 {
+        return;
+    }
+    let m = unsafe { &*(m_ptr as *const NslTensor) };
+    let v = unsafe { &*(v_ptr as *const NslTensor) };
+    let mp = unsafe { &*(mp_ptr as *const NslTensor) };
+    let mut th_data = theta_dev;
+    let mut m_data = m.data as u64;
+    let mut v_data = v.data as u64;
+    let mut mp_data = mp.data as u64;
+    let mut n_val = n as u64;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
+    let args = [
+        &mut th_data as *mut _ as *mut std::ffi::c_void,
+        &mut m_data as *mut _ as *mut std::ffi::c_void,
+        &mut v_data as *mut _ as *mut std::ffi::c_void,
+        &mut mp_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut b1 as *mut _ as *mut std::ffi::c_void,
+        &mut omb1 as *mut _ as *mut std::ffi::c_void,
+        &mut b2 as *mut _ as *mut std::ffi::c_void,
+        &mut omb2 as *mut _ as *mut std::ffi::c_void,
+        &mut eps as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr as *mut _ as *mut std::ffi::c_void,
+        &mut neg_lr_wd as *mut _ as *mut std::ffi::c_void,
+        &mut bc1 as *mut _ as *mut std::ffi::c_void,
+        &mut bc2 as *mut _ as *mut std::ffi::c_void,
+        &mut has_wd_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_STEP_BF16SR_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_step_bf16sr\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_step_bf16sr kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
+/// P4 item 17: SR-BF16 rounding-tail probe over raw device buffers — parity
+/// gate hook only (see `SR_BF16_ROUND_PROBE_PTX`).
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sr_bf16_round_probe(
+    src_f32_dev: u64, dst_bf16_dev: u64, n: usize, sr_key: u64, sr_ctr_base: u64,
+) {
+    if n == 0 {
+        return;
+    }
+    let mut src = src_f32_dev;
+    let mut dst = dst_bf16_dev;
+    let mut n_val = n as u64;
+    let (mut key_val, mut ctr_val) = (sr_key, sr_ctr_base);
+    let args = [
+        &mut src as *mut _ as *mut std::ffi::c_void,
+        &mut dst as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut ctr_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::SR_BF16_ROUND_PROBE_PTX.as_ptr(),
+        b"nsl_sr_bf16_round_probe\0".as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU sr_bf16_round_probe kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
+/// P4 item 17: raw-buffer precision casts between a bf16 mirror and an f32
+/// working view (grid-stride kernels from `precision_cast_kernels`). Both
+/// pointers are raw device allocations; `n` is the element count.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cast_raw_f32_to_bf16(src_f32_dev: u64, dst_bf16_dev: u64, n: usize) {
+    gpu_cast_raw(
+        precision_cast_kernels::PTX_F32_TO_BF16.as_ptr(),
+        precision_cast_kernels::KNAME_F32_TO_BF16.as_ptr(),
+        src_f32_dev, dst_bf16_dev, n,
+    );
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cast_raw_bf16_to_f32(src_bf16_dev: u64, dst_f32_dev: u64, n: usize) {
+    gpu_cast_raw(
+        precision_cast_kernels::PTX_BF16_TO_F32.as_ptr(),
+        precision_cast_kernels::KNAME_BF16_TO_F32.as_ptr(),
+        src_bf16_dev, dst_f32_dev, n,
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_cast_raw(ptx: *const u8, kname: *const u8, src: u64, dst: u64, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut src_val = src;
+    let mut dst_val = dst;
+    let mut n_val = n as u64;
+    let args = [
+        &mut src_val as *mut _ as *mut std::ffi::c_void,
+        &mut dst_val as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = (((n as i64) + block - 1) / block).min(4096);
+    let result = inner::kernel_launch(ptx, kname, [grid, 1, 1], [block, 1, 1], &args, 0);
+    assert_eq!(result as u32, 0, "GPU raw precision cast failed: {}", result as u32);
+    inner::sync_after_kernel();
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
@@ -2902,6 +3400,65 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
 // === GPU backward op helpers ===
 
 /// GPU backward binary op: takes grad tensor and a saved tensor, produces output of same shape as grad.
+/// P5 item 20 slice B: ternary elementwise backward launch
+/// (grad, up, input) -> out, same conventions as `gpu_backward_binary`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_backward_ternary(
+    a_ptr: i64,
+    b_ptr: i64,
+    c_ptr: i64,
+    ptx: &str,
+    kernel_name: &str,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    inner::set_oom_context(kernel_name.trim_end_matches('\0'));
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let c = unsafe { &*(c_ptr as *const NslTensor) };
+    assert!(
+        a.len == b.len && a.len == c.len,
+        "GPU ternary backward: length mismatch ({}, {}, {})",
+        a.len, b.len, c.len
+    );
+
+    let n = a.len as usize;
+    let out_data = inner::alloc_managed(n * 4); // f32
+    let shape = NslTensor::copy_shape(a.shape, a.ndim);
+    let strides = NslTensor::compute_strides(shape, a.ndim);
+    let out = Box::new(NslTensor::new(
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
+    ));
+    let out_ptr = Box::into_raw(out);
+    let out_t = unsafe { &*out_ptr };
+
+    let mut a_data = a.data as u64;
+    let mut b_data = b.data as u64;
+    let mut c_data = c.data as u64;
+    let mut o_data = out_t.data as u64;
+    let mut n_val = n as u64;
+    let args = [
+        &mut a_data as *mut _ as *mut std::ffi::c_void,
+        &mut b_data as *mut _ as *mut std::ffi::c_void,
+        &mut c_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut n_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    let grid = ((n as i64) + block - 1) / block;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(), kernel_name.as_ptr(),
+        [grid, 1, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU ternary backward kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    inner::sync_after_kernel();
+    out_ptr as i64
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name: &str) -> i64 {
     use crate::tensor::NslTensor;
@@ -3437,7 +3994,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 
     // Select kernel based on indices dtype: i32 indices use ld.global.s32,
     // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::EMBEDDING_I32IDX_PTX, b"nsl_embedding_i32idx\0")
     } else {
         (fused_kernels::EMBEDDING_F32_PTX, b"nsl_embedding_f32\0")
@@ -3471,7 +4028,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 ///
 /// `grad` must be a GPU f32 contiguous `[seq_len, embed_dim]` tensor;
 /// `indices` a GPU tensor of `seq_len` token ids (f32 dtype=1 or i32
-/// dtype=4, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
+/// DTYPE_I32, mirroring `gpu_embedding_lookup`'s kernel pair). Out-of-range
 /// and negative ids are skipped in-kernel, matching the CPU reference.
 /// Returns a published GPU `[vocab, embed]` NslTensor, or 0 when the
 /// index dtype has no kernel (caller falls back to the host scatter).
@@ -3501,7 +4058,7 @@ pub(crate) fn gpu_embedding_backward(
     // sets this; NSL_EMBEDDING_BWD_CPU handled by the caller (host scatter).
     let deterministic = crate::deterministic_ops::is_deterministic();
     let (ptx, kernel_name): (&str, &[u8]) = match (deterministic, indices.dtype) {
-        (true, 4) => (
+        (true, crate::tensor::DTYPE_I32) => (
             fused_kernels::EMBEDDING_BWD_DET_I32IDX_PTX,
             b"nsl_embedding_bwd_det_i32idx\0",
         ),
@@ -3509,7 +4066,7 @@ pub(crate) fn gpu_embedding_backward(
             fused_kernels::EMBEDDING_BWD_DET_F32_PTX,
             b"nsl_embedding_bwd_det_f32\0",
         ),
-        (false, 4) => (
+        (false, crate::tensor::DTYPE_I32) => (
             fused_kernels::EMBEDDING_BWD_I32IDX_PTX,
             b"nsl_embedding_bwd_i32idx\0",
         ),
@@ -3946,6 +4503,124 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
 
     // raw = [min, max, sum, sum_sq]; slot 3 is the raw Σx² (pre-transform).
     f64::from(raw[3])
+}
+
+/// Fusion-queue item 2: GPU-native cross-entropy backward.
+/// out = (softmax(logits) - onehot(targets)) * grad_output / num_valid,
+/// invalid (target < 0) rows zeroed — the CPU arm's semantics, computed
+/// entirely on device (softmax kernel + valid-count reduction + finish
+/// pass; grad_output read in-kernel when device-resident). No host
+/// readbacks: the loss epilogue stays cuda-graph-capturable.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cross_entropy_backward_f32(
+    logits_ptr: i64,
+    targets_ptr: i64,
+    grad_out_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::{CE_BWD_COUNT_F32_PTX, CE_BWD_FINISH_F32_PTX};
+
+    inner::set_oom_context("ce_backward_f32");
+    let sm = gpu_softmax_f32(logits_ptr);
+    let smt = unsafe { &*(sm as *const NslTensor) };
+    let ndim = smt.ndim as usize;
+    let cols = unsafe { *smt.shape.add(ndim - 1) } as u32;
+    let total = smt.len as u32;
+    let rows = total / cols.max(1);
+
+    thread_local! {
+        static CE_SCRATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let scratch = CE_SCRATCH.with(|c| {
+        if c.get() == 0 {
+            c.set(inner::alloc_managed(16) as u64);
+        }
+        c.get()
+    });
+
+    let tgt = unsafe { &*(targets_ptr as *const NslTensor) };
+    let tgt_i32: u32 = u32::from(tgt.dtype == crate::tensor::DTYPE_I32);
+
+    // K1: valid-target count -> scratch[0] (denom, already max(count,1)).
+    {
+        let mut a0 = tgt.data as u64;
+        let mut a1 = rows;
+        let mut a2 = tgt_i32;
+        let mut a3 = scratch;
+        let args: [*mut std::ffi::c_void; 4] = [
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let r = inner::kernel_launch(
+            CE_BWD_COUNT_F32_PTX.as_ptr(),
+            b"nsl_ce_bwd_count_f32\0".as_ptr(),
+            [1, 1, 1],
+            [256, 1, 1],
+            &args,
+            0, // smem is STATIC in the kernel (.shared .u32 cnt[256])
+        );
+        assert_eq!(r as u32, 0, "GPU ce_bwd_count kernel failed: {r:?}");
+    }
+
+    // grad_output: device f32 scalar -> read in-kernel; host scalar ->
+    // folded immediate (a host read of a CPU tensor is free); non-scalar
+    // -> 1.0 (CPU-arm semantics).
+    let go = unsafe { &*(grad_out_ptr as *const NslTensor) };
+    let (go_mode, gop, go_imm): (u32, u64, f32) = if go.len == 1 {
+        if go.device > 0 && go.dtype == 1 {
+            (1, go.data as u64, 1.0)
+        } else if go.device == 0 {
+            let v = match go.dtype {
+                1 => unsafe { *(go.data as *const f32) },
+                crate::tensor::DTYPE_I32 => unsafe { *(go.data as *const i32) as f32 },
+                _ => unsafe { *(go.data as *const f64) as f32 },
+            };
+            (0, 0, v)
+        } else {
+            (0, 0, 1.0)
+        }
+    } else {
+        (0, 0, 1.0)
+    };
+
+    // K2: finish pass in place over the softmax buffer.
+    {
+        let mut a0 = smt.data as u64;
+        let mut a1 = tgt.data as u64;
+        let mut a2 = scratch;
+        let mut a3 = gop;
+        let mut a4 = go_imm;
+        let mut a5 = go_mode;
+        let mut a6 = tgt_i32;
+        let mut a7 = total;
+        let mut a8 = cols;
+        let args: [*mut std::ffi::c_void; 9] = [
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+            &mut a4 as *mut _ as *mut std::ffi::c_void,
+            &mut a5 as *mut _ as *mut std::ffi::c_void,
+            &mut a6 as *mut _ as *mut std::ffi::c_void,
+            &mut a7 as *mut _ as *mut std::ffi::c_void,
+            &mut a8 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let block = 256i64;
+        let grid = ((total as i64) + block - 1) / block;
+        let r = inner::kernel_launch(
+            CE_BWD_FINISH_F32_PTX.as_ptr(),
+            b"nsl_ce_bwd_finish_f32\0".as_ptr(),
+            [grid, 1, 1],
+            [block, 1, 1],
+            &args,
+            0,
+        );
+        assert_eq!(r as u32, 0, "GPU ce_bwd_finish kernel failed: {r:?}");
+    }
+    inner::sync_after_kernel();
+    sm
 }
 
 /// P1 Muon items 8+10: Frobenius-normalize an f32 tensor ENTIRELY on-device —
@@ -4639,6 +5314,184 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
 /// `gamma` must be contiguous f32 on-device; returns a fresh f32 dx tensor of
 /// `x`'s shape. Recomputes rms internally (no saved-rms dependency), matching
 /// the correct RMSNorm dx (no mean-subtract).
+/// P5 item 20 slice A: fused RMSNorm gamma gradient.
+/// dgamma[j] = sum_rows(dy[i,j] * x[i,j] / rms_i), computed as two
+/// deterministic launches (per-row 1/rms into a tiny scratch, then a
+/// per-column sequential row loop) — replaces the 7-op decomposition and
+/// its three [rows, cols] temporaries. Fixed summation order per column,
+/// so bit-deterministic run-to-run.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    eps: f32,
+) -> i64 {
+    inner::set_oom_context("rmsnorm_dgamma_bwd_f32");
+    use crate::tensor::NslTensor;
+    use fused_kernels::{RMSNORM_DGAMMA_F32_PTX, RMSNORM_RINV_ROWS_F32_PTX};
+
+    let x = NslTensor::from_ptr(x_ptr);
+    let ndim = x.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (x.len as u64) / cols;
+
+    let g = NslTensor::from_ptr(gamma_ptr);
+    assert_eq!(
+        g.len as u64, cols,
+        "rmsnorm dgamma: gamma len {} != last dim {}",
+        g.len, cols
+    );
+    assert_eq!(
+        NslTensor::from_ptr(dy_ptr).len,
+        x.len,
+        "rmsnorm dgamma: dy/x length mismatch"
+    );
+
+    // Output rides gamma's shape (rank-1 [cols] in every stdlib norm).
+    let out_data = inner::alloc_managed(cols as usize * 4);
+    let out_shape = NslTensor::copy_shape(g.shape, g.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, g.ndim);
+    // Tiny per-row scratch for 1/rms.
+    let rinv = inner::alloc_managed(rows as usize * 4);
+
+    let dy = NslTensor::from_ptr(dy_ptr);
+    let mut dy_data = dy.data as u64;
+    let mut x_data = x.data as u64;
+    let mut rinv_u64 = rinv as u64;
+    let mut out_u64 = out_data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+
+    let rinv_args: [*mut std::ffi::c_void; 5] = [
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+        &mut eps_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let grid_rows = rows.div_ceil(256) as i64;
+    let result = inner::kernel_launch(
+        RMSNORM_RINV_ROWS_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_rinv_rows_f32\0".as_ptr(),
+        [grid_rows.max(1), 1, 1],
+        [256, 1, 1],
+        &rinv_args,
+        0,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm rinv kernel failed: {:?}", result);
+
+    let dg_args: [*mut std::ffi::c_void; 6] = [
+        &mut dy_data as *mut _ as *mut std::ffi::c_void,
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut out_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let grid_cols = cols.div_ceil(256) as i64;
+    let result = inner::kernel_launch(
+        RMSNORM_DGAMMA_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_dgamma_f32\0".as_ptr(),
+        [grid_cols.max(1), 1, 1],
+        [256, 1, 1],
+        &dg_args,
+        0,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm dgamma kernel failed: {:?}", result);
+    inner::sync_after_kernel();
+
+    // Stream-ordered pool free: the block only re-enters circulation via
+    // this thread's in-order allocator, so the kernel that read it has
+    // retired before any same-stream reuse (the caching allocator never
+    // returns memory to the driver here).
+    inner::free_managed(rinv);
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides, g.ndim, g.len, x.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
+#[cfg(feature = "cuda")]
+/// P5 slice C: fused RMSNorm dx + residual-gradient fold (one launch for
+/// what was dx-kernel + elementwise Add). `res` must be contiguous f32 of
+/// x's shape on the same device.
+pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    res_ptr: i64,
+    eps: f32,
+) -> i64 {
+    inner::set_oom_context("rmsnorm_dx_bwd_add_f32");
+    use crate::tensor::NslTensor;
+    use fused_kernels::RMSNORM_DX_BWD_ADD_F32_PTX;
+
+    let x = NslTensor::from_ptr(x_ptr);
+    let ndim = x.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (x.len as u64) / cols;
+    assert_eq!(
+        NslTensor::from_ptr(res_ptr).len,
+        x.len,
+        "rmsnorm dx+res: residual/x length mismatch"
+    );
+    assert_eq!(
+        NslTensor::from_ptr(dy_ptr).len,
+        x.len,
+        "rmsnorm dx+res: dy/x length mismatch"
+    );
+
+    let total = x.len as usize;
+    let out_data = inner::alloc_managed(total * 4);
+    let out_shape = NslTensor::copy_shape(x.shape, x.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, x.ndim);
+
+    let dy = NslTensor::from_ptr(dy_ptr);
+    let g = NslTensor::from_ptr(gamma_ptr);
+    let r = NslTensor::from_ptr(res_ptr);
+
+    let mut dy_data = dy.data as u64;
+    let mut x_data = x.data as u64;
+    let mut g_data = g.data as u64;
+    let mut out_u64 = out_data as u64;
+    let mut res_data = r.data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+
+    let args: [*mut std::ffi::c_void; 8] = [
+        &mut dy_data as *mut _ as *mut std::ffi::c_void,
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut res_data as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+        &mut eps_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let result = inner::kernel_launch(
+        RMSNORM_DX_BWD_ADD_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_dx_bwd_add_f32\0".as_ptr(),
+        [rows as i64, 1, 1],
+        [256, 1, 1],
+        &args,
+        256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm dx+res kernel failed: {:?}", result);
+    inner::sync_after_kernel();
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides, x.ndim, x.len, x.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_rmsnorm_dx_backward_f32(
     dy_ptr: i64,
@@ -4862,7 +5715,7 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     let grid_y = ((inner_dim as i64) + block_y - 1) / block_y;
 
     // Select kernel based on indices dtype: i32 uses ld.global.s32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::GATHER_I32IDX_PTX, b"nsl_gather_i32idx\0")
     } else {
         (GATHER_F32_PTX, b"nsl_gather_f32\0")

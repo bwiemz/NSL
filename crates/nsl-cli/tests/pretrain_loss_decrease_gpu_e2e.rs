@@ -89,7 +89,7 @@ fn run_program_with_env(source: &str, tag: &str, extra_env: &[(&str, &str)]) -> 
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-q", "--features", "cuda", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"])
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"));

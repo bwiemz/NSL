@@ -412,8 +412,8 @@ mod tests {
             assert_eq!(bytes.len(), 4, "bf16 must upcast to 4-byte f32, not be empty");
             assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 4.0);
 
-            // i32 token dtype (4) -> FLOAT (upcast), value preserved
-            let t = raw_tensor(7i32.to_le_bytes().to_vec(), 1, 4);
+            // i32 token dtype (DTYPE_I32) -> FLOAT (upcast), value preserved
+            let t = raw_tensor(7i32.to_le_bytes().to_vec(), 1, crate::tensor::DTYPE_I32);
             let (bytes, dt) = tensor_raw_bytes(&t);
             assert_eq!(dt, FLOAT);
             assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 7.0);

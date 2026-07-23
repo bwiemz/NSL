@@ -1,0 +1,57 @@
+# P5 item 19 gate fixture — pure-tensor residual MLP for CUDA-graph capture.
+#
+# Deliberately: NO embedding, NO DataLoader, NO norm layers, NO biases.
+#   - embedding/CE backward bounce tensors through the host every step
+#     (device-reconciliation readbacks) — those regions self-heal to eager,
+#     which the csla_layerwise_ffn self-heal gate covers; THIS fixture's
+#     regions must be readback-free so they actually capture.
+#   - norm params hit the known CPU-resident-after-.to(cuda) quirk.
+#   - bias grads hit the pre-existing FASE broadcast-accumulate abort.
+#   - mse_loss leaks its (pred-target) intermediate every step on the
+#     source-AD path (pre-existing, structure-dependent leak — tracked
+#     separately), which makes the leaked block's address march and the
+#     region digest never stabilize. l1_loss is leak-free.
+#
+# Every training input is device-resident BEFORE the train block, so the
+# lowered forward/backward regions contain only kernels, gemms and
+# (pseudo-op) transfers.
+#
+# Rewrite marker (harness convention): the GPU_PLACEMENT comment below is
+# replaced with "m.to(cuda)" + x/y .to(cuda) lines for GPU runs.
+
+from nsl.nn.losses import l1_loss
+
+model Blk:
+    w_up: Tensor = randn([64, 128]) * 0.15
+    w_down: Tensor = randn([128, 64]) * 0.15
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let f = silu(h @ self.w_up) @ self.w_down
+        return h + f
+
+model TinyMLP:
+    w_in: Tensor = randn([32, 64]) * 0.2
+    blocks: [Blk; 2] = Blk()
+    w_out: Tensor = randn([64, 32]) * 0.2
+
+    fn forward_train(self, x: Tensor) -> Tensor:
+        let h = x @ self.w_in
+        for block in self.blocks:
+            h = block.forward(h)
+        return h @ self.w_out
+
+let m = TinyMLP()
+let x = randn([8, 32])
+let y = randn([8, 32]) * 0.1
+# GPU_PLACEMENT
+
+print("LOSS_STREAM_BEGIN")
+train(model=m, epochs=8, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let pred = m.forward_train(x)
+        let loss = l1_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+print("LOSS_STREAM_END")

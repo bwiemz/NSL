@@ -39,7 +39,7 @@ fn run_wggo(source: &str, tag: &str) -> String {
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad", "--wggo", "greedy"])
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad", "--wggo", "greedy"])
         .arg(&fixture)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))

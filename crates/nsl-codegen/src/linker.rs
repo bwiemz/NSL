@@ -22,6 +22,62 @@ fn wants_cuda_runtime() -> bool {
     cfg!(feature = "cuda")
 }
 
+/// A symbol that exists ONLY in cuda-featured runtime archives. Used to
+/// verify a candidate archive actually matches this binary's features —
+/// the fingerprint scan can transiently fail mid-rebuild (concurrent
+/// workspace builds rewrite .fingerprint entries), and the mtime-newest
+/// fallback then happily links a CPU-only runtime into a CUDA program,
+/// which surfaces later as a runtime "CUDA support not compiled" abort in
+/// the trained program rather than a link-time error.
+const CUDA_MARKER_SYMBOL: &[u8] = b"gpu_fase_fused_adamw_step";
+
+/// Cheap containment probe: the GNU ar symbol index sits at the head of the
+/// archive and names every exported symbol, so scanning the first slice of
+/// the file is sufficient (and pinned wrong by neither strip level nor
+/// member ordering). Reads at most 64 MiB.
+fn archive_has_cuda_marker(path: &Path) -> bool {
+    use std::io::Read;
+    const HEAD_LIMIT: usize = 64 * 1024 * 1024;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(HEAD_LIMIT.min(8 * 1024 * 1024));
+    if file.take(HEAD_LIMIT as u64).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let m = CUDA_MARKER_SYMBOL;
+    if head.len() < m.len() {
+        return false;
+    }
+    // Naive first-byte-skip search — runs once per link over the index head.
+    let first = m[0];
+    let mut i = 0;
+    while i + m.len() <= head.len() {
+        match head[i..].iter().position(|&b| b == first) {
+            Some(off) => {
+                let start = i + off;
+                if start + m.len() > head.len() {
+                    return false;
+                }
+                if &head[start..start + m.len()] == m {
+                    return true;
+                }
+                i = start + 1;
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Feature-verify a candidate archive against this binary's build. Only the
+/// cuda direction is checked: linking a cuda archive into a non-cuda build
+/// already fails loudly at link time on the missing driver symbols, but the
+/// reverse silently produces a binary that aborts mid-training.
+fn archive_matches_features(path: &Path) -> bool {
+    !wants_cuda_runtime() || archive_has_cuda_marker(path)
+}
+
 fn current_target_os() -> &'static str {
     if cfg!(windows) {
         "windows"
@@ -151,12 +207,21 @@ fn find_feature_matched_runtime_lib(compile_time_path: &Path) -> Option<PathBuf>
     }
 
     exact_matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-    if let Some((_, path)) = exact_matches.into_iter().next() {
-        return Some(path);
+    // Feature-verify each candidate newest-first: the fingerprint said cuda,
+    // but the archive itself is the ground truth (a fingerprint written by a
+    // concurrent build can point at an archive that is mid-write or from a
+    // differently-featured unification).
+    for (_, path) in exact_matches {
+        if archive_matches_features(&path) {
+            return Some(path);
+        }
     }
 
     fallback_matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-    fallback_matches.into_iter().next().map(|(_, path)| path)
+    fallback_matches
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| archive_matches_features(path))
 }
 
 /// Find the runtime library, searching multiple locations for toolchain distribution.
@@ -189,8 +254,23 @@ fn find_runtime_lib() -> Result<PathBuf, CodegenError> {
     if let Some(feature_matched) = find_feature_matched_runtime_lib(&compile_time) {
         return Ok(feature_matched);
     }
-    if compile_time.exists() {
+    if compile_time.exists() && archive_matches_features(&compile_time) {
         return Ok(compile_time);
+    }
+
+    if compile_time.exists() {
+        // The archive exists but fails the feature probe — refuse rather
+        // than link a CPU-only runtime into a CUDA binary (the failure
+        // would otherwise surface as "CUDA support not compiled" aborts
+        // inside the trained program, far from the cause).
+        return Err(CodegenError::new(
+            "nsl-runtime static library found, but no candidate contains the \
+             CUDA runtime this binary was built with (concurrent workspace \
+             builds can leave differently-featured archives newest in \
+             target/). Rebuild with `cargo build -p nsl-cli --features cuda` \
+             or set NSL_RUNTIME_LIB_PATH_OVERRIDE."
+                .to_string(),
+        ));
     }
 
     Err(CodegenError::new(
@@ -753,7 +833,9 @@ mod tests {
         let cpu_lib = profile_dir.join("deps").join(deps_runtime_name(cpu_hash));
         let cuda_lib = profile_dir.join("deps").join(deps_runtime_name(cuda_hash));
         fs::write(&cpu_lib, b"cpu").unwrap();
-        fs::write(&cuda_lib, b"cuda").unwrap();
+        // The archive-content probe requires the marker symbol in a
+        // cuda-featured archive — fake it in the fixture body.
+        fs::write(&cuda_lib, [b"cuda ".as_slice(), CUDA_MARKER_SYMBOL].concat()).unwrap();
 
         let compile_time = profile_dir.join(top_level_runtime_name_for_target(
             current_target_os(),
@@ -867,8 +949,14 @@ mod tests {
             .join("deps")
             .join(deps_runtime_name(fallback_hash));
         let exact_lib = profile_dir.join("deps").join(deps_runtime_name(exact_hash));
-        fs::write(&fallback_lib, b"fallback").unwrap();
-        fs::write(&exact_lib, b"exact").unwrap();
+        // Under cfg(cuda) the content probe must accept both fixtures so the
+        // rustflags preference (not the probe) decides.
+        fs::write(
+            &fallback_lib,
+            [b"fallback ".as_slice(), CUDA_MARKER_SYMBOL].concat(),
+        )
+        .unwrap();
+        fs::write(&exact_lib, [b"exact ".as_slice(), CUDA_MARKER_SYMBOL].concat()).unwrap();
 
         let compile_time = profile_dir.join(top_level_runtime_name_for_target(
             current_target_os(),

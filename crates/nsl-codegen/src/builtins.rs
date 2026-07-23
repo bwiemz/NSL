@@ -220,6 +220,50 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // P1 Muon items 8+10: planned Newton-Schulz orthogonalization primitive
     // (no .item() sync; device-resident norm; materialized tall/wide).
     ("nsl_tensor_muon_orthogonalize", &[types::I64, types::F64], Some(types::I64)),
+    // Muon perf campaign: batched momentum + Newton-Schulz + param update
+    // over (params, grads, m, routes) lists; f64 lr/momentum/wd, i64
+    // nesterov flag, f64 ns_steps.
+    (
+        "nsl_muon_step_batch",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::I64,
+            types::F64,
+        ],
+        None,
+    ),
+    // Muon internal profiler (perf-campaign item 2): explicit begin/end
+    // region markers + on-demand report, no-ops unless NSL_MUON_PROF is set.
+    ("nsl_muon_prof_begin", &[types::I64], None),
+    ("nsl_muon_prof_end", &[types::I64], None),
+    ("nsl_muon_prof_report", &[], None),
+    // Fusion item 1: multi-tensor fused AdamW final step over the whole
+    // param/m/v/m_partial lists (one pointer-table launch, bit-identical).
+    (
+        "nsl_fase_fused_adamw_step_multi",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+            types::F64,
+        ],
+        None,
+    ),
     // PCA Stage C: non-aborting shape probe (0 for out-of-range dims).
     ("nsl_tensor_dim_or_zero", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_len", &[types::I64], Some(types::I64)),
@@ -652,6 +696,18 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Item 9: fused RMSNorm input-gradient (dy, x, gamma, eps) -> dx.
     (
         "nsl_rmsnorm_dx_backward",
+        &[types::I64, types::I64, types::I64, types::F64],
+        Some(types::I64),
+    ),
+    // P5 slice C: fused RMSNorm dx + residual fold (dy, x, gamma, res, eps) -> dx+res.
+    (
+        "nsl_rmsnorm_dx_backward_add",
+        &[types::I64, types::I64, types::I64, types::I64, types::F64],
+        Some(types::I64),
+    ),
+    // P5 item 20 slice A: fused RMSNorm gamma-gradient (dy, x, gamma, eps) -> dgamma.
+    (
+        "nsl_rmsnorm_dgamma_backward",
         &[types::I64, types::I64, types::I64, types::F64],
         Some(types::I64),
     ),
@@ -2518,6 +2574,30 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_zero_sync_params", &[types::I64, types::I64], Some(types::I64)), // (param_list, num_params)
     ("nsl_zero_destroy", &[], Some(types::I64)),
     ("nsl_zero_owns_param", &[types::I64], Some(types::I64)), // (param_idx) -> 1 if owned
+    // P3 ZeRO-3: tensor-granular parameter sharding (items 12-14).
+    ("nsl_zero3_enable", &[], Some(types::I64)),
+    ("nsl_zero3_note_param", &[types::I64, types::I64], Some(types::I64)), // (tensor, idx)
+    // P5 item 19: opportunistic per-region CUDA graph capture/replay
+    ("nsl_cuda_graphs_enable", &[types::I64], None), // (accum_window)
+    ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)
+    ("nsl_cuda_graph_region_end", &[types::I64], None), // (region_id)
+    ("nsl_cuda_graphs_report", &[], None),
+    // P4 item 17: SR-BF16 authoritative weights
+    ("nsl_sr_bf16_enable", &[], None),
+    ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)
+    // P4 item 18 rung 2: (src_f32, dst_bf16, step, param_idx)
+    ("nsl_muon_state_sr_store", &[types::I64, types::I64, types::I64, types::I64], None),
+    (
+        "nsl_sr_bf16_step_adamw",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // theta, m, v, mp
+            types::F64, types::F64, types::F64, types::F64, types::F64, // lr, b1, omb1, b2, omb2
+            types::F64, types::F64, types::F64, types::F64, // eps, wd, bc1_inv, bc2_inv
+            types::I64, // step
+        ],
+        None,
+    ),
+    ("nsl_zero3_reduce_grad_slot", &[types::I64, types::I64], Some(types::I64)), // (list, idx)
     // D3 v2: record an owned optimizer-moment allocation's element count so the
     // G3 gate can prove per-rank optimizer state shrank to ~1/world_size.
     ("nsl_zero_note_optim_alloc", &[types::I64], Some(types::I64)), // (tensor_ptr) -> running elems
@@ -2733,6 +2813,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_tensor_silu_backward",
         &[types::I64, types::I64],
+        Some(types::I64),
+    ),
+    // P5 item 20 slice B: fused SwiGLU gate backward (y_bar, up, gate_in) -> dgate.
+    (
+        "nsl_tensor_swiglu_gate_backward",
+        &[types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
     // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.

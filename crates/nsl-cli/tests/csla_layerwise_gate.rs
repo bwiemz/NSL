@@ -81,7 +81,7 @@ fn run_program(source: &str, tag: &str, cuda: bool, deterministic: bool, extra_a
     }
     cmd.arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--", "run", "--source-ad"]);
+        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     if deterministic {
         cmd.arg("--deterministic");
     }
@@ -1151,7 +1151,7 @@ fn csla_mpartial_surface_shrinks_gpu() {
             .args(["run", "-q", "--features", "cuda"])
             .arg("--manifest-path")
             .arg(root.join("Cargo.toml"))
-            .args(["-p", "nsl-cli", "--", "run", "--source-ad", "--deterministic"])
+            .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad", "--deterministic"])
             .args(extra)
             .arg(&prog)
             .current_dir(&dir)

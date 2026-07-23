@@ -224,6 +224,21 @@ pub fn compile_wengert_ops_range(
         }
         m
     });
+    // P5 item 19 (`--cuda-graphs`): bracket this contiguous lowering as one
+    // capture region. Each static invocation claims a fresh id, so a
+    // region's identity is its code location — the same emitted code runs
+    // every step, letting the runtime accumulate digest history per region.
+    // Weight-stream transfers and optimizer updates are emitted by the
+    // CALLERS around this function, so they land outside the region.
+    let graph_region_id = if compiler.compile_options.cuda_graphs {
+        let id = compiler.next_cuda_graph_region_id;
+        compiler.next_cuda_graph_region_id += 1;
+        let idv = builder.ins().iconst(cl_types::I64, id);
+        call(compiler, builder, "nsl_cuda_graph_region_begin", &[idv])?;
+        Some(id)
+    } else {
+        None
+    };
     let range_start = range.start;
     for (rel_i, op) in wengert.ops[range].iter().enumerate() {
         let abs_i = range_start + rel_i;
@@ -434,6 +449,10 @@ pub fn compile_wengert_ops_range(
             owned_values.push((op.result, result_val, result_type));
         }
         var_types.insert(op.result, result_type);
+    }
+    if let Some(id) = graph_region_id {
+        let idv = builder.ins().iconst(cl_types::I64, id);
+        call(compiler, builder, "nsl_cuda_graph_region_end", &[idv])?;
     }
     Ok(())
 }
@@ -3344,6 +3363,34 @@ fn lower_single_op(
                     let key = compiler.compile_string_literal(builder, field)?;
                     call(compiler, builder, "nsl_dict_get_str", &[inputs[0], key])
                 }
+                _ if name.starts_with("rmsnorm_dgamma_backward:") => {
+                    // P5 item 20 slice A: fused RMSNorm gamma gradient.
+                    // inputs = [dy, x, gamma]; eps bit-encoded in the name.
+                    let bits: u64 = name["rmsnorm_dgamma_backward:".len()..]
+                        .parse()
+                        .unwrap_or(0);
+                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_rmsnorm_dgamma_backward",
+                        &[inputs[0], inputs[1], inputs[2], e],
+                    )
+                }
+                _ if name.starts_with("rmsnorm_dx_backward_add:") => {
+                    // P5 slice C: fused dx + residual fold.
+                    // inputs = [dy, x, gamma, res]; eps bit-encoded.
+                    let bits: u64 = name["rmsnorm_dx_backward_add:".len()..]
+                        .parse()
+                        .unwrap_or(0);
+                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_rmsnorm_dx_backward_add",
+                        &[inputs[0], inputs[1], inputs[2], inputs[3], e],
+                    )
+                }
                 _ if name.starts_with("rmsnorm_dx_backward:") => {
                     // Item 9 fused RMSNorm input gradient. inputs = [dy, x, gamma];
                     // eps is bit-encoded in the name suffix (exact round-trip).
@@ -3394,6 +3441,15 @@ fn lower_single_op(
                         compiler,
                         builder,
                         "nsl_l1_backward",
+                        &[inputs[0], inputs[1], inputs[2]],
+                    )
+                }
+                "swiglu_gate_backward" => {
+                    // P5 item 20 slice B. inputs = [y_bar, up, gate_input].
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_swiglu_gate_backward",
                         &[inputs[0], inputs[1], inputs[2]],
                     )
                 }

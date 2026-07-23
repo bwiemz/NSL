@@ -45,7 +45,7 @@ fn run(save_path: &std::path::Path, checkpoint_blocks: bool, tag: &str) -> (bool
     std::fs::write(&src_path, program).unwrap();
 
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["run", "-q", "-p", "nsl-cli", "--", "run", "--source-ad"]);
+    cmd.args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     if checkpoint_blocks {
         cmd.arg("--checkpoint-blocks");
     }

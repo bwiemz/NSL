@@ -4169,12 +4169,72 @@ impl Compiler<'_> {
                      independently with no gradient reduction. Drop one",
                 ));
             }
+            // P4 items 17/18: neither precision ladder is lowered on the
+            // pipelined path — without these refusals a @pipeline program
+            // would compile cleanly and train plain f32 while the user
+            // believes they are validating bf16 (deferral-must-refuse).
+            if self.features.param_dtype_bf16sr {
+                return Err(CodegenError::new(
+                    "--param-dtype bf16-sr is not supported on the pipelined                      train path (@pipeline): the bf16 mirror schedule and the                      fused SR step are not lowered there. Drop one",
+                ));
+            }
+            if self.features.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-state-dtype bf16 is not supported on the pipelined                      train path (@pipeline): the CSLA state envelope is not                      lowered there. Drop one",
+                ));
+            }
+            // P5 item 19: the pipelined path lowers its stages outside the
+            // region-marker emission — the flag would silently train eager
+            // while the user believes graphs are active.
+            if self.compile_options.cuda_graphs {
+                return Err(CodegenError::new(
+                    "--cuda-graphs is not supported on the pipelined train \
+                     path (@pipeline): capture regions are not emitted \
+                     there. Drop one",
+                ));
+            }
+            // Muon perf campaign: the pipelined path never reaches the
+            // batch/resident emission — refuse rather than silently no-op
+            // (the non-pipeline path refuses non-muon optimizers too).
+            if self.compile_options.muon_batch_ns {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns is not supported on the pipelined train \
+                     path (@pipeline). Drop one",
+                ));
+            }
+            if self.compile_options.muon_resident_momentum {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum is not supported on the \
+                     pipelined train path (@pipeline). Drop one",
+                ));
+            }
             return self.compile_train_block_pipelined(
                 builder,
                 state,
                 train,
                 train_block_stmt_id,
             );
+        }
+
+        // P5 item 19 (`--cuda-graphs`): opportunistic per-region capture.
+        // Regions only exist in Wengert lowerings (source-AD); the tape
+        // path would silently ignore the flag. Multi-rank collectives wait
+        // on their own streams mid-backward — unvalidated with capture.
+        if self.compile_options.cuda_graphs {
+            if !self.features.source_ad_enabled {
+                return Err(CodegenError::new(
+                    "--cuda-graphs requires --source-ad: capture regions \
+                     bracket the source-AD Wengert lowerings; the tape path \
+                     has none and would silently train eager",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--cuda-graphs does not compose with --zero-stage yet \
+                     (collective waits inside the backward are incompatible \
+                     with stream capture). Drop one of the flags",
+                ));
+            }
         }
 
         // CFTP v10 (item 3): install the fused-CE config for THIS train
@@ -4265,6 +4325,19 @@ impl Compiler<'_> {
                     _ => {} // ignore unknown config for forward compat
                 }
             }
+        }
+
+        // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
+        // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
+        // legacy NULL stream). The accumulation window rides along — each
+        // micro-batch phase within a window has its own self-consistent
+        // allocator state, so the runtime captures one graph per
+        // (region, phase) instead of requiring a phase-free digest.
+        if self.compile_options.cuda_graphs {
+            let win = builder
+                .ins()
+                .iconst(cl_types::I64, grad_accumulation_steps.max(1));
+            self.compile_call_by_name(builder, "nsl_cuda_graphs_enable", &[win])?;
         }
 
         // CPKD: a distill block delegates here with an empty config — the
@@ -4548,6 +4621,88 @@ impl Compiler<'_> {
             }
         }
 
+        // Muon perf campaign (`--muon-batch-ns`): the batched engine is
+        // wired into the FullBuffer optimizer loop only. Every path where
+        // it would silently not batch (or corrupt state) refuses loudly.
+        if self.compile_options.muon_batch_ns {
+            if optimizer_name != "muon" {
+                return Err(CodegenError::new(format!(
+                    "--muon-batch-ns requires the muon optimizer (train block \
+                     uses '{optimizer_name}'). Drop the flag"
+                )));
+            }
+            if self.compile_options.layerwise_accum {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --layerwise-accum \
+                     yet: CSLA fires per-layer group updates at window \
+                     boundaries, and cross-layer batching there would change \
+                     the accumulation discipline. Drop one of the flags",
+                ));
+            }
+            if self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with \
+                     --optim-state-offload: the batched kernels update the \
+                     momentum in place on the DEVICE, but offload keeps it \
+                     host-resident. Use --muon-resident-momentum (device m) \
+                     or drop one of the flags",
+                ));
+            }
+            if self.compile_options.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --muon-state-dtype \
+                     bf16: the batched kernels read/write f32 momentum \
+                     directly. Drop one of the flags",
+                ));
+            }
+            if self.compile_options.param_dtype_bf16sr {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --param-dtype \
+                     bf16-sr: the batched kernels read/write f32 params \
+                     directly. Drop one of the flags",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--muon-batch-ns does not compose with --zero-stage: the \
+                     batch call updates every listed param, but ZeRO shards \
+                     ownership per rank. Drop one of the flags",
+                ));
+            }
+        }
+
+        // Muon perf campaign (`--muon-resident-momentum`): only meaningful
+        // under offload, and only for the muon optimizer's routed params.
+        if self.compile_options.muon_resident_momentum {
+            if optimizer_name != "muon" {
+                return Err(CodegenError::new(format!(
+                    "--muon-resident-momentum requires the muon optimizer \
+                     (train block uses '{optimizer_name}'). Drop the flag"
+                )));
+            }
+            if !self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum is only meaningful with \
+                     --optim-state-offload (without offload the momentum is \
+                     already device-resident). Drop the flag",
+                ));
+            }
+            if self.compile_options.muon_state_bf16 {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum does not compose with \
+                     --muon-state-dtype bf16 (the bf16 envelope owns the \
+                     momentum layout). Drop one of the flags",
+                ));
+            }
+            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+                return Err(CodegenError::new(
+                    "--muon-resident-momentum does not compose with \
+                     --zero-stage (owner-gated moment allocation). Drop one \
+                     of the flags",
+                ));
+            }
+        }
+
         let (step_body, step_param_sym) =
             step_body.ok_or_else(|| CodegenError::new("train block requires a step section"))?;
 
@@ -4734,12 +4889,20 @@ impl Compiler<'_> {
                      the layerwise gate is bit-exact and compressed saves are not",
                 ));
             }
-            if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+            // P3 ZeRO-3: stage 3 is BUILT ON the layerwise schedule (its
+            // per-layer group updates host the gradient all-reduce + the
+            // owner-gated step, and its upload/evict sites drive the JIT
+            // gather/release) — only stages 1/2 keep the M43 incompatibility:
+            // their hooks read every accum slot after the backward, but the
+            // layerwise schedule frees per-layer accumulators before the
+            // (bypassed) optimizer gate.
+            if self.features.zero_stage.filter(|&s| (1..=2).contains(&s)).is_some() {
                 return Err(CodegenError::new(
-                    "--layerwise-accum is incompatible with --zero-stage: the M43 \
-                     ZeRO hooks read every accum slot after the backward, but the \
-                     layerwise schedule's per-layer accumulators are freed before \
-                     the optimizer gate. Drop one",
+                    "--layerwise-accum is incompatible with --zero-stage 1/2: the \
+                     M43 ZeRO hooks read every accum slot after the backward, but \
+                     the layerwise schedule's per-layer accumulators are freed \
+                     before the optimizer gate. Drop one (or use --zero-stage 3, \
+                     which composes with the layerwise schedule)",
                 ));
             }
         }
@@ -4753,19 +4916,38 @@ impl Compiler<'_> {
         if let Some(s) = self.features.zero_stage {
             // P4 item 16: stage 2 (gradient partitioning via owner-segmented
             // reduce_scatter) is lowered — same emission points as stage 1;
-            // the runtime dispatches on the baked stage. Stage 3 (parameter
-            // partitioning + just-in-time all-gather) still refuses: params
-            // freed between steps would break mid-loop model_save/callbacks
-            // and eval reads, which need the residency machinery generalized
-            // from the weight-stream Item-12 guard first.
-            if s >= 3 {
+            // the runtime dispatches on the baked stage.
+            //
+            // P3 ZeRO-3 (items 12-14): stage 3 (tensor-granular parameter
+            // partitioning + JIT gather) is lowered ON the layerwise
+            // schedule: it requires --layerwise-accum + --weight-stream so
+            // the per-layer residency sites exist (in zero3 mode their
+            // backend is the collective broadcast, not host mirrors), and
+            // the per-layer group updates host the gradient all-reduce +
+            // owner-gated step. Anything else refuses.
+            if s >= 4 {
                 return Err(CodegenError::new(format!(
-                    "--zero-stage {s} is not lowered yet: stages 1 (optimizer \
-                     sharding) and 2 (gradient partitioning) are implemented. \
-                     Stage 3 parameter partitioning needs the callback/\
-                     model_save residency guard generalized to sharded params \
-                     — use --zero-stage 2",
+                    "--zero-stage {s} does not exist: stages are 1 (optimizer \
+                     sharding), 2 (+ gradient partitioning), 3 (+ parameter \
+                     partitioning)",
                 )));
+            }
+            if s == 3 && !(csla_active && self.compile_options.weight_stream) {
+                return Err(CodegenError::new(
+                    "--zero-stage 3 requires --layerwise-accum --weight-stream \
+                     (+ --checkpoint-blocks --source-ad): parameter sharding \
+                     rides the layer-major residency schedule — its per-layer \
+                     upload/evict sites become the JIT gather/release and its \
+                     group updates host the owner-gated step. Add those flags \
+                     or use --zero-stage 2",
+                ));
+            }
+            if s == 3 && self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "--zero-stage 3 with --optim-state-offload is not lowered: \
+                     host-resident moments x owner-gated sharded updates is an \
+                     untested composition (deferral-must-refuse). Drop one",
+                ));
             }
             // D3 v1 (review): --zero-stage x grad_clip is unsafe and unlowered.
             // The all-reduce is emitted BEFORE the Deferred dispatch, but
@@ -4922,6 +5104,45 @@ impl Compiler<'_> {
             self.intern_string(part_msg)?;
             let part_msg_ptr = self.compile_string_literal(builder, part_msg)?;
             self.compile_call_by_name(builder, "nsl_assert", &[part_ok, part_msg_ptr])?;
+
+            // P3 ZeRO-3 (item 12): activate the tensor-granular residency
+            // table and map every param pointer to its index (owners come
+            // from the byte-balanced partition above). The weight-stream
+            // registration/upload/evict sites the layerwise schedule emits
+            // then redirect to the zero3 broadcast-fill backend at runtime.
+            if self.features.zero_stage == Some(3) {
+                self.compile_call_by_name(builder, "nsl_zero3_enable", &[])?;
+                let z3_i_var = state.new_variable();
+                builder.declare_var(z3_i_var, cl_types::I64);
+                let z3_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(z3_i_var, z3_zero);
+                let z3_hdr = builder.create_block();
+                let z3_body = builder.create_block();
+                let z3_exit = builder.create_block();
+                builder.ins().jump(z3_hdr, &[]);
+                builder.switch_to_block(z3_hdr);
+                state.current_block = Some(z3_hdr);
+                let z3_i = builder.use_var(z3_i_var);
+                let z3_n = builder
+                    .ins()
+                    .iconst(cl_types::I64, param_paths.len() as i64);
+                let z3_c = builder.ins().icmp(IntCC::SignedLessThan, z3_i, z3_n);
+                builder.ins().brif(z3_c, z3_body, &[], z3_exit, &[]);
+                builder.switch_to_block(z3_body);
+                builder.seal_block(z3_body);
+                state.current_block = Some(z3_body);
+                let z3_p =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[param_list, z3_i])?;
+                self.compile_call_by_name(builder, "nsl_zero3_note_param", &[z3_p, z3_i])?;
+                let z3_one = builder.ins().iconst(cl_types::I64, 1);
+                let z3_next = builder.ins().iadd(z3_i, z3_one);
+                builder.def_var(z3_i_var, z3_next);
+                builder.ins().jump(z3_hdr, &[]);
+                builder.seal_block(z3_hdr);
+                builder.switch_to_block(z3_exit);
+                builder.seal_block(z3_exit);
+                state.current_block = Some(z3_exit);
+            }
         }
         let num_params_val = builder
             .ins()
@@ -5101,6 +5322,115 @@ impl Compiler<'_> {
                      --wggo-moment-precision / the CPDT precision plan, or use \
                      AdamW",
                 ));
+            }
+            // P3 ZeRO-3: the owner-gated group updates don't thread the
+            // precision envelope — refuse rather than feed FP16 moments to
+            // an unwrapped update (deferral-must-refuse).
+            if dtype_data.is_some() && self.features.zero_stage == Some(3) {
+                return Err(CodegenError::new(
+                    "--zero-stage 3 does not support reduced-precision \
+                     optimizer moments yet. Drop --wggo-moment-precision / \
+                     the CPDT precision plan, or use --zero-stage 2",
+                ));
+            }
+            // P4 item 17: SR-BF16 authoritative weights. The fused SR step
+            // is the ONLY sanctioned theta writer — refuse every composition
+            // that could route any parameter's update through a non-SR path
+            // (stdlib dispatch, interpreted envelope, owner-gated collective
+            // update), or that assumes f32 authoritative storage.
+            if self.features.param_dtype_bf16sr {
+                if optimizer_name != "adamw" && optimizer_name != "adam" {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr supports only AdamW/Adam in v1 \
+                         (the fused SR step; Muon SR-state is the item-18 \
+                         ladder). Drop the flag or switch optimizers",
+                    ));
+                }
+                if !self.compile_options.weight_stream {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires --weight-stream: the \
+                         bf16 authoritative mirrors ride the streaming \
+                         residency schedule (transient f32 working views)",
+                    ));
+                }
+                if self.features.zero_stage.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         --zero-stage yet (the ZeRO gather/reduce paths pin \
+                         f32 device storage). Drop one of the flags",
+                    ));
+                }
+                if self.compile_options.optim_state_offload {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         --optim-state-offload (m/v must be plain device f32 \
+                         for the fused SR step)",
+                    ));
+                }
+                if dtype_data.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with \
+                         reduced-precision optimizer moments (drop \
+                         --wggo-moment-precision / the CPDT precision plan)",
+                    ));
+                }
+                if self.compile_options.training_reference {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires the fused optimizer \
+                         step, which --training-reference disables",
+                    ));
+                }
+                if !fase_deferred {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr requires the FASE-Deferred \
+                         plan (the FullBuffer stdlib dispatch would update \
+                         theta without stochastic rounding). Train with \
+                         gradient accumulation / --source-ad",
+                    ));
+                }
+                if self.wggo_overrides.is_some() {
+                    return Err(CodegenError::new(
+                        "--param-dtype bf16-sr does not compose with WGGO \
+                         per-layer FASE overrides yet (a FullBuffer-routed \
+                         param would bypass the SR step). Drop the WGGO plan",
+                    ));
+                }
+            }
+            // P4 item 18 rung 2: BF16 Muon momentum (f32 working buffer +
+            // counter-based SR store). The envelope lives in the CSLA muon
+            // group update — refuse every path that would read/write the
+            // bf16 m buffer without it.
+            if self.features.muon_state_bf16 {
+                if optimizer_name != "muon" {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 applies to the Muon \
+                         optimizer only (AdamW reduced-precision moments are \
+                         --wggo-moment-precision / the CPDT plan). Drop the \
+                         flag or switch to Muon",
+                    ));
+                }
+                if !self.compile_options.layerwise_accum {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 requires --layerwise-accum: \
+                         the dequant->step->SR-quant envelope lives in the \
+                         CSLA group update (the FullBuffer stdlib dispatch \
+                         would touch the bf16 momentum unwrapped)",
+                    ));
+                }
+                if self.features.zero_stage.is_some() {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 does not compose with \
+                         --zero-stage yet (shard-allocated moments bypass \
+                         the envelope). Drop one of the flags",
+                    ));
+                }
+                if self.compile_options.optim_state_offload {
+                    return Err(CodegenError::new(
+                        "--muon-state-dtype bf16 does not compose with \
+                         --optim-state-offload (host-resident momentum would \
+                         bypass the device SR store). Drop one of the flags",
+                    ));
+                }
             }
             if let Some((m_codes, v_codes)) = dtype_data {
                 let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
@@ -5285,6 +5615,21 @@ impl Compiler<'_> {
             }
         }
 
+        // P4 item 18 rung 2: per-param dtype-code list forcing every
+        // first-moment buffer to BF16 storage (code 3). Reuses the CPDT
+        // precision alloc plumbing; v stays f32 (null-sloted per param on
+        // the Muon route, and the AdamW arm's v is untouched by rung 2).
+        let muon_state_m_codes: Option<Value> = if self.features.muon_state_bf16 {
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let bf16_code = builder.ins().iconst(cl_types::I64, 3);
+            for _ in 0..param_paths.len() {
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, bf16_code])?;
+            }
+            Some(list)
+        } else {
+            None
+        };
+
         let state_list_1 = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         let state_list_2 = if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_new", &[])?
@@ -5333,18 +5678,72 @@ impl Compiler<'_> {
             // perturb the identical-collective-sequence spin-barrier invariant.
             // `zero_enabled` is recomputed locally: the outer binding is
             // introduced far below (near the optimizer loop), out of scope here.
-            let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
+            // P3 ZeRO-3: stage 3 keeps optimizer state REPLICATED in v1
+            // (resident/tied params update on every rank from all-reduced
+            // gradients and need m/v everywhere; owner-only m/v for the
+            // sharded set is a follow-up) — owner-gated moment allocation is
+            // stages 1/2 only, and a loud note records the choice.
+            let zero_enabled = self
+                .features
+                .zero_stage
+                .filter(|&s| (1..=2).contains(&s))
+                .is_some();
             let offload = self.compile_options.optim_state_offload;
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
             // so projecting each moment's dtype-code list by value is fine.
-            let m_list = cpdt_precision_dtypes.map(|(m, _)| m);
+            let m_list = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
 
             // P0.1: first-moment buffers under the OptimM surface. The offload
             // variant allocates HOST tensors — inert GPU tag (host state is not
             // VRAM).
             let surface_optim_m = builder.ins().iconst(cl_types::I8, SURFACE_OPTIM_M);
             self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_optim_m])?;
-            let buf1 = if zero_enabled {
+            // Muon perf campaign (`--muon-resident-momentum`): under offload,
+            // Muon-routed rank-2 params keep their momentum DEVICE-resident
+            // (the stdlib-call envelope skips its staging on the exact same
+            // (route==0 && rank==2) condition — the two sites must agree or
+            // a host m would be updated as if device / vice versa). Refused
+            // combos (zero/bf16/non-muon/no-offload) were rejected at parse.
+            let muon_resident_m = optimizer_name == "muon"
+                && offload
+                && self.compile_options.muon_resident_momentum;
+            let buf1 = if muon_resident_m {
+                let route_list = muon_route_list
+                    .expect("muon route list is built before state buffers (4a)");
+                let flag_i =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+                let ndim_m =
+                    self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_i])?;
+                let two_c = builder.ins().iconst(cl_types::I64, 2);
+                let zero_c = builder.ins().iconst(cl_types::I64, 0);
+                let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_c);
+                let is_r2 = builder.ins().icmp(IntCC::Equal, ndim_m, two_c);
+                let resident = builder.ins().band(is_muon, is_r2);
+                let dev_b = builder.create_block();
+                let host_b = builder.create_block();
+                let merge_b = builder.create_block();
+                builder.append_block_param(merge_b, cl_types::I64);
+                builder.ins().brif(resident, dev_b, &[], host_b, &[]);
+
+                builder.switch_to_block(dev_b);
+                builder.seal_block(dev_b);
+                state.current_block = Some(dev_b);
+                let dev_m =
+                    self.emit_moment_zeros_like(builder, param_i, idx, m_list, false)?;
+                builder.ins().jump(merge_b, &[dev_m]);
+
+                builder.switch_to_block(host_b);
+                builder.seal_block(host_b);
+                state.current_block = Some(host_b);
+                let host_m =
+                    self.emit_moment_zeros_like(builder, param_i, idx, m_list, true)?;
+                builder.ins().jump(merge_b, &[host_m]);
+
+                builder.switch_to_block(merge_b);
+                builder.seal_block(merge_b);
+                state.current_block = Some(merge_b);
+                builder.block_params(merge_b)[0]
+            } else if zero_enabled {
                 self.emit_owner_gated_moment(builder, state, param_i, idx, m_list, offload)?
             } else {
                 self.emit_moment_zeros_like(builder, param_i, idx, m_list, offload)?
@@ -7004,8 +7403,142 @@ impl Compiler<'_> {
                     // `Auto` searches strides against the projected activation
                     // peak — with the CSLA accumulation window G applied to the
                     // saved boundaries — and the checkpoint byte budget.
+                    // P5 item 21: `dp` resolves to a NON-UNIFORM kept-anchor
+                    // set rather than a stride; carried out-of-band to the
+                    // plan construction below.
+                    let mut dp_kept_anchors: Option<Vec<usize>> = None;
                     let resolved_stride = match self.compile_options.checkpoint_stride {
                         crate::CheckpointStride::Fixed(k) => k,
+                        crate::CheckpointStride::Dp => {
+                            let sizes = crate::profiling::captures::size_hints_from_var_nodes(
+                                extractor.var_nodes(),
+                                self.type_map,
+                            );
+                            let window = if csla_active {
+                                (grad_accumulation_steps.max(1)) as u64
+                            } else {
+                                1
+                            };
+                            let budget_bytes = self
+                                .compile_options
+                                .checkpoint_budget_mib
+                                .map(|m| m.saturating_mul(1024 * 1024));
+                            let spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                                .unwrap_or_else(crate::gpu_specs::default_gpu);
+                            let model = crate::ccr::DpCostModel {
+                                window,
+                                budget_bytes,
+                                launch_overhead_ns: spec.kernel_launch_overhead_ns,
+                                hbm_gbps: spec.peak_bandwidth_gbs,
+                                // #403 measured −37% backward launches from the
+                                // dx fusion alone; gamma fusion (P5 slice A)
+                                // removes the remaining norm decompositions.
+                                bwd_launch_factor: if self.compile_options.fuse_rmsnorm_backward {
+                                    1.3
+                                } else {
+                                    2.0
+                                },
+                                // Conservative overlap credit: only the fixed
+                                // PCIe latency any in-flight prefetch is
+                                // guaranteed to hide (10 us), and only when the
+                                // prefetch machinery is actually on.
+                                overlap_credit_ns: if self.compile_options.stream_prefetch {
+                                    10_000
+                                } else {
+                                    0
+                                },
+                            };
+                            let mut fell_back = true;
+                            if sizes.is_empty() {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride dp: no static tensor sizes \
+                                     available (symbolic shapes) — falling back to the \
+                                     uniform-stride search"
+                                );
+                            } else if let Some(choice) = crate::ccr::select_partition_dp(
+                                &effective_primal,
+                                claimed_ids.as_ref(),
+                                policy,
+                                &sizes,
+                                &model,
+                            ) {
+                                // Verify the DP's projection against the TRUE
+                                // plan before committing (the DP models
+                                // coalesced escapes from stride-1 metrics; the
+                                // real segment analysis is the authority).
+                                if let Some(p) = crate::ccr::plan_with_kept_anchors(
+                                    &effective_primal,
+                                    claimed_ids.as_ref(),
+                                    policy,
+                                    false,
+                                    &choice.keep,
+                                ) {
+                                    let true_peak =
+                                        crate::ccr::project_activation_peak(&p, &sizes)
+                                            .peak_bytes(window);
+                                    let budget_ok = budget_bytes
+                                        .is_none_or(|b| true_peak <= b)
+                                        || !choice.fits_budget;
+                                    if budget_ok {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp: kept {} of {} block \
+                                             anchors {:?} (true peak {} MiB, DP projected {} MiB, \
+                                             est recompute {:.2} ms/step, window G={window}{})",
+                                            choice.keep.len(),
+                                            p.segments.len().max(choice.keep.len()),
+                                            choice.keep,
+                                            true_peak / (1024 * 1024),
+                                            choice.projected_peak_bytes / (1024 * 1024),
+                                            choice.est_recompute_ns as f64 / 1e6,
+                                            if choice.fits_budget {
+                                                ""
+                                            } else {
+                                                ", NO partition fits the budget — min-peak"
+                                            },
+                                        );
+                                        dp_kept_anchors = Some(choice.keep);
+                                        fell_back = false;
+                                    } else {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp: true plan peak \
+                                             {} MiB contradicts the DP projection ({} MiB) \
+                                             over budget — falling back to the uniform search",
+                                            true_peak / (1024 * 1024),
+                                            choice.projected_peak_bytes / (1024 * 1024),
+                                        );
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride dp: DP declined (single block \
+                                     or no plan) — falling back to the uniform-stride search"
+                                );
+                            }
+                            if fell_back {
+                                match crate::ccr::select_stride(
+                                    &effective_primal,
+                                    claimed_ids.as_ref(),
+                                    policy,
+                                    &sizes,
+                                    window,
+                                    budget_bytes,
+                                    crate::ccr::DEFAULT_STRIDE_CANDIDATES,
+                                ) {
+                                    Some(c) => {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp fallback: uniform \
+                                             stride {} (peak {} MiB)",
+                                            c.stride,
+                                            c.peak_bytes / (1024 * 1024)
+                                        );
+                                        c.stride
+                                    }
+                                    None => 1,
+                                }
+                            } else {
+                                1 // unused: dp_kept_anchors drives the plan below
+                            }
+                        }
                         crate::CheckpointStride::Auto => {
                             let sizes = crate::profiling::captures::size_hints_from_var_nodes(
                                 extractor.var_nodes(),
@@ -7074,13 +7607,23 @@ impl Compiler<'_> {
                             }
                         }
                     };
-                    let plan = crate::ccr::plan(
-                        &effective_primal,
-                        claimed_ids.as_ref(),
-                        policy,
-                        compress_requested,
-                        resolved_stride,
-                    );
+                    let plan = if let Some(keep) = &dp_kept_anchors {
+                        crate::ccr::plan_with_kept_anchors(
+                            &effective_primal,
+                            claimed_ids.as_ref(),
+                            policy,
+                            compress_requested,
+                            keep,
+                        )
+                    } else {
+                        crate::ccr::plan(
+                            &effective_primal,
+                            claimed_ids.as_ref(),
+                            policy,
+                            compress_requested,
+                            resolved_stride,
+                        )
+                    };
                     // Item 8: one coalescing note for the FINAL stride (the Auto
                     // search above ran plan() per candidate silently).
                     if resolved_stride > 1 {
@@ -7299,6 +7842,17 @@ impl Compiler<'_> {
                 if !adjoint_needed.is_empty() {
                     adjoint.ops =
                         crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &adjoint_needed);
+                }
+                // P5 item 20 slice B: fuse SwiGLU gate-gradient pairs
+                // (bit-exact — see fuse_swiglu_gate_backward).
+                crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
+                // P5 slice C: fold residual-gradient accumulates into fused
+                // RMSNorm dx ops (bit-exact; no-op unless
+                // --fuse-rmsnorm-backward emitted them).
+                let norm_res_folds =
+                    crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &adjoint_needed);
+                if norm_res_folds > 0 {
+                    eprintln!("[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
                 }
 
                 // 6b.5 CSLA (Milestone B): report the layerwise-accumulation
@@ -7879,10 +8433,20 @@ impl Compiler<'_> {
                 // without it the first window's forward peak would still be
                 // the full-residency wall the flag exists to remove.
                 if let Some(wsplan) = &ws_fwd_plan {
+                    if self.features.param_dtype_bf16sr {
+                        self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
+                    }
                     for &idx in &wsplan.register_idxs {
                         let iv = builder.ins().iconst(cl_types::I64, idx);
                         let pw = self
                             .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                        if self.features.param_dtype_bf16sr {
+                            self.compile_call_by_name(
+                                builder,
+                                "nsl_sr_bf16_note_param",
+                                &[pw, iv],
+                            )?;
+                        }
                         self.compile_call_by_name(
                             builder,
                             "nsl_weight_stream_register",
@@ -9879,8 +10443,33 @@ impl Compiler<'_> {
                 wrap_precision: bool,
                 wrap_offload: bool,
                 muon: Option<&MuonCslaCtx>,
+                // P3 ZeRO-3: Some(streamed idx set) under --zero-stage 3.
+                // The group's gradient slots all-reduce FIRST (this is item
+                // 14's ordering — source AD just completed this layer's
+                // backward), then SHARDED (streamed) params update behind an
+                // owner gate while resident/tied params update on every rank
+                // from the identical reduced gradients.
+                zero3: Option<&std::collections::HashSet<i64>>,
+                // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
+                sr_step: Option<Value>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
+                if zero3.is_some() {
+                    for &i in idxs {
+                        let iv = builder.ins().iconst(cl_types::I64, i);
+                        let rc = c.compile_call_by_name(
+                            builder,
+                            "nsl_zero3_reduce_grad_slot",
+                            &[accum_val, iv],
+                        )?;
+                        let z = builder.ins().iconst(cl_types::I64, 0);
+                        let ok = builder.ins().icmp(IntCC::Equal, rc, z);
+                        let msg = "nsl: zero3 layer gradient all-reduce failed — aborting";
+                        c.intern_string(msg)?;
+                        let mp = c.compile_string_literal(builder, msg)?;
+                        c.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
+                    }
+                }
                 for &i in idxs {
                     let iv = builder.ins().iconst(cl_types::I64, i);
                     let theta =
@@ -9894,6 +10483,26 @@ impl Compiler<'_> {
                     } else {
                         m
                     };
+                    // P3 ZeRO-3: owner-gate the update of a SHARDED param —
+                    // non-owners' gathered copies are released right after
+                    // this group and refetched (post-update) from the owner
+                    // next window, so skipping their update is the sharded
+                    // semantic, not a divergence.
+                    let z3_gate: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Block)> =
+                        if zero3.is_some_and(|s| s.contains(&i)) {
+                            let owns =
+                                c.compile_call_by_name(builder, "nsl_zero_owns_param", &[iv])?;
+                            let one = builder.ins().iconst(cl_types::I64, 1);
+                            let owned = builder.ins().icmp(IntCC::Equal, owns, one);
+                            let do_b = builder.create_block();
+                            let join_b = builder.create_block();
+                            builder.ins().brif(owned, do_b, &[], join_b, &[]);
+                            builder.switch_to_block(do_b);
+                            builder.seal_block(do_b);
+                            Some((do_b, join_b))
+                        } else {
+                            None
+                        };
                     if let Some(mc) = muon {
                         // Muon separate-accumulator mode: m_partial holds the
                         // RAW window gradient sum (accum_scale forced to 1.0),
@@ -9911,13 +10520,30 @@ impl Compiler<'_> {
                         )?;
                         let flag_f = builder.ins().fcvt_from_sint(cl_types::F64, flag_i);
                         let ns_c = builder.ins().f64const(mc.ns_steps);
+                        // P4 item 18 rung 2: dequant the bf16 momentum into
+                        // an f32 working buffer for the step; SR-quant it
+                        // back after (nsl_muon_state_sr_store) and free the
+                        // working copy. m is never null (unlike v), so no
+                        // runtime null branch is needed.
+                        let m_bf16_env: Option<(Value, Value)> = if c.features.muon_state_bf16 {
+                            let f32_code = builder.ins().iconst(cl_types::I64, 1);
+                            let m_work = c.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_cast",
+                                &[m, f32_code],
+                            )?;
+                            Some((m_work, m))
+                        } else {
+                            None
+                        };
+                        let m_step = m_bf16_env.map_or(m, |(w, _)| w);
                         c.emit_stdlib_optim_call(
                             builder,
                             "muon",
                             &mc.opt_fn,
                             theta,
                             m_partial,
-                            m,
+                            m_step,
                             v,
                             mc.lr,
                             mc.momentum,
@@ -9933,6 +10559,18 @@ impl Compiler<'_> {
                             wrap_offload,
                             Some((flag_f, ns_c, mc.adamw_lr)),
                         )?;
+                        if let Some((m_work, m_bf)) = m_bf16_env {
+                            let step_v = sr_step.ok_or_else(|| CodegenError::new(
+                                "muon-state bf16 envelope reached without an \
+                                 opt_step value — dispatcher must thread sr_step",
+                            ))?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_muon_state_sr_store",
+                                &[m_work, m_bf, step_v, iv],
+                            )?;
+                            c.compile_call_by_name(builder, "nsl_tensor_free", &[m_work])?;
+                        }
                     } else {
                         // D2a: wrap_offload stages host-pinned m/v to θ's device
                         // for the update and streams them back asynchronously —
@@ -9952,12 +10590,19 @@ impl Compiler<'_> {
                             Some(bc),
                             wrap_precision,
                             wrap_offload,
+                            sr_step,
                         )?;
+                    }
+                    if let Some((_do_b, join_b)) = z3_gate {
+                        builder.ins().jump(join_b, &[]);
+                        builder.switch_to_block(join_b);
+                        builder.seal_block(join_b);
                     }
                     // The baseline zeroes m_partial for reuse; the layerwise
                     // schedule frees it — next window allocates fresh zeros.
                     // (muon_step borrows the gradient, so freeing here is the
-                    // muon arm's zeroing equivalent too.)
+                    // muon arm's zeroing equivalent too. Under zero3 the free
+                    // runs on every rank — owner and skipped non-owner alike.)
                     c.compile_call_by_name(builder, "nsl_tensor_free", &[m_partial])?;
                     let z = builder.ins().iconst(cl_types::I64, 0);
                     c.compile_call_by_name(builder, "nsl_list_set", &[accum_val, iv, z])?;
@@ -10011,11 +10656,29 @@ impl Compiler<'_> {
             let ws_active = self.compile_options.weight_stream;
             let ws_streamed: std::collections::HashSet<i64> =
                 pending.schedule.ws_streamed.iter().copied().collect();
+            // P3 ZeRO-3: the sharded set == the streamed set (view-rooted /
+            // resident params stay Replicated). Passed into every group
+            // update for the per-layer reduce + owner gating.
+            let zero3_streamed: Option<std::collections::HashSet<i64>> =
+                (self.features.zero_stage == Some(3)).then(|| ws_streamed.clone());
             if ws_active {
+                // P4 item 17: activate the bf16 mirror backend and assign
+                // each streamed param its stable SR counter block BEFORE the
+                // first registration (register aborts on an un-noted param).
+                if self.features.param_dtype_bf16sr {
+                    self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
+                }
                 for &idx in &pending.schedule.ws_streamed {
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+                    if self.features.param_dtype_bf16sr {
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_sr_bf16_note_param",
+                            &[pw, iv],
+                        )?;
+                    }
                     self.compile_call_by_name(builder, "nsl_weight_stream_register", &[pw])?;
                 }
             }
@@ -10711,6 +11374,8 @@ impl Compiler<'_> {
                     wrap_precision,
                     self.compile_options.optim_state_offload,
                     muon_csla_ctx.as_ref(),
+                    zero3_streamed.as_ref(),
+                    Some(opt_step),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -10783,6 +11448,8 @@ impl Compiler<'_> {
                 wrap_precision,
                 self.compile_options.optim_state_offload,
                 muon_csla_ctx.as_ref(),
+                zero3_streamed.as_ref(),
+                Some(opt_step),
                 global_group,
             )?;
             // D2b part 2: NO post-epilogue restore. The next iterations'
@@ -10930,8 +11597,14 @@ impl Compiler<'_> {
         // The rc is asserted: a mid-run collective failure (capacity -4,
         // GPU-placement refusal -5, dtype -1) must abort, not continue with
         // un-reduced gradients (review: discarded rc -> silent wrong train).
+        // P3 ZeRO-3: stage 3 reduces PER LAYER GROUP inside the (csla)
+        // window backward — the monolithic all-param reduce here would run
+        // on the window's already-nulled accum slots, so it is stages 1/2
+        // only.
         let zero_enabled = self.features.zero_stage.filter(|&s| s >= 1).is_some();
-        if zero_enabled {
+        let zero_monolithic =
+            self.features.zero_stage.filter(|&s| (1..=2).contains(&s)).is_some();
+        if zero_monolithic {
             let rc = self.compile_call_by_name(
                 builder,
                 "nsl_zero_reduce_grads",
@@ -11215,6 +11888,7 @@ impl Compiler<'_> {
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
+                        Some(opt_step),
                     )?;
                     if let Some(pb_join) = pb_zero_blocks {
                         builder.ins().jump(pb_join, &[]);
@@ -11237,6 +11911,58 @@ impl Compiler<'_> {
                 } else {
                     // ── Non-clip Deferred path: per-parameter fused final step ──
                     // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
+                    //
+                    // Fusion item 1: when EVERY param would take the fused
+                    // AdamW path (exact structural match, no envelopes, no
+                    // ZeRO gating), the whole loop collapses into ONE
+                    // multi-tensor pointer-table launch — bit-identical per
+                    // element (the multi kernel is the single kernel's body
+                    // with table addressing, and it folds the shared tail's
+                    // m_partial zero). Kill-switch NSL_FASE_MULTI_STEP=0
+                    // (compile-time, like NSL_FASE_FUSED_STEP).
+                    let multi_scalars = if cpdt_precision_dtypes.is_none()
+                        && !self.compile_options.training_reference
+                        && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
+                        && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
+                        && !zero_enabled
+                        && !self.compile_options.optim_state_offload
+                        && !self.features.param_dtype_bf16sr
+                        && num_state_buffers >= 2
+                    {
+                        Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                            &fase_plan.recipe,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(sc) = multi_scalars {
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_fase_fused_adamw_step_multi",
+                            &[
+                                param_list,
+                                state_list_1,
+                                state_list_2,
+                                accum,
+                                lr_v,
+                                b1_v,
+                                omb1_v,
+                                b2_v,
+                                omb2_v,
+                                eps_v,
+                                wd_v,
+                                bc1_inv,
+                                bc2_inv,
+                            ],
+                        )?;
+                    } else {
                     let fs_i_var = state.new_variable();
                     builder.declare_var(fs_i_var, cl_types::I64);
                     let fs_zero = builder.ins().iconst(cl_types::I64, 0);
@@ -11304,6 +12030,7 @@ impl Compiler<'_> {
                         Some((bc1_inv, bc2_inv)),
                         wrap_precision,
                         self.compile_options.optim_state_offload,
+                        Some(opt_step),
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     if let Some(fs_join) = fs_zero_blocks {
@@ -11319,8 +12046,12 @@ impl Compiler<'_> {
                     builder.switch_to_block(fs_exit);
                     builder.seal_block(fs_exit);
                     state.current_block = Some(fs_exit);
+                    }
                     // Offload P0.2: one drain per optimizer step (transfer-
                     // stream sync + deferred frees of the staged tensors).
+                    // (Structurally unreachable on the multi path — offload
+                    // is excluded from its admission — kept outside the
+                    // else for byte-stability of the legacy arm.)
                     if self.compile_options.optim_state_offload {
                         self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
                     }
@@ -11360,6 +12091,45 @@ impl Compiler<'_> {
 
         // 7f. Optimizer step loop: for i in 0..num_params (runtime loop)
         {
+            // Muon perf campaign (`--muon-batch-ns`): ONE batched call
+            // handles every Muon-routed rank-2 param (momentum update +
+            // shape-grouped Newton-Schulz + parameter update, all on
+            // device); the per-param loop below then SKIPS those params and
+            // keeps the stdlib call — bit-for-bit — for the AdamW-routed
+            // and non-rank-2 remainder. Combos that would break this split
+            // (CSLA, offload, ZeRO, bf16 momentum, non-muon) were refused
+            // at parse time above.
+            let muon_batch_active =
+                self.compile_options.muon_batch_ns && optimizer_name == "muon";
+            if muon_batch_active {
+                let route_list = muon_route_list.ok_or_else(|| {
+                    CodegenError::new(
+                        "--muon-batch-ns: muon route list missing (internal)",
+                    )
+                })?;
+                let mom_c = builder.ins().f64const(momentum_value);
+                let wd_c = builder.ins().f64const(weight_decay_value);
+                let nest_c = builder
+                    .ins()
+                    .iconst(cl_types::I64, i64::from(nesterov_value));
+                let ns_c = builder.ins().f64const(ns_steps_value);
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_muon_step_batch",
+                    &[
+                        param_list,
+                        opt_grads,
+                        state_list_1,
+                        route_list,
+                        lr,
+                        mom_c,
+                        wd_c,
+                        nest_c,
+                        ns_c,
+                    ],
+                )?;
+            }
+
             let opt_i_var = state.new_variable();
             builder.declare_var(opt_i_var, cl_types::I64);
             let opt_zero = builder.ins().iconst(cl_types::I64, 0);
@@ -11427,6 +12197,31 @@ impl Compiler<'_> {
             } else {
                 None
             };
+            // --muon-batch-ns: params the pre-loop batch call already
+            // updated are skipped here. Eligibility must mirror
+            // nsl_muon_step_batch's filter EXACTLY (route flag 0 AND
+            // runtime rank 2) or a param would be double-stepped/dropped.
+            let batch_skip_join = if muon_batch_active {
+                let route_list = muon_route_list.expect("refused above when None");
+                let flag_i =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[route_list, idx])?;
+                let ndim =
+                    self.compile_call_by_name(builder, "nsl_tensor_ndim", &[param_val])?;
+                let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                let two_i = builder.ins().iconst(cl_types::I64, 2);
+                let is_muon = builder.ins().icmp(IntCC::Equal, flag_i, zero_i);
+                let is_r2 = builder.ins().icmp(IntCC::Equal, ndim, two_i);
+                let both = builder.ins().band(is_muon, is_r2);
+                let do_block = builder.create_block();
+                let join = builder.create_block();
+                builder.ins().brif(both, join, &[], do_block, &[]);
+                builder.switch_to_block(do_block);
+                builder.seal_block(do_block);
+                state.current_block = Some(do_block);
+                Some(join)
+            } else {
+                None
+            };
             // FullBuffer-global path (no mode table, no WGGO). The CPDT
             // PrecisionPlan gate (`precision_active`'s 4th condition
             // requires `fase_deferred=true`) suppresses cpdt_precision_dtypes
@@ -11455,6 +12250,13 @@ impl Compiler<'_> {
                 self.compile_options.optim_state_offload,
                 muon_extra,
             )?;
+
+            if let Some(join) = batch_skip_join {
+                builder.ins().jump(join, &[]);
+                builder.switch_to_block(join);
+                builder.seal_block(join);
+                state.current_block = Some(join);
+            }
 
             if let Some(z_join) = opt_zero_blocks {
                 builder.ins().jump(z_join, &[]);
@@ -11895,6 +12697,11 @@ impl Compiler<'_> {
 
         // Drain GPU caching allocator — only releases Transient segments,
         // which are now fully free since forward/backward intermediates were freed.
+        //
+        // P5 item 19: the runtime skips this drain while cuda-graph capture is
+        // ARMED (per-step segment release would churn every transient address
+        // and unmap memory captured graphs reference) — checked at runtime,
+        // not compile time, so a declined enable() keeps the drain (review L5).
         self.compile_call_by_name(builder, "nsl_gpu_drain_cache", &[])?;
 
         // Debug: GPU memory after step cleanup
@@ -12155,6 +12962,12 @@ impl Compiler<'_> {
         // null data pointers.
         if csla_active && self.compile_options.weight_stream {
             self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
+        }
+
+        // P5 item 19: capture/replay counter banner (anti-vacuity evidence
+        // for the gates; harmless no-op when the runtime declined to arm).
+        if self.compile_options.cuda_graphs {
+            self.compile_call_by_name(builder, "nsl_cuda_graphs_report", &[])?;
         }
 
         state.variables = saved_variables;
@@ -13471,6 +14284,11 @@ impl Compiler<'_> {
         if let Some(target_adj_var) = gen.adjoint_of(target_var_id) {
             let needed = std::collections::HashSet::from([target_adj_var]);
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
+            // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied
+            // on the train path).
+            crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &needed);
+            // P5 slice C (residual fold — see the train path).
+            crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &needed);
 
             if !adjoint.ops.is_empty() {
                 // P0.2: arm the gradient-integrity guard for the `grad` block's
