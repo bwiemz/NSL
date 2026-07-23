@@ -182,8 +182,49 @@ muon_step applies:
 
 ## 500M confirmation
 
-RESULTS_500M
+Config: coder500m (505M params), seq 256, grad_accumulation 8, seed 1,
+`--source-ad --deterministic --checkpoint-blocks --optim-state-offload`,
+150 optimizer steps requested (1200 micro-batches). AdamW lr=3e-4; Muon
+lr=0.02 / momentum 0.95 / nesterov / ns_steps=5 (the 3M-scale winner),
+AdamW arm for 1-D params. Both arms ran on the SAME fixed binary
+(post model-`.to(device)` slot fix — an earlier muon attempt on the
+pre-fix binary spent 6h CPU-bound on host-resident tail params and was
+discarded; the pre-fix AdamW result is preserved as
+`result.prefix-bug.json` for provenance).
+
+| arm | micros reached | val_nsl@400 | val_rs@400 | val_nsl@800 | val_rs@800 | wall | s/micro |
+|---|---|---|---|---|---|---|---|
+| AdamW 3e-4 | 800 (died rc=1: known eval leak) | 3.2720 | 3.6958 | 3.4523 | 3.7307 | 3469 s | 4.3 |
+| Muon 0.02  | 400 (wrapper timeout, SIGKILL)   | 5.6558 | 5.6611 | — | — | 26713 s | 66.8 |
+
+Symmetric comparison point = micro 400 (both arms healthy there):
+
+- **Quality**: Muon val_nsl 5.656 vs AdamW 3.272 — **+2.38 nats behind at
+  the same micro-batch count**. Muon's val_nsl ≈ val_rs (5.656 vs 5.661)
+  says the model has barely learned domain structure at all by micro 400.
+- **Throughput**: 66.8 s/micro vs 4.3 s/micro — **~15× slower wall-clock**.
+  The Newton-Schulz orthogonalization (5 iterations of large Gram-matrix
+  GEMMs per rank-2 param per optimizer step) plus per-step offload
+  round-trips of the Muon momentum dominate; the profile was GPU-bound
+  (98% util), so this is real compute, not a host stall.
 
 ## Verdict
 
-RESULTS_VERDICT
+**At 500M under this configuration, Muon decisively loses on both axes**:
+~15× slower per micro-batch and +2.38 nats worse val_nsl at the symmetric
+micro-400 point. The clear 3M-scale wins (tune400: muon-0.02 train 1.11 vs
+adamw 2.63; main3000: muon ahead on every val metric) did NOT transfer to
+500M with the same hyperparameters.
+
+Caveats before writing Muon off at scale: single seed; lr=0.02 was tuned
+at 3M and NOT re-tuned at 500M (Muon's effective step scales with the
+spectral-normalized update, and 500M layer shapes are far from the 3M
+tune's); `--optim-state-offload` taxes Muon's momentum uniquely (AdamW's
+m/v staging is amortized by the fused step, while Muon pays PCIe on every
+NS input); and the eval-leak rc=1 caps the horizon at micro 800. A fair
+rematch needs: an lr sweep at ≥100M scale, Muon state resident (no
+offload), and the NS GEMM cost amortized (batched NS or lower ns_steps).
+Until someone runs that, **AdamW (fused, lr 3e-4) remains the production
+optimizer for ≥500M NSL pretraining**, and Muon stays a small/mid-scale
+option where its per-step quality advantage is proven and its NS overhead
+is negligible.

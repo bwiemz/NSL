@@ -23,10 +23,10 @@ print("MODEL_READY")
 let tokens = load_mmap("TOKENS_PATH", 3)
 let loader = DataLoader(tokens, batch_size=2, seq_len=512, shuffle=false, drop_last=true)
 
-let val_nsl_in = load_mmap("DATA_DIR/val_nsl_small_in.bin", 1).reshape([2, 1024]).to(cuda)
-let val_nsl_lab = load_mmap("DATA_DIR/val_nsl_small_lab.bin", 1).reshape([2, 1024]).to(cuda)
-let val_rs_in = load_mmap("DATA_DIR/val_rust_small_in.bin", 1).reshape([2, 1024]).to(cuda)
-let val_rs_lab = load_mmap("DATA_DIR/val_rust_small_lab.bin", 1).reshape([2, 1024]).to(cuda)
+let val_nsl_in = load_mmap("DATA_DIR/val_nsl_tiny_in.bin", 1).reshape([2, 256]).to(cuda)
+let val_nsl_lab = load_mmap("DATA_DIR/val_nsl_tiny_lab.bin", 1).reshape([2, 256]).to(cuda)
+let val_rs_in = load_mmap("DATA_DIR/val_rust_tiny_in.bin", 1).reshape([2, 256]).to(cuda)
+let val_rs_lab = load_mmap("DATA_DIR/val_rust_tiny_lab.bin", 1).reshape([2, 256]).to(cuda)
 
 print("LOSS_STREAM_BEGIN")
 
