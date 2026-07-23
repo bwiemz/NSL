@@ -4920,8 +4920,9 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![11.0, 22.0, 33.0]);
-        nsl_tensor_free(a);      // input ref
-        nsl_tensor_free(result); // output ref
+        // RELINQUISH_A transferred the input ref into the result — one free total.
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
+        nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
 
@@ -4952,7 +4953,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![20.0, 30.0, 40.0]);
-        nsl_tensor_free(a);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
@@ -4968,7 +4969,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![5.0, 5.0, 6.0]);
-        nsl_tensor_free(a);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
@@ -4984,7 +4985,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![7.0, 13.0]);
-        nsl_tensor_free(a);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
         nsl_tensor_free(b);
     }
@@ -5012,7 +5013,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![11.0, 12.0, 13.0]);
-        nsl_tensor_free(ptr);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
     }
 
@@ -5026,7 +5027,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![10.0, 15.0, 20.0]);
-        nsl_tensor_free(ptr);
+        assert_eq!(t.refcount.load(Ordering::SeqCst), 1, "in-place reuse must not add a ref");
         nsl_tensor_free(result);
     }
 
