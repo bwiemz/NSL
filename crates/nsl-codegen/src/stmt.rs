@@ -7261,8 +7261,142 @@ impl Compiler<'_> {
                     // `Auto` searches strides against the projected activation
                     // peak — with the CSLA accumulation window G applied to the
                     // saved boundaries — and the checkpoint byte budget.
+                    // P5 item 21: `dp` resolves to a NON-UNIFORM kept-anchor
+                    // set rather than a stride; carried out-of-band to the
+                    // plan construction below.
+                    let mut dp_kept_anchors: Option<Vec<usize>> = None;
                     let resolved_stride = match self.compile_options.checkpoint_stride {
                         crate::CheckpointStride::Fixed(k) => k,
+                        crate::CheckpointStride::Dp => {
+                            let sizes = crate::profiling::captures::size_hints_from_var_nodes(
+                                extractor.var_nodes(),
+                                self.type_map,
+                            );
+                            let window = if csla_active {
+                                (grad_accumulation_steps.max(1)) as u64
+                            } else {
+                                1
+                            };
+                            let budget_bytes = self
+                                .compile_options
+                                .checkpoint_budget_mib
+                                .map(|m| m.saturating_mul(1024 * 1024));
+                            let spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                                .unwrap_or_else(crate::gpu_specs::default_gpu);
+                            let model = crate::ccr::DpCostModel {
+                                window,
+                                budget_bytes,
+                                launch_overhead_ns: spec.kernel_launch_overhead_ns,
+                                hbm_gbps: spec.peak_bandwidth_gbs,
+                                // #403 measured −37% backward launches from the
+                                // dx fusion alone; gamma fusion (P5 slice A)
+                                // removes the remaining norm decompositions.
+                                bwd_launch_factor: if self.compile_options.fuse_rmsnorm_backward {
+                                    1.3
+                                } else {
+                                    2.0
+                                },
+                                // Conservative overlap credit: only the fixed
+                                // PCIe latency any in-flight prefetch is
+                                // guaranteed to hide (10 us), and only when the
+                                // prefetch machinery is actually on.
+                                overlap_credit_ns: if self.compile_options.stream_prefetch {
+                                    10_000
+                                } else {
+                                    0
+                                },
+                            };
+                            let mut fell_back = true;
+                            if sizes.is_empty() {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride dp: no static tensor sizes \
+                                     available (symbolic shapes) — falling back to the \
+                                     uniform-stride search"
+                                );
+                            } else if let Some(choice) = crate::ccr::select_partition_dp(
+                                &effective_primal,
+                                claimed_ids.as_ref(),
+                                policy,
+                                &sizes,
+                                &model,
+                            ) {
+                                // Verify the DP's projection against the TRUE
+                                // plan before committing (the DP models
+                                // coalesced escapes from stride-1 metrics; the
+                                // real segment analysis is the authority).
+                                if let Some(p) = crate::ccr::plan_with_kept_anchors(
+                                    &effective_primal,
+                                    claimed_ids.as_ref(),
+                                    policy,
+                                    false,
+                                    &choice.keep,
+                                ) {
+                                    let true_peak =
+                                        crate::ccr::project_activation_peak(&p, &sizes)
+                                            .peak_bytes(window);
+                                    let budget_ok = budget_bytes
+                                        .is_none_or(|b| true_peak <= b)
+                                        || !choice.fits_budget;
+                                    if budget_ok {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp: kept {} of {} block \
+                                             anchors {:?} (true peak {} MiB, DP projected {} MiB, \
+                                             est recompute {:.2} ms/step, window G={window}{})",
+                                            choice.keep.len(),
+                                            p.segments.len().max(choice.keep.len()),
+                                            choice.keep,
+                                            true_peak / (1024 * 1024),
+                                            choice.projected_peak_bytes / (1024 * 1024),
+                                            choice.est_recompute_ns as f64 / 1e6,
+                                            if choice.fits_budget {
+                                                ""
+                                            } else {
+                                                ", NO partition fits the budget — min-peak"
+                                            },
+                                        );
+                                        dp_kept_anchors = Some(choice.keep);
+                                        fell_back = false;
+                                    } else {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp: true plan peak \
+                                             {} MiB contradicts the DP projection ({} MiB) \
+                                             over budget — falling back to the uniform search",
+                                            true_peak / (1024 * 1024),
+                                            choice.projected_peak_bytes / (1024 * 1024),
+                                        );
+                                    }
+                                }
+                            } else {
+                                eprintln!(
+                                    "[ccr] --checkpoint-stride dp: DP declined (single block \
+                                     or no plan) — falling back to the uniform-stride search"
+                                );
+                            }
+                            if fell_back {
+                                match crate::ccr::select_stride(
+                                    &effective_primal,
+                                    claimed_ids.as_ref(),
+                                    policy,
+                                    &sizes,
+                                    window,
+                                    budget_bytes,
+                                    crate::ccr::DEFAULT_STRIDE_CANDIDATES,
+                                ) {
+                                    Some(c) => {
+                                        eprintln!(
+                                            "[ccr] --checkpoint-stride dp fallback: uniform \
+                                             stride {} (peak {} MiB)",
+                                            c.stride,
+                                            c.peak_bytes / (1024 * 1024)
+                                        );
+                                        c.stride
+                                    }
+                                    None => 1,
+                                }
+                            } else {
+                                1 // unused: dp_kept_anchors drives the plan below
+                            }
+                        }
                         crate::CheckpointStride::Auto => {
                             let sizes = crate::profiling::captures::size_hints_from_var_nodes(
                                 extractor.var_nodes(),
@@ -7331,13 +7465,23 @@ impl Compiler<'_> {
                             }
                         }
                     };
-                    let plan = crate::ccr::plan(
-                        &effective_primal,
-                        claimed_ids.as_ref(),
-                        policy,
-                        compress_requested,
-                        resolved_stride,
-                    );
+                    let plan = if let Some(keep) = &dp_kept_anchors {
+                        crate::ccr::plan_with_kept_anchors(
+                            &effective_primal,
+                            claimed_ids.as_ref(),
+                            policy,
+                            compress_requested,
+                            keep,
+                        )
+                    } else {
+                        crate::ccr::plan(
+                            &effective_primal,
+                            claimed_ids.as_ref(),
+                            policy,
+                            compress_requested,
+                            resolved_stride,
+                        )
+                    };
                     // Item 8: one coalescing note for the FINAL stride (the Auto
                     // search above ran plan() per candidate silently).
                     if resolved_stride > 1 {

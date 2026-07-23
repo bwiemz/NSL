@@ -1074,6 +1074,13 @@ pub struct WrgaCheckContext {
 pub enum CheckpointStride {
     Fixed(usize),
     Auto,
+    /// P5 item 21: non-uniform partition chosen by the checkpoint DP
+    /// (`--checkpoint-stride dp`) — minimizes GpuSpec-calibrated recompute
+    /// time subject to the projected activation-peak budget, with the CSLA
+    /// window applied and coarse prefetch-overlap credit. Falls back to the
+    /// `Auto` uniform search when the DP declines or its projection is
+    /// contradicted by the true plan.
+    Dp,
 }
 
 impl Default for CheckpointStride {

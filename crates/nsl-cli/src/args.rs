@@ -760,6 +760,12 @@ pub(crate) struct BuildArgs {
         /// window). `auto` searches strides against --checkpoint-budget-mib and
         /// picks the smallest projected activation peak that fits. `1` (default)
         /// = classic per-block. Bit-exact at any stride.
+        /// `N` coalesces every N block anchors; `auto` searches uniform
+        /// strides against the projected activation peak; `dp` (P5 item 21)
+        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
+        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
+        /// window applied, fusion-aware launch costs and a conservative
+        /// prefetch-overlap credit. Any choice is bit-exact.
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 
@@ -1238,6 +1244,12 @@ pub(crate) struct RunArgs {
         /// window). `auto` searches strides against --checkpoint-budget-mib and
         /// picks the smallest projected activation peak that fits. `1` (default)
         /// = classic per-block. Bit-exact at any stride.
+        /// `N` coalesces every N block anchors; `auto` searches uniform
+        /// strides against the projected activation peak; `dp` (P5 item 21)
+        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
+        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
+        /// window applied, fusion-aware launch costs and a conservative
+        /// prefetch-overlap credit. Any choice is bit-exact.
         #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
         pub(crate) checkpoint_stride: String,
 

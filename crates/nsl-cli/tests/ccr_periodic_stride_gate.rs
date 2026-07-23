@@ -137,6 +137,79 @@ fn auto_stride_reports_a_decision() {
     );
 }
 
+/// P5 item 21: the partition DP must (a) print its decision, (b) stay
+/// bit-exact with the stride-1 reference (any partition reuses the same
+/// recompute machinery), under CSLA where the window weighting matters.
+#[test]
+fn dp_stride_is_bit_exact_and_reports_decision() {
+    let base = ["--checkpoint-blocks", "--layerwise-accum"];
+    let mut ref_args = base.to_vec();
+    ref_args.extend_from_slice(&["--checkpoint-stride", "1"]);
+    let reference = run(false, false, &ref_args);
+    assert!(reference.ok, "stride-1 run failed:\n{}", reference.stderr);
+    let ref_losses = loss_stream(&reference.stdout);
+    assert!(!ref_losses.is_empty());
+
+    let mut dp_args = base.to_vec();
+    dp_args.extend_from_slice(&["--checkpoint-stride", "dp"]);
+    let dp = run(false, false, &dp_args);
+    assert!(dp.ok, "dp run failed:\n{}", dp.stderr);
+    assert!(
+        dp.stderr.contains("--checkpoint-stride dp:"),
+        "expected a dp decision line:\n{}",
+        dp.stderr
+    );
+    assert_eq!(
+        loss_stream(&dp.stdout),
+        ref_losses,
+        "dp partition diverged from stride 1 — recompute must be bit-exact"
+    );
+}
+
+/// With a tight budget the DP must still run, report, and stay bit-exact.
+#[test]
+fn dp_stride_with_budget_is_bit_exact() {
+    let base = ["--checkpoint-blocks", "--layerwise-accum"];
+    let mut ref_args = base.to_vec();
+    ref_args.extend_from_slice(&["--checkpoint-stride", "1"]);
+    let reference = run(false, false, &ref_args);
+    assert!(reference.ok);
+    let ref_losses = loss_stream(&reference.stdout);
+
+    let mut dp_args = base.to_vec();
+    dp_args.extend_from_slice(&[
+        "--checkpoint-stride",
+        "dp",
+        "--checkpoint-budget-mib",
+        "1",
+    ]);
+    let dp = run(false, false, &dp_args);
+    assert!(dp.ok, "dp+budget run failed:\n{}", dp.stderr);
+    assert!(dp.stderr.contains("--checkpoint-stride dp:"), "{}", dp.stderr);
+    assert_eq!(loss_stream(&dp.stdout), ref_losses, "dp+budget diverged");
+}
+
+/// GPU: the DP's min-peak partition must not exceed the per-block (stride 1)
+/// activation peak — it can only save or match.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn dp_stride_activation_peak_not_worse_gpu() {
+    let base = ["--checkpoint-blocks", "--layerwise-accum"];
+    let peak_with = |extra: &[&str]| -> u64 {
+        let mut args = base.to_vec();
+        args.extend_from_slice(extra);
+        let r = run(true, true, &args);
+        assert!(r.ok, "gpu run {extra:?} failed:\n{}", r.stderr);
+        act_peak(&r.stdout).unwrap_or_else(|| panic!("no ACT_PEAK:\n{}", r.stdout))
+    };
+    let p1 = peak_with(&["--checkpoint-stride", "1"]);
+    let pdp = peak_with(&["--checkpoint-stride", "dp"]);
+    assert!(
+        pdp <= p1,
+        "dp partition must not raise the activation peak: dp={pdp} vs stride1={p1}"
+    );
+}
+
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn periodic_stride_reduces_activation_peak_gpu() {

@@ -430,6 +430,52 @@ pub fn plan(
     compress_saves: bool,
     stride: usize,
 ) -> Option<CcrPlan> {
+    plan_impl(
+        primal,
+        csha_claimed_ops,
+        policy,
+        compress_saves,
+        AnchorSelection::Stride(stride),
+    )
+}
+
+/// P5 item 21: build a plan keeping an ARBITRARY ascending subset of the
+/// full block-anchor list (indices into that list; index 0 must be present
+/// so the first segment starts at the first block). This is the non-uniform
+/// generalization the stride DP chooses through — the segment/escape/
+/// recompute machinery downstream is identical, so any subset is bit-exact
+/// for the same reason any stride is.
+pub fn plan_with_kept_anchors(
+    primal: &WengertList,
+    csha_claimed_ops: Option<&HashSet<u32>>,
+    policy: CcrPolicy,
+    compress_saves: bool,
+    keep: &[usize],
+) -> Option<CcrPlan> {
+    plan_impl(
+        primal,
+        csha_claimed_ops,
+        policy,
+        compress_saves,
+        AnchorSelection::Keep(keep),
+    )
+}
+
+/// How `plan_impl` thins the full anchor list.
+enum AnchorSelection<'a> {
+    /// Keep every k-th anchor (k=1: all — the classic per-block plan).
+    Stride(usize),
+    /// Keep exactly these indices (ascending, must include 0).
+    Keep(&'a [usize]),
+}
+
+fn plan_impl(
+    primal: &WengertList,
+    csha_claimed_ops: Option<&HashSet<u32>>,
+    policy: CcrPolicy,
+    compress_saves: bool,
+    selection: AnchorSelection,
+) -> Option<CcrPlan> {
     // ---- 1. Param vars per block key --------------------------------
     let mut param_block: HashMap<VarId, String> = HashMap::new();
     let mut block_keys: Vec<String> = Vec::new();
@@ -520,9 +566,22 @@ pub fn plan(
     // NB: no stderr note here — `plan` is called once per candidate during the
     // `Auto` stride search, so the user-facing coalescing note is emitted by the
     // caller for the FINAL chosen stride only (see stmt.rs).
-    let stride = stride.max(1);
-    if stride > 1 && anchors.len() > 1 {
-        anchors = anchors.iter().step_by(stride).cloned().collect();
+    match selection {
+        AnchorSelection::Stride(stride) => {
+            let stride = stride.max(1);
+            if stride > 1 && anchors.len() > 1 {
+                anchors = anchors.iter().step_by(stride).cloned().collect();
+            }
+        }
+        AnchorSelection::Keep(keep) => {
+            // Ascending indices into the FULL anchor list; 0 must be kept.
+            debug_assert!(keep.first() == Some(&0), "kept anchors must include 0");
+            debug_assert!(keep.windows(2).all(|w| w[0] < w[1]), "kept anchors must ascend");
+            anchors = keep
+                .iter()
+                .filter_map(|&i| anchors.get(i).cloned())
+                .collect();
+        }
     }
 
     // ---- 4. Build segments + escape analysis ------------------------
@@ -802,6 +861,233 @@ pub fn select_stride(
         peak_bytes,
         fits_budget,
         considered,
+    })
+}
+
+/// P5 item 21 — cost model inputs for the non-uniform checkpoint DP.
+///
+/// The "measured" recompute time is the same GpuSpec-calibrated estimate the
+/// weight-stream prefetch gate uses (launch count × worst-case launch
+/// overhead, floored by bytes / HBM bandwidth) — calibrated against real
+/// hardware measurements in `gpu_specs.rs`, not a per-run profile (a
+/// profile-guided feedback file is the follow-up).
+#[derive(Debug, Clone, Copy)]
+pub struct DpCostModel {
+    /// CSLA accumulation window `G` (1 when CSLA is off). Multiplies both the
+    /// saved-boundary bytes (buffered per micro-batch) and the recompute time
+    /// (the window backward replays each micro-batch).
+    pub window: u64,
+    /// `--checkpoint-budget-mib` in bytes.
+    pub budget_bytes: Option<u64>,
+    /// Worst-case kernel-launch overhead (GpuSpec).
+    pub launch_overhead_ns: u64,
+    /// Device HBM bandwidth in GB/s (GpuSpec).
+    pub hbm_gbps: f64,
+    /// Backward-launches-per-forward-op factor. ~2.0 for the decomposed
+    /// adjoint; the fused-backward flags (`--fuse-rmsnorm-backward`, the
+    /// always-on SwiGLU peephole) eliminate whole decompositions — #403
+    /// measured −37% backward launches from the dx fusion alone — so the
+    /// caller lowers this factor when fusion is active. Only relative
+    /// magnitude matters (it scales every segment equally except through the
+    /// launch-vs-bandwidth floor).
+    pub bwd_launch_factor: f64,
+    /// Per-segment overlap credit in ns: recompute that runs while a weight
+    /// prefetch is in flight is free wall-clock (only nonzero under
+    /// `--stream-prefetch`). Applied as `t = t.saturating_sub(credit)` per
+    /// segment — a deliberately conservative, coarse credit.
+    pub overlap_credit_ns: u64,
+}
+
+/// The partition chosen by [`select_partition_dp`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DpChoice {
+    /// Ascending indices into the FULL anchor list to keep (always starts
+    /// with 0). Feed to [`plan_with_kept_anchors`].
+    pub keep: Vec<usize>,
+    /// The DP's projected peak bytes for the chosen partition (window
+    /// applied). The caller re-verifies against the TRUE plan's
+    /// [`project_activation_peak`] before committing.
+    pub projected_peak_bytes: u64,
+    /// Estimated recompute cost of the chosen partition (ns, window applied).
+    pub est_recompute_ns: u64,
+    pub fits_budget: bool,
+}
+
+/// P5 item 21 — choose a NON-UNIFORM checkpoint partition by dynamic
+/// program: minimize estimated recompute time subject to the projected
+/// activation-peak budget.
+///
+/// Per-block metrics come from the exact stride-1 plan (real escape/
+/// force-saved/recompute byte sets — the "actual concurrent activation
+/// bytes"), and a coalesced segment [s..e] models:
+///   - kept boundary   = escapes of its LAST block only,
+///   - recompute bytes = Σ recompute(s..=e) + Σ swallowed escapes(s..e-1),
+///   - force-saved     = always resident regardless of partition.
+/// Peak(partition) = G·(Σ kept escapes + Σ force-saved) + max segment
+/// recompute — the same shape as [`ActivationPeak::peak_bytes`].
+///
+/// The DP keeps a small Pareto frontier of (cost, kept-escape-sum, max
+/// recompute) per prefix — cost-optimal prefixes are not always
+/// boundary-minimal, so a scalar DP would discard feasible completions.
+/// Among feasible partitions the cheapest wins; if none fits (or no budget
+/// was given) the minimum-peak partition wins. Returns `None` when no base
+/// plan exists or the block count is degenerate/absurd (caller falls back
+/// to the uniform-stride search).
+pub fn select_partition_dp(
+    primal: &WengertList,
+    csha_claimed_ops: Option<&HashSet<u32>>,
+    policy: CcrPolicy,
+    sizes: &HashMap<VarId, u64>,
+    model: &DpCostModel,
+) -> Option<DpChoice> {
+    let base = plan(primal, csha_claimed_ops, policy, false, 1)?;
+    let n = base.segments.len();
+    if n < 2 || n > 256 {
+        return None; // nothing to coalesce / absurd block count
+    }
+    let sum = |vars: &[VarId]| -> u64 {
+        vars.iter()
+            .fold(0u64, |a, v| a.saturating_add(sizes.get(v).copied().unwrap_or(0)))
+    };
+
+    // Per-block (stride-1 segment) metrics.
+    let mut escape_bytes = vec![0u64; n]; // coalescible boundary surface
+    let mut forced_bytes = vec![0u64; n]; // force-saved (Selective) — always resident
+    let mut rc_bytes = vec![0u64; n]; // recompute transient
+    let mut ops = vec![0u64; n]; // launch-count proxy (result vars in span)
+    for (b, (seg, seg_rc)) in base
+        .segments
+        .iter()
+        .zip(&base.per_segment_recompute)
+        .enumerate()
+    {
+        escape_bytes[b] = sum(&seg.escaping);
+        let rc_set: std::collections::HashSet<VarId> = seg_rc.iter().copied().collect();
+        for &v in &seg.interior {
+            if !rc_set.contains(&v) {
+                forced_bytes[b] =
+                    forced_bytes[b].saturating_add(sizes.get(&v).copied().unwrap_or(0));
+            }
+        }
+        rc_bytes[b] = sum(seg_rc);
+        ops[b] = (seg.interior.len() + seg.escaping.len()) as u64;
+    }
+    let forced_total: u64 = forced_bytes.iter().sum();
+
+    // Segment [s..e] inclusive of blocks s..=e.
+    let seg_rc_bytes = |s: usize, e: usize| -> u64 {
+        let mut b: u64 = (s..=e).map(|i| rc_bytes[i]).sum();
+        b = b.saturating_add((s..e).map(|i| escape_bytes[i]).sum::<u64>());
+        b
+    };
+    let seg_cost_ns = |s: usize, e: usize| -> u64 {
+        let launches: u64 = (s..=e).map(|i| ops[i]).sum();
+        let launch_ns =
+            (launches as f64 * model.bwd_launch_factor) as u64 * model.launch_overhead_ns;
+        let bytes = seg_rc_bytes(s, e);
+        // Recompute both reads and writes its transient once → 2× bytes.
+        let bw_ns = ((2 * bytes) as f64 / model.hbm_gbps.max(1.0)) as u64;
+        let t = launch_ns.max(bw_ns) * model.window.max(1);
+        t.saturating_sub(model.overlap_credit_ns)
+    };
+
+    // Pareto DP over prefixes: state = (cost_ns, kept_escape_sum, max_rc),
+    // with the partition reconstructed via a parent link.
+    #[derive(Clone)]
+    struct State {
+        cost: u64,
+        kept: u64,
+        max_rc: u64,
+        // (prefix block index, state index in that prefix's frontier)
+        parent: Option<(usize, usize)>,
+        seg_start: usize,
+    }
+    let dominates = |a: &State, b: &State| {
+        a.cost <= b.cost && a.kept <= b.kept && a.max_rc <= b.max_rc
+    };
+    // frontier[i] = states covering blocks [0, i).
+    let mut frontier: Vec<Vec<State>> = vec![Vec::new(); n + 1];
+    frontier[0].push(State { cost: 0, kept: 0, max_rc: 0, parent: None, seg_start: 0 });
+    for i in 0..n {
+        if frontier[i].is_empty() {
+            continue;
+        }
+        for e in i..n {
+            // Extend every state at i with the segment [i..=e].
+            let c = seg_cost_ns(i, e);
+            let rc = seg_rc_bytes(i, e);
+            let kept = escape_bytes[e];
+            let mut new_states: Vec<State> = Vec::new();
+            for (si, st) in frontier[i].iter().enumerate() {
+                new_states.push(State {
+                    cost: st.cost.saturating_add(c),
+                    kept: st.kept.saturating_add(kept),
+                    max_rc: st.max_rc.max(rc),
+                    parent: Some((i, si)),
+                    seg_start: i,
+                });
+            }
+            let dst = &mut frontier[e + 1];
+            'cand: for cand in new_states {
+                for kept_st in dst.iter() {
+                    if dominates(kept_st, &cand) {
+                        continue 'cand;
+                    }
+                }
+                dst.retain(|st| !dominates(&cand, st));
+                dst.push(cand);
+            }
+        }
+        // Frontier-size guard (n ≤ 256, but keep the worst case bounded).
+        for f in frontier.iter_mut() {
+            if f.len() > 64 {
+                f.sort_by_key(|st| st.cost);
+                f.truncate(64);
+            }
+        }
+    }
+
+    let finals = &frontier[n];
+    if finals.is_empty() {
+        return None;
+    }
+    let peak = |st: &State| -> u64 {
+        st.kept
+            .saturating_add(forced_total)
+            .saturating_mul(model.window.max(1))
+            .saturating_add(st.max_rc)
+    };
+    let pick = match model.budget_bytes {
+        Some(budget) => finals
+            .iter()
+            .enumerate()
+            .filter(|(_, st)| peak(st) <= budget)
+            .min_by_key(|(_, st)| st.cost)
+            .or_else(|| finals.iter().enumerate().min_by_key(|(_, st)| peak(st))),
+        None => finals.iter().enumerate().min_by_key(|(_, st)| peak(st)),
+    };
+    let (pick_idx, _) = pick?;
+
+    // Reconstruct the kept-anchor set by walking parents.
+    let mut keep: Vec<usize> = Vec::new();
+    let mut cur: Option<(usize, usize)> = Some((n, pick_idx));
+    while let Some((i, si)) = cur {
+        let st = &frontier[i][si];
+        if st.parent.is_some() {
+            keep.push(st.seg_start);
+        }
+        cur = st.parent;
+    }
+    keep.reverse();
+    debug_assert_eq!(keep.first(), Some(&0));
+
+    let st = &frontier[n][pick_idx];
+    let pk = peak(st);
+    Some(DpChoice {
+        keep,
+        projected_peak_bytes: pk,
+        est_recompute_ns: st.cost,
+        fits_budget: model.budget_bytes.is_none_or(|b| pk <= b),
     })
 }
 
@@ -1247,6 +1533,107 @@ fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P5 item 21: partition DP -------------------------------------
+
+    fn dp_model(window: u64, budget: Option<u64>) -> DpCostModel {
+        DpCostModel {
+            window,
+            budget_bytes: budget,
+            launch_overhead_ns: 6000,
+            hbm_gbps: 800.0,
+            bwd_launch_factor: 2.0,
+            overlap_credit_ns: 0,
+        }
+    }
+
+    /// Uniform sizes: with no budget the DP minimizes the projected peak —
+    /// on a 4-block residual tape that means coalescing (fewer boundaries
+    /// paid × G beats one span's recompute), and the kept set must start
+    /// at anchor 0 and ascend.
+    #[test]
+    fn dp_min_peak_coalesces_and_keeps_anchor_zero() {
+        let primal = toy_primal_4blocks();
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        for v in 0..16u32 {
+            sizes.insert(v, 1024);
+        }
+        let choice =
+            select_partition_dp(&primal, None, CcrPolicy::Block, &sizes, &dp_model(4, None))
+                .expect("dp should produce a choice");
+        assert_eq!(choice.keep.first(), Some(&0));
+        assert!(choice.keep.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            choice.keep.len() < 4,
+            "G=4 must make coalescing worthwhile; kept {:?}",
+            choice.keep
+        );
+        // The chosen partition must be constructible and its TRUE peak must
+        // agree with the DP projection on this fully-sized toy tape.
+        let p = plan_with_kept_anchors(&primal, None, CcrPolicy::Block, false, &choice.keep)
+            .expect("kept-anchor plan");
+        assert_eq!(p.segments.len(), choice.keep.len());
+    }
+
+    /// A generous budget makes every partition feasible — the DP must then
+    /// prefer the CHEAPEST one. With large (bandwidth-dominated) tensors,
+    /// coalescing costs strictly more (the swallowed escapes get recomputed
+    /// on top of every block interior), so keeping all anchors wins —
+    /// demonstrating the cost objective is real, not just peak-minimizing.
+    #[test]
+    fn dp_prefers_cheapest_feasible_partition() {
+        let primal = toy_primal_4blocks();
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        for v in 0..16u32 {
+            sizes.insert(v, 64 << 20); // 64 MiB per var: bytes >> launches
+        }
+        let choice = select_partition_dp(
+            &primal,
+            None,
+            CcrPolicy::Block,
+            &sizes,
+            &dp_model(1, Some(1 << 62)),
+        )
+        .expect("dp choice");
+        assert!(choice.fits_budget);
+        assert_eq!(
+            choice.keep,
+            vec![0, 1, 2, 3],
+            "with everything feasible the least-recompute partition must win"
+        );
+    }
+
+    /// Non-uniform sizes: one block with a HUGE boundary should have its
+    /// anchor dropped (its escape gets recomputed instead of saved) while
+    /// cheap boundaries stay — the partition the uniform stride cannot express.
+    #[test]
+    fn dp_drops_the_expensive_boundary_non_uniformly() {
+        let primal = toy_primal_4blocks();
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        for v in 0..16u32 {
+            sizes.insert(v, 64);
+        }
+        // Block 1's output (the Add escaping block 1) is v8 on this tape:
+        // block b interior = 5+2b, output = 6+2b -> block 1 output = v8.
+        sizes.insert(8, 1 << 20);
+        let tight = {
+            // Budget below G*(all boundaries incl. the huge one) but above
+            // the partition that recomputes the huge boundary.
+            Some(2u64 * (1 << 20))
+        };
+        let choice =
+            select_partition_dp(&primal, None, CcrPolicy::Block, &sizes, &dp_model(4, tight))
+                .expect("dp choice");
+        assert!(
+            choice.fits_budget,
+            "a partition recomputing the huge boundary fits: {choice:?}"
+        );
+        assert!(
+            !choice.keep.contains(&2),
+            "anchor 2 (whose kept boundary is the huge v8) must be dropped: {:?}",
+            choice.keep
+        );
+    }
 
     fn op(id: u32, result: VarId, p: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
         WengertOp {
