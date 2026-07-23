@@ -3377,6 +3377,20 @@ fn lower_single_op(
                         &[inputs[0], inputs[1], inputs[2], e],
                     )
                 }
+                _ if name.starts_with("rmsnorm_dx_backward_add:") => {
+                    // P5 slice C: fused dx + residual fold.
+                    // inputs = [dy, x, gamma, res]; eps bit-encoded.
+                    let bits: u64 = name["rmsnorm_dx_backward_add:".len()..]
+                        .parse()
+                        .unwrap_or(0);
+                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_rmsnorm_dx_backward_add",
+                        &[inputs[0], inputs[1], inputs[2], inputs[3], e],
+                    )
+                }
                 _ if name.starts_with("rmsnorm_dx_backward:") => {
                     // Item 9 fused RMSNorm input gradient. inputs = [dy, x, gamma];
                     // eps is bit-encoded in the name suffix (exact round-trip).

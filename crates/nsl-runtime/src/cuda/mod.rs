@@ -5043,6 +5043,83 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
 }
 
 #[cfg(feature = "cuda")]
+/// P5 slice C: fused RMSNorm dx + residual-gradient fold (one launch for
+/// what was dx-kernel + elementwise Add). `res` must be contiguous f32 of
+/// x's shape on the same device.
+pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    res_ptr: i64,
+    eps: f32,
+) -> i64 {
+    inner::set_oom_context("rmsnorm_dx_bwd_add_f32");
+    use crate::tensor::NslTensor;
+    use fused_kernels::RMSNORM_DX_BWD_ADD_F32_PTX;
+
+    let x = NslTensor::from_ptr(x_ptr);
+    let ndim = x.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = (x.len as u64) / cols;
+    assert_eq!(
+        NslTensor::from_ptr(res_ptr).len,
+        x.len,
+        "rmsnorm dx+res: residual/x length mismatch"
+    );
+    assert_eq!(
+        NslTensor::from_ptr(dy_ptr).len,
+        x.len,
+        "rmsnorm dx+res: dy/x length mismatch"
+    );
+
+    let total = x.len as usize;
+    let out_data = inner::alloc_managed(total * 4);
+    let out_shape = NslTensor::copy_shape(x.shape, x.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, x.ndim);
+
+    let dy = NslTensor::from_ptr(dy_ptr);
+    let g = NslTensor::from_ptr(gamma_ptr);
+    let r = NslTensor::from_ptr(res_ptr);
+
+    let mut dy_data = dy.data as u64;
+    let mut x_data = x.data as u64;
+    let mut g_data = g.data as u64;
+    let mut out_u64 = out_data as u64;
+    let mut res_data = r.data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+
+    let args: [*mut std::ffi::c_void; 8] = [
+        &mut dy_data as *mut _ as *mut std::ffi::c_void,
+        &mut x_data as *mut _ as *mut std::ffi::c_void,
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_u64 as *mut _ as *mut std::ffi::c_void,
+        &mut res_data as *mut _ as *mut std::ffi::c_void,
+        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut cols_val as *mut _ as *mut std::ffi::c_void,
+        &mut eps_val as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let result = inner::kernel_launch(
+        RMSNORM_DX_BWD_ADD_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_dx_bwd_add_f32\0".as_ptr(),
+        [rows as i64, 1, 1],
+        [256, 1, 1],
+        &args,
+        256 * 4,
+    );
+    assert_eq!(result as u32, 0, "GPU rmsnorm dx+res kernel failed: {:?}", result);
+    inner::sync_after_kernel();
+
+    let out = Box::new(NslTensor::new(
+        out_data, out_shape, out_strides, x.ndim, x.len, x.device, 1, 1, 0,
+    ));
+    NslTensor::publish(out)
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn gpu_rmsnorm_dx_backward_f32(
     dy_ptr: i64,
     x_ptr: i64,
