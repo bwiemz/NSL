@@ -198,6 +198,20 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
         view
     };
 
+    // Tape record (identity-only fields, no refcount bumps): a reshape VIEW
+    // carries tape_id 0, so without this node the recorded graph silently
+    // disconnects at every reshape between two recorded ops — grads never
+    // reach anything upstream. Backward reshapes the grad to input_shape.
+    if autodiff::is_recording() {
+        let input_shape: Vec<i64> =
+            (0..tensor.ndim as usize).map(|i| unsafe { *tensor.shape.add(i) }).collect();
+        autodiff::maybe_record(autodiff::TapeOp::Reshape {
+            a: tensor_ptr,
+            out: result,
+            input_shape,
+        });
+    }
+
     // Tracing (unchanged)
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {

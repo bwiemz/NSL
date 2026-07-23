@@ -72,6 +72,11 @@ pub enum TapeOp {
     Softmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     LogSoftmax { a: i64, out: i64, saved_out: i64, dim: i64 },
     Slice { a: i64, out: i64, dim: i64, start: i64, input_shape: Vec<i64> },
+    /// Metadata-only relabel: backward reshapes the gradient back to the
+    /// input's shape. Without this op every reshape between two recorded ops
+    /// silently DISCONNECTED the tape (views get a fresh tape_id), which is
+    /// how the Q/K/V-projection -> attention chain lost all its param grads.
+    Reshape { a: i64, out: i64, input_shape: Vec<i64> },
     Cat { inputs: Vec<i64>, out: i64, dim: i64, split_sizes: Vec<i64> },
     EmbeddingLookup { weight: i64, indices: i64, out: i64, saved_weight: i64, saved_indices: i64 },
     LayerNorm { input: i64, weight: i64, bias: i64, out: i64, saved_input: i64, saved_mean: i64, saved_inv_std: i64, saved_weight: i64 },
@@ -164,6 +169,9 @@ impl TapeOp {
             }
             TapeOp::Unsqueeze { input, out, .. } | TapeOp::Expand { input, out, .. } => {
                 *input = tape.get_or_assign_id(*input); *out = tape.get_or_assign_id(*out);
+            }
+            TapeOp::Reshape { a, out, .. } => {
+                *a = tape.get_or_assign_id(*a); *out = tape.get_or_assign_id(*out);
             }
             TapeOp::Cat { inputs, out, .. } | TapeOp::Stack { inputs, out, .. } => {
                 for inp in inputs.iter_mut() { *inp = tape.get_or_assign_id(*inp); }
@@ -338,6 +346,7 @@ fn tape_op_trace(op: &TapeOp) -> String {
         TapeOp::SumReduce { a, out, dim, .. } => format!("SumReduce a={a} out={out} dim={dim}"),
         TapeOp::MeanReduce { a, out, dim, .. } => format!("MeanReduce a={a} out={out} dim={dim}"),
         TapeOp::Transpose { a, out, .. } => format!("Transpose a={a} out={out}"),
+        TapeOp::Reshape { a, out, .. } => format!("Reshape a={a} out={out}"),
         _ => format!("(other op discriminant {:?})", std::mem::discriminant(op)),
     }
 }
@@ -478,6 +487,9 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
             }
             TapeOp::Unsqueeze { .. } => {}
             TapeOp::Expand { .. } => {}
+            TapeOp::Reshape { .. } => {
+                // identity-only fields (tape_ids) — nothing saved to free
+            }
             TapeOp::Stack { .. } | TapeOp::Cat { .. } => {
                 // inputs are tape_ids after assign_ids — nothing to free
             }

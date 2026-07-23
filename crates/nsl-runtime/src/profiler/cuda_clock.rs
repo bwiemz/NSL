@@ -45,6 +45,11 @@ impl CudaEventClock {
             return e;
         }
         unsafe {
+            // Driver invariant: every thread must ensure_context() before its
+            // first driver call — a fresh profiler thread (or a bare test
+            // process) otherwise gets CUDA_ERROR_NOT_INITIALIZED and a dead
+            // 0 handle for every timing region.
+            crate::cuda::inner::ensure_context();
             match crate::cuda::cu_event_create_checked() {
                 Ok(e) => e,
                 Err(res) => {

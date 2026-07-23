@@ -885,22 +885,30 @@ fn csla_parity_fused_lmce_gpu() {
     let losses: Vec<f64> = base.loss_stream.lines().filter_map(parse).collect();
     let first_loss = *losses.first().expect("empty loss stream");
     // Pinned to the composite-derived ground truth for this deterministic
-    // init + data (review D2c-4: the old (4.5, 6.4) band ADMITTED the
-    // measured tag-4-garbled value 5.19 — a band is not a discriminator).
+    // init + data (review D2c-4: a band is not a discriminator — the old
+    // (4.5, 6.4) band ADMITTED the tag-4-garbled value 5.19).
+    //
+    // Re-derived 2026-07-23: the P0 cert campaign fixed `--seed` being a
+    // NO-OP for model init, which changed what `--deterministic` initializes
+    // and moved this fixture's pre-update loss from 5.6485 to 5.16154. The
+    // pin below is today's COMPOSITE (decorator stripped, zero-bias head)
+    // first loss — bit-equal to the fused arm's, re-derivable the same way.
     assert!(
-        (first_loss - 5.6485).abs() < 0.02,
-        "first fused-CE loss {first_loss} != composite ground truth 5.6485 \
+        (first_loss - 5.16154).abs() < 0.02,
+        "first fused-CE loss {first_loss} != composite ground truth 5.16154 \
          — the kernel is not computing real cross-entropy (targets dtype \
-         bridge regressed?)"
+         bridge regressed? if the seeded init changed again, re-derive the \
+         pin from the composite twin — see the comment above)"
     );
-    // Whole-stream mean separates trained (measured 4.78) from
-    // grads-dropped/frozen (measured 5.36 at lr~0 — per-block data
-    // difficulty makes single-loss descent checks noisy).
+    // Whole-stream mean separates trained from grads-dropped/frozen
+    // (per-block data difficulty makes single-loss descent checks noisy).
+    // Re-measured with the seeded init: trained composite mean 4.57;
+    // frozen sits near the flat first loss (~5.1+).
     let mean_loss: f64 = losses.iter().sum::<f64>() / losses.len() as f64;
     assert!(
-        mean_loss < 5.1,
-        "fused-CE mean loss {mean_loss} looks frozen (trained ~4.78, \
-         grads-dropped ~5.36) — ghost-adjoint prune regressed?"
+        mean_loss < 4.85,
+        "fused-CE mean loss {mean_loss} looks frozen (trained ~4.57, \
+         grads-dropped ~5.1+) — ghost-adjoint prune regressed?"
     );
 
     // Parity: with a deterministic backward, demand bit-exactness (loss

@@ -113,13 +113,12 @@ pub fn enabled() -> bool {
 /// Synchronize the device so the elapsed wall time attributes the kernels
 /// launched inside the region to the region. Mode 2 skips this on purpose.
 fn maybe_sync() {
-    if mode() != 1 {
-        return;
-    }
-    #[cfg(feature = "cuda")]
-    unsafe {
-        crate::cuda::inner::ensure_context();
-        cudarc::driver::sys::cuCtxSynchronize();
+    if mode() == 1 {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            crate::cuda::inner::ensure_context();
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
     }
 }
 

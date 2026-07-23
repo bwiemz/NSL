@@ -1979,6 +1979,20 @@ pub(crate) fn run_backward_core_strict(
                     accumulate_grad(&mut grad_map, *a, neg_rotated);
                 }
             }
+            TapeOp::Reshape { a, out, input_shape } => {
+                if let Some(&g) = grad_map.get(out) {
+                    // Reshape the gradient back to the input's shape. The
+                    // result is a view holding a data_owner ref on `g`, so
+                    // the final grad_map sweep freeing `g` composes safely.
+                    let shape_list = crate::list::nsl_list_new();
+                    for &d in input_shape.iter() {
+                        crate::list::nsl_list_push(shape_list, d);
+                    }
+                    let grad_a = crate::tensor::nsl_tensor_reshape(g, shape_list);
+                    crate::list::nsl_list_free(shape_list);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                }
+            }
             TapeOp::Checkpoint { .. } => {
                 // Checkpoint ops handled by rematerialization pass
             }
