@@ -220,6 +220,131 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
     FASE_FUSED_STEP_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+
+/// Fusion-queue item 1: MULTI-TENSOR fused AdamW/Adam final step — the
+/// whole non-clip Deferred optimizer loop in ONE call. Takes the train
+/// block's param/m/v/m_partial NslLists and performs, per parameter,
+/// exactly what the per-param loop emitted: the fused step (bit-identical
+/// arithmetic) plus the shared tail's m_partial zeroing.
+///
+/// GPU device-f32 quadruples batch into ONE pointer-table kernel launch
+/// (per-element math byte-for-byte the single-step kernel's, so results are
+/// BIT-IDENTICAL to N launches). Anything else — CPU tensors, mixed
+/// placement — falls back to the single-step FFI + zero, preserving every
+/// existing numeric contract. Emitted only for configurations where the
+/// per-param loop would have taken the fused path for EVERY param
+/// (admission mirrored in codegen; see stmt.rs). Kill-switch:
+/// NSL_FASE_MULTI_STEP=0 at compile time keeps the legacy loop.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fase_fused_adamw_step_multi(
+    params_list: i64,
+    m_list: i64,
+    v_list: i64,
+    mp_list: i64,
+    lr: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1_inv: f64,
+    bc2_inv: f64,
+) {
+    let params = crate::list::NslList::from_ptr(params_list);
+    let ms = crate::list::NslList::from_ptr(m_list);
+    let vs = crate::list::NslList::from_ptr(v_list);
+    let mps = crate::list::NslList::from_ptr(mp_list);
+    let count = params.len as usize;
+    assert!(
+        ms.len as usize == count && vs.len as usize == count && mps.len as usize == count,
+        "fase_fused_step_multi: list length mismatch"
+    );
+
+    #[cfg(feature = "cuda")]
+    let mut gpu: (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+
+    for i in 0..count {
+        let (tp, mp_, vp, ap) = unsafe {
+            (
+                *params.data.add(i),
+                *ms.data.add(i),
+                *vs.data.add(i),
+                *mps.data.add(i),
+            )
+        };
+        assert!(
+            tp != 0 && mp_ != 0 && vp != 0 && ap != 0,
+            "fase_fused_step_multi: null tensor at param {i} (ZeRO/conditional-v \
+             configurations must use the per-param loop)"
+        );
+        #[cfg(feature = "cuda")]
+        {
+            let th = unsafe { &*(tp as *const NslTensor) };
+            let m = unsafe { &*(mp_ as *const NslTensor) };
+            let v = unsafe { &*(vp as *const NslTensor) };
+            let a = unsafe { &*(ap as *const NslTensor) };
+            let uniform_gpu_f32 = th.device > 0
+                && [th, m, v, a].iter().all(|t| {
+                    t.device == th.device && t.dtype == 1 && t.is_contiguous() && t.len == th.len
+                })
+                && th.len <= u32::MAX as i64;
+            // Review A1: two param entries can alias ONE theta storage
+            // (tied weights). The legacy loop updated them sequentially;
+            // concurrent grid.y slices would race last-writer-wins. Route
+            // aliases to the sequential fallback arm (k is small — linear
+            // scan is fine).
+            let theta_aliased = gpu.0.contains(&(th.data as u64));
+            if uniform_gpu_f32 && !theta_aliased {
+                gpu.0.push(th.data as u64);
+                gpu.1.push(m.data as u64);
+                gpu.2.push(v.data as u64);
+                gpu.3.push(a.data as u64);
+                gpu.4.push(th.len as u32);
+                continue;
+            }
+        }
+        // Fallback arm: single fused step (its own preconditions assert
+        // loudly) + the shared tail's m_partial zero.
+        nsl_fase_fused_adamw_step(
+            tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps, wd,
+            bc1_inv, bc2_inv,
+        );
+        crate::tensor::nsl_tensor_zero_inplace(ap);
+    }
+
+    #[cfg(feature = "cuda")]
+    if !gpu.0.is_empty() {
+        let k = gpu.0.len();
+        crate::cuda::gpu_fase_fused_adamw_step_multi(
+            &gpu.0,
+            &gpu.1,
+            &gpu.2,
+            &gpu.3,
+            &gpu.4,
+            beta1 as f32,
+            one_minus_beta1 as f32,
+            beta2 as f32,
+            one_minus_beta2 as f32,
+            eps as f32,
+            (-lr) as f32,
+            ((-lr) * wd) as f32,
+            bc1_inv as f32,
+            bc2_inv as f32,
+            wd != 0.0,
+        );
+        // Keep the fused-step counter's per-param semantics (gates read it).
+        FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
+        // One-time anti-vacuity marker for the e2e gates.
+        static MARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !MARKED.swap(true, Ordering::Relaxed) {
+            eprintln!("[fase-multi] batched {k} params into one fused AdamW launch");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

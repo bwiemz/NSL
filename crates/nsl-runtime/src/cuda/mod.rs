@@ -2854,6 +2854,157 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     inner::sync_after_kernel();
 }
 
+/// Fusion-queue item 1: MULTI-TENSOR fused AdamW step — one launch for k
+/// parameters via device pointer tables. `ptrs` slices carry raw DEVICE
+/// DATA pointers (already resolved from NslTensors by the FFI); `lens` the
+/// per-param element counts. Tables are staged through a persistent pinned
+/// block on the COMPUTE stream (the muon_batch discipline: sync before the
+/// host rewrite; enqueue uploads on current_stream so the kernel is
+/// stream-ordered after them).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_fase_fused_adamw_step_multi(
+    t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64], lens: &[u32],
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+) {
+    let k = t_ptrs.len();
+    if k == 0 {
+        return;
+    }
+    assert!(
+        k == m_ptrs.len() && k == v_ptrs.len() && k == mp_ptrs.len() && k == lens.len(),
+        "multi adamw: table length mismatch"
+    );
+    assert!(k <= 65535, "multi adamw: grid.y cap exceeded ({k})");
+
+    struct MultiWs {
+        cap: usize,
+        stage: u64,   // pinned host: 4*cap u64 + cap u32
+        tabs: [u64; 4], // device u64 tables
+        ntab: u64,    // device u32 table
+    }
+    thread_local! {
+        static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+
+    inner::set_oom_context("fase_fused_adamw_multi");
+    let ws: &mut MultiWs = WS.with(|c| {
+        let cur = c.get();
+        let need_new = cur.is_null() || unsafe { (*cur).cap } < k;
+        if need_new {
+            unsafe {
+                inner::ensure_context();
+                // Quiesce before releasing/rewriting anything a prior step
+                // may still be reading.
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+                if !cur.is_null() {
+                    let old = Box::from_raw(cur);
+                    for t in old.tabs {
+                        inner::free_managed(t as *mut c_void);
+                    }
+                    inner::free_managed(old.ntab as *mut c_void);
+                    cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
+                }
+                let mut stage: *mut c_void = std::ptr::null_mut();
+                let bytes = 4 * k * 8 + k * 4;
+                let r = cudarc::driver::sys::cuMemAllocHost_v2(&mut stage, bytes.max(8));
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi adamw: pinned staging alloc failed"
+                );
+                let tabs = [
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                    inner::alloc_managed(k * 8) as u64,
+                ];
+                let ntab = inner::alloc_managed(k * 4) as u64;
+                let fresh = Box::into_raw(Box::new(MultiWs { cap: k, stage: stage as u64, tabs, ntab }));
+                c.set(fresh);
+            }
+        } else {
+            // Same-cap reuse: the previous optimizer step's uploads read this
+            // pinned block — quiesce before the host rewrite below.
+            unsafe {
+                inner::ensure_context();
+                let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+                assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            }
+        }
+        unsafe { &mut *c.get() }
+    });
+
+    unsafe {
+        let base = ws.stage as *mut u64;
+        std::ptr::copy_nonoverlapping(t_ptrs.as_ptr(), base, k);
+        std::ptr::copy_nonoverlapping(m_ptrs.as_ptr(), base.add(ws.cap), k);
+        std::ptr::copy_nonoverlapping(v_ptrs.as_ptr(), base.add(2 * ws.cap), k);
+        std::ptr::copy_nonoverlapping(mp_ptrs.as_ptr(), base.add(3 * ws.cap), k);
+        let nbase = (ws.stage as usize + 4 * ws.cap * 8) as *mut u32;
+        std::ptr::copy_nonoverlapping(lens.as_ptr(), nbase, k);
+        let up = |dst: u64, src_off: usize, bytes: usize| {
+            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst,
+                (ws.stage as usize + src_off) as *const c_void,
+                bytes,
+                inner::current_stream(),
+            );
+            assert_eq!(
+                r,
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                "multi adamw: table upload failed"
+            );
+        };
+        for (idx, tab) in ws.tabs.iter().enumerate() {
+            up(*tab, idx * ws.cap * 8, k * 8);
+        }
+        up(ws.ntab, 4 * ws.cap * 8, k * 4);
+    }
+
+    let max_n = *lens.iter().max().unwrap() as i64;
+    let mut a0 = ws.tabs[0];
+    let mut a1 = ws.tabs[1];
+    let mut a2 = ws.tabs[2];
+    let mut a3 = ws.tabs[3];
+    let mut a4 = ws.ntab;
+    let (mut b1, mut omb1, mut b2, mut omb2) = (b1, omb1, b2, omb2);
+    let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
+        (eps, neg_lr, neg_lr_wd, bc1, bc2);
+    let mut has_wd_val: u32 = u32::from(has_wd);
+    let args = [
+        &mut a0 as *mut _ as *mut c_void,
+        &mut a1 as *mut _ as *mut c_void,
+        &mut a2 as *mut _ as *mut c_void,
+        &mut a3 as *mut _ as *mut c_void,
+        &mut a4 as *mut _ as *mut c_void,
+        &mut b1 as *mut _ as *mut c_void,
+        &mut omb1 as *mut _ as *mut c_void,
+        &mut b2 as *mut _ as *mut c_void,
+        &mut omb2 as *mut _ as *mut c_void,
+        &mut eps as *mut _ as *mut c_void,
+        &mut neg_lr as *mut _ as *mut c_void,
+        &mut neg_lr_wd as *mut _ as *mut c_void,
+        &mut bc1 as *mut _ as *mut c_void,
+        &mut bc2 as *mut _ as *mut c_void,
+        &mut has_wd_val as *mut _ as *mut c_void,
+    ];
+    let block = 256i64;
+    let grid_x = (max_n + block - 1) / block;
+    let result = inner::kernel_launch(
+        kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
+        b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
+        [grid_x, k as i64, 1], [block, 1, 1], &args, 0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU fase_fused_adamw_multi kernel failed: {}", result as u32
+    );
+    inner::sync_after_kernel();
+}
+
 /// P4 item 17: fused AdamW step against a BF16 AUTHORITATIVE theta with
 /// counter-based stochastic rounding. `theta_dev` is the RAW device pointer
 /// of the bf16 mirror (2 bytes/elem, not an NslTensor); m/v/mp are the f32
@@ -4352,6 +4503,124 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
 
     // raw = [min, max, sum, sum_sq]; slot 3 is the raw Σx² (pre-transform).
     f64::from(raw[3])
+}
+
+/// Fusion-queue item 2: GPU-native cross-entropy backward.
+/// out = (softmax(logits) - onehot(targets)) * grad_output / num_valid,
+/// invalid (target < 0) rows zeroed — the CPU arm's semantics, computed
+/// entirely on device (softmax kernel + valid-count reduction + finish
+/// pass; grad_output read in-kernel when device-resident). No host
+/// readbacks: the loss epilogue stays cuda-graph-capturable.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_cross_entropy_backward_f32(
+    logits_ptr: i64,
+    targets_ptr: i64,
+    grad_out_ptr: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::{CE_BWD_COUNT_F32_PTX, CE_BWD_FINISH_F32_PTX};
+
+    inner::set_oom_context("ce_backward_f32");
+    let sm = gpu_softmax_f32(logits_ptr);
+    let smt = unsafe { &*(sm as *const NslTensor) };
+    let ndim = smt.ndim as usize;
+    let cols = unsafe { *smt.shape.add(ndim - 1) } as u32;
+    let total = smt.len as u32;
+    let rows = total / cols.max(1);
+
+    thread_local! {
+        static CE_SCRATCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let scratch = CE_SCRATCH.with(|c| {
+        if c.get() == 0 {
+            c.set(inner::alloc_managed(16) as u64);
+        }
+        c.get()
+    });
+
+    let tgt = unsafe { &*(targets_ptr as *const NslTensor) };
+    let tgt_i32: u32 = u32::from(tgt.dtype == crate::tensor::DTYPE_I32);
+
+    // K1: valid-target count -> scratch[0] (denom, already max(count,1)).
+    {
+        let mut a0 = tgt.data as u64;
+        let mut a1 = rows;
+        let mut a2 = tgt_i32;
+        let mut a3 = scratch;
+        let args: [*mut std::ffi::c_void; 4] = [
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let r = inner::kernel_launch(
+            CE_BWD_COUNT_F32_PTX.as_ptr(),
+            b"nsl_ce_bwd_count_f32\0".as_ptr(),
+            [1, 1, 1],
+            [256, 1, 1],
+            &args,
+            0, // smem is STATIC in the kernel (.shared .u32 cnt[256])
+        );
+        assert_eq!(r as u32, 0, "GPU ce_bwd_count kernel failed: {r:?}");
+    }
+
+    // grad_output: device f32 scalar -> read in-kernel; host scalar ->
+    // folded immediate (a host read of a CPU tensor is free); non-scalar
+    // -> 1.0 (CPU-arm semantics).
+    let go = unsafe { &*(grad_out_ptr as *const NslTensor) };
+    let (go_mode, gop, go_imm): (u32, u64, f32) = if go.len == 1 {
+        if go.device > 0 && go.dtype == 1 {
+            (1, go.data as u64, 1.0)
+        } else if go.device == 0 {
+            let v = match go.dtype {
+                1 => unsafe { *(go.data as *const f32) },
+                crate::tensor::DTYPE_I32 => unsafe { *(go.data as *const i32) as f32 },
+                _ => unsafe { *(go.data as *const f64) as f32 },
+            };
+            (0, 0, v)
+        } else {
+            (0, 0, 1.0)
+        }
+    } else {
+        (0, 0, 1.0)
+    };
+
+    // K2: finish pass in place over the softmax buffer.
+    {
+        let mut a0 = smt.data as u64;
+        let mut a1 = tgt.data as u64;
+        let mut a2 = scratch;
+        let mut a3 = gop;
+        let mut a4 = go_imm;
+        let mut a5 = go_mode;
+        let mut a6 = tgt_i32;
+        let mut a7 = total;
+        let mut a8 = cols;
+        let args: [*mut std::ffi::c_void; 9] = [
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+            &mut a4 as *mut _ as *mut std::ffi::c_void,
+            &mut a5 as *mut _ as *mut std::ffi::c_void,
+            &mut a6 as *mut _ as *mut std::ffi::c_void,
+            &mut a7 as *mut _ as *mut std::ffi::c_void,
+            &mut a8 as *mut _ as *mut std::ffi::c_void,
+        ];
+        let block = 256i64;
+        let grid = ((total as i64) + block - 1) / block;
+        let r = inner::kernel_launch(
+            CE_BWD_FINISH_F32_PTX.as_ptr(),
+            b"nsl_ce_bwd_finish_f32\0".as_ptr(),
+            [grid, 1, 1],
+            [block, 1, 1],
+            &args,
+            0,
+        );
+        assert_eq!(r as u32, 0, "GPU ce_bwd_finish kernel failed: {r:?}");
+    }
+    inner::sync_after_kernel();
+    sm
 }
 
 /// P1 Muon items 8+10: Frobenius-normalize an f32 tensor ENTIRELY on-device —

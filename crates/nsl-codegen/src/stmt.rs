@@ -11911,6 +11911,58 @@ impl Compiler<'_> {
                 } else {
                     // ── Non-clip Deferred path: per-parameter fused final step ──
                     // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
+                    //
+                    // Fusion item 1: when EVERY param would take the fused
+                    // AdamW path (exact structural match, no envelopes, no
+                    // ZeRO gating), the whole loop collapses into ONE
+                    // multi-tensor pointer-table launch — bit-identical per
+                    // element (the multi kernel is the single kernel's body
+                    // with table addressing, and it folds the shared tail's
+                    // m_partial zero). Kill-switch NSL_FASE_MULTI_STEP=0
+                    // (compile-time, like NSL_FASE_FUSED_STEP).
+                    let multi_scalars = if cpdt_precision_dtypes.is_none()
+                        && !self.compile_options.training_reference
+                        && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
+                        && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
+                        && !zero_enabled
+                        && !self.compile_options.optim_state_offload
+                        && !self.features.param_dtype_bf16sr
+                        && num_state_buffers >= 2
+                    {
+                        Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                            &fase_plan.recipe,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(sc) = multi_scalars {
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_fase_fused_adamw_step_multi",
+                            &[
+                                param_list,
+                                state_list_1,
+                                state_list_2,
+                                accum,
+                                lr_v,
+                                b1_v,
+                                omb1_v,
+                                b2_v,
+                                omb2_v,
+                                eps_v,
+                                wd_v,
+                                bc1_inv,
+                                bc2_inv,
+                            ],
+                        )?;
+                    } else {
                     let fs_i_var = state.new_variable();
                     builder.declare_var(fs_i_var, cl_types::I64);
                     let fs_zero = builder.ins().iconst(cl_types::I64, 0);
@@ -11994,8 +12046,12 @@ impl Compiler<'_> {
                     builder.switch_to_block(fs_exit);
                     builder.seal_block(fs_exit);
                     state.current_block = Some(fs_exit);
+                    }
                     // Offload P0.2: one drain per optimizer step (transfer-
                     // stream sync + deferred frees of the staged tensors).
+                    // (Structurally unreachable on the multi path — offload
+                    // is excluded from its admission — kept outside the
+                    // else for byte-stability of the legacy arm.)
                     if self.compile_options.optim_state_offload {
                         self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
                     }

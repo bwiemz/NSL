@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — Fusion queue: multi-tensor fused AdamW + GPU-native cross-entropy backward
+
+- **Multi-tensor fused AdamW** (always on for eligible configs;
+  `NSL_FASE_MULTI_STEP=0` kill-switch): the non-clip FASE-Deferred
+  optimizer loop (one fused-step launch + one zero per param per step)
+  collapses into ONE `nsl_fase_fused_adamw_step_multi` pointer-table
+  launch over the param/m/v/m_partial lists — grid.y = param index,
+  per-param length table with early-exit blocks, tables staged through
+  persistent pinned memory on the compute stream. The kernel body is
+  byte-for-byte the single-step kernel's sequence, so results are
+  **BIT-IDENTICAL** to N launches; the shared tail's m_partial zeroing is
+  folded into the same kernel. CPU/non-uniform tensors fall back
+  per-param (also bit-identical). Admission mirrors the fused-step
+  conditions exactly and excludes ZeRO / offload / bf16-sr / CPDT
+  precision; the fused-step counter keeps per-param semantics. Gates:
+  GPU and CPU bit-identity (multi on vs off) + marker/kill-switch
+  anti-vacuity.
+- **GPU-native cross-entropy backward** (default on;
+  `NSL_GPU_CE_BACKWARD=0` restores the bounce): `nsl_cross_entropy_backward`
+  no longer copies logits `[N, vocab]`, targets, and grad_output to the
+  host — the whole softmax-minus-onehot gradient runs on device (existing
+  softmax kernel + a valid-count reduction + an in-place finish pass),
+  with grad_output read in-kernel when device-resident. Kills CE
+  training's largest per-step PCIe round trip and removes one of the two
+  taints keeping loss-epilogue cuda-graph regions eager (embedding
+  backward still bounces). Target semantics mirror the CPU arm exactly
+  (truncate-then-compare, `target < 0` rows zeroed, `max(valid, 1)`
+  denominator); f32 kernel vs the old f64 host math differs ~1e-6
+  relative. Gates: GPU-vs-CPU elementwise parity, ignored-row exact-zero,
+  device-scalar grad_output; ptxas covers all new kernels.
+
+### Deferred — wgrad GEMM-accumulate into CSLA buffers (fusion item 3, design banked)
+Writing weight-gradient GEMMs straight into `m_partial` with
+`alpha=accum_scale, beta=1` (eliminating the fresh dW alloc + the
+separate axpy launch) requires a wengert-lowering pattern pass that fuses
+across Transpose -> Matmul -> reduce_to_shape AND re-plumbs the FASE
+hook's ownership bookkeeping (owned_values / explicit_freed /
+still_needed) — grad-integrity-sensitive surgery deliberately not
+attempted as a session add-on. Admission notes for the future slice:
+identity-reduce shapes only, non-still_needed adjoints only, Deferred
+hook path only; two-phase clip composes (it scales m_partial after
+accumulation).
+
 ### Added — Muon perf campaign: batched Newton-Schulz + resident momentum + internal profiler
 
 - **`--muon-batch-ns`** (default off, GPU-only): every Muon-routed rank-2
