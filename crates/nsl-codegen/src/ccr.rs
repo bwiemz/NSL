@@ -942,7 +942,7 @@ pub fn select_partition_dp(
 ) -> Option<DpChoice> {
     let base = plan(primal, csha_claimed_ops, policy, false, 1)?;
     let n = base.segments.len();
-    if n < 2 || n > 256 {
+    if !(2..=256).contains(&n) {
         return None; // nothing to coalesce / absurd block count
     }
     let sum = |vars: &[VarId]| -> u64 {
