@@ -1054,7 +1054,12 @@ impl Compiler<'_> {
             format!("__nsl_model_{model_name}_{method_name}")
         };
 
-        // Compile args
+        // Compile args. Deliberately NOT compile_nested_expr: the callee may
+        // ESCAPE a param (member-assign stores the raw pointer with no
+        // retain — `fn set(self, t): self.buf = t`), so freeing a tracked
+        // owning arg at statement end is a use-after-free on the stored
+        // field. Owning call-result args strand instead (status quo) until
+        // member stores retain.
         let mut arg_vals = vec![self_val];
         for arg in args {
             arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
@@ -1071,7 +1076,9 @@ impl Compiler<'_> {
         method: &str,
         args: &[nsl_ast::expr::Arg],
     ) -> Result<Value, CodegenError> {
-        let obj_val = self.compile_expr(builder, state, object)?;
+        // Nested compile: a chained receiver that is itself an owning call
+        // (`m.forward(x).sum()`) must register as a temporary or it strands.
+        let obj_val = self.compile_nested_expr(builder, state, object)?;
         match method {
             // M46: Full reductions (no dim arg) don't have 1-arg deterministic variants;
             // deterministic swap only applies to the 3-arg sum_dim/mean_dim in calls.rs.

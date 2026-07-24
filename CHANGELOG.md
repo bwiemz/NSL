@@ -6,6 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — inference-loop tensor leak: the loop-let free machinery never fired
+
+- **The ELTLS loop-let predeclare zero-def was emitted INSIDE the loop
+  body**, re-zeroing the variable slot at the top of every iteration — so
+  the rebind free (`eltls_clear_old_slot`) only ever saw `0` and the
+  previous iteration's tensor stranded, at ALL FIVE loop lowerings
+  (for/while/while-let/model-array/dataloader — including the one labeled
+  "THE PRIMARY FIX FOR THE TRAINING-LOOP LEAK", which had therefore never
+  worked at runtime). A script-scope `for i in range(N): let y =
+  m.forward(x)` leaked one activation set per iteration forever — the
+  "2.3GB/forward" inference-leak class. The predeclare now lands in the
+  pre-loop block, so each rebind frees the loop-carried value.
+- **Ownership veto on the newly-activated frees:** a symbol is only
+  predeclared (and its loop-top free armed) when EVERY binding of it in
+  the loop body yields an owning, tensor-typed reference. Ident copies,
+  member reads (`let w = m.w_in`), and non-dict subscripts (lists,
+  tuples, Unknown all share elements via `nsl_list_get` with no retain)
+  hand out the referent's own pointer — freeing a loop-carried borrow
+  would free a model weight or a shared tuple element. Int-typed
+  bindings are vetoed too: an armed clear on an INT slot hands the
+  integer to `free_if_valid`, whose magic probe dereferences any
+  8-aligned value >= 0x10000. Loop/while-let/match PATTERN bindings of
+  the same name and opaque block constructs (train/grad/distill/quant/
+  serve) also veto — their bindings write the same slot. Vetoed symbols
+  keep the old declare-in-body behavior.
+- **`main()` now runs the return-local sweep**: top-level `let`-bound
+  tensors (script inputs, the final iteration's activations) were never
+  freed — `compile_main` had no epilogue sweep at all.
+- **The return-local sweep (fn returns AND the new main epilogue) now
+  filters by semantic type** (tensor/indeterminate locals only).
+  `nsl_tensor_free_if_valid`'s pointer probes are not sufficient for
+  plain integers: a large 8-aligned int local (e.g. a byte count from
+  `gpu_peak_bytes()`) passes the null/low/alignment checks and the magic
+  probe dereferences it — a latent segfault in the #415 fn sweeps, caught
+  live by the mem-accounting gate once main() gained the sweep.
+- **Method-form calls participate in temporary cleanup.** `y.sum()`
+  parses as `Call{callee: MemberAccess}`, which the owned-temporary
+  predicate never matched — statement-position method temps
+  (`print(y.sum())`) stranded one block per call. The predicate now
+  covers fresh-result tensor methods (never `.clone()`/`.to()`, which can
+  hand back the receiver) and model methods (compiled NSL fns return
+  owning refs by contract; `.to(device)` excepted), and the safe
+  consumer sites (print args, expression statements, method receivers)
+  compile through the tracking path. Call ARGS deliberately stay
+  untracked: a callee may ESCAPE a param (member-assign stores the raw
+  pointer with no retain — `self.buf = t`), so freeing a tracked owning
+  arg at statement end would be a use-after-free on the stored field;
+  owning call-result args strand (status quo) until member stores
+  retain.
+- Gate: `inference_loop_leak_gate.rs` — exit live_blocks must be
+  IDENTICAL across iteration counts (3 vs 9) for the method-call and
+  method-temp loops, pinned to the exact weight count; plus a borrow
+  fixture asserting the veto (identical per-iteration sums prove the
+  rebound weight survived).
+
+### Fixed — #415 follow-ups (previously unreleased-note gaps)
+
+- `TapeOp::Reshape`: reshape views carried tape_id 0 and silently
+  disconnected the tape at every reshape; the masked-SDPA tape parity
+  gate had passed vacuously since inception. Backward reshapes the
+  gradient back via a zero-copy view.
+- `csla_parity_fused_lmce_gpu` ground truth re-derived: the pinned
+  composite loss predated P0's `--seed` fix (which changed deterministic
+  init); the fused kernel bit-matches a freshly derived composite twin —
+  the "parity failure" was a stale pin, not a kernel bug.
+- CSHA g14_b/g14_c gates set `rope_q=false` — checkpoint(full)+rope_q now
+  refuses up front by design.
+- `cuda_clock` checkout_event calls `ensure_context()` before
+  `cuEventCreate` (silent dead-handle class).
+
 ### Fixed — tape-AD on GPU computed ZERO gradients (silent), plus the per-step tensor leaks
 
 - **GPU ops now record on the autodiff tape.** Every GPU arm in the tensor

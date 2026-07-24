@@ -1392,7 +1392,10 @@ impl Compiler<'_> {
             }
 
             StmtKind::Expr(expr) => {
-                let _ = self.compile_expr(builder, state, expr)?;
+                // compile_nested_expr so a discarded owning result (bare
+                // `user_fn(x)`, `y.sum()`) registers as a temporary and the
+                // sweep below frees it.
+                let _ = self.compile_nested_expr(builder, state, expr)?;
                 // Free all tensor temporaries from this expression (none are kept)
                 self.free_tensor_temporaries(builder, state, None);
                 // M38b: Free linear tensors consumed during this expression statement
@@ -2220,14 +2223,19 @@ impl Compiler<'_> {
     /// Skips symbols already present in state.variables (parameter,
     /// outer-scope let, etc.) — those are not loop-local rebinds and
     /// should not be touched here.
+    /// Returns the symbols ACTUALLY inserted — callers must remove exactly
+    /// these from state.eltls_loop_predeclared after the body compiles.
+    /// Returning skipped (already-declared) syms would let an inner
+    /// same-name loop's removal strip a sym the OUTER loop armed.
     pub(crate) fn eltls_predeclare_loop_lets(
         &self,
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
         syms: &[nsl_ast::Symbol],
-    ) {
+    ) -> Vec<nsl_ast::Symbol> {
+        let mut inserted = Vec::new();
         if syms.is_empty() {
-            return;
+            return inserted;
         }
         let zero = builder.ins().iconst(cl_types::I64, 0);
         for &sym in syms {
@@ -2242,6 +2250,166 @@ impl Compiler<'_> {
             builder.def_var(var, zero);
             state.variables.insert(sym, (var, cl_types::I64));
             state.eltls_loop_predeclared.insert(sym);
+            inserted.push(sym);
+        }
+        inserted
+    }
+
+    /// Collect + ownership-vet + predeclare loop-body let symbols in one
+    /// step. This is the only entry point loop lowerings should use.
+    ///
+    /// Predeclaring a symbol activates a loop-top free of the loop-carried
+    /// value at its first rebind (eltls_clear_old_slot). That is only sound
+    /// when EVERY binding of the symbol anywhere in the loop body yields an
+    /// OWNING reference: ident copies and member reads hand out the
+    /// referent's own pointer with no retain, and freeing a loop-carried
+    /// borrow frees the referent itself (a model weight, another local's
+    /// tensor). Symbols with any unowned binding are left out — they keep
+    /// the old declare-in-body behavior (worst case a status-quo strand,
+    /// never a double-free).
+    ///
+    /// Returns the predeclared symbols; callers must remove them from
+    /// state.eltls_loop_predeclared after compiling the body.
+    pub(crate) fn eltls_predeclare_loop_lets_checked(
+        &self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        body: &nsl_ast::stmt::Block,
+    ) -> Vec<nsl_ast::Symbol> {
+        let syms: Vec<_> = self
+            .eltls_collect_loop_let_idents(&body.stmts)
+            .into_iter()
+            .filter(|s| self.sym_bindings_all_owning_in_block(body, *s))
+            .collect();
+        self.eltls_predeclare_loop_lets(builder, state, &syms)
+    }
+
+    /// True when every VarDecl/Assign binding of `sym` in the block —
+    /// including nested if/loop/match blocks, which rebind the SAME slot
+    /// (this lowering has no block-level scoping) — has an owning RHS.
+    fn sym_bindings_all_owning_in_block(
+        &self,
+        block: &nsl_ast::stmt::Block,
+        sym: nsl_ast::Symbol,
+    ) -> bool {
+        block
+            .stmts
+            .iter()
+            .all(|s| self.sym_bindings_all_owning_in_stmt(s, sym))
+    }
+
+    fn pattern_binds_sym(&self, pattern: &nsl_ast::pattern::Pattern, sym: nsl_ast::Symbol) -> bool {
+        let mut bound = std::collections::HashSet::new();
+        self.collect_pattern_bound_symbols(pattern, &mut bound);
+        bound.contains(&sym)
+    }
+
+    fn sym_bindings_all_owning_in_stmt(
+        &self,
+        stmt: &nsl_ast::stmt::Stmt,
+        sym: nsl_ast::Symbol,
+    ) -> bool {
+        use nsl_ast::stmt::StmtKind;
+        match &stmt.kind {
+            StmtKind::VarDecl { pattern, value, .. } => {
+                if let nsl_ast::pattern::PatternKind::Ident(s) = &pattern.kind {
+                    if *s == sym {
+                        // The RHS must be owning AND tensor-typed: an armed
+                        // clear on an INT slot hands the integer to
+                        // free_if_valid, whose magic probe dereferences any
+                        // 8-aligned value >= 0x10000.
+                        return value.as_ref().is_none_or(|e| {
+                            self.loop_binding_rhs_is_owning(e)
+                                && matches!(self.node_type(e.id),
+                                            ty if ty.is_tensor() || ty.is_indeterminate())
+                        });
+                    }
+                    return true;
+                }
+                // Destructuring patterns (`let (y, z) = pair`) bind shared
+                // tuple/list members — non-owning.
+                !self.pattern_binds_sym(pattern, sym)
+            }
+            StmtKind::Assign { target, value, .. } => {
+                if let ExprKind::Ident(s) = &target.kind {
+                    if *s == sym {
+                        return self.loop_binding_rhs_is_owning(value)
+                            && matches!(self.node_type(value.id),
+                                        ty if ty.is_tensor() || ty.is_indeterminate());
+                    }
+                }
+                true
+            }
+            StmtKind::If {
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
+                self.sym_bindings_all_owning_in_block(then_block, sym)
+                    && elif_clauses
+                        .iter()
+                        .all(|(_, b)| self.sym_bindings_all_owning_in_block(b, sym))
+                    && else_block
+                        .as_ref()
+                        .is_none_or(|b| self.sym_bindings_all_owning_in_block(b, sym))
+            }
+            // Loop/while-let/match patterns bind borrowed elements (list
+            // members via nsl_list_get, match subjects) into the SAME slot
+            // when the name shadows an armed sym — that's a non-owning
+            // binding of `sym`.
+            StmtKind::For { pattern, body, .. } | StmtKind::WhileLet { pattern, body, .. } => {
+                !self.pattern_binds_sym(pattern, sym)
+                    && self.sym_bindings_all_owning_in_block(body, sym)
+            }
+            StmtKind::While { body, .. } => self.sym_bindings_all_owning_in_block(body, sym),
+            StmtKind::Match { arms, .. } => arms.iter().all(|arm| {
+                !self.pattern_binds_sym(&arm.pattern, sym)
+                    && self.sym_bindings_all_owning_in_block(&arm.body, sym)
+            }),
+            StmtKind::Decorated { stmt, .. } => self.sym_bindings_all_owning_in_stmt(stmt, sym),
+            // Opaque block constructs compile their bodies against the SAME
+            // FuncState but through their own lowering — this walker cannot
+            // see their bindings. Presence of one vetoes the sym.
+            StmtKind::TrainBlock(_)
+            | StmtKind::GradBlock(_)
+            | StmtKind::DistillBlock(_)
+            | StmtKind::QuantBlock(_)
+            | StmtKind::ServeBlock(_) => false,
+            _ => true,
+        }
+    }
+
+    /// Does this RHS hand back a reference the binding OWNS?
+    /// False for the raw-pointer-copy forms: ident references (no retain),
+    /// member access (model weights / struct fields share the stored
+    /// handle), and non-dict subscripts — compile_subscript lowers
+    /// EVERYTHING except Dict (lists, tuples, Unknown) through
+    /// nsl_list_get, which shares the stored element with no retain. Only
+    /// dict subscripts clone tensors (owned). Match/block expressions do
+    /// not retain their arm results (unlike if-expressions, which do), so
+    /// they are vetoed too. Calls, method calls, and operators produce
+    /// fresh results.
+    fn loop_binding_rhs_is_owning(&self, expr: &nsl_ast::expr::Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(_) => false,
+            ExprKind::MemberAccess { .. } => false,
+            ExprKind::MatchExpr { .. } => false,
+            ExprKind::BlockExpr(_) => false,
+            ExprKind::Paren(inner) => self.loop_binding_rhs_is_owning(inner),
+            ExprKind::IfExpr {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.loop_binding_rhs_is_owning(then_expr)
+                    && self.loop_binding_rhs_is_owning(else_expr)
+            }
+            ExprKind::Subscript { object, .. } => matches!(
+                self.node_type(object.id),
+                nsl_semantic::types::Type::Dict(_, _)
+            ),
+            _ => true,
         }
     }
 
@@ -2348,6 +2516,15 @@ impl Compiler<'_> {
             .iter()
             .filter(|(sym, _)| !state.param_symbols.contains(sym))
             .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
+            // Semantic-type filter: only tensor (or indeterminate) locals.
+            // free_if_valid's pointer probes are NOT sufficient for plain
+            // integers — a large 8-aligned int (e.g. a byte count from
+            // gpu_peak_bytes()) passes the null/low/alignment checks and the
+            // magic probe DEREFERENCES it, segfaulting on unmapped memory.
+            .filter(|(sym, _)| {
+                matches!(state.variable_types.get(sym),
+                         Some(ty) if ty.is_tensor() || ty.is_indeterminate())
+            })
             .filter_map(|(_, (var, cl_type))| {
                 if *cl_type == cl_types::I64 {
                     Some(*var)
@@ -2677,6 +2854,14 @@ impl Compiler<'_> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
+        // body so the second-and-later rebinds fire eltls_clear_old_slot
+        // and free the previous iteration's tensor. MUST be emitted in the
+        // pre-loop block: a def inside the body re-zeroes the slot every
+        // iteration, so the rebind free only ever sees 0 and the previous
+        // iteration's tensor strands.
+        let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
+
         builder.ins().jump(header_block, &[]);
 
         builder.switch_to_block(header_block);
@@ -2689,12 +2874,6 @@ impl Compiler<'_> {
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
-
-        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
-        // body so the second-and-later rebinds fire eltls_clear_old_slot
-        // and free the previous iteration's tensor.
-        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
-        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
 
         state
             .cleanup
@@ -2758,6 +2937,11 @@ impl Compiler<'_> {
         let body_block = builder.create_block();
         let exit_block = builder.create_block();
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from
+        // the body so rebinds across iterations free the previous value.
+        // Pre-loop block on purpose — see compile_while.
+        let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
+
         builder.ins().jump(header_block, &[]);
 
         // Header: evaluate expression, check truthiness (non-zero = continue)
@@ -2776,11 +2960,6 @@ impl Compiler<'_> {
         if let Some(var) = pattern_var {
             builder.def_var(var, val);
         }
-
-        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from
-        // the body so rebinds across iterations free the previous value.
-        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
-        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
 
         state
             .cleanup
@@ -2914,6 +3093,11 @@ impl Compiler<'_> {
         let increment_block = builder.create_block();
         let exit_block = builder.create_block();
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
+        // body so the second-and-later rebinds fire eltls_clear_old_slot.
+        // Pre-loop block on purpose — see compile_while.
+        let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
+
         builder.ins().jump(header_block, &[]);
 
         builder.switch_to_block(header_block);
@@ -3009,13 +3193,6 @@ impl Compiler<'_> {
             _ => unreachable!(),
         }
 
-        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
-        // body so the second-and-later rebinds fire eltls_clear_old_slot.
-        // This is the primary fix for the `for batch in dl: let y = model(batch)`
-        // training leak pattern.
-        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
-        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
-
         // continue jumps to increment_block (not header) so counter is incremented
         state
             .cleanup
@@ -3104,6 +3281,10 @@ impl Compiler<'_> {
         let increment_block = builder.create_block();
         let exit_block = builder.create_block();
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
+        // Pre-loop block on purpose — see compile_while.
+        let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
+
         builder.ins().jump(header_block, &[]);
 
         // Header: check i < size
@@ -3126,10 +3307,6 @@ impl Compiler<'_> {
             .ins()
             .load(cl_types::I64, MemFlags::trusted(), addr, 0);
         builder.def_var(elem_var, elem_ptr);
-
-        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
-        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
-        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
 
         // Compile body statements
         state
@@ -3260,6 +3437,20 @@ impl Compiler<'_> {
         let exhausted_exit_block = builder.create_block();
         let exit_block = builder.create_block();
 
+        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
+        // THIS IS THE PRIMARY FIX FOR THE TRAINING-LOOP LEAK:
+        //   for batch in dataloader:
+        //       let y = model(batch)     # previously leaked y each iteration
+        //       let loss = loss_fn(y, batch["labels"])
+        //       ...
+        // By pre-declaring y and loss in the pre-loop scope with zero init,
+        // each subsequent rebind is detected as a reassignment and
+        // eltls_clear_old_slot fires nsl_tensor_free_if_valid on the
+        // previous iteration's tensor. The zero-def MUST live in the
+        // pre-loop block — inside the body it re-zeroes the slot every
+        // iteration and the free only ever sees 0.
+        let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
+
         builder.ins().jump(header_block, &[]);
 
         // Header: call nsl_dataloader_next_batch, branch on null
@@ -3279,19 +3470,6 @@ impl Compiler<'_> {
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
         state.current_block = Some(body_block);
-
-        // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
-        // THIS IS THE PRIMARY FIX FOR THE TRAINING-LOOP LEAK:
-        //   for batch in dataloader:
-        //       let y = model(batch)     # previously leaked y each iteration
-        //       let loss = loss_fn(y, batch["labels"])
-        //       ...
-        // By pre-declaring y and loss in the pre-loop scope with zero init,
-        // each subsequent rebind is detected as a reassignment and
-        // eltls_clear_old_slot fires nsl_tensor_free_if_valid on the
-        // previous iteration's tensor.
-        let predecl_syms = self.eltls_collect_loop_let_idents(&body.stmts);
-        self.eltls_predeclare_loop_lets(builder, state, &predecl_syms);
 
         // Rely on codegen-level tensor_temporaries for per-statement cleanup.
         // Do NOT use scope_begin/scope_end — it double-frees tensors that are
