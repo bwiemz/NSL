@@ -744,32 +744,37 @@ impl NslTensor {
         dst
     }
 
-    /// Returns true if this tensor can be safely mutated in-place (FBIP).
-    /// Requires: sole owner (refcount==1), owns data (not a view),
-    /// no dependent views (data_owner==0), contiguous layout, CPU device,
-    /// and autodiff tape is NOT recording (to preserve saved activations).
+    /// FBIP refcount-based in-place elision — PERMANENTLY DISABLED (2026-07-23).
+    ///
+    /// The premise "refcount==1 means exclusively owned, safe to mutate" is
+    /// UNSOUND in this runtime: variable bindings hold exactly one reference
+    /// and ident/member reads hand out the pointer WITHOUT retaining, so a
+    /// live `let` binding, a model FIELD (weight!), or a dict entry all look
+    /// identical to an owned temporary at the FFI boundary. Observed live:
+    /// `print(sum(abs(m.wq)))` rewrote the model weight to |wq| in place and
+    /// `let s = abs(x)` overwrote `x` — silently, exit 0. Training paths
+    /// were shielded only by accident (is_recording() during tape-AD,
+    /// inplace_suppressed() during source-AD forwards); inference and
+    /// script-scope code corrupted.
+    ///
+    /// Sound in-place mutation remains available through the codegen-proven
+    /// channels, which are unaffected: the `nsl_tensor_*_inplace` variants
+    /// (selected only for single-use bindings / ownership-lowering-proven
+    /// linear values) and the binary `*_inplace_fbip` / relinquish-flag
+    /// paths (explicit compile-time transfer of ownership). If a
+    /// refcount-based fast path is ever wanted again, borrows must first be
+    /// made to retain — the counts cannot carry this decision today.
     #[inline]
     pub(crate) fn can_mutate_inplace(&self) -> bool {
-        self.refcount.load(Ordering::Acquire) == 1
-            && self.owns_data == 1
-            && self.data_owner == 0
-            && self.is_contiguous()
-            && self.device == 0
-            && !autodiff::is_recording()
-            && !inplace_suppressed()
+        false
     }
 
-    /// Returns true if this GPU tensor can be safely mutated in-place (FBIP).
-    /// Same logic as CPU but requires device > 0.
+    /// GPU twin of `can_mutate_inplace` — disabled for the same soundness
+    /// hole (see above).
     #[inline]
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn can_mutate_inplace_gpu(&self) -> bool {
-        self.refcount.load(Ordering::Acquire) == 1
-            && self.owns_data == 1
-            && self.data_owner == 0
-            && self.device > 0
-            && !autodiff::is_recording()
-            && !inplace_suppressed()
+        false
     }
 
     /// Returns true if two tensors have identical shapes.

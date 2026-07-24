@@ -314,8 +314,22 @@ pub extern "C" fn nsl_flash_attention(
         let mut csha_eps: f32 = 0.0;
         let mut csha_active_heads: u32 = 0;
         let mut csha_d_model: u32 = 0;
+        // Tier C save slots: the v2 forward prelude ALWAYS declares the six
+        // save params after the CSHA block (q/k/v_proj, row_max/row_sum,
+        // x_raw) — null here (inference, no saves; the kernel null-checks).
+        // Conditional params (segment_ids/doc_starts/sinks/skip_decisions)
+        // are only declared when the synthesizing config enables them; the
+        // inference config does not, so the list ends at 36. An arg list
+        // SHORTER than the declared params is not an error the driver
+        // reports — cuLaunchKernel SEGFAULTS reading past the array.
+        let mut save_q_proj: u64 = 0;
+        let mut save_k_proj: u64 = 0;
+        let mut save_v_proj: u64 = 0;
+        let mut save_row_max: u64 = 0;
+        let mut save_row_sum: u64 = 0;
+        let mut save_x_raw: u64 = 0;
 
-        let args: [*mut c_void; 30] = [
+        let args: [*mut c_void; 36] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -346,6 +360,12 @@ pub extern "C" fn nsl_flash_attention(
             &mut csha_eps as *mut _ as *mut c_void,
             &mut csha_active_heads as *mut _ as *mut c_void,
             &mut csha_d_model as *mut _ as *mut c_void,
+            &mut save_q_proj as *mut _ as *mut c_void,
+            &mut save_k_proj as *mut _ as *mut c_void,
+            &mut save_v_proj as *mut _ as *mut c_void,
+            &mut save_row_max as *mut _ as *mut c_void,
+            &mut save_row_sum as *mut _ as *mut c_void,
+            &mut save_x_raw as *mut _ as *mut c_void,
         ];
 
         // ── Ampere / Hopper dispatch ──────────────────────────────────────────
