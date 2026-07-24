@@ -2038,12 +2038,18 @@ mod silu_backward_tests {
         }
         for p in [x, y] { nsl_tensor_free(p); }
 
-        // Not suppressed + uniquely owned: FBIP mutates in place (same pointer).
+        // 2026-07-23: refcount-based elision is permanently disabled — even
+        // UNSUPPRESSED, a unique-owner input must not be reused (rc==1 also
+        // describes a live `let` binding or a model field, which do not
+        // retain on read). The input-preserving behavior the suppression
+        // scope enforced is now the unconditional contract.
         let x2 = make_f32(&xs);
         let y2 = nsl_tensor_silu(x2);
-        assert_eq!(x2, y2, "unsuppressed unique-owner silu should reuse the buffer in place");
-        // x2 == y2 is ONE allocation whose refcount FBIP bumped to 2 (two logical
-        // owners: the input handle and the result handle) — free both to reach 0.
+        assert_ne!(x2, y2, "unsuppressed silu must ALSO allocate — refcount elision is unsound");
+        let x2t = NslTensor::from_ptr(x2);
+        for (i, &v) in xs.iter().enumerate() {
+            assert_eq!(unsafe { *x2t.data_f32().add(i) }, v, "x2 mutated at {i}");
+        }
         nsl_tensor_free(x2);
         nsl_tensor_free(y2);
     }

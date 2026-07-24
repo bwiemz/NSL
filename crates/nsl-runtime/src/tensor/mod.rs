@@ -78,6 +78,11 @@ thread_local! {
 /// common case (recomputed inputs are model params / refcount > 1), but a future
 /// `--checkpoint-blocks` path that recomputes a uniquely-owned input feeding an
 /// input-reading activation would need the guard raised around the recompute too.
+/// Currently unreferenced: its only consumers were the (permanently
+/// disabled) refcount-elision predicates. Kept — source-AD still emits the
+/// paired nsl_set_inplace_suppressed scopes, and any future compiler-proven
+/// in-place path must consult this guard again.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn inplace_suppressed() -> bool {
     INPLACE_SUPPRESS_DEPTH.with(|c| c.get() > 0)
@@ -4866,16 +4871,19 @@ mod tests {
         ptr
     }
 
+    /// Refcount-based elision is PERMANENTLY DISABLED (2026-07-23): rc==1
+    /// cannot distinguish an owned temporary from a live variable or model
+    /// field, because ident/member reads do not retain. These tests pin the
+    /// SOUND contract: normal unary FFIs never mutate their input.
     #[test]
     fn test_fbip_can_mutate_inplace() {
         let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
         let t = NslTensor::from_ptr(ptr);
-        assert!(t.can_mutate_inplace(), "unique owned contiguous CPU tensor should be mutable in-place");
-
-        // Bump refcount — should no longer be mutable
-        t.refcount.fetch_add(1, Ordering::SeqCst);
-        assert!(!t.can_mutate_inplace(), "refcount>1 should prevent in-place mutation");
-        t.refcount.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            !t.can_mutate_inplace(),
+            "refcount-based elision must stay disabled: a live `let` binding \
+             and a model field also sit at refcount==1"
+        );
         nsl_tensor_free(ptr);
     }
 
@@ -4883,14 +4891,15 @@ mod tests {
     fn test_fbip_relu_inplace() {
         let ptr = make_f64_tensor(&[-2.0, -1.0, 0.0, 1.0, 2.0]);
         let result = activation::nsl_tensor_relu(ptr);
-        // FBIP: same pointer returned, refcount bumped to 2
-        assert_eq!(result, ptr, "relu should reuse tensor when refcount==1");
+        assert_ne!(result, ptr, "relu must NOT reuse the input at rc==1 (unsound elision)");
         let t = NslTensor::from_ptr(result);
-        assert_eq!(t.refcount.load(Ordering::Relaxed), 2);
         let vals: Vec<f64> = (0..5).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
-        nsl_tensor_free(ptr);    // input ref
-        nsl_tensor_free(result); // output ref → frees
+        // The input must be PRESERVED — the `let s = relu(x); use x` contract.
+        let orig = NslTensor::from_ptr(ptr);
+        assert_eq!(unsafe { *orig.data_f64().add(0) }, -2.0);
+        nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
     }
 
     #[test]
@@ -4915,46 +4924,51 @@ mod tests {
     fn test_fbip_exp_inplace() {
         let ptr = make_f64_tensor(&[0.0, 1.0]);
         let result = activation::nsl_tensor_exp(ptr);
-        assert_eq!(result, ptr);
+        assert_ne!(result, ptr, "exp must NOT reuse the input at rc==1 (unsound elision)");
         let t = NslTensor::from_ptr(result);
         assert!((unsafe { *t.data_f64().add(0) } - 1.0).abs() < 1e-10);
         assert!((unsafe { *t.data_f64().add(1) } - std::f64::consts::E).abs() < 1e-10);
-        nsl_tensor_free(ptr);    // input ref
-        nsl_tensor_free(result); // output ref
+        // Input preserved.
+        assert_eq!(unsafe { *NslTensor::from_ptr(ptr).data_f64().add(0) }, 0.0);
+        nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
     }
 
     #[test]
     fn test_fbip_neg_inplace() {
         let ptr = make_f64_tensor(&[1.0, -2.0, 0.0]);
         let result = arithmetic::nsl_tensor_neg(ptr);
-        assert_eq!(result, ptr);
+        assert_ne!(result, ptr, "neg must NOT reuse the input at rc==1 (unsound elision)");
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![-1.0, 2.0, 0.0]);
-        nsl_tensor_free(ptr);
+        assert_eq!(unsafe { *NslTensor::from_ptr(ptr).data_f64().add(0) }, 1.0);
         nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
     }
 
     #[test]
     fn test_fbip_sigmoid_inplace() {
         let ptr = make_f64_tensor(&[0.0]);
         let result = activation::nsl_tensor_sigmoid(ptr);
-        assert_eq!(result, ptr);
+        assert_ne!(result, ptr, "sigmoid must NOT reuse the input at rc==1 (unsound elision)");
         let t = NslTensor::from_ptr(result);
         assert!((unsafe { *t.data_f64().add(0) } - 0.5).abs() < 1e-10);
-        nsl_tensor_free(ptr);
+        assert_eq!(unsafe { *NslTensor::from_ptr(ptr).data_f64().add(0) }, 0.0);
         nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
     }
 
     #[test]
     fn test_fbip_tanh_inplace() {
-        let ptr = make_f64_tensor(&[0.0]);
+        let ptr = make_f64_tensor(&[0.5]);
         let result = activation::nsl_tensor_tanh_act(ptr);
-        assert_eq!(result, ptr);
+        assert_ne!(result, ptr, "tanh must NOT reuse the input at rc==1 (unsound elision)");
         let t = NslTensor::from_ptr(result);
-        assert!((unsafe { *t.data_f64().add(0) }).abs() < 1e-10);
-        nsl_tensor_free(ptr);
+        assert!((unsafe { *t.data_f64().add(0) } - 0.5f64.tanh()).abs() < 1e-10);
+        assert_eq!(unsafe { *NslTensor::from_ptr(ptr).data_f64().add(0) }, 0.5);
         nsl_tensor_free(result);
+        nsl_tensor_free(ptr);
     }
 
     #[test]
@@ -5081,15 +5095,16 @@ mod tests {
 
     #[test]
     fn test_fbip_chained_ops_inplace() {
-        // Test that FBIP works for chained operations:
-        // After free(input), refcount drops back to 1 → next op can FBIP
+        // Chained normal-variant unary ops allocate fresh results at every
+        // step (refcount elision disabled — rc==1 also describes live
+        // variables and model fields); values stay correct end to end.
         let ptr = make_f64_tensor(&[-2.0, 3.0]);
         let r1 = activation::nsl_tensor_relu(ptr);
-        assert_eq!(r1, ptr, "first op should FBIP");
-        nsl_tensor_free(ptr); // drop input ref → refcount=1
+        assert_ne!(r1, ptr, "no refcount elision on the first op");
+        nsl_tensor_free(ptr);
         let r2 = activation::nsl_tensor_exp(r1);
-        assert_eq!(r2, r1, "second op should also FBIP after input freed");
-        nsl_tensor_free(r1); // drop r1 ref → refcount=1
+        assert_ne!(r2, r1, "no refcount elision on the second op either");
+        nsl_tensor_free(r1);
         // Values: relu([-2, 3]) = [0, 3], exp([0, 3]) = [1, e^3]
         let t = NslTensor::from_ptr(r2);
         assert!((unsafe { *t.data_f64().add(0) } - 1.0).abs() < 1e-10);
@@ -5121,12 +5136,12 @@ mod tests {
 
     #[test]
     fn test_fbip_gpu_method_requires_device() {
-        // Manually construct a tensor-like struct to verify the GPU check logic
+        // Both predicates are permanently disabled — neither device may
+        // authorize refcount-based mutation.
         let ptr = make_f64_tensor(&[1.0]);
         let t = NslTensor::from_ptr(ptr);
-        // CPU tensor: can_mutate_inplace() should be true, can_mutate_inplace_gpu() false
-        assert!(t.can_mutate_inplace(), "CPU tensor with refcount=1 should pass CPU check");
-        assert!(!t.can_mutate_inplace_gpu(), "CPU tensor should fail GPU check");
+        assert!(!t.can_mutate_inplace(), "CPU refcount elision must stay disabled");
+        assert!(!t.can_mutate_inplace_gpu(), "GPU refcount elision must stay disabled");
         nsl_tensor_free(ptr);
     }
 
