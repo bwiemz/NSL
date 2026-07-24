@@ -502,16 +502,14 @@ impl Compiler<'_> {
                         }
                     }
                 }
-                // Fall back to use-count heuristic for non-linear bindings
-                if let Some(ref uc) = state.use_counts {
-                    if uc.is_single_use(sym) {
-                        let inplace = format!("nsl_tensor_{op_name}_inplace");
-                        // Verify the inplace variant is registered before using it
-                        if self.registry.functions.contains_key(&inplace) {
-                            return inplace;
-                        }
-                    }
-                }
+                // The use-count heuristic fallback that used to live here
+                // (`uc.is_single_use(sym)`) is removed: a textually single-use
+                // Ident is not proof of exclusive ownership — `sym` may be
+                // bound to a model field or another live alias whose owner
+                // is reachable elsewhere (see the identical-class fix in
+                // `expr/advanced.rs`'s `.clone()` handling and ad59b929).
+                // Only the ownership-lowering branch above, which proves the
+                // absence of borrows/sharing, may select the inplace variant.
             }
         }
         format!("nsl_tensor_{op_name}")
