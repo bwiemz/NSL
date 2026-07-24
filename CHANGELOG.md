@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — FBIP refcount-based in-place elision silently mutated live variables and MODEL WEIGHTS
+
+- `let s = abs(x)` left `x` overwritten with `|x|`; `print(sum(abs(m.wq)))`
+  rewrote the model weight in place — silently, exit 0. The runtime's
+  `can_mutate_inplace{,_gpu}` treated refcount==1 as "exclusively owned",
+  but ident/member reads hand out pointers WITHOUT retaining, so a live
+  `let` binding, a model field, or a dict entry is indistinguishable from
+  an owned temporary at the FFI boundary. Training was shielded only by
+  accident (tape recording gates the elision under tape-AD; the source-AD
+  forward raises the suppression scope) — inference and script-scope code
+  corrupted freely. Both predicates are now permanently disabled; sound
+  in-place mutation is unaffected (the codegen-proven `nsl_tensor_*_inplace`
+  variants and the binary relinquish-flag paths carry compile-time
+  ownership proof). Runtime unit tests now pin the input-preserving
+  contract.
+- **`@flash_attention` inference never worked from compiled NSL code** —
+  three stacked breaks, all fixed: the Cranelift call site passes tensor
+  BOX pointers which `nsl_flash_attention` forwarded raw as device
+  addresses (inputs now resolve through the CSHA data-pointer path with
+  CPU auto-promote; CPU-resident write targets hard-abort with an
+  actionable message); the launch passed 21 then 30 args against a v2
+  kernel that declares 36 parameters (a short kernel-params array is not
+  an error the driver reports — cuLaunchKernel SEGFAULTS); and a failed
+  launch printed "Refusing to continue silently" while continuing with a
+  zeros output (now a real abort, `NSL_FLASH_ALLOW_FAILED=1` escape).
+  Known remaining (documented, next slice): the v2 inference kernel
+  currently produces ~zero output values — the launch pipeline is fixed,
+  the kernel-internal numerical debug and the fused-vs-baseline dQ/dK/dV
+  certification gates are the follow-on work.
+
+
 ### Added — `--grad-integrity` now covers the CSLA (`--layerwise-accum`) windowed backward
 
 - The gradient-integrity gate previously reported `checks=0` under

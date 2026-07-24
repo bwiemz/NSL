@@ -129,6 +129,57 @@ fn flash_attention_hopper(
     0
 }
 
+/// Resolve a WRITE-target operand (attention out / logsumexp) of the
+/// classic `nsl_flash_attention` entry to a raw device pointer.
+///
+/// History: this entry forwarded its i64 args STRAIGHT into the kernel
+/// launch as device addresses. The nsl-codegen kernel harnesses pass raw
+/// device pointers (fine), but the Cranelift inference call site
+/// (`compile_flash_attention_call`) passes NslTensor BOX pointers — host
+/// memory — so every inference `@flash_attention` launch failed with
+/// CUDA_ERROR_INVALID_VALUE and the pre-zeroed output flowed on as
+/// "results" with exit 0 (the forward twin of the #324 silent-zero bug).
+/// Inputs are now routed through `csha_tensor_data_ptr` (raw-device
+/// passthrough + CPU auto-promote + `.data` extract, same as the CSHA
+/// entries). Write targets cannot auto-promote — the kernel would write
+/// a promoted COPY and the caller's box would keep zeros — so a
+/// CPU-resident out/lse box is a hard abort instead.
+#[cfg(feature = "cuda")]
+fn fa_write_target_data_ptr(entry: &str, name: &str, ptr: i64) -> u64 {
+    if ptr == 0 {
+        return 0;
+    }
+    // Raw device pointer (test harness path) — pass through unchanged.
+    unsafe {
+        use cudarc::driver::sys::{
+            cuPointerGetAttribute, CUpointer_attribute, CUmemorytype, CUresult,
+        };
+        let mut mem_type: u32 = 0;
+        let rc = cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            ptr as cudarc::driver::sys::CUdeviceptr,
+        );
+        if rc == CUresult::CUDA_SUCCESS
+            && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+        {
+            return ptr as u64;
+        }
+    }
+    let t = NslTensor::from_ptr(ptr);
+    if t.device == 0 {
+        eprintln!(
+            "[flash-attn] FATAL: {entry} write target '{name}' is a CPU-resident \
+             tensor — the fused attention kernels are GPU-only, and promoting a \
+             write target would strand the results in a hidden copy. Move the \
+             model and inputs to the GPU (`m.to(cuda)`, `x.to(cuda)`) or drop \
+             the @flash_attention claim to use the naive path."
+        );
+        std::process::abort();
+    }
+    t.data as u64
+}
+
 /// FlashAttention-2 kernel launch wrapper.
 ///
 /// All params are i64 for Cranelift ABI compatibility (same pattern as nsl_kernel_launch).
@@ -217,11 +268,16 @@ pub extern "C" fn nsl_flash_attention(
         let block_y = 1i64;
         let block_z = 1i64;
 
-        // Marshal all kernel arguments as u64 values
-        let mut q = q_ptr as u64;
-        let mut k = k_ptr as u64;
-        let mut v = v_ptr as u64;
-        let mut out = out_ptr as u64;
+        // Marshal all kernel arguments as u64 values. Inputs resolve via
+        // csha_tensor_data_ptr (raw-device passthrough for the kernel test
+        // harnesses; NslTensor boxes auto-promote CPU->GPU and pass .data —
+        // this call site previously forwarded BOX pointers straight into
+        // the launch, so the Cranelift inference path always failed and
+        // returned zeros). Write targets refuse CPU boxes outright.
+        let mut q = csha_tensor_data_ptr(q_ptr);
+        let mut k = csha_tensor_data_ptr(k_ptr);
+        let mut v = csha_tensor_data_ptr(v_ptr);
+        let mut out = fa_write_target_data_ptr("nsl_flash_attention", "out", out_ptr);
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -240,9 +296,40 @@ pub extern "C" fn nsl_flash_attention(
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
         // Backward pass: logsumexp auxiliary output
-        let mut lse = logsumexp_ptr as u64;
+        let mut lse =
+            fa_write_target_data_ptr("nsl_flash_attention", "logsumexp", logsumexp_ptr);
+        // CSHA extension slots: `emit_flash_attention_entry` ALWAYS declares
+        // the 9 CSHA params (comment there: "so cuLaunchKernel alignment
+        // stays stable across variants"), but this wrapper was never widened
+        // past 21 args — cuLaunchKernel with a short kernel-params array
+        // fails with CUDA_ERROR_INVALID_VALUE, so every launch through this
+        // entry failed and returned a zeros output. Null/zero here; the
+        // kernel body ignores them when compiled without CSHA.
+        let mut csha_x: u64 = 0;
+        let mut csha_norm_w: u64 = 0;
+        let mut csha_wq: u64 = 0;
+        let mut csha_wk: u64 = 0;
+        let mut csha_wv: u64 = 0;
+        let mut csha_wo: u64 = 0;
+        let mut csha_eps: f32 = 0.0;
+        let mut csha_active_heads: u32 = 0;
+        let mut csha_d_model: u32 = 0;
+        // Tier C save slots: the v2 forward prelude ALWAYS declares the six
+        // save params after the CSHA block (q/k/v_proj, row_max/row_sum,
+        // x_raw) — null here (inference, no saves; the kernel null-checks).
+        // Conditional params (segment_ids/doc_starts/sinks/skip_decisions)
+        // are only declared when the synthesizing config enables them; the
+        // inference config does not, so the list ends at 36. An arg list
+        // SHORTER than the declared params is not an error the driver
+        // reports — cuLaunchKernel SEGFAULTS reading past the array.
+        let mut save_q_proj: u64 = 0;
+        let mut save_k_proj: u64 = 0;
+        let mut save_v_proj: u64 = 0;
+        let mut save_row_max: u64 = 0;
+        let mut save_row_sum: u64 = 0;
+        let mut save_x_raw: u64 = 0;
 
-        let args: [*mut c_void; 21] = [
+        let args: [*mut c_void; 36] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -264,6 +351,21 @@ pub extern "C" fn nsl_flash_attention(
             &mut dfs_exit as *mut _ as *mut c_void,
             &mut num_tree_nodes as *mut _ as *mut c_void,
             &mut lse as *mut _ as *mut c_void,
+            &mut csha_x as *mut _ as *mut c_void,
+            &mut csha_norm_w as *mut _ as *mut c_void,
+            &mut csha_wq as *mut _ as *mut c_void,
+            &mut csha_wk as *mut _ as *mut c_void,
+            &mut csha_wv as *mut _ as *mut c_void,
+            &mut csha_wo as *mut _ as *mut c_void,
+            &mut csha_eps as *mut _ as *mut c_void,
+            &mut csha_active_heads as *mut _ as *mut c_void,
+            &mut csha_d_model as *mut _ as *mut c_void,
+            &mut save_q_proj as *mut _ as *mut c_void,
+            &mut save_k_proj as *mut _ as *mut c_void,
+            &mut save_v_proj as *mut _ as *mut c_void,
+            &mut save_row_max as *mut _ as *mut c_void,
+            &mut save_row_sum as *mut _ as *mut c_void,
+            &mut save_x_raw as *mut _ as *mut c_void,
         ];
 
         // ── Ampere / Hopper dispatch ──────────────────────────────────────────
@@ -320,6 +422,14 @@ pub extern "C" fn nsl_flash_attention(
                      invalid. Check the PTX with nsl_test_cuda_jit_log. \
                      Refusing to continue silently."
                 );
+                // The Cranelift call sites ignore this return code, so
+                // "refusing" must mean refusing: continuing here hands an
+                // all-zeros attention output to the rest of the program.
+                // NSL_FLASH_ALLOW_FAILED=1 restores continue-with-zeros for
+                // debugging.
+                if std::env::var("NSL_FLASH_ALLOW_FAILED").ok().as_deref() != Some("1") {
+                    std::process::abort();
+                }
             }
             rc
         };
@@ -4803,11 +4913,16 @@ pub extern "C" fn nsl_flash_attention_quantized(
         let block_y = 1i64;
         let block_z = 1i64;
 
-        // Marshal all kernel arguments as u64 values
-        let mut q = q_ptr as u64;
-        let mut k = k_ptr as u64;
-        let mut v = v_ptr as u64;
-        let mut out = out_ptr as u64;
+        // Marshal all kernel arguments as u64 values. Inputs resolve via
+        // csha_tensor_data_ptr (raw-device passthrough for the kernel test
+        // harnesses; NslTensor boxes auto-promote CPU->GPU and pass .data —
+        // this call site previously forwarded BOX pointers straight into
+        // the launch, so the Cranelift inference path always failed and
+        // returned zeros). Write targets refuse CPU boxes outright.
+        let mut q = csha_tensor_data_ptr(q_ptr);
+        let mut k = csha_tensor_data_ptr(k_ptr);
+        let mut v = csha_tensor_data_ptr(v_ptr);
+        let mut out = fa_write_target_data_ptr("nsl_flash_attention", "out", out_ptr);
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
