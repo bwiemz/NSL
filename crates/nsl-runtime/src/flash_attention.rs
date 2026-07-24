@@ -239,6 +239,94 @@ fn fa_widen_out_staging(
     conv_rc
 }
 
+/// Resolve an operand the fused BACKWARD kernel reads as **f16**
+/// (`dO` and `O` in the D = rowsum(dO . O) preprocess — `ld.global.b16`
+/// + `cvt.f32.f16` in phases/backward/ds_compute.rs) to a device
+/// pointer of actual f16 data.
+///
+/// The Cranelift training path hands NslTensor boxes holding **f32**
+/// data: the loss gradient dO is a plain f32 wengert tensor, and O is
+/// the forward's out tensor — genuinely f32 since the forward FFIs
+/// gained their f16 staging+widen (2026-07-24). Before that fix the
+/// forward left raw f16 bits in the "f32" out buffer, so the backward's
+/// f16 read of O was accidentally correct while every f32 consumer
+/// (the loss!) got garbage — the two consumers could never both be
+/// right until the dtype is normalised at this boundary.
+///
+/// Resolution:
+///   * raw device pointer (kernel-harness path) — passthrough, the
+///     harness already stages f16;
+///   * f16 NslTensor box — pass `.data`;
+///   * f32 NslTensor box — narrow into a transient f16 device buffer
+///     (`csha_bwd_convert_f32_to_f16`), record it in `staging` for the
+///     caller to free after the backward launch;
+///   * anything else — loud abort (a silently mis-typed operand here
+///     produces smoothly-wrong gradients, not an error).
+#[cfg(feature = "cuda")]
+fn csha_bwd_f16_read_ptr(
+    entry: &str,
+    name: &str,
+    ptr: i64,
+    elems: usize,
+    staging: &mut Vec<*mut c_void>,
+) -> u64 {
+    if ptr == 0 {
+        return 0;
+    }
+    // Raw device pointer (test harness path) — pass through unchanged.
+    unsafe {
+        use cudarc::driver::sys::{
+            cuPointerGetAttribute, CUmemorytype, CUpointer_attribute, CUresult,
+        };
+        let mut mem_type: u32 = 0;
+        let rc = cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            ptr as cudarc::driver::sys::CUdeviceptr,
+        );
+        if rc == CUresult::CUDA_SUCCESS
+            && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+        {
+            return ptr as u64;
+        }
+    }
+    let t = NslTensor::from_ptr(ptr);
+    match t.dtype {
+        crate::tensor::DTYPE_FP16 => csha_tensor_data_ptr(ptr),
+        crate::tensor::DTYPE_F32 => {
+            // Narrow f32 -> f16 into transient staging (freed by the
+            // caller after the backward launch). csha_tensor_data_ptr
+            // handles the CPU-box auto-promote for the read source.
+            let src = csha_tensor_data_ptr(ptr);
+            let dst = {
+                let _surface = crate::cuda::caching_allocator::SurfaceGuard::new(
+                    crate::cuda::caching_allocator::SurfaceTag::AttnWorkspace,
+                );
+                crate::cuda::inner::alloc_managed(elems * 2)
+            };
+            crate::cuda::inner::memset_d8(dst, elems * 2);
+            let rc = csha_bwd_convert_f32_to_f16(src as *mut c_void, dst, elems);
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                eprintln!(
+                    "[{entry}] f32->f16 narrow of '{name}' FAILED (rc {rc:?}) — \
+                     the fused backward will read zeros for this operand."
+                );
+            }
+            staging.push(dst);
+            dst as u64
+        }
+        other => {
+            eprintln!(
+                "[{entry}] FATAL: operand '{name}' has dtype {other}, but the \
+                 fused backward kernel reads it as f16 — a silent reinterpret \
+                 here produces smoothly-wrong gradients. Supported: f32 \
+                 (narrowed) or f16 (passthrough)."
+            );
+            std::process::abort();
+        }
+    }
+}
+
 /// FlashAttention-2 kernel launch wrapper.
 ///
 /// All params are i64 for Cranelift ABI compatibility (same pattern as nsl_kernel_launch).
@@ -3073,7 +3161,19 @@ fn csha_backward_impl(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = csha_tensor_data_ptr(out_ptr);
+        // dO and O are read by the kernel as f16 (D = rowsum(dO . O)
+        // preprocess) but arrive from the Cranelift training path as f32
+        // tensors — narrow into transient f16 staging (freed after the
+        // launch loop below). See `csha_bwd_f16_read_ptr`.
+        let mut bwd_f16_staging: Vec<*mut c_void> = Vec::new();
+        let f16_in_elems = (batch * heads * seq_len * head_dim) as usize;
+        let mut out = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "out",
+            out_ptr,
+            f16_in_elems,
+            &mut bwd_f16_staging,
+        );
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -3093,9 +3193,33 @@ fn csha_backward_impl(
         let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
         let mut x = csha_tensor_data_ptr(x_ptr);
         let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
-        let mut wq = csha_tensor_data_ptr(wq_ptr);
-        let mut wk = csha_tensor_data_ptr(wk_ptr);
-        let mut wv = csha_tensor_data_ptr(wv_ptr);
+        // Wq/Wk/Wv are read by the backward kernel as f16 ([d_model,
+        // kv_dim] f16 layout, `ld.global.b16` in the dRMSNorm dx_norm
+        // phase) but arrive from the Cranelift training path as the
+        // model's f32 weight tensors — narrow like dO/O above. gamma
+        // (norm_weight) and x_raw are f32-read by the kernel; no staging.
+        let w_elems = (d_model * heads * head_dim) as usize;
+        let mut wq = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "wq",
+            wq_ptr,
+            w_elems,
+            &mut bwd_f16_staging,
+        );
+        let mut wk = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "wk",
+            wk_ptr,
+            w_elems,
+            &mut bwd_f16_staging,
+        );
+        let mut wv = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "wv",
+            wv_ptr,
+            w_elems,
+            &mut bwd_f16_staging,
+        );
         let mut wo = csha_tensor_data_ptr(wo_ptr);
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
@@ -3111,7 +3235,13 @@ fn csha_backward_impl(
         // NslTensor handles — resolve to device pointers via csha_tensor_data_ptr.
         // PR #74 added dx_norm as the 8th extract so dgamma can be computed
         // from the post-RMSNorm gradient directly.
-        let mut d_o = csha_tensor_data_ptr(do_ptr);
+        let mut d_o = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "dO",
+            do_ptr,
+            f16_in_elems,
+            &mut bwd_f16_staging,
+        );
         let mut d_q = csha_tensor_data_ptr(dq_ptr);
         let mut d_k = csha_tensor_data_ptr(dk_ptr);
         let mut d_v = csha_tensor_data_ptr(dv_ptr);
@@ -3586,6 +3716,13 @@ fn csha_backward_impl(
                 qp, kpj, vpj, rmax, rsum, xraw,
                 d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn,
             );
+        }
+
+        // The transient f16 narrows of dO / O (csha_bwd_f16_read_ptr) are
+        // dead once the launch loop and the dump readback above are done.
+        // free_managed goes through the caching allocator (stream-safe).
+        for st in bwd_f16_staging {
+            crate::cuda::inner::free_managed(st);
         }
 
         rc as i64
