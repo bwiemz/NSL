@@ -1115,15 +1115,24 @@ impl Compiler<'_> {
                         }
                     }
                 }
-                // FBIP Phase 2: skip clone when source binding is single-use
-                // (the binding won't be referenced again, so cloning is unnecessary)
-                if let ExprKind::Ident(sym) = &object.kind {
-                    if let Some(ref uc) = state.use_counts {
-                        if uc.is_single_use(sym) && !state.flags.in_tape_region {
-                            return Ok(obj_val); // elide clone
-                        }
-                    }
-                }
+                // FBIP Phase 2 used to skip the clone here whenever the source
+                // binding was textually single-use (`uc.is_single_use(sym)`),
+                // on the theory that a binding referenced only once "won't be
+                // referenced again, so cloning is unnecessary". That heuristic
+                // is UNSOUND for the same reason ad59b929 (2026-07-23) disabled
+                // the analogous runtime refcount==1 check: a single textual
+                // reference to `sym` says nothing about whether the tensor
+                // `sym` is BOUND to is exclusively owned. `let x = m.w; let c =
+                // x.clone()` counts `x` as single-use and elided the clone,
+                // returning `m.w`'s own pointer as `c` — so `c[0, 0] = 99.0`
+                // silently corrupted the model weight `m.w` (reproduced live:
+                // `sum(m.w)` went from -4.0 to 96.0 after the "clone" was
+                // mutated). Ident reads of a field/alias hand out the pointer
+                // WITHOUT any additional retain, so the source is indistinguishable
+                // from an owned temporary to this analysis. Always emit the real
+                // clone; only the ownership-lowering (`--linear-types`) path above
+                // is sound here, because it actually proves no borrows/sharing
+                // exist rather than counting textual references.
                 self.compile_call_by_name(builder, "nsl_tensor_clone", &[obj_val])
             }
             "item" => self.compile_call_by_name(builder, "nsl_tensor_item", &[obj_val]),
