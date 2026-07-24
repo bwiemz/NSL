@@ -180,6 +180,65 @@ fn fa_write_target_data_ptr(entry: &str, name: &str, ptr: i64) -> u64 {
     t.data as u64
 }
 
+/// Allocate + zero the f16 output STAGING buffer for a FlashAttention
+/// forward launch.
+///
+/// EVERY FlashAttention forward kernel stores its output as **f16**
+/// (`cvt.rn.f16.f32` + `st.global.b16` — classic
+/// `emit_flash_attention_entry` in nsl-codegen/src/flash_attention.rs AND
+/// the v2 synthesizer's finalize phase), while the out tensor the
+/// Cranelift call sites allocate (`nsl_tensor_zeros_like(q)`) and the
+/// backward preprocess kernel (f32 element stride) are f32. Launching
+/// with the final f32 buffer as `out_ptr` is the Stage-C parity bug all
+/// over again: f16 bit pairs reinterpreted as f32 are ~0, so the
+/// attention output collapses to noise-scale values with exit 0 (probe:
+/// OUT_L1 identical 1.7329e-8 at seq 32 AND seq 64 — input-independent).
+/// `nsl_sdpa_fused_forward` has carried the stage-and-widen contract
+/// since Stage C; the `nsl_flash_attention*` entries never did.
+///
+/// The kernel must therefore write into this f16 staging buffer and the
+/// launcher widens on-device afterwards via `fa_widen_out_staging`.
+#[cfg(feature = "cuda")]
+fn fa_alloc_out_f16_staging(total_out: usize) -> *mut c_void {
+    // VRAM accounting: staging is attention workspace, not a real output.
+    let staging = {
+        let _surface = crate::cuda::caching_allocator::SurfaceGuard::new(
+            crate::cuda::caching_allocator::SurfaceTag::AttnWorkspace,
+        );
+        crate::cuda::inner::alloc_managed(total_out * 2)
+    };
+    crate::cuda::inner::memset_d8(staging, total_out * 2);
+    staging
+}
+
+/// Widen the f16 staging output into the caller's final f32 buffer and
+/// free the staging. Same stream as the forward launch, so in-stream
+/// ordering guarantees the conversion sees the completed forward — no
+/// intermediate sync needed (same contract as `nsl_sdpa_fused_forward`).
+/// `dest_f32 == 0` (null out target) skips the convert and just frees.
+/// Returns the conversion kernel's launch rc.
+#[cfg(feature = "cuda")]
+fn fa_widen_out_staging(
+    entry: &str,
+    out_f16: *mut c_void,
+    dest_f32: u64,
+    total_out: usize,
+) -> cudarc::driver::sys::CUresult {
+    let conv_rc = if dest_f32 == 0 {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    } else {
+        csha_fwd_convert_f16_to_f32(out_f16 as u64, dest_f32 as *mut c_void, total_out)
+    };
+    crate::cuda::inner::free_managed(out_f16);
+    if conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        eprintln!(
+            "[{entry}] f16->f32 output widen kernel FAILED (rc {conv_rc:?}) — \
+             the f32 attention output buffer is UNWRITTEN (zeros)."
+        );
+    }
+    conv_rc
+}
+
 /// FlashAttention-2 kernel launch wrapper.
 ///
 /// All params are i64 for Cranelift ABI compatibility (same pattern as nsl_kernel_launch).
@@ -277,7 +336,13 @@ pub extern "C" fn nsl_flash_attention(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = fa_write_target_data_ptr("nsl_flash_attention", "out", out_ptr);
+        // The forward kernel stores its output as f16 — launch into a
+        // staging buffer and widen into the caller's f32 tensor after the
+        // launch (see `fa_alloc_out_f16_staging` for the full story).
+        let out_final = fa_write_target_data_ptr("nsl_flash_attention", "out", out_ptr);
+        let total_out = (batch * heads * seq_len * head_dim) as usize;
+        let out_f16 = fa_alloc_out_f16_staging(total_out);
+        let mut out = out_f16 as u64;
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -392,7 +457,9 @@ pub extern "C" fn nsl_flash_attention(
         };
 
         let result: i64 = if fa3_ok {
-            // FA3 already launched and synced; treat as success.
+            // FA3 already launched and synced; treat as success. The FA2
+            // f16 staging buffer was never written — just release it.
+            crate::cuda::inner::free_managed(out_f16);
             0
         } else {
             if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
@@ -430,6 +497,25 @@ pub extern "C" fn nsl_flash_attention(
                 if std::env::var("NSL_FLASH_ALLOW_FAILED").ok().as_deref() != Some("1") {
                     std::process::abort();
                 }
+            }
+            // Widen the f16 staging output into the caller's f32 tensor
+            // (frees the staging in all cases). A failed widen leaves the
+            // output unwritten — same honest-abort policy as a failed
+            // forward launch.
+            if rc == 0 {
+                let conv_rc = fa_widen_out_staging(
+                    "nsl_flash_attention",
+                    out_f16,
+                    out_final,
+                    total_out,
+                );
+                if conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                    && std::env::var("NSL_FLASH_ALLOW_FAILED").ok().as_deref() != Some("1")
+                {
+                    std::process::abort();
+                }
+            } else {
+                crate::cuda::inner::free_managed(out_f16);
             }
             rc
         };
@@ -1748,7 +1834,16 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = csha_tensor_data_ptr(out_ptr);
+        // The forward kernel stores its output as f16 — launch into a
+        // staging buffer and widen into the caller's f32 tensor after the
+        // launch (see `fa_alloc_out_f16_staging`). Write targets resolve
+        // via `fa_write_target_data_ptr` (CPU boxes abort — auto-promotion
+        // would strand the kernel's writes in a hidden copy).
+        let out_final =
+            fa_write_target_data_ptr("nsl_flash_attention_csha", "out", out_ptr);
+        let total_out = (batch * heads * seq_len * head_dim) as usize;
+        let out_f16 = fa_alloc_out_f16_staging(total_out);
+        let mut out = out_f16 as u64;
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -1765,7 +1860,13 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
+        // lse is stored f32 by the kernel — no staging, but it is a write
+        // target (CPU boxes must abort, not promote).
+        let mut lse = fa_write_target_data_ptr(
+            "nsl_flash_attention_csha",
+            "logsumexp",
+            logsumexp_ptr,
+        );
 
         // 9 CSHA extras, matching the PTX param declarations in
         // `emit_flash_attention_entry`. eps is declared .f32; heads /
@@ -1879,6 +1980,24 @@ pub extern "C" fn nsl_flash_attention_csha(
             &args,
             shared_mem_bytes as u32,
         ) as i64;
+
+        // Widen the f16 staging output into the caller's f32 tensor
+        // (frees the staging in all cases; a failed widen surfaces as a
+        // nonzero rc instead of silently returning an unwritten output).
+        let result = if result == 0 {
+            match fa_widen_out_staging(
+                "nsl_flash_attention_csha",
+                out_f16,
+                out_final,
+                total_out,
+            ) {
+                cudarc::driver::sys::CUresult::CUDA_SUCCESS => 0,
+                conv_rc => conv_rc as i64,
+            }
+        } else {
+            crate::cuda::inner::free_managed(out_f16);
+            result
+        };
 
         // Tape recording mirrors `nsl_flash_attention` exactly — CSHA
         // is a forward-pass optimisation; the backward pass re-reads Q/K/V
@@ -2144,7 +2263,19 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = csha_tensor_data_ptr(out_ptr);
+        // The forward kernel stores its output as f16 — launch into a
+        // staging buffer and widen into the caller's f32 tensor after the
+        // final launch (launch B on the multi-tile path; see
+        // `fa_alloc_out_f16_staging`). Write targets resolve via
+        // `fa_write_target_data_ptr` (CPU boxes abort).
+        let out_final = fa_write_target_data_ptr(
+            "nsl_flash_attention_csha_with_saves",
+            "out",
+            out_ptr,
+        );
+        let total_out = (batch * heads * seq_len * head_dim) as usize;
+        let out_f16 = fa_alloc_out_f16_staging(total_out);
+        let mut out = out_f16 as u64;
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -2161,7 +2292,13 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
+        // lse is stored f32 by the kernel — no staging, but it is a write
+        // target (CPU boxes must abort, not promote).
+        let mut lse = fa_write_target_data_ptr(
+            "nsl_flash_attention_csha_with_saves",
+            "logsumexp",
+            logsumexp_ptr,
+        );
         let mut x = csha_tensor_data_ptr(x_ptr);
         let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
         let mut wq = csha_tensor_data_ptr(wq_ptr);
@@ -2383,6 +2520,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                             crate::cuda::inner::free_device(st);
                         }
                     }
+                    crate::cuda::inner::free_managed(out_f16);
                     return -1;
                 }
             }
@@ -2425,6 +2563,20 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             if !st.is_null() {
                 crate::cuda::inner::free_device(st);
             }
+        }
+
+        // Widen the f16 staging output into the caller's f32 tensor
+        // (frees the staging in all cases; a failed widen surfaces as a
+        // nonzero rc instead of silently returning an unwritten output).
+        if fwd_rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            fwd_rc = fa_widen_out_staging(
+                "nsl_flash_attention_csha_with_saves",
+                out_f16,
+                out_final,
+                total_out,
+            );
+        } else {
+            crate::cuda::inner::free_managed(out_f16);
         }
 
         // Immediately after the forward kernel, sync + read back q_proj and
