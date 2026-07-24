@@ -36,6 +36,16 @@
 //!     step with `nsl_grad_integrity_step_begin(n)`, calls
 //!     `nsl_grad_integrity_note(grad_ptr, idx)` per parameter from the FASE
 //!     hook, and closes it with `nsl_grad_integrity_step_end()`.
+//!
+//! Bracket granularity differs by path: the FASE-interleaved backward
+//! brackets each MICRO-batch (checks counts micros), the CSLA
+//! `--layerwise-accum` windowed replay brackets each accumulation WINDOW
+//! (checks counts optimizer steps; each param is noted once per micro-batch
+//! and repeat notes MERGE — finite ANDs, nonzero ORs — so the report attests
+//! the whole window's partials, not just the first). Under CSLA on GPU each
+//! note pays a device sync + D2H copy per (param, micro-batch) — an
+//! acceptable observe-only diagnostic cost, but expect it to serialize
+//! streams and taint (self-healing) cuda-graph capture regions.
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex, Once};
@@ -49,10 +59,14 @@ struct StepAcc {
     expected: usize,
     /// One flag per parameter index: did it receive a non-null gradient?
     present: Vec<bool>,
-    /// Of the present gradients, how many are finite (no NaN/Inf).
-    finite: usize,
-    /// Of the present gradients, how many have a nonzero element.
-    nonzero: usize,
+    /// Per-index classification, valid where `present`. Repeat notes for the
+    /// same index MERGE (`fin &= finite`, `nz |= nonzero`): under the CSLA
+    /// window-scoped bracket a parameter is noted once per micro-batch, and
+    /// a NaN/Inf in ANY partial poisons the accumulated gradient, while a
+    /// nonzero in ANY partial makes the window sum (approximately) nonzero.
+    /// First-wins here would attest only micro-batch 0's partial.
+    fin: Vec<bool>,
+    nz: Vec<bool>,
 }
 
 #[derive(Default)]
@@ -140,11 +154,23 @@ fn classify_grad(grad_ptr: i64) -> (bool, bool) {
 /// Roll a finished step's accumulator into the global worst-case aggregate.
 fn finalize(agg: &mut Aggregate, step: StepAcc) {
     let gradient = step.present.iter().filter(|p| **p).count();
+    let finite = step
+        .present
+        .iter()
+        .zip(step.fin.iter())
+        .filter(|(p, f)| **p && **f)
+        .count();
+    let nonzero = step
+        .present
+        .iter()
+        .zip(step.nz.iter())
+        .filter(|(p, z)| **p && **z)
+        .count();
     agg.checks += 1;
     agg.expected = agg.expected.max(step.expected);
     agg.min_gradient = Some(agg.min_gradient.map_or(gradient, |m| m.min(gradient)));
-    agg.min_finite = Some(agg.min_finite.map_or(step.finite, |m| m.min(step.finite)));
-    agg.min_nonzero = Some(agg.min_nonzero.map_or(step.nonzero, |m| m.min(step.nonzero)));
+    agg.min_finite = Some(agg.min_finite.map_or(finite, |m| m.min(finite)));
+    agg.min_nonzero = Some(agg.min_nonzero.map_or(nonzero, |m| m.min(nonzero)));
     for (i, present) in step.present.iter().enumerate() {
         if !present {
             agg.missing_union.insert(i);
@@ -164,8 +190,8 @@ pub extern "C" fn nsl_grad_integrity_check(grads_list: i64, num_params: i64) {
     let mut step = StepAcc {
         expected: n,
         present: vec![false; n],
-        finite: 0,
-        nonzero: 0,
+        fin: vec![false; n],
+        nz: vec![false; n],
     };
     for i in 0..n.min(grads.len as usize) {
         let grad_ptr = unsafe { *grads.data.add(i) };
@@ -174,12 +200,8 @@ pub extern "C" fn nsl_grad_integrity_check(grads_list: i64, num_params: i64) {
         }
         step.present[i] = true;
         let (finite, nonzero) = classify_grad(grad_ptr);
-        if finite {
-            step.finite += 1;
-        }
-        if nonzero {
-            step.nonzero += 1;
-        }
+        step.fin[i] = finite;
+        step.nz[i] = nonzero;
     }
     let mut state = STATE.lock().unwrap();
     finalize(&mut state.agg, step);
@@ -196,8 +218,8 @@ pub extern "C" fn nsl_grad_integrity_step_begin(num_params: i64) {
     state.cur = Some(StepAcc {
         expected: n,
         present: vec![false; n],
-        finite: 0,
-        nonzero: 0,
+        fin: vec![false; n],
+        nz: vec![false; n],
     });
 }
 
@@ -217,13 +239,17 @@ pub extern "C" fn nsl_grad_integrity_note(grad_ptr: i64, param_idx: i64) {
     if idx >= cur.present.len() {
         return;
     }
-    if grad_ptr != 0 && !cur.present[idx] {
-        cur.present[idx] = true;
-        if finite {
-            cur.finite += 1;
-        }
-        if nonzero {
-            cur.nonzero += 1;
+    if grad_ptr != 0 {
+        if !cur.present[idx] {
+            cur.present[idx] = true;
+            cur.fin[idx] = finite;
+            cur.nz[idx] = nonzero;
+        } else {
+            // Repeat note (CSLA window bracket: one per micro-batch): a
+            // NaN/Inf in ANY partial poisons the accumulated gradient; a
+            // nonzero in ANY partial makes the window sum nonzero.
+            cur.fin[idx] &= finite;
+            cur.nz[idx] |= nonzero;
         }
     }
 }
@@ -304,7 +330,12 @@ mod tests {
             let mut s = STATE.lock().unwrap();
             finalize(
                 &mut s.agg,
-                StepAcc { expected: 3, present: vec![true, true, true], finite: 3, nonzero: 2 },
+                StepAcc {
+                    expected: 3,
+                    present: vec![true, true, true],
+                    fin: vec![true, true, true],
+                    nz: vec![true, true, false],
+                },
             );
         }
         // Step 2: param 1 missing, finite 2, nonzero 2.
@@ -312,7 +343,12 @@ mod tests {
             let mut s = STATE.lock().unwrap();
             finalize(
                 &mut s.agg,
-                StepAcc { expected: 3, present: vec![true, false, true], finite: 2, nonzero: 2 },
+                StepAcc {
+                    expected: 3,
+                    present: vec![true, false, true],
+                    fin: vec![true, false, true],
+                    nz: vec![true, false, true],
+                },
             );
         }
         let (checks, expected, gradient, finite, nonzero, missing) = grad_integrity_snapshot();

@@ -5395,19 +5395,11 @@ impl Compiler<'_> {
         // var. The per-step check/note calls below feed the accumulator.
         if self.compile_options.grad_integrity {
             self.compile_call_by_name(builder, "nsl_grad_integrity_arm", &[])?;
-            // v1 does not wire the gate into the CSLA (--layerwise-accum)
-            // windowed-replay backward, so it would report checks=0 there —
-            // silently. Warn loudly rather than let a gate pass vacuously
-            // (deferral-must-refuse). The FullBuffer and FASE-interleaved paths
-            // are covered.
-            if self.compile_options.layerwise_accum {
-                eprintln!(
-                    "[grad-integrity] WARNING: --grad-integrity is not wired into the \
-                     --layerwise-accum (CSLA) windowed backward yet — the report will \
-                     show checks=0. Drop --layerwise-accum to check gradients, or treat \
-                     checks=0 as 'not measured', not 'no problems'."
-                );
-            }
+            // All three backward paths feed the accumulator now: FullBuffer
+            // (whole-list scan), FASE-interleaved (per-micro brackets), and
+            // the CSLA windowed replay (window-scoped bracket — begin before
+            // the range loop, note in the replay hook, end after the
+            // epilogue update).
         }
 
         // CPDT precision-adaptive optimizer execution (v1): build per-param
@@ -11013,6 +11005,21 @@ impl Compiler<'_> {
             // grads may come from any range).
             emit_csla_accum_alloc(self, builder, param_list, accum_val, global_group)?;
 
+            // P0.3: open a WINDOW-scoped grad-integrity step. The CSLA
+            // schedule delivers each parameter's gradient somewhere in the
+            // range loop below (layer-local params in their range, epilogue/
+            // cross-layer params from any range), all before the epilogue
+            // update closes the bracket — so one begin/end pair per window
+            // gives exactly "every optimizer step, every trainable param got
+            // a usable gradient", the property the gate documents.
+            if self.compile_options.grad_integrity {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_grad_integrity_step_begin",
+                    &[num_params_val],
+                )?;
+            }
+
             // Cross-range adjoint carry: one inner list per micro-batch,
             // slot-indexed, created by the first range's replay loop.
             let carry_outer = if n_carry > 0 {
@@ -11398,6 +11405,21 @@ impl Compiler<'_> {
                         b.ins().iconst(cranelift_codegen::ir::types::I64, accum_idx);
                     let m_partial =
                         c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
+                    // P0.3: note this parameter's gradient BEFORE accumulate
+                    // consumes it — same convention as the baseline fase_cb.
+                    // The bracket is WINDOW-scoped (step_begin before the
+                    // range loop, step_end after the epilogue update), so
+                    // note() fires once per (param, micro-batch) — each
+                    // param's adjoint lands in exactly one range — and the
+                    // accumulator merges repeat notes per index (finite ANDs,
+                    // nonzero ORs), so the report attests every partial.
+                    if c.compile_options.grad_integrity {
+                        c.compile_call_by_name(
+                            b,
+                            "nsl_grad_integrity_note",
+                            &[grad_ptr, idx_val],
+                        )?;
+                    }
                     c.fase_emit_accumulate(b, m_partial, grad_ptr, accum_scale, false)?;
                     // Defer the free when this param grad is a shared
                     // intermediate a later in-slice op still reads (bias-grad
@@ -11702,6 +11724,12 @@ impl Compiler<'_> {
                 Some(opt_step),
                 global_group,
             )?;
+            // P0.3: close the window-scoped grad-integrity step — every
+            // range's hook (and the epilogue params' notes from whichever
+            // range produced them) has fired by here.
+            if self.compile_options.grad_integrity {
+                self.compile_call_by_name(builder, "nsl_grad_integrity_step_end", &[])?;
+            }
             // D2b part 2: NO post-epilogue restore. The next iterations'
             // forwards re-upload each layer right before its own segment
             // (and evict it after its last primal touch), so streamed

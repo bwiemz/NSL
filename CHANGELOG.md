@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — `--grad-integrity` now covers the CSLA (`--layerwise-accum`) windowed backward
+
+- The gradient-integrity gate previously reported `checks=0` under
+  `--layerwise-accum` (with a loud not-wired warning): the CSLA windowed
+  replay consumed parameter gradients through its own hook, which never
+  fed the accumulator. The replay hook now notes each parameter's
+  gradient before accumulating it, bracketed once per accumulation
+  window (`step_begin` before the range loop, `step_end` after the
+  epilogue update) — so `checks` counts optimizer steps and the report
+  proves every trainable parameter received a finite, nonzero gradient
+  on EVERY window. Repeat notes for the same parameter (one per
+  micro-batch under the window bracket) MERGE — finite ANDs, nonzero
+  ORs — so a NaN in any micro-batch's partial gradient is caught, not
+  just micro-batch 0's (review finding; the accumulator previously kept
+  only the first classification). Trailing partial windows don't check,
+  exactly as they don't step. Observe-only: the CSLA loss stream AND
+  saved model bytes are bit-identical with the flag on. Gate:
+  `csla_grad_integrity_layerwise_cpu` (window-count pin, full-coverage
+  pin, anti-vacuity via the window-phase counter, stale-warning absence,
+  observe-only loss + model-bytes comparison).
+
 ### Fixed — inference-loop tensor leak: the loop-let free machinery never fired
 
 - **The ELTLS loop-let predeclare zero-def was emitted INSIDE the loop

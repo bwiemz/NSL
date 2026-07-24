@@ -1292,3 +1292,134 @@ fn csla_refusals() {
         "expected the source-ad refusal, got:\n{stderr}"
     );
 }
+
+/// Parse the `[grad-integrity]` atexit block:
+/// `(checks, expected, gradient, finite, nonzero, missing_is_empty)`.
+fn grad_integrity_report(stderr: &str) -> Option<(i64, i64, i64, i64, i64, bool)> {
+    // Scope the parse to the lines following the [grad-integrity] header so
+    // a future subsystem printing a colliding key can't satisfy a field.
+    let block: Vec<&str> = stderr
+        .lines()
+        .skip_while(|l| l.trim() != "[grad-integrity]")
+        .skip(1)
+        .take(6)
+        .collect();
+    let field = |key: &str| -> Option<i64> {
+        block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix(key))
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    };
+    let missing_empty = block
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("missing=["))
+        .map(|rest| rest.trim_end_matches(']').trim().is_empty())?;
+    Some((
+        field("checks=")?,
+        field("expected_params=")?,
+        field("gradient_params=")?,
+        field("finite=")?,
+        field("nonzero=")?,
+        missing_empty,
+    ))
+}
+
+/// P0.3 wiring gate: `--grad-integrity` must feed from the CSLA windowed
+/// replay. Before the wiring it reported checks=0 there (with a loud
+/// warning); a gate reading that report would have passed vacuously.
+///
+///   - checks == the complete-window count (6): the bracket is
+///     window-scoped — one integrity step per optimizer step — and the
+///     trailing partial window must NOT check, exactly as it must not step;
+///   - full coverage on the WORST step: every trainable param (6 layer-
+///     grouped + 2 epilogue) present, finite, nonzero; missing=[];
+///   - anti-vacuity: the CSLA window backward itself fired 6 times, so the
+///     report cannot have come from the baseline path (and the old warning
+///     text must be gone);
+///   - observe-only: the loss stream is bit-identical to the un-flagged
+///     layerwise arm (probed for env determinism first, gate discipline).
+#[test]
+fn csla_grad_integrity_layerwise_cpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_gi_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let save_a = tmp.join("gi_plain_a.nslm");
+    let save_b = tmp.join("gi_plain_b.nslm");
+    let save_f = tmp.join("gi_flagged.nslm");
+
+    // Env-determinism probe: two identical un-flagged layerwise runs.
+    let plain_a = run_program(
+        &program("csla_layerwise_ffn.nsl", false, &save_a, &[]),
+        "gi_plain_a",
+        false,
+        false,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(plain_a.success, "plain layerwise run A failed:\n{}", plain_a.stderr);
+    let plain_b = run_program(
+        &program("csla_layerwise_ffn.nsl", false, &save_b, &[]),
+        "gi_plain_b",
+        false,
+        false,
+        &["--checkpoint-blocks", "--layerwise-accum"],
+    );
+    assert!(plain_b.success, "plain layerwise run B failed:\n{}", plain_b.stderr);
+    let env_deterministic = plain_a.loss_stream == plain_b.loss_stream;
+
+    // Flagged arm.
+    let flagged = run_program(
+        &program("csla_layerwise_ffn.nsl", false, &save_f, &[]),
+        "gi_flagged",
+        false,
+        false,
+        &["--checkpoint-blocks", "--layerwise-accum", "--grad-integrity"],
+    );
+    assert!(flagged.success, "--grad-integrity layerwise run failed:\n{}", flagged.stderr);
+
+    // Anti-vacuity: the windowed replay actually ran, and the pre-wiring
+    // "not wired" warning is gone.
+    assert_eq!(
+        window_phase_count(&flagged.stderr),
+        Some(6),
+        "csla window backward did not fire 6 times:\n{}",
+        flagged.stderr
+    );
+    assert!(
+        !flagged.stderr.contains("is not wired into"),
+        "stale not-wired warning still printed:\n{}",
+        flagged.stderr
+    );
+
+    let (checks, expected, gradient, finite, nonzero, missing_empty) =
+        grad_integrity_report(&flagged.stderr)
+            .unwrap_or_else(|| panic!("no [grad-integrity] report in:\n{}", flagged.stderr));
+    assert_eq!(
+        checks, 6,
+        "grad-integrity checks != window count (window-scoped bracket):\n{}",
+        flagged.stderr
+    );
+    assert_eq!(expected, 8, "ffn fixture has 6 layer-grouped + 2 epilogue params");
+    assert_eq!(gradient, expected, "some param received no gradient on some window");
+    assert_eq!(finite, expected, "some param gradient had NaN/Inf on some window");
+    assert_eq!(nonzero, expected, "some param gradient was all-zero on some window");
+    assert!(missing_empty, "missing list not empty:\n{}", flagged.stderr);
+
+    // Observe-only: the diagnostic must not perturb training. Byte-compare
+    // the saved models too — a perturbation in the FINAL window's update is
+    // invisible to the printed losses.
+    if env_deterministic {
+        assert_eq!(
+            plain_a.loss_stream, flagged.loss_stream,
+            "--grad-integrity changed the CSLA loss stream (must observe only)"
+        );
+        let bytes_plain = std::fs::read(&save_a).expect("plain model_save missing");
+        let bytes_flagged = std::fs::read(&save_f).expect("flagged model_save missing");
+        assert!(
+            bytes_plain == bytes_flagged,
+            "--grad-integrity changed the saved model bytes (must observe only)"
+        );
+    } else {
+        let first_p = plain_a.loss_stream.lines().next().unwrap_or("");
+        let first_f = flagged.loss_stream.lines().next().unwrap_or("");
+        assert_eq!(first_p, first_f, "first loss must match even in nondeterministic envs");
+    }
+}
