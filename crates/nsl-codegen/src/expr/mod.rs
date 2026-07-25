@@ -375,6 +375,24 @@ impl Compiler<'_> {
                             | "log_softmax"
                             | "mean"
                             | "sum"
+                            // The attention family always finishes on a fresh
+                            // `nsl_tensor_matmul(attn_weights, v)` (or the fused
+                            // flash kernel's fresh output), so the result is an
+                            // owning ref. Their absence here made
+                            // `return scaled_dot_product_attention(...)` take
+                            // the Unknown-ownership arm in stmt.rs's Return
+                            // handler, which RETAINS — double-owning the result
+                            // so the caller's single free left one reference
+                            // behind. That stranded one attention output per
+                            // call (caught by fn_lifetime_leak_gate).
+                            //
+                            // NOTE: this allowlist is hand-maintained and drifts
+                            // silently — a missing fresh-result builtin costs a
+                            // leak, never a crash, so nothing fails loudly. New
+                            // fresh-result builtins belong here.
+                            | "scaled_dot_product_attention"
+                            | "scaled_dot_product_attention_masked"
+                            | "scaled_dot_product_attention_packed"
                     );
                 }
                 // Method-form calls. `y.sum()` parses as Call with a

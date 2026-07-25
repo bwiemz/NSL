@@ -1481,12 +1481,18 @@ impl Compiler<'_> {
             let scaled =
                 self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val, matmul_flags0])?;
 
+            // `causal_mask_val` is hoisted out of the branch so the transient
+            // release below can see it: the freshly built [S,S] causal mask is
+            // itself a chain intermediate, and leaving it out stranded exactly
+            // one mask per call (caught by fn_lifetime_leak_gate).
+            let mut causal_mask_val: Option<Value> = None;
             let masked = if causal {
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
                 let seq_len =
                     self.compile_call_by_name(builder, "nsl_tensor_shape_dim", &[q_val, dim_neg2])?;
                 let mask =
                     self.compile_call_by_name(builder, "nsl_tensor_causal_mask", &[seq_len])?;
+                causal_mask_val = Some(mask);
                 {
                     // ELTLS (FBIP-3): nsl_tensor_add takes flags=0 here.
                     let flags_zero = builder.ins().iconst(cl_types::I8, 0);
@@ -1501,7 +1507,38 @@ impl Compiler<'_> {
                 self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
             // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
             let final_matmul_flags0 = builder.ins().iconst(cl_types::I8, 0);
-            return self.compile_traced_call(builder, "nsl_tensor_matmul", &[attn_weights, v_val, final_matmul_flags0]);
+            let attn_out = self.compile_traced_call(
+                builder,
+                "nsl_tensor_matmul",
+                &[attn_weights, v_val, final_matmul_flags0],
+            )?;
+
+            // Release the chain's transients. None of these is reachable from
+            // `attn_out`, and none is ever named in NSL source — but nothing
+            // downstream knew that, so every one of them stranded. At
+            // Coder-50M `[2,1024]` that was one 64 MB `scores`, one 64 MB
+            // `scaled` and one 64 MB `attn_weights` PER LAYER PER FORWARD.
+            //
+            // `nsl_tensor_free_transient` is a no-op while the tape is
+            // recording (TapeOp holds bare pointers), so training lifetimes
+            // are untouched; see its doc comment for the full argument.
+            //
+            // `masked` aliases `scaled` in the non-causal case — the emitted
+            // frees are refcount decrements on the same Cranelift Value, so
+            // the dedup below keeps the count honest.
+            let mut transients = vec![k_t, scores, scaled, attn_weights];
+            if masked != scaled {
+                transients.push(masked);
+            }
+            if let Some(mask) = causal_mask_val {
+                transients.push(mask);
+            }
+            transients.sort();
+            transients.dedup();
+            for t in transients {
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_free_transient", &[t])?;
+            }
+            return Ok(attn_out);
         }
 
         // sum/mean with dim args -- overload: sum(tensor) or sum(tensor, dim, keepdim)

@@ -657,6 +657,82 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Loop twin of `materialize_non_owning_aliases_before_if`.
+    ///
+    /// `state.non_owning_symbols` is flow-INSENSITIVE, but a loop body is
+    /// generated exactly once. So the compile-time state seen at the body's
+    /// single `eltls_clear_old_slot` site is the FIRST-iteration state. A
+    /// local seeded from a borrow — `let h = x` where `x` is a parameter or a
+    /// model field — is non-owning at that moment, the rebind free is skipped,
+    /// and because the site is only emitted once it is skipped for EVERY
+    /// iteration. `h = block.forward(h)` then strands one owned activation per
+    /// iteration, forever. The same veto at `emit_return_local_sweep` strands
+    /// the last one too.
+    ///
+    /// Measured on `main` before this fix (Coder-50M, `[2,1024]`, RTX 5070 Ti):
+    /// **+1.81 GB retained per forward**, ~40 transient segments per forward,
+    /// OOM by the 8th call — and `@no_grad` did not change a single byte,
+    /// because the leak is ownership bookkeeping, not tape retention.
+    ///
+    /// Fix: before entering the loop, give each such alias its own reference
+    /// (`nsl_tensor_retain`, O(1) — a refcount bump, NOT a data copy) and drop
+    /// it from `non_owning_symbols`. From the loop's point of view the symbol
+    /// is now an ordinary owned local: the first rebind's `free_if_valid`
+    /// releases the reference we just took — the lender's own reference keeps
+    /// the storage alive — and every later rebind frees that iteration's
+    /// value. If the loop body never runs, the return sweep releases it.
+    ///
+    /// Conservative guard: only materialize when EVERY binding of the symbol
+    /// inside the body is owning (`sym_bindings_all_owning_in_block`, the same
+    /// predicate that arms the loop-let predeclare). A body that sometimes
+    /// rebinds the slot to another borrow cannot be handled by a single
+    /// statically-placed free, so those are left alone — leaking, but sound.
+    fn materialize_non_owning_aliases_before_loop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        body: &nsl_ast::stmt::Block,
+    ) -> Result<(), CodegenError> {
+        let mut assigned_symbols = std::collections::HashSet::new();
+        self.collect_assignment_targets_from_block(body, &mut assigned_symbols);
+
+        let materialize: Vec<_> = assigned_symbols
+            .into_iter()
+            // Only aliases the veto currently disarms.
+            .filter(|sym| state.non_owning_symbols.contains(sym))
+            // Never a parameter: the caller owns it, `eltls_clear_old_slot`
+            // and the return sweep both skip params, so a retain here would
+            // never be released.
+            .filter(|sym| !state.param_symbols.contains(sym))
+            // DataLoader handles are freed by loader teardown, not by us.
+            .filter(|sym| !state.borrowed_batch_symbols.contains(sym))
+            .filter(|sym| !state.dataloader_symbols.contains(sym))
+            // Every in-body binding must be owning (see doc comment).
+            .filter(|sym| self.sym_bindings_all_owning_in_block(body, *sym))
+            .filter_map(|sym| {
+                let is_tensor = state
+                    .variable_types
+                    .get(&sym)
+                    .map(|ty| ty.is_tensor())
+                    .unwrap_or(false);
+                if !is_tensor {
+                    return None;
+                }
+                state.variables.get(&sym).and_then(|(var, cl_type)| {
+                    (*cl_type == cl_types::I64).then_some((sym, *var))
+                })
+            })
+            .collect();
+
+        for (sym, var) in materialize {
+            let current_val = builder.use_var(var);
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_retain", &[current_val])?;
+            state.non_owning_symbols.remove(&sym);
+        }
+
+        Ok(())
+    }
+
     fn update_non_owning_binding(
         &self,
         state: &mut FuncState,
@@ -1346,11 +1422,35 @@ impl Compiler<'_> {
                     // M38b: Free linear tensors consumed during the return expression
                     self.free_linear_consumes(builder, state, Some(val));
                     // Free non-parameter tensor locals (see emit_return_local_sweep).
-                    // Only for tensor-typed returns whose aliasing the retain
-                    // above compensates; aggregate returns (lists/dicts) may
-                    // alias locals without a retain and keep today's behavior.
-                    if val_is_ptr
-                        && ret_ty.is_tensor()
+                    //
+                    // Tensor returns: safe because the retain above compensates
+                    // for the returned value aliasing a swept local.
+                    //
+                    // SCALAR returns: also safe, and previously missed. A
+                    // `-> f64` / `-> int` / `-> bool` result is a value, not a
+                    // handle — it cannot alias a tensor local, so no retain is
+                    // needed to protect it. Skipping the sweep here stranded one
+                    // tensor per call for the extremely common
+                    // `fn loss(...) -> f64: let d = a - b; return sum(d*d).item()`
+                    // shape (measured: live_blocks 5 -> 11 over 3 -> 9 calls,
+                    // while the identical `-> void` twin stayed flat at 2).
+                    //
+                    // Aggregate returns (list/dict/tuple/str/model) stay
+                    // excluded: they can alias a local without a retain.
+                    let ret_is_scalar = matches!(
+                        ret_ty,
+                        Type::Int
+                            | Type::Float
+                            | Type::Bool
+                            | Type::F32
+                            | Type::F64
+                            | Type::Int8
+                            | Type::Int16
+                            | Type::Int32
+                            | Type::Int64
+                            | Type::Uint8
+                    );
+                    if (ret_is_scalar || (val_is_ptr && ret_ty.is_tensor()))
                         && !state.flags.in_dtype_method
                         && !state.flags.in_tape_region
                     {
@@ -2860,6 +2960,11 @@ impl Compiler<'_> {
         // pre-loop block: a def inside the body re-zeroes the slot every
         // iteration, so the rebind free only ever sees 0 and the previous
         // iteration's tensor strands.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -2940,6 +3045,11 @@ impl Compiler<'_> {
         // ELTLS Task 16.1: pre-declare top-level let-ident symbols from
         // the body so rebinds across iterations free the previous value.
         // Pre-loop block on purpose — see compile_while.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3096,6 +3206,11 @@ impl Compiler<'_> {
         // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
         // body so the second-and-later rebinds fire eltls_clear_old_slot.
         // Pre-loop block on purpose — see compile_while.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3283,6 +3398,11 @@ impl Compiler<'_> {
 
         // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
         // Pre-loop block on purpose — see compile_while.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3449,6 +3569,11 @@ impl Compiler<'_> {
         // previous iteration's tensor. The zero-def MUST live in the
         // pre-loop block — inside the body it re-zeroes the slot every
         // iteration and the free only ever sees 0.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);

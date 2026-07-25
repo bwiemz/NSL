@@ -11,8 +11,8 @@ Every acronym, keyword, and decorator you will see in NSL code, specs, or PRs. O
 ### <a id="awq"></a>AWQ — Activation-aware Weight Quantization
 Build-time per-channel weight quantization that scales by observed activation magnitudes; produces INT4/INT8 weights with minimal perplexity loss. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md); implementation in `crates/nsl-codegen/src/calibration/`.
 
-### <a id="ccr"></a>CCR — Common-kernel Combination Rewriting
-Planned future pass — no implementation yet. See [`CCR.pdf`](../research/CCR.pdf) for the research concept.
+### <a id="ccr"></a>CCR — Compiler-Chosen Recomputation
+Block-granular activation checkpointing on the source-AD path: a transformer block's interior activations are freed after the forward and bit-exactly recomputed just before that block's backward. Implemented in [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs); driven by `--checkpoint-blocks`. See [`CCR.pdf`](../research/CCR.pdf) for the research background and [Optimization-Passes](Optimization-Passes.md#ccr--compiler-chosen-recomputation) for the pass description.
 
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
 Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.

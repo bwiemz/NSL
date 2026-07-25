@@ -203,7 +203,9 @@ docs/              Design documents, plans, and summaries
 
 ## Benchmarks
 
-All benchmarks run on CPU (AMD 9800X3D, 64GB RAM). GPU benchmarks require `--features cuda`.
+The tables **on this page** are CPU measurements (AMD 9800X3D, 64GB RAM). Building with `--features cuda` is required for any GPU path.
+
+Measured **GPU** results live under [`models/benchmarks/`](models/benchmarks/) (RTX 5070 Ti, 16 GiB, sm120) — including [`CERTIFICATION_POST403.md`](models/benchmarks/CERTIFICATION_POST403.md) (50M / 500M / 1B certification curves), [`PIPELINE_BENCH_POST405.md`](models/benchmarks/PIPELINE_BENCH_POST405.md) (overlap-stack cost at 1B), [`MEMORY_REDUCTION_RESULTS.md`](models/benchmarks/MEMORY_REDUCTION_RESULTS.md), [`MUON_VS_ADAMW.md`](models/benchmarks/MUON_VS_ADAMW.md), and the WGGO scaling matrices.
 
 ### Operator Fusion (M31)
 

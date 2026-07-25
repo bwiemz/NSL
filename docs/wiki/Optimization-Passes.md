@@ -78,9 +78,23 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 
 ## Per-pass descriptions
 
-### CCR — Common-kernel Combination Rewriting
+### CCR — Compiler-Chosen Recomputation
 
-**No implementation file exists.** CCR is a research concept defined in [`docs/research/CCR.pdf`](../../docs/research/CCR.pdf). The Compiler-Pipeline page mentions it alongside the other passes for historical context; it is not a current implementation step. Do not link to a source file that does not exist.
+Source: [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs). Research background: [`docs/research/CCR.pdf`](../../docs/research/CCR.pdf).
+
+Block-granular activation checkpointing on the decorator-free source-AD path. The source-AD lowerer retains every primal intermediate until end-of-backward, so the activation wall is O(layers × per-layer intermediates); CCR converts it to O(layers × boundary tensors + one block's interiors). The pass:
+
+1. **Segments** the flat inlined primal tape into per-transformer-block ranges using the same `blocks.N` parameter-name prefixes WGGO uses (`wggo_graph::layer_prefix`).
+2. **Classifies** each in-segment result: *escaping* (consumed by a later primal op — the residual stream and anything else crossing the block boundary) stays SAVED; *interior* (consumed only inside the segment and/or by the adjoint) becomes RECOMPUTE.
+3. **Early-frees** the original interiors right after the forward.
+4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers.
+5. **Frees** each recomputed tensor right after the last adjoint op that consumes it.
+
+Recompute clones run the same kernels in the same order on the same inputs, so the transform is **bit-exact**. Ops with non-replayable semantics (Dropout — RNG) are force-saved, and segments owned by a CSHA backward claim are exempted (the claim table is keyed by primal `OpId`, which a clone cannot satisfy).
+
+Driven by `--checkpoint-blocks`, with `--checkpoint-selective` (never recompute matmul-class ops), `--checkpoint-budget-mib` (knapsack flips the most expensive-to-recompute tensors back to SAVE within budget), and `--checkpoint-stride` (coalesce every N block anchors into one super-segment; `auto` searches strides against the budget). Codegen integration lives in `stmt.rs` (`CcrPolicy`, `DpCostModel`, `select_partition_dp`, `plan_with_kept_anchors`, `project_activation_peak`).
+
+Fires: **source-AD backward only**, and only on models with `blocks.N`-style structure — otherwise it is a no-op with a stderr note.
 
 ---
 

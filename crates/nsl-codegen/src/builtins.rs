@@ -444,6 +444,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_clone_if_valid", &[types::I64], Some(types::I64)),
     ("nsl_tensor_free", &[types::I64], None),
     ("nsl_tensor_free_if_valid", &[types::I64], None),
+    ("nsl_tensor_free_transient", &[types::I64], None),
     ("nsl_tensor_retain", &[types::I64], None),
     ("nsl_tensor_release", &[types::I64], None),
     ("nsl_tensor_scope_begin", &[], None),
