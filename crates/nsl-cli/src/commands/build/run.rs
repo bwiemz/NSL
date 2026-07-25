@@ -120,9 +120,10 @@ pub(crate) fn execute_temp_build(
         );
     }
 
-    // Clean up
-    let _ = std::fs::remove_file(&build.exe_path);
-    let _ = std::fs::remove_dir(&build.temp_dir);
+    // Clean up the whole scratch directory, not just the executable: the
+    // build leaves object files behind, so the old non-recursive remove_dir
+    // silently failed and the directory (and its contents) survived.
+    super::cleanup_temp_dir(&build.temp_dir);
 
     status.code().unwrap_or(1)
 }

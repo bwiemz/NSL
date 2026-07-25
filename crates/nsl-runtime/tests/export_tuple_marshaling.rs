@@ -99,6 +99,23 @@ fn build_test_lib(nsl_src: &str) -> std::path::PathBuf {
     out
 }
 
+/// Remove this test's compile-scratch directory.
+///
+/// These tests `nsl build --shared-lib` into their own temp dir and dlopen the
+/// result; nothing ever removed it. Each such directory is ~138 MB (the shared
+/// library statically links the runtime), and they accumulate one per suite
+/// run. On a machine where /tmp is tmpfs that eventually exhausts it and the
+/// LINKER starts failing with "No space left on device" — which surfaces as
+/// unrelated-looking test failures across the workspace.
+///
+/// Honours NSL_KEEP_TEMP=1 for debugging, matching the CLI helper.
+fn cleanup_scratch(tmp: &std::path::Path) {
+    if std::env::var("NSL_KEEP_TEMP").as_deref() == Ok("1") {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn tuple_return_and_param_round_trip() {
     let lib_path = build_test_lib(
@@ -193,4 +210,6 @@ fn addpair(pair: (Tensor<[4], f32>, Tensor<[4], f32>)) -> Tensor<[4], f32>:
     let mut ret2 = Desc::zeroed();
     let rc = unsafe { addpair(dummy_model, items.as_ptr(), 1, &mut ret2) };
     assert_eq!(rc, -1, "addpair with wrong tuple count must return -1");
+
+    cleanup_scratch(&std::env::temp_dir().join(format!("nsl_tuple_export_{}", std::process::id())));
 }

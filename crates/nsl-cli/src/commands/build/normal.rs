@@ -532,10 +532,11 @@ fn run_build_multi(
 
     match nsl_codegen::linker::link_multi(&obj_files, &exe_path) {
         Ok(()) => {
-            // Clean up .o files
-            for obj in &obj_files {
-                let _ = std::fs::remove_file(obj);
-            }
+            // Remove the whole scratch directory, not just the .o files it
+            // holds — PTX, staging and other intermediates live there too and
+            // nothing else ever deletes them. A failed link deliberately
+            // leaves it behind for debugging.
+            super::cleanup_temp_dir(&temp_dir);
             if !quiet { println!("Built {}", exe_path.display()); }
         }
         Err(e) => {
