@@ -60,7 +60,15 @@ KNOWN_RED="ci/gpu-cert-known-red.txt"
 # which calls into nsl-codegen internals). Without these the targets compile
 # to ZERO tests and the gates silently do not exist. The first sweep reported
 # them as NOTFOUND, which is exactly what that status is for.
-CERT_FEATURES="${NSL_CERT_FEATURES:-cuda,test-hooks,test-helpers}"
+#
+# `nsl-test/cuda` is a CROSS-PACKAGE feature and it is load-bearing.
+# nsl-codegen's own `cuda` feature is ["nsl-runtime/cuda", "dep:cudarc"] — it
+# does NOT reach nsl-test, the shared diagnostic harness. Without it, four
+# tier_b2 `*_b1_forward` gates take diagnostic_mode.rs's
+# `#[cfg(not(feature = "cuda"))]` arm and panic with "FSource::B1Forward
+# requires feature='cuda'" — reported as a kernel failure when the kernel was
+# never reached. They pass once it is enabled.
+CERT_FEATURES="${NSL_CERT_FEATURES:-cuda,test-hooks,test-helpers,nsl-test/cuda}"
 
 # ---------------------------------------------------------------------------
 # Inventory
@@ -102,11 +110,20 @@ target_args() {
 # it made 114 gates report NOTFOUND on a sweep where only 7 were genuinely
 # unreachable.
 features_for_pkg() {
-    local pkg="$1" manifest="crates/$1/Cargo.toml" out="" f
+    local pkg="$1" manifest="crates/$1/Cargo.toml" out="" f dep
     [[ -f "${manifest}" ]] || { printf ''; return; }
-    IFS=',' read -r -a _feats <<< "${CERT_FEATURES}"
-    for f in "${_feats[@]}"; do
-        if grep -qE "^${f} *=" "${manifest}"; then
+    local feats
+    IFS=',' read -r -a feats <<< "${CERT_FEATURES}"
+    for f in "${feats[@]}"; do
+        if [[ "${f}" == */* ]]; then
+            # Cross-package feature `dep/feat`: valid iff this package actually
+            # declares `dep` as a dependency, else cargo rejects the whole
+            # invocation.
+            dep="${f%%/*}"
+            if grep -qE "^${dep}[ =]" "${manifest}"; then
+                out="${out:+${out},}${f}"
+            fi
+        elif grep -qE "^${f} *=" "${manifest}"; then
             out="${out:+${out},}${f}"
         fi
     done

@@ -20,10 +20,10 @@
 # Format (tab-separated, matching the report's first two columns):
 #   <cargo target args><TAB><test name>
 #
-# Baseline: 254 gates, 235 PASS / 18 FAIL / 1 NOTFOUND on RTX 5070 Ti (sm_120),
+# Baseline: 255 gates, 237 PASS / 16 FAIL / 2 NOTFOUND on RTX 5070 Ti (sm_120),
 # CUDA 13.3, driver 610.43.03, 2026-07-25.
 
-# ── CSHA fused backward / Tier B.2 (11) ──────────────────────────────────
+# ── CSHA fused backward / Tier B.2 (9) ────────────────────────────────────
 # Numerical parity against the CPU reference. The multi-tile backward is
 # documented as refused at Phase 1.1, and these sweeps exercise paths beyond
 # the single-tile scope the canary covers.
@@ -34,8 +34,6 @@
 -p nsl-codegen --test csha_cycle15_bug1_ablations 	a1_rope_q_off_causal_true_fused_proj_true_hd64
 -p nsl-codegen --test csha_cycle15_bug1_ablations 	a2_causal_off_rope_q_true_fused_proj_true_hd64
 -p nsl-codegen --test csha_cycle15_bug1_ablations 	a3_fused_proj_off_causal_true_rope_q_true_hd64
--p nsl-codegen --test tier_b2_dkdv_kernel_cpu_reference 	tier_b2_dkdv_sweep_b1_forward
--p nsl-codegen --test tier_b2_dq_kernel_cpu_reference 	tier_b2_dq_sweep_b1_forward
 -p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_b1_forward
 -p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_b1_forward_causal
 -p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_cpu_naive
