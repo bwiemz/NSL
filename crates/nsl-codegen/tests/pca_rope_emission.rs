@@ -142,8 +142,38 @@ fn find_ptxas() -> Option<String> {
 fn assemble_ptx(ptxas_path: &str, ptx_bytes: &[u8], sm_arch: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
+    // `-o -` does NOT mean stdout to ptxas — it writes a file literally named
+    // `-`, into the process CWD, which for a cargo integration test is the
+    // package root. That dropped a 1.7 MB cubin at `crates/nsl-codegen/-` on
+    // every suite run. Write to a real temp path and delete it. (`Stdio::null`
+    // on stdout hid the mistake: nothing appeared on the terminal, so the
+    // stray file looked unrelated to this test.)
+    //
+    // The name must be unique per CALL, not per process: three default-run
+    // tests in this file assemble the same arches, and libtest runs them on
+    // threads of ONE process, so a pid-only name has all three racing on the
+    // same path — one test's cleanup can unlink the file another's ptxas is
+    // still writing.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cubin = std::env::temp_dir().join(format!(
+        "nsl_rope_reset_{sm_arch}_{}_{}.cubin",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // Delete on EVERY exit path. `write_all` below can fail with EPIPE when
+    // ptxas rejects the PTX and exits early — which is exactly the case these
+    // tests exist to catch, so the error path is the one that must not leak.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(cubin.clone());
     let mut child = Command::new(ptxas_path)
-        .args(["--gpu-name", sm_arch, "-O0", "-o", "-", "-"])
+        .args(["--gpu-name", sm_arch, "-O0", "-o"])
+        .arg(&cubin)
+        .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

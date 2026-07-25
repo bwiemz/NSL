@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+#
+# gpu-cert.sh — the GPU certification lane (roadmap item 19).
+#
+# Before this script existed, the repository carried 295 `#[ignore]` tests, of
+# which ~190 require a CUDA device, and .github/workflows/ci.yml contained
+# ZERO jobs that run on real hardware. The one CUDA job there is named
+# "CUDA feature — compile + GPU-free tests": it links against cudart STUBS and
+# runs a ptxas syntax check. Nothing executed on a device, ever, in CI.
+#
+# That means every gate certifying flash-attention backward, CSHA, PCA, CFIE,
+# ZeRO collectives, weight streaming, SR-BF16, Muon, CUDA graphs and the
+# tensor-lifetime leak fixes only ran when a human remembered to type the
+# command. This script is that human's replacement.
+#
+# PRIOR ART: tools/gpu-test.ps1 + tools/gpu-canary.txt already existed. Two
+# reasons it is not enough, neither of them a criticism of its design:
+#   - the canary is a deliberately CURATED set of 3 tests ("if they pass, the
+#     harness itself is working") — an acceptance check, not coverage;
+#   - it is PowerShell, and the project's dev environment moved to Linux where
+#     pwsh is not installed, so it cannot run at all on the reference machine.
+# This script is complementary: it enumerates and runs EVERYTHING, in bash.
+# The canary keeps its job as the fast is-the-GPU-sane check.
+#
+# Usage:
+#   scripts/gpu-cert.sh --list                  inventory as TSV, no build
+#   scripts/gpu-cert.sh --check-inventory       drift gate (GPU-free, for CI)
+#   scripts/gpu-cert.sh --write-manifest        refresh the committed manifest
+#   scripts/gpu-cert.sh --run [--tier TIER]     build + execute the lane
+#
+# --run honours:
+#   NSL_CERT_TIER      gpu | toolchain | multiproc | isolate | all  (default: gpu)
+#   NSL_CERT_TIMEOUT   per-target timeout in seconds (default: 900)
+#   NSL_CERT_OUT       report path (default: target/gpu-cert-report.tsv)
+#   NSL_CERT_FEATURES  cargo features (default: cuda,test-hooks,test-helpers)
+#   CARGO_TARGET_DIR   respected as usual
+#
+# Set TMPDIR to a DISK-backed path before a full run. Many gates spawn `nsl`
+# builds; where /tmp is tmpfs the sweep exhausts it, and the resulting linker
+# errors surface as generic "nsl run failed" panics that read like compiler
+# bugs rather than a full disk.
+#
+# Exit status for --run is 1 if any gate FAILS that is not listed in
+# ci/gpu-cert-known-red.txt, else 0. Pre-existing breakage therefore does not
+# block, but a NEW regression does — the same posture as the doc-agreement
+# gate added in 0a5246cd.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+AWK_RULES="scripts/gpu-gate-inventory.awk"
+MANIFEST="ci/gpu-cert-manifest.tsv"
+KNOWN_RED="ci/gpu-cert-known-red.txt"
+
+# `cuda` alone is NOT enough to reach every gate. Seven gates live in files
+# whose whole module is cfg'd on an extra feature — `test-hooks` (cuBLAS
+# equivalence, FP8 dispatcher) or `test-helpers` (the fused-LM-CE e2e set,
+# which calls into nsl-codegen internals). Without these the targets compile
+# to ZERO tests and the gates silently do not exist. The first sweep reported
+# them as NOTFOUND, which is exactly what that status is for.
+CERT_FEATURES="${NSL_CERT_FEATURES:-cuda,test-hooks,test-helpers}"
+
+# ---------------------------------------------------------------------------
+# Inventory
+# ---------------------------------------------------------------------------
+
+# Emit "file<TAB>fn<TAB>class<TAB>reason" for every #[ignore] test in the tree.
+# The cuda_gated flag is computed per file in the shell (awk would have to
+# buffer the whole file to look ahead at the cfg attributes).
+inventory() {
+    local f gated
+    while IFS= read -r f; do
+        if grep -q 'feature = "cuda"' "${f}"; then gated=1; else gated=0; fi
+        awk -v cuda_gated="${gated}" -f "${AWK_RULES}" "${f}"
+    done < <(find crates -name '*.rs' -type f | sort)
+}
+
+# Map a source path to the cargo invocation that can run its tests.
+# crates/<pkg>/tests/<target>.rs  -> -p <pkg> --test <target>
+# crates/<pkg>/src/**.rs          -> -p <pkg> --lib
+target_args() {
+    local path="$1" pkg target
+    pkg="$(printf '%s' "${path}" | cut -d/ -f2)"
+    case "${path}" in
+        crates/*/tests/*)
+            target="$(basename "${path}" .rs)"
+            printf -- '-p\n%s\n--test\n%s\n' "${pkg}" "${target}"
+            ;;
+        *)
+            printf -- '-p\n%s\n--lib\n' "${pkg}"
+            ;;
+    esac
+}
+
+# Features are NOT uniform across the workspace. `cargo test -p <pkg>` REFUSES
+# a feature the package does not define ("the package 'nsl-runtime' does not
+# contain this feature: test-helpers") — only `--workspace` unifies them. So
+# every per-target invocation gets the intersection of CERT_FEATURES with what
+# that package actually declares. Getting this wrong is not subtle-but-benign:
+# it made 114 gates report NOTFOUND on a sweep where only 7 were genuinely
+# unreachable.
+features_for_pkg() {
+    local pkg="$1" manifest="crates/$1/Cargo.toml" out="" f
+    [[ -f "${manifest}" ]] || { printf ''; return; }
+    IFS=',' read -r -a _feats <<< "${CERT_FEATURES}"
+    for f in "${_feats[@]}"; do
+        if grep -qE "^${f} *=" "${manifest}"; then
+            out="${out:+${out},}${f}"
+        fi
+    done
+    printf '%s' "${out}"
+}
+
+classes_for_tier() {
+    case "$1" in
+        gpu)       printf 'gpu\ngpu-inferred\n' ;;
+        toolchain) printf 'toolchain\n' ;;
+        multiproc) printf 'multiproc\n' ;;
+        isolate)   printf 'isolate\n' ;;
+        all)       printf 'gpu\ngpu-inferred\ntoolchain\nmultiproc\nisolate\n' ;;
+        *) echo "gpu-cert: unknown tier '$1'" >&2; exit 2 ;;
+    esac
+}
+
+# True when the target holds any `isolate`-class gate. Such a gate declares
+# that a faulting kernel poisons the CUDA context for everything sharing the
+# process, so it must not be batched with its siblings — and it DOES share a
+# target with 8 gpu-class gates. Previously `isolate` was a documented class
+# with no implementation behind it (review finding): under `--tier all` all 9
+# were batched into one process, exactly what the reason string forbids.
+target_has_isolate() {
+    inventory | awk -F'\t' -v k="$1" '
+        $3 == "isolate" { print $1 }' | while IFS= read -r f; do
+            [[ "$(target_args "${f}" | tr '\n' ' ')" == "$1" ]] && { echo yes; return; }
+        done
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_list() { inventory; }
+
+cmd_write_manifest() {
+    mkdir -p "$(dirname "${MANIFEST}")"
+    {
+        echo "# GPU certification gate manifest — generated by scripts/gpu-cert.sh"
+        echo "# Regenerate with: scripts/gpu-cert.sh --write-manifest"
+        echo "# Columns: file<TAB>test<TAB>class<TAB>reason"
+        inventory
+    } > "${MANIFEST}"
+    echo "wrote ${MANIFEST} ($(inventory | wc -l) gates)"
+}
+
+# The GPU-free half of item 19: CI cannot execute these gates, but it CAN
+# prove the inventory still matches the source. A gate that is deleted,
+# renamed, or silently un-#[ignore]d changes this file; a stale manifest fails
+# the build. Without it the lane would rot the moment someone moved a test.
+cmd_check_inventory() {
+    if [[ ! -f "${MANIFEST}" ]]; then
+        echo "gpu-cert: ${MANIFEST} is missing — run --write-manifest" >&2
+        exit 1
+    fi
+    # Script-global, not `local`: the EXIT trap runs after this function's
+    # frame is gone, and under `set -u` a dead local makes the trap itself
+    # fail — turning a PASSING check into exit 1.
+    SCRATCH="$(mktemp)"
+    trap 'rm -f "${SCRATCH:-}"' EXIT
+    inventory > "${SCRATCH}"
+    if ! diff -u <(grep -v '^#' "${MANIFEST}") "${SCRATCH}" > /dev/null; then
+        echo "gpu-cert: GATE INVENTORY DRIFT — ${MANIFEST} is stale." >&2
+        echo "" >&2
+        diff -u <(grep -v '^#' "${MANIFEST}") "${SCRATCH}" | head -40 >&2
+        echo "" >&2
+        echo "If the change is intended, run: scripts/gpu-cert.sh --write-manifest" >&2
+        exit 1
+    fi
+    echo "gpu-cert: inventory agrees with source ($(grep -cv '^#' "${MANIFEST}") gates)"
+}
+
+# PREFLIGHT — the lane's most important guard.
+#
+# 55 of the run-class test files gate their body on a `cuda_available()` helper
+# that returns false when NSL_SKIP_CUDA_TESTS is set or `nsl_cuda_init()`
+# fails, and then `return;` — which libtest reports as **ok**. Without this
+# check, `--run --tier gpu` on a box with no device, a wedged driver, or that
+# variable exported prints "PASS 255", writes an all-green report, exits 0, and
+# has executed ZERO kernels. That is precisely the failure the lane exists to
+# prevent, and it is silent.
+#
+# tools/gpu-test.ps1 already refused to run for this reason ("NSL_SKIP_CUDA_TESTS
+# makes every CUDA test early-return as a 'pass' … falsely report green"). The
+# bash lane must not be the weaker of the two.
+preflight() {
+    local tier="$1"
+    if [[ -n "${NSL_SKIP_CUDA_TESTS:-}" ]]; then
+        echo "gpu-cert: REFUSING — NSL_SKIP_CUDA_TESTS is set. Every CUDA test" >&2
+        echo "          early-returns as a PASS under it, so the sweep would" >&2
+        echo "          report green having run nothing. Unset it and re-run." >&2
+        exit 2
+    fi
+    case "${tier}" in
+        gpu|isolate|multiproc|all)
+            if [[ "${CUDA_VISIBLE_DEVICES-unset}" == "" ]]; then
+                echo "gpu-cert: REFUSING — CUDA_VISIBLE_DEVICES is set to empty;" >&2
+                echo "          no device is visible and every gate would skip-as-pass." >&2
+                exit 2
+            fi
+            if ! command -v nvidia-smi > /dev/null 2>&1; then
+                echo "gpu-cert: REFUSING — nvidia-smi not found; cannot prove a device" >&2
+                echo "          is present, and a skip-as-pass sweep is worse than none." >&2
+                exit 2
+            fi
+            if ! nvidia-smi -L 2>/dev/null | grep -q '^GPU '; then
+                echo "gpu-cert: REFUSING — nvidia-smi lists no GPU." >&2
+                exit 2
+            fi
+            echo "gpu-cert: device — $(nvidia-smi -L 2>/dev/null | head -1)"
+            ;;
+    esac
+    if [[ "${tier}" == "toolchain" || "${tier}" == "all" ]]; then
+        if ! command -v ptxas > /dev/null 2>&1; then
+            echo "gpu-cert: REFUSING — ptxas not on PATH; toolchain gates print" >&2
+            echo "          'ptxas not found — skipping' and report as PASS." >&2
+            exit 2
+        fi
+    fi
+}
+
+cmd_run() {
+    local tier="${NSL_CERT_TIER:-gpu}"
+    local timeout_s="${NSL_CERT_TIMEOUT:-900}"
+    local out="${NSL_CERT_OUT:-${CARGO_TARGET_DIR:-target}/gpu-cert-report.tsv}"
+    mkdir -p "$(dirname "${out}")"
+
+    local wanted
+    wanted="$(classes_for_tier "${tier}")"
+    preflight "${tier}"
+
+    # Group the selected gates by cargo target so each test binary is invoked
+    # once with an --exact filter per test, rather than once per test.
+    local inv
+    # Script-global for the same reason as SCRATCH above: a `local` here is
+    # already out of scope when the EXIT trap runs, and `set -u` would make
+    # the trap fail and mask the real exit status.
+    SCRATCHDIR="$(mktemp -d)"
+    trap 'rm -rf "${SCRATCHDIR:-}"' EXIT
+    local tmpdir="${SCRATCHDIR}"
+    inv="${tmpdir}/inv.tsv"
+    inventory | awk -F'\t' -v want="${wanted}" '
+        BEGIN { n = split(want, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1 }
+        ($3 in keep) { print $1 "\t" $2 }
+    ' > "${inv}"
+
+    local total
+    total="$(wc -l < "${inv}")"
+    echo "gpu-cert: tier=${tier} gates=${total}"
+    if [[ "${total}" -eq 0 ]]; then
+        echo "gpu-cert: nothing to run" >&2
+        exit 2
+    fi
+
+    echo "gpu-cert: building test targets (--features ${CERT_FEATURES})"
+    cargo test --workspace --features "${CERT_FEATURES}" --no-run --quiet
+
+    : > "${out}"
+
+    # Collapse source files onto cargo targets. Several src/ files share one
+    # --lib target, so this both dedups invocations and unions their gates.
+    local key
+    while IFS=$'\t' read -r file fn; do
+        [[ -z "${file}" ]] && continue
+        key="$(target_args "${file}" | tr '\n' ' ')"
+        printf '%s\t%s\n' "${key}" "${fn}" >> "${tmpdir}/bytarget.tsv"
+    done < "${inv}"
+
+    local targets
+    targets="$(cut -f1 "${tmpdir}/bytarget.tsv" | sort -u)"
+
+    # ALWAYS single-threaded. The GPU is one shared resource with one CUDA
+    # context per process, and libtest's default is to run a target's tests
+    # concurrently. The first full sweep ran them in parallel and reported 51
+    # failures; re-running the same gates serially turned 4-of-4 CFIE decode
+    # gates (and most of the rest) green. Concurrency was manufacturing
+    # failures wholesale — a lane that cries wolf gets switched off, so this
+    # is not a knob.
+    #
+    # One target at a time, too: concurrent `nsl` builds were what exhausted
+    # /tmp during the lifetime campaign.
+    local threads=(--test-threads=1)
+
+    local args wanted_fns listed selected rc status nsel pkg feats
+    while IFS= read -r key; do
+        [[ -z "${key}" ]] && continue
+        read -r -a args <<< "${key}"
+        pkg="${args[1]}"
+        feats="$(features_for_pkg "${pkg}")"
+        local featarg=()
+        [[ -n "${feats}" ]] && featarg=(--features "${feats}")
+
+        # libtest, not the filename, is the authority on test NAMES: a gate
+        # inside `mod tests` is `path::tests::name`, and --exact matches the
+        # full path. Join cargo's listing to the classified basenames.
+        mapfile -t wanted_fns < <(
+            awk -F'\t' -v k="${key}" '$1 == k { print $2 }' "${tmpdir}/bytarget.tsv" | sort -u)
+        mapfile -t listed < <(
+            cargo test "${args[@]}" "${featarg[@]}" -- --ignored --list \
+              < /dev/null 2> "${tmpdir}/list.err" \
+            | sed -n 's/^\(.*\): test$/\1/p')
+        mapfile -t selected < <(
+            printf '%s\n' "${listed[@]}" | awk -v want="$(printf '%s\n' "${wanted_fns[@]}")" '
+                BEGIN { n = split(want, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1 }
+                { base = $0; sub(/^.*::/, "", base); if (base in keep) print $0 }')
+
+        nsel="${#selected[@]}"
+
+        # Account for EVERY wanted gate, not just the ones that matched. A
+        # target can list some of its gates and not others — `wrga_b32_trigger_
+        # measurement_requires_cuda` is #[cfg(not(feature = "cuda"))], so it
+        # cannot exist in a CUDA build, while eight sibling gates in the same
+        # target list fine. Marking NOTFOUND only when nsel==0 dropped that one
+        # gate from the report with no trace: 255 selected, 254 reported. The
+        # reconciliation check at the end catches the count, but the gate still
+        # needs a row saying what happened to it.
+        local miss matched
+        matched=" $(printf '%s\n' "${selected[@]}" | sed 's/^.*:://' | tr '\n' ' ')"
+        for miss in "${wanted_fns[@]}"; do
+            case "${matched}" in
+                *" ${miss} "*) ;;
+                *) printf '%s\t%s\tNOTFOUND\n' "${key}" "${miss}" >> "${out}" ;;
+            esac
+        done
+
+        if [[ "${nsel}" -eq 0 ]]; then
+            echo "  [${key}] 0 of ${#wanted_fns[@]} gate(s) listed — NOTFOUND"
+            continue
+        fi
+
+        # A target holding an `isolate` gate skips batching entirely and goes
+        # straight to one-process-per-gate, honouring that class's contract
+        # instead of merely labelling it.
+        if [[ -n "$(target_has_isolate "${key}")" ]]; then
+            echo "  [${key}] ${nsel} gate(s) — isolate class: one process each"
+            rc=1
+            status=FAIL
+        else
+        echo "  [${key}] ${nsel} gate(s)"
+        set +e
+        timeout --signal=KILL "${timeout_s}" \
+            cargo test "${args[@]}" "${featarg[@]}" -- \
+            --ignored --exact "${selected[@]}" "${threads[@]}" \
+            < /dev/null > "${tmpdir}/out.txt" 2>&1
+        rc=$?
+        set -e
+
+        case ${rc} in
+            0)   status=PASS ;;
+            137) status=TIMEOUT ;;
+            *)   status=FAIL ;;
+        esac
+        fi
+
+        if [[ "${status}" == "PASS" ]]; then
+            local fn
+            for fn in "${selected[@]}"; do
+                printf '%s\t%s\tPASS\n' "${key}" "${fn}" >> "${out}"
+            done
+            continue
+        fi
+
+        # CONFIRMATION PASS. A batch result cannot be trusted once anything in
+        # the target failed: a kernel that faults poisons the CUDA context for
+        # every LATER test in the same process, even at --test-threads=1. That
+        # is not hypothetical — `a4_hd128_causal_true_rope_q_true_fused_proj_
+        # true` was reported red purely because a1..a3 crashed ahead of it, and
+        # it passes 3/3 alone. So when a target goes red, re-run each of its
+        # gates in its OWN process and let that verdict stand.
+        #
+        # Only failing targets pay this cost, so a green sweep stays fast.
+        # (An isolate-class target arrives here unconditionally — by design.)
+        echo "      running ${nsel} gate(s) individually (one process each)"
+        local fn rc1 st1
+        for fn in "${selected[@]}"; do
+            set +e
+            timeout --signal=KILL "${timeout_s}" \
+                cargo test "${args[@]}" "${featarg[@]}" -- \
+                --ignored --exact "${fn}" --test-threads=1 \
+                < /dev/null > "${tmpdir}/one.txt" 2>&1
+            rc1=$?
+            set -e
+            case ${rc1} in
+                0)   st1=PASS ;;
+                137) st1=TIMEOUT ;;
+                *)   st1=FAIL ;;
+            esac
+            printf '%s\t%s\t%s\n' "${key}" "${fn}" "${st1}" >> "${out}"
+            if [[ "${st1}" != "PASS" ]]; then
+                echo "      FAIL ${fn}"
+                grep -E "^(thread .* panicked|assertion|error)" "${tmpdir}/one.txt" \
+                    | head -3 | sed 's/^/           | /' || true
+            fi
+        done
+    done <<< "${targets}"
+
+    echo ""
+    echo "gpu-cert: report -> ${out}"
+    awk -F'\t' '{ c[$3]++ } END { for (k in c) printf "  %-8s %d\n", k, c[k] }' "${out}"
+
+    # RECONCILE (review finding F6). Every selected gate must appear in the
+    # report exactly once. Without this, any path that drops a target — a
+    # future refactor, or a cargo invocation that consumed the loop's stdin —
+    # leaves a SHORT report that still exits 0. A green lane that silently ran
+    # fewer gates than it announced is the failure mode this whole file exists
+    # to make impossible.
+    local reported
+    reported="$(wc -l < "${out}")"
+    if [[ "${reported}" -ne "${total}" ]]; then
+        echo "gpu-cert: INTERNAL — announced ${total} gate(s) but reported ${reported}." >&2
+        echo "          The sweep is not trustworthy; refusing to report success." >&2
+        exit 3
+    fi
+
+    # Regression posture: only gates NOT already known-red can fail the lane.
+    local unexpected=0
+    if [[ -s "${KNOWN_RED}" ]]; then
+        # FILENAME==ARGV[1], not NR==FNR (review finding F8): if KNOWN_RED is
+        # ever truncated to zero bytes, NR==FNR stays true for the report's
+        # FIRST line, which would be eaten as an allowlist entry and never
+        # checked.
+        unexpected="$(awk -F'\t' -v kr="${KNOWN_RED}" '
+            FILENAME == kr { if ($0 !~ /^#/ && $0 != "") red[$0]=1; next }
+            $3 != "PASS" && !(($1 "\t" $2) in red) { n++ }
+            END { print n + 0 }' "${KNOWN_RED}" "${out}")"
+    else
+        unexpected="$(awk -F'\t' '$3 != "PASS" { n++ } END { print n + 0 }' "${out}")"
+    fi
+    if [[ "${unexpected}" -gt 0 ]]; then
+        echo "gpu-cert: ${unexpected} gate(s) red and not in ${KNOWN_RED}" >&2
+        exit 1
+    fi
+    echo "gpu-cert: no unexpected failures"
+}
+
+usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Bare invocation exits 2, not 0: a CI step that runs this with no argument
+# must not read as a green check that did nothing. Explicit --help still exits 0.
+if [[ $# -eq 0 ]]; then
+    echo "gpu-cert: no command given" >&2; echo "" >&2; usage >&2; exit 2
+fi
+
+case "$1" in
+    --list)            cmd_list ;;
+    --write-manifest)  cmd_write_manifest ;;
+    --check-inventory) cmd_check_inventory ;;
+    --run)
+        shift
+        if [[ "${1:-}" == "--tier" ]]; then
+            [[ -n "${2:-}" ]] || { echo "gpu-cert: --tier needs a value" >&2; exit 2; }
+            NSL_CERT_TIER="$2"; export NSL_CERT_TIER
+        elif [[ -n "${1:-}" ]]; then
+            echo "gpu-cert: unknown option after --run: $1" >&2; exit 2
+        fi
+        cmd_run
+        ;;
+    -h|--help)         usage ;;
+    # Anything else EXITS NON-ZERO. Printing help and exiting 0 (review finding
+    # F5) meant a typo in a CI `run:` line — `--check-inventroy` — produced a
+    # green job that checked nothing.
+    *) echo "gpu-cert: unknown argument: $1" >&2; echo "" >&2; usage >&2; exit 2 ;;
+esac

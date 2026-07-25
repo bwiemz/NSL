@@ -70,16 +70,38 @@ fn find_ptxas() -> Option<String> {
 /// Invoke ptxas on `ptx_bytes` targeting `sm_arch`. Returns Ok(()) on
 /// successful assembly or Err(stderr) on rejection.
 fn assemble_ptx(ptxas_path: &str, ptx_bytes: &[u8], sm_arch: &str) -> Result<(), String> {
-    // `ptxas -o - -` reads PTX from stdin, writes cubin to stdout.
+    // ptxas reads PTX from stdin as `-`, but `-o -` is NOT stdout: ptxas
+    // treats it as a literal FILENAME and writes the cubin into the process
+    // CWD (the package root under cargo). The comment that used to sit here
+    // claimed otherwise, and the resulting `crates/nsl-codegen/-` file was a
+    // 1.7 MB binary nobody could account for. Write to a real temp path.
+    // Unique per CALL, not per process: six default-run tests in this file
+    // assemble the same arches on threads of ONE libtest process, so a
+    // pid-only name has them racing on a single path. Cleanup runs from Drop
+    // so the `?` on write_all — reachable via EPIPE when ptxas rejects the PTX
+    // and exits early, i.e. the case these tests exist to catch — cannot leak.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cubin = std::env::temp_dir().join(format!(
+        "nsl_csha_ptxas_{sm_arch}_{}_{}.cubin",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(cubin.clone());
     let mut child = Command::new(ptxas_path)
         .args([
             "--gpu-name",
             sm_arch,
             "-O0",      // skip optimisation — focus on syntactic validation
             "-o",
-            "-",        // cubin to stdout (discarded via `Stdio::null`)
-            "-",        // read PTX from stdin
         ])
+        .arg(&cubin)
+        .arg("-")       // read PTX from stdin
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

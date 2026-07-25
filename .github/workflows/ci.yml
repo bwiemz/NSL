@@ -347,3 +347,55 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check documentation claims agree with the repository
         run: ./scripts/check-doc-agreement.sh
+
+  # ── GPU gate inventory (roadmap item 19) ────────────────────────────────
+  #
+  # This repository carries ~295 #[ignore] tests, of which ~255 need a CUDA
+  # device. No hosted runner has a GPU, so CI cannot EXECUTE them — the
+  # "CUDA feature" job above links cudart stubs and runs a ptxas syntax check
+  # only. What CI can do is prove the inventory of gates still matches the
+  # source, so a gate cannot be renamed, deleted, or silently un-#[ignore]d
+  # without the manifest changing in the same commit.
+  #
+  # Execution happens on hardware via `scripts/gpu-cert.sh --run`. This job is
+  # the drift half; it needs no toolchain and finishes in seconds.
+  gpu-gate-inventory:
+    name: GPU gate inventory (manifest == tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the GPU gate manifest agrees with the source
+        run: ./scripts/gpu-cert.sh --check-inventory
+      - name: Manifest holds a plausible number of gates
+        run: |
+          set -euo pipefail
+          # A floor, so a scanner that silently degrades to near-zero rows
+          # cannot be blessed by re-running --write-manifest.
+          n="$(grep -cv '^#' ci/gpu-cert-manifest.tsv)"
+          echo "manifest gates: ${n}"
+          [ "${n}" -ge 250 ] || { echo "manifest collapsed to ${n} gates" >&2; exit 1; }
+
+      - name: Prove the drift check is not vacuous
+        run: |
+          set -euo pipefail
+          # Delete one gate's #[ignore] and require a non-zero exit. Without
+          # this, a manifest/scanner mismatch that made inventory() return
+          # nothing would pass silently forever.
+          victim="crates/nsl-cli/tests/fn_lifetime_leak_gate.rs"
+          cp "${victim}" /tmp/victim.bak
+          # Restore on EVERY exit path, including a failure between here and
+          # the end of the step.
+          trap 'cp /tmp/victim.bak "${victim}"' EXIT
+          perl -0pi -e 's/#\[ignore = "requires CUDA GPU"\]\n//' "${victim}"
+          # Assert the edit LANDED. If the reason string is ever reworded, perl
+          # no-ops, --check-inventory stays green, and the failure below would
+          # blame vacuity instead of a stale pattern.
+          if git diff --quiet -- "${victim}"; then
+            echo "victim pattern no longer matches — update this step" >&2
+            exit 1
+          fi
+          if ./scripts/gpu-cert.sh --check-inventory > /dev/null 2>&1; then
+            echo "ANTI-VACUITY FAILURE: removing gates left --check-inventory green" >&2
+            exit 1
+          fi
+          echo "drift check correctly rejects a removed gate"
