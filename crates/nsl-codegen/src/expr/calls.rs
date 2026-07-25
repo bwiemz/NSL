@@ -1311,11 +1311,18 @@ impl Compiler<'_> {
             let dim_neg1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let attn =
                 self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
-            return self.compile_traced_call(
+            let out = self.compile_traced_call(
                 builder,
                 "nsl_tensor_matmul",
                 &[attn, v_val, flags0],
-            );
+            )?;
+            // Same transient release as the plain naive chain — see the
+            // comment there. `mask_val` is the CALLER's mask argument, not a
+            // chain intermediate, so it is deliberately NOT freed here.
+            for t in [k_t, scores, scaled, masked, attn] {
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_free_transient", &[t])?;
+            }
+            return Ok(out);
         }
 
         // PCA Stage C: scaled_dot_product_attention_packed(Q, K, V, scale,
@@ -1378,6 +1385,11 @@ impl Compiler<'_> {
             // shapes only), so freeing right after use is safe even while
             // the tape is recording.
             self.compile_call_by_name(builder, "nsl_tensor_free", &[mask_val])?;
+            // The rest of the chain got no such treatment — same transient
+            // release as the other two naive chains.
+            for t in [k_t, scores, scaled, masked, attn] {
+                let _ = self.compile_call_by_name(builder, "nsl_tensor_free_transient", &[t])?;
+            }
             return Ok(out);
         }
 
@@ -3064,13 +3076,20 @@ impl Compiler<'_> {
             || self.registry.runtime_fns.contains_key(&func_name)
         {
             let mut arg_vals = Vec::new();
-            for arg in args {
-                // Deliberately NOT compile_nested_expr: the callee may
-                // ESCAPE a param (member-assign / nsl_list_push store the
-                // raw pointer with no retain), so freeing a tracked owning
-                // arg at statement end is a use-after-free on the stored
-                // copy. See compile_model_method_call for the same rule.
-                arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+            for (i, arg) in args.iter().enumerate() {
+                // A fresh argument may only be released at statement end when
+                // the callee's matching parameter is PROVEN not to escape —
+                // otherwise a member-assign / nsl_list_push inside the callee
+                // stores the raw pointer with no retain and the statement-end
+                // free becomes a use-after-free on the stored copy.
+                // `param_is_captive` is false for every unknown callee, so an
+                // un-analysed function keeps the historical blanket refusal.
+                let v = if self.escape.param_is_captive(&func_name, i) {
+                    self.compile_nested_expr(builder, state, &arg.value)?
+                } else {
+                    self.compile_expr(builder, state, &arg.value)?
+                };
+                arg_vals.push(v);
             }
             let result = self.compile_call_by_name(builder, &func_name, &arg_vals)?;
             self.register_ffi_result_ownership(

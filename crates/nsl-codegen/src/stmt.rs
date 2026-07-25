@@ -692,7 +692,16 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
         body: &nsl_ast::stmt::Block,
+        loop_pattern: Option<&nsl_ast::pattern::Pattern>,
     ) -> Result<(), CodegenError> {
+        // The sweep only runs where a release can actually pair with the
+        // retain. `emit_return_local_sweep` is skipped inside dtype methods
+        // and tape regions, so materializing there would leak the refcount we
+        // are about to take whenever the loop body runs zero times.
+        if state.flags.in_dtype_method || state.flags.in_tape_region {
+            return Ok(());
+        }
+
         let mut assigned_symbols = std::collections::HashSet::new();
         self.collect_assignment_targets_from_block(body, &mut assigned_symbols);
 
@@ -707,6 +716,34 @@ impl Compiler<'_> {
             // DataLoader handles are freed by loader teardown, not by us.
             .filter(|sym| !state.borrowed_batch_symbols.contains(sym))
             .filter(|sym| !state.dataloader_symbols.contains(sym))
+            // NEVER the loop's OWN induction/pattern binding.
+            //
+            // Every loop lowering re-declares its pattern symbol and def's it
+            // to ZERO before this hook runs, then rebinds it per iteration to
+            // a BORROW taken with no retain (`nsl_list_get`, the dataloader's
+            // `next_batch`, a model-array slot). If the pattern name shadows a
+            // symbol already in `non_owning_symbols` —
+            //
+            //     let h = x          # x a param/field, so h is non-owning
+            //     for h in items:    # h's slot is re-declared and zeroed
+            //         h = f(h)       # owning RHS, so the veto below passes
+            //
+            // — then `use_var` reads the freshly zeroed slot and the retain is
+            // a silent no-op (`nsl_tensor_retain(0)` returns immediately),
+            // while the `non_owning_symbols.remove` below still lands. From
+            // then on `eltls_clear_old_slot` fires once per iteration on a
+            // borrowed container element that nothing ever retained: an
+            // UNPAIRED free, i.e. a negative net refcount and a box handed
+            // back to the allocator while the container still points at it.
+            // A later `free_if_valid` magic probe then hits a recycled box and
+            // decrements a DIFFERENT live tensor.
+            //
+            // `sym_bindings_all_owning_in_block` already rejects *nested*
+            // pattern binders, but the loop's own pattern is not part of the
+            // body it inspects — it has to be excluded here.
+            .filter(|sym| {
+                loop_pattern.is_none_or(|p| !self.pattern_binds_sym(p, *sym))
+            })
             // Every in-body binding must be owning (see doc comment).
             .filter(|sym| self.sym_bindings_all_owning_in_block(body, *sym))
             .filter_map(|sym| {
@@ -748,6 +785,24 @@ impl Compiler<'_> {
             if state.param_symbols.contains(source_sym)
                 || state.non_owning_symbols.contains(source_sym)
             {
+                state.non_owning_symbols.insert(target_sym);
+                return;
+            }
+        }
+
+        // A non-Dict subscript hands out a BORROWED element: `compile_subscript`
+        // lowers lists/tuples through `nsl_list_get`, which returns the stored
+        // raw pointer with no retain. `let t = items[0]` therefore aliases an
+        // element the container still owns, and treating it as owning let the
+        // return sweep free a live element. Dict reads are the exception the
+        // rest of this file already carves out (`loop_binding_rhs_is_owning`
+        // encodes exactly this rule for the loop-rebind free).
+        if let ExprKind::Subscript { object, .. } = &expr.kind {
+            let is_dict = matches!(
+                self.node_type(object.id),
+                nsl_semantic::types::Type::Dict(_, _)
+            );
+            if !is_dict {
                 state.non_owning_symbols.insert(target_sym);
                 return;
             }
@@ -1426,10 +1481,18 @@ impl Compiler<'_> {
                     // Tensor returns: safe because the retain above compensates
                     // for the returned value aliasing a swept local.
                     //
-                    // SCALAR returns: also safe, and previously missed. A
+                    // SCALAR returns: also swept, and previously missed. Note
+                    // what the return type does and does not buy us. A
                     // `-> f64` / `-> int` / `-> bool` result is a value, not a
-                    // handle — it cannot alias a tensor local, so no retain is
-                    // needed to protect it. Skipping the sweep here stranded one
+                    // handle, so it cannot alias a swept local and needs no
+                    // retain to protect it. The precondition the SWEEP itself
+                    // needs is different and orthogonal: no swept local may
+                    // have ESCAPED. That is carried by `non_owning_symbols`
+                    // (member reads, borrowed batch handles and — since the
+                    // 2026-07-24 review — non-Dict subscripts are all marked
+                    // non-owning and skipped), exactly as it already is for
+                    // the `-> void` and fall-through return paths this merely
+                    // brings into line. Skipping the sweep here stranded one
                     // tensor per call for the extremely common
                     // `fn loss(...) -> f64: let d = a - b; return sum(d*d).item()`
                     // shape (measured: live_blocks 5 -> 11 over 3 -> 9 calls,
@@ -2964,7 +3027,7 @@ impl Compiler<'_> {
         // by the flow-insensitive non_owning_symbols set, so their single
         // generated rebind-free site never fires. Give them their own
         // reference first — see materialize_non_owning_aliases_before_loop.
-        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, None)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3049,7 +3112,7 @@ impl Compiler<'_> {
         // by the flow-insensitive non_owning_symbols set, so their single
         // generated rebind-free site never fires. Give them their own
         // reference first — see materialize_non_owning_aliases_before_loop.
-        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3210,7 +3273,7 @@ impl Compiler<'_> {
         // by the flow-insensitive non_owning_symbols set, so their single
         // generated rebind-free site never fires. Give them their own
         // reference first — see materialize_non_owning_aliases_before_loop.
-        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3402,7 +3465,7 @@ impl Compiler<'_> {
         // by the flow-insensitive non_owning_symbols set, so their single
         // generated rebind-free site never fires. Give them their own
         // reference first — see materialize_non_owning_aliases_before_loop.
-        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3573,7 +3636,7 @@ impl Compiler<'_> {
         // by the flow-insensitive non_owning_symbols set, so their single
         // generated rebind-free site never fires. Give them their own
         // reference first — see materialize_non_owning_aliases_before_loop.
-        self.materialize_non_owning_aliases_before_loop(builder, state, body)?;
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);

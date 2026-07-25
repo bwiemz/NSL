@@ -81,6 +81,7 @@ pub mod compiler;
 pub mod context;
 pub mod dynamic_shapes;
 pub mod error;
+pub mod escape;
 pub mod expr;
 pub mod ffi_ownership;
 pub mod func;

@@ -20,6 +20,11 @@
 //!   3. `emit_return_local_sweep` was gated on `ret_ty.is_tensor()`, so any
 //!      function returning a scalar never swept its tensor locals.
 //!
+//!   4. An owning call-result passed as an ARGUMENT stranded, because both
+//!      call sites blanket-refused to track arguments on the grounds that the
+//!      callee might escape a parameter. `nsl_codegen::escape` now decides
+//!      that per parameter instead of assuming the worst.
+//!
 //! Gate design mirrors `inference_loop_leak_gate.rs`: run the same fixture at
 //! two call counts and assert the caching allocator's exit `live_blocks` are
 //! IDENTICAL. Anything that strands per call scales with the count.
@@ -159,8 +164,9 @@ fn naive_sdpa_chain_transients_are_released() {
     let (lb2, out2) = run_fixture(&sdpa_src(2), "sdpa", 2);
     let (lb6, out6) = run_fixture(&sdpa_src(6), "sdpa", 6);
     // Anti-vacuity: the attention actually ran the expected number of times.
-    assert_eq!(out2.matches('4').count() >= 2, true, "expected 2 rank prints:\n{out2}");
-    assert!(out6.lines().filter(|l| l.trim() == "4").count() == 6, "expected 6 rank prints:\n{out6}");
+    let rank_prints = |s: &str| s.lines().filter(|l| l.trim() == "4").count();
+    assert_eq!(rank_prints(&out2), 2, "expected 2 rank prints:\n{out2}");
+    assert_eq!(rank_prints(&out6), 6, "expected 6 rank prints:\n{out6}");
     assert_eq!(
         lb2, lb6,
         "live_blocks scale with call count — the naive SDPA chain is stranding \
@@ -260,5 +266,113 @@ fn no_grad_inference_is_iteration_independent() {
         lb2, lb6,
         "live_blocks scale with call count under @no_grad — bounded inference \
          allocation regressed"
+    );
+}
+
+// ── Gate 5: escape analysis releases owning call-result arguments ─────────
+
+/// `self.inner.forward(self.n.forward(x))` passes a FRESH tensor straight into
+/// a method that only reads it. Both call sites used to blanket-refuse to
+/// track arguments — "the callee may ESCAPE a param" — so every such argument
+/// stranded. `nsl_codegen::escape` now proves per-parameter captivity and the
+/// argument is released at statement end.
+///
+/// LIMITATION pinned by this fixture's shape: all three models are declared in
+/// ONE module. Imported model method bodies are not threaded into module
+/// compiles (`compile_module_with_imports` receives only names + signatures),
+/// so a call into an IMPORTED model still takes the conservative path.
+fn escape_arg_src(calls: usize) -> String {
+    let mut s = String::from(
+        r#"
+model Norm:
+    g: Tensor = randn([256, 256]) * 0.05
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return silu(x @ self.g)
+
+model Inner:
+    w: Tensor = randn([256, 256]) * 0.05
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Blk:
+    n: Norm = Norm()
+    inner: Inner = Inner()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return self.inner.forward(self.n.forward(x))
+
+let m = Blk()
+m.to(cuda)
+let x = randn([128, 256]).to(cuda)
+"#,
+    );
+    for i in 0..calls {
+        s.push_str(&format!("let r{i} = m.forward(x)\nprint(r{i}.ndim)\n"));
+    }
+    s.push_str("print(\"DONE\")\n");
+    s
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn owning_call_result_argument_is_released() {
+    let (lb2, _) = run_fixture(&escape_arg_src(2), "escarg", 2);
+    let (lb6, _) = run_fixture(&escape_arg_src(6), "escarg", 6);
+    assert_eq!(
+        lb2, lb6,
+        "live_blocks scale with call count — the intermediate passed as an \
+         argument is stranding again (escape analysis regressed or was \
+         disabled)"
+    );
+    // Anti-vacuity: only the two model weights may survive.
+    assert_eq!(lb2, 2, "expected exactly the 2 model weights live at exit");
+}
+
+/// The escape hatch must really restore the old behaviour, and the old
+/// behaviour must really be worse — otherwise the gate above proves nothing.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn disabling_escape_analysis_restores_the_strand() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_fnlife_{}_escoff", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let prog = tmp.join("prog.nsl");
+
+    let mut lbs = Vec::new();
+    for n in [2usize, 6usize] {
+        std::fs::write(&prog, escape_arg_src(n)).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+            .args(["run", "--deterministic"])
+            .arg(&prog)
+            .current_dir(&tmp)
+            .env("NSL_STDLIB_PATH", root.join("stdlib"))
+            .env("NSL_GPU_MEM_REPORT", "1")
+            .env("NSL_NO_ESCAPE_ANALYSIS", "1")
+            .output()
+            .expect("spawn nsl run");
+        assert!(out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        lbs.push(
+            stderr
+                .lines()
+                .filter_map(|l| {
+                    l.split("live_blocks=")
+                        .nth(1)
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|s| s.parse::<i64>().ok())
+                })
+                .last()
+                .expect("no live_blocks report"),
+        );
+    }
+    assert!(
+        lbs[1] > lbs[0],
+        "with NSL_NO_ESCAPE_ANALYSIS=1 the argument should strand once per \
+         call, so live_blocks must GROW ({} -> {}); if it does not, the \
+         companion gate is vacuous",
+        lbs[0],
+        lbs[1]
     );
 }

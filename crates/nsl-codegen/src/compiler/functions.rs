@@ -23,9 +23,74 @@ fn model_def_from_stmt(stmt: &Stmt) -> Option<&nsl_ast::decl::ModelDef> {
 }
 
 impl Compiler<'_> {
+    /// Build the interprocedural parameter-escape facts consumed by call-site
+    /// argument lowering (`crate::escape`).
+    ///
+    /// Must run BEFORE any body is compiled — the whole point is that a call
+    /// site can ask about a callee it has not lowered yet. Model methods are
+    /// keyed `Model::method` from `models.model_method_bodies`, which is
+    /// already populated for source-AD inlining; free functions are keyed by
+    /// bare name and collected from the statement list here.
+    ///
+    /// Until this runs, `self.escape` is `disabled()` — every parameter
+    /// escapes, i.e. exactly the pre-analysis behaviour.
+    pub fn build_escape_analysis(&mut self, stmts: &[Stmt]) {
+        let mut defs: std::collections::HashMap<String, nsl_ast::decl::FnDef> =
+            std::collections::HashMap::new();
+
+        fn collect_fn_defs(
+            c: &Compiler<'_>,
+            stmts: &[Stmt],
+            out: &mut std::collections::HashMap<String, nsl_ast::decl::FnDef>,
+        ) {
+            for s in stmts {
+                match &s.kind {
+                    StmtKind::FnDef(f) => {
+                        out.insert(c.resolve_sym(f.name).to_string(), f.clone());
+                    }
+                    StmtKind::Decorated { stmt, .. } => {
+                        std::slice::from_ref(stmt.as_ref())
+                            .iter()
+                            .for_each(|inner| collect_fn_defs(c, std::slice::from_ref(inner), out));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        collect_fn_defs(self, stmts, &mut defs);
+
+        for (model, methods) in &self.models.model_method_bodies {
+            for (method, def) in methods {
+                defs.insert(crate::escape::method_key(model, method), def.clone());
+            }
+        }
+
+        let interner = self.interner;
+        let resolve = |sym: nsl_ast::Symbol| {
+            interner.resolve(sym.0).unwrap_or("<unknown>").to_string()
+        };
+        self.escape = crate::escape::EscapeAnalysis::analyze(&defs, &resolve);
+
+        if std::env::var("NSL_DEBUG_ESCAPE").as_deref() == Ok("1") {
+            eprintln!("[escape] analysed {} functions/methods", self.escape.len());
+            for (k, info) in self.escape.iter() {
+                eprintln!(
+                    "[escape]   {k}: offset={} escapes={:?}",
+                    info.arg_offset, info.param_escapes
+                );
+            }
+        }
+    }
+
     // ── Pass 2: Compile function bodies ─────────────────────────────
 
     pub fn compile_user_functions(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        // Interprocedural escape facts must exist before the first body is
+        // lowered — call sites consult them for callees not yet compiled.
+        if self.escape.is_empty() {
+            self.build_escape_analysis(stmts);
+        }
+
         // M56 Task 18 (spec §5.2, Option A): collect @pipeline_agent fns separately so
         // they get the pipeline-specific lowering instead of the generic compile_fn_def.
         let pipeline_fn_names: std::collections::HashSet<String> = stmts
