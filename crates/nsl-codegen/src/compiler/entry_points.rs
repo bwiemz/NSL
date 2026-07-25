@@ -1176,6 +1176,7 @@ pub fn compile_module(
         &[],
         HashMap::new(),
         HashSet::new(),
+        HashMap::new(),
         dump_ir,
         options,
     )
@@ -1191,6 +1192,12 @@ pub fn compile_module_with_imports(
     imported_fns: &[(String, String, Signature)],
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
     imported_model_names: HashSet<String>,
+    // Model -> method -> FnDef for models defined in DEPENDENCY modules.
+    // `collect_models` only ever sees THIS module's AST, so without these an
+    // imported callee's body is invisible to the escape analysis and every
+    // argument passed to it must stay conservative. `compile_entry` has had
+    // this since it shipped; the module path never did.
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<Vec<u8>, CodegenError> {
@@ -1202,6 +1209,7 @@ pub fn compile_module_with_imports(
         imported_fns,
         imported_struct_layouts,
         imported_model_names,
+        imported_model_method_bodies,
         dump_ir,
         options,
     )
@@ -1222,6 +1230,12 @@ pub fn compile_module_with_imports_returning_plan(
     imported_fns: &[(String, String, Signature)],
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
     imported_model_names: HashSet<String>,
+    // Model -> method -> FnDef for models defined in DEPENDENCY modules.
+    // `collect_models` only ever sees THIS module's AST, so without these an
+    // imported callee's body is invisible to the escape analysis and every
+    // argument passed to it must stay conservative. `compile_entry` has had
+    // this since it shipped; the module path never did.
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
@@ -1233,6 +1247,7 @@ pub fn compile_module_with_imports_returning_plan(
         imported_fns,
         imported_struct_layouts,
         imported_model_names,
+        imported_model_method_bodies,
         dump_ir,
         options,
     );
@@ -1251,6 +1266,12 @@ pub fn compile_module_with_imports_best_effort_plan(
     imported_fns: &[(String, String, Signature)],
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
     imported_model_names: HashSet<String>,
+    // Model -> method -> FnDef for models defined in DEPENDENCY modules.
+    // `collect_models` only ever sees THIS module's AST, so without these an
+    // imported callee's body is invisible to the escape analysis and every
+    // argument passed to it must stay conservative. `compile_entry` has had
+    // this since it shipped; the module path never did.
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> (Result<Vec<u8>, CodegenError>, Option<crate::wrga::WrgaPlan>) {
@@ -1262,6 +1283,7 @@ pub fn compile_module_with_imports_best_effort_plan(
         imported_fns,
         imported_struct_layouts,
         imported_model_names,
+        imported_model_method_bodies,
         dump_ir,
         options,
     );
@@ -1281,6 +1303,12 @@ pub fn compile_module_with_imports_best_effort_plans(
     imported_fns: &[(String, String, Signature)],
     imported_struct_layouts: HashMap<String, crate::context::StructLayout>,
     imported_model_names: HashSet<String>,
+    // Model -> method -> FnDef for models defined in DEPENDENCY modules.
+    // `collect_models` only ever sees THIS module's AST, so without these an
+    // imported callee's body is invisible to the escape analysis and every
+    // argument passed to it must stay conservative. `compile_entry` has had
+    // this since it shipped; the module path never did.
+    imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
     dump_ir: bool,
     options: &crate::CompileOptions,
 ) -> (
@@ -1300,6 +1328,14 @@ pub fn compile_module_with_imports_best_effort_plans(
     }
     for name in imported_model_names {
         compiler.models.imported_model_names.insert(name);
+    }
+    for (model, methods) in imported_model_method_bodies {
+        compiler
+            .models
+            .model_method_bodies
+            .entry(model)
+            .or_default()
+            .extend(methods);
     }
 
     // Dev Tools Phase 2, Task 4: run the kernel-profile pre-pass once at the

@@ -431,6 +431,7 @@ pub fn debug_compile_and_return_cfie_plan_from_ast(
             &[],
             HashMap::new(),
             std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
             false,
             options,
         );
@@ -462,6 +463,7 @@ fn debug_compile_and_return_plan_with_imports(
         imported_fns,
         HashMap::new(),
         std::collections::HashSet::new(),
+        std::collections::HashMap::new(),
         false,
         options,
     );
