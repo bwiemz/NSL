@@ -228,10 +228,23 @@ fn fa_out_write_resolution(entry: &str, name: &str, ptr: i64) -> (u64, bool) {
         );
         std::process::abort();
     }
-    if t.dtype == crate::tensor::DTYPE_FP16 {
-        return (t.data as u64, false);
+    match t.dtype {
+        crate::tensor::DTYPE_FP16 => (t.data as u64, false),
+        crate::tensor::DTYPE_F32 => (t.data as u64, true),
+        other => {
+            // The widen stores total_out*4 bytes — into a 2-byte-dtype
+            // buffer (bf16/u16) that's a device heap overflow, into an
+            // f64 buffer it's silent bit garbage. No call site passes
+            // these today; refuse loudly rather than corrupt.
+            eprintln!(
+                "[flash-attn] FATAL: {entry} write target '{name}' has dtype \
+                 {other} — the forward kernel stores f16 and this launcher \
+                 only knows how to deliver into f32 (staged widen) or f16 \
+                 (direct) tensors."
+            );
+            std::process::abort();
+        }
     }
-    (t.data as u64, true)
 }
 
 /// Allocate + zero the f16 output STAGING buffer for a FlashAttention
@@ -585,7 +598,14 @@ pub extern "C" fn nsl_flash_attention(
         // Detect SM version once; on Hopper (sm_90+) try FA3 (wgmma) first.
         // If FA3 launch fails fall through to FA2 with the caller-supplied PTX.
         let sm = crate::cuda::inner::detect_sm_version();
-        let fa3_ok = if sm >= 90 {
+        // FA3 exemption guard (review 2026-07-24): `flash_attention_hopper`
+        // forwards q/k/v/out RAW into its launch — no box resolution, no
+        // f16 staging — and its kernel reads/writes f16. That is only
+        // valid for the raw-device (kernel-harness) calling convention.
+        // On the Cranelift path (out_needs_widen: f32 NslTensor boxes)
+        // FA3 would deref host box pointers as device memory; skip it and
+        // take the FA2 staged path until FA3 gets the same resolution.
+        let fa3_ok = if sm >= 90 && !out_needs_widen {
             let fa3_result = flash_attention_hopper(
                 q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
                 f32::from_bits(scale_bits as u32),
@@ -3095,7 +3115,39 @@ fn csha_backward_impl(
     #[cfg(feature = "cuda")]
     {
         if tier_b2_active != 0 {
-            return csha_tier_b2_backward_launch(
+            // Review 2026-07-24 (finding 3): Tier B.2's d_prepass reads dO
+            // and O as f16 (`ld.global.b16` in tier_b2/backward/
+            // d_prepass.rs), and kernel 4 (proj_backward, scalar ABI)
+            // reads Wq/Wk/Wv as f16 — same contracts as the scalar path
+            // below, which this branch early-returns AROUND. Narrow f32
+            // boxes here and hand the launcher raw f16 device pointers
+            // (its own csha_tensor_data_ptr resolution passes raw device
+            // pointers through untouched). Raw-device callers (harnesses)
+            // pass through unchanged.
+            let mut tb2_staging: Vec<*mut c_void> = Vec::new();
+            let n_qkv = (batch * heads * seq_len * head_dim) as usize;
+            let n_w = (d_model * heads * head_dim) as usize;
+            let tb2_do = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "dO", do_ptr, n_qkv, &mut tb2_staging,
+            );
+            let tb2_out = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "out", out_ptr, n_qkv, &mut tb2_staging,
+            );
+            let tb2_wq = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "wq", wq_ptr, n_w, &mut tb2_staging,
+            );
+            let tb2_wk = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "wk", wk_ptr, n_w, &mut tb2_staging,
+            );
+            let tb2_wv = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "wv", wv_ptr, n_w, &mut tb2_staging,
+            );
+            let rc = csha_tier_b2_backward_launch(
                 ptx_ptr,
                 batch, heads, seq_len, head_dim,
                 block_q,
@@ -3105,14 +3157,14 @@ fn csha_backward_impl(
                 causal,
                 // RMSNorm + projection (scalar-ABI) forward inputs.
                 x_ptr, norm_weight_ptr,
-                wq_ptr, wk_ptr, wv_ptr, wo_ptr,
+                tb2_wq as i64, tb2_wk as i64, tb2_wv as i64, wo_ptr,
                 rmsnorm_eps_bits,
                 // Forward-saved activations.
                 q_proj_ptr, k_proj_ptr, v_proj_ptr,
                 row_max_ptr, row_sum_ptr, x_raw_ptr,
-                logsumexp_ptr, out_ptr,
+                logsumexp_ptr, tb2_out as i64,
                 // dO seed + gradient buffers.
-                do_ptr,
+                tb2_do as i64,
                 dq_ptr, dk_ptr, dv_ptr,
                 dwq_ptr, dwk_ptr, dwv_ptr,
                 dx_ptr, dx_norm_ptr,
@@ -3124,6 +3176,10 @@ fn csha_backward_impl(
                 // here is never read).
                 cos_ptr, sin_ptr,
             );
+            for st in tb2_staging {
+                crate::cuda::inner::free_managed(st);
+            }
+            return rc;
         }
     }
 
@@ -3798,9 +3854,14 @@ fn csha_backward_impl(
             );
         }
 
-        // The transient f16 narrows of dO / O (csha_bwd_f16_read_ptr) are
-        // dead once the launch loop and the dump readback above are done.
-        // free_managed goes through the caching allocator (stream-safe).
+        // The transient f16 narrows of dO / O / Wq/Wk/Wv are dead once the
+        // launch loop, post-pass, and dump readback above are done.
+        // free_managed returns the block to the caching allocator's free
+        // list immediately (no completion event) — safe here because every
+        // consumer that could reuse the block is a same-stream kernel or a
+        // legacy-NULL-stream sync copy (both ordered after the launches);
+        // the async offload transfer stream is NOT ordered against compute,
+        // so do not compose FA staging frees with weight-streaming writes.
         for st in bwd_f16_staging {
             crate::cuda::inner::free_managed(st);
         }
