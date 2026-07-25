@@ -332,3 +332,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check version strings agree with Cargo [workspace.package].version
         run: ./scripts/check-version-agreement.sh
+
+  # Documentation agreement — the twin of version-agreement, for claims about
+  # the CODE rather than about version strings. Build-free, so it costs
+  # seconds. Every check exists because the corresponding drift was found in
+  # the tree: a wiki page asserting CCR had no implementation while ccr.rs was
+  # 2027 lines and wired in; a README claiming all benchmarks were CPU while
+  # models/benchmarks/ held RTX 5070 Ti curves; a CI job described as existing
+  # "only during PR 3's review window" still present 12 weeks later.
+  doc-agreement:
+    name: Documentation agreement (docs == tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check documentation claims agree with the repository
+        run: ./scripts/check-doc-agreement.sh

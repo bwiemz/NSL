@@ -30,4 +30,4 @@ Documentation for developers working **on** NeuralScript. For users of the langu
 
 ---
 
-*Design: [`docs/superpowers/specs/2026-04-21-nsl-contributor-wiki-design.md`](../superpowers/specs/2026-04-21-nsl-contributor-wiki-design.md) (local-only per `.gitignore`).*
+*Design: `docs/superpowers/specs/2026-04-21-nsl-contributor-wiki-design.md` — not in the repository (local-only working note), so this is deliberately not a link.*
