@@ -3098,11 +3098,28 @@ fn lower_single_op(
                 ],
             )?;
 
+            // The kernel writes dq..dwv as f16 (`st.global.u16`), but every
+            // downstream consumer — adjoint chains, grad-integrity, the
+            // optimizer's SGD/AdamW update — reads gradient tensors as f32.
+            // Handing the f16 tensors through directly made the optimizer
+            // reinterpret f16 bit pairs as f32: weight updates collapsed to
+            // ~1e-39 denormals (wq/wk "frozen") with exit 0.  Widen on-device
+            // here; `nsl_tensor_to_f32` publishes the copies into the step's
+            // scope sweep and the f16 originals are already published by
+            // `nsl_tensor_zeros_f16_on`, so lifecycles are unchanged.
+            // dx/dxn are f32-written by the kernel — no widen.
+            let dq_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dq_dev])?;
+            let dk_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dk_dev])?;
+            let dv_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dv_dev])?;
+            let dwq_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwq_dev])?;
+            let dwk_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwk_dev])?;
+            let dwv_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwv_dev])?;
+
             // Populate Gap C cache so extract ops can read outputs.
             // Slot 7 (dxn_dev) added by the Gap I.5 Option-A fix.
             compiler
                 .csha_fused_bwd_cache
-                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev]);
+                .insert(key_val, [dq_f32, dk_f32, dv_f32, dwq_f32, dwk_f32, dwv_f32, dx_dev, dxn_dev]);
 
             // Gap A cleanup: now that the backward has consumed the save
             // pointers, free them.  (Moved here from the forward site in

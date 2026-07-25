@@ -180,6 +180,220 @@ fn fa_write_target_data_ptr(entry: &str, name: &str, ptr: i64) -> u64 {
     t.data as u64
 }
 
+/// Resolve the `out` write target of a FlashAttention forward launch and
+/// decide whether the f16 staging+widen contract applies.
+///
+/// Returns `(dest, needs_widen)`:
+///   * raw device pointer (kernel-harness path) — `(ptr, false)`: the
+///     harnesses own f16-sized buffers and read them back as f16
+///     (`csha_cuda_backward.rs` d2h at elems*2); the kernel writes them
+///     directly. Widening here would store 4 bytes/elem into a
+///     2-byte/elem allocation and corrupt the neighbouring buffers.
+///   * f16 NslTensor box — `(t.data, false)`: kernel writes f16 in place.
+///   * f32 NslTensor box (the Cranelift call sites allocate out as
+///     `zeros_like(q)`, f32) — `(t.data, true)`: launch into transient
+///     f16 staging and widen after the launch (`fa_widen_out_staging`).
+///   * CPU-resident box — hard abort (promoting a write target strands
+///     the kernel's writes in a hidden copy; same policy as
+///     `fa_write_target_data_ptr`).
+#[cfg(feature = "cuda")]
+fn fa_out_write_resolution(entry: &str, name: &str, ptr: i64) -> (u64, bool) {
+    if ptr == 0 {
+        return (0, false);
+    }
+    unsafe {
+        use cudarc::driver::sys::{
+            cuPointerGetAttribute, CUmemorytype, CUpointer_attribute, CUresult,
+        };
+        let mut mem_type: u32 = 0;
+        let rc = cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            ptr as cudarc::driver::sys::CUdeviceptr,
+        );
+        if rc == CUresult::CUDA_SUCCESS
+            && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+        {
+            return (ptr as u64, false);
+        }
+    }
+    let t = NslTensor::from_ptr(ptr);
+    if t.device == 0 {
+        eprintln!(
+            "[flash-attn] FATAL: {entry} write target '{name}' is a CPU-resident \
+             tensor — the fused attention kernels are GPU-only, and promoting a \
+             write target would strand the results in a hidden copy. Move the \
+             model and inputs to the GPU (`m.to(cuda)`, `x.to(cuda)`) or drop \
+             the @flash_attention claim to use the naive path."
+        );
+        std::process::abort();
+    }
+    match t.dtype {
+        crate::tensor::DTYPE_FP16 => (t.data as u64, false),
+        crate::tensor::DTYPE_F32 => (t.data as u64, true),
+        other => {
+            // The widen stores total_out*4 bytes — into a 2-byte-dtype
+            // buffer (bf16/u16) that's a device heap overflow, into an
+            // f64 buffer it's silent bit garbage. No call site passes
+            // these today; refuse loudly rather than corrupt.
+            eprintln!(
+                "[flash-attn] FATAL: {entry} write target '{name}' has dtype \
+                 {other} — the forward kernel stores f16 and this launcher \
+                 only knows how to deliver into f32 (staged widen) or f16 \
+                 (direct) tensors."
+            );
+            std::process::abort();
+        }
+    }
+}
+
+/// Allocate + zero the f16 output STAGING buffer for a FlashAttention
+/// forward launch.
+///
+/// EVERY FlashAttention forward kernel stores its output as **f16**
+/// (`cvt.rn.f16.f32` + `st.global.b16` — classic
+/// `emit_flash_attention_entry` in nsl-codegen/src/flash_attention.rs AND
+/// the v2 synthesizer's finalize phase), while the out tensor the
+/// Cranelift call sites allocate (`nsl_tensor_zeros_like(q)`) and the
+/// backward preprocess kernel (f32 element stride) are f32. Launching
+/// with the final f32 buffer as `out_ptr` is the Stage-C parity bug all
+/// over again: f16 bit pairs reinterpreted as f32 are ~0, so the
+/// attention output collapses to noise-scale values with exit 0 (probe:
+/// OUT_L1 identical 1.7329e-8 at seq 32 AND seq 64 — input-independent).
+/// `nsl_sdpa_fused_forward` has carried the stage-and-widen contract
+/// since Stage C; the `nsl_flash_attention*` entries never did.
+///
+/// The kernel must therefore write into this f16 staging buffer and the
+/// launcher widens on-device afterwards via `fa_widen_out_staging`.
+#[cfg(feature = "cuda")]
+fn fa_alloc_out_f16_staging(total_out: usize) -> *mut c_void {
+    // VRAM accounting: staging is attention workspace, not a real output.
+    let staging = {
+        let _surface = crate::cuda::caching_allocator::SurfaceGuard::new(
+            crate::cuda::caching_allocator::SurfaceTag::AttnWorkspace,
+        );
+        crate::cuda::inner::alloc_managed(total_out * 2)
+    };
+    crate::cuda::inner::memset_d8(staging, total_out * 2);
+    staging
+}
+
+/// Widen the f16 staging output into the caller's final f32 buffer and
+/// free the staging. Same stream as the forward launch, so in-stream
+/// ordering guarantees the conversion sees the completed forward — no
+/// intermediate sync needed (same contract as `nsl_sdpa_fused_forward`).
+/// `dest_f32 == 0` (null out target) skips the convert and just frees.
+/// Returns the conversion kernel's launch rc.
+#[cfg(feature = "cuda")]
+fn fa_widen_out_staging(
+    entry: &str,
+    out_f16: *mut c_void,
+    dest_f32: u64,
+    total_out: usize,
+) -> cudarc::driver::sys::CUresult {
+    let conv_rc = if dest_f32 == 0 {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    } else {
+        csha_fwd_convert_f16_to_f32(out_f16 as u64, dest_f32 as *mut c_void, total_out)
+    };
+    crate::cuda::inner::free_managed(out_f16);
+    if conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        eprintln!(
+            "[{entry}] f16->f32 output widen kernel FAILED (rc {conv_rc:?}) — \
+             the f32 attention output buffer is UNWRITTEN (zeros)."
+        );
+    }
+    conv_rc
+}
+
+/// Resolve an operand the fused BACKWARD kernel reads as **f16**
+/// (`dO` and `O` in the D = rowsum(dO . O) preprocess — `ld.global.b16`
+/// + `cvt.f32.f16` in phases/backward/ds_compute.rs) to a device
+/// pointer of actual f16 data.
+///
+/// The Cranelift training path hands NslTensor boxes holding **f32**
+/// data: the loss gradient dO is a plain f32 wengert tensor, and O is
+/// the forward's out tensor — genuinely f32 since the forward FFIs
+/// gained their f16 staging+widen (2026-07-24). Before that fix the
+/// forward left raw f16 bits in the "f32" out buffer, so the backward's
+/// f16 read of O was accidentally correct while every f32 consumer
+/// (the loss!) got garbage — the two consumers could never both be
+/// right until the dtype is normalised at this boundary.
+///
+/// Resolution:
+///   * raw device pointer (kernel-harness path) — passthrough, the
+///     harness already stages f16;
+///   * f16 NslTensor box — pass `.data`;
+///   * f32 NslTensor box — narrow into a transient f16 device buffer
+///     (`csha_bwd_convert_f32_to_f16`), record it in `staging` for the
+///     caller to free after the backward launch;
+///   * anything else — loud abort (a silently mis-typed operand here
+///     produces smoothly-wrong gradients, not an error).
+#[cfg(feature = "cuda")]
+fn csha_bwd_f16_read_ptr(
+    entry: &str,
+    name: &str,
+    ptr: i64,
+    elems: usize,
+    staging: &mut Vec<*mut c_void>,
+) -> u64 {
+    if ptr == 0 {
+        return 0;
+    }
+    // Raw device pointer (test harness path) — pass through unchanged.
+    unsafe {
+        use cudarc::driver::sys::{
+            cuPointerGetAttribute, CUmemorytype, CUpointer_attribute, CUresult,
+        };
+        let mut mem_type: u32 = 0;
+        let rc = cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            ptr as cudarc::driver::sys::CUdeviceptr,
+        );
+        if rc == CUresult::CUDA_SUCCESS
+            && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+        {
+            return ptr as u64;
+        }
+    }
+    let t = NslTensor::from_ptr(ptr);
+    match t.dtype {
+        crate::tensor::DTYPE_FP16 => csha_tensor_data_ptr(ptr),
+        crate::tensor::DTYPE_F32 => {
+            // Narrow f32 -> f16 into transient staging (freed by the
+            // caller after the backward launch). csha_tensor_data_ptr
+            // handles the CPU-box auto-promote for the read source.
+            let src = csha_tensor_data_ptr(ptr);
+            let dst = {
+                let _surface = crate::cuda::caching_allocator::SurfaceGuard::new(
+                    crate::cuda::caching_allocator::SurfaceTag::AttnWorkspace,
+                );
+                crate::cuda::inner::alloc_managed(elems * 2)
+            };
+            crate::cuda::inner::memset_d8(dst, elems * 2);
+            let rc = csha_bwd_convert_f32_to_f16(src as *mut c_void, dst, elems);
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                eprintln!(
+                    "[{entry}] f32->f16 narrow of '{name}' FAILED (rc {rc:?}) — \
+                     the fused backward will read zeros for this operand."
+                );
+            }
+            staging.push(dst);
+            dst as u64
+        }
+        other => {
+            eprintln!(
+                "[{entry}] FATAL: operand '{name}' has dtype {other}, but the \
+                 fused backward kernel reads it as f16 — a silent reinterpret \
+                 here produces smoothly-wrong gradients. Supported: f32 \
+                 (narrowed) or f16 (passthrough)."
+            );
+            std::process::abort();
+        }
+    }
+}
+
 /// FlashAttention-2 kernel launch wrapper.
 ///
 /// All params are i64 for Cranelift ABI compatibility (same pattern as nsl_kernel_launch).
@@ -277,7 +491,19 @@ pub extern "C" fn nsl_flash_attention(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = fa_write_target_data_ptr("nsl_flash_attention", "out", out_ptr);
+        // The forward kernel stores its output as f16 — when the target is
+        // an f32 NslTensor (Cranelift call sites), launch into a staging
+        // buffer and widen after the launch. Raw-device / f16 targets get
+        // the kernel's f16 store directly (see `fa_out_write_resolution`).
+        let (out_final, out_needs_widen) =
+            fa_out_write_resolution("nsl_flash_attention", "out", out_ptr);
+        let total_out = (batch * heads * seq_len * head_dim) as usize;
+        let out_f16 = if out_needs_widen {
+            fa_alloc_out_f16_staging(total_out)
+        } else {
+            std::ptr::null_mut()
+        };
+        let mut out = if out_needs_widen { out_f16 as u64 } else { out_final };
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -372,7 +598,14 @@ pub extern "C" fn nsl_flash_attention(
         // Detect SM version once; on Hopper (sm_90+) try FA3 (wgmma) first.
         // If FA3 launch fails fall through to FA2 with the caller-supplied PTX.
         let sm = crate::cuda::inner::detect_sm_version();
-        let fa3_ok = if sm >= 90 {
+        // FA3 exemption guard (review 2026-07-24): `flash_attention_hopper`
+        // forwards q/k/v/out RAW into its launch — no box resolution, no
+        // f16 staging — and its kernel reads/writes f16. That is only
+        // valid for the raw-device (kernel-harness) calling convention.
+        // On the Cranelift path (out_needs_widen: f32 NslTensor boxes)
+        // FA3 would deref host box pointers as device memory; skip it and
+        // take the FA2 staged path until FA3 gets the same resolution.
+        let fa3_ok = if sm >= 90 && !out_needs_widen {
             let fa3_result = flash_attention_hopper(
                 q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
                 f32::from_bits(scale_bits as u32),
@@ -392,7 +625,11 @@ pub extern "C" fn nsl_flash_attention(
         };
 
         let result: i64 = if fa3_ok {
-            // FA3 already launched and synced; treat as success.
+            // FA3 already launched and synced; treat as success. The FA2
+            // f16 staging buffer (if any) was never written — release it.
+            if out_needs_widen {
+                crate::cuda::inner::free_managed(out_f16);
+            }
             0
         } else {
             if !FA_VARIANT_LOGGED.swap(true, Ordering::Relaxed) {
@@ -429,6 +666,28 @@ pub extern "C" fn nsl_flash_attention(
                 // debugging.
                 if std::env::var("NSL_FLASH_ALLOW_FAILED").ok().as_deref() != Some("1") {
                     std::process::abort();
+                }
+            }
+            // Widen the f16 staging output into the caller's f32 tensor
+            // (frees the staging in all cases). A failed widen leaves the
+            // output unwritten — same honest-abort policy as a failed
+            // forward launch.
+            if out_needs_widen {
+                if rc == 0 {
+                    let conv_rc = fa_widen_out_staging(
+                        "nsl_flash_attention",
+                        out_f16,
+                        out_final,
+                        total_out,
+                    );
+                    if conv_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                        && std::env::var("NSL_FLASH_ALLOW_FAILED").ok().as_deref()
+                            != Some("1")
+                    {
+                        std::process::abort();
+                    }
+                } else {
+                    crate::cuda::inner::free_managed(out_f16);
                 }
             }
             rc
@@ -1748,7 +2007,19 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = csha_tensor_data_ptr(out_ptr);
+        // The forward kernel stores its output as f16 — when the target is
+        // an f32 NslTensor (Cranelift call sites), launch into a staging
+        // buffer and widen after the launch. Raw-device / f16 targets get
+        // the kernel's f16 store directly (see `fa_out_write_resolution`).
+        let (out_final, out_needs_widen) =
+            fa_out_write_resolution("nsl_flash_attention_csha", "out", out_ptr);
+        let total_out = (batch * heads * seq_len * head_dim) as usize;
+        let out_f16 = if out_needs_widen {
+            fa_alloc_out_f16_staging(total_out)
+        } else {
+            std::ptr::null_mut()
+        };
+        let mut out = if out_needs_widen { out_f16 as u64 } else { out_final };
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -1765,7 +2036,13 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
+        // lse is stored f32 by the kernel — no staging, but it is a write
+        // target (CPU boxes must abort, not promote).
+        let mut lse = fa_write_target_data_ptr(
+            "nsl_flash_attention_csha",
+            "logsumexp",
+            logsumexp_ptr,
+        );
 
         // 9 CSHA extras, matching the PTX param declarations in
         // `emit_flash_attention_entry`. eps is declared .f32; heads /
@@ -1879,6 +2156,28 @@ pub extern "C" fn nsl_flash_attention_csha(
             &args,
             shared_mem_bytes as u32,
         ) as i64;
+
+        // Widen the f16 staging output into the caller's f32 tensor
+        // (frees the staging in all cases; a failed widen surfaces as a
+        // nonzero rc instead of silently returning an unwritten output).
+        let result = if out_needs_widen {
+            if result == 0 {
+                match fa_widen_out_staging(
+                    "nsl_flash_attention_csha",
+                    out_f16,
+                    out_final,
+                    total_out,
+                ) {
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS => 0,
+                    conv_rc => conv_rc as i64,
+                }
+            } else {
+                crate::cuda::inner::free_managed(out_f16);
+                result
+            }
+        } else {
+            result
+        };
 
         // Tape recording mirrors `nsl_flash_attention` exactly — CSHA
         // is a forward-pass optimisation; the backward pass re-reads Q/K/V
@@ -2144,7 +2443,23 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = csha_tensor_data_ptr(out_ptr);
+        // The forward kernel stores its output as f16 — when the target is
+        // an f32 NslTensor (Cranelift call sites), launch into a staging
+        // buffer and widen after the final launch (launch B on the
+        // multi-tile path). Raw-device / f16 targets get the kernel's f16
+        // store directly (see `fa_out_write_resolution`).
+        let (out_final, out_needs_widen) = fa_out_write_resolution(
+            "nsl_flash_attention_csha_with_saves",
+            "out",
+            out_ptr,
+        );
+        let total_out = (batch * heads * seq_len * head_dim) as usize;
+        let out_f16 = if out_needs_widen {
+            fa_alloc_out_f16_staging(total_out)
+        } else {
+            std::ptr::null_mut()
+        };
+        let mut out = if out_needs_widen { out_f16 as u64 } else { out_final };
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -2161,7 +2476,13 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
+        // lse is stored f32 by the kernel — no staging, but it is a write
+        // target (CPU boxes must abort, not promote).
+        let mut lse = fa_write_target_data_ptr(
+            "nsl_flash_attention_csha_with_saves",
+            "logsumexp",
+            logsumexp_ptr,
+        );
         let mut x = csha_tensor_data_ptr(x_ptr);
         let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
         let mut wq = csha_tensor_data_ptr(wq_ptr);
@@ -2383,6 +2704,9 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                             crate::cuda::inner::free_device(st);
                         }
                     }
+                    if out_needs_widen {
+                        crate::cuda::inner::free_managed(out_f16);
+                    }
                     return -1;
                 }
             }
@@ -2424,6 +2748,22 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         for st in mt_staging {
             if !st.is_null() {
                 crate::cuda::inner::free_device(st);
+            }
+        }
+
+        // Widen the f16 staging output into the caller's f32 tensor
+        // (frees the staging in all cases; a failed widen surfaces as a
+        // nonzero rc instead of silently returning an unwritten output).
+        if out_needs_widen {
+            if fwd_rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                fwd_rc = fa_widen_out_staging(
+                    "nsl_flash_attention_csha_with_saves",
+                    out_f16,
+                    out_final,
+                    total_out,
+                );
+            } else {
+                crate::cuda::inner::free_managed(out_f16);
             }
         }
 
@@ -2775,7 +3115,39 @@ fn csha_backward_impl(
     #[cfg(feature = "cuda")]
     {
         if tier_b2_active != 0 {
-            return csha_tier_b2_backward_launch(
+            // Review 2026-07-24 (finding 3): Tier B.2's d_prepass reads dO
+            // and O as f16 (`ld.global.b16` in tier_b2/backward/
+            // d_prepass.rs), and kernel 4 (proj_backward, scalar ABI)
+            // reads Wq/Wk/Wv as f16 — same contracts as the scalar path
+            // below, which this branch early-returns AROUND. Narrow f32
+            // boxes here and hand the launcher raw f16 device pointers
+            // (its own csha_tensor_data_ptr resolution passes raw device
+            // pointers through untouched). Raw-device callers (harnesses)
+            // pass through unchanged.
+            let mut tb2_staging: Vec<*mut c_void> = Vec::new();
+            let n_qkv = (batch * heads * seq_len * head_dim) as usize;
+            let n_w = (d_model * heads * head_dim) as usize;
+            let tb2_do = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "dO", do_ptr, n_qkv, &mut tb2_staging,
+            );
+            let tb2_out = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "out", out_ptr, n_qkv, &mut tb2_staging,
+            );
+            let tb2_wq = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "wq", wq_ptr, n_w, &mut tb2_staging,
+            );
+            let tb2_wk = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "wk", wk_ptr, n_w, &mut tb2_staging,
+            );
+            let tb2_wv = csha_bwd_f16_read_ptr(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                "wv", wv_ptr, n_w, &mut tb2_staging,
+            );
+            let rc = csha_tier_b2_backward_launch(
                 ptx_ptr,
                 batch, heads, seq_len, head_dim,
                 block_q,
@@ -2785,14 +3157,14 @@ fn csha_backward_impl(
                 causal,
                 // RMSNorm + projection (scalar-ABI) forward inputs.
                 x_ptr, norm_weight_ptr,
-                wq_ptr, wk_ptr, wv_ptr, wo_ptr,
+                tb2_wq as i64, tb2_wk as i64, tb2_wv as i64, wo_ptr,
                 rmsnorm_eps_bits,
                 // Forward-saved activations.
                 q_proj_ptr, k_proj_ptr, v_proj_ptr,
                 row_max_ptr, row_sum_ptr, x_raw_ptr,
-                logsumexp_ptr, out_ptr,
+                logsumexp_ptr, tb2_out as i64,
                 // dO seed + gradient buffers.
-                do_ptr,
+                tb2_do as i64,
                 dq_ptr, dk_ptr, dv_ptr,
                 dwq_ptr, dwk_ptr, dwv_ptr,
                 dx_ptr, dx_norm_ptr,
@@ -2804,6 +3176,10 @@ fn csha_backward_impl(
                 // here is never read).
                 cos_ptr, sin_ptr,
             );
+            for st in tb2_staging {
+                crate::cuda::inner::free_managed(st);
+            }
+            return rc;
         }
     }
 
@@ -2921,7 +3297,19 @@ fn csha_backward_impl(
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        let mut out = csha_tensor_data_ptr(out_ptr);
+        // dO and O are read by the kernel as f16 (D = rowsum(dO . O)
+        // preprocess) but arrive from the Cranelift training path as f32
+        // tensors — narrow into transient f16 staging (freed after the
+        // launch loop below). See `csha_bwd_f16_read_ptr`.
+        let mut bwd_f16_staging: Vec<*mut c_void> = Vec::new();
+        let f16_in_elems = (batch * heads * seq_len * head_dim) as usize;
+        let mut out = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "out",
+            out_ptr,
+            f16_in_elems,
+            &mut bwd_f16_staging,
+        );
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -2941,9 +3329,33 @@ fn csha_backward_impl(
         let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
         let mut x = csha_tensor_data_ptr(x_ptr);
         let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
-        let mut wq = csha_tensor_data_ptr(wq_ptr);
-        let mut wk = csha_tensor_data_ptr(wk_ptr);
-        let mut wv = csha_tensor_data_ptr(wv_ptr);
+        // Wq/Wk/Wv are read by the backward kernel as f16 ([d_model,
+        // kv_dim] f16 layout, `ld.global.b16` in the dRMSNorm dx_norm
+        // phase) but arrive from the Cranelift training path as the
+        // model's f32 weight tensors — narrow like dO/O above. gamma
+        // (norm_weight) and x_raw are f32-read by the kernel; no staging.
+        let w_elems = (d_model * heads * head_dim) as usize;
+        let mut wq = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "wq",
+            wq_ptr,
+            w_elems,
+            &mut bwd_f16_staging,
+        );
+        let mut wk = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "wk",
+            wk_ptr,
+            w_elems,
+            &mut bwd_f16_staging,
+        );
+        let mut wv = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "wv",
+            wv_ptr,
+            w_elems,
+            &mut bwd_f16_staging,
+        );
         let mut wo = csha_tensor_data_ptr(wo_ptr);
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
@@ -2959,7 +3371,13 @@ fn csha_backward_impl(
         // NslTensor handles — resolve to device pointers via csha_tensor_data_ptr.
         // PR #74 added dx_norm as the 8th extract so dgamma can be computed
         // from the post-RMSNorm gradient directly.
-        let mut d_o = csha_tensor_data_ptr(do_ptr);
+        let mut d_o = csha_bwd_f16_read_ptr(
+            "nsl_flash_attention_csha_backward",
+            "dO",
+            do_ptr,
+            f16_in_elems,
+            &mut bwd_f16_staging,
+        );
         let mut d_q = csha_tensor_data_ptr(dq_ptr);
         let mut d_k = csha_tensor_data_ptr(dk_ptr);
         let mut d_v = csha_tensor_data_ptr(dv_ptr);
@@ -3434,6 +3852,18 @@ fn csha_backward_impl(
                 qp, kpj, vpj, rmax, rsum, xraw,
                 d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn,
             );
+        }
+
+        // The transient f16 narrows of dO / O / Wq/Wk/Wv are dead once the
+        // launch loop, post-pass, and dump readback above are done.
+        // free_managed returns the block to the caching allocator's free
+        // list immediately (no completion event) — safe here because every
+        // consumer that could reuse the block is a same-stream kernel or a
+        // legacy-NULL-stream sync copy (both ordered after the launches);
+        // the async offload transfer stream is NOT ordered against compute,
+        // so do not compose FA staging frees with weight-streaming writes.
+        for st in bwd_f16_staging {
+            crate::cuda::inner::free_managed(st);
         }
 
         rc as i64
