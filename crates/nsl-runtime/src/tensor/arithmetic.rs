@@ -937,6 +937,101 @@ pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f
     nsl_tensor_free(scaled);
 }
 
+/// Read a tensor's shape as a `Vec<i64>`.
+fn shape_vec(t: &NslTensor) -> Vec<i64> {
+    (0..t.ndim as usize).map(|d| unsafe { *t.shape.add(d) }).collect()
+}
+
+/// Fused weight-gradient accumulate (Item 7, `--fuse-wgrad-accum`).
+///
+/// Computes `m_partial += scale * (x^T @ g)` contracted over ALL leading
+/// (batch/time) dimensions, replacing this three-step chain:
+///
+/// ```text
+///   x_t      = transpose(x)              [B, d, T]
+///   raw_grad = matmul(x_t, g)            [B, d, o]   <- B x P temporary
+///   dW       = reduce_to_shape(raw, W)   [d, o]      <- reads all B x P
+///   m       += scale * dW                            <- extra launch
+/// ```
+///
+/// The batch sum is mathematically just part of the contraction —
+/// `sum_{b,t} x[b,t,i] g[b,t,j]` is the same sum whether you group it by `b`
+/// first or not — so flattening `[B, T, *]` to `[B*T, *]` turns the whole
+/// chain into one GEMM with `beta = 1.0` writing straight into `m_partial`.
+///
+/// # NOT bit-exact with the unfused chain
+///
+/// Deliberately so, and gated behind an opt-in flag for that reason:
+///   * the scale-and-add happens in cuBLAS's epilogue, which uses FMA (one
+///     rounding). The `.rn` mitigation that kept `scalar_mul_add_inplace`
+///     bit-exact is unavailable inside a closed cuBLAS kernel.
+///   * `alpha` multiplies the in-register accumulator rather than a stored,
+///     already-rounded f32 `dW`.
+///   * the per-batch products are no longer rounded to f32 before being
+///     summed — the batch sum moves inside the GEMM accumulator.
+/// The result stays deterministic run-to-run; it just is not the same bits as
+/// the decomposed path.
+///
+/// Falls back to the exact decomposed chain whenever the fast path's
+/// preconditions do not hold, so correctness never depends on them.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: f64) {
+    let m = NslTensor::from_ptr(m_ptr);
+    let x = NslTensor::from_ptr(x_ptr);
+    let g = NslTensor::from_ptr(g_ptr);
+
+    let xs = shape_vec(x);
+    let gs = shape_vec(g);
+    let ms = shape_vec(m);
+
+    // Preconditions for the single-GEMM form:
+    //   x: [..., d]   g: [..., o]   m: [d, o]
+    //   leading dims of x and g identical (they index the same tokens)
+    //   everything GPU-resident f32 and contiguous (the flatten must be a view)
+    let ok = ms.len() == 2
+        && xs.len() >= 2
+        && gs.len() >= 2
+        && xs.len() == gs.len()
+        && xs[..xs.len() - 1] == gs[..gs.len() - 1]
+        && xs[xs.len() - 1] == ms[0]
+        && gs[gs.len() - 1] == ms[1]
+        && m.device > 0
+        && x.device == m.device
+        && g.device == m.device
+        && m.dtype == crate::tensor::DTYPE_F32
+        && x.dtype == crate::tensor::DTYPE_F32
+        && g.dtype == crate::tensor::DTYPE_F32
+        && m.is_contiguous()
+        && x.is_contiguous()
+        && g.is_contiguous();
+
+    if ok {
+        #[cfg(feature = "cuda")]
+        {
+            let n_rows: i64 = xs[..xs.len() - 1].iter().product();
+            let d_in = ms[0];
+            let d_out = ms[1];
+            if n_rows > 0 && d_in > 0 && d_out > 0 {
+                crate::cuda::gpu_wgrad_accum_f32(
+                    m_ptr, x_ptr, g_ptr, n_rows as u64, d_in as u64, d_out as u64, s as f32,
+                );
+                return;
+            }
+        }
+    }
+
+    // Fallback: the exact chain codegen would otherwise have emitted. Keeping
+    // this here means a shape the compiler's static pre-pass misjudged
+    // degrades to slow-but-correct instead of producing a wrong gradient.
+    let x_t = crate::tensor::nsl_tensor_transpose(x_ptr, -2, -1);
+    let raw = nsl_tensor_matmul(x_t, g_ptr, 0);
+    let dw = crate::tensor::nsl_tensor_reduce_to_shape(raw, m_ptr);
+    nsl_tensor_scalar_mul_add_inplace(m_ptr, dw, s);
+    nsl_tensor_free(dw);
+    nsl_tensor_free(raw);
+    nsl_tensor_free(x_t);
+}
+
 // === Sparse matrix multiply (M52c: weight-aware CSR SpMM) ===
 
 /// CSR sparse matmul: C = A_sparse @ B_dense

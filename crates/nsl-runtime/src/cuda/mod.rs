@@ -2171,6 +2171,90 @@ pub(crate) mod cublas_inner {
         )
     }
 
+    /// Weight-gradient contraction: `C[d, o] = alpha * (X[N, d]^T @ G[N, o]) + beta * C`.
+    ///
+    /// All three operands are ROW-MAJOR. This is the shape the weight gradient
+    /// actually has once the batch dimension is flattened: for a forward
+    /// `y = x @ W` with `x: [B, T, d]`, the gradient is
+    /// `dW[d, o] = sum_{b,t} x[b,t,d] * dy[b,t,o]`, which is exactly this
+    /// contraction with `N = B*T` — the batch sum falls out of the reduction
+    /// dimension instead of needing a separate `[B, d, o]` temporary and a
+    /// batch-reduce pass.
+    ///
+    /// With `beta = 1.0` and `C = m_partial`, the whole
+    /// "matmul -> reduce_to_shape -> scaled accumulate" chain collapses into
+    /// this single call.
+    ///
+    /// # Column-major derivation (get this wrong and it is silently transposed)
+    ///
+    /// Row-major `M[r, c]` is column-major `M_cm[c, r]` with `ld = c`. So:
+    ///   * `C[d, o]` -> `C_cm[o, d]`, ldc = o
+    ///   * `G[N, o]` -> `G_cm[o, N]`, lda = o
+    ///   * `X[N, d]` -> `X_cm[d, N]`, ldb = d
+    /// and `C[d,o] = sum_n X[n,d] G[n,o]` becomes
+    /// `C_cm[o,d] = sum_n G_cm[o,n] X_cm[d,n] = G_cm @ X_cm^T`.
+    /// Hence `transa = N` on G, `transb = T` on X, `m = o`, `n = d`, `k = N`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_wgrad_accum(
+        x_dev: *const f32,
+        g_dev: *const f32,
+        c_dev: *mut f32,
+        n_rows: u64, // N = flattened batch*time (the contraction dim)
+        d_in: u64,   // d = C rows      (x's trailing dim)
+        d_out: u64,  // o = C cols      (g's trailing dim)
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(
+            n_rows > 0 && d_in > 0 && d_out > 0,
+            "wgrad gemm requires N,d,o > 0"
+        );
+        debug_assert!(
+            n_rows <= i32::MAX as u64 && d_in <= i32::MAX as u64 && d_out <= i32::MAX as u64,
+            "wgrad gemm dims must fit in i32"
+        );
+        // cuda-graphs: recorded as a distinct pseudo-op shape. The alpha/beta
+        // bits are part of GpuOp::Sgemm's identity, so an accumulating gemm
+        // can never be replayed as an overwriting one.
+        if !super::graph_capture::on_sgemm(
+            x_dev as usize,
+            g_dev as usize,
+            c_dev as usize,
+            n_rows,
+            d_in,
+            d_out,
+            alpha,
+            beta,
+        ) {
+            return Ok(());
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — wgrad gemm stays on its previous stream", r);
+            }
+        }
+        cublas_result::sgemm(
+            handle,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N, // G_cm, no transpose
+            cublas_sys::cublasOperation_t::CUBLAS_OP_T, // X_cm, transposed
+            d_out as i32,  // cublas m = rows of C_cm = o
+            d_in as i32,   // cublas n = cols of C_cm = d
+            n_rows as i32, // contraction dim = N
+            &alpha,
+            g_dev, d_out as i32,  // A := G_cm, lda = o
+            x_dev, d_in as i32,   // B := X_cm, ldb = d
+            &beta,
+            c_dev, d_out as i32,  // C := C_cm, ldc = o
+        )
+    }
+
     /// Strided-batched SGEMM in RAW cuBLAS column-major terms (muon batched
     /// Newton-Schulz). The caller does its own row/column-major mapping —
     /// the muon batch engine's square operands are all symmetric, which is
@@ -2774,6 +2858,83 @@ pub(crate) fn gpu_scale_raw_f32(dev: *mut std::ffi::c_void, n: usize, scalar: f3
         result as u32
     );
     inner::sync_after_kernel();
+}
+
+/// Fused weight-gradient accumulate: `m_partial += scale * (x^T @ g)`,
+/// contracted over the flattened leading dimensions.
+///
+/// One cuBLAS call with `alpha = scale, beta = 1.0` writing straight into
+/// `m_partial` — no `[B, d, o]` temporary, no batch-reduce pass, no separate
+/// elementwise accumulate launch. See `sgemm_wgrad_accum` for the column-major
+/// derivation and `nsl_tensor_wgrad_accum` for the (deliberate)
+/// non-bit-exactness.
+///
+/// The caller has already validated device/dtype/contiguity/shape.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_wgrad_accum_f32(
+    m_ptr: i64,
+    x_ptr: i64,
+    g_ptr: i64,
+    n_rows: u64,
+    d_in: u64,
+    d_out: u64,
+    scale: f32,
+) {
+    use crate::tensor::NslTensor;
+    let m = unsafe { &*(m_ptr as *const NslTensor) };
+    let x = unsafe { &*(x_ptr as *const NslTensor) };
+    let g = unsafe { &*(g_ptr as *const NslTensor) };
+    debug_assert_eq!(
+        m.len as u64,
+        d_in * d_out,
+        "wgrad accum: m_partial length must be d_in * d_out"
+    );
+    debug_assert_eq!(
+        x.len as u64,
+        n_rows * d_in,
+        "wgrad accum: x length must be N * d_in"
+    );
+    debug_assert_eq!(
+        g.len as u64,
+        n_rows * d_out,
+        "wgrad accum: g length must be N * d_out"
+    );
+
+    inner::ensure_context();
+
+    // SAFETY: all three are device f32 buffers of the sizes asserted above,
+    // validated by `nsl_tensor_wgrad_accum` before dispatch.
+    let res = unsafe {
+        cublas_inner::sgemm_wgrad_accum(
+            x.data as *const f32,
+            g.data as *const f32,
+            m.data as *mut f32,
+            n_rows,
+            d_in,
+            d_out,
+            scale,
+            // beta = 1.0: ACCUMULATE into m_partial rather than overwrite it.
+            // This is the whole point of the fusion; a 0.0 here would silently
+            // discard every earlier micro-batch's contribution.
+            1.0,
+        )
+    };
+    if let Err(e) = res {
+        panic!(
+            "[nsl-wgrad] cuBLAS wgrad accum failed (N={n_rows} d={d_in} o={d_out}): {e:?}. \
+             This writes gradients in place, so there is no safe partial result to \
+             continue from."
+        );
+    }
+
+    if inner::sync_mode_enabled() {
+        let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+        assert_eq!(
+            sync_result,
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "[nsl-wgrad] async CUDA error after wgrad accum gemm"
+        );
+    }
 }
 
 /// FASE fused scaled-add (Milestone C · p4): `m[i] = m[i] + g[i] * scale`,
