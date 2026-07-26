@@ -120,6 +120,7 @@ pub mod training_report;
 pub mod vmap;
 pub mod wengert;
 pub mod wengert_lower;
+pub mod wgrad_fusion;
 
 // --- Quantization & precision --------------------------------------------
 pub mod bitnet;
@@ -1312,6 +1313,24 @@ pub struct CompileOptions {
     /// the decomposition to an f32 tolerance (approx rsqrt/div), so it is an
     /// opt-in speedup, not a bit-exact substitution.
     pub fuse_rmsnorm_backward: bool,
+    /// Item 7 (`--fuse-wgrad-accum`): collapse the source-AD weight-gradient
+    /// chain `Transpose -> Matmul -> reduce_to_shape` PLUS the FASE Deferred
+    /// accumulate into ONE cuBLAS call — the flattened contraction
+    /// `[d, B*T] x [B*T, o]` with `beta = 1.0` writing straight into
+    /// `m_partial`. Removes the `[B, d, o]` raw-gradient temporary (B x the
+    /// parameter) and the full read-back the reduce performs over it.
+    ///
+    /// Off by default and NOT bit-exact: the products are summed in cuBLAS's
+    /// order instead of rounding each per-batch partial before the reduce.
+    /// Measured against an f64 CPU reference it is *closer* to the true value
+    /// than the chain it replaces in 2 of 3 shapes, but different is
+    /// different — same opt-in tolerance contract as `fuse_rmsnorm_backward`.
+    ///
+    /// Refuses to compose with `grad_integrity` (which must read the raw
+    /// gradient the fusion never materializes) and `optim_state_offload`
+    /// (host-resident `m_partial`, which the device GEMM cannot write).
+    /// See [`crate::wgrad_fusion`].
+    pub fuse_wgrad_accum: bool,
     /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
     /// Selective policy's saved matmul-class interiors to half precision
     /// between forward and backward (cast-on-save, dequant-on-load via the
@@ -1493,6 +1512,7 @@ impl Default for CompileOptions {
             checkpoint_budget_mib: None,
             checkpoint_stride: CheckpointStride::default(),
             fuse_rmsnorm_backward: false,
+            fuse_wgrad_accum: false,
             checkpoint_compress: None,
             layerwise_accum: false,
             weight_stream: false,

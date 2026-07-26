@@ -972,8 +972,36 @@ fn shape_vec(t: &NslTensor) -> Vec<i64> {
 /// The result stays deterministic run-to-run; it just is not the same bits as
 /// the decomposed path.
 ///
+/// Counts of `nsl_tensor_wgrad_accum` calls that took the single-GEMM path
+/// versus the decomposed fallback. Always live (one relaxed atomic per
+/// parameter per micro-batch — negligible next to a GEMM); the
+/// `NSL_WGRAD_COUNTER=1` atexit report and the getters below only expose them.
+///
+/// These exist for anti-vacuity, not telemetry: the fallback is deliberately
+/// silent, so without a counter a green parity gate cannot distinguish "the
+/// fused GEMM agrees with the chain" from "the fused GEMM never ran".
+pub static WGRAD_FUSED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WGRAD_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// In-process getters (same family as `nsl_fase_fused_step_count`).
+#[no_mangle]
+pub extern "C" fn nsl_wgrad_fused_count() -> i64 {
+    WGRAD_FUSED_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_wgrad_fallback_count() -> i64 {
+    WGRAD_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
 /// Falls back to the exact decomposed chain whenever the fast path's
 /// preconditions do not hold, so correctness never depends on them.
+///
+/// Because that fallback is SILENT, both outcomes are counted (see
+/// [`WGRAD_FUSED_COUNT`] / [`WGRAD_FALLBACK_COUNT`]). A parity gate that only
+/// checked "the numbers agree" would pass just as happily if every call had
+/// fallen back — testing the decomposed chain against itself.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: f64) {
     let m = NslTensor::from_ptr(m_ptr);
@@ -1015,9 +1043,26 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
                 crate::cuda::gpu_wgrad_accum_f32(
                     m_ptr, x_ptr, g_ptr, n_rows as u64, d_in as u64, d_out as u64, s as f32,
                 );
+                WGRAD_FUSED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         }
+    }
+    WGRAD_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("NSL_WGRAD_DEBUG").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[wgrad-accum] fallback: m{ms:?} dev={} dt={} contig={} | \
+             x{xs:?} dev={} dt={} contig={} | g{gs:?} dev={} dt={} contig={}",
+            m.device,
+            m.dtype,
+            m.is_contiguous(),
+            x.device,
+            x.dtype,
+            x.is_contiguous(),
+            g.device,
+            g.dtype,
+            g.is_contiguous(),
+        );
     }
 
     // Fallback: the exact chain codegen would otherwise have emitted. Keeping
@@ -1026,7 +1071,16 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
     let x_t = crate::tensor::nsl_tensor_transpose(x_ptr, -2, -1);
     let raw = nsl_tensor_matmul(x_t, g_ptr, 0);
     let dw = crate::tensor::nsl_tensor_reduce_to_shape(raw, m_ptr);
-    nsl_tensor_scalar_mul_add_inplace(m_ptr, dw, s);
+    // Migrate to the accumulator's (device, dtype) exactly as
+    // `fase_emit_accumulate` does. This matters whenever the activations are
+    // CPU while `m_partial` is GPU — the common mixed case that also sends us
+    // down this fallback in the first place. `scalar_mul_add_inplace` would
+    // survive the mismatch via its own mul_scalar/add_inplace fallback, but
+    // depending on that is depending on an unstated contract two layers down;
+    // `to_device_like` is a refcount bump when the placements already match.
+    let dw_migrated = crate::tensor::nsl_tensor_to_device_like(dw, m_ptr);
+    nsl_tensor_scalar_mul_add_inplace(m_ptr, dw_migrated, s);
+    nsl_tensor_free(dw_migrated);
     nsl_tensor_free(dw);
     nsl_tensor_free(raw);
     nsl_tensor_free(x_t);

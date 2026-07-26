@@ -9528,7 +9528,7 @@ impl Compiler<'_> {
                     let plist = param_list;
                     let mut fase_cb = |c: &mut Compiler,
                                        var_id: crate::wengert::VarId,
-                                       grad_ptr: Value,
+                                       grad_src: crate::wengert_lower::ParamGradSource,
                                        still_needed: bool,
                                        b: &mut cranelift_frontend::FunctionBuilder|
                      -> Result<(), CodegenError> {
@@ -9552,6 +9552,26 @@ impl Compiler<'_> {
                         let m_partial =
                             c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
                         let off = c.compile_options.optim_state_offload;
+                        // Item 7: the fused chain never materializes a
+                        // gradient tensor — emit the accumulating GEMM over
+                        // the chain's operands and we are done. There is
+                        // nothing to note for grad-integrity and nothing to
+                        // free; both compositions are refused at option
+                        // validation so neither can be silently skipped here.
+                        let grad_ptr = match grad_src {
+                            crate::wengert_lower::ParamGradSource::FusedWgrad { x, g } => {
+                                debug_assert!(!c.compile_options.grad_integrity);
+                                debug_assert!(!off);
+                                let scale_val = b.ins().f64const(accum_scale);
+                                c.compile_call_by_name(
+                                    b,
+                                    "nsl_tensor_wgrad_accum",
+                                    &[m_partial, x, g, scale_val],
+                                )?;
+                                return Ok(());
+                            }
+                            crate::wengert_lower::ParamGradSource::Materialized(v) => v,
+                        };
                         // P0.3: note this parameter's gradient BEFORE accumulate
                         // frees/consumes it. accum_idx == the param_paths index.
                         if c.compile_options.grad_integrity {
@@ -11582,10 +11602,28 @@ impl Compiler<'_> {
                 let accum_scale = pending.accum_scale;
                 let mut fase_cb = |c: &mut Compiler,
                                    var_id: crate::wengert::VarId,
-                                   grad_ptr: Value,
+                                   grad_src: crate::wengert_lower::ParamGradSource,
                                    still_needed: bool,
                                    b: &mut cranelift_frontend::FunctionBuilder|
                  -> Result<(), CodegenError> {
+                    // Item 7 is refused alongside --layerwise-accum at option
+                    // validation, so this arm is unreachable. It is a hard
+                    // error rather than a silent fallthrough because the
+                    // reason is subtle: CSLA lowers PRE-SLICED tapes, so
+                    // `wgrad_fusion::plan` would see slice-local reader
+                    // counts and could elide a matmul whose result a LATER
+                    // slice still reads — a silently dropped gradient.
+                    let grad_ptr = match grad_src {
+                        crate::wengert_lower::ParamGradSource::Materialized(v) => v,
+                        crate::wengert_lower::ParamGradSource::FusedWgrad { .. } => {
+                            return Err(CodegenError::new(
+                                "internal: --fuse-wgrad-accum fired inside the CSLA window \
+                                 replay, which lowers pre-sliced tapes where the fusion's \
+                                 single-reader proof does not hold. This composition is \
+                                 supposed to be refused at option validation.",
+                            ));
+                        }
+                    };
                     let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
                         return Ok(());
                     };

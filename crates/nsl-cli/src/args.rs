@@ -778,6 +778,30 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
 
+        /// Item 7: collapse the source-AD weight-gradient chain
+        /// (transpose -> batched matmul -> reduce) AND the FASE Deferred
+        /// accumulate into ONE cuBLAS call, writing straight into m_partial.
+        /// Removes the [B, d, o] raw-gradient temporary — B times the size of
+        /// the parameter — and the reduce's full read-back over it.
+        /// Requires --source-ad and a FASE-Deferred plan.
+        ///
+        /// NOT bit-exact: products are summed in cuBLAS's order rather than
+        /// rounding each per-batch partial first. Measured against an f64
+        /// reference it is closer to the true gradient than the chain it
+        /// replaces in 2 of 3 shapes, but validate loss parity at the repo's
+        /// 3-4 dp standard before relying on it.
+        ///
+        /// Refuses --grad-integrity (which must read the raw gradient this
+        /// never materializes), --optim-state-offload (host-resident
+        /// m_partial the device GEMM cannot write), and --layerwise-accum
+        /// (pre-sliced tapes defeat the fusion's single-reader proof).
+        #[arg(
+            long,
+            requires = "source_ad",
+            conflicts_with_all = ["grad_integrity", "optim_state_offload", "layerwise_accum"]
+        )]
+        pub(crate) fuse_wgrad_accum: bool,
+
         /// With --checkpoint-selective: compress the saved matmul-class
         /// activations to half precision between forward and backward
         /// (fp16 or bf16). Not bit-exact — backward reads rounded
@@ -1282,6 +1306,30 @@ pub(crate) struct RunArgs {
         /// the fused paths are bit-deterministic run-to-run.
         #[arg(long, requires = "source_ad")]
         pub(crate) fuse_rmsnorm_backward: bool,
+
+        /// Item 7: collapse the source-AD weight-gradient chain
+        /// (transpose -> batched matmul -> reduce) AND the FASE Deferred
+        /// accumulate into ONE cuBLAS call, writing straight into m_partial.
+        /// Removes the [B, d, o] raw-gradient temporary — B times the size of
+        /// the parameter — and the reduce's full read-back over it.
+        /// Requires --source-ad and a FASE-Deferred plan.
+        ///
+        /// NOT bit-exact: products are summed in cuBLAS's order rather than
+        /// rounding each per-batch partial first. Measured against an f64
+        /// reference it is closer to the true gradient than the chain it
+        /// replaces in 2 of 3 shapes, but validate loss parity at the repo's
+        /// 3-4 dp standard before relying on it.
+        ///
+        /// Refuses --grad-integrity (which must read the raw gradient this
+        /// never materializes), --optim-state-offload (host-resident
+        /// m_partial the device GEMM cannot write), and --layerwise-accum
+        /// (pre-sliced tapes defeat the fusion's single-reader proof).
+        #[arg(
+            long,
+            requires = "source_ad",
+            conflicts_with_all = ["grad_integrity", "optim_state_offload", "layerwise_accum"]
+        )]
+        pub(crate) fuse_wgrad_accum: bool,
 
         /// With --checkpoint-selective: compress the saved matmul-class
         /// activations to half precision between forward and backward

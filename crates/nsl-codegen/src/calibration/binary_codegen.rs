@@ -1580,10 +1580,26 @@ fn emit_model_backward_bridge(
         let arena_map = &adj_to_arena;
         let mut grad_cb = |c: &mut crate::compiler::Compiler<'_>,
                            var_id: crate::wengert::VarId,
-                           grad_val: cranelift_codegen::ir::Value,
+                           grad_src: crate::wengert_lower::ParamGradSource,
                            still_needed: bool,
                            fb: &mut FunctionBuilder|
          -> Result<(), crate::error::CodegenError> {
+            // Item 7 does not compose with calibration: this callback exists
+            // to memcpy the gradient's RAW DATA into the calibration arena,
+            // and the fused chain never materializes a gradient tensor to
+            // copy from. Refuse rather than emit a binary whose arena is
+            // silently full of stale bytes.
+            let grad_val = match grad_src {
+                crate::wengert_lower::ParamGradSource::Materialized(v) => v,
+                crate::wengert_lower::ParamGradSource::FusedWgrad { .. } => {
+                    return Err(crate::error::CodegenError::new(
+                        "--fuse-wgrad-accum cannot be used when emitting a calibration \
+                         binary: the gradient arena needs a materialized gradient tensor, \
+                         which the fused weight-gradient GEMM never produces. Rebuild the \
+                         calibration binary without --fuse-wgrad-accum.",
+                    ));
+                }
+            };
             // `still_needed`: this param grad is a shared intermediate that a
             // later adjoint op still reads. wengert_lower keeps it live in
             // var_map; the callback must NOT free it (freeing would be a

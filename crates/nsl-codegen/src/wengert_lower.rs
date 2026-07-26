@@ -105,11 +105,29 @@ fn describe_producer_chain(
 /// `primal_vars` maps VarIds from the forward pass to their Cranelift Values (i64 tensor pointers).
 /// Returns a map from all VarIds (including adjoint) to Cranelift Values.
 ///
+/// How a parameter gradient reaches the FASE hook.
+///
+/// Normally the gradient is a materialized tensor the hook folds into
+/// `m_partial` and then frees. Under `--fuse-wgrad-accum` the whole
+/// `Transpose -> Matmul -> reduce_to_shape` chain is elided and the hook
+/// receives its *operands* instead, folding the contraction and the
+/// accumulate into one GEMM. See [`crate::wgrad_fusion`].
+#[derive(Debug, Clone, Copy)]
+pub enum ParamGradSource {
+    /// Pointer to the computed gradient tensor.
+    Materialized(Value),
+    /// Operands of an elided weight-gradient chain: the hook must emit
+    /// `m_partial += scale * (x^T @ g)`. No gradient tensor exists, so there
+    /// is nothing here for the hook to free — `x` and `g` remain owned by the
+    /// normal end-of-backward cleanup.
+    FusedWgrad { x: Value, g: Value },
+}
+
 /// `on_param_grad`, when `Some((set, cb))`, causes `cb` to be invoked
 /// immediately after any op whose `result` VarId is in `set`.  The callback
-/// receives `(&mut Compiler, VarId, Value, &mut FunctionBuilder)` — the
-/// compiler is passed explicitly so the closure does NOT need to capture it,
-/// avoiding a double-mutable-borrow with the `compiler` parameter above.
+/// receives `(&mut Compiler, VarId, ParamGradSource, bool, &mut FunctionBuilder)`
+/// — the compiler is passed explicitly so the closure does NOT need to capture
+/// it, avoiding a double-mutable-borrow with the `compiler` parameter above.
 /// The gradient is then REMOVED from `var_map` — the callback is responsible
 /// for freeing or otherwise owning that tensor.  Used by FASE Deferred to
 /// consume parameter gradients during backward lowering so only one gradient
@@ -125,7 +143,7 @@ pub fn compile_wengert_ops(
         &mut dyn FnMut(
             &mut Compiler,
             VarId,
-            Value,
+            ParamGradSource,
             bool,
             &mut FunctionBuilder,
         ) -> Result<(), CodegenError>,
@@ -203,7 +221,7 @@ pub fn compile_wengert_ops_range(
         &mut dyn FnMut(
             &mut Compiler,
             VarId,
-            Value,
+            ParamGradSource,
             bool,
             &mut FunctionBuilder,
         ) -> Result<(), CodegenError>,
@@ -224,6 +242,27 @@ pub fn compile_wengert_ops_range(
         }
         m
     });
+    // Item 7 (`--fuse-wgrad-accum`): which weight-gradient chains collapse
+    // into a single accumulating GEMM. Planned once over the whole tape, not
+    // per-slice — `plan` needs global reader counts to prove the elided
+    // intermediates have no other consumer, and a CSLA slice boundary must
+    // not be able to make a chain look dead when it is not.
+    let wgrad_plan = match (&on_param_grad, compiler.compile_options.fuse_wgrad_accum) {
+        (Some((param_set, _)), true) => crate::wgrad_fusion::plan(wengert, param_set),
+        _ => crate::wgrad_fusion::WgradFusionPlan::default(),
+    };
+    if compiler.compile_options.fuse_wgrad_accum {
+        // Non-vacuity signal for the parity gate: a flag-on-vs-flag-off loss
+        // comparison passes trivially if the fusion never fired. Print the
+        // count so the gate can assert it is non-zero, and so a tape change
+        // that quietly stops matching the pattern is visible as a lost
+        // speedup rather than as nothing at all.
+        eprintln!(
+            "[wgrad-fusion] {} chain(s) fused out of {} adjoint ops",
+            wgrad_plan.by_reduce_result.len(),
+            wengert.ops.len()
+        );
+    }
     // P5 item 19 (`--cuda-graphs`): bracket this contiguous lowering as one
     // capture region. Each static invocation claims a fresh id, so a
     // region's identity is its code location — the same emitted code runs
@@ -242,6 +281,58 @@ pub fn compile_wengert_ops_range(
     let range_start = range.start;
     for (rel_i, op) in wengert.ops[range].iter().enumerate() {
         let abs_i = range_start + rel_i;
+        // Item 7: the transpose and batched matmul of a fused weight-gradient
+        // chain emit NOTHING and their results stay UNMAPPED.
+        //
+        // This MUST precede the unresolved-input check below. The chain's
+        // matmul reads the elided transpose, so by the time we reach it that
+        // input is legitimately missing — and because the matmul is
+        // structurally reachable from a parameter gradient, the P0.2
+        // grad-integrity guard would (correctly, on its own terms) hard-fail
+        // the compile. Suppressing first states the intent before the guard
+        // can misread it as a dropped gradient.
+        //
+        // Safe only because `wgrad_fusion::plan` proved each suppressed
+        // result has exactly one reader — the next op in the chain, which is
+        // itself suppressed or replaced. Any other reader would ghost-skip.
+        if wgrad_plan.suppressed.contains(&op.result) {
+            continue;
+        }
+        // The `reduce_to_shape` terminating a fused chain: hand the hook the
+        // chain's OPERANDS instead of a gradient tensor. Also placed ahead of
+        // the unresolved-input check, and for the same reason — its own input
+        // (the elided matmul) is deliberately unmapped.
+        //
+        // `x` and `g` were produced earlier and are still mapped; the plan's
+        // contiguity requirement guarantees nothing freed or mutated them
+        // between the tape's consumption point and this one.
+        if let Some(fusion) = wgrad_plan.by_reduce_result.get(&op.result) {
+            if let Some(ref mut hook) = on_param_grad {
+                let (param_set, cb) = hook;
+                debug_assert!(
+                    param_set.contains(&op.result),
+                    "wgrad_fusion::plan only admits chains ending in a param adjoint"
+                );
+                let (Some(&x), Some(&g)) = (var_map.get(&fusion.x), var_map.get(&fusion.g)) else {
+                    // An operand ghost-skipped upstream, so this gradient was
+                    // never computable by either path. Leave the result
+                    // unmapped, exactly as the unfused lowering would.
+                    continue;
+                };
+                cb(
+                    compiler,
+                    op.result,
+                    ParamGradSource::FusedWgrad { x, g },
+                    // Never "still needed": the plan requires zero later
+                    // readers of this param adjoint, and no tensor was
+                    // materialized for one to read.
+                    false,
+                    builder,
+                )?;
+                hook_freed_param_vars.insert(op.result);
+            }
+            continue;
+        }
         // Skip ops whose inputs can't be resolved (ghost VarIds from
         // get_or_create_adjoint that never received a gradient).
         // These produce dead adjoint paths for non-differentiable ops.
@@ -364,7 +455,13 @@ pub fn compile_wengert_ops_range(
                     .as_ref()
                     .and_then(|m| m.get(&op.result))
                     .is_some_and(|&last| last > abs_i);
-                cb(compiler, op.result, result_val, still_needed, builder)?;
+                cb(
+                    compiler,
+                    op.result,
+                    ParamGradSource::Materialized(result_val),
+                    still_needed,
+                    builder,
+                )?;
                 // still_needed: the callback accumulated but deferred the free.
                 // Leave the tensor in var_map for the later op, and do NOT
                 // record it as hook-freed — it falls through to the

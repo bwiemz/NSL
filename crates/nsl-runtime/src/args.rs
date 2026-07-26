@@ -77,6 +77,20 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // Item 7: fused weight-gradient GEMM vs decomposed-fallback counts,
+    // enabled when NSL_WGRAD_COUNTER=1. The fallback inside
+    // `nsl_tensor_wgrad_accum` is SILENT by design (a shape the compiler's
+    // pre-pass misjudged must degrade to correct-but-slow, not abort), which
+    // is exactly why the parity gate needs to see which path actually ran.
+    if std::env::var("NSL_WGRAD_COUNTER").ok().as_deref() == Some("1") {
+        extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_wgrad_count_atexit);
+        }
+    }
+
     // D1 (CSLA Stage-2): layerwise window-backward count, enabled when
     // NSL_CSLA_COUNTER=1. Lets the differential gate assert the buffered
     // backward phase actually fired (anti-vacuity), same pattern as above.
@@ -171,6 +185,14 @@ extern "C" fn nsl_fase_fused_step_count_atexit() {
     eprintln!(
         "[fase-fused] optimizer fused-step launches: {}",
         crate::fase_step::nsl_fase_fused_step_count()
+    );
+}
+
+extern "C" fn nsl_wgrad_count_atexit() {
+    eprintln!(
+        "[wgrad-accum] fused GEMM: {}, decomposed fallback: {}",
+        crate::tensor::arithmetic::nsl_wgrad_fused_count(),
+        crate::tensor::arithmetic::nsl_wgrad_fallback_count()
     );
 }
 

@@ -317,6 +317,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::F64],
         None,
     ),
+    // Item 7 fused weight-gradient accumulate: m += s * (x^T @ g), in place,
+    // void. Args (m_partial, x, g, s) — x/g are the PRE-transpose activation
+    // and the upstream gradient; the transpose is folded into the GEMM.
+    (
+        "nsl_tensor_wgrad_accum",
+        &[types::I64, types::I64, types::I64, types::F64],
+        None,
+    ),
     // FASE Deferred bias correction: 1/(1 - base^step).  Scalar, no tensor args.
     (
         "nsl_bias_correction_inv",
