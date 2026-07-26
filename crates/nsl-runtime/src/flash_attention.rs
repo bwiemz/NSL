@@ -4036,11 +4036,47 @@ fn csha_tier_b2_backward_launch(
         // proj_backward does not write dK/dV — no f32 scratch needed.
         let mut a_dk_scratch = 0u64;
         let mut a_dv_scratch = 0u64;
+
+        // ABI FIX: the backward prelude declares `dw{q,k,v}_scratch_ptr`
+        // immediately after `d{k,v}_scratch_ptr` (prelude.rs, "positional
+        // lockstep with the PTX param list"), and `emit_dproj` does an
+        // UNGUARDED `ld.global.f32`/`st.global.f32` through them — the only
+        // null-guards are on csha_w*_ptr and dw*_ptr. This launcher never
+        // supplied them: the array was 49 long against a 50-param kernel, so
+        // `a_seg`/`a_docs` landed in the dwq/dwk scratch slots and the driver
+        // read PAST THE END of the array marshalling dwv_scratch_ptr —
+        // SIGSEGV inside cuLaunchKernel, which is how all four
+        // tier_b2_full_backward gates were failing.
+        //
+        // Allocate real zero-initialised f32 scratch exactly as the scalar
+        // path does. Shape [d_model, kv_dim] with kv_dim =
+        // max(active_heads,1)*head_dim, matching emit_dproj's cell layout.
+        let dw_kv_dim = active_heads.max(1) * head_dim;
+        let dw_elems = (d_model * dw_kv_dim) as usize;
+        let dw_scratch_bytes = dw_elems * 4; // f32
+        let alloc_dw = |out: u64| -> *mut c_void {
+            if out != 0 && dw_scratch_bytes > 0 {
+                let p = crate::cuda::inner::alloc_device(dw_scratch_bytes);
+                if !p.is_null() {
+                    crate::cuda::inner::memset_d8(p, dw_scratch_bytes);
+                }
+                p
+            } else {
+                std::ptr::null_mut()
+            }
+        };
+        let dwq_scratch_raw = alloc_dw(a_dwq);
+        let dwk_scratch_raw = alloc_dw(a_dwk);
+        let dwv_scratch_raw = alloc_dw(a_dwv);
+        let mut a_dwq_scratch = dwq_scratch_raw as u64;
+        let mut a_dwk_scratch = dwk_scratch_raw as u64;
+        let mut a_dwv_scratch = dwv_scratch_raw as u64;
+
         let mut a_seg = segment_ids_ptr as u64;
         let mut a_docs = doc_starts_ptr as u64;
         let _ = causal; // proj/dRMSNorm are causal-agnostic; param resolved for ABI parity
 
-        let args: [*mut c_void; 49] = [
+        let args: [*mut c_void; 52] = [
             &mut k as *mut _ as *mut c_void, // q_ptr slot (unused; pass 0)
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -4088,6 +4124,13 @@ fn csha_tier_b2_backward_launch(
             &mut a_dxn as *mut _ as *mut c_void,
             &mut a_dk_scratch as *mut _ as *mut c_void,
             &mut a_dv_scratch as *mut _ as *mut c_void,
+            // Positional lockstep with the PTX param list: dW f32 scratch sits
+            // right after dk/dv scratch and BEFORE the segment/doc trailing
+            // slots. Getting this order wrong is silent — the driver just
+            // marshals whatever is at that index.
+            &mut a_dwq_scratch as *mut _ as *mut c_void,
+            &mut a_dwk_scratch as *mut _ as *mut c_void,
+            &mut a_dwv_scratch as *mut _ as *mut c_void,
             &mut a_seg as *mut _ as *mut c_void,
             &mut a_docs as *mut _ as *mut c_void,
         ];
@@ -4117,6 +4160,32 @@ fn csha_tier_b2_backward_launch(
                 break;
             }
         }
+
+        // Drain the dW f32 scratch into the f16 destinations, then free it.
+        // emit_dproj accumulates read-modify-write across the q_block launches
+        // above, and dW = sum over ALL q positions of x_norm^T . dY, so the
+        // post-loop scratch already holds the complete gradient — unlike the
+        // scalar path's dWk/dWv, which need a post-pass because their
+        // per-q-block values are not a plain sum.
+        for &(scratch_raw, out) in &[
+            (dwq_scratch_raw, a_dwq),
+            (dwk_scratch_raw, a_dwk),
+            (dwv_scratch_raw, a_dwv),
+        ] {
+            if rc == success && !scratch_raw.is_null() && out != 0 {
+                let c_rc =
+                    csha_bwd_convert_f32_to_f16(scratch_raw, out as *mut c_void, dw_elems);
+                if c_rc != success {
+                    rc = c_rc;
+                }
+            }
+        }
+        for scratch_raw in [dwq_scratch_raw, dwk_scratch_raw, dwv_scratch_raw] {
+            if !scratch_raw.is_null() {
+                crate::cuda::inner::free_device(scratch_raw);
+            }
+        }
+
         if rc != success {
             free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return rc as i64;
