@@ -65,14 +65,25 @@
 //! `nsl_flash_attention_csha_with_saves` -> flash_attention.rs:2327).
 //!
 //! A3's doc comment below predicted this failure mode and expected a
-//! synthesizer refusal to catch it. **A refusal would be the WRONG fix.**
-//! `CshaExtras::level1(eps)` constructs precisely this combination
-//! (fused_rmsnorm=true, fused_projections=false) and
-//! flash_attention_selector.rs:139 selects it in production — n1_p0 is a
-//! first-class supported configuration, so refusing it would break a shipping
-//! path rather than protect one. R3 in `validate_checkpoint_eligibility`
-//! demands both flags, but only under @checkpoint, and A3 runs Path A with
-//! checkpoint stripped, which is why nothing gates it here.
+//! synthesizer refusal to catch it — and that turned out to be right, though
+//! only after the blast radius was pinned down. `CshaExtras::level1(eps)`
+//! does construct this combination and `csha_apply.rs:910` maps
+//! `FusionLevel::Boundary` to it, so it is production-CONSTRUCTED; but
+//! `tier_b2_can_dispatch` rejects `level < 2` with `DispatchReject::LevelTooLow`
+//! and `plan_layer` reports `BackwardTierReport::Scalar`, so it is never
+//! production-REACHED. (Two other `CshaExtras::level1` sites are NOT
+//! production: `flash_attention_selector.rs:139` sets `fused_projections:true`
+//! under a test marker, and `flash_attention.rs:7489` is inside `mod tests`,
+//! which starts at 6862.) R3 in `validate_checkpoint_eligibility` demands both
+//! flags but only under @checkpoint, and A3 runs Path A with checkpoint
+//! stripped, which is why nothing gated it here.
+//!
+//! RESOLVED: **R13** in `synthesize_backward_with_tier_b` now refuses the
+//! flag pair — keyed on `fused_rmsnorm && !fused_projections`, NOT on level,
+//! so `n1_p1` (`level1_with_fused_proj`, exercised by A0/A1/A2) keeps working.
+//! Pinned by `csha_r13_n1p0_refusal.rs`, including two anti-vacuity tests.
+//! A3 and D1-D5 now refuse cleanly instead of aborting the process, which
+//! also removes the context poisoning that was killing their sibling tests.
 //!
 //! DISCRIMINATOR RESULT (D1-D5 below, one process per cell):
 //!
@@ -99,10 +110,10 @@
 //! backward. The broken kernel is reachable only by driving the FFI directly
 //! with a hand-built config, which is exactly what this harness does.
 //!
-//! Therefore the fix is a synthesis-time refusal of the fused CSHA backward
-//! for n1_p0 — not because the config is incoherent, but to make synthesis
-//! agree with the dispatch rejection that already exists one layer above,
-//! instead of silently emitting a kernel the dispatcher refuses to use.
+//! The fix is therefore a synthesis-time refusal (R13) — not because the
+//! config is incoherent, but so synthesis agrees with the dispatch rejection
+//! that already exists one layer above, instead of silently emitting a kernel
+//! the dispatcher refuses to use.
 
 #![cfg(feature = "cuda")]
 
@@ -798,7 +809,7 @@ fn a2_causal_off_rope_q_true_fused_proj_true_hd64() {
 /// unconditionally declares those registers. The synthesizer refusal check
 /// at the start of run_ablation will catch this and mark A3 STRUCTURALLY-BLOCKED.
 #[test]
-#[ignore = "broken: fused_rmsnorm=true + fused_projections=false (n1_p0) synthesizes then faults with an invalid __shared__ read at the window base; needs a synthesis-time refusal, see module header"]
+#[ignore = "blocked: R13 now refuses n1_p0 at synthesis, so this cannot reach the GPU; it resumes real coverage if the fused-projection SMEM staging is fixed and R13 lifted"]
 fn a3_fused_proj_off_causal_true_rope_q_true_hd64() {
     run_ablation("A3-fused-proj-off", 64, 512, |cfg| {
         if let Some(csha) = cfg.csha.as_mut() {
@@ -859,13 +870,13 @@ fn n1p0(cfg: &mut FlashAttentionConfig) {
 }
 
 #[test]
-#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
 fn d1_n1p0_rope_q_on_multitile_s512() {
     run_ablation("D1-n1p0-rope-multitile", 64, 512, n1p0);
 }
 
 #[test]
-#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
 fn d2_n1p0_rope_q_off_multitile_s512() {
     run_ablation("D2-n1p0-norope-multitile", 64, 512, |cfg| {
         n1p0(cfg);
@@ -874,13 +885,13 @@ fn d2_n1p0_rope_q_off_multitile_s512() {
 }
 
 #[test]
-#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
 fn d3_n1p0_rope_q_on_singletile_s32() {
     run_ablation("D3-n1p0-rope-singletile", 64, 32, n1p0);
 }
 
 #[test]
-#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
 fn d4_n1p0_rope_q_off_singletile_s32() {
     run_ablation("D4-n1p0-norope-singletile", 64, 32, |cfg| {
         n1p0(cfg);
@@ -892,7 +903,7 @@ fn d4_n1p0_rope_q_off_singletile_s32() {
 /// but this passes at S=32, the fault is specific to n1_p0 rather than to the
 /// small shape or the harness.
 #[test]
-#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
 fn d5_control_n1p1_rope_q_on_singletile_s32() {
     run_ablation("D5-control-n1p1-singletile", 64, 32, |_cfg| {});
 }

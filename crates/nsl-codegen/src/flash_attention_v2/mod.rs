@@ -1542,6 +1542,57 @@ pub fn synthesize_backward_with_tier_b(
     // no-decorator path.
     validate_checkpoint_eligibility(config)?;
 
+    // ── R13: fused_rmsnorm WITHOUT fused_projections (kernel suffix `n1_p0`)
+    //
+    // MEASURED 2026-07-25 on RTX 5070 Ti (sm_120), one process per cell
+    // (`csha_cycle15_bug1_ablations::d1..d5`):
+    //
+    //                    rope_q=true        rope_q=false
+    //     S=512          ILLEGAL_ADDRESS    zero gradients
+    //     S=32           ILLEGAL_ADDRESS    zero gradients
+    //     n1_p1 control  PASS               --
+    //
+    // RoPE-Q reads cos/sin staged into SMEM by the fused-projection prologue.
+    // With `fused_projections=false` that prologue never runs, so the read
+    // lands at the shared-window base 0xff800000 and the FORWARD kernel
+    // faults. It does NOT depend on multi-tile: S=32 is a single q tile and a
+    // single kv tile and still faults. With rope_q off there is no fault, but
+    // the backward returns all-zero gradients (`max_abs == max|ref|`) — the
+    // silent arm, and the dangerous one, since training would appear to run
+    // and learn nothing.
+    //
+    // This is defense-in-depth rather than new policy. `tier_b2_can_dispatch`
+    // already rejects `csha.level < 2` with `DispatchReject::LevelTooLow`, so
+    // production never reaches the fused backward for a level-1 config —
+    // `plan_layer` reports `BackwardTierReport::Scalar` and falls back. The
+    // gap this closes is a caller that builds `FlashAttentionConfig` by hand
+    // and calls this entry directly, which is exactly the bypass class the
+    // sinks refusal below was added for, and exactly what the cycle-15
+    // ablation harness does.
+    //
+    // Keyed on the FLAG PAIR, not on `level`: `level = 1` WITH
+    // `fused_projections = true` (`n1_p1`, i.e. `level1_with_fused_proj`) is
+    // exercised by passing GPU gates and must keep working. Only `level1()`
+    // produces the broken pair — `level2`/`level3` set both flags.
+    if let Some(csha) = config.csha.as_ref() {
+        if csha.fused_rmsnorm && !csha.fused_projections {
+            return Err(format!(
+                "CSHA fused backward refused for fused_rmsnorm=true + \
+                 fused_projections=false (kernel suffix n1_p0): the RoPE-Q \
+                 epilogue reads cos/sin from SMEM staged only by the \
+                 fused-projection prologue, so with rope_q=true the forward \
+                 kernel faults on an invalid __shared__ read, and with \
+                 rope_q=false the backward returns all-zero gradients \
+                 (measured at both S=512 and S=32, csha level={}). Production \
+                 does not reach here — tier_b2_can_dispatch rejects level < 2 \
+                 with LevelTooLow and falls back to the scalar backward — so \
+                 set fused_projections=true (CshaExtras::level1_with_fused_proj) \
+                 or use level >= 2 if you are calling this entry directly.",
+                csha.level
+            ));
+        }
+    }
+
     // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
     // The forward eligibility predicate already refuses
     // `csha.save_activations_for_backward = true` + `num_sink_tokens > 0`
