@@ -13,6 +13,19 @@
 //! turn them from blocked into silently-wrong rather than into failures. This
 //! file exists so the refusal itself has a gate.
 //!
+//! MEASURED 2026-07-26 (RTX 5070 Ti sm_120), R7 temporarily bypassed in a
+//! local experiment, `t_recompute_hd64_s512_bq32` three-way oracle:
+//!
+//!     path A vs cpu_ref   dq 7.695e-3   dx 8.755e-2   (max|ref| ~4.4 / ~47)
+//!     path B vs cpu_ref   dq 2.152e3    dx 1.485e4    max_rel up to 3.26e6
+//!     path B vs path A    dq 2.152e3    dx 1.485e4
+//!
+//! Path B is 2-3 orders of magnitude LARGER than the reference values and
+//! diverges from the working Path A by the same amount. Two other "gross
+//! numerical error" claims in this subsystem turned out to be harness
+//! artifacts with the `max_abs == max|ref|` (gpu==0) signature; this one is
+//! not that, and is real. The refusal stays until Path B's math is fixed.
+//!
 //! Costs nothing to run: pure PTX synthesis, no device required.
 
 #![cfg(feature = "cuda")]

@@ -1182,6 +1182,27 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
     // `emit_rope_k_epilogue` ("only implements RopeStyle::Adjacent").
     // Refuse both cases until Path B's kv-recompute math is fixed and
     // GPU-validated.
+    //
+    // MEASURED 2026-07-26 (RTX 5070 Ti sm_120) with R7 temporarily bypassed
+    // in a local experiment: `t_recompute_hd64_s512_bq32` three-way oracle at
+    // hd=64 S=512 bq=32. The claim above had been carried on assertion alone
+    // since 8f774ad; it now has numbers behind it, and it is CORRECT:
+    //
+    //     path A vs cpu_ref   dq 7.695e-3   dx 8.755e-2   (max|ref| ~4.4 / ~47)
+    //     path B vs cpu_ref   dq 2.152e3    dx 1.485e4    max_rel up to 3.26e6
+    //     path B vs path A    dq 2.152e3    dx 1.485e4
+    //
+    // Path B's error is 2-3 ORDERS OF MAGNITUDE LARGER than the reference
+    // values themselves, and it diverges from the working Path A by the same
+    // amount, so this is not an oracle disagreement. The signature is NOT
+    // `max_abs == max|ref|` — that would mean the kernel wrote zeros, which is
+    // the artifact behind cycle-15 "Bug 1" and the n1_p0 zero-gradient arm.
+    // Path B instead produces values ~500x too LARGE: genuine numerical
+    // explosion. (Path A's apparent FAIL in that run is the separate f16
+    // tolerance-calibration artifact — atol=5e-4 sits below the f16 storage
+    // floor; see F16_ACCUM_AMP in csha_cycle15_bug1_ablations.rs.)
+    //
+    // KEEP THIS REFUSAL. Pinned by csha_r7_checkpoint_rope_q_refusal.rs.
     if config.rope_q {
         return Err(if config.segment_masked {
             "PCA packing with rope_q=true under @checkpoint deferred to v4: \
