@@ -2,6 +2,7 @@
 //! the `nsl` binary and by integration tests.
 
 pub mod analysis_bridges;
+pub mod feature_rules;
 pub mod health_monitor;
 pub mod monitor;
 pub mod profile;
