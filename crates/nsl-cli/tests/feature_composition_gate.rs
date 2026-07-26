@@ -714,9 +714,15 @@ fn tier_c_fragments_are_registered() {
     }
 }
 
-/// The supported baseline the control run uses. Every tier-C case is this set
-/// PLUS the flag(s) under test, so a refusal can only be attributed to what
-/// the case added.
+/// The supported baseline most tier-C controls use.
+///
+/// Most cases are this set PLUS the flag under test. One is not: a `requires`
+/// rule is expressed by REMOVING the prerequisite (`--cuda-graphs` without
+/// `--source-ad`), so that case differs from its control by two edits.
+/// Attribution there rests on guard ORDER — stmt.rs:4656 (--cuda-graphs
+/// requires --source-ad) is reached before stmt.rs:5276 (--layerwise-accum
+/// requires --source-ad) — which is why the case asserts the specific
+/// fragment rather than merely a nonzero exit.
 const TIER_C_BASE: &[&str] = &["--source-ad", "--checkpoint-blocks", "--layerwise-accum"];
 
 const CG: &[&str] = &[
@@ -876,15 +882,27 @@ fn materialize_csla_fixture(tag: &str, gpu: bool) -> PathBuf {
     // into the cwd, and losing GPU_PLACEMENT leaves the GPU tier running a
     // CPU-resident model, where `--weight-stream` aborts and every case in
     // that tier fails for the wrong reason.
+    // Look for the markers on a NON-COMMENT line. The fixture documents its
+    // own rewrite convention in a `#`-comment header that mentions both
+    // tokens, so a plain `src.contains(..)` is satisfied by the documentation
+    // even after the real marker is deleted — the assertion would pass while
+    // `.replace()` silently no-ops. Found in review.
+    let live = |needle: &str| {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with('#') || l.trim() == "# GPU_PLACEMENT")
+            .any(|l| l.contains(needle))
+    };
     assert!(
-        src.contains("CSLA_SAVE_PATH"),
-        "fixture lost its CSLA_SAVE_PATH marker; this gate would write a stray \
-         file into the working directory"
+        live("CSLA_SAVE_PATH"),
+        "fixture lost its CSLA_SAVE_PATH marker (found only in the comment \
+         header, if at all); this gate would write a stray file into the \
+         working directory"
     );
     assert!(
-        src.contains("# GPU_PLACEMENT"),
-        "fixture lost its # GPU_PLACEMENT marker; the GPU tier would silently \
-         run on a CPU-resident model"
+        live("# GPU_PLACEMENT"),
+        "fixture lost its # GPU_PLACEMENT marker (found only in the comment \
+         header, if at all); the GPU tier would silently run on a \
+         CPU-resident model"
     );
     // PID-suffixed, matching csla_layerwise_gate's convention: a fixed name in
     // a world-writable dir collides between concurrent `cargo test` runs, and
@@ -969,7 +987,13 @@ const SWEEP_FILES: &[&str] = &[
 ];
 
 /// Directories swept wholesale, so a refusal added to a NEW file is found.
-const SWEEP_DIRS: &[&str] = &["crates/nsl-cli/src/commands"];
+const SWEEP_DIRS: &[&str] = &[
+    "crates/nsl-cli/src/commands",
+    // Added after review: restricting the codegen side to three named files
+    // left `wggo_gradient_scorer.rs`'s `--wggo-importance=grad requires
+    // --calibration-data` invisible — the same blind spot one level up.
+    "crates/nsl-codegen/src",
+];
 
 /// Recursively collect `.rs` files under `dir` as repo-relative paths.
 fn collect_rs_files(dir: &std::path::Path, out: &mut BTreeSet<String>, root: &std::path::Path) {
@@ -1004,6 +1028,8 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
     ("warning \u{2014} --wrga-ablate=spectral", "advisory warning, run continues"),
     ("--trace is not implemented", "unimplemented-subcommand notice, not a composition"),
     ("cannot determine export format", "diagnostic listing ways to supply a format"),
+    ("usage: cpdt_", "usage banner for a dev-tool binary"),
+    ("not found at {}. Run cpdt_fixture_generate", "missing-input diagnostic, not a flag composition"),
 ];
 
 /// Two-flag refusals present in the source but absent from the registry.
@@ -1083,12 +1109,15 @@ fn every_exec_marker_is_still_emitted_by_its_source() {
     let mut lost = Vec::new();
 
     for marker in nsl_cli::exec_markers::EXEC_MARKERS {
-        let hay = cache
-            .entry(marker.emitted_by)
-            .or_insert_with(|| anchored_text(&root.join(marker.emitted_by), PRINT_MARKERS));
-        if !hay.contains(marker.token) {
+        let found = marker.emitted_by.iter().any(|file| {
+            cache
+                .entry(file)
+                .or_insert_with(|| anchored_text(&root.join(file), PRINT_MARKERS))
+                .contains(marker.token)
+        });
+        if !found {
             lost.push(format!(
-                "  {} — not emitted by any print macro in {} ({})",
+                "  {} — not emitted by any print macro in {:?} ({})",
                 marker.token, marker.emitted_by, marker.means
             ));
         }
@@ -1121,7 +1150,7 @@ fn exec_marker_tokens_are_well_formed_and_unique() {
         );
     }
     assert!(
-        seen.len() >= 18,
+        seen.len() >= 23,
         "only {} markers registered; the vocabulary has shrunk unexpectedly",
         seen.len()
     );
@@ -1140,15 +1169,14 @@ fn every_marker_asserted_in_the_test_suite_is_registered() {
         .collect();
     // Tokens that are test-local scaffolding or third-party output, not
     // subsystem markers emitted by NSL.
+    // Tokens a test may mention without them needing a vocabulary entry.
+    // NOT "third-party output" — an earlier comment claimed that and was
+    // wrong; these are NSL markers whose engagement no test asserts on, so
+    // there is nothing for the emission gate to protect. Seven further
+    // entries were removed after review because they suppressed nothing: an
+    // allowlist of no-ops reads as considered exclusions and is not.
     const NOT_SUBSYSTEM_MARKERS: &[&str] = &[
-        "[wgrad-fusion]", // item 7 codegen diagnostic, gated by its own flag
-        "[wgrad-accum]",  // item 7 runtime counter, gated by NSL_WGRAD_COUNTER
-        "[fase-fused]",   // p9 counter, gated by NSL_FASE_FUSED_COUNTER
-        "[ccr]",          // advisory note, no test asserts engagement on it
-        "[weight-stream]",
-        "[ws]",
-        "[grad-integrity]",
-        "[nsl]",
+        "[nsl]", // generic CLI prefix, not a subsystem engagement marker
     ];
 
     let mut unknown: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -1158,7 +1186,25 @@ fn every_marker_asserted_in_the_test_suite_is_registered() {
             continue;
         }
         let src = std::fs::read_to_string(&path).unwrap_or_default();
-        for cap in src.split("contains(\"").skip(1) {
+        // Tests read markers several ways, not just `contains("[`. Missing a
+        // form is a silent coverage hole: `[cuda-graph]` went unregistered
+        // because cuda_graph_gate uses `starts_with(`. Note the irony that
+        // migrating an assertion to a constant (`format!("{} csha[", CSHA)`)
+        // also removes it from this sweep's view — which is why
+        // NEGATIVE_NEEDLES pins those separately.
+        const READ_FORMS: &[&str] = &[
+            "contains(\"",
+            "starts_with(\"",
+            "strip_prefix(\"",
+            "trim_start_matches(\"",
+            "splitn(2, \"",
+            "split(\"",
+        ];
+        let mut caps: Vec<&str> = Vec::new();
+        for form in READ_FORMS {
+            caps.extend(src.split(form).skip(1));
+        }
+        for cap in caps {
             let Some(tok) = cap.split('"').next() else { continue };
             if !tok.starts_with('[') {
                 continue;
@@ -1192,5 +1238,122 @@ fn every_marker_asserted_in_the_test_suite_is_registered() {
             .map(|(t, files)| format!("  {t} — asserted in {files:?}"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+#[test]
+fn every_negative_assertion_needle_is_still_emitted() {
+    // The gate that `every_exec_marker_is_still_emitted_by_its_source` was not.
+    //
+    // Pinning a TOKEN says "[csha] appears somewhere". That is satisfied by an
+    // unrelated `[csha] gpu spec:` probe while the string a negative assertion
+    // actually depends on — `[csha] csha[`, assembled from a prefix in stmt.rs
+    // and a summary in csha.rs — quietly stops existing. A negative assertion
+    // that can no longer fail is worse than no assertion, because it reads as
+    // coverage. Each needle is pinned part by part, in the file that emits it.
+    let root = repo_root();
+    let mut cache: BTreeMap<&'static str, String> = BTreeMap::new();
+    let mut lost = Vec::new();
+    let mut parts_checked = 0usize;
+
+    for needle in nsl_cli::exec_markers::NEGATIVE_NEEDLES {
+        for (literal, file) in needle.parts {
+            parts_checked += 1;
+            let hay = cache
+                .entry(file)
+                .or_insert_with(|| anchored_text(&root.join(file), PRINT_MARKERS));
+            if !hay.contains(literal) {
+                lost.push(format!(
+                    "  {literal:?} no longer emitted by {file}\n      breaks: {} ({})",
+                    needle.test, needle.asserts
+                ));
+            }
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} negative-assertion needle(s) rotted. The assertions resting on \
+         them can NO LONGER FAIL — they now pass unconditionally while still \
+         reading as coverage:\n{}",
+        lost.len(),
+        lost.join("\n")
+    );
+    assert!(
+        parts_checked >= 5,
+        "only {parts_checked} needle parts checked; NEGATIVE_NEEDLES has shrunk"
+    );
+}
+
+#[test]
+fn every_negative_marker_assertion_in_the_suite_is_pinned() {
+    // Completeness for the gate above: a negative assertion nobody registered
+    // is a silently-unfailable test. Sweeps for `!<expr>.contains("[...")`.
+    let root = repo_root();
+    let registered: BTreeSet<&str> = nsl_cli::exec_markers::NEGATIVE_NEEDLES
+        .iter()
+        .map(|n| n.test)
+        .collect();
+    let mut unpinned = Vec::new();
+    for entry in std::fs::read_dir(root.join("crates/nsl-cli/tests")).expect("read tests dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if registered.contains(rel.as_str()) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            // `!x.contains("[` — the negative form. The positive form fails
+            // loudly on rot and needs no pin.
+            //
+            // The negation must be tested against the RECEIVER, not merely
+            // "is there a `!` earlier on the line": `assert!(out.contains(..))`
+            // is positive but has a `!` in `assert!`. Walk back over the
+            // receiver expression and look at the character before it.
+            let Some(pos) = t.find(".contains(\"[") else {
+                continue;
+            };
+            if t.trim_start().starts_with("//") {
+                continue;
+            }
+            let before = &t[..pos];
+            let recv_start = before
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '&'))
+                .map_or(0, |i| i + 1);
+            let negated = before[..recv_start].trim_end().ends_with('!');
+            if !negated {
+                continue;
+            }
+            // Only bracketed lowercase tokens are subsystem markers; a shape
+            // assertion like `contains("[8, 2048, 512]")` is not one.
+            let after = &t[pos + ".contains(\"".len()..];
+            let is_marker = after
+                .split(']')
+                .next()
+                .and_then(|b| b.strip_prefix('['))
+                .is_some_and(|b| {
+                    !b.is_empty()
+                        && b.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                        && b.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                });
+            if is_marker {
+                unpinned.push(format!("  {rel}:{}  {}", i + 1, t.trim()));
+            }
+        }
+    }
+    assert!(
+        unpinned.is_empty(),
+        "negative marker assertion(s) not registered in \
+         exec_markers::NEGATIVE_NEEDLES. Each can silently become \
+         always-true:\n{}",
+        unpinned.join("\n")
     );
 }

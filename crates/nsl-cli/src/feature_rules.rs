@@ -112,6 +112,8 @@ const CLI_CHECK: &str = "crates/nsl-cli/src/commands/check.rs";
 const CLI_REPORTS: &str = "crates/nsl-cli/src/commands/build/reports.rs";
 const CLI_OPTIONS: &str = "crates/nsl-cli/src/commands/build/options.rs";
 const CLI_CEP: &str = "crates/nsl-cli/src/commands/cep.rs";
+const WGGO_SCORER: &str = "crates/nsl-codegen/src/wggo_gradient_scorer.rs";
+const CPDT_CALIB: &str = "crates/nsl-codegen/src/bin/cpdt_calibrate.rs";
 
 /// Every composition rule the compiler enforces, measured from the source
 /// rather than recalled. Ordered by subsystem so a reader can see the shape
@@ -411,6 +413,11 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         CLI_CHECK,
         "--cpkd-target requires --cpkd-design-student",
     ),
+    // MODEL LIMITATION, stated rather than hidden: the guard is
+    // `ablate_active && wrga_analyze.is_none() && wrga_compare.is_none()`, i.e.
+    // "requires analyze OR compare". `RuleKind` has no disjunction, so `other`
+    // names one arm and the fragment carries the full truth. Reading this as
+    // "--wrga-ablate --wrga-compare is refused" would be wrong — it is legal.
     src_rule(
         "--wrga-ablate",
         RuleKind::Requires,
@@ -434,8 +441,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     ),
     // ── build / cep / calibration subcommands ──────────────────────────────
     // All twelve found by the widened sweep, none by hand.
+    // CORRECTED after review. The guard is
+    // `calibration_data.is_none() && calibrate != "required"`, and `required`
+    // is the DEFAULT — so this fires only for `--calibrate best-effort`. The
+    // first version claimed a rule the CLI does not enforce for the common
+    // invocation. `flag` names the value, not just the option, so the entry
+    // cannot be read as covering both.
     src_rule(
-        "--calibrate",
+        "--calibrate best-effort",
         RuleKind::Requires,
         "--calibration-data",
         CLI_OPTIONS,
@@ -483,6 +496,16 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         CLI_CHECK,
         "--cpkd-design-student is mutually exclusive with --cep-search/--cep-profile",
     ),
+    // The guard is `cpkd_design_student.is_some() && (cep_search || cep_profile)`.
+    // Registering only the --cep-search half would let the --cep-profile arm be
+    // dropped from the condition with the message — and every gate — untouched.
+    src_rule(
+        "--cpkd-design-student",
+        RuleKind::Conflicts,
+        "--cep-profile",
+        CLI_CHECK,
+        "--cpkd-design-student is mutually exclusive with --cep-search/--cep-profile",
+    ),
     src_rule(
         "--wrga-analyze",
         RuleKind::Conflicts,
@@ -496,6 +519,20 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--weights",
         CLI_CHECK,
         "--weight-analysis requires --weights <path>",
+    ),
+    src_rule(
+        "--wggo-importance",
+        RuleKind::Requires,
+        "--calibration-data",
+        WGGO_SCORER,
+        "--wggo-importance=grad requires --calibration-data",
+    ),
+    src_rule(
+        "--emit-calibration",
+        RuleKind::Requires,
+        "--medium-dir",
+        CPDT_CALIB,
+        "--emit-calibration requires --medium-dir <path>",
     ),
     // ── CUDA graphs ────────────────────────────────────────────────────────
     src_rule(
