@@ -142,10 +142,17 @@ fn csha_disable_decorator_round_trips_through_build_csha_report() {
          decorator's `disabled` field did not flow through. Full stderr:\n{}",
         stderr,
     );
+    // NEGATIVE assertion — the one shape that goes SILENTLY vacuous if the
+    // marker is renamed (a positive `contains` would fail loudly; this one
+    // would just pass forever). Built from the registered token so a rename
+    // is a compile error here, and
+    // `feature_composition_gate::every_exec_marker_is_still_emitted_by_its_source`
+    // separately pins that the token still has an emitting call site.
+    let csha_summary = format!("{} csha[", nsl_cli::exec_markers::tokens::CSHA);
     assert!(
-        !stderr.contains("[csha] csha["),
+        !stderr.contains(&csha_summary),
         "regression: `@csha(disable=true)` did not suppress the CSHA planner. \
-         The `[csha] csha[...]` summary line appeared in stderr. Full stderr:\n{}",
+         The `{csha_summary}...]` summary line appeared in stderr. Full stderr:\n{}",
         stderr,
     );
 }

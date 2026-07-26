@@ -417,13 +417,31 @@ const REFUSAL_MARKERS: &[&str] = &[
 /// only the subprocess tier can catch that, and it covers one rule. Stated
 /// plainly because a gate's limits are as important as its coverage.
 fn refusal_text(path: &std::path::Path) -> String {
+    anchored_text(path, REFUSAL_MARKERS)
+}
+
+/// Print macros — the call sites that can put a marker on stderr.
+const PRINT_MARKERS: &[&str] = &[
+    "eprintln!(",
+    "println!(",
+    "eprint!(",
+    "print!(",
+    "writeln!(",
+    "write!(",
+    "format!(",
+];
+
+/// The argument text of every call to one of `markers`, comment-stripped and
+/// whitespace-normalized. See [`refusal_text`] for why both transformations
+/// are load-bearing.
+fn anchored_text(path: &std::path::Path, markers: &[&str]) -> String {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let code = strip_comments(&raw);
     let unwrapped = code.replace("\\\n", " ");
 
     let mut spans = String::new();
-    for marker in REFUSAL_MARKERS {
+    for marker in markers {
         let mut from = 0usize;
         while let Some(pos) = unwrapped[from..].find(marker) {
             let start = from + pos + marker.len();
@@ -618,10 +636,17 @@ fn flag_to_field_matches_clap_naming() {
 /// A tier-C case: run the compiler with `flags` on the CSLA fixture and
 /// require the registered `fragment` on stderr.
 struct FireCase {
+    /// What the case is, for the failure message.
+    name: &'static str,
+    /// The FULL argument list (fixture excluded).
     flags: &'static [&'static str],
     /// Registered fragment that must appear. Kept in sync with the registry by
     /// `tier_c_fragments_are_registered` below.
     fragment: &'static str,
+    /// Args that must SUCCEED. This is what makes the refusal attributable:
+    /// without it, a case passes when the compile failed for any reason at
+    /// all. Every control is run (deduplicated) before any case.
+    control: &'static [&'static str],
 }
 
 fn run_nsl(fixture: &std::path::Path, extra: &[&str]) -> (bool, String) {
@@ -663,16 +688,28 @@ fn tier_c_fragments_are_registered() {
         })
         .collect();
     assert!(
-        !TIER_C.is_empty(),
-        "TIER_C is empty — this test and the subprocess gate both degrade to \
-         asserting nothing"
+        !TIER_C.is_empty() && !TIER_C_GPU.is_empty(),
+        "a tier-C table is empty — this test and the subprocess gates degrade \
+         to asserting nothing"
     );
-    for case in TIER_C {
+    for case in TIER_C.iter().chain(TIER_C_GPU) {
         assert!(
             registered.contains(case.fragment),
-            "tier-C case asserts {:?}, which no registry rule declares — tier \
-             B would never notice if that refusal disappeared",
+            "tier-C case {:?} asserts {:?}, which no registry rule declares — \
+             tier B would never notice if that refusal disappeared",
+            case.name,
             case.fragment
+        );
+        // Each case must DIFFER from its control, or the two runs are the
+        // same invocation and the refusal is attributable to nothing.
+        // Deliberately not "flags must be longer": a `requires` case is
+        // expressed by REMOVING the prerequisite (e.g. --cuda-graphs without
+        // --source-ad), which is the same length as its control.
+        assert!(
+            case.flags != case.control,
+            "tier-C case {:?} is identical to its control — the refusal cannot \
+             be attributed to anything",
+            case.name
         );
     }
 }
@@ -682,17 +719,146 @@ fn tier_c_fragments_are_registered() {
 /// the case added.
 const TIER_C_BASE: &[&str] = &["--source-ad", "--checkpoint-blocks", "--layerwise-accum"];
 
-/// Scoped deliberately. A case belongs here only if the SOURCE-level refusal
-/// is what the CLI actually reaches — measured, not assumed. Notably absent:
-/// `--weight-stream requires --layerwise-accum`, which `stmt.rs` also refuses
-/// but clap rejects first (see `feature_rules`' two-layer note), so driving
-/// the binary would test clap while appearing to test `stmt.rs`.
+const CG: &[&str] = &[
+    "--source-ad",
+    "--checkpoint-blocks",
+    "--layerwise-accum",
+    "--cuda-graphs",
+];
+
+/// Every case here was MEASURED to reach its registered refusal, and to have a
+/// control that genuinely compiles — not assumed from reading the guard.
 ///
-/// Broadening this means adding fixtures that genuinely reach each refusal —
-/// not reusing this one and accepting a failure for the wrong reason.
-const TIER_C: &[FireCase] = &[FireCase {
-    flags: &["--checkpoint-selective", "--checkpoint-compress", "fp16"],
-    fragment: "--layerwise-accum is incompatible with --checkpoint-compress",
+/// Deliberately absent, each for a stated reason:
+/// * `--weight-stream requires --layerwise-accum` — `stmt.rs` refuses it, but
+///   clap rejects it first, so driving the binary would exercise clap while
+///   appearing to exercise `stmt.rs` (see `feature_rules`' two-layer note).
+/// * the `--param-dtype` x `--optim-state-offload` pair — its control needs
+///   `--weight-stream`, which aborts at RUNTIME on a CPU-resident model
+///   ("--weight-stream requires GPU placement"). It lives in `TIER_C_GPU`.
+const TIER_C: &[FireCase] = &[
+    FireCase {
+        name: "CSLA x --checkpoint-compress",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--checkpoint-selective",
+            "--checkpoint-compress",
+            "fp16",
+        ],
+        fragment: "--layerwise-accum is incompatible with --checkpoint-compress",
+        control: TIER_C_BASE,
+    },
+    FireCase {
+        name: "CSLA x --zero-stage 1",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--zero-stage",
+            "1",
+        ],
+        fragment: "--layerwise-accum is incompatible with --zero-stage 1/2",
+        control: TIER_C_BASE,
+    },
+    FireCase {
+        name: "--zero-stage 3 without --weight-stream",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--zero-stage",
+            "3",
+        ],
+        fragment: "--zero-stage 3 requires --layerwise-accum --weight-stream",
+        control: TIER_C_BASE,
+    },
+    FireCase {
+        // Note this rule is enforced ONLY in codegen — unlike
+        // --fuse-rmsnorm-backward / --fuse-wgrad-accum, --cuda-graphs carries
+        // no clap `requires = source_ad`. Dropping --source-ad therefore
+        // reaches the stmt.rs refusal rather than a clap error.
+        name: "--cuda-graphs without --source-ad",
+        flags: &["--checkpoint-blocks", "--layerwise-accum", "--cuda-graphs"],
+        fragment: "--cuda-graphs requires --source-ad",
+        control: TIER_C_BASE,
+    },
+    FireCase {
+        name: "--cuda-graphs x --zero-stage",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--cuda-graphs",
+            "--zero-stage",
+            "1",
+        ],
+        fragment: "--cuda-graphs does not compose with --zero-stage",
+        control: CG,
+    },
+    FireCase {
+        name: "--cuda-graphs x --cuda-sync",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--cuda-graphs",
+            "--cuda-sync",
+        ],
+        fragment: "--cuda-graphs does not compose with --cuda-sync",
+        control: CG,
+    },
+    FireCase {
+        name: "--cuda-graphs x --profile-kernels",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--cuda-graphs",
+            "--profile-kernels",
+        ],
+        fragment: "--cuda-graphs does not compose with --profile-kernels",
+        control: CG,
+    },
+    FireCase {
+        name: "--param-dtype bf16-sr without --weight-stream",
+        flags: &[
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--param-dtype",
+            "bf16-sr",
+        ],
+        fragment: "--param-dtype bf16-sr requires --weight-stream",
+        control: TIER_C_BASE,
+    },
+];
+
+/// Cases whose CONTROL needs a device. `--weight-stream` aborts at runtime on
+/// a CPU-resident model, so anything downstream of it cannot have a passing
+/// control in the CPU tier — the refusal would be indistinguishable from that
+/// abort. Runs against a `m.to(cuda)` fixture under `--ignored`.
+const TIER_C_GPU: &[FireCase] = &[FireCase {
+    name: "--param-dtype bf16-sr x --optim-state-offload",
+    flags: &[
+        "--source-ad",
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+        "--param-dtype",
+        "bf16-sr",
+        "--optim-state-offload",
+    ],
+    fragment: "--param-dtype bf16-sr does not compose with --optim-state-offload",
+    control: &[
+        "--source-ad",
+        "--checkpoint-blocks",
+        "--layerwise-accum",
+        "--weight-stream",
+        "--param-dtype",
+        "bf16-sr",
+    ],
 }];
 
 /// Materialize the CSLA fixture into a temp file with its `CSLA_SAVE_PATH`
@@ -700,59 +866,94 @@ const TIER_C: &[FireCase] = &[FireCase {
 /// `csla_layerwise_gate.rs`. Running the fixture verbatim makes `model_save`
 /// write a file literally named `CSLA_SAVE_PATH` into the CURRENT DIRECTORY —
 /// which for this gate is the repo root.
-fn materialize_csla_fixture() -> PathBuf {
+fn materialize_csla_fixture(tag: &str, gpu: bool) -> PathBuf {
     let root = repo_root();
     let src_path = root.join("crates/nsl-cli/tests/fixtures/csla_layerwise_ffn.nsl");
     let src = std::fs::read_to_string(&src_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", src_path.display()));
+    // Both markers are the fixture's own documented rewrite convention. Assert
+    // rather than silently no-op: losing CSLA_SAVE_PATH writes a stray file
+    // into the cwd, and losing GPU_PLACEMENT leaves the GPU tier running a
+    // CPU-resident model, where `--weight-stream` aborts and every case in
+    // that tier fails for the wrong reason.
     assert!(
         src.contains("CSLA_SAVE_PATH"),
-        "fixture lost its CSLA_SAVE_PATH marker; this gate would write into \
-         the repo root"
+        "fixture lost its CSLA_SAVE_PATH marker; this gate would write a stray \
+         file into the working directory"
+    );
+    assert!(
+        src.contains("# GPU_PLACEMENT"),
+        "fixture lost its # GPU_PLACEMENT marker; the GPU tier would silently \
+         run on a CPU-resident model"
     );
     // PID-suffixed, matching csla_layerwise_gate's convention: a fixed name in
     // a world-writable dir collides between concurrent `cargo test` runs, and
     // between users on a shared runner.
     let tmp = std::env::temp_dir();
     let pid = std::process::id();
-    let out = tmp.join(format!("nsl_feature_composition_csla_{pid}.nsl"));
-    let save = tmp.join(format!("nsl_feature_composition_csla_{pid}.nslm"));
-    std::fs::write(
-        &out,
-        src.replace("CSLA_SAVE_PATH", save.to_str().expect("utf-8 temp path")),
-    )
-    .expect("write temp fixture");
+    let out = tmp.join(format!("nsl_featcomp_csla_{tag}_{pid}.nsl"));
+    let save = tmp.join(format!("nsl_featcomp_csla_{tag}_{pid}.nslm"));
+    let body = src
+        .replace("CSLA_SAVE_PATH", save.to_str().expect("utf-8 temp path"))
+        .replace("# GPU_PLACEMENT", if gpu { "m.to(cuda)" } else { "" });
+    std::fs::write(&out, body).expect("write temp fixture");
     out
 }
 
 #[test]
 fn registered_refusals_actually_fire_on_a_real_compile() {
-    let fixture = materialize_csla_fixture();
+    let fixture = materialize_csla_fixture("cpu", false);
+    run_fire_cases(&fixture, TIER_C);
+}
 
-    // CONTROL FIRST. If the fixture cannot compile cleanly in its supported
-    // configuration, every refusal assertion below would pass for the wrong
-    // reason. This is the single most important line in tier C.
-    let (ok, out) = run_nsl(&fixture, TIER_C_BASE);
-    assert!(
-        ok,
-        "CONTROL FAILED: the fixture must compile in its SUPPORTED \
-         configuration {TIER_C_BASE:?}, or the refusal assertions below prove \
-         nothing (they would pass on any unrelated error).\n{out}"
-    );
+/// Run every control (deduplicated), then every case.
+///
+/// CONTROLS FIRST, and this is the load-bearing part of the whole tier: if the
+/// fixture cannot compile in a case's supported configuration, that case's
+/// refusal assertion proves nothing — it would pass on any unrelated error.
+/// Each control is run once even when several cases share it.
+fn run_fire_cases(fixture: &std::path::Path, cases: &[FireCase]) {
+    assert!(!cases.is_empty(), "no cases — this gate asserts nothing");
 
-    for case in TIER_C {
-        let mut args: Vec<&str> = TIER_C_BASE.to_vec();
-        args.extend_from_slice(case.flags);
-        let (ok, out) = run_nsl(&fixture, &args);
-        assert!(!ok, "{:?} must be refused, but the compile succeeded", args);
+    let controls: BTreeSet<&[&str]> = cases.iter().map(|c| c.control).collect();
+    for control in &controls {
+        let (ok, out) = run_nsl(fixture, control);
         assert!(
-            out.contains(case.fragment),
-            "refused, but NOT for the registered reason {:?} — the compile may \
-             have failed for an unrelated cause, which would make this \
-             assertion vacuous. args={args:?}\n{out}",
-            case.fragment
+            ok,
+            "CONTROL FAILED for {control:?}: the fixture must compile in this \
+             SUPPORTED configuration, or every refusal assertion resting on it \
+             proves nothing.\n{out}"
         );
     }
+
+    for case in cases {
+        let (ok, out) = run_nsl(fixture, case.flags);
+        assert!(
+            !ok,
+            "{}: must be refused, but the compile SUCCEEDED. args={:?}",
+            case.name, case.flags
+        );
+        assert!(
+            out.contains(case.fragment),
+            "{}: refused, but NOT for the registered reason {:?} — the compile \
+             may have failed for an unrelated cause, which would make this \
+             assertion vacuous. args={:?}\n{out}",
+            case.name,
+            case.fragment,
+            case.flags
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU (--weight-stream needs device-resident params)"]
+fn registered_refusals_actually_fire_on_gpu_only_configurations() {
+    // `--weight-stream` aborts at RUNTIME on a CPU-resident model, so every
+    // rule downstream of it has no passing control in the CPU tier — the
+    // refusal under test would be indistinguishable from that abort. These
+    // cases get a `m.to(cuda)` fixture and a device.
+    let fixture = materialize_csla_fixture("gpu", true);
+    run_fire_cases(&fixture, TIER_C_GPU);
 }
 
 // ──────────────── Tier B2: the registry cannot be silently INCOMPLETE ──────
@@ -760,6 +961,33 @@ fn registered_refusals_actually_fire_on_a_real_compile() {
 /// Refusals deliberately outside this registry's scope, with the reason.
 /// Anything here is a conscious exclusion, not an oversight — which is the
 /// distinction the sweep below exists to force someone to make.
+/// Individual files that host composition refusals.
+const SWEEP_FILES: &[&str] = &[
+    "crates/nsl-codegen/src/stmt.rs",
+    "crates/nsl-codegen/src/stmt_fase.rs",
+    "crates/nsl-codegen/src/calibration/binary_codegen.rs",
+];
+
+/// Directories swept wholesale, so a refusal added to a NEW file is found.
+const SWEEP_DIRS: &[&str] = &["crates/nsl-cli/src/commands"];
+
+/// Recursively collect `.rs` files under `dir` as repo-relative paths.
+fn collect_rs_files(dir: &std::path::Path, out: &mut BTreeSet<String>, root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out, root);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.insert(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
 const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
     // Flag x LANGUAGE CONSTRUCT, not flag x flag: the partner is `@pipeline`
     // or a `grad_clip=` train-block argument, neither of which is a CLI flag,
@@ -773,6 +1001,9 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
     // continues. The registry models refusals — RuleKind has no "advisory"
     // variant — so recording it here would overstate what is enforced.
     ("has no effect without --monitor", "advisory warning, run continues"),
+    ("warning \u{2014} --wrga-ablate=spectral", "advisory warning, run continues"),
+    ("--trace is not implemented", "unimplemented-subcommand notice, not a composition"),
+    ("cannot determine export format", "diagnostic listing ways to supply a format"),
 ];
 
 /// Two-flag refusals present in the source but absent from the registry.
@@ -785,12 +1016,15 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
 #[test]
 fn no_two_flag_refusal_is_missing_from_the_registry() {
     let root = repo_root();
-    let files: BTreeSet<&'static str> = source_rules()
-        .filter_map(|r| match r.enforcement {
-            Enforcement::Source { file, .. } => Some(file),
-            Enforcement::Clap => None,
-        })
-        .collect();
+    // Derive the search set from a FIXED list, not from the files the registry
+    // already cites. Deriving it from the registry is a bootstrapping blind
+    // spot: a refusal living in a file with no entry yet is invisible to the
+    // sweep whose whole job is to find exactly that. Five real rules
+    // (--gpu x --perf, the cpkd/wrga ones) hid there until this changed.
+    let mut files: BTreeSet<String> = SWEEP_FILES.iter().map(|f| f.to_string()).collect();
+    for dir in SWEEP_DIRS {
+        collect_rs_files(&root.join(dir), &mut files, &root);
+    }
 
     let registered: Vec<&str> = source_rules()
         .filter_map(|r| match r.enforcement {
@@ -831,5 +1065,132 @@ fn no_two_flag_refusal_is_missing_from_the_registry() {
          each, or add it to SWEEP_ALLOWLIST with a reason:\n{}",
         unregistered.len(),
         unregistered.join("\n")
+    );
+}
+
+// ─────────────────── Tier D: the execution-marker vocabulary ───────────────
+
+#[test]
+fn every_exec_marker_is_still_emitted_by_its_source() {
+    // Why this matters more than it looks: a POSITIVE assertion
+    // (`stderr.contains("[csla]")`) fails loudly when a marker is renamed, so
+    // it needs no help. A NEGATIVE one — asserting a feature did NOT engage —
+    // passes forever once the token stops existing, which is exactly backwards
+    // and completely silent. This pins that every registered token still has
+    // an emitting call site.
+    let root = repo_root();
+    let mut cache: BTreeMap<&'static str, String> = BTreeMap::new();
+    let mut lost = Vec::new();
+
+    for marker in nsl_cli::exec_markers::EXEC_MARKERS {
+        let hay = cache
+            .entry(marker.emitted_by)
+            .or_insert_with(|| anchored_text(&root.join(marker.emitted_by), PRINT_MARKERS));
+        if !hay.contains(marker.token) {
+            lost.push(format!(
+                "  {} — not emitted by any print macro in {} ({})",
+                marker.token, marker.emitted_by, marker.means
+            ));
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} execution marker(s) are registered but no longer emitted. Any \
+         NEGATIVE assertion on these is now vacuous — it can never fail. \
+         Update crates/nsl-cli/src/exec_markers.rs, or restore the emit:\n{}",
+        lost.len(),
+        lost.join("\n")
+    );
+}
+
+#[test]
+fn exec_marker_tokens_are_well_formed_and_unique() {
+    // ANTI-VACUITY for the gate above: an empty or `[`-less token would match
+    // trivially, and a duplicate would inflate the coverage it appears to give.
+    let mut seen = BTreeSet::new();
+    for marker in nsl_cli::exec_markers::EXEC_MARKERS {
+        assert!(
+            marker.token.starts_with('[') && marker.token.ends_with(']') && marker.token.len() > 3,
+            "malformed marker token {:?}",
+            marker.token
+        );
+        assert!(
+            seen.insert(marker.token),
+            "duplicate marker token {:?}",
+            marker.token
+        );
+    }
+    assert!(
+        seen.len() >= 18,
+        "only {} markers registered; the vocabulary has shrunk unexpectedly",
+        seen.len()
+    );
+}
+
+#[test]
+fn every_marker_asserted_in_the_test_suite_is_registered() {
+    // The sweep, mirroring the refusal one: a marker a test asserts on but the
+    // vocabulary does not know about is a token nobody is watching. Finding
+    // them is the whole reason to have a vocabulary rather than 42 literals.
+    let root = repo_root();
+    let dir = root.join("crates/nsl-cli/tests");
+    let known: BTreeSet<&str> = nsl_cli::exec_markers::EXEC_MARKERS
+        .iter()
+        .map(|m| m.token)
+        .collect();
+    // Tokens that are test-local scaffolding or third-party output, not
+    // subsystem markers emitted by NSL.
+    const NOT_SUBSYSTEM_MARKERS: &[&str] = &[
+        "[wgrad-fusion]", // item 7 codegen diagnostic, gated by its own flag
+        "[wgrad-accum]",  // item 7 runtime counter, gated by NSL_WGRAD_COUNTER
+        "[fase-fused]",   // p9 counter, gated by NSL_FASE_FUSED_COUNTER
+        "[ccr]",          // advisory note, no test asserts engagement on it
+        "[weight-stream]",
+        "[ws]",
+        "[grad-integrity]",
+        "[nsl]",
+    ];
+
+    let mut unknown: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("read tests dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        for cap in src.split("contains(\"").skip(1) {
+            let Some(tok) = cap.split('"').next() else { continue };
+            if !tok.starts_with('[') {
+                continue;
+            }
+            let Some(close) = tok.find(']') else { continue };
+            let token = &tok[..=close];
+            // A marker is `[lowercase-with-hyphens]`. Without this, a shape
+            // assertion like `contains("[8, 2048, 512]")` reads as a marker.
+            let body = &token[1..close];
+            let is_marker = !body.is_empty()
+                && body.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                && body
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !is_marker || known.contains(token) || NOT_SUBSYSTEM_MARKERS.contains(&token) {
+                continue;
+            }
+            unknown
+                .entry(token.to_string())
+                .or_default()
+                .insert(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "test(s) assert on execution marker(s) absent from \
+         crates/nsl-cli/src/exec_markers.rs. Register each, or add it to \
+         NOT_SUBSYSTEM_MARKERS with a reason:\n{}",
+        unknown
+            .iter()
+            .map(|(t, files)| format!("  {t} — asserted in {files:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

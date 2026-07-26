@@ -108,6 +108,10 @@ const STMT: &str = "crates/nsl-codegen/src/stmt.rs";
 const STMT_FASE: &str = "crates/nsl-codegen/src/stmt_fase.rs";
 const CLI_RUN: &str = "crates/nsl-cli/src/commands/run.rs";
 const CALIB: &str = "crates/nsl-codegen/src/calibration/binary_codegen.rs";
+const CLI_CHECK: &str = "crates/nsl-cli/src/commands/check.rs";
+const CLI_REPORTS: &str = "crates/nsl-cli/src/commands/build/reports.rs";
+const CLI_OPTIONS: &str = "crates/nsl-cli/src/commands/build/options.rs";
+const CLI_CEP: &str = "crates/nsl-cli/src/commands/cep.rs";
 
 /// Every composition rule the compiler enforces, measured from the source
 /// rather than recalled. Ordered by subsystem so a reader can see the shape
@@ -388,6 +392,110 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--weights",
         CLI_RUN,
         "1. Add --weights <path.safetensors> to this invocation.",
+    ),
+    // ── nsl check / report subcommands ─────────────────────────────────────
+    // Found by widening the sweep's search set beyond the files the registry
+    // already cited — a bootstrapping blind spot: a refusal in a file with no
+    // registry entry was invisible to the sweep that is supposed to find it.
+    src_rule(
+        "--gpu",
+        RuleKind::Requires,
+        "--perf",
+        CLI_CHECK,
+        "error: --gpu requires --perf",
+    ),
+    src_rule(
+        "--cpkd-target",
+        RuleKind::Requires,
+        "--cpkd-design-student",
+        CLI_CHECK,
+        "--cpkd-target requires --cpkd-design-student",
+    ),
+    src_rule(
+        "--wrga-ablate",
+        RuleKind::Requires,
+        "--wrga-analyze",
+        CLI_CHECK,
+        "--wrga-ablate requires --wrga-analyze or --wrga-compare",
+    ),
+    src_rule(
+        "--wrga-report",
+        RuleKind::Requires,
+        "--source-ad",
+        CLI_REPORTS,
+        "--wrga-report requires --source-ad when WRGA decorators are present",
+    ),
+    src_rule(
+        "--muon-batch-ns",
+        RuleKind::Requires,
+        "muon optimizer",
+        STMT,
+        "--muon-batch-ns requires the muon optimizer",
+    ),
+    // ── build / cep / calibration subcommands ──────────────────────────────
+    // All twelve found by the widened sweep, none by hand.
+    src_rule(
+        "--calibrate",
+        RuleKind::Requires,
+        "--calibration-data",
+        CLI_OPTIONS,
+        "requires --calibration-data <PATH>",
+    ),
+    src_rule(
+        "--standalone",
+        RuleKind::Requires,
+        "--weights",
+        CLI_OPTIONS,
+        "--standalone requires -w/--weights <path>",
+    ),
+    src_rule(
+        "--cep-prune",
+        RuleKind::Conflicts,
+        "--cep-joint",
+        CLI_OPTIONS,
+        "--cep-prune and --cep-joint are mutually exclusive",
+    ),
+    src_rule(
+        "--cep-prune",
+        RuleKind::Requires,
+        "--weights",
+        CLI_CEP,
+        "--cep-prune requires --weights <file.safetensors>",
+    ),
+    src_rule(
+        "--cep-joint",
+        RuleKind::Requires,
+        "--weights",
+        CLI_CEP,
+        "--cep-joint requires --weights <file.safetensors>",
+    ),
+    src_rule(
+        "--cep-search",
+        RuleKind::Conflicts,
+        "--cep-profile",
+        CLI_CHECK,
+        "--cep-search and --cep-profile are mutually exclusive",
+    ),
+    src_rule(
+        "--cpkd-design-student",
+        RuleKind::Conflicts,
+        "--cep-search",
+        CLI_CHECK,
+        "--cpkd-design-student is mutually exclusive with --cep-search/--cep-profile",
+    ),
+    src_rule(
+        "--wrga-analyze",
+        RuleKind::Conflicts,
+        "--wrga-compare",
+        CLI_CHECK,
+        "--wrga-analyze and --wrga-compare are mutually exclusive",
+    ),
+    src_rule(
+        "--weight-analysis",
+        RuleKind::Requires,
+        "--weights",
+        CLI_CHECK,
+        "--weight-analysis requires --weights <path>",
     ),
     // ── CUDA graphs ────────────────────────────────────────────────────────
     src_rule(
