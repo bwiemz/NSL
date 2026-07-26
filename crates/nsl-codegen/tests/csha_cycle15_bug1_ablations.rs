@@ -60,10 +60,23 @@
 //! STILL OPEN — a separate, pre-existing bug that A3 surfaces:
 //! `fused_rmsnorm=true` + `fused_projections=false` (kernel suffix `n1_p0`)
 //! synthesizes without complaint and then faults with an invalid __shared__
-//! read at the shared-window base. A3's own doc comment below anticipated
-//! exactly this and expected a synthesizer refusal to catch it; no such
-//! refusal exists, so the composition crashes instead of refusing. Per the
-//! project's deferral doctrine the fix is a loud refusal at synthesis.
+//! read of 2 bytes at the shared-window base 0xff800000, inside the FORWARD
+//! kernel (localized with compute-sanitizer:
+//! `nsl_flash_attention_csha_with_saves` -> flash_attention.rs:2327).
+//!
+//! A3's doc comment below predicted this failure mode and expected a
+//! synthesizer refusal to catch it. **A refusal would be the WRONG fix.**
+//! `CshaExtras::level1(eps)` constructs precisely this combination
+//! (fused_rmsnorm=true, fused_projections=false) and
+//! flash_attention_selector.rs:139 selects it in production — n1_p0 is a
+//! first-class supported configuration, so refusing it would break a shipping
+//! path rather than protect one. R3 in `validate_checkpoint_eligibility`
+//! demands both flags, but only under @checkpoint, and A3 runs Path A with
+//! checkpoint stripped, which is why nothing gates it here.
+//!
+//! What is NOT yet established: whether the fault needs rope_q, needs
+//! multi-tile (S=512 with 32x32 tiles), or reproduces for plain level-1 at
+//! single tile. Those discriminators come first — the fix depends on which.
 
 #![cfg(feature = "cuda")]
 
