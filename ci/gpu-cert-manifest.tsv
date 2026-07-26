@@ -147,10 +147,11 @@ crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_u
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_two_equal	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_three_unequal	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t4_csha_backward_ffi_smoke	gpu-inferred	
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a1_rope_q_off_causal_true_fused_proj_true_hd64	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a2_causal_off_rope_q_true_fused_proj_true_hd64	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a3_fused_proj_off_causal_true_rope_q_true_hd64	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a4_hd128_causal_true_rope_q_true_fused_proj_true	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a0_base_config_control_causal_rope_q_fused_proj_hd64	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a1_rope_q_off_causal_true_fused_proj_true_hd64	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a2_causal_off_rope_q_true_fused_proj_true_hd64	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a3_fused_proj_off_causal_true_rope_q_true_hd64	unclassified	broken: fused_rmsnorm=true + fused_projections=false (n1_p0) synthesizes then faults with an invalid __shared__ read at the window base; needs a synthesis-time refusal, see module header
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a4_hd128_causal_true_rope_q_true_fused_proj_true	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cycle19_ds_probe.rs	csha_cycle19_ds_probe_slots_populated_at_causal_row1	broken	GPU required — c20 T1-followup lands the FFI plumbing and compile-verifies the probe symbol ABI; running this body requires a CUDA device. Run with `cargo test -p nsl-codegen --features cuda,csha_cycle19_probe -- --ignored csha_cycle19_ds_probe`. Numerical CPU-reference matching is T5/c21 scope.
 crates/nsl-codegen/tests/csha_cycle19_qload_rope_numerical.rs	qload_rope_adjacent_matches_cpu_reference	broken	non-CSHA v2 rope_q forward launcher not yet wired at FFI level (structural fix guarded by csha_cycle19_qload_rope_partner.rs)
 crates/nsl-codegen/tests/csha_cycle19_qload_rope_numerical.rs	qload_rope_halfsplit_matches_cpu_reference	broken	non-CSHA v2 rope_q forward launcher not yet wired at FFI level (structural fix guarded by csha_cycle19_qload_rope_partner.rs)
