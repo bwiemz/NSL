@@ -388,19 +388,39 @@ pub fn emit_drope_branch(
             ptx.push_str("    ld.global.b16 %h_tmp, [%rd36];  // sin (f16)\n");
             ptx.push_str("    cvt.f32.f16 %f1, %h_tmp;\n");
 
-            // dY addr: tile_off + (row*head_dim + 2*pair_in_row)*4 (f32 tile)
+            // dY addr: tile_off + (row*head_dim + x0_col)*4 (f32 tile).
+            // The INVERSE rotation must pair the same two elements the
+            // forward sweep rotated, or the composition is not the identity:
+            //   Adjacent  x0_col = 2*pair, sibling at +1 col  (+4 bytes)
+            //   HalfSplit x0_col =   pair, sibling at +half_dim cols
+            // Getting this wrong leaves dv/dwv correct (V is never rotated)
+            // while every Q/K-derived gradient is wrong — which is exactly
+            // how the HalfSplit mismatch showed up in the oracle.
+            let sibling_bytes = match config.rope_style {
+                crate::flash_attention::RopeStyle::Adjacent => 4,
+                crate::flash_attention::RopeStyle::HalfSplit => (head_dim / 2) * 4,
+            };
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd36, %rd33, {};  // row * head_dim\n", head_dim
             ));
-            ptx.push_str("    shl.b64 %rd37, %rd34, 1;  // 2 * pair_in_row\n");
-            ptx.push_str("    add.u64 %rd36, %rd36, %rd37;\n");
+            match config.rope_style {
+                crate::flash_attention::RopeStyle::Adjacent => {
+                    ptx.push_str("    shl.b64 %rd37, %rd34, 1;  // 2 * pair_in_row\n");
+                    ptx.push_str("    add.u64 %rd36, %rd36, %rd37;\n");
+                }
+                crate::flash_attention::RopeStyle::HalfSplit => {
+                    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;  // + pair_in_row\n");
+                }
+            }
             ptx.push_str("    shl.b64 %rd36, %rd36, 2;  // *4 (f32 slot)\n");
             ptx.push_str(&format!(
                 "    add.u64 %rd36, %rd36, {tile_off};\n"
             ));
             ptx.push_str("    add.u64 %rd36, %shmem_base, %rd36;\n");
             ptx.push_str("    ld.shared.f32 %f2, [%rd36];  // dY[2i]\n");
-            ptx.push_str("    ld.shared.f32 %f3, [%rd36 + 4];  // dY[2i+1]\n");
+            ptx.push_str(&format!(
+                "    ld.shared.f32 %f3, [%rd36 + {sibling_bytes}];  // dY[2i+1]\n"
+            ));
 
             // dx0 = dY[2i]*cos + dY[2i+1]*sin
             ptx.push_str("    mul.f32 %f4, %f2, %f0;\n");
@@ -411,7 +431,9 @@ pub fn emit_drope_branch(
             ptx.push_str("    fma.rn.f32 %f5, %f3, %f0, %f5;\n");
 
             ptx.push_str("    st.shared.f32 [%rd36], %f4;\n");
-            ptx.push_str("    st.shared.f32 [%rd36 + 4], %f5;\n");
+            ptx.push_str(&format!(
+                "    st.shared.f32 [%rd36 + {sibling_bytes}], %f5;\n"
+            ));
 
             ptx.push_str(&format!(
                 "V2_BWD_DROPE_{label}_SKIP_{q_tile_iter}_{k}:\n"
@@ -1478,7 +1500,7 @@ mod cycle11_recompute_tests {
         FlashAttentionConfig {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit,
+            rope_style: crate::flash_attention::RopeStyle::HalfSplit,
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
@@ -1616,7 +1638,7 @@ mod tests {
         FlashAttentionConfig {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit,
+            rope_style: crate::flash_attention::RopeStyle::HalfSplit,
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {

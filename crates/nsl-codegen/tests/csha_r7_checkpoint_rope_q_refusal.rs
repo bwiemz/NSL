@@ -71,18 +71,16 @@ fn rope_q_with_checkpoint_adjacent_now_synthesizes() {
 }
 
 #[test]
-fn rope_q_with_checkpoint_halfsplit_is_still_refused() {
-    // The half of R7 that is still real: emit_rope_k_epilogue asserts
-    // Adjacent-only, so HalfSplit is an uncaught PANIC rather than wrong
-    // numbers. Refusing is strictly better than panicking in the emitter.
+fn rope_q_with_checkpoint_halfsplit_now_synthesizes() {
+    // Was refused, because emit_rope_k_epilogue asserted Adjacent-only.
+    // Both the forward sweep and the backward emit_drope now select the
+    // element pairing from config.rope_style, and the CPU oracle became
+    // style-aware in the same change, so HalfSplit is compared against a
+    // HalfSplit reference. Three-way oracle GREEN at hd=64, S=32 and S=512.
     let mut c = cfg(true, true, false);
     c.rope_style = RopeStyle::HalfSplit;
-    let err = synthesize_backward_with_tier_b(&c, None)
-        .expect_err("rope_q + @checkpoint + HalfSplit must still be refused");
-    assert!(
-        err.contains("HalfSplit") || err.contains("Adjacent"),
-        "refusal must name the rope style; got: {err}"
-    );
+    synthesize_backward_with_tier_b(&c, None)
+        .expect("rope_q + @checkpoint + HalfSplit must now synthesize");
 }
 
 #[test]

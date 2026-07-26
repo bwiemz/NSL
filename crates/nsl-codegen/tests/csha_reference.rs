@@ -25,6 +25,8 @@ pub struct CshaInputs<'a> {
     pub sin: &'a [f32],         // [seq, head_dim/2]
 }
 
+use nsl_codegen::flash_attention::RopeStyle;
+
 pub struct CshaShape {
     pub seq: usize,
     pub heads: usize,
@@ -35,6 +37,25 @@ pub struct CshaShape {
     /// When false, cos/sin slices are empty and RoPE is skipped entirely.
     /// Set to false for ablation A1 (rope_q=false kernel configs).
     pub rope_q: bool,
+    /// Which element pairing the rotation uses. MUST match the kernel config:
+    /// a mismatch here rotates different element pairs than the GPU does and
+    /// the oracle diverges silently, which is precisely the failure mode the
+    /// old "Adjacent ONLY" guard was protecting against.
+    pub rope_style: RopeStyle,
+}
+
+/// The two element indices a RoPE pair touches, relative to a row base.
+///
+///   Adjacent  (GPT-NeoX / GPT-J): (x[2i], x[2i+1])
+///   HalfSplit (LLaMA / Qwen):     (x[i],  x[i + head_dim/2])
+///
+/// Single source of truth for the pairing, so the forward rotation and the
+/// backward inverse rotation below cannot drift apart.
+fn rope_pair_indices(style: RopeStyle, pair: usize, half: usize) -> (usize, usize) {
+    match style {
+        RopeStyle::Adjacent => (2 * pair, 2 * pair + 1),
+        RopeStyle::HalfSplit => (pair, pair + half),
+    }
 }
 
 /// Apply RMSNorm to a single row of length `d_model`.
@@ -67,17 +88,17 @@ fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 /// Apply RoPE in-place to a tensor of shape [seq, heads, head_dim].
 /// cos/sin have shape [seq, head_dim/2].
 ///
-/// **Implements `RopeStyle::Adjacent` (GPT-NeoX / GPT-J layout) ONLY.**
+/// Implements BOTH `RopeStyle::Adjacent` and `RopeStyle::HalfSplit`; the
+/// pairing comes from `rope_pair_indices` and must match `shape.rope_style`.
 /// Pair `i` rotates `(x[2i], x[2i+1])`.  This matches `emit_rope_pair_sweep`
-/// in `csha_hooks.rs`.  Do NOT call this function for `RopeStyle::HalfSplit`
+/// in `csha_hooks.rs`.  `shape.rope_style` MUST match the kernel config
 /// (LLaMA / Qwen: `x[i]` paired with `x[i + head_dim/2]`) — the kernel and
 /// CPU reference would diverge silently.
 ///
 /// Rotation formula (matching v2 kernel §A.2.4):
 ///   new_x[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
 ///   new_x[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
-fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f32], sin: &[f32]) {
-    // Consistency guard: this function only implements Adjacent layout.
+fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f32], sin: &[f32], style: RopeStyle) {
     // If head_dim is 0 somehow, the loop is a no-op — but flag odd configs.
     debug_assert!(head_dim > 0 && head_dim % 2 == 0, "apply_rope requires even head_dim > 0");
     let half = head_dim / 2;
@@ -87,10 +108,11 @@ fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f
             for pair in 0..half {
                 let cos_val = cos[s * half + pair];
                 let sin_val = sin[s * half + pair];
-                let x0 = q[base + 2 * pair];
-                let x1 = q[base + 2 * pair + 1];
-                q[base + 2 * pair]     = x0 * cos_val - x1 * sin_val;
-                q[base + 2 * pair + 1] = x0 * sin_val + x1 * cos_val;
+                let (o0, o1) = rope_pair_indices(style, pair, half);
+                let x0 = q[base + o0];
+                let x1 = q[base + o1];
+                q[base + o0] = x0 * cos_val - x1 * sin_val;
+                q[base + o1] = x0 * sin_val + x1 * cos_val;
             }
         }
     }
@@ -116,7 +138,7 @@ fn softmax_rows(s: &mut [f32], rows: usize, cols: usize) {
 ///
 /// Returns O of shape `[seq, heads * head_dim]` — the pre-Wo attention output.
 pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q } = *shape;
+    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q, rope_style: _ } = *shape;
     let kv_dim = heads * head_dim;
 
     // Step 1: RMSNorm(x) -> x_norm   shape [seq, d_model]
@@ -136,8 +158,8 @@ pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
 
     // Step 3: RoPE(Q, cos, sin); RoPE(K, cos, sin) -- skipped when rope_q=false.
     if rope_q {
-        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
-        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style);
+        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style);
     }
 
     // Step 4a: S = Q @ K^T / sqrt(head_dim)  per head, shape [seq, seq]
@@ -238,7 +260,7 @@ struct Intermediates {
 /// Compute the full set of forward intermediates. Keeps the chain-rule
 /// backward arithmetically closed-form (no numerical re-derivation).
 fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermediates {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q } = *shape;
+    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q, rope_style: _ } = *shape;
     let kv_dim = heads * head_dim;
 
     let mut x_norm = Vec::with_capacity(seq * d_model);
@@ -256,8 +278,8 @@ fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermed
     let v = matmul(&x_norm, inputs.wv, seq, d_model, kv_dim);
 
     if rope_q {
-        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
-        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style);
+        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style);
     }
 
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -299,7 +321,7 @@ pub fn csha_reference_backward(
     shape: &CshaShape,
     do_out: &[f32],
 ) -> CshaGradients {
-    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _, rope_q } = *shape;
+    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _, rope_q, rope_style: _ } = *shape;
     let kv_dim = heads * head_dim;
     let inter = forward_intermediates(inputs, shape);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -383,10 +405,11 @@ pub fn csha_reference_backward(
                     for pair in 0..half {
                         let cos_v = inputs.cos[s * half + pair];
                         let sin_v = inputs.sin[s * half + pair];
-                        let y0 = tensor[base + 2 * pair];
-                        let y1 = tensor[base + 2 * pair + 1];
-                        tensor[base + 2 * pair]     =  y0 * cos_v + y1 * sin_v;
-                        tensor[base + 2 * pair + 1] = -y0 * sin_v + y1 * cos_v;
+                        let (o0, o1) = rope_pair_indices(shape.rope_style, pair, half);
+                        let y0 = tensor[base + o0];
+                        let y1 = tensor[base + o1];
+                        tensor[base + o0] =  y0 * cos_v + y1 * sin_v;
+                        tensor[base + o1] = -y0 * sin_v + y1 * cos_v;
                     }
                 }
             }
@@ -493,6 +516,7 @@ mod tests {
             causal: false,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         #[rustfmt::skip]
         let x = [
@@ -581,6 +605,7 @@ mod tests {
             causal: true,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         let kv_dim = shape.heads * shape.head_dim;
         let x = det_seq(42, shape.seq * shape.d_model);
@@ -637,6 +662,7 @@ mod tests {
             causal: false,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         let kv_dim = shape.heads * shape.head_dim;
         let mut x = det_seq(7, shape.seq * shape.d_model);
@@ -731,6 +757,7 @@ mod tests {
             causal: true,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         let x = det_seq(42, shape.seq * shape.d_model);
         let w_size = shape.d_model * shape.heads * shape.head_dim;

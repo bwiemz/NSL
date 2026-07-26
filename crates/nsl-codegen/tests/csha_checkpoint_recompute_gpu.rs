@@ -224,6 +224,10 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 /// configs back inside the sm_120 99 KB dynamic-SMEM cap per spec §1.7),
 /// `gpu_sm=80` to unlock the Tier B.1 dispatch fork on Blackwell.
 fn build_cycle14_config(head_dim: u32, _seq_len: u32) -> FlashAttentionConfig {
+    build_cycle14_config_styled(head_dim, _seq_len, RopeStyle::Adjacent)
+}
+
+fn build_cycle14_config_styled(head_dim: u32, _seq_len: u32, rope_style: RopeStyle) -> FlashAttentionConfig {
     // seq_len enters via the harness `inputs`/launch shape; FlashAttentionConfig
     // doesn't carry a sequence dimension (the kernel takes it at launch).
     let d_model = head_dim; // 1 head, dm == hd for shape alignment with CPU ref
@@ -234,7 +238,7 @@ fn build_cycle14_config(head_dim: u32, _seq_len: u32) -> FlashAttentionConfig {
         causal: true,
         paged: false,
         rope_q: true,
-        rope_style: RopeStyle::Adjacent,
+        rope_style,
         gqa_group_size: 1,
         tree_mask: false,
         num_sink_tokens: 0,
@@ -845,6 +849,10 @@ fn assert_grads_within_tolerance(
 ///   T4: backward Path A (checkpoint=None baseline) vs cpu_reference
 ///   T5: backward Path B (checkpoint=Some(Full)) vs cpu_reference + vs Path A
 fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
+    run_three_way_oracle_styled(head_dim, seq_len, RopeStyle::Adjacent)
+}
+
+fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyle) {
     if !cuda_available() {
         eprintln!(
             "[cycle14 csha checkpoint recompute] skipping hd={head_dim} S={seq_len} \
@@ -853,7 +861,7 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
         return;
     }
 
-    let config = build_cycle14_config(head_dim, seq_len);
+    let config = build_cycle14_config_styled(head_dim, seq_len, rope_style);
     // A synthesizer refusal is a legitimate outcome, not a failure: hd=128
     // under @checkpoint needs 220 KB of SMEM against a 99 KB device cap, so
     // the config cannot exist on this hardware. Asserting here reported that
@@ -894,6 +902,7 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
         causal: config.causal,
         norm_eps: 1e-6,
         rope_q: true,
+        rope_style: config.rope_style,
     };
     let cpu_grads: CshaGradients = csha_reference_backward(&inputs, &shape, &artifacts.do_f32);
 
@@ -1017,4 +1026,70 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
 #[ignore = "requires CUDA GPU"]
 fn t_recompute_hd64_s32_bq32_single_tile_discriminator() {
     run_three_way_oracle(64, 32);
+}
+
+/// HalfSplit (LLaMA / Qwen) end-to-end oracle. `emit_rope_pair_sweep` used to
+/// implement Adjacent only — `emit_rope_k_epilogue` asserted on anything else,
+/// which is the second half of what R7 refused. The CPU reference was likewise
+/// Adjacent-only and is now style-aware, so this compares a HalfSplit kernel
+/// against a HalfSplit oracle rather than against the wrong pairing.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn t_recompute_hd64_s512_bq32_halfsplit() {
+    run_three_way_oracle_styled(64, 512, RopeStyle::HalfSplit);
+}
+
+/// HalfSplit at single tile, so a failure here is the pairing itself rather
+/// than any tiling interaction.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn t_recompute_hd64_s32_bq32_halfsplit_single_tile() {
+    run_three_way_oracle_styled(64, 32, RopeStyle::HalfSplit);
+}
+
+/// hd=128 under @checkpoint needs 217472 bytes against a 101376-byte device
+/// cap at block_q=32. The refusal message says "Reduce head_dim,
+/// block_q/block_kv, or d_model" — this probe measures whether any smaller
+/// tile actually fits, so "hd=128 is impossible" is a measurement rather than
+/// an assumption. GPU-free: pure layout arithmetic + the validator.
+#[test]
+fn probe_hd128_checkpoint_smem_vs_block_q() {
+    for bq in [8u32, 16, 32] {
+        let mut cfg = build_cycle14_config(128, 512);
+        cfg.block_q = bq as i64;
+        cfg.block_kv = bq as i64;
+        let total = smem_layout::total_bytes(&cfg);
+        let verdict = match synthesize_backward_with_tier_b(&cfg, None) {
+            Ok(_) => "SYNTHESIZES".to_string(),
+            Err(e) => {
+                let first = e.split(';').next().unwrap_or(&e).to_string();
+                format!("REFUSED: {first}")
+            }
+        };
+        eprintln!("[hd128-probe] block_q=block_kv={bq:>2}  total_bytes={total:>7}  {verdict}");
+        assert!(
+            verdict.starts_with("REFUSED"),
+            "hd=128 + @checkpoint unexpectedly synthesizes at block_q={bq}. If the \
+             layout genuinely shrank, this is good news — unblock the hd=128 \
+             oracles and delete this assertion. If it did not, the SMEM \
+             validator has been weakened."
+        );
+    }
+
+    // The load-bearing fact, measured rather than assumed: at the SMALLEST
+    // legal tile (block_kv must be one of [16,32,64,128], so 16), the FORWARD
+    // component alone is 107648 bytes against a 101376-byte cap — before any
+    // backward or recompute storage is added. So no admissible block_q makes
+    // hd=128 + @checkpoint fit on a 99 KB device, and "reduce block_q/block_kv"
+    // from the refusal message cannot rescue this particular config.
+    let mut smallest = build_cycle14_config(128, 512);
+    smallest.block_q = 16;
+    smallest.block_kv = 16;
+    let forward_only = smem_layout::total_bytes(&smallest);
+    assert!(
+        forward_only > smem_layout::SMEM_DYNAMIC_BUDGET_BYTES,
+        "forward-only SMEM at hd=128 block_q=16 is {forward_only}, which now FITS \
+         within {} — hd=128 + @checkpoint may have become viable; re-measure.",
+        smem_layout::SMEM_DYNAMIC_BUDGET_BYTES
+    );
 }

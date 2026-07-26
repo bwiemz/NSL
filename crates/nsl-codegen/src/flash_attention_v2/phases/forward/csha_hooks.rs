@@ -1316,16 +1316,11 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         return;
     }
 
-    // emit_rope_pair_sweep implements RopeStyle::Adjacent (GPT-NeoX / GPT-J layout):
-    //   pair i rotates (x[2i], x[2i+1]).
-    // RopeStyle::HalfSplit (LLaMA / Qwen layout: x[i] paired with x[i+head_dim/2])
-    // is NOT implemented here.  If you need HalfSplit, add a separate sweep variant.
-    assert!(
-        matches!(config.rope_style, RopeStyle::Adjacent),
-        "emit_rope_pair_sweep only implements RopeStyle::Adjacent; got {:?}",
-        config.rope_style
-    );
-
+    // `emit_rope_pair_sweep` now implements BOTH pairings — Adjacent
+    // (GPT-NeoX / GPT-J: x[2i] with x[2i+1]) and HalfSplit (LLaMA / Qwen:
+    // x[i] with x[i+head_dim/2]) — selected from `config.rope_style`. The
+    // Adjacent-only assert that used to sit here is gone; the sibling assert
+    // in `emit_rope_k_epilogue` went with it.
     let block_q  = config.block_q  as u32;
     let head_dim = config.head_dim as u32;
     let half_dim = head_dim / 2;
@@ -1397,12 +1392,6 @@ pub fn emit_rope_k_epilogue(
         return;
     }
 
-    assert!(
-        matches!(config.rope_style, RopeStyle::Adjacent),
-        "emit_rope_k_epilogue only implements RopeStyle::Adjacent; got {:?}",
-        config.rope_style
-    );
-
     let block_kv = config.block_kv as u32;
     let head_dim = config.head_dim as u32;
     let half_dim = head_dim / 2;
@@ -1445,8 +1434,9 @@ pub fn emit_rope_k_epilogue(
 ///
 /// Rotation math per pair:
 ///   cos, sin  = cos_ptr[row * half_dim + dim_pair], sin_ptr[same]  (f16→f32)
-///   x0        = tile[row, 2*dim_pair]     (f16→f32)
-///   x1        = tile[row, 2*dim_pair + 1] (f16→f32)
+///   x0, x1    = the pair selected by `config.rope_style` (f16→f32):
+///                 Adjacent  -> tile[row, 2*dim_pair], tile[row, 2*dim_pair+1]
+///                 HalfSplit -> tile[row, dim_pair],   tile[row, dim_pair+half_dim]
 ///   new_x0    = x0*cos - x1*sin           (2× fma)
 ///   new_x1    = x0*sin + x1*cos           (2× fma)
 ///   store f32→f16, write back to SMEM
@@ -1619,11 +1609,41 @@ fn emit_rope_pair_sweep(
         "    mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, {head_dim_x2};\n",
         head_dim_x2 = head_dim * 2
     ));
-    // x0: col = 2*dim_pair → byte offset = 2*dim_pair*2 = 4*dim_pair
-    ptx.push_str("    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair\n");
-    ptx.push_str("    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n");
-    // x1: col = 2*dim_pair+1 → byte offset = (2*dim_pair+1)*2 = 4*dim_pair+2
-    ptx.push_str("    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes\n");
+    // Pairing depends on the RoPE style (see `RopeStyle` in
+    // flash_attention.rs). f16 tile, so a column costs 2 bytes:
+    //
+    //   Adjacent  (GPT-NeoX/GPT-J): x0 col = 2*dim_pair,  x1 = x0 + 1 col
+    //                               -> x0 byte = 4*dim_pair, x1 = x0 + 2
+    //   HalfSplit (LLaMA/Qwen):     x0 col = dim_pair,    x1 = x0 + half_dim
+    //                               -> x0 byte = 2*dim_pair, x1 = x0 + half_dim*2
+    //
+    // The rotation arithmetic below is identical for both; only which two
+    // elements are paired changes.
+    match config.rope_style {
+        RopeStyle::Adjacent => {
+            ptx.push_str(
+                "    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair\n",
+            );
+            ptx.push_str(
+                "    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n",
+            );
+            // Comment text is load-bearing for byte-identity: fa_v2_snapshots
+            // pins the emitted PTX verbatim, so keep "+2 bytes" exactly.
+            ptx.push_str("    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes\n");
+        }
+        RopeStyle::HalfSplit => {
+            ptx.push_str(
+                "    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 1;  // 2*dim_pair\n",
+            );
+            ptx.push_str(
+                "    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n",
+            );
+            ptx.push_str(&format!(
+                "    add.u32 %r_rope_x1_off, %r_rope_x0_off, {};   // +half_dim cols\n",
+                half_dim * 2
+            ));
+        }
+    }
 
     // Precompute full SMEM addresses for x0 and x1 into u64 regs.
     ptx.push_str("    cvt.u64.u32 %rd_rope_x0_off, %r_rope_x0_off;\n");

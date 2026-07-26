@@ -1253,30 +1253,22 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
     // inside the f16 accumulation bound.) hd=128 stays structurally refused by
     // the SMEM validator: 220 KB against a 99 KB device cap.
     //
-    // What is STILL unfixed, and what this refusal now covers:
-    //   - RopeStyle::HalfSplit: `emit_rope_k_epilogue` asserts Adjacent-only,
-    //     so HalfSplit is an uncaught panic, not wrong numbers. Untouched here.
+    // HalfSplit is now implemented too (2026-07-26): `emit_rope_pair_sweep`
+    // and the backward `emit_drope` both select the element pairing from
+    // `config.rope_style`, and the CPU reference oracle became style-aware in
+    // the same change so HalfSplit is compared against a HalfSplit oracle
+    // rather than the wrong pairing. Three-way oracle GREEN at hd=64 for
+    // S=32 and S=512.
+    //
+    // What is STILL unfixed, and all this refusal now covers:
     //   - segment_masked: the PCA packing / RoPE-Q write-back index collision
     //     is a separate v4 item and was never about Path B's math.
-    if config.rope_q
-        && (config.segment_masked
-            || !matches!(config.rope_style, crate::flash_attention::RopeStyle::Adjacent))
-        && !r7_path_b_validation_requested()
-    {
-        return Err(if config.segment_masked {
+    if config.rope_q && config.segment_masked && !r7_path_b_validation_requested() {
+        return Err({
             "PCA packing with rope_q=true under @checkpoint deferred to v4: \
              the segment-aware causal mask shares index machinery with the \
              RoPE-Q write-back path; safe composition requires the v4 \
              rotated-Q SMEM-staging refactor"
-                .to_string()
-        } else {
-            "checkpoint policy=\"full\" + rope_q=true is supported only for \
-             RopeStyle::Adjacent: emit_rope_k_epilogue implements the Adjacent \
-             rotation only and would panic on HalfSplit. Path B's Adjacent \
-             kv-recompute numerics were fixed and GPU-validated on 2026-07-26 \
-             (three-way oracle GREEN at hd=64 for S=32/512/2048); HalfSplit \
-             support is the remaining work. Use RopeStyle::Adjacent, or \
-             disable @checkpoint or rope_q"
                 .to_string()
         });
     }

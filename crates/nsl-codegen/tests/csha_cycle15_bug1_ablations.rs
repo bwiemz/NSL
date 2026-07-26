@@ -599,6 +599,7 @@ fn run_ablation(
         causal,
         norm_eps: 1e-6,
         rope_q: config.rope_q,
+        rope_style: config.rope_style,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_f32);
 
