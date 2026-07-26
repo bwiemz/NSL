@@ -20,7 +20,11 @@
 //!   fused GEMM, which is NOT bit-exact (cuBLAS sums the `B*T` products in its
 //!   own order instead of rounding each per-batch partial first). Held to the
 //!   repo's f32 training tolerance.
-//! * **Refusals** — the three compositions that would be silently wrong.
+//! * **Refusals** — the compositions that would be silently wrong.
+//!
+//! Both the batched (`[B, T, d]`, real reduce) and 2-D (`[T, d]`, identity
+//! reduce) shapes are covered at each layer; they take different ownership
+//! paths in the runtime fallback.
 //!
 //! Every parity assertion is paired with a non-vacuity check on the
 //! `[wgrad-fusion] N chain(s) fused` line. Without it, a tape change that
@@ -39,15 +43,19 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Two weight shapes on purpose, because the fusion's whole point is the
-/// BATCHED case:
+/// `batched = true` feeds a 3-D `[B, T, d]` activation, so the weight adjoint
+/// builds a `[B, d, o]` raw gradient — B times the parameter — that
+/// `reduce_to_shape` then sums away. That temporary is what the fused GEMM
+/// removes, and it is the case the flag exists for.
 ///
-/// * `w1` is fed a 3-D `[B, T, d]` activation, so the weight adjoint builds a
-///   `[B, d, o]` raw gradient — B times the parameter — that `reduce_to_shape`
-///   then sums away. That temporary is what the fused GEMM removes.
-/// * `w2` is fed the 2-D result, where the reduce is an identity. The fusion
-///   still applies (N = T rather than B*T); covering it keeps the identity
-///   path from regressing unnoticed.
+/// `batched = false` feeds a 2-D `[T, d]` activation, where the reduce is an
+/// IDENTITY. The fusion still applies (N = T rather than B*T), and the
+/// identity reduce is the branch with the delicate refcounting in the runtime
+/// fallback — `nsl_tensor_reduce_to_shape` returns its input with a refcount
+/// bump rather than a fresh tensor, so `raw` reaches rc=3 and is released by
+/// three separate frees. Both shapes are exercised; an earlier version of this
+/// gate claimed to cover the identity path but fed `w2` the 3-D result, so it
+/// ran the batched path twice.
 ///
 /// `grad_accumulation=4` + AdamW + `--source-ad` is what selects the
 /// FASE-Deferred path, which owns the accumulate the fusion folds into.
@@ -60,11 +68,16 @@ fn repo_root() -> PathBuf {
 /// silently becomes a second CPU arm. (That is not hypothetical: this gate was
 /// green that way until the `[wgrad-accum]` counter exposed 16 of 16 calls
 /// falling back.)
-fn fixture_src(cuda: bool) -> String {
+fn fixture_src(cuda: bool, batched: bool) -> String {
     let (to_device, xs, ys) = if cuda {
         ("m.to(cuda)\n", "x.to(cuda)", "y.to(cuda)")
     } else {
         ("", "x", "y")
+    };
+    let (x_shape, y_shape) = if batched {
+        ("(arange(40).reshape([2, 5, 4])) * 0.01", "(arange(30).reshape([2, 5, 3])) * 0.01")
+    } else {
+        ("(arange(20).reshape([5, 4])) * 0.01", "(arange(15).reshape([5, 3])) * 0.01")
     };
     format!(
         r#"from nsl.nn.losses import mse_loss
@@ -78,8 +91,8 @@ model Net:
         return h @ self.w2
 
 let m = Net()
-{to_device}let x = (arange(40).reshape([2, 5, 4])) * 0.01
-let y = (arange(30).reshape([2, 5, 3])) * 0.01
+{to_device}let x = {x_shape}
+let y = {y_shape}
 let xd = {xs}
 let yd = {ys}
 
@@ -200,15 +213,15 @@ fn assert_weights_trained(w1: &[f64], w2: &[f64]) {
     );
 }
 
-fn write_fixture(name: &str, cuda: bool) -> PathBuf {
+fn write_fixture(name: &str, cuda: bool, batched: bool) -> PathBuf {
     let p = std::env::temp_dir().join(name);
-    std::fs::write(&p, fixture_src(cuda)).expect("write fixture");
+    std::fs::write(&p, fixture_src(cuda, batched)).expect("write fixture");
     p
 }
 
 #[test]
 fn cpu_fused_wgrad_is_bit_identical_to_the_unfused_chain() {
-    let f = write_fixture("nsl_wgrad_accum_gate_cpu.nsl", false);
+    let f = write_fixture("nsl_wgrad_accum_gate_cpu.nsl", false, true);
 
     let off = run(&f, false, &[]);
     assert!(off.ok, "flag-off run failed:\n{}", off.stderr);
@@ -261,11 +274,76 @@ fn cpu_fused_wgrad_is_bit_identical_to_the_unfused_chain() {
 }
 
 #[test]
+fn cpu_identity_reduce_chain_also_fuses_and_matches() {
+    // The 2-D case: `x` is `[T, d]`, so `reduce_to_shape` is an IDENTITY and
+    // returns its input with a refcount bump instead of a fresh tensor. That
+    // makes the fallback's ownership the tricky part (`raw` reaches rc=3 and
+    // is released by three separate frees), and it is a shape `plan` admits
+    // just as readily as the batched one. Covered separately because the
+    // batched fixture cannot reach it.
+    let f = write_fixture("nsl_wgrad_accum_gate_cpu_2d.nsl", false, false);
+
+    let off = run(&f, false, &[]);
+    assert!(off.ok, "flag-off run failed:\n{}", off.stderr);
+    let on = run(&f, false, &["--fuse-wgrad-accum"]);
+    assert!(on.ok, "flag-on run failed:\n{}", on.stderr);
+
+    let fired = fused_chains(&on.stderr).unwrap_or(0);
+    assert!(
+        fired >= 2,
+        "expected >= 2 fused chains on the 2-D shape, got {fired}\nstderr:\n{}",
+        on.stderr
+    );
+
+    let (on_w1, on_w2) = weights(&on.stdout);
+    let (off_w1, off_w2) = weights(&off.stdout);
+    assert_weights_trained(&on_w1, &on_w2);
+    assert_eq!(on_w1, off_w1, "w1 differs on the identity-reduce path");
+    assert_eq!(on_w2, off_w2, "w2 differs on the identity-reduce path");
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gpu_identity_reduce_chain_uses_the_fused_gemm() {
+    // The identity reduce on GPU: proves the flattened contraction handles
+    // N = T (no batch dim) through the real cuBLAS path, not just the
+    // fallback. Same tolerance contract as the batched GPU arm.
+    let f = write_fixture("nsl_wgrad_accum_gate_gpu_2d.nsl", true, false);
+
+    let off = run(&f, true, &[]);
+    assert!(off.ok, "flag-off GPU run failed:\n{}", off.stderr);
+    let on = run(&f, true, &["--fuse-wgrad-accum"]);
+    assert!(on.ok, "flag-on GPU run failed:\n{}", on.stderr);
+
+    let (gemm, fallback) = wgrad_runtime_counts(&on.stderr)
+        .unwrap_or_else(|| panic!("no counter line\nstderr:\n{}", on.stderr));
+    assert!(
+        gemm > 0 && fallback == 0,
+        "identity-reduce shape did not reach the fused GEMM \
+         (fused={gemm}, fallback={fallback})"
+    );
+
+    let (on_w1, on_w2) = weights(&on.stdout);
+    let (off_w1, off_w2) = weights(&off.stdout);
+    assert_weights_trained(&on_w1, &on_w2);
+    const TOL: f64 = 2e-3;
+    for (name, (a, b)) in [("w1", (&on_w1, &off_w1)), ("w2", (&on_w2, &off_w2))] {
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < TOL,
+                "{name}[{i}] fused={x} unfused={y} (|Δ|={})",
+                (x - y).abs()
+            );
+        }
+    }
+}
+
+#[test]
 fn fuse_wgrad_accum_requires_source_ad() {
     // ANTI-VACUITY for the refusals below: prove the CLI rejects things at
     // all in this position, and specifically that the flag cannot be used on
     // the tape-AD path (which has no FASE accumulate hook to fold into).
-    let f = write_fixture("nsl_wgrad_accum_gate_nosad.nsl", false);
+    let f = write_fixture("nsl_wgrad_accum_gate_nosad.nsl", false, true);
     let root = repo_root();
     let out = Command::new(env!("CARGO"))
         .args([
@@ -293,7 +371,7 @@ fn fuse_wgrad_accum_requires_source_ad() {
 /// needs no device.
 #[test]
 fn incompatible_compositions_are_refused() {
-    let f = write_fixture("nsl_wgrad_accum_gate_conflict.nsl", false);
+    let f = write_fixture("nsl_wgrad_accum_gate_conflict.nsl", false, true);
     let root = repo_root();
     // (flag, why it cannot compose)
     let cases: [(&[&str], &str); 3] = [
@@ -330,7 +408,7 @@ fn incompatible_compositions_are_refused() {
 #[test]
 #[ignore = "requires a CUDA GPU (2 FASE training runs)"]
 fn gpu_fused_wgrad_matches_the_unfused_chain_within_f32_tolerance() {
-    let f = write_fixture("nsl_wgrad_accum_gate_gpu.nsl", true);
+    let f = write_fixture("nsl_wgrad_accum_gate_gpu.nsl", true, true);
 
     let off = run(&f, true, &[]);
     assert!(off.ok, "flag-off GPU run failed:\n{}", off.stderr);

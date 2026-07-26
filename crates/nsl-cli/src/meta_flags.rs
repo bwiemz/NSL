@@ -126,6 +126,11 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
     off_bool!(stream_prefetch, "--stream-prefetch");
     off_bool!(stream_async_writeback, "--stream-async-writeback");
     off_bool!(optim_state_offload, "--optim-state-offload");
+    // Both change the ARITHMETIC, not just the schedule — a reference run must
+    // not silently keep a deliberately non-bit-exact fusion. (`--fuse-rmsnorm-backward`
+    // was missing here too; same reason, same fix.)
+    off_bool!(fuse_wgrad_accum, "--fuse-wgrad-accum (non-bit-exact)");
+    off_bool!(fuse_rmsnorm_backward, "--fuse-rmsnorm-backward (non-bit-exact)");
     if opts.checkpoint_budget_mib.is_some() {
         opts.checkpoint_budget_mib = None;
         disabled.push("--checkpoint-budget-mib (CCR)");

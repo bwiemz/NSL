@@ -149,3 +149,190 @@ fn dead_ghost_op_with_unresolved_input_is_still_skipped() {
         "a dead/ghost op with an unresolved input must be skipped, not errored"
     );
 }
+
+/// Item 7 regression: `--fuse-wgrad-accum` must NOT be able to turn the guard
+/// above into a silent gradient drop.
+///
+/// The fusion elides the chain's `Transpose` and `Matmul` and consults their
+/// operands at the `reduce_to_shape` instead. Both elided ops are in
+/// `grad_live_results` (`reachable_result_vars` walks back from the needed
+/// param adjoints through `op.inputs`), so unfused, an unmapped `x` fails the
+/// compile on the transpose. The first version of the fused path returned
+/// `continue` there — which would compile clean and train that weight at
+/// exactly zero gradient, the precise #396 regression this file exists to
+/// prevent. It must be an error on BOTH paths.
+#[test]
+fn fused_wgrad_chain_with_an_unresolved_operand_is_still_a_compile_error() {
+    let interner = Interner::new();
+    let type_map: TypeMap = HashMap::new();
+    let mut opts = CompileOptions::default();
+    opts.fuse_wgrad_accum = true;
+    let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new should succeed");
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(CallConv::Fast),
+    ));
+    let mut fb_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+    let mut state = FuncState::new();
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    state.current_block = Some(entry);
+
+    // The canonical weight-gradient chain, with the upstream gradient (VarId 1)
+    // NEVER produced — the ghost-adjoint case. x=0, g=1, w=2.
+    let wengert = WengertList {
+        ops: vec![
+            op(
+                0,
+                10,
+                PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX },
+                vec![0],
+            ),
+            op(1, 11, PrimalOp::Matmul, vec![10, 1]),
+            op(
+                2,
+                12,
+                PrimalOp::Passthrough("reduce_to_shape".into()),
+                vec![11, 2],
+            ),
+        ],
+        output: 12,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+    // `x` (0) and `w` (2) resolve; `g` (1) does not.
+    let mut primal_vars: HashMap<u32, cranelift_codegen::ir::Value> = HashMap::new();
+    let zero = {
+        use cranelift_codegen::ir::InstBuilder;
+        builder.ins().iconst(cranelift_codegen::ir::types::I64, 0)
+    };
+    primal_vars.insert(0, zero);
+    primal_vars.insert(2, zero);
+
+    compiler.grad_live_results = Some(HashSet::from([10u32, 11u32, 12u32]));
+    let param_adj: HashSet<u32> = HashSet::from([12u32]);
+    let mut cb = |_: &mut nsl_codegen::compiler::Compiler,
+                  _: u32,
+                  _: nsl_codegen::wengert_lower::ParamGradSource,
+                  _: bool,
+                  _: &mut FunctionBuilder|
+     -> Result<(), nsl_codegen::error::CodegenError> {
+        panic!("the hook must not fire: the chain's operand never resolved");
+    };
+
+    let result = compile_wengert_ops(
+        &mut compiler,
+        &mut builder,
+        &mut state,
+        &wengert,
+        &primal_vars,
+        Some((&param_adj, &mut cb)),
+    );
+    let err = match result {
+        Ok(_) => panic!(
+            "a fused wgrad chain with an unresolved operand must be a hard \
+             error — returning Ok would silently zero this parameter's gradient"
+        ),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("fused weight-gradient chain has an unresolved operand"),
+        "diagnostic must name the fused failure mode:\n{msg}"
+    );
+    assert!(
+        msg.contains("unresolved input(s): [1]"),
+        "must name the unresolved operand (g = VarId 1):\n{msg}"
+    );
+    assert!(
+        msg.contains("--fuse-wgrad-accum"),
+        "must tell the user which flag to drop for the precise diagnostic:\n{msg}"
+    );
+}
+
+/// ANTI-VACUITY for the test above: the SAME tape with every operand resolved
+/// must lower cleanly and fire the hook once. Without this, the assertion
+/// above would still pass if the fusion had simply stopped matching the
+/// pattern (or if `plan` rejected the chain for an unrelated reason).
+#[test]
+fn fused_wgrad_chain_with_resolved_operands_fires_the_hook() {
+    let interner = Interner::new();
+    let type_map: TypeMap = HashMap::new();
+    let mut opts = CompileOptions::default();
+    opts.fuse_wgrad_accum = true;
+    let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new should succeed");
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        Signature::new(CallConv::Fast),
+    ));
+    let mut fb_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+    let mut state = FuncState::new();
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    state.current_block = Some(entry);
+
+    let wengert = WengertList {
+        ops: vec![
+            op(
+                0,
+                10,
+                PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX },
+                vec![0],
+            ),
+            op(1, 11, PrimalOp::Matmul, vec![10, 1]),
+            op(
+                2,
+                12,
+                PrimalOp::Passthrough("reduce_to_shape".into()),
+                vec![11, 2],
+            ),
+        ],
+        output: 12,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+    let zero = {
+        use cranelift_codegen::ir::InstBuilder;
+        builder.ins().iconst(cranelift_codegen::ir::types::I64, 0)
+    };
+    let primal_vars: HashMap<u32, cranelift_codegen::ir::Value> =
+        HashMap::from([(0, zero), (1, zero), (2, zero)]);
+
+    compiler.grad_live_results = Some(HashSet::from([10u32, 11u32, 12u32]));
+    let param_adj: HashSet<u32> = HashSet::from([12u32]);
+    let mut fired = 0usize;
+    let mut cb = |_: &mut nsl_codegen::compiler::Compiler,
+                  vid: u32,
+                  src: nsl_codegen::wengert_lower::ParamGradSource,
+                  still_needed: bool,
+                  _: &mut FunctionBuilder|
+     -> Result<(), nsl_codegen::error::CodegenError> {
+        assert_eq!(vid, 12, "hook must fire on the param adjoint");
+        assert!(!still_needed, "a fused chain has no later reader by construction");
+        assert!(
+            matches!(src, nsl_codegen::wengert_lower::ParamGradSource::FusedWgrad { .. }),
+            "hook must receive the chain's OPERANDS, not a materialized gradient"
+        );
+        fired += 1;
+        Ok(())
+    };
+
+    compile_wengert_ops(
+        &mut compiler,
+        &mut builder,
+        &mut state,
+        &wengert,
+        &primal_vars,
+        Some((&param_adj, &mut cb)),
+    )
+    .expect("a fully-resolved fused chain must lower cleanly");
+    assert_eq!(fired, 1, "the hook must fire exactly once for one chain");
+}

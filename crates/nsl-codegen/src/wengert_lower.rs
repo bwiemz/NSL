@@ -251,12 +251,33 @@ pub fn compile_wengert_ops_range(
         (Some((param_set, _)), true) => crate::wgrad_fusion::plan(wengert, param_set),
         _ => crate::wgrad_fusion::WgradFusionPlan::default(),
     };
-    if compiler.compile_options.fuse_wgrad_accum {
+    // The fusion's contiguity proof is a property of TAPE INDICES, but
+    // `compile_wengert_ops_range` exists precisely so a caller can emit FFI
+    // (weight-stream upload/evict) BETWEEN slices. If a hooked caller ever
+    // passed a partial range with a boundary between the suppressed matmul and
+    // the reduce, "nothing runs in between" would stay true on the tape and
+    // become false in the emitted code. Today the only ranged caller passes no
+    // hook, and `--layerwise-accum` is refused at the CLI — but that guard
+    // lives three crates away, so state the assumption where it is relied on.
+    debug_assert!(
+        wgrad_plan.is_empty() || (range.start == 0 && range.end == wengert.ops.len()),
+        "wgrad fusion requires a whole-tape lowering; got range {}..{} of {} ops. \
+         A slice boundary inside a fused chain would break the contiguity proof.",
+        range.start,
+        range.end,
+        wengert.ops.len()
+    );
+    if compiler.compile_options.fuse_wgrad_accum && on_param_grad.is_some() {
         // Non-vacuity signal for the parity gate: a flag-on-vs-flag-off loss
         // comparison passes trivially if the fusion never fired. Print the
         // count so the gate can assert it is non-zero, and so a tape change
         // that quietly stops matching the pattern is visible as a lost
         // speedup rather than as nothing at all.
+        //
+        // Gated on the hook being present: without it `wgrad_plan` is empty by
+        // construction, and printing "0 chain(s) fused out of N adjoint ops"
+        // for the forward primal, the CCR free-list and every weight-stream
+        // slice would be both noisy and wrong (those N are PRIMAL ops).
         eprintln!(
             "[wgrad-fusion] {} chain(s) fused out of {} adjoint ops",
             wgrad_plan.by_reduce_result.len(),
@@ -314,10 +335,35 @@ pub fn compile_wengert_ops_range(
                     "wgrad_fusion::plan only admits chains ending in a param adjoint"
                 );
                 let (Some(&x), Some(&g)) = (var_map.get(&fusion.x), var_map.get(&fusion.g)) else {
-                    // An operand ghost-skipped upstream, so this gradient was
-                    // never computable by either path. Leave the result
-                    // unmapped, exactly as the unfused lowering would.
-                    continue;
+                    // An operand ghost-skipped upstream. This must be the SAME
+                    // hard error the unfused path raises, not a quiet skip.
+                    //
+                    // `reachable_result_vars` walks back from the needed param
+                    // adjoints through `op.inputs`, so the chain's transpose and
+                    // matmul are both in `grad_live_results`. Unfused, an
+                    // unmapped `x` or `g` reaches the P0.2 guard below on one of
+                    // those ops and fails the compile. Suppressing them moves
+                    // this decision here — so returning `continue` would turn a
+                    // refused compile into a silently-zero gradient, which is
+                    // exactly the #396 regression the guard exists to prevent.
+                    let missing: Vec<VarId> = [fusion.x, fusion.g]
+                        .into_iter()
+                        .filter(|vid| !var_map.contains_key(vid))
+                        .collect();
+                    let chain = describe_producer_chain(wengert, &missing, var_map);
+                    return Err(CodegenError::new(format!(
+                        "[source-ad] fused weight-gradient chain has an unresolved \
+                         operand — a parameter gradient would be silently dropped.\n  \
+                         param adjoint VarId: {}\n  unresolved input(s): {:?}\n  \
+                         producer chain:\n{}\n\
+                         This is the `--fuse-wgrad-accum` form of the P0.2 \
+                         grad-integrity guard: the elided Transpose/Matmul are \
+                         structurally reachable from a needed parameter gradient, so \
+                         skipping them would zero a real gradient. Rerun without \
+                         --fuse-wgrad-accum to get the unfused diagnostic, which \
+                         names the exact op that failed to resolve.",
+                        op.result, missing, chain
+                    )));
                 };
                 cb(
                     compiler,
