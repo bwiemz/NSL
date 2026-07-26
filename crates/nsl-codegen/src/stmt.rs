@@ -11161,7 +11161,10 @@ impl Compiler<'_> {
             // gate exists (deferral-must-refuse).
             if wrap_precision && self.compile_options.optim_state_offload {
                 return Err(CodegenError::new(
-                    "--layerwise-accum with --optim-state-offload does not yet                      support a CPDT reduced-precision moment plan (the P0.3                      combined staging arm is ungated under the layerwise                      schedule). Drop the precision plan or --optim-state-offload",
+                    "--layerwise-accum with --optim-state-offload does not yet \
+                     support a CPDT reduced-precision moment plan (the P0.3 \
+                     combined staging arm is ungated under the layerwise \
+                     schedule). Drop the precision plan or --optim-state-offload",
                 ));
             }
             let two_state = num_state_buffers >= 2;

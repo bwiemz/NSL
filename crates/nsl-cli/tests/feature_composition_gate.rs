@@ -98,43 +98,150 @@ fn parse_arg_struct(src: &str, struct_name: &str) -> BTreeMap<String, Constraint
 /// Pull `requires`/`requires_all`/`conflicts_with`/`conflicts_with_all` values
 /// out of a joined `#[arg(...)]` attribute.
 fn extract_constraints(attr: &str) -> Constraints {
-    fn collect(attr: &str, keys: &[&str]) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        for key in keys {
-            let mut rest = attr;
-            while let Some(pos) = rest.find(key) {
-                let after = &rest[pos + key.len()..];
-                let after = after.trim_start();
-                // Skip past `=` then read either "lit" or [ "a", "b" ].
-                let Some(after) = after.strip_prefix('=') else {
-                    rest = &rest[pos + key.len()..];
-                    continue;
+    let requires = collect_key(attr, &["requires_all", "requires"]);
+    let conflicts = collect_key(attr, &["conflicts_with_all", "conflicts_with"]);
+    (requires, conflicts)
+}
+
+/// Values for `key = ...` AND `key(...)`.
+///
+/// Both forms are honored by clap_derive — `#[arg(conflicts_with("tape_ad"))]`
+/// is exactly as binding as `conflicts_with = "tape_ad"`. An earlier version
+/// of this parser accepted only the `=` form and silently returned nothing for
+/// the other, which made the drift gate pass while `nsl run` and `nsl build`
+/// genuinely disagreed. Anything that is neither form is reported by
+/// [`unparsed_constraint_values`] rather than dropped, because a value this
+/// cannot read (a const, an expression) is a rule the gate cannot see.
+fn collect_key(attr: &str, keys: &[&str]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for key in keys {
+        let mut rest = attr;
+        while let Some(pos) = rest.find(key) {
+            let tail = &rest[pos + key.len()..];
+            // `requires` must not match inside `requires_all`; the longer key
+            // is tried first, so reject a continuation into an ident char.
+            let boundary_ok = !tail
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if boundary_ok {
+                let t = tail.trim_start();
+                let body = if let Some(eq) = t.strip_prefix('=') {
+                    Some(eq.trim_start())
+                } else {
+                    t.strip_prefix('(').map(|c| c.trim_start())
                 };
-                let after = after.trim_start();
-                if let Some(list) = after.strip_prefix('[') {
-                    if let Some(close) = list.find(']') {
-                        for tok in list[..close].split(',') {
-                            let t = tok.trim().trim_matches('"').trim();
-                            if !t.is_empty() {
-                                out.insert(t.to_string());
-                            }
-                        }
-                    }
-                } else if let Some(lit) = after.strip_prefix('"') {
-                    if let Some(close) = lit.find('"') {
-                        out.insert(lit[..close].to_string());
-                    }
+                if let Some(body) = body {
+                    read_values(body, &mut out);
                 }
-                rest = &rest[pos + key.len()..];
+            }
+            rest = &rest[pos + key.len()..];
+        }
+    }
+    out
+}
+
+/// Read `"lit"`, `["a", "b"]`, or `("a")` — the value forms clap accepts.
+fn read_values(body: &str, out: &mut BTreeSet<String>) {
+    let body = body.trim_start();
+    if let Some(list) = body.strip_prefix('[') {
+        if let Some(close) = list.find(']') {
+            for tok in list[..close].split(',') {
+                let t = tok.trim().trim_matches('"').trim();
+                if !t.is_empty() {
+                    out.insert(t.to_string());
+                }
             }
         }
-        out
+    } else if let Some(lit) = body.strip_prefix('"') {
+        if let Some(close) = lit.find('"') {
+            out.insert(lit[..close].to_string());
+        }
     }
-    // Order matters: match the `_all` forms first so the plain form's `find`
-    // does not consume `requires_all=` as `requires` + junk.
-    let requires = collect(attr, &["requires_all", "requires"]);
-    let conflicts = collect(attr, &["conflicts_with_all", "conflicts_with"]);
-    (requires, conflicts)
+}
+
+/// `(field, joined #[arg(...)] attribute)` for one struct — the raw form, so
+/// callers can inspect values `extract_constraints` chose not to keep.
+fn raw_attrs(src: &str, struct_name: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains(&format!("struct {struct_name} {{")))
+        .unwrap_or_else(|| panic!("{struct_name} not found in args.rs"));
+    let mut depth = 0i32;
+    let mut end = lines.len();
+    for (k, l) in lines.iter().enumerate().skip(start) {
+        depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+        if depth == 0 && k > start {
+            end = k;
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    let mut pending = String::new();
+    let mut k = start;
+    while k < end {
+        let l = lines[k].trim();
+        if l.starts_with("#[arg(") {
+            let mut attr = l.to_string();
+            let mut j = k;
+            while attr.matches('(').count() > attr.matches(')').count() && j + 1 < end {
+                j += 1;
+                attr.push(' ');
+                attr.push_str(lines[j].trim());
+            }
+            pending.push_str(&attr);
+            k = j + 1;
+            continue;
+        }
+        if let Some(field) = l
+            .strip_prefix("pub(crate) ")
+            .and_then(|r| r.split(':').next())
+            .filter(|f| {
+                !f.is_empty()
+                    && f.chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            })
+        {
+            out.push((field.to_string(), std::mem::take(&mut pending)));
+        }
+        k += 1;
+    }
+    out
+}
+
+/// Constraint values this parser could NOT read — a const path, an expression,
+/// anything not a string literal or literal list. Each is a composition rule
+/// invisible to every gate here, so they are surfaced as a failure rather than
+/// silently skipped.
+fn unparsed_constraint_values(attr: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for key in ["requires_all", "requires", "conflicts_with_all", "conflicts_with"] {
+        let mut rest = attr;
+        while let Some(pos) = rest.find(key) {
+            let tail = &rest[pos + key.len()..];
+            let boundary_ok = !tail
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if boundary_ok {
+                let t = tail.trim_start();
+                let body = t
+                    .strip_prefix('=')
+                    .or_else(|| t.strip_prefix('('))
+                    .map(str::trim_start);
+                if let Some(b) = body {
+                    let mut probe = BTreeSet::new();
+                    read_values(b, &mut probe);
+                    if probe.is_empty() {
+                        bad.push(format!("{key} -> {:.40}", b));
+                    }
+                }
+            }
+            rest = &rest[pos + key.len()..];
+        }
+    }
+    bad
 }
 
 fn args_src() -> String {
@@ -180,9 +287,36 @@ fn run_and_build_declare_identical_composition_rules() {
         .filter(|(f, c)| run.contains_key(*f) && !(c.0.is_empty() && c.1.is_empty()))
         .count();
     assert!(
-        shared_constrained >= 10,
-        "parsed only {shared_constrained} constrained shared flags — the \
-         args.rs parser has probably stopped matching, making this gate vacuous"
+        shared_constrained >= 12,
+        "parsed only {shared_constrained} constrained shared flags (expected \
+         12) — the args.rs parser has stopped matching, making this gate \
+         vacuous. Raise this floor when a constrained flag is added, so a \
+         parser that truncates part-way still trips it."
+    );
+}
+
+#[test]
+fn no_clap_constraint_value_is_unreadable_by_this_parser() {
+    // A `requires = SOME_CONST`, or any value that is not a string literal or
+    // literal list, parses to NOTHING here — so the rule stays enforced by
+    // clap but invisible to every gate in this file. That is a silent coverage
+    // hole, which is the failure mode this whole file exists to prevent, so it
+    // fails loudly instead.
+    let src = args_src();
+    let mut bad = Vec::new();
+    for struct_name in ["BuildArgs", "RunArgs"] {
+        for (field, attr) in raw_attrs(&src, struct_name) {
+            for v in unparsed_constraint_values(&attr) {
+                bad.push(format!("  {struct_name}::{field}: {v}"));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "clap constraint value(s) this gate cannot read — enforced, but \
+         invisible to the registry cross-check. Teach `read_values` the new \
+         form, or express the constraint as a string literal:\n{}",
+        bad.join("\n")
     );
 }
 
@@ -236,25 +370,147 @@ fn every_clap_constraint_is_registered_and_vice_versa() {
          now permitted) or the registry is stale — in both cases the table is \
          lying about coverage:\n{extra:#?}"
     );
-    assert!(
-        in_registry.len() >= 12,
-        "only {} clap rules registered; the parser or the registry has \
-         collapsed and this gate is vacuous",
-        in_registry.len()
-    );
+    // ANTI-VACUITY. Assert on the PARSER's output, per struct — not on
+    // `in_registry`, which is a const array the parser cannot affect (its
+    // "the parser collapsed" message would have been unreachable), and not on
+    // the union, which stays complete when only ONE struct fails to parse.
+    for (name, map) in [("BuildArgs", &build), ("RunArgs", &run)] {
+        let n = map
+            .values()
+            .filter(|(r, c)| !r.is_empty() || !c.is_empty())
+            .count();
+        assert!(
+            n >= 12,
+            "parsed only {n} constrained fields from {name}; the args.rs \
+             parser has stopped matching and every assertion above is vacuous"
+        );
+    }
 }
 
 // ─────────────────────── Tier B: the refusal still exists ─────────────────
 
-/// Rust string literals in these files wrap with `\` continuations and
-/// indentation, so a fragment like `--layerwise-accum requires --source-ad`
-/// is not contiguous in the raw bytes. Collapse all whitespace runs (and drop
-/// the backslash-newline pairs) before searching.
-fn normalized(path: &std::path::Path) -> String {
+/// Markers that begin a refusal. A fragment only counts if it appears in the
+/// text FOLLOWING one of these.
+const REFUSAL_MARKERS: &[&str] = &[
+    "CodegenError::new(",
+    "eprintln!(",
+    "panic!(",
+    "Err(format!(",
+    "format!(",
+];
+
+/// The refusal-bearing text of a file, normalized.
+///
+/// Two transformations, each load-bearing:
+///
+/// * **Whitespace collapse.** Rust literals here wrap with `\` continuations
+///   and indentation, so `--layerwise-accum requires --source-ad` is not
+///   contiguous in the raw bytes.
+/// * **Anchoring to refusal sites.** Searching the WHOLE file would let a
+///   deleted refusal keep this gate green as long as its message survived in
+///   a `//` comment or a `#[cfg(test)]` assertion — which is exactly how a
+///   removed guard would look after someone "documented why it used to be
+///   there". Only the span following a refusal marker counts.
+///
+/// This still cannot see the GUARD. Narrowing a refusal's condition (say
+/// `a && (b || c)` to `a && b`) leaves the message untouched and passes here;
+/// only the subprocess tier can catch that, and it covers one rule. Stated
+/// plainly because a gate's limits are as important as its coverage.
+fn refusal_text(path: &std::path::Path) -> String {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let unwrapped = raw.replace("\\\n", " ");
-    unwrapped.split_whitespace().collect::<Vec<_>>().join(" ")
+    let code = strip_comments(&raw);
+    let unwrapped = code.replace("\\\n", " ");
+
+    let mut spans = String::new();
+    for marker in REFUSAL_MARKERS {
+        let mut from = 0usize;
+        while let Some(pos) = unwrapped[from..].find(marker) {
+            let start = from + pos + marker.len();
+            // Capture exactly this call's ARGUMENTS — up to its matching close
+            // paren — rather than a fixed window. A fixed window reaches past
+            // the call into whatever follows, which is how the first version
+            // of this gate stayed green after a refusal was deleted and its
+            // message left behind nearby.
+            let mut depth = 1i32;
+            let mut end = start;
+            for (i, c) in unwrapped[start..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                end = start + i + c.len_utf8();
+            }
+            spans.push_str(&unwrapped[start..end]);
+            spans.push(' ');
+            from = start;
+        }
+    }
+    spans.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Remove `//` and `/* */` comments while respecting string literals, so a
+/// refusal message quoted in a comment cannot stand in for the refusal.
+fn strip_comments(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let (mut i, n) = (0usize, b.len());
+    let (mut in_str, mut in_line, mut in_block) = (false, false, false);
+    while i < n {
+        let c = b[i];
+        let next = if i + 1 < n { b[i + 1] } else { '\0' };
+        if in_line {
+            if c == '\n' {
+                in_line = false;
+                out.push(c);
+            }
+            i += 1;
+        } else if in_block {
+            if c == '*' && next == '/' {
+                in_block = false;
+                i += 2;
+            } else {
+                if c == '\n' {
+                    out.push(c);
+                }
+                i += 1;
+            }
+        } else if in_str {
+            if c == '\\' {
+                out.push(c);
+                if i + 1 < n {
+                    out.push(next);
+                }
+                i += 2;
+            } else {
+                if c == '"' {
+                    in_str = false;
+                }
+                out.push(c);
+                i += 1;
+            }
+        } else if c == '/' && next == '/' {
+            in_line = true;
+            i += 2;
+        } else if c == '/' && next == '*' {
+            in_block = true;
+            i += 2;
+        } else {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[test]
@@ -275,7 +531,7 @@ fn every_registered_refusal_message_still_exists_in_its_source() {
         };
         let hay = cache
             .entry(file)
-            .or_insert_with(|| normalized(&root.join(file)));
+            .or_insert_with(|| refusal_text(&root.join(file)));
         let needle = fragment.split_whitespace().collect::<Vec<_>>().join(" ");
         checked += 1;
         if !hay.contains(&needle) {
@@ -312,8 +568,19 @@ fn refusal_fragments_are_distinctive_enough_to_be_meaningful() {
         let Enforcement::Source { fragment, .. } = rule.enforcement else {
             continue;
         };
-        if fragment.len() < 24 || !fragment.contains("--") {
-            weak.push(format!("  {} -> {fragment:?}", rule.flag));
+        // `contains("--")` alone was near-useless: every fragment starts with
+        // its own flag, so it passed unconditionally. What matters is that the
+        // fragment pins the PARTNER too — otherwise a refusal can be narrowed
+        // to drop `other` from its condition while the pinned text survives
+        // untouched. Review found exactly that on the --param-dtype x
+        // --optim-state-offload entry, whose fragment stopped one clause short
+        // of naming its partner.
+        let names_partner = !rule.other.starts_with("--") || fragment.contains(rule.other);
+        if fragment.len() < 24 || !fragment.contains("--") || !names_partner {
+            weak.push(format!(
+                "  {} {:?} {} -> {fragment:?}",
+                rule.flag, rule.kind, rule.other
+            ));
         }
     }
     assert!(
@@ -359,13 +626,23 @@ struct FireCase {
 
 fn run_nsl(fixture: &std::path::Path, extra: &[&str]) -> (bool, String) {
     let root = repo_root();
-    let out = Command::new(env!("CARGO"))
-        .args(["run", "-q", "-p", "nsl-cli", "--manifest-path"])
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args(["run", "-q", "-p", "nsl-cli"]);
+    // Exercise the binary built with the SAME feature set as this test.
+    // Without this, a `--features cuda` run silently drives the default build.
+    if cfg!(feature = "cuda") {
+        cmd.args(["--features", "cuda"]);
+    }
+    let out = cmd
+        .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .args(["--", "run"])
         .args(extra)
         .arg(fixture)
-        .current_dir(&root)
+        // Scratch cwd, NOT the repo: anything the compiled program writes
+        // relatively then lands in temp. A CSLA_SAVE_PATH-shaped mistake once
+        // dropped a stray file in the repo root from exactly this call.
+        .current_dir(std::env::temp_dir())
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .output()
         .expect("spawn nsl run");
@@ -385,6 +662,11 @@ fn tier_c_fragments_are_registered() {
             Enforcement::Clap => None,
         })
         .collect();
+    assert!(
+        !TIER_C.is_empty(),
+        "TIER_C is empty — this test and the subprocess gate both degrade to \
+         asserting nothing"
+    );
     for case in TIER_C {
         assert!(
             registered.contains(case.fragment),
@@ -428,9 +710,13 @@ fn materialize_csla_fixture() -> PathBuf {
         "fixture lost its CSLA_SAVE_PATH marker; this gate would write into \
          the repo root"
     );
+    // PID-suffixed, matching csla_layerwise_gate's convention: a fixed name in
+    // a world-writable dir collides between concurrent `cargo test` runs, and
+    // between users on a shared runner.
     let tmp = std::env::temp_dir();
-    let out = tmp.join("nsl_feature_composition_csla.nsl");
-    let save = tmp.join("nsl_feature_composition_csla.nslm");
+    let pid = std::process::id();
+    let out = tmp.join(format!("nsl_feature_composition_csla_{pid}.nsl"));
+    let save = tmp.join(format!("nsl_feature_composition_csla_{pid}.nslm"));
     std::fs::write(
         &out,
         src.replace("CSLA_SAVE_PATH", save.to_str().expect("utf-8 temp path")),
@@ -467,4 +753,83 @@ fn registered_refusals_actually_fire_on_a_real_compile() {
             case.fragment
         );
     }
+}
+
+// ──────────────── Tier B2: the registry cannot be silently INCOMPLETE ──────
+
+/// Refusals deliberately outside this registry's scope, with the reason.
+/// Anything here is a conscious exclusion, not an oversight — which is the
+/// distinction the sweep below exists to force someone to make.
+const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
+    // Flag x LANGUAGE CONSTRUCT, not flag x flag: the partner is `@pipeline`
+    // or a `grad_clip=` train-block argument, neither of which is a CLI flag,
+    // so a pairwise CLI registry cannot express them.
+    ("pipelined train", "flag x @pipeline decorator"),
+    ("grad_clip", "flag x train-block argument"),
+    ("CSHA-claimed fused attention", "flag x @flash_attention decorator"),
+    // Diagnostics and advice, not composition refusals.
+    ("re-run with --source-ad", "advice appended to an unrelated error"),
+    // ADVISORY, not a refusal: --health-interval without --monitor warns and
+    // continues. The registry models refusals — RuleKind has no "advisory"
+    // variant — so recording it here would overstate what is enforced.
+    ("has no effect without --monitor", "advisory warning, run continues"),
+];
+
+/// Two-flag refusals present in the source but absent from the registry.
+///
+/// Tier A is bidirectional for clap rules; without this, the SOURCE half is
+/// one-way — a refusal added tomorrow would simply never be registered, and
+/// therefore never gated, while `FEATURE_RULES`' doc claims to hold "every
+/// composition rule the compiler enforces". This is the sweep that keeps that
+/// claim honest.
+#[test]
+fn no_two_flag_refusal_is_missing_from_the_registry() {
+    let root = repo_root();
+    let files: BTreeSet<&'static str> = source_rules()
+        .filter_map(|r| match r.enforcement {
+            Enforcement::Source { file, .. } => Some(file),
+            Enforcement::Clap => None,
+        })
+        .collect();
+
+    let registered: Vec<&str> = source_rules()
+        .filter_map(|r| match r.enforcement {
+            Enforcement::Source { fragment, .. } => Some(fragment),
+            Enforcement::Clap => None,
+        })
+        .collect();
+
+    let mut unregistered = Vec::new();
+    for file in &files {
+        let text = refusal_text(&root.join(file));
+        // Split the anchored refusal text into individual string literals.
+        for lit in text.split('"') {
+            let flags: BTreeSet<&str> = lit
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .filter(|t| t.starts_with("--") && t.len() > 4)
+                .collect();
+            if flags.len() < 2 {
+                continue;
+            }
+            if registered.iter().any(|frag| {
+                let f = frag.split_whitespace().collect::<Vec<_>>().join(" ");
+                lit.contains(&f)
+            }) {
+                continue;
+            }
+            if SWEEP_ALLOWLIST.iter().any(|(pat, _)| lit.contains(pat)) {
+                continue;
+            }
+            unregistered.push(format!("  {file}: {:?}\n      flags: {flags:?}", &lit[..lit.len().min(150)]));
+        }
+    }
+
+    assert!(
+        unregistered.is_empty(),
+        "{} two-flag refusal(s) exist in the source but are NOT in \
+         crates/nsl-cli/src/feature_rules.rs, so nothing gates them. Register \
+         each, or add it to SWEEP_ALLOWLIST with a reason:\n{}",
+        unregistered.len(),
+        unregistered.join("\n")
+    );
 }

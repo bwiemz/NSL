@@ -1,11 +1,11 @@
 //! Item 20: a declarative registry of feature-composition rules.
 //!
-//! NSL has ~14 composable training features and **51 measured pairwise rules**
-//! governing them — "A requires B", "A does not compose with B". Twelve are
-//! clap attributes; the other thirty-nine live as hand-written refusals deep
-//! in `stmt.rs` / `stmt_fase.rs` / the CLI, each covered (if at all) by a
-//! bespoke test. Nothing ties the two halves together, so three things can rot
-//! silently:
+//! NSL has ~14 composable training features and a large body of pairwise rules
+//! governing them — "A requires B", "A does not compose with B". Fifteen are
+//! clap attributes (spread over twelve constrained fields); the rest live as
+//! hand-written refusals deep in `stmt.rs` / `stmt_fase.rs` / the CLI, each
+//! covered (if at all) by a bespoke test. Nothing tied the two halves
+//! together, so three things can rot silently:
 //!
 //! 1. **`nsl run` and `nsl build` drift.** `args.rs` declares every shared flag
 //!    TWICE (`BuildArgs`, `RunArgs`). A `conflicts_with` added to one and not
@@ -150,7 +150,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         RuleKind::Requires,
         "--checkpoint-blocks",
         STMT,
-        "--layerwise-accum requires an active checkpoint plan",
+        "--layerwise-accum requires an active checkpoint plan: pass --checkpoint-blocks",
     ),
     src_rule(
         "--layerwise-accum",
@@ -171,14 +171,21 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         RuleKind::Conflicts,
         "--wggo",
         STMT,
-        "--layerwise-accum is incompatible with a WGGO per-parameter FASE mode table",
+        "Drop --wggo overrides or --layerwise-accum",
     ),
+    // CORRECTED after review: the guard here is
+    // `wrap_precision && optim_state_offload`, NOT `layerwise_accum &&
+    // optim_state_offload`. Plain CSLA + offload is a SUPPORTED path (see the
+    // staging note above the guard); only the reduced-precision moment plan
+    // on top of it is ungated. The original entry claimed a refusal that does
+    // not exist — precisely the "registry lies about coverage" rot this
+    // module names, found in the registry's own first version.
     src_rule(
-        "--layerwise-accum",
-        RuleKind::Conflicts,
         "--optim-state-offload",
+        RuleKind::Conflicts,
+        "CPDT reduced-precision moment plan",
         STMT,
-        "--layerwise-accum with --optim-state-offload does not yet support",
+        "--layerwise-accum with --optim-state-offload does not yet support a CPDT reduced-precision moment plan",
     ),
     // ── ZeRO ───────────────────────────────────────────────────────────────
     src_rule(
@@ -200,14 +207,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         RuleKind::Conflicts,
         "--wggo-moment-precision",
         STMT,
-        "--zero-stage 3 does not support reduced-precision optimizer moments",
+        "Drop --wggo-moment-precision / the CPDT precision plan, or use --zero-stage 2",
     ),
     src_rule(
         "--zero-stage",
         RuleKind::Conflicts,
         "--wggo",
         STMT,
-        "--zero-stage is not supported with a WGGO per-param mode table",
+        "Drop --wggo mode overrides or --zero-stage",
     ),
     // ── SR-BF16 (`--param-dtype bf16-sr`) envelope ─────────────────────────
     src_rule(
@@ -220,7 +227,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     src_rule(
         "--param-dtype",
         RuleKind::Requires,
-        "--source-ad",
+        "FASE-Deferred plan",
         STMT,
         "--param-dtype bf16-sr requires the FASE-Deferred plan",
     ),
@@ -243,7 +250,7 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         RuleKind::Conflicts,
         "--wggo-moment-precision",
         STMT,
-        "--param-dtype bf16-sr does not compose with reduced-precision optimizer moments",
+        "--param-dtype bf16-sr does not compose with reduced-precision optimizer moments (drop --wggo-moment-precision",
     ),
     src_rule(
         "--param-dtype",
@@ -252,12 +259,21 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         STMT,
         "--param-dtype bf16-sr requires the fused optimizer step, which --training-reference disables",
     ),
+    // Found by the completeness sweep below — the registry had CSLA x --wggo
+    // and ZeRO x --wggo but not this one.
+    src_rule(
+        "--param-dtype",
+        RuleKind::Conflicts,
+        "WGGO per-layer FASE overrides",
+        STMT,
+        "--param-dtype bf16-sr does not compose with WGGO per-layer FASE overrides",
+    ),
     src_rule(
         "--param-dtype",
         RuleKind::Conflicts,
         "--optim-state-offload",
         STMT_FASE,
-        "--param-dtype bf16-sr does not compose with reduced-precision moment plans",
+        "--param-dtype bf16-sr does not compose with reduced-precision moment plans or --optim-state-offload",
     ),
     // ── Muon envelope ──────────────────────────────────────────────────────
     src_rule(
@@ -337,12 +353,41 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         STMT,
         "--muon-state-dtype bf16 does not compose with --optim-state-offload",
     ),
+    // CORRECTED after review: the guard is `optimizer_name != "muon"`. This is
+    // a flag x OPTIMIZER constraint, not flag x flag — `--wggo-moment-precision`
+    // appears only as advice in the message. Recorded with a non-flag `other`
+    // rather than deleted, so the refusal keeps its deleted-refusal gate.
     src_rule(
         "--muon-state-dtype",
-        RuleKind::Conflicts,
-        "--wggo-moment-precision",
+        RuleKind::Requires,
+        "muon optimizer",
         STMT,
         "--muon-state-dtype bf16 applies to the Muon optimizer only",
+    ),
+    // Second enforcement site for --param-dtype x --training-reference (the
+    // stmt.rs one guards the plan, this one the optimizer program shape).
+    // Found by the completeness sweep, not by hand.
+    src_rule(
+        "--param-dtype",
+        RuleKind::Conflicts,
+        "--training-reference",
+        STMT_FASE,
+        "NSL_FASE_FUSED_STEP=0 / --training-reference, or drop --param-dtype bf16-sr",
+    ),
+    // ── CPDT ───────────────────────────────────────────────────────────────
+    src_rule(
+        "--cpdt",
+        RuleKind::Requires,
+        "--cpdt-num-gpus",
+        CLI_RUN,
+        "--cpdt requires --cpdt-num-gpus N",
+    ),
+    src_rule(
+        "--cpdt",
+        RuleKind::Requires,
+        "--weights",
+        CLI_RUN,
+        "1. Add --weights <path.safetensors> to this invocation.",
     ),
     // ── CUDA graphs ────────────────────────────────────────────────────────
     src_rule(
@@ -380,14 +425,14 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
     src_rule(
         "--fuse-wgrad-accum",
         RuleKind::Conflicts,
-        "--layerwise-accum",
+        "CSLA window replay",
         STMT,
         "--fuse-wgrad-accum fired inside the CSLA window replay",
     ),
     src_rule(
         "--fuse-wgrad-accum",
         RuleKind::Conflicts,
-        "--calibrate",
+        "calibration binary",
         CALIB,
         "--fuse-wgrad-accum cannot be used when emitting a calibration binary",
     ),
