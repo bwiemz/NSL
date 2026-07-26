@@ -4,59 +4,39 @@
 # Gates listed here are ALLOWED to fail without failing the lane. Everything
 # else that is not PASS makes `scripts/gpu-cert.sh --run` exit 1.
 #
-# The posture is deliberate. The first full run found breakage that pre-dated
-# the lane, and blocking on all of it would have meant the lane could never go
-# green — so it would have been switched off within a week. Instead:
-# pre-existing red is recorded here with evidence, and any NEW red fails.
+# This file started at 19 entries. Triage closed all but the two below:
 #
-# EVERY entry below was verified against origin/main (1e86f101) in a separate
-# worktree before being written here. None is a regression from the roadmap
-# campaign; "it was failing when I got here" is the point of the file, but it
-# had to be MEASURED, not assumed.
+#   - tier_b2 full backward x4   REAL BUG: the launcher passed 49 args to a
+#                                50-param kernel (62b64e37). Fixed.
+#   - csha_gap_gpu_e2e x1        BAD TEST: an all-ones probe makes dS vanish
+#                                identically, so dWq/dWk are zero as a matter
+#                                of arithmetic. Kernel was correct.
+#   - ZeRO collectives x2        STALE: counts encoded the pre-f1030f76 world
+#                                where `model.to(device)` skipped fields after
+#                                an inline model array.
+#   - zero_reduce_grads x1       STALE: asserted success where the codebase now
+#                                deliberately REFUSES (-5) a device-resident
+#                                gradient on a non-CUDA-aware backend.
+#   - cuda_graph x1              UNDER-PROVISIONED: capture needs a warm-up, and
+#                                the fixture ended on the capturing occurrence,
+#                                so `replays` could never be > 0.
+#   - cycle-15 ablations x3      Reclassified `diagnostic`: they are Bug-1
+#                                bisection probes whose pass/fail pattern IS
+#                                the output.
+#   - checkpoint_recompute x4    Reclassified `broken`: R7 refuses rope_q +
+#                                @checkpoint, so synthesis never runs. The
+#                                refusal is now pinned by
+#                                csha_r7_checkpoint_rope_q_refusal.rs.
 #
-# Deleting a line is how a fix gets locked in — the lane then enforces that
-# gate forever after.
+# Deleting a line is how a fix gets locked in — the lane enforces that gate
+# forever after.
 #
 # Format (tab-separated, matching the report's first two columns):
 #   <cargo target args><TAB><test name>
-#
-# Baseline: 255 gates, 237 PASS / 16 FAIL / 2 NOTFOUND on RTX 5070 Ti (sm_120),
-# CUDA 13.3, driver 610.43.03, 2026-07-25.
 
-# ── CSHA fused backward / Tier B.2 (9) ────────────────────────────────────
-# Numerical parity against the CPU reference. The multi-tile backward is
-# documented as refused at Phase 1.1, and these sweeps exercise paths beyond
-# the single-tile scope the canary covers.
--p nsl-codegen --test csha_checkpoint_recompute_gpu 	t_recompute_hd128_s2048_bq32
--p nsl-codegen --test csha_checkpoint_recompute_gpu 	t_recompute_hd128_s512_bq32
--p nsl-codegen --test csha_checkpoint_recompute_gpu 	t_recompute_hd64_s2048_bq32
--p nsl-codegen --test csha_checkpoint_recompute_gpu 	t_recompute_hd64_s512_bq32
--p nsl-codegen --test csha_cycle15_bug1_ablations 	a1_rope_q_off_causal_true_fused_proj_true_hd64
--p nsl-codegen --test csha_cycle15_bug1_ablations 	a2_causal_off_rope_q_true_fused_proj_true_hd64
--p nsl-codegen --test csha_cycle15_bug1_ablations 	a3_fused_proj_off_causal_true_rope_q_true_hd64
--p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_b1_forward
--p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_b1_forward_causal
--p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_cpu_naive
--p nsl-codegen --test tier_b2_full_backward_cpu_reference 	tier_b2_full_backward_sweep_cpu_naive_causal
-
-# ── ZeRO collectives (3) ─────────────────────────────────────────────────
-# sim-gpu 2-rank bit-exactness and the gradient-reduce divisor.
--p nsl-cli --test zero_gpu_collectives_gate 	sim_gpu_stage2_reduce_scatter_bit_exact
--p nsl-cli --test zero_gpu_collectives_gate 	sim_gpu_two_rank_parity_bit_exact
--p nsl-runtime --test zero_grad_gpu 	zero_reduce_grads_divides_gpu_tensor
-
-# ── CUDA graphs + CSHA e2e (2) ───────────────────────────────────────────
-# cuda_graph_capture_replay_bitexact_gpu guards the --cuda-graphs feature
-# shipped in the P5 campaign; it is red on origin/main too.
--p nsl-cli --test csha_gap_gpu_e2e_smoke 	csha_gap_gpu_e2e_csha_fused_path
--p nsl-cli --test cuda_graph_gate 	cuda_graph_capture_replay_bitexact_gpu
-
-# ── Structurally unreachable under the lane (1) ──────────────────────────
-# `cuda_feature_required` is #[cfg(not(feature = "cuda"))] — it exists ONLY in
-# non-CUDA builds, so a CUDA sweep can never list it. Not breakage; recorded
-# so the NOTFOUND is accounted for rather than silently ignored.
+# ── Structurally unreachable under the lane (2) ──────────────────────────
+# Both are #[cfg(not(feature = "cuda"))] — they exist ONLY in non-CUDA builds,
+# so a CUDA sweep can never list them. Not breakage; recorded so the NOTFOUND
+# is accounted for rather than silently ignored.
 -p nsl-runtime --test fp8_dispatcher 	cuda_feature_required
-# Same structural case: #[cfg(not(feature = "cuda"))]. Its target's eight
-# sibling gates list normally, so this one used to vanish from the report
-# entirely rather than showing as NOTFOUND.
 -p nsl-cli --test wrga_gatedlora_backward_trigger 	wrga_b32_trigger_measurement_requires_cuda

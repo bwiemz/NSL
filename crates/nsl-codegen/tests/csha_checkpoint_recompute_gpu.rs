@@ -236,25 +236,25 @@ impl WithDModel for FlashAttentionConfig {
 // lifts `#[ignore]` AFTER one green pass on real CUDA hardware.
 
 #[test]
-#[ignore]
+#[ignore = "prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run"]
 fn t_recompute_hd64_s512_bq32() {
     run_three_way_oracle(64, 512);
 }
 
 #[test]
-#[ignore]
+#[ignore = "prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run"]
 fn t_recompute_hd64_s2048_bq32() {
     run_three_way_oracle(64, 2048);
 }
 
 #[test]
-#[ignore]
+#[ignore = "prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run"]
 fn t_recompute_hd128_s512_bq32() {
     run_three_way_oracle(128, 512);
 }
 
 #[test]
-#[ignore]
+#[ignore = "prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run"]
 fn t_recompute_hd128_s2048_bq32() {
     run_three_way_oracle(128, 2048);
 }

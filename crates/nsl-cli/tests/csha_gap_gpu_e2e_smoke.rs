@@ -127,7 +127,15 @@ model TinyAttn:
         return scaled_dot_product_attention(q, k, v, scale)
 
 let m = TinyAttn()
-let x = ones([1, 1, 32, 32])
+# x MUST vary along the sequence axis. With `ones([1,1,32,32])` every row of
+# V is identical, so dP_ij is constant in j and
+# dS = P * (dP - sum_k P_ik dP_ik) vanishes IDENTICALLY. dQ = dS.K and
+# dK = dS^T.Q are then exactly zero, so dWq and dWk are zero as a matter of
+# arithmetic — and the all-four-params assertion below could never hold. The
+# kernel was correct the whole time; the probe was degenerate (the same trap
+# recorded for CSHA cycle 18). Verified: this input moves all four params,
+# `ones` moves only wv and w_norm.
+let x = (arange(1024).reshape([1, 1, 32, 32]) * 0.01) + 0.5
 let y = zeros([1, 1, 32, 32])
 
 print("BEFORE_wq")

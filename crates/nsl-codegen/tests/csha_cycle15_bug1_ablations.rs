@@ -46,7 +46,7 @@ use nsl_codegen::flash_attention::{
 };
 use nsl_codegen::flash_attention_v2::{
     flash_attention_kernel_name_v2, smem_layout, synthesize_backward_with_tier_b,
-    synthesize_flash_attention_ptx_v2,
+    synthesize_forward_multi_tile_combined,
 };
 use nsl_test::cpu_naive_prologue::{cpu_naive_norm_proj_rope, PrologueConfig};
 
@@ -308,7 +308,17 @@ fn run_ablation(
     }
 
     // ── Forward launch ───────────────────────────────────────────────────────
-    let fwd_ptx = synthesize_flash_attention_ptx_v2(&config);
+    // These ablations run at S=512 with 32x32 tiles, i.e. MULTI-TILE. For a
+    // fused-projection config `nsl_flash_attention_csha_with_saves` then does
+    // a two-launch dispatch and looks up a `<name>_mt_attn` twin entry, which
+    // `synthesize_flash_attention_ptx_v2` alone does not emit — the lookup
+    // fails with CUDA_ERROR_NOT_FOUND (500), exactly as flash_attention.rs
+    // documents ("if the module lacks the twin ... the name lookup fails and
+    // the error surfaces loudly in the rc"). That refusal is correct; the
+    // harness was simply handing it single-kernel PTX. The combined
+    // synthesizer emits both entries and degrades to the plain kernel for
+    // configs with no twin (non-fused / sinks / segment / checkpoint / paged).
+    let fwd_ptx = synthesize_forward_multi_tile_combined(&config);
     let fwd_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(&config);
     let fwd_smem_dyn = if smem_layout::needs_dynamic_smem(&config) {
@@ -542,7 +552,7 @@ fn run_ablation(
 /// If A1 PASSES but the base config FAILs, the bug is in the dRoPE inverse
 /// rotation (Candidate B: csha_hooks_backward.rs:191-365 emit_drope).
 #[test]
-#[ignore]
+#[ignore = "diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open"]
 fn a1_rope_q_off_causal_true_fused_proj_true_hd64() {
     run_ablation("A1-rope-q-off", 64, 512, |cfg| {
         cfg.rope_q = false;
@@ -555,7 +565,7 @@ fn a1_rope_q_off_causal_true_fused_proj_true_hd64() {
 /// If A2 PASSES but the base config FAILs, the bug is in the causal mask
 /// predicate (Candidate A: ds_compute.rs:212-232 setp.gt / or.pred).
 #[test]
-#[ignore]
+#[ignore = "diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open"]
 fn a2_causal_off_rope_q_true_fused_proj_true_hd64() {
     run_ablation("A2-causal-off", 64, 512, |cfg| {
         cfg.causal = false;
@@ -577,7 +587,7 @@ fn a2_causal_off_rope_q_true_fused_proj_true_hd64() {
 /// unconditionally declares those registers. The synthesizer refusal check
 /// at the start of run_ablation will catch this and mark A3 STRUCTURALLY-BLOCKED.
 #[test]
-#[ignore]
+#[ignore = "diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open"]
 fn a3_fused_proj_off_causal_true_rope_q_true_hd64() {
     run_ablation("A3-fused-proj-off", 64, 512, |cfg| {
         if let Some(csha) = cfg.csha.as_mut() {
@@ -599,7 +609,7 @@ fn a3_fused_proj_off_causal_true_rope_q_true_hd64() {
 /// by G14-D for hd=64; the budget scales linearly with head_dim so hd=128
 /// bq=32 stays well within bounds).
 #[test]
-#[ignore]
+#[ignore = "diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open"]
 fn a4_hd128_causal_true_rope_q_true_fused_proj_true() {
     run_ablation("A4-hd128", 128, 512, |cfg| {
         cfg.head_dim = 128;

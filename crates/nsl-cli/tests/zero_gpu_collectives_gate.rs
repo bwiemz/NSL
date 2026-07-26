@@ -101,12 +101,20 @@ fn sim_gpu_two_rank_parity_bit_exact() {
         spmd.stderr
     );
 
-    // Anti-vacuity: bucketed collectives actually ran on both ranks. On the
-    // GPU fixture each step reduces TWO buckets (not every gradient lands
-    // on-device — one CPU f64 group rides alongside the GPU f32 bucket) and
-    // syncs THREE owner groups (2 GPU owner buckets + the CPU group), so 6
-    // steps give all_reduce=12, broadcast=18, with all 96 tensor-memberships
-    // covered by buckets.
+    // Anti-vacuity: bucketed collectives actually ran on both ranks. Each step
+    // reduces ONE bucket and syncs TWO owner groups, so 6 steps give
+    // all_reduce=6, broadcast=12, with all 96 tensor-memberships covered.
+    //
+    // These counts were all_reduce=12 / broadcast=18 when this gate was written
+    // (2026-07-20), on the premise that "not every gradient lands on-device —
+    // one CPU f64 group rides alongside the GPU f32 bucket". That premise was a
+    // BUG, not a property: `model.to(device)` skipped every field declared
+    // AFTER an inline model array, and this fixture is `blocks: [Blk; 2]`
+    // followed by `norm_out`. f1030f76 (2026-07-22) fixed it, so the whole
+    // model is now GPU-resident, the CPU group is gone, and the two buckets
+    // collapse into one. bucket_members stays 96 — the same tensors are
+    // covered, in fewer buckets. The bit-exactness assertion above is the real
+    // correctness property and it still holds.
     for rank in 0..2 {
         let line = spmd
             .stderr
@@ -114,8 +122,8 @@ fn sim_gpu_two_rank_parity_bit_exact() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
         assert!(
-            line.contains("all_reduce=12 ")
-                && line.contains("broadcast=18 ")
+            line.contains("all_reduce=6 ")
+                && line.contains("broadcast=12 ")
                 && line.contains("bucket_members=96 "),
             "wrong collective counts: {line}"
         );
@@ -159,10 +167,14 @@ fn sim_gpu_stage2_reduce_scatter_bit_exact() {
             .lines()
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
-        // 6 steps × (1 CPU f64 group + 1 GPU f32 group) = 12 scatters; no
-        // gradient may travel through an all_reduce.
+        // 6 steps × 1 GPU f32 group = 6 scatters; no gradient may travel
+        // through an all_reduce. Was 12 on the same stale premise corrected in
+        // the stage-1 gate above: the second (CPU f64) group only existed
+        // because `model.to(device)` skipped fields after an inline model
+        // array, fixed in f1030f76. all_reduce=0 is the load-bearing half of
+        // this assertion and is unchanged.
         assert!(
-            line.trim_end().ends_with("reduce_scatter=12") && line.contains("all_reduce=0 "),
+            line.trim_end().ends_with("reduce_scatter=6") && line.contains("all_reduce=0 "),
             "stage-2 GPU collective counts wrong: {line}"
         );
     }

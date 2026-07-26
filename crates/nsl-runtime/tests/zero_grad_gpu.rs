@@ -226,34 +226,100 @@ fn grad_zero_gpu_clears_buffer() {
     }
 }
 
-/// (f) nsl_zero_reduce_grads with a GPU tensor in the list: world_size=4
-/// simulated averaging must divide device-resident gradients too (pre-fix:
-/// GPU tensors were silently skipped). ZeRO ctx is initialized directly —
-/// nsl_zero_init has no production emitter yet (M43b), matching how the
-/// zero.rs unit tests drive the context.
+/// (f) `nsl_zero_reduce_grads` must never SILENTLY skip a device-resident
+/// gradient. The original bug was exactly that: GPU tensors fell through the
+/// reduce loop untouched, so ranks kept unsynchronised gradients and training
+/// diverged with nothing in the logs.
+///
+/// This gate used to assert the divide succeeded under a single-process
+/// `nsl_zero_init(1, 4)`. Two deliberate hardenings since made that
+/// unreachable, and asserting it was asserting behaviour the codebase has
+/// intentionally removed:
+///
+///   1. `nsl_zero_init` refuses world_size > 1 without `NSL_TP_SHM_PATH`
+///      (-3) — pinned by zero.rs's own `test_zero_ffi_lifecycle`.
+///   2. A device-resident gradient under a non-CUDA-aware backend is REFUSED
+///      with -5 ("GPU-resident ZeRO SPMD needs real collectives") instead of
+///      being skipped. That refusal IS the fix for the original bug.
+///
+/// Driving a genuine CUDA-aware reduce needs a real multi-rank spawn: the
+/// `sim-gpu` backend aborts when a single process claims ws=4. That path is
+/// covered end-to-end by `nsl-cli/tests/zero_gpu_collectives_gate.rs`, which
+/// goes through `nsl run --devices 2 --collectives sim-gpu`.
+///
+/// So what this gate pins now is the property that actually regressed once
+/// and could regress again: the failure is LOUD and NON-DESTRUCTIVE — a
+/// refusal code, with the gradient left bit-for-bit untouched rather than
+/// half-reduced.
 #[test]
-#[ignore]
-fn zero_reduce_grads_divides_gpu_tensor() {
+#[ignore = "requires CUDA GPU"]
+fn zero_reduce_grads_refuses_gpu_tensor_without_cuda_aware_backend() {
     if !cuda_available() {
         return;
     }
-    // Clean any stale ctx from a previous aborted run, then init ws=4.
     unsafe { nsl_zero_destroy() };
-    assert_eq!(unsafe { nsl_zero_init(1, 4) }, 0);
+    let shm_path = std::env::temp_dir().join(format!(
+        "nsl_zero_grad_gpu_{}.shm",
+        std::process::id()
+    ));
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&shm_path)
+            .expect("create shm file");
+        // Header + 64 MiB per rank, matching commands/run.rs's spawner.
+        f.set_len(64 + 4 * 64 * 1024 * 1024).expect("size shm file");
+    }
+    unsafe {
+        std::env::set_var("NSL_TP_SHM_PATH", &shm_path);
+        std::env::set_var("NSL_LOCAL_RANK", "1");
+        std::env::set_var("NSL_COLLECTIVES", "sim");
+    }
+    // Teardown must survive a failing assertion. These vars are PROCESS-global
+    // and three other tests share this binary, so leaking them on the error
+    // path would silently reconfigure whatever runs next — and the shm file is
+    // ~256 MiB to strand on disk. Cleanup matters most exactly when the test
+    // fails, so it belongs in a Drop guard rather than at the happy-path end.
+    struct EnvShmGuard(std::path::PathBuf);
+    impl Drop for EnvShmGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("NSL_TP_SHM_PATH");
+                std::env::remove_var("NSL_LOCAL_RANK");
+                std::env::remove_var("NSL_COLLECTIVES");
+            }
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = EnvShmGuard(shm_path.clone());
+
+    assert_eq!(
+        unsafe { nsl_zero_init(1, 4) },
+        0,
+        "ws=4 init must succeed once NSL_TP_SHM_PATH exists"
+    );
 
     let vals = [4.0_f32, 8.0, 12.0, 16.0];
     let cpu = cpu_f32_tensor(&vals);
     let gpu = unsafe { nsl_tensor_to_device(cpu, 1) };
-
     let list = unsafe { nsl_list_new() };
     unsafe { nsl_list_push(list, gpu) };
 
     let rc = unsafe { nsl_zero_reduce_grads(list, 1) };
-    assert_eq!(rc, 0, "reduce_grads with a GPU tensor must succeed");
+    assert_eq!(
+        rc, -5,
+        "a device-resident gradient under the CPU-shm `sim` backend must be \
+         REFUSED, not silently skipped"
+    );
 
+    // The load-bearing half: refusing must not have partially mutated the
+    // gradient. A half-applied divisor would be worse than either extreme.
     let got = read_gpu_f32_as_host_f32(gpu);
     for (i, &v) in vals.iter().enumerate() {
-        assert_eq!(got[i], v / 4.0, "elem {i}: {} / 4 != {}", v, got[i]);
+        assert_eq!(got[i], v, "elem {i} must be untouched by a refused reduce");
     }
 
     assert_eq!(unsafe { nsl_zero_destroy() }, 0);
@@ -262,4 +328,5 @@ fn zero_reduce_grads_divides_gpu_tensor() {
         nsl_tensor_free(cpu);
         nsl_tensor_free(gpu);
     }
+    // env vars + shm file released by `_guard`.
 }

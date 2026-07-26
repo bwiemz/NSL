@@ -1,0 +1,85 @@
+//! R7 refusal pin: `rope_q = true` + `@checkpoint` must be REFUSED.
+//!
+//! Path B (the kv-recompute backward) has a known GROSS numerical error at
+//! multi-tile under `RopeStyle::Adjacent`, and `RopeStyle::HalfSplit` is not
+//! implemented there at all — `emit_rope_k_epilogue` panics. Rather than emit
+//! silently-wrong gradients for what is a perfectly ordinary training config
+//! (RoPE + gradient checkpointing), `validate_checkpoint_eligibility` refuses
+//! the composition outright.
+//!
+//! That refusal is load-bearing and invisible: nothing else fails if it is
+//! removed. The four `csha_checkpoint_recompute_gpu` gates that used to cover
+//! this ground now cannot run *because* of the refusal, so deleting it would
+//! turn them from blocked into silently-wrong rather than into failures. This
+//! file exists so the refusal itself has a gate.
+//!
+//! Costs nothing to run: pure PTX synthesis, no device required.
+
+#![cfg(feature = "cuda")]
+
+use nsl_codegen::flash_attention::{
+    CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
+};
+use nsl_codegen::flash_attention_v2::synthesize_backward_with_tier_b;
+
+fn cfg(rope_q: bool, checkpoint: bool, segment_masked: bool) -> FlashAttentionConfig {
+    FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q,
+        rope_style: RopeStyle::Adjacent,
+        gqa_group_size: 1,
+        tree_mask: false,
+        num_sink_tokens: 0,
+        gpu_sm: 80,
+        segment_masked,
+        csha: Some({
+            let mut e = CshaExtras::level1_with_fused_proj(1e-6);
+            e.d_model = 64;
+            e
+        }),
+        checkpoint: checkpoint.then(CheckpointExtras::full),
+    }
+}
+
+#[test]
+fn rope_q_with_checkpoint_is_refused() {
+    let err = synthesize_backward_with_tier_b(&cfg(true, true, false), None)
+        .expect_err("rope_q + @checkpoint must be refused, not synthesized");
+    assert!(
+        err.contains("rope_q=true") && err.contains("kv-recompute"),
+        "refusal must name the composition and the reason; got: {err}"
+    );
+}
+
+#[test]
+fn rope_q_with_checkpoint_and_segment_masking_is_refused() {
+    // The segment_masked arm has its own message (PCA packing / RoPE-Q
+    // write-back index collision); both arms must refuse.
+    let err = synthesize_backward_with_tier_b(&cfg(true, true, true), None)
+        .expect_err("segment_masked + rope_q + @checkpoint must be refused");
+    assert!(
+        err.contains("rope_q=true"),
+        "refusal must name rope_q; got: {err}"
+    );
+}
+
+#[test]
+fn checkpoint_without_rope_q_still_synthesizes() {
+    // ANTI-VACUITY: the refusal must be specific to rope_q. If this ever
+    // starts failing, R7 has widened into refusing all of @checkpoint and the
+    // two assertions above would still pass while covering nothing.
+    synthesize_backward_with_tier_b(&cfg(false, true, false), None)
+        .expect("@checkpoint without rope_q must still synthesize");
+}
+
+#[test]
+fn rope_q_without_checkpoint_still_synthesizes() {
+    // ANTI-VACUITY, other axis: rope_q alone is fine — it is only the
+    // composition with @checkpoint that is unsound today.
+    synthesize_backward_with_tier_b(&cfg(true, false, false), None)
+        .expect("rope_q without @checkpoint must still synthesize");
+}

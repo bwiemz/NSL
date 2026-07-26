@@ -124,10 +124,10 @@ crates/nsl-codegen/tests/cfie_weight_binding_gpu_parity.rs	ffi_uploaded_weights_
 crates/nsl-codegen/tests/cfie_weight_binding_gpu_parity.rs	upload_zero_elems_refuses_minus1	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cpdt_precision_fp16_weights_gen.rs	gen_cpdt_precision_fp16_weights	generator	
 crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs	fused_kl_ce_gpu_forward_and_backward_match_reference	gpu-inferred	
-crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s512_bq32	gpu-inferred	
-crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s2048_bq32	gpu-inferred	
-crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd128_s512_bq32	gpu-inferred	
-crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd128_s2048_bq32	gpu-inferred	
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s512_bq32	broken	prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s2048_bq32	broken	prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd128_s512_bq32	broken	prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd128_s2048_bq32	broken	prerequisite: R7 refuses rope_q + @checkpoint until Path B kv-recompute numerics are fixed and GPU-validated (cycle-15 Bug 1); synthesis is refused, so these cannot run
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_smoke_single_config	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_hd64_block32_dv_probe	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_multitile_seq128	gpu-inferred	
@@ -147,10 +147,10 @@ crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_u
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_two_equal	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_three_unequal	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t4_csha_backward_ffi_smoke	gpu-inferred	
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a1_rope_q_off_causal_true_fused_proj_true_hd64	gpu-inferred	
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a2_causal_off_rope_q_true_fused_proj_true_hd64	gpu-inferred	
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a3_fused_proj_off_causal_true_rope_q_true_hd64	gpu-inferred	
-crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a4_hd128_causal_true_rope_q_true_fused_proj_true	gpu-inferred	
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a1_rope_q_off_causal_true_fused_proj_true_hd64	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a2_causal_off_rope_q_true_fused_proj_true_hd64	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a3_fused_proj_off_causal_true_rope_q_true_hd64	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
+crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a4_hd128_causal_true_rope_q_true_fused_proj_true	diagnostic	diagnostic: cycle-15 Bug-1 bisection; pass/fail pattern IS the output, so red is the expected state while Bug 1 is open
 crates/nsl-codegen/tests/csha_cycle19_ds_probe.rs	csha_cycle19_ds_probe_slots_populated_at_causal_row1	broken	GPU required — c20 T1-followup lands the FFI plumbing and compile-verifies the probe symbol ABI; running this body requires a CUDA device. Run with `cargo test -p nsl-codegen --features cuda,csha_cycle19_probe -- --ignored csha_cycle19_ds_probe`. Numerical CPU-reference matching is T5/c21 scope.
 crates/nsl-codegen/tests/csha_cycle19_qload_rope_numerical.rs	qload_rope_adjacent_matches_cpu_reference	broken	non-CSHA v2 rope_q forward launcher not yet wired at FFI level (structural fix guarded by csha_cycle19_qload_rope_partner.rs)
 crates/nsl-codegen/tests/csha_cycle19_qload_rope_numerical.rs	qload_rope_halfsplit_matches_cpu_reference	broken	non-CSHA v2 rope_q forward launcher not yet wired at FFI level (structural fix guarded by csha_cycle19_qload_rope_partner.rs)
@@ -293,6 +293,6 @@ crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	w_prepass_matches_cpu_reference	
 crates/nsl-runtime/tests/zero_grad_gpu.rs	gpu_dst_gpu_src_accumulate_matches_cpu_reference	gpu-inferred	
 crates/nsl-runtime/tests/zero_grad_gpu.rs	gpu_dst_cpu_f64_src_accumulate	gpu-inferred	
 crates/nsl-runtime/tests/zero_grad_gpu.rs	grad_zero_gpu_clears_buffer	gpu-inferred	
-crates/nsl-runtime/tests/zero_grad_gpu.rs	zero_reduce_grads_divides_gpu_tensor	gpu-inferred	
+crates/nsl-runtime/tests/zero_grad_gpu.rs	zero_reduce_grads_refuses_gpu_tensor_without_cuda_aware_backend	gpu	requires CUDA GPU
 crates/nsl-test/tests/diagnostic_mode_localizes_d_bug.rs	diagnostic_mode_swap_localizes_d_bug	unclassified	
 crates/nsl-test/tests/fpga_mlp_v1_parity.rs	fpga_mlp_v1_parity_full_diagnostic	broken	M57.1 v1 closure prerequisite: AST->KIR dispatch, HIR port/wire generation, end-to-end CLI wiring (nsl fpga-compile), and Verilog synthesizability. See spec §1.5 deferred-roadmap / crates/nsl-test/tests/fpga_mlp_v1_parity.rs header.
