@@ -131,6 +131,9 @@ crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd128_s204
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s32_bq32_single_tile_discriminator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s512_bq32_halfsplit	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s32_bq32_halfsplit_single_tile	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_two_docs	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_two_docs_halfsplit	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_four_docs	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_smoke_single_config	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_hd64_block32_dv_probe	gpu-inferred	
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_multitile_seq128	gpu-inferred	

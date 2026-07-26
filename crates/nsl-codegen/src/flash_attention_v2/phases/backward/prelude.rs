@@ -21,7 +21,8 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    backward_extra_bytes, pca_smem_layout, total_bytes, Direction, SMEM_BUDGET_BYTES,
+    backward_extra_bytes, pca_smem_layout, recompute_extra_bytes, total_bytes, Direction,
+    SMEM_BUDGET_BYTES,
 };
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
@@ -52,7 +53,23 @@ fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
     // layout (matches the forward budget check; doc was previously uncounted).
     // No embed — backward already embeds seg_smem in the shmem[] tail; doc stays
     // a separate static `.shared`. This only fixes the static-cap decision.
+    //
+    // `recompute_extra` MUST be in this predicate, not just in the declaration
+    // below. The static `.shared` array the non-dynamic path emits is sized
+    // `backward_total_bytes + seg_overhead + recompute_extra`; routing on a
+    // SMALLER number lets a config take the static path and then declare an
+    // array past the 48 KB static cap, which synthesizes fine and is rejected
+    // by ptxas at JIT. `validate_scalar_v2_config` only checks the 99 KB
+    // DYNAMIC cap, so nothing else catches it. Concretely, bq=bkv=32, hd=32,
+    // d_model=36, checkpoint=Full routes static at 47232 and then declares
+    // 49280 > 49152.
+    let recompute_extra = if config.checkpoint.is_some() {
+        crate::flash_attention_v2::smem_layout::recompute_extra_bytes(config) as u32
+    } else {
+        0
+    };
     pca_smem_layout(backward_total_bytes(config), config.segment_masked, config.rope_q).total
+        + recompute_extra
         > SMEM_BUDGET_BYTES
 }
 
@@ -208,7 +225,26 @@ pub fn emit(
         } else {
             0
         };
-        emit_static_smem_decl(ptx, (backward_total_bytes(config) + seg_overhead) as usize);
+        // The kv-recompute x_norm scratch lives past both of the above (see
+        // `smem_layout::recompute_xnorm_offset`) and MUST be inside the
+        // declared array. This term was missing: on the static path a
+        // `@checkpoint` config declared only `backward_total_bytes +
+        // seg_overhead` while the scratch wrote `recompute_extra_bytes` past
+        // `backward_total_bytes`. Before the 2026-07-26 aliasing fix that
+        // overflow was hidden for segmented configs — the scratch was landing
+        // inside `seg_overhead`, i.e. on top of `seg_smem`, which is precisely
+        // the bug that fix addressed. Non-checkpoint configs have
+        // `recompute_extra_bytes == 0`, so their declaration is unchanged and
+        // the `fa_v2_snapshots` byte-identity invariant holds.
+        let recompute_extra: u32 = if config.checkpoint.is_some() {
+            recompute_extra_bytes(config) as u32
+        } else {
+            0
+        };
+        emit_static_smem_decl(
+            ptx,
+            (backward_total_bytes(config) + seg_overhead + recompute_extra) as usize,
+        );
     }
 
     // Base register pool. f32 pool: 48 scratch + head_dim/32 Q slice +

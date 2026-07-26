@@ -38,7 +38,10 @@
 
 #[path = "csha_reference.rs"]
 mod csha_reference;
-use csha_reference::{csha_reference_backward, CshaGradients, CshaInputs, CshaShape};
+// Only the `_packed` entry point is used here: it is a strict superset —
+// `packing = None` is exactly `csha_reference_backward` — and the packed
+// oracles need the same call site to take a fixture.
+use csha_reference::{csha_reference_backward_packed, CshaGradients, CshaInputs, CshaShape};
 
 use std::ffi::CString;
 
@@ -249,6 +252,89 @@ fn build_cycle14_config_styled(head_dim: u32, _seq_len: u32, rope_style: RopeSty
     }.with_d_model(d_model)
 }
 
+/// Same as `build_cycle14_config_styled` but with PCA document packing on.
+///
+/// `segment_masked` forces `block_q == block_kv == seq_len` usage at the call
+/// site: the runtime refuses `multi_tile_fused && segment_ids_ptr != 0`
+/// (`nsl-runtime/src/flash_attention.rs:2112`), so the CSHA fused segmented
+/// path is single-tile only. That refusal is independent of R7 and is NOT
+/// what this harness is validating.
+fn build_segmask_config(head_dim: u32, rope_style: RopeStyle) -> FlashAttentionConfig {
+    let mut cfg = build_cycle14_config_styled(head_dim, 0, rope_style);
+    cfg.segment_masked = true;
+    cfg
+}
+
+/// Host-side PCA packing fixture: `segment_ids[seq]` + `doc_starts[257]`.
+///
+/// Layout is fixed by the kernel, not by taste:
+///   * `segment_ids` — one `u16` per absolute position (`seq * 2` bytes).
+///   * `doc_starts`  — `[MAX_NUM_DOCS + 1] = [257]` `i32`, 1028 bytes per
+///     batch row (`pca_rope::MAX_NUM_DOCS`). Slots past the last document
+///     hold `-1` sentinels.
+struct PackedFixture {
+    seg_ids: Vec<u16>,
+    doc_starts: Vec<i32>,
+}
+
+impl PackedFixture {
+    /// `seq` positions split into `num_docs` equal documents.
+    ///
+    /// Equal splits keep the fixture readable; the property that matters is
+    /// that at least one document starts at a NON-ZERO offset, so
+    /// `effective_pos != abs_pos` for some rows. A single document (or
+    /// `doc_starts` all zero) makes the reset a no-op and the test degenerate
+    /// — that is exactly the trap the existing Tier-A "null-guard" tests fall
+    /// into, and why they never exercised the reset arithmetic.
+    fn equal_docs(seq: usize, num_docs: usize) -> Self {
+        assert!(num_docs >= 1 && seq % num_docs == 0, "seq must divide evenly");
+        let per = seq / num_docs;
+        let seg_ids: Vec<u16> = (0..seq).map(|s| (s / per) as u16).collect();
+        let mut doc_starts = vec![-1i32; 257];
+        for d in 0..=num_docs {
+            doc_starts[d] = (d * per) as i32;
+        }
+        assert!(
+            num_docs == 1 || doc_starts[1] > 0,
+            "fixture must place at least one document at a non-zero start, \
+             else the RoPE reset is unobservable"
+        );
+        Self { seg_ids, doc_starts }
+    }
+
+    fn as_packed_docs(&self) -> csha_reference::PackedDocs<'_> {
+        csha_reference::PackedDocs {
+            segment_ids: &self.seg_ids,
+            doc_starts: &self.doc_starts,
+        }
+    }
+}
+
+/// Upload a packing fixture, returning `(segment_ids_dev, doc_starts_dev)`.
+/// `(0, 0)` when unpacked — the kernel's null-guards then yield identity
+/// positions and a segment-blind mask.
+fn upload_packing(packing: Option<&PackedFixture>) -> (i64, i64) {
+    let Some(p) = packing else { return (0, 0) };
+    let seg_bytes = (p.seg_ids.len() * 2) as i64;
+    let ds_bytes = (p.doc_starts.len() * 4) as i64;
+    let seg_dev = unsafe { nsl_test_cuda_alloc(seg_bytes) };
+    let ds_dev = unsafe { nsl_test_cuda_alloc(ds_bytes) };
+    if seg_dev == 0 || ds_dev == 0 {
+        // Release whichever one succeeded before unwinding, so an OOM here does
+        // not also leak. `free_all` null-guards, so this is safe either way.
+        free_all(&[seg_dev, ds_dev]);
+        panic!(
+            "packing device alloc returned null (seg={seg_bytes}B -> {seg_dev}, \
+             doc_starts={ds_bytes}B -> {ds_dev})"
+        );
+    }
+    unsafe {
+        nsl_test_cuda_h2d(seg_dev, p.seg_ids.as_ptr() as i64, seg_bytes);
+        nsl_test_cuda_h2d(ds_dev, p.doc_starts.as_ptr() as i64, ds_bytes);
+    }
+    (seg_dev, ds_dev)
+}
+
 // `FlashAttentionConfig` doesn't have a `with_d_model` builder today;
 // the d_model lives inside the CshaExtras. Provide a local extension trait
 // so the harness reads cleanly. Compile-only — cycle 13 may inline this.
@@ -406,6 +492,7 @@ fn forward_launch_and_saves(
     config: &FlashAttentionConfig,
     head_dim: u32,
     seq_len: u32,
+    packing: Option<&PackedFixture>,
 ) -> ForwardArtifacts {
     let batch = 1usize;
     let heads = 1usize;
@@ -498,13 +585,29 @@ fn forward_launch_and_saves(
     // harness which uses a checkpoint-free forward config.
     let mut fwd_config = config.clone();
     fwd_config.checkpoint = None;
-    let fwd_ptx =
-        nsl_codegen::flash_attention_v2::synthesize_forward_multi_tile_combined(&fwd_config);
+    // The `_mt_attn` twin exists only for the multi-tile two-launch dispatch.
+    // `segment_masked` configs are single-tile by construction (the runtime
+    // refuses multi-tile + segmented at flash_attention.rs:2112), so they take
+    // the canonical single-kernel synthesizer — the same one the PCA Tier-A
+    // launches use. Non-segmented configs keep the combined module verbatim.
+    let fwd_ptx = if fwd_config.segment_masked {
+        assert!(
+            seq_len as i64 <= fwd_config.block_q,
+            "segment_masked forward is single-tile only (seq_len={seq_len} > \
+             block_q={}); the runtime refuses the multi-tile segmented dispatch",
+            fwd_config.block_q
+        );
+        synthesize_flash_attention_ptx_v2(&fwd_config)
+    } else {
+        nsl_codegen::flash_attention_v2::synthesize_forward_multi_tile_combined(&fwd_config)
+    };
     let fwd_name = CString::new(flash_attention_kernel_name_v2(&fwd_config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(config);
     let fwd_smem_dyn = if smem_layout::needs_dynamic_smem(config) {
         fwd_smem_total as i64
     } else { 0 };
+
+    let (fwd_seg_dev, fwd_doc_dev) = upload_packing(packing);
 
     let rc_fwd = unsafe {
         nsl_flash_attention_csha_with_saves(
@@ -526,7 +629,9 @@ fn forward_launch_and_saves(
             saves.x_raw,
             // segment_ids_ptr, tier_b_ptx_ptr, tier_b_name_ptr, doc_starts_ptr,
             // num_docs_or_zero (PCA per-doc CTA Strategy 3 v1 — added post-merge).
-            0, 0, 0, 0, 0,
+            // num_docs stays 0: that selects the per-doc-CTA grid, which is a
+            // different (default-OFF) kernel variant, not what this validates.
+            fwd_seg_dev, 0, 0, fwd_doc_dev, 0,
         )
     };
     if rc_fwd != 0 {
@@ -539,13 +644,12 @@ fn forward_launch_and_saves(
         unsafe { nsl_csha_free_backward_activations(saves); }
         free_all(&[q_dev, k_dev, v_dev, out_dev, lse_dev,
             x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            cos_dev, sin_dev, do_dev]);
+            cos_dev, sin_dev, do_dev, fwd_seg_dev, fwd_doc_dev]);
         panic!(
             "[cycle14] forward launch FAILED rc={rc_fwd} hd={head_dim} S={seq_len}\n\
              JIT log:\n{log}"
         );
     }
-
     // ── Eyeball check: forward outputs should be finite + non-trivial ──────
     // Read back the FULL `out` buffer (cheap at our smoke sizes) so the
     // probe sees the late-sequence rows that have the most non-trivial
@@ -559,6 +663,31 @@ fn forward_launch_and_saves(
             (total_out_elems * 2) as i64,
         );
     }
+    // Free the packing buffers ONLY here — AFTER the D2H above, never right
+    // after the launch.
+    //
+    // `kernel_launch` does NOT synchronize on the default path: its sync is
+    // gated on `sync_mode_enabled()` and it ends with an explicit
+    // "cuCtxSynchronize removed — same-stream kernels are implicitly ordered"
+    // note (`nsl-runtime/src/cuda/mod.rs`). Same-stream ORDERING does not help
+    // here, because `nsl_test_cuda_free` -> `inner::free_device` is an eager
+    // `cuMemFree_v2`, and the runtime's own comment states the rule: "a raw
+    // `cuMemFree` is NOT stream-ordered: it must not run until the kernels
+    // reading the buffer have finished" — which is precisely why
+    // `defer_free_device` exists.
+    //
+    // The forward kernel's warp-0 cooperative prologue is still reading these
+    // two buffers (`ld.global.u16` of segment_ids, `ld.global.s32` of
+    // doc_starts). Freeing before a barrier races the kernel, and if the VA is
+    // recycled by the backward's very next alloc the symptom is garbage
+    // segment ids — indistinguishable from the SMEM aliasing bug this change
+    // exists to fix. The D2H above is the first real barrier.
+    //
+    // This mirrors the established pattern in
+    // `pca_tier_a_forward_correctness::launch_pca_ex`, which frees its
+    // seg_ids/doc_starts only after its readback.
+    free_all(&[fwd_seg_dev, fwd_doc_dev]);
+
     let out_all_f32: Vec<f32> = out_all.iter().map(|&b| f16_to_f32(b)).collect();
     let nonzero = out_all_f32.iter().filter(|x| x.abs() > 1e-6).count();
     let all_finite = out_all_f32.iter().all(|x| x.is_finite());
@@ -604,6 +733,7 @@ fn launch_backward_path(
     head_dim: u32,
     seq_len: u32,
     path_label: &str,
+    packing: Option<&PackedFixture>,
 ) -> CshaGradients {
     let batch = 1usize;
     let heads = 1usize;
@@ -676,6 +806,8 @@ fn launch_backward_path(
     );
 
     // ── Launch ─────────────────────────────────────────────────────────────
+    let (bwd_seg_dev, bwd_doc_dev) = upload_packing(packing);
+
     let rc_bwd = unsafe {
         nsl_flash_attention_csha_backward(
             forward.q_dev, forward.k_dev, forward.v_dev,
@@ -703,7 +835,7 @@ fn launch_backward_path(
             dxn_dev,
             // segment_ids, tier_b_ptx, tier_b_name, doc_starts, tier_b2_active,
             // num_docs_or_zero (PCA per-doc CTA Sprint 5 — added post-merge).
-            0, 0, 0, 0, 0, 0,
+            bwd_seg_dev, 0, 0, bwd_doc_dev, 0, 0,
         )
     };
     if rc_bwd != 0 {
@@ -714,7 +846,7 @@ fn launch_backward_path(
             } else { "<no log>".into() }
         };
         free_all(&[dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev,
-            dx_dev, dxn_dev]);
+            dx_dev, dxn_dev, bwd_seg_dev, bwd_doc_dev]);
         panic!(
             "[{path_label}] backward launch FAILED rc={rc_bwd} hd={head_dim} S={seq_len}\n\
              JIT log:\n{log}"
@@ -746,7 +878,7 @@ fn launch_backward_path(
     };
 
     free_all(&[dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev,
-        dx_dev, dxn_dev]);
+        dx_dev, dxn_dev, bwd_seg_dev, bwd_doc_dev]);
     grads
 }
 
@@ -853,6 +985,25 @@ fn run_three_way_oracle(head_dim: u32, seq_len: u32) {
 }
 
 fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyle) {
+    let config = build_cycle14_config_styled(head_dim, seq_len, rope_style);
+    run_three_way_oracle_cfg(config, head_dim, seq_len, None)
+}
+
+/// Three-way oracle over an explicit config + optional PCA packing.
+///
+/// Comparisons:
+///   * `A_vs_cpu` — kv_load backward (checkpoint=None) vs the CPU reference
+///   * `B_vs_cpu` — kv_recompute backward (@checkpoint) vs the CPU reference
+///   * `B_vs_A`   — the two GPU paths against each other
+///
+/// `B_vs_A` is the load-bearing one for a recompute bug: it isolates the
+/// substitution from any shared upstream disagreement with the CPU oracle.
+fn run_three_way_oracle_cfg(
+    config: FlashAttentionConfig,
+    head_dim: u32,
+    seq_len: u32,
+    packing: Option<&PackedFixture>,
+) {
     if !cuda_available() {
         eprintln!(
             "[cycle14 csha checkpoint recompute] skipping hd={head_dim} S={seq_len} \
@@ -861,7 +1012,6 @@ fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyl
         return;
     }
 
-    let config = build_cycle14_config_styled(head_dim, seq_len, rope_style);
     // A synthesizer refusal is a legitimate outcome, not a failure: hd=128
     // under @checkpoint needs 220 KB of SMEM against a 99 KB device cap, so
     // the config cannot exist on this hardware. Asserting here reported that
@@ -888,7 +1038,7 @@ fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyl
     let dm = hd;
 
     // ── Task 3: forward launch with saves ──────────────────────────────────
-    let artifacts = forward_launch_and_saves(&config, head_dim, seq_len);
+    let artifacts = forward_launch_and_saves(&config, head_dim, seq_len, packing);
 
     // ── CPU full-stack reference ───────────────────────────────────────────
     let inputs = CshaInputs {
@@ -904,7 +1054,13 @@ fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyl
         rope_q: true,
         rope_style: config.rope_style,
     };
-    let cpu_grads: CshaGradients = csha_reference_backward(&inputs, &shape, &artifacts.do_f32);
+    // The oracle MUST model the packing too: doc-relative RoPE positions AND
+    // the block-diagonal (cross-document) mask. Comparing a packed kernel to
+    // an unpacked reference would fail for reasons unrelated to the recompute.
+    let packed_docs = packing.map(|p| p.as_packed_docs());
+    let cpu_grads: CshaGradients = csha_reference_backward_packed(
+        &inputs, &shape, &artifacts.do_f32, packed_docs.as_ref(),
+    );
 
     // CPU prologue oracle (kept live for cycle-15 SMEM readback).
     let prologue_cfg = PrologueConfig {
@@ -930,9 +1086,39 @@ fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyl
         "[cycle14 path A] hd={head_dim} S={seq_len} launching backward with \
          checkpoint=None (kv_load baseline)"
     );
-    let gpu_a = launch_backward_path(&cfg_a, &artifacts, head_dim, seq_len, "path A");
+    let gpu_a = launch_backward_path(&cfg_a, &artifacts, head_dim, seq_len, "path A", packing);
     eprintln!("[cycle14 path A] vs cpu_reference:");
     let fails_a = diff_summary("path A vs cpu_ref", &gpu_a, &cpu_grads, hd);
+
+    // ── NEGATIVE CONTROL: the packed comparison must be able to FAIL ───────
+    //
+    // A GREEN packed oracle proves nothing unless a kernel that IGNORED the
+    // packing would have been caught. So re-score the SAME GPU gradients
+    // against an UNPACKED reference (absolute RoPE positions, no cross-doc
+    // mask) and require that to FAIL. If it passes, the fixture is degenerate
+    // — every position would be in document 0 with doc_start 0 — and the
+    // packed run was measuring nothing. This is the cycle-15 "no base-config
+    // control" lesson and the cycle-18 degenerate-probe lesson applied at the
+    // point where they actually bite.
+    if packing.is_some() {
+        let cpu_unpacked = csha_reference_backward_packed(
+            &inputs, &shape, &artifacts.do_f32, None,
+        );
+        let control_fails = diff_summary(
+            "CONTROL path A vs UNPACKED cpu_ref (MUST FAIL)", &gpu_a, &cpu_unpacked, hd,
+        );
+        assert!(
+            !control_fails.is_empty(),
+            "negative control PASSED: the GPU gradients also match an UNPACKED \
+             reference, so this fixture does not discriminate doc-relative RoPE \
+             positions or the cross-document mask. The packed GREEN above is \
+             vacuous — fix the fixture before trusting it."
+        );
+        eprintln!(
+            "[cycle14 control] packed oracle is discriminating — unpacked \
+             reference fails on {control_fails:?} as required"
+        );
+    }
 
     // ── Task 5 diagnostic: Path B (checkpoint=Some(Full)) — §5.3 EVIDENCE ──
     // Even when Path A baseline is RED vs cpu_reference, the Path A vs
@@ -950,7 +1136,7 @@ fn run_three_way_oracle_styled(head_dim: u32, seq_len: u32, rope_style: RopeStyl
     );
     let mut cfg_b = config.clone();
     cfg_b.checkpoint = Some(CheckpointExtras::full());
-    let gpu_b = launch_backward_path(&cfg_b, &artifacts, head_dim, seq_len, "path B");
+    let gpu_b = launch_backward_path(&cfg_b, &artifacts, head_dim, seq_len, "path B", packing);
 
     eprintln!("[cycle14 path B] vs cpu_reference:");
     let fails_b_vs_cpu = diff_summary("path B vs cpu_ref", &gpu_b, &cpu_grads, hd);
@@ -1092,4 +1278,309 @@ fn probe_hd128_checkpoint_smem_vs_block_q() {
          within {} — hd=128 + @checkpoint may have become viable; re-measure.",
         smem_layout::SMEM_DYNAMIC_BUDGET_BYTES
     );
+}
+
+// ── PCA packing under @checkpoint (R7's last arm) ──────────────────────────
+
+/// The checkpoint kv-recompute's x_norm scratch must NOT alias `seg_smem`.
+///
+/// Both regions used to be anchored at exactly `total_bytes +
+/// backward_extra_bytes`:
+///   * `backward/prelude.rs` sets `%seg_base = %shmem_base + backward_total_bytes`
+///   * `recompute_xnorm_offset` returned that same expression
+///
+/// so step 2 of the kv-recompute (`emit_prologue_recompute_from_raw`, which
+/// writes `block_q * head_dim * 2` bytes of f16 x_norm) overwrote the segment
+/// ids that step 5's RoPE-K epilogue then read back with `ld.shared.u16`. The
+/// resulting `sid` is an f16 mantissa pattern up to 65535, which indexes
+/// `smem_doc_starts[sid]` up to 262140 bytes into a 1028-byte array.
+///
+/// This is GPU-free arithmetic, so it holds this invariant even on machines
+/// with no CUDA device.
+#[test]
+fn g_segmask_xnorm_scratch_does_not_alias_seg_smem() {
+    let seg_budget = nsl_codegen::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32;
+
+    for hd in [32u32, 64] {
+        let cfg = build_segmask_config(hd, RopeStyle::Adjacent);
+        let seg_base = nsl_codegen::flash_attention_v2::phases::backward::prelude::backward_total_bytes(&cfg);
+        let xn_off = smem_layout::recompute_xnorm_offset(&cfg);
+        let xn_len = smem_layout::recompute_extra_bytes(&cfg) as u32;
+        eprintln!(
+            "[segmask-alias] hd={hd:>3} seg_base={seg_base:>6} seg_len={seg_budget:>6} \
+             xnorm=[{xn_off}, {})",
+            xn_off + xn_len
+        );
+        assert!(
+            xn_off >= seg_base + seg_budget,
+            "hd={hd}: recompute x_norm scratch starts at {xn_off}, inside the \
+             seg_smem region [{seg_base}, {}) — the kv-recompute would overwrite \
+             segment_ids before the RoPE-K epilogue reads them back",
+            seg_base + seg_budget
+        );
+        // And the whole scratch must still fit inside the grant the launcher asks for.
+        let granted = shared_mem_bytes_v2_backward(&cfg);
+        assert!(
+            xn_off + xn_len <= granted,
+            "hd={hd}: x_norm scratch ends at {} but the launcher only grants \
+             {granted} bytes",
+            xn_off + xn_len
+        );
+    }
+
+    // Byte-identical for unpacked configs — every currently-green Path B gate
+    // runs with segment_masked=false and must be unaffected by the fix above.
+    for hd in [32u32, 64, 128] {
+        let cfg = build_cycle14_config(hd, 512);
+        assert_eq!(
+            smem_layout::recompute_xnorm_offset(&cfg),
+            smem_layout::total_bytes(&cfg) + smem_layout::backward_extra_bytes(&cfg),
+            "unpacked hd={hd} offset moved — the aliasing fix must be a no-op \
+             when !segment_masked"
+        );
+    }
+}
+
+/// Measures whether a packed `@checkpoint` config fits the 99 KB cap, and at
+/// which head_dim. `segment_masked` costs a flat DEFAULT_SMEM_SEGMENT_BUDGET
+/// (32 KB) on top of the backward layout, which is a large fraction of the
+/// budget — so which shapes are admissible is a measurement, not a guess.
+#[test]
+fn probe_segmask_checkpoint_smem_budget() {
+    for hd in [32u32, 64, 128] {
+        let cfg = build_segmask_config(hd, RopeStyle::Adjacent);
+        let bwd_total = nsl_codegen::flash_attention_v2::phases::backward::prelude::backward_total_bytes(&cfg);
+        let granted = shared_mem_bytes_v2_backward(&cfg);
+        let verdict = match synthesize_backward_with_tier_b(&cfg, None) {
+            Ok(_) => "SYNTHESIZES".to_string(),
+            Err(e) => format!("REFUSED: {}", e.split(';').next().unwrap_or(&e)),
+        };
+        eprintln!(
+            "[segmask-budget] hd={hd:>3} bwd_total={bwd_total:>6} granted={granted:>6} \
+             cap={} {verdict}",
+            smem_layout::SMEM_DYNAMIC_BUDGET_BYTES
+        );
+    }
+}
+
+/// Non-vacuity wrapper for the packed oracles.
+///
+/// `run_three_way_oracle_cfg` SKIPS (and passes) when the synthesizer refuses.
+/// That is right for structurally-impossible shapes like hd=128, but for these
+/// gates a refusal is precisely the regression to catch: if R7 came back or R12
+/// widened again, every packed test below would go green while running nothing.
+/// Assert synthesis FIRST so the refusal path cannot masquerade as a pass.
+fn run_segmask_oracle(
+    cfg: FlashAttentionConfig,
+    head_dim: u32,
+    seq_len: u32,
+    packing: &PackedFixture,
+) {
+    synthesize_backward_with_tier_b(&cfg, None).unwrap_or_else(|e| {
+        panic!(
+            "segment_masked + rope_q + @checkpoint must synthesize at hd={head_dim}; \
+             got a refusal: {e}\nIf this is intentional, the packed oracles below are \
+             no longer validating anything and must be re-scoped, not left green."
+        )
+    });
+    run_three_way_oracle_cfg(cfg, head_dim, seq_len, Some(packing));
+}
+
+/// Three-way oracle for PCA document packing under `@checkpoint` — R7's last arm.
+///
+/// The shape is forced by two INDEPENDENT constraints, both measured rather
+/// than assumed:
+///   * **single tile** (`seq_len == block_q`) — the runtime refuses
+///     `multi_tile_fused && segment_ids_ptr != 0`
+///     (`nsl-runtime/src/flash_attention.rs:2112`). That refusal predates R7
+///     and is not what this validates.
+///   * **head_dim = 32** — `segment_masked` costs a flat 32 KB `seg_smem`
+///     region, so hd=64 needs 127360 bytes against the 101376 cap. See
+///     `probe_segmask_checkpoint_smem_budget` for the numbers.
+///
+/// The fixture packs 2 documents of 16, so rows 16..32 have
+/// `effective_pos = abs_pos - 16` and the reset is actually observable. A
+/// single document, or `doc_starts` all zero, would make this test pass
+/// without exercising any of the reset arithmetic.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn t_segmask_recompute_hd32_s32_two_docs() {
+    let cfg = build_segmask_config(32, RopeStyle::Adjacent);
+    let packing = PackedFixture::equal_docs(32, 2);
+    run_segmask_oracle(cfg, 32, 32, &packing);
+}
+
+/// HalfSplit twin of `t_segmask_recompute_hd32_s32_two_docs`.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn t_segmask_recompute_hd32_s32_two_docs_halfsplit() {
+    let cfg = build_segmask_config(32, RopeStyle::HalfSplit);
+    let packing = PackedFixture::equal_docs(32, 2);
+    run_segmask_oracle(cfg, 32, 32, &packing);
+}
+
+/// Four unequal-ish documents, to catch an off-by-one that two equal 16-row
+/// documents would not: doc boundaries at 8/16/24 land mid-warp rather than on
+/// the tile's half.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn t_segmask_recompute_hd32_s32_four_docs() {
+    let cfg = build_segmask_config(32, RopeStyle::Adjacent);
+    let packing = PackedFixture::equal_docs(32, 4);
+    run_segmask_oracle(cfg, 32, 32, &packing);
+}
+
+/// The static-vs-dynamic SMEM routing predicate must agree with the array the
+/// static path actually declares.
+///
+/// `backward_needs_dynamic_smem` decides the path from a byte count; the static
+/// branch then emits `.shared` sized `backward_total_bytes + seg_overhead +
+/// recompute_extra`. If the predicate omits `recompute_extra`, a config can be
+/// routed static on a number BELOW the 48 KB hardware cap and then declare an
+/// array ABOVE it — synthesis succeeds and ptxas rejects the module at JIT,
+/// because `validate_scalar_v2_config` only checks the 99 KB DYNAMIC cap.
+///
+/// The witness below is the exact band where that happens (d_model=36 tunes
+/// `backward_total_bytes` to just under the static cap).
+#[test]
+fn g_static_smem_routing_accounts_for_recompute_extra() {
+    let mut cfg = build_cycle14_config(32, 32);
+    cfg.block_q = 32;
+    cfg.block_kv = 32;
+    if let Some(e) = cfg.csha.as_mut() {
+        e.d_model = 36;
+    }
+
+    let bwd_total =
+        nsl_codegen::flash_attention_v2::phases::backward::prelude::backward_total_bytes(&cfg);
+    let recompute_extra = smem_layout::recompute_extra_bytes(&cfg) as u32;
+    let static_cap = smem_layout::SMEM_BUDGET_BYTES;
+    let declared = bwd_total + recompute_extra;
+    eprintln!(
+        "[static-routing] bwd_total={bwd_total} recompute_extra={recompute_extra} \
+         declared={declared} static_cap={static_cap}"
+    );
+
+    // Only meaningful while the witness actually straddles the cap.
+    if !(bwd_total <= static_cap && declared > static_cap) {
+        eprintln!(
+            "[static-routing] witness no longer straddles the static cap \
+             (bwd_total={bwd_total}, declared={declared}, cap={static_cap}) — \
+             re-tune d_model rather than leaving this gate vacuous"
+        );
+        return;
+    }
+
+    // Straddling the cap, the config MUST be routed to the dynamic path.
+    // `synthesize_backward_with_tier_b` is the observable: the emitted PTX must
+    // use `.extern .shared`, never a static `.shared` array over the cap.
+    let ptx = synthesize_backward_with_tier_b(&cfg, None)
+        .expect("witness config must synthesize (it is under the 99 KB dynamic cap)");
+    assert!(
+        ptx.contains(".extern .shared"),
+        "config straddling the static cap (bwd_total={bwd_total} <= {static_cap} < \
+         declared={declared}) must route to the DYNAMIC smem path; it emitted a \
+         static declaration that ptxas will reject at JIT"
+    );
+}
+
+/// R12 must not be bypassable, because it now guards an SMEM offset collision.
+///
+/// After the aliasing fix, `recompute_xnorm_offset` and
+/// `tier_b_range_table_offset(Backward)` are the SAME byte. R12 is what keeps a
+/// packed checkpoint config from being emitted with Tier-B's range table and the
+/// kv-recompute x_norm scratch stacked at one address. A test seam that
+/// bypassed it would hand out memory-unsafe PTX, so the seam was removed.
+#[test]
+fn g_r12_tier_b_offset_collision_is_real_and_unbypassable() {
+    let cfg = build_segmask_config(32, RopeStyle::Adjacent);
+    let xn_off = smem_layout::recompute_xnorm_offset(&cfg);
+    let tier_b_off = smem_layout::tier_b_range_table_offset(&cfg, smem_layout::Direction::Backward);
+    eprintln!("[r12-collision] xnorm_off={xn_off} tier_b_off={tier_b_off}");
+    assert_eq!(
+        xn_off, tier_b_off,
+        "if these ever differ the collision is gone and R12 may be re-examined \
+         on its original (tile-active predicate) merits alone — update this gate \
+         and the R12 comment together"
+    );
+
+    // With Tier-B admitted, R12 must refuse — with NO environment variable able
+    // to turn it off.
+    let seq_len = 4096u32;
+    let residency = nsl_codegen::pca_segment::SegmentResidency::Shared;
+    if !nsl_codegen::pca_tilerange::should_emit_tier_b(&cfg, seq_len as u64, residency) {
+        eprintln!("[r12-collision] Tier-B not admitted at seq_len={seq_len}; re-pick a shape");
+        return;
+    }
+    // SAFETY of this test: setting the old bypass var must have no effect.
+    unsafe { std::env::set_var("NSL_VALIDATE_PATH_B", "1") };
+    let err = synthesize_backward_with_tier_b(&cfg, Some((seq_len, residency)));
+    unsafe { std::env::remove_var("NSL_VALIDATE_PATH_B") };
+    let err = err.expect_err(
+        "R12 must refuse segment_masked + Tier-B + @checkpoint even with \
+         NSL_VALIDATE_PATH_B set — the seam was removed precisely because \
+         bypassing R12 yields two SMEM regions at the same base",
+    );
+    assert!(
+        err.contains("paged-segment-masked composition deferred"),
+        "expected R12's message; got: {err}"
+    );
+}
+
+/// Does a SMALLER tile let head_dim=64 packed+checkpoint through?
+#[test]
+fn probe_segmask_checkpoint_smem_vs_block_q() {
+    for hd in [32u32, 64, 128] {
+        for bq in [16i64, 32, 64] {
+            let mut cfg = build_segmask_config(hd, RopeStyle::Adjacent);
+            cfg.block_q = bq;
+            cfg.block_kv = bq;
+            let granted = shared_mem_bytes_v2_backward(&cfg);
+            // `ds_compute` hard-asserts block_kv==32, so some shapes PANIC
+            // rather than refusing. Catch it so the probe can report the whole
+            // surface instead of dying on the first cell.
+            let verdict = std::panic::catch_unwind(|| {
+                match synthesize_backward_with_tier_b(&cfg, None) {
+                    Ok(_) => "SYNTHESIZES".to_string(),
+                    Err(e) => format!(
+                        "REFUSED: {}",
+                        e.split(';').next().unwrap_or(&e).chars().take(58).collect::<String>()
+                    ),
+                }
+            })
+            .unwrap_or_else(|_| "PANICS (emitter assert)".to_string());
+            eprintln!("[segmask-shape] hd={hd:>3} bq=bkv={bq:>3} granted={granted:>7} {verdict}");
+        }
+    }
+
+    // d_model is an independent knob (the SMEM weight tile is
+    // 3 * head_dim * min(d_model, 256) * 2), so sweep it too: a small d_model
+    // is the obvious way someone could try to squeeze an UNVALIDATED head_dim
+    // under the cap.
+    for hd in [32u32, 64, 128] {
+        for dm in [8u32, 16, 32, 64, 128, 256] {
+            let mut cfg = build_segmask_config(hd, RopeStyle::Adjacent);
+            if let Some(e) = cfg.csha.as_mut() { e.d_model = dm; }
+            let granted = shared_mem_bytes_v2_backward(&cfg);
+            let verdict = std::panic::catch_unwind(|| {
+                match synthesize_backward_with_tier_b(&cfg, None) {
+                    Ok(_) => "SYNTHESIZES".to_string(),
+                    Err(_) => "REFUSED".to_string(),
+                }
+            })
+            .unwrap_or_else(|_| "PANICS".to_string());
+            eprintln!("[segmask-dmodel] hd={hd:>3} d_model={dm:>4} granted={granted:>7} {verdict}");
+            // R14 bounds this to the MEASURED envelope. Anything that
+            // synthesizes here must have a green three-way oracle behind it.
+            if hd != 32 {
+                assert_ne!(
+                    verdict, "SYNTHESIZES",
+                    "head_dim={hd} d_model={dm} packed+@checkpoint SYNTHESIZES but has \
+                     NO GPU validation (only head_dim=32 is measured). Either validate \
+                     it on hardware and widen R14's list, or keep the refusal — do not \
+                     let an unvalidated composition emit silently."
+                );
+            }
+        }
+    }
 }

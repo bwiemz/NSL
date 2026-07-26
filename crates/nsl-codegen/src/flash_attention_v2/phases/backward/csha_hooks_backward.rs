@@ -1492,9 +1492,9 @@ pub fn emit_kv_recompute(
 #[cfg(test)]
 mod cycle11_recompute_tests {
     use super::*;
-    use crate::flash_attention::{
-        CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
-    };
+    // `RopeStyle` is referenced fully-qualified below (matching the emitter
+    // above), so it is deliberately not imported here.
+    use crate::flash_attention::{CheckpointExtras, CshaExtras, FlashAttentionConfig};
 
     fn cfg_full_bypass() -> FlashAttentionConfig {
         FlashAttentionConfig {
@@ -1629,7 +1629,8 @@ mod cycle11_recompute_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    // `RopeStyle` is referenced fully-qualified below; no import needed.
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig};
 
     fn base_cfg_fused_backward(
         block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,

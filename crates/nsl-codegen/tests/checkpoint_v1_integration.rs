@@ -130,19 +130,27 @@ fn g2_r3_no_csha_refuses() {
 }
 
 #[test]
-fn g2_r7_pca_packing_with_rope_q_refuses() {
-    // R7: segment_masked + rope_q + checkpoint composition is deferred
-    // to v4. base_fusible already satisfies R3 (cycle-12 fused_projections=true),
-    // so R7 is reachable.
+fn g2_r7_pca_packing_with_rope_q_now_synthesizes() {
+    // SUPERSEDED 2026-07-26 — R7 is RETIRED. This asserted that
+    // segment_masked + rope_q + @checkpoint refuses "deferred to v4: the
+    // segment-aware causal mask shares index machinery with the RoPE-Q
+    // write-back path". There was no such index collision: the segment mask
+    // uses `%*_SEGMASK` registers and the RoPE reset uses `%*_doc_*`, and they
+    // never alias. Three real defects sat underneath the refusal — a hardcoded
+    // `%q_start` in the RoPE reset branch, an SMEM alias between the
+    // kv-recompute x_norm scratch and `seg_smem`, and a literal "§" emitted
+    // into the PTX (ptxas rc=218) — all fixed and GPU-validated by
+    // `csha_checkpoint_recompute_gpu::t_segmask_recompute_hd32_s32_*`, whose
+    // negative control confirms the packed oracle actually discriminates.
+    //
+    // INVERTED rather than deleted: if R7 is ever reinstated, or the emitters
+    // regress such that this composition stops synthesizing, this fails.
     let mut cfg = base_fusible();
     cfg.segment_masked = true;
     cfg.rope_q = true;
-    let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R7: segment_masked+rope_q must refuse");
-    assert!(
-        err.contains("PCA packing with rope_q=true under @checkpoint deferred to v4"),
-        "R7 missing expected substring: {err}"
-    );
+    synthesize_backward_with_tier(&cfg).unwrap_or_else(|e| {
+        panic!("segment_masked + rope_q + @checkpoint must synthesize at hd=32: {e}")
+    });
 }
 
 #[test]
@@ -221,15 +229,46 @@ fn g2_r81_sinks_v2_composition_refuses() {
 }
 
 #[test]
-fn g2_r12_segment_masked_refuses() {
-    // R12 (cycle-12 new): segment_masked + @checkpoint composition is
-    // deferred. base_fusible has rope_q=false so R7 does NOT fire;
-    // segment_masked=true with rope_q=false reaches R12.
+fn g2_r12_segment_masked_without_tier_b_now_synthesizes() {
+    // SUPERSEDED 2026-07-26 — R12 NARROWED, not retired. It was keyed on
+    // `config.segment_masked` alone, but the hazard its own message describes
+    // is the PCA **Tier-B** planner's tile-active predicate gating recompute
+    // writes. Tier-A segment masking with no Tier-B planner has none of that,
+    // and is now GPU-validated. R12 therefore refuses on Tier-B actually being
+    // co-emitted; `g2_r12_segment_masked_with_tier_b_still_refuses` below pins
+    // the arm that remains.
     let mut cfg = base_fusible();
     cfg.segment_masked = true;
     cfg.rope_q = false;
-    let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R12: segment_masked must refuse");
+    synthesize_backward_with_tier(&cfg).unwrap_or_else(|e| {
+        panic!("segment_masked without Tier-B must synthesize at hd=32: {e}")
+    });
+}
+
+#[test]
+fn g2_r12_segment_masked_with_tier_b_still_refuses() {
+    // The arm R12 still covers, and the anti-vacuity guard for the narrowing
+    // above: co-emitting the Tier-B planner with the checkpoint kv-recompute
+    // remains unvalidated and MUST refuse. Without this test, narrowing R12 to
+    // `segment_masked && tier_b_emitted` could silently degrade to a no-op.
+    let mut cfg = base_fusible();
+    cfg.segment_masked = true;
+    cfg.rope_q = false;
+    // Tier-B is emitted only for sequences long enough to justify a range
+    // table; `should_emit_tier_b` decides. Pick a seq_len well past any
+    // threshold so this test pins the refusal, not the admission heuristic.
+    let seq_len = 4096u32;
+    let residency = nsl_codegen::pca_segment::SegmentResidency::Shared;
+    if !nsl_codegen::pca_tilerange::should_emit_tier_b(&cfg, seq_len as u64, residency) {
+        eprintln!(
+            "[g2_r12] Tier-B not admitted at seq_len={seq_len} — admission \
+             heuristic changed; re-pick a shape that admits Tier-B rather than \
+             leaving this gate vacuous"
+        );
+        return;
+    }
+    let err = synthesize_backward_with_tier_b(&cfg, Some((seq_len, residency)))
+        .expect_err("R12: segment_masked + Tier-B co-emission must refuse");
     assert!(
         err.contains("paged-segment-masked composition deferred"),
         "R12 missing expected substring 'paged-segment-masked composition deferred': {err}"

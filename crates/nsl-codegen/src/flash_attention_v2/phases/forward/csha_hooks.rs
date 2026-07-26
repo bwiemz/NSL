@@ -60,7 +60,31 @@ pub(super) fn should_emit_kv_save(cfg: &FlashAttentionConfig) -> bool {
         .checkpoint
         .as_ref()
         .is_some_and(|c| c.policy == CheckpointPolicy::Full);
-    let cascade_ok = validate_checkpoint_eligibility(cfg).is_ok();
+    // `tier_b = None`: this is a FORWARD-side decision and the Tier-B planner
+    // choice is not known here, so R12 is answered permissively. That is sound
+    // for R12 specifically — its hazard is a BACKWARD-side SMEM overlap, and a
+    // config that trips it emits no backward at all, so there is no
+    // suppressed-saves/live-recompute mismatch to create.
+    //
+    // SCOPE, stated precisely (an earlier version of this comment overclaimed):
+    // this consults the refusal CASCADE only, matching the cycle-12 invariant
+    // that the forward-emit and backward-dispatch decisions read the SAME
+    // cascade. It does NOT consult the SMEM budget validator, which the backward
+    // runs separately. So a config that the cascade admits but the SMEM
+    // validator rejects — e.g. `segment_masked && rope_q && @checkpoint` at
+    // head_dim >= 64 after R7's retirement (127360 bytes vs the 101376 cap) —
+    // has its K/V saves suppressed here while no backward PTX is emitted at all.
+    //
+    // That is not a correctness hazard: with no backward emitted there is no
+    // consumer, so nothing reads uninitialised HBM and no gradient is wrong.
+    // It IS a diagnosability wart, and a quiet one, because `compiler/kernel.rs`
+    // turns a backward-synthesis `Err` into an `eprintln!` plus
+    // `(None, None, None, None)` rather than failing the compile. Widening this
+    // predicate to include the SMEM validator would couple the forward's emitted
+    // PTX to a backward budget check and breaks the cycle-12 invariant's own
+    // gates (`csha_checkpoint_full_save_suppression::g9_a/g9_c`), so the fix
+    // belongs at the swallow site in `compiler/kernel.rs`, not here.
+    let cascade_ok = validate_checkpoint_eligibility(cfg, None).is_ok();
     let suppress = policy_full && cascade_ok;
     !suppress
 }
@@ -1528,12 +1552,39 @@ fn emit_rope_pair_sweep(
     // (mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, head_dim*2) still
     // addresses the correct tile-local row.
     if reset_active {
+        // ASCII-ONLY: this string is EMITTED PTX, not a Rust comment. A "§"
+        // here makes ptxas abort the whole module with
+        // "Unexpected non-ASCII character" (rc=218) — see
+        // `feedback_ptx_comment_ascii_only`. The backward twin at
+        // csha_hooks_backward.rs already spells it "sec."; this one did not,
+        // which is why no segmented CSHA-fused kernel had ever compiled.
         ptx.push_str(&format!(
-            "    // PCA §4.3 site {site}: forward {tl} effective_pos\n",
+            "    // PCA sec.4.3 site {site}: forward {tl} effective_pos\n",
             site = if tl == "Q" { 1 } else { 2 }
         ));
-        // abs_row = (q_start narrowed to u32) + tile_local_row.
-        ptx.push_str("    cvt.u32.u64 %r_abs_pos, %q_start;\n");
+        // abs_row = (row_base narrowed to u32) + tile_local_row.
+        //
+        // THIRD instance of the `%q_start`-where-`%k_start`-was-needed
+        // confusion (the first two were fixed in 0d768f93:
+        // `emit_prologue_recompute_from_raw`'s x_norm row base, and the
+        // non-reset cs_row below). This branch hardcoded `%q_start`, which is
+        // right for BOTH forward call sites — the Q epilogue is genuinely
+        // based at q_start, and the forward K epilogue is called with
+        // "%q_start" too because the K pre-pass writes K rows at
+        // q_start + warp_row — but WRONG for the backward kv-recompute, which
+        // rotates the K tile at `%k_start` as k_start iterates independently
+        // inside the kv loop. Invisible at single tile, where the two
+        // coincide; under multi-tile it rotates K by another tile's positions,
+        // and because the backward normalises with the FORWARD's saved LSE
+        // the result explodes rather than drifts (P = exp(S_wrong -
+        // LSE_correct) is not a distribution). It survived 0d768f93 only
+        // because R7 refuses segment_masked, so this branch was unreachable.
+        //
+        // Byte-identity: both forward call sites pass "%q_start", so the
+        // emitted string is unchanged for every shipping forward config.
+        ptx.push_str(&format!(
+            "    cvt.u32.u64 %r_abs_pos, {row_base_reg};\n"
+        ));
         ptx.push_str("    add.u32 %r_abs_pos, %r_abs_pos, %r_rope_row;\n");
         // sid = segment_ids[abs_row] from seg_smem (u16 entries).
         ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_abs_pos, 2;\n");

@@ -267,6 +267,11 @@ fn run_fused_backward_config_seq(
         seq, heads: h, head_dim: hd, d_model: dm,
         causal, norm_eps,
         rope_q: true,
+        // Mirrors the kernel config's `RopeStyle::Adjacent`. Unlike the
+        // identity-RoPE Tier-B.1 tests, this one feeds REAL cos/sin tables,
+        // so the pairing is numerically live — a mismatch here would rotate
+        // different element pairs than the GPU and diverge silently.
+        rope_style: RopeStyle::Adjacent,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_host);
 

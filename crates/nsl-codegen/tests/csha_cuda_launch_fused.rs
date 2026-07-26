@@ -339,6 +339,10 @@ fn run_fused_config_dmodel(
             let shape = CshaShape {
                 seq, heads: 1, head_dim, d_model: head_dim, causal, norm_eps,
                 rope_q: true,
+                // Mirror the kernel config. Identity RoPE (cos=1, sin=0) makes
+                // the pairing unobservable here, but oracle and kernel must
+                // still agree on it by construction.
+                rope_style: RopeStyle::HalfSplit,
             };
             let inputs = CshaInputs {
                 x: &x_h, wq: &wq_f32, wk: &wk_f32, wv: &wv_f32,
@@ -367,6 +371,7 @@ fn run_fused_config_dmodel(
             let shape = CshaShape {
                 seq, heads: 1, head_dim, d_model, causal, norm_eps,
                 rope_q: true,
+                rope_style: RopeStyle::HalfSplit,
             };
             // Use all-ones norm_weight and pass pre-normalised x_norm_dmodel
             // as the x input, with identity norm (norm_eps=0, weight=1 ensures

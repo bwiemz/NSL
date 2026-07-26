@@ -301,6 +301,10 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
         &CshaShape {
             seq, heads, head_dim, d_model, causal, norm_eps,
             rope_q: true,
+            // Mirror the kernel config above. Identity RoPE (cos=1, sin=0)
+            // makes the pairing unobservable here, but oracle and kernel must
+            // agree on it by construction.
+            rope_style: RopeStyle::HalfSplit,
         },
     );
 

@@ -84,15 +84,52 @@ fn rope_q_with_checkpoint_halfsplit_now_synthesizes() {
 }
 
 #[test]
-fn rope_q_with_checkpoint_and_segment_masking_is_refused() {
-    // The segment_masked arm has its own message (PCA packing / RoPE-Q
-    // write-back index collision); both arms must refuse.
+fn rope_q_with_checkpoint_and_segment_masking_at_hd64_refused_by_r14_envelope() {
+    // SUPERSEDED 2026-07-26 — R7 is RETIRED, but this shape is STILL refused,
+    // for a different and more honest reason. The distinction matters: a test
+    // that merely checked "it refuses" would have kept passing through the
+    // retirement while silently changing meaning.
+    //
+    // `cfg()` here is head_dim=64, which is OUTSIDE the GPU-measured envelope
+    // (only head_dim=32 has a green three-way oracle), so R14 refuses it.
+    //
+    // An intermediate version of this test asserted the SMEM validator caught
+    // it instead. That was true only because `cfg()` also has d_model=64
+    // (127360 bytes vs the 101376 cap); at d_model=8 the same head_dim fits in
+    // 91520 and would have sailed through. The budget correlated with the
+    // envelope, it did not define it — which is exactly why R14 exists.
     let err = synthesize_backward_with_tier_b(&cfg(true, true, true), None)
-        .expect_err("segment_masked + rope_q + @checkpoint must be refused");
+        .expect_err("segment_masked + rope_q + @checkpoint at hd=64 must refuse");
     assert!(
-        err.contains("PCA packing") || err.contains("rope_q=true"),
-        "refusal must name the segment_masked composition; got: {err}"
+        err.contains("GPU-validated only at head_dim"),
+        "hd=64 packed checkpoint must be refused by R14's measured-envelope \
+         gate; got: {err}"
     );
+    assert!(
+        !err.contains("deferred to v4"),
+        "R7's deferral message must be gone — it was retired after the packed \
+         path was fixed and GPU-validated; got: {err}"
+    );
+}
+
+#[test]
+fn rope_q_with_checkpoint_and_segment_masking_synthesizes_when_it_fits() {
+    // ANTI-VACUITY for the test above: prove the hd=64 refusal is a BUDGET
+    // limit, not a reinstated categorical refusal of the packed composition.
+    // The same config at head_dim=32 fits (80256 <= 101376) and must
+    // synthesize — this is the shape the GPU oracles in
+    // `csha_checkpoint_recompute_gpu::t_segmask_recompute_hd32_s32_*` validate.
+    let mut small = cfg(true, true, true);
+    small.head_dim = 32;
+    if let Some(e) = small.csha.as_mut() {
+        e.d_model = 32;
+    }
+    synthesize_backward_with_tier_b(&small, None).unwrap_or_else(|e| {
+        panic!(
+            "segment_masked + rope_q + @checkpoint must synthesize at hd=32 \
+             (it fits the SMEM cap and is GPU-validated): {e}"
+        )
+    });
 }
 
 #[test]
