@@ -2086,6 +2086,15 @@ pub(crate) mod cublas_inner {
     /// # Safety
     /// `a_dev`, `b_dev`, `c_dev` must be valid device f32 pointers of sizes
     /// m*k, k*n, m*n respectively, with m, n, k > 0 and fitting in i32.
+    /// Row-major SGEMM: `C = alpha * (A @ B) + beta * C`.
+    ///
+    /// `alpha`/`beta` are explicit so the weight-gradient GEMM can accumulate
+    /// straight into an existing buffer (`alpha = accum_scale, beta = 1.0`)
+    /// instead of materialising a full dW temporary and running a separate
+    /// elementwise accumulate. Plain matmul passes `(1.0, 0.0)`, which is
+    /// exactly the behaviour this function had when those values were
+    /// hardcoded.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn sgemm_row_major(
         a_dev: *const f32,
         b_dev: *const f32,
@@ -2093,6 +2102,8 @@ pub(crate) mod cublas_inner {
         m: u64,
         n: u64,
         k: u64,
+        alpha: f32,
+        beta: f32,
     ) -> Result<(), cublas_result::CublasError> {
         debug_assert!(m > 0 && n > 0 && k > 0, "sgemm requires m,n,k > 0");
         debug_assert!(
@@ -2109,6 +2120,8 @@ pub(crate) mod cublas_inner {
             m,
             n,
             k,
+            alpha,
+            beta,
         ) {
             return Ok(());
         }
@@ -2135,11 +2148,14 @@ pub(crate) mod cublas_inner {
         }
         // Safe API takes alpha/beta by value via *const pointers. Under
         // CUBLAS_POINTER_MODE_HOST (default) cuBLAS reads these synchronously
-        // before the FFI returns, but we pin them as locals here since
-        // cublas_result::sgemm reads them before returning — no async footgun
-        // with host-pointer mode.
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
+        // before the FFI returns. They are now by-value PARAMETERS rather than
+        // locals declared here, which is equally sound: a by-value parameter
+        // lives on this frame for the whole call, so `&alpha`/`&beta` stay
+        // valid until `cublas_result::sgemm` returns. Do NOT change them to
+        // references or thread them from a caller-owned temporary without
+        // re-checking that lifetime — under CUBLAS_POINTER_MODE_DEVICE the
+        // same pointers would be read asynchronously and this would become a
+        // real footgun.
         cublas_result::sgemm(
             handle,
             cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -3259,6 +3275,8 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
                 b.data as *const f32,
                 out_data as *mut f32,
                 m, n, k,
+                // Plain matmul: overwrite a freshly-allocated output.
+                1.0, 0.0,
             )
         };
         if let Err(e) = res {

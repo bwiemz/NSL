@@ -143,6 +143,16 @@ mod imp {
             m: u64,
             n: u64,
             k: u64,
+            /// `alpha`/`beta` as raw f32 BIT PATTERNS.
+            ///
+            /// Stored as bits, not f32, so this stays usable in the exact
+            /// equality comparison below — and, more importantly, so a FUSED
+            /// accumulating gemm (`beta = 1.0`, writing into an existing
+            /// buffer) can never compare equal to, or be replayed as, an
+            /// overwriting one (`beta = 0.0`). Replaying the wrong beta would
+            /// silently double-count or drop a gradient contribution.
+            alpha_bits: u32,
+            beta_bits: u32,
         },
         Memset {
             dst: usize,
@@ -181,9 +191,13 @@ mod imp {
                     },
                 ) => func == f2 && grid == g2 && block == b2 && shared == s2 && params == p2 && offsets == o2,
                 (
-                    GpuOp::Sgemm { a, b, c, m, n, k },
-                    GpuOp::Sgemm { a: a2, b: b2, c: c2, m: m2, n: n2, k: k2 },
-                ) => a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2,
+                    GpuOp::Sgemm { a, b, c, m, n, k, alpha_bits, beta_bits },
+                    GpuOp::Sgemm {
+                        a: a2, b: b2, c: c2, m: m2, n: n2, k: k2,
+                        alpha_bits: al2, beta_bits: be2,
+                    },
+                ) => a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2
+                    && alpha_bits == al2 && beta_bits == be2,
                 (GpuOp::Memset { dst, bytes }, GpuOp::Memset { dst: d2, bytes: n2 }) => {
                     dst == d2 && bytes == n2
                 }
@@ -321,7 +335,7 @@ mod imp {
                     eat(&(offsets.len() as u64).to_le_bytes());
                     eat(params);
                 }
-                GpuOp::Sgemm { a, b, c, m, n, k } => {
+                GpuOp::Sgemm { a, b, c, m, n, k, .. } => {
                     eat(&[2]);
                     for v in [*a as u64, *b as u64, *c as u64, *m, *n, *k] {
                         eat(&v.to_le_bytes());
@@ -383,13 +397,15 @@ mod imp {
                         "[cuda-graph] eager-repair kernel relaunch failed: {r:?}"
                     );
                 }
-                GpuOp::Sgemm { a, b, c, m, n, k } => {
+                GpuOp::Sgemm { a, b, c, m, n, k, alpha_bits, beta_bits } => {
                     let r = unsafe {
                         crate::cuda::cublas_inner::sgemm_row_major(
                             *a as *const f32,
                             *b as *const f32,
                             *c as *mut f32,
                             *m, *n, *k,
+                            f32::from_bits(*alpha_bits),
+                            f32::from_bits(*beta_bits),
                         )
                     };
                     assert!(r.is_ok(), "[cuda-graph] eager-repair sgemm failed: {r:?}");
@@ -476,7 +492,7 @@ mod imp {
                             params.len(),
                             &params[..params.len().min(48)]
                         ),
-                        GpuOp::Sgemm { a, b, c, m, n, k } => {
+                        GpuOp::Sgemm { a, b, c, m, n, k, .. } => {
                             format!("sgemm a={a:#x} b={b:#x} c={c:#x} {m}x{n}x{k}")
                         }
                         GpuOp::Memset { dst, bytes } => format!("memset dst={dst:#x} n={bytes}"),
@@ -992,11 +1008,18 @@ mod imp {
 
     /// Hook for `sgemm_row_major`. Returns `false` when the gemm must be
     /// skipped (verified against the captured sequence).
-    pub fn on_sgemm(a: usize, b: usize, c: usize, m: u64, n: u64, k: u64) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_sgemm(
+        a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
+    ) -> bool {
         if !enabled() {
             return true;
         }
-        let op = GpuOp::Sgemm { a, b, c, m, n, k };
+        let op = GpuOp::Sgemm {
+            a, b, c, m, n, k,
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+        };
         let to_repair = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else { return None };
