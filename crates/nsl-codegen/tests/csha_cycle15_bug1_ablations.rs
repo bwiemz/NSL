@@ -74,9 +74,35 @@
 //! demands both flags, but only under @checkpoint, and A3 runs Path A with
 //! checkpoint stripped, which is why nothing gates it here.
 //!
-//! What is NOT yet established: whether the fault needs rope_q, needs
-//! multi-tile (S=512 with 32x32 tiles), or reproduces for plain level-1 at
-//! single tile. Those discriminators come first — the fix depends on which.
+//! DISCRIMINATOR RESULT (D1-D5 below, one process per cell):
+//!
+//!                    rope_q=true        rope_q=false
+//!     S=512          ILLEGAL_ADDRESS    zero gradients
+//!     S=32           ILLEGAL_ADDRESS    zero gradients
+//!     n1_p1 control  PASS               —
+//!
+//! The fault needs `rope_q` and does NOT need multi-tile — S=32 is a single
+//! q tile and a single kv tile and still faults, which rules out the tiling
+//! hypothesis. RoPE-Q reads cos/sin staged in SMEM by the fused-projection
+//! prologue; with `fused_projections=false` that prologue never runs, so the
+//! read lands at the shared-window base.
+//!
+//! And with rope_q OFF there is no fault but the gradients come back ZERO —
+//! `max_abs == max|ref|` again, `abs/floor` ~2500-4700. So n1_p0 is broken in
+//! BOTH directions: it either faults or silently produces nothing.
+//!
+//! SEVERITY: latent, NOT a live production bug. `csha_apply.rs:910` does map
+//! `FusionLevel::Boundary` to `CshaExtras::level1()` (= n1_p0), but the fused
+//! Tier-B.2 backward is never reached for it: `tier_b2/dispatch.rs:79` returns
+//! `DispatchReject::LevelTooLow` for level 1 and `plan_layer` reports
+//! `BackwardTierReport::Scalar`, so production falls back to the scalar
+//! backward. The broken kernel is reachable only by driving the FFI directly
+//! with a hand-built config, which is exactly what this harness does.
+//!
+//! Therefore the fix is a synthesis-time refusal of the fused CSHA backward
+//! for n1_p0 — not because the config is incoherent, but to make synthesis
+//! agree with the dispatch rejection that already exists one layer above,
+//! instead of silently emitting a kernel the dispatcher refuses to use.
 
 #![cfg(feature = "cuda")]
 
@@ -802,4 +828,71 @@ fn a4_hd128_causal_true_rope_q_true_fused_proj_true() {
             csha.d_model = 128; // dm == hd for 1-head case
         }
     });
+}
+
+// ── n1_p0 discriminator matrix ───────────────────────────────────────────────
+//
+// A3 (fused_rmsnorm=true, fused_projections=false — kernel suffix `n1_p0`)
+// faults with an invalid __shared__ read at the shared-window base inside the
+// FORWARD kernel. `n1_p0` is a first-class config (`CshaExtras::level1`), so
+// the fix is NOT a refusal and cannot be chosen until the failing axis is
+// known. These four cells vary the two plausible axes independently:
+//
+//              rope_q=true      rope_q=false
+//   S=512      D1 (== A3)       D2
+//   S=32       D3               D4
+//
+// S=32 with block_q=block_kv=32 is exactly one q tile and one kv tile, so it
+// isolates the multi-tile axis. Read the matrix as: if only the S=512 row
+// faults the bug is in multi-tile tiling; if only the rope_q=true column
+// faults it is in the RoPE prologue; if all four fault, plain level-1 forward
+// is broken for every shape and the blast radius is far larger than A3.
+//
+// Each cell MUST run in its own process — an illegal address poisons the CUDA
+// context for every later test in the binary, which is what made A3 look like
+// it was killing its siblings.
+
+fn n1p0(cfg: &mut FlashAttentionConfig) {
+    if let Some(c) = cfg.csha.as_mut() {
+        c.fused_projections = false; // fused_rmsnorm deliberately left TRUE
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+fn d1_n1p0_rope_q_on_multitile_s512() {
+    run_ablation("D1-n1p0-rope-multitile", 64, 512, n1p0);
+}
+
+#[test]
+#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+fn d2_n1p0_rope_q_off_multitile_s512() {
+    run_ablation("D2-n1p0-norope-multitile", 64, 512, |cfg| {
+        n1p0(cfg);
+        cfg.rope_q = false;
+    });
+}
+
+#[test]
+#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+fn d3_n1p0_rope_q_on_singletile_s32() {
+    run_ablation("D3-n1p0-rope-singletile", 64, 32, n1p0);
+}
+
+#[test]
+#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+fn d4_n1p0_rope_q_off_singletile_s32() {
+    run_ablation("D4-n1p0-norope-singletile", 64, 32, |cfg| {
+        n1p0(cfg);
+        cfg.rope_q = false;
+    });
+}
+
+/// CONTROL: the same shapes with projections fused (`n1_p1`). If D3/D4 fault
+/// but this passes at S=32, the fault is specific to n1_p0 rather than to the
+/// small shape or the harness.
+#[test]
+#[ignore = "diagnostic: n1_p0 fault discriminator; run one cell per process"]
+fn d5_control_n1p1_rope_q_on_singletile_s32() {
+    run_ablation("D5-control-n1p1-singletile", 64, 32, |_cfg| {});
 }
