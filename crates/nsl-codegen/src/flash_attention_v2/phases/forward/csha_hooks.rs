@@ -1358,6 +1358,7 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         q_tile_iter,
         "Q",
         "%q_smem_base",
+        "%q_start", // Q tile genuinely is based at q_start
         block_q,
         head_dim,
         half_dim,
@@ -1382,7 +1383,11 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
 ///
 /// Null-guarded on `cos_ptr` AND `sin_ptr`.  Only emits when `rope_q=true`
 /// AND `csha.fused_projections=true`.
-pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
+pub fn emit_rope_k_epilogue(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    row_base_reg: &str,
+) {
     if config.csha.is_none() || !config.rope_q {
         ptx.push_str("    // CSHA RoPE K epilogue: rope_q=false or no CSHA, skip\n");
         return;
@@ -1423,6 +1428,7 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
         0, // not per-q_iter; runs once for the whole K tile
         "K",
         "%k_smem_base",
+        row_base_reg,
         block_kv,
         head_dim,
         half_dim,
@@ -1464,6 +1470,7 @@ fn emit_rope_pair_sweep(
     q_tile_iter: u32,
     tile_label: &str,    // "Q" or "K"
     smem_base_reg: &str, // "%q_smem_base" or "%k_smem_base"
+    row_base_reg: &str,  // "%q_start" (forward) or "%k_start" (bwd recompute)
     block_q: u32,
     head_dim: u32,
     half_dim: u32,
@@ -1572,10 +1579,18 @@ fn emit_rope_pair_sweep(
     // warp_row), so cos/sin[tile_local] mis-rotates every block past position 0.
     // Byte-identical numerically at single-tile (q_start=0). The RoPE-reset
     // (segment_masked) path keeps its document-relative effective_pos.
+    // Phase 1.1 indexed this off `%q_start` unconditionally, which is right
+    // for the FORWARD (Q and K share q_start there) but wrong for the
+    // BACKWARD kv-recompute: that rotates the K tile at `%k_start`, and
+    // k_start iterates independently of q_start inside the kv loop. The
+    // caller therefore names the base register. Forward passes "%q_start"
+    // and is byte-identical to before.
     let cs_row_reg = if reset_active {
         effective_pos_reg
     } else {
-        ptx.push_str("    cvt.u32.u64 %r_rope_cs_row, %q_start;\n");
+        ptx.push_str(&format!(
+            "    cvt.u32.u64 %r_rope_cs_row, {row_base_reg};\n"
+        ));
         ptx.push_str("    add.u32 %r_rope_cs_row, %r_rope_cs_row, %r_rope_row;\n");
         "%r_rope_cs_row"
     };
@@ -1758,7 +1773,7 @@ mod tests {
     fn a4_rope_k_epilogue_emits_k_rotation_for_fused_path() {
         let cfg = base_cfg_for_rope_test();
         let mut ptx = String::new();
-        emit_rope_k_epilogue(&mut ptx, &cfg);
+        emit_rope_k_epilogue(&mut ptx, &cfg, "%q_start");
 
         // K rotation loop must be present.
         assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation loop label missing");
@@ -1781,7 +1796,7 @@ mod tests {
         let mut cfg = base_cfg_for_rope_test();
         cfg.csha = Some(CshaExtras { fused_projections: false, d_model: 128, ..CshaExtras::default() });
         let mut ptx = String::new();
-        emit_rope_k_epilogue(&mut ptx, &cfg);
+        emit_rope_k_epilogue(&mut ptx, &cfg, "%q_start");
         assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when fused_projections=false");
     }
 
@@ -1790,7 +1805,7 @@ mod tests {
         let mut cfg = base_cfg_for_rope_test();
         cfg.rope_q = false;
         let mut ptx = String::new();
-        emit_rope_k_epilogue(&mut ptx, &cfg);
+        emit_rope_k_epilogue(&mut ptx, &cfg, "%q_start");
         assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when rope_q=false");
     }
 

@@ -59,12 +59,29 @@ fn cfg(rope_q: bool, checkpoint: bool, segment_masked: bool) -> FlashAttentionCo
 }
 
 #[test]
-fn rope_q_with_checkpoint_is_refused() {
-    let err = synthesize_backward_with_tier_b(&cfg(true, true, false), None)
-        .expect_err("rope_q + @checkpoint must be refused, not synthesized");
+fn rope_q_with_checkpoint_adjacent_now_synthesizes() {
+    // R7 NARROWED 2026-07-26. This test previously asserted a refusal. Path
+    // B's Adjacent kv-recompute numerics were two %q_start-vs-%k_start
+    // confusions (x_norm row base, and the cos/sin index in the K RoPE
+    // epilogue); both are fixed and the three-way oracle is GREEN at hd=64
+    // for S=32/512/2048. Keeping the old assertion would have pinned a
+    // refusal that no longer has a reason to exist.
+    synthesize_backward_with_tier_b(&cfg(true, true, false), None)
+        .expect("rope_q + @checkpoint with RopeStyle::Adjacent must now synthesize");
+}
+
+#[test]
+fn rope_q_with_checkpoint_halfsplit_is_still_refused() {
+    // The half of R7 that is still real: emit_rope_k_epilogue asserts
+    // Adjacent-only, so HalfSplit is an uncaught PANIC rather than wrong
+    // numbers. Refusing is strictly better than panicking in the emitter.
+    let mut c = cfg(true, true, false);
+    c.rope_style = RopeStyle::HalfSplit;
+    let err = synthesize_backward_with_tier_b(&c, None)
+        .expect_err("rope_q + @checkpoint + HalfSplit must still be refused");
     assert!(
-        err.contains("rope_q=true") && err.contains("kv-recompute"),
-        "refusal must name the composition and the reason; got: {err}"
+        err.contains("HalfSplit") || err.contains("Adjacent"),
+        "refusal must name the rope style; got: {err}"
     );
 }
 
@@ -75,8 +92,8 @@ fn rope_q_with_checkpoint_and_segment_masking_is_refused() {
     let err = synthesize_backward_with_tier_b(&cfg(true, true, true), None)
         .expect_err("segment_masked + rope_q + @checkpoint must be refused");
     assert!(
-        err.contains("rope_q=true"),
-        "refusal must name rope_q; got: {err}"
+        err.contains("PCA packing") || err.contains("rope_q=true"),
+        "refusal must name the segment_masked composition; got: {err}"
     );
 }
 

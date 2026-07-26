@@ -175,7 +175,7 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
         //   Must run ONCE after K pre-pass (all rows populated) and BEFORE any
         //   S-compute reads K for QK^T.  Q rotation runs per-q_iter inside
         //   emit_rope_epilogue; K rotation runs once here for the whole tile.
-        phases::csha_hooks::emit_rope_k_epilogue(&mut ptx, config);
+        phases::csha_hooks::emit_rope_k_epilogue(&mut ptx, config, "%q_start");
 
         // ── Step 3c: K save — post-RoPE K save runs here so asymmetric
         //   tiles (block_q != block_kv) cover exactly block_kv K rows.
@@ -1134,6 +1134,36 @@ pub fn synthesize_backward_with_tier(
 /// (`synthesize_backward_with_tier_b`). When `config.checkpoint.is_none()`
 /// the helper is a no-op — preserving the byte-identity invariant of
 /// the no-decorator path (`fa_v2_snapshots` 25/25 byte-identical).
+/// Test-only seam that lets the four `csha_checkpoint_recompute_gpu` oracles
+/// exercise Path B (`rope_q` + `@checkpoint`) so a fix to its kv-recompute
+/// math can actually be VALIDATED.
+///
+/// Without this, R7 is a deadlock: the refusal exists because Path B was never
+/// GPU-validated, and Path B cannot be GPU-validated because the refusal
+/// blocks every entry point. The seam breaks that cycle for tests ONLY.
+///
+/// Two properties make it safe to carry in-tree:
+///   1. It is gated on the `test-helpers` dev-feature, which production builds
+///      do not enable — so this cannot weaken R7 for any shipping caller.
+///   2. It announces itself on stderr, so a run that took the Path-B branch
+///      can never be mistaken for a normal one.
+#[cfg(feature = "test-helpers")]
+fn r7_path_b_validation_requested() -> bool {
+    let on = std::env::var("NSL_VALIDATE_PATH_B").is_ok();
+    if on {
+        eprintln!(
+            "[csha] R7 BYPASSED for Path-B validation (NSL_VALIDATE_PATH_B set, \
+             test-helpers build). Gradients from this run are NOT certified."
+        );
+    }
+    on
+}
+
+#[cfg(not(feature = "test-helpers"))]
+fn r7_path_b_validation_requested() -> bool {
+    false
+}
+
 pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> Result<(), String> {
     use crate::flash_attention::CheckpointPolicy;
     use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
@@ -1202,8 +1232,37 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
     // tolerance-calibration artifact — atol=5e-4 sits below the f16 storage
     // floor; see F16_ACCUM_AMP in csha_cycle15_bug1_ablations.rs.)
     //
-    // KEEP THIS REFUSAL. Pinned by csha_r7_checkpoint_rope_q_refusal.rs.
-    if config.rope_q {
+    // ── R7 NARROWED 2026-07-26: Path B's Adjacent numerics are FIXED ──
+    //
+    // Two `%q_start`-vs-`%k_start` confusions were the whole of the "GROSS
+    // numerical error at multi-tile":
+    //   1. `emit_prologue_recompute_from_raw` normalised the Q tile's rows and
+    //      then built K/V from them.
+    //   2. `emit_rope_k_epilogue` indexed cos/sin off `%q_start`, so the K tile
+    //      was rotated by the wrong positions.
+    // Both are invisible at single tile, where q_start == k_start. The second
+    // one explodes rather than drifts because the backward still normalises
+    // with the FORWARD's saved LSE: P = exp(S_wrong - LSE_correct) is not a
+    // distribution, so dV = P^T dO blows up.
+    //
+    // Measured after the fix (three-way oracle, all three comparisons GREEN):
+    //     hd=64 S=32   (single tile)   A_vs_cpu B_vs_cpu B_vs_A  all GREEN
+    //     hd=64 S=512  (multi-tile)    A_vs_cpu B_vs_cpu B_vs_A  all GREEN
+    //     hd=64 S=2048 (multi-tile)    A_vs_cpu B_vs_cpu B_vs_A  all GREEN
+    // (dq went 2.624e3 -> 1.117e-2, i.e. from 500x the reference magnitude to
+    // inside the f16 accumulation bound.) hd=128 stays structurally refused by
+    // the SMEM validator: 220 KB against a 99 KB device cap.
+    //
+    // What is STILL unfixed, and what this refusal now covers:
+    //   - RopeStyle::HalfSplit: `emit_rope_k_epilogue` asserts Adjacent-only,
+    //     so HalfSplit is an uncaught panic, not wrong numbers. Untouched here.
+    //   - segment_masked: the PCA packing / RoPE-Q write-back index collision
+    //     is a separate v4 item and was never about Path B's math.
+    if config.rope_q
+        && (config.segment_masked
+            || !matches!(config.rope_style, crate::flash_attention::RopeStyle::Adjacent))
+        && !r7_path_b_validation_requested()
+    {
         return Err(if config.segment_masked {
             "PCA packing with rope_q=true under @checkpoint deferred to v4: \
              the segment-aware causal mask shares index machinery with the \
@@ -1211,12 +1270,13 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
              rotated-Q SMEM-staging refactor"
                 .to_string()
         } else {
-            "checkpoint policy=\"full\" + rope_q=true composition refused: \
-             the kv-recompute backward (Path B) has a known GROSS numerical \
-             error at multi-tile (RopeStyle::Adjacent) and an unimplemented \
-             path (RopeStyle::HalfSplit) that is not yet fixed or \
-             GPU-validated (tracked for follow-up); disable @checkpoint or \
-             rope_q until Path B's kv-recompute math is corrected"
+            "checkpoint policy=\"full\" + rope_q=true is supported only for \
+             RopeStyle::Adjacent: emit_rope_k_epilogue implements the Adjacent \
+             rotation only and would panic on HalfSplit. Path B's Adjacent \
+             kv-recompute numerics were fixed and GPU-validated on 2026-07-26 \
+             (three-way oracle GREEN at hd=64 for S=32/512/2048); HalfSplit \
+             support is the remaining work. Use RopeStyle::Adjacent, or \
+             disable @checkpoint or rope_q"
                 .to_string()
         });
     }
