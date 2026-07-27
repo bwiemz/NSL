@@ -1995,29 +1995,56 @@ pub(crate) mod cublas_inner {
     /// the handle; a restart is required to switch modes.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum CublasMathMode {
-        /// `CUBLAS_DEFAULT_MATH` — TF32 tensor cores on sm_80+.
-        Default,
-        /// `CUBLAS_PEDANTIC_MATH` — strict f32 throughout, no TF32.
+        /// `CUBLAS_DEFAULT_MATH` — f32 throughout, on FP32 CUDA cores.
+        ///
+        /// This variant used to be called `Default` and was documented as
+        /// "TF32 tensor cores on sm_80+". That was **false**, and NSL's
+        /// startup banner repeated it. `CUBLAS_DEFAULT_MATH` does not enable
+        /// TF32 for `cublasSgemm`; that needs `CUBLAS_TF32_TENSOR_OP_MATH` or
+        /// a `..._FAST_TF32` compute type. Measured at 4096^3 on an RTX
+        /// 5070 Ti: this mode 32.9 TFLOP/s, `Pedantic` 33.2 — against a banner
+        /// promising pedantic would be "~5-10x slower". A comment on
+        /// `sgemm_strided_batched_raw` in this same file had said so all
+        /// along; only the muon path ever requested TF32.
+        Fp32Cores,
+        /// `CUBLAS_PEDANTIC_MATH` — strict f32, no algorithmic shortcuts.
+        ///
+        /// Distinct from `Fp32Cores` in what cuBLAS is permitted to do
+        /// internally (split-k reassociation, alternate kernels), not in the
+        /// arithmetic unit used. On this hardware the two measure the same.
         Pedantic,
+        /// `CUBLAS_TF32_TENSOR_OP_MATH` — f32 in and out, 10-bit-mantissa
+        /// multiplies on tensor cores.
+        ///
+        /// **Opt-in only.** Every product loses roughly 13 bits of mantissa
+        /// precision, so this is a numerics change for the entire stack, not
+        /// a free speedup — see `tests/matmul_tf32_mode.rs`, which asserts it
+        /// is both measurably faster AND measurably less accurate.
+        Tf32,
     }
 
     /// Resolve the math mode via env-var > Cargo-feature precedence (spec §9).
     ///
     /// - `NSL_MATMUL_PEDANTIC=1` forces pedantic (beats everything).
-    /// - `NSL_MATMUL_TF32=1` forces TF32 default.
-    /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic
-    ///   if the feature is on, else TF32 default.
+    /// - `NSL_MATMUL_TF32=1` forces TF32 tensor cores.
+    /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic if
+    ///   the feature is on, else plain f32 on FP32 CUDA cores.
+    ///
+    /// The default is unchanged by the item-9 correction: it is what NSL has
+    /// always actually done, only now named accurately. Flipping the default
+    /// to TF32 is a separate decision that needs a tolerance audit across
+    /// every gate, because TF32 drift (~1e-3 relative) exceeds most of them.
     pub(crate) fn resolve_math_mode() -> CublasMathMode {
         if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
             return CublasMathMode::Pedantic;
         }
         if std::env::var("NSL_MATMUL_TF32").ok().as_deref() == Some("1") {
-            return CublasMathMode::Default;
+            return CublasMathMode::Tf32;
         }
         if cfg!(feature = "strict-matmul") {
             CublasMathMode::Pedantic
         } else {
-            CublasMathMode::Default
+            CublasMathMode::Fp32Cores
         }
     }
 
@@ -2044,8 +2071,9 @@ pub(crate) mod cublas_inner {
                 // safe API surface — raw call is the canonical path.
                 let mode = resolve_math_mode();
                 let raw_mode = match mode {
-                    CublasMathMode::Default => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
+                    CublasMathMode::Fp32Cores => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
                     CublasMathMode::Pedantic => cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
+                    CublasMathMode::Tf32 => cublas_sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
                 };
                 // SAFETY: `handle` was just returned by `create_handle` and is a
                 // valid `cublasHandle_t`; `raw_mode` is a valid enum variant.
@@ -2058,13 +2086,18 @@ pub(crate) mod cublas_inner {
                 }
 
                 match mode {
-                    CublasMathMode::Default => eprintln!(
-                        "[nsl-matmul] cuBLAS math mode: TF32 (default — set NSL_MATMUL_PEDANTIC=1 \
-                         or build with --features strict-matmul for strict f32)"
+                    CublasMathMode::Fp32Cores => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores (default). \
+                         Set NSL_MATMUL_TF32=1 for tensor cores — faster, and ~13 bits less \
+                         mantissa per product."
                     ),
                     CublasMathMode::Pedantic => eprintln!(
-                        "[nsl-matmul] cuBLAS math mode: pedantic (strict f32, ~5-10x slower than \
-                         TF32 default)"
+                        "[nsl-matmul] cuBLAS math mode: pedantic (strict f32; same arithmetic \
+                         units as the default, fewer internal shortcuts)"
+                    ),
+                    CublasMathMode::Tf32 => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: TF32 tensor cores (NSL_MATMUL_TF32=1) — \
+                         every product carries a 10-bit mantissa; expect ~1e-3 relative drift."
                     ),
                 }
 

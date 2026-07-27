@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — every transformer projection ran on a naive scalar PTX kernel, not cuBLAS
+
+- `gpu_matmul_f32` dispatched to cuBLAS **only when `total_batch == 1`**;
+  everything else launched `nsl_bmm_f32`, a 16x16 scalar-`fma.rn.f32` kernel.
+  `total_batch` counts the OUTPUT batch dims, so `[B,S,C] @ [C,O]` — the shape
+  of every transformer projection — had `total_batch = B` and took the naive
+  arm, and nothing in codegen flattened it first. A `GroupedQueryAttention`
+  forward profiled six `nsl_bmm_f32` launches and ZERO cuBLAS calls.
+- Two dispatch paths added. `[..,m,k] @ [k,n]` with a batch-free B collapses to
+  a single sgemm — a reinterpretation of A's existing buffer as
+  `(batch*m) x k`, summing the same products in the same order. Genuinely
+  batched products (in a transformer, QK^T and PV) go to
+  `cublasGemmStridedBatchedEx` via a new row-major `sgemm_batched_row_major`.
+  `NSL_MATMUL_NO_BATCH_COLLAPSE=1` restores the old dispatch.
+- Measured on an RTX 5070 Ti / CUDA 13.3: `[8,1024,512] @ [512,512]`
+  **0.67 -> 29.5 TFLOP/s**; a Coder-50M `[2,1024]` forward
+  **147.1 -> 33.3 ms (4.42x)**; GQA forward 6 naive launches -> 0.
+- `GpuOp::Sgemm` gains batch/stride fields. Batched products used to reach a
+  captured CUDA-graph region as `GpuOp::Kernel`, whose params blob
+  distinguished them for free; as cuBLAS pseudo-ops they would otherwise have
+  compared equal on `(a,b,c,m,n,k)` alone and replayed a graph built for the
+  wrong shape.
+
+### Fixed — `NSL_MATMUL_TF32=1` did nothing, and the startup banner said the opposite
+
+- The 2026-04-21 cuBLAS-swap work recorded `CUBLAS_DEFAULT_MATH` as "TF32
+  tensor cores on sm_80+" and shipped a banner telling users pedantic mode was
+  "~5-10x slower than TF32 default". Both false: that mode does not enable
+  TF32 for `cublasSgemm`. Measured at 4096^3 — default 32.9 TFLOP/s, pedantic
+  **33.2** (marginally *faster*). `NSL_MATMUL_TF32=1` selected the same
+  do-nothing variant, so there was no way to reach tensor cores at all outside
+  the muon batch engine. (The P6 muon notes below had already recorded the
+  discrepancy; nothing acted on it.)
+- `CublasMathMode` is now `{Fp32Cores, Pedantic, Tf32}`, named for what each
+  actually does, and `Tf32` sets `CUBLAS_TF32_TENSOR_OP_MATH`. Measured:
+  N=2048 **4.12x** faster / 698x less accurate, N=4096 **1.51x** / 190x.
+- **The default is unchanged** — it is what NSL has always really done, only
+  now described accurately. Flipping it to TF32 buys 1.5-4x on every matmul
+  but costs ~13 bits of mantissa per product, which needs a tolerance audit
+  across every numerical gate first. Deliberately left as a separate decision.
+- `matmul_cublas_tf32_default_sanity.rs` could not have caught any of this:
+  its 5e-3 tolerance is satisfied by real f32 and real TF32 alike. The new
+  `matmul_tf32_mode.rs` asserts TF32 is both measurably faster AND measurably
+  less accurate, because either alone passes for the wrong reasons.
+
 ### Fixed — FBIP refcount-based in-place elision silently mutated live variables and MODEL WEIGHTS
 
 - `let s = abs(x)` left `x` overwritten with `|x|`; `print(sum(abs(m.wq)))`
