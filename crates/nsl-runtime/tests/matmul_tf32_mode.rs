@@ -95,14 +95,23 @@ fn measure() -> Probe {
     let a = gpu_2d(N, N, &a_data);
     let b = gpu_2d(N, N, &b_data);
 
-    for _ in 0..3 {
+    // 200 warmup iterations, not 3. Each probe runs in a freshly spawned
+    // process, and 3 + 20 iterations is roughly 14 ms of work — nowhere near
+    // enough to move this GPU off its 180 MHz idle clock toward the 3090 MHz
+    // boost. With the short warmup, eight consecutive runs of this test
+    // measured speedups of 0.96, 0.74, 0.97, 1.29, 1.29, 1.30, 0.73 and 0.98:
+    // every single one below the 1.3 floor, i.e. the gate failed on every run
+    // while the feature underneath it worked. Clock state, not TF32.
+    for _ in 0..200 {
         nsl_tensor_free(nsl_tensor_matmul(a, b, 0));
     }
+    nsl_runtime::test_cuda_device_synchronize();
     let t0 = std::time::Instant::now();
-    let iters = 20;
+    let iters = 50;
     for _ in 0..iters {
         nsl_tensor_free(nsl_tensor_matmul(a, b, 0));
     }
+    nsl_runtime::test_cuda_device_synchronize();
     let secs_per_call = t0.elapsed().as_secs_f64() / iters as f64;
 
     let c = nsl_tensor_matmul(a, b, 0);
@@ -114,6 +123,12 @@ fn measure() -> Probe {
     // random walks through zero and a per-element ratio would be dominated by
     // whichever entry happened to land nearest 0.
     let rms = (want.iter().map(|w| w * w).sum::<f64>() / want.len() as f64).sqrt();
+    // NaN check first: `f64::max` drops NaN, so folding over an all-NaN row
+    // would yield 0.0 and read as perfect accuracy.
+    assert!(
+        (0..N).all(|j| got[row * N + j].is_finite()),
+        "GPU result row {row} contains a non-finite value"
+    );
     let max_rel_err = (0..N)
         .map(|j| (got[row * N + j] - want[j]).abs())
         .fold(0.0f64, f64::max)
@@ -203,15 +218,20 @@ fn tf32_is_faster_and_less_accurate_than_the_default() {
     // build where it reaches cuBLAS but the pointers are wrong shows only the
     // second.
     // Measured with `CUBLAS_TF32_TENSOR_OP_MATH` on an RTX 5070 Ti / CUDA 13.3
-    // — so the deprecated math-mode route is still honoured there, and no
-    // `cublasGemmEx` rewrite is needed yet:
+    // — the deprecated math-mode route is still honoured there, so no
+    // `cublasGemmEx` rewrite is needed yet. Steady state at N=2048, after the
+    // warmup above:
     //
-    //   N=2048   1.56 -> 0.38 ms   4.12x   error 1.4e-6 -> 9.5e-4  (x698)
-    //   N=4096   4.54 -> 3.00 ms   1.51x   error 5.7e-6 -> 1.1e-3  (x190)
+    //   default  0.583 ms  29.5 TFLOP/s   err 1.358e-6
+    //   TF32     0.365 ms  47.1 TFLOP/s   err 9.482e-4
+    //            -> 1.60x faster, 698x less accurate
     //
-    // The floor is set against the WEAKER of the two, not the headline.
+    // An earlier version of this comment claimed 4.12x. That number came from
+    // an under-warmed run against an already-busy GPU and does not reproduce;
+    // 1.60x is what holds when the clock is settled. The accuracy ratio, by
+    // contrast, is bit-deterministic across every run.
     assert!(
-        speedup > 1.3,
+        speedup > 1.35,
         "NSL_MATMUL_TF32=1 gave only {speedup:.2}x. Either the mode is not \
          reaching cuBLAS (CUBLAS_TF32_TENSOR_OP_MATH is deprecated — check \
          whether this CUDA version still honours it for cublasSgemm, and move \

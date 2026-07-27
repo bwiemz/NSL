@@ -143,6 +143,11 @@ pub use cuda::test_detect_sm_version;
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::test_set_batch_collapse_disabled;
 
+// Test-only re-export: explicit device sync, required by any test that TIMES
+// GPU work (`sync_after_kernel` is a no-op without NSL_CUDA_SYNC=1).
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::test_cuda_device_synchronize;
+
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;

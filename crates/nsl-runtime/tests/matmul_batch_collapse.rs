@@ -38,7 +38,7 @@ use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, test_build_tensor_2d_f32,
     test_read_tensor_f64, NslTensor,
 };
-use nsl_runtime::test_set_batch_collapse_disabled;
+use nsl_runtime::{test_cuda_device_synchronize, test_set_batch_collapse_disabled};
 
 /// The cuBLAS handle and the collapse state are process-global, and the
 /// kernel profiler is a singleton. Tests in one binary must not interleave.
@@ -135,6 +135,19 @@ fn cpu_ref(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize) -> 
 /// four orders of magnitude above the tolerance below.
 fn max_err_vs_rms(got: &[f32], want: &[f32]) -> f64 {
     assert_eq!(got.len(), want.len());
+    // NaN check FIRST, and separately. `f64::max` propagates the non-NaN
+    // operand, so `.fold(0.0, f64::max)` over an all-NaN difference returns
+    // 0.0 and every tolerance below passes. That is not hypothetical for these
+    // gates: the failure they exist to catch is reading the wrong device
+    // memory, and recycled GPU memory is frequently NaN bit patterns.
+    let bad = got.iter().position(|v| !v.is_finite());
+    assert!(
+        bad.is_none(),
+        "GPU result has a non-finite value at index {} ({}) — the kernel read \
+         memory it does not own, or wrote none at all",
+        bad.unwrap(),
+        got[bad.unwrap()]
+    );
     let rms =
         (want.iter().map(|&w| (w as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
     assert!(rms > 1e-6, "degenerate reference (rms {rms:e}) — the fixture is all zeros");
@@ -143,6 +156,30 @@ fn max_err_vs_rms(got: &[f32], want: &[f32]) -> f64 {
         .map(|(&g, &w)| (g as f64 - w as f64).abs())
         .fold(0.0f64, f64::max)
         / rms
+}
+
+/// The metric's own guard. Not a GPU test — it pins the property that every
+/// tolerance assertion in this file depends on, and that the metric did not
+/// have when it was written.
+#[test]
+#[should_panic(expected = "non-finite")]
+fn the_error_metric_rejects_nan_instead_of_scoring_it_perfect() {
+    let want = vec![1.0f32, 2.0, 3.0, 4.0];
+    let got = vec![f32::NAN; 4];
+    // Without the explicit check this returns 0.0 — `f64::max` propagates the
+    // non-NaN operand, so folding NaN differences from a 0.0 seed yields 0.0
+    // and an all-garbage GPU result scores as a perfect match.
+    let _ = max_err_vs_rms(&got, &want);
+}
+
+/// ...and still reports a real disagreement as one.
+#[test]
+fn the_error_metric_still_reports_finite_disagreement() {
+    let want = vec![1.0f32, 2.0, 3.0, 4.0];
+    let mut got = want.clone();
+    got[2] = 3.5;
+    assert!(max_err_vs_rms(&got, &want) > 0.1);
+    assert_eq!(max_err_vs_rms(&want, &want), 0.0);
 }
 
 /// Run one `[batch, m, k] @ [k, n]` product on the GPU under a forced dispatch
@@ -223,9 +260,23 @@ fn the_projection_shape_reaches_cublas() {
     };
 
     let with = run(true);
+    // Name the exact marker. "any gemm" is NOT sufficient, and this gate said
+    // so for one commit before it was true: once the strided-batched arm
+    // landed, `[batch,m,k] @ [k,n]` had a SECOND cuBLAS route (that arm handles
+    // it with stride_b = 0), so deleting the collapse entirely left this test —
+    // and all five others in this file — green while the shape regressed 1.66x.
+    // A loose matcher on a two-route dispatch tests nothing.
     assert!(
-        with.iter().any(|k| k.contains("sgemm") || k.contains("gemm_")),
-        "[4,128,64] @ [64,64] did not reach cuBLAS; kernels seen: {with:?}"
+        with.iter().any(|k| k == "sgemm_cublas"),
+        "[4,128,64] @ [64,64] did not reach the single-sgemm collapse; \
+         kernels seen: {with:?}"
+    );
+    assert!(
+        !with.iter().any(|k| k == "sgemm_cublas_batched"),
+        "[4,128,64] @ [64,64] went to the strided-batched arm instead of \
+         collapsing. That is still cuBLAS and still correct, so nothing else \
+         here would notice — but it launches one gemm per slice for a product \
+         that is one gemm. Kernels seen: {with:?}"
     );
     assert!(
         !with.iter().any(|k| k == "nsl_bmm_f32"),
@@ -265,7 +316,15 @@ fn both_arms_agree_with_the_cpu_reference() {
         let (naive, want2, naive_kernels) = project(batch, m, k, n, false);
         assert_eq!(want, want2, "the reference itself is not deterministic");
 
-        // Anti-vacuity: prove the two arms are actually two arms.
+        // Anti-vacuity: prove the two arms are actually two arms, and that the
+        // first one is the collapse specifically — `sgemm_cublas_batched` here
+        // would mean this file is comparing the strided-batched arm against the
+        // naive kernel and never touching the collapse at all.
+        assert!(
+            collapsed_kernels.iter().any(|kn| kn == "sgemm_cublas"),
+            "[{batch},{m},{k}]: the 'collapsed' arm did not take the collapse \
+             ({collapsed_kernels:?})"
+        );
         assert!(
             !collapsed_kernels.iter().any(|kn| kn == "nsl_bmm_f32"),
             "[{batch},{m},{k}]: the 'collapsed' arm still ran the naive kernel \
@@ -473,6 +532,77 @@ fn a_broadcast_operand_uses_a_zero_stride_correctly() {
     nsl_tensor_free(b);
 }
 
+/// Partial batch broadcast must refuse, not return an out-of-bounds read.
+///
+/// `[2,3,m,k] @ [2,1,k,n]` needs a different stride per batch DIMENSION; the
+/// GPU path carries one stride per operand, so it walked B for 6 slices when B
+/// holds 2. Measured error before the refusal: 2.61 relative to the result's
+/// own RMS — and bit-identical through the naive kernel and through cuBLAS, so
+/// this predates item 9 by a long way. The CPU path gets it right, which makes
+/// it a silent CPU/GPU divergence.
+///
+/// This pins the refusal, not a fix. If per-dimension strides are implemented
+/// later, this test should become a correctness check against the CPU
+/// reference — deleting it would leave the OOB read unguarded.
+///
+/// Runs in a CHILD process. `#[should_panic]` does not work here: the refusal
+/// fires inside `gpu_matmul_f32`, which is reached through the `extern "C"`
+/// `nsl_tensor_matmul`, and a panic crossing an `extern "C"` boundary is a
+/// non-unwinding abort — SIGABRT, not a catchable panic. So the assertion has
+/// to be on the child's exit status and stderr.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "zz_partial_broadcast_child",
+            "--exact",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("NSL_PARTIAL_BCAST_CHILD", "1")
+        .output()
+        .expect("spawn child");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "partial batch broadcast was ACCEPTED. The GPU path cannot express a \
+         per-dimension broadcast stride, so it read past the end of the \
+         smaller operand and returned plausible garbage (measured 2.61 \
+         relative to the result's own RMS).\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("PARTIAL batch broadcasting"),
+        "the child died, but not on the partial-broadcast refusal — so this \
+         gate is passing for the wrong reason.\nstderr:\n{stderr}"
+    );
+}
+
+/// Child body for the test above. Inert unless explicitly asked.
+#[test]
+#[ignore = "spawned by partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds"]
+fn zz_partial_broadcast_child() {
+    if std::env::var("NSL_PARTIAL_BCAST_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    test_set_batch_collapse_disabled(false);
+    let (b0, b1, m, k, n) = (2usize, 3usize, 4usize, 5usize, 6usize);
+    let a = gpu_tensor(
+        &[b0 as i64, b1 as i64, m as i64, k as i64],
+        &deterministic(b0 * b1 * m * k, 71),
+    );
+    // B's second batch dim is 1 while A's is 3: broadcast on ONE axis only.
+    let b = gpu_tensor(&[b0 as i64, 1, k as i64, n as i64], &deterministic(b0 * k * n, 73));
+    let c = nsl_tensor_matmul(a, b, 0);
+    nsl_tensor_free(c);
+    nsl_tensor_free(a);
+    nsl_tensor_free(b);
+}
+
 /// The point of the change. Expressed as a RATIO against the same math written
 /// 2-D, so the floor does not encode this particular GPU: the 3-D form now
 /// runs the identical cuBLAS call, and the only difference left is dispatch
@@ -494,23 +624,40 @@ fn the_projection_shape_is_not_slower_than_its_2d_form() {
     let x2 = gpu_tensor(&[(batch * s) as i64, c_in as i64], &x);
 
     let time = |a: i64| -> f64 {
-        for _ in 0..3 {
+        // Long warmup, not 3 iterations: a freshly spawned process finds the
+        // GPU idling at its 180 MHz floor against a 3090 MHz boost clock, and
+        // ~14 ms of work never gets it there. Under-warming makes the
+        // measurement swing by 2x run to run.
+        for _ in 0..100 {
             nsl_tensor_free(nsl_tensor_matmul(a, w, 0));
         }
+        test_cuda_device_synchronize();
+        let iters = 50;
         let t0 = std::time::Instant::now();
-        for _ in 0..10 {
+        for _ in 0..iters {
             nsl_tensor_free(nsl_tensor_matmul(a, w, 0));
         }
-        t0.elapsed().as_secs_f64() / 10.0
+        // REQUIRED — `sync_after_kernel` is a no-op unless NSL_CUDA_SYNC=1, so
+        // without this the loop measures kernel ENQUEUE. Measured with the
+        // collapse deleted: 0.0042 vs 0.0032 ms, ratio 0.78, gate green. The
+        // original "11.8x slower" negative control for this test only
+        // reproduced because the author had NSL_CUDA_SYNC=1 exported in their
+        // shell; from a clean environment it proved nothing.
+        test_cuda_device_synchronize();
+        t0.elapsed().as_secs_f64() / iters as f64
     };
     let t3 = time(x3);
     let t2 = time(x2);
     let ratio = t2 / t3;
+    // Measured with sync: 0.1478 vs 0.1469 ms, ratio 0.99 — the two forms run
+    // the identical cuBLAS call, so anything below ~0.9 means they no longer
+    // do. The old 0.5 floor was too loose to catch the 3-D form falling back
+    // to the strided-batched arm (measured ratio 0.707 there).
     assert!(
-        ratio > 0.5,
-        "the 3-D projection is {:.1}x slower than the identical 2-D math \
-         ({:.4} ms vs {:.4} ms). Below 0.5 means it is no longer sharing the \
-         cuBLAS path — check the collapse preconditions in gpu_matmul_f32.",
+        ratio > 0.85,
+        "the 3-D projection is {:.2}x slower than the identical 2-D math \
+         ({:.4} ms vs {:.4} ms). They should be the same cuBLAS call — check \
+         the collapse preconditions in gpu_matmul_f32.",
         1.0 / ratio,
         t3 * 1e3,
         t2 * 1e3

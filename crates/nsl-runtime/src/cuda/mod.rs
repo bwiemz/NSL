@@ -2220,11 +2220,16 @@ pub(crate) mod cublas_inner {
     /// records a proper pseudo-op instead — tainting here would disable graph
     /// capture for every model containing a batched product.
     ///
-    /// Compute type is `CUBLAS_COMPUTE_32F`, matching `sgemm_row_major`. It is
-    /// deliberately NOT the TF32 variant the muon path opts into: routing the
-    /// general matmul to cuBLAS and changing its precision are separate
-    /// decisions, and bundling them would make any resulting numerical change
-    /// impossible to attribute.
+    /// Compute type is `CUBLAS_COMPUTE_32F`, matching `sgemm_row_major`, so
+    /// this arm does not itself request tensor cores.
+    ///
+    /// That is NOT the same as "this arm is always full f32". On CUDA 13.3 the
+    /// handle's math mode wins over the per-call compute type: under
+    /// `NSL_MATMUL_TF32=1` this call was measured at 8.104e-4 error against
+    /// the 2-D path's 8.101e-4 on the same product, i.e. both went to tensor
+    /// cores. That consistency is what you want — QK^T and the projections
+    /// should not disagree about precision — but it means the compute type
+    /// here is a floor, not a guarantee.
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn sgemm_batched_row_major(
         a_dev: *const f32,
@@ -2444,12 +2449,18 @@ pub(crate) mod cublas_inner {
         };
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
-        // GemmStridedBatchedEx with an explicit compute type: the process
-        // handle sits in CUBLAS_DEFAULT_MATH (which, despite NSL's "TF32
-        // default" banner, runs f32 gemms on FP32 CUDA cores), so tensor-core
-        // TF32 must be requested per call. The muon batch engine opts in —
-        // Newton-Schulz is a coarse polynomial approximation and its own
-        // gates are tolerance-based; nothing else in the runtime is affected.
+        // GemmStridedBatchedEx with an explicit compute type. By DEFAULT the
+        // process handle sits in CUBLAS_DEFAULT_MATH, which runs f32 gemms on
+        // FP32 CUDA cores, so tensor-core TF32 must be requested per call —
+        // the muon batch engine opts in, Newton-Schulz being a coarse
+        // polynomial approximation whose own gates are tolerance-based.
+        //
+        // The converse no longer holds. Item 9 made `NSL_MATMUL_TF32=1` put
+        // the handle in CUBLAS_TF32_TENSOR_OP_MATH, and on CUDA 13.3 the
+        // handle's math mode overrides this per-call compute type: under that
+        // flag `tf32 = false` here still runs on tensor cores. Callers passing
+        // false are asking for no TF32 *from this call site*, not asserting
+        // the process is in full-f32 mode.
         let compute = if tf32 {
             cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
         } else {
@@ -3639,6 +3650,31 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let stride_b = if b_total_batch == 1 { 0u64 } else { b_mat_stride };
     let stride_c = c_mat_stride;
 
+    // PARTIAL batch broadcast is not representable by the single stride above,
+    // and the GPU path has always got it wrong. `[2,3,m,k] @ [2,1,k,n]` gives
+    // b_total_batch = 2, so stride_b = k*n — but the product has 6 slices and
+    // B holds 2, so slices 2..6 read past the end of B's allocation. Measured
+    // error against a CPU reference: 2.61 relative to the result's own RMS,
+    // BIT-IDENTICAL through the naive kernel and through cuBLAS. The CPU path
+    // (`tensor/arithmetic.rs`) walks per-dimension broadcast strides and is
+    // correct, so this is a live CPU/GPU divergence.
+    //
+    // Fixing it means per-dimension strides here, which is a real change with
+    // its own gates. Until then this refuses rather than returning plausible
+    // garbage from an out-of-bounds read — a wrong number that propagates into
+    // a training run is worse than a stopped process.
+    let partial_broadcast = |total: u64| total != 1 && total != total_batch;
+    assert!(
+        !partial_broadcast(a_total_batch) && !partial_broadcast(b_total_batch),
+        "GPU matmul does not support PARTIAL batch broadcasting: A batch \
+         extent {a_total_batch}, B batch extent {b_total_batch}, output batch \
+         {total_batch} (shapes {a_shape:?} @ {b_shape:?}). Each operand must \
+         be either fully broadcast (extent 1) or fully present (extent \
+         {total_batch}). The CPU path handles this correctly; the GPU path \
+         would read past the end of the smaller operand. Expand the operand \
+         explicitly, or run this product on CPU."
+    );
+
     // Item 9 phase 1: collapse `[.., m, k] @ [k, n]` to ONE 2-D sgemm.
     //
     // This is the shape of every transformer projection (`x @ w` with
@@ -3676,6 +3712,12 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let collapse_to_2d = total_batch > 1
         && b_total_batch == 1
         && a.is_contiguous()
+        // B too: it is handed to cuBLAS as a flat row-major `k x n`, so a
+        // strided B is as wrong here as a strided A. The doc above says every
+        // precondition is checked rather than assumed, and for one commit this
+        // one was assumed — the strided-batched arm below checked both operands
+        // while this arm checked only A.
+        && b.is_contiguous()
         && collapse_rows <= i32::MAX as u64
         && !batch_collapse_disabled();
 
@@ -3817,6 +3859,13 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             eprintln!(
                 "[nsl-matmul] cuBLAS batched gemm failed ({total_batch}x{m}x{n}x{k}): {e:?}"
             );
+            // Release the output we allocated above before signalling failure.
+            // The 2-D arm's `return 0` does NOT do this and leaks the buffer,
+            // its shape and its strides on every cuBLAS error; that is
+            // pre-existing and left alone here rather than folded into an
+            // unrelated change, but a new `return 0` should not add a second
+            // instance of it.
+            crate::tensor::nsl_tensor_free(out_ptr as i64);
             return 0;
         }
         if inner::sync_mode_enabled() {
@@ -7478,6 +7527,29 @@ pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = (dst, src, bytes); }
+}
+
+/// Test hook: block until every kernel queued on this context has finished.
+///
+/// Any integration test that TIMES GPU work needs this. `sync_after_kernel` is
+/// a no-op unless `NSL_CUDA_SYNC=1`, so a bare `Instant::now()` loop around
+/// `nsl_tensor_matmul` measures kernel *enqueue* — which is how the first
+/// throughput probe for item 9 reported a 4096^3 gemm at 22,000 TFLOP/s, and
+/// how the first version of `matmul_batch_collapse.rs`'s ratchet passed with
+/// the fast path deleted (0.0037 vs 0.0034 ms, ratio 0.92).
+///
+/// Preferred over setting `NSL_CUDA_SYNC=1` from a test: that variable is read
+/// once during context init, so whether it takes effect depends on which test
+/// in the binary touched CUDA first.
+#[cfg(all(feature = "test-hooks", feature = "cuda"))]
+pub fn test_cuda_device_synchronize() {
+    inner::ensure_context();
+    let rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    assert_eq!(
+        rc,
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuCtxSynchronize failed: {rc:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
