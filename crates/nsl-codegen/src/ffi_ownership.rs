@@ -73,6 +73,19 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_broadcast_to", OwnedNewResult);
     // Views (alias input storage)
     m.insert("nsl_tensor_view", BorrowedFromInput(0));
+    // KNOWN-WRONG, left as-is deliberately (item 1, 2026-07-27). The runtime
+    // allocates FRESH storage on both paths — `shape_ops.rs` slice CPU, and
+    // `cuda::gpu_slice_f32_with_shape` on GPU — so this is an owning result
+    // misfiled as a borrow, i.e. an under-free. `expr::tensor_method_returns_
+    // owned_ref` classifies the `.slice()` METHOD correctly as owning; this
+    // table governs a different path and the two now disagree.
+    //
+    // Not flipped here because changing it ADDS frees on a path with no
+    // measurement behind it, and the failure mode of being wrong in that
+    // direction is a use-after-free rather than a leak. Fix it with a leak
+    // measurement in hand. `nsl_tensor_select`, `nsl_tensor_unsqueeze` and
+    // `nsl_tensor_cumsum` are absent from this table entirely, despite the
+    // header above saying every tensor-returning FFI should have an entry.
     m.insert("nsl_tensor_slice", BorrowedFromInput(0));
     // Reductions
     m.insert("nsl_tensor_sum", OwnedNewResult);

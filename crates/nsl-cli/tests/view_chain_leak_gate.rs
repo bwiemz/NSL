@@ -81,14 +81,27 @@ fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String) {
         })
         .last()
         .unwrap_or_else(|| panic!("[{tag}/{n}] no [gpu-mem] live_blocks report:\n{stderr}"));
+    // Remove the scratch dir. `nsl run` links ~140 MB of objects per invocation
+    // into the system temp dir, which here is a 31 GB tmpfs — leaving these
+    // behind across a full test run fills it, and the resulting
+    // "ld: final link failed: No space left on device" surfaces as failures in
+    // whatever unrelated suite happens to run next.
+    std::fs::remove_dir_all(&tmp).ok();
     (live_blocks, stdout)
 }
 
 /// The real `nsl.nn.gqa` forward, which is where this was found and where the
-/// improvement is measured. A hand-written chain fixture is NOT a substitute:
-/// the first version of this gate used one, and it showed byte-identical block
-/// counts with the fix applied and reverted — it simply did not reach the
-/// affected path, and would have "passed" while proving nothing about the fix.
+/// improvement is measured.
+///
+/// A hand-written chain fixture is NOT a substitute: the first version of this
+/// gate used one and it showed byte-identical block counts with the fix applied
+/// and reverted. The reason is NOT that it missed the affected path — review
+/// showed view-only chains really are fixed there (`x.transpose(0,1).sum()`
+/// goes 1 -> 0 blocks). It is that the fixture ended in a materialising
+/// `.contiguous()` feeding `.sum()`, whose own separate residual is larger than
+/// the improvement and masked it entirely. Either way the lesson stands: a gate
+/// whose numbers do not move when you revert the fix is measuring something
+/// else.
 fn gqa_src(calls: usize) -> String {
     let mut s = String::from(
         r#"

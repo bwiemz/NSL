@@ -19,9 +19,16 @@ use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::operator::UnaryOp;
 use nsl_semantic::types::Type;
 
-/// Every tensor method the codegen dispatch table (`expr/advanced.rs`) can
-/// lower, classified by whether its result is an OWNING reference the caller
-/// must release.
+/// Whether a tensor method's result is an OWNING reference the caller must
+/// release.
+///
+/// Covers every method `compile_tensor_method_call` (`expr/advanced.rs`) can
+/// lower — `every_tensor_method_is_classified` enforces that direction. The
+/// converse does NOT hold and is not enforced: the reduction/elementwise names
+/// below are inherited from the predecessor allowlist and most of them
+/// (`exp`, `relu`, `softmax`, ...) are not dispatchable as methods at all —
+/// `x.relu()` fails with "unknown tensor method". They are harmless and are
+/// kept so the classification survives if method forms are ever added.
 ///
 /// `Some(true)`  — caller owns a reference; failing to free it leaks.
 /// `Some(false)` — result may alias the receiver, or is not a tensor at all;
@@ -45,11 +52,28 @@ use nsl_semantic::types::Type;
 /// let k_exp = k5.expand([...]).contiguous().reshape([...])  # expand AND contiguous are
 /// ```
 ///
-/// there are exactly seven anonymous intermediates, and exactly seven blocks
-/// stranded per call — 20 MB, ×8 layers, on every Coder-50M forward.
+/// there are seven anonymous intermediates. Registering them recovered 3 of
+/// the 8 blocks retained per call (24 MB -> 16 MB), ×8 layers on every
+/// Coder-50M forward. NOT one block per intermediate: a view shares the root's
+/// data pointer, so leaked *handles* and leaked *blocks* do not correspond, and
+/// four blocks per call still strand for a separate reason (see
+/// `the_residual_is_still_present_and_bounded`).
 ///
 /// The classification is a property of the RUNTIME function, so each entry
 /// records why. Do not add an entry without reading the implementation.
+///
+/// # Not covered: the free-function forms
+///
+/// This table governs METHOD calls only. The sibling `ExprKind::Ident` arm in
+/// `expr_result_is_owned_temporary` still carries the original hand-maintained
+/// allowlist and still has the same omission, with no gate. Measured: the
+/// method form `x.transpose(0,1).contiguous().sum()` improves to 1 retained
+/// block per call, while the free-function form
+/// `contiguous(x.transpose(0,1)).sum()` is unchanged at 2 — `contiguous(t)`,
+/// `unsqueeze(t,d)`, `stack(l,d)` and `tensor_cat` all take dedicated
+/// early-return paths in `expr/calls.rs` and are absent from that allowlist.
+/// Extending it needs a per-function read of the runtime, since a wrong entry
+/// there is a use-after-free rather than a leak.
 pub(crate) fn tensor_method_returns_owned_ref(method: &str) -> Option<bool> {
     let owned = match method {
         // ── Reductions and elementwise maths: freshly allocated results. ──

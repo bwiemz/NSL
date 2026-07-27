@@ -38,6 +38,88 @@ fn expr_mod_rs() -> String {
         .expect("expr/mod.rs readable")
 }
 
+/// Parse `"a" | "b" => <verdict>` match arms out of a source region.
+///
+/// ONE parser for both the dispatcher and the ownership table, because they
+/// have the same syntax and had different bugs when written separately.
+///
+/// Arms wrap. rustfmt splits a long arm across lines and puts the leading `|`
+/// on the continuation, so a line-at-a-time parser that requires `=>` on the
+/// same line as the name drops every name on a wrapped arm. That is not
+/// hypothetical: the first version of this file required both, and rewriting
+/// `"contiguous" =>` as `"contiguous"\n | "materialize" =>` made BOTH names
+/// invisible — `contiguous` vanished from the dispatcher set and a brand-new
+/// unclassified method was never noticed, with all four gates still green. A
+/// reformat could have silently disarmed the gate.
+///
+/// Returns `(name, Some(owned))` for a resolved arm. `None` cannot escape:
+/// pending names are resolved when the `=>` line arrives, and any left over at
+/// the end are returned as `None` so callers can fail loudly rather than
+/// inherit a default.
+fn parse_match_arms(body: &str, verdict_of: impl Fn(&str) -> bool) -> Vec<(String, Option<bool>)> {
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    // Arm HEADS sit at one fixed indentation; string literals inside arm BODIES
+    // sit deeper. Without this, error-message and runtime-function-name literals
+    // get scraped as if they were method names — dropping the `=>`-on-the-same-
+    // line requirement (needed for wrapped arms) removed the accident that used
+    // to filter them out. Take the shallowest `"…" =>` line as the arm indent.
+    let arm_indent = body
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('"') && l.contains("=>")
+        })
+        .map(indent_of)
+        .min()
+        .unwrap_or(0);
+
+    let mut out: Vec<(String, Option<bool>)> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim();
+        // A name-bearing line starts with a quote or a continuation bar...
+        if !t.starts_with('"') && !t.starts_with("| \"") {
+            continue;
+        }
+        // ...and sits at the arm indentation, not inside an arm body.
+        if indent_of(line) != arm_indent {
+            continue;
+        }
+        let (names_part, verdict) = match t.split_once("=>") {
+            Some((n, v)) => (n, Some(verdict_of(v))),
+            None => (t, None),
+        };
+        let names: Vec<String> = names_part
+            .split('|')
+            .filter_map(|p| {
+                let p = p.trim().trim_matches(',').trim();
+                p.strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect();
+        for n in names {
+            out.push((n, verdict));
+        }
+        if let Some(v) = verdict {
+            // Resolve every name still waiting from earlier lines of THIS arm.
+            // Walking backwards and stopping at the first resolved entry keeps
+            // this arm's continuation lines from reaching into a previous arm —
+            // the bug in the `const PENDING: bool = false` version, where a
+            // sentinel was indistinguishable from a real `false` verdict and a
+            // new wrapped arm retroactively flipped every earlier `false` entry
+            // to `true`, failing with a use-after-free warning about
+            // perfectly correct source.
+            for entry in out.iter_mut().rev() {
+                if entry.1.is_some() {
+                    continue;
+                }
+                entry.1 = Some(v);
+            }
+        }
+    }
+    out
+}
+
 /// Every method name the tensor-method dispatcher can lower.
 ///
 /// Parsed from `compile_tensor_method_call`'s match arms rather than restated,
@@ -53,23 +135,10 @@ fn dispatchable_tensor_methods() -> Vec<String> {
         .find(r#"unknown tensor method '.{method}()'"#)
         .map(|o| start + o)
         .expect("the unknown-method catch-all still exists");
-    let body = &src[start..end];
-
-    let mut methods = Vec::new();
-    for line in body.lines() {
-        let t = line.trim();
-        // Match-arm heads look like `"name" => ...` or `"a" | "b" => ...`.
-        if !t.starts_with('"') || !t.contains("=>") {
-            continue;
-        }
-        let head = t.split("=>").next().unwrap_or("");
-        for piece in head.split('|') {
-            let p = piece.trim().trim_matches(',').trim();
-            if let Some(name) = p.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                if !name.is_empty() && !methods.contains(&name.to_string()) {
-                    methods.push(name.to_string());
-                }
-            }
+    let mut methods: Vec<String> = Vec::new();
+    for (name, _) in parse_match_arms(&src[start..end], |_| true) {
+        if !methods.contains(&name) {
+            methods.push(name);
         }
     }
     methods
@@ -88,53 +157,18 @@ fn classified_methods() -> Vec<(String, bool)> {
         .find("\n        _ => return None,")
         .map(|o| start + o)
         .expect("the table's unclassified fall-through still exists");
-    let body = &src[start..end];
-
-    let mut out: Vec<(String, bool)> = Vec::new();
-    for line in body.lines() {
-        let t = line.trim();
-        if !t.starts_with('"') && !t.starts_with("| \"") {
-            continue;
-        }
-        // An arm may wrap across lines; the verdict is on whichever line has
-        // the `=>`. Collect names first, then attach the verdict when seen.
-        let (names_part, verdict) = match t.split_once("=>") {
-            Some((n, v)) => (n, Some(v.contains("true"))),
-            None => (t, None),
-        };
-        let names: Vec<String> = names_part
-            .split('|')
-            .filter_map(|p| {
-                let p = p.trim().trim_matches(',').trim();
-                p.strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .map(str::to_string)
-            })
-            .collect();
-        match verdict {
-            Some(v) => {
-                // Attach this verdict to these names AND to any names still
-                // waiting from previous wrapped lines.
-                for (_, pending) in out.iter_mut().filter(|(_, p)| *p == PENDING) {
-                    *pending = v;
-                }
-                for n in names {
-                    out.push((n, v));
-                }
-            }
-            None => {
-                for n in names {
-                    out.push((n, PENDING));
-                }
-            }
-        }
-    }
-    out
+    parse_match_arms(&src[start..end], |v| v.contains("true"))
+        .into_iter()
+        .map(|(n, v)| {
+            (
+                n.clone(),
+                v.unwrap_or_else(|| {
+                    panic!("`{n}` was parsed with no verdict — the table's arm syntax has changed")
+                }),
+            )
+        })
+        .collect()
 }
-
-/// Sentinel for "name parsed, verdict on a later line". `bool` has no third
-/// state; a wrapped arm resolves to the verdict of the line carrying `=>`.
-const PENDING: bool = false;
 
 #[test]
 fn every_tensor_method_is_classified() {
@@ -142,8 +176,12 @@ fn every_tensor_method_is_classified() {
     // falls through to `None` and is treated as non-owning — which is exactly
     // how the shape/view family leaked for as long as it did.
     let dispatchable = dispatchable_tensor_methods();
+    // Floor set just under the 14 arms present when this was written. It has
+    // to bite BEFORE a parser regression can hide a method: the previous floor
+    // of 12 tolerated two silently-dropped arms, which is exactly how many a
+    // single wrapped arm removes.
     assert!(
-        dispatchable.len() >= 12,
+        dispatchable.len() >= 14,
         "only parsed {} dispatchable methods ({dispatchable:?}) — the match-arm \
          parser has stopped matching the dispatcher and this gate is vacuous",
         dispatchable.len()
