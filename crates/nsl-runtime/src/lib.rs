@@ -138,6 +138,11 @@ pub use cuda::tier_b1_prepass::{
 #[cfg(feature = "test-hooks")]
 pub use cuda::test_detect_sm_version;
 
+// Test-only re-export: forces the item-9 batch-collapse dispatch decision so
+// `tests/matmul_batch_collapse.rs` can drive both arms from one process.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::test_set_batch_collapse_disabled;
+
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;

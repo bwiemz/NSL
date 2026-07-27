@@ -3383,6 +3383,47 @@ fn gpu_cast_raw(ptx: *const u8, kname: *const u8, src: u64, dst: u64, n: usize) 
     inner::sync_after_kernel();
 }
 
+/// `NSL_MATMUL_NO_BATCH_COLLAPSE=1` — keep batched products on the naive
+/// `nsl_bmm_f32` kernel instead of collapsing them into one cuBLAS sgemm.
+///
+/// This exists so the parity gate has a reference arm that is the OLD
+/// numerics, and so a suspected cuBLAS-tiling difference in a training run can
+/// be bisected without a rebuild. The env var is read once — `gpu_matmul_f32`
+/// is on the hot path and a per-call `std::env::var` would show up in the
+/// profile — but the resolved answer lives in an atomic rather than a
+/// `OnceLock<bool>` so `test_set_batch_collapse_disabled` can flip it. Without
+/// that, comparing the two arms would need two test BINARIES (the isolation
+/// dance `matmul_cublas_tf32_default_sanity.rs` documents), and a parity gate
+/// split across two processes cannot diff the two results against each other.
+///
+/// 0 = unresolved, 1 = collapse enabled, 2 = collapse disabled.
+#[cfg(feature = "cuda")]
+static BATCH_COLLAPSE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+fn batch_collapse_disabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match BATCH_COLLAPSE_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let disabled = std::env::var("NSL_MATMUL_NO_BATCH_COLLAPSE").as_deref() == Ok("1");
+            BATCH_COLLAPSE_STATE.store(u8::from(disabled) + 1, Ordering::Relaxed);
+            disabled
+        }
+    }
+}
+
+/// Test hook: force the batch-collapse decision for the rest of the process.
+///
+/// Gated on `test-hooks` so production builds cannot reach it. Used by
+/// `tests/matmul_batch_collapse.rs` to drive both dispatch arms from one
+/// process and compare their outputs element-wise.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_set_batch_collapse_disabled(disabled: bool) {
+    BATCH_COLLAPSE_STATE.store(u8::from(disabled) + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
@@ -3461,7 +3502,50 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let stride_b = if b_total_batch == 1 { 0u64 } else { b_mat_stride };
     let stride_c = c_mat_stride;
 
-    if total_batch == 1 {
+    // Item 9 phase 1: collapse `[.., m, k] @ [k, n]` to ONE 2-D sgemm.
+    //
+    // This is the shape of every transformer projection (`x @ w` with
+    // `x: [batch, seq, d_model]`), and until this existed it took the
+    // `total_batch > 1` arm below — the naive 16x16 scalar `nsl_bmm_f32`.
+    // Measured on an RTX 5070 Ti at `[8,1024,512] @ [512,512]`:
+    // **0.67 TFLOP/s through the batched kernel vs 29.54 through cuBLAS for
+    // the identical math** written as `[8192,512] @ [512,512]`. A
+    // `GroupedQueryAttention` forward profiled six `nsl_bmm_f32` and zero
+    // cuBLAS calls.
+    //
+    // The collapse is a pure REINTERPRETATION, not a reassociation: when B is
+    // shared across the batch and A's slices are contiguous and adjacent, A's
+    // buffer already IS a row-major `(total_batch*m) x k` matrix and C's
+    // already IS `(total_batch*m) x n`. Every output element sums the same k
+    // products in the same index order, so this changes nothing about which
+    // reduction happens — only which kernel performs it. (cuBLAS's tiling
+    // still orders that reduction differently from the naive kernel, so
+    // results DO move; see the parity gate in
+    // `crates/nsl-runtime/tests/matmul_batch_collapse.rs`.)
+    //
+    // Preconditions, each checked rather than assumed:
+    //   * B carries no batch extent (`b_total_batch == 1`), so one B serves
+    //     every slice. Combined with `total_batch > 1` this forces
+    //     `a_total_batch == total_batch`, hence `stride_a == a_mat_stride`.
+    //   * A is contiguous. The sole caller (`nsl_tensor_matmul`) materialises
+    //     both operands first, but a strided A would make the flattening a
+    //     silently-wrong read — the same class of bug as the tied-embedding
+    //     miscompile in PR #335.
+    //   * The collapsed row count fits the i32 cuBLAS dimension.
+    //
+    // `NSL_MATMUL_NO_BATCH_COLLAPSE=1` forces the old kernel; the parity gate
+    // uses it as its reference arm.
+    let collapse_rows = total_batch.saturating_mul(m);
+    let collapse_to_2d = total_batch > 1
+        && b_total_batch == 1
+        && a.is_contiguous()
+        && collapse_rows <= i32::MAX as u64
+        && !batch_collapse_disabled();
+
+    if total_batch == 1 || collapse_to_2d {
+        // The only thing the collapse changes is the row count handed to
+        // cuBLAS: `k`, `n` and all three data pointers are already correct.
+        let m = if collapse_to_2d { collapse_rows } else { m };
         // Non-batched f32 matmul: dispatch to cuBLAS sgemm via the row-major
         // operand-swap idiom (spec 2026-04-21 §2.1). Replaces the naive
         // nsl_matmul_f32 PTX kernel (~1-2 TFLOPs/s on a 5070 Ti) with
