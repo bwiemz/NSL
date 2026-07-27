@@ -4012,22 +4012,34 @@ pub fn cuda_device_name() -> Option<String> {
         if cuDeviceGet(&mut device, ordinal) != CUresult::CUDA_SUCCESS {
             return None;
         }
-        let mut buf = [0i8; 128];
-        if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
-            return None;
+        device_marketing_name(device)
+    }
+}
+
+/// `cuDeviceGetName` for an already-resolved device, with the vendor/brand
+/// prefixes stripped. Shared by `cuda_device_name` and `cuda_device_identity`
+/// so the two can never disagree about what the card is called.
+///
+/// # Safety
+/// `device` must be a valid `CUdevice` obtained from `cuDeviceGet`.
+#[cfg(feature = "cuda")]
+unsafe fn device_marketing_name(device: cudarc::driver::sys::CUdevice) -> Option<String> {
+    use cudarc::driver::sys::*;
+    let mut buf = [0i8; 128];
+    if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
+    let mut name = cstr.to_str().ok()?.trim().to_string();
+    for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            name = rest.to_string();
         }
-        let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
-        let mut name = cstr.to_str().ok()?.trim().to_string();
-        for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
-            if let Some(rest) = name.strip_prefix(prefix) {
-                name = rest.to_string();
-            }
-        }
-        if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -4065,19 +4077,23 @@ pub struct CudaDeviceIdentity {
 #[cfg(feature = "cuda")]
 pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
     use cudarc::driver::sys::*;
-    let name = cuda_device_name()?;
     unsafe {
-        // `cuda_device_name` already ran cuInit and rc-checked it; repeating it
-        // is harmless (cuInit is idempotent) and keeps this probe standalone.
         if cuInit(0) != CUresult::CUDA_SUCCESS {
             return None;
         }
+        // Resolve the ordinal ONCE and derive both the name and the attributes
+        // from it. Calling `cuda_device_name()` here instead would run
+        // `select_device_ordinal` a second time, which under the SPMD spawner
+        // prints its "binding CUDA device N" line twice per probe and, worse,
+        // lets the name and the attributes resolve to different ordinals if the
+        // environment changes in between.
         let ordinal = inner::select_device_ordinal();
         let mut device: CUdevice = 0;
         if cuDeviceGet(&mut device, ordinal) != CUresult::CUDA_SUCCESS {
             return None;
         }
-        let mut attr = |a| -> Option<u32> {
+        let name = device_marketing_name(device)?;
+        let attr = |a| -> Option<u32> {
             let mut v: i32 = 0;
             if cuDeviceGetAttribute(&mut v, a, device) != CUresult::CUDA_SUCCESS || v < 0 {
                 return None;
@@ -4105,6 +4121,17 @@ pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
 pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
     None
 }
+
+/// Whether this binary was compiled with CUDA support at all.
+///
+/// `cuda` is NOT a default feature (`nsl-cli` and `nsl-codegen` both default to
+/// `[]`, and the release workflow builds with no features), so the stock `nsl`
+/// binary cannot probe a device even on a machine that has one. Callers that
+/// record or key on device identity must be able to say *why* they have none —
+/// "this machine has no GPU" and "this compiler cannot see GPUs" are different
+/// claims, and conflating them would put `no-cuda-device` in a cache record
+/// written on a box with a 5070 Ti sitting in it.
+pub const CUDA_SUPPORT_COMPILED: bool = cfg!(feature = "cuda");
 
 /// Launch a PTX kernel. All params are i64 for Cranelift ABI compatibility.
 ///

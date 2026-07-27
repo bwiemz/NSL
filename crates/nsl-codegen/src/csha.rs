@@ -491,11 +491,17 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
     let detected = crate::gpu_specs::resolve_local_gpu();
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     LOGGED.get_or_init(|| {
-        // Only speak when a device was actually probed. On a GPU-less machine
-        // the original code returned before its `eprintln!` (via `?` on
-        // `cuda_device_name`), and CI parses this stream — staying silent there
-        // is behaviour to preserve, not an omission.
-        let Some(name) = crate::gpu_specs::local_device_identity().map(|d| &d.name) else {
+        // Gate on `cuda_device_name` — the ORIGINAL oracle — not on the richer
+        // identity probe. On a GPU-less machine the original code returned
+        // before its `eprintln!` (via `?` on `cuda_device_name`), and CI parses
+        // this stream, so staying silent there is behaviour to preserve.
+        //
+        // But `local_device_identity` additionally calls cuDeviceGetAttribute
+        // three times and cuDriverGetVersion. Gating on IT would mean that if
+        // any of those failed, csha would both fall back to the A100 spec and
+        // suppress the message saying so — turning a loud fallback into a
+        // silent one on exactly the machines where something is already wrong.
+        let Some(name) = nsl_runtime::cuda_device_name() else {
             return;
         };
         match detected {

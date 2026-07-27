@@ -87,14 +87,24 @@ pub struct DeviceIdentity {
     pub driver_version: u32,
 }
 
-/// Device name recorded when there is no local CUDA device at all.
+/// Device name recorded when the compiler CAN see GPUs but found none.
 ///
 /// A *named* sentinel, not a fallback to some real GPU's spec: a cache built on
 /// a GPU-less machine must not be indistinguishable from one built on an A100.
 pub const NO_DEVICE_NAME: &str = "no-cuda-device";
 
+/// Device name recorded when the compiler was built without CUDA support.
+///
+/// Distinct from [`NO_DEVICE_NAME`] because the two are different claims and
+/// only one of them is about the hardware. `cuda` is not a default feature, so
+/// the stock `nsl` binary takes this path **even on a machine with a GPU in
+/// it** — writing "no-cuda-device" there would be a false statement about the
+/// box, and would let a no-CUDA build's entries and a real probe's entries be
+/// confused if the probe ever failed.
+pub const NO_CUDA_SUPPORT_NAME: &str = "cuda-unsupported-build";
+
 impl DeviceIdentity {
-    /// The local device's identity, or the [`NO_DEVICE_NAME`] sentinel.
+    /// The local device's identity, or a sentinel naming why there isn't one.
     ///
     /// This is the function that fixes item 10's core defect. The cache key was
     /// previously built from `gpu_specs::default_gpu()`, whose contract is "the
@@ -102,6 +112,11 @@ impl DeviceIdentity {
     /// unconditionally. Hashing that meant the key said "A100-SXM / sm_80 / 108
     /// SMs" on every machine, so an entry measured on one GPU was reused
     /// verbatim on any other.
+    ///
+    /// It must never consult `gpu_specs`' database for identity, in any branch.
+    /// `local_identity_never_reads_the_gpu_database` pins that, because the
+    /// natural-looking regression — "fall back to the default spec when the
+    /// probe fails" — restores the original bug exactly.
     pub fn local() -> Self {
         match crate::gpu_specs::local_device_identity() {
             Some(d) => Self {
@@ -110,14 +125,29 @@ impl DeviceIdentity {
                 sm_count: d.sm_count,
                 driver_version: d.driver_version,
             },
+            None if !nsl_runtime::CUDA_SUPPORT_COMPILED => Self::no_cuda_support(),
             None => Self::no_device(),
         }
     }
 
     /// The sentinel identity for "no CUDA device was found".
     pub fn no_device() -> Self {
+        Self::sentinel(NO_DEVICE_NAME)
+    }
+
+    /// The sentinel identity for "this compiler has no CUDA support".
+    pub fn no_cuda_support() -> Self {
+        Self::sentinel(NO_CUDA_SUPPORT_NAME)
+    }
+
+    /// Whether this identity describes real probed silicon.
+    pub fn is_real_device(&self) -> bool {
+        self.device_name != NO_DEVICE_NAME && self.device_name != NO_CUDA_SUPPORT_NAME
+    }
+
+    fn sentinel(name: &str) -> Self {
         Self {
-            device_name: NO_DEVICE_NAME.to_string(),
+            device_name: name.to_string(),
             sm_version: 0,
             sm_count: 0,
             driver_version: 0,
@@ -179,8 +209,22 @@ pub enum CacheReject {
         found: Box<DeviceIdentity>,
         expected: Box<DeviceIdentity>,
     },
+    /// The roofline was priced against a different `GpuSpec` than this build
+    /// would use, so the winner it chose no longer follows from the model.
+    CostModelSpecChanged { found: String, expected: String },
     /// Parsed and validated, but carries no winner to return.
     EmptyWinner,
+}
+
+/// First 16 characters of a cache key, for diagnostics.
+///
+/// Character-wise, not byte-wise. `found` comes from a JSON file on disk, whose
+/// whole threat model is that it was "copied, committed, restored from a CI
+/// artifact, or shared over a network mount" — so it is arbitrary text, and
+/// `&s[..16]` panics when byte 16 lands mid-codepoint. That panic ran inside
+/// the compiler, aborting a build over a malformed cache file.
+fn abbreviate_key(key: &str) -> String {
+    key.chars().take(16).collect()
 }
 
 impl CacheReject {
@@ -195,8 +239,11 @@ impl CacheReject {
             }
             Self::KeyMismatch { found, expected } => format!(
                 "records cache key {} but was looked up under {} — copied or renamed file",
-                &found[..found.len().min(16)],
-                &expected[..expected.len().min(16)]
+                abbreviate_key(found),
+                abbreviate_key(expected)
+            ),
+            Self::CostModelSpecChanged { found, expected } => format!(
+                "was priced against the {found} cost model, but this build prices against {expected}"
             ),
             Self::DeviceMismatch { found, expected } => format!(
                 "describes {} but this machine is {}",
@@ -215,10 +262,20 @@ impl CacheReject {
     /// mismatch means an entry from another machine is sitting in this cache,
     /// which is exactly what nobody would otherwise notice.
     pub fn is_noteworthy(&self) -> bool {
-        matches!(
-            self,
-            Self::DeviceMismatch { .. } | Self::KeyMismatch { .. } | Self::EmptyWinner
-        )
+        match self {
+            // Expected right after an upgrade or a schema bump. Warning per
+            // kernel here is noise that trains users to ignore the channel.
+            Self::Unparseable(_) | Self::SchemaMismatch { .. } => false,
+            // An entry from another machine, or a file that is not what its
+            // name says: nobody would otherwise notice these.
+            Self::DeviceMismatch { .. } | Self::KeyMismatch { .. } => true,
+            // Recoverable but worth saying — the recorded winner no longer
+            // follows from the model this build would use.
+            Self::CostModelSpecChanged { .. } => true,
+            // Should be unwritable (see `build_cache_record`); if one appears,
+            // something upstream is producing empty winners.
+            Self::EmptyWinner => true,
+        }
     }
 }
 
@@ -240,16 +297,19 @@ pub fn cartesian_product(params: &TuningParams) -> Vec<Variant> {
 }
 
 /// Select the middle value from each parameter range (`--no-autotune` fallback).
-/// Panics if any parameter has an empty values list (semantic checker prevents this).
+///
+/// Parameters with an empty value list are skipped rather than asserted on. The
+/// semantic checker now rejects `@autotune(x=[])` at the source level, which it
+/// did NOT do when this function's doc first claimed it did — so the assertion
+/// that used to be here was reachable from ordinary NSL and aborted the whole
+/// compiler. Belt and braces: refusing in the checker gives a real diagnostic
+/// with a span, and skipping here means a caller constructing `TuningParams`
+/// programmatically cannot panic the compiler either.
 pub fn select_middle_values(params: &TuningParams) -> Variant {
     params
         .iter()
+        .filter(|(_, values)| !values.is_empty())
         .map(|(name, values)| {
-            assert!(
-                !values.is_empty(),
-                "autotune param '{}' has empty value list",
-                name
-            );
             let mid_idx = values.len() / 2;
             (name.clone(), values[mid_idx])
         })
@@ -275,15 +335,24 @@ pub struct BenchmarkResult {
 
 /// Callback type for benchmarking a single variant on real hardware.
 ///
-/// The runtime provides this — it loads the PTX, allocates dummy data, launches
-/// with CUDA events, and returns the `BenchmarkResult`.
+/// **Nothing implements this.** The intended implementation belongs in the
+/// runtime — load the PTX, allocate dummy data, launch with CUDA events, return
+/// a `BenchmarkResult` — but no such function exists anywhere in the tree, so
+/// the only callers are this module's unit tests passing synthetic closures.
+/// Wiring it is the measured half of roadmap item 10; see the module header.
 ///
 /// Arguments: (ptx_source, kernel_name, variant_params) -> Result<BenchmarkResult>
 pub type BenchmarkFn = dyn Fn(&str, &str, &Variant) -> Result<BenchmarkResult, String>;
 
 /// Number of warmup launches (not timed) before measured runs.
+///
+/// Advisory only — read by nothing, because nothing implements [`BenchmarkFn`].
+/// It describes the protocol a future measured path should follow, not one this
+/// compiler performs.
 pub const WARMUP_RUNS: usize = 5;
 /// Number of measured launches for computing median latency.
+///
+/// Advisory only, for the same reason as [`WARMUP_RUNS`].
 pub const MEASURED_RUNS: usize = 10;
 /// Maximum time (ms) for a single variant before it's skipped.
 pub const VARIANT_TIMEOUT_MS: f64 = 5000.0;
@@ -306,7 +375,9 @@ pub fn find_best_variant(
     benchmark_fn: &BenchmarkFn,
 ) -> Result<Variant, String> {
     // 1. Check cache
-    if let Some(cached) = check_cache(kernel_name, cache_hash, device) {
+    // `None`: this path measures, so there is no cost-model spec to invalidate
+    // against. A Measured record stays valid until the device or key changes.
+    if let Some(cached) = check_cache(kernel_name, cache_hash, device, None) {
         if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
             eprintln!("[autotune] cache hit for {kernel_name}");
         }
@@ -414,7 +485,8 @@ pub fn find_best_variant_cost_model(
 ) -> Result<Variant, String> {
     // 1. Check cache (unless fresh)
     if !fresh {
-        if let Some(cached) = check_cache(kernel_name, cache_hash, device) {
+        if let Some(cached) = check_cache(kernel_name, cache_hash, device, Some(cost_model_spec))
+        {
             if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
                 eprintln!("[autotune] cache hit for {kernel_name}");
             }
@@ -601,6 +673,7 @@ pub fn load_cache_record(
     kernel_name: &str,
     hash: &str,
     device: &DeviceIdentity,
+    cost_model_spec: Option<&str>,
 ) -> Result<Option<AutotuneCacheRecord>, CacheReject> {
     let path = cache_dir().join(format!("{}_{}.json", kernel_name, hash));
     let Ok(content) = std::fs::read_to_string(&path) else {
@@ -614,17 +687,36 @@ pub fn load_cache_record(
             expected: CACHE_SCHEMA_VERSION,
         });
     }
+    // Device before key: both are disqualifying, but only one of them names the
+    // machines involved, and a foreign entry that ALSO carries a foreign key
+    // would otherwise be reported as a mere filename problem.
+    if record.device != *device {
+        return Err(CacheReject::DeviceMismatch {
+            found: Box::new(record.device),
+            expected: Box::new(device.clone()),
+        });
+    }
     if record.cache_key != hash {
         return Err(CacheReject::KeyMismatch {
             found: record.cache_key,
             expected: hash.to_string(),
         });
     }
-    if record.device != *device {
-        return Err(CacheReject::DeviceMismatch {
-            found: Box::new(record.device),
-            expected: Box::new(device.clone()),
-        });
+    // A cost-model winner is only as good as the spec it was priced against,
+    // and that spec is NOT part of the key — it is a model, not an identity.
+    // The realistic drift: a card missing from GPU_DATABASE is priced against
+    // the A100 default, someone later adds its real GpuSpec (which csha's
+    // fallback message actively asks them to do), and the device identity is
+    // unchanged — so without this check the A100-priced winner survives every
+    // rebuild until someone passes --autotune-fresh.
+    if let (SelectionMethod::CostModel { spec }, Some(expected)) = (&record.selection, cost_model_spec)
+    {
+        if spec != expected {
+            return Err(CacheReject::CostModelSpecChanged {
+                found: spec.clone(),
+                expected: expected.to_string(),
+            });
+        }
     }
     if record.winner.is_empty() {
         return Err(CacheReject::EmptyWinner);
@@ -637,8 +729,13 @@ pub fn load_cache_record(
 /// A rejected entry is a miss, never an error: the worst outcome of ignoring a
 /// cache file is recomputing the selection. Noteworthy rejections warn so the
 /// entry does not silently do nothing forever.
-pub fn check_cache(kernel_name: &str, hash: &str, device: &DeviceIdentity) -> Option<Variant> {
-    match load_cache_record(kernel_name, hash, device) {
+pub fn check_cache(
+    kernel_name: &str,
+    hash: &str,
+    device: &DeviceIdentity,
+    cost_model_spec: Option<&str>,
+) -> Option<Variant> {
+    match load_cache_record(kernel_name, hash, device, cost_model_spec) {
         Ok(Some(record)) => Some(record.winner),
         Ok(None) => None,
         Err(reject) => {
@@ -691,6 +788,14 @@ pub fn build_cache_record(hash: &str, kernel_name: &str, result: &AutotuneResult
 
 /// Write an autotune result (winner + all timings) to the cache directory.
 pub fn write_cache(hash: &str, kernel_name: &str, result: &AutotuneResult) {
+    // Never persist a winnerless entry. `load_cache_record` refuses one, so
+    // writing it creates a file that is rejected on every subsequent read and
+    // rewritten on every subsequent miss — a permanent warn-and-rewrite loop
+    // that never converges. A kernel with no tuning parameters legitimately has
+    // an empty winner; it simply has nothing worth caching.
+    if result.winner.is_empty() {
+        return;
+    }
     let dir = cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -856,7 +961,7 @@ mod tests {
         let hash = "test_hash_roundtrip_12345";
         write_cache(hash, "test_kernel", &result);
 
-        let cached = check_cache("test_kernel", hash, &dev("TestGPU"));
+        let cached = check_cache("test_kernel", hash, &dev("TestGPU"), None);
         assert!(cached.is_some(), "cache file should be readable");
         let winner = cached.unwrap();
         assert_eq!(winner, vec![("block_size".to_string(), 256)]);
@@ -868,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_check_cache_miss() {
-        let cached = check_cache("nonexistent_kernel", "nonexistent_hash", &dev("TestGPU"));
+        let cached = check_cache("nonexistent_kernel", "nonexistent_hash", &dev("TestGPU"), None);
         assert!(cached.is_none());
     }
 

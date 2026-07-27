@@ -1220,6 +1220,18 @@ impl<'a> TypeChecker<'a> {
                                                 // Each arg value must be a list literal of integers
                                                 match &arg.value.kind {
                                                     ExprKind::ListLiteral(items) => {
+                                                        // An EMPTY list is not a tuning range. Downstream,
+                                                        // `autotune::select_middle_values` asserts on it (its
+                                                        // doc even claimed "semantic checker prevents this",
+                                                        // which was not true), so `@autotune(block_size=[])`
+                                                        // aborted the compiler with a panic instead of
+                                                        // reporting a source error.
+                                                        if items.is_empty() {
+                                                            self.diagnostics.push(
+                                                                Diagnostic::error("@autotune parameter value list must not be empty")
+                                                                    .with_label(arg.value.span, "expected at least one candidate value")
+                                                            );
+                                                        }
                                                         for item in items {
                                                             if !matches!(item.kind, ExprKind::IntLiteral(_)) {
                                                                 self.diagnostics.push(
@@ -1263,6 +1275,18 @@ impl<'a> TypeChecker<'a> {
                                                     let _aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
                                                     match &arg.value.kind {
                                                         ExprKind::ListLiteral(items) => {
+                                                            // An EMPTY list is not a tuning range. Downstream,
+                                                            // `autotune::select_middle_values` asserts on it (its
+                                                            // doc even claimed "semantic checker prevents this",
+                                                            // which was not true), so `@autotune(block_size=[])`
+                                                            // aborted the compiler with a panic instead of
+                                                            // reporting a source error.
+                                                            if items.is_empty() {
+                                                                self.diagnostics.push(
+                                                                    Diagnostic::error("@autotune parameter value list must not be empty")
+                                                                        .with_label(arg.value.span, "expected at least one candidate value")
+                                                                );
+                                                            }
                                                             for item in items {
                                                                 if !matches!(item.kind, ExprKind::IntLiteral(_)) {
                                                                     self.diagnostics.push(

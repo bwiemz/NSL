@@ -156,6 +156,8 @@ Selects tile sizes, warp counts, and SMEM allocation for a `kernel` block at bui
 
 Winners are cached under `.nsl-cache/autotune/<kernel>_<key>.json`. The key and the record both carry the **driver-reported** device identity (name, compute capability, SM count, CUDA driver version), and an entry describing different hardware is refused with a warning rather than reused. `--autotune-fresh` ignores the cache, `--autotune-clean` deletes it, `--no-autotune` skips selection entirely and takes the middle of each range.
 
+**Device identity requires a `--features cuda` build.** `cuda` is not a default feature, so the stock `nsl` binary cannot probe a device even on a machine that has one; it records the identity `cuda-unsupported-build`, prices the roofline against the database default, and says so once per compile. Selection is then a generic estimate rather than a device-specific one, and every default-build machine shares one cache key — consistent, but not hardware-aware. Build with `--features cuda` on the target machine for a device-specific selection.
+
 See [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
 
 ### <a id="dec-backward"></a>`@backward`

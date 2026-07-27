@@ -142,7 +142,7 @@ pub use cuda::test_detect_sm_version;
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;
 // Driver-reported device identity for the @autotune cache key (item 10).
-pub use cuda::{cuda_device_identity, CudaDeviceIdentity};
+pub use cuda::{cuda_device_identity, CudaDeviceIdentity, CUDA_SUPPORT_COMPILED};
 
 pub mod autodiff;
 pub mod checkpoint;

@@ -17,7 +17,8 @@
 
 use nsl_codegen::autotune::{
     build_cache_record, cache_dir, check_cache, hash_kernel_ast, load_cache_record, AutotuneResult,
-    CacheReject, DeviceIdentity, SelectionMethod, CACHE_SCHEMA_VERSION, NO_DEVICE_NAME,
+    CacheReject, DeviceIdentity, SelectionMethod, CACHE_SCHEMA_VERSION, NO_CUDA_SUPPORT_NAME,
+    NO_DEVICE_NAME,
 };
 use std::path::{Path, PathBuf};
 
@@ -105,37 +106,83 @@ fn old_key_scheme_collided_across_machines() {
 }
 
 #[test]
-fn local_identity_is_not_the_database_default() {
+fn local_identity_is_exactly_one_of_probed_or_a_named_sentinel() {
     // `default_gpu()` is a fallback for cost modelling, never an identity.
-    // Whatever this test host is, the identity must not silently claim A100.
+    //
+    // This test previously had an if/else in which BOTH branches passed, so it
+    // stayed green when `local()` was mutated to return the A100 database
+    // constants with a plausible driver version — i.e. with the exact defect
+    // item 10 exists to fix, fully reintroduced. It now pins each configuration
+    // to ONE permitted outcome, and
+    // `local_identity_never_reads_the_gpu_database` closes the same hole from
+    // the source side in every build configuration.
     let local = DeviceIdentity::local();
-    let default_spec = nsl_codegen::gpu_specs::default_gpu();
-    if local.device_name == NO_DEVICE_NAME {
-        // GPU-less machine: the sentinel, not a real card's spec.
-        assert_eq!(local, DeviceIdentity::no_device());
-        assert_eq!(local.sm_version, 0);
-        assert_eq!(local.sm_count, 0);
+    if nsl_runtime::CUDA_SUPPORT_COMPILED {
+        match nsl_runtime::cuda_device_name() {
+            // CUDA support + a visible device => a real probe, nothing else.
+            Some(name) => {
+                assert!(
+                    local.is_real_device(),
+                    "device \"{name}\" is visible but the identity is a sentinel: {}",
+                    local.describe()
+                );
+                assert_eq!(local.device_name, name);
+            }
+            // CUDA support, no device => the no-device sentinel, exactly.
+            None => assert_eq!(local, DeviceIdentity::no_device()),
+        }
     } else {
-        // A real device was probed. It may legitimately BE an A100, but then
-        // the SM count has to come from the driver rather than the database
-        // default's constant.
-        assert!(
-            local.sm_version > 0 && local.sm_count > 0,
-            "a probed device must report a real compute capability and SM count, got {}",
-            local.describe()
-        );
-        assert!(
-            local.driver_version > 0,
-            "a probed device must report a driver version, got {}",
-            local.describe()
+        // No CUDA support => the build sentinel, exactly. This is the branch CI
+        // runs, and it is what makes the default-build behaviour pinned rather
+        // than merely assumed: `cuda` is not a default feature, so the stock
+        // binary always lands here even on a machine with a GPU.
+        assert_eq!(
+            local,
+            DeviceIdentity::no_cuda_support(),
+            "a build without CUDA support must say so, not claim the box has no GPU"
         );
     }
-    // Either way: the sentinel must never be mistakable for a database entry.
-    assert!(
-        nsl_codegen::gpu_specs::find_gpu(NO_DEVICE_NAME).is_none(),
-        "the no-device sentinel must not resolve to a GpuSpec"
+    // Neither sentinel may be mistakable for a database entry.
+    for sentinel in [NO_DEVICE_NAME, NO_CUDA_SUPPORT_NAME] {
+        assert!(
+            nsl_codegen::gpu_specs::find_gpu(sentinel).is_none(),
+            "sentinel {sentinel} must not resolve to a GpuSpec"
+        );
+    }
+    assert_ne!(
+        NO_DEVICE_NAME, NO_CUDA_SUPPORT_NAME,
+        "the two sentinels must stay distinguishable"
     );
-    let _ = default_spec;
+}
+
+#[test]
+fn local_identity_never_reads_the_gpu_database() {
+    // The regression that survives every runtime assertion, because it looks
+    // like defensive programming: "if the probe fails, fall back to the default
+    // spec." That restores the original bug exactly — every machine reports
+    // A100-SXM again — and on a GPU-less CI box it is indistinguishable from
+    // correct behaviour at runtime. So it is pinned at the source.
+    let src = std::fs::read_to_string(repo_root().join("crates/nsl-codegen/src/autotune.rs"))
+        .expect("autotune.rs readable");
+    let start = src
+        .find("    pub fn local() -> Self {")
+        .expect("DeviceIdentity::local still exists");
+    let end = src[start..]
+        .find("\n    }\n")
+        .map(|o| start + o)
+        .expect("local() body terminates");
+    let body = &src[start..end];
+    for forbidden in ["default_gpu", "find_gpu", "GPU_DATABASE", "resolve_local_gpu"] {
+        assert!(
+            !body.contains(forbidden),
+            "DeviceIdentity::local() must not consult the GPU database ({forbidden} found). \
+             Identity comes from the driver; the database is for cost modelling only."
+        );
+    }
+    assert!(
+        body.contains("local_device_identity"),
+        "local() must still go through the driver probe"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +300,8 @@ fn a_record_from_another_machine_is_refused() {
 
     let (rejected, missed) = with_cached_record(kernel, hash, &json, || {
         (
-            load_cache_record(kernel, hash, &blackwell()),
-            check_cache(kernel, hash, &blackwell()),
+            load_cache_record(kernel, hash, &blackwell(), None),
+            check_cache(kernel, hash, &blackwell(), None),
         )
     })
     .expect("cache dir writable");
@@ -282,7 +329,7 @@ fn the_same_machine_still_hits() {
     let json = serde_json::to_string(&record).unwrap();
 
     let hit = with_cached_record(kernel, hash, &json, || {
-        check_cache(kernel, hash, &blackwell())
+        check_cache(kernel, hash, &blackwell(), None)
     })
     .expect("cache dir writable");
 
@@ -301,7 +348,7 @@ fn a_renamed_or_copied_file_is_refused() {
     let json = serde_json::to_string(&record).unwrap();
 
     let rejected = with_cached_record(kernel, "key_B", &json, || {
-        load_cache_record(kernel, "key_B", &blackwell())
+        load_cache_record(kernel, "key_B", &blackwell(), None)
     })
     .expect("cache dir writable");
 
@@ -323,7 +370,7 @@ fn an_older_schema_is_refused() {
     let json = serde_json::to_string(&record).unwrap();
 
     let rejected = with_cached_record(kernel, hash, &json, || {
-        load_cache_record(kernel, hash, &blackwell())
+        load_cache_record(kernel, hash, &blackwell(), None)
     })
     .expect("cache dir writable");
 
@@ -363,8 +410,8 @@ fn a_pre_item10_cache_file_is_refused_not_misread() {
 
     let (rejected, missed) = with_cached_record(kernel, hash, legacy, || {
         (
-            load_cache_record(kernel, hash, &blackwell()),
-            check_cache(kernel, hash, &blackwell()),
+            load_cache_record(kernel, hash, &blackwell(), None),
+            check_cache(kernel, hash, &blackwell(), None),
         )
     })
     .expect("cache dir writable");
@@ -381,12 +428,17 @@ fn a_pre_item10_cache_file_is_refused_not_misread() {
 
 #[test]
 fn a_missing_entry_is_a_miss_not_a_rejection() {
-    let got = load_cache_record("item10_absent_kernel", "item10_absent_hash", &blackwell());
+    let got = load_cache_record(
+        "item10_absent_kernel",
+        "item10_absent_hash",
+        &blackwell(),
+        None,
+    );
     assert_eq!(got, Ok(None), "no file on disk is Ok(None), not an error");
 }
 
 #[test]
-fn only_device_and_key_mismatches_warn() {
+fn expected_states_stay_quiet_and_foreign_entries_warn() {
     // Rationale check for `is_noteworthy`. A schema bump is the expected state
     // of a cache directory right after an upgrade; warning per kernel there
     // trains users to ignore the channel. A foreign entry is the thing nobody
@@ -411,9 +463,31 @@ fn only_device_and_key_mismatches_warn() {
 }
 
 #[test]
-fn reject_descriptions_do_not_panic_on_short_keys() {
-    // `describe` truncates keys to 16 chars for readability; a shorter key must
-    // not index out of bounds.
+fn reject_descriptions_do_not_panic_on_hostile_keys() {
+    // `describe` abbreviates keys for readability. `found` is read verbatim out
+    // of a JSON file on disk, and the whole threat model for that file is that
+    // it came from somewhere else — so it is arbitrary text, not hex.
+    //
+    // Byte-slicing (`&s[..16]`) panicked when byte 16 landed mid-codepoint, and
+    // that panic ran INSIDE the compiler: `nsl build` aborted with "byte index
+    // 16 is not a char boundary" on a cache file with a non-ASCII cache_key.
+    // The original version of this test only used ASCII, so it passed.
+    for hostile in [
+        "日本語日本語日本語日本語",          // multibyte, boundary at 16 is mid-char
+        "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}", // 4-byte codepoints
+        "e\u{301}".repeat(20).as_str(),      // combining marks
+        "",                                   // empty
+        "ab",                                 // shorter than the limit
+        "\u{FEFF}\u{200B}ключ",              // BOM + zero-width + Cyrillic
+    ] {
+        let msg = CacheReject::KeyMismatch {
+            found: hostile.to_string(),
+            expected: "0123456789abcdef0123".to_string(),
+        }
+        .describe();
+        assert!(!msg.is_empty());
+    }
+
     let msg = CacheReject::KeyMismatch {
         found: "ab".to_string(),
         expected: "cd".to_string(),
@@ -432,6 +506,129 @@ fn reject_descriptions_do_not_panic_on_short_keys() {
     );
 }
 
+#[test]
+fn a_stale_cost_model_spec_is_refused() {
+    // The winner a roofline picks is only as good as the GpuSpec it was priced
+    // against, and that spec is deliberately NOT part of the key — it is a
+    // model, not an identity. The realistic drift: a card missing from
+    // GPU_DATABASE gets priced against the A100 default; someone later adds its
+    // real GpuSpec (which csha's fallback message explicitly asks them to do);
+    // the device identity is unchanged, so the key is unchanged, and the
+    // A100-priced winner would survive every rebuild.
+    let kernel = "item10_specdrift_kernel";
+    let hash = "item10_specdrift_hash";
+    let result = AutotuneResult {
+        selection: SelectionMethod::CostModel {
+            spec: "A100-SXM".to_string(),
+        },
+        ..sample_result(&blackwell())
+    };
+    let json = serde_json::to_string(&build_cache_record(hash, kernel, &result)).unwrap();
+
+    let (stale, same) = with_cached_record(kernel, hash, &json, || {
+        (
+            load_cache_record(kernel, hash, &blackwell(), Some("RTX-5070-Ti")),
+            // Anti-vacuity: the SAME spec must still hit, so the rejection above
+            // is attributable to the spec changing and not to the fixture.
+            check_cache(kernel, hash, &blackwell(), Some("A100-SXM")),
+        )
+    })
+    .expect("cache dir writable");
+
+    match stale {
+        Err(CacheReject::CostModelSpecChanged { found, expected }) => {
+            assert_eq!(found, "A100-SXM");
+            assert_eq!(expected, "RTX-5070-Ti");
+        }
+        other => panic!("expected CostModelSpecChanged, got {other:?}"),
+    }
+    assert!(same.is_some(), "an unchanged spec must still be a cache hit");
+}
+
+#[test]
+fn a_measured_record_is_not_invalidated_by_the_cost_model_spec() {
+    // A measurement does not become wrong because the roofline's spec changed —
+    // it never consulted the roofline. Only CostModel records are spec-checked.
+    let kernel = "item10_measured_spec_kernel";
+    let hash = "item10_measured_spec_hash";
+    let json =
+        serde_json::to_string(&build_cache_record(hash, kernel, &sample_result(&blackwell())))
+            .unwrap();
+
+    let hit = with_cached_record(kernel, hash, &json, || {
+        check_cache(kernel, hash, &blackwell(), Some("some-other-spec"))
+    })
+    .expect("cache dir writable");
+
+    assert!(
+        hit.is_some(),
+        "a Measured record must survive a cost-model spec change"
+    );
+}
+
+#[test]
+fn a_foreign_entry_names_both_machines_even_when_its_key_also_differs() {
+    // Ordering check. Both device and key mismatches are disqualifying, but only
+    // the device message names the machines — and the commit that introduced
+    // this validation promised it would. With the key checked first, a record
+    // copied from another machine (which will generally carry that machine's
+    // key too) was reported as a mere filename problem.
+    let kernel = "item10_bothwrong_kernel";
+    let record = build_cache_record("some_other_key", kernel, &sample_result(&hopper()));
+    let json = serde_json::to_string(&record).unwrap();
+
+    let rejected = with_cached_record(kernel, "looked_up_key", &json, || {
+        load_cache_record(kernel, "looked_up_key", &blackwell(), None)
+    })
+    .expect("cache dir writable");
+
+    let Err(reject) = rejected else {
+        panic!("expected a rejection, got {rejected:?}");
+    };
+    assert!(
+        matches!(reject, CacheReject::DeviceMismatch { .. }),
+        "device mismatch must be reported ahead of key mismatch, got {reject:?}"
+    );
+    let msg = reject.describe();
+    assert!(
+        msg.contains("H100-SXM") && msg.contains("RTX 5070 Ti"),
+        "the warning must name both machines, got {msg}"
+    );
+}
+
+#[test]
+fn a_winnerless_result_is_never_written() {
+    // `load_cache_record` refuses an empty winner, so writing one creates a file
+    // that is rejected on every read and rewritten on every miss — a permanent
+    // warn-and-rewrite loop that never converges.
+    let kernel = "item10_emptywinner_kernel";
+    let hash = "item10_emptywinner_hash";
+    let path = cache_dir().join(format!("{kernel}_{hash}.json"));
+    std::fs::remove_file(&path).ok();
+
+    nsl_codegen::autotune::write_cache(
+        hash,
+        kernel,
+        &AutotuneResult {
+            winner: vec![],
+            all_timings: vec![],
+            device: blackwell(),
+            selection: SelectionMethod::Measured,
+        },
+    );
+    assert!(
+        !path.exists(),
+        "a winnerless result must not be persisted at all"
+    );
+
+    // Anti-vacuity: the same call with a winner DOES write, so the assertion
+    // above is about the empty winner and not about write_cache being inert.
+    nsl_codegen::autotune::write_cache(hash, kernel, &sample_result(&blackwell()));
+    let wrote = path.exists();
+    std::fs::remove_file(&path).ok();
+    assert!(wrote, "a normal result must still be written");
+}
+
 // ---------------------------------------------------------------------------
 // Drift gates
 // ---------------------------------------------------------------------------
@@ -446,10 +643,13 @@ fn the_autotune_key_is_not_built_from_the_database_default() {
     let start = src
         .find("fn autotune_select_best")
         .expect("autotune_select_best still exists");
+    // `.expect`, not `.unwrap_or(src.len())`: an end anchor that stops
+    // matching would otherwise silently widen the scanned region to the rest of
+    // the file, and the gate would keep passing on evidence it never had.
     let end = src[start..]
         .find("\n    // ── FlashAttention")
         .map(|o| start + o)
-        .unwrap_or(src.len());
+        .expect("the region-end anchor after autotune_select_best still exists");
     let body = &src[start..end];
 
     assert!(

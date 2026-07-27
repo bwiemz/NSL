@@ -451,7 +451,40 @@ impl Compiler<'_> {
         // so every machine hashed the same device string and reused each
         // other's entries.
         let device = crate::autotune::DeviceIdentity::local();
-        let gpu = crate::gpu_specs::resolve_local_gpu().unwrap_or_else(crate::gpu_specs::default_gpu);
+        let gpu = match crate::gpu_specs::resolve_local_gpu() {
+            Some(spec) => spec,
+            None => {
+                // Say so. The roofline is about to price this kernel against
+                // hardware that is not in this machine, and the only other
+                // trace of that is the `spec` field buried in the cache
+                // record. Once per process, not per kernel.
+                static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                let fallback = crate::gpu_specs::default_gpu();
+                WARNED.get_or_init(|| {
+                    // Two different causes, two different remedies. Telling
+                    // someone to "add a GpuSpec entry" for a build that cannot
+                    // see GPUs at all would send them to the wrong file.
+                    if device.is_real_device() {
+                        eprintln!(
+                            "[autotune] no GpuSpec entry for {} — pricing the roofline against \
+                             {} instead. Variant selection is an estimate for the wrong card; \
+                             add a GpuSpec entry for this device to fix it.",
+                            device.describe(),
+                            fallback.name
+                        );
+                    } else {
+                        eprintln!(
+                            "[autotune] no local GPU to price against ({}) — using {}. \
+                             Variant selection is an estimate for hardware this build cannot \
+                             see; rebuild with --features cuda on the target machine for a \
+                             device-specific selection.",
+                            device.device_name, fallback.name
+                        );
+                    }
+                });
+                fallback
+            }
+        };
         let ast_bytes = format!("{:?}", kernel.body).into_bytes();
         let cache_hash = crate::autotune::hash_kernel_ast(
             kernel_name,
