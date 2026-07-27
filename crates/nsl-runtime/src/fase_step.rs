@@ -262,9 +262,13 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
         "fase_fused_step_multi: list length mismatch"
     );
 
+    // Item 8: collect eligible parameters as `UpdateDesc`s and bucket by
+    // `UpdateKey` before launching, instead of accumulating one flat pointer
+    // table. See `UpdateKey` for why `device` has to be part of the key.
     #[cfg(feature = "cuda")]
-    let mut gpu: (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u32>) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut descs: Vec<UpdateDesc> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let mut batched_thetas: Vec<u64> = Vec::new();
 
     for i in 0..count {
         let (tp, mp_, vp, ap) = unsafe {
@@ -293,16 +297,28 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
                 && th.len <= u32::MAX as i64;
             // Review A1: two param entries can alias ONE theta storage
             // (tied weights). The legacy loop updated them sequentially;
-            // concurrent grid.y slices would race last-writer-wins. Route
+            // concurrent grid slices would race last-writer-wins. Route
             // aliases to the sequential fallback arm (k is small — linear
             // scan is fine).
-            let theta_aliased = gpu.0.contains(&(th.data as u64));
+            //
+            // Kept GLOBAL across all buckets rather than per-bucket, which
+            // would batch slightly more: two aliasing thetas can only land in
+            // different buckets by differing in device or dtype, and an alias
+            // across devices is not a thing this can reason about safely.
+            let theta_aliased = batched_thetas.contains(&(th.data as u64));
             if uniform_gpu_f32 && !theta_aliased {
-                gpu.0.push(th.data as u64);
-                gpu.1.push(m.data as u64);
-                gpu.2.push(v.data as u64);
-                gpu.3.push(a.data as u64);
-                gpu.4.push(th.len as u32);
+                batched_thetas.push(th.data as u64);
+                descs.push(UpdateDesc {
+                    theta: th.data as u64,
+                    m: m.data as u64,
+                    v: v.data as u64,
+                    mp: a.data as u64,
+                    len: th.len as u32,
+                    key: UpdateKey {
+                        device: th.device,
+                        dtype: th.dtype,
+                    },
+                });
                 continue;
             }
         }
@@ -316,31 +332,50 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     }
 
     #[cfg(feature = "cuda")]
-    if !gpu.0.is_empty() {
-        let k = gpu.0.len();
-        crate::cuda::gpu_fase_fused_adamw_step_multi(
-            &gpu.0,
-            &gpu.1,
-            &gpu.2,
-            &gpu.3,
-            &gpu.4,
-            beta1 as f32,
-            one_minus_beta1 as f32,
-            beta2 as f32,
-            one_minus_beta2 as f32,
-            eps as f32,
-            (-lr) as f32,
-            ((-lr) * wd) as f32,
-            bc1_inv as f32,
-            bc2_inv as f32,
-            wd != 0.0,
-        );
-        // Keep the fused-step counter's per-param semantics (gates read it).
-        FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
-        // One-time anti-vacuity marker for the e2e gates.
-        static MARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !MARKED.swap(true, Ordering::Relaxed) {
-            eprintln!("[fase-multi] batched {k} params into one fused AdamW launch");
+    {
+        // One launch per bucket. With a single CUDA device — every
+        // configuration this repo currently builds — there is exactly one
+        // bucket and this is byte-for-byte the previous behaviour.
+        let buckets = bucket_updates(&descs);
+        let n_buckets = buckets.len();
+        for (_key, members) in buckets {
+            let k = members.len();
+            if k == 0 {
+                continue;
+            }
+            let thetas: Vec<u64> = members.iter().map(|d| d.theta).collect();
+            let ms_p: Vec<u64> = members.iter().map(|d| d.m).collect();
+            let vs_p: Vec<u64> = members.iter().map(|d| d.v).collect();
+            let mps_p: Vec<u64> = members.iter().map(|d| d.mp).collect();
+            let lens: Vec<u32> = members.iter().map(|d| d.len).collect();
+            crate::cuda::gpu_fase_fused_adamw_step_multi(
+                &thetas,
+                &ms_p,
+                &vs_p,
+                &mps_p,
+                &lens,
+                beta1 as f32,
+                one_minus_beta1 as f32,
+                beta2 as f32,
+                one_minus_beta2 as f32,
+                eps as f32,
+                (-lr) as f32,
+                ((-lr) * wd) as f32,
+                bc1_inv as f32,
+                bc2_inv as f32,
+                wd != 0.0,
+            );
+            // Keep the fused-step counter's per-param semantics (gates read it).
+            FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
+            // One-time anti-vacuity marker for the e2e gates.
+            static MARKED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !MARKED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[fase-multi] batched {k} params into one fused AdamW launch \
+                     ({n_buckets} bucket(s))"
+                );
+            }
         }
     }
 }
@@ -545,6 +580,618 @@ mod tests {
             }
             for p in [rt, rm, rv, rmp, ft, fm, fv, fmp] {
                 nsl_tensor_free(p);
+            }
+        }
+    }
+}
+
+// ─── Item 8: the multi-tensor update descriptor table ──────────────────────
+//
+// The three items below are used by the CUDA launch path and by the CPU unit
+// tests. The tests deliberately do NOT require the `cuda` feature — the whole
+// point of extracting `build_block_tables` and `bucket_updates` as pure
+// functions is that the batching logic is checked on every build, GPU or not.
+// So they are compiled unconditionally, and dead-code is silenced only for a
+// non-cuda, non-test build where nothing calls them.
+
+/// One parameter's slot in a batched optimizer launch.
+///
+/// The roadmap called this `UpdateDesc`. It is the unit the batching key is
+/// computed FROM and the unit the device tables are built from, so a rule
+/// about which parameters may share a launch has exactly one place to live.
+///
+/// Deliberately NOT `#[repr(C)]`: it never crosses the FFI. The device side
+/// receives parallel arrays — four pointer tables and a length table indexed
+/// by PARAMETER, plus two tables indexed by BLOCK (see
+/// [`build_block_tables`]) — because that is what the kernel indexes. Packing
+/// a struct-of-arrays here and scattering it there would put the layout
+/// contract in two places.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpdateDesc {
+    pub theta: u64,
+    pub m: u64,
+    pub v: u64,
+    pub mp: u64,
+    pub len: u32,
+    pub key: UpdateKey,
+}
+
+/// What must match for two parameters to share one kernel launch.
+///
+/// `device` is the field that matters and the one the pre-item-8 code did not
+/// consider: `NslTensor::device` is `0 = CPU, 1+ = CUDA device ID`, and the
+/// old eligibility test only checked each parameter's four tensors against
+/// EACH OTHER (`t.device == th.device`). Two parameters resident on different
+/// CUDA devices both passed and were pushed into the same pointer table, so a
+/// single launch would have dereferenced pointers from another device's
+/// address space.
+///
+/// Bucketing is a PRECONDITION for handling that, not a fix for it. Nothing
+/// in `gpu_fase_fused_adamw_step_multi` selects a device: `ensure_context()`
+/// sets the one process-wide context chosen at init, so two buckets would both
+/// launch on that context and the second would still dereference the other
+/// device's pointers. What bucketing buys is that the parameters are already
+/// partitioned by device, so making the launch device-aware becomes a change
+/// to one loop rather than a rework of the eligibility test. Whether any of
+/// this is reachable today depends on whether anything sets a device ID above
+/// 1; the single-GPU paths do not.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct UpdateKey {
+    /// CUDA device ID. Parameters on different devices cannot share a launch.
+    pub device: u8,
+    /// Tensor dtype tag. The batched kernel is f32-only; other dtypes never
+    /// reach a bucket today, but the key carries the field so that adding a
+    /// bf16 kernel is a new bucket rather than a new eligibility branch.
+    pub dtype: u16,
+}
+
+/// Map CUDA blocks to (parameter, element offset) for a FLAT launch grid.
+///
+/// The batched AdamW kernel used a rectangular grid `(ceil(max_n/block), k)`,
+/// giving every parameter enough blocks for the LARGEST one. Measured against
+/// Coder-50M's real parameter list (74 params, 38.5M elements, largest 16.4M):
+/// 4,736,000 blocks launched to do 150,562 blocks of work — **96.8% exited
+/// immediately on the bounds guard**, a 31.5x overshoot. It also capped the
+/// parameter count at 65535 (the `grid.y` limit).
+///
+/// MEASURED (RTX 5070 Ti, CUDA 13.3, Coder-50M shapes, 200 iterations, n=3
+/// runs each, spread under 0.2%): rectangular grid 6777.0 us/step, flat grid
+/// 1641.8 us/step — a **4.13x speedup** on the batched AdamW step. The A/B
+/// drove the SAME kernel and changed only the launch shape, so the difference
+/// is block-launch overhead and nothing else.
+///
+/// `item8_gpu_bench` reproduces the FLAT arm only; the rectangular arm no
+/// longer exists in the tree, so the comparison is not re-runnable from the
+/// committed code. To reproduce it, make this function emit
+/// `max(lens).div_ceil(block)` blocks for every parameter (and widen
+/// `total_blocks` to match, or its `debug_assert` fires) and re-run the bench.
+///
+/// Returns `(block_param, block_base)`, both indexed by block id:
+/// `block_param[b]` is the parameter block `b` works on and `block_base[b]`
+/// is the element offset of its first thread within that parameter. The
+/// kernel then needs two loads and no search.
+///
+/// Zero-length parameters get no blocks — they have no work, and emitting a
+/// block for them would reintroduce exactly the wasted launch this removes.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn build_block_tables(lens: &[u32], block: u32) -> (Vec<u32>, Vec<u32>) {
+    assert!(block > 0, "block size must be positive");
+    let total_blocks: usize = lens
+        .iter()
+        .map(|&n| n.div_ceil(block) as usize)
+        .sum();
+    let mut bparam = Vec::with_capacity(total_blocks);
+    let mut bbase = Vec::with_capacity(total_blocks);
+    for (j, &n) in lens.iter().enumerate() {
+        let nb = n.div_ceil(block);
+        for b in 0..nb {
+            bparam.push(j as u32);
+            bbase.push(b * block);
+        }
+    }
+    debug_assert_eq!(bparam.len(), total_blocks);
+    (bparam, bbase)
+}
+
+/// Partition parameters into launch buckets by [`UpdateKey`].
+///
+/// Returns buckets in a deterministic order (sorted by key) so a run is
+/// reproducible and a test can assert on the result. Order across buckets does
+/// not affect numerics — each parameter is touched by exactly one bucket.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn bucket_updates(descs: &[UpdateDesc]) -> Vec<(UpdateKey, Vec<UpdateDesc>)> {
+    let mut keys: Vec<UpdateKey> = descs.iter().map(|d| d.key).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .map(|k| {
+            let members: Vec<UpdateDesc> =
+                descs.iter().copied().filter(|d| d.key == k).collect();
+            (k, members)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod item8_tests {
+    //! Item 8 — CPU-side unit tests for the batching machinery.
+    //!
+    //! The triage noted that the pre-existing module tests cover only the
+    //! single-parameter FFI, so `nsl_fase_fused_adamw_step_multi`'s routing
+    //! had no test at all. These run everywhere (no `#[ignore]`, no CUDA)
+    //! because `build_block_tables` and `bucket_updates` are pure functions —
+    //! which is why they were written as free functions rather than inlined
+    //! into the launch path.
+
+    use super::*;
+
+    fn desc(theta: u64, len: u32, device: u8, dtype: u16) -> UpdateDesc {
+        UpdateDesc {
+            theta,
+            m: theta + 1,
+            v: theta + 2,
+            mp: theta + 3,
+            len,
+            key: UpdateKey { device, dtype },
+        }
+    }
+
+    // ─── build_block_tables ────────────────────────────────────────────────
+
+    #[test]
+    fn block_tables_cover_every_element_exactly_once() {
+        let lens = [1u32, 255, 256, 257, 1000, 16_384_000];
+        let block = 256u32;
+        let (bparam, bbase) = build_block_tables(&lens, block);
+        assert_eq!(bparam.len(), bbase.len());
+
+        // Reconstruct the element set each block covers and check it is a
+        // partition of every parameter's index range. This is the property the
+        // kernel depends on: miss an element and a weight silently stops
+        // updating; double-cover one and it updates twice.
+        let mut covered: Vec<Vec<bool>> =
+            lens.iter().map(|&n| vec![false; n as usize]).collect();
+        for (b, (&j, &base)) in bparam.iter().zip(bbase.iter()).enumerate() {
+            let j = j as usize;
+            assert!(j < lens.len(), "block {b} names parameter {j}, out of range");
+            for t in 0..block {
+                let idx = (base + t) as usize;
+                if idx < lens[j] as usize {
+                    assert!(
+                        !covered[j][idx],
+                        "element {idx} of param {j} covered twice (block {b})"
+                    );
+                    covered[j][idx] = true;
+                }
+            }
+        }
+        for (j, c) in covered.iter().enumerate() {
+            let missed = c.iter().filter(|x| !**x).count();
+            assert_eq!(missed, 0, "param {j} has {missed} uncovered elements");
+        }
+    }
+
+    /// Architecture constants read FROM `models/coder50m/model.nsl` at test
+    /// time, so the fixture cannot quietly stop describing the model.
+    ///
+    /// The first version of this hardcoded VOCAB_SIZE=32000, N_KV_HEADS=2 and
+    /// D_FF=1376 while claiming to be "Coder-50M's real parameter shapes".
+    /// The real values are 49152 / 4 / 1408 — three of five constants wrong,
+    /// giving a 38.5M-parameter list labelled as a ~50M model. It also carried
+    /// an `assert_eq!(lens.len(), 74, "parameter count changed")` that could
+    /// not fire, because the list was built from consts six lines above it:
+    /// the assertion promised drift detection against a file it never read.
+    /// Parsing the file is what makes the promise true.
+    pub(super) fn coder50m_consts() -> std::collections::HashMap<String, i64> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate is two levels below the repo root")
+            .join("models/coder50m/model.nsl");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut out = std::collections::HashMap::new();
+        for line in src.lines() {
+            let Some(rest) = line.trim().strip_prefix("const ") else {
+                continue;
+            };
+            let Some((name, val)) = rest.split_once('=') else {
+                continue;
+            };
+            let val = val.split('#').next().unwrap_or("").trim();
+            if let Ok(v) = val.parse::<i64>() {
+                out.insert(name.trim().to_string(), v);
+            }
+        }
+        for k in ["VOCAB_SIZE", "D_MODEL", "N_LAYERS", "N_HEADS", "N_KV_HEADS", "D_FF"] {
+            assert!(
+                out.contains_key(k),
+                "{k} not found in models/coder50m/model.nsl — the parser or the \
+                 model changed, and every number pinned below is unfounded"
+            );
+        }
+        out
+    }
+
+    /// Coder-50M's weight-tensor lengths, derived from those constants.
+    ///
+    /// Covers the tensors AdamW actually batches: the embedding, the final
+    /// norm, and per block a norm + `wq/wk/wv/wo` + a norm + `w_gate/w_up/
+    /// w_down`. It EXCLUDES the six `full([1])` metadata scalars each
+    /// `GroupedQueryAttention` carries (`_d_model`, `_n_heads`, ...): they are
+    /// one element each, contribute one block each under either grid, and so
+    /// cannot change the conclusion — including them moves the overshoot from
+    /// 38.2x to 62.9x, i.e. it would only flatter the result.
+    pub(super) fn coder50m_param_lens() -> Vec<u32> {
+        let c = coder50m_consts();
+        let d = c["D_MODEL"] as u32;
+        let ff = c["D_FF"] as u32;
+        let heads = c["N_HEADS"] as u32;
+        let kv_heads = c["N_KV_HEADS"] as u32;
+        let head_dim = d / heads;
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        let mut lens = vec![c["VOCAB_SIZE"] as u32 * d, d];
+        for _ in 0..c["N_LAYERS"] {
+            lens.extend_from_slice(&[
+                d,            // attn_norm
+                d * q_dim,    // wq
+                d * kv_dim,   // wk
+                d * kv_dim,   // wv
+                q_dim * d,    // wo
+                d,            // ffn_norm
+                d * ff,       // w_gate
+                d * ff,       // w_up
+                ff * d,       // w_down
+            ]);
+        }
+        lens
+    }
+
+    #[test]
+    fn block_count_matches_the_useful_minimum() {
+        // The whole point: no block that exits immediately.
+        let lens = coder50m_param_lens();
+        let block = 256u32;
+        let (bparam, _) = build_block_tables(&lens, block);
+        let useful: usize = lens.iter().map(|&n| n.div_ceil(block) as usize).sum();
+        assert_eq!(
+            bparam.len(),
+            useful,
+            "the flat grid must launch exactly the blocks that have work"
+        );
+    }
+
+    #[test]
+    fn flat_grid_is_a_large_reduction_at_coder50m_shapes() {
+        // Pins the measurement the change was justified by. The reduction is
+        // bounded above by the parameter count (when one parameter dominates,
+        // rectangular ~= useful * k), so a small synthetic fixture cannot show
+        // it — which is why this derives the real shape list.
+        let lens = coder50m_param_lens();
+        let block = 256u32;
+        let (bparam, _) = build_block_tables(&lens, block);
+        let rectangular =
+            (lens.iter().max().unwrap().div_ceil(block) as usize) * lens.len();
+        let total: u64 = lens.iter().map(|&n| n as u64).sum();
+
+        // Sanity-check the derivation against the model's own header, which
+        // says "~50M parameters". A fixture that silently stopped describing
+        // the model would land far from this.
+        assert!(
+            (45_000_000..55_000_000).contains(&total),
+            "derived {total} weight elements, which is not a ~50M model — the \
+             constants or the field list have drifted"
+        );
+        assert_eq!(lens.len(), 74, "expected 2 + 8*9 weight tensors");
+        assert_eq!(rectangular, 7_274_496);
+        assert_eq!(bparam.len(), 190_498);
+        let factor = rectangular as f64 / bparam.len() as f64;
+        assert!(
+            (38.0..38.5).contains(&factor),
+            "expected ~38.2x fewer blocks at Coder-50M shapes, got {factor:.2}x"
+        );
+    }
+
+    #[test]
+    fn zero_length_parameters_get_no_blocks() {
+        // A zero-length parameter has no work. Emitting a block for it would
+        // reintroduce exactly the wasted launch this change removes, and the
+        // kernel's bounds guard would discard it anyway.
+        let (bparam, _) = build_block_tables(&[0, 256, 0], 256);
+        assert_eq!(bparam, vec![1]);
+    }
+
+    #[test]
+    fn empty_shape_list_yields_no_blocks() {
+        let (bparam, bbase) = build_block_tables(&[], 256);
+        assert!(bparam.is_empty() && bbase.is_empty());
+    }
+
+    // ─── bucket_updates ────────────────────────────────────────────────────
+
+    #[test]
+    fn one_device_and_dtype_means_one_bucket() {
+        // The single-GPU case, i.e. every configuration this repo builds
+        // today. Behaviour must be identical to the pre-item-8 single table.
+        let descs: Vec<UpdateDesc> = (0..8).map(|i| desc(0x1000 + i * 0x100, 64, 1, 1)).collect();
+        let buckets = bucket_updates(&descs);
+        assert_eq!(buckets.len(), 1, "single device+dtype must not split");
+        assert_eq!(buckets[0].1.len(), 8);
+        // Order within a bucket must be preserved: the pointer tables and the
+        // length table are parallel arrays, so a reordering that touched one
+        // and not the other would pair a parameter with another's length.
+        let order: Vec<u64> = buckets[0].1.iter().map(|d| d.theta).collect();
+        let expected: Vec<u64> = descs.iter().map(|d| d.theta).collect();
+        assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn parameters_on_different_devices_never_share_a_launch() {
+        // The defect the key exists to prevent. `NslTensor::device` is a CUDA
+        // device ID, and the pre-item-8 eligibility test compared each
+        // parameter's four tensors only against EACH OTHER — so two params on
+        // devices 1 and 2 both passed and were pushed into the same pointer
+        // table. One launch would then dereference another device's pointers.
+        let descs = vec![
+            desc(0x1000, 64, 1, 1),
+            desc(0x2000, 64, 2, 1),
+            desc(0x3000, 64, 1, 1),
+        ];
+        let buckets = bucket_updates(&descs);
+        assert_eq!(buckets.len(), 2, "two devices must give two buckets");
+        for (key, members) in &buckets {
+            for d in members {
+                assert_eq!(
+                    d.key.device, key.device,
+                    "a bucket contains a parameter from another device"
+                );
+            }
+        }
+        let total: usize = buckets.iter().map(|(_, m)| m.len()).sum();
+        assert_eq!(total, 3, "bucketing must not drop or duplicate a parameter");
+    }
+
+    #[test]
+    fn differing_dtype_splits_buckets() {
+        let descs = vec![desc(0x1000, 64, 1, 1), desc(0x2000, 64, 1, 2)];
+        assert_eq!(bucket_updates(&descs).len(), 2);
+    }
+
+    #[test]
+    fn bucketing_is_a_partition() {
+        // Every parameter appears in exactly one bucket. Losing one silently
+        // stops a weight updating; duplicating one applies AdamW twice.
+        let descs: Vec<UpdateDesc> = (0..20)
+            .map(|i| desc(0x1000 + i * 0x100, 32 + i as u32, (i % 3) as u8, (i % 2) as u16))
+            .collect();
+        let buckets = bucket_updates(&descs);
+        let mut seen: Vec<u64> = buckets
+            .iter()
+            .flat_map(|(_, m)| m.iter().map(|d| d.theta))
+            .collect();
+        seen.sort_unstable();
+        let mut expected: Vec<u64> = descs.iter().map(|d| d.theta).collect();
+        expected.sort_unstable();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn empty_input_yields_no_buckets() {
+        assert!(bucket_updates(&[]).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod item8_gpu_bench {
+    //! Item 8 — measure the flat-grid launch at real shapes.
+    //!
+    //! In-crate rather than an integration test because
+    //! `crate::cuda::gpu_fase_fused_adamw_step_multi` is `pub(crate)` and a
+    //! benchmark is not a reason to widen the public surface.
+    //!
+    //! This is a MEASUREMENT, not a correctness gate. Numerical parity is held
+    //! by `crates/nsl-cli/tests/multi_adamw_gate.rs`
+    //! (`multi_adamw_gpu_bit_identical_and_fires`), which was verified to fail
+    //! on a one-element offset in the block table — so it genuinely exercises
+    //! this path rather than passing on a fallback.
+    //!
+    //! ```bash
+    //! cargo test -p nsl-runtime --features cuda --lib item8_gpu_bench \
+    //!     -- --ignored --nocapture --test-threads=1
+    //! ```
+
+    use super::super::cuda::{gpu_fase_fused_adamw_step_multi, nsl_cuda_init};
+    use crate::{nsl_test_cuda_alloc, nsl_test_cuda_free, nsl_test_cuda_h2d};
+
+    /// Reuses the shape list the CPU tests derive from
+    /// `models/coder50m/model.nsl`, rather than a second copy of the
+    /// constants — a duplicated fixture is exactly how the first version of
+    /// this work ended up describing a model that does not exist.
+    use super::item8_tests::coder50m_param_lens;
+
+    /// Numerical correctness on UNALIGNED parameter lengths.
+    ///
+    /// The existing parity gate (`crates/nsl-cli/tests/multi_adamw_gate.rs`)
+    /// drives `cuda_graph_gate.nsl`, whose six parameters are 2048/8192/8192/
+    /// 8192/8192/2048 elements — every one an exact multiple of the 256-thread
+    /// block. The kernel's `i >= n` bounds guard is therefore never taken on
+    /// any path that gate covers, so a regression in partial-block handling
+    /// would be caught by the CPU table test and by nothing that runs the
+    /// actual kernel. Review found that gap; this closes it.
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn unaligned_parameter_lengths_are_numerically_correct() {
+        if unsafe { nsl_cuda_init() } != 0 {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        // Deliberately awkward: 1 element, one short of a block, one over a
+        // block boundary, a prime, and a large non-multiple.
+        let lens: Vec<u32> = vec![1, 255, 257, 1021, 70_001];
+        let k = lens.len();
+
+        // Distinct per-element values so a cross-parameter write or a skipped
+        // tail shows up as a wrong number rather than a coincidence.
+        let host: Vec<Vec<f32>> = lens
+            .iter()
+            .enumerate()
+            .map(|(j, &n)| {
+                (0..n)
+                    .map(|i| ((j as f32 + 1.0) * 0.5) + (i as f32) * 1e-4)
+                    .collect()
+            })
+            .collect();
+
+        let mut bufs: Vec<[i64; 4]> = Vec::with_capacity(k);
+        for (j, &n) in lens.iter().enumerate() {
+            let bytes = n as i64 * 4;
+            let mut quad = [0i64; 4];
+            for (slot_idx, slot) in quad.iter_mut().enumerate() {
+                let d = unsafe { nsl_test_cuda_alloc(bytes) };
+                assert!(d != 0, "device alloc failed");
+                // theta/m/v/mp all seeded from the same distinct pattern.
+                let src: Vec<f32> = if slot_idx == 3 {
+                    host[j].iter().map(|x| x * 0.1).collect()
+                } else {
+                    host[j].clone()
+                };
+                unsafe { nsl_test_cuda_h2d(d, src.as_ptr() as i64, bytes) };
+                *slot = d;
+            }
+            bufs.push(quad);
+        }
+        let thetas: Vec<u64> = bufs.iter().map(|q| q[0] as u64).collect();
+        let ms: Vec<u64> = bufs.iter().map(|q| q[1] as u64).collect();
+        let vs: Vec<u64> = bufs.iter().map(|q| q[2] as u64).collect();
+        let mps: Vec<u64> = bufs.iter().map(|q| q[3] as u64).collect();
+
+        let (b1, omb1, b2, omb2) = (0.9f32, 0.1f32, 0.95f32, 0.05f32);
+        let (eps, neg_lr, neg_lr_wd, bc1, bc2) =
+            (1e-8f32, -1e-3f32, -1e-5f32, 1.0f32, 1.0f32);
+        gpu_fase_fused_adamw_step_multi(
+            &thetas, &ms, &vs, &mps, &lens, b1, omb1, b2, omb2, eps, neg_lr,
+            neg_lr_wd, bc1, bc2, true,
+        );
+
+        // Same arithmetic as the kernel, in f32, on the host.
+        for (j, &n) in lens.iter().enumerate() {
+            let mut got = vec![0f32; n as usize];
+            unsafe {
+                crate::nsl_test_cuda_d2h(
+                    got.as_mut_ptr() as i64,
+                    bufs[j][0],
+                    n as i64 * 4,
+                )
+            };
+            for i in 0..n as usize {
+                let theta = host[j][i];
+                let m0 = host[j][i];
+                let v0 = host[j][i];
+                let g = host[j][i] * 0.1;
+                let m = m0 * b1 + g * omb1;
+                let v = v0 * b2 + (g * g) * omb2;
+                let mut upd = (m * bc1) / ((v * bc2).sqrt() + eps) * neg_lr;
+                upd += theta * neg_lr_wd;
+                let want = theta + upd;
+                let err = (got[i] - want).abs() / want.abs().max(1e-3);
+                assert!(
+                    err < 1e-4,
+                    "param {j} (len {n}) element {i}: got {}, want {want} \
+                     (rel err {err:.2e}). A wrong value in the LAST partial \
+                     block means the bounds guard or the block base is off; a \
+                     wrong value elsewhere means cross-parameter indexing.",
+                    got[i]
+                );
+            }
+        }
+
+        for q in bufs {
+            for d in q {
+                unsafe { nsl_test_cuda_free(d) };
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn flat_grid_multi_adamw_step_at_coder50m_shapes() {
+        if unsafe { nsl_cuda_init() } != 0 {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let lens = coder50m_param_lens();
+        let k = lens.len();
+        let total: u64 = lens.iter().map(|&n| n as u64).sum();
+        assert_eq!(k, 74, "parameter count changed; re-derive the numbers below");
+
+        let mut bufs: Vec<[i64; 4]> = Vec::with_capacity(k);
+        for &n in &lens {
+            let bytes = n as i64 * 4;
+            let host = vec![0.01f32; n as usize];
+            let mut quad = [0i64; 4];
+            for slot in quad.iter_mut() {
+                let d = unsafe { nsl_test_cuda_alloc(bytes) };
+                assert!(d != 0, "device alloc failed");
+                unsafe { nsl_test_cuda_h2d(d, host.as_ptr() as i64, bytes) };
+                *slot = d;
+            }
+            bufs.push(quad);
+        }
+        let thetas: Vec<u64> = bufs.iter().map(|q| q[0] as u64).collect();
+        let ms: Vec<u64> = bufs.iter().map(|q| q[1] as u64).collect();
+        let vs: Vec<u64> = bufs.iter().map(|q| q[2] as u64).collect();
+        let mps: Vec<u64> = bufs.iter().map(|q| q[3] as u64).collect();
+
+        let step = || {
+            gpu_fase_fused_adamw_step_multi(
+                &thetas, &ms, &vs, &mps, &lens, 0.9, 0.1, 0.95, 0.05, 1e-8, -1e-3, -1e-5,
+                1.0, 1.0, true,
+            );
+        };
+
+        // Warm up: the first call builds and uploads the block tables and
+        // loads the module. Timing that would measure setup, not the launch.
+        for _ in 0..5 {
+            step();
+        }
+
+        let iters = 200;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            step();
+        }
+        let per_step_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        let block = 256u32;
+        let useful: u64 = lens.iter().map(|&n| n.div_ceil(block) as u64).sum();
+        let rectangular = (*lens.iter().max().unwrap()).div_ceil(block) as u64 * k as u64;
+        eprintln!(
+            "multi AdamW @ Coder-50M: k={k}, {total} elems\n  \
+             flat grid  : {useful} blocks\n  \
+             rectangular: {rectangular} blocks ({:.1}x more)\n  \
+             measured   : {per_step_us:.1} us/step over {iters} iters",
+            rectangular as f64 / useful as f64
+        );
+
+        // Anti-vacuity. Four f32 arrays are read (theta, m, v, m_partial) and
+        // FOUR written (m, v, theta, and m_partial's zeroing) = 8 * 4 bytes
+        // per element. At 900 GB/s — just above the 5070 Ti's 896 GB/s spec,
+        // so an unachievable ceiling and therefore a true lower bound on time
+        // — that is a floor no correct kernel can beat. A launch that silently
+        // did nothing would land far below it.
+        let floor_us = (total * 4 * 8) as f64 / 900e9 * 1e6;
+        assert!(
+            per_step_us > floor_us * 0.5,
+            "measured {per_step_us:.1} us is below half the bandwidth floor \
+             ({floor_us:.1} us) — the kernel cannot have touched the data"
+        );
+
+        for q in bufs {
+            for d in q {
+                unsafe { nsl_test_cuda_free(d) };
             }
         }
     }

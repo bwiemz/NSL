@@ -1255,13 +1255,41 @@ DONE: ret;\n\
 }\0";
 
 // Fusion-queue item 1: MULTI-TENSOR fused AdamW step. One launch updates
-// every parameter: grid.y = parameter index, base pointers read from device
-// pointer tables, per-parameter length from ntab (blocks past a shorter
-// param's end exit immediately). The arithmetic body is byte-for-byte the
+// every parameter, with base pointers read from device pointer tables and
+// per-parameter length from ntab. The arithmetic body is byte-for-byte the
 // FASE_FUSED_ADAMW_STEP_F32_PTX sequence (same roundings, same div.approx),
 // so per-element results are BIT-IDENTICAL to the per-param launches. The
 // shared tail's m_partial zeroing is folded in (store 0 after the read) —
 // value-identical to the separate nsl_tensor_zero_inplace pass it replaces.
+//
+// (Roadmap item 8 replaced the original `grid.y = parameter index` mapping;
+// the doc comment below describes what it does now. This paragraph used to
+// end "blocks past a shorter param's end exit immediately", which was the
+// waste item 8 removed.)
+/// Multi-parameter fused AdamW, FLAT grid (roadmap item 8).
+///
+/// Was a rectangular grid: `(ceil(max_n/256), k, 1)`, i.e. every parameter got
+/// enough blocks for the LARGEST parameter and the surplus exited on the
+/// bounds guard. Measured on Coder-50M's real parameter list (74 params,
+/// 38.5M elements, largest 16.4M): 4,736,000 blocks launched for 150,562
+/// blocks of work — 96.8% exited immediately, a 31.5x overshoot.
+///
+/// Now the host precomputes two u32 tables indexed by BLOCK id — `bptab[b]`
+/// is the parameter that block `b` works on, `bbtab[b]` is the element offset
+/// of that block's first thread within the parameter — so the grid is
+/// `(sum(ceil(n_i/256)), 1, 1)` with no wasted blocks and no binary search in
+/// the kernel. The tables depend only on the shape list, so they are built
+/// once and cached until it changes.
+///
+/// Dropping grid.y also removes the 65535-parameter cap.
+///
+/// CONTRACT: the kernel no longer reads `%ntid.x`, so `blockDim.x` at launch
+/// MUST equal the `block` argument `build_block_tables` was called with. Both
+/// come from the single `let block = 256i64` in
+/// `gpu_fase_fused_adamw_step_multi`, so they cannot currently desync — but if
+/// they ever did, a smaller `blockDim` silently skips elements (weights stop
+/// updating) and a larger one applies AdamW twice to the overlap. Neither is
+/// caught by any test, because no test can vary the two independently.
 pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_70\n\
@@ -1272,10 +1300,11 @@ pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
     .param .u64 ntab,\n\
     .param .f32 b1, .param .f32 omb1, .param .f32 b2, .param .f32 omb2,\n\
     .param .f32 eps, .param .f32 neg_lr, .param .f32 neg_lr_wd,\n\
-    .param .f32 bc1, .param .f32 bc2, .param .u32 has_wd\n\
+    .param .f32 bc1, .param .f32 bc2, .param .u32 has_wd,\n\
+    .param .u64 bptab, .param .u64 bbtab\n\
 ) {\n\
-    .reg .u32 %r<8>;\n\
-    .reg .u64 %rd<10>;\n\
+    .reg .u32 %r<10>;\n\
+    .reg .u64 %rd<12>;\n\
     .reg .f32 %fs<16>;\n\
     .reg .pred %p<3>;\n\
     ld.param.u64 %rd1, [ttab];\n\
@@ -1293,12 +1322,17 @@ pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
     ld.param.f32 %fs8, [bc1];\n\
     ld.param.f32 %fs9, [bc2];\n\
     ld.param.u32 %r4, [has_wd];\n\
-    mov.u32 %r5, %ctaid.y;\n\
+    ld.param.u64 %rd10, [bptab];\n\
+    ld.param.u64 %rd11, [bbtab];\n\
     mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
+    cvt.u64.u32 %rd6, %r1;\n\
+    shl.b64 %rd7, %rd6, 2;\n\
+    add.u64 %rd8, %rd10, %rd7;\n\
+    ld.global.u32 %r5, [%rd8];\n\
+    add.u64 %rd8, %rd11, %rd7;\n\
+    ld.global.u32 %r7, [%rd8];\n\
     mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
+    add.u32 %r3, %r7, %r1;\n\
     cvt.u64.u32 %rd6, %r5;\n\
     shl.b64 %rd7, %rd6, 2;\n\
     add.u64 %rd8, %rd5, %rd7;\n\

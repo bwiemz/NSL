@@ -3053,13 +3053,23 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         k == m_ptrs.len() && k == v_ptrs.len() && k == mp_ptrs.len() && k == lens.len(),
         "multi adamw: table length mismatch"
     );
-    assert!(k <= 65535, "multi adamw: grid.y cap exceeded ({k})");
+    // No grid.y cap any more: the grid is flat (item 8). The old
+    // `assert!(k <= 65535)` guarded `grid.y`, which no longer exists.
 
     struct MultiWs {
         cap: usize,
         stage: u64,   // pinned host: 4*cap u64 + cap u32
         tabs: [u64; 4], // device u64 tables
         ntab: u64,    // device u32 table
+        /// Item 8: block -> (param index, element base) tables, and the shape
+        /// list they were built from. These depend ONLY on the shapes, which
+        /// are static across training steps, so rebuilding them every step
+        /// would be a pure per-step H2D cost (1.2 MB at Coder-50M). Cached and
+        /// rebuilt only when `lens` changes.
+        blk_lens: Vec<u32>,
+        blk_param: u64,  // device u32[nblocks]
+        blk_base: u64,   // device u32[nblocks]
+        blk_count: usize,
     }
     thread_local! {
         static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
@@ -3082,6 +3092,10 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                         inner::free_managed(t as *mut c_void);
                     }
                     inner::free_managed(old.ntab as *mut c_void);
+                    if old.blk_param != 0 {
+                        inner::free_managed(old.blk_param as *mut c_void);
+                        inner::free_managed(old.blk_base as *mut c_void);
+                    }
                     cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
                 }
                 let mut stage: *mut c_void = std::ptr::null_mut();
@@ -3099,7 +3113,16 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                     inner::alloc_managed(k * 8) as u64,
                 ];
                 let ntab = inner::alloc_managed(k * 4) as u64;
-                let fresh = Box::into_raw(Box::new(MultiWs { cap: k, stage: stage as u64, tabs, ntab }));
+                let fresh = Box::into_raw(Box::new(MultiWs {
+                    cap: k,
+                    stage: stage as u64,
+                    tabs,
+                    ntab,
+                    blk_lens: Vec::new(),
+                    blk_param: 0,
+                    blk_base: 0,
+                    blk_count: 0,
+                }));
                 c.set(fresh);
             }
         } else {
@@ -3141,7 +3164,43 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         up(ws.ntab, 4 * ws.cap * 8, k * 4);
     }
 
-    let max_n = *lens.iter().max().unwrap() as i64;
+    // Item 8: (re)build the block -> param / element-base tables when the
+    // shape list changes. `build_block_tables` is a pure function of `lens`
+    // and is unit-tested on the CPU (`fase_step::item8_tests`).
+    let block = 256i64;
+    if ws.blk_lens != lens {
+        let (bparam, bbase) = crate::fase_step::build_block_tables(lens, block as u32);
+        let nblocks = bparam.len();
+        unsafe {
+            inner::ensure_context();
+            // The previous step's launch may still be reading these.
+            let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+            assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            if ws.blk_param != 0 {
+                inner::free_managed(ws.blk_param as *mut c_void);
+                inner::free_managed(ws.blk_base as *mut c_void);
+            }
+            ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
+            ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
+            let cp = |dst: u64, src: &[u32]| {
+                let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    dst,
+                    src.as_ptr() as *const c_void,
+                    src.len() * 4,
+                );
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi adamw: block table upload failed"
+                );
+            };
+            cp(ws.blk_param, &bparam);
+            cp(ws.blk_base, &bbase);
+        }
+        ws.blk_count = nblocks;
+        ws.blk_lens = lens.to_vec();
+    }
+
     let mut a0 = ws.tabs[0];
     let mut a1 = ws.tabs[1];
     let mut a2 = ws.tabs[2];
@@ -3151,6 +3210,8 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
         (eps, neg_lr, neg_lr_wd, bc1, bc2);
     let mut has_wd_val: u32 = u32::from(has_wd);
+    let mut a5 = ws.blk_param;
+    let mut a6 = ws.blk_base;
     let args = [
         &mut a0 as *mut _ as *mut c_void,
         &mut a1 as *mut _ as *mut c_void,
@@ -3167,13 +3228,14 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut bc1 as *mut _ as *mut c_void,
         &mut bc2 as *mut _ as *mut c_void,
         &mut has_wd_val as *mut _ as *mut c_void,
+        &mut a5 as *mut _ as *mut c_void,
+        &mut a6 as *mut _ as *mut c_void,
     ];
-    let block = 256i64;
-    let grid_x = (max_n + block - 1) / block;
+    let grid_x = ws.blk_count as i64;
     let result = inner::kernel_launch(
         kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
         b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
-        [grid_x, k as i64, 1], [block, 1, 1], &args, 0,
+        [grid_x, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
         result as u32, 0,
