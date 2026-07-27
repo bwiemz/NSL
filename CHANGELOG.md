@@ -6,6 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — a weight-grad gemm and a plain gemm recorded as the SAME cuda-graph op
+
+- `GpuOp::Sgemm` carried `(a, b, c, m, n, k, alpha, beta)` and no operand
+  transposition. `sgemm_wgrad_accum` and `sgemm_row_major` both call
+  `on_sgemm` with those eight values but hand cuBLAS different mappings —
+  `OP_N/OP_T` for the weight-gradient contraction versus `OP_N/OP_N` with the
+  row-major swap — so under `--cuda-graphs` the two compared EQUAL over the
+  same buffers, and eager repair reconstructed whichever it held as a plain
+  row-major gemm. Silently wrong gradients, no error. Latent before item 9;
+  `OP_T` on the general matmul path would have made it reachable from every
+  model instead of only the weight-gradient fusion.
+- `GpuOp::Sgemm` gains `kind` (`RowMajor` / `WgradAccum`) plus `transa`/`transb`,
+  in equality, in the digest, and in replay dispatch.
+
+### Fixed — GPU matmul read non-f32 tensors as f32, two bytes for one
+
+- `gpu_matmul_f32` never inspected `.dtype`: it sizes the output `* 4`,
+  hardcodes the output dtype to f32, and casts `a.data as *const f32`. A bf16
+  or f16 operand carries the same element COUNT in half the bytes, so it was
+  read past the end of its allocation — returning plausible numbers rather
+  than faulting. It now refuses, naming the dtypes. Mixed-precision GEMM
+  dispatch is roadmap item 9 and remains unimplemented; saying so is the only
+  honest option.
+- Relatedly, `gpu_matmul_f32` returns 0 on a cuBLAS error with a comment
+  saying that is "so callers can detect the failure". No caller ever did — the
+  null propagated and the process died wherever it was next dereferenced.
+  `nsl_tensor_matmul` now checks it, with the shapes still in scope.
+
+### Added — `NSL_MATMUL_TRANSPOSE_VIEWS=1`: CUBLAS_OP_T for transposed operands (opt-in, and the default is faster)
+
+- A 2-D transposed view can go to cuBLAS as `OP_T` instead of being copied.
+  For the weight-tied LM head (`x @ embed.transpose(0,1)`,
+  models/coder50m/model.nsl:80) the copy is 25,165,824 elements — 96 MiB per
+  forward, through a kernel doing a software 64-bit div/rem per element. On a
+  Coder-50M forward, `nsl_strided_copy_f32` was the most-launched kernel of
+  all: 105 of 308 launches, 453 MB moved.
+- **The obvious conclusion is wrong, and only measurement caught it.** That
+  copy is not waste; it buys a much faster GEMM:
+
+  | shape | `OP_T` | copy + `OP_N` | verdict |
+  |---|---|---|---|
+  | `[2048,512] @ [512,49152]` (LM head) | 5.92 ms | 1.04 + 2.89 = **3.93 ms** | OP_T **1.51x slower** |
+  | `[2048,512] @ [512,4096]` | 0.344 ms | 0.351 ms | a wash |
+  | `[512,512] @ [512,512]` | **0.023 ms** | 0.043 ms | OP_T 1.9x faster |
+
+  End to end: 29 ms/forward with the copy, 33 ms without; peak GPU 2.10 GB
+  versus 2.01 GB. So it trades ~90 MB of peak memory for ~4 ms per forward —
+  useful when memory binds, a regression otherwise. Hence opt-in, and hence a
+  gate asserting the default still materialises.
+- Not defaulted on behind a shape heuristic: three data points is not a cost
+  model, and this repo already shipped one of those (item 10's autotune DB
+  ranked variants by a roofline estimate with no measurement behind it).
+
 ### Fixed — every transformer projection ran on a naive scalar PTX kernel, not cuBLAS
 
 - `gpu_matmul_f32` dispatched to cuBLAS **only when `total_batch == 1`**;

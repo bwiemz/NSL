@@ -118,6 +118,21 @@ mod imp {
         }
     }
 
+    /// Which cuBLAS wrapper a recorded `GpuOp::Sgemm` came from.
+    ///
+    /// Replay must call the same one: the wrappers differ in operand order,
+    /// transposition and leading dimensions, so reconstructing a weight-grad
+    /// contraction through the row-major wrapper computes a different (and
+    /// silently plausible) product.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum SgemmKind {
+        /// `sgemm_row_major` / `sgemm_batched_row_major` — row-major operands
+        /// with the `C^T = B^T A^T` swap.
+        RowMajor,
+        /// `sgemm_wgrad_accum` — `C[d,o] = alpha * X[N,d]^T @ G[N,o] + beta*C`.
+        WgradAccum,
+    }
+
     /// One recorded GPU interaction. Everything needed both to compare a
     /// later step's issuance for equality and to eagerly re-issue the op
     /// during self-repair.
@@ -137,6 +152,26 @@ mod imp {
             name: String,
         },
         Sgemm {
+            /// WHICH cuBLAS wrapper produced this, and therefore which one
+            /// must reproduce it on replay.
+            ///
+            /// Not cosmetic. `sgemm_wgrad_accum` and `sgemm_row_major` both
+            /// call `on_sgemm` with `(a, b, c, m, n, k, alpha, beta)`, but
+            /// they hand cuBLAS completely different operand mappings —
+            /// `OP_N/OP_N` with the row-major swap versus `OP_N/OP_T` for the
+            /// weight-gradient contraction. Without this field a wgrad gemm
+            /// and a plain gemm over the same three buffers with the same
+            /// three dims compare EQUAL, and eager repair replays either one
+            /// as `sgemm_row_major`. That was true before item 9 and is why
+            /// this field exists now: OP_T on the general matmul path makes
+            /// the collision reachable from every model instead of only from
+            /// the weight-gradient fusion.
+            kind: SgemmKind,
+            /// Operand transposition, for the row-major wrapper. `lda`/`ldb`
+            /// are derived from these plus (m, n, k) inside the wrapper, so
+            /// recording the flags pins the leading dimensions too.
+            transa: bool,
+            transb: bool,
             a: usize,
             b: usize,
             c: usize,
@@ -208,15 +243,18 @@ mod imp {
                 ) => func == f2 && grid == g2 && block == b2 && shared == s2 && params == p2 && offsets == o2,
                 (
                     GpuOp::Sgemm {
+                        kind, transa, transb,
                         a, b, c, m, n, k, alpha_bits, beta_bits,
                         batch, stride_a, stride_b, stride_c,
                     },
                     GpuOp::Sgemm {
+                        kind: kd2, transa: ta2, transb: tb2,
                         a: a2, b: b2, c: c2, m: m2, n: n2, k: k2,
                         alpha_bits: al2, beta_bits: be2,
                         batch: bt2, stride_a: sa2, stride_b: sb2, stride_c: sc2,
                     },
-                ) => a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2
+                ) => kind == kd2 && transa == ta2 && transb == tb2
+                    && a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2
                     && alpha_bits == al2 && beta_bits == be2
                     && batch == bt2 && stride_a == sa2 && stride_b == sb2 && stride_c == sc2,
                 (GpuOp::Memset { dst, bytes }, GpuOp::Memset { dst: d2, bytes: n2 }) => {
@@ -356,11 +394,22 @@ mod imp {
                     eat(&(offsets.len() as u64).to_le_bytes());
                     eat(params);
                 }
-                GpuOp::Sgemm { a, b, c, m, n, k, batch, stride_a, stride_b, stride_c, .. } => {
+                GpuOp::Sgemm {
+                    kind, transa, transb,
+                    a, b, c, m, n, k, batch, stride_a, stride_b, stride_c, ..
+                } => {
                     eat(&[2]);
-                    // Batch geometry is digested for the same reason it is
-                    // compared: a batched product and a single-slice one over
-                    // the same buffers must not hash alike.
+                    // Wrapper identity and transposition are digested for the
+                    // same reason batch geometry is: two calls that produce
+                    // different products must not hash alike.
+                    eat(&[
+                        match kind {
+                            SgemmKind::RowMajor => 0u8,
+                            SgemmKind::WgradAccum => 1u8,
+                        },
+                        u8::from(*transa),
+                        u8::from(*transb),
+                    ]);
                     for v in [
                         *a as u64, *b as u64, *c as u64, *m, *n, *k,
                         *batch, *stride_a, *stride_b, *stride_c,
@@ -425,32 +474,42 @@ mod imp {
                     );
                 }
                 GpuOp::Sgemm {
+                    kind, transa, transb,
                     a, b, c, m, n, k, alpha_bits, beta_bits,
                     batch, stride_a, stride_b, stride_c,
                 } => {
-                    let r = if *batch == 1 {
-                        unsafe {
-                            crate::cuda::cublas_inner::sgemm_row_major(
+                    let (alpha, beta) = (f32::from_bits(*alpha_bits), f32::from_bits(*beta_bits));
+                    // Dispatch on `kind`, not on shape. Replaying a
+                    // weight-gradient contraction through `sgemm_row_major`
+                    // would recompute a DIFFERENT product from the same three
+                    // buffers — no error, no crash, just a wrong gradient.
+                    let r = match (kind, *batch) {
+                        (SgemmKind::RowMajor, 1) => unsafe {
+                            crate::cuda::cublas_inner::sgemm_row_major_t(
                                 *a as *const f32,
                                 *b as *const f32,
                                 *c as *mut f32,
-                                *m, *n, *k,
-                                f32::from_bits(*alpha_bits),
-                                f32::from_bits(*beta_bits),
+                                *m, *n, *k, *transa, *transb, alpha, beta,
                             )
-                        }
-                    } else {
-                        unsafe {
+                        },
+                        (SgemmKind::RowMajor, _) => unsafe {
                             crate::cuda::cublas_inner::sgemm_batched_row_major(
                                 *a as *const f32,
                                 *b as *const f32,
                                 *c as *mut f32,
                                 *m, *n, *k,
                                 *batch, *stride_a, *stride_b, *stride_c,
-                                f32::from_bits(*alpha_bits),
-                                f32::from_bits(*beta_bits),
+                                alpha, beta,
                             )
-                        }
+                        },
+                        (SgemmKind::WgradAccum, _) => unsafe {
+                            crate::cuda::cublas_inner::sgemm_wgrad_accum(
+                                *a as *const f32,
+                                *b as *const f32,
+                                *c as *mut f32,
+                                *m, *n, *k, alpha, beta,
+                            )
+                        },
                     };
                     assert!(r.is_ok(), "[cuda-graph] eager-repair sgemm failed: {r:?}");
                 }
@@ -525,12 +584,13 @@ mod imp {
                     );
                 }
                 (
-                    GpuOp::Sgemm { a: aa, b: ab, c: ac, batch: abt, .. },
-                    GpuOp::Sgemm { a: ba, b: bb, c: bc, batch: bbt, .. },
+                    GpuOp::Sgemm { a: aa, b: ab, c: ac, batch: abt, kind: akd, .. },
+                    GpuOp::Sgemm { a: ba, b: bb, c: bc, batch: bbt, kind: bkd, .. },
                 ) => {
                     eprintln!(
                         "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs \
-                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} vs ({ba:#x},{bb:#x},{bc:#x}) batch={bbt}"
+                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} vs \
+                         ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?}"
                     );
                 }
                 _ => {
@@ -540,8 +600,11 @@ mod imp {
                             params.len(),
                             &params[..params.len().min(48)]
                         ),
-                        GpuOp::Sgemm { a, b, c, m, n, k, batch, .. } => {
-                            format!("sgemm a={a:#x} b={b:#x} c={c:#x} {m}x{n}x{k} batch={batch}")
+                        GpuOp::Sgemm { a, b, c, m, n, k, batch, kind, transa, transb, .. } => {
+                            format!(
+                                "sgemm[{kind:?} ta={transa} tb={transb}] a={a:#x} b={b:#x} \
+                                 c={c:#x} {m}x{n}x{k} batch={batch}"
+                            )
                         }
                         GpuOp::Memset { dst, bytes } => format!("memset dst={dst:#x} n={bytes}"),
                         GpuOp::HtoD { dst, len, .. } => format!("htod dst={dst:#x} n={len}"),
@@ -1060,11 +1123,10 @@ mod imp {
     pub fn on_sgemm(
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
     ) -> bool {
-        // A plain sgemm is the one-slice case. The strides are the natural
-        // per-slice extents rather than 0 so that a `batch = 1` op recorded
-        // here and one recorded by `on_sgemm_batched` for a genuinely
-        // single-slice batched call describe the same geometry.
-        on_sgemm_batched(a, b, c, m, n, k, alpha, beta, 1, m * k, k * n, m * n)
+        on_sgemm_full(
+            SgemmKind::RowMajor, false, false,
+            a, b, c, m, n, k, alpha, beta, 1, m * k, k * n, m * n,
+        )
     }
 
     /// Hook for `sgemm_batched_row_major` (item 9). Same contract as
@@ -1074,10 +1136,29 @@ mod imp {
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
         batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
     ) -> bool {
+        on_sgemm_full(
+            SgemmKind::RowMajor, false, false,
+            a, b, c, m, n, k, alpha, beta, batch, stride_a, stride_b, stride_c,
+        )
+    }
+
+    /// The full hook. Every cuBLAS gemm wrapper routes here so that ops which
+    /// differ in wrapper or transposition cannot compare equal.
+    ///
+    /// The `strides` for a `batch == 1` op are the natural per-slice extents
+    /// rather than 0, so a single-slice call recorded through the batched hook
+    /// and one recorded through `on_sgemm` describe the same geometry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_sgemm_full(
+        kind: SgemmKind, transa: bool, transb: bool,
+        a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
+        batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
+    ) -> bool {
         if !enabled() {
             return true;
         }
         let op = GpuOp::Sgemm {
+            kind, transa, transb,
             a, b, c, m, n, k,
             alpha_bits: alpha.to_bits(),
             beta_bits: beta.to_bits(),
@@ -1469,6 +1550,6 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 #[cfg(feature = "cuda")]
 pub(crate) use imp::{
     in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm, on_sgemm_batched,
-    queue_deferred_free, taint,
-    MemsetAction,
+    on_sgemm_full, queue_deferred_free, taint,
+    MemsetAction, SgemmKind,
 };

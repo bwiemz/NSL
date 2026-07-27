@@ -2204,6 +2204,99 @@ pub(crate) mod cublas_inner {
         )
     }
 
+    /// `sgemm_row_major`, but either operand may be supplied as a TRANSPOSED
+    /// 2-D view instead of being materialised first (item 9 phase 2).
+    ///
+    /// `transa` means: the buffer at `a_dev` is stored as a contiguous
+    /// row-major `[k, m]`, and the caller wants its transpose `[m, k]`. Same
+    /// for `transb` with `[n, k]` -> `[k, n]`. This is exactly what NSL's
+    /// `.transpose(0, 1)` on a 2-D tensor produces — a view with swapped
+    /// shape and swapped strides over an untouched buffer.
+    ///
+    /// ## Deriving the ops and leading dimensions
+    ///
+    /// The wrapper computes `C_row = A_row @ B_row` by asking cuBLAS (which is
+    /// column-major) for `C^T = B^T A^T`, exploiting that a row-major `[p, q]`
+    /// buffer IS a column-major `[q, p]`. So cuBLAS's first operand is B and
+    /// its second is A. Under that swap:
+    ///
+    /// * `transb` toggles the op of cuBLAS's FIRST operand, `transa` the
+    ///   SECOND. Getting this backwards is the whole risk of this function.
+    /// * The leading dimension is always the row length of the operand AS
+    ///   STORED, which is what changes: a non-transposed `B_row` is stored
+    ///   `[k, n]` so `lda = n`; a transposed one is stored `[n, k]` so
+    ///   `lda = k`. Likewise `ldb` is `k` normally and `m` when `transa`.
+    ///
+    /// Cross those and cuBLAS reads a real, in-bounds, WRONG sub-matrix —
+    /// silent garbage, which is precisely the tied-embedding miscompile of
+    /// PR #335. `sgemm_wgrad_accum` below is the in-tree precedent for the
+    /// crossed form and was used to check this derivation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_row_major_t(
+        a_dev: *const f32,
+        b_dev: *const f32,
+        c_dev: *mut f32,
+        m: u64,
+        n: u64,
+        k: u64,
+        transa: bool,
+        transb: bool,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(m > 0 && n > 0 && k > 0, "sgemm requires m,n,k > 0");
+        debug_assert!(
+            m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
+            "sgemm dims must fit in i32"
+        );
+        if !super::graph_capture::on_sgemm_full(
+            super::graph_capture::SgemmKind::RowMajor,
+            transa,
+            transb,
+            a_dev as usize,
+            b_dev as usize,
+            c_dev as usize,
+            m, n, k, alpha, beta,
+            1, m * k, k * n, m * n,
+        ) {
+            return Ok(());
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!("[nsl] cublasSetStream_v2 failed: {r:?} — gemm stays on its previous stream");
+            }
+        }
+        let op = |t: bool| {
+            if t {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
+        cublas_result::sgemm(
+            handle,
+            op(transb), // cuBLAS's FIRST operand is B_row
+            op(transa), // ...and its SECOND is A_row
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha,
+            b_dev,
+            if transb { k as i32 } else { n as i32 }, // lda: B_row's stored row length
+            a_dev,
+            if transa { m as i32 } else { k as i32 }, // ldb: A_row's stored row length
+            &beta,
+            c_dev, n as i32,
+        )
+    }
+
     /// Strided-batched row-major SGEMM: `C[i] = alpha * A[i] @ B[i] + beta * C[i]`
     /// for `batch` slices (item 9).
     ///
@@ -2352,7 +2445,15 @@ pub(crate) mod cublas_inner {
         // cuda-graphs: recorded as a distinct pseudo-op shape. The alpha/beta
         // bits are part of GpuOp::Sgemm's identity, so an accumulating gemm
         // can never be replayed as an overwriting one.
-        if !super::graph_capture::on_sgemm(
+        // Recorded with its OWN kind. `sgemm_row_major` calls the same hook
+        // with the same eight values, but performs a different contraction —
+        // without the discriminator the two compare equal under capture and
+        // eager repair reconstructs whichever it happens to hold as a plain
+        // row-major gemm. Silently wrong gradients, no error.
+        if !super::graph_capture::on_sgemm_full(
+            super::graph_capture::SgemmKind::WgradAccum,
+            false,
+            false,
             x_dev as usize,
             g_dev as usize,
             c_dev as usize,
@@ -2361,6 +2462,10 @@ pub(crate) mod cublas_inner {
             d_out,
             alpha,
             beta,
+            1,
+            n_rows * d_in,
+            n_rows * d_out,
+            d_in * d_out,
         ) {
             return Ok(());
         }
@@ -3572,6 +3677,169 @@ pub fn test_set_batch_collapse_disabled(disabled: bool) {
     BATCH_COLLAPSE_STATE.store(u8::from(disabled) + 1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Is `t` a 2-D view whose buffer is a contiguous row-major `[cols, rows]`,
+/// i.e. exactly what `.transpose(0, 1)` on a 2-D tensor produces?
+///
+/// Such an operand needs no materialisation: cuBLAS reads it directly with
+/// `CUBLAS_OP_T`. `x @ self.embed.transpose(0, 1)` — the weight-tied LM head
+/// every model in `models/` uses — otherwise copies a whole `[vocab, d_model]`
+/// matrix on every forward (96 MiB for Coder-50M's 49152 x 512).
+///
+/// Deliberately conservative:
+/// * `is_contiguous()` is checked FIRST. A `[k, 1]` contiguous tensor has
+///   strides `[1, 1]` and would satisfy the pattern below when `k == 1`;
+///   treating a contiguous operand as transposed is a silent transpose of the
+///   result.
+/// * Zero strides are rejected. `expand` produces them (shape_ops.rs), and a
+///   broadcast operand is not a transpose — `OP_T` would read one row as if
+///   it were the whole matrix.
+/// * `ndim == 2` only. A permuted 4-D attention tensor is not expressible as
+///   `OP_T`, and pretending otherwise reads the wrong elements in bounds.
+#[cfg(feature = "cuda")]
+fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
+    if t.ndim != 2 || t.is_contiguous() {
+        return false;
+    }
+    let shape = unsafe { std::slice::from_raw_parts(t.shape, 2) };
+    let strides = unsafe { std::slice::from_raw_parts(t.strides, 2) };
+    shape[0] > 0
+        && shape[1] > 0
+        && strides[0] == 1
+        && strides[1] == shape[0]
+}
+
+/// `NSL_MATMUL_TRANSPOSE_VIEWS=1` — hand a 2-D transposed operand to cuBLAS as
+/// `OP_T` instead of materialising it. **Default OFF, and the default is the
+/// fast one.**
+///
+/// The argument for defaulting this ON is seductive and false. Materialising
+/// `embed.transpose(0,1)` for the weight-tied LM head costs a 25,165,824-element
+/// strided copy on every forward — 96 MiB, in a kernel doing a software 64-bit
+/// div/rem per element — and cuBLAS reads a transposed operand natively, so the
+/// copy looks like pure waste. It is not waste: it buys a much faster GEMM.
+///
+/// Measured on an RTX 5070 Ti / CUDA 13.3, f32, per call:
+///
+/// | shape | `OP_T` | copy + `OP_N` | verdict |
+/// |---|---|---|---|
+/// | `[2048,512] @ [512,49152]` (Coder-50M LM head) | 5.92 ms | 1.04 + 2.89 = **3.93 ms** | OP_T **1.51x SLOWER** |
+/// | `[2048,512] @ [512,4096]` | 0.344 ms | 0.084 + 0.267 = 0.351 ms | a wash |
+/// | `[512,512] @ [512,512]` | **0.023 ms** | 0.024 + 0.019 = 0.043 ms | OP_T 1.9x faster |
+///
+/// End to end on a Coder-50M forward: 29 ms/forward with the copy, 33 ms
+/// without it, peak GPU 2.10 GB vs 2.01 GB. So this trades ~90 MB of peak
+/// memory for ~4 ms per forward — worth having when memory is the binding
+/// constraint, and a regression otherwise.
+///
+/// It is NOT defaulted on with a shape heuristic because three data points is
+/// not a cost model. This repo already learned that lesson: item 10's autotune
+/// database was ranking variants by a roofline ESTIMATE with no measurement
+/// behind it, and no consumer at all. A heuristic here would be the same
+/// mistake with fewer points.
+/// 0 = unresolved, 1 = off, 2 = on.
+#[cfg(feature = "cuda")]
+static TRANSPOSE_VIEWS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+fn transpose_views_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match TRANSPOSE_VIEWS_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("NSL_MATMUL_TRANSPOSE_VIEWS").as_deref() == Ok("1");
+            TRANSPOSE_VIEWS_STATE.store(u8::from(on) + 1, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test hook: force the transposed-view decision for the rest of the process.
+/// The gates need BOTH arms in one binary — the default-off path must keep
+/// materialising, and the opt-in path must stay numerically correct.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_set_transpose_views(enabled: bool) {
+    TRANSPOSE_VIEWS_STATE.store(u8::from(enabled) + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Can `gpu_matmul_f32` consume this operand WITHOUT materialising it?
+///
+/// `is_a` selects which operand is being asked about. THE SAME function
+/// answers for the caller (`nsl_tensor_matmul`, deciding whether to skip
+/// `nsl_tensor_contiguous`) and for the dispatcher (deciding whether to pass
+/// `CUBLAS_OP_T`). Two copies of this predicate that disagreed by one
+/// condition would either materialise pointlessly — harmless — or hand a
+/// strided buffer to a stride-blind kernel, which is PR #335 again. There is
+/// one copy, and `matmul_operand_exemption_agrees_with_dispatch` pins that.
+///
+/// Returns true ONLY for an operand that is already contiguous (nothing to do)
+/// or is a 2-D transposed view that the 2-D/collapse arm will express as
+/// `OP_T`. Every other arm requires contiguous operands, so this returns false
+/// for them and the caller copies exactly as it always did.
+#[cfg(feature = "cuda")]
+pub(crate) fn matmul_operand_needs_no_copy(a_ptr: i64, b_ptr: i64, is_a: bool) -> bool {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let me = if is_a { a } else { b };
+
+    if me.is_contiguous() {
+        return true; // `nsl_tensor_contiguous` would only bump a refcount.
+    }
+    // OFF BY DEFAULT — the obvious argument for this is wrong, and measurement
+    // is the only reason we know. See `transpose_views_enabled`.
+    if !transpose_views_enabled() {
+        return false;
+    }
+    // Beyond here the operand IS strided, so it may only be skipped if the
+    // dispatch will genuinely express it.
+    if a.ndim < 2 || b.ndim < 2 || a.dtype != 1 || b.dtype != 1 {
+        return false;
+    }
+    if !is_transposed_2d_view(me) {
+        return false;
+    }
+
+    // Re-derive the output batch extent exactly as `gpu_matmul_f32` does; a
+    // transposed A is only expressible when there is no batch to flatten.
+    let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
+    let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
+    let a_batch = &a_shape[..a.ndim as usize - 2];
+    let b_batch = &b_shape[..b.ndim as usize - 2];
+    let nd = a_batch.len().max(b_batch.len());
+    let mut total_batch: i64 = 1;
+    for i in 0..nd {
+        let ad = if i < nd - a_batch.len() { 1 } else { a_batch[i - (nd - a_batch.len())] };
+        let bd = if i < nd - b_batch.len() { 1 } else { b_batch[i - (nd - b_batch.len())] };
+        if ad != bd && ad != 1 && bd != 1 {
+            return false; // shape error; let the dispatcher report it
+        }
+        total_batch = total_batch.saturating_mul(ad.max(bd));
+    }
+    let total_batch = total_batch.max(1) as u64;
+
+    if is_a {
+        // The collapse flattens A's leading dims into the row count, which
+        // needs A's slices contiguous and adjacent. A transposed A is neither,
+        // so it is only expressible in the plain 2-D case.
+        total_batch == 1
+    } else {
+        // B is 2-D in both the plain and collapse cases. In the collapse case
+        // it must still carry no batch extent of its own, and the collapse
+        // must actually be enabled.
+        let b_total_batch: u64 = b_batch.iter().product::<i64>().max(1) as u64;
+        if total_batch == 1 {
+            true
+        } else {
+            b_total_batch == 1
+                && a.is_contiguous()
+                && total_batch.saturating_mul(a_shape[a.ndim as usize - 2] as u64)
+                    <= i32::MAX as u64
+                && !batch_collapse_disabled()
+        }
+    }
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
@@ -3581,6 +3849,27 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let b = unsafe { &*(b_ptr as *const NslTensor) };
 
     assert!(a.ndim >= 2 && b.ndim >= 2, "matmul requires 2D+ tensors");
+
+    // This whole function is f32-only and says so nowhere else: it sizes the
+    // output `alloc_managed(out_total * 4)`, hardcodes the output dtype to 1,
+    // and casts `a.data as *const f32`. A bf16 or f16 tensor carries the same
+    // element COUNT in half the bytes, so it would be read two-for-one past
+    // the end of its allocation — a live out-of-bounds read that returns
+    // plausible numbers rather than crashing.
+    //
+    // Refuse instead of silently mis-reading. Item 9's "mixed precision"
+    // bullet is exactly the work that would make this dispatch real; until
+    // then, saying so is the only honest option.
+    assert!(
+        a.dtype == 1 && b.dtype == 1,
+        "GPU matmul is f32-only (dtype 1); got dtype {} @ dtype {}. A non-f32 \
+         tensor here would be read as f32 — for a 2-byte dtype that is a \
+         read of twice the allocation, returning plausible wrong numbers. \
+         Cast the operands with `.to(f32)` first. (Mixed-precision GEMM \
+         dispatch is roadmap item 9 and is not implemented.)",
+        a.dtype,
+        b.dtype
+    );
 
     let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
     let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
@@ -3708,20 +3997,55 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     //
     // `NSL_MATMUL_NO_BATCH_COLLAPSE=1` forces the old kernel; the parity gate
     // uses it as its reference arm.
+    // Item 9 phase 2: a 2-D TRANSPOSED operand goes to cuBLAS as `OP_T`
+    // instead of being materialised.
+    //
+    // `nsl_tensor_matmul` used to copy both operands contiguous before every
+    // GPU dispatch — correct and necessary when the target was a stride-blind
+    // PTX kernel (PR #335, where a stride-blind read of
+    // `emb @ embed.transpose(0,1)` silently produced the wrong product and the
+    // GPU loss climbed to the uniform plateau while CPU descended). Once the
+    // target is cuBLAS that copy buys nothing: `CUBLAS_OP_T` reads the
+    // original buffer.
+    //
+    // What it costs today, measured on Coder-50M: the weight-tied LM head at
+    // models/coder50m/model.nsl:80 is `x @ self.embed.transpose(0, 1)` with
+    // `embed: [49152, 512]`, so every forward runs one 25,165,824-element
+    // strided copy — 96 MiB in and 96 MiB out, through a kernel that does a
+    // software 64-bit div/rem per element.
+    //
+    // Eligibility is per-arm, because only the 2-D/collapse arm reaches
+    // `sgemm_row_major_t`:
+    //   * A may be transposed only when `total_batch == 1`. The collapse
+    //     flattens A's leading dims into the row count, which requires A's
+    //     slices to be contiguous and adjacent — a transposed A is neither.
+    //   * B may be transposed in both cases: it is 2-D either way.
+    // The batched and naive arms below stay strictly contiguous-only.
+    // Same predicate the caller used to decide not to copy — one function, so
+    // the exemption and the dispatch cannot drift apart.
+    let a_2d_transposed = !a.is_contiguous() && matmul_operand_needs_no_copy(a_ptr, b_ptr, true);
+    let b_2d_transposed = !b.is_contiguous() && matmul_operand_needs_no_copy(a_ptr, b_ptr, false);
+
     let collapse_rows = total_batch.saturating_mul(m);
     let collapse_to_2d = total_batch > 1
         && b_total_batch == 1
         && a.is_contiguous()
-        // B too: it is handed to cuBLAS as a flat row-major `k x n`, so a
-        // strided B is as wrong here as a strided A. The doc above says every
-        // precondition is checked rather than assumed, and for one commit this
-        // one was assumed — the strided-batched arm below checked both operands
-        // while this arm checked only A.
-        && b.is_contiguous()
+        // B: contiguous, or a 2-D transpose we can express as OP_T. The doc
+        // above says every precondition is checked rather than assumed, and
+        // for one commit this one was assumed — the strided-batched arm below
+        // checked both operands while this arm checked only A.
+        && (b.is_contiguous() || b_2d_transposed)
         && collapse_rows <= i32::MAX as u64
         && !batch_collapse_disabled();
 
-    if total_batch == 1 || collapse_to_2d {
+    // The 2-D arm is only reachable with a strided operand when that operand
+    // is one we can express; anything else must still have been materialised
+    // by the caller.
+    let two_d_arm = total_batch == 1
+        && (a.is_contiguous() || a_2d_transposed)
+        && (b.is_contiguous() || b_2d_transposed);
+
+    if two_d_arm || collapse_to_2d {
         // The only thing the collapse changes is the row count handed to
         // cuBLAS: `k`, `n` and all three data pointers are already correct.
         let m = if collapse_to_2d { collapse_rows } else { m };
@@ -3754,13 +4078,17 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 
         // SAFETY: a.data, b.data, out_data are valid device f32 pointers of
         // sizes m*k, k*n, m*n respectively (verified by the shape derivation
-        // above + the caller contract of gpu_matmul_f32).
+        // above + the caller contract of gpu_matmul_f32). A transposed operand
+        // spans the same element count in the same buffer — only the read
+        // order differs, which is what OP_T expresses.
         let res = unsafe {
-            cublas_inner::sgemm_row_major(
+            cublas_inner::sgemm_row_major_t(
                 a.data as *const f32,
                 b.data as *const f32,
                 out_data as *mut f32,
                 m, n, k,
+                a_2d_transposed,
+                b_2d_transposed,
                 // Plain matmul: overwrite a freshly-allocated output.
                 1.0, 0.0,
             )

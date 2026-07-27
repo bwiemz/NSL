@@ -35,3 +35,6 @@ nsl-runtime | matmul_batch_collapse | both_arms_agree_with_the_cpu_reference | [
 nsl-runtime | matmul_batch_collapse | a_broadcast_operand_uses_a_zero_stride_correctly | strided-batched cuBLAS with strideA=0, batch=3 distinct slices vs f64 CPU reference (item 9)
 nsl-runtime | matmul_batch_collapse | a_transposed_operand_still_computes_the_right_product | a transposed 3-D operand must materialise before the collapse; vs f64 CPU reference (item 9)
 nsl-runtime | matmul_tf32_mode | the_default_mode_is_still_full_f32 | the default matmul math mode has not silently become TF32; vs f64 CPU reference (item 9)
+nsl-runtime | matmul_transposed_operand | a_transposed_right_operand_is_not_copied | opt-in CUBLAS_OP_T for a transposed right operand (the tied-LM-head shape) vs f64 CPU reference (item 9)
+nsl-runtime | matmul_transposed_operand | both_operands_transposed | both operands transposed at once — catches transa/transb crossed, which neither single-sided test can (item 9)
+nsl-runtime | matmul_transposed_operand | a_broadcast_view_is_still_materialised | a stride-0 expand view must NOT be taken for a transpose; vs f64 CPU reference (item 9)

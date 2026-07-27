@@ -148,6 +148,11 @@ pub use cuda::test_set_batch_collapse_disabled;
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::test_cuda_device_synchronize;
 
+// Test-only re-export: forces the opt-in OP_T transposed-operand dispatch,
+// which is OFF by default because measurement showed it loses on wide GEMMs.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::test_set_transpose_views;
+
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;

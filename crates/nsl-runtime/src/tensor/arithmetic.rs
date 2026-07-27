@@ -1180,20 +1180,60 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         if a.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                // The GPU matmul kernels index flat row-major and never read
-                // strides, so a zero-copy view (transpose/expand) as either
-                // operand computes a silently-WRONG product — found via the
-                // tied-embedding pretrain repro `emb @ embed.transpose(0,1)`
+                // The naive GPU matmul kernels index flat row-major and never
+                // read strides, so a zero-copy view (transpose/expand) as
+                // either operand computes a silently-WRONG product — found via
+                // the tied-embedding pretrain repro `emb @ embed.transpose(0,1)`
                 // (PR #335: GPU loss climbed to the uniform plateau while CPU
                 // descended; the CPU path below always had these guards).
                 // `nsl_tensor_contiguous` is a native on-device strided copy
                 // for GPU views and a refcount bump when already contiguous;
                 // it always returns an owned ref, freed right after the kernel.
-                let a_c = nsl_tensor_contiguous(a_ptr);
-                let b_c = nsl_tensor_contiguous(b_ptr);
+                //
+                // Item 9 phase 2: a 2-D TRANSPOSED view is now exempt. cuBLAS
+                // reads it natively with OP_T, so materialising it is pure
+                // waste — for the very shape PR #335 was about, `[49152, 512]`
+                // in Coder-50M, that waste is 96 MiB copied and freed on every
+                // forward. Exemption is narrow on purpose:
+                // `gpu_matmul_f32` re-derives the same predicate and only the
+                // 2-D/collapse arm honours it; every other arm still requires
+                // contiguous operands, and anything not matching the exact
+                // transposed-2-D stride pattern is materialised exactly as
+                // before.
+                // The retain mirrors what `nsl_tensor_contiguous` does in its
+                // already-contiguous case, so the `nsl_tensor_free` pair below
+                // stays balanced on every path.
+                let keep = |p: i64| -> i64 {
+                    NslTensor::from_ptr(p).refcount.fetch_add(1, Ordering::SeqCst);
+                    p
+                };
+                let a_c = if crate::cuda::matmul_operand_needs_no_copy(a_ptr, b_ptr, true) {
+                    keep(a_ptr)
+                } else {
+                    nsl_tensor_contiguous(a_ptr)
+                };
+                let b_c = if crate::cuda::matmul_operand_needs_no_copy(a_ptr, b_ptr, false) {
+                    keep(b_ptr)
+                } else {
+                    nsl_tensor_contiguous(b_ptr)
+                };
                 let result = crate::cuda::gpu_matmul_f32(a_c, b_c);
                 nsl_tensor_free(a_c);
                 nsl_tensor_free(b_c);
+                // `gpu_matmul_f32` returns 0 on a cuBLAS error, and its comment
+                // says that is "so callers can detect the failure". No caller
+                // ever did: the null flowed on and the process died in
+                // whatever touched the tensor next — observed as a SIGSEGV
+                // inside a readback, with the actual cuBLAS status printed
+                // thousands of lines earlier. Detect it here, where the shapes
+                // are still in scope.
+                assert!(
+                    result != 0,
+                    "GPU matmul failed for [{:?}] @ [{:?}] — see the \
+                     [nsl-matmul] cuBLAS status logged above",
+                    get_shape_vec(NslTensor::from_ptr(a_ptr)),
+                    get_shape_vec(NslTensor::from_ptr(b_orig)),
+                );
                 // Tape record on the GPU arm (see nsl_tensor_add). Saved refs
                 // bumped before the relinquish frees so the tape keeps its
                 // operands alive for backward.
