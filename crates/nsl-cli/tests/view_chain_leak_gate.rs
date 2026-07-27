@@ -1,0 +1,197 @@
+//! Regression gate for the SHAPE/VIEW-CHAIN tensor lifetime leak
+//! (roadmap item 1 residual, 2026-07-27).
+//!
+//! `expr_result_is_owned_temporary`'s tensor-method allowlist carried its own
+//! warning: *"this allowlist is hand-maintained and drifts silently — a missing
+//! fresh-result builtin costs a leak, never a crash, so nothing fails loudly."*
+//! That is precisely what had happened. The entire shape/view family —
+//! `reshape`, `transpose`, `expand`, `contiguous`, `unsqueeze`, `select`,
+//! `slice`, `cumsum` — was absent, so every such call in NESTED position
+//! produced a handle nothing ever registered and nothing ever freed. A method
+//! call bound to a `let` was fine (the named local is swept on return); only the
+//! ANONYMOUS links of a chain stranded.
+//!
+//! A view is still an owning reference: `NslTensor::new_view_i64` allocates a
+//! fresh handle and bumps the root owner's refcount. `contiguous` is the subtle
+//! one — when the tensor is already contiguous it returns the receiver pointer,
+//! but only after `refcount.fetch_add(1)`, so the caller owns a counted
+//! reference either way.
+//!
+//! Measured on an RTX 5070 Ti / CUDA 13.3, `nsl.nn.gqa`'s
+//! `GroupedQueryAttention::forward` at `[2,1024,512]`, which chains
+//!
+//! ```text
+//! let q4    = q.reshape([...]).transpose(1, 2)
+//! let k_exp = k5.expand([...]).contiguous().reshape([...])
+//! ```
+//!
+//! went from **8 to 5 retained blocks per call** (24 MB -> 16 MB); a whole
+//! Coder-50M `[2,1024]` forward went from **+89 to +65 blocks** and
+//! **+292 MB to +228 MB** per call, with the N=3 peak 2.29 GB -> 2.10 GB.
+//!
+//! Gate design mirrors `fn_lifetime_leak_gate.rs`: run the same fixture at two
+//! call counts and assert the caching allocator's exit `live_blocks` are
+//! IDENTICAL. Anything that strands per call scales with the count.
+
+use std::process::Command;
+
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Run a whole program and return (exit live_blocks, stdout).
+fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String) {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_viewchain_{}_{tag}_{n}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(["run", "--deterministic"])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_GPU_MEM_REPORT", "1")
+        .output()
+        .expect("spawn nsl run");
+    assert!(
+        out.status.success(),
+        "[{tag}/{n}] run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("DONE"),
+        "[{tag}/{n}] fixture did not complete:\n{stdout}"
+    );
+    let live_blocks = stderr
+        .lines()
+        .filter_map(|l| {
+            l.split("live_blocks=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .last()
+        .unwrap_or_else(|| panic!("[{tag}/{n}] no [gpu-mem] live_blocks report:\n{stderr}"));
+    (live_blocks, stdout)
+}
+
+/// The real `nsl.nn.gqa` forward, which is where this was found and where the
+/// improvement is measured. A hand-written chain fixture is NOT a substitute:
+/// the first version of this gate used one, and it showed byte-identical block
+/// counts with the fix applied and reverted — it simply did not reach the
+/// affected path, and would have "passed" while proving nothing about the fix.
+fn gqa_src(calls: usize) -> String {
+    let mut s = String::from(
+        r#"
+from nsl.nn.gqa import GroupedQueryAttention
+let g = GroupedQueryAttention(512, 8, 4, 64, 0.1)
+g.to(cuda)
+let x = full([2, 1024, 512], 1.0).to(cuda)
+"#,
+    );
+    for i in 0..calls {
+        s.push_str(&format!("let r{i} = g.forward(x, false)\n"));
+    }
+    s.push_str("print(\"DONE\")\n");
+    s
+}
+
+/// Per-call retained blocks, from two call counts.
+fn blocks_per_call(tag: &str) -> f64 {
+    let (lb1, _) = run_fixture(&gqa_src(1), tag, 1);
+    let (lb3, _) = run_fixture(&gqa_src(3), tag, 3);
+    assert!(
+        lb1 > 0,
+        "[{tag}] the fixture retained no GPU blocks at all — it is not \
+         exercising the device, so any ratchet below would pass vacuously"
+    );
+    (lb3 - lb1) as f64 / 2.0
+}
+
+/// Measured on an RTX 5070 Ti / CUDA 13.3, `GroupedQueryAttention::forward` at
+/// `[2,1024,512]`:
+///
+/// | | blocks/call | MB/call |
+/// |---|---|---|
+/// | before the view-family fix | 8 | 24 |
+/// | after | **5** | **16** |
+/// | ideal (the live result only) | 1 | 4 |
+///
+/// This is a RATCHET, not a proof of zero. Four blocks per call still strand,
+/// and the gate says so rather than pretending otherwise — see
+/// `the_residual_is_still_present_and_bounded` below.
+const GQA_BLOCKS_PER_CALL_CEILING: f64 = 5.0;
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn anonymous_view_chain_links_do_not_strand_per_call() {
+    let per_call = blocks_per_call("gqa_ratchet");
+    assert!(
+        per_call <= GQA_BLOCKS_PER_CALL_CEILING,
+        "GroupedQueryAttention::forward now retains {per_call} blocks per call, \
+         above the {GQA_BLOCKS_PER_CALL_CEILING} ceiling. The pre-fix value was 8. \
+         Check that the shape/view family is still classified owning in \
+         `tensor_method_returns_owned_ref` (nsl-codegen/src/expr/mod.rs) — \
+         dropping reshape/transpose/expand/contiguous back out of that table \
+         restores exactly this regression."
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_residual_is_still_present_and_bounded() {
+    // Deliberately asserts the leak is NOT closed. Only one block per call is
+    // legitimate (the returned tensor, which the caller binds); the rest is
+    // roadmap item 1's open residual, localised to `GroupedQueryAttention::
+    // forward` but not yet root-caused beyond the view family.
+    //
+    // If someone closes it, this test fails — and that is the intended signal
+    // to drop the ceiling above rather than to delete this. A gate that
+    // silently tolerates improvement cannot tell "fixed" from "never measured".
+    let per_call = blocks_per_call("gqa_residual");
+    assert!(
+        per_call > 1.0,
+        "the per-call residual is gone ({per_call} blocks/call, ideal is 1). \
+         Lower GQA_BLOCKS_PER_CALL_CEILING to the new value and update this \
+         test — do not just delete it."
+    );
+}
+
+/// The view ops must still compute the right thing. Freeing a handle that the
+/// result actually aliases would corrupt values rather than leak them, so a
+/// leak gate alone cannot tell a fix from a use-after-free.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn view_chain_results_are_numerically_unchanged() {
+    // Deterministic inputs: arange, not randn, so the expected sums are exact
+    // integers computable by hand. sum(0..4095) = 4095*4096/2 = 8_386_560.
+    let src = r#"
+let x = arange(0.0, 4096.0).reshape([2, 4, 512]).to(cuda)
+let a = x.reshape([2, 4, 8, 64]).transpose(1, 2)
+let b = a.reshape([2, 8, 1, 4, 64]).expand([2, 8, 2, 4, 64]).contiguous().reshape([2, 16, 4, 64])
+print(x.sum().item())
+print(a.sum().item())
+print(b.sum().item())
+print("DONE")
+"#;
+    let (_, out) = run_fixture(src, "viewnum", 1);
+    let nums: Vec<f64> = out
+        .lines()
+        .filter_map(|l| l.trim().parse::<f64>().ok())
+        .collect();
+    assert_eq!(nums.len(), 3, "expected three sums, got:\n{out}");
+    // A permutation cannot change the sum.
+    assert_eq!(nums[0], 8_386_560.0, "arange sum changed: {out}");
+    assert_eq!(nums[1], 8_386_560.0, "transpose is not a permutation: {out}");
+    // `expand` duplicates the kv axis 2x, so the sum doubles exactly.
+    assert_eq!(nums[2], 16_773_120.0, "expand(2x) did not double the sum: {out}");
+}

@@ -30,3 +30,5 @@ nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_
 nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward | Tier B.2 full backward against the real Tier B.1 forward, causal off (item 15)
 nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward_causal | Tier B.2 full backward against the real Tier B.1 forward, causal on (item 15)
 nsl-codegen | flash_attention_gqa_backward_gpu | gqa_backward_matches_cpu_reference | GQA backward vs CPU reference (item 15)
+nsl-cli | view_chain_leak_gate | anonymous_view_chain_links_do_not_strand_per_call | GQA forward retains <= 5 blocks/call; 8 before the view-family ownership fix (item 1)
+nsl-cli | view_chain_leak_gate | view_chain_results_are_numerically_unchanged | reshape/transpose/expand/contiguous sums exact after the added frees (item 1)
