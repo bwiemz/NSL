@@ -15,8 +15,14 @@
 //! The full backward math is emitted: tile-skip gate, S = Q@K^T, intra-tile
 //! causal mask, P-recompute, dP = dO@V^T, dS = P*(dP-D), P/dS col-major scatter,
 //! Q/dO re-stage, and MMA-3/4 (dV += P^T@dO, dK += dS^T@Q) plus HBM finalize.
-//! Structurally/ptxas-validated; GPU-numerical validation is still pending
-//! (GPU tests are `#[ignore]` + `feature=cuda`).
+//! GPU-numerically VALIDATED on sm_120 (roadmap item 15): the dK/dV sweeps
+//! run green against a CPU reference at head_dim 32/64/128, both forward
+//! sources, worst margin 12.5% of tolerance (hd=64, CpuNaive forward, dV:
+//! rel 6.2385e-3 against a 5.0e-2 bound). The 52.8% figure quoted in the
+//! certification doc is a FULL-backward dWq row, not a dK/dV one. Per-row evidence is banked in
+//! `docs/hardware/attention_backward_certification.md`. NOT validated for
+//! `gqa_group_size > 1` — that regime is refused by
+//! `DispatchReject::GqaUnvalidated` rather than dispatched.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md ss4 + ss5.2
 

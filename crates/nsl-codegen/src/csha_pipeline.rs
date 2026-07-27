@@ -553,8 +553,10 @@ pub fn plan_all(
 /// real four-kernel PTX module (`Ok`), and `synthesize_backward_with_tier`
 /// consumes it directly. Callers still fall back to scalar v2 backward when
 /// `tier_b2_can_dispatch` rejects the config (unsupported head_dim, sm < 80,
-/// sink tokens, etc.). The emitted kernels are structurally/ptxas-validated but
-/// not yet GPU-numerically validated (GPU tests are `#[ignore]` + `feature=cuda`).
+/// sink tokens, `gqa_group_size > 1`, etc.). The emitted kernels are
+/// GPU-numerically validated on sm_120 for the regimes recorded in
+/// `docs/hardware/attention_backward_certification.md` (roadmap item 15);
+/// grouped-KV is refused because it is not among them.
 pub fn backward_dispatch_tier(
     config: &crate::flash_attention::FlashAttentionConfig,
 ) -> crate::flash_attention_v2::tier_b2::BackwardTier {

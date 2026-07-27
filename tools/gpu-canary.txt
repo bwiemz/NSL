@@ -10,7 +10,9 @@
 # NUMERICAL_GATE_ENABLED=false) — those are tracked in the harness doc's
 # "known-blocked" list, not here.
 #
-# Reference hardware: NVIDIA GeForce RTX 5070 Ti (sm_120), CUDA 13.2 toolkit.
+# Reference hardware: NVIDIA GeForce RTX 5070 Ti (sm_120), CUDA 13.3 toolkit.
+#
+# Run (POSIX): tools/gpu-test.sh   |  List: tools/gpu-test.sh --list
 #
 # Format (pipe-delimited, one test per line):
 #   package | test_binary | test_fn | note
@@ -21,3 +23,10 @@
 nsl-runtime | tier_b1_prepass_gpu | w_prepass_matches_cpu_reference | CSHA D pre-pass (W): narrow+col-major chunkify, bit-exact vs CPU
 nsl-runtime | tier_b1_prepass_gpu | x_prepass_matches_cpu_reference | CSHA D pre-pass (X): RMSNorm+narrow+chunkify, tol 5e-2 (rsqrt.approx)
 nsl-codegen | csha_cuda_backward | t6_3_smoke_single_config       | CSHA fused backward, smoke scope (heads=1, seq=bq=32, hd=32): 7 grads vs CPU ref within Tier-A tol. NOTE: single-tile only; multi-tile backward is refused (Phase 1.1).
+nsl-codegen | tier_b2_dkdv_kernel_cpu_reference | tier_b2_dkdv_sweep_cpu_naive | Tier B.2 dK/dV vs CPU naive forward, hd 32/64/128 (item 15; rows in docs/hardware/attention_backward_certification.md)
+nsl-codegen | tier_b2_dkdv_kernel_cpu_reference | tier_b2_dkdv_sweep_b1_forward | Tier B.2 dK/dV against the real Tier B.1 forward, hd 32/64/128 (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_cpu_naive | Tier B.2 full backward (7 grads) vs CPU naive, hd 64/128, causal off (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_cpu_naive_causal | Tier B.2 full backward (7 grads) vs CPU naive, causal on (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward | Tier B.2 full backward against the real Tier B.1 forward, causal off (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward_causal | Tier B.2 full backward against the real Tier B.1 forward, causal on (item 15)
+nsl-codegen | flash_attention_gqa_backward_gpu | gqa_backward_matches_cpu_reference | GQA backward vs CPU reference (item 15)
