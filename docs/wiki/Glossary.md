@@ -150,7 +150,13 @@ Block keyword for the declarative training DSL; generates an epoch loop with imp
 Specifies adapter configuration (type, target layers, rank) for LoRA/IA³/GatedLoRA injection. Used alongside `@freeze` and `@wrga` to declare per-layer adapter parameters that will be optimized separately from frozen base weights. See [Glossary#wrga](#wrga).
 
 ### <a id="dec-autotune"></a>`@autotune`
-Triggers build-time tuning of tile sizes, warp counts, and SMEM allocation for a `kernel` block; stores the winning config in the binary's autotune table. See [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
+Selects tile sizes, warp counts, and SMEM allocation for a `kernel` block at build time. The compiler generates the Cartesian product of the declared parameter ranges, discards variants that fail to compile, and picks a winner.
+
+**The winner is currently *estimated*, not measured.** The production path scores each variant with the roofline cost model (`cost_model.rs`) priced against the local GPU's `GpuSpec`; nothing is launched. `autotune.rs` also contains a real CUDA-event measurement path, but no runtime callback is wired to it — see that module's header for the current state. A cache entry records which of the two produced it, so an estimate is never mistaken for a measurement.
+
+Winners are cached under `.nsl-cache/autotune/<kernel>_<key>.json`. The key and the record both carry the **driver-reported** device identity (name, compute capability, SM count, CUDA driver version), and an entry describing different hardware is refused with a warning rather than reused. `--autotune-fresh` ignores the cache, `--autotune-clean` deletes it, `--no-autotune` skips selection entirely and takes the middle of each range.
+
+See [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
 
 ### <a id="dec-backward"></a>`@backward`
 Marks a function as a hand-written backward pass that overrides the compiler's source-AD-generated adjoint for a particular op. Full reference: [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md).

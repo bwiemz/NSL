@@ -4037,6 +4037,75 @@ pub fn cuda_device_name() -> Option<String> {
     None
 }
 
+/// Identity of the local CUDA device, as reported by the DRIVER.
+///
+/// This is the cache-key identity for `@autotune` (roadmap item 10). It is
+/// deliberately independent of `nsl-codegen`'s `GpuSpec` database: a tuning
+/// result is only transferable to hardware that reports the same values here,
+/// and that has to be true even for a card the database has never heard of.
+/// Reading identity out of the database instead would collapse every unknown
+/// GPU onto whatever the database default happens to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaDeviceIdentity {
+    /// Marketing name with vendor prefixes stripped, e.g. "RTX 5070 Ti".
+    pub name: String,
+    /// Compute capability major * 10 + minor, e.g. 120 for sm_120.
+    pub sm_version: u32,
+    /// Multiprocessor count.
+    pub sm_count: u32,
+    /// `cuDriverGetVersion`, e.g. 13030 for CUDA 13.3.
+    pub driver_version: u32,
+}
+
+/// Probe the local CUDA device for its cache-key identity.
+///
+/// Non-panicking for the same reason `cuda_device_name` is: this runs at
+/// COMPILE time, where an abort would kill the compiler. Every driver call is
+/// rc-checked and no context is created or retained.
+#[cfg(feature = "cuda")]
+pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
+    use cudarc::driver::sys::*;
+    let name = cuda_device_name()?;
+    unsafe {
+        // `cuda_device_name` already ran cuInit and rc-checked it; repeating it
+        // is harmless (cuInit is idempotent) and keeps this probe standalone.
+        if cuInit(0) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let ordinal = inner::select_device_ordinal();
+        let mut device: CUdevice = 0;
+        if cuDeviceGet(&mut device, ordinal) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut attr = |a| -> Option<u32> {
+            let mut v: i32 = 0;
+            if cuDeviceGetAttribute(&mut v, a, device) != CUresult::CUDA_SUCCESS || v < 0 {
+                return None;
+            }
+            Some(v as u32)
+        };
+        let major = attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let minor = attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let sm_count = attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+        let mut driver: i32 = 0;
+        if cuDriverGetVersion(&mut driver) != CUresult::CUDA_SUCCESS || driver < 0 {
+            return None;
+        }
+        Some(CudaDeviceIdentity {
+            name,
+            sm_version: major * 10 + minor,
+            sm_count,
+            driver_version: driver as u32,
+        })
+    }
+}
+
+/// Non-cuda build: no device to identify.
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
+    None
+}
+
 /// Launch a PTX kernel. All params are i64 for Cranelift ABI compatibility.
 ///
 /// - `ptx_ptr`: pointer to null-terminated PTX source string

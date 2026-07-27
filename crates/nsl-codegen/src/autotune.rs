@@ -4,10 +4,26 @@
 //! for cache key generation, and provides read/write for the `.nsl-cache/autotune/`
 //! directory.
 //!
-//! GPU benchmarking: `find_best_variant()` accepts a `BenchmarkFn` callback that
-//! the runtime provides (actual CUDA event timing). When no GPU is available or
-//! `NSL_AUTOTUNE_FALLBACK=1` is set, `select_middle_values()` is used instead.
+//! # What actually runs today
+//!
+//! The production compile path (`compiler::kernel::autotune_select_best`) calls
+//! [`find_best_variant_cost_model`], which **estimates** each variant with the
+//! roofline model. It never launches anything.
+//!
+//! [`find_best_variant`] — the real-measurement path — takes a [`BenchmarkFn`]
+//! that the runtime would supply (CUDA-event timing). **No such callback exists
+//! anywhere in the tree**: `find_best_variant` is reached only from this
+//! module's own unit tests, which pass a synthetic closure. Wiring it is the
+//! measured half of roadmap item 10. Until then a cache entry records
+//! [`SelectionMethod::CostModel`] and says which `GpuSpec` it was priced
+//! against, so nobody mistakes an estimate for a measurement.
+//! `autotune_selection_method_is_honest` in
+//! `tests/autotune_cache_identity.rs` fails if that stops being true.
+//!
+//! When `NSL_AUTOTUNE_FALLBACK=1` is set, `select_middle_values()` is used
+//! instead of either path.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -21,9 +37,189 @@ pub type Variant = Vec<(String, i64)>;
 pub struct AutotuneResult {
     pub winner: Variant,
     pub all_timings: Vec<(Variant, f64)>,
+    /// Which machine this result describes.
+    pub device: DeviceIdentity,
+    /// How the winner was chosen — estimated or measured. Kept separate from
+    /// `device` on purpose: the pre-item-10 record stuffed the literal string
+    /// `"cost_model"` into its device-name field, so a reader could not tell an
+    /// unmeasured estimate from a result for a machine named "cost_model".
+    pub selection: SelectionMethod,
+}
+
+/// Version of the cache key + on-disk record format.
+///
+/// Bump on ANY change to what [`hash_kernel_ast`] absorbs or to
+/// [`AutotuneCacheRecord`]'s shape. It is hashed into the key, so a bump
+/// invalidates every existing entry rather than risking a stale entry being
+/// read back under new semantics.
+///
+/// - v1: implicit; device identity came from `gpu_specs::default_gpu()`, which
+///   returns A100-SXM unconditionally. Every machine produced the same key.
+/// - v2: driver-reported device identity, length-prefixed hash fields,
+///   serde record.
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
+
+/// How a winning variant was chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SelectionMethod {
+    /// Roofline estimate. Nothing was launched. `spec` names the `GpuSpec` the
+    /// roofline was priced against — NOT necessarily the local device, because
+    /// the GPU database may have no entry for it.
+    CostModel { spec: String },
+    /// Median of real CUDA-event timings on the device recorded alongside.
+    Measured,
+}
+
+/// The machine a tuning result describes.
+///
+/// Every field comes from the CUDA driver, never from `gpu_specs`. See
+/// [`DeviceIdentity::local`] for why that distinction is the whole point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIdentity {
     pub device_name: String,
-    pub compute_capability: String,
+    /// Compute capability major*10 + minor, e.g. 120 for sm_120.
+    pub sm_version: u32,
     pub sm_count: u32,
+    /// `cuDriverGetVersion`, e.g. 13030 for CUDA 13.3. A driver upgrade can
+    /// change ptxas codegen and therefore which variant wins, so it is part of
+    /// the identity rather than metadata.
+    pub driver_version: u32,
+}
+
+/// Device name recorded when there is no local CUDA device at all.
+///
+/// A *named* sentinel, not a fallback to some real GPU's spec: a cache built on
+/// a GPU-less machine must not be indistinguishable from one built on an A100.
+pub const NO_DEVICE_NAME: &str = "no-cuda-device";
+
+impl DeviceIdentity {
+    /// The local device's identity, or the [`NO_DEVICE_NAME`] sentinel.
+    ///
+    /// This is the function that fixes item 10's core defect. The cache key was
+    /// previously built from `gpu_specs::default_gpu()`, whose contract is "the
+    /// default when auto-detect is unavailable" — it returns A100-SXM
+    /// unconditionally. Hashing that meant the key said "A100-SXM / sm_80 / 108
+    /// SMs" on every machine, so an entry measured on one GPU was reused
+    /// verbatim on any other.
+    pub fn local() -> Self {
+        match crate::gpu_specs::local_device_identity() {
+            Some(d) => Self {
+                device_name: d.name.clone(),
+                sm_version: d.sm_version,
+                sm_count: d.sm_count,
+                driver_version: d.driver_version,
+            },
+            None => Self::no_device(),
+        }
+    }
+
+    /// The sentinel identity for "no CUDA device was found".
+    pub fn no_device() -> Self {
+        Self {
+            device_name: NO_DEVICE_NAME.to_string(),
+            sm_version: 0,
+            sm_count: 0,
+            driver_version: 0,
+        }
+    }
+
+    /// Human-readable one-liner for diagnostics.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} (sm_{}, {} SMs, driver {})",
+            self.device_name, self.sm_version, self.sm_count, self.driver_version
+        )
+    }
+}
+
+/// One measured or estimated variant, as stored on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimingEntry {
+    pub params: Vec<(String, i64)>,
+    pub median_ms: f64,
+}
+
+/// The on-disk shape of a `.nsl-cache/autotune/<kernel>_<hash>.json` entry.
+///
+/// Serde-derived rather than built with `format!` and read back with substring
+/// arithmetic: the previous writer emitted JSON by string concatenation and the
+/// reader recovered the winner by locating `"winner":`, then the next `{`, then
+/// the next `}`. Neither side validated anything — not the schema, not the
+/// device, not even that the file's own recorded key matched the key that was
+/// looked up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutotuneCacheRecord {
+    pub schema_version: u32,
+    pub kernel: String,
+    pub cache_key: String,
+    pub device: DeviceIdentity,
+    pub selection: SelectionMethod,
+    pub winner: Vec<(String, i64)>,
+    pub winner_ms: f64,
+    pub variants_tested: usize,
+    pub all_timings: Vec<TimingEntry>,
+    pub timestamp_secs: u64,
+}
+
+/// Why a cache entry on disk was not usable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheReject {
+    /// Not valid JSON for the current record type — including every pre-item-10
+    /// entry, which had no `schema_version` field at all.
+    Unparseable(String),
+    /// Written by a different schema version.
+    SchemaMismatch { found: u32, expected: u32 },
+    /// The record's own `cache_key` is not the key it was looked up under, so
+    /// the file was renamed or copied from elsewhere.
+    KeyMismatch { found: String, expected: String },
+    /// Measured on different hardware. This is the failure item 10 exists to
+    /// prevent, so it is the one that always warns.
+    DeviceMismatch {
+        found: Box<DeviceIdentity>,
+        expected: Box<DeviceIdentity>,
+    },
+    /// Parsed and validated, but carries no winner to return.
+    EmptyWinner,
+}
+
+impl CacheReject {
+    /// Explain the rejection for a user-facing warning.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unparseable(e) => {
+                format!("not readable as a v{CACHE_SCHEMA_VERSION} record ({e})")
+            }
+            Self::SchemaMismatch { found, expected } => {
+                format!("written by schema v{found}, this build reads v{expected}")
+            }
+            Self::KeyMismatch { found, expected } => format!(
+                "records cache key {} but was looked up under {} — copied or renamed file",
+                &found[..found.len().min(16)],
+                &expected[..expected.len().min(16)]
+            ),
+            Self::DeviceMismatch { found, expected } => format!(
+                "describes {} but this machine is {}",
+                found.describe(),
+                expected.describe()
+            ),
+            Self::EmptyWinner => "contains no winning variant".to_string(),
+        }
+    }
+
+    /// Whether this rejection deserves an unconditional warning.
+    ///
+    /// A schema bump or an unparseable pre-item-10 entry is the expected state
+    /// of a cache directory right after an upgrade — warning per kernel there
+    /// would be noise that trains users to ignore the channel. A device or key
+    /// mismatch means an entry from another machine is sitting in this cache,
+    /// which is exactly what nobody would otherwise notice.
+    pub fn is_noteworthy(&self) -> bool {
+        matches!(
+            self,
+            Self::DeviceMismatch { .. } | Self::KeyMismatch { .. } | Self::EmptyWinner
+        )
+    }
 }
 
 /// Generate the Cartesian product of all tuning parameter combinations.
@@ -105,11 +301,12 @@ pub fn find_best_variant(
     kernel_name: &str,
     tuning_params: &TuningParams,
     cache_hash: &str,
+    device: &DeviceIdentity,
     ptx_generator: &dyn Fn(&Variant) -> Result<String, String>,
     benchmark_fn: &BenchmarkFn,
 ) -> Result<Variant, String> {
     // 1. Check cache
-    if let Some(cached) = check_cache(kernel_name, cache_hash) {
+    if let Some(cached) = check_cache(kernel_name, cache_hash, device) {
         if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
             eprintln!("[autotune] cache hit for {kernel_name}");
         }
@@ -188,9 +385,8 @@ pub fn find_best_variant(
             .iter()
             .map(|r| (r.variant.clone(), r.median_ms))
             .collect(),
-        device_name: String::new(), // filled by runtime if available
-        compute_capability: String::new(),
-        sm_count: 0,
+        device: device.clone(),
+        selection: SelectionMethod::Measured,
     };
     write_cache(cache_hash, kernel_name, &autotune_result);
 
@@ -210,13 +406,15 @@ pub fn find_best_variant_cost_model(
     kernel_name: &str,
     tuning_params: &TuningParams,
     cache_hash: &str,
+    device: &DeviceIdentity,
+    cost_model_spec: &str,
     fresh: bool,
     ptx_generator: &dyn Fn(&Variant) -> Result<String, String>,
     cost_estimator: &dyn Fn(&Variant) -> Result<f64, String>,
 ) -> Result<Variant, String> {
     // 1. Check cache (unless fresh)
     if !fresh {
-        if let Some(cached) = check_cache(kernel_name, cache_hash) {
+        if let Some(cached) = check_cache(kernel_name, cache_hash, device) {
             if std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
                 eprintln!("[autotune] cache hit for {kernel_name}");
             }
@@ -297,9 +495,10 @@ pub fn find_best_variant_cost_model(
             .iter()
             .map(|r| (r.variant.clone(), r.median_ms))
             .collect(),
-        device_name: "cost_model".to_string(),
-        compute_capability: String::new(),
-        sm_count: 0,
+        device: device.clone(),
+        selection: SelectionMethod::CostModel {
+            spec: cost_model_spec.to_string(),
+        },
     };
     write_cache(cache_hash, kernel_name, &autotune_result);
 
@@ -336,37 +535,53 @@ pub fn print_benchmark_report(kernel_name: &str, results: &[BenchmarkResult]) {
 
 /// Hash a kernel's AST body for cache key generation (SHA-256).
 ///
-/// The hash incorporates the kernel name, serialised AST body, tuning parameter
-/// definitions, input tensor shapes, and the target GPU's device name, compute
-/// capability, and SM count. This ensures the cache is invalidated whenever any
-/// of these change.
+/// Absorbs the schema version, kernel name, serialised AST body, tuning
+/// parameter definitions, input tensor shapes, and the **driver-reported**
+/// device identity. The cache is invalidated whenever any of these change.
+///
+/// `input_shapes` is empty on the compile path — shapes are not known until
+/// runtime. That is a real limit on how specific the key can be, not an
+/// oversight; a variant tuned for one shape is reused for all of them. It is
+/// hashed anyway so a future shape-specialised caller does not collide with
+/// today's entries.
+///
+/// Every field is length-prefixed. Concatenating raw bytes let adjacent fields
+/// slide into one another — kernel `"ab"` with body `"c"` hashed identically to
+/// kernel `"a"` with body `"bc"`.
 pub fn hash_kernel_ast(
     kernel_name: &str,
     ast_bytes: &[u8],
     tuning_params: &TuningParams,
     input_shapes: &[Vec<i64>],
-    device_name: &str,
-    compute_capability: &str,
-    sm_count: u32,
+    device: &DeviceIdentity,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(kernel_name.as_bytes());
-    hasher.update(ast_bytes);
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(&CACHE_SCHEMA_VERSION.to_le_bytes());
+    field(kernel_name.as_bytes());
+    field(ast_bytes);
+    field(&(tuning_params.len() as u64).to_le_bytes());
     for (name, values) in tuning_params {
-        hasher.update(name.as_bytes());
+        field(name.as_bytes());
+        field(&(values.len() as u64).to_le_bytes());
         for v in values {
-            hasher.update(v.to_le_bytes());
+            field(&v.to_le_bytes());
         }
     }
+    field(&(input_shapes.len() as u64).to_le_bytes());
     for shape in input_shapes {
+        field(&(shape.len() as u64).to_le_bytes());
         for &dim in shape {
-            hasher.update(dim.to_le_bytes());
+            field(&dim.to_le_bytes());
         }
-        hasher.update(b"|");
     }
-    hasher.update(device_name.as_bytes());
-    hasher.update(compute_capability.as_bytes());
-    hasher.update(sm_count.to_le_bytes());
+    field(device.device_name.as_bytes());
+    field(&device.sm_version.to_le_bytes());
+    field(&device.sm_count.to_le_bytes());
+    field(&device.driver_version.to_le_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -375,177 +590,201 @@ pub fn cache_dir() -> PathBuf {
     PathBuf::from(".nsl-cache/autotune")
 }
 
-/// Check whether a cached winner exists for the given kernel + hash.
-pub fn check_cache(kernel_name: &str, hash: &str) -> Option<Variant> {
+/// Read and validate the cache entry for a kernel + hash.
+///
+/// Returns `Ok(None)` when there is simply no entry, `Err(reason)` when one
+/// exists but must not be trusted. Validation is the point: the key alone
+/// cannot be relied on to keep foreign entries out, because a `.nsl-cache`
+/// directory is an ordinary directory that gets copied, committed, restored
+/// from a CI artifact, or shared over a network mount.
+pub fn load_cache_record(
+    kernel_name: &str,
+    hash: &str,
+    device: &DeviceIdentity,
+) -> Result<Option<AutotuneCacheRecord>, CacheReject> {
     let path = cache_dir().join(format!("{}_{}.json", kernel_name, hash));
-    if !path.exists() {
-        return None;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let record: AutotuneCacheRecord = serde_json::from_str(&content)
+        .map_err(|e| CacheReject::Unparseable(e.to_string()))?;
+    if record.schema_version != CACHE_SCHEMA_VERSION {
+        return Err(CacheReject::SchemaMismatch {
+            found: record.schema_version,
+            expected: CACHE_SCHEMA_VERSION,
+        });
     }
-    let content = std::fs::read_to_string(&path).ok()?;
-    parse_winner_from_cache(&content)
+    if record.cache_key != hash {
+        return Err(CacheReject::KeyMismatch {
+            found: record.cache_key,
+            expected: hash.to_string(),
+        });
+    }
+    if record.device != *device {
+        return Err(CacheReject::DeviceMismatch {
+            found: Box::new(record.device),
+            expected: Box::new(device.clone()),
+        });
+    }
+    if record.winner.is_empty() {
+        return Err(CacheReject::EmptyWinner);
+    }
+    Ok(Some(record))
 }
 
-/// Write an autotune result (winner + all timings) to the cache directory.
-pub fn write_cache(hash: &str, kernel_name: &str, result: &AutotuneResult) {
-    let dir = cache_dir();
-    std::fs::create_dir_all(&dir).ok();
+/// Check whether a usable cached winner exists for the given kernel + hash.
+///
+/// A rejected entry is a miss, never an error: the worst outcome of ignoring a
+/// cache file is recomputing the selection. Noteworthy rejections warn so the
+/// entry does not silently do nothing forever.
+pub fn check_cache(kernel_name: &str, hash: &str, device: &DeviceIdentity) -> Option<Variant> {
+    match load_cache_record(kernel_name, hash, device) {
+        Ok(Some(record)) => Some(record.winner),
+        Ok(None) => None,
+        Err(reject) => {
+            if reject.is_noteworthy() || std::env::var("NSL_AUTOTUNE_VERBOSE").is_ok() {
+                eprintln!(
+                    "[autotune] ignoring cache entry for '{kernel_name}': {}",
+                    reject.describe()
+                );
+            }
+            None
+        }
+    }
+}
 
-    let timings_json: Vec<String> = result
-        .all_timings
-        .iter()
-        .map(|(variant, ms)| {
-            let params: Vec<String> = variant
-                .iter()
-                .map(|(k, v)| format!(r#""{}": {}"#, k, v))
-                .collect();
-            format!(
-                r#"    {{"params": {{{}}}, "median_ms": {:.4}}}"#,
-                params.join(", "),
-                ms
-            )
-        })
-        .collect();
-
-    let winner_json: Vec<String> = result
-        .winner
-        .iter()
-        .map(|(k, v)| format!(r#""{}": {}"#, k, v))
-        .collect();
-
-    let timestamp = {
-        use std::time::SystemTime;
-        let secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        format!("{}", secs)
-    };
-
+/// Build the on-disk record for an autotune result.
+///
+/// Split out from [`write_cache`] so a test can assert on the record without
+/// touching the filesystem.
+pub fn build_cache_record(hash: &str, kernel_name: &str, result: &AutotuneResult) -> AutotuneCacheRecord {
     let winner_ms = result
         .all_timings
         .iter()
         .find(|(v, _)| v == &result.winner)
         .map(|(_, ms)| *ms)
         .unwrap_or(0.0);
-
-    let json = format!(
-        r#"{{
-  "kernel": "{}",
-  "device": "{}",
-  "compute_capability": "{}",
-  "sm_count": {},
-  "variants_tested": {},
-  "winner": {{{}}},
-  "median_time_ms": {:.4},
-  "all_timings": [
-{}
-  ],
-  "timestamp": "{}",
-  "cache_key": "{}"
-}}"#,
-        kernel_name,
-        result.device_name,
-        result.compute_capability,
-        result.sm_count,
-        result.all_timings.len(),
-        winner_json.join(", "),
+    let timestamp_secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    AutotuneCacheRecord {
+        schema_version: CACHE_SCHEMA_VERSION,
+        kernel: kernel_name.to_string(),
+        cache_key: hash.to_string(),
+        device: result.device.clone(),
+        selection: result.selection.clone(),
+        winner: result.winner.clone(),
         winner_ms,
-        timings_json.join(",\n"),
-        timestamp,
-        hash,
-    );
-
-    let path = dir.join(format!("{}_{}.json", kernel_name, hash));
-    std::fs::write(&path, json).ok();
+        variants_tested: result.all_timings.len(),
+        all_timings: result
+            .all_timings
+            .iter()
+            .map(|(params, ms)| TimingEntry {
+                params: params.clone(),
+                median_ms: *ms,
+            })
+            .collect(),
+        timestamp_secs,
+    }
 }
 
-/// Parse the winner variant from a cached JSON file.
-fn parse_winner_from_cache(json: &str) -> Option<Variant> {
-    let winner_start = json.find("\"winner\":")?;
-    let brace_start = json[winner_start..].find('{')? + winner_start;
-    let brace_end = json[brace_start..].find('}')? + brace_start;
-    let winner_str = &json[brace_start + 1..brace_end];
-
-    let mut variant = Vec::new();
-    for pair in winner_str.split(',') {
-        let parts: Vec<&str> = pair.split(':').collect();
-        if parts.len() == 2 {
-            let key = parts[0].trim().trim_matches('"').to_string();
-            let val: i64 = parts[1].trim().parse().ok()?;
-            variant.push((key, val));
-        }
+/// Write an autotune result (winner + all timings) to the cache directory.
+pub fn write_cache(hash: &str, kernel_name: &str, result: &AutotuneResult) {
+    let dir = cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
     }
-
-    if variant.is_empty() {
-        None
-    } else {
-        Some(variant)
-    }
+    let record = build_cache_record(hash, kernel_name, result);
+    let Ok(json) = serde_json::to_string_pretty(&record) else {
+        return;
+    };
+    let path = dir.join(format!("{}_{}.json", kernel_name, hash));
+    std::fs::write(&path, json).ok();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A device identity that is not the local machine's, for hash and record
+    /// tests that must not depend on what GPU the test host happens to have.
+    fn dev(name: &str) -> DeviceIdentity {
+        DeviceIdentity {
+            device_name: name.to_string(),
+            sm_version: 86,
+            sm_count: 84,
+            driver_version: 12_000,
+        }
+    }
+
     #[test]
     fn test_ast_hash_deterministic_and_sensitive() {
         let params = vec![("block_size".to_string(), vec![64, 128])];
+        let d = dev("GPU0");
 
-        let hash1 = hash_kernel_ast(
-            "my_kernel",
-            b"body_v1",
-            &params,
-            &[vec![256]],
-            "GPU0",
-            "8.6",
-            84,
-        );
-        let hash2 = hash_kernel_ast(
-            "my_kernel",
-            b"body_v1",
-            &params,
-            &[vec![256]],
-            "GPU0",
-            "8.6",
-            84,
-        );
+        let hash1 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], &d);
+        let hash2 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], &d);
         assert_eq!(hash1, hash2, "identical inputs must produce the same hash");
 
         // Different AST body
-        let hash3 = hash_kernel_ast(
-            "my_kernel",
-            b"body_v2",
-            &params,
-            &[vec![256]],
-            "GPU0",
-            "8.6",
-            84,
-        );
+        let hash3 = hash_kernel_ast("my_kernel", b"body_v2", &params, &[vec![256]], &d);
         assert_ne!(hash1, hash3, "different AST body must change hash");
 
         // Different input shapes
-        let hash4 = hash_kernel_ast(
-            "my_kernel",
-            b"body_v1",
-            &params,
-            &[vec![512]],
-            "GPU0",
-            "8.6",
-            84,
-        );
+        let hash4 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![512]], &d);
         assert_ne!(hash1, hash4, "different input shapes must change hash");
 
-        // Different device
-        let hash5 = hash_kernel_ast(
-            "my_kernel",
-            b"body_v1",
-            &params,
-            &[vec![256]],
-            "GPU1",
-            "8.9",
-            128,
-        );
+        // Different device name
+        let hash5 = hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], &dev("GPU1"));
         assert_ne!(hash1, hash5, "different device must change hash");
+
+        // Each identity field independently participates. Without this, a key
+        // could name the right card and still describe the wrong silicon —
+        // a rebadged part, a different SKU's SM count, a driver upgrade that
+        // changes ptxas codegen.
+        for (label, other) in [
+            (
+                "sm_version",
+                DeviceIdentity {
+                    sm_version: 89,
+                    ..d.clone()
+                },
+            ),
+            (
+                "sm_count",
+                DeviceIdentity {
+                    sm_count: 128,
+                    ..d.clone()
+                },
+            ),
+            (
+                "driver_version",
+                DeviceIdentity {
+                    driver_version: 13_030,
+                    ..d.clone()
+                },
+            ),
+        ] {
+            assert_ne!(
+                hash1,
+                hash_kernel_ast("my_kernel", b"body_v1", &params, &[vec![256]], &other),
+                "a different {label} must change the cache key"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_fields_do_not_slide_into_one_another() {
+        // Length-prefixing check: without it, concatenating the raw bytes of
+        // adjacent fields makes ("ab", "c") and ("a", "bc") hash identically,
+        // so two genuinely different kernels share a cache entry.
+        let params: TuningParams = vec![];
+        let d = dev("GPU0");
+        assert_ne!(
+            hash_kernel_ast("ab", b"c", &params, &[], &d),
+            hash_kernel_ast("a", b"bc", &params, &[], &d),
+        );
     }
 
     #[test]
@@ -610,15 +849,14 @@ mod tests {
                 (vec![("block_size".to_string(), 128)], 1.5),
                 (vec![("block_size".to_string(), 256)], 0.8),
             ],
-            device_name: "TestGPU".to_string(),
-            compute_capability: "8.6".to_string(),
-            sm_count: 84,
+            device: dev("TestGPU"),
+            selection: SelectionMethod::Measured,
         };
 
         let hash = "test_hash_roundtrip_12345";
         write_cache(hash, "test_kernel", &result);
 
-        let cached = check_cache("test_kernel", hash);
+        let cached = check_cache("test_kernel", hash, &dev("TestGPU"));
         assert!(cached.is_some(), "cache file should be readable");
         let winner = cached.unwrap();
         assert_eq!(winner, vec![("block_size".to_string(), 256)]);
@@ -630,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_check_cache_miss() {
-        let cached = check_cache("nonexistent_kernel", "nonexistent_hash");
+        let cached = check_cache("nonexistent_kernel", "nonexistent_hash", &dev("TestGPU"));
         assert!(cached.is_none());
     }
 
@@ -669,7 +907,14 @@ mod tests {
         let path = cache_dir().join(format!("test_kernel_{}.json", hash));
         std::fs::remove_file(&path).ok();
 
-        let winner = find_best_variant("test_kernel", &params, hash, &ptx_gen, &benchmark)
+        let winner = find_best_variant(
+            "test_kernel",
+            &params,
+            hash,
+            &dev("MockGPU"),
+            &ptx_gen,
+            &benchmark,
+        )
             .expect("should find a winner");
 
         assert_eq!(
@@ -689,9 +934,8 @@ mod tests {
         let result = AutotuneResult {
             winner: vec![("tile_k".to_string(), 32)],
             all_timings: vec![(vec![("tile_k".to_string(), 32)], 0.5)],
-            device_name: "MockGPU".to_string(),
-            compute_capability: "8.0".to_string(),
-            sm_count: 108,
+            device: dev("MockGPU"),
+            selection: SelectionMethod::Measured,
         };
         write_cache(hash, "cached_kernel", &result);
 
@@ -703,7 +947,14 @@ mod tests {
             panic!("should not be called — cache hit");
         };
 
-        let winner = find_best_variant("cached_kernel", &params, hash, &ptx_gen, &benchmark)
+        let winner = find_best_variant(
+            "cached_kernel",
+            &params,
+            hash,
+            &dev("MockGPU"),
+            &ptx_gen,
+            &benchmark,
+        )
             .expect("cache hit should succeed");
 
         assert_eq!(winner, vec![("tile_k".to_string(), 32)]);
@@ -727,7 +978,14 @@ mod tests {
             panic!("should not be called — PTX gen fails");
         };
 
-        let winner = find_best_variant("fail_kernel", &params, hash, &ptx_gen, &benchmark)
+        let winner = find_best_variant(
+            "fail_kernel",
+            &params,
+            hash,
+            &dev("MockGPU"),
+            &ptx_gen,
+            &benchmark,
+        )
             .expect("should fall back to median");
 
         // Median of [1,2,3] is index 1 => value 2
@@ -755,7 +1013,14 @@ mod tests {
             })
         };
 
-        let winner = find_best_variant("timeout_kernel", &params, hash, &ptx_gen, &benchmark)
+        let winner = find_best_variant(
+            "timeout_kernel",
+            &params,
+            hash,
+            &dev("MockGPU"),
+            &ptx_gen,
+            &benchmark,
+        )
             .expect("should pick fast variant");
 
         assert_eq!(
@@ -812,7 +1077,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let winner =
-            find_best_variant_cost_model("cost_kernel", &params, hash, false, &ptx_gen, &cost_est)
+            find_best_variant_cost_model(
+                "cost_kernel",
+                &params,
+                hash,
+                &dev("MockGPU"),
+                "MockSpec",
+                false, &ptx_gen, &cost_est)
                 .expect("should find a winner");
 
         assert_eq!(
@@ -833,9 +1104,10 @@ mod tests {
         let result = AutotuneResult {
             winner: vec![("x".to_string(), 1)],
             all_timings: vec![(vec![("x".to_string(), 1)], 0.1)],
-            device_name: "cost_model".to_string(),
-            compute_capability: String::new(),
-            sm_count: 0,
+            device: dev("MockGPU"),
+            selection: SelectionMethod::CostModel {
+                spec: "MockSpec".to_string(),
+            },
         };
         write_cache(hash, "fresh_kernel", &result);
 
@@ -850,13 +1122,25 @@ mod tests {
 
         // Without fresh: should return cached winner (x=1)
         let cached_winner =
-            find_best_variant_cost_model("fresh_kernel", &params, hash, false, &ptx_gen, &cost_est)
+            find_best_variant_cost_model(
+                "fresh_kernel",
+                &params,
+                hash,
+                &dev("MockGPU"),
+                "MockSpec",
+                false, &ptx_gen, &cost_est)
                 .expect("cache hit");
         assert_eq!(cached_winner, vec![("x".to_string(), 1)]);
 
         // With fresh=true: should re-evaluate and pick x=3
         let fresh_winner =
-            find_best_variant_cost_model("fresh_kernel", &params, hash, true, &ptx_gen, &cost_est)
+            find_best_variant_cost_model(
+                "fresh_kernel",
+                &params,
+                hash,
+                &dev("MockGPU"),
+                "MockSpec",
+                true, &ptx_gen, &cost_est)
                 .expect("fresh evaluation");
         assert_eq!(fresh_winner, vec![("x".to_string(), 3)]);
 
@@ -889,7 +1173,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let winner =
-            find_best_variant_cost_model("skip_kernel", &params, hash, false, &ptx_gen, &cost_est)
+            find_best_variant_cost_model(
+                "skip_kernel",
+                &params,
+                hash,
+                &dev("MockGPU"),
+                "MockSpec",
+                false, &ptx_gen, &cost_est)
                 .expect("should skip size=32 and pick from 64,128");
 
         // size=128 wins (1000/128 < 1000/64)
@@ -911,10 +1201,12 @@ mod tests {
         };
 
         let winner = find_best_variant_cost_model(
-            "allfail_kernel",
-            &params,
-            hash,
-            false,
+                "allfail_kernel",
+                &params,
+                hash,
+                &dev("MockGPU"),
+                "MockSpec",
+                false,
             &ptx_gen,
             &cost_est,
         )
@@ -949,10 +1241,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let winner = find_best_variant_cost_model(
-            "twopar_kernel",
-            &params,
-            hash,
-            false,
+                "twopar_kernel",
+                &params,
+                hash,
+                &dev("MockGPU"),
+                "MockSpec",
+                false,
             &ptx_gen,
             &cost_est,
         )

@@ -434,17 +434,31 @@ impl Compiler<'_> {
     ) -> Result<HashMap<String, i64>, CodegenError> {
         let fresh = self.compile_options.autotune_fresh;
 
-        // Compute a cache key from the kernel AST + tuning params + target GPU
-        let gpu = crate::gpu_specs::default_gpu();
+        // Two different notions of "which GPU", and conflating them was the
+        // item-10 defect:
+        //
+        //   `device` is IDENTITY — driver-reported, hashed into the cache key,
+        //   and recorded in the entry. It answers "may this result transfer to
+        //   that machine?", so it must never be a default.
+        //
+        //   `gpu` is a MODEL — the GpuSpec the roofline prices against. The
+        //   database may have no entry for the local card, in which case
+        //   falling back to a similar one yields an estimate rather than
+        //   nothing. That fallback is safe precisely because it does not
+        //   participate in the key.
+        //
+        // Before this, both were `default_gpu()` — A100-SXM unconditionally —
+        // so every machine hashed the same device string and reused each
+        // other's entries.
+        let device = crate::autotune::DeviceIdentity::local();
+        let gpu = crate::gpu_specs::resolve_local_gpu().unwrap_or_else(crate::gpu_specs::default_gpu);
         let ast_bytes = format!("{:?}", kernel.body).into_bytes();
         let cache_hash = crate::autotune::hash_kernel_ast(
             kernel_name,
             &ast_bytes,
             tuning_params,
-            &[], // no specific input shapes at compile time
-            gpu.name,
-            &format!("{}", gpu.sm_version),
-            gpu.num_sms,
+            &[], // shapes are unknown until runtime — see hash_kernel_ast
+            &device,
         );
 
         // PTX generator closure: compile kernel with substituted constants
@@ -499,6 +513,8 @@ impl Compiler<'_> {
             kernel_name,
             tuning_params,
             &cache_hash,
+            &device,
+            gpu.name,
             fresh,
             &ptx_generator,
             &cost_estimator,
@@ -1677,7 +1693,17 @@ impl Compiler<'_> {
             ];
 
             if self.compile_options.no_autotune {
-                eprintln!("[nsl] autotune: --no-autotune, using middle values for flash_attention");
+                // Not "--no-autotune made us use middle values" — nothing here
+                // ever did anything else. The primary config below is
+                // `select_middle_values` unconditionally, and no cost model or
+                // benchmark runs on this path, so the flag has nothing to
+                // switch off. The old wording claimed the flag had an effect it
+                // does not have. `flash_attention_block_sizes_are_never_tuned`
+                // in tests/autotune_cache_identity.rs pins this.
+                eprintln!(
+                    "[nsl] autotune: flash_attention block sizes are not autotuned — \
+                     middle values are always the primary config, with or without --no-autotune"
+                );
             }
 
             // Generate all (block_q, block_kv) combinations

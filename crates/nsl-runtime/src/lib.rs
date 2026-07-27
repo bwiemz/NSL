@@ -141,6 +141,8 @@ pub use cuda::test_detect_sm_version;
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;
+// Driver-reported device identity for the @autotune cache key (item 10).
+pub use cuda::{cuda_device_identity, CudaDeviceIdentity};
 
 pub mod autodiff;
 pub mod checkpoint;
