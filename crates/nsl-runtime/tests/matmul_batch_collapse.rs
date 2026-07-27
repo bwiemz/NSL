@@ -359,11 +359,17 @@ fn a_transposed_operand_still_computes_the_right_product() {
     nsl_tensor_free(b);
 }
 
-/// A genuinely batched B (`[batch, k, n]`, a different matrix per slice) must
-/// keep taking the batched arm — there is no single 2-D B to share.
+/// A genuinely batched B (`[batch, k, n]`, a different matrix per slice) has no
+/// single 2-D B to share, so it must NOT be collapsed. It goes to
+/// `cublasGemmStridedBatchedEx` instead — a different kernel computing the same
+/// contraction, not a reinterpretation — and must still be correct.
+///
+/// The dispatch assertion names `sgemm_cublas_batched` specifically rather than
+/// "any gemm": collapsing this shape would emit the plain `sgemm_cublas` marker
+/// and silently multiply every slice by slice 0's B.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn a_batched_b_is_not_collapsed() {
+fn a_batched_b_takes_the_strided_batched_path_not_the_collapse() {
     // `into_inner` on poison: one failing test must not cascade into four
     // `PoisonError` failures that hide which gate actually broke.
     let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -379,8 +385,14 @@ fn a_batched_b_is_not_collapsed() {
         nsl_tensor_free(c);
     });
     assert!(
-        names.iter().any(|kname| kname == "nsl_bmm_f32"),
-        "a per-slice B must stay on the batched kernel; kernels seen: {names:?}"
+        names.iter().any(|kname| kname == "sgemm_cublas_batched"),
+        "a per-slice B must take the strided-batched cuBLAS path; \
+         kernels seen: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|kname| kname == "sgemm_cublas"),
+        "a per-slice B was collapsed into a single sgemm — every slice would be \
+         multiplied by slice 0's B. Kernels seen: {names:?}"
     );
 
     // ...and still be correct.
@@ -401,6 +413,61 @@ fn a_batched_b_is_not_collapsed() {
     }
     let err = max_err_vs_rms(&got, &want);
     assert!(err < 1e-5, "batched-B product drifted {err:e}");
+    nsl_tensor_free(c);
+    nsl_tensor_free(a);
+    nsl_tensor_free(b);
+}
+
+/// `[1,m,k] @ [batch,k,n]` — A is BROADCAST across the batch, expressed to
+/// cuBLAS as `strideA = 0`.
+///
+/// This is the one geometry where the strided-batched call does something the
+/// naive kernel encoded differently, and a zero stride is easy to get wrong in
+/// a way that produces plausible numbers: swap `stride_a` and `stride_b` at the
+/// operand-swap site and slice 0 still comes out right, so a single-slice or
+/// symmetric fixture would pass. Hence batch=3 with distinct per-slice data and
+/// a full element-wise check.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn a_broadcast_operand_uses_a_zero_stride_correctly() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_set_batch_collapse_disabled(false);
+    let (batch, m, k, n) = (3usize, 4usize, 5usize, 6usize);
+    let a_data = deterministic(m * k, 61); // ONE slice, reused for all `batch`
+    let b_data = deterministic(batch * k * n, 67);
+    let a = gpu_tensor(&[1, m as i64, k as i64], &a_data);
+    let b = gpu_tensor(&[batch as i64, k as i64, n as i64], &b_data);
+
+    let names = kernels_during(|| {
+        let c = nsl_tensor_matmul(a, b, 0);
+        nsl_tensor_free(c);
+    });
+    assert!(
+        names.iter().any(|kname| kname == "sgemm_cublas_batched"),
+        "broadcast-A must reach the strided-batched path; kernels seen: {names:?}"
+    );
+
+    let c = nsl_tensor_matmul(a, b, 0);
+    let got = read_back(c);
+    let mut want = vec![0.0f32; batch * m * n];
+    for bi in 0..batch {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for p in 0..k {
+                    // A carries NO batch index — that is the whole point.
+                    acc += a_data[i * k + p] as f64 * b_data[bi * k * n + p * n + j] as f64;
+                }
+                want[bi * m * n + i * n + j] = acc as f32;
+            }
+        }
+    }
+    let err = max_err_vs_rms(&got, &want);
+    assert!(
+        err < 1e-5,
+        "broadcast-A product drifted {err:e} — a zero stride is being applied \
+         to the wrong operand, or not at all"
+    );
     nsl_tensor_free(c);
     nsl_tensor_free(a);
     nsl_tensor_free(b);

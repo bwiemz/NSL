@@ -2171,6 +2171,104 @@ pub(crate) mod cublas_inner {
         )
     }
 
+    /// Strided-batched row-major SGEMM: `C[i] = alpha * A[i] @ B[i] + beta * C[i]`
+    /// for `batch` slices (item 9).
+    ///
+    /// All three operands are ROW-MAJOR, using the same operand-swap idiom as
+    /// `sgemm_row_major`: cuBLAS is asked for `C^T = B^T A^T` in its
+    /// column-major view, which is the same bytes. `stride_*` are ELEMENT
+    /// offsets between consecutive slices; **0 broadcasts** that operand
+    /// across the batch, which is how `gpu_matmul_f32` expresses
+    /// `[b,m,k] @ [k,n]`-style shape broadcasting.
+    ///
+    /// Distinct from `sgemm_strided_batched_raw` above, which takes RAW
+    /// column-major arguments, is muon-only, and deliberately taints
+    /// cuda-graph regions. This one is on the general matmul path, so it
+    /// records a proper pseudo-op instead — tainting here would disable graph
+    /// capture for every model containing a batched product.
+    ///
+    /// Compute type is `CUBLAS_COMPUTE_32F`, matching `sgemm_row_major`. It is
+    /// deliberately NOT the TF32 variant the muon path opts into: routing the
+    /// general matmul to cuBLAS and changing its precision are separate
+    /// decisions, and bundling them would make any resulting numerical change
+    /// impossible to attribute.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_batched_row_major(
+        a_dev: *const f32,
+        b_dev: *const f32,
+        c_dev: *mut f32,
+        m: u64,
+        n: u64,
+        k: u64,
+        batch: u64,
+        stride_a: u64,
+        stride_b: u64,
+        stride_c: u64,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(m > 0 && n > 0 && k > 0 && batch > 0);
+        debug_assert!(
+            m <= i32::MAX as u64
+                && n <= i32::MAX as u64
+                && k <= i32::MAX as u64
+                && batch <= i32::MAX as u64,
+            "batched gemm dims must fit in i32"
+        );
+        if !super::graph_capture::on_sgemm_batched(
+            a_dev as usize, b_dev as usize, c_dev as usize,
+            m, n, k, alpha, beta, batch, stride_a, stride_b, stride_c,
+        ) {
+            return Ok(());
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!(
+                    "[nsl] cublasSetStream_v2 failed: {r:?} — batched matmul stays on its previous stream"
+                );
+            }
+        }
+        let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
+        let status = unsafe {
+            cublas_sys::cublasGemmStridedBatchedEx(
+                handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n as i32, // cublas m = N (cols of row-major C)
+                m as i32, // cublas n = M (rows of row-major C)
+                k as i32, // contraction dim
+                &alpha as *const f32 as *const std::ffi::c_void,
+                b_dev as *const std::ffi::c_void, // A^cublas := B_row
+                f32t,
+                n as i32,        // lda = N
+                stride_b as i64, // ...and B_row's stride goes with it
+                a_dev as *const std::ffi::c_void, // B^cublas := A_row
+                f32t,
+                k as i32, // ldb = K
+                stride_a as i64,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c_dev as *mut std::ffi::c_void,
+                f32t,
+                n as i32, // ldc = N
+                stride_c as i64,
+                batch as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
+            )
+        };
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublas_result::CublasError(status));
+        }
+        Ok(())
+    }
+
     /// Weight-gradient contraction: `C[d, o] = alpha * (X[N, d]^T @ G[N, o]) + beta * C`.
     ///
     /// All three operands are ROW-MAJOR. This is the shape the weight gradient
@@ -3383,8 +3481,14 @@ fn gpu_cast_raw(ptx: *const u8, kname: *const u8, src: u64, dst: u64, n: usize) 
     inner::sync_after_kernel();
 }
 
-/// `NSL_MATMUL_NO_BATCH_COLLAPSE=1` — keep batched products on the naive
-/// `nsl_bmm_f32` kernel instead of collapsing them into one cuBLAS sgemm.
+/// `NSL_MATMUL_NO_BATCH_COLLAPSE=1` — restore the pre-item-9 dispatch, keeping
+/// every batched product on the naive `nsl_bmm_f32` kernel.
+///
+/// One switch covers BOTH item-9 paths — the collapse of `[..,m,k] @ [k,n]`
+/// into a single sgemm and the routing of genuinely batched products to
+/// `cublasGemmStridedBatchedEx`. They are separate dispatch decisions but a
+/// single escape hatch is what an operator actually wants: "put the matmul
+/// back the way it was" while a suspected numerical regression is bisected.
 ///
 /// This exists so the parity gate has a reference arm that is the OLD
 /// numerics, and so a suspected cuBLAS-tiling difference in a training run can
@@ -3619,6 +3723,92 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             // can still match.
             crate::kernel_profiler::kernel_profiler_push_trace(
                 "sgemm_cublas",
+                [1, 1, 1],
+                [1, 1, 1],
+            );
+        }
+    } else if !batch_collapse_disabled()
+        && total_batch <= i32::MAX as u64
+        && m <= i32::MAX as u64
+        && n <= i32::MAX as u64
+        && k <= i32::MAX as u64
+        && a.is_contiguous()
+        && b.is_contiguous()
+    {
+        // Item 9: a genuinely batched product — both operands carry a batch
+        // extent, or A is broadcast — goes to `cublasGemmStridedBatchedEx`.
+        // This is what remains after the collapse above: in a transformer it
+        // is QK^T and PV, which the collapse cannot touch because B differs
+        // per slice.
+        //
+        // Unlike the collapse this is NOT a reinterpretation — it is a
+        // different kernel computing the same contraction, so summation order
+        // changes exactly as it did for the 2-D cuBLAS swap.
+        //
+        // Contiguity is required because the strides handed to cuBLAS are the
+        // natural per-slice extents; a strided view would need its real
+        // strides, and passing the natural ones would read the wrong memory
+        // rather than fail. The caller materialises both operands, so this is
+        // defence in depth.
+        inner::ensure_context();
+
+        // Profiler-event wrapping mirrors the 2-D arm above, and must: a bare
+        // `kernel_profiler_push_trace` indexes the event pool at
+        // `pool_cursor - 1`, so without a popped pair it points one before the
+        // start of the pool and the trace is dropped at flush.
+        let profiler_events = if crate::kernel_profiler::kernel_profiler_enabled() {
+            crate::kernel_profiler::kernel_profiler_pop_events()
+        } else {
+            None
+        };
+        if let Some((start, _, _)) = &profiler_events {
+            unsafe {
+                cudarc::driver::sys::cuEventRecord(
+                    *start as cudarc::driver::sys::CUevent,
+                    inner::current_stream(),
+                );
+            }
+        }
+
+        let res = unsafe {
+            cublas_inner::sgemm_batched_row_major(
+                a.data as *const f32,
+                b.data as *const f32,
+                out_data as *mut f32,
+                m, n, k,
+                total_batch, stride_a, stride_b, stride_c,
+                1.0, 0.0,
+            )
+        };
+        if let Err(e) = res {
+            eprintln!(
+                "[nsl-matmul] cuBLAS batched gemm failed ({total_batch}x{m}x{n}x{k}): {e:?}"
+            );
+            return 0;
+        }
+        if inner::sync_mode_enabled() {
+            let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+            if sync_result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                panic!(
+                    "[nsl] CUDA async error after cuBLAS batched gemm \
+                     ({total_batch}x{m}x{n}x{k}): {sync_result:?}"
+                );
+            }
+        }
+        if let Some((_, stop, _)) = &profiler_events {
+            unsafe {
+                cudarc::driver::sys::cuEventRecord(
+                    *stop as cudarc::driver::sys::CUevent,
+                    inner::current_stream(),
+                );
+            }
+            // Same synthetic-marker convention as the 2-D arm: the real
+            // arch-dispatched cuBLAS kernel name is not visible from the
+            // public API. Named distinctly so a profile can tell the two
+            // cuBLAS paths apart — and so the "did this collapse?" assertion
+            // in the gates can be specific rather than matching any gemm.
+            crate::kernel_profiler::kernel_profiler_push_trace(
+                "sgemm_cublas_batched",
                 [1, 1, 1],
                 [1, 1, 1],
             );
