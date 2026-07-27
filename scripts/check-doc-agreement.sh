@@ -31,7 +31,9 @@
 #   2. No doc claims a pass is unimplemented while its source file exists.
 #   3. Docs that describe benchmark scope must acknowledge the GPU results
 #      that exist on disk.
-#   4. Every CI job name quoted in the docs exists in .github/workflows/.
+#   4. Every `cargo ...` command documented in the Testing-Strategy CI table is
+#      actually run by ci.yml.
+#   5. Every CI job id named in the docs exists in .github/workflows/.
 #
 set -euo pipefail
 
@@ -102,6 +104,7 @@ PASS_SOURCES=(
   "CPKD:crates/nsl-codegen/src/cpkd.rs"
   "CFIE:crates/nsl-codegen/src/cfie.rs"
   "PCA:crates/nsl-codegen/src/pca_detect.rs"
+  "MemoryPlanner:crates/nsl-codegen/src/memory_planner.rs"
 )
 # Phrases that assert absence. Matched case-insensitively on the same line as
 # the pass label, or on the 3 lines following it (docs put the claim under the
@@ -183,6 +186,71 @@ if [[ -e "${strategy_doc}" && -e .github/workflows/ci.yml ]]; then
   [[ "${missing_cmds}" -eq 0 ]] && ok "all ${n_cmds} documented cargo commands appear in ci.yml"
 else
   ok "no Testing-Strategy CI table to reconcile"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. CI job ids named in the docs must exist in .github/workflows/.
+#
+# Roadmap item 21 asked for this; check 4 above covers COMMANDS, which is a
+# different surface. The docs name jobs directly too — CONTRIBUTING.md calls
+# out `test-onnx-rt` and `fpga` as blocking, Testing-Strategy.md names
+# `doc-agreement` and `gpu-gate-inventory`. A renamed or deleted job leaves
+# those references pointing at nothing, which is exactly how the
+# `merge-gate-preview` reference outlived the job it described.
+#
+# Scope: backticked kebab-case tokens on lines that also mention CI or a job,
+# minus RUNNER LABELS (`ubuntu-latest`, `macos-14`) and crate names, which have
+# the same shape as a job id and are what a first cut of this check flagged.
+#
+# KNOWN GAP, stated rather than papered over: only KEBAB-CASE tokens (>=1
+# hyphen) are validated. A single-word job id such as `fpga` is
+# indistinguishable from ordinary backticked prose, so renaming THAT job would
+# not be caught here. Widening the pattern flags every inline code span in the
+# docs, which is worse than the gap.
+# checked against the job ids parsed from the workflows. Restricting
+# to those lines is what keeps this precise — an earlier attempt at a job-id
+# check scanned freely and matched prose and YAML keys, producing pure noise.
+# ---------------------------------------------------------------------------
+echo
+echo "5. CI job ids named in the docs exist in .github/workflows/"
+# Only keys under the top-level `jobs:` mapping are job ids. A blanket
+# two-space-key match also picks up `push`, `pull_request`, `contents` and the
+# other `on:`/`permissions:` keys — which is precisely the "matched YAML keys"
+# noise the previous attempt at this check ran into.
+job_ids="$(awk '/^jobs:/{inj=1; next} /^[a-z]/{inj=0} inj && /^  [a-z0-9_-]+:/{sub(/:.*/,""); sub(/^  /,""); print}' \
+           .github/workflows/*.yml 2>/dev/null | sort -u)"
+if [[ -z "${job_ids}" ]]; then
+  err "no job ids parsed out of .github/workflows/*.yml — this check would be vacuous"
+else
+  n_jobs="$(wc -l <<< "${job_ids}" | tr -d ' ')"
+  bad_jobs=0
+  n_refs=0
+  for doc in CONTRIBUTING.md "${DOCS[@]}"; do
+    [[ -e "${doc}" ]] || continue
+    while IFS= read -r tok; do
+      [[ -z "${tok}" ]] && continue
+      n_refs=$((n_refs + 1))
+      if ! grep -qx -- "${tok}" <<< "${job_ids}"; then
+        err "${doc} names CI job '${tok}', which no workflow defines"
+        bad_jobs=$((bad_jobs + 1))
+      fi
+    done < <(grep -iE -A 1 '(\bCI\b|\bjobs?\b)' "${doc}" \
+             | grep -oE '`[a-z0-9]+(-[a-z0-9]+)+`' | tr -d '`' \
+             | grep -vE '^(ubuntu|macos|windows)-' \
+             | grep -vE '^(cargo|continue-on-error|rust-toolchain|check-doc-agreement|check-version-agreement|gpu-cert|pull-request|merge-queue|nsl-cli|nsl-codegen|nsl-runtime|nsl-semantic|test-threads|include-ignored)' \
+             | sort -u || true)
+  done
+  # Only tokens that ARE job ids should be asserted; anything else shaped like
+  # one but absent is reported above. Guard against the filter eating
+  # everything, which would make this pass while checking nothing.
+  # The docs name at least four jobs today (test-onnx-rt, doc-agreement,
+  # gpu-gate-inventory, ...). A threshold of 0 would still read green after the
+  # filter silently ate all but one reference, so pin it near the real count.
+  if [[ "${n_refs}" -lt 3 ]]; then
+    err "check 5 matched only ${n_refs} doc job reference(s) — the filter is too aggressive and this check is near-vacuous"
+  elif [[ "${bad_jobs}" -eq 0 ]]; then
+    ok "all ${n_refs} documented CI job references resolve (${n_jobs} jobs defined)"
+  fi
 fi
 
 echo

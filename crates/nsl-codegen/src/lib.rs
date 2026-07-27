@@ -172,6 +172,7 @@ pub mod fusion_graph;
 pub mod fusion_report;
 pub mod inspect;
 pub mod memory_planner;
+pub mod pass_registry;
 pub mod profiling;
 pub mod reduction_fusion;
 pub mod serve;
