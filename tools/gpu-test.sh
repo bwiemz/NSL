@@ -118,8 +118,13 @@ for line in "${entries[@]}"; do
   # depend on nsl-test; passing it to nsl-runtime is a hard cargo error
   # ("the package 'nsl-runtime' does not contain this feature"), which is how
   # the first version of this runner reported two false FAILs.
+  # `test-hooks` is needed too: nsl-runtime's integration tests reach the
+  # tensor builders/readers (`test_build_tensor_2d_f32`, `test_read_tensor_f64`)
+  # through it, so a `--features cuda` run compiles those files to nothing and
+  # the filter matches no test. That reads as NOTFOUND here rather than a false
+  # green only because of the summary-line parse below.
   case "${pkg}" in
-    nsl-runtime) feats="cuda" ;;
+    nsl-runtime) feats="cuda,test-hooks" ;;
     *)           feats="cuda,nsl-test/cuda" ;;
   esac
 

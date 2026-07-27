@@ -174,7 +174,11 @@ function Get-CanaryEntries {
 }
 
 function Invoke-CargoTest($pkg, $bin, $extraArgs, $label, $strict) {
-    $cargoArgs = @('test', '-p', $pkg, '--features', 'cuda')
+    # Kept in step with tools/gpu-test.sh: nsl-runtime's integration tests need
+    # `test-hooks` for the tensor builders/readers, and without it those files
+    # compile to nothing and every filter matches no test.
+    $feats = if ($pkg -eq 'nsl-runtime') { 'cuda,test-hooks' } else { 'cuda' }
+    $cargoArgs = @('test', '-p', $pkg, '--features', $feats)
     if ($Release) { $cargoArgs += '--release' }
     if ($bin)     { $cargoArgs += @('--test', $bin) }
     $cargoArgs += '--'

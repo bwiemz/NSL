@@ -31,3 +31,7 @@ nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_
 nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward_causal | Tier B.2 full backward against the real Tier B.1 forward, causal on (item 15)
 nsl-codegen | flash_attention_gqa_backward_gpu | gqa_backward_matches_cpu_reference | GQA backward vs CPU reference (item 15)
 nsl-cli | view_chain_leak_gate | view_chain_results_are_numerically_unchanged | reshape/transpose/expand/contiguous sums exact after the added frees (item 1)
+nsl-runtime | matmul_batch_collapse | both_arms_agree_with_the_cpu_reference | [batch,m,k]@[k,n] via the collapsed cuBLAS sgemm and via the naive kernel, both vs an f64 CPU reference at 1e-5 (item 9)
+nsl-runtime | matmul_batch_collapse | a_broadcast_operand_uses_a_zero_stride_correctly | strided-batched cuBLAS with strideA=0, batch=3 distinct slices vs f64 CPU reference (item 9)
+nsl-runtime | matmul_batch_collapse | a_transposed_operand_still_computes_the_right_product | a transposed 3-D operand must materialise before the collapse; vs f64 CPU reference (item 9)
+nsl-runtime | matmul_tf32_mode | the_default_mode_is_still_full_f32 | the default matmul math mode has not silently become TF32; vs f64 CPU reference (item 9)
