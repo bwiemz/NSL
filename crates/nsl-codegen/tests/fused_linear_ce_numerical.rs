@@ -8,10 +8,22 @@
 //! Targets: 128 entries with -100 at every position where (b*S + s) % 16 == 0
 //! (8 ignored, 120 valid).
 //!
-//! ## Tolerances (documented in design)
-//! * Forward loss: |gpu - ref| / max(|ref|, 1.0) < 1e-3
-//! * Backward dx:  max_abs |dx_gpu - dx_ref| < 5e-3
-//! * Skip identity: dx_gpu[row, :] == 0 exactly for all -100 rows
+//! ## Tolerances
+//! * Forward loss:  |gpu - ref| / max(|ref|, 1.0) < 1e-3
+//! * Backward dx:    max_abs |dx_gpu - dx_ref| < 1e-5
+//! * Backward dW:    max_abs |dw_gpu - dw_ref| < 1e-5      (item 6)
+//! * Backward dbias: max_abs |db_gpu - db_ref| < 1e-5      (item 6)
+//! * Skip identity:  dx_gpu[row, :] == 0 exactly for all -100 rows
+//!
+//! Every gradient bound is paired with an assertion that the REFERENCE's own
+//! max magnitude is at least 10x the bound. Without that, a tolerance can be
+//! looser than the signal and silently pass a kernel that wrote nothing —
+//! which is what the original 5e-3 dx bound did (max|dx_ref| here is ~1.3e-3).
+//! Measured errors on this rig are ~1e-8, so 1e-5 leaves three orders of
+//! headroom while still discriminating.
+//!
+//! dW/dbias come from `red.global.add.f32` scatters, so atomic ordering makes
+//! them ULP-nondeterministic; the tolerance is a bound, never an equality.
 //!
 //! ## Running
 //! ```bash
@@ -22,6 +34,8 @@
 //! `#[ignore]` gates on live CUDA device availability.
 
 #![cfg(feature = "cuda")]
+
+mod common;
 
 use nsl_codegen::fused_linear_ce::{
     Dtype, FusedLinearCEConfig, synthesize_fused_linear_ce_ptx,
@@ -403,16 +417,63 @@ fn fused_linear_ce_gpu_forward_and_backward() {
     };
     assert_eq!(bwd_rc, 0, "nsl_fused_linear_ce_backward failed rc={}", bwd_rc);
 
-    // Read back dx.
+    // Read back dx, dW and dbias.
+    //
+    // Item 6: dW and dbias were allocated, zeroed, and passed to the FFI here
+    // but never read back — and the local `cpu_reference_backward` returns
+    // `(dx, dlogits)`, so its second component was discarded at the call site
+    // and NO dW/dbias reference was ever computed for F32. The kernel's
+    // `red.global.add.f32` scatters into dW/dbias were therefore unchecked at
+    // this shape: only the V=49152 fp16/bf16 twins covered them, and neither
+    // exercises the F32 emitter. Closed below against the shared f64 helper.
     let mut dx_gpu = vec![0f32; rows * H];
+    let mut dw_gpu = vec![0f32; V * H];
+    let mut dbias_gpu = vec![0f32; V];
     unsafe {
         nsl_test_cuda_d2h(dx_gpu.as_mut_ptr() as i64, dx_dev, dx_bytes);
+        nsl_test_cuda_d2h(dw_gpu.as_mut_ptr() as i64, dw_dev, dw_bytes);
+        nsl_test_cuda_d2h(dbias_gpu.as_mut_ptr() as i64, dbias_dev, dbias_bytes);
     }
 
     // ── 6. CPU backward reference ─────────────────────────────────────────
 
     let (dx_ref, _) = cpu_reference_backward(
         &x_host, &w_host, &bias_host, &targets, &ref_lse, 1.0,
+    );
+
+    // dW / dbias reference from the shared f64 helper — the same one the
+    // fp16/bf16 v49152 tests use, so a change to the reference semantics
+    // moves all three tests together instead of leaving F32 on a private
+    // copy that can drift.
+    let x_f64: Vec<f64> = x_host.iter().map(|&v| v as f64).collect();
+    let w_f64: Vec<f64> = w_host.iter().map(|&v| v as f64).collect();
+    let bias_f64: Vec<f64> = bias_host.iter().map(|&v| v as f64).collect();
+    let targets_i32: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
+    let cpu_bwd = common::fused_lce_cpu_f64::cpu_lce_backward_f64(
+        &x_f64, &w_f64, &bias_f64, &targets_i32, &ref_lse, 1.0, rows, V, H,
+    );
+
+    // Cross-check the two references against each other on dx before either
+    // is used as ground truth. They are independent implementations, so
+    // agreement here is what licenses trusting the helper's dW/dbias — which
+    // have no second opinion available.
+    let mut ref_disagreement = 0f64;
+    for row in 0..rows {
+        if targets[row] == IGNORE_INDEX {
+            continue;
+        }
+        for hi in 0..H {
+            let d = (dx_ref[row * H + hi] as f64 - cpu_bwd.dx[row * H + hi]).abs();
+            if d > ref_disagreement {
+                ref_disagreement = d;
+            }
+        }
+    }
+    assert!(
+        ref_disagreement < 1e-5,
+        "the local f32 reference and the shared f64 helper disagree on dx by \
+         {ref_disagreement:.3e} — one of them is wrong, so neither can be \
+         trusted for the dW/dbias comparison below"
     );
 
     // ── 7. Compare dx ─────────────────────────────────────────────────────
@@ -441,10 +502,108 @@ fn fused_linear_ce_gpu_forward_and_backward() {
     }
 
     eprintln!("backward dx max_abs_err = {:.2e} over {} elements", max_abs_err, n_checked);
+    // The original 5e-3 here had the same defect as the dW bound below: the
+    // reference's own max|dx| at this fixture is ~1.3e-3, so 5e-3 admitted an
+    // all-zero dx. Measured error on an f32 kernel is ~1.3e-8, and the
+    // lower-precision fp16/bf16 V=49152 twins hold 1e-5, so 1e-5 is a
+    // conservative bound that actually discriminates.
+    let dx_signal = dx_ref.iter().fold(0f32, |m, &v| m.max(v.abs()));
     assert!(
-        max_abs_err < 5e-3,
-        "backward dx error {:.2e} exceeds 5e-3 tolerance",
-        max_abs_err
+        (dx_signal as f64) > 1e-5 * 10.0,
+        "dx reference signal {dx_signal:.2e} is not comfortably above the 1e-5 \
+         tolerance — the assertion below would not discriminate."
+    );
+    assert!(
+        max_abs_err < 1e-5,
+        "backward dx error {max_abs_err:.2e} exceeds 1e-5 (signal {dx_signal:.2e})"
+    );
+
+    // ── 7b. Compare dW and dbias ──────────────────────────────────────────
+    //
+    // These are the components that had no assertion at all on the F32 path.
+    // They come out of `red.global.add.f32` scatters, so atomic ordering makes
+    // them ULP-nondeterministic — an exact comparison would be flaky by
+    // construction. Tolerance matches dx's 5e-3.
+
+    let mut dw_max_abs = 0f64;
+    let mut dw_nonzero = 0usize;
+    for i in 0..V * H {
+        let d = (dw_gpu[i] as f64 - cpu_bwd.dw[i]).abs();
+        if d > dw_max_abs {
+            dw_max_abs = d;
+        }
+        if dw_gpu[i] != 0.0 {
+            dw_nonzero += 1;
+        }
+    }
+    let mut db_max_abs = 0f64;
+    let mut db_nonzero = 0usize;
+    for vi in 0..V {
+        let d = (dbias_gpu[vi] as f64 - cpu_bwd.dbias[vi]).abs();
+        if d > db_max_abs {
+            db_max_abs = d;
+        }
+        if dbias_gpu[vi] != 0.0 {
+            db_nonzero += 1;
+        }
+    }
+    eprintln!(
+        "backward dW max_abs_err = {:.2e} ({dw_nonzero}/{} nonzero), \
+         dbias max_abs_err = {:.2e} ({db_nonzero}/{V} nonzero)",
+        dw_max_abs,
+        V * H,
+        db_max_abs,
+    );
+
+    // Anti-vacuity FIRST: an all-zero dW would compare "close" to a reference
+    // whose own entries are small, so a tolerance alone can pass on a kernel
+    // that never wrote anything. Every valid row contributes to every
+    // vocabulary entry through the softmax, so both buffers must be densely
+    // nonzero.
+    assert!(
+        dw_nonzero > (V * H) / 2,
+        "dW is {dw_nonzero}/{} nonzero — the dW scatter appears not to have \
+         run at all, which would make the tolerance check below vacuous",
+        V * H
+    );
+    assert!(
+        db_nonzero > V / 2,
+        "dbias is {db_nonzero}/{V} nonzero — the dbias scatter appears not to \
+         have run at all"
+    );
+
+    // A tolerance is only meaningful if it is SMALLER than the signal it is
+    // checking. At this fixture the reference magnitudes are max|dW| ~ 2.5e-3
+    // and max|dbias| ~ 8.2e-3, so the 5e-3 bound this file uses for dx would
+    // admit an all-zero dW (error 2.5e-3 < 5e-3) — it would "pass" a kernel
+    // that computed nothing. Bound at 1e-5, matching the fp16/bf16 V=49152
+    // twins, and assert the discriminating power explicitly rather than
+    // trusting a hardcoded constant to stay meaningful as the fixture evolves.
+    let dw_signal = cpu_bwd.dw.iter().fold(0f64, |m, &v| m.max(v.abs()));
+    let db_signal = cpu_bwd.dbias.iter().fold(0f64, |m, &v| m.max(v.abs()));
+    const GRAD_TOL: f64 = 1e-5;
+    assert!(
+        dw_signal > GRAD_TOL * 10.0,
+        "dW reference signal {dw_signal:.2e} is not comfortably above the \
+         {GRAD_TOL:.0e} tolerance — the assertion below would not discriminate \
+         a correct kernel from a dead one. Re-derive the tolerance."
+    );
+    assert!(
+        db_signal > GRAD_TOL * 10.0,
+        "dbias reference signal {db_signal:.2e} is not comfortably above the \
+         {GRAD_TOL:.0e} tolerance — the assertion below would not discriminate."
+    );
+
+    assert!(
+        dw_max_abs < GRAD_TOL,
+        "backward dW error {dw_max_abs:.2e} exceeds {GRAD_TOL:.0e} (signal \
+         {dw_signal:.2e}) — check the dlogits x outer-product scatter \
+         (red.global.add.f32) in emit_bwd_kernel"
+    );
+    assert!(
+        db_max_abs < GRAD_TOL,
+        "backward dbias error {db_max_abs:.2e} exceeds {GRAD_TOL:.0e} (signal \
+         {db_signal:.2e}) — check the dlogits row-sum scatter in emit_bwd_kernel"
     );
 
     // ── 8. Cleanup ────────────────────────────────────────────────────────
@@ -461,5 +620,8 @@ fn fused_linear_ce_gpu_forward_and_backward() {
         nsl_test_cuda_free(dbias_dev);
     }
 
-    eprintln!("PASS: forward loss err {:.2e} < 1e-3, backward dx err {:.2e} < 5e-3", loss_err, max_abs_err);
+    eprintln!(
+        "PASS: loss err {:.2e} < 1e-3; dx {:.2e}, dW {:.2e}, dbias {:.2e} all < 1e-5",
+        loss_err, max_abs_err, dw_max_abs, db_max_abs
+    );
 }

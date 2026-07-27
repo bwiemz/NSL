@@ -6790,6 +6790,98 @@ impl Compiler<'_> {
 
             let extraction_ok = extractor.extract_stmts(&step_body.stmts);
 
+            // Item 6: refuse a `@fused_lm_ce(enabled = true)` that fused
+            // NOTHING.
+            //
+            // The decorator's whole purpose is to remove the `[N, V]`
+            // logits-gradient surface (402 MB per step at V=49152, H=2048).
+            // Its substitution declines for twelve distinct reasons and every
+            // one used to fall silently through to
+            // `PrimalOp::CrossEntropyLoss`, so a
+            // user whose LM head is biasless or reshaped before the loss —
+            // which is every production coder model in this repo — got a
+            // clean compile, no diagnostic, and the full composite path while
+            // believing the fused kernel was live. Per
+            // `feedback_deferral_must_refuse`, a capability that cannot be
+            // delivered must say so.
+            //
+            // Scoped to "NOTHING fused" rather than "any decline" on purpose:
+            // a step body may legitimately contain an auxiliary
+            // `cross_entropy` that is not the LM head, and refusing that
+            // would make the decorator unusable. Partial declines warn.
+            if extraction_ok {
+                // Deduplicate before reporting. `try_unroll_for` re-extracts a
+                // loop body once per iteration, so ONE `cross_entropy` inside
+                // an unrolled loop yields N identical declines; reporting "N
+                // cross_entropy call(s)" for a single source call, N times,
+                // would be actively misleading.
+                let mut declines: Vec<crate::source_ad::FusedLceDecline> =
+                    Vec::new();
+                for d in extractor.fused_lce_declines() {
+                    if !declines.contains(d) {
+                        declines.push(d.clone());
+                    }
+                }
+                if !declines.is_empty() {
+                    if extractor.fused_lce_substitution_count() == 0 {
+                        let mut reasons = String::new();
+                        for (i, d) in declines.iter().enumerate() {
+                            reasons.push_str(&format!("\n  {}. {}", i + 1, d.describe()));
+                        }
+                        return Err(CodegenError::new(format!(
+                            "@fused_lm_ce(enabled = true) is active on this train \
+                             block, but the fused linear-CE kernel could not be \
+                             substituted for ANY of the {} distinct cross_entropy \
+                             site(s) in the step body — so the full [batch*seq, \
+                             vocab] logits gradient would still be materialized \
+                             every step, which is exactly what the decorator \
+                             exists to avoid.\
+                             \n\nWhy each call declined:{}\n\n\
+                             Fix the head so it matches, or set enabled = false (or \
+                             drop the decorator) to request the composite path \
+                             deliberately.",
+                            declines.len(),
+                            reasons,
+                        )));
+                    }
+                    // Partial: at least one call fused. Report the rest so a
+                    // head that quietly stopped matching is still visible.
+                    for d in &declines {
+                        eprintln!(
+                            "[fused-lm-ce] a cross_entropy call fell back to the \
+                             composite path: {}",
+                            d.describe()
+                        );
+                    }
+                }
+            } else if self.active_fused_ce_config.as_ref().is_some_and(|c| c.enabled) {
+                // Item 6: the OTHER way an enabled decorator delivers nothing.
+                //
+                // The refusal above is gated on `extraction_ok` because a body
+                // that source-AD cannot extract never reaches the substitution
+                // arm at all — there are no declines to report, and the
+                // fallback below is a general mechanism, not a fused-CE
+                // decision. But the user's promise is broken just the same: the
+                // fused kernel only exists on the source-AD path, so a tape
+                // fallback means it definitely did not run.
+                //
+                // This is not hypothetical. `crates/nsl-codegen/tests/fixtures/
+                // fused_lm_ce_e2e_{fp16,bf16}.nsl` both carry a fully-hinted
+                // enabled decorator and both land here, because their heads use
+                // `bias_add(...)`, which has no source-AD handler. Warn rather
+                // than refuse: unlike a decline, this path has a legitimate
+                // reading (the body genuinely is not statically extractable)
+                // and refusing would break those fixtures.
+                eprintln!(
+                    "[fused-lm-ce] @fused_lm_ce(enabled = true) is active, but \
+                     source-AD extraction of the step body failed — the fused \
+                     linear-CE kernel exists only on the source-AD path, so it \
+                     will NOT run and the full [batch*seq, vocab] logits gradient \
+                     will be materialized. Restrict the step body to \
+                     source-AD-supported operations, or drop the decorator."
+                );
+            }
+
             if !extraction_ok {
                 // CPKD: the tape records EVERY op on the thread-local tape —
                 // including the teacher forward — and its backward allocates

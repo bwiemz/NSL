@@ -3940,8 +3940,10 @@ fn embed_fused_ce_data(
     Ok((ptx_val, name_val))
 }
 
-/// Build a CPU-side f32 NslTensor with `shape` then move it to device=1
-/// (CUDA). Returns the NslTensor handle Value (i64).
+/// Allocate a zeroed f32 NslTensor of `shape` directly on device=1 (CUDA).
+/// Returns the NslTensor handle Value (i64).
+///
+/// Backs the 13 fused-CE / fused-KL-CE output and gradient buffers.
 fn alloc_gpu_f32_tensor(
     compiler: &mut crate::compiler::Compiler,
     builder: &mut FunctionBuilder,
@@ -3952,14 +3954,53 @@ fn alloc_gpu_f32_tensor(
         let dim_val = builder.ins().iconst(cl_types::I64, dim);
         call(compiler, builder, "nsl_list_push", &[shape_list, dim_val])?;
     }
-    let cpu_tensor = call(compiler, builder, "nsl_tensor_zeros", &[shape_list])?;
+    // Item 6: allocate + zero ON THE DEVICE.
+    //
+    // This used to be `nsl_tensor_zeros` (a HOST f32 alloc + host-side zero
+    // fill) followed by `nsl_tensor_to_device` (a second, device allocation
+    // plus an H2D copy of those zeros). Every fused-CE and fused-KL-CE buffer
+    // goes through here, so each training step paid a host allocation, a host
+    // memset and a PCIe transfer for buffers whose entire initial content is
+    // zero — including the `[V, H]` dW buffer, which is 402 MB at V=49152,
+    // H=2048. Transferring zeros across PCIe to initialize a device buffer is
+    // pure waste; `nsl_tensor_zeros_on(shape, 1)` does a device-side
+    // `memset_d8` instead.
+    //
+    // Same allocator either way: `nsl_tensor_zeros_on`'s device arm and
+    // `nsl_tensor_to_device` both route through
+    // `cuda::inner::alloc_managed`, which is the caching allocator (the name
+    // is historical — it is not CUDA managed/unified memory). So this changes
+    // how the buffer is filled, not where it lives, and the resulting tensor
+    // is f32/device-1/owning exactly as before.
+    //
+    // MEASURED (RTX 5070 Ti, csla_fused_lmce scaled to V=4096/H=512, 13
+    // steps): losses agree within 1.14e-7, which is BELOW the kernel's own
+    // run-to-run noise of 1.99e-7 (the dW/dbias `red.global.add.f32` scatters
+    // are atomic-order dependent, so bit-exactness is not available here);
+    // fused-CE launch counts identical at 13 forward / 13 backward. Wall
+    // clock 3.42 s -> 3.41 s and peak host RSS 444.6 MB -> 444.4 MB, i.e. NO
+    // measurable win at that shape — ~104 MB of eliminated H2D over the whole
+    // run is under the noise floor, and the host staging tensor was not
+    // leaking. The saving is proportional to V*H and only becomes significant
+    // at production vocab: dW alone is 402 MB PER STEP at V=49152, H=2048.
     let cuda_device = builder.ins().iconst(cl_types::I64, 1);
     let gpu_tensor = call(
         compiler,
         builder,
-        "nsl_tensor_to_device",
-        &[cpu_tensor, cuda_device],
+        "nsl_tensor_zeros_on",
+        &[shape_list, cuda_device],
     )?;
+    // Free the shape list: `nsl_tensor_zeros_on` copies the dims into its own
+    // `checked_alloc`'d buffer and never retains the `NslList`, so this is
+    // neither a use-after-free nor a double-free. This helper previously
+    // dropped `shape_list` on the floor once per buffer per step.
+    //
+    // Not a claim about the rest of the file: of the other `*_zeros_on` call
+    // sites, only the flash-attention pair around line 1060 frees. The ones
+    // routed through the `alloc_shape_on` closure in the CSHA backward
+    // (~line 3032) leak the same way this one did — a separate, much smaller
+    // leak (one `NslList` per buffer) that is out of scope here.
+    call(compiler, builder, "nsl_list_free", &[shape_list])?;
     Ok(gpu_tensor)
 }
 

@@ -210,6 +210,24 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "item 7 reported how many weight-gradient chains the pre-pass fused",
     ),
     m(
+        "[fused-lm-ce]",
+        &[
+            // stmt.rs: the partial-decline warning, and the
+            // extraction-failed warning.
+            "crates/nsl-codegen/src/stmt.rs",
+            // source_ad.rs: the explicit `fused_linear_ce(...)` call
+            // diagnostics (no decorator / disabled / missing hints). Listed
+            // because pinning only one emitting file lets the others be
+            // renamed silently — the exact defect a review caught in this
+            // registry's first version.
+            "crates/nsl-codegen/src/source_ad.rs",
+        ],
+        "item 6 warned that a fused linear-CE substitution did not happen \
+         while @fused_lm_ce was active (the PARTIAL / unextractable / \
+         explicit-call cases — a total decline failure is a hard CodegenError, \
+         not this marker)",
+    ),
+    m(
         "[nsl-kernel-count]",
         &[
             "crates/nsl-runtime/src/fused_adapter.rs",
@@ -305,6 +323,22 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
             "[fuse] rmsnorm dx+residual folds:",
             "crates/nsl-codegen/src/stmt.rs",
         )],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/fused_lm_ce_decline_gate.rs",
+        asserts: "a matching LM head, and a disabled decorator, produced NO \
+                  fused linear-CE fallback diagnostic",
+        // Both assertions are `!stderr.contains("[fused-lm-ce]")`, so the bare
+        // token is the whole needle. Two emitting files: the partial-decline /
+        // extraction-failed warnings in stmt.rs and the explicit-call
+        // diagnostics in source_ad.rs. Rename either prefix and BOTH negative
+        // assertions become permanently true while the positive assertions in
+        // the same file still pass — which is why the token is pinned per
+        // file rather than once.
+        parts: &[
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/stmt.rs"),
+            ("[fused-lm-ce]", "crates/nsl-codegen/src/source_ad.rs"),
+        ],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/multi_adamw_gate.rs",
