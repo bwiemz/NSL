@@ -92,48 +92,23 @@ let y = relu(x * w + b)
 - Synthesizes PTX with correct ISA (log2→ln conversion, ex2 adjustment)
 - Supported ops: add, mul, relu, gelu, sigmoid, tanh, exp, log, sqrt, neg, silu
 
-### Level 2: Epilogue Fusion (M31)
-**File**: `epilogue_fusion.rs` (961 lines)
+### Levels 2-4: Epilogue / reduction / graph fusion (M31) — REMOVED
 
-Fuses post-matmul operations into the matmul kernel's epilogue:
-```
-# Before: matmul kernel + separate bias + activation kernels
-let y = relu(x @ w + bias)
+`epilogue_fusion.rs`, `reduction_fusion.rs` and `fusion_graph.rs` described
+matmul-epilogue fusion, map-into-reduction fusion, and DAG-level fusion
+planning. All three were deleted (see the changelog): a `FusionGraph` was
+never constructed outside `#[cfg(test)]`, so none of the three passes was
+reachable from any compilation. `epilogue_fusion`'s PTX synthesiser also
+emitted an un-indexed store against an indexed load — every thread would have
+written element 0 — which nothing noticed because the kernel had never been
+assembled, let alone launched.
 
-# After: single matmul kernel with in-register epilogue
-# bias add and relu happen before writing results to memory
-```
-
-- Detects matmul → bias → activation chains
-- Epilogue ops: bias add, activation (relu/gelu/sigmoid/tanh/silu), scalar multiply, clamp
-- Variants for standard, FP8, AWQ, and GPTQ matmul
-- In-register computation (no extra memory traffic)
-
-### Level 3: Reduction Fusion (M31)
-**File**: `reduction_fusion.rs` (1,428 lines)
-
-Fuses map operations into reduction kernels:
-```
-# Before: elementwise square kernel + sum reduction kernel
-let variance = mean(x * x)
-
-# After: single kernel that squares and sums simultaneously
-```
-
-- Block-partitioned reductions with shared memory
-- Tree-reduce patterns within thread blocks
-- Weighted aggregation for Welford online variance
-- Sum, mean, max reduction types
-- Pre-reduction map operations (square, abs, exp, identity)
-
-### Level 4: Graph-Level Fusion (M31)
-**File**: `fusion_graph.rs` (455 lines)
-
-DAG-level analysis for global fusion planning:
-- Builds a directed acyclic graph of all operations
-- Identifies fusion opportunities across the full computation graph
-- Tracks producer-consumer relationships
-- `@fuse_graph` decorator for explicit graph fusion regions
+What actually ships is Level 1 above (elementwise fusion, which does run) plus
+the purpose-built fused emitters: fused linear-CE, fused RMSNorm backward,
+fused AdamW, the CSHA fused attention kernels, and the cuBLAS `beta = 1`
+weight-gradient accumulation (`--fuse-wgrad-accum`). Those are separate
+emitters reached from `stmt.rs` and `wengert_lower.rs`, not from a general
+fusion-graph framework.
 
 ---
 

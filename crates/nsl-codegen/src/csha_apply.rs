@@ -21,7 +21,6 @@ use crate::csha::CshaPlan;
 use crate::csha_boundary::ProjKind;
 use crate::csha_pipeline::{FusionLevel, LayerPlan};
 use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-use crate::fusion_graph::{FusionGraph, FusionOp};
 
 /// One flash-attention kernel specialisation produced by the bridge.
 #[derive(Debug, Clone, Serialize)]
@@ -941,45 +940,13 @@ fn build_flash_config(
     }
 }
 
-/// Apply CSHA fusion marks to a `FusionGraph`, tagging matmul / RMSNorm /
-/// RoPE nodes that belong to CSHA-fused kernels so the independent
-/// fusion passes skip them.
-///
-/// Returns the number of nodes successfully marked.  The search is by
-/// parameter name — the graph's name_to_node map must contain the
-/// weight params for the marks to apply.
-pub fn apply_marks_to_graph(graph: &mut FusionGraph, marks: &[FusionMark]) -> usize {
-    let mut n_applied = 0;
-    for m in marks {
-        let Some(&param_node) = graph.name_to_node.get(&m.param_name) else {
-            continue;
-        };
-        // The matmul that consumes this param is the Q/K/V projection
-        // we want to claim.  Walk the param's consumers and find the
-        // first Matmul.
-        let consumers: Vec<u32> = graph.nodes[param_node as usize].consumers.clone();
-        let mm = consumers
-            .into_iter()
-            .find(|&c| matches!(graph.nodes[c as usize].op, FusionOp::Matmul));
-        let Some(mm_id) = mm else { continue };
-        if graph.nodes[mm_id as usize].fused_into.is_none() {
-            // Reserve kernel-id 0xFF_00_00_00 | role as a CSHA marker.
-            // This avoids collisions with real `FusedKernelId`s (which
-            // grow from 0) and makes it trivial to detect in
-            // downstream passes.
-            let csha_tag: u32 = 0xFF00_0000 | m.role as u32;
-            graph.nodes[mm_id as usize].fused_into = Some(csha_tag);
-            n_applied += 1;
-        }
-    }
-    n_applied
-}
-
-/// Returns `true` if a given `fused_into` value was produced by
-/// `apply_marks_to_graph` (i.e. high byte = 0xFF).
-pub fn is_csha_fused(kid: u32) -> bool {
-    (kid & 0xFF00_0000) == 0xFF00_0000
-}
+// NOTE (item 9 phase 2): `apply_marks_to_graph` and `is_csha_fused` lived
+// here, tagging `FusionGraph` nodes so the independent fusion passes would
+// skip CSHA-claimed matmuls. Both were deleted with the fusion-graph
+// subsystem itself: a `FusionGraph` was never constructed outside
+// `#[cfg(test)]`, so nothing downstream ever read the marks. The `FusionMark`
+// values produced above remain live — the fused-backward emitter consumes
+// them directly.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1524,51 +1491,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn csha_fused_tag_is_distinguishable() {
-        assert!(is_csha_fused(0xFF00_0000));
-        assert!(is_csha_fused(0xFF00_0002));
-        assert!(!is_csha_fused(0));
-        assert!(!is_csha_fused(1));
-        assert!(!is_csha_fused(0x7FFF_FFFF));
-    }
-
-    #[test]
-    fn apply_marks_tags_matmul_consumers() {
-        let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut Vec::new());
-
-        // Minimal fusion graph: one param node consumed by one matmul.
-        let mut g = FusionGraph::new();
-        let p = g.add_named_node(
-            "blocks.0.attn.wq".into(),
-            FusionOp::Input,
-            vec![],
-        );
-        let mm = g.add_node(FusionOp::Matmul, vec![p]);
-        g.nodes[p as usize].consumers.push(mm);
-
-        let n = apply_marks_to_graph(&mut g, &r.marks);
-        assert!(n >= 1);
-        let fused = g.nodes[mm as usize].fused_into.unwrap();
-        assert!(is_csha_fused(fused));
-    }
-
-    #[test]
-    fn apply_marks_is_idempotent() {
-        let plan = toy_plan(CshaMode::Auto);
-        let r = bridge(&plan, 64, &mut Vec::new());
-        let mut g = FusionGraph::new();
-        let p = g.add_named_node("blocks.0.attn.wq".into(), FusionOp::Input, vec![]);
-        let mm = g.add_node(FusionOp::Matmul, vec![p]);
-        g.nodes[p as usize].consumers.push(mm);
-
-        let n1 = apply_marks_to_graph(&mut g, &r.marks);
-        let n2 = apply_marks_to_graph(&mut g, &r.marks);
-        // Second pass shouldn't re-mark already-fused nodes.
-        assert!(n1 >= 1);
-        assert_eq!(n2, 0);
-    }
 
     #[test]
     fn config_payload_round_trips_csha_level() {

@@ -161,20 +161,17 @@ pub mod tensor_parallel;
 pub mod autotune;
 pub mod calibration;
 pub mod cost_model;
-pub mod epilogue_fusion;
 pub mod flash_attention;
 pub mod flash_attention_selector;
 pub mod flash_attention_v2;
 pub mod fused_linear_ce;
 pub mod precision_cast_ptx;
 pub mod fusion;
-pub mod fusion_graph;
 pub mod fusion_report;
 pub mod inspect;
 pub mod memory_planner;
 pub mod pass_registry;
 pub mod profiling;
-pub mod reduction_fusion;
 pub mod serve;
 pub mod wcet;
 
@@ -320,9 +317,9 @@ pub mod distributed {
 /// Cost modeling, fusion, memory planning, and other analysis passes.
 pub mod analysis {
     pub use crate::{
-        autotune, calibration, cost_model, epilogue_fusion, flash_attention,
-        flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion, fusion_graph,
-        fusion_report, inspect, memory_planner, profiling, reduction_fusion, serve,
+        autotune, calibration, cost_model, flash_attention,
+        flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion,
+        fusion_report, inspect, memory_planner, profiling, serve,
         wcet,
     };
 }

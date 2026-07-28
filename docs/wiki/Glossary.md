@@ -182,7 +182,7 @@ Signals to the compiler that the decorated function implements multi-head attent
 Marks model parameters as frozen during training; the compiler removes their VarIds from `backward_live` so no adjoint is emitted for them. Used in conjunction with WRGA adapter injection.
 
 ### <a id="dec-fuse"></a>`@fuse`
-Requests elementwise fusion of the decorated function with its producer/consumer ops (M26/M31); the compiler attempts to merge them into a single kernel dispatch via the epilogue fusion pass in `epilogue_fusion.rs`.
+Requests elementwise fusion of the decorated function with its producer/consumer ops (M26/M31); the compiler validates the body and extracts its op chain in `stmt.rs`, registering it for a fused kernel launch at each call site. (It does **not** go through an "epilogue fusion pass" — the M31 `epilogue_fusion.rs` this entry used to cite was never reachable from any compilation and was deleted; see the changelog.)
 
 ### <a id="dec-inspect"></a>`@inspect`
 Compiler-native debugger decorator (Dev Tools Phase 1) that captures tensor state at the decorated call site and writes an NSLI-format dump, readable via `nsl run --monitor`. Implementation: `crates/nsl-codegen/src/inspect/`.

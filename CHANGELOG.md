@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Removed — the M31 fusion-graph subsystem (4,200 lines that never ran)
+
+- `epilogue_fusion.rs` (1237), `reduction_fusion.rs` (1573) and
+  `fusion_graph.rs` (496) implemented matmul-epilogue fusion, map-into-reduction
+  fusion, and DAG-level fusion planning. A `FusionGraph` was never constructed
+  outside a `#[cfg(test)]` block or a test file, so **none of the three passes
+  was reachable from any compilation**. Their only non-test references were to
+  each other.
+- `epilogue_fusion`'s PTX synthesiser was also wrong, not merely unused: it
+  computed an indexed load (`add.u64 %rd6, %rd2, %rd5`) against an
+  **un-indexed store** (`st.global.f32 [%rd4]`), so every thread would have
+  written element 0. Nothing noticed because the kernel had never been
+  assembled by ptxas, let alone launched; all ten of its tests were
+  `.contains()` checks on the emitted string.
+- Went with them: `csha_apply::apply_marks_to_graph` / `is_csha_fused` (CSHA's
+  interface to the graph — the marks it applied had no reader), the two test
+  files that existed solely to exercise the dead passes, and one snapshot.
+  `FusionMark` and its producers stay: the fused-backward emitter consumes
+  them directly.
+- Also removed `fp8.rs`'s `compile_fp8_matmul` and both
+  `emit_fp8_matmul_ptx{,_wgmma}` emitters (~365 lines). Both were already
+  `#[allow(dead_code)]`, `compile_fp8_matmul` had no caller outside its own
+  file, and the PTX targets `sm_90` — unloadable on this repo's sm_120
+  hardware. Every test was a string `.contains()`.
+- Docs corrected rather than deleted: `docs/wiki/Glossary.md` claimed `@fuse`
+  works "via the epilogue fusion pass in `epilogue_fusion.rs`". It does not —
+  `stmt.rs` validates the body and extracts its op chain for a fused launch at
+  each call site. `docs/summaries/02-gpu-kernels-and-optimization.md` described
+  all three passes as shipping features.
+
 ### Fixed — cuda-graph eager repair replayed a weight-grad gemm as a plain one
 
 - `GpuOp::Sgemm` recorded no operand transposition and no wrapper identity.
