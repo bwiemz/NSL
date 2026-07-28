@@ -581,6 +581,23 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         CALIB,
         "--fuse-wgrad-accum cannot be used when emitting a calibration binary",
     ),
+    // ── Item 9 phase 2: `@fp8_compute` × source AD — added 2026-07-28 ──────
+    // The decorator's only effect is routing matmuls to
+    // `nsl_fp8_matmul_training` on the TAPE path (`expr/advanced.rs`); source
+    // AD lowers every `PrimalOp::Matmul` to plain `nsl_tensor_matmul`, so the
+    // composition refuses instead of silently training f32 under a decorator
+    // that claims otherwise. `yet`-flavoured: an FP8 lowering in
+    // `wengert_lower.rs` would delete this rule. The flag column holds the
+    // decorator as the user types it — the subprocess sweep cannot drive a
+    // source-level decorator from the command line, so this rule is covered
+    // by the source tier only (fragment + deleted-refusal gates).
+    src_rule(
+        "@fp8_compute",
+        RuleKind::Conflicts,
+        "--source-ad",
+        STMT,
+        "@fp8_compute has no effect under --source-ad",
+    ),
 ];
 
 /// Rules whose enforcement is a clap attribute.

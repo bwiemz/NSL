@@ -6841,8 +6841,9 @@ impl Compiler<'_> {
                         names.push_str(&format!("\n  {}. {}", i + 1, m));
                     }
                     return Err(CodegenError::new(format!(
-                        "@fp8_compute has no effect under source-to-source AD, \
-                         but this train block inlined {} decorated method(s):{}\
+                        "@fp8_compute has no effect under --source-ad \
+                         (source-to-source AD), but this train block inlined \
+                         {} decorated method(s):{}\
                          \n\nSource AD lowers every matmul to nsl_tensor_matmul \
                          (see wengert_lower.rs, PrimalOp::Matmul) — there is no \
                          FP8 lowering on this path, so the step would train in \

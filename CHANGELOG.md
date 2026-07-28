@@ -21,6 +21,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   renamed two `matmul_tf32_mode` gates after its manifest regeneration, and
   the fp8 device-guard commit added five gates without one.
 
+### Changed — `@fp8_compute × --source-ad` joins the feature-composition registry
+
+- The item-9 refusal is now a registered item-20 rule
+  (`@fp8_compute` Conflicts `--source-ad`, enforced in `stmt.rs`), so the
+  deleted-refusal and fragment gates defend it like every other composition.
+  The refusal message now names `--source-ad` explicitly — required by the
+  fragment-distinctiveness gate, and clearer for the user. The subprocess
+  sweep cannot drive a source-level decorator from the command line, so the
+  rule is covered by the source tier only.
+
 ### Fixed — fp8 host-path FFIs: GPU segfault and wrong tape gradients
 
 - Every fp8 FFI (`nsl_fp8_cast`, `nsl_fp8_compute_scale`,
