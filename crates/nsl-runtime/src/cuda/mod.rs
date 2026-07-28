@@ -2041,25 +2041,56 @@ pub(crate) mod cublas_inner {
     /// Resolve the math mode via env-var > Cargo-feature precedence (spec §9).
     ///
     /// - `NSL_MATMUL_PEDANTIC=1` forces pedantic (beats everything).
-    /// - `NSL_MATMUL_TF32=1` forces TF32 tensor cores.
+    /// - `NSL_MATMUL_TF32=1` forces TF32; `NSL_MATMUL_TF32=0` forces it off.
     /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic if
-    ///   the feature is on, else plain f32 on FP32 CUDA cores.
+    ///   the feature is on, else **TF32**.
     ///
-    /// The default is unchanged by the item-9 correction: it is what NSL has
-    /// always actually done, only now named accurately. Flipping the default
-    /// to TF32 is a separate decision that needs a tolerance audit across
-    /// every gate, because TF32 drift (~1e-3 relative) exceeds most of them.
+    /// # The default is TF32, and that is a numerics decision
+    ///
+    /// Measured on a Coder-50M forward (RTX 5070 Ti, sm_120), steady-state
+    /// over the second half of a 20-forward loop so the SM clock is up —
+    /// a single cold forward swings this by 10x and is worthless:
+    ///
+    /// | | FP32 cores | TF32 | |
+    /// |---|---|---|---|
+    /// | sgemm | 33.3 ms | 21.4 ms | **1.55x** |
+    /// | all kernels | 76.5 ms | 64.8 ms | **1.18x** |
+    ///
+    /// The GEMM speedup is real and reproducible (three paired runs, spread
+    /// under 5%), but GEMM is only ~44% of kernel time at this model size, so
+    /// the end-to-end win is ~15%, not 55%. Quoting the GEMM number as if it
+    /// were the model number would be the same overstatement this file's
+    /// history is already littered with.
+    ///
+    /// The cost is ~13 bits of mantissa on every product (f32's 24-bit
+    /// significand down to TF32's 11). Anything needing full f32 sets
+    /// `NSL_MATMUL_TF32=0`, or builds with `strict-matmul` for pedantic.
+    ///
+    /// **Known consequence, not a bug:** the naive PTX matmul kernels
+    /// (`nsl_bmm_f32` and friends) run on FP32 CUDA cores regardless. A
+    /// product that falls off the cuBLAS path — a strided operand, an
+    /// inexpressible batch shape — is therefore computed at a DIFFERENT
+    /// precision than the same product on the cuBLAS path. That divergence
+    /// existed before this change (as `NSL_MATMUL_TF32=1`) but was opt-in;
+    /// it is now the default, so `matmul_batch_collapse`'s two-arm parity
+    /// gate carries the wider tolerance explicitly rather than by accident.
     pub(crate) fn resolve_math_mode() -> CublasMathMode {
         if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
             return CublasMathMode::Pedantic;
         }
-        if std::env::var("NSL_MATMUL_TF32").ok().as_deref() == Some("1") {
-            return CublasMathMode::Tf32;
+        match std::env::var("NSL_MATMUL_TF32").ok().as_deref() {
+            Some("1") => return CublasMathMode::Tf32,
+            // Explicit opt-out. Anything else (unset, or a value we do not
+            // recognise) falls through to the default rather than silently
+            // meaning "off" — a typo'd `NSL_MATMUL_TF32=true` must not
+            // quietly change the arithmetic.
+            Some("0") => return CublasMathMode::Fp32Cores,
+            _ => {}
         }
         if cfg!(feature = "strict-matmul") {
             CublasMathMode::Pedantic
         } else {
-            CublasMathMode::Fp32Cores
+            CublasMathMode::Tf32
         }
     }
 
@@ -2102,17 +2133,17 @@ pub(crate) mod cublas_inner {
 
                 match mode {
                     CublasMathMode::Fp32Cores => eprintln!(
-                        "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores (default). \
-                         Set NSL_MATMUL_TF32=1 for tensor cores — faster, and ~13 bits less \
-                         mantissa per product."
+                        "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores \
+                         (NSL_MATMUL_TF32=0)"
                     ),
                     CublasMathMode::Pedantic => eprintln!(
                         "[nsl-matmul] cuBLAS math mode: pedantic (strict f32; same arithmetic \
-                         units as the default, fewer internal shortcuts)"
+                         units as FP32 cores, fewer internal shortcuts)"
                     ),
                     CublasMathMode::Tf32 => eprintln!(
-                        "[nsl-matmul] cuBLAS math mode: TF32 tensor cores (NSL_MATMUL_TF32=1) — \
-                         every product carries a 10-bit mantissa; expect ~1e-3 relative drift."
+                        "[nsl-matmul] cuBLAS math mode: TF32 tensor cores (default) — 1.55x on \
+                         gemms, 1.18x on total kernel time at Coder-50M, at ~13 bits less \
+                         mantissa per product. Set NSL_MATMUL_TF32=0 for full f32."
                     ),
                 }
 

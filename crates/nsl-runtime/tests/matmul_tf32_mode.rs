@@ -198,14 +198,18 @@ fn zz_probe_child() {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn tf32_is_faster_and_less_accurate_than_the_default() {
-    let base = probe_with(&[]);
-    let tf32 = probe_with(&[("NSL_MATMUL_TF32", "1")]);
+fn tf32_is_faster_and_less_accurate_than_full_f32() {
+    // NOTE: `base` is the OPT-OUT, not the default. The default became TF32,
+    // so comparing `probe_with(&[])` against `NSL_MATMUL_TF32=1` would be
+    // TF32 against itself — a ~1.0x speedup and a ~1.0x error ratio, which
+    // would fail this gate for entirely the wrong reason.
+    let base = probe_with(&[("NSL_MATMUL_TF32", "0")]);
+    let tf32 = probe_with(&[]);
 
     let speedup = base.secs_per_call / tf32.secs_per_call;
     let accuracy_ratio = tf32.max_rel_err / base.max_rel_err;
     eprintln!(
-        "default: {:.4} ms, err {:e} | tf32: {:.4} ms, err {:e} | \
+        "f32 (opt-out): {:.4} ms, err {:e} | tf32 (default): {:.4} ms, err {:e} | \
          speedup {speedup:.2}x, error x{accuracy_ratio:.1}",
         base.secs_per_call * 1e3,
         base.max_rel_err,
@@ -232,7 +236,7 @@ fn tf32_is_faster_and_less_accurate_than_the_default() {
     // contrast, is bit-deterministic across every run.
     assert!(
         speedup > 1.35,
-        "NSL_MATMUL_TF32=1 gave only {speedup:.2}x. Either the mode is not \
+        "the TF32 default gave only {speedup:.2}x over NSL_MATMUL_TF32=0. Either the mode is not \
          reaching cuBLAS (CUBLAS_TF32_TENSOR_OP_MATH is deprecated — check \
          whether this CUDA version still honours it for cublasSgemm, and move \
          to cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 if not), or this \
@@ -252,23 +256,53 @@ fn tf32_is_faster_and_less_accurate_than_the_default() {
 /// documentation; silently switching every matmul in the project to a 10-bit
 /// mantissa would be a different change entirely, and one that needs a
 /// tolerance audit across every numerical gate first.
+/// The default IS TF32 now, and the opt-out works.
+///
+/// Both halves matter. Asserting only "the default is fast" would pass
+/// against a default that had silently become something else fast and less
+/// accurate; asserting only "the opt-out is accurate" would pass against a
+/// default that never changed. So this pins the default into TF32's accuracy
+/// band — clearly worse than pedantic f32, clearly better than garbage — and
+/// pins the opt-out back onto f32.
+///
+/// Measured at N=2048 on an RTX 5070 Ti: pedantic 1.4e-6, TF32 ~9.5e-4.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn the_default_mode_is_still_full_f32() {
+fn the_default_mode_is_tf32_and_the_opt_out_restores_f32() {
     let base = probe_with(&[]);
     let pedantic = probe_with(&[("NSL_MATMUL_PEDANTIC", "1")]);
+    let opted_out = probe_with(&[("NSL_MATMUL_TF32", "0")]);
     eprintln!(
-        "default err {:e} | pedantic err {:e}",
-        base.max_rel_err, pedantic.max_rel_err
+        "default err {:e} | pedantic err {:e} | NSL_MATMUL_TF32=0 err {:e}",
+        base.max_rel_err, pedantic.max_rel_err, opted_out.max_rel_err
     );
-    // Measured 1.1e-7 for both at N=2048; TF32 lands near 1e-4. A factor of 4
-    // between the two f32 modes is generous, and still an order of magnitude
-    // clear of TF32.
+
+    // The default lost mantissa relative to strict f32. A default that
+    // matched pedantic would mean the flip silently reverted.
     assert!(
-        base.max_rel_err < pedantic.max_rel_err.max(1e-6) * 4.0,
-        "the default matmul mode drifted to {:e} against pedantic's {:e} — the \
-         default has been changed to something less precise than f32",
+        base.max_rel_err > pedantic.max_rel_err * 10.0,
+        "the default matmul mode is as accurate as pedantic f32 ({:e} vs \
+         {:e}) — TF32 is supposed to be the default and it is not in effect",
         base.max_rel_err,
+        pedantic.max_rel_err
+    );
+    // ...but only about as much as TF32 should. 1e-2 is ~10x TF32's measured
+    // drift: loose enough not to flake, tight enough that a default of f16 or
+    // a genuinely broken kernel fails here.
+    assert!(
+        base.max_rel_err < 1e-2,
+        "the default matmul mode drifted {:e}, well past TF32's ~1e-3 — the \
+         default is not TF32, it is something worse",
+        base.max_rel_err
+    );
+
+    // The escape hatch has to actually restore f32, or "opt out for full
+    // precision" in the banner is a lie.
+    assert!(
+        opted_out.max_rel_err < pedantic.max_rel_err.max(1e-6) * 4.0,
+        "NSL_MATMUL_TF32=0 drifted {:e} against pedantic's {:e} — the opt-out \
+         does not restore full f32",
+        opted_out.max_rel_err,
         pedantic.max_rel_err
     );
 }

@@ -55,6 +55,37 @@ use nsl_runtime::tensor::{
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Take the serialising lock AND pin cuBLAS to full f32 for this process.
+///
+/// # Why the pin
+///
+/// The matmul default is now TF32 (see `cuda::resolve_math_mode`), which
+/// drifts ~1e-3 relative. Every gate in this file compares a GPU product
+/// against an f64 CPU reference at 1e-5 in order to catch **operand-mapping**
+/// bugs — a crossed `lda`/`ldb`, an `OP_T` on the wrong cuBLAS operand, a
+/// stride-0 broadcast mistaken for a transpose. Those produce errors of order
+/// 1e0 (measured 2.0e1, 4.3e0 and 6.4e0 in the mutation controls), so the
+/// tolerance has three orders of magnitude of headroom either way.
+///
+/// Widening these to ~5e-3 to accommodate TF32 would still catch a crossed
+/// lda, but it would throw away the sensitivity for free, and these gates are
+/// not the place TF32 belongs under test — `matmul_tf32_mode.rs` is, and it
+/// asserts the default IS TF32 from a fresh process.
+///
+/// # Why it is sound to set this here
+///
+/// `resolve_math_mode` is read exactly once per process, inside
+/// `cublas_handle()`'s `OnceLock` initialiser. Every GPU test in this file
+/// goes through this function before touching cuBLAS, so whichever test runs
+/// first performs the init with the variable already set — order-independent.
+/// If that ever stops holding, the affected test fails with a ~1e-3 drift
+/// message rather than passing quietly, so this is self-checking.
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    std::env::set_var("NSL_MATMUL_TF32", "0");
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+
 fn deterministic(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
@@ -152,7 +183,7 @@ fn kernels_during(f: impl FnOnce()) -> Vec<String> {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_transposed_right_operand_is_not_copied() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_transpose_views(true);
     let (m, k, n) = (24usize, 40usize, 56usize);
     let a_data = deterministic(m * k, 11);
@@ -202,7 +233,7 @@ fn a_transposed_right_operand_is_not_copied() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_transposed_left_operand_is_not_copied() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_transpose_views(true);
     let (m, k, n) = (24usize, 40usize, 56usize);
     // A is stored [k, m]; presented as [m, k].
@@ -240,7 +271,7 @@ fn a_transposed_left_operand_is_not_copied() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn both_operands_transposed() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_transpose_views(true);
     let (m, k, n) = (12usize, 20usize, 28usize);
     let a_data = deterministic(k * m, 23);
@@ -275,7 +306,7 @@ fn both_operands_transposed() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn the_tied_lm_head_shape_collapses_and_transposes_together() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_transpose_views(true);
     let (batch, s, c_in, vocab) = (2usize, 8usize, 16usize, 40usize);
     let x = deterministic(batch * s * c_in, 31);
@@ -323,7 +354,7 @@ fn the_tied_lm_head_shape_collapses_and_transposes_together() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_broadcast_view_is_still_materialised() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_transpose_views(true);
     let (m, k, n) = (6usize, 5usize, 7usize);
     let a_data = deterministic(m * k, 41);
@@ -370,7 +401,7 @@ fn a_broadcast_view_is_still_materialised() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_degenerate_unit_shape_is_not_mistaken_for_a_transpose() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_transpose_views(true);
     for &(m, k, n) in &[(1usize, 1usize, 1usize), (3, 1, 4), (1, 5, 1), (4, 1, 1)] {
         let a_data = deterministic(m * k, 47);

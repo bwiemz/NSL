@@ -44,6 +44,37 @@ use nsl_runtime::{test_cuda_device_synchronize, test_set_batch_collapse_disabled
 /// kernel profiler is a singleton. Tests in one binary must not interleave.
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Take the serialising lock AND pin cuBLAS to full f32 for this process.
+///
+/// # Why the pin
+///
+/// The matmul default is now TF32 (see `cuda::resolve_math_mode`), which
+/// drifts ~1e-3 relative. Every gate in this file compares a GPU product
+/// against an f64 CPU reference at 1e-5 in order to catch **operand-mapping**
+/// bugs — a crossed `lda`/`ldb`, an `OP_T` on the wrong cuBLAS operand, a
+/// stride-0 broadcast mistaken for a transpose. Those produce errors of order
+/// 1e0 (measured 2.0e1, 4.3e0 and 6.4e0 in the mutation controls), so the
+/// tolerance has three orders of magnitude of headroom either way.
+///
+/// Widening these to ~5e-3 to accommodate TF32 would still catch a crossed
+/// lda, but it would throw away the sensitivity for free, and these gates are
+/// not the place TF32 belongs under test — `matmul_tf32_mode.rs` is, and it
+/// asserts the default IS TF32 from a fresh process.
+///
+/// # Why it is sound to set this here
+///
+/// `resolve_math_mode` is read exactly once per process, inside
+/// `cublas_handle()`'s `OnceLock` initialiser. Every GPU test in this file
+/// goes through this function before touching cuBLAS, so whichever test runs
+/// first performs the init with the variable already set — order-independent.
+/// If that ever stops holding, the affected test fails with a ~1e-3 drift
+/// message rather than passing quietly, so this is self-checking.
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    std::env::set_var("NSL_MATMUL_TF32", "0");
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+
 fn deterministic(n: usize, seed: u64) -> Vec<f32> {
     // A cheap full-period LCG mapped to [-1, 1). Deliberately not `rand`: the
     // two dispatch arms must see BYTE-IDENTICAL inputs, and a shared seeded
@@ -246,7 +277,7 @@ fn kernels_during(f: impl FnOnce()) -> Vec<String> {
 fn the_projection_shape_reaches_cublas() {
     // `into_inner` on poison: one failing test must not cascade into four
     // `PoisonError` failures that hide which gate actually broke.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     let run = |collapse: bool| {
         test_set_batch_collapse_disabled(!collapse);
         kernels_during(|| {
@@ -301,7 +332,7 @@ fn the_projection_shape_reaches_cublas() {
 fn both_arms_agree_with_the_cpu_reference() {
     // `into_inner` on poison: one failing test must not cascade into four
     // `PoisonError` failures that hide which gate actually broke.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     // Shapes chosen so the collapsed row count is NOT a multiple of any
     // plausible cuBLAS tile: an aligned-only fixture cannot catch an
     // off-by-one in the flattening (the lesson from item 8's parity gate,
@@ -378,7 +409,7 @@ fn both_arms_agree_with_the_cpu_reference() {
 fn a_transposed_operand_still_computes_the_right_product() {
     // `into_inner` on poison: one failing test must not cascade into four
     // `PoisonError` failures that hide which gate actually broke.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_batch_collapse_disabled(false);
     let (batch, m, k, n) = (3usize, 8usize, 5usize, 6usize);
     // Build A as the TRANSPOSE of a [batch, k, m] buffer, i.e. a view whose
@@ -431,7 +462,7 @@ fn a_transposed_operand_still_computes_the_right_product() {
 fn a_batched_b_takes_the_strided_batched_path_not_the_collapse() {
     // `into_inner` on poison: one failing test must not cascade into four
     // `PoisonError` failures that hide which gate actually broke.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_batch_collapse_disabled(false);
     let (batch, m, k, n) = (3usize, 4usize, 5usize, 6usize);
     let a_data = deterministic(batch * m * k, 41);
@@ -489,7 +520,7 @@ fn a_batched_b_takes_the_strided_batched_path_not_the_collapse() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_broadcast_operand_uses_a_zero_stride_correctly() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_batch_collapse_disabled(false);
     let (batch, m, k, n) = (3usize, 4usize, 5usize, 6usize);
     let a_data = deterministic(m * k, 61); // ONE slice, reused for all `batch`
@@ -553,7 +584,7 @@ fn a_broadcast_operand_uses_a_zero_stride_correctly() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn partial_batch_broadcast_refuses_rather_than_reading_out_of_bounds() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     let exe = std::env::current_exe().expect("test binary path");
     let out = std::process::Command::new(exe)
         .args([
@@ -614,7 +645,7 @@ fn zz_partial_broadcast_child() {
 fn the_projection_shape_is_not_slower_than_its_2d_form() {
     // `into_inner` on poison: one failing test must not cascade into four
     // `PoisonError` failures that hide which gate actually broke.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = test_guard();
     test_set_batch_collapse_disabled(false);
     let (batch, s, c_in, o) = (8usize, 1024usize, 512usize, 512usize);
     let x = deterministic(batch * s * c_in, 53);

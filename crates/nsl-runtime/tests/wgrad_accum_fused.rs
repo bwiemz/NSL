@@ -28,10 +28,34 @@ use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_from_static, nsl_tensor_get, nsl_tensor_to_device,
 };
 use nsl_runtime::tensor::arithmetic::{
+
     nsl_tensor_matmul, nsl_tensor_scalar_mul_add_inplace, nsl_tensor_wgrad_accum,
 };
 
 const DTYPE_F32: i64 = 1;
+
+/// Pin cuBLAS to full f32 for this process before any GPU work.
+///
+/// The matmul default is TF32 (see `cuda::resolve_math_mode`), which drifts
+/// ~1e-3 relative. The gates in this file compare against an f64 CPU
+/// reference at ~1e-5 in order to catch **dispatch** bugs — stride-blindness,
+/// a crossed operand mapping, a fused GEMM writing the wrong accumulation.
+/// Those err by order 1e0, so full f32 keeps four orders of magnitude of
+/// headroom; widening to accommodate TF32 would spend that for nothing.
+///
+/// Sound because `resolve_math_mode` is read exactly once per process, inside
+/// `cublas_handle()`'s `OnceLock`, and every GPU test in this file calls this
+/// first — so whichever runs first performs the init with the variable
+/// already set. Self-checking: if that stops holding, the test fails with a
+/// ~1e-4 drift message rather than passing quietly.
+///
+/// NOT covered here: whether these paths are correct *under* TF32. The math
+/// mode is process-global, so that needs a child process (the pattern
+/// `matmul_tf32_mode.rs` uses). The risk is low — the mode applies identically
+/// to both arms of every comparison in this file — but it is a real gap.
+fn pin_full_f32() {
+    std::env::set_var("NSL_MATMUL_TF32", "0");
+}
 
 fn cuda_available() -> bool {
     if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
@@ -164,6 +188,7 @@ fn run_case(b: usize, tt: usize, d: usize, o: usize, scale: f64)
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn fused_wgrad_matches_decomposed_chain_and_cpu() {
+    pin_full_f32();
     if !cuda_available() {
         eprintln!("skipped: no CUDA device");
         return;
@@ -210,6 +235,7 @@ fn fused_wgrad_matches_decomposed_chain_and_cpu() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn fused_wgrad_comparison_is_sensitive() {
+    pin_full_f32();
     if !cuda_available() {
         eprintln!("skipped: no CUDA device");
         return;
@@ -254,6 +280,7 @@ fn fused_wgrad_comparison_is_sensitive() {
 /// producing a wrong gradient. This exercises that path on CPU tensors.
 #[test]
 fn fallback_path_is_correct_on_cpu_tensors() {
+    pin_full_f32();
     let (b, t, d, o) = (2usize, 5usize, 4usize, 3usize);
     let scale = 0.25f64;
     let x_h = det(0x71, b * t * d);

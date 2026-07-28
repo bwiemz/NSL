@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed — TF32 is now the matmul default (`NSL_MATMUL_TF32=0` opts out)
+
+- Every `cublasSgemm` NSL issues now runs on tensor cores with a 10-bit
+  mantissa instead of FP32 CUDA cores. This is a numerics change for the whole
+  stack, taken deliberately.
+- **Measured at model scale, not extrapolated from a microbenchmark.** On a
+  Coder-50M forward (RTX 5070 Ti, sm_120), steady state over the second half
+  of a 20-forward loop:
+
+  | | FP32 cores | TF32 | |
+  |---|---|---|---|
+  | sgemm | 33.3 ms | 21.4 ms | **1.55x** |
+  | all kernels | 76.5 ms | 64.8 ms | **1.18x** |
+
+  Three paired runs, spread under 5%. **The end-to-end win is ~15%, not 55%** —
+  GEMM is only ~44% of kernel time at this size. The N=2048 microbenchmark says
+  1.60x and agrees with the sgemm column; it says nothing about the model.
+- A first attempt measuring ONE forward per configuration gave
+  `{9.9, 9.7, 10.1, 25.3, 25.5}` against `{3.3, 24.1, 35.5, 3.6, 10.3}` — the
+  same configuration swinging 10x, because the SM clock idles at 1515 MHz
+  against a ~2900 boost and a single forward samples a different point on the
+  ramp each run. Numbers from unlooped GPU runs are not evidence.
+- Cost: ~13 bits of mantissa per product. Measured at N=2048, pedantic f32
+  drifts 1.36e-6 and TF32 9.48e-4 — **698x**, bit-deterministic across runs.
+- `NSL_MATMUL_TF32` is a tri-state: only the literal `"1"` and `"0"` are
+  honoured and anything else falls through to the default, so a typo'd
+  `NSL_MATMUL_TF32=true` cannot quietly change the arithmetic.
+  `NSL_MATMUL_PEDANTIC=1` and the `strict-matmul` feature still win.
+- **Known property of the dispatcher, now default-visible:** the naive PTX
+  matmul kernels run on FP32 cores regardless of the cuBLAS math mode, so a
+  product that falls off the cuBLAS path is computed at a different precision
+  than the same product on it — `matmul_batch_collapse` measures 1.03e-3
+  versus 9.75e-7 for the two arms. In practice nothing falls off: a kernel
+  histogram of a 20-forward Coder-50M loop shows 758 `sgemm_cublas` + 212
+  `sgemm_cublas_batched` and **zero** naive-matmul launches, because
+  `nsl_tensor_matmul` materialises every non-expressible operand first.
+- Gates: the operand-mapping suites (`matmul_batch_collapse`,
+  `matmul_transposed_operand`) pin `NSL_MATMUL_TF32=0` rather than widening
+  their tolerances. They exist to catch a crossed `lda`/`ldb` or an `OP_T` on
+  the wrong operand, which produce errors of order 1e0 — full f32 keeps three
+  orders of magnitude of headroom for free. `matmul_tf32_mode` asserts both
+  halves from fresh child processes: the default IS TF32, and the opt-out
+  restores f32.
+
 ### Removed — the M31 fusion-graph subsystem (4,200 lines that never ran)
 
 - `epilogue_fusion.rs` (1237), `reduction_fusion.rs` (1573) and
