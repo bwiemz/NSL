@@ -361,6 +361,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `matmul_tf32_mode.rs` asserts TF32 is both measurably faster AND measurably
   less accurate, because either alone passes for the wrong reasons.
 
+### Fixed — FlashAttention forward output and fused-backward operands crossed the f16/f32 boundary as raw bits
+
+- **Every** FlashAttention forward kernel (classic and v2) stores its
+  output as f16, but `nsl_flash_attention`, `nsl_flash_attention_csha`,
+  and `nsl_flash_attention_csha_with_saves` handed the caller's f32
+  tensor straight to the kernel and never widened: f16 bit pairs
+  reinterpreted as f32 are ~0, so every `@flash_attention` inference
+  call returned an input-independent noise-scale output (identical
+  1.7e-8 L1 across different inputs) with exit 0, and the fused
+  training forward fed the same garbage to the loss.
+  `nsl_sdpa_fused_forward` has carried the correct stage-and-widen
+  contract since PCA Stage C; the `nsl_flash_attention*` entries never
+  did — hidden until the launch pipeline was repaired. The three
+  entries now launch into transient f16 staging and widen on-device
+  into the caller's tensor — but only for f32 `NslTensor` targets: the
+  kernel-harness ABI (raw device f16 buffers) keeps the direct f16
+  store. Inference certified against exact numpy ground truth at seq 32
+  (rel 2.8e-5) and seq 64 (rel 3.7e-6).
+- The fused CSHA **backward** had three mirror-image breaks: it reads
+  dO and O as f16 (the `D = rowsum(dO . O)` preprocess) but received
+  f32 tensors — dO showed the classic reinterpret signature (powers of
+  two, -512.0) and amplified into dwq = -inf; the dRMSNorm phase reads
+  Wq/Wk/Wv as f16 but got the f32 model weights — dx_norm came out
+  2/3 NaN, poisoning dgamma and dx; and the six f16 gradient outputs
+  were handed directly to the f32-reading optimizer — weight updates
+  collapsed to ~1e-39 denormals ("frozen" wq/wk with exit 0). The FFI
+  now narrows f32-boxed f16-read operands into transient staging, and
+  the lowering widens the f16 gradients on-device before the extract
+  cache.
+- Certification: new `csha_gap_gpu_e2e_fused_vs_baseline_parity` gate
+  trains the toy twice (per-op AD baseline vs `--csha auto`) and
+  compares per-parameter SGD movement — one step makes
+  `delta_l1 = lr * |grad|_1`, so this certifies gradient-L1 parity for
+  dQ/dK/dV/dgamma. Measured agreement: ≤3e-4 relative on all four
+  params (tolerance bar 5e-2). The old e2e fixture was doubly
+  degenerate (all-ones x AND weights → dQ/dK mathematically zero, the
+  baseline "passed" on one f32 ulp of noise; softmax saturation;
+  never `m.to(cuda)`) — rewritten sin-varied on GPU with
+  `sum(abs(w - w0))` movement probes, and the historical
+  graceful-skip ladders are now hard asserts.
+
 ### Fixed — FBIP refcount-based in-place elision silently mutated live variables and MODEL WEIGHTS
 
 - `let s = abs(x)` left `x` overwritten with `|x|`; `print(sum(abs(m.wq)))`
@@ -386,10 +427,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   an error the driver reports — cuLaunchKernel SEGFAULTS); and a failed
   launch printed "Refusing to continue silently" while continuing with a
   zeros output (now a real abort, `NSL_FLASH_ALLOW_FAILED=1` escape).
-  Known remaining (documented, next slice): the v2 inference kernel
-  currently produces ~zero output values — the launch pipeline is fixed,
-  the kernel-internal numerical debug and the fused-vs-baseline dQ/dK/dV
-  certification gates are the follow-on work.
+  The "v2 kernel produces ~zero output" residual noted here at the time
+  was the missing f16→f32 output widen — fixed above.
 
 
 ### Added — `--grad-integrity` now covers the CSLA (`--layerwise-accum`) windowed backward
