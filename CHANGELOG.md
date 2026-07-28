@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — fp8 host-path FFIs: GPU segfault and wrong tape gradients
+
+- Every fp8 FFI (`nsl_fp8_cast`, `nsl_fp8_compute_scale`,
+  `calibrate_gradient_scale`, `nsl_fp8_update_calibration`,
+  `nsl_mxfp8_quantize`, `nsl_nvfp4_quantize`) walked `t.data` with
+  `from_raw_parts` as host memory. Two live consequences:
+  - **GPU segfault:** the tape-AD backward for `@fp8_compute` hands
+    GPU-resident gradients straight into `calibrate_gradient_scale` and
+    `nsl_fp8_cast`, so `@fp8_compute` + `--tape-ad` + GPU crashed at the
+    first backward step — and since source AD refuses `@fp8_compute`, that
+    was the only path. Reproduced as SIGSEGV by the new
+    `fp8_gpu_device_guard` gates against the pre-fix code.
+  - **Wrong CPU gradients:** the backward transposes `saved_a`/`saved_b` as
+    zero-copy views, and the stride-blind cast read the shared storage flat
+    while stamping fresh row-major strides onto the view's shape — turning
+    the transpose into a reshape. `grad_A = G @ reshape(B)` instead of
+    `G @ B^T`: misplaced operands, not reduced precision. Confirmed by
+    mutation control (the new rectangular-shape tape gate fails against the
+    old code with errors of order 1e0).
+- Fix: a `stage_for_host_read` guard on every host-path FFI — D2H transfer
+  for device tensors, `nsl_tensor_contiguous` for CPU views, loud refusal
+  (abort with a named FFI) for dtypes outside {f32, f64}, which would read
+  at the wrong element stride. Quantizer outputs are built on host and moved
+  to the input's device, replacing the old behavior of stamping the input's
+  device label onto a host allocation.
+- `nsl_fp8_update_calibration` refuses a device-resident or non-{f32,f64}
+  running-max state tensor instead of corrupting it through a host
+  read-modify-write (no in-tree caller creates one).
+- New gates: 3 CPU unit gates (view ordering for cast + block quantizer,
+  end-to-end tape gradients on rectangular shapes) and 5 GPU gates
+  (`fp8_gpu_device_guard`: cast/scale/backward/tape/block-quantizers vs the
+  CPU run on identical values). The two load-bearing GPU gates joined the
+  canary list (26 entries).
+
 ### Changed — TF32 is now the matmul default (`NSL_MATMUL_TF32=0` opts out)
 
 - Every `cublasSgemm` NSL issues now runs on tensor cores with a 10-bit
