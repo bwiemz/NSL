@@ -255,9 +255,15 @@ fn tape_fp8_training_backward_on_gpu_matches_the_cpu_run() {
         } else {
             (read_cpu(ga_ptr, m * k), read_cpu(gb_ptr, k * n))
         };
+        // nsl_list_free frees only the list storage, not the elements.
+        nsl_tensor_free(ga_ptr);
+        nsl_tensor_free(gb_ptr);
         nsl_list_free(grads);
         nsl_tape_stop();
         nsl_list_free(params);
+        nsl_tensor_free(out);
+        nsl_tensor_free(a);
+        nsl_tensor_free(b);
         (ga, gb)
     };
 

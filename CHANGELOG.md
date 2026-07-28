@@ -64,6 +64,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`fp8_gpu_device_guard`: cast/scale/backward/tape/block-quantizers vs the
   CPU run on identical values). The two load-bearing GPU gates joined the
   canary list (26 entries).
+- Post-review hardening: the guard no longer trusts `is_contiguous()` for
+  rank-1 tensors (it returns true regardless of strides, so a 1-D stride-0
+  expand view would have flat-read past its buffer — gated by a new unit
+  test with a mutation control); the tape backward now quantizes each
+  operand ONCE instead of staging the gradient three times per matmul
+  (five→three synchronous PCIe round-trips per step on GPU); the dtype
+  refusal now fires for empty tensors on every FFI.
 
 ### Changed — TF32 is now the matmul default (`NSL_MATMUL_TF32=0` opts out)
 

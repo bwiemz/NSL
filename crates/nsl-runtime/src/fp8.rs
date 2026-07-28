@@ -142,11 +142,34 @@ fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
         );
         std::process::abort();
     }
+    // A zero-length read never dereferences, so nothing below applies.
+    if t.len == 0 {
+        return (tensor_ptr, false);
+    }
+    // `is_contiguous()` is the runtime-wide predicate, but it returns true
+    // for EVERY rank-<=1 tensor regardless of strides, so a 1-D expand view
+    // ([N] with stride 0 over a 1-element buffer) would pass straight
+    // through to the flat read — an OOB read, the exact hazard this guard
+    // exists to close. The rank-1 stride is checked explicitly here;
+    // `nsl_tensor_contiguous` compares strides directly (not via
+    // `is_contiguous`) and its GPU path is a stride-walking kernel, so it
+    // materializes such views correctly on both devices. It must run BEFORE
+    // any D2H transfer: `nsl_tensor_to_device` shares the blind predicate
+    // and would flat-copy the same OOB range out of device memory.
+    let flat_read_unsafe =
+        !t.is_contiguous() || (t.ndim == 1 && t.len > 1 && unsafe { *t.strides } != 1);
+    if flat_read_unsafe {
+        let contig = crate::tensor::nsl_tensor_contiguous(tensor_ptr);
+        let c = unsafe { &*(contig as *const NslTensor) };
+        if c.device != 0 {
+            let cpu = crate::tensor::nsl_tensor_to_device(contig, 0);
+            crate::tensor::nsl_tensor_free(contig);
+            return (cpu, true);
+        }
+        return (contig, true);
+    }
     if t.device != 0 {
         return (crate::tensor::nsl_tensor_to_device(tensor_ptr, 0), true);
-    }
-    if !t.is_contiguous() {
-        return (crate::tensor::nsl_tensor_contiguous(tensor_ptr), true);
     }
     (tensor_ptr, false)
 }
@@ -211,13 +234,7 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
         crate::tensor::nsl_tensor_free(src_ptr);
     }
 
-    let out_ptr = if orig_device != 0 {
-        let moved = crate::tensor::nsl_tensor_to_device(host_ptr, orig_device as i64);
-        crate::tensor::nsl_tensor_free(host_ptr);
-        moved
-    } else {
-        host_ptr
-    };
+    let out_ptr = move_to_original_device(host_ptr, orig_device);
 
     // Register scale for this tensor
     set_fp8_scale(out_ptr, actual_scale as f32);
@@ -363,12 +380,15 @@ pub extern "C" fn nsl_fp8_matmul_training(
 /// Gradients change dramatically between steps, so we compute scale fresh each time.
 /// Returns amax / FP8E5M2_MAX, or 1.0 if all zeros.
 pub fn calibrate_gradient_scale(tensor_ptr: i64) -> f32 {
-    if NslTensor::from_ptr(tensor_ptr).len == 0 {
-        return 1.0;
-    }
+    // Guard first so the dtype refusal fires for empty tensors too (the
+    // guard's own len==0 short-circuit makes the staging free); an empty
+    // tensor then takes the early return below with `staged == false`.
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "calibrate_gradient_scale");
     let t = NslTensor::from_ptr(src_ptr);
     let len = t.len as usize;
+    if len == 0 {
+        return 1.0;
+    }
     let amax: f32 = if t.dtype == 1 {
         let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
         data.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
@@ -524,12 +544,14 @@ pub extern "C" fn nsl_fp8_update_calibration(
     running_max_ptr: i64,
     momentum: f64,
 ) -> f64 {
-    if NslTensor::from_ptr(tensor_ptr).len == 0 {
-        return 0.0;
-    }
+    // Guard first (dtype refusal must fire for empty tensors too; the
+    // guard short-circuits len==0 without staging).
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_update_calibration");
     let tensor = NslTensor::from_ptr(src_ptr);
     let len = tensor.len as usize;
+    if len == 0 {
+        return 0.0;
+    }
 
     // Compute batch amax
     let mut batch_amax: f64 = 0.0;
@@ -710,7 +732,9 @@ pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8
 
 /// FFI: Quantize tensor with MXFP8 per-block scaling.
 /// Returns a new tensor with quantized-then-dequantized values (simulates precision loss).
-/// The E8M0 scale factors are stored in a separate tensor accessible via nsl_mxfp8_get_scales.
+/// The per-block E8M0 scale factors are computed internally and DROPPED at
+/// this boundary — only the dequantized data survives. (This comment used to
+/// claim an `nsl_mxfp8_get_scales` accessor; no such symbol has ever existed.)
 #[no_mangle]
 pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_format: i64) -> i64 {
     let orig_device = NslTensor::from_ptr(tensor_ptr).device;
@@ -1563,6 +1587,46 @@ mod tests {
         crate::tensor::nsl_tensor_free(t);
     }
 
+    /// The rank-1 blind spot (review finding): `is_contiguous()` returns
+    /// true for EVERY rank-<=1 tensor regardless of strides, so the guard's
+    /// first draft passed a 1-D stride-0 expand view straight to the flat
+    /// read — 1 valid element and N-1 heap-OOB reads. The guard now checks
+    /// the rank-1 stride explicitly.
+    #[test]
+    fn fp8_cast_materializes_a_rank1_broadcast_view() {
+        // A [4] stride-0 view over a 1-element buffer — what
+        // `nsl_tensor_expand` legally produces.
+        let base = make_2d(1, 1, &[2.0]);
+        let base_t = crate::tensor::NslTensor::from_ptr(base);
+        let shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *shape = 4 };
+        let strides = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *strides = 0 };
+        let view = Box::new(crate::tensor::NslTensor::new(
+            base_t.data,
+            shape,
+            strides,
+            1,
+            4,
+            0,
+            1,
+            0, // borrowed storage — the base owns the data
+            0,
+        ));
+        let view_ptr = Box::into_raw(view) as i64;
+
+        let out = nsl_fp8_cast(view_ptr, FP8_FORMAT_E4M3, 1.0);
+        assert_eq!(
+            read_f32(out, 4),
+            [2.0, 2.0, 2.0, 2.0],
+            "a rank-1 stride-0 view must broadcast, not flat-read past its buffer"
+        );
+
+        crate::tensor::nsl_tensor_free(out);
+        crate::tensor::nsl_tensor_free(view_ptr);
+        crate::tensor::nsl_tensor_free(base);
+    }
+
     /// Same hazard for the per-block quantizer, where flat order also
     /// changes the BLOCK PARTITION (and therefore the per-block scales),
     /// not just element placement.
@@ -1630,9 +1694,15 @@ mod tests {
             );
         }
 
+        // nsl_list_free frees only the list storage, not the elements.
+        crate::tensor::nsl_tensor_free(crate::list::nsl_list_get(grads, 0));
+        crate::tensor::nsl_tensor_free(crate::list::nsl_list_get(grads, 1));
         crate::list::nsl_list_free(grads);
         crate::autodiff::nsl_tape_stop();
         crate::list::nsl_list_free(params);
+        crate::tensor::nsl_tensor_free(out);
+        crate::tensor::nsl_tensor_free(a);
+        crate::tensor::nsl_tensor_free(b);
     }
 
     #[test]
