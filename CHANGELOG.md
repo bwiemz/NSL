@@ -21,6 +21,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   renamed two `matmul_tf32_mode` gates after its manifest regeneration, and
   the fp8 device-guard commit added five gates without one.
 
+### Added — dispatch-path correctness gates UNDER TF32
+
+- Every pinned matmul suite documents the same gap: dispatch paths were
+  gated at full f32 only, while TF32 — the shipped default — selects a
+  different cuBLAS kernel family that could carry its own operand-mapping
+  bug. `matmul_dispatch_under_tf32` closes it from fresh child processes
+  (the math mode resolves once per process): transposed left/right/both,
+  batch collapse, the tied-LM-head composite, and fused wgrad accumulation,
+  each against an f64 CPU reference at 5e-3 relative (~5x TF32 drift,
+  three orders below a mapping bug).
+- Two anti-vacuity devices: a probe that requires a 256^3 product to drift
+  MORE than full f32 ever would (so a math-mode resolver regression fails
+  loudly instead of making the gates trivially green), and a path witness
+  that counts `nsl_strided_copy_f32` launches — at small K the OP_T and
+  copy arms produce bit-identical values, so values alone cannot prove
+  which arm ran.
+- `op_t_exemption_is_correct_under_tf32` is the named precondition for
+  flipping the `NSL_MATMUL_TRANSPOSE_VIEWS` default, now that the
+  reproducer below shows OP_T is faster under TF32.
+
 ### Added — committed reproducer for the OP_T-vs-copy measurement, which now flips under TF32
 
 - `matmul_transposed_operand::the_op_t_tradeoff_is_remeasurable` (class

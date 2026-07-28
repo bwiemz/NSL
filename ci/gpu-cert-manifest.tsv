@@ -313,6 +313,8 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	unc
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_cublas_equivalence.rs	matmul_cublas_pedantic_equivalence_llama	gpu-inferred	
 crates/nsl-runtime/tests/matmul_cublas_tf32_default_sanity.rs	matmul_cublas_tf32_default_sanity_llama	gpu-inferred	
+crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	dispatch_paths_are_correct_under_the_tf32_default	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	op_t_exemption_is_correct_under_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_tf32_mode.rs	tf32_is_faster_and_less_accurate_than_full_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_tf32_mode.rs	the_default_mode_is_tf32_and_the_opt_out_restores_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_transposed_right_operand_is_not_copied	gpu	requires CUDA GPU
