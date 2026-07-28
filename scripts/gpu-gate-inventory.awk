@@ -20,6 +20,9 @@
 #                 nothing meaningful
 #   gpu-inferred  bare #[ignore] in a file that   -> RUN
 #                 is `feature = "cuda"`-gated
+#   cpu-stub      `#[cfg(not(feature = "cuda"))]` -> NEVER in the lane: the
+#                 placeholder for non-cuda builds    cuda-featured build the
+#                                                    lane uses compiles it OUT
 #   unclassified  bare #[ignore], no reason, no   -> NOT run, but REPORTED
 #                 cuda gating
 #
@@ -99,6 +102,22 @@ function classify(r, fname, path,    lower) {
     return "unclassified"
 }
 
+# Track `#[cfg(not(feature = "cuda"))]` through the current attribute stack.
+# The lane builds WITH the cuda feature, so a test under this cfg is compiled
+# OUT of every binary the lane can run — classifying it into a RUN class
+# guarantees a permanent NOTFOUND (the two placeholder stubs
+# `wrga_b32_trigger_measurement_requires_cuda` and
+# `fp8_dispatcher::cuda_feature_required` sat exactly there). The flag is
+# position-independent within the stack (the cfg may come before or after
+# `#[ignore]`) and is cleared by the first line that is not an attribute,
+# comment, or blank — so a cfg-gated item elsewhere in the file cannot leak
+# onto a later, genuinely runnable gate (that would silently DELETE coverage,
+# the F1 defect pointing the other way).
+/^[ \t]*#\[cfg\(not\(feature[ \t]*=[ \t]*"cuda"\)\)\]/ {
+    in_not_cuda_stack = 1
+    next
+}
+
 # Accumulate a (possibly line-continued) #[ignore ...] attribute.
 #
 # NOT anchored to start-of-line (review finding F4): `#[test] #[ignore = "..."]`
@@ -142,12 +161,23 @@ function classify(r, fname, path,    lower) {
     next
 }
 
-# The first fn after the attribute is the test it gates.
+# The first fn after the attribute is the test it gates. The cfg-not check
+# overrides the reason-based classifier: `cuda_feature_required`'s reason
+# ("...require the cuda feature + sm_89+") matches the `gpu` ALLOW rule, but
+# no cuda-featured binary contains the symbol.
 pending && /^[ \t]*(pub[ \t]+)?(async[ \t]+)?fn[ \t]+[A-Za-z0-9_]+/ {
     line = $0
     sub(/^[ \t]*(pub[ \t]+)?(async[ \t]+)?fn[ \t]+/, "", line)
     sub(/[^A-Za-z0-9_].*$/, "", line)
-    printf "%s\t%s\t%s\t%s\n", FILENAME, line, classify(reason, line, FILENAME), reason
+    cls = in_not_cuda_stack ? "cpu-stub" : classify(reason, line, FILENAME)
+    printf "%s\t%s\t%s\t%s\n", FILENAME, line, cls, reason
     pending = 0
     reason = ""
+}
+
+# Attribute-stack boundary: any line that is not an attribute, comment, or
+# blank ends the stack (the fn-emission rule above has already consumed the
+# flag by the time this runs on the same line).
+!/^[ \t]*#\[/ && !/^[ \t]*\/\// && !/^[ \t]*$/ {
+    in_not_cuda_stack = 0
 }

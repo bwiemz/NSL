@@ -71,7 +71,7 @@ crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_fused_wgrad_matches_the_unfu
 crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	broken	Pre-existing inference-path segfault when adapter synth fields (m.gate_...) are overwritten at top-level after the train block — verified failing at HEAD by both Commit A and Commit B subagents without any option-3 changes to the segfaulting path. The anti-drift intent of this test still has value: if the shared rewrite_stmts_for_model helper were ever forked, Cranelift's and source-AD's AST copies would diverge in a runnable way. Unblock when the top-level synth-field-read / inference-path lowering bug lands as a separate milestone; see the synth-field-read follow-up in project_wrga_b32_measurement.md.
 crates/nsl-cli/tests/wrga_b32_per_op_breakdown.rs	b32_per_op_breakdown_prescribed_shape	gpu-inferred	
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement	gpu-inferred	
-crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement_requires_cuda	gpu-inferred	
+crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement_requires_cuda	cpu-stub	
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_fused_trigger_final	gpu-inferred	
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_unfused_side_measurement	gpu-inferred	
 crates/nsl-cli/tests/ws_arena_gate.rs	arena_bit_exact_ffn_gpu	gpu	requires CUDA GPU
@@ -290,7 +290,12 @@ crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exa
 crates/nsl-runtime/src/tensor/ad_ops.rs	embedding_backward_deterministic_gpu_matches_cpu_and_is_stable	gpu	GPU: requires CUDA device
 crates/nsl-runtime/src/tensor/ad_ops.rs	test_gpu_ce_backward_matches_cpu_bounce	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/mod.rs	sum_sq_gpu_matches_cpu_reference	gpu	GPU: requires CUDA device
-crates/nsl-runtime/tests/fp8_dispatcher.rs	cuda_feature_required	gpu	FP8 dispatcher tests require the cuda feature + sm_89+
+crates/nsl-runtime/tests/fp8_dispatcher.rs	cuda_feature_required	cpu-stub	FP8 dispatcher tests require the cuda feature + sm_89+
+crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_cast_of_a_gpu_tensor_matches_the_cpu_run	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_scale_probes_of_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_e5m2_backward_with_gpu_view_operands_matches_the_cpu_run	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	tape_fp8_training_backward_on_gpu_matches_the_cpu_run	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	block_quantizers_on_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_maxpool2d_argmax_readback.rs	gpu_maxpool2d_argmax_readback_does_not_segfault	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/tests/gpu_strided_view_ops.rs	gpu_matmul_with_transposed_view_matches_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_strided_view_ops.rs	gpu_matmul_with_transposed_view_left_matches_reference	gpu	requires CUDA GPU
@@ -308,8 +313,8 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	unc
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_cublas_equivalence.rs	matmul_cublas_pedantic_equivalence_llama	gpu-inferred	
 crates/nsl-runtime/tests/matmul_cublas_tf32_default_sanity.rs	matmul_cublas_tf32_default_sanity_llama	gpu-inferred	
-crates/nsl-runtime/tests/matmul_tf32_mode.rs	tf32_is_faster_and_less_accurate_than_the_default	gpu	requires CUDA GPU
-crates/nsl-runtime/tests/matmul_tf32_mode.rs	the_default_mode_is_still_full_f32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_tf32_mode.rs	tf32_is_faster_and_less_accurate_than_full_f32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_tf32_mode.rs	the_default_mode_is_tf32_and_the_opt_out_restores_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_transposed_right_operand_is_not_copied	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_transposed_left_operand_is_not_copied	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	both_operands_transposed	gpu	requires CUDA GPU

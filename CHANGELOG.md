@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — gpu-cert lane: `cpu-stub` class ends the permanent 2-NOTFOUND noise
+
+- The gate-inventory scanner classified `#[cfg(not(feature = "cuda"))]`
+  placeholder tests into RUN classes, but the lane builds WITH the cuda
+  feature, which compiles those tests out of every binary it can run — a
+  guaranteed, permanent NOTFOUND on every sweep
+  (`wrga_b32_trigger_measurement_requires_cuda`,
+  `fp8_dispatcher::cuda_feature_required`). The scanner now tracks the cfg
+  through the attribute stack and files them as `cpu-stub`, a never-run
+  class; the flag is cleared at the first non-attribute line so a cfg-gated
+  item elsewhere in a file cannot demote a later, genuinely runnable gate.
+- Regenerating the manifest also heals a red CI drift gate: the TF32 commit
+  renamed two `matmul_tf32_mode` gates after its manifest regeneration, and
+  the fp8 device-guard commit added five gates without one.
+
 ### Fixed — fp8 host-path FFIs: GPU segfault and wrong tape gradients
 
 - Every fp8 FFI (`nsl_fp8_cast`, `nsl_fp8_compute_scale`,

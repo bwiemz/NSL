@@ -116,7 +116,7 @@ the tree, classifies each one, and runs the classes that need a device.
 
 ```bash
 scripts/gpu-cert.sh --list             # inventory as TSV, no build
-scripts/gpu-cert.sh --run --tier gpu   # the ~255 device-requiring gates
+scripts/gpu-cert.sh --run --tier gpu   # the ~292 device-requiring gates
 scripts/gpu-cert.sh --check-inventory  # drift gate (GPU-free; runs in CI)
 ```
 
@@ -125,7 +125,10 @@ tests are fixture and baseline *generators* — running them under `--ignored`
 would silently rewrite the reference data other gates compare against — and
 each is denied by an explicit rule on its reason string, file suffix, or
 function name. Diagnostics that assert nothing, gates blocked on unlanded
-work, and tests needing opt-in cargo features are likewise excluded. Anything
+work, and tests needing opt-in cargo features are likewise excluded, as are
+`cpu-stub` placeholders — tests under `#[cfg(not(feature = "cuda"))]` exist
+only in non-cuda builds, so the cuda-featured binaries the lane runs compile
+them out and any RUN classification would report a permanent NOTFOUND. Anything
 the ruleset does not recognise is classified `unclassified` and never run; it
 appears in `--list` and in `ci/gpu-cert-manifest.tsv`, so the drift gate still
 tracks it even though it is absent from the run report.
@@ -136,7 +139,7 @@ GPU tests early-return as a *pass* when no device is available, so a sweep
 under those conditions would report green having executed nothing — worse than
 not running at all.
 
-`--tier gpu` is the default and covers the 255 device-requiring gates. It does
+`--tier gpu` is the default and covers the ~292 device-requiring gates. It does
 **not** include the `toolchain` (11), `multiproc` (6), or `isolate` (1) tiers;
 run those separately.
 
