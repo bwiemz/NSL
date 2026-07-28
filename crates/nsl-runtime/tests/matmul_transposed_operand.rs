@@ -350,10 +350,23 @@ fn a_broadcast_view_is_still_materialised() {
     nsl_tensor_free(a);
 }
 
-/// A contiguous `[k, 1]` tensor has strides `[1, 1]`, which satisfies the
-/// transposed pattern's arithmetic when `k == 1`. The predicate checks
-/// `is_contiguous()` FIRST for exactly this reason; if that ordering is ever
-/// reversed, a contiguous operand gets silently transposed.
+/// Degenerate 2-D shapes still produce the right product with the exemption
+/// ON.
+///
+/// **What this does NOT gate**, corrected after review: the original comment
+/// claimed it pinned `is_transposed_2d_view`'s internal `is_contiguous()`
+/// check — the ordering that stops a contiguous `[k, 1]` (strides `[1, 1]`)
+/// being read as a transpose. It cannot. That predicate has exactly one
+/// caller, `matmul_operand_needs_no_copy`, which returns `true` on the
+/// contiguity fast path before ever reaching it, so the internal check is
+/// unreachable defence and deleting it changes nothing observable. Every
+/// tensor this test builds is contiguous, so it exercises the fast path, not
+/// the predicate.
+///
+/// It is still worth running: these shapes are where the `m`/`n`/`k`-derived
+/// leading dimensions collapse onto each other, and a wrong `lda` at
+/// `[1, 5] @ [5, 1]` is arithmetically invisible in a way it is not at
+/// `[24, 40]`.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_degenerate_unit_shape_is_not_mistaken_for_a_transpose() {
@@ -406,10 +419,18 @@ fn matmul_operand_exemption_agrees_with_dispatch() {
         .find("fn is_transposed_2d_view")
         .expect("the transposed-view predicate still exists");
     let body = &cuda[start..start + 900];
+    // The predicate's own contiguity rejection. Kept as a drift assertion but
+    // honestly labelled after review: this is defence, not a live guard. The
+    // sole caller returns on its contiguity fast path first, so removing the
+    // inner check changes nothing observable today. It earns its place only
+    // if a second caller ever appears — which is exactly when it would matter
+    // and exactly when nobody would think to re-derive it.
     assert!(
         body.contains("t.is_contiguous()"),
-        "is_transposed_2d_view no longer rejects contiguous tensors first — a \
-         contiguous [k,1] has strides [1,1] and would be read transposed"
+        "is_transposed_2d_view no longer rejects contiguous tensors itself. \
+         Unreachable behind today's only caller, but it makes the predicate \
+         correct standalone: a contiguous [k,1] has strides [1,1] and matches \
+         the transposed pattern when k == 1"
     );
     assert!(
         body.contains("strides[0] == 1") && body.contains("strides[1] == shape[0]"),
@@ -418,15 +439,25 @@ fn matmul_operand_exemption_agrees_with_dispatch() {
     );
 }
 
-/// The DEFAULT must still materialise. `OP_T` is opt-in because it is slower
-/// on wide GEMMs — 5.92 ms versus 1.04 + 2.89 for the Coder-50M LM head — so a
-/// build that silently enabled it would be a 1.51x regression on the exact
-/// shape this file is named after.
+/// Env var the child probe below reads to know it is the child.
+const DEFAULT_PROBE: &str = "NSL_TRANSPOSE_DEFAULT_PROBE";
+
+/// The child entry point for `the_default_still_materialises_transposed_operands`.
+///
+/// It runs in a FRESH PROCESS with `NSL_MATMUL_TRANSPOSE_VIEWS` removed from
+/// the environment, and it deliberately does NOT call
+/// `test_set_transpose_views` — that hook writes `TRANSPOSE_VIEWS_STATE`
+/// directly, and `transpose_views_enabled()` short-circuits on an already
+/// resolved state, so a test that used the hook would never execute the env
+/// lookup at all.  Only a virgin process resolves the real default.
+///
+/// Prints one line the parent parses. Cargo runs every `#[test]` in the
+/// binary, so this has to be a test; it returns immediately unless asked.
 #[test]
-#[ignore = "requires CUDA GPU"]
-fn the_default_still_materialises_transposed_operands() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_set_transpose_views(false);
+fn zz_default_probe_child() {
+    if std::env::var(DEFAULT_PROBE).as_deref() != Ok("1") {
+        return;
+    }
     let (m, k, n) = (24usize, 40usize, 56usize);
     let a = gpu_2d(m, k, &deterministic(m * k, 11));
     let (bt, base) = transposed_view(n, k, &deterministic(n * k, 13));
@@ -434,14 +465,101 @@ fn the_default_still_materialises_transposed_operands() {
         let c = nsl_tensor_matmul(a, bt, 0);
         nsl_tensor_free(c);
     });
-    assert!(
-        names.iter().any(|kn| kn == "nsl_strided_copy_f32"),
-        "with NSL_MATMUL_TRANSPOSE_VIEWS unset the operand must still be \
-         materialised — OP_T is 1.51x SLOWER on the LM-head shape and must \
-         not become the default by accident. Kernels seen: {names:?}"
-    );
     nsl_tensor_free(bt);
     nsl_tensor_free(base);
     nsl_tensor_free(a);
-    test_set_transpose_views(true);
+    println!(
+        "DEFAULTPROBE copied={} kernels={}",
+        names.iter().any(|kn| kn == "nsl_strided_copy_f32"),
+        names.join(",")
+    );
+}
+
+/// The DEFAULT must still materialise. `OP_T` is opt-in because it is slower
+/// on wide GEMMs — 5.92 ms versus 1.04 + 2.89 for the Coder-50M LM head — so a
+/// build that silently enabled it would be a 1.51x regression on the exact
+/// shape this file is named after.
+///
+/// **Why this spawns a child.** The first version of this gate called
+/// `test_set_transpose_views(false)`, which sets the resolved-state atomic
+/// directly. `transpose_views_enabled()` returns early on states 1 and 2 and
+/// only consults `NSL_MATMUL_TRANSPOSE_VIEWS` in the unresolved arm — so that
+/// version never ran the resolution logic, and flipping the default (say
+/// `== Ok("1")` to `!= Ok("0")`, or seeding the atomic to "enabled") left the
+/// gate green while every real run took the slower path. An independent
+/// review caught it. A fresh process with the variable REMOVED is the only
+/// way to observe the actual default.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_default_still_materialises_transposed_operands() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "zz_default_probe_child",
+            "--exact",
+            // Not cosmetic: libtest swallows a passing test's stdout, so
+            // without this the child runs and the line never arrives.
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEFAULT_PROBE, "1")
+        // The whole point of the gate: observe what happens with the opt-in
+        // absent, whatever this shell happens to export.
+        .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
+        .output()
+        .expect("spawn default probe child");
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Substring, not prefix: libtest prefixes captured output with the test's
+    // own name.
+    let line = text
+        .lines()
+        .find_map(|l| l.find("DEFAULTPROBE ").map(|i| &l[i..]))
+        .unwrap_or_else(|| {
+            panic!(
+                "default-probe child produced no line\nstdout:\n{text}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    assert!(
+        line.contains("copied=true"),
+        "with NSL_MATMUL_TRANSPOSE_VIEWS absent the operand must still be \
+         materialised — OP_T is 1.51x SLOWER on the LM-head shape and must \
+         not become the default by accident. Child said: {line}"
+    );
+}
+
+/// The opt-in must also actually be reachable THROUGH THE ENV VAR, not just
+/// through the test hook. Without this, `the_default_still_materialises_*`
+/// could pass simply because the feature was unreachable by any means.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_env_var_really_enables_the_exemption() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "zz_default_probe_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEFAULT_PROBE, "1")
+        .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
+        .output()
+        .expect("spawn default probe child");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .find_map(|l| l.find("DEFAULTPROBE ").map(|i| &l[i..]))
+        .unwrap_or_else(|| {
+            panic!(
+                "default-probe child produced no line\nstdout:\n{text}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    assert!(
+        line.contains("copied=false"),
+        "NSL_MATMUL_TRANSPOSE_VIEWS=1 must skip the materialising copy — \
+         if it does not, the opt-in is unreachable and the default gate \
+         proves nothing. Child said: {line}"
+    );
 }

@@ -6,19 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Fixed — a weight-grad gemm and a plain gemm recorded as the SAME cuda-graph op
+### Fixed — cuda-graph eager repair replayed a weight-grad gemm as a plain one
 
-- `GpuOp::Sgemm` carried `(a, b, c, m, n, k, alpha, beta)` and no operand
-  transposition. `sgemm_wgrad_accum` and `sgemm_row_major` both call
-  `on_sgemm` with those eight values but hand cuBLAS different mappings —
-  `OP_N/OP_T` for the weight-gradient contraction versus `OP_N/OP_N` with the
-  row-major swap — so under `--cuda-graphs` the two compared EQUAL over the
-  same buffers, and eager repair reconstructed whichever it held as a plain
-  row-major gemm. Silently wrong gradients, no error. Latent before item 9;
-  `OP_T` on the general matmul path would have made it reachable from every
-  model instead of only the weight-gradient fusion.
+- `GpuOp::Sgemm` recorded no operand transposition and no wrapper identity.
+  `sgemm_wgrad_accum` and the plain row-major path both fed one shared hook,
+  while handing cuBLAS different mappings — `OP_N/OP_T` for the
+  weight-gradient contraction versus `OP_N/OP_N` with the row-major swap.
+- The unconditional half was **replay**: the dispatch branched on
+  `batch == 1` alone, so a recorded wgrad op was reconstructed as a
+  row-major gemm regardless of what else it carried. Wrong contraction,
+  silently wrong gradients, no error.
+- Equality and the digest could also collide, but only for two gemms sharing
+  all three device pointers as well as `(m, n, k, alpha, beta)` — a much
+  narrower precondition than the replay bug, and one an earlier draft of this
+  entry overstated as "the same eight values compare equal". Corrected here.
 - `GpuOp::Sgemm` gains `kind` (`RowMajor` / `WgradAccum`) plus `transa`/`transb`,
-  in equality, in the digest, and in replay dispatch.
+  in equality, in the digest, and in replay dispatch. Four unit gates in
+  `graph_capture.rs` now pin that those three agree — the failure class being
+  fixed is precisely "three places that must agree, and one didn't", and
+  nothing had pinned it.
+
+### Fixed — `--profile-kernels` reported every kernel as 0.0 ms
+
+- `kernel_profile.json` gave `"dur": 0.0` and `"ts": 0.0` for every launch and
+  `total_kernel_time_ms: 0.0`, on runs doing tens of milliseconds of real GPU
+  work. Long-standing enough that a previous campaign attributed kernel cost
+  by launch count and bytes moved instead.
+- Root cause is `atexit` ordering. Handlers run LIFO. The profiler registered
+  its flush from `nsl_kernel_profiler_start`, inside `nsl_args_init` — before
+  the first kernel launch, so before the CUDA context exists, so before the
+  driver registers its own teardown. LIFO ran the driver's teardown FIRST and
+  the flush met a deinitialised driver. Reproduced deliberately: the flush
+  then reports `744 of 744 timing queries FAILED (CUDA_ERROR_DEINITIALIZED)`.
+  (The same hazard is already documented for the cuBLAS handle, leaked on
+  purpose because destroying it post-teardown "produces spurious driver
+  errors".) Registration moved to `ensure_event_pool_initialized`, which runs
+  from `kernel_launch` after `ensure_context()`.
+- Second defect, independent: `cu_event_elapsed_time` discarded its
+  `CUresult`, and `cuEventElapsedTime_v2` leaves its out-param UNTOUCHED on
+  failure — so a failed query became a 0.0 indistinguishable from a
+  measurement. It now returns the status; the flush counts failures, prints a
+  refusal naming the driver error, and stamps `timing_valid` /
+  `timing_query_failures` into the JSON so a consumer can reject the file.
+- Measured after the fix on the cuda-graph fixture: 412/412 durations
+  non-zero, `total_kernel_time_ms: 52.26`, `timing_valid: true`.
+
+### Fixed — `@fp8_compute` was silently ignored under source-to-source AD
+
+- The decorator routes matmuls to `nsl_fp8_matmul_training` so the backward
+  records a `TapeOp::Fp8MatMul` and applies the E5M2 round-trip. That routing
+  lives in `expr/advanced.rs`, which source AD does not use: it inlines the
+  method body into a Wengert list, and `wengert_lower.rs` lowers
+  `PrimalOp::Matmul` to an unconditional `nsl_tensor_matmul`. Neither
+  `source_ad.rs` nor `wengert_lower.rs` contains a single occurrence of "fp8".
+- So a user who wrote the decorator and trained with `--source-ad` — the
+  default, and the path every production model in this repo uses — got plain
+  f32 with no error and no warning.
+- The train/grad lowering now refuses, naming each offending
+  `Model::method` and pointing at `--tape-ad`, where the decorator does take
+  effect. Sub-model methods reached through `self.field` are covered, which is
+  how every real model here is structured.
+
+### Changed — dispatch narrowing in `gpu_matmul_f32` (documenting an item 9 side effect)
+
+- The 2-D cuBLAS arm's condition changed from `total_batch == 1` to also
+  requiring each operand be contiguous or an expressible transpose. A strided
+  2-D operand that is neither now falls through to the naive `nsl_bmm_f32`
+  kernel rather than cuBLAS. Not a live behaviour change — `nsl_tensor_matmul`
+  is the sole caller and materialises every non-exempt operand first, and both
+  kernels are stride-blind — but it removes a defence-in-depth property and
+  went undocumented when it landed.
 
 ### Fixed — GPU matmul read non-f32 tensors as f32, two bytes for one
 

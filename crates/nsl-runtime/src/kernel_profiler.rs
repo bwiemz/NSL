@@ -72,11 +72,14 @@ const EVENT_POOL_SIZE: usize = 4096;
 pub extern "C" fn nsl_kernel_profiler_start() {
     KERNEL_PROFILER.enabled.store(true, Ordering::Relaxed);
 
-    if !ATEXIT_REGISTERED.swap(true, Ordering::Relaxed) {
-        unsafe {
-            atexit(kernel_profiler_atexit);
-        }
-    }
+    // CPU-only builds have no CUDA teardown to race, so registering here —
+    // the earliest possible point — is correct and keeps the flush
+    // unconditional.
+    //
+    // CUDA builds deliberately do NOT register here; see
+    // `register_atexit_once` and `ensure_event_pool_initialized`.
+    #[cfg(not(feature = "cuda"))]
+    register_atexit_once();
 
     *KERNEL_PROFILER.cpu_start_time.lock().unwrap() = Some(Instant::now());
     *KERNEL_PROFILER.traces.lock().unwrap() = Vec::new();
@@ -118,6 +121,11 @@ pub(crate) fn ensure_event_pool_initialized() {
     if !pool.is_empty() {
         return;
     }
+    // Register the flush hook HERE, not at profiler start — see
+    // `register_atexit_once`. We are inside `kernel_launch`, past
+    // `ensure_context()`, so the driver's own teardown handler is already
+    // registered and LIFO will run our flush before it.
+    register_atexit_once();
     // Acquire the base-event lock BEFORE releasing the pool lock so
     // both are populated atomically from the observer's perspective.
     let mut base = KERNEL_PROFILER.gpu_base_event.lock().unwrap();
@@ -148,6 +156,36 @@ pub(crate) fn ensure_event_pool_initialized() {
 #[no_mangle]
 pub extern "C" fn nsl_kernel_profiler_stop() {
     KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
+}
+
+/// Register the flush hook exactly once.
+///
+/// **Ordering is the whole point.** `atexit` handlers run LIFO, and the CUDA
+/// driver registers its own primary-context teardown when the context is
+/// created.  The profiler used to register from `nsl_kernel_profiler_start`,
+/// which runs inside `nsl_args_init` — strictly BEFORE the first kernel
+/// launch, therefore before the context exists, therefore before the
+/// driver's teardown handler.  LIFO then ran the driver's teardown FIRST and
+/// this flush found a dead context: `cuEventElapsedTime_v2` failed on every
+/// pair and, because its status was discarded and it leaves the out-param
+/// alone on failure, every duration and timestamp in `kernel_profile.json`
+/// came out 0.0.  412 launches, `total_kernel_time_ms: 0.0`, no diagnostic.
+///
+/// The same hazard is already documented for the cuBLAS handle a few
+/// hundred lines into `cuda/mod.rs`, which is leaked on purpose because
+/// "cuBLAS destruction after the CUDA context has been torn down produces
+/// spurious driver errors".
+///
+/// So on CUDA builds this is called from `ensure_event_pool_initialized`,
+/// which runs from inside `kernel_launch` AFTER `ensure_context()` — i.e.
+/// after the driver's teardown handler is registered, so LIFO puts this
+/// flush first, while the context is still alive.
+fn register_atexit_once() {
+    if !ATEXIT_REGISTERED.swap(true, Ordering::Relaxed) {
+        unsafe {
+            atexit(kernel_profiler_atexit);
+        }
+    }
 }
 
 extern "C" fn kernel_profiler_atexit() {
@@ -271,6 +309,13 @@ pub(crate) fn flush_traces_gpu(path: &str) {
 
     let mut events_json = Vec::new();
     let mut total_kernel_time_ms = 0.0f64;
+    // Every `cuEventElapsedTime_v2` that did not return CUDA_SUCCESS. The
+    // driver leaves the out-param untouched on failure, so an unchecked
+    // query yields a 0.0 that is indistinguishable from a real measurement
+    // — which is exactly how this profiler shipped a JSON claiming hundreds
+    // of kernels ran in 0.00 ms. Counted here and refused below.
+    let mut timing_failures = 0usize;
+    let mut first_failure: Option<cuda::CUresult> = None;
 
     for trace in traces.iter() {
         if trace.pool_idx >= pool.len() { continue; }
@@ -279,8 +324,15 @@ pub(crate) fn flush_traces_gpu(path: &str) {
         let mut duration_ms: f32 = 0.0;
         let mut offset_ms: f32 = 0.0;
         unsafe {
-            cuda::cu_event_elapsed_time(&mut duration_ms, start_event, stop_event);
-            cuda::cu_event_elapsed_time(&mut offset_ms, base_event, start_event);
+            for rc in [
+                cuda::cu_event_elapsed_time(&mut duration_ms, start_event, stop_event),
+                cuda::cu_event_elapsed_time(&mut offset_ms, base_event, start_event),
+            ] {
+                if rc != cuda::CUresult::CUDA_SUCCESS {
+                    timing_failures += 1;
+                    first_failure.get_or_insert(rc);
+                }
+            }
         }
 
         let ts_us = cpu_start + (offset_ms as f64) * 1000.0;
@@ -296,11 +348,30 @@ pub(crate) fn flush_traces_gpu(path: &str) {
     }
 
     let total_launches = traces.len();
+    // Refuse to pass off unresolved timings as measurements. `timing_valid`
+    // is machine-readable so a consumer can reject the file; the stderr line
+    // is for the human who just asked for a profile and would otherwise read
+    // "0.00 ms" as a result.
+    let timing_valid = timing_failures == 0;
+    if !timing_valid {
+        eprintln!(
+            "[nsl] kernel profiler: {} of {} timing queries FAILED ({:?}) — \
+             every duration and timestamp in '{}' is unresolved, NOT measured. \
+             cuEventElapsedTime leaves its out-param untouched on failure, so \
+             those entries read 0.0. Do not interpret this file as timing data.",
+            timing_failures,
+            total_launches * 2,
+            first_failure,
+            path,
+        );
+    }
     let json = format!(
-        r#"{{"traceEvents":[{}],"metadata":{{"total_kernel_launches":{},"total_kernel_time_ms":{:.2}}}}}"#,
+        r#"{{"traceEvents":[{}],"metadata":{{"total_kernel_launches":{},"total_kernel_time_ms":{:.2},"timing_valid":{},"timing_query_failures":{}}}}}"#,
         events_json.join(","),
         total_launches,
         total_kernel_time_ms,
+        timing_valid,
+        timing_failures,
     );
 
     if let Ok(mut f) = std::fs::File::create(path) {

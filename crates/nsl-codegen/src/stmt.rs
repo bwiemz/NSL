@@ -6744,6 +6744,12 @@ impl Compiler<'_> {
             // adapter rewrite (fused FFI name + adapter field names).
             extractor.set_synth_call_names(self.synth_call_names.clone());
             extractor.set_synth_member_names(self.synth_member_names.clone());
+            // Item 9 phase 2: thread the `@fp8_compute` model-method set so the
+            // extractor can record any decorated method it inlines. Source-AD
+            // lowering has no FP8 path at all, so an inlined decorated method
+            // silently computes in f32; the refusal below turns that into a
+            // compile error naming the method.
+            extractor.set_fp8_compute_methods(self.features.fp8_compute_methods.clone());
 
             // Register the model variable as a model instance so method calls get inlined
             extractor.register_model_instance(model_sym, &model_type_name);
@@ -6809,6 +6815,48 @@ impl Compiler<'_> {
             // a step body may legitimately contain an auxiliary
             // `cross_entropy` that is not the LM head, and refusing that
             // would make the decorator unusable. Partial declines warn.
+            // Item 9 phase 2: `@fp8_compute` does not survive source AD.
+            //
+            // The decorator's whole job is to route matmuls in the decorated
+            // body to `nsl_fp8_matmul_training` so the backward records a
+            // `TapeOp::Fp8MatMul` and the weight/activation gradients get the
+            // E5M2 round-trip. That routing lives in `expr/advanced.rs`, which
+            // source AD does not use: the method body is inlined into a
+            // Wengert list and `wengert_lower.rs` lowers `PrimalOp::Matmul` to
+            // an unconditional `nsl_tensor_matmul`. Neither `source_ad.rs` nor
+            // `wengert_lower.rs` contains a single occurrence of "fp8".
+            //
+            // So the user gets plain f32 training with no error, no warning,
+            // and a decorator in the source claiming otherwise — the failure
+            // shape `feedback_deferral_must_refuse` exists to prevent.
+            //
+            // Gated on `extraction_ok` because a body source AD could not
+            // extract falls back to tape AD, where the decorator DOES take
+            // effect. Only refuse when source AD actually took the body.
+            if extraction_ok {
+                let dropped = extractor.inlined_fp8_methods();
+                if !dropped.is_empty() {
+                    let mut names = String::new();
+                    for (i, m) in dropped.iter().enumerate() {
+                        names.push_str(&format!("\n  {}. {}", i + 1, m));
+                    }
+                    return Err(CodegenError::new(format!(
+                        "@fp8_compute has no effect under source-to-source AD, \
+                         but this train block inlined {} decorated method(s):{}\
+                         \n\nSource AD lowers every matmul to nsl_tensor_matmul \
+                         (see wengert_lower.rs, PrimalOp::Matmul) — there is no \
+                         FP8 lowering on this path, so the step would train in \
+                         plain f32 while the decorator says otherwise.\
+                         \n\nEither pass --tape-ad to compile this block on the \
+                         tape path, where @fp8_compute routes through \
+                         nsl_fp8_matmul_training, or remove the decorator to \
+                         request f32 deliberately.",
+                        dropped.len(),
+                        names,
+                    )));
+                }
+            }
+
             if extraction_ok {
                 // Deduplicate before reporting. `try_unroll_for` re-extracts a
                 // loop body once per iteration, so ONE `cross_entropy` inside

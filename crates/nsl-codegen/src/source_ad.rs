@@ -2113,6 +2113,28 @@ pub struct WengertExtractor<'a> {
     /// recorded here and the train block lowering refuses when NONE of the
     /// block's `cross_entropy` calls fused.
     fused_lce_declines: Vec<FusedLceDecline>,
+    /// Item 9 phase 2: model methods carrying `@fp8_compute`, keyed
+    /// `"ModelName::method_name"` — mirrors `Compiler::features
+    /// .fp8_compute_methods`, threaded here by `set_fp8_compute_methods`.
+    fp8_compute_methods: HashSet<String>,
+    /// Item 9 phase 2: the subset of `fp8_compute_methods` this extractor
+    /// actually INLINED into the Wengert list.
+    ///
+    /// `wengert_lower.rs` has no FP8 lowering — `PrimalOp::Matmul` emits an
+    /// unconditional `nsl_tensor_matmul`, and neither this file nor
+    /// `wengert_lower.rs` contains a single occurrence of "fp8".  So every
+    /// matmul inside an inlined `@fp8_compute` method computes in plain f32
+    /// while the user believes FP8 is active.  That is the same silent-
+    /// degradation shape as item 6's fused-CE declines, and
+    /// `feedback_deferral_must_refuse` says it must refuse.
+    ///
+    /// Recorded rather than refused on the spot so the diagnostic can name
+    /// every offending method at once, and so a non-training extraction
+    /// (e.g. the WGGO pre-pass, which builds a throwaway extractor purely
+    /// for importance scoring) does not abort the compile.
+    ///
+    /// `BTreeSet` for a deterministic message order.
+    inlined_fp8_methods: std::collections::BTreeSet<String>,
     /// Item 6: how many calls this extractor DID substitute — both
     /// auto-substituted `cross_entropy` and explicit `fused_linear_ce(...)`.
     ///
@@ -2341,6 +2363,8 @@ impl<'a> WengertExtractor<'a> {
             known_ranks: HashMap::new(),
             pending_fused_lce_prunes: Vec::new(),
             fused_lce_declines: Vec::new(),
+            fp8_compute_methods: HashSet::new(),
+            inlined_fp8_methods: std::collections::BTreeSet::new(),
             fused_lce_substitutions: 0,
             fused_kl_ce_config: None,
             distill_loss_alpha_temp: (None, None),
@@ -2458,6 +2482,25 @@ impl<'a> WengertExtractor<'a> {
     /// what the program asked for, so there is nothing to report.
     pub fn fused_lce_declines(&self) -> &[FusedLceDecline] {
         &self.fused_lce_declines
+    }
+
+    /// Item 9 phase 2: mirror `Compiler::features.fp8_compute_methods` into
+    /// this extractor so inline sites can recognise a decorated method.
+    ///
+    /// Leaving this unset (the default) disables the refusal entirely, which
+    /// is what every extractor built outside the train/grad lowering wants.
+    pub fn set_fp8_compute_methods(&mut self, methods: HashSet<String>) {
+        self.fp8_compute_methods = methods;
+    }
+
+    /// Item 9 phase 2: the `@fp8_compute` model methods whose bodies were
+    /// inlined into this Wengert list, `"ModelName::method_name"`, sorted.
+    ///
+    /// Non-empty means the decorator was silently dropped — source-AD
+    /// lowering has no FP8 path — so the caller must refuse rather than emit
+    /// f32 matmuls under an FP8 banner.
+    pub fn inlined_fp8_methods(&self) -> Vec<String> {
+        self.inlined_fp8_methods.iter().cloned().collect()
     }
 
     /// Item 6: how many `cross_entropy` / `fused_linear_ce` calls actually
@@ -3537,7 +3580,12 @@ impl<'a> WengertExtractor<'a> {
                                 .and_then(|methods| methods.get(&method_name))
                                 .cloned();
                             if let Some(fn_def) = fn_def {
-                                return self.inline_method_call(*obj_sym, &fn_def, args);
+                                return self.inline_method_call(
+                                    *obj_sym,
+                                    &fn_def,
+                                    args,
+                                    Some(model_type.as_str()),
+                                );
                             } else {
                                 eprintln!("[source-ad] method '{}' not found in model type '{}' (available: {:?})",
                                     method_name, model_type,
@@ -3596,7 +3644,12 @@ impl<'a> WengertExtractor<'a> {
                                         let extracted = self.pre_extract_args(&fn_def, args)?;
                                         let saved_self = self.self_context.clone();
                                         self.self_context = Some(compound_prefix);
-                                        let result = self.inline_method_body(&fn_def, extracted);
+                                        let sub_type_owned = sub_type.clone();
+                                        let result = self.inline_method_body(
+                                            &fn_def,
+                                            extracted,
+                                            Some(sub_type_owned.as_str()),
+                                        );
                                         self.self_context = saved_self;
                                         return result;
                                     }
@@ -3620,7 +3673,11 @@ impl<'a> WengertExtractor<'a> {
                                     let extracted = self.pre_extract_args(&fn_def, args)?;
                                     let saved_self = self.self_context.clone();
                                     self.self_context = Some(ctx);
-                                    let result = self.inline_method_body(&fn_def, extracted);
+                                    let result = self.inline_method_body(
+                                        &fn_def,
+                                        extracted,
+                                        Some(model_type.as_str()),
+                                    );
                                     self.self_context = saved_self;
                                     return result;
                                 }
@@ -4973,6 +5030,7 @@ impl<'a> WengertExtractor<'a> {
         model_sym: nsl_ast::Symbol,
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
+        model_type: Option<&str>,
     ) -> Option<VarId> {
         // Pre-extract args in caller's context before switching to callee's
         let extracted = self.pre_extract_args(fn_def, call_args)?;
@@ -4988,7 +5046,7 @@ impl<'a> WengertExtractor<'a> {
             });
         let saved_self = self.self_context.clone();
         self.self_context = Some(name);
-        let result = self.inline_method_body(fn_def, extracted);
+        let result = self.inline_method_body(fn_def, extracted, model_type);
         self.self_context = saved_self;
         result
     }
@@ -5034,6 +5092,7 @@ impl<'a> WengertExtractor<'a> {
         &mut self,
         fn_def: &nsl_ast::decl::FnDef,
         extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,
+        model_type: Option<&str>,
     ) -> Option<VarId> {
         // Inline callee locals in an isolated symbol scope so names like
         // `batch` inside a model method do not overwrite caller bindings such
@@ -5067,6 +5126,22 @@ impl<'a> WengertExtractor<'a> {
             .unwrap_or("?")
             .to_string();
         self.apply_checkpoint_policy(&fn_name);
+
+        // Item 9 phase 2: this method's body is now part of the Wengert list,
+        // where `PrimalOp::Matmul` lowers to an unconditional
+        // `nsl_tensor_matmul`.  If it carried `@fp8_compute`, that decorator
+        // has just been dropped on the floor — record it so the train/grad
+        // lowering can refuse instead of emitting f32 under an FP8 banner.
+        //
+        // Recorded AFTER the body extracted successfully: a method whose
+        // extraction bailed contributed no ops, so it neither degraded
+        // silently nor deserves to fail the compile.
+        if let Some(mt) = model_type {
+            let key = format!("{mt}::{fn_name}");
+            if self.fp8_compute_methods.contains(&key) {
+                self.inlined_fp8_methods.insert(key);
+            }
+        }
 
         // The method's return value is the list output (set by Return stmt extraction)
         let result = self.list.output;

@@ -155,8 +155,9 @@ mod imp {
             /// WHICH cuBLAS wrapper produced this, and therefore which one
             /// must reproduce it on replay.
             ///
-            /// Not cosmetic. `sgemm_wgrad_accum` and `sgemm_row_major` both
-            /// call `on_sgemm` with `(a, b, c, m, n, k, alpha, beta)`, but
+            /// Not cosmetic. `sgemm_wgrad_accum` and the plain row-major path
+            /// (`sgemm_row_major_t` with both ops `N`) both recorded
+            /// `(a, b, c, m, n, k, alpha, beta)` through one shared hook, but
             /// they hand cuBLAS completely different operand mappings —
             /// `OP_N/OP_N` with the row-major swap versus `OP_N/OP_T` for the
             /// weight-gradient contraction. Without this field a wgrad gemm
@@ -442,7 +443,7 @@ mod imp {
     /// Eagerly re-issue recorded ops (bit-identical by construction: same
     /// function handles, same argument bytes, same stream). Must be called
     /// with the ACTIVE borrow RELEASED and the mode already advanced to
-    /// EagerRest/none — `sgemm_row_major` re-enters the on_sgemm hook.
+    /// EagerRest/none — the gemm wrappers re-enter the `on_sgemm_*` hooks.
     fn repair(ops: &[GpuOp]) {
         if ops.is_empty() {
             return;
@@ -1117,20 +1118,9 @@ mod imp {
         Some(GpuOp::Kernel { func, grid, block, shared, params, offsets, name })
     }
 
-    /// Hook for `sgemm_row_major`. Returns `false` when the gemm must be
-    /// skipped (verified against the captured sequence).
-    #[allow(clippy::too_many_arguments)]
-    pub fn on_sgemm(
-        a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
-    ) -> bool {
-        on_sgemm_full(
-            SgemmKind::RowMajor, false, false,
-            a, b, c, m, n, k, alpha, beta, 1, m * k, k * n, m * n,
-        )
-    }
-
-    /// Hook for `sgemm_batched_row_major` (item 9). Same contract as
-    /// `on_sgemm`; `stride_*` are element offsets, 0 meaning broadcast.
+    /// Hook for `sgemm_batched_row_major` (item 9). Returns `false` when the
+    /// gemm must be skipped (verified against the captured sequence);
+    /// `stride_*` are element offsets, 0 meaning broadcast.
     #[allow(clippy::too_many_arguments)]
     pub fn on_sgemm_batched(
         a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
@@ -1147,7 +1137,7 @@ mod imp {
     ///
     /// The `strides` for a `batch == 1` op are the natural per-slice extents
     /// rather than 0, so a single-slice call recorded through the batched hook
-    /// and one recorded through `on_sgemm` describe the same geometry.
+    /// and one recorded through the 2-D hook describe the same geometry.
     #[allow(clippy::too_many_arguments)]
     pub fn on_sgemm_full(
         kind: SgemmKind, transa: bool, transb: bool,
@@ -1489,6 +1479,118 @@ mod imp {
             EAGER_REGIONS.load(Ordering::Relaxed),
         );
     }
+
+    // ------------------------------------------------------------------
+    // Op-identity gates (item 9 phase 2, added after independent review)
+    // ------------------------------------------------------------------
+    //
+    // These live inside `imp` because `GpuOp` is private to it. They need no
+    // GPU: equality and `digest` are pure functions over recorded values.
+    //
+    // Why they exist: the bug this commit fixed was "three places that must
+    // agree about op identity, and one of them didn't". The fix added
+    // `kind`/`transa`/`transb` to `GpuOp::Sgemm` and threaded them through
+    // equality, the digest and the replay dispatch — but nothing pinned that
+    // agreement, so dropping `kind` from the digest while keeping it in `eq`
+    // (or the reverse) left the whole workspace green. An independent review
+    // pointed that out. These are the gates it asked for.
+    #[cfg(test)]
+    mod op_identity_tests {
+        use super::*;
+
+        /// A row-major gemm and a weight-gradient gemm over the SAME three
+        /// buffers with the SAME dims — the exact collision that used to make
+        /// eager repair replay a wgrad contraction as a plain matmul.
+        fn colliding_pair() -> (GpuOp, GpuOp) {
+            let common = |kind: SgemmKind| GpuOp::Sgemm {
+                kind,
+                transa: false,
+                transb: false,
+                a: 0x1000,
+                b: 0x2000,
+                c: 0x3000,
+                m: 64,
+                n: 128,
+                k: 32,
+                alpha_bits: 1.0f32.to_bits(),
+                beta_bits: 0.0f32.to_bits(),
+                batch: 1,
+                stride_a: 64 * 32,
+                stride_b: 32 * 128,
+                stride_c: 64 * 128,
+            };
+            (common(SgemmKind::RowMajor), common(SgemmKind::WgradAccum))
+        }
+
+        #[test]
+        fn wgrad_and_row_major_are_not_equal() {
+            let (row, wgrad) = colliding_pair();
+            // `assert!(a != b)`, not `assert_ne!`: `GpuOp` has no `Debug`
+            // (its `Kernel` variant carries a raw params blob).
+            assert!(
+                row != wgrad,
+                "a weight-gradient gemm and a row-major gemm over the same \
+                 buffers and dims compare EQUAL — replay would reproduce one \
+                 as the other, silently computing the wrong contraction"
+            );
+        }
+
+        #[test]
+        fn wgrad_and_row_major_digest_differently() {
+            let (row, wgrad) = colliding_pair();
+            assert_ne!(
+                digest(std::slice::from_ref(&row)),
+                digest(std::slice::from_ref(&wgrad)),
+                "the digest ignores SgemmKind, so a captured graph built for \
+                 one contraction would be reused for the other. Equality and \
+                 the digest must agree — disagreement between them is the \
+                 exact failure class this field was added to close"
+            );
+        }
+
+        /// Transposition is part of identity for the same reason: the ops
+        /// select different lda/ldb, so a replay under the wrong flags reads a
+        /// real, in-bounds, WRONG sub-matrix.
+        #[test]
+        fn transposition_flags_are_part_of_op_identity() {
+            let (base, _) = colliding_pair();
+            for mutate in [
+                |o: &mut GpuOp| {
+                    if let GpuOp::Sgemm { transa, .. } = o {
+                        *transa = true;
+                    }
+                },
+                |o: &mut GpuOp| {
+                    if let GpuOp::Sgemm { transb, .. } = o {
+                        *transb = true;
+                    }
+                },
+            ] {
+                let mut other = base.clone();
+                mutate(&mut other);
+                assert!(base != other, "transposition dropped from equality");
+                assert_ne!(
+                    digest(std::slice::from_ref(&base)),
+                    digest(std::slice::from_ref(&other)),
+                    "transposition dropped from the digest"
+                );
+            }
+        }
+
+        /// Sanity: two identical ops MUST still compare equal and hash alike.
+        /// Without this the tests above would pass against an implementation
+        /// that simply declared everything unequal.
+        #[test]
+        fn identical_ops_still_match() {
+            let (row, _) = colliding_pair();
+            let same = row.clone();
+            assert!(row == same, "two identical ops compare unequal");
+            assert_eq!(
+                digest(std::slice::from_ref(&row)),
+                digest(std::slice::from_ref(&same))
+            );
+        }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1549,7 +1651,7 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 
 #[cfg(feature = "cuda")]
 pub(crate) use imp::{
-    in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm, on_sgemm_batched,
+    in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
     on_sgemm_full, queue_deferred_free, taint,
     MemsetAction, SgemmKind,
 };

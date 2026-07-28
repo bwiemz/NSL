@@ -1596,8 +1596,18 @@ pub(crate) mod inner {
         cuEventRecord(event as CUevent, current_stream())
     }
 
-    pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) {
-        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent);
+    /// Elapsed time between two recorded events, in milliseconds.
+    ///
+    /// Returns the driver status rather than discarding it.  It used to be
+    /// discarded, and `cuEventElapsedTime_v2` leaves its out-param UNTOUCHED
+    /// on failure — so every failed query silently became a 0.0 ms
+    /// measurement.  That is how `--profile-kernels` came to write a
+    /// `kernel_profile.json` reporting 412 launches and
+    /// `total_kernel_time_ms: 0.0`: not a fast program, a dead API call
+    /// nobody was checking.
+    #[must_use]
+    pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) -> CUresult {
+        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent)
     }
 
     pub unsafe fn cu_event_destroy(event: u64) {
@@ -1959,6 +1969,11 @@ pub(crate) use inner::{cu_event_create, cu_event_elapsed_time, cu_event_destroy,
 #[cfg(feature = "cuda")]
 pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
 
+/// Re-exported so callers that now CHECK a driver status (rather than
+/// discarding it) can name the success case without importing cudarc.
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::sys::CUresult;
+
 // === cuBLAS handle + sgemm wrapper (spec 2026-04-21-matmul-cublas-swap-design) ===
 
 /// cuBLAS handle lifecycle + sgemm dispatch for `gpu_matmul_f32`.
@@ -2104,104 +2119,6 @@ pub(crate) mod cublas_inner {
                 CublasHandle(handle)
             })
             .0
-    }
-
-    /// Single-matmul dispatch: C[M,N] = A[M,K] @ B[K,N], f32, row-major.
-    ///
-    /// Per §2.1's rectangular worked example:
-    ///   cublasSgemm_v2(handle, N, N, m=N, n=M, k=K,
-    ///                  alpha, B_ptr, lda=N,
-    ///                         A_ptr, ldb=K,
-    ///                  beta,  C_ptr, ldc=N)
-    ///
-    /// Returns `Ok(())` on success; translates cuBLAS status to a `CublasError`.
-    ///
-    /// # Safety
-    /// `a_dev`, `b_dev`, `c_dev` must be valid device f32 pointers of sizes
-    /// m*k, k*n, m*n respectively, with m, n, k > 0 and fitting in i32.
-    /// Row-major SGEMM: `C = alpha * (A @ B) + beta * C`.
-    ///
-    /// `alpha`/`beta` are explicit so the weight-gradient GEMM can accumulate
-    /// straight into an existing buffer (`alpha = accum_scale, beta = 1.0`)
-    /// instead of materialising a full dW temporary and running a separate
-    /// elementwise accumulate. Plain matmul passes `(1.0, 0.0)`, which is
-    /// exactly the behaviour this function had when those values were
-    /// hardcoded.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn sgemm_row_major(
-        a_dev: *const f32,
-        b_dev: *const f32,
-        c_dev: *mut f32,
-        m: u64,
-        n: u64,
-        k: u64,
-        alpha: f32,
-        beta: f32,
-    ) -> Result<(), cublas_result::CublasError> {
-        debug_assert!(m > 0 && n > 0 && k > 0, "sgemm requires m,n,k > 0");
-        debug_assert!(
-            m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
-            "sgemm dims must fit in i32"
-        );
-        // cuda-graphs (P5 item 19): the gemm is a pseudo-op — recorded during
-        // record/capture passes, verified-and-skipped during replay (the
-        // region-end graph launch carries the captured cuBLAS kernels).
-        if !super::graph_capture::on_sgemm(
-            a_dev as usize,
-            b_dev as usize,
-            c_dev as usize,
-            m,
-            n,
-            k,
-            alpha,
-            beta,
-        ) {
-            return Ok(());
-        }
-        let handle = cublas_handle();
-        // p8 PR-A: bind the gemm to the per-thread compute stream so cuBLAS
-        // kernels ride the same stream as every other kernel (ordering-neutral
-        // vs the old NULL-stream default thanks to blocking-stream semantics;
-        // required for future graph capture). Set per call — the handle is
-        // process-global while the stream is per-thread, and cublasSetStream_v2
-        // is a cheap handle-field write.
-        {
-            let r = unsafe {
-                cublas_sys::cublasSetStream_v2(
-                    handle,
-                    super::inner::current_stream() as cublas_sys::cudaStream_t,
-                )
-            };
-            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                // Ordering stays correct on failure (the handle falls back to
-                // its previous stream, still barrier-ordered) but graph
-                // capture (PR-B) would silently miss the gemm — log loudly.
-                eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — gemm stays on its previous stream", r);
-            }
-        }
-        // Safe API takes alpha/beta by value via *const pointers. Under
-        // CUBLAS_POINTER_MODE_HOST (default) cuBLAS reads these synchronously
-        // before the FFI returns. They are now by-value PARAMETERS rather than
-        // locals declared here, which is equally sound: a by-value parameter
-        // lives on this frame for the whole call, so `&alpha`/`&beta` stay
-        // valid until `cublas_result::sgemm` returns. Do NOT change them to
-        // references or thread them from a caller-owned temporary without
-        // re-checking that lifetime — under CUBLAS_POINTER_MODE_DEVICE the
-        // same pointers would be read asynchronously and this would become a
-        // real footgun.
-        cublas_result::sgemm(
-            handle,
-            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-            n as i32, // cublas m = N (cols of row-major C)
-            m as i32, // cublas n = M (rows of row-major C)
-            k as i32, // contraction dim
-            &alpha,
-            b_dev, n as i32, // A^cublas := B_row, lda = N
-            a_dev, k as i32, // B^cublas := A_row, ldb = K
-            &beta,
-            c_dev, n as i32, // C^cublas := C_row, ldc = N
-        )
     }
 
     /// `sgemm_row_major`, but either operand may be supplied as a TRANSPOSED
