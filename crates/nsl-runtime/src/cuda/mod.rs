@@ -2094,6 +2094,23 @@ pub(crate) mod cublas_inner {
         }
     }
 
+    /// The math mode this PROCESS runs under, resolved exactly once.
+    ///
+    /// Two consumers exist: the cuBLAS handle (bakes the mode at its lazy
+    /// init) and the transpose-views dispatch coupling (resolves at the
+    /// first non-contiguous matmul). Before this cache each did its own
+    /// `resolve_math_mode()` env read at its own first-use time, so a
+    /// process that mutated `NSL_MATMUL_TF32` between those two moments
+    /// silently landed in a MIXED cell — e.g. a TF32 handle with copy-arm
+    /// dispatch, the configuration measured 1.12x slower — with no signal
+    /// (dispatch choice has no numeric signature; review finding on the
+    /// coupling commit). First reader wins; both consumers agree forever.
+    static RESOLVED_MATH_MODE: std::sync::OnceLock<CublasMathMode> = std::sync::OnceLock::new();
+
+    pub(crate) fn resolved_math_mode() -> CublasMathMode {
+        *RESOLVED_MATH_MODE.get_or_init(resolve_math_mode)
+    }
+
     /// Return a reference to the process-global cuBLAS handle, creating it on
     /// first call. Panics on creation failure (catastrophic — no recovery).
     ///
@@ -2115,7 +2132,7 @@ pub(crate) mod cublas_inner {
                 // Apply the resolved math mode via raw FFI.  `cublasSetMathMode`
                 // is exported by `cudarc::cublas::sys` but not wrapped by the
                 // safe API surface — raw call is the canonical path.
-                let mode = resolve_math_mode();
+                let mode = resolved_math_mode();
                 let raw_mode = match mode {
                     CublasMathMode::Fp32Cores => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
                     CublasMathMode::Pedantic => cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
@@ -3704,9 +3721,11 @@ fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
 ///
 /// The default is per-math-mode because each arm won only in its own
 /// measured cell: FP32 cores keep the copy (OP_T 1.40x SLOWER on the LM
-/// head there), Pedantic keeps the copy (unmeasured). That is a decision
-/// per measured cell — NOT the shape heuristic the paragraph above warns
-/// about, which would interpolate into cells nobody measured.
+/// head per the committed reproducer — the table above says 1.51x because
+/// it is the ORIGINAL 2026-07-27 hand grid; same cell, different runs),
+/// Pedantic keeps the copy (unmeasured). That is a decision per measured
+/// cell — NOT the shape heuristic the paragraph above warns about, which
+/// would interpolate into cells nobody measured.
 /// 0 = unresolved, 1 = off, 2 = on.
 #[cfg(feature = "cuda")]
 static TRANSPOSE_VIEWS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -3733,7 +3752,7 @@ fn transpose_views_enabled() -> bool {
                 Some("1") => true,
                 Some("0") => false,
                 _ => matches!(
-                    cublas_inner::resolve_math_mode(),
+                    cublas_inner::resolved_math_mode(),
                     cublas_inner::CublasMathMode::Tf32
                 ),
             };
@@ -3744,8 +3763,9 @@ fn transpose_views_enabled() -> bool {
 }
 
 /// Test hook: force the transposed-view decision for the rest of the process.
-/// The gates need BOTH arms in one binary — the default-off path must keep
-/// materialising, and the opt-in path must stay numerically correct.
+/// The gates need BOTH arms in one binary — the copy arm must keep
+/// materialising correctly, and the OP_T arm must stay numerically correct —
+/// regardless of what the math-mode coupling would have resolved.
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_set_transpose_views(enabled: bool) {
     TRANSPOSE_VIEWS_STATE.store(u8::from(enabled) + 1, std::sync::atomic::Ordering::Relaxed);
@@ -3775,8 +3795,12 @@ pub(crate) fn matmul_operand_needs_no_copy(a_ptr: i64, b_ptr: i64, is_a: bool) -
     if me.is_contiguous() {
         return true; // `nsl_tensor_contiguous` would only bump a refcount.
     }
-    // OFF BY DEFAULT — the obvious argument for this is wrong, and measurement
-    // is the only reason we know. See `transpose_views_enabled`.
+    // MATH-MODE-COUPLED DEFAULT (2026-07-28): ON under TF32, OFF under FP32
+    // cores and Pedantic; the env literal always wins. Each arm is measured
+    // in exactly its own cell — see `transpose_views_enabled`. Do NOT reason
+    // downstream from "strided operands are always materialised": under the
+    // shipped defaults every stdlib Linear's `x @ w.transpose(0,1)` takes
+    // OP_T.
     if !transpose_views_enabled() {
         return false;
     }

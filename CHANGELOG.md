@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — flip hardening: one shared math-mode resolution, and the two gates the flip broke
+
+- The cuBLAS handle and the dispatch coupling each did their own lazy
+  `resolve_math_mode()` env read at different first-use times, so a process
+  mutating `NSL_MATMUL_TF32` between them silently landed in a mixed cell
+  (e.g. TF32 handle + copy dispatch — the measured-slower configuration)
+  with no numeric signature. Both now read one `OnceLock`; first reader
+  wins, both consumers agree forever (review finding).
+- The full lane caught two e2e gates broken by the flip, both the same
+  shape: they compare two paths whose transposes sit at different call
+  sites, so the coupled default put the compared paths on different kernel
+  arms and the reduction-order delta crossed their tolerances
+  (`muon_p1_gate` at 1.09e-6 vs 1e-6; the FASE-vs-plain checkpoint gate
+  past 5e-3 after 32 AdamW steps). Both gates' subjects are not dispatch
+  policy — the Muon primitive and optimizer windowing semantics — so both
+  pin `NSL_MATMUL_TRANSPOSE_VIEWS=0` in their child runs, the same
+  isolation move as the existing `NSL_FLASH_BWD_CPU` pin. Dispatch arms
+  keep their own value gates.
+- OP_T-under-Pedantic — the one env-reachable cell no value gate had ever
+  touched — is now gated (`op_t_override_is_correct_under_pedantic`); the
+  vacuity probe's expected math-mode signature is parent-declared so the
+  pedantic parent can require the ABSENCE of TF32 drift. Stale
+  "OFF BY DEFAULT" comments inside the shared dispatch predicate corrected.
+
 ### Changed — transposed views now reach cuBLAS as `OP_T` under TF32 (math-mode-coupled default)
 
 - `NSL_MATMUL_TRANSPOSE_VIEWS` grew a per-math-mode default: **OP_T under

@@ -152,10 +152,17 @@ fn zz_tf32_dispatch_child() {
         return;
     }
 
-    // ── Vacuity probe: TF32 must actually be ON in this process. ─────────
-    // At K=256, full f32 drifts ~1e-6 relative; TF32 ~1e-3. Requiring more
-    // than 1e-5 means a math-mode resolver regression (TF32 silently off)
-    // fails HERE instead of making every gate below vacuously green.
+    // ── Vacuity probe: the math mode must match the parent's declaration. ─
+    // At K=256, full f32/pedantic drifts ~1e-6 relative; TF32 ~1e-3. The
+    // parent declares which signature to require (EXPECT_TF32), so a
+    // math-mode resolver regression fails HERE instead of making every gate
+    // below vacuously green — and pedantic-cell parents can use the same
+    // child without the probe demanding TF32 drift they must not have.
+    let expect_tf32 = match std::env::var("NSL_TF32_DISPATCH_EXPECT_TF32").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        other => panic!("parent must declare the expected math mode, got {other:?}"),
+    };
     {
         let n = 256usize;
         let a = det_seq(91, n * n);
@@ -174,12 +181,22 @@ fn zz_tf32_dispatch_child() {
         let bt = gpu_tensor(&b, &[n as i64, n as i64]);
         let ct = nsl_tensor_matmul(at, bt, 0);
         let e = rel_err(&read_gpu(ct, n * n), &want);
-        assert!(
-            e > 1e-5,
-            "vacuity probe: a 256^3 product drifted only {e:.3e} — that is \
-             full-f32 accuracy, so TF32 is NOT active in this child and every \
-             gate below would be meaningless. Did resolve_math_mode change?"
-        );
+        if expect_tf32 {
+            assert!(
+                e > 1e-5,
+                "vacuity probe: a 256^3 product drifted only {e:.3e} — that is \
+                 full-f32 accuracy, so TF32 is NOT active in this child and \
+                 every gate below would be meaningless. Did resolve_math_mode \
+                 change?"
+            );
+        } else {
+            assert!(
+                e < 1e-5,
+                "vacuity probe: a 256^3 product drifted {e:.3e} — TF32 \
+                 signature in a child whose parent declared a non-TF32 math \
+                 mode (pedantic/f32-cores). The configuration did not take."
+            );
+        }
         assert!(e < TOL, "vacuity probe: {e:.3e} exceeds even the TF32 tolerance");
         println!("TF32CHECK vacuity max_rel={e:.3e}");
         for t in [ct, bt, at] {
@@ -429,7 +446,8 @@ fn dispatch_paths_are_correct_under_the_shipped_defaults() {
         cmd.env_remove("NSL_MATMUL_TF32")
             .env_remove("NSL_MATMUL_PEDANTIC")
             .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
-            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0");
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0")
+            .env("NSL_TF32_DISPATCH_EXPECT_TF32", "1");
     });
 }
 
@@ -446,7 +464,8 @@ fn copy_arm_is_correct_under_tf32() {
         cmd.env("NSL_MATMUL_TF32", "1")
             .env("NSL_MATMUL_TRANSPOSE_VIEWS", "0")
             .env_remove("NSL_MATMUL_PEDANTIC")
-            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "1");
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "1")
+            .env("NSL_TF32_DISPATCH_EXPECT_TF32", "1");
     });
 }
 
@@ -466,6 +485,28 @@ fn op_t_exemption_is_correct_under_tf32() {
         cmd.env("NSL_MATMUL_TF32", "1")
             .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
             .env_remove("NSL_MATMUL_PEDANTIC")
-            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0");
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0")
+            .env("NSL_TF32_DISPATCH_EXPECT_TF32", "1");
+    });
+}
+
+/// Every dispatch path with OP_T FORCED under Pedantic — the one cell the
+/// env override can reach that no value gate had ever touched (the OP_T
+/// value gates ran under Fp32Cores or TF32 only; review finding on the
+/// coupling commit). The coupling itself keeps Pedantic on the copy arm,
+/// but `NSL_MATMUL_TRANSPOSE_VIEWS=1` always wins, so the cell is
+/// reachable and must be gated, not merely legal.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn op_t_override_is_correct_under_pedantic() {
+    if !cuda_available() {
+        return;
+    }
+    spawn_child(|cmd| {
+        cmd.env("NSL_MATMUL_PEDANTIC", "1")
+            .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
+            .env_remove("NSL_MATMUL_TF32")
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0")
+            .env("NSL_TF32_DISPATCH_EXPECT_TF32", "0");
     });
 }

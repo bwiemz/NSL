@@ -90,12 +90,15 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///
 /// # Why it is sound to set this here
 ///
-/// `resolve_math_mode` is read exactly once per process, inside
-/// `cublas_handle()`'s `OnceLock` initialiser. Every GPU test in this file
-/// goes through this function before touching cuBLAS, so whichever test runs
-/// first performs the init with the variable already set — order-independent.
-/// If that ever stops holding, the affected test fails with a ~1e-3 drift
-/// message rather than passing quietly, so this is self-checking.
+/// The math mode is resolved exactly once per process through the shared
+/// `resolved_math_mode()` OnceLock, consulted by BOTH the cuBLAS handle and
+/// the transpose-views dispatch coupling — first reader wins, and every GPU
+/// test in this file goes through this function before touching cuBLAS, so
+/// the resolution happens with the variable already set, order-independent.
+/// A violation on the handle side self-signals as ~1e-3 drift. A violation
+/// on the DISPATCH side has no numeric signature (arm choice flips kernels,
+/// not values), which is why the tests here also force the arm explicitly
+/// via `test_set_transpose_views` rather than trusting the coupling.
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     std::env::set_var("NSL_MATMUL_TF32", "0");
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
