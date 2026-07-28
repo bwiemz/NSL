@@ -6,6 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — the GQA view-chain residual: Unknown-typed chain links no longer strand (roadmap item 1)
+
+- **Root cause, two layers.** The semantic member table
+  (`check_member_access`, nsl-semantic/src/checker/ops.rs) typed the results
+  of `expand`, `contiguous`, `unsqueeze`, `select`, `slice` and `cumsum` as
+  `Unknown` — only `reshape`/`transpose` were covered — so every LATER link
+  of a method chain was Unknown-typed. Codegen ownership tracking
+  (`track_owned_tensor_expr_result`) filters on the result type and the
+  owned-temporary classifier required a proven-Tensor receiver, so each such
+  anonymous link silently stranded its handle: per
+  `expand(..).contiguous().reshape(..)` chain, the expand view pinned the
+  source block (the RoPE output) and the contiguous materialisation stranded
+  outright. `GroupedQueryAttention::forward` leaked 4 blocks (12 MB) per
+  pure-inference call.
+- **Fix layer 1 (root):** the six methods are now typed in the member table —
+  `contiguous`/`cumsum` return the receiver's type (shape-preserving),
+  `expand`/`unsqueeze`/`select`/`slice` return tensor-typed unknown-shape
+  results, and `expand` gets its exact target shape at the call site the same
+  way `reshape` does. Drift gate:
+  `nsl-semantic/tests/tensor_method_result_typing.rs` (fails naming the
+  method if any of them regresses to Unknown).
+- **Fix layer 2 (backstop):** the codegen ownership filters accept
+  indeterminate types exactly where the dispatcher already defaults to tensor
+  dispatch — an Unknown-receiver method call classified by the same ownership
+  table the dispatch uses, and an indeterminate RESULT type accepted only for
+  table-owning tensor-method calls (never Ident-callee builtins or user fns,
+  where an Unknown-typed value can be a scalar or list and freeing it as a
+  tensor is memory corruption; a Cranelift I64 pointer-type guard backs this
+  up). With layer 1 deliberately reverted, this layer alone still holds GQA
+  at the 1-block floor — mutation-verified both ways.
+- **Fix layer 3:** the free-function spellings (`contiguous(t)`,
+  `unsqueeze(t,d)`, `slice(t,..)`, `stack(l,d)`, `tensor_cat(l,d)`,
+  `cumsum(t,d)`, `argmax(t)`, `causal_mask(n)`) joined the Ident allowlist in
+  `expr_result_is_owned_temporary`, each entry verified against its runtime
+  implementation. Measured before: `contiguous(x.transpose(0,1)).sum()`
+  retained 2 blocks/call while the method spelling retained 1 — same runtime
+  call, different books.
+- **Measured (RTX 5070 Ti, CUDA 13.3):** GQA `[2,1024,512]` forward
+  5 → **1 block/call** (the caller-bound result — the floor), 16 → 4 MB/call.
+  Coder-50M `[2,1024]` pure-inference forward +65 → **+33 blocks/call**,
+  +228 → **+132 MB/call**; N=3 reserved 2.10 → 1.99 GB. The remaining +33 is
+  the separate nested-model-method-argument class (escape.rs's sound refusal
+  for un-analysed callees), unchanged by this fix.
+- **Gates:** `view_chain_leak_gate.rs` ceiling lowered 5.0 → 1.0;
+  `the_residual_is_still_present_and_bounded` (which deliberately failed on
+  improvement) replaced by `the_gqa_residual_is_closed_exactly`, pinning
+  exactly one retained block per call in both directions — fewer than one
+  means the bound result itself was freed, the use-after-free direction. New:
+  `free_function_chain_links_do_not_strand_per_call` and
+  `unknown_typed_receiver_chains_do_not_strand_per_call` (anti-vacuity via
+  the compiler's "defaulting to tensor dispatch" warning and driver
+  allocation counters). Every gate proven RED against its own layer's
+  reverted fix before shipping.
+- **Diagnostics:** `NSL_DEBUG_MEM_TRACE=1` now prints a `[tensor-trace] new`
+  line at every tensor-handle publish (pointer, data, len, ndim, device,
+  data-owner), pairing with the existing free trace so leaked handles can be
+  diffed generation-accurately instead of by data-pointer heuristics.
+
 ### Fixed — flip hardening: one shared math-mode resolution, and the two gates the flip broke
 
 - The cuBLAS handle and the dispatch coupling each did their own lazy

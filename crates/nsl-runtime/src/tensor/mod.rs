@@ -515,6 +515,13 @@ impl NslTensor {
             debug_track_gpu_alloc(bytes);
         }
         let ptr = Box::into_raw(tensor) as i64;
+        if tensor_trace_on() {
+            let t = NslTensor::from_ptr(ptr);
+            eprintln!(
+                "[tensor-trace] new t={:#x} data={:p} len={} ndim={} dev={} owner={:#x}",
+                ptr, t.data, t.len, t.ndim, t.device, t.data_owner
+            );
+        }
         scope_track(ptr);
         ptr
     }

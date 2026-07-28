@@ -29,6 +29,16 @@
 //! Coder-50M `[2,1024]` forward went from **+89 to +65 blocks** and
 //! **+292 MB to +228 MB** per call, with the N=3 peak 2.29 GB -> 2.10 GB.
 //!
+//! 2026-07-28: the remaining 4-block GQA residual was closed. Root cause was
+//! two-layered: the semantic member table (`check_member_access`) typed
+//! `expand`/`contiguous`/`unsqueeze`/`select`/`slice`/`cumsum` results as
+//! Unknown, and the codegen ownership filters (`track_owned_tensor_expr_
+//! result`, `expr_result_is_owned_temporary`) silently drop non-Tensor
+//! types — so every chain link after the first `expand` stranded. GQA is now
+//! at the 1-block/call floor (the bound result); Coder-50M went **+65 to +33
+//! blocks** and **+228 MB to +132 MB** per call (the rest is the separate
+//! nested-model-method-argument class, escape.rs's sound refusal).
+//!
 //! Gate design mirrors `fn_lifetime_leak_gate.rs`: run the same fixture at two
 //! call counts and assert the caching allocator's exit `live_blocks` are
 //! IDENTICAL. Anything that strands per call scales with the count.
@@ -44,8 +54,8 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// Run a whole program and return (exit live_blocks, stdout).
-fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String) {
+/// Run a whole program and return (exit live_blocks, stdout, stderr).
+fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String, String) {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_viewchain_{}_{tag}_{n}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -66,7 +76,7 @@ fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String) {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         stdout.contains("DONE"),
         "[{tag}/{n}] fixture did not complete:\n{stdout}"
@@ -87,7 +97,7 @@ fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String) {
     // "ld: final link failed: No space left on device" surfaces as failures in
     // whatever unrelated suite happens to run next.
     std::fs::remove_dir_all(&tmp).ok();
-    (live_blocks, stdout)
+    (live_blocks, stdout, stderr)
 }
 
 /// The real `nsl.nn.gqa` forward, which is where this was found and where the
@@ -120,8 +130,8 @@ let x = full([2, 1024, 512], 1.0).to(cuda)
 
 /// Per-call retained blocks, from two call counts.
 fn blocks_per_call(tag: &str) -> f64 {
-    let (lb1, _) = run_fixture(&gqa_src(1), tag, 1);
-    let (lb3, _) = run_fixture(&gqa_src(3), tag, 3);
+    let (lb1, _, _) = run_fixture(&gqa_src(1), tag, 1);
+    let (lb3, _, _) = run_fixture(&gqa_src(3), tag, 3);
     assert!(
         lb1 > 0,
         "[{tag}] the fixture retained no GPU blocks at all — it is not \
@@ -136,13 +146,17 @@ fn blocks_per_call(tag: &str) -> f64 {
 /// | | blocks/call | MB/call |
 /// |---|---|---|
 /// | before the view-family fix | 8 | 24 |
-/// | after | **5** | **16** |
-/// | ideal (the live result only) | 1 | 4 |
+/// | after the view-family fix | 5 | 16 |
+/// | after the member-table + tracking-filter fix (2026-07-28) | **1** | **4** |
 ///
-/// This is a RATCHET, not a proof of zero. Four blocks per call still strand,
-/// and the gate says so rather than pretending otherwise — see
-/// `the_residual_is_still_present_and_bounded` below.
-const GQA_BLOCKS_PER_CALL_CEILING: f64 = 5.0;
+/// One block per call is the FLOOR: the returned attention output, which the
+/// caller binds and legitimately keeps. The former 4-block residual was two
+/// stranded handles per `expand(..).contiguous().reshape(..)` chain — the
+/// expand view pinning the RoPE output block, plus the contiguous
+/// materialisation — both dropped from tracking because the semantic member
+/// table typed `expand`/`contiguous` results Unknown and the codegen
+/// ownership filters silently skip non-Tensor types.
+const GQA_BLOCKS_PER_CALL_CEILING: f64 = 1.0;
 
 #[test]
 #[ignore = "requires CUDA GPU"]
@@ -151,31 +165,149 @@ fn anonymous_view_chain_links_do_not_strand_per_call() {
     assert!(
         per_call <= GQA_BLOCKS_PER_CALL_CEILING,
         "GroupedQueryAttention::forward now retains {per_call} blocks per call, \
-         above the {GQA_BLOCKS_PER_CALL_CEILING} ceiling. The pre-fix value was 8. \
-         Check that the shape/view family is still classified owning in \
-         `tensor_method_returns_owned_ref` (nsl-codegen/src/expr/mod.rs) — \
-         dropping reshape/transpose/expand/contiguous back out of that table \
-         restores exactly this regression."
+         above the {GQA_BLOCKS_PER_CALL_CEILING} ceiling (the pre-fix values \
+         were 8, then 5, then 1 = the live result only). Three independent \
+         mechanisms feed this gate; check all of them: (1) the shape/view \
+         family classified owning in `tensor_method_returns_owned_ref` \
+         (nsl-codegen/src/expr/mod.rs); (2) the same methods typed Tensor in \
+         `check_member_access` (nsl-semantic/src/checker/ops.rs — see \
+         tensor_method_result_typing.rs, which fails first and names the \
+         method); (3) the indeterminate-type acceptance in \
+         `track_owned_tensor_expr_result` / `expr_result_is_owned_temporary`."
     );
 }
 
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn the_residual_is_still_present_and_bounded() {
-    // Deliberately asserts the leak is NOT closed. Only one block per call is
-    // legitimate (the returned tensor, which the caller binds); the rest is
-    // roadmap item 1's open residual, localised to `GroupedQueryAttention::
-    // forward` but not yet root-caused beyond the view family.
+fn the_gqa_residual_is_closed_exactly() {
+    // The predecessor of this test (`the_residual_is_still_present_and_bounded`)
+    // deliberately asserted the 4-block residual was STILL PRESENT, so that
+    // closing it would fail a gate and force the ceiling down instead of
+    // letting the improvement pass silently. That fired on 2026-07-28: the
+    // residual is now closed, the ceiling above is 1.0, and this replacement
+    // pins EXACTITUDE — exactly one retained block per call (the bound
+    // result), no more, no fewer.
     //
-    // If someone closes it, this test fails — and that is the intended signal
-    // to drop the ceiling above rather than to delete this. A gate that
-    // silently tolerates improvement cannot tell "fixed" from "never measured".
+    // "No fewer" matters as much as "no more": per-call growth below 1 would
+    // mean the caller-bound result itself was freed — that is the
+    // use-after-free direction, and `view_chain_results_are_numerically_
+    // unchanged` alone might miss it if the allocator recycles the block
+    // late.
     let per_call = blocks_per_call("gqa_residual");
     assert!(
-        per_call > 1.0,
-        "the per-call residual is gone ({per_call} blocks/call, ideal is 1). \
-         Lower GQA_BLOCKS_PER_CALL_CEILING to the new value and update this \
-         test — do not just delete it."
+        (per_call - 1.0).abs() < f64::EPSILON,
+        "GroupedQueryAttention::forward retains {per_call} blocks/call; \
+         expected exactly 1.0 (the caller-bound result). More than 1 = a \
+         chain link stranded again; less than 1 = something freed the bound \
+         result (use-after-free hazard)."
+    );
+}
+
+/// The FREE-FUNCTION spellings of the same family (`contiguous(t)`,
+/// `unsqueeze(t, d)`, `slice(t, ...)`, `stack(l, d)`, `tensor_cat(l, d)`,
+/// `cumsum(t, d)`) take dedicated early-return lowerings in expr/calls.rs and
+/// are classified by the IDENT allowlist in `expr_result_is_owned_temporary`,
+/// not the method table. Before 2026-07-28 that allowlist omitted all of
+/// them: `x.transpose(0,1).contiguous().sum()` retained 1 block/call while
+/// the semantically identical `contiguous(x.transpose(0,1)).sum()` retained
+/// 2 — same runtime call, different books.
+///
+/// The fixture ends in `.item()` so nothing tensor-typed is bound per
+/// iteration: with every link tracked, per-call growth must be ZERO.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn free_function_chain_links_do_not_strand_per_call() {
+    let src = |calls: usize| {
+        let mut s = String::from("let x = full([256, 1024], 1.0).to(cuda)\n");
+        for i in 0..calls {
+            s.push_str(&format!(
+                "let v{i} = contiguous(x.transpose(0, 1)).sum().item()\n"
+            ));
+        }
+        s.push_str("print(\"DONE\")\n");
+        s
+    };
+    let (lb1, _, _) = run_fixture(&src(1), "freefn", 1);
+    let (lb3, _, _) = run_fixture(&src(3), "freefn", 3);
+    assert!(
+        lb1 > 0,
+        "[freefn] fixture retained no GPU blocks at all — not exercising the \
+         device, the growth assertion below would pass vacuously"
+    );
+    assert_eq!(
+        lb3, lb1,
+        "free-function chain strands {} blocks over 2 extra calls; the \
+         free-function names (contiguous/unsqueeze/slice/stack/tensor_cat/\
+         cumsum/argmax/causal_mask) must stay in the Ident allowlist of \
+         `expr_result_is_owned_temporary` (nsl-codegen/src/expr/mod.rs)",
+        lb3 - lb1
+    );
+}
+
+/// Layer-2 backstop: a chain hanging off an UNANNOTATED fn parameter. The
+/// parameter's type is Unknown, so the semantic member table cannot help —
+/// tracking works only because (a) `expr_result_is_owned_temporary` accepts
+/// indeterminate receivers (the dispatcher defaults them to tensor dispatch,
+/// so the classification must follow) and (b) `track_owned_tensor_expr_result`
+/// accepts an indeterminate RESULT type for table-owning tensor-method calls.
+/// Reverting either re-strands these links.
+///
+/// Anti-vacuity: the run must actually take the Unknown-dispatch path, which
+/// the compiler announces on stderr ("defaulting to tensor dispatch"). If
+/// type inference later learns to type unannotated params, this fixture
+/// silently stops testing the backstop — the stderr assertion turns that
+/// into a visible failure so the fixture gets rewritten instead.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn unknown_typed_receiver_chains_do_not_strand_per_call() {
+    let src = |calls: usize| {
+        let mut s = String::from(
+            "fn probe(p) -> f64:\n    return p.transpose(0, 1).contiguous().sum().item()\n\nlet x = full([256, 1024], 1.0).to(cuda)\n",
+        );
+        for i in 0..calls {
+            s.push_str(&format!("let v{i} = probe(x)\n"));
+        }
+        s.push_str("print(\"DONE\")\n");
+        s
+    };
+    let (lb1, _, err1) = run_fixture(&src(1), "unkrecv", 1);
+    let (lb3, _, _) = run_fixture(&src(3), "unkrecv", 3);
+    assert!(
+        err1.contains("defaulting to tensor dispatch"),
+        "fixture no longer exercises the Unknown-receiver dispatch path (no \
+         'defaulting to tensor dispatch' warning on stderr) — the backstop \
+         assertion below is vacuous; rewrite the fixture so the receiver is \
+         genuinely untyped:\n{err1}"
+    );
+    // Anti-vacuity: this fixture legitimately ends with ZERO live blocks
+    // (every per-call result is a scalar, and the sweeps free everything
+    // else), so "lb1 > 0" cannot be the device-exercise probe here. Driver
+    // allocation counters can: they only move when the caching allocator
+    // actually served device memory. Mutation-verified 2026-07-28: with the
+    // indeterminate acceptance reverted, this fixture strands 2 blocks/call
+    // (3 -> 7 across these two run lengths).
+    let drv_allocs = err1
+        .lines()
+        .filter_map(|l| {
+            l.split("drv_allocs=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .last()
+        .unwrap_or(0);
+    assert!(
+        drv_allocs > 0,
+        "[unkrecv] no driver allocations reported — the fixture is not \
+         exercising the device:\n{err1}"
+    );
+    assert_eq!(
+        lb3, lb1,
+        "Unknown-receiver chain strands {} blocks over 2 extra calls; check \
+         the indeterminate acceptance in `expr_result_is_owned_temporary` \
+         and `track_owned_tensor_expr_result`/`expr_is_owning_tensor_method_\
+         call` (nsl-codegen/src/expr/mod.rs)",
+        lb3 - lb1
     );
 }
 
@@ -196,7 +328,7 @@ print(a.sum().item())
 print(b.sum().item())
 print("DONE")
 "#;
-    let (_, out) = run_fixture(src, "viewnum", 1);
+    let (_, out, _) = run_fixture(src, "viewnum", 1);
     let nums: Vec<f64> = out
         .lines()
         .filter_map(|l| l.trim().parse::<f64>().ok())
