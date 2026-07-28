@@ -11,6 +11,7 @@ crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	compile_time_emits_fused_dgamm
 crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	runtime_executes_fused_dgamma	gpu	requires CUDA toolchain + GPU; runs the full CSHA fused-backward pipeline end-to-end including SGD writeback on f16 grads.
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_weights_change_after_one_step	gpu	requires a CUDA-capable GPU
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_csha_fused_path	gpu	requires a CUDA-capable GPU; runs the full CSHA fused-backward pipeline end-to-end including SGD writeback on f16 grads.
+crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_fused_vs_baseline_parity	gpu	requires a CUDA-capable GPU; runs the toy train twice (baseline + --csha auto) and compares per-param movements.
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_ffn_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_packed_gqa_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_packed_mha_gpu_fused	gpu	requires CUDA GPU
@@ -313,8 +314,10 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	zz_partial_broadcast_child	unc
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_slower_than_its_2d_form	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_cublas_equivalence.rs	matmul_cublas_pedantic_equivalence_llama	gpu-inferred	
 crates/nsl-runtime/tests/matmul_cublas_tf32_default_sanity.rs	matmul_cublas_tf32_default_sanity_llama	gpu-inferred	
-crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	dispatch_paths_are_correct_under_the_tf32_default	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	dispatch_paths_are_correct_under_the_shipped_defaults	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	copy_arm_is_correct_under_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	op_t_exemption_is_correct_under_tf32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	op_t_override_is_correct_under_pedantic	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_tf32_mode.rs	tf32_is_faster_and_less_accurate_than_full_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_tf32_mode.rs	the_default_mode_is_tf32_and_the_opt_out_restores_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_transposed_right_operand_is_not_copied	gpu	requires CUDA GPU
@@ -323,8 +326,10 @@ crates/nsl-runtime/tests/matmul_transposed_operand.rs	both_operands_transposed	g
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_tied_lm_head_shape_collapses_and_transposes_together	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_broadcast_view_is_still_materialised	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_degenerate_unit_shape_is_not_mistaken_for_a_transpose	gpu	requires CUDA GPU
-crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_default_still_materialises_transposed_operands	gpu	requires CUDA GPU
-crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_env_var_really_enables_the_exemption	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_default_under_tf32_takes_op_t	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_default_under_f32_cores_still_materialises	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_default_under_pedantic_still_materialises	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_env_var_wins_over_the_coupling	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_op_t_tradeoff_is_remeasurable	diagnostic	diagnostic: reruns the OP_T-vs-copy measurement grid behind the transpose-views default and prints the table; asserts only that the probes ran
 crates/nsl-runtime/tests/mul_scalar_gpu.rs	mul_scalar_inplace_gpu_matches_cpu_reference	gpu-inferred	
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_bf16_round_trip_within_epsilon	gpu-inferred	

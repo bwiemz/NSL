@@ -275,7 +275,15 @@ fn fase_deferred_matches_plain_adamw_checkpoint() {
     // (measured 5.999e-3) for reasons unrelated to what this test pins:
     // FASE-deferred vs per-step AdamW OPTIMIZER equivalence. 4.2 keeps the
     // GPU backward in its path; this gate isolates the optimizer semantics.
-    let det = &[("NSL_FLASH_BWD_CPU", "1")][..];
+    // NSL_MATMUL_TRANSPOSE_VIEWS=0 pins the copy dispatch arm for the same
+    // reason the flash backward is pinned: the FASE-deferred and plain
+    // lowerings drive their weight-grad matmuls through differently-shaped
+    // call sites, so the math-mode-coupled OP_T default (2026-07-28) puts
+    // parts of the two runs on different kernel arms and the reduction-order
+    // delta compounds through 32 AdamW steps past the 5e-3 gate — for
+    // reasons unrelated to what this test pins (optimizer WINDOWING
+    // semantics). Dispatch arms have their own value gates.
+    let det = &[("NSL_FLASH_BWD_CPU", "1"), ("NSL_MATMUL_TRANSPOSE_VIEWS", "0")][..];
     let fase = run_program_with_env(&downscaled_program(&ckpt_fase, 4, 65536), "fase43", det);
     assert!(fase.success, "FASE run failed:\n{}", fase.stderr);
     let plain = run_program_with_env(&downscaled_program(&ckpt_plain, 1, 16384), "plain43", det);

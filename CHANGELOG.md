@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — flip hardening: one shared math-mode resolution, and the two gates the flip broke
+
+- The cuBLAS handle and the dispatch coupling each did their own lazy
+  `resolve_math_mode()` env read at different first-use times, so a process
+  mutating `NSL_MATMUL_TF32` between them silently landed in a mixed cell
+  (e.g. TF32 handle + copy dispatch — the measured-slower configuration)
+  with no numeric signature. Both now read one `OnceLock`; first reader
+  wins, both consumers agree forever (review finding).
+- The full lane caught two e2e gates broken by the flip, both the same
+  shape: they compare two paths whose transposes sit at different call
+  sites, so the coupled default put the compared paths on different kernel
+  arms and the reduction-order delta crossed their tolerances
+  (`muon_p1_gate` at 1.09e-6 vs 1e-6; the FASE-vs-plain checkpoint gate
+  past 5e-3 after 32 AdamW steps). Both gates' subjects are not dispatch
+  policy — the Muon primitive and optimizer windowing semantics — so both
+  pin `NSL_MATMUL_TRANSPOSE_VIEWS=0` in their child runs, the same
+  isolation move as the existing `NSL_FLASH_BWD_CPU` pin. Dispatch arms
+  keep their own value gates.
+- OP_T-under-Pedantic — the one env-reachable cell no value gate had ever
+  touched — is now gated (`op_t_override_is_correct_under_pedantic`); the
+  vacuity probe's expected math-mode signature is parent-declared so the
+  pedantic parent can require the ABSENCE of TF32 drift. Stale
+  "OFF BY DEFAULT" comments inside the shared dispatch predicate corrected.
+
+### Changed — transposed views now reach cuBLAS as `OP_T` under TF32 (math-mode-coupled default)
+
+- `NSL_MATMUL_TRANSPOSE_VIEWS` grew a per-math-mode default: **OP_T under
+  TF32** (the shipped default), the materialising copy under FP32 cores and
+  Pedantic. The literal `"1"`/`"0"` always win; any other value falls
+  through to the coupling (same tri-state discipline as `NSL_MATMUL_TF32`).
+- Flipped on two levels of measurement plus gates, per the process the
+  reproducer commit demanded: the per-call grid (OP_T 0.65x/0.72x/0.46x
+  under TF32) and a Coder-50M 20-forward loop — **63.4 → 56.6 ms
+  end-to-end (1.12x)**, three paired runs, sgemm at parity, the whole win
+  the vanished 96 MiB LM-head copy; plus the ~90 MB of peak memory that
+  copy always cost. OP_T values under TF32 are gated by
+  `matmul_dispatch_under_tf32` (path-witnessed).
+- The coupling is a decision per **measured cell**, not a shape heuristic:
+  FP32 cores keep the copy because OP_T measured 1.40x slower on the LM
+  head in that cell; Pedantic keeps the copy because that cell is
+  unmeasured and unmeasured cells keep the conservative arm.
+- New behavior gates spawn children with all three matmul variables
+  controlled: default-under-TF32 takes OP_T, default-under-f32/Pedantic
+  materialises, and the env var beats the coupling in both directions.
+  The under-TF32 suite gained an explicit copy-arm configuration, and its
+  path witness now takes its expectation from the parent instead of
+  re-deriving the resolution it is testing.
+
 ### Fixed — gpu-cert lane: `cpu-stub` class ends the permanent 2-NOTFOUND noise
 
 - The gate-inventory scanner classified `#[cfg(not(feature = "cuda"))]`

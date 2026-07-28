@@ -28,6 +28,10 @@ struct RunOut {
 }
 
 fn run_source(tag: &str, src: &str, extra: &[&str]) -> RunOut {
+    run_source_env(tag, src, extra, &[])
+}
+
+fn run_source_env(tag: &str, src: &str, extra: &[&str], env: &[(&str, &str)]) -> RunOut {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_muon_p1_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -38,6 +42,7 @@ fn run_source(tag: &str, src: &str, extra: &[&str]) -> RunOut {
         .args(extra)
         .arg(&prog)
         .current_dir(&tmp)
+        .envs(env.iter().copied())
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -263,7 +268,20 @@ fn fast_primitive_matches_reference_gpu() {
         .replace("# GPU_PLACEMENT_W", "gw = gw.to(cuda)")
         .replace("# GPU_PLACEMENT_T", "gt = gt.to(cuda)")
         .replace("# GPU_PLACEMENT_S", "gs = gs.to(cuda)");
-    let out = run_source("equiv_gpu", &src, &[]);
+    // Pin the copy dispatch arm. The fast path and the reference differ in
+    // WHERE they transpose, so the math-mode-coupled OP_T default (2026-07-28)
+    // puts the two compared paths on DIFFERENT kernel arms and the
+    // reduction-order delta lands right at this gate's 1e-6 line (measured
+    // 1.09e-6). The gate's subject is the Muon primitive, not dispatch
+    // policy — dispatch arms have their own gates (matmul_dispatch_under_
+    // tf32) — so both compared paths are held on one arm, same policy as
+    // the NSL_FLASH_BWD_CPU pin in pretrain_loss_decrease_gpu_e2e.
+    let out = run_source_env(
+        "equiv_gpu",
+        &src,
+        &[],
+        &[("NSL_MATMUL_TRANSPOSE_VIEWS", "0")],
+    );
     assert!(out.success, "GPU equivalence probe failed:\n{}", out.stderr);
     let diffs = parse_diffs(&out.stdout);
     assert_eq!(diffs.len(), 3, "expected 3 diffs:\n{}", out.stdout);
