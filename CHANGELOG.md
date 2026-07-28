@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — Coder-50M pure-inference forward no longer leaks AT ALL (roadmap item 1 complete)
+
+- **The remaining +33 blocks / +132 MB per forward is closed: per-call growth
+  is now ZERO** (154 blocks / 216 MB at N=1 and N=3, RTX 5070 Ti). At the
+  campaign's start a Coder-50M forward stranded +292 MB per call.
+- **Root cause A — the Return-arm double-own, recurring:** a compiled
+  function's Return arm conservatively retains any result it cannot prove
+  owning. `return rmsnorm(...)` (RMSNorm) and `return dropout(...)` (GQA,
+  SwiGLUFFN) hit that arm because the free-function builtins were missing
+  from the owning-ref allowlist — the same bug previously fixed for
+  `return scaled_dot_product_attention(...)`, one allowlist gap later. Each
+  nested call stranded its fresh output: 4 blocks per TransformerBlock call
+  (two RMSNorm outputs + two eval-`dropout` clones — eval dropout returns
+  `nsl_tensor_clone`, which ALWAYS allocates), ×8 layers = 32 of the 33.
+  Fixed by adding `rmsnorm`/`dropout`/`layernorm`/`bias_add`/`gather`/
+  `embedding_lookup` to the allowlist, each verified against its runtime
+  implementation on every path (the stdlib's complete set of
+  return-position tensor builtins).
+- **Root cause B — the Assign-arm double-own:** the Return handler had an
+  Unknown→Owned upgrade via `expr_call_returns_owning_ref`; the ASSIGN
+  handler did not, so `x = self.norm.forward(x)` (model-method results carry
+  no ELTLS registration) conservatively retained and stranded one block per
+  reassignment — the final-norm strand on every Coder-50M forward
+  (`forward_core`'s post-loop `x = self.norm.forward(x)`). The Assign
+  handler now carries the identical upgrade.
+- **The GQA gate's former "1 block/call floor" was a misdiagnosis** — that
+  block was GQA's double-owned `dropout` clone, not the caller-bound live
+  result (top-level `let`s are swept at main's return). The ceiling is now
+  0.0 and `the_gqa_residual_is_closed_exactly` pins exactly zero.
+- **New composition gate**
+  (`nested_model_composition_and_reassignment_do_not_strand_per_call`):
+  the exact Coder-50M TransformerBlock/forward_core shape — nested
+  model-method args and operands, builtin-returning callees, assign-in-loop
+  and post-loop reassignment — asserts zero per-call growth. Mutation-proven
+  red against both root causes independently (M6: Assign upgrade reverted;
+  M7: rmsnorm/dropout entries removed — which also reddens the GQA gate).
+- Diagnostics: `NSL_DEBUG_MEM_TRACE=1` now also prints `retain` and
+  `deref-owner` events, completing the per-handle ref-history needed to find
+  double-owns (this is how both root causes were isolated).
+
 ### Fixed — the GQA view-chain residual: Unknown-typed chain links no longer strand (roadmap item 1)
 
 - **Root cause, two layers.** The semantic member table

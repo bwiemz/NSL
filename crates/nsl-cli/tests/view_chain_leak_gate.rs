@@ -147,16 +147,19 @@ fn blocks_per_call(tag: &str) -> f64 {
 /// |---|---|---|
 /// | before the view-family fix | 8 | 24 |
 /// | after the view-family fix | 5 | 16 |
-/// | after the member-table + tracking-filter fix (2026-07-28) | **1** | **4** |
+/// | after the member-table + tracking-filter fix (2026-07-28) | 1 | 4 |
+/// | after the return/assign owning-ref upgrade (2026-07-28) | **0** | **0** |
 ///
-/// One block per call is the FLOOR: the returned attention output, which the
-/// caller binds and legitimately keeps. The former 4-block residual was two
-/// stranded handles per `expand(..).contiguous().reshape(..)` chain — the
-/// expand view pinning the RoPE output block, plus the contiguous
-/// materialisation — both dropped from tracking because the semantic member
-/// table typed `expand`/`contiguous` results Unknown and the codegen
-/// ownership filters silently skip non-Tensor types.
-const GQA_BLOCKS_PER_CALL_CEILING: f64 = 1.0;
+/// ZERO is the true floor. The "1" of the previous row was believed to be
+/// the caller-bound live result — it was not: top-level `let`s are swept at
+/// main's return, so the bound result never survives to the exit report.
+/// That block was GQA's `return dropout(out, ...)` being DOUBLE-owned: the
+/// free-function builtins `rmsnorm`/`dropout` were missing from the
+/// owning-ref allowlist, so the callee's Return arm conservatively retained
+/// a result that was already an owning transfer, and the caller's single
+/// free left one reference behind (the scaled_dot_product_attention bug
+/// shape, recurring one allowlist gap later).
+const GQA_BLOCKS_PER_CALL_CEILING: f64 = 0.0;
 
 #[test]
 #[ignore = "requires CUDA GPU"]
@@ -183,23 +186,93 @@ fn the_gqa_residual_is_closed_exactly() {
     // The predecessor of this test (`the_residual_is_still_present_and_bounded`)
     // deliberately asserted the 4-block residual was STILL PRESENT, so that
     // closing it would fail a gate and force the ceiling down instead of
-    // letting the improvement pass silently. That fired on 2026-07-28: the
-    // residual is now closed, the ceiling above is 1.0, and this replacement
-    // pins EXACTITUDE — exactly one retained block per call (the bound
-    // result), no more, no fewer.
-    //
-    // "No fewer" matters as much as "no more": per-call growth below 1 would
-    // mean the caller-bound result itself was freed — that is the
-    // use-after-free direction, and `view_chain_results_are_numerically_
-    // unchanged` alone might miss it if the allocator recycles the block
-    // late.
+    // letting the improvement pass silently. That fired TWICE on 2026-07-28:
+    // first when the chain links stopped stranding (5 -> 1), then when the
+    // return-arm double-own of `dropout` was fixed (1 -> 0). Zero retained
+    // blocks per call is exact: every per-call allocation is freed, and the
+    // caller-bound results are swept at main's return before the exit
+    // report. Use-after-free coverage is carried by
+    // `view_chain_results_are_numerically_unchanged` and the full train/e2e
+    // suites — a wrongly freed live tensor there produces wrong numbers, not
+    // just block-count drift.
     let per_call = blocks_per_call("gqa_residual");
     assert!(
-        (per_call - 1.0).abs() < f64::EPSILON,
+        per_call.abs() < f64::EPSILON,
         "GroupedQueryAttention::forward retains {per_call} blocks/call; \
-         expected exactly 1.0 (the caller-bound result). More than 1 = a \
-         chain link stranded again; less than 1 = something freed the bound \
-         result (use-after-free hazard)."
+         expected exactly 0. Any growth means a per-call allocation stopped \
+         being freed — check the owning-ref allowlist (rmsnorm/dropout \
+         entries), the Return/Assign Unknown->Owned upgrades, and the \
+         ownership tracking filters in nsl-codegen/src/expr/mod.rs."
+    );
+}
+
+/// End-to-end composition gate for the WHOLE item-1 mechanism, in the exact
+/// shape of Coder-50M's `TransformerBlock` + `forward_core`: nested
+/// model-method calls as arguments and operands (`x + self.inner.forward(
+/// self.norm.forward(x))`), callees whose returns are free-function builtins
+/// (`return rmsnorm(...)`, `return dropout(...)` — the Return-arm double-own
+/// class), and model-method results ASSIGNED to an existing variable in a
+/// loop and after it (`x = self.fwd(x)` — the Assign-arm double-own class).
+/// Before 2026-07-28 this shape stranded 4 blocks per block-call plus 1 per
+/// reassignment; a Coder-50M forward leaked +33 blocks / +132 MB. Now: ZERO
+/// growth.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn nested_model_composition_and_reassignment_do_not_strand_per_call() {
+    let src = |calls: usize| {
+        let mut s = String::from(
+            r#"
+model Norm(dim: int):
+    weight: Tensor = ones([dim])
+    fn forward(self, x: Tensor) -> Tensor:
+        return rmsnorm(x, self.weight, 0.00001)
+
+model Inner(dim: int):
+    w: Tensor = randn([dim, dim]) * full([1], 0.02)
+    fn forward(self, x: Tensor) -> Tensor:
+        let out = x @ self.w
+        return dropout(out, 0.1, false)
+
+model Block(dim: int):
+    norm1: Norm = Norm(dim)
+    inner: Inner = Inner(dim)
+    norm2: Norm = Norm(dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.inner.forward(self.norm1.forward(x))
+        return h + self.inner.forward(self.norm2.forward(h))
+    fn run(self, x0: Tensor) -> Tensor:
+        let x = x0 + full([1], 0.0)
+        for i in range(0, 2):
+            x = self.forward(x)
+        x = self.norm1.forward(x)
+        return x
+
+let b = Block(512)
+b.to(cuda)
+let x = full([2, 256, 512], 1.0).to(cuda)
+"#,
+        );
+        for i in 0..calls {
+            s.push_str(&format!("let r{i} = b.run(x)\n"));
+        }
+        s.push_str("print(\"DONE\")\n");
+        s
+    };
+    let (lb1, _, _) = run_fixture(&src(1), "composition", 1);
+    let (lb3, _, _) = run_fixture(&src(3), "composition", 3);
+    assert!(
+        lb1 > 0,
+        "[composition] fixture retained no GPU blocks at all — not \
+         exercising the device (the weights alone should hold blocks)"
+    );
+    assert_eq!(
+        lb3, lb1,
+        "nested model composition strands {} blocks over 2 extra calls; \
+         check (a) rmsnorm/dropout in the owning-ref allowlist, (b) the \
+         Assign handler's Unknown->Owned upgrade in stmt.rs (the \
+         `x = self.norm.forward(x)` twin of the Return-arm upgrade), and \
+         (c) escape-analysis captivity for nested model-method args",
+        lb3 - lb1
     );
 }
 

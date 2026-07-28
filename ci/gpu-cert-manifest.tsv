@@ -66,6 +66,7 @@ crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_determinist
 crates/nsl-cli/tests/transient_arena_gpu_gate.rs	arena_report_is_consistent_and_loss_neutral	gpu	requires CUDA GPU (~2 runs of the packed-GQA fixture)
 crates/nsl-cli/tests/view_chain_leak_gate.rs	anonymous_view_chain_links_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	the_gqa_residual_is_closed_exactly	gpu	requires CUDA GPU
+crates/nsl-cli/tests/view_chain_leak_gate.rs	nested_model_composition_and_reassignment_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	free_function_chain_links_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	unknown_typed_receiver_chains_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	view_chain_results_are_numerically_unchanged	gpu	requires CUDA GPU
