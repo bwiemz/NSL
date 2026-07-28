@@ -937,6 +937,155 @@ pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f
     nsl_tensor_free(scaled);
 }
 
+/// Read a tensor's shape as a `Vec<i64>`.
+fn shape_vec(t: &NslTensor) -> Vec<i64> {
+    (0..t.ndim as usize).map(|d| unsafe { *t.shape.add(d) }).collect()
+}
+
+/// Fused weight-gradient accumulate (Item 7, `--fuse-wgrad-accum`).
+///
+/// Computes `m_partial += scale * (x^T @ g)` contracted over ALL leading
+/// (batch/time) dimensions, replacing this three-step chain:
+///
+/// ```text
+///   x_t      = transpose(x)              [B, d, T]
+///   raw_grad = matmul(x_t, g)            [B, d, o]   <- B x P temporary
+///   dW       = reduce_to_shape(raw, W)   [d, o]      <- reads all B x P
+///   m       += scale * dW                            <- extra launch
+/// ```
+///
+/// The batch sum is mathematically just part of the contraction —
+/// `sum_{b,t} x[b,t,i] g[b,t,j]` is the same sum whether you group it by `b`
+/// first or not — so flattening `[B, T, *]` to `[B*T, *]` turns the whole
+/// chain into one GEMM with `beta = 1.0` writing straight into `m_partial`.
+///
+/// # NOT bit-exact with the unfused chain
+///
+/// Deliberately so, and gated behind an opt-in flag for that reason:
+///   * the scale-and-add happens in cuBLAS's epilogue, which uses FMA (one
+///     rounding). The `.rn` mitigation that kept `scalar_mul_add_inplace`
+///     bit-exact is unavailable inside a closed cuBLAS kernel.
+///   * `alpha` multiplies the in-register accumulator rather than a stored,
+///     already-rounded f32 `dW`.
+///   * the per-batch products are no longer rounded to f32 before being
+///     summed — the batch sum moves inside the GEMM accumulator.
+/// The result stays deterministic run-to-run; it just is not the same bits as
+/// the decomposed path.
+///
+/// Counts of `nsl_tensor_wgrad_accum` calls that took the single-GEMM path
+/// versus the decomposed fallback. Always live (one relaxed atomic per
+/// parameter per micro-batch — negligible next to a GEMM); the
+/// `NSL_WGRAD_COUNTER=1` atexit report and the getters below only expose them.
+///
+/// These exist for anti-vacuity, not telemetry: the fallback is deliberately
+/// silent, so without a counter a green parity gate cannot distinguish "the
+/// fused GEMM agrees with the chain" from "the fused GEMM never ran".
+pub static WGRAD_FUSED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WGRAD_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// In-process getters (same family as `nsl_fase_fused_step_count`).
+#[no_mangle]
+pub extern "C" fn nsl_wgrad_fused_count() -> i64 {
+    WGRAD_FUSED_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn nsl_wgrad_fallback_count() -> i64 {
+    WGRAD_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// Falls back to the exact decomposed chain whenever the fast path's
+/// preconditions do not hold, so correctness never depends on them.
+///
+/// Because that fallback is SILENT, both outcomes are counted (see
+/// [`WGRAD_FUSED_COUNT`] / [`WGRAD_FALLBACK_COUNT`]). A parity gate that only
+/// checked "the numbers agree" would pass just as happily if every call had
+/// fallen back — testing the decomposed chain against itself.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: f64) {
+    let m = NslTensor::from_ptr(m_ptr);
+    let x = NslTensor::from_ptr(x_ptr);
+    let g = NslTensor::from_ptr(g_ptr);
+
+    let xs = shape_vec(x);
+    let gs = shape_vec(g);
+    let ms = shape_vec(m);
+
+    // Preconditions for the single-GEMM form:
+    //   x: [..., d]   g: [..., o]   m: [d, o]
+    //   leading dims of x and g identical (they index the same tokens)
+    //   everything GPU-resident f32 and contiguous (the flatten must be a view)
+    let ok = ms.len() == 2
+        && xs.len() >= 2
+        && gs.len() >= 2
+        && xs.len() == gs.len()
+        && xs[..xs.len() - 1] == gs[..gs.len() - 1]
+        && xs[xs.len() - 1] == ms[0]
+        && gs[gs.len() - 1] == ms[1]
+        && m.device > 0
+        && x.device == m.device
+        && g.device == m.device
+        && m.dtype == crate::tensor::DTYPE_F32
+        && x.dtype == crate::tensor::DTYPE_F32
+        && g.dtype == crate::tensor::DTYPE_F32
+        && m.is_contiguous()
+        && x.is_contiguous()
+        && g.is_contiguous();
+
+    if ok {
+        #[cfg(feature = "cuda")]
+        {
+            let n_rows: i64 = xs[..xs.len() - 1].iter().product();
+            let d_in = ms[0];
+            let d_out = ms[1];
+            if n_rows > 0 && d_in > 0 && d_out > 0 {
+                crate::cuda::gpu_wgrad_accum_f32(
+                    m_ptr, x_ptr, g_ptr, n_rows as u64, d_in as u64, d_out as u64, s as f32,
+                );
+                WGRAD_FUSED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    WGRAD_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("NSL_WGRAD_DEBUG").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[wgrad-accum] fallback: m{ms:?} dev={} dt={} contig={} | \
+             x{xs:?} dev={} dt={} contig={} | g{gs:?} dev={} dt={} contig={}",
+            m.device,
+            m.dtype,
+            m.is_contiguous(),
+            x.device,
+            x.dtype,
+            x.is_contiguous(),
+            g.device,
+            g.dtype,
+            g.is_contiguous(),
+        );
+    }
+
+    // Fallback: the exact chain codegen would otherwise have emitted. Keeping
+    // this here means a shape the compiler's static pre-pass misjudged
+    // degrades to slow-but-correct instead of producing a wrong gradient.
+    let x_t = crate::tensor::nsl_tensor_transpose(x_ptr, -2, -1);
+    let raw = nsl_tensor_matmul(x_t, g_ptr, 0);
+    let dw = crate::tensor::nsl_tensor_reduce_to_shape(raw, m_ptr);
+    // Migrate to the accumulator's (device, dtype) exactly as
+    // `fase_emit_accumulate` does. This matters whenever the activations are
+    // CPU while `m_partial` is GPU — the common mixed case that also sends us
+    // down this fallback in the first place. `scalar_mul_add_inplace` would
+    // survive the mismatch via its own mul_scalar/add_inplace fallback, but
+    // depending on that is depending on an unstated contract two layers down;
+    // `to_device_like` is a refcount bump when the placements already match.
+    let dw_migrated = crate::tensor::nsl_tensor_to_device_like(dw, m_ptr);
+    nsl_tensor_scalar_mul_add_inplace(m_ptr, dw_migrated, s);
+    nsl_tensor_free(dw_migrated);
+    nsl_tensor_free(dw);
+    nsl_tensor_free(raw);
+    nsl_tensor_free(x_t);
+}
+
 // === Sparse matrix multiply (M52c: weight-aware CSR SpMM) ===
 
 /// CSR sparse matmul: C = A_sparse @ B_dense
@@ -1031,20 +1180,60 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         if a.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                // The GPU matmul kernels index flat row-major and never read
-                // strides, so a zero-copy view (transpose/expand) as either
-                // operand computes a silently-WRONG product — found via the
-                // tied-embedding pretrain repro `emb @ embed.transpose(0,1)`
+                // The naive GPU matmul kernels index flat row-major and never
+                // read strides, so a zero-copy view (transpose/expand) as
+                // either operand computes a silently-WRONG product — found via
+                // the tied-embedding pretrain repro `emb @ embed.transpose(0,1)`
                 // (PR #335: GPU loss climbed to the uniform plateau while CPU
                 // descended; the CPU path below always had these guards).
                 // `nsl_tensor_contiguous` is a native on-device strided copy
                 // for GPU views and a refcount bump when already contiguous;
                 // it always returns an owned ref, freed right after the kernel.
-                let a_c = nsl_tensor_contiguous(a_ptr);
-                let b_c = nsl_tensor_contiguous(b_ptr);
+                //
+                // Item 9 phase 2: a 2-D TRANSPOSED view is now exempt. cuBLAS
+                // reads it natively with OP_T, so materialising it is pure
+                // waste — for the very shape PR #335 was about, `[49152, 512]`
+                // in Coder-50M, that waste is 96 MiB copied and freed on every
+                // forward. Exemption is narrow on purpose:
+                // `gpu_matmul_f32` re-derives the same predicate and only the
+                // 2-D/collapse arm honours it; every other arm still requires
+                // contiguous operands, and anything not matching the exact
+                // transposed-2-D stride pattern is materialised exactly as
+                // before.
+                // The retain mirrors what `nsl_tensor_contiguous` does in its
+                // already-contiguous case, so the `nsl_tensor_free` pair below
+                // stays balanced on every path.
+                let keep = |p: i64| -> i64 {
+                    NslTensor::from_ptr(p).refcount.fetch_add(1, Ordering::SeqCst);
+                    p
+                };
+                let a_c = if crate::cuda::matmul_operand_needs_no_copy(a_ptr, b_ptr, true) {
+                    keep(a_ptr)
+                } else {
+                    nsl_tensor_contiguous(a_ptr)
+                };
+                let b_c = if crate::cuda::matmul_operand_needs_no_copy(a_ptr, b_ptr, false) {
+                    keep(b_ptr)
+                } else {
+                    nsl_tensor_contiguous(b_ptr)
+                };
                 let result = crate::cuda::gpu_matmul_f32(a_c, b_c);
                 nsl_tensor_free(a_c);
                 nsl_tensor_free(b_c);
+                // `gpu_matmul_f32` returns 0 on a cuBLAS error, and its comment
+                // says that is "so callers can detect the failure". No caller
+                // ever did: the null flowed on and the process died in
+                // whatever touched the tensor next — observed as a SIGSEGV
+                // inside a readback, with the actual cuBLAS status printed
+                // thousands of lines earlier. Detect it here, where the shapes
+                // are still in scope.
+                assert!(
+                    result != 0,
+                    "GPU matmul failed for [{:?}] @ [{:?}] — see the \
+                     [nsl-matmul] cuBLAS status logged above",
+                    get_shape_vec(NslTensor::from_ptr(a_ptr)),
+                    get_shape_vec(NslTensor::from_ptr(b_orig)),
+                );
                 // Tape record on the GPU arm (see nsl_tensor_add). Saved refs
                 // bumped before the relinquish frees so the tape keeps its
                 // operands alive for backward.

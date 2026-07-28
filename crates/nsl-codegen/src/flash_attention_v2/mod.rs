@@ -175,7 +175,7 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
         //   Must run ONCE after K pre-pass (all rows populated) and BEFORE any
         //   S-compute reads K for QK^T.  Q rotation runs per-q_iter inside
         //   emit_rope_epilogue; K rotation runs once here for the whole tile.
-        phases::csha_hooks::emit_rope_k_epilogue(&mut ptx, config);
+        phases::csha_hooks::emit_rope_k_epilogue(&mut ptx, config, "%q_start");
 
         // ── Step 3c: K save — post-RoPE K save runs here so asymmetric
         //   tiles (block_q != block_kv) cover exactly block_kv K rows.
@@ -1134,7 +1134,25 @@ pub fn synthesize_backward_with_tier(
 /// (`synthesize_backward_with_tier_b`). When `config.checkpoint.is_none()`
 /// the helper is a no-op — preserving the byte-identity invariant of
 /// the no-decorator path (`fa_v2_snapshots` 25/25 byte-identical).
-pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> Result<(), String> {
+///
+/// # The `NSL_VALIDATE_PATH_B` seam is GONE (2026-07-26)
+///
+/// It existed to break R7's deadlock — the refusal existed because Path B had
+/// never been GPU-validated, and Path B could not be GPU-validated because the
+/// refusal blocked every entry point. It did its job: R7 was measured through
+/// it, narrowed twice, and is now retired. The packed oracles need no bypass
+/// (`run_segmask_oracle` passes `tier_b = None` and asserts synthesis succeeds).
+///
+/// It was deliberately NOT re-pointed at R12. Bypassing R7 only produced
+/// uncertified gradients; bypassing R12 would produce a kernel with two live
+/// SMEM regions at the same base (see the comment at the R12 check). A seam
+/// that can hand out memory-unsafe PTX is not a diagnostic tool. If Tier-B +
+/// `@checkpoint` is ever taken up, give those two regions disjoint offsets
+/// FIRST, then add a seam scoped to whatever remains unvalidated.
+pub(crate) fn validate_checkpoint_eligibility(
+    config: &FlashAttentionConfig,
+    tier_b: Option<(u32, SegmentResidency)>,
+) -> Result<(), String> {
     use crate::flash_attention::CheckpointPolicy;
     use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
 
@@ -1182,23 +1200,110 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
     // `emit_rope_k_epilogue` ("only implements RopeStyle::Adjacent").
     // Refuse both cases until Path B's kv-recompute math is fixed and
     // GPU-validated.
-    if config.rope_q {
-        return Err(if config.segment_masked {
-            "PCA packing with rope_q=true under @checkpoint deferred to v4: \
-             the segment-aware causal mask shares index machinery with the \
-             RoPE-Q write-back path; safe composition requires the v4 \
-             rotated-Q SMEM-staging refactor"
-                .to_string()
-        } else {
-            "checkpoint policy=\"full\" + rope_q=true composition refused: \
-             the kv-recompute backward (Path B) has a known GROSS numerical \
-             error at multi-tile (RopeStyle::Adjacent) and an unimplemented \
-             path (RopeStyle::HalfSplit) that is not yet fixed or \
-             GPU-validated (tracked for follow-up); disable @checkpoint or \
-             rope_q until Path B's kv-recompute math is corrected"
-                .to_string()
-        });
-    }
+    //
+    // MEASURED 2026-07-26 (RTX 5070 Ti sm_120) with R7 temporarily bypassed
+    // in a local experiment: `t_recompute_hd64_s512_bq32` three-way oracle at
+    // hd=64 S=512 bq=32. The claim above had been carried on assertion alone
+    // since 8f774ad; it now has numbers behind it, and it is CORRECT:
+    //
+    //     path A vs cpu_ref   dq 7.695e-3   dx 8.755e-2   (max|ref| ~4.4 / ~47)
+    //     path B vs cpu_ref   dq 2.152e3    dx 1.485e4    max_rel up to 3.26e6
+    //     path B vs path A    dq 2.152e3    dx 1.485e4
+    //
+    // Path B's error is 2-3 ORDERS OF MAGNITUDE LARGER than the reference
+    // values themselves, and it diverges from the working Path A by the same
+    // amount, so this is not an oracle disagreement. The signature is NOT
+    // `max_abs == max|ref|` — that would mean the kernel wrote zeros, which is
+    // the artifact behind cycle-15 "Bug 1" and the n1_p0 zero-gradient arm.
+    // Path B instead produces values ~500x too LARGE: genuine numerical
+    // explosion. (Path A's apparent FAIL in that run is the separate f16
+    // tolerance-calibration artifact — atol=5e-4 sits below the f16 storage
+    // floor; see F16_ACCUM_AMP in csha_cycle15_bug1_ablations.rs.)
+    //
+    // ── R7 NARROWED 2026-07-26: Path B's Adjacent numerics are FIXED ──
+    //
+    // Two `%q_start`-vs-`%k_start` confusions were the whole of the "GROSS
+    // numerical error at multi-tile":
+    //   1. `emit_prologue_recompute_from_raw` normalised the Q tile's rows and
+    //      then built K/V from them.
+    //   2. `emit_rope_k_epilogue` indexed cos/sin off `%q_start`, so the K tile
+    //      was rotated by the wrong positions.
+    // Both are invisible at single tile, where q_start == k_start. The second
+    // one explodes rather than drifts because the backward still normalises
+    // with the FORWARD's saved LSE: P = exp(S_wrong - LSE_correct) is not a
+    // distribution, so dV = P^T dO blows up.
+    //
+    // Measured after the fix (three-way oracle, all three comparisons GREEN):
+    //     hd=64 S=32   (single tile)   A_vs_cpu B_vs_cpu B_vs_A  all GREEN
+    //     hd=64 S=512  (multi-tile)    A_vs_cpu B_vs_cpu B_vs_A  all GREEN
+    //     hd=64 S=2048 (multi-tile)    A_vs_cpu B_vs_cpu B_vs_A  all GREEN
+    // (dq went 2.624e3 -> 1.117e-2, i.e. from 500x the reference magnitude to
+    // inside the f16 accumulation bound.) hd=128 stays structurally refused by
+    // the SMEM validator: 220 KB against a 99 KB device cap.
+    //
+    // HalfSplit is now implemented too (2026-07-26): `emit_rope_pair_sweep`
+    // and the backward `emit_drope` both select the element pairing from
+    // `config.rope_style`, and the CPU reference oracle became style-aware in
+    // the same change so HalfSplit is compared against a HalfSplit oracle
+    // rather than the wrong pairing. Three-way oracle GREEN at hd=64 for
+    // S=32 and S=512.
+    //
+    // ── R7 RETIRED 2026-07-26: the segment_masked arm is fixed + measured ──
+    //
+    // The final arm claimed "the segment-aware causal mask shares index
+    // machinery with the RoPE-Q write-back path". That was never a register
+    // conflict — the segment mask uses `%*_SEGMASK`, the RoPE reset uses
+    // `%*_doc_*`, and they never alias. THREE real defects sat underneath it,
+    // all of which had to be fixed before a packed kernel could even run:
+    //
+    //   1. `emit_rope_pair_sweep`'s `reset_active` branch hardcoded `%q_start`
+    //      when computing `%r_abs_pos`, discarding the caller's
+    //      `row_base_reg`. Correct for both FORWARD call sites; wrong for the
+    //      backward kv-recompute, which passes `%k_start`. (Third instance of
+    //      the same confusion fixed in 0d768f93 — it survived because R7 made
+    //      the branch unreachable.)
+    //   2. `recompute_xnorm_offset` returned exactly `backward_total_bytes`,
+    //      which is also where `backward/prelude.rs` anchors the embedded
+    //      `seg_smem`. The kv-recompute's x_norm scratch therefore overwrote
+    //      segment_ids before the RoPE-K epilogue read them back.
+    //   3. The `reset_active` branch emitted a literal "§" into the PTX, so
+    //      ptxas aborted the entire module with rc=218. This is why NO
+    //      segmented CSHA-fused kernel had ever compiled, forward or backward.
+    //
+    // MEASURED after all three fixes (RTX 5070 Ti sm_120), three-way oracle at
+    // hd=32 S=32 with 2 and 4 packed documents, Adjacent and HalfSplit:
+    //
+    //     A_vs_cpu = GREEN   B_vs_cpu = GREEN   B_vs_A = GREEN
+    //
+    // and the negative control — the SAME GPU gradients re-scored against an
+    // UNPACKED reference — FAILS on all 7 tensors by 2-3 orders of magnitude
+    // (dq 1.221e0 vs 1.829e-3 packed). So the packed oracle genuinely
+    // discriminates doc-relative positions and the cross-document mask; the
+    // GREEN is not the degenerate "everything is document 0" pass.
+    //
+    // What still bounds this composition, each by its own gate rather than R7:
+    //   * head_dim != 32 — R14 below. NOTE: the SMEM validator alone is NOT a
+    //     sufficient bound here, though an earlier draft of this note claimed
+    //     it was. `segment_masked` costs a flat 32 KB, which pushes hd=64 to
+    //     127360 bytes vs the 101376 cap AT d_model=64 — but d_model is a free
+    //     knob, and at d_model=8 the same head_dim fits in 91520. The measured
+    //     envelope is narrower than the admissible one, so R14 states it
+    //     explicitly instead of leaning on a budget that happens to correlate.
+    //   * block_kv — 16 hits a hard assert in `ds_compute` and 64 is
+    //     SMEM-refused, so 32 is the only reachable tile. Not a deliberate gate;
+    //     recorded so nobody mistakes it for one.
+    //   * multi-tile — the runtime refuses `multi_tile_fused &&
+    //     segment_ids_ptr != 0` (`nsl-runtime/src/flash_attention.rs:2112`).
+    //     `FlashAttentionConfig` carries no sequence length, so this cannot be
+    //     a synthesis-time refusal. It is also FORWARD-only: the backward FFI
+    //     has no matching guard, and a packed backward is only ever reached
+    //     through a forward that already refused.
+    //   * Tier-B co-emission — R12 below, now narrowed to exactly that case.
+    //   * GQA (`gqa_group_size > 1`) — UNGUARDED, and pre-existing: no emitter
+    //     under `phases/` reads `gqa_group_size`, and `emit_kv_recompute`
+    //     rebuilds K/V with no kv-head remap. That is a checkpoint-wide gap,
+    //     not a packing one; recorded here because R7's retirement means
+    //     `segment_masked` no longer incidentally masks half of it.
 
     // ── R9: @paged_kv model + @checkpoint fn composition ─────────
     if extras.paged_kv_collision {
@@ -1252,16 +1357,80 @@ pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> 
         );
     }
 
-    // ── R12 (cycle-12 new): segment_masked (PCA Tier-B) + @checkpoint ─
+    // ── R12 (cycle-12; NARROWED 2026-07-26): Tier-B + @checkpoint ─────────
     // PCA Tier-B planner and kv-recompute are not co-emitted in v1; the
     // segment-aware tile-active predicate would gate recompute writes
     // unpredictably. Deferred to a co-emission lift in a later cycle.
-    if config.segment_masked {
+    //
+    // This was keyed on `config.segment_masked` alone, which over-refused: the
+    // hazard the message describes is Tier-B's tile-active predicate, and
+    // Tier-A segment masking without a Tier-B planner has none of it. The
+    // Tier-A-only packed path is now GPU-validated (see the R7 retirement note
+    // above), so refuse on what the message actually says — Tier-B being
+    // co-emitted — rather than on the flag that merely correlated with it.
+    let tier_b_emitted = tier_b.is_some_and(|(seq_len, residency)| {
+        crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+    });
+    // NOT bypassable by a test seam, unlike R7 was. Retiring R7 only unlocked a
+    // numerics question; bypassing R12 would hand out a kernel whose PTX has TWO
+    // LIVE REGIONS AT THE SAME BASE. After the 2026-07-26 aliasing fix,
+    //   `recompute_xnorm_offset(config)`      = backward_total_bytes + seg_overhead
+    //   `tier_b_range_table_offset(Backward)` = align_up(that same value, 2)
+    // are the identical byte, while `shared_mem_bytes_v2_backward_with_seqlen`
+    // grants `.. + recompute_extra + tier_b_bytes` as though they were stacked.
+    // R12 is therefore now load-bearing for MEMORY SAFETY, not merely for the
+    // unvalidated tile-active predicate it was originally written about.
+    // Anyone lifting it must give the two regions disjoint offsets first — note
+    // that `recompute_xnorm_offset` cannot compute the Tier-B offset itself,
+    // since it has no seq_len/residency to hand.
+    if config.segment_masked && tier_b_emitted {
         return Err(
             "@checkpoint(policy=\"full\") + paged-segment-masked composition deferred; \
              PCA Tier-B planner and kv-recompute not co-emitted"
                 .to_string(),
         );
+    }
+
+    // ── R14 (2026-07-26): packed @checkpoint outside the MEASURED envelope ──
+    //
+    // Retiring R7 opened this composition to every shape the SMEM validator
+    // admits. That is a wider set than what was measured, and the gap is real —
+    // `probe_segmask_checkpoint_smem_vs_block_q` enumerates it:
+    //
+    //     head_dim=32 : d_model 8/16/32/64 synthesize   (measured: d_model=32)
+    //     head_dim=64 : d_model 8/16       synthesize   (measured: NONE)
+    //     head_dim=128: nothing synthesizes
+    //
+    // So "head_dim >= 64 is refused by the SMEM validator" — which an earlier
+    // version of the R7 retirement note asserted — is FALSE. It holds only at
+    // d_model >= 32; a small enough d_model slips head_dim=64 under the cap at
+    // 91520 bytes. head_dim is exactly the axis the packed code path is
+    // sensitive to (`emit_rope_pair_sweep` sweeps `block_q * head_dim/2` pairs
+    // and the reset branch lives inside that loop), so shipping it unmeasured
+    // is the same mistake 8f774ad made: unblock the config, leave the numerics
+    // unvalidated.
+    //
+    // block_q needs no clause here: block_kv=16 hits a hard assert in
+    // `ds_compute` ("T3.3 requires block_kv=32") and block_kv=64 is
+    // SMEM-refused, so 32 is the only reachable tile.
+    //
+    // TO LIFT: run `csha_checkpoint_recompute_gpu::t_segmask_recompute_*` at the
+    // new head_dim and widen this list once the three-way oracle AND its
+    // negative control are green. The harness currently ties d_model to
+    // head_dim, so covering head_dim=64 also needs that decoupled (its only
+    // admissible d_models are 8 and 16).
+    const MEASURED_PACKED_CHECKPOINT_HEAD_DIMS: [i64; 1] = [32];
+    if config.segment_masked
+        && !MEASURED_PACKED_CHECKPOINT_HEAD_DIMS.contains(&config.head_dim)
+    {
+        return Err(format!(
+            "PCA packing under @checkpoint(policy=\"full\") is GPU-validated only at \
+             head_dim in {MEASURED_PACKED_CHECKPOINT_HEAD_DIMS:?} (got head_dim={}); \
+             the composition synthesizes at other head_dims only when d_model is \
+             small enough to fit the SMEM cap, and those shapes have never been \
+             measured. Use head_dim=32, drop @checkpoint, or disable packing.",
+            config.head_dim
+        ));
     }
 
     Ok(())
@@ -1286,7 +1455,10 @@ pub fn synthesize_backward_with_recompute(
     // This is also called from `synthesize_backward_with_tier_b` so the
     // refusals fire from the production call chain too — closing the
     // cycle-5 invariant gap Reviewer 1 caught.
-    validate_checkpoint_eligibility(config)?;
+    //
+    // `tier_b = None`: this entry point never co-emits the PCA Tier-B
+    // planner, so R12's co-emission hazard cannot arise here.
+    validate_checkpoint_eligibility(config, None)?;
 
     // SMEM budget extension (Cut 7 / R5): re-run the scalar v2 validator
     // with the checkpoint carrier in place so `recompute_extra_bytes` is
@@ -1540,7 +1712,58 @@ pub fn synthesize_backward_with_tier_b(
     // `config.checkpoint.is_none()` this is a no-op, preserving the
     // `fa_v2_snapshots` 25/25 byte-identity invariant for the
     // no-decorator path.
-    validate_checkpoint_eligibility(config)?;
+    validate_checkpoint_eligibility(config, tier_b)?;
+
+    // ── R13: fused_rmsnorm WITHOUT fused_projections (kernel suffix `n1_p0`)
+    //
+    // MEASURED 2026-07-25 on RTX 5070 Ti (sm_120), one process per cell
+    // (`csha_cycle15_bug1_ablations::d1..d5`):
+    //
+    //                    rope_q=true        rope_q=false
+    //     S=512          ILLEGAL_ADDRESS    zero gradients
+    //     S=32           ILLEGAL_ADDRESS    zero gradients
+    //     n1_p1 control  PASS               --
+    //
+    // RoPE-Q reads cos/sin staged into SMEM by the fused-projection prologue.
+    // With `fused_projections=false` that prologue never runs, so the read
+    // lands at the shared-window base 0xff800000 and the FORWARD kernel
+    // faults. It does NOT depend on multi-tile: S=32 is a single q tile and a
+    // single kv tile and still faults. With rope_q off there is no fault, but
+    // the backward returns all-zero gradients (`max_abs == max|ref|`) — the
+    // silent arm, and the dangerous one, since training would appear to run
+    // and learn nothing.
+    //
+    // This is defense-in-depth rather than new policy. `tier_b2_can_dispatch`
+    // already rejects `csha.level < 2` with `DispatchReject::LevelTooLow`, so
+    // production never reaches the fused backward for a level-1 config —
+    // `plan_layer` reports `BackwardTierReport::Scalar` and falls back. The
+    // gap this closes is a caller that builds `FlashAttentionConfig` by hand
+    // and calls this entry directly, which is exactly the bypass class the
+    // sinks refusal below was added for, and exactly what the cycle-15
+    // ablation harness does.
+    //
+    // Keyed on the FLAG PAIR, not on `level`: `level = 1` WITH
+    // `fused_projections = true` (`n1_p1`, i.e. `level1_with_fused_proj`) is
+    // exercised by passing GPU gates and must keep working. Only `level1()`
+    // produces the broken pair — `level2`/`level3` set both flags.
+    if let Some(csha) = config.csha.as_ref() {
+        if csha.fused_rmsnorm && !csha.fused_projections {
+            return Err(format!(
+                "CSHA fused backward refused for fused_rmsnorm=true + \
+                 fused_projections=false (kernel suffix n1_p0): the RoPE-Q \
+                 epilogue reads cos/sin from SMEM staged only by the \
+                 fused-projection prologue, so with rope_q=true the forward \
+                 kernel faults on an invalid __shared__ read, and with \
+                 rope_q=false the backward returns all-zero gradients \
+                 (measured at both S=512 and S=32, csha level={}). Production \
+                 does not reach here — tier_b2_can_dispatch rejects level < 2 \
+                 with LevelTooLow and falls back to the scalar backward — so \
+                 set fused_projections=true (CshaExtras::level1_with_fused_proj) \
+                 or use level >= 2 if you are calling this entry directly.",
+                csha.level
+            ));
+        }
+    }
 
     // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
     // The forward eligibility predicate already refuses

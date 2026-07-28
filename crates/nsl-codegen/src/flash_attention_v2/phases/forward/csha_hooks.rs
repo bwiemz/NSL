@@ -60,7 +60,31 @@ pub(super) fn should_emit_kv_save(cfg: &FlashAttentionConfig) -> bool {
         .checkpoint
         .as_ref()
         .is_some_and(|c| c.policy == CheckpointPolicy::Full);
-    let cascade_ok = validate_checkpoint_eligibility(cfg).is_ok();
+    // `tier_b = None`: this is a FORWARD-side decision and the Tier-B planner
+    // choice is not known here, so R12 is answered permissively. That is sound
+    // for R12 specifically — its hazard is a BACKWARD-side SMEM overlap, and a
+    // config that trips it emits no backward at all, so there is no
+    // suppressed-saves/live-recompute mismatch to create.
+    //
+    // SCOPE, stated precisely (an earlier version of this comment overclaimed):
+    // this consults the refusal CASCADE only, matching the cycle-12 invariant
+    // that the forward-emit and backward-dispatch decisions read the SAME
+    // cascade. It does NOT consult the SMEM budget validator, which the backward
+    // runs separately. So a config that the cascade admits but the SMEM
+    // validator rejects — e.g. `segment_masked && rope_q && @checkpoint` at
+    // head_dim >= 64 after R7's retirement (127360 bytes vs the 101376 cap) —
+    // has its K/V saves suppressed here while no backward PTX is emitted at all.
+    //
+    // That is not a correctness hazard: with no backward emitted there is no
+    // consumer, so nothing reads uninitialised HBM and no gradient is wrong.
+    // It IS a diagnosability wart, and a quiet one, because `compiler/kernel.rs`
+    // turns a backward-synthesis `Err` into an `eprintln!` plus
+    // `(None, None, None, None)` rather than failing the compile. Widening this
+    // predicate to include the SMEM validator would couple the forward's emitted
+    // PTX to a backward budget check and breaks the cycle-12 invariant's own
+    // gates (`csha_checkpoint_full_save_suppression::g9_a/g9_c`), so the fix
+    // belongs at the swallow site in `compiler/kernel.rs`, not here.
+    let cascade_ok = validate_checkpoint_eligibility(cfg, None).is_ok();
     let suppress = policy_full && cascade_ok;
     !suppress
 }
@@ -1316,16 +1340,11 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         return;
     }
 
-    // emit_rope_pair_sweep implements RopeStyle::Adjacent (GPT-NeoX / GPT-J layout):
-    //   pair i rotates (x[2i], x[2i+1]).
-    // RopeStyle::HalfSplit (LLaMA / Qwen layout: x[i] paired with x[i+head_dim/2])
-    // is NOT implemented here.  If you need HalfSplit, add a separate sweep variant.
-    assert!(
-        matches!(config.rope_style, RopeStyle::Adjacent),
-        "emit_rope_pair_sweep only implements RopeStyle::Adjacent; got {:?}",
-        config.rope_style
-    );
-
+    // `emit_rope_pair_sweep` now implements BOTH pairings — Adjacent
+    // (GPT-NeoX / GPT-J: x[2i] with x[2i+1]) and HalfSplit (LLaMA / Qwen:
+    // x[i] with x[i+head_dim/2]) — selected from `config.rope_style`. The
+    // Adjacent-only assert that used to sit here is gone; the sibling assert
+    // in `emit_rope_k_epilogue` went with it.
     let block_q  = config.block_q  as u32;
     let head_dim = config.head_dim as u32;
     let half_dim = head_dim / 2;
@@ -1358,6 +1377,7 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         q_tile_iter,
         "Q",
         "%q_smem_base",
+        "%q_start", // Q tile genuinely is based at q_start
         block_q,
         head_dim,
         half_dim,
@@ -1382,7 +1402,11 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
 ///
 /// Null-guarded on `cos_ptr` AND `sin_ptr`.  Only emits when `rope_q=true`
 /// AND `csha.fused_projections=true`.
-pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
+pub fn emit_rope_k_epilogue(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    row_base_reg: &str,
+) {
     if config.csha.is_none() || !config.rope_q {
         ptx.push_str("    // CSHA RoPE K epilogue: rope_q=false or no CSHA, skip\n");
         return;
@@ -1391,12 +1415,6 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    // CSHA RoPE K epilogue: fused_projections=false, skip\n");
         return;
     }
-
-    assert!(
-        matches!(config.rope_style, RopeStyle::Adjacent),
-        "emit_rope_k_epilogue only implements RopeStyle::Adjacent; got {:?}",
-        config.rope_style
-    );
 
     let block_kv = config.block_kv as u32;
     let head_dim = config.head_dim as u32;
@@ -1423,6 +1441,7 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
         0, // not per-q_iter; runs once for the whole K tile
         "K",
         "%k_smem_base",
+        row_base_reg,
         block_kv,
         head_dim,
         half_dim,
@@ -1439,8 +1458,9 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
 ///
 /// Rotation math per pair:
 ///   cos, sin  = cos_ptr[row * half_dim + dim_pair], sin_ptr[same]  (f16→f32)
-///   x0        = tile[row, 2*dim_pair]     (f16→f32)
-///   x1        = tile[row, 2*dim_pair + 1] (f16→f32)
+///   x0, x1    = the pair selected by `config.rope_style` (f16→f32):
+///                 Adjacent  -> tile[row, 2*dim_pair], tile[row, 2*dim_pair+1]
+///                 HalfSplit -> tile[row, dim_pair],   tile[row, dim_pair+half_dim]
 ///   new_x0    = x0*cos - x1*sin           (2× fma)
 ///   new_x1    = x0*sin + x1*cos           (2× fma)
 ///   store f32→f16, write back to SMEM
@@ -1464,6 +1484,7 @@ fn emit_rope_pair_sweep(
     q_tile_iter: u32,
     tile_label: &str,    // "Q" or "K"
     smem_base_reg: &str, // "%q_smem_base" or "%k_smem_base"
+    row_base_reg: &str,  // "%q_start" (forward) or "%k_start" (bwd recompute)
     block_q: u32,
     head_dim: u32,
     half_dim: u32,
@@ -1531,12 +1552,39 @@ fn emit_rope_pair_sweep(
     // (mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, head_dim*2) still
     // addresses the correct tile-local row.
     if reset_active {
+        // ASCII-ONLY: this string is EMITTED PTX, not a Rust comment. A "§"
+        // here makes ptxas abort the whole module with
+        // "Unexpected non-ASCII character" (rc=218) — see
+        // `feedback_ptx_comment_ascii_only`. The backward twin at
+        // csha_hooks_backward.rs already spells it "sec."; this one did not,
+        // which is why no segmented CSHA-fused kernel had ever compiled.
         ptx.push_str(&format!(
-            "    // PCA §4.3 site {site}: forward {tl} effective_pos\n",
+            "    // PCA sec.4.3 site {site}: forward {tl} effective_pos\n",
             site = if tl == "Q" { 1 } else { 2 }
         ));
-        // abs_row = (q_start narrowed to u32) + tile_local_row.
-        ptx.push_str("    cvt.u32.u64 %r_abs_pos, %q_start;\n");
+        // abs_row = (row_base narrowed to u32) + tile_local_row.
+        //
+        // THIRD instance of the `%q_start`-where-`%k_start`-was-needed
+        // confusion (the first two were fixed in 0d768f93:
+        // `emit_prologue_recompute_from_raw`'s x_norm row base, and the
+        // non-reset cs_row below). This branch hardcoded `%q_start`, which is
+        // right for BOTH forward call sites — the Q epilogue is genuinely
+        // based at q_start, and the forward K epilogue is called with
+        // "%q_start" too because the K pre-pass writes K rows at
+        // q_start + warp_row — but WRONG for the backward kv-recompute, which
+        // rotates the K tile at `%k_start` as k_start iterates independently
+        // inside the kv loop. Invisible at single tile, where the two
+        // coincide; under multi-tile it rotates K by another tile's positions,
+        // and because the backward normalises with the FORWARD's saved LSE
+        // the result explodes rather than drifts (P = exp(S_wrong -
+        // LSE_correct) is not a distribution). It survived 0d768f93 only
+        // because R7 refuses segment_masked, so this branch was unreachable.
+        //
+        // Byte-identity: both forward call sites pass "%q_start", so the
+        // emitted string is unchanged for every shipping forward config.
+        ptx.push_str(&format!(
+            "    cvt.u32.u64 %r_abs_pos, {row_base_reg};\n"
+        ));
         ptx.push_str("    add.u32 %r_abs_pos, %r_abs_pos, %r_rope_row;\n");
         // sid = segment_ids[abs_row] from seg_smem (u16 entries).
         ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_abs_pos, 2;\n");
@@ -1572,10 +1620,18 @@ fn emit_rope_pair_sweep(
     // warp_row), so cos/sin[tile_local] mis-rotates every block past position 0.
     // Byte-identical numerically at single-tile (q_start=0). The RoPE-reset
     // (segment_masked) path keeps its document-relative effective_pos.
+    // Phase 1.1 indexed this off `%q_start` unconditionally, which is right
+    // for the FORWARD (Q and K share q_start there) but wrong for the
+    // BACKWARD kv-recompute: that rotates the K tile at `%k_start`, and
+    // k_start iterates independently of q_start inside the kv loop. The
+    // caller therefore names the base register. Forward passes "%q_start"
+    // and is byte-identical to before.
     let cs_row_reg = if reset_active {
         effective_pos_reg
     } else {
-        ptx.push_str("    cvt.u32.u64 %r_rope_cs_row, %q_start;\n");
+        ptx.push_str(&format!(
+            "    cvt.u32.u64 %r_rope_cs_row, {row_base_reg};\n"
+        ));
         ptx.push_str("    add.u32 %r_rope_cs_row, %r_rope_cs_row, %r_rope_row;\n");
         "%r_rope_cs_row"
     };
@@ -1604,11 +1660,41 @@ fn emit_rope_pair_sweep(
         "    mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, {head_dim_x2};\n",
         head_dim_x2 = head_dim * 2
     ));
-    // x0: col = 2*dim_pair → byte offset = 2*dim_pair*2 = 4*dim_pair
-    ptx.push_str("    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair\n");
-    ptx.push_str("    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n");
-    // x1: col = 2*dim_pair+1 → byte offset = (2*dim_pair+1)*2 = 4*dim_pair+2
-    ptx.push_str("    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes\n");
+    // Pairing depends on the RoPE style (see `RopeStyle` in
+    // flash_attention.rs). f16 tile, so a column costs 2 bytes:
+    //
+    //   Adjacent  (GPT-NeoX/GPT-J): x0 col = 2*dim_pair,  x1 = x0 + 1 col
+    //                               -> x0 byte = 4*dim_pair, x1 = x0 + 2
+    //   HalfSplit (LLaMA/Qwen):     x0 col = dim_pair,    x1 = x0 + half_dim
+    //                               -> x0 byte = 2*dim_pair, x1 = x0 + half_dim*2
+    //
+    // The rotation arithmetic below is identical for both; only which two
+    // elements are paired changes.
+    match config.rope_style {
+        RopeStyle::Adjacent => {
+            ptx.push_str(
+                "    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair\n",
+            );
+            ptx.push_str(
+                "    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n",
+            );
+            // Comment text is load-bearing for byte-identity: fa_v2_snapshots
+            // pins the emitted PTX verbatim, so keep "+2 bytes" exactly.
+            ptx.push_str("    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes\n");
+        }
+        RopeStyle::HalfSplit => {
+            ptx.push_str(
+                "    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 1;  // 2*dim_pair\n",
+            );
+            ptx.push_str(
+                "    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;\n",
+            );
+            ptx.push_str(&format!(
+                "    add.u32 %r_rope_x1_off, %r_rope_x0_off, {};   // +half_dim cols\n",
+                half_dim * 2
+            ));
+        }
+    }
 
     // Precompute full SMEM addresses for x0 and x1 into u64 regs.
     ptx.push_str("    cvt.u64.u32 %rd_rope_x0_off, %r_rope_x0_off;\n");
@@ -1758,7 +1844,7 @@ mod tests {
     fn a4_rope_k_epilogue_emits_k_rotation_for_fused_path() {
         let cfg = base_cfg_for_rope_test();
         let mut ptx = String::new();
-        emit_rope_k_epilogue(&mut ptx, &cfg);
+        emit_rope_k_epilogue(&mut ptx, &cfg, "%q_start");
 
         // K rotation loop must be present.
         assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation loop label missing");
@@ -1781,7 +1867,7 @@ mod tests {
         let mut cfg = base_cfg_for_rope_test();
         cfg.csha = Some(CshaExtras { fused_projections: false, d_model: 128, ..CshaExtras::default() });
         let mut ptx = String::new();
-        emit_rope_k_epilogue(&mut ptx, &cfg);
+        emit_rope_k_epilogue(&mut ptx, &cfg, "%q_start");
         assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when fused_projections=false");
     }
 
@@ -1790,7 +1876,7 @@ mod tests {
         let mut cfg = base_cfg_for_rope_test();
         cfg.rope_q = false;
         let mut ptx = String::new();
-        emit_rope_k_epilogue(&mut ptx, &cfg);
+        emit_rope_k_epilogue(&mut ptx, &cfg, "%q_start");
         assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when rope_q=false");
     }
 

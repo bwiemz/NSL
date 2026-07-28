@@ -11,8 +11,8 @@ Every acronym, keyword, and decorator you will see in NSL code, specs, or PRs. O
 ### <a id="awq"></a>AWQ — Activation-aware Weight Quantization
 Build-time per-channel weight quantization that scales by observed activation magnitudes; produces INT4/INT8 weights with minimal perplexity loss. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md); implementation in `crates/nsl-codegen/src/calibration/`.
 
-### <a id="ccr"></a>CCR — Common-kernel Combination Rewriting
-Planned future pass — no implementation yet. See [`CCR.pdf`](../research/CCR.pdf) for the research concept.
+### <a id="ccr"></a>CCR — Compiler-Chosen Recomputation
+Block-granular activation checkpointing on the source-AD path: a transformer block's interior activations are freed after the forward and bit-exactly recomputed just before that block's backward. Implemented in [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs); driven by `--checkpoint-blocks`. See [`CCR.pdf`](../research/CCR.pdf) for the research background and [Optimization-Passes](Optimization-Passes.md#ccr--compiler-chosen-recomputation) for the pass description.
 
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
 Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
@@ -150,7 +150,15 @@ Block keyword for the declarative training DSL; generates an epoch loop with imp
 Specifies adapter configuration (type, target layers, rank) for LoRA/IA³/GatedLoRA injection. Used alongside `@freeze` and `@wrga` to declare per-layer adapter parameters that will be optimized separately from frozen base weights. See [Glossary#wrga](#wrga).
 
 ### <a id="dec-autotune"></a>`@autotune`
-Triggers build-time tuning of tile sizes, warp counts, and SMEM allocation for a `kernel` block; stores the winning config in the binary's autotune table. See [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
+Selects tile sizes, warp counts, and SMEM allocation for a `kernel` block at build time. The compiler generates the Cartesian product of the declared parameter ranges, discards variants that fail to compile, and picks a winner.
+
+**The winner is currently *estimated*, not measured.** The production path scores each variant with the roofline cost model (`cost_model.rs`) priced against the local GPU's `GpuSpec`; nothing is launched. `autotune.rs` also contains a real CUDA-event measurement path, but no runtime callback is wired to it — see that module's header for the current state. A cache entry records which of the two produced it, so an estimate is never mistaken for a measurement.
+
+Winners are cached under `.nsl-cache/autotune/<kernel>_<key>.json`. The key and the record both carry the **driver-reported** device identity (name, compute capability, SM count, CUDA driver version), and an entry describing different hardware is refused with a warning rather than reused. `--autotune-fresh` ignores the cache, `--autotune-clean` deletes it, `--no-autotune` skips selection entirely and takes the middle of each range.
+
+**Device identity requires a `--features cuda` build.** `cuda` is not a default feature, so the stock `nsl` binary cannot probe a device even on a machine that has one; it records the identity `cuda-unsupported-build`, prices the roofline against the database default, and says so once per compile. Selection is then a generic estimate rather than a device-specific one, and every default-build machine shares one cache key — consistent, but not hardware-aware. Build with `--features cuda` on the target machine for a device-specific selection.
+
+See [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
 
 ### <a id="dec-backward"></a>`@backward`
 Marks a function as a hand-written backward pass that overrides the compiler's source-AD-generated adjoint for a particular op. Full reference: [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md).
@@ -174,7 +182,7 @@ Signals to the compiler that the decorated function implements multi-head attent
 Marks model parameters as frozen during training; the compiler removes their VarIds from `backward_live` so no adjoint is emitted for them. Used in conjunction with WRGA adapter injection.
 
 ### <a id="dec-fuse"></a>`@fuse`
-Requests elementwise fusion of the decorated function with its producer/consumer ops (M26/M31); the compiler attempts to merge them into a single kernel dispatch via the epilogue fusion pass in `epilogue_fusion.rs`.
+Requests elementwise fusion of the decorated function with its producer/consumer ops (M26/M31); the compiler validates the body and extracts its op chain in `stmt.rs`, registering it for a fused kernel launch at each call site. (It does **not** go through an "epilogue fusion pass" — the M31 `epilogue_fusion.rs` this entry used to cite was never reachable from any compilation and was deleted; see the changelog.)
 
 ### <a id="dec-inspect"></a>`@inspect`
 Compiler-native debugger decorator (Dev Tools Phase 1) that captures tensor state at the decorated call site and writes an NSLI-format dump, readable via `nsl run --monitor`. Implementation: `crates/nsl-codegen/src/inspect/`.

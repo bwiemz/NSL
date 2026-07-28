@@ -25,6 +25,8 @@ pub struct CshaInputs<'a> {
     pub sin: &'a [f32],         // [seq, head_dim/2]
 }
 
+use nsl_codegen::flash_attention::RopeStyle;
+
 pub struct CshaShape {
     pub seq: usize,
     pub heads: usize,
@@ -35,6 +37,97 @@ pub struct CshaShape {
     /// When false, cos/sin slices are empty and RoPE is skipped entirely.
     /// Set to false for ablation A1 (rope_q=false kernel configs).
     pub rope_q: bool,
+    /// Which element pairing the rotation uses. MUST match the kernel config:
+    /// a mismatch here rotates different element pairs than the GPU does and
+    /// the oracle diverges silently, which is precisely the failure mode the
+    /// old "Adjacent ONLY" guard was protecting against.
+    pub rope_style: RopeStyle,
+}
+
+/// PCA document packing: several documents concatenated into one sequence.
+///
+/// Two things change relative to the unpacked reference, and BOTH must be
+/// modelled or the oracle silently disagrees with the kernel:
+///
+///   1. **RoPE positions reset per document.** Row `s` rotates by
+///      `s - doc_starts[segment_ids[s]]`, not by `s`. This is what
+///      `emit_rope_pair_sweep`'s `reset_active` branch computes as
+///      `effective_pos`.
+///   2. **Attention is block-diagonal.** A query may not attend to a key in
+///      a different document, regardless of causal order. This is what
+///      `segment_mask::emit_segment_mask_predicate` OR-s into the causal
+///      mask predicate.
+///
+/// Modelling only (1) would leave cross-document attention in the reference
+/// and make every packed comparison fail for a reason that has nothing to do
+/// with RoPE; modelling only (2) would compare a doc-relative kernel against
+/// an absolute-position reference. The GPU does both, so the oracle does both.
+pub struct PackedDocs<'a> {
+    /// `[seq]` — document index owning each absolute position.
+    pub segment_ids: &'a [u16],
+    /// `[MAX_NUM_DOCS + 1]` — first absolute position of each document.
+    /// Entries past `num_docs` are `-1` sentinels and must never be indexed.
+    pub doc_starts: &'a [i32],
+}
+
+impl PackedDocs<'_> {
+    /// Document-relative RoPE position for absolute position `s`.
+    fn position(&self, s: usize) -> usize {
+        let sid = self.segment_ids[s] as usize;
+        let start = self.doc_starts[sid];
+        debug_assert!(
+            start >= 0,
+            "doc_starts[{sid}] = {start} is a -1 sentinel — segment_ids[{s}] \
+             names a document that was never packed"
+        );
+        let rel = s as i64 - start as i64;
+        debug_assert!(
+            rel >= 0,
+            "effective_pos for s={s} is negative ({rel}); doc_starts must be \
+             non-decreasing and segment_ids[s] must own s"
+        );
+        rel as usize
+    }
+
+    /// True when query `q` and key `k` live in different documents, so the
+    /// cell must be masked even if it is causally legal.
+    fn cross_doc(&self, q: usize, k: usize) -> bool {
+        self.segment_ids[q] != self.segment_ids[k]
+    }
+}
+
+/// Per-row RoPE positions: document-relative when packed, identity otherwise.
+///
+/// Single source of truth so the forward rotation and the backward inverse
+/// rotation cannot drift apart — the same reason `rope_pair_indices` exists.
+fn rope_positions(seq: usize, packing: Option<&PackedDocs<'_>>) -> Vec<usize> {
+    match packing {
+        Some(p) => (0..seq).map(|s| p.position(s)).collect(),
+        None => (0..seq).collect(),
+    }
+}
+
+/// True when cell `(i, j)` is masked to `-inf`.
+///
+/// Every row keeps at least the diagonal cell `(i, i)` unmasked (it is
+/// causally legal and trivially same-document), so `softmax_rows` never sees
+/// an all-`-inf` row and cannot produce NaN.
+fn is_masked(i: usize, j: usize, causal: bool, packing: Option<&PackedDocs<'_>>) -> bool {
+    (causal && j > i) || packing.is_some_and(|p| p.cross_doc(i, j))
+}
+
+/// The two element indices a RoPE pair touches, relative to a row base.
+///
+///   Adjacent  (GPT-NeoX / GPT-J): (x[2i], x[2i+1])
+///   HalfSplit (LLaMA / Qwen):     (x[i],  x[i + head_dim/2])
+///
+/// Single source of truth for the pairing, so the forward rotation and the
+/// backward inverse rotation below cannot drift apart.
+fn rope_pair_indices(style: RopeStyle, pair: usize, half: usize) -> (usize, usize) {
+    match style {
+        RopeStyle::Adjacent => (2 * pair, 2 * pair + 1),
+        RopeStyle::HalfSplit => (pair, pair + half),
+    }
 }
 
 /// Apply RMSNorm to a single row of length `d_model`.
@@ -67,30 +160,44 @@ fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 /// Apply RoPE in-place to a tensor of shape [seq, heads, head_dim].
 /// cos/sin have shape [seq, head_dim/2].
 ///
-/// **Implements `RopeStyle::Adjacent` (GPT-NeoX / GPT-J layout) ONLY.**
+/// Implements BOTH `RopeStyle::Adjacent` and `RopeStyle::HalfSplit`; the
+/// pairing comes from `rope_pair_indices` and must match `shape.rope_style`.
 /// Pair `i` rotates `(x[2i], x[2i+1])`.  This matches `emit_rope_pair_sweep`
-/// in `csha_hooks.rs`.  Do NOT call this function for `RopeStyle::HalfSplit`
+/// in `csha_hooks.rs`.  `shape.rope_style` MUST match the kernel config
 /// (LLaMA / Qwen: `x[i]` paired with `x[i + head_dim/2]`) — the kernel and
 /// CPU reference would diverge silently.
 ///
 /// Rotation formula (matching v2 kernel §A.2.4):
 ///   new_x[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
 ///   new_x[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
-fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f32], sin: &[f32]) {
-    // Consistency guard: this function only implements Adjacent layout.
+fn apply_rope(
+    q: &mut [f32],
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+    style: RopeStyle,
+    positions: &[usize],
+) {
     // If head_dim is 0 somehow, the loop is a no-op — but flag odd configs.
     debug_assert!(head_dim > 0 && head_dim % 2 == 0, "apply_rope requires even head_dim > 0");
+    debug_assert_eq!(positions.len(), seq, "positions must have one entry per row");
     let half = head_dim / 2;
     for s in 0..seq {
+        // Document-relative under packing, identity otherwise. The cos/sin
+        // ROW is the position; the tensor row stays `s`.
+        let pos = positions[s];
         for h in 0..heads {
             let base = (s * heads + h) * head_dim;
             for pair in 0..half {
-                let cos_val = cos[s * half + pair];
-                let sin_val = sin[s * half + pair];
-                let x0 = q[base + 2 * pair];
-                let x1 = q[base + 2 * pair + 1];
-                q[base + 2 * pair]     = x0 * cos_val - x1 * sin_val;
-                q[base + 2 * pair + 1] = x0 * sin_val + x1 * cos_val;
+                let cos_val = cos[pos * half + pair];
+                let sin_val = sin[pos * half + pair];
+                let (o0, o1) = rope_pair_indices(style, pair, half);
+                let x0 = q[base + o0];
+                let x1 = q[base + o1];
+                q[base + o0] = x0 * cos_val - x1 * sin_val;
+                q[base + o1] = x0 * sin_val + x1 * cos_val;
             }
         }
     }
@@ -116,8 +223,21 @@ fn softmax_rows(s: &mut [f32], rows: usize, cols: usize) {
 ///
 /// Returns O of shape `[seq, heads * head_dim]` — the pre-Wo attention output.
 pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q } = *shape;
+    csha_reference_packed(inputs, shape, None)
+}
+
+/// CPU reference with optional PCA document packing.
+///
+/// `packing == None` is exactly `csha_reference` — unpacked, absolute RoPE
+/// positions, plain causal mask.
+pub fn csha_reference_packed(
+    inputs: &CshaInputs<'_>,
+    shape: &CshaShape,
+    packing: Option<&PackedDocs<'_>>,
+) -> Vec<f32> {
+    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q, rope_style: _ } = *shape;
     let kv_dim = heads * head_dim;
+    let positions = rope_positions(seq, packing);
 
     // Step 1: RMSNorm(x) -> x_norm   shape [seq, d_model]
     let mut x_norm = Vec::with_capacity(seq * d_model);
@@ -136,8 +256,8 @@ pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
 
     // Step 3: RoPE(Q, cos, sin); RoPE(K, cos, sin) -- skipped when rope_q=false.
     if rope_q {
-        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
-        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style, &positions);
+        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style, &positions);
     }
 
     // Step 4a: S = Q @ K^T / sqrt(head_dim)  per head, shape [seq, seq]
@@ -173,11 +293,13 @@ pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
             }
         }
 
-        // Causal mask: upper triangle -> -inf
-        if causal {
+        // Causal mask (upper triangle) OR-ed with the cross-document mask.
+        if causal || packing.is_some() {
             for i in 0..seq {
-                for j in (i + 1)..seq {
-                    s_mat[i * seq + j] = f32::NEG_INFINITY;
+                for j in 0..seq {
+                    if is_masked(i, j, causal, packing) {
+                        s_mat[i * seq + j] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
@@ -237,9 +359,14 @@ struct Intermediates {
 
 /// Compute the full set of forward intermediates. Keeps the chain-rule
 /// backward arithmetically closed-form (no numerical re-derivation).
-fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermediates {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q } = *shape;
+fn forward_intermediates(
+    inputs: &CshaInputs<'_>,
+    shape: &CshaShape,
+    packing: Option<&PackedDocs<'_>>,
+) -> Intermediates {
+    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps, rope_q, rope_style: _ } = *shape;
     let kv_dim = heads * head_dim;
+    let positions = rope_positions(seq, packing);
 
     let mut x_norm = Vec::with_capacity(seq * d_model);
     let mut rms = Vec::with_capacity(seq);
@@ -256,8 +383,8 @@ fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermed
     let v = matmul(&x_norm, inputs.wv, seq, d_model, kv_dim);
 
     if rope_q {
-        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin);
-        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin);
+        apply_rope(&mut q, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style, &positions);
+        apply_rope(&mut k, seq, heads, head_dim, inputs.cos, inputs.sin, shape.rope_style, &positions);
     }
 
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -274,10 +401,12 @@ fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermed
                 s_mat[i * seq + j] = dot * scale;
             }
         }
-        if causal {
+        if causal || packing.is_some() {
             for i in 0..seq {
-                for j in (i + 1)..seq {
-                    s_mat[i * seq + j] = f32::NEG_INFINITY;
+                for j in 0..seq {
+                    if is_masked(i, j, causal, packing) {
+                        s_mat[i * seq + j] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
@@ -299,9 +428,22 @@ pub fn csha_reference_backward(
     shape: &CshaShape,
     do_out: &[f32],
 ) -> CshaGradients {
-    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _, rope_q } = *shape;
+    csha_reference_backward_packed(inputs, shape, do_out, None)
+}
+
+/// Backward reference with optional PCA document packing.
+///
+/// `packing == None` is exactly `csha_reference_backward`.
+pub fn csha_reference_backward_packed(
+    inputs: &CshaInputs<'_>,
+    shape: &CshaShape,
+    do_out: &[f32],
+    packing: Option<&PackedDocs<'_>>,
+) -> CshaGradients {
+    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _, rope_q, rope_style: _ } = *shape;
     let kv_dim = heads * head_dim;
-    let inter = forward_intermediates(inputs, shape);
+    let inter = forward_intermediates(inputs, shape, packing);
+    let positions = rope_positions(seq, packing);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     // Per-head accumulators for dQ_post_rope, dK_post_rope, dV.
@@ -378,15 +520,19 @@ pub fn csha_reference_backward(
         let half = head_dim / 2;
         for tensor in [&mut d_q, &mut d_k] {
             for s in 0..seq {
+                // MUST be the same position the forward rotated row `s` by,
+                // or the inverse rotation is not the inverse.
+                let pos = positions[s];
                 for h in 0..heads {
                     let base = s * kv_dim + h * head_dim;
                     for pair in 0..half {
-                        let cos_v = inputs.cos[s * half + pair];
-                        let sin_v = inputs.sin[s * half + pair];
-                        let y0 = tensor[base + 2 * pair];
-                        let y1 = tensor[base + 2 * pair + 1];
-                        tensor[base + 2 * pair]     =  y0 * cos_v + y1 * sin_v;
-                        tensor[base + 2 * pair + 1] = -y0 * sin_v + y1 * cos_v;
+                        let cos_v = inputs.cos[pos * half + pair];
+                        let sin_v = inputs.sin[pos * half + pair];
+                        let (o0, o1) = rope_pair_indices(shape.rope_style, pair, half);
+                        let y0 = tensor[base + o0];
+                        let y1 = tensor[base + o1];
+                        tensor[base + o0] =  y0 * cos_v + y1 * sin_v;
+                        tensor[base + o1] = -y0 * sin_v + y1 * cos_v;
                     }
                 }
             }
@@ -493,6 +639,7 @@ mod tests {
             causal: false,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         #[rustfmt::skip]
         let x = [
@@ -581,6 +728,7 @@ mod tests {
             causal: true,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         let kv_dim = shape.heads * shape.head_dim;
         let x = det_seq(42, shape.seq * shape.d_model);
@@ -637,6 +785,7 @@ mod tests {
             causal: false,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         let kv_dim = shape.heads * shape.head_dim;
         let mut x = det_seq(7, shape.seq * shape.d_model);
@@ -731,6 +880,7 @@ mod tests {
             causal: true,
             norm_eps: 1e-5,
             rope_q: true,
+            rope_style: RopeStyle::Adjacent,
         };
         let x = det_seq(42, shape.seq * shape.d_model);
         let w_size = shape.d_model * shape.heads * shape.head_dim;

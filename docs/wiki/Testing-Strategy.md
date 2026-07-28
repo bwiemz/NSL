@@ -109,17 +109,64 @@ cargo test -p nsl-codegen --features cuda --test csha_cuda_launch_fused -- --ign
 NSL_SKIP_CUDA_TESTS=1 cargo test --workspace
 ```
 
-### Reproducible harness
+### The certification lane
 
-The commands above are the raw form. For a **documented, reproducible gate** —
-toolchain preflight, provenance stamping, a curated known-green canary, and a
-PASS/FAIL summary that fails loud (and refuses to run if `NSL_SKIP_CUDA_TESTS`
-is set so a skip cannot masquerade as green) — use the harness:
+`scripts/gpu-cert.sh` is the full sweep: it discovers every `#[ignore]` test in
+the tree, classifies each one, and runs the classes that need a device.
+
+```bash
+scripts/gpu-cert.sh --list             # inventory as TSV, no build
+scripts/gpu-cert.sh --run --tier gpu   # the ~292 device-requiring gates
+scripts/gpu-cert.sh --check-inventory  # drift gate (GPU-free; runs in CI)
+```
+
+Classification is what makes the sweep safe to automate. Four `#[ignore]`
+tests are fixture and baseline *generators* — running them under `--ignored`
+would silently rewrite the reference data other gates compare against — and
+each is denied by an explicit rule on its reason string, file suffix, or
+function name. Diagnostics that assert nothing, gates blocked on unlanded
+work, and tests needing opt-in cargo features are likewise excluded, as are
+`cpu-stub` placeholders — tests under `#[cfg(not(feature = "cuda"))]` exist
+only in non-cuda builds, so the cuda-featured binaries the lane runs compile
+them out and any RUN classification would report a permanent NOTFOUND. Anything
+the ruleset does not recognise is classified `unclassified` and never run; it
+appears in `--list` and in `ci/gpu-cert-manifest.tsv`, so the drift gate still
+tracks it even though it is absent from the run report.
+
+The lane **refuses to start** if `NSL_SKIP_CUDA_TESTS` is set, if
+`CUDA_VISIBLE_DEVICES` is empty, or if `nvidia-smi` reports no device. Most
+GPU tests early-return as a *pass* when no device is available, so a sweep
+under those conditions would report green having executed nothing — worse than
+not running at all.
+
+`--tier gpu` is the default and covers the ~292 device-requiring gates. It does
+**not** include the `toolchain` (11), `multiproc` (6), or `isolate` (1) tiers;
+run those separately.
+
+Set `TMPDIR` to a disk-backed path before a full run. Many gates spawn `nsl`
+builds, and on a machine where `/tmp` is tmpfs the sweep can exhaust it — the
+resulting linker errors surface as generic "nsl run failed" panics that read
+like compiler bugs.
+
+Pre-existing failures are recorded in `ci/gpu-cert-known-red.txt` with a note
+each; only *new* red fails the lane. When a target goes red the lane re-runs
+each of its gates in a separate process, because a faulting kernel poisons the
+CUDA context for every later test sharing that process — without this, one
+real bug reports as a cluster.
+
+### Canary (fast sanity check)
+
+For a quick "is the GPU path working at all" check there is a curated
+3-test canary with toolchain preflight and provenance stamping:
 
 ```powershell
 pwsh tools/gpu-test.ps1 -Canary        # acceptance gate: the known-green canary
 pwsh tools/gpu-test.ps1 -ListCanary    # show the manifest
 ```
+
+This is an acceptance check for the harness itself, not coverage — and it
+needs `pwsh`, which is absent from the Linux dev environment. Use
+`scripts/gpu-cert.sh` for coverage.
 
 See [GPU-Test-Harness](GPU-Test-Harness.md) for the full reference, the canary
 set, and the "structural pass ≠ numerical pass" known-blocked list.
@@ -136,7 +183,16 @@ The CI workflow (`.github/workflows/ci.yml`) runs on a matrix of `ubuntu-latest`
 | E2E smoke (Linux + Windows, blocking) | `cargo test -p nsl-cli --test e2e -- --test-threads=1` |
 | E2E smoke (macOS, non-blocking) | same command with `continue-on-error: true` |
 
-GPU tests must be run manually on a machine with a CUDA device before merging any kernel-level change.
+CI additionally runs two build-free agreement gates: `doc-agreement`
+(`scripts/check-doc-agreement.sh`) and `gpu-gate-inventory`
+(`scripts/gpu-cert.sh --check-inventory`). The latter cannot execute GPU
+tests, but it proves the gate manifest in `ci/gpu-cert-manifest.tsv` still
+matches the source — so a gate cannot be renamed, deleted, or silently
+un-`#[ignore]`d without that showing up in the same commit. It carries its own
+anti-vacuity step that removes a gate and requires the check to go red.
+
+GPU tests must be run manually on a machine with a CUDA device before merging
+any kernel-level change: `scripts/gpu-cert.sh --run --tier gpu`.
 
 ## E2E tests — real `.nsl` programs
 

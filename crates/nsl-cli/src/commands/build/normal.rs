@@ -393,6 +393,8 @@ fn run_build_multi(
             let mut lib_imported_fns = Vec::new();
             let mut lib_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
             let mut lib_model_names = std::collections::HashSet::new();
+            let mut lib_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>> =
+                HashMap::new();
 
             // Check if this module has any imports
             let has_imports = mod_data.ast.stmts.iter().any(|s| {
@@ -449,9 +451,45 @@ fn run_build_multi(
                     lib_imported_fns.extend(model_sigs);
 
                     for stmt in &dep_data.ast.stmts {
-                        if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
-                            let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
-                            lib_model_names.insert(model_name);
+                        // Unwrap `@decorator`-wrapped model defs too — a decorated
+                        // model is still an imported model.
+                        let md = match &stmt.kind {
+                            nsl_ast::stmt::StmtKind::ModelDef(md) => Some(md),
+                            nsl_ast::stmt::StmtKind::Decorated { stmt: inner, .. } => {
+                                match &inner.kind {
+                                    nsl_ast::stmt::StmtKind::ModelDef(md) => Some(md),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let Some(md) = md else { continue };
+                        let model_name =
+                            interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        lib_model_names.insert(model_name.clone());
+
+                        // The escape analysis needs an imported callee's BODY to
+                        // prove its parameters captive; without it every argument
+                        // passed into an imported model method stays conservative.
+                        // Read the methods straight off the dependency AST —
+                        // `Compiler::model_method_bodies` is populated by
+                        // `declare_user_functions_with_linkage`, which the dep
+                        // pre-scan above never runs.
+                        let mut methods = HashMap::new();
+                        for member in &md.members {
+                            if let nsl_ast::decl::ModelMember::Method(fn_def, _) = member {
+                                let mname = interner
+                                    .resolve(fn_def.name.0)
+                                    .unwrap_or("<unknown>")
+                                    .to_string();
+                                methods.insert(mname, fn_def.clone());
+                            }
+                        }
+                        if !methods.is_empty() {
+                            lib_model_method_bodies
+                                .entry(model_name)
+                                .or_default()
+                                .extend(methods);
                         }
                     }
 
@@ -469,6 +507,7 @@ fn run_build_multi(
                 &lib_imported_fns,
                 lib_struct_layouts,
                 lib_model_names,
+                lib_model_method_bodies,
                 dump_ir,
                 options,
             ) {
@@ -532,10 +571,11 @@ fn run_build_multi(
 
     match nsl_codegen::linker::link_multi(&obj_files, &exe_path) {
         Ok(()) => {
-            // Clean up .o files
-            for obj in &obj_files {
-                let _ = std::fs::remove_file(obj);
-            }
+            // Remove the whole scratch directory, not just the .o files it
+            // holds — PTX, staging and other intermediates live there too and
+            // nothing else ever deletes them. A failed link deliberately
+            // leaves it behind for debugging.
+            super::cleanup_temp_dir(&temp_dir);
             if !quiet { println!("Built {}", exe_path.display()); }
         }
         Err(e) => {

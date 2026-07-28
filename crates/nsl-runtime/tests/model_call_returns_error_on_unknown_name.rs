@@ -44,6 +44,23 @@ fn alpha(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     (lib, weights)
 }
 
+/// Remove this test's compile-scratch directory.
+///
+/// These tests `nsl build --shared-lib` into their own temp dir and dlopen the
+/// result; nothing ever removed it. Each such directory is ~138 MB (the shared
+/// library statically links the runtime), and they accumulate one per suite
+/// run. On a machine where /tmp is tmpfs that eventually exhausts it and the
+/// LINKER starts failing with "No space left on device" — which surfaces as
+/// unrelated-looking test failures across the workspace.
+///
+/// Honours NSL_KEEP_TEMP=1 for debugging, matching the CLI helper.
+fn cleanup_scratch(tmp: &std::path::Path) {
+    if std::env::var("NSL_KEEP_TEMP").as_deref() == Ok("1") {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn unknown_name_returns_minus_one_and_sets_export_missing_error() {
     let (lib, weights) = build_lib_with_one_export();
@@ -70,6 +87,8 @@ fn unknown_name_returns_minus_one_and_sets_export_missing_error() {
     );
 
     nsl_runtime::c_api::nsl_model_destroy(model);
+
+    cleanup_scratch(&std::env::temp_dir().join(format!("nsl_unkn_{}", std::process::id())));
 }
 /// Path to the `nsl` binary built by `cargo test --workspace`.
 ///

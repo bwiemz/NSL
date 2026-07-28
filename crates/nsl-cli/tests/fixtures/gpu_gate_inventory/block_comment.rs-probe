@@ -1,0 +1,6 @@
+#[cfg(not(feature = "cuda"))]
+/* the placeholder below only exists so non-cuda builds compile
+   this file; the real tests are above */
+#[test]
+#[ignore = "requires the cuda feature"]
+fn commented_stub() {}

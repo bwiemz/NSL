@@ -559,8 +559,44 @@ pub fn find_gpu(name: &str) -> Option<&'static GpuSpec> {
 }
 
 /// Default GPU when none specified and auto-detect unavailable.
+///
+/// This is a *fallback*, not an identity. Anything that keys a cache, a tuning
+/// record, or any other artifact that must not transfer between machines has to
+/// go through [`local_device_identity`] instead — see its doc comment.
 pub fn default_gpu() -> &'static GpuSpec {
     find_gpu("A100-SXM").unwrap()
+}
+
+/// The local CUDA device's driver-reported identity, probed once per process.
+///
+/// Roadmap item 10. `None` on a GPU-less machine, a non-cuda build, or when any
+/// driver call fails — callers decide what that means for them.
+///
+/// **Why this is not `default_gpu()`:** the `@autotune` cache key used to be
+/// built from `default_gpu()`, which returns `A100-SXM` unconditionally. Every
+/// machine therefore hashed the string "A100-SXM / 80 / 108" into its key, so a
+/// tuning result measured on one GPU was indistinguishable from — and reused
+/// verbatim as — a result for any other. The identity has to come from the
+/// driver for the key to mean anything.
+pub fn local_device_identity() -> Option<&'static nsl_runtime::CudaDeviceIdentity> {
+    static IDENTITY: std::sync::OnceLock<Option<nsl_runtime::CudaDeviceIdentity>> =
+        std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(nsl_runtime::cuda_device_identity)
+        .as_ref()
+}
+
+/// The GPU-database entry for the local device, matched EXACTLY on the
+/// driver-reported name.
+///
+/// EXACT match only: `find_gpu`'s prefix fallback would silently hand a plain
+/// "RTX 5070" the RTX-5070-Ti's spec, because "RTX-5070-TI" starts with
+/// "RTX-5070". Detected names are full marketing strings — either the database
+/// has that exact card or this returns `None` and the caller falls back loudly.
+pub fn resolve_local_gpu() -> Option<&'static GpuSpec> {
+    let name = &local_device_identity()?.name;
+    let normalized = name.to_uppercase().replace(' ', "-");
+    find_gpu(name).filter(|s| s.name.to_uppercase() == normalized)
 }
 
 /// Hardware specifications for an FPGA device (used for certified WCET analysis).

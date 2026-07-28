@@ -1054,15 +1054,36 @@ impl Compiler<'_> {
             format!("__nsl_model_{model_name}_{method_name}")
         };
 
-        // Compile args. Deliberately NOT compile_nested_expr: the callee may
-        // ESCAPE a param (member-assign stores the raw pointer with no
-        // retain — `fn set(self, t): self.buf = t`), so freeing a tracked
-        // owning arg at statement end is a use-after-free on the stored
-        // field. Owning call-result args strand instead (status quo) until
-        // member stores retain.
+        // Compile args. A fresh argument may only be released at statement end
+        // when the callee's matching parameter is PROVEN not to escape —
+        // otherwise a member-assign inside the callee (`fn set(self, t):
+        // self.buf = t`) stores the raw pointer with no retain and the
+        // statement-end free becomes a use-after-free on the stored field.
+        //
+        // `param_is_captive` answers false for every unknown callee, so an
+        // imported model or an un-analysed method keeps the historical
+        // blanket refusal (owning call-result args strand, but soundly).
+        //
+        // NOTE: `self` IS part of the declared parameter list — the parser
+        // materialises it as `params[0]` — so argument index 0 is parameter
+        // index 1. `param_is_captive` applies that offset itself; do not
+        // "simplify" it away (escape.rs::EscapeInfo::arg_offset, and the test
+        // `method_arg_indices_skip_the_self_param`).
+        let escape_key = crate::escape::method_key(model_name, method_name);
+        if std::env::var("NSL_DEBUG_ESCAPE").as_deref() == Ok("1") {
+            let flags: Vec<bool> = (0..args.len())
+                .map(|i| self.escape.param_is_captive(&escape_key, i))
+                .collect();
+            eprintln!("[escape/site] {escape_key} nargs={} captive={flags:?}", args.len());
+        }
         let mut arg_vals = vec![self_val];
-        for arg in args {
-            arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+        for (i, arg) in args.iter().enumerate() {
+            let v = if self.escape.param_is_captive(&escape_key, i) {
+                self.compile_nested_expr(builder, state, &arg.value)?
+            } else {
+                self.compile_expr(builder, state, &arg.value)?
+            };
+            arg_vals.push(v);
         }
 
         self.compile_call_by_name(builder, &mangled, &arg_vals)

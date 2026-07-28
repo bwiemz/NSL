@@ -202,20 +202,35 @@ fn g9_c_suppression_comment_present() {
 
 #[test]
 fn g9_d_reachability_refusal_when_cascade_rejects() {
-    // segment_masked=true + rope_q=true triggers R7 (PCA packing with
-    // rope_q under @checkpoint). The cycle-12 REACHABILITY corollary
-    // requires that suppression fires ONLY when the cascade admits — so
-    // K/V saves MUST be emitted here as the fallback path.
+    // The cycle-12 REACHABILITY corollary: suppression fires ONLY when the
+    // refusal cascade ADMITS the config. When it rejects, K/V saves must be
+    // emitted as the fallback path — otherwise the forward would drop the
+    // activations a backward that never got built would have needed.
     //
-    // We use rope_q+segment_masked rather than segment_masked alone
-    // because R7 specifically requires both. Plain segment_masked=true
-    // without rope_q would not hit R7 — but R12 (Tier B.2 hybrid
-    // backward composition) may catch it depending on dispatch
-    // eligibility. Using R7's exact predicate is the most robust
-    // single-rule reachability assertion.
+    // RE-VEHICLED 2026-07-26. This used segment_masked + rope_q to trip R7.
+    // R7 is retired (that composition is fixed and GPU-validated), so that
+    // config now ADMITS and suppression correctly fires — which made this gate
+    // fail for the right reason. The corollary under test has nothing to do
+    // with PCA packing; it needs any config the cascade still rejects.
+    //
+    // R10 (asymmetric tile, block_q != block_kv) is the most robust vehicle
+    // available: it is a pure shape predicate with no numerics behind it, so
+    // it will not be "fixed" out from under this test the way R7 was.
     let mut cfg = csha_save_config_checkpoint_full();
-    cfg.segment_masked = true;
-    cfg.rope_q = true;
+    cfg.block_kv = cfg.block_q * 2;
+
+    // Guard against silent re-vehicling failure: if R10 is ever lifted too,
+    // this test would go green while asserting nothing.
+    let err = nsl_codegen::flash_attention_v2::synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err(
+            "reachability fixture must be REJECTED by the cascade; if asymmetric \
+             tiles under @checkpoint became legal, re-vehicle this test onto \
+             another still-active refusal rather than deleting it",
+        );
+    assert!(
+        err.contains("symmetric") || err.contains("block_q") || err.contains("block_kv"),
+        "expected the asymmetric-tile refusal (R10); got: {err}"
+    );
 
     let ptx = synth(&cfg);
 

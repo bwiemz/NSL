@@ -142,7 +142,7 @@ pub(crate) fn run_build_standalone(
             for obj in &obj_paths {
                 let _ = std::fs::remove_file(obj);
             }
-            let _ = std::fs::remove_dir(&temp_dir);
+            super::cleanup_temp_dir(&temp_dir);
 
             println!("Built {} (standalone{})", output_path.display(),
                 if embedded { ", weights embedded" } else { ", sidecar weights" });

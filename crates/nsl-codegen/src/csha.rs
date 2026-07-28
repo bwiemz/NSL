@@ -484,17 +484,27 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
     if let Some(gpu) = find_gpu(target) {
         return gpu;
     }
-    static DETECTED: std::sync::OnceLock<Option<&'static GpuSpec>> = std::sync::OnceLock::new();
-    let detected = *DETECTED.get_or_init(|| {
-        let name = nsl_runtime::cuda_device_name()?;
-        // EXACT match only for auto-detected names (review finding):
-        // find_gpu's prefix fallback would silently hand a plain
-        // "RTX 5070" the RTX-5070-Ti's spec ("RTX-5070-TI" starts with
-        // "RTX-5070"). Detected names are full marketing strings — either
-        // the database has that exact card or we fall back loudly.
-        let normalized = name.to_uppercase().replace(' ', "-");
-        let spec = find_gpu(&name).filter(|s| s.name.to_uppercase() == normalized);
-        match spec {
+    // The probe itself (and its EXACT-match discipline) now lives in
+    // `gpu_specs::resolve_local_gpu` so the @autotune cache key can share it —
+    // item 10. This function keeps its own once-per-process log because the
+    // `[csha]` prefix is what makes a plan report attributable.
+    let detected = crate::gpu_specs::resolve_local_gpu();
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        // Gate on `cuda_device_name` — the ORIGINAL oracle — not on the richer
+        // identity probe. On a GPU-less machine the original code returned
+        // before its `eprintln!` (via `?` on `cuda_device_name`), and CI parses
+        // this stream, so staying silent there is behaviour to preserve.
+        //
+        // But `local_device_identity` additionally calls cuDeviceGetAttribute
+        // three times and cuDriverGetVersion. Gating on IT would mean that if
+        // any of those failed, csha would both fall back to the A100 spec and
+        // suppress the message saying so — turning a loud fallback into a
+        // silent one on exactly the machines where something is already wrong.
+        let Some(name) = nsl_runtime::cuda_device_name() else {
+            return;
+        };
+        match detected {
             Some(s) => eprintln!(
                 "[csha] gpu spec: {} (auto-detected from local device \"{name}\")",
                 s.name
@@ -505,7 +515,6 @@ fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
                 default_gpu().name
             ),
         }
-        spec
     });
     detected.unwrap_or_else(default_gpu)
 }

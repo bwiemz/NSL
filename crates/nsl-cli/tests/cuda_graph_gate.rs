@@ -100,6 +100,16 @@ const GPU_MLP: (&str, &str) = (
 const XG: (&str, &str) = ("m.forward_train(x)", "m.forward_train(xg)");
 const YG: (&str, &str) = ("l1_loss(pred, y)", "l1_loss(pred, yg)");
 
+/// Capture is opportunistic and needs a WARM-UP: a region records, waits for
+/// STABLE_STREAK identical digests, and only then captures. On this fixture
+/// the sgemm output pointer moves between the first and second window, so the
+/// streak restarts and capture completes on window 4 of 4 — with no fifth
+/// occurrence, `replays` is necessarily 0 and this gate could never pass.
+/// That is a fixture that is too short, not a broken feature: the shared
+/// `epochs=8` belongs to three other gates, so lengthen it HERE only.
+/// 20 epochs / grad_accumulation=2 = 10 windows, leaving ~6 replays per region.
+const EPOCHS: (&str, &str) = ("epochs=8", "epochs=20");
+
 /// Tape AD has no Wengert lowerings, so there is nothing to bracket — the
 /// flag must refuse rather than silently train eager.
 #[test]
@@ -161,7 +171,7 @@ fn cuda_graph_capture_replay_bitexact_gpu() {
         let on = run_fixture(
             "cuda_graph_gate.nsl",
             &format!("on_{shape}"),
-            &[GPU_MLP, XG, YG],
+            &[GPU_MLP, XG, YG, EPOCHS],
             &on_args,
         );
         assert!(
@@ -195,7 +205,7 @@ fn cuda_graph_capture_replay_bitexact_gpu() {
         let off = run_fixture(
             "cuda_graph_gate.nsl",
             &format!("off_{shape}"),
-            &[GPU_MLP, XG, YG],
+            &[GPU_MLP, XG, YG, EPOCHS],
             &off_args,
         );
         assert!(off.success, "[{shape}] graphs-off run failed:\n{}", off.stderr);
@@ -208,7 +218,7 @@ fn cuda_graph_capture_replay_bitexact_gpu() {
         let on2 = run_fixture(
             "cuda_graph_gate.nsl",
             &format!("on2_{shape}"),
-            &[GPU_MLP, XG, YG],
+            &[GPU_MLP, XG, YG, EPOCHS],
             &on_args,
         );
         assert!(on2.success, "[{shape}] rerun failed:\n{}", on2.stderr);

@@ -10,7 +10,9 @@
 # NUMERICAL_GATE_ENABLED=false) — those are tracked in the harness doc's
 # "known-blocked" list, not here.
 #
-# Reference hardware: NVIDIA GeForce RTX 5070 Ti (sm_120), CUDA 13.2 toolkit.
+# Reference hardware: NVIDIA GeForce RTX 5070 Ti (sm_120), CUDA 13.3 toolkit.
+#
+# Run (POSIX): tools/gpu-test.sh   |  List: tools/gpu-test.sh --list
 #
 # Format (pipe-delimited, one test per line):
 #   package | test_binary | test_fn | note
@@ -21,3 +23,26 @@
 nsl-runtime | tier_b1_prepass_gpu | w_prepass_matches_cpu_reference | CSHA D pre-pass (W): narrow+col-major chunkify, bit-exact vs CPU
 nsl-runtime | tier_b1_prepass_gpu | x_prepass_matches_cpu_reference | CSHA D pre-pass (X): RMSNorm+narrow+chunkify, tol 5e-2 (rsqrt.approx)
 nsl-codegen | csha_cuda_backward | t6_3_smoke_single_config       | CSHA fused backward, smoke scope (heads=1, seq=bq=32, hd=32): 7 grads vs CPU ref within Tier-A tol. NOTE: single-tile only; multi-tile backward is refused (Phase 1.1).
+nsl-codegen | tier_b2_dkdv_kernel_cpu_reference | tier_b2_dkdv_sweep_cpu_naive | Tier B.2 dK/dV vs CPU naive forward, hd 32/64/128 (item 15; rows in docs/hardware/attention_backward_certification.md)
+nsl-codegen | tier_b2_dkdv_kernel_cpu_reference | tier_b2_dkdv_sweep_b1_forward | Tier B.2 dK/dV against the real Tier B.1 forward, hd 32/64/128 (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_cpu_naive | Tier B.2 full backward (7 grads) vs CPU naive, hd 64/128, causal off (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_cpu_naive_causal | Tier B.2 full backward (7 grads) vs CPU naive, causal on (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward | Tier B.2 full backward against the real Tier B.1 forward, causal off (item 15)
+nsl-codegen | tier_b2_full_backward_cpu_reference | tier_b2_full_backward_sweep_b1_forward_causal | Tier B.2 full backward against the real Tier B.1 forward, causal on (item 15)
+nsl-codegen | flash_attention_gqa_backward_gpu | gqa_backward_matches_cpu_reference | GQA backward vs CPU reference (item 15)
+nsl-cli | view_chain_leak_gate | view_chain_results_are_numerically_unchanged | reshape/transpose/expand/contiguous sums exact after the added frees (item 1)
+nsl-runtime | matmul_batch_collapse | both_arms_agree_with_the_cpu_reference | [batch,m,k]@[k,n] via the collapsed cuBLAS sgemm and via the naive kernel, both vs an f64 CPU reference at 1e-5 (item 9)
+nsl-runtime | matmul_batch_collapse | a_broadcast_operand_uses_a_zero_stride_correctly | strided-batched cuBLAS with strideA=0, batch=3 distinct slices vs f64 CPU reference (item 9)
+nsl-runtime | matmul_batch_collapse | a_transposed_operand_still_computes_the_right_product | a transposed 3-D operand must materialise before the collapse; vs f64 CPU reference (item 9)
+nsl-runtime | matmul_tf32_mode | the_default_mode_is_tf32_and_the_opt_out_restores_f32 | the default IS TF32 (~9.5e-4 drift, ~700x pedantic) AND NSL_MATMUL_TF32=0 restores full f32; both halves, from fresh child processes
+nsl-runtime | matmul_transposed_operand | a_transposed_right_operand_is_not_copied | opt-in CUBLAS_OP_T for a transposed right operand (the tied-LM-head shape) vs f64 CPU reference (item 9)
+nsl-runtime | matmul_transposed_operand | both_operands_transposed | both operands transposed at once — catches transa/transb crossed, which neither single-sided test can (item 9)
+nsl-runtime | matmul_transposed_operand | a_broadcast_view_is_still_materialised | a stride-0 expand view must NOT be taken for a transpose; vs f64 CPU reference (item 9)
+nsl-runtime | matmul_transposed_operand | the_default_still_materialises_transposed_operands | spawns a child with NSL_MATMUL_TRANSPOSE_VIEWS REMOVED — the only way to observe the real default; catches a flipped opt-in that the test hook cannot (item 9 review)
+nsl-runtime | matmul_transposed_operand | the_env_var_really_enables_the_exemption | the opt-in is reachable through the env var, so the default gate above is proving something (item 9 review)
+nsl-runtime | matmul_transposed_operand | a_transposed_left_operand_is_not_copied | opt-in CUBLAS_OP_T for a transposed LEFT operand vs f64 CPU reference (item 9)
+nsl-runtime | matmul_transposed_operand | the_tied_lm_head_shape_collapses_and_transposes_together | [B,S,C]@transposed[V,C] — batch collapse and OP_T on the same call, the Coder-50M LM head (item 9)
+nsl-runtime | matmul_transposed_operand | a_degenerate_unit_shape_is_not_mistaken_for_a_transpose | degenerate 2-D shapes ([1,1], [3,1], [1,5], [4,1]) still produce the right product with the exemption ON. NOTE: end-to-end only — is_transposed_2d_view's own contiguity check is unreachable behind the caller's fast path, so this does not gate that ordering (item 9 review)
+nsl-cli | kernel_profile_timing_gate | profile_kernels_reports_real_durations | --profile-kernels must write real durations; all 412 were 0.0 because atexit LIFO ran CUDA teardown before the flush (item 9 phase 2)
+nsl-runtime | fp8_gpu_device_guard | fp8_e5m2_backward_with_gpu_view_operands_matches_the_cpu_run | fp8 host-path FFIs must D2H-stage GPU operands (and materialise views) instead of dereferencing device pointers; segfault pre-guard, vs CPU run
+nsl-runtime | fp8_gpu_device_guard | tape_fp8_training_backward_on_gpu_matches_the_cpu_run | full @fp8_compute tape path on GPU: matmul_training forward + tape backward; the exact sequence that segfaulted at calibrate_gradient_scale(g)

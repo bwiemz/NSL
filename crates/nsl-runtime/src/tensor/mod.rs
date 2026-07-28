@@ -1371,6 +1371,42 @@ pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
     }
 }
 
+/// Release a compiler-emitted *transient*: an intermediate that exists only
+/// for the span of one builtin lowering and is never named in NSL source, so
+/// nothing downstream can observe it.
+///
+/// The motivating case is the naive `scaled_dot_product_attention` chain
+/// (`nsl-codegen/src/expr/calls.rs`), which emits
+/// `transpose -> matmul -> mul_scalar -> (+mask) -> softmax -> matmul` and
+/// hands only the last result back to the expression. Every earlier link was
+/// unreachable-but-live: at Coder-50M `[2,1024]` that stranded one 64 MB
+/// score matrix and one 64 MB softmax per layer per forward.
+///
+/// # Why this is safe
+///
+/// **Tape mode is excluded outright.** `TapeOp` stores bare `i64` pointers and
+/// only the ops with explicit `saved_*` fields take a refcount, so a recording
+/// tape cannot survive its inputs being released (see the SumReduce/MeanReduce
+/// `ones_like(*a)` use-after-free). When `is_recording()` is true this is a
+/// no-op and lifetimes are exactly what they were before.
+///
+/// **Source-AD mode is already covered by construction.** Ordinary expression
+/// temporaries (the `a + b` inside `a + b + c`) are freed at statement end by
+/// `free_tensor_temporaries` on this same path, and source-AD training passes
+/// today — its backward reaches saved tensors through plumbing that retains,
+/// never through forward SSA temporaries. A transient is strictly weaker than
+/// those: it is not even reachable from the expression result.
+///
+/// The free itself is the refcount-decrementing `nsl_tensor_free_if_valid`, so
+/// any other holder (a tape lease, an alias) keeps the storage alive.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_free_transient(ptr: i64) {
+    if crate::autodiff::is_recording() {
+        return;
+    }
+    nsl_tensor_free_if_valid(ptr);
+}
+
 /// ELTLS instrumentation: read the total number of actual frees performed by
 /// `nsl_tensor_free_if_valid`. A non-zero value indicates tensors escaping
 /// producer-site ownership tracking and being cleaned up by the runtime epilog

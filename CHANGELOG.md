@@ -6,6 +6,361 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — gpu-cert lane: `cpu-stub` class ends the permanent 2-NOTFOUND noise
+
+- The gate-inventory scanner classified `#[cfg(not(feature = "cuda"))]`
+  placeholder tests into RUN classes, but the lane builds WITH the cuda
+  feature, which compiles those tests out of every binary it can run — a
+  guaranteed, permanent NOTFOUND on every sweep
+  (`wrga_b32_trigger_measurement_requires_cuda`,
+  `fp8_dispatcher::cuda_feature_required`). The scanner now tracks the cfg
+  through the attribute stack and files them as `cpu-stub`, a never-run
+  class; the flag is cleared at the first non-attribute line so a cfg-gated
+  item elsewhere in a file cannot demote a later, genuinely runnable gate.
+- Regenerating the manifest also heals a red CI drift gate: the TF32 commit
+  renamed two `matmul_tf32_mode` gates after its manifest regeneration, and
+  the fp8 device-guard commit added five gates without one.
+
+### Fixed — inventory-scanner review findings, pinned by committed probes
+
+- The batch review probed `gpu-gate-inventory.awk` with synthetic files and
+  found holes the in-tree stubs don't exercise: a one-line
+  `#[ignore] #[cfg(not(feature = "cuda"))]` classified `gpu` (a permanent
+  NOTFOUND back from the dead), the mirror order vanished from the
+  inventory entirely, a block-comment line inside the attribute stack
+  cleared the cfg flag, and spacing variants of the cfg escaped the
+  anchored regex. All fixed; a block-comment state machine also stops the
+  scanner from parsing `#[ignore]` prose inside `/* ... */` as gates.
+- The probes are committed as `.rs-probe` fixtures with a 7-gate test
+  (`gpu_gate_inventory_scanner`) — not inline strings, which the
+  line-oriented scanner itself inventoried as phantom gates; not `.rs`
+  files, which the inventory's `find` would walk.
+- Known limit, documented in the scanner: `#[cfg(not(feature = "cuda"))]`
+  on a `mod` of stubs is still defeated by the boundary rule (surfaces as a
+  visible NOTFOUND, never silent coverage loss). No in-tree stub is
+  mod-scoped; brace tracking waits until one is.
+- The OP_T measurement children now strip `NSL_MATMUL_PEDANTIC`, which
+  outranks `NSL_MATMUL_TF32` and would have silently measured pedantic math
+  in all four grid cells under a pedantic-pinned shell.
+
+### Added — dispatch-path correctness gates UNDER TF32
+
+- Every pinned matmul suite documents the same gap: dispatch paths were
+  gated at full f32 only, while TF32 — the shipped default — selects a
+  different cuBLAS kernel family that could carry its own operand-mapping
+  bug. `matmul_dispatch_under_tf32` closes it from fresh child processes
+  (the math mode resolves once per process): transposed left/right/both,
+  batch collapse, the tied-LM-head composite, and fused wgrad accumulation,
+  each against an f64 CPU reference at 5e-3 relative (~5x TF32 drift,
+  three orders below a mapping bug).
+- Two anti-vacuity devices: a probe that requires a 256^3 product to drift
+  MORE than full f32 ever would (so a math-mode resolver regression fails
+  loudly instead of making the gates trivially green), and a path witness
+  that counts `nsl_strided_copy_f32` launches — at small K the OP_T and
+  copy arms produce bit-identical values, so values alone cannot prove
+  which arm ran.
+- `op_t_exemption_is_correct_under_tf32` is the named precondition for
+  flipping the `NSL_MATMUL_TRANSPOSE_VIEWS` default, now that the
+  reproducer below shows OP_T is faster under TF32.
+
+### Added — committed reproducer for the OP_T-vs-copy measurement, which now flips under TF32
+
+- `matmul_transposed_operand::the_op_t_tradeoff_is_remeasurable` (class
+  `diagnostic`, manual-run) re-measures the grid behind the
+  `NSL_MATMUL_TRANSPOSE_VIEWS` default from four fresh child processes —
+  {copy+OP_N, OP_T} × {full f32, TF32} over the three documented shapes —
+  with the clock-ramp discipline (1 s busy warmup per shape, drained
+  per-call timing). Until now the default rode on a one-off hand
+  measurement reconstructible only from prose.
+- First run reproduced the documented f32 table (OP_T 1.40x slower on the
+  LM head vs the recorded 1.51x) **and showed the premise inverts under
+  the new TF32 default**: OP_T measured faster on every shape (0.65x /
+  0.72x / 0.46x). The default stays OFF — OP_T has no correctness gates
+  under TF32 yet, and a dispatch default should not move on one grid — but
+  both doc sites now record that the "copy wins" table is a property of
+  FP32-core math, and the flip is an open decision rather than an
+  oversight.
+
+### Changed — `@fp8_compute × --source-ad` joins the feature-composition registry
+
+- The item-9 refusal is now a registered item-20 rule
+  (`@fp8_compute` Conflicts `--source-ad`, enforced in `stmt.rs`), so the
+  deleted-refusal and fragment gates defend it like every other composition.
+  The refusal message now names `--source-ad` explicitly — required by the
+  fragment-distinctiveness gate, and clearer for the user. The subprocess
+  sweep cannot drive a source-level decorator from the command line, so the
+  rule is covered by the source tier only.
+
+### Fixed — fp8 host-path FFIs: GPU segfault and wrong tape gradients
+
+- Every fp8 FFI (`nsl_fp8_cast`, `nsl_fp8_compute_scale`,
+  `calibrate_gradient_scale`, `nsl_fp8_update_calibration`,
+  `nsl_mxfp8_quantize`, `nsl_nvfp4_quantize`) walked `t.data` with
+  `from_raw_parts` as host memory. Two live consequences:
+  - **GPU segfault:** the tape-AD backward for `@fp8_compute` hands
+    GPU-resident gradients straight into `calibrate_gradient_scale` and
+    `nsl_fp8_cast`, so `@fp8_compute` + `--tape-ad` + GPU crashed at the
+    first backward step — and since source AD refuses `@fp8_compute`, that
+    was the only path. Reproduced as SIGSEGV by the new
+    `fp8_gpu_device_guard` gates against the pre-fix code.
+  - **Wrong CPU gradients:** the backward transposes `saved_a`/`saved_b` as
+    zero-copy views, and the stride-blind cast read the shared storage flat
+    while stamping fresh row-major strides onto the view's shape — turning
+    the transpose into a reshape. `grad_A = G @ reshape(B)` instead of
+    `G @ B^T`: misplaced operands, not reduced precision. Confirmed by
+    mutation control (the new rectangular-shape tape gate fails against the
+    old code with errors of order 1e0).
+- Fix: a `stage_for_host_read` guard on every host-path FFI — D2H transfer
+  for device tensors, `nsl_tensor_contiguous` for CPU views, loud refusal
+  (abort with a named FFI) for dtypes outside {f32, f64}, which would read
+  at the wrong element stride. Quantizer outputs are built on host and moved
+  to the input's device, replacing the old behavior of stamping the input's
+  device label onto a host allocation.
+- `nsl_fp8_update_calibration` refuses a device-resident or non-{f32,f64}
+  running-max state tensor instead of corrupting it through a host
+  read-modify-write (no in-tree caller creates one).
+- New gates: 3 CPU unit gates (view ordering for cast + block quantizer,
+  end-to-end tape gradients on rectangular shapes) and 5 GPU gates
+  (`fp8_gpu_device_guard`: cast/scale/backward/tape/block-quantizers vs the
+  CPU run on identical values). The two load-bearing GPU gates joined the
+  canary list (26 entries).
+- Post-review hardening: the guard no longer trusts `is_contiguous()` for
+  rank-1 tensors (it returns true regardless of strides, so a 1-D stride-0
+  expand view would have flat-read past its buffer — gated by a new unit
+  test with a mutation control); the tape backward now quantizes each
+  operand ONCE instead of staging the gradient three times per matmul
+  (five→three synchronous PCIe round-trips per step on GPU); the dtype
+  refusal now fires for empty tensors on every FFI.
+
+### Changed — TF32 is now the matmul default (`NSL_MATMUL_TF32=0` opts out)
+
+- Every `cublasSgemm` NSL issues now runs on tensor cores with a 10-bit
+  mantissa instead of FP32 CUDA cores. This is a numerics change for the whole
+  stack, taken deliberately.
+- **Measured at model scale, not extrapolated from a microbenchmark.** On a
+  Coder-50M forward (RTX 5070 Ti, sm_120), steady state over the second half
+  of a 20-forward loop:
+
+  | | FP32 cores | TF32 | |
+  |---|---|---|---|
+  | sgemm | 33.3 ms | 21.4 ms | **1.55x** |
+  | all kernels | 76.5 ms | 64.8 ms | **1.18x** |
+
+  Three paired runs, spread under 5%. **The end-to-end win is ~15%, not 55%** —
+  GEMM is only ~44% of kernel time at this size. The N=2048 microbenchmark says
+  1.60x and agrees with the sgemm column; it says nothing about the model.
+- A first attempt measuring ONE forward per configuration gave
+  `{9.9, 9.7, 10.1, 25.3, 25.5}` against `{3.3, 24.1, 35.5, 3.6, 10.3}` — the
+  same configuration swinging 10x, because the SM clock idles at 1515 MHz
+  against a ~2900 boost and a single forward samples a different point on the
+  ramp each run. Numbers from unlooped GPU runs are not evidence.
+- Cost: ~13 bits of mantissa per product. Measured at N=2048, pedantic f32
+  drifts 1.36e-6 and TF32 9.48e-4 — **698x**, bit-deterministic across runs.
+- `NSL_MATMUL_TF32` is a tri-state: only the literal `"1"` and `"0"` are
+  honoured and anything else falls through to the default, so a typo'd
+  `NSL_MATMUL_TF32=true` cannot quietly change the arithmetic.
+  `NSL_MATMUL_PEDANTIC=1` and the `strict-matmul` feature still win.
+- **Known property of the dispatcher, now default-visible:** the naive PTX
+  matmul kernels run on FP32 cores regardless of the cuBLAS math mode, so a
+  product that falls off the cuBLAS path is computed at a different precision
+  than the same product on it — `matmul_batch_collapse` measures 1.03e-3
+  versus 9.75e-7 for the two arms. In practice nothing falls off: a kernel
+  histogram of a 20-forward Coder-50M loop shows 758 `sgemm_cublas` + 212
+  `sgemm_cublas_batched` and **zero** naive-matmul launches, because
+  `nsl_tensor_matmul` materialises every non-expressible operand first.
+- Gates: the operand-mapping suites (`matmul_batch_collapse`,
+  `matmul_transposed_operand`) pin `NSL_MATMUL_TF32=0` rather than widening
+  their tolerances. They exist to catch a crossed `lda`/`ldb` or an `OP_T` on
+  the wrong operand, which produce errors of order 1e0 — full f32 keeps three
+  orders of magnitude of headroom for free. `matmul_tf32_mode` asserts both
+  halves from fresh child processes: the default IS TF32, and the opt-out
+  restores f32.
+
+### Removed — the M31 fusion-graph subsystem (4,200 lines that never ran)
+
+- `epilogue_fusion.rs` (1237), `reduction_fusion.rs` (1573) and
+  `fusion_graph.rs` (496) implemented matmul-epilogue fusion, map-into-reduction
+  fusion, and DAG-level fusion planning. A `FusionGraph` was never constructed
+  outside a `#[cfg(test)]` block or a test file, so **none of the three passes
+  was reachable from any compilation**. Their only non-test references were to
+  each other.
+- `epilogue_fusion`'s PTX synthesiser was also wrong, not merely unused: it
+  computed an indexed load (`add.u64 %rd6, %rd2, %rd5`) against an
+  **un-indexed store** (`st.global.f32 [%rd4]`), so every thread would have
+  written element 0. Nothing noticed because the kernel had never been
+  assembled by ptxas, let alone launched; all ten of its tests were
+  `.contains()` checks on the emitted string.
+- Went with them: `csha_apply::apply_marks_to_graph` / `is_csha_fused` (CSHA's
+  interface to the graph — the marks it applied had no reader), the two test
+  files that existed solely to exercise the dead passes, and one snapshot.
+  `FusionMark` and its producers stay: the fused-backward emitter consumes
+  them directly.
+- Also removed `fp8.rs`'s `compile_fp8_matmul` and both
+  `emit_fp8_matmul_ptx{,_wgmma}` emitters (~365 lines). Both were already
+  `#[allow(dead_code)]`, `compile_fp8_matmul` had no caller outside its own
+  file, and the PTX targets `sm_90` — unloadable on this repo's sm_120
+  hardware. Every test was a string `.contains()`.
+- Docs corrected rather than deleted: `docs/wiki/Glossary.md` claimed `@fuse`
+  works "via the epilogue fusion pass in `epilogue_fusion.rs`". It does not —
+  `stmt.rs` validates the body and extracts its op chain for a fused launch at
+  each call site. `docs/summaries/02-gpu-kernels-and-optimization.md` described
+  all three passes as shipping features.
+
+### Fixed — cuda-graph eager repair replayed a weight-grad gemm as a plain one
+
+- `GpuOp::Sgemm` recorded no operand transposition and no wrapper identity.
+  `sgemm_wgrad_accum` and the plain row-major path both fed one shared hook,
+  while handing cuBLAS different mappings — `OP_N/OP_T` for the
+  weight-gradient contraction versus `OP_N/OP_N` with the row-major swap.
+- The unconditional half was **replay**: the dispatch branched on
+  `batch == 1` alone, so a recorded wgrad op was reconstructed as a
+  row-major gemm regardless of what else it carried. Wrong contraction,
+  silently wrong gradients, no error.
+- Equality and the digest could also collide, but only for two gemms sharing
+  all three device pointers as well as `(m, n, k, alpha, beta)` — a much
+  narrower precondition than the replay bug, and one an earlier draft of this
+  entry overstated as "the same eight values compare equal". Corrected here.
+- `GpuOp::Sgemm` gains `kind` (`RowMajor` / `WgradAccum`) plus `transa`/`transb`,
+  in equality, in the digest, and in replay dispatch. Four unit gates in
+  `graph_capture.rs` now pin that those three agree — the failure class being
+  fixed is precisely "three places that must agree, and one didn't", and
+  nothing had pinned it.
+
+### Fixed — `--profile-kernels` reported every kernel as 0.0 ms
+
+- `kernel_profile.json` gave `"dur": 0.0` and `"ts": 0.0` for every launch and
+  `total_kernel_time_ms: 0.0`, on runs doing tens of milliseconds of real GPU
+  work. Long-standing enough that a previous campaign attributed kernel cost
+  by launch count and bytes moved instead.
+- Root cause is `atexit` ordering. Handlers run LIFO. The profiler registered
+  its flush from `nsl_kernel_profiler_start`, inside `nsl_args_init` — before
+  the first kernel launch, so before the CUDA context exists, so before the
+  driver registers its own teardown. LIFO ran the driver's teardown FIRST and
+  the flush met a deinitialised driver. Reproduced deliberately: the flush
+  then reports `744 of 744 timing queries FAILED (CUDA_ERROR_DEINITIALIZED)`.
+  (The same hazard is already documented for the cuBLAS handle, leaked on
+  purpose because destroying it post-teardown "produces spurious driver
+  errors".) Registration moved to `ensure_event_pool_initialized`, which runs
+  from `kernel_launch` after `ensure_context()`.
+- Second defect, independent: `cu_event_elapsed_time` discarded its
+  `CUresult`, and `cuEventElapsedTime_v2` leaves its out-param UNTOUCHED on
+  failure — so a failed query became a 0.0 indistinguishable from a
+  measurement. It now returns the status; the flush counts failures, prints a
+  refusal naming the driver error, and stamps `timing_valid` /
+  `timing_query_failures` into the JSON so a consumer can reject the file.
+- Measured after the fix on the cuda-graph fixture: 412/412 durations
+  non-zero, `total_kernel_time_ms: 52.26`, `timing_valid: true`.
+
+### Fixed — `@fp8_compute` was silently ignored under source-to-source AD
+
+- The decorator routes matmuls to `nsl_fp8_matmul_training` so the backward
+  records a `TapeOp::Fp8MatMul` and applies the E5M2 round-trip. That routing
+  lives in `expr/advanced.rs`, which source AD does not use: it inlines the
+  method body into a Wengert list, and `wengert_lower.rs` lowers
+  `PrimalOp::Matmul` to an unconditional `nsl_tensor_matmul`. Neither
+  `source_ad.rs` nor `wengert_lower.rs` contains a single occurrence of "fp8".
+- So a user who wrote the decorator and trained with `--source-ad` — the
+  default, and the path every production model in this repo uses — got plain
+  f32 with no error and no warning.
+- The train/grad lowering now refuses, naming each offending
+  `Model::method` and pointing at `--tape-ad`, where the decorator does take
+  effect. Sub-model methods reached through `self.field` are covered, which is
+  how every real model here is structured.
+
+### Changed — dispatch narrowing in `gpu_matmul_f32` (documenting an item 9 side effect)
+
+- The 2-D cuBLAS arm's condition changed from `total_batch == 1` to also
+  requiring each operand be contiguous or an expressible transpose. A strided
+  2-D operand that is neither now falls through to the naive `nsl_bmm_f32`
+  kernel rather than cuBLAS. Not a live behaviour change — `nsl_tensor_matmul`
+  is the sole caller and materialises every non-exempt operand first, and both
+  kernels are stride-blind — but it removes a defence-in-depth property and
+  went undocumented when it landed.
+
+### Fixed — GPU matmul read non-f32 tensors as f32, two bytes for one
+
+- `gpu_matmul_f32` never inspected `.dtype`: it sizes the output `* 4`,
+  hardcodes the output dtype to f32, and casts `a.data as *const f32`. A bf16
+  or f16 operand carries the same element COUNT in half the bytes, so it was
+  read past the end of its allocation — returning plausible numbers rather
+  than faulting. It now refuses, naming the dtypes. Mixed-precision GEMM
+  dispatch is roadmap item 9 and remains unimplemented; saying so is the only
+  honest option.
+- Relatedly, `gpu_matmul_f32` returns 0 on a cuBLAS error with a comment
+  saying that is "so callers can detect the failure". No caller ever did — the
+  null propagated and the process died wherever it was next dereferenced.
+  `nsl_tensor_matmul` now checks it, with the shapes still in scope.
+
+### Added — `NSL_MATMUL_TRANSPOSE_VIEWS=1`: CUBLAS_OP_T for transposed operands (opt-in, and the default is faster)
+
+- A 2-D transposed view can go to cuBLAS as `OP_T` instead of being copied.
+  For the weight-tied LM head (`x @ embed.transpose(0,1)`,
+  models/coder50m/model.nsl:80) the copy is 25,165,824 elements — 96 MiB per
+  forward, through a kernel doing a software 64-bit div/rem per element. On a
+  Coder-50M forward, `nsl_strided_copy_f32` was the most-launched kernel of
+  all: 105 of 308 launches, 453 MB moved.
+- **The obvious conclusion is wrong, and only measurement caught it.** That
+  copy is not waste; it buys a much faster GEMM:
+
+  | shape | `OP_T` | copy + `OP_N` | verdict |
+  |---|---|---|---|
+  | `[2048,512] @ [512,49152]` (LM head) | 5.92 ms | 1.04 + 2.89 = **3.93 ms** | OP_T **1.51x slower** |
+  | `[2048,512] @ [512,4096]` | 0.344 ms | 0.351 ms | a wash |
+  | `[512,512] @ [512,512]` | **0.023 ms** | 0.043 ms | OP_T 1.9x faster |
+
+  End to end: 29 ms/forward with the copy, 33 ms without; peak GPU 2.10 GB
+  versus 2.01 GB. So it trades ~90 MB of peak memory for ~4 ms per forward —
+  useful when memory binds, a regression otherwise. Hence opt-in, and hence a
+  gate asserting the default still materialises.
+- Not defaulted on behind a shape heuristic: three data points is not a cost
+  model, and this repo already shipped one of those (item 10's autotune DB
+  ranked variants by a roofline estimate with no measurement behind it).
+
+### Fixed — every transformer projection ran on a naive scalar PTX kernel, not cuBLAS
+
+- `gpu_matmul_f32` dispatched to cuBLAS **only when `total_batch == 1`**;
+  everything else launched `nsl_bmm_f32`, a 16x16 scalar-`fma.rn.f32` kernel.
+  `total_batch` counts the OUTPUT batch dims, so `[B,S,C] @ [C,O]` — the shape
+  of every transformer projection — had `total_batch = B` and took the naive
+  arm, and nothing in codegen flattened it first. A `GroupedQueryAttention`
+  forward profiled six `nsl_bmm_f32` launches and ZERO cuBLAS calls.
+- Two dispatch paths added. `[..,m,k] @ [k,n]` with a batch-free B collapses to
+  a single sgemm — a reinterpretation of A's existing buffer as
+  `(batch*m) x k`, summing the same products in the same order. Genuinely
+  batched products (in a transformer, QK^T and PV) go to
+  `cublasGemmStridedBatchedEx` via a new row-major `sgemm_batched_row_major`.
+  `NSL_MATMUL_NO_BATCH_COLLAPSE=1` restores the old dispatch.
+- Measured on an RTX 5070 Ti / CUDA 13.3: `[8,1024,512] @ [512,512]`
+  **0.67 -> 29.5 TFLOP/s**; a Coder-50M `[2,1024]` forward
+  **147.1 -> 33.3 ms (4.42x)**; GQA forward 6 naive launches -> 0.
+- `GpuOp::Sgemm` gains batch/stride fields. Batched products used to reach a
+  captured CUDA-graph region as `GpuOp::Kernel`, whose params blob
+  distinguished them for free; as cuBLAS pseudo-ops they would otherwise have
+  compared equal on `(a,b,c,m,n,k)` alone and replayed a graph built for the
+  wrong shape.
+
+### Fixed — `NSL_MATMUL_TF32=1` did nothing, and the startup banner said the opposite
+
+- The 2026-04-21 cuBLAS-swap work recorded `CUBLAS_DEFAULT_MATH` as "TF32
+  tensor cores on sm_80+" and shipped a banner telling users pedantic mode was
+  "~5-10x slower than TF32 default". Both false: that mode does not enable
+  TF32 for `cublasSgemm`. Measured at 4096^3 — default 32.9 TFLOP/s, pedantic
+  **33.2** (marginally *faster*). `NSL_MATMUL_TF32=1` selected the same
+  do-nothing variant, so there was no way to reach tensor cores at all outside
+  the muon batch engine. (The P6 muon notes below had already recorded the
+  discrepancy; nothing acted on it.)
+- `CublasMathMode` is now `{Fp32Cores, Pedantic, Tf32}`, named for what each
+  actually does, and `Tf32` sets `CUBLAS_TF32_TENSOR_OP_MATH`. Measured:
+  N=2048 **4.12x** faster / 698x less accurate, N=4096 **1.51x** / 190x.
+- **The default is unchanged** — it is what NSL has always really done, only
+  now described accurately. Flipping it to TF32 buys 1.5-4x on every matmul
+  but costs ~13 bits of mantissa per product, which needs a tolerance audit
+  across every numerical gate first. Deliberately left as a separate decision.
+- `matmul_cublas_tf32_default_sanity.rs` could not have caught any of this:
+  its 5e-3 tolerance is satisfied by real f32 and real TF32 alike. The new
+  `matmul_tf32_mode.rs` asserts TF32 is both measurably faster AND measurably
+  less accurate, because either alone passes for the wrong reasons.
+
 ### Fixed — FlashAttention forward output and fused-backward operands crossed the f16/f32 boundary as raw bits
 
 - **Every** FlashAttention forward kernel (classic and v2) stores its

@@ -23,6 +23,29 @@ use nsl_runtime::tensor::{
 };
 use nsl_runtime::{nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d};
 
+/// Pin cuBLAS to full f32 for this process before any GPU work.
+///
+/// The matmul default is TF32 (see `cuda::resolve_math_mode`), which drifts
+/// ~1e-3 relative. The gates in this file compare against an f64 CPU
+/// reference at ~1e-5 in order to catch **dispatch** bugs — stride-blindness,
+/// a crossed operand mapping, a fused GEMM writing the wrong accumulation.
+/// Those err by order 1e0, so full f32 keeps four orders of magnitude of
+/// headroom; widening to accommodate TF32 would spend that for nothing.
+///
+/// Sound because `resolve_math_mode` is read exactly once per process, inside
+/// `cublas_handle()`'s `OnceLock`, and every GPU test in this file calls this
+/// first — so whichever runs first performs the init with the variable
+/// already set. Self-checking: if that stops holding, the test fails with a
+/// ~1e-4 drift message rather than passing quietly.
+///
+/// NOT covered here: whether these paths are correct *under* TF32. The math
+/// mode is process-global, so that needs a child process (the pattern
+/// `matmul_tf32_mode.rs` uses). The risk is low — the mode applies identically
+/// to both arms of every comparison in this file — but it is a real gap.
+fn pin_full_f32() {
+    std::env::set_var("NSL_MATMUL_TF32", "0");
+}
+
 fn cuda_available() -> bool {
     if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
         return false;
@@ -72,6 +95,7 @@ fn det_seq(seed: u32, n: usize) -> Vec<f32> {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn gpu_matmul_with_transposed_view_matches_reference() {
+    pin_full_f32();
     if !cuda_available() {
         return;
     }
@@ -113,6 +137,7 @@ fn gpu_matmul_with_transposed_view_matches_reference() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn gpu_matmul_with_transposed_view_left_matches_reference() {
+    pin_full_f32();
     if !cuda_available() {
         return;
     }
@@ -152,6 +177,7 @@ fn gpu_matmul_with_transposed_view_left_matches_reference() {
 use nsl_runtime::tensor::nsl_tensor_exp;
 use nsl_runtime::tensor::nsl_tensor_mul_scalar;
 
+
 /// exp() of a transposed GPU view must equal exp of the logically-transposed
 /// values (gpu_elementwise_unary's contiguous guard). Before the guard, the
 /// kernel read the view's storage flat, producing values in transposed order
@@ -159,6 +185,7 @@ use nsl_runtime::tensor::nsl_tensor_mul_scalar;
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn gpu_unary_on_transposed_view_matches_reference() {
+    pin_full_f32();
     if !cuda_available() {
         return;
     }
@@ -186,6 +213,7 @@ fn gpu_unary_on_transposed_view_matches_reference() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn gpu_scalar_op_on_transposed_view_matches_reference() {
+    pin_full_f32();
     if !cuda_available() {
         return;
     }

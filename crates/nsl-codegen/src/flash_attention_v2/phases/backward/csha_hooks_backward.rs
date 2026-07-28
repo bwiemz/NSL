@@ -388,19 +388,39 @@ pub fn emit_drope_branch(
             ptx.push_str("    ld.global.b16 %h_tmp, [%rd36];  // sin (f16)\n");
             ptx.push_str("    cvt.f32.f16 %f1, %h_tmp;\n");
 
-            // dY addr: tile_off + (row*head_dim + 2*pair_in_row)*4 (f32 tile)
+            // dY addr: tile_off + (row*head_dim + x0_col)*4 (f32 tile).
+            // The INVERSE rotation must pair the same two elements the
+            // forward sweep rotated, or the composition is not the identity:
+            //   Adjacent  x0_col = 2*pair, sibling at +1 col  (+4 bytes)
+            //   HalfSplit x0_col =   pair, sibling at +half_dim cols
+            // Getting this wrong leaves dv/dwv correct (V is never rotated)
+            // while every Q/K-derived gradient is wrong — which is exactly
+            // how the HalfSplit mismatch showed up in the oracle.
+            let sibling_bytes = match config.rope_style {
+                crate::flash_attention::RopeStyle::Adjacent => 4,
+                crate::flash_attention::RopeStyle::HalfSplit => (head_dim / 2) * 4,
+            };
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd36, %rd33, {};  // row * head_dim\n", head_dim
             ));
-            ptx.push_str("    shl.b64 %rd37, %rd34, 1;  // 2 * pair_in_row\n");
-            ptx.push_str("    add.u64 %rd36, %rd36, %rd37;\n");
+            match config.rope_style {
+                crate::flash_attention::RopeStyle::Adjacent => {
+                    ptx.push_str("    shl.b64 %rd37, %rd34, 1;  // 2 * pair_in_row\n");
+                    ptx.push_str("    add.u64 %rd36, %rd36, %rd37;\n");
+                }
+                crate::flash_attention::RopeStyle::HalfSplit => {
+                    ptx.push_str("    add.u64 %rd36, %rd36, %rd34;  // + pair_in_row\n");
+                }
+            }
             ptx.push_str("    shl.b64 %rd36, %rd36, 2;  // *4 (f32 slot)\n");
             ptx.push_str(&format!(
                 "    add.u64 %rd36, %rd36, {tile_off};\n"
             ));
             ptx.push_str("    add.u64 %rd36, %shmem_base, %rd36;\n");
             ptx.push_str("    ld.shared.f32 %f2, [%rd36];  // dY[2i]\n");
-            ptx.push_str("    ld.shared.f32 %f3, [%rd36 + 4];  // dY[2i+1]\n");
+            ptx.push_str(&format!(
+                "    ld.shared.f32 %f3, [%rd36 + {sibling_bytes}];  // dY[2i+1]\n"
+            ));
 
             // dx0 = dY[2i]*cos + dY[2i+1]*sin
             ptx.push_str("    mul.f32 %f4, %f2, %f0;\n");
@@ -411,7 +431,9 @@ pub fn emit_drope_branch(
             ptx.push_str("    fma.rn.f32 %f5, %f3, %f0, %f5;\n");
 
             ptx.push_str("    st.shared.f32 [%rd36], %f4;\n");
-            ptx.push_str("    st.shared.f32 [%rd36 + 4], %f5;\n");
+            ptx.push_str(&format!(
+                "    st.shared.f32 [%rd36 + {sibling_bytes}], %f5;\n"
+            ));
 
             ptx.push_str(&format!(
                 "V2_BWD_DROPE_{label}_SKIP_{q_tile_iter}_{k}:\n"
@@ -987,11 +1009,26 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
 /// Cargo feature via `CheckpointExtras::bypass_r0_for_testing()`. In
 /// production the R0 refusal at `synthesize_backward_with_recompute`
 /// prevents reaching this codepath — see cycle-10 Phase F.
+/// Recompute `RMSNorm(x_raw)` for one tile into the SMEM xnorm scratch.
+///
+/// `row_base_reg` is the PTX register holding the ABSOLUTE first row of the
+/// tile being recomputed, and `rows` is how many rows that tile has.
+///
+/// These are parameters and not hardcoded to `%q_start`/`block_q` because the
+/// only production caller — `emit_kv_recompute` — is recomputing the **KV**
+/// tile, which begins at `%k_start`. Hardcoding `%q_start` silently produced
+/// K/V from the wrong rows of `x` for every `(q_tile, kv_tile)` pair where the
+/// two differ, i.e. everywhere except the single-tile case
+/// `seq == block_q == block_kv`. That is the "GROSS numerical error at
+/// multi-tile" recorded in 8f774ada and refused by R7: measured dq error
+/// 2.152e3 against `max|ref|` 4.4 before this fix.
 pub fn emit_prologue_recompute_from_raw(
     ptx: &mut String,
     config: &FlashAttentionConfig,
     q_tile_iter: u32,
     namespace_suffix: &str,
+    row_base_reg: &str,
+    rows: u32,
 ) {
     if config.csha.is_none() {
         ptx.push_str(
@@ -1000,7 +1037,8 @@ pub fn emit_prologue_recompute_from_raw(
         return;
     }
     let head_dim = config.head_dim as u32;
-    let block_q = config.block_q as u32;
+    // (no `block_q` here — the active-row count is the caller's `rows`, since
+    // this recomputes the KV tile, not the Q tile.)
     let xn_off = recompute_xnorm_offset(config);
 
     ptx.push_str(&format!(
@@ -1035,21 +1073,27 @@ pub fn emit_prologue_recompute_from_raw(
     ptx.push_str("    setp.eq.u64 %p_xraw_null, %rd_x_raw_ptr, 0;\n");
     ptx.push_str("    @%p_xraw_null trap;\n");
 
-    // One thread per row of the Q tile (block_q rows, tid_x identifies
-    // the row in this scope). Other lanes idle through both passes;
-    // matches `emit_xnorm_recompute`'s partition contract.
+    // One thread per row of the tile being recomputed (`rows` rows, tid_x
+    // identifies the row in this scope). Other lanes idle through both
+    // passes; matches `emit_xnorm_recompute`'s partition contract.
     ptx.push_str(&format!(
-        "    setp.lt.u32 %p_row_active{namespace_suffix}, %tid_x, {block_q};\n"
+        "    setp.lt.u32 %p_row_active{namespace_suffix}, %tid_x, {rows};\n"
     ));
     ptx.push_str(&format!(
         "    @!%p_row_active{namespace_suffix} bra V2_PROLOGUE_RECOMPUTE_FROM_RAW_DONE{namespace_suffix};\n"
     ));
 
     // ── Address: x_raw_row_base = x_raw_ptr +
-    //               ((batch*heads + head_idx)*seq + (q_start+tid_x)) * head_dim * 4
+    //               ((batch*heads + head_idx)*seq + (row_base+tid_x)) * head_dim * 4
     //   (head_dim==d_model in the v1.1 smoke scope; see emit_xnorm_recompute).
+    //
+    // `row_base_reg` MUST be the base of the tile whose x_norm the caller is
+    // about to consume. For `emit_kv_recompute` that is `%k_start`, not
+    // `%q_start` — see this function's doc comment.
     ptx.push_str("    cvt.u64.u32 %rd_xr0, %tid_x;\n");
-    ptx.push_str("    add.u64 %rd_xr0, %rd_xr0, %q_start;        // row_global\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd_xr0, %rd_xr0, {row_base_reg};        // row_global\n"
+    ));
     ptx.push_str("    mul.lo.u64 %rd_xr1, %head_idx, %rd6;       // head_idx * seq\n");
     ptx.push_str("    add.u64 %rd_xr1, %rd_xr1, %rd_xr0;\n");
     ptx.push_str("    mul.lo.u64 %rd_xr1, %rd_xr1, %rd7;         // * head_dim\n");
@@ -1373,8 +1417,24 @@ pub fn emit_kv_recompute(
     ptx.push_str("    } // end Cycle-14 kv_recompute null-guard reg scope\n");
 
     // Step 2: produce x_norm in SMEM scratch via the cycle-11 Task-2 emitter.
+    //
+    // ROW BASE IS `%k_start`, NOT `%q_start`. Steps 3/4 below consume this
+    // scratch to build K and V for the KV tile, so the rows normalised here
+    // must be the KV tile's rows. This used to be hardcoded to `%q_start`,
+    // which only coincides with `%k_start` when there is a single tile
+    // (seq == block_q == block_kv) — the "smoke scope" the step-3 indexing
+    // note describes. At multi-tile every (q_tile, kv_tile) pair with
+    // q_tile != kv_tile recomputed K/V from the wrong rows of x, which is
+    // the Path-B "GROSS numerical error at multi-tile" R7 refuses.
     let suffix = format!("_bwd_recompute_{kv_iter_suffix}");
-    emit_prologue_recompute_from_raw(ptx, config, 0, &suffix);
+    emit_prologue_recompute_from_raw(
+        ptx,
+        config,
+        0,
+        &suffix,
+        "%k_start",
+        config.block_kv as u32,
+    );
 
     // Step 3: K_proj recompute -> %k_smem_base
     ptx.push_str(&format!(
@@ -1411,7 +1471,14 @@ pub fn emit_kv_recompute(
     ptx.push_str(&format!(
         "    // Cycle-11 sec.3 step 5: K RoPE epilogue ({kv_iter_suffix})\n"
     ));
-    crate::flash_attention_v2::phases::forward::csha_hooks::emit_rope_k_epilogue(ptx, config);
+    // ROW BASE IS `%k_start`. This rotates the K tile the kv loop is currently
+    // on; `%q_start` (the old hardcoded base) only coincides at single tile.
+    // A wrong rotation here does not merely perturb K: the backward still
+    // normalises with the FORWARD's saved LSE, so P = exp(S_wrong - LSE_correct)
+    // stops being a distribution and the gradients explode rather than drift.
+    crate::flash_attention_v2::phases::forward::csha_hooks::emit_rope_k_epilogue(
+        ptx, config, "%k_start",
+    );
 
     // Step 6: terminating bar.sync 0 to satisfy kv_load's post-condition
     // contract (downstream ds_compute consumers in ds_compute.rs:309,330
@@ -1425,15 +1492,15 @@ pub fn emit_kv_recompute(
 #[cfg(test)]
 mod cycle11_recompute_tests {
     use super::*;
-    use crate::flash_attention::{
-        CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
-    };
+    // `RopeStyle` is referenced fully-qualified below (matching the emitter
+    // above), so it is deliberately not imported here.
+    use crate::flash_attention::{CheckpointExtras, CshaExtras, FlashAttentionConfig};
 
     fn cfg_full_bypass() -> FlashAttentionConfig {
         FlashAttentionConfig {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit,
+            rope_style: crate::flash_attention::RopeStyle::HalfSplit,
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
@@ -1450,7 +1517,7 @@ mod cycle11_recompute_tests {
     fn cycle11_emit_prologue_recompute_from_raw_uses_x_raw_not_csha_x_ptr() {
         let cfg = cfg_full_bypass();
         let mut ptx = String::new();
-        emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0");
+        emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0", "%k_start", cfg.block_kv as u32);
 
         // Reads from x_raw_ptr (the Cycle-10 trap T7 fix).
         assert!(
@@ -1494,7 +1561,7 @@ mod cycle11_recompute_tests {
         let mut cfg = cfg_full_bypass();
         cfg.csha = None;
         let mut ptx = String::new();
-        emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0");
+        emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0", "%k_start", cfg.block_kv as u32);
         assert!(ptx.contains("csha=None, no emission"));
         assert!(!ptx.contains("ld.param.u64 %rd_x_raw_ptr"));
     }
@@ -1562,7 +1629,8 @@ mod cycle11_recompute_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    // `RopeStyle` is referenced fully-qualified below; no import needed.
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig};
 
     fn base_cfg_fused_backward(
         block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
@@ -1571,7 +1639,7 @@ mod tests {
         FlashAttentionConfig {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit,
+            rope_style: crate::flash_attention::RopeStyle::HalfSplit,
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {

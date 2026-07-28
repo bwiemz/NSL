@@ -1,0 +1,9 @@
+#[cfg(not(feature = "cuda"))]
+#[test]
+#[ignore = "FP8 dispatcher tests require the cuda feature + sm_89+"]
+fn reasoned_stub() {}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+#[ignore]
+fn bare_stub() {}

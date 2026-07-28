@@ -147,6 +147,12 @@ fn clear_csha_per_function_caches_empties_both_maps() {
             sin:     Value::from_u32(408),
             backward_ptx_data_id: None,
             backward_name_data_id: None,
+            // PCA Tier B planner spec §5. This test asserts only that
+            // clear_csha_per_function_caches() empties the record, so the
+            // Tier-B-on IDs are irrelevant to it — None is the non-
+            // segment_masked production value.
+            backward_tier_b_on_ptx_data_id: None,
+            backward_tier_b_on_name_data_id: None,
         },
     );
 

@@ -108,6 +108,15 @@ model TinyAttn:
 
 let m = TinyAttn()
 m.to(cuda)
+# x MUST vary along the sequence axis. With `ones([1,1,32,32])` every row of
+# V is identical, so dP_ij is constant in j and
+# dS = P * (dP - sum_k P_ik dP_ik) vanishes IDENTICALLY. dQ = dS.K and
+# dK = dS^T.Q are then exactly zero, so dWq and dWk are zero as a matter of
+# arithmetic — and the all-four-params assertion below could never hold. The
+# kernel was correct the whole time; the probe was degenerate (the same trap
+# recorded for CSHA cycle 18). Both sides of the 2026-07-28 merge fixed this
+# independently; the sin-based input (with the GPU placement its parity gate
+# certifies against) is the survivor.
 let x = ((tensor_sin(arange(1024.0) * 0.37)).reshape([1, 1, 32, 32])).to(cuda)
 let y = (zeros([1, 1, 32, 32])).to(cuda)
 

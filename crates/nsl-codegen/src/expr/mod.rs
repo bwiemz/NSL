@@ -19,6 +19,107 @@ use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::operator::UnaryOp;
 use nsl_semantic::types::Type;
 
+/// Whether a tensor method's result is an OWNING reference the caller must
+/// release.
+///
+/// Covers every method `compile_tensor_method_call` (`expr/advanced.rs`) can
+/// lower — `every_tensor_method_is_classified` enforces that direction. The
+/// converse does NOT hold and is not enforced: the reduction/elementwise names
+/// below are inherited from the predecessor allowlist and most of them
+/// (`exp`, `relu`, `softmax`, ...) are not dispatchable as methods at all —
+/// `x.relu()` fails with "unknown tensor method". They are harmless and are
+/// kept so the classification survives if method forms are ever added.
+///
+/// `Some(true)`  — caller owns a reference; failing to free it leaks.
+/// `Some(false)` — result may alias the receiver, or is not a tensor at all;
+///                 freeing it would double-free or corrupt.
+/// `None`        — unclassified. `every_tensor_method_is_classified` in
+///                 `tests/tensor_method_ownership.rs` fails on any dispatchable
+///                 method that lands here, so the table cannot silently fall
+///                 behind the dispatcher.
+///
+/// # Why this is a table and not an allowlist
+///
+/// It used to be a bare `matches!` allowlist carrying its own warning: *"this
+/// allowlist is hand-maintained and drifts silently — a missing fresh-result
+/// builtin costs a leak, never a crash, so nothing fails loudly."* That is
+/// exactly what happened. The entire shape/view family was absent, so every
+/// such call in NESTED position produced a handle nothing ever freed. In
+/// `nsl.nn.gqa`'s `GroupedQueryAttention::forward`,
+///
+/// ```text
+/// let q4    = q.reshape([...]).transpose(1, 2)          # reshape result is anonymous
+/// let k_exp = k5.expand([...]).contiguous().reshape([...])  # expand AND contiguous are
+/// ```
+///
+/// there are seven anonymous intermediates. Registering them recovered 3 of
+/// the 8 blocks retained per call (24 MB -> 16 MB), ×8 layers on every
+/// Coder-50M forward. NOT one block per intermediate: a view shares the root's
+/// data pointer, so leaked *handles* and leaked *blocks* do not correspond, and
+/// four blocks per call still strand for a separate reason (see
+/// `the_residual_is_still_present_and_bounded`).
+///
+/// The classification is a property of the RUNTIME function, so each entry
+/// records why. Do not add an entry without reading the implementation.
+///
+/// # Not covered: the free-function forms
+///
+/// This table governs METHOD calls only. The sibling `ExprKind::Ident` arm in
+/// `expr_result_is_owned_temporary` still carries the original hand-maintained
+/// allowlist and still has the same omission, with no gate. Measured: the
+/// method form `x.transpose(0,1).contiguous().sum()` improves to 1 retained
+/// block per call, while the free-function form
+/// `contiguous(x.transpose(0,1)).sum()` is unchanged at 2 — `contiguous(t)`,
+/// `unsqueeze(t,d)`, `stack(l,d)` and `tensor_cat` all take dedicated
+/// early-return paths in `expr/calls.rs` and are absent from that allowlist.
+/// Extending it needs a per-function read of the runtime, since a wrong entry
+/// there is a use-after-free rather than a leak.
+pub(crate) fn tensor_method_returns_owned_ref(method: &str) -> Option<bool> {
+    let owned = match method {
+        // ── Reductions and elementwise maths: freshly allocated results. ──
+        "sum" | "mean" | "exp" | "log" | "sqrt" | "abs" | "relu" | "gelu" | "silu"
+        | "sigmoid" | "tanh" | "softmax" | "log_softmax" => true,
+
+        // ── Shape / view family (`tensor/shape_ops.rs`). ──
+        //
+        // A "view" is still an OWNING reference: `NslTensor::new_view_i64`
+        // allocates a fresh handle AND bumps the root owner's refcount, so the
+        // caller holds a real reference and must release it.
+        "reshape" | "transpose" | "unsqueeze" => true,
+        // `expand` likewise shares the data pointer and bumps the root's
+        // refcount (shape_ops.rs, "ZERO-COPY: share data pointer, bump the
+        // root owner's refcount to keep it alive").
+        "expand" => true,
+        // `contiguous` is the subtle one and the reason this needs prose. When
+        // the tensor is ALREADY contiguous it returns `tensor_ptr` — the
+        // receiver itself — which looks exactly like the aliasing hazard that
+        // keeps `clone`/`to` off this list. It is not: it does
+        // `t.refcount.fetch_add(1)` *before* returning, so the caller owns a
+        // counted reference either way. Not freeing it is the leak.
+        "contiguous" => true,
+        // Both return a freshly built tensor, never the receiver.
+        "select" | "slice" => true,
+        // `nsl_tensor_cumsum` (sampling.rs) allocates via
+        // `create_tensor_with_shape_rs_dtype`.
+        "cumsum" => true,
+
+        // ── NOT owning. ──
+        //
+        // `.clone()` can elide to the receiver under FBIP, and `.to()` hands
+        // back the receiver when the tensor is already on the target device —
+        // neither bumps a refcount, so freeing the result would release a
+        // buffer the named variable still owns.
+        "clone" | "to" => false,
+        // Not tensors: `.item()` yields a scalar, `.shape` an NslList. The
+        // caller's tensor-type filter would reject them anyway; they are named
+        // here so the completeness gate has something to match.
+        "item" | "shape" => false,
+
+        _ => return None,
+    };
+    Some(owned)
+}
+
 impl Compiler<'_> {
     pub fn compile_expr(
         &mut self,
@@ -375,6 +476,24 @@ impl Compiler<'_> {
                             | "log_softmax"
                             | "mean"
                             | "sum"
+                            // The attention family always finishes on a fresh
+                            // `nsl_tensor_matmul(attn_weights, v)` (or the fused
+                            // flash kernel's fresh output), so the result is an
+                            // owning ref. Their absence here made
+                            // `return scaled_dot_product_attention(...)` take
+                            // the Unknown-ownership arm in stmt.rs's Return
+                            // handler, which RETAINS — double-owning the result
+                            // so the caller's single free left one reference
+                            // behind. That stranded one attention output per
+                            // call (caught by fn_lifetime_leak_gate).
+                            //
+                            // NOTE: this allowlist is hand-maintained and drifts
+                            // silently — a missing fresh-result builtin costs a
+                            // leak, never a crash, so nothing fails loudly. New
+                            // fresh-result builtins belong here.
+                            | "scaled_dot_product_attention"
+                            | "scaled_dot_product_attention_masked"
+                            | "scaled_dot_product_attention_packed"
                     );
                 }
                 // Method-form calls. `y.sum()` parses as Call with a
@@ -384,26 +503,9 @@ impl Compiler<'_> {
                 // `print(y.sum())` leak).
                 if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let obj_ty = self.node_type(object.id);
-                    // Tensor methods with fresh-result guarantees only —
-                    // NEVER .clone() (elides to the receiver under FBIP) or
-                    // .to() (may hand back the receiver).
                     if obj_ty.is_tensor() {
-                        return matches!(
-                            self.resolve_sym(*member),
-                            "sum"
-                                | "mean"
-                                | "exp"
-                                | "log"
-                                | "sqrt"
-                                | "abs"
-                                | "relu"
-                                | "gelu"
-                                | "silu"
-                                | "sigmoid"
-                                | "tanh"
-                                | "softmax"
-                                | "log_softmax"
-                        );
+                        return tensor_method_returns_owned_ref(self.resolve_sym(*member))
+                            .unwrap_or(false);
                     }
                     // Model methods are compiled NSL functions, whose Return
                     // arm always hands back an owning reference (Owned

@@ -286,6 +286,12 @@ fn tier_b1_canonical_matches_cpu_reference() {
             causal,
             norm_eps,
             rope_q: true,
+            // Mirror `canonical_config()`. Numerically moot here — this test
+            // passes identity RoPE (cos=1, sin=0) so no pairing is observable
+            // — but the field exists so the oracle can never disagree with the
+            // kernel about pairing, and hardcoding the other variant would
+            // make this site read as a real mismatch.
+            rope_style: RopeStyle::HalfSplit,
         },
     );
 

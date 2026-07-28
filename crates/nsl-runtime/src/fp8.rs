@@ -104,14 +104,88 @@ pub fn dequantize_fp8(fp8_value: f64, scale: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Host staging guard
+// ---------------------------------------------------------------------------
+
+/// Stage a tensor for a host-side flat read (`from_raw_parts` over `len`
+/// elements). Returns `(readable_ptr, owned)`; when `owned` is true the
+/// caller must free the returned tensor.
+///
+/// Every FFI in this file walks `t.data` as CPU memory in row-major order.
+/// Two tensor states break that:
+///  * `device != 0` — `t.data` is a CUDA device pointer, so the read is a
+///    segfault (the tape-AD backward for `@fp8_compute` hands GPU-resident
+///    gradients straight into `calibrate_gradient_scale` and
+///    `nsl_fp8_cast`; same hazard class as the moe/ffi.rs device guard).
+///  * non-contiguous views — `nsl_tensor_transpose` swaps strides over
+///    shared storage, so a flat walk visits elements in STORAGE order while
+///    the output gets fresh row-major strides stamped onto the view's
+///    shape. That turns a transpose into a reshape: the E5M2 backward
+///    quantized `B^T` in the wrong element order, so the tape-AD fp8 path
+///    computed gradients from misplaced operands — wrong values, not
+///    reduced precision.
+///
+/// Both are fixed by materializing: a D2H transfer for device tensors
+/// (`nsl_tensor_to_device` materializes views itself before copying), an
+/// explicit `nsl_tensor_contiguous` copy for CPU views.
+///
+/// dtypes outside {0=f64, 1=f32} would be read at the wrong element stride
+/// (a heap OOB read for the 2-byte dtypes), and every caller feeds the
+/// result into training arithmetic, so that case refuses loudly instead of
+/// guessing.
+fn stage_for_host_read(tensor_ptr: i64, ctx: &str) -> (i64, bool) {
+    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    if t.dtype != 0 && t.dtype != 1 {
+        eprintln!(
+            "nsl: {ctx}: unsupported dtype {} — the fp8 host path reads only f32 (1) and f64 (0)",
+            t.dtype
+        );
+        std::process::abort();
+    }
+    // A zero-length read never dereferences, so nothing below applies.
+    if t.len == 0 {
+        return (tensor_ptr, false);
+    }
+    // `is_contiguous()` is the runtime-wide predicate, but it returns true
+    // for EVERY rank-<=1 tensor regardless of strides, so a 1-D expand view
+    // ([N] with stride 0 over a 1-element buffer) would pass straight
+    // through to the flat read — an OOB read, the exact hazard this guard
+    // exists to close. The rank-1 stride is checked explicitly here;
+    // `nsl_tensor_contiguous` compares strides directly (not via
+    // `is_contiguous`) and its GPU path is a stride-walking kernel, so it
+    // materializes such views correctly on both devices. It must run BEFORE
+    // any D2H transfer: `nsl_tensor_to_device` shares the blind predicate
+    // and would flat-copy the same OOB range out of device memory.
+    let flat_read_unsafe =
+        !t.is_contiguous() || (t.ndim == 1 && t.len > 1 && unsafe { *t.strides } != 1);
+    if flat_read_unsafe {
+        let contig = crate::tensor::nsl_tensor_contiguous(tensor_ptr);
+        let c = unsafe { &*(contig as *const NslTensor) };
+        if c.device != 0 {
+            let cpu = crate::tensor::nsl_tensor_to_device(contig, 0);
+            crate::tensor::nsl_tensor_free(contig);
+            return (cpu, true);
+        }
+        return (contig, true);
+    }
+    if t.device != 0 {
+        return (crate::tensor::nsl_tensor_to_device(tensor_ptr, 0), true);
+    }
+    (tensor_ptr, false)
+}
+
+// ---------------------------------------------------------------------------
 // FFI: FP8 cast
 // ---------------------------------------------------------------------------
 
 /// Cast a tensor to FP8 with given scale. If scale=0.0, auto-compute.
-/// Returns a new tensor pointer with FP8-quantized-then-dequantized values.
+/// Returns a new tensor pointer with FP8-quantized-then-dequantized values,
+/// on the same device as the input.
 #[no_mangle]
 pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -> i64 {
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let orig_device = unsafe { (*(tensor_ptr as *const NslTensor)).device };
+    let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_cast");
+    let t = unsafe { &*(src_ptr as *const NslTensor) };
     let len = t.len as usize;
 
     // Read source data as f32 (default runtime dtype)
@@ -141,18 +215,26 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
     let strides = NslTensor::compute_strides(shape, t.ndim);
 
+    // Built on host (device 0); moved to the input's device below. The old
+    // code stamped `t.device` directly onto this host allocation, producing
+    // a GPU-labeled tensor whose data pointer was a CPU heap pointer.
     let out = Box::new(NslTensor::new(
         result_data as *mut c_void,
         shape,
         strides,
         t.ndim,
         t.len,
-        t.device,
+        0,
         1,
         1,
         0,
     ));
-    let out_ptr = Box::into_raw(out) as i64;
+    let host_ptr = Box::into_raw(out) as i64;
+    if staged {
+        crate::tensor::nsl_tensor_free(src_ptr);
+    }
+
+    let out_ptr = move_to_original_device(host_ptr, orig_device);
 
     // Register scale for this tensor
     set_fp8_scale(out_ptr, actual_scale as f32);
@@ -163,15 +245,20 @@ pub extern "C" fn nsl_fp8_cast(tensor_ptr: i64, target_dtype: i64, scale: f64) -
 /// Compute optimal scale factor for FP8 conversion.
 #[no_mangle]
 pub extern "C" fn nsl_fp8_compute_scale(tensor_ptr: i64, fp8_dtype: i64) -> f64 {
-    let t = unsafe { &*(tensor_ptr as *const NslTensor) };
+    let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_compute_scale");
+    let t = unsafe { &*(src_ptr as *const NslTensor) };
     let len = t.len as usize;
-    if t.dtype == 1 {
+    let scale = if t.dtype == 1 {
         let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
         compute_scale_f32(data, fp8_dtype)
     } else {
         let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
         compute_scale(data, fp8_dtype)
+    };
+    if staged {
+        crate::tensor::nsl_tensor_free(src_ptr);
     }
+    scale
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +380,11 @@ pub extern "C" fn nsl_fp8_matmul_training(
 /// Gradients change dramatically between steps, so we compute scale fresh each time.
 /// Returns amax / FP8E5M2_MAX, or 1.0 if all zeros.
 pub fn calibrate_gradient_scale(tensor_ptr: i64) -> f32 {
-    let t = NslTensor::from_ptr(tensor_ptr);
+    // Guard first so the dtype refusal fires for empty tensors too (the
+    // guard's own len==0 short-circuit makes the staging free); an empty
+    // tensor then takes the early return below with `staged == false`.
+    let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "calibrate_gradient_scale");
+    let t = NslTensor::from_ptr(src_ptr);
     let len = t.len as usize;
     if len == 0 {
         return 1.0;
@@ -305,6 +396,9 @@ pub fn calibrate_gradient_scale(tensor_ptr: i64) -> f32 {
         let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
         data.iter().map(|v| v.abs() as f32).fold(0.0f32, f32::max)
     };
+    if staged {
+        crate::tensor::nsl_tensor_free(src_ptr);
+    }
     if amax == 0.0 { 1.0 } else { amax / FP8E5M2_MAX }
 }
 
@@ -450,7 +544,10 @@ pub extern "C" fn nsl_fp8_update_calibration(
     running_max_ptr: i64,
     momentum: f64,
 ) -> f64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Guard first (dtype refusal must fire for empty tensors too; the
+    // guard short-circuits len==0 without staging).
+    let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_fp8_update_calibration");
+    let tensor = NslTensor::from_ptr(src_ptr);
     let len = tensor.len as usize;
     if len == 0 {
         return 0.0;
@@ -469,10 +566,26 @@ pub extern "C" fn nsl_fp8_update_calibration(
             batch_amax = batch_amax.max(val.abs());
         }
     }
+    if staged {
+        crate::tensor::nsl_tensor_free(src_ptr);
+    }
 
     // Update running max via EMA
     if running_max_ptr != 0 {
         let rm = NslTensor::from_ptr(running_max_ptr);
+        // The running max is read AND written in place through host pointers.
+        // A device-resident or non-{f32,f64} state tensor has no correct
+        // host-side read-modify-write here; a raw dereference would segfault
+        // (device) or read at the wrong stride (dtype). No in-tree caller
+        // creates one — refuse loudly rather than corrupt calibration.
+        if rm.device != 0 || (rm.dtype != 0 && rm.dtype != 1) {
+            eprintln!(
+                "nsl: nsl_fp8_update_calibration: running-max state must be a CPU f32/f64 \
+                 tensor (device={}, dtype={}); keep FP8 calibration state on the host",
+                rm.device, rm.dtype
+            );
+            std::process::abort();
+        }
         let old_max = if rm.dtype == 1 {
             unsafe { *rm.data_f32() as f64 }
         } else {
@@ -619,10 +732,14 @@ pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8
 
 /// FFI: Quantize tensor with MXFP8 per-block scaling.
 /// Returns a new tensor with quantized-then-dequantized values (simulates precision loss).
-/// The E8M0 scale factors are stored in a separate tensor accessible via nsl_mxfp8_get_scales.
+/// The per-block E8M0 scale factors are computed internally and DROPPED at
+/// this boundary — only the dequantized data survives. (This comment used to
+/// claim an `nsl_mxfp8_get_scales` accessor; no such symbol has ever existed.)
 #[no_mangle]
 pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_format: i64) -> i64 {
-    let t = NslTensor::from_ptr(tensor_ptr);
+    let orig_device = NslTensor::from_ptr(tensor_ptr).device;
+    let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_mxfp8_quantize");
+    let t = NslTensor::from_ptr(src_ptr);
     let len = t.len as usize;
     let bs = block_size as usize;
 
@@ -650,12 +767,28 @@ pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_forma
         strides,
         t.ndim,
         t.len,
-        t.device,
+        0,
         1,
         1,
         0,
     ));
-    Box::into_raw(out) as i64
+    let host_ptr = Box::into_raw(out) as i64;
+    if staged {
+        crate::tensor::nsl_tensor_free(src_ptr);
+    }
+    move_to_original_device(host_ptr, orig_device)
+}
+
+/// H2D-move a freshly built host result back to the input's device (no-op
+/// for CPU inputs). Keeps the quantizer FFIs from stamping a device label
+/// onto a host allocation.
+fn move_to_original_device(host_ptr: i64, orig_device: u8) -> i64 {
+    if orig_device == 0 {
+        return host_ptr;
+    }
+    let moved = crate::tensor::nsl_tensor_to_device(host_ptr, orig_device as i64);
+    crate::tensor::nsl_tensor_free(host_ptr);
+    moved
 }
 
 // ===========================================================================
@@ -786,7 +919,9 @@ pub fn dequantize_nvfp4(quantized: &NvFp4Quantized) -> Vec<f32> {
 /// FFI: Quantize tensor with NVFP4 (E2M1) and optional Hadamard preprocessing.
 #[no_mangle]
 pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_hadamard: i64) -> i64 {
-    let t = NslTensor::from_ptr(tensor_ptr);
+    let orig_device = NslTensor::from_ptr(tensor_ptr).device;
+    let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_nvfp4_quantize");
+    let t = NslTensor::from_ptr(src_ptr);
     let len = t.len as usize;
     let bs = block_size as usize;
 
@@ -813,12 +948,16 @@ pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_had
         strides,
         t.ndim,
         t.len,
-        t.device,
+        0,
         1,
         1,
         0,
     ));
-    Box::into_raw(out) as i64
+    let host_ptr = Box::into_raw(out) as i64;
+    if staged {
+        crate::tensor::nsl_tensor_free(src_ptr);
+    }
+    move_to_original_device(host_ptr, orig_device)
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1527,182 @@ mod tests {
             let err = (orig - rec).abs();
             assert!(err < 2.0, "NVFP4 roundtrip error too large: {orig} → {rec} (err={err})");
         }
+    }
+
+    // ── Host-staging guard tests (device/view/dtype hazards) ────────────
+
+    fn make_2d(rows: i64, cols: i64, data: &[f32]) -> i64 {
+        assert_eq!(data.len(), (rows * cols) as usize);
+        let data_ptr =
+            crate::memory::checked_alloc(data.len() * std::mem::size_of::<f32>()) as *mut f32;
+        for (i, &v) in data.iter().enumerate() {
+            unsafe { *data_ptr.add(i) = v };
+        }
+        let shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+        unsafe {
+            *shape = rows;
+            *shape.add(1) = cols;
+        }
+        let strides = crate::tensor::NslTensor::compute_strides(shape, 2);
+        let t = Box::new(crate::tensor::NslTensor::new(
+            data_ptr as *mut std::ffi::c_void,
+            shape,
+            strides,
+            2,
+            rows * cols,
+            0,
+            1,
+            1,
+            0,
+        ));
+        Box::into_raw(t) as i64
+    }
+
+    fn read_f32(ptr: i64, len: usize) -> Vec<f32> {
+        let t = crate::tensor::NslTensor::from_ptr(ptr);
+        assert_eq!(t.dtype, 1);
+        (0..len).map(|i| unsafe { *t.data_f32().add(i) }).collect()
+    }
+
+    /// `nsl_fp8_cast` on a zero-copy transposed view must quantize the
+    /// elements in LOGICAL order. Before the staging guard it read the
+    /// shared storage flat and stamped fresh row-major strides onto the
+    /// view's shape — reinterpreting the transpose as a reshape.
+    #[test]
+    fn fp8_cast_materializes_transposed_views_in_logical_order() {
+        // Integers ≤ 6 are exactly representable in E4M3 at scale 1.0, so
+        // quantization is the identity and any mismatch is pure ordering.
+        let t = make_2d(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let view = crate::tensor::nsl_tensor_transpose(t, 0, 1); // [3,2] view
+        let out = nsl_fp8_cast(view, FP8_FORMAT_E4M3, 1.0);
+        let got = read_f32(out, 6);
+        // Logical [3,2] row-major: column-major walk of the [2,3] input.
+        let expect = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+        assert_eq!(
+            got, expect,
+            "cast of a transposed view returned storage order (reshape), not the transpose"
+        );
+        crate::tensor::nsl_tensor_free(out);
+        crate::tensor::nsl_tensor_free(view);
+        crate::tensor::nsl_tensor_free(t);
+    }
+
+    /// The rank-1 blind spot (review finding): `is_contiguous()` returns
+    /// true for EVERY rank-<=1 tensor regardless of strides, so the guard's
+    /// first draft passed a 1-D stride-0 expand view straight to the flat
+    /// read — 1 valid element and N-1 heap-OOB reads. The guard now checks
+    /// the rank-1 stride explicitly.
+    #[test]
+    fn fp8_cast_materializes_a_rank1_broadcast_view() {
+        // A [4] stride-0 view over a 1-element buffer — what
+        // `nsl_tensor_expand` legally produces.
+        let base = make_2d(1, 1, &[2.0]);
+        let base_t = crate::tensor::NslTensor::from_ptr(base);
+        let shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *shape = 4 };
+        let strides = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+        unsafe { *strides = 0 };
+        let view = Box::new(crate::tensor::NslTensor::new(
+            base_t.data,
+            shape,
+            strides,
+            1,
+            4,
+            0,
+            1,
+            0, // borrowed storage — the base owns the data
+            0,
+        ));
+        let view_ptr = Box::into_raw(view) as i64;
+
+        let out = nsl_fp8_cast(view_ptr, FP8_FORMAT_E4M3, 1.0);
+        assert_eq!(
+            read_f32(out, 4),
+            [2.0, 2.0, 2.0, 2.0],
+            "a rank-1 stride-0 view must broadcast, not flat-read past its buffer"
+        );
+
+        crate::tensor::nsl_tensor_free(out);
+        crate::tensor::nsl_tensor_free(view_ptr);
+        crate::tensor::nsl_tensor_free(base);
+    }
+
+    /// Same hazard for the per-block quantizer, where flat order also
+    /// changes the BLOCK PARTITION (and therefore the per-block scales),
+    /// not just element placement.
+    #[test]
+    fn mxfp8_quantize_materializes_transposed_views_in_logical_order() {
+        let t = make_2d(2, 2, &[1000.0, 0.3, 0.4, 2000.0]);
+        let view = crate::tensor::nsl_tensor_transpose(t, 0, 1);
+        let out = nsl_mxfp8_quantize(view, 2, FP8_FORMAT_E4M3);
+        let got = read_f32(out, 4);
+        // Reference: the pure function on the logically-transposed data.
+        let expect = quantize_mxfp8(&[1000.0, 0.4, 0.3, 2000.0], 2, FP8_FORMAT_E4M3).data;
+        assert_eq!(
+            got, expect,
+            "block quantizer partitioned the view's storage order, not its logical order"
+        );
+        crate::tensor::nsl_tensor_free(out);
+        crate::tensor::nsl_tensor_free(view);
+        crate::tensor::nsl_tensor_free(t);
+    }
+
+    /// End-to-end tape gate: the Fp8MatMul backward transposes `saved_a` /
+    /// `saved_b` as zero-copy views before handing them to
+    /// `fp8_matmul_e5m2_backward`. With the stride-blind cast this computed
+    /// gradients from MISPLACED operands (grad_A = G @ reshape(B) instead
+    /// of G @ B^T) — wrong values on the CPU tape path, not reduced
+    /// precision. Rectangular shapes (M=2, K=3, N=4) so a reshape cannot
+    /// masquerade as the transpose.
+    #[test]
+    fn tape_fp8_backward_gradients_use_the_logical_transpose() {
+        // All values are multiples of 0.5 with small magnitude, so E5M2
+        // quantization at the default scale 1.0 is exact for A and B; the
+        // ones-seed gradient survives its amax-based scale to ~1e-7.
+        let a = make_2d(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = make_2d(
+            3,
+            4,
+            &[1.0, -2.0, 0.5, 3.0, 2.0, 1.0, -1.0, 0.5, 0.5, 4.0, 2.0, -3.0],
+        );
+
+        let params = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(params, a);
+        crate::list::nsl_list_push(params, b);
+        crate::autodiff::nsl_tape_start(params);
+
+        let out = nsl_fp8_matmul_training(a, b, 0);
+        let grads = crate::autodiff::nsl_tape_backward(out, params);
+
+        // Seed G = ones[2,4]:
+        //   grad_A[i][k] = sum_n B[k][n]  (row sums of B)
+        //   grad_B[k][n] = sum_m A[m][k]  (column sums of A)
+        let grad_a = read_f32(crate::list::nsl_list_get(grads, 0), 6);
+        let grad_b = read_f32(crate::list::nsl_list_get(grads, 1), 12);
+        let expect_a = [2.5, 2.5, 3.5, 2.5, 2.5, 3.5];
+        let expect_b = [5.0, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0, 7.0, 9.0, 9.0, 9.0, 9.0];
+        for (i, (&g, &e)) in grad_a.iter().zip(expect_a.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "grad_A[{i}]={g} expected {e} — fp8 backward used storage-order operands"
+            );
+        }
+        for (i, (&g, &e)) in grad_b.iter().zip(expect_b.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "grad_B[{i}]={g} expected {e} — fp8 backward used storage-order operands"
+            );
+        }
+
+        // nsl_list_free frees only the list storage, not the elements.
+        crate::tensor::nsl_tensor_free(crate::list::nsl_list_get(grads, 0));
+        crate::tensor::nsl_tensor_free(crate::list::nsl_list_get(grads, 1));
+        crate::list::nsl_list_free(grads);
+        crate::autodiff::nsl_tape_stop();
+        crate::list::nsl_list_free(params);
+        crate::tensor::nsl_tensor_free(out);
+        crate::tensor::nsl_tensor_free(a);
+        crate::tensor::nsl_tensor_free(b);
     }
 
     #[test]

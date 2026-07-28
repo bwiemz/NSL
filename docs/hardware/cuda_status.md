@@ -37,7 +37,12 @@ Validated silicon: **NVIDIA RTX 5070 Ti, sm_120** (2026-05-20).
 
 These are tracked honestly so users don't over-trust the backend:
 
-- **dK / dV backward numerics are not yet GPU-confirmed** (dQ is). The Tier B.2
+- ~~**dK / dV backward numerics are not yet GPU-confirmed**~~ — **CLOSED
+  2026-07-26 (roadmap item 15).** The dK/dV sweeps were run on an RTX 5070 Ti
+  (sm_120) and every row banked in
+  [`attention_backward_certification.md`](attention_backward_certification.md);
+  worst margin 12.5% of tolerance. The rest of this bullet is kept for the
+  record of what was validated when. The Tier B.2
   backward emitters (dQ, dK/dV, projection) are data-mobile as of the Phase 3
   work: they emit real `cp.async` loads, HBM address derivation, SMEM scatter,
   and loop back-edges — the earlier PTX-comment "scaffold" stage is done, so the
@@ -47,14 +52,20 @@ These are tracked honestly so users don't over-trust the backend:
   module doc). **dK/dV** are structurally + `ptxas`-validated and launchable, but
   their GPU-numerical parity tests are still `#[cfg(feature = "cuda")]` +
   `#[ignore]` (manual GPU-box runs) — treat dK/dV numerics as unconfirmed on
-  silicon until those are lifted (`dkdv.rs` module doc).
+  silicon until those are lifted (`dkdv.rs` module doc). **Those runs are now
+  done and recorded** (item 15). They stay `#[ignore]`d because no hosted CI
+  runner has a GPU — a CI-capability limit, not unconfirmed numerics.
 - **The full 7-gradient hybrid backward** (`d_prepass → dq → dkdv → proj`,
   dispatched through `nsl_flash_attention_csha_backward`) is synthesized and
   wired; its all-gradient parity gate,
   `crates/nsl-codegen/tests/tier_b2_full_backward_cpu_reference.rs`, is a manual
   GPU gate (`cuda` + `#[ignore]`) that pins a narrow config (`head_dim ∈ {64,128}`,
-  heads=1, seq=block_q, batch=1, causal, sm_80). No broader golden-on-silicon run
-  is recorded in-repo beyond the D pre-pass (sm_120) and dQ.
+  heads=1, seq=block_q, batch=1, causal, sm_80). **Item 15 ran and banked it**
+  — 56 rows, both causal arms, both forward sources, in
+  [`attention_backward_certification.md`](attention_backward_certification.md).
+  The config is still narrow; that doc's coverage table says exactly how
+  narrow, including that `head_dim=32` is covered only by the dK/dV sweep and
+  not by the full backward.
 - sm_80/sm_90 (A100/H100-class) are **targeted and roofline-modeled** but the
   golden-validation rows are not yet recorded on this repo's hardware.
 - Multi-GPU / NCCL collectives live in the **Experimental** distributed
@@ -79,7 +90,7 @@ Representative tests (search the tree for the current set):
 |------|--------|--------|
 | `crates/nsl-codegen/tests/tier_b2_full_backward_cpu_reference.rs` | independent f64 backward, all 7 grads | Phase-3 hybrid gate; GPU-only (`cuda`+`#[ignore]`), narrow config |
 | `crates/nsl-codegen/tests/tier_b2_dq_kernel_cpu_reference.rs` | D pre-pass + dQ reference | cuda-gated; GPU parity `#[ignore]` (dQ GPU-validated hd 32/64/128) |
-| `crates/nsl-codegen/tests/tier_b2_dkdv_kernel_cpu_reference.rs` | dK/dV CPU reference | CPU analytic case in CI; GPU parity `#[ignore]`+cuda (numerics pending) |
+| `crates/nsl-codegen/tests/tier_b2_dkdv_kernel_cpu_reference.rs` | dK/dV CPU reference | CPU analytic case in CI; GPU parity `#[ignore]`+cuda — **validated on sm_120**, rows in [`attention_backward_certification.md`](attention_backward_certification.md) |
 | `crates/nsl-test/.../diagnostic_mode` (`compute_d_for_test`) | CSHA backward D | CPU oracle reusable as a bisection probe |
 | FlashAttention-v2 D pre-pass (this doc, "Numerical contract") | rowsum(dO·O) | GPU-validated **bit-exact** on sm_120 |
 | `crates/nsl-codegen/tests/ptx_metadata_public_api.rs` | declared regs / SMEM / target SM parsed from PTX text | CI (no GPU; static analysis) |

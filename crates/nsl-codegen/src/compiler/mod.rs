@@ -421,6 +421,22 @@ pub struct FeatureConfigs {
     // ── Quantization & Precision (M35) ───────────────────────────────
     /// M35: Functions with @fp8_compute decorator
     pub fp8_compute_fns: HashSet<String>,
+    /// M35 / item 9 phase 2: model METHODS carrying `@fp8_compute`, keyed
+    /// `"ModelName::method_name"`.
+    ///
+    /// Distinct from `fp8_compute_fns`, which only ever holds free-function
+    /// and nested-`fn` names — the model-method arm of the decorator is read
+    /// straight off the `ModelMember::Method` decorator list in
+    /// `compiler/functions.rs`, so before this field there was no
+    /// compiler-wide record that a given method was fp8-decorated.
+    ///
+    /// The source-AD extractor needs exactly that record: `wengert_lower.rs`
+    /// has no FP8 lowering at all (`PrimalOp::Matmul` emits an unconditional
+    /// `nsl_tensor_matmul`), so a decorated method inlined into a Wengert
+    /// list computes in plain f32.  `WengertExtractor` consults this set at
+    /// every inline site and the train/grad lowering refuses rather than
+    /// silently dropping the decorator.
+    pub fp8_compute_methods: HashSet<String>,
     /// M62: Functions decorated with `@export` — collected during
     /// declaration so the CLI can emit a matching C header after the
     /// shared-lib build completes.
@@ -508,6 +524,7 @@ impl FeatureConfigs {
             kv_compress_policies: HashMap::new(),
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
+            fp8_compute_methods: HashSet::new(),
             export_functions: Vec::new(),
             export_wrappers: Vec::new(),
             quant_configs: HashMap::new(),
@@ -547,6 +564,15 @@ pub struct Compiler<'a> {
 
     // ── Function registry ────────────────────────────────────────────
     pub registry: FunctionRegistry,
+
+    // ── Interprocedural analyses ─────────────────────────────────────
+    /// Parameter escape facts for every function and model method with a
+    /// visible body. Computed once, before any body is compiled, and read at
+    /// call sites to decide whether a fresh argument may be released at
+    /// statement end. Defaults to `EscapeAnalysis::disabled()` (every
+    /// parameter escapes = the historical blanket refusal) until
+    /// `build_escape_analysis` runs.
+    pub escape: crate::escape::EscapeAnalysis,
 
     // ── Type system ──────────────────────────────────────────────────
     pub types: TypeRegistry,
@@ -1036,6 +1062,7 @@ impl<'a> Compiler<'a> {
             func_index: 0,
             next_cuda_graph_region_id: 0,
             registry: FunctionRegistry::new(),
+            escape: crate::escape::EscapeAnalysis::disabled(),
             types: TypeRegistry::new(),
             models: ModelMetadata::new(),
             module_prefix: String::new(),

@@ -143,6 +143,40 @@ pub fn synthesize_tier_b2_backward(
         ));
     }
 
+    // Roadmap item 15: refuse `gqa_group_size > 1` at SYNTHESIS, not just at
+    // dispatch.
+    //
+    // The dispatch predicate (`DispatchReject::GqaUnvalidated`) keeps the
+    // planner off this path, but `synthesize_tier_b2_backward` is reachable
+    // from several callers and from any direct call in a test — the same
+    // argument the sinks and segment_masked refusals above make for
+    // themselves. Without this arm a direct call still emits the unvalidated
+    // grouped-KV addressing with no complaint.
+    //
+    // NOTE, and this is the part that matters: unlike `segment_masked` above,
+    // the scalar fallback is NOT a correct alternative here. No emitter under
+    // `phases/backward/` reads `gqa_group_size` (verified: the only mentions
+    // are `gqa_group_size: 1` literals in their test fixtures), and
+    // `emit_kv_recompute` rebuilds K/V with no kv-head remap — see the
+    // pre-existing note at `flash_attention_v2/mod.rs:1302-1305`. So BOTH
+    // backward paths are grouped-KV-blind: Tier B.2's addressing is
+    // implemented but unvalidated, the scalar's is absent. Refusing loudly is
+    // the only honest option; silently choosing the scalar path would swap an
+    // unverified implementation for a known-missing one.
+    if config.gqa_group_size > 1 {
+        return Err(BackwardSynthError::UnsupportedConfig(format!(
+            "gqa_group_size = {} is not supported by the Tier B.2 backward: the \
+             grouped-KV stride pattern is implemented (backward/hbm_addr.rs) but \
+             has NO numerical coverage — every Tier B.2 sweep fixes \
+             gqa_group_size = 1. The scalar backward is not a fallback here \
+             either: no phases/backward emitter reads gqa_group_size at all. \
+             Use n_kv_heads == n_heads, or see \
+             docs/hardware/attention_backward_certification.md for what it \
+             would take to certify the grouped path.",
+            config.gqa_group_size
+        )));
+    }
+
     // Phase 1.4a (pretraining plan): compile-time SMEM budget refusal using the
     // REAL launch layout. `tier_b2_dq/dkdv_total_smem_bytes` include the
     // col-major re-stage bands that the planner's simplified `tier_b2_smem_bytes`

@@ -28,6 +28,92 @@
 //! All four tests are gated on `#[cfg(feature = "cuda")]` + `#[ignore]` so
 //! they never run in default CI and only execute when `--ignored` is passed
 //! with a real CUDA device.
+//!
+//! ─────────────────────────────────────────────────────────────────────────
+//! RESOLUTION (2026-07-25): **Bug 1 was not a numerics bug.**
+//!
+//! The magnitudes quoted above are not error magnitudes — they are the max
+//! MAGNITUDES of the reference tensors. Compare, from the A0 control:
+//!
+//!     reported "max_abs"   A0 max|ref|
+//!     dq   4.420e0         4.420e0
+//!     dk   4.356e0         4.356e0
+//!     dwq  3.403e1         3.403e1
+//!     dwk  3.664e1         3.664e1
+//!     dwv  1.733e1         1.733e1
+//!     dx   4.691e1         4.691e1
+//!
+//! Six exact matches. `max_abs_diff(gpu, ref) == max|ref|` together with
+//! `dq max_rel = 1.000e0` is the arithmetic signature of `gpu == 0`: the
+//! kernel never wrote its outputs. That is the harness defect fixed below —
+//! a multi-tile fused config was handed single-kernel PTX, the `_mt_attn`
+//! twin lookup failed, and the comparison dutifully reported the reference
+//! against a buffer of zeros.
+//!
+//! With the correct PTX, A0/A1/A2 agree with the CPU oracle to 3-11x the f16
+//! storage floor, which is ordinary accumulation growth. They previously
+//! "failed" for a second, independent reason: six of the seven compared
+//! tensors are read back as f16, but `atol` was calibrated for f32 and sits
+//! BELOW the f16 representation floor, so the absolute half of the criterion
+//! was unsatisfiable no matter how correct the arithmetic. See F16_ACCUM_AMP.
+//!
+//! STILL OPEN — a separate, pre-existing bug that A3 surfaces:
+//! `fused_rmsnorm=true` + `fused_projections=false` (kernel suffix `n1_p0`)
+//! synthesizes without complaint and then faults with an invalid __shared__
+//! read of 2 bytes at the shared-window base 0xff800000, inside the FORWARD
+//! kernel (localized with compute-sanitizer:
+//! `nsl_flash_attention_csha_with_saves` -> flash_attention.rs:2327).
+//!
+//! A3's doc comment below predicted this failure mode and expected a
+//! synthesizer refusal to catch it — and that turned out to be right, though
+//! only after the blast radius was pinned down. `CshaExtras::level1(eps)`
+//! does construct this combination and `csha_apply.rs:910` maps
+//! `FusionLevel::Boundary` to it, so it is production-CONSTRUCTED; but
+//! `tier_b2_can_dispatch` rejects `level < 2` with `DispatchReject::LevelTooLow`
+//! and `plan_layer` reports `BackwardTierReport::Scalar`, so it is never
+//! production-REACHED. (Two other `CshaExtras::level1` sites are NOT
+//! production: `flash_attention_selector.rs:139` sets `fused_projections:true`
+//! under a test marker, and `flash_attention.rs:7489` is inside `mod tests`,
+//! which starts at 6862.) R3 in `validate_checkpoint_eligibility` demands both
+//! flags but only under @checkpoint, and A3 runs Path A with checkpoint
+//! stripped, which is why nothing gated it here.
+//!
+//! RESOLVED: **R13** in `synthesize_backward_with_tier_b` now refuses the
+//! flag pair — keyed on `fused_rmsnorm && !fused_projections`, NOT on level,
+//! so `n1_p1` (`level1_with_fused_proj`, exercised by A0/A1/A2) keeps working.
+//! Pinned by `csha_r13_n1p0_refusal.rs`, including two anti-vacuity tests.
+//! A3 and D1-D5 now refuse cleanly instead of aborting the process, which
+//! also removes the context poisoning that was killing their sibling tests.
+//!
+//! DISCRIMINATOR RESULT (D1-D5 below, one process per cell):
+//!
+//!                    rope_q=true        rope_q=false
+//!     S=512          ILLEGAL_ADDRESS    zero gradients
+//!     S=32           ILLEGAL_ADDRESS    zero gradients
+//!     n1_p1 control  PASS               —
+//!
+//! The fault needs `rope_q` and does NOT need multi-tile — S=32 is a single
+//! q tile and a single kv tile and still faults, which rules out the tiling
+//! hypothesis. RoPE-Q reads cos/sin staged in SMEM by the fused-projection
+//! prologue; with `fused_projections=false` that prologue never runs, so the
+//! read lands at the shared-window base.
+//!
+//! And with rope_q OFF there is no fault but the gradients come back ZERO —
+//! `max_abs == max|ref|` again, `abs/floor` ~2500-4700. So n1_p0 is broken in
+//! BOTH directions: it either faults or silently produces nothing.
+//!
+//! SEVERITY: latent, NOT a live production bug. `csha_apply.rs:910` does map
+//! `FusionLevel::Boundary` to `CshaExtras::level1()` (= n1_p0), but the fused
+//! Tier-B.2 backward is never reached for it: `tier_b2/dispatch.rs:79` returns
+//! `DispatchReject::LevelTooLow` for level 1 and `plan_layer` reports
+//! `BackwardTierReport::Scalar`, so production falls back to the scalar
+//! backward. The broken kernel is reachable only by driving the FFI directly
+//! with a hand-built config, which is exactly what this harness does.
+//!
+//! The fix is therefore a synthesis-time refusal (R13) — not because the
+//! config is incoherent, but so synthesis agrees with the dispatch rejection
+//! that already exists one layer above, instead of silently emitting a kernel
+//! the dispatcher refuses to use.
 
 #![cfg(feature = "cuda")]
 
@@ -46,7 +132,7 @@ use nsl_codegen::flash_attention::{
 };
 use nsl_codegen::flash_attention_v2::{
     flash_attention_kernel_name_v2, smem_layout, synthesize_backward_with_tier_b,
-    synthesize_flash_attention_ptx_v2,
+    synthesize_forward_multi_tile_combined,
 };
 use nsl_test::cpu_naive_prologue::{cpu_naive_norm_proj_rope, PrologueConfig};
 
@@ -136,6 +222,24 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 
 fn tol_dqkv(head_dim: usize) -> (f32, f32) {
     if head_dim >= 128 { (2e-3, 1e-2) } else { (5e-4, 5e-3) }
+}
+
+/// The SMALLEST `max_abs` any correct f16-storing kernel can achieve against an
+/// f32 reference: round-trip the reference through f16 and measure. Six of the
+/// seven compared tensors are read back as f16 (only `dx` is f32), so a tensor
+/// whose floor already exceeds `atol` cannot pass on absolute error no matter
+/// how correct the arithmetic is — and the OR in `check` then rests entirely on
+/// `max_rel`, which `max_rel_diff` inflates without bound near zero because it
+/// divides by `y.abs().max(1e-6)`.
+fn f16_floor(reference: &[f32]) -> f32 {
+    reference
+        .iter()
+        .map(|&y| (f16_to_f32(f32_to_f16_bits(y)) - y).abs())
+        .fold(0f32, f32::max)
+}
+
+fn max_mag(v: &[f32]) -> f32 {
+    v.iter().map(|x| x.abs()).fold(0f32, f32::max)
 }
 
 fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
@@ -308,7 +412,17 @@ fn run_ablation(
     }
 
     // ── Forward launch ───────────────────────────────────────────────────────
-    let fwd_ptx = synthesize_flash_attention_ptx_v2(&config);
+    // These ablations run at S=512 with 32x32 tiles, i.e. MULTI-TILE. For a
+    // fused-projection config `nsl_flash_attention_csha_with_saves` then does
+    // a two-launch dispatch and looks up a `<name>_mt_attn` twin entry, which
+    // `synthesize_flash_attention_ptx_v2` alone does not emit — the lookup
+    // fails with CUDA_ERROR_NOT_FOUND (500), exactly as flash_attention.rs
+    // documents ("if the module lacks the twin ... the name lookup fails and
+    // the error surfaces loudly in the rc"). That refusal is correct; the
+    // harness was simply handing it single-kernel PTX. The combined
+    // synthesizer emits both entries and degrades to the plain kernel for
+    // configs with no twin (non-fused / sinks / segment / checkpoint / paged).
+    let fwd_ptx = synthesize_forward_multi_tile_combined(&config);
     let fwd_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(&config);
     let fwd_smem_dyn = if smem_layout::needs_dynamic_smem(&config) {
@@ -485,6 +599,7 @@ fn run_ablation(
         causal,
         norm_eps: 1e-6,
         rope_q: config.rope_q,
+        rope_style: config.rope_style,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_f32);
 
@@ -493,14 +608,36 @@ fn run_ablation(
     let atol_dw = 1e-3f32; let rtol_dw = 1e-2f32;
     let atol_dx = 1e-2f32; let rtol_dx = 2e-2f32;
 
+    // Accumulation amplification allowed over the f16 storage floor. The
+    // reductions here run over S=512 (attention) and d_model=64 (projections);
+    // f16 error through an N-term reduction grows ~sqrt(N), so sqrt(512)=22.6
+    // is the loose bound and 16 is a deliberately TIGHTER pre-registered
+    // choice, fixed before checking whether it passes rather than fitted to
+    // the data. Observed worst case across A0/A1/A2 is 11.10 (A2 dq), i.e.
+    // the bound is not tight against the measurements but does constrain them.
+    const F16_ACCUM_AMP: f32 = 16.0;
+
     let check = |name: &str, x: &[f32], y: &[f32], atol: f32, rtol: f32| -> bool {
         let abs = max_abs_diff(x, y);
         let rel = max_rel_diff(x, y);
+        // A tolerance below the storage floor is unsatisfiable by construction,
+        // so raise `atol` to the floor-derived bound when it is the smaller of
+        // the two. `dx` is f32 and has floor ~0, so it keeps its original atol.
+        let atol = atol.max(F16_ACCUM_AMP * f16_floor(y));
         let ok = abs <= atol || rel <= rtol;
+        // `floor` is what a PERFECT f16 kernel would score; `ratio` is how many
+        // times worse this run is than that. ratio ~1 means the discrepancy is
+        // storage precision, not arithmetic — and `atol` below `floor` means
+        // the absolute half of the criterion was never satisfiable.
+        let floor = f16_floor(y);
+        let ratio = if floor > 0.0 { abs / floor } else { f32::INFINITY };
         eprintln!(
             "  [{ablation_label}] {name}: max_abs={abs:.3e} max_rel={rel:.3e} \
-             (atol={atol:.0e} rtol={rtol:.0e}) {}",
-            if ok { "PASS" } else { "FAIL" }
+             (atol={atol:.0e} rtol={rtol:.0e}) {} \
+             | max|ref|={:.3e} f16_floor={floor:.3e} abs/floor={ratio:.2}{}",
+            if ok { "PASS" } else { "FAIL" },
+            max_mag(y),
+            if floor > atol { "  <-- atol BELOW f16 floor" } else { "" }
         );
         ok
     };
@@ -539,10 +676,106 @@ fn run_ablation(
 /// A1: causal=true, rope_q=FALSE, fused_projections=true, hd=64
 ///
 /// Toggles RoPE off while keeping causal mask and fused projections.
+/// Pure-synthesis probe (no GPU): does the FORWARD kernel's shared-memory
+/// declaration agree with what `needs_dynamic_smem` tells the launcher to
+/// allocate? A3 faults with an invalid `__shared__` read at 0xff800000 — the
+/// base of the shared window, which is what a read hits when the dynamic
+/// allocation is zero. That is the signature of an `.extern .shared` kernel
+/// launched with dyn=0.
+#[test]
+fn probe_forward_smem_decl_matches_launcher_for_ablation_configs() {
+    for (label, mutate) in [
+        ("A0-base", &(|_: &mut FlashAttentionConfig| {}) as &dyn Fn(&mut FlashAttentionConfig)),
+        // EXACTLY what a3 does — only `fused_projections` is cleared, so
+        // `fused_rmsnorm` stays TRUE. That n1_p0 combination is the one whose
+        // kernel faults; clearing both (n0_p0) is a different, working config.
+        ("A3-fused-proj-off", &|cfg: &mut FlashAttentionConfig| {
+            if let Some(c) = cfg.csha.as_mut() {
+                c.fused_projections = false;
+            }
+        }),
+        ("A3b-both-off", &|cfg: &mut FlashAttentionConfig| {
+            if let Some(c) = cfg.csha.as_mut() {
+                c.fused_projections = false;
+                c.fused_rmsnorm = false;
+            }
+        }),
+    ] {
+        let mut config = FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 64,
+            causal: true,
+            paged: false,
+            rope_q: true,
+            rope_style: RopeStyle::Adjacent,
+            gqa_group_size: 1,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some({
+                let mut e = CshaExtras::level1_with_fused_proj(1e-6);
+                e.d_model = 64;
+                e
+            }),
+            checkpoint: None,
+        };
+        mutate(&mut config);
+
+        let ptx = synthesize_forward_multi_tile_combined(&config);
+        let end = ptx.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        let txt = String::from_utf8_lossy(&ptx[..end]).into_owned();
+
+        let declares_extern = txt.contains(".extern .shared");
+        let static_decl = txt.contains(".shared .align 16 .b8 shmem[");
+        let total = smem_layout::total_bytes(&config);
+        let needs_dyn = smem_layout::needs_dynamic_smem(&config);
+        eprintln!(
+            "[{label}] total_bytes={total} needs_dynamic_smem={needs_dyn} \
+             ptx_extern_shared={declares_extern} ptx_static_shmem={static_decl}"
+        );
+        // Reported, NOT asserted: a combined module legitimately carries two
+        // entries with different SMEM shapes, so a module-scope
+        // `.extern .shared` does not imply the launched entry uses it. A0
+        // declares extern AND launches at dyn=0 and is correct.
+        let entry = flash_attention_kernel_name_v2(&config);
+        let uses_extern_in_entry = txt
+            .split_once(&format!(".visible .entry {entry}"))
+            .map(|(_, rest)| {
+                let body = rest.split(".visible .entry").next().unwrap_or(rest);
+                !body.contains(".shared .align 16 .b8 shmem[")
+            })
+            .unwrap_or(false);
+        eprintln!(
+            "[{label}]   entry={entry}\n[{label}]   \
+             launched_entry_relies_on_dynamic_shmem={uses_extern_in_entry} \
+             (launcher would pass dyn={})",
+            if needs_dyn { total } else { 0 }
+        );
+    }
+}
+
+/// A0 — THE MISSING CONTROL. Every other test here mutates the config, but
+/// nothing ran it unmutated, so "A1 passes / A1 fails" had no baseline inside
+/// this harness to be measured against. The cycle-14 magnitudes quoted in the
+/// module header (dq max_abs=4.420e0) come from a DIFFERENT test binary with
+/// its own inputs; comparing an ablation here against those numbers silently
+/// assumes the two harnesses agree, which is exactly the kind of assumption
+/// that produced the fake results earlier in this investigation.
+///
+/// A0 makes the comparison internal: same inputs, same oracle, same
+/// tolerances, only the ablation removed. Read A1/A2/A3 against THIS.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn a0_base_config_control_causal_rope_q_fused_proj_hd64() {
+    run_ablation("A0-base-control", 64, 512, |_cfg| {});
+}
+
 /// If A1 PASSES but the base config FAILs, the bug is in the dRoPE inverse
 /// rotation (Candidate B: csha_hooks_backward.rs:191-365 emit_drope).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn a1_rope_q_off_causal_true_fused_proj_true_hd64() {
     run_ablation("A1-rope-q-off", 64, 512, |cfg| {
         cfg.rope_q = false;
@@ -555,7 +788,7 @@ fn a1_rope_q_off_causal_true_fused_proj_true_hd64() {
 /// If A2 PASSES but the base config FAILs, the bug is in the causal mask
 /// predicate (Candidate A: ds_compute.rs:212-232 setp.gt / or.pred).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn a2_causal_off_rope_q_true_fused_proj_true_hd64() {
     run_ablation("A2-causal-off", 64, 512, |cfg| {
         cfg.causal = false;
@@ -577,7 +810,7 @@ fn a2_causal_off_rope_q_true_fused_proj_true_hd64() {
 /// unconditionally declares those registers. The synthesizer refusal check
 /// at the start of run_ablation will catch this and mark A3 STRUCTURALLY-BLOCKED.
 #[test]
-#[ignore]
+#[ignore = "blocked: R13 now refuses n1_p0 at synthesis, so this cannot reach the GPU; it resumes real coverage if the fused-projection SMEM staging is fixed and R13 lifted"]
 fn a3_fused_proj_off_causal_true_rope_q_true_hd64() {
     run_ablation("A3-fused-proj-off", 64, 512, |cfg| {
         if let Some(csha) = cfg.csha.as_mut() {
@@ -599,7 +832,7 @@ fn a3_fused_proj_off_causal_true_rope_q_true_hd64() {
 /// by G14-D for hd=64; the budget scales linearly with head_dim so hd=128
 /// bq=32 stays well within bounds).
 #[test]
-#[ignore]
+#[ignore = "requires CUDA GPU"]
 fn a4_hd128_causal_true_rope_q_true_fused_proj_true() {
     run_ablation("A4-hd128", 128, 512, |cfg| {
         cfg.head_dim = 128;
@@ -607,4 +840,71 @@ fn a4_hd128_causal_true_rope_q_true_fused_proj_true() {
             csha.d_model = 128; // dm == hd for 1-head case
         }
     });
+}
+
+// ── n1_p0 discriminator matrix ───────────────────────────────────────────────
+//
+// A3 (fused_rmsnorm=true, fused_projections=false — kernel suffix `n1_p0`)
+// faults with an invalid __shared__ read at the shared-window base inside the
+// FORWARD kernel. `n1_p0` is a first-class config (`CshaExtras::level1`), so
+// the fix is NOT a refusal and cannot be chosen until the failing axis is
+// known. These four cells vary the two plausible axes independently:
+//
+//              rope_q=true      rope_q=false
+//   S=512      D1 (== A3)       D2
+//   S=32       D3               D4
+//
+// S=32 with block_q=block_kv=32 is exactly one q tile and one kv tile, so it
+// isolates the multi-tile axis. Read the matrix as: if only the S=512 row
+// faults the bug is in multi-tile tiling; if only the rope_q=true column
+// faults it is in the RoPE prologue; if all four fault, plain level-1 forward
+// is broken for every shape and the blast radius is far larger than A3.
+//
+// Each cell MUST run in its own process — an illegal address poisons the CUDA
+// context for every later test in the binary, which is what made A3 look like
+// it was killing its siblings.
+
+fn n1p0(cfg: &mut FlashAttentionConfig) {
+    if let Some(c) = cfg.csha.as_mut() {
+        c.fused_projections = false; // fused_rmsnorm deliberately left TRUE
+    }
+}
+
+#[test]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
+fn d1_n1p0_rope_q_on_multitile_s512() {
+    run_ablation("D1-n1p0-rope-multitile", 64, 512, n1p0);
+}
+
+#[test]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
+fn d2_n1p0_rope_q_off_multitile_s512() {
+    run_ablation("D2-n1p0-norope-multitile", 64, 512, |cfg| {
+        n1p0(cfg);
+        cfg.rope_q = false;
+    });
+}
+
+#[test]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
+fn d3_n1p0_rope_q_on_singletile_s32() {
+    run_ablation("D3-n1p0-rope-singletile", 64, 32, n1p0);
+}
+
+#[test]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
+fn d4_n1p0_rope_q_off_singletile_s32() {
+    run_ablation("D4-n1p0-norope-singletile", 64, 32, |cfg| {
+        n1p0(cfg);
+        cfg.rope_q = false;
+    });
+}
+
+/// CONTROL: the same shapes with projections fused (`n1_p1`). If D3/D4 fault
+/// but this passes at S=32, the fault is specific to n1_p0 rather than to the
+/// small shape or the harness.
+#[test]
+#[ignore = "blocked: R13 refuses n1_p0 at synthesis so these now SKIP; kept as the reproduction that measured the fault, and they resume real coverage if R13 is lifted"]
+fn d5_control_n1p1_rope_q_on_singletile_s32() {
+    run_ablation("D5-control-n1p1-singletile", 64, 32, |_cfg| {});
 }

@@ -54,12 +54,17 @@ onnx-rt-op = []
 # tests are #![cfg(feature = "bench-internal")]-gated so they don't run in
 # normal `cargo test` invocations.
 bench-internal = []
-# Force cuBLAS to use `CUBLAS_PEDANTIC_MATH` (strict f32) as the default math
-# mode instead of `CUBLAS_DEFAULT_MATH` (which enables TF32 tensor cores on
-# sm_80+). Per spec 2026-04-21-matmul-cublas-swap-design §9 this is the
-# compile-time opt-out for workloads that require strict f32 summation bounds.
-# Runtime env vars `NSL_MATMUL_PEDANTIC=1` / `NSL_MATMUL_TF32=1` take
-# precedence over this Cargo feature.
+# Force cuBLAS to `CUBLAS_PEDANTIC_MATH` (strict f32) instead of the default,
+# which is `CUBLAS_TF32_TENSOR_OP_MATH`. Per spec
+# 2026-04-21-matmul-cublas-swap-design §9 this is the compile-time opt-out for
+# workloads that require strict f32 summation bounds; `NSL_MATMUL_TF32=0` is
+# the runtime equivalent. `NSL_MATMUL_PEDANTIC=1` takes precedence over both.
+#
+# This comment previously said the alternative was `CUBLAS_DEFAULT_MATH`,
+# "which enables TF32 tensor cores on sm_80+". That was false — it does not
+# enable TF32 for `cublasSgemm` — and it is the same claim the startup banner
+# carried until item 9 corrected it. TF32 is the default now because it was
+# measured and chosen, not because the constant's name suggested it.
 strict-matmul = []
 # CSHA cycle 19 T1: probe FFI that adds trailing probe_ds_out_ptr / probe_dv_out_ptr
 # slots to `nsl_flash_attention_csha_backward_probe` (variant-B new symbol; the

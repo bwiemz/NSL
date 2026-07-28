@@ -149,7 +149,7 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::Adjacent, gqa_group_size: 1,  // emit_rope_pair_sweep implements Adjacent
+        rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
         tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras::level2(1e-5, 32)),
         checkpoint: None,
     }

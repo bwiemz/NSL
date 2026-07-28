@@ -138,9 +138,26 @@ pub use cuda::tier_b1_prepass::{
 #[cfg(feature = "test-hooks")]
 pub use cuda::test_detect_sm_version;
 
+// Test-only re-export: forces the item-9 batch-collapse dispatch decision so
+// `tests/matmul_batch_collapse.rs` can drive both arms from one process.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::test_set_batch_collapse_disabled;
+
+// Test-only re-export: explicit device sync, required by any test that TIMES
+// GPU work (`sync_after_kernel` is a no-op without NSL_CUDA_SYNC=1).
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::test_cuda_device_synchronize;
+
+// Test-only re-export: forces the opt-in OP_T transposed-operand dispatch,
+// which is OFF by default because measurement showed it loses on wide GEMMs.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::test_set_transpose_views;
+
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
 pub use cuda::cuda_device_name;
+// Driver-reported device identity for the @autotune cache key (item 10).
+pub use cuda::{cuda_device_identity, CudaDeviceIdentity, CUDA_SUPPORT_COMPILED};
 
 pub mod autodiff;
 pub mod checkpoint;

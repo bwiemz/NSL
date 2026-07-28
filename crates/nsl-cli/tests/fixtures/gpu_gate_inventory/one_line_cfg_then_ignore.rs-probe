@@ -1,0 +1,3 @@
+#[test]
+#[cfg(not(feature = "cuda"))] #[ignore = "stub for non-cuda builds"]
+fn mirror_one_liner() {}

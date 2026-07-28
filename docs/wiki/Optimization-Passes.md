@@ -72,15 +72,30 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 6. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).
 7. **CPDT** — `invoke_cpdt_if_enabled`; consumes the `AppliedPlan` from WGGO. **CPDT is a no-op unless WGGO produced a plan first.**
 8. **Source-AD adjoint generation + lowering** — `AdjointGenerator` rewrites the pruned `WengertList` into an adjoint program; `wengert_lower` lowers it to Cranelift IR.
-9. **Memory planner (M36)** — runs after all user-function bodies are compiled, before `compile_main`. See above.
+9. **CCR (Compiler-Chosen Recomputation)** — straddles step 8. Its *planning* half (`ccr::plan`, `select_partition_dp`, `apply_budget`) runs on the PRIMAL tape before `AdjointGenerator`, segmenting per transformer block and classifying each result as escaping or interior; its *rewriting* half (`apply_to_adjoint`, `splice_decompress`, `insert_adjoint_last_use_frees`) then early-frees the interiors and splices recompute clones into the generated adjoint. Driven by `--checkpoint-blocks` / `--checkpoint-stride`; see the per-pass description below.
+10. **Memory planner (M36)** — runs after all user-function bodies are compiled, before `compile_main`. See above.
 
 **Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT hard-depends on WGGO: if `--wggo` is absent, `cpdt_plan` remains `None`. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
 
 ## Per-pass descriptions
 
-### CCR — Common-kernel Combination Rewriting
+### CCR — Compiler-Chosen Recomputation
 
-**No implementation file exists.** CCR is a research concept defined in [`docs/research/CCR.pdf`](../../docs/research/CCR.pdf). The Compiler-Pipeline page mentions it alongside the other passes for historical context; it is not a current implementation step. Do not link to a source file that does not exist.
+Source: [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs). Research background: [`docs/research/CCR.pdf`](../../docs/research/CCR.pdf).
+
+Block-granular activation checkpointing on the decorator-free source-AD path. The source-AD lowerer retains every primal intermediate until end-of-backward, so the activation wall is O(layers × per-layer intermediates); CCR converts it to O(layers × boundary tensors + one block's interiors). The pass:
+
+1. **Segments** the flat inlined primal tape into per-transformer-block ranges using the same `blocks.N` parameter-name prefixes WGGO uses (`wggo_graph::layer_prefix`).
+2. **Classifies** each in-segment result: *escaping* (consumed by a later primal op — the residual stream and anything else crossing the block boundary) stays SAVED; *interior* (consumed only inside the segment and/or by the adjoint) becomes RECOMPUTE.
+3. **Early-frees** the original interiors right after the forward.
+4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers.
+5. **Frees** each recomputed tensor right after the last adjoint op that consumes it.
+
+Recompute clones run the same kernels in the same order on the same inputs, so the transform is **bit-exact**. Ops with non-replayable semantics (Dropout — RNG) are force-saved, and segments owned by a CSHA backward claim are exempted (the claim table is keyed by primal `OpId`, which a clone cannot satisfy).
+
+Driven by `--checkpoint-blocks`, with `--checkpoint-selective` (never recompute matmul-class ops), `--checkpoint-budget-mib` (knapsack flips the most expensive-to-recompute tensors back to SAVE within budget), and `--checkpoint-stride` (coalesce every N block anchors into one super-segment; `auto` searches strides against the budget). Codegen integration lives in `stmt.rs` (`CcrPolicy`, `DpCostModel`, `select_partition_dp`, `plan_with_kept_anchors`, `project_activation_peak`).
+
+Fires: **source-AD backward only**, and only on models with `blocks.N`-style structure — otherwise it is a no-op with a stderr note.
 
 ---
 
@@ -147,7 +162,7 @@ Fires: **`@flash_attention`-annotated models inside `@train`, when `--csha <mode
 
 ---
 
-### WRGA — Wengert-Ranked Gradient Adapters
+### WRGA — Wengert-Pruned Roofline-Guided Adaptation
 
 Source: [`crates/nsl-codegen/src/wrga_prune.rs`](../../crates/nsl-codegen/src/wrga_prune.rs) (Innovation 1 — dead gradient elimination), [`wrga_roofline.rs`](../../crates/nsl-codegen/src/wrga_roofline.rs) (Innovation 2 — roofline-guided adapter kind selection), [`wrga_spectral.rs`](../../crates/nsl-codegen/src/wrga_spectral.rs) (Innovation 3 — randomized-SVD rank allocation), [`wrga_fusion.rs`](../../crates/nsl-codegen/src/wrga_fusion.rs) (Innovation 4 — fusion-integrated adapters), [`wrga_memory.rs`](../../crates/nsl-codegen/src/wrga_memory.rs) (Innovation 5 — activation-sharing memory planner). The WRGA driver that sequences these is invoked via `invoke_wrga_if_enabled` in [`stmt.rs`](../../crates/nsl-codegen/src/stmt.rs). Adapter-site pre-scan and model-method body rewrite are in [`wrga_prescan.rs`](../../crates/nsl-codegen/src/wrga_prescan.rs).
 
@@ -172,6 +187,42 @@ Design specs: [`docs/superpowers/specs/2026-04-15-cpdt-pipeline-integration-desi
 The CPDT driver composes five passes into a single `CpdtPlan`: (1) ZeRO evaluation — chooses the ZeRO stage (0, 1, 2, or 3) based on cluster topology and model size derived from WGGO's `AppliedPlan`; (2) communication schedule — builds the AllReduce / ReduceScatter / AllGather sequence for the chosen ZeRO stage; (3) precision selection (`cpdt_tier_apply::plan_map`) — assigns fp32 / fp16 / int8 / int4 tiers per-layer using weight-aware calibration data when `--weights` is supplied; (4) quantized optimizer codegen — emits the fused AdamW step for the selected precision; (5) expert placement — assigns MoE expert shards to GPUs. When `CpdtMode::Full` is active, `cpdt_joint.rs` drives an iterative joint solver that alternates between fixing expert placement while optimising ZeRO + precision and fixing ZeRO + precision while optimising expert placement, converging in 3–5 iterations. The driver is pure and deterministic. **CPDT is a no-op unless WGGO produced a plan first** (`invoke_cpdt_if_enabled` checks `wggo_applied`). The `@cpdt(weight_aware=false)` decorator opts individual models out of weight-aware precision selection; the compiler enforces that at most one `@cpdt` decorator appears per program.
 
 Fires: **train-block, when `--cpdt` is set and WGGO produced an `AppliedPlan`.**
+
+### PCA — Packed Causal Attention
+
+Source: [`crates/nsl-codegen/src/pca_detect.rs`](../../crates/nsl-codegen/src/pca_detect.rs) (variant detection), plus [`pca_segment.rs`](../../crates/nsl-codegen/src/pca_segment.rs) (segment-id construction), [`pca_activation.rs`](../../crates/nsl-codegen/src/pca_activation.rs) (dispatch/activation), [`pca_per_doc.rs`](../../crates/nsl-codegen/src/pca_per_doc.rs) (per-document CTA admission), [`pca_tier_b.rs`](../../crates/nsl-codegen/src/pca_tier_b.rs) (Tier-B kernels).
+
+When a `dataset` block sets `packing = true`, many short documents are concatenated into one fixed-length sequence, and attention must not cross document boundaries. The naive encoding is a dense `S x S` boolean mask, which costs `O(S^2)` memory and bandwidth for information that is really `O(S)`. PCA replaces it with a compact `segment_ids: [u16; seq_len]` tensor and synthesises an attention kernel that compares segment ids instead of reading a mask.
+
+`pca_detect` chooses between three variants: **SegmentIdMasked** (the general case, arbitrary document lengths), **PerDocumentCta** (documents short and roughly even — each CTA takes one whole document rather than one Q-tile), and **NoPacking** (packing disabled; ordinary FlashAttention).
+
+Fires: **during kernel synthesis, when the dataset block enables packing.** PCA is not a `compile_train_block` pass and never sees the `WengertList` — `pca_activation::detect_packing_for_stmts` is called from `compiler/kernel.rs` as a scan over the module AST, before `compile_main`. Consequently it cannot consume WGGO's `AppliedPlan`. The `@pca(strategy = per_document)` decorator selects the per-document-CTA path; it does not by itself enable packing, and the detector recommending `PerDocumentCta` does not by itself enable it either. No CLI flag.
+
+### CPKD — Compiler-Planned Knowledge Distillation
+
+Source: [`crates/nsl-codegen/src/cpkd.rs`](../../crates/nsl-codegen/src/cpkd.rs) (driver), plus [`cpkd_fused_loss.rs`](../../crates/nsl-codegen/src/cpkd_fused_loss.rs) (fused KL-CE kernel), [`cpkd_spectral.rs`](../../crates/nsl-codegen/src/cpkd_spectral.rs) (spectral logit compression), [`cpkd_student.rs`](../../crates/nsl-codegen/src/cpkd_student.rs) (CEP-guided student design).
+
+Treats distillation as one compilation problem rather than two model executions. In a `distill(teacher=t, student=s, epochs=N)` block the **teacher is structurally frozen**: every teacher model field registers as a `PrimalOp::Input` leaf, so no adjoint is ever generated for it and the teacher backward is physically absent from the compiled step — there are no teacher gradient buffers to blow up memory. The `@fused_kl_ce` decorator additionally fuses both LM-head matmuls, the temperature-scaled KL term and the hard-label CE term into one kernel, so neither logit tensor is materialized in HBM.
+
+Remaining paper innovations are **advisory** plan entries in v1 (spectral rank, WGGO per-layer feature-match choices, CEP-guided student design); v1 deferrals refuse loudly rather than degrading silently.
+
+Fires: **distill-block.** Design-time analysis is driven by `--cpkd-target` / `--cpkd-design-student` on `nsl check`.
+
+### CEP — Compilation-Evaluated Pruning
+
+Source: [`crates/nsl-codegen/src/cep.rs`](../../crates/nsl-codegen/src/cep.rs) (driver), plus [`cep_extract.rs`](../../crates/nsl-codegen/src/cep_extract.rs), [`cep_importance.rs`](../../crates/nsl-codegen/src/cep_importance.rs), [`cep_rewrite.rs`](../../crates/nsl-codegen/src/cep_rewrite.rs), [`cep_search.rs`](../../crates/nsl-codegen/src/cep_search.rs), [`cep_slice.rs`](../../crates/nsl-codegen/src/cep_slice.rs).
+
+Structured pruning verified by compilation rather than by a runtime proxy. Three CLI-reachable entry points: `run_prune` prunes a pre-trained model (`--cep-prune` / `@cep_prune`), `run_joint` runs joint prune-search over heads, FFN and layer drops (`--cep-joint`), and `run_search` performs hardware-aware architecture search (`--cep-search` / `@cep_search`). The driver is pure and deterministic — the same inputs always produce an identical report. (`cep.rs`'s own module doc still says "two user-facing entry points"; `run_joint` was added later.)
+
+**Not a train-block pass.** CEP rewrites the model offline and emits new weights and/or new NSL source, so it sits outside the `compile_train_block` pass sequence. `--cep-search` and `--cep-profile` are analysis-only and live on `nsl check`; `--cep-prune`, `--cep-joint`, `--cep-sparsity`, `--cep-emit-source` and `--cep-emit-weights` perform surgery and live on `nsl build`; `--cep-target` and `--cep-out` are accepted by both.
+
+### CFIE — Compiler-Fused Inference Engine
+
+Source: [`crates/nsl-codegen/src/cfie.rs`](../../crates/nsl-codegen/src/cfie.rs) (driver), plus [`cfie_kv_plan.rs`](../../crates/nsl-codegen/src/cfie_kv_plan.rs), [`cfie_persistent.rs`](../../crates/nsl-codegen/src/cfie_persistent.rs), [`cfie_serve.rs`](../../crates/nsl-codegen/src/cfie_serve.rs), [`cfie_speculative.rs`](../../crates/nsl-codegen/src/cfie_speculative.rs).
+
+Composes six inference passes — KV planning, fused sampling, speculative decoding, persistent decode + scheduler, KV quantization, and grammar-constrained decoding — into a single `CfiePlan`. Five of the six contribute a *kernel family*, and all five emit real PTX (KV planning shapes the pool rather than emitting a kernel of its own). On the monolithic `serve` path that PTX is embedded and registered with the runtime engine at serve init, and per-token launches go through the host decode loop.
+
+**Not a train-block pass.** CFIE is invoked from `serve.rs::run_cfie_for_serve`, a separate driver entry point. Flags (`--cfie`, `--cfie-report`) live on `nsl build` only.
 
 ## Load-bearing invariants
 

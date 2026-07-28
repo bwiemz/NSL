@@ -657,6 +657,119 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Loop twin of `materialize_non_owning_aliases_before_if`.
+    ///
+    /// `state.non_owning_symbols` is flow-INSENSITIVE, but a loop body is
+    /// generated exactly once. So the compile-time state seen at the body's
+    /// single `eltls_clear_old_slot` site is the FIRST-iteration state. A
+    /// local seeded from a borrow — `let h = x` where `x` is a parameter or a
+    /// model field — is non-owning at that moment, the rebind free is skipped,
+    /// and because the site is only emitted once it is skipped for EVERY
+    /// iteration. `h = block.forward(h)` then strands one owned activation per
+    /// iteration, forever. The same veto at `emit_return_local_sweep` strands
+    /// the last one too.
+    ///
+    /// Measured on `main` before this fix (Coder-50M, `[2,1024]`, RTX 5070 Ti):
+    /// **+1.81 GB retained per forward**, ~40 transient segments per forward,
+    /// OOM by the 8th call — and `@no_grad` did not change a single byte,
+    /// because the leak is ownership bookkeeping, not tape retention.
+    ///
+    /// Fix: before entering the loop, give each such alias its own reference
+    /// (`nsl_tensor_retain`, O(1) — a refcount bump, NOT a data copy) and drop
+    /// it from `non_owning_symbols`. From the loop's point of view the symbol
+    /// is now an ordinary owned local: the first rebind's `free_if_valid`
+    /// releases the reference we just took — the lender's own reference keeps
+    /// the storage alive — and every later rebind frees that iteration's
+    /// value. If the loop body never runs, the return sweep releases it.
+    ///
+    /// Conservative guard: only materialize when EVERY binding of the symbol
+    /// inside the body is owning (`sym_bindings_all_owning_in_block`, the same
+    /// predicate that arms the loop-let predeclare). A body that sometimes
+    /// rebinds the slot to another borrow cannot be handled by a single
+    /// statically-placed free, so those are left alone — leaking, but sound.
+    fn materialize_non_owning_aliases_before_loop(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        body: &nsl_ast::stmt::Block,
+        loop_pattern: Option<&nsl_ast::pattern::Pattern>,
+    ) -> Result<(), CodegenError> {
+        // The sweep only runs where a release can actually pair with the
+        // retain. `emit_return_local_sweep` is skipped inside dtype methods
+        // and tape regions, so materializing there would leak the refcount we
+        // are about to take whenever the loop body runs zero times.
+        if state.flags.in_dtype_method || state.flags.in_tape_region {
+            return Ok(());
+        }
+
+        let mut assigned_symbols = std::collections::HashSet::new();
+        self.collect_assignment_targets_from_block(body, &mut assigned_symbols);
+
+        let materialize: Vec<_> = assigned_symbols
+            .into_iter()
+            // Only aliases the veto currently disarms.
+            .filter(|sym| state.non_owning_symbols.contains(sym))
+            // Never a parameter: the caller owns it, `eltls_clear_old_slot`
+            // and the return sweep both skip params, so a retain here would
+            // never be released.
+            .filter(|sym| !state.param_symbols.contains(sym))
+            // DataLoader handles are freed by loader teardown, not by us.
+            .filter(|sym| !state.borrowed_batch_symbols.contains(sym))
+            .filter(|sym| !state.dataloader_symbols.contains(sym))
+            // NEVER the loop's OWN induction/pattern binding.
+            //
+            // Every loop lowering re-declares its pattern symbol and def's it
+            // to ZERO before this hook runs, then rebinds it per iteration to
+            // a BORROW taken with no retain (`nsl_list_get`, the dataloader's
+            // `next_batch`, a model-array slot). If the pattern name shadows a
+            // symbol already in `non_owning_symbols` —
+            //
+            //     let h = x          # x a param/field, so h is non-owning
+            //     for h in items:    # h's slot is re-declared and zeroed
+            //         h = f(h)       # owning RHS, so the veto below passes
+            //
+            // — then `use_var` reads the freshly zeroed slot and the retain is
+            // a silent no-op (`nsl_tensor_retain(0)` returns immediately),
+            // while the `non_owning_symbols.remove` below still lands. From
+            // then on `eltls_clear_old_slot` fires once per iteration on a
+            // borrowed container element that nothing ever retained: an
+            // UNPAIRED free, i.e. a negative net refcount and a box handed
+            // back to the allocator while the container still points at it.
+            // A later `free_if_valid` magic probe then hits a recycled box and
+            // decrements a DIFFERENT live tensor.
+            //
+            // `sym_bindings_all_owning_in_block` already rejects *nested*
+            // pattern binders, but the loop's own pattern is not part of the
+            // body it inspects — it has to be excluded here.
+            .filter(|sym| {
+                loop_pattern.is_none_or(|p| !self.pattern_binds_sym(p, *sym))
+            })
+            // Every in-body binding must be owning (see doc comment).
+            .filter(|sym| self.sym_bindings_all_owning_in_block(body, *sym))
+            .filter_map(|sym| {
+                let is_tensor = state
+                    .variable_types
+                    .get(&sym)
+                    .map(|ty| ty.is_tensor())
+                    .unwrap_or(false);
+                if !is_tensor {
+                    return None;
+                }
+                state.variables.get(&sym).and_then(|(var, cl_type)| {
+                    (*cl_type == cl_types::I64).then_some((sym, *var))
+                })
+            })
+            .collect();
+
+        for (sym, var) in materialize {
+            let current_val = builder.use_var(var);
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_retain", &[current_val])?;
+            state.non_owning_symbols.remove(&sym);
+        }
+
+        Ok(())
+    }
+
     fn update_non_owning_binding(
         &self,
         state: &mut FuncState,
@@ -672,6 +785,24 @@ impl Compiler<'_> {
             if state.param_symbols.contains(source_sym)
                 || state.non_owning_symbols.contains(source_sym)
             {
+                state.non_owning_symbols.insert(target_sym);
+                return;
+            }
+        }
+
+        // A non-Dict subscript hands out a BORROWED element: `compile_subscript`
+        // lowers lists/tuples through `nsl_list_get`, which returns the stored
+        // raw pointer with no retain. `let t = items[0]` therefore aliases an
+        // element the container still owns, and treating it as owning let the
+        // return sweep free a live element. Dict reads are the exception the
+        // rest of this file already carves out (`loop_binding_rhs_is_owning`
+        // encodes exactly this rule for the loop-rebind free).
+        if let ExprKind::Subscript { object, .. } = &expr.kind {
+            let is_dict = matches!(
+                self.node_type(object.id),
+                nsl_semantic::types::Type::Dict(_, _)
+            );
+            if !is_dict {
                 state.non_owning_symbols.insert(target_sym);
                 return;
             }
@@ -1346,11 +1477,43 @@ impl Compiler<'_> {
                     // M38b: Free linear tensors consumed during the return expression
                     self.free_linear_consumes(builder, state, Some(val));
                     // Free non-parameter tensor locals (see emit_return_local_sweep).
-                    // Only for tensor-typed returns whose aliasing the retain
-                    // above compensates; aggregate returns (lists/dicts) may
-                    // alias locals without a retain and keep today's behavior.
-                    if val_is_ptr
-                        && ret_ty.is_tensor()
+                    //
+                    // Tensor returns: safe because the retain above compensates
+                    // for the returned value aliasing a swept local.
+                    //
+                    // SCALAR returns: also swept, and previously missed. Note
+                    // what the return type does and does not buy us. A
+                    // `-> f64` / `-> int` / `-> bool` result is a value, not a
+                    // handle, so it cannot alias a swept local and needs no
+                    // retain to protect it. The precondition the SWEEP itself
+                    // needs is different and orthogonal: no swept local may
+                    // have ESCAPED. That is carried by `non_owning_symbols`
+                    // (member reads, borrowed batch handles and — since the
+                    // 2026-07-24 review — non-Dict subscripts are all marked
+                    // non-owning and skipped), exactly as it already is for
+                    // the `-> void` and fall-through return paths this merely
+                    // brings into line. Skipping the sweep here stranded one
+                    // tensor per call for the extremely common
+                    // `fn loss(...) -> f64: let d = a - b; return sum(d*d).item()`
+                    // shape (measured: live_blocks 5 -> 11 over 3 -> 9 calls,
+                    // while the identical `-> void` twin stayed flat at 2).
+                    //
+                    // Aggregate returns (list/dict/tuple/str/model) stay
+                    // excluded: they can alias a local without a retain.
+                    let ret_is_scalar = matches!(
+                        ret_ty,
+                        Type::Int
+                            | Type::Float
+                            | Type::Bool
+                            | Type::F32
+                            | Type::F64
+                            | Type::Int8
+                            | Type::Int16
+                            | Type::Int32
+                            | Type::Int64
+                            | Type::Uint8
+                    );
+                    if (ret_is_scalar || (val_is_ptr && ret_ty.is_tensor()))
                         && !state.flags.in_dtype_method
                         && !state.flags.in_tape_region
                     {
@@ -2860,6 +3023,11 @@ impl Compiler<'_> {
         // pre-loop block: a def inside the body re-zeroes the slot every
         // iteration, so the rebind free only ever sees 0 and the previous
         // iteration's tensor strands.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, None)?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -2940,6 +3108,11 @@ impl Compiler<'_> {
         // ELTLS Task 16.1: pre-declare top-level let-ident symbols from
         // the body so rebinds across iterations free the previous value.
         // Pre-loop block on purpose — see compile_while.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3096,6 +3269,11 @@ impl Compiler<'_> {
         // ELTLS Task 16.1: pre-declare top-level let-ident symbols from the
         // body so the second-and-later rebinds fire eltls_clear_old_slot.
         // Pre-loop block on purpose — see compile_while.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3283,6 +3461,11 @@ impl Compiler<'_> {
 
         // ELTLS Task 16.1: pre-declare top-level let-ident symbols from body.
         // Pre-loop block on purpose — see compile_while.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -3449,6 +3632,11 @@ impl Compiler<'_> {
         // previous iteration's tensor. The zero-def MUST live in the
         // pre-loop block — inside the body it re-zeroes the slot every
         // iteration and the free only ever sees 0.
+        // Loop-carried locals seeded from a borrow (`let h = x`) are vetoed
+        // by the flow-insensitive non_owning_symbols set, so their single
+        // generated rebind-free site never fires. Give them their own
+        // reference first — see materialize_non_owning_aliases_before_loop.
+        self.materialize_non_owning_aliases_before_loop(builder, state, body, Some(pattern))?;
         let predecl_syms = self.eltls_predeclare_loop_lets_checked(builder, state, body);
 
         builder.ins().jump(header_block, &[]);
@@ -6556,6 +6744,12 @@ impl Compiler<'_> {
             // adapter rewrite (fused FFI name + adapter field names).
             extractor.set_synth_call_names(self.synth_call_names.clone());
             extractor.set_synth_member_names(self.synth_member_names.clone());
+            // Item 9 phase 2: thread the `@fp8_compute` model-method set so the
+            // extractor can record any decorated method it inlines. Source-AD
+            // lowering has no FP8 path at all, so an inlined decorated method
+            // silently computes in f32; the refusal below turns that into a
+            // compile error naming the method.
+            extractor.set_fp8_compute_methods(self.features.fp8_compute_methods.clone());
 
             // Register the model variable as a model instance so method calls get inlined
             extractor.register_model_instance(model_sym, &model_type_name);
@@ -6601,6 +6795,141 @@ impl Compiler<'_> {
             }
 
             let extraction_ok = extractor.extract_stmts(&step_body.stmts);
+
+            // Item 6: refuse a `@fused_lm_ce(enabled = true)` that fused
+            // NOTHING.
+            //
+            // The decorator's whole purpose is to remove the `[N, V]`
+            // logits-gradient surface (402 MB per step at V=49152, H=2048).
+            // Its substitution declines for twelve distinct reasons and every
+            // one used to fall silently through to
+            // `PrimalOp::CrossEntropyLoss`, so a
+            // user whose LM head is biasless or reshaped before the loss —
+            // which is every production coder model in this repo — got a
+            // clean compile, no diagnostic, and the full composite path while
+            // believing the fused kernel was live. Per
+            // `feedback_deferral_must_refuse`, a capability that cannot be
+            // delivered must say so.
+            //
+            // Scoped to "NOTHING fused" rather than "any decline" on purpose:
+            // a step body may legitimately contain an auxiliary
+            // `cross_entropy` that is not the LM head, and refusing that
+            // would make the decorator unusable. Partial declines warn.
+            // Item 9 phase 2: `@fp8_compute` does not survive source AD.
+            //
+            // The decorator's whole job is to route matmuls in the decorated
+            // body to `nsl_fp8_matmul_training` so the backward records a
+            // `TapeOp::Fp8MatMul` and the weight/activation gradients get the
+            // E5M2 round-trip. That routing lives in `expr/advanced.rs`, which
+            // source AD does not use: the method body is inlined into a
+            // Wengert list and `wengert_lower.rs` lowers `PrimalOp::Matmul` to
+            // an unconditional `nsl_tensor_matmul`. Neither `source_ad.rs` nor
+            // `wengert_lower.rs` contains a single occurrence of "fp8".
+            //
+            // So the user gets plain f32 training with no error, no warning,
+            // and a decorator in the source claiming otherwise — the failure
+            // shape `feedback_deferral_must_refuse` exists to prevent.
+            //
+            // Gated on `extraction_ok` because a body source AD could not
+            // extract falls back to tape AD, where the decorator DOES take
+            // effect. Only refuse when source AD actually took the body.
+            if extraction_ok {
+                let dropped = extractor.inlined_fp8_methods();
+                if !dropped.is_empty() {
+                    let mut names = String::new();
+                    for (i, m) in dropped.iter().enumerate() {
+                        names.push_str(&format!("\n  {}. {}", i + 1, m));
+                    }
+                    return Err(CodegenError::new(format!(
+                        "@fp8_compute has no effect under --source-ad \
+                         (source-to-source AD), but this train block inlined \
+                         {} decorated method(s):{}\
+                         \n\nSource AD lowers every matmul to nsl_tensor_matmul \
+                         (see wengert_lower.rs, PrimalOp::Matmul) — there is no \
+                         FP8 lowering on this path, so the step would train in \
+                         plain f32 while the decorator says otherwise.\
+                         \n\nEither pass --tape-ad to compile this block on the \
+                         tape path, where @fp8_compute routes through \
+                         nsl_fp8_matmul_training, or remove the decorator to \
+                         request f32 deliberately.",
+                        dropped.len(),
+                        names,
+                    )));
+                }
+            }
+
+            if extraction_ok {
+                // Deduplicate before reporting. `try_unroll_for` re-extracts a
+                // loop body once per iteration, so ONE `cross_entropy` inside
+                // an unrolled loop yields N identical declines; reporting "N
+                // cross_entropy call(s)" for a single source call, N times,
+                // would be actively misleading.
+                let mut declines: Vec<crate::source_ad::FusedLceDecline> =
+                    Vec::new();
+                for d in extractor.fused_lce_declines() {
+                    if !declines.contains(d) {
+                        declines.push(d.clone());
+                    }
+                }
+                if !declines.is_empty() {
+                    if extractor.fused_lce_substitution_count() == 0 {
+                        let mut reasons = String::new();
+                        for (i, d) in declines.iter().enumerate() {
+                            reasons.push_str(&format!("\n  {}. {}", i + 1, d.describe()));
+                        }
+                        return Err(CodegenError::new(format!(
+                            "@fused_lm_ce(enabled = true) is active on this train \
+                             block, but the fused linear-CE kernel could not be \
+                             substituted for ANY of the {} distinct cross_entropy \
+                             site(s) in the step body — so the full [batch*seq, \
+                             vocab] logits gradient would still be materialized \
+                             every step, which is exactly what the decorator \
+                             exists to avoid.\
+                             \n\nWhy each call declined:{}\n\n\
+                             Fix the head so it matches, or set enabled = false (or \
+                             drop the decorator) to request the composite path \
+                             deliberately.",
+                            declines.len(),
+                            reasons,
+                        )));
+                    }
+                    // Partial: at least one call fused. Report the rest so a
+                    // head that quietly stopped matching is still visible.
+                    for d in &declines {
+                        eprintln!(
+                            "[fused-lm-ce] a cross_entropy call fell back to the \
+                             composite path: {}",
+                            d.describe()
+                        );
+                    }
+                }
+            } else if self.active_fused_ce_config.as_ref().is_some_and(|c| c.enabled) {
+                // Item 6: the OTHER way an enabled decorator delivers nothing.
+                //
+                // The refusal above is gated on `extraction_ok` because a body
+                // that source-AD cannot extract never reaches the substitution
+                // arm at all — there are no declines to report, and the
+                // fallback below is a general mechanism, not a fused-CE
+                // decision. But the user's promise is broken just the same: the
+                // fused kernel only exists on the source-AD path, so a tape
+                // fallback means it definitely did not run.
+                //
+                // This is not hypothetical. `crates/nsl-codegen/tests/fixtures/
+                // fused_lm_ce_e2e_{fp16,bf16}.nsl` both carry a fully-hinted
+                // enabled decorator and both land here, because their heads use
+                // `bias_add(...)`, which has no source-AD handler. Warn rather
+                // than refuse: unlike a decline, this path has a legitimate
+                // reading (the body genuinely is not statically extractable)
+                // and refusing would break those fixtures.
+                eprintln!(
+                    "[fused-lm-ce] @fused_lm_ce(enabled = true) is active, but \
+                     source-AD extraction of the step body failed — the fused \
+                     linear-CE kernel exists only on the source-AD path, so it \
+                     will NOT run and the full [batch*seq, vocab] logits gradient \
+                     will be materialized. Restrict the step body to \
+                     source-AD-supported operations, or drop the decorator."
+                );
+            }
 
             if !extraction_ok {
                 // CPKD: the tape records EVERY op on the thread-local tape —
@@ -9340,7 +9669,7 @@ impl Compiler<'_> {
                     let plist = param_list;
                     let mut fase_cb = |c: &mut Compiler,
                                        var_id: crate::wengert::VarId,
-                                       grad_ptr: Value,
+                                       grad_src: crate::wengert_lower::ParamGradSource,
                                        still_needed: bool,
                                        b: &mut cranelift_frontend::FunctionBuilder|
                      -> Result<(), CodegenError> {
@@ -9364,6 +9693,26 @@ impl Compiler<'_> {
                         let m_partial =
                             c.compile_call_by_name(b, "nsl_list_get", &[accum_val, idx_val])?;
                         let off = c.compile_options.optim_state_offload;
+                        // Item 7: the fused chain never materializes a
+                        // gradient tensor — emit the accumulating GEMM over
+                        // the chain's operands and we are done. There is
+                        // nothing to note for grad-integrity and nothing to
+                        // free; both compositions are refused at option
+                        // validation so neither can be silently skipped here.
+                        let grad_ptr = match grad_src {
+                            crate::wengert_lower::ParamGradSource::FusedWgrad { x, g } => {
+                                debug_assert!(!c.compile_options.grad_integrity);
+                                debug_assert!(!off);
+                                let scale_val = b.ins().f64const(accum_scale);
+                                c.compile_call_by_name(
+                                    b,
+                                    "nsl_tensor_wgrad_accum",
+                                    &[m_partial, x, g, scale_val],
+                                )?;
+                                return Ok(());
+                            }
+                            crate::wengert_lower::ParamGradSource::Materialized(v) => v,
+                        };
                         // P0.3: note this parameter's gradient BEFORE accumulate
                         // frees/consumes it. accum_idx == the param_paths index.
                         if c.compile_options.grad_integrity {
@@ -10953,7 +11302,10 @@ impl Compiler<'_> {
             // gate exists (deferral-must-refuse).
             if wrap_precision && self.compile_options.optim_state_offload {
                 return Err(CodegenError::new(
-                    "--layerwise-accum with --optim-state-offload does not yet                      support a CPDT reduced-precision moment plan (the P0.3                      combined staging arm is ungated under the layerwise                      schedule). Drop the precision plan or --optim-state-offload",
+                    "--layerwise-accum with --optim-state-offload does not yet \
+                     support a CPDT reduced-precision moment plan (the P0.3 \
+                     combined staging arm is ungated under the layerwise \
+                     schedule). Drop the precision plan or --optim-state-offload",
                 ));
             }
             let two_state = num_state_buffers >= 2;
@@ -11394,10 +11746,28 @@ impl Compiler<'_> {
                 let accum_scale = pending.accum_scale;
                 let mut fase_cb = |c: &mut Compiler,
                                    var_id: crate::wengert::VarId,
-                                   grad_ptr: Value,
+                                   grad_src: crate::wengert_lower::ParamGradSource,
                                    still_needed: bool,
                                    b: &mut cranelift_frontend::FunctionBuilder|
                  -> Result<(), CodegenError> {
+                    // Item 7 is refused alongside --layerwise-accum at option
+                    // validation, so this arm is unreachable. It is a hard
+                    // error rather than a silent fallthrough because the
+                    // reason is subtle: CSLA lowers PRE-SLICED tapes, so
+                    // `wgrad_fusion::plan` would see slice-local reader
+                    // counts and could elide a matmul whose result a LATER
+                    // slice still reads — a silently dropped gradient.
+                    let grad_ptr = match grad_src {
+                        crate::wengert_lower::ParamGradSource::Materialized(v) => v,
+                        crate::wengert_lower::ParamGradSource::FusedWgrad { .. } => {
+                            return Err(CodegenError::new(
+                                "internal: --fuse-wgrad-accum fired inside the CSLA window \
+                                 replay, which lowers pre-sliced tapes where the fusion's \
+                                 single-reader proof does not hold. This composition is \
+                                 supposed to be refused at option validation.",
+                            ));
+                        }
+                    };
                     let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
                         return Ok(());
                     };

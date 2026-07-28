@@ -27,6 +27,33 @@ pub enum DispatchReject {
     UnsupportedHeadDim(u32),
     /// SMEM budget exceeded even at the smallest bq the ladder allows.
     SmemOverBudget { needed: u32, budget: u32 },
+    /// Roadmap item 15: `gqa_group_size > 1` is IMPLEMENTED but has no
+    /// numerical coverage, so it is refused rather than dispatched.
+    ///
+    /// The GQA zero-copy stride pattern exists in the emitters
+    /// (`backward/hbm_addr.rs` divides the head register by `gqa_group_size`
+    /// for K/V/dK/dV addressing), but every Tier B.2 numerical gate hardcodes
+    /// `gqa_group_size: 1` — the sweeps in
+    /// `tier_b2_dkdv_kernel_cpu_reference.rs`,
+    /// `tier_b2_dq_kernel_cpu_reference.rs` and
+    /// `tier_b2_full_backward_cpu_reference.rs` all do. So the grouped-KV
+    /// addressing has never been compared against a reference on any GPU.
+    ///
+    /// This does NOT make grouped-KV safe, and the first version of this
+    /// comment wrongly said it did ("falling back to the scalar backward is
+    /// correct and slower"). It is not: no emitter under `phases/backward/`
+    /// reads `gqa_group_size` — the only mentions are `gqa_group_size: 1`
+    /// literals in their test fixtures — and `emit_kv_recompute` rebuilds K/V
+    /// with no kv-head remap (see `flash_attention_v2/mod.rs:1302-1305`). BOTH
+    /// backward paths are grouped-KV-blind. What this guard buys is that Tier
+    /// B.2 does not ADD a second unvalidated path, and the LOUD refusal in
+    /// `synthesize_tier_b2_backward` covers the direct-call route.
+    ///
+    /// LIFT POINT: give `nsl-test/src/cpu_naive_backward.rs` a kv-head-group
+    /// reference, widen the three sweeps above to `gqa_group_size in {2, 4}`,
+    /// bank the rows in `docs/hardware/attention_backward_certification.md`,
+    /// and delete this arm.
+    GqaUnvalidated { group_size: u32 },
 }
 
 /// Per-hd bq + chunk schedule from spec §6.4.
@@ -80,6 +107,23 @@ pub fn tier_b2_can_dispatch(
     }
     if config.gpu_sm < 80 {
         return Err(DispatchReject::SmTooOld);
+    }
+    // Item 15: refuse the grouped-KV regime — implemented, never validated.
+    // See `DispatchReject::GqaUnvalidated`.
+    //
+    // Defense in depth, NOT a live fix, and the first version of this comment
+    // over-claimed by calling it "REACHABLE". Every production config that
+    // reaches here has `csha.level == 1` — `compiler/kernel.rs:900-922`
+    // hardcodes it in both branches and logs a "clamped to level 1" override
+    // for any layer asking for more — so `LevelTooLow` fires two lines above
+    // and Tier B.2 never dispatches in production at all, GQA or otherwise.
+    // The guard matters for the paths that bypass that clamp (direct
+    // construction, tests, and whatever lifts the clamp later), which is
+    // exactly when an unvalidated regime would slip through unnoticed.
+    if config.gqa_group_size > 1 {
+        return Err(DispatchReject::GqaUnvalidated {
+            group_size: config.gqa_group_size,
+        });
     }
     let hd = config.head_dim as u32;
     let Some((bq, chunk)) = ladder_row(hd) else {
@@ -201,6 +245,111 @@ pub fn tier_b2_hybrid_backward_compile_time_eligible(config: &FlashAttentionConf
     // in `tier_b2_hybrid_backward_eligible` for the full rationale.
     csha.active_heads == 1
         && csha.d_model == hd
+}
+
+#[cfg(test)]
+mod item15_gqa_refusal_tests {
+    //! Roadmap item 15 — the grouped-KV regime must not dispatch unvalidated.
+
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    /// A config that dispatches to Tier B.2 in every respect EXCEPT the GQA
+    /// group size, so the only thing the assertions below turn on is that
+    /// field.
+    fn dispatchable(gqa_group_size: u32) -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                d_model: 64,
+                active_heads: 1,
+                ..Default::default()
+            }),
+            checkpoint: None,
+        }
+    }
+
+    /// The control. Without it, `refuses_grouped_kv` would pass for a config
+    /// that was never dispatchable in the first place, and the guard would
+    /// look load-bearing while gating nothing.
+    #[test]
+    fn the_same_config_with_group_size_1_still_dispatches() {
+        assert!(
+            matches!(
+                tier_b2_can_dispatch(&dispatchable(1)),
+                Ok(BackwardTier::TierB2 { .. })
+            ),
+            "the control config must dispatch, or the refusal test below is \
+             testing nothing"
+        );
+    }
+
+    #[test]
+    fn refuses_grouped_kv_until_it_is_numerically_validated() {
+        for g in [2u32, 4, 8] {
+            match tier_b2_can_dispatch(&dispatchable(g)) {
+                Err(DispatchReject::GqaUnvalidated { group_size }) => {
+                    assert_eq!(group_size, g, "the refusal must report the size");
+                }
+                other => panic!(
+                    "gqa_group_size={g} must be refused (the emitters' grouped-KV \
+                     addressing has no numerical coverage), got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Pins WHY the guard is needed: every Tier B.2 numerical sweep fixes
+    /// `gqa_group_size: 1`, so nothing validates the grouped path. If a sweep
+    /// ever gains a `gqa_group_size` above 1, this fails and points at the
+    /// lift point on `DispatchReject::GqaUnvalidated`.
+    #[test]
+    fn no_tier_b2_numerical_sweep_covers_grouped_kv() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let sweeps = [
+            "tier_b2_dkdv_kernel_cpu_reference.rs",
+            "tier_b2_dq_kernel_cpu_reference.rs",
+            "tier_b2_full_backward_cpu_reference.rs",
+        ];
+        let mut covered = Vec::new();
+        for f in sweeps {
+            let path = root.join(f);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            assert!(
+                src.contains("gqa_group_size"),
+                "{f} no longer mentions gqa_group_size — this gate can no \
+                 longer tell whether the grouped path is covered"
+            );
+            for line in src.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("gqa_group_size:") {
+                    let v = rest.trim().trim_end_matches(',').trim();
+                    if v != "1" {
+                        covered.push(format!("{f}: gqa_group_size: {v}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            covered.is_empty(),
+            "a Tier B.2 sweep now covers grouped KV: {covered:?}\n\
+             If that coverage is real and banked, remove the \
+             DispatchReject::GqaUnvalidated arm and this test."
+        );
+    }
 }
 
 #[cfg(test)]

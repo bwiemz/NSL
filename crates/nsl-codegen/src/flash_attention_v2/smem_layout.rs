@@ -228,7 +228,34 @@ pub fn recompute_xnorm_offset(config: &FlashAttentionConfig) -> u32 {
     // occupy `total_bytes(config)`, the backward extra (`dQ`/`dK`/`dV`/
     // `x_norm`/`dx_norm`/`rms_strip`/`P`) sits after, and the recompute
     // xnorm scratch comes last.
-    total_bytes(config) + backward_extra_bytes(config)
+    //
+    // ── PCA ALIASING FIX (2026-07-26) ────────────────────────────────────
+    // When `segment_masked`, the backward embeds `seg_smem` at the tail of
+    // the extern shmem region and anchors it at EXACTLY this same offset:
+    //   `prelude.rs`: add.u64 %seg_base, %shmem_base, backward_total_bytes(config)
+    //   and `backward_total_bytes` is literally `total_bytes + backward_extra_bytes`.
+    // So the two regions were the same bytes. `emit_prologue_recompute_from_raw`
+    // writes `block_q * head_dim * 2` bytes of recomputed f16 x_norm there in
+    // step 2 of the kv-recompute, and step 5's RoPE-K epilogue then reads
+    // `ld.shared.u16` segment ids back out of those same bytes — getting f16
+    // mantissa patterns instead. A bogus sid (up to 65535) then indexes
+    // `smem_doc_starts[sid]`, i.e. up to 262140 bytes into a 1028-byte array:
+    // either CUDA_ERROR_ILLEGAL_ADDRESS or a garbage `effective_pos`.
+    //
+    // The launcher already reserves room for both regions —
+    // `shared_mem_bytes_v2_backward` returns
+    // `backward_total_bytes + seg_overhead + recompute_extra` — they were
+    // merely stacked at the same base. Skipping past the segment budget makes
+    // the two disjoint within the allocation that was always being granted.
+    //
+    // Byte-identical when `!segment_masked`, which is every currently-green
+    // checkpoint gate, so the Path-B oracles are unaffected.
+    let seg_overhead = if config.segment_masked {
+        crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
+    } else {
+        0
+    };
+    total_bytes(config) + backward_extra_bytes(config) + seg_overhead
 }
 
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.

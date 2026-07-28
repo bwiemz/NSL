@@ -1946,13 +1946,24 @@ pub(crate) fn run_backward_core_strict(
                 if let Some(&g) = grad_map.get(out) {
                     let _ = (k_dim, device);
 
-                    let scale_g = crate::fp8::calibrate_gradient_scale(g);
+                    // One E5M2 quantization per tensor. The previous shape —
+                    // `calibrate_gradient_scale(g)` plus two
+                    // `fp8_matmul_e5m2_backward` calls, each of which casts
+                    // both of its operands — quantized g THREE times, and on
+                    // GPU every cast is a synchronous D2H/H2D round-trip
+                    // (five stagings per matmul per step). Cast g once with
+                    // scale 0.0: `nsl_fp8_cast`'s auto-compute is the same
+                    // amax/FP8E5M2_MAX rule calibrate applied, and the
+                    // quantized operands feed plain matmuls, which is
+                    // exactly what `fp8_matmul_e5m2_backward` (still the
+                    // reference form, gated by its own tests) does inside.
+                    let g_q = crate::fp8::nsl_fp8_quantize_e5m2(g, 0.0);
 
                     let b_t = tensor_transpose(*saved_b, -2, -1);
-                    let grad_a = crate::fp8::fp8_matmul_e5m2_backward(
-                        g, b_t, scale_g, *scale_b,
-                    );
+                    let b_q = crate::fp8::nsl_fp8_quantize_e5m2(b_t, *scale_b as f64);
                     tensor_free(b_t);
+                    let grad_a = crate::tensor::nsl_tensor_matmul(g_q, b_q, 0);
+                    tensor_free(b_q);
 
                     let a_t = tensor_transpose(*saved_a, -2, -1);
                     // Eagerly free saved tensors after transpose
@@ -1960,10 +1971,11 @@ pub(crate) fn run_backward_core_strict(
                     tensor_free(*saved_b);
                     *saved_a = 0;
                     *saved_b = 0;
-                    let grad_b = crate::fp8::fp8_matmul_e5m2_backward(
-                        a_t, g, *scale_a, scale_g,
-                    );
+                    let a_q = crate::fp8::nsl_fp8_quantize_e5m2(a_t, *scale_a as f64);
                     tensor_free(a_t);
+                    let grad_b = crate::tensor::nsl_tensor_matmul(a_q, g_q, 0);
+                    tensor_free(a_q);
+                    tensor_free(g_q);
 
                     accumulate_grad(&mut grad_map, *a, grad_a);
                     accumulate_grad(&mut grad_map, *b, grad_b);

@@ -118,6 +118,21 @@ mod imp {
         }
     }
 
+    /// Which cuBLAS wrapper a recorded `GpuOp::Sgemm` came from.
+    ///
+    /// Replay must call the same one: the wrappers differ in operand order,
+    /// transposition and leading dimensions, so reconstructing a weight-grad
+    /// contraction through the row-major wrapper computes a different (and
+    /// silently plausible) product.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum SgemmKind {
+        /// `sgemm_row_major` / `sgemm_batched_row_major` — row-major operands
+        /// with the `C^T = B^T A^T` swap.
+        RowMajor,
+        /// `sgemm_wgrad_accum` — `C[d,o] = alpha * X[N,d]^T @ G[N,o] + beta*C`.
+        WgradAccum,
+    }
+
     /// One recorded GPU interaction. Everything needed both to compare a
     /// later step's issuance for equality and to eagerly re-issue the op
     /// during self-repair.
@@ -137,12 +152,59 @@ mod imp {
             name: String,
         },
         Sgemm {
+            /// WHICH cuBLAS wrapper produced this, and therefore which one
+            /// must reproduce it on replay.
+            ///
+            /// Not cosmetic. `sgemm_wgrad_accum` and the plain row-major path
+            /// (`sgemm_row_major_t` with both ops `N`) both recorded
+            /// `(a, b, c, m, n, k, alpha, beta)` through one shared hook, but
+            /// they hand cuBLAS completely different operand mappings —
+            /// `OP_N/OP_N` with the row-major swap versus `OP_N/OP_T` for the
+            /// weight-gradient contraction. Without this field a wgrad gemm
+            /// and a plain gemm over the same three buffers with the same
+            /// three dims compare EQUAL, and eager repair replays either one
+            /// as `sgemm_row_major`. That was true before item 9 and is why
+            /// this field exists now: OP_T on the general matmul path makes
+            /// the collision reachable from every model instead of only from
+            /// the weight-gradient fusion.
+            kind: SgemmKind,
+            /// Operand transposition, for the row-major wrapper. `lda`/`ldb`
+            /// are derived from these plus (m, n, k) inside the wrapper, so
+            /// recording the flags pins the leading dimensions too.
+            transa: bool,
+            transb: bool,
             a: usize,
             b: usize,
             c: usize,
             m: u64,
             n: u64,
             k: u64,
+            /// `alpha`/`beta` as raw f32 BIT PATTERNS.
+            ///
+            /// Stored as bits, not f32, so this stays usable in the exact
+            /// equality comparison below — and, more importantly, so a FUSED
+            /// accumulating gemm (`beta = 1.0`, writing into an existing
+            /// buffer) can never compare equal to, or be replayed as, an
+            /// overwriting one (`beta = 0.0`). Replaying the wrong beta would
+            /// silently double-count or drop a gradient contribution.
+            alpha_bits: u32,
+            beta_bits: u32,
+            /// Number of matrix slices; 1 for a plain sgemm.
+            ///
+            /// Item 9: batched products used to reach the graph as a
+            /// `GpuOp::Kernel` — the naive `nsl_bmm_f32` launch, whose params
+            /// blob carried the batch count and strides and so distinguished
+            /// them automatically. Routing them to cuBLAS makes them
+            /// pseudo-ops instead, so the batch geometry has to become part of
+            /// THIS op's identity. Without it two products differing only in
+            /// batch count or stride compare equal, and a replay reuses a
+            /// captured graph built for the wrong shape.
+            batch: u64,
+            /// Element offsets between consecutive slices. 0 broadcasts that
+            /// operand across the whole batch.
+            stride_a: u64,
+            stride_b: u64,
+            stride_c: u64,
         },
         Memset {
             dst: usize,
@@ -181,9 +243,21 @@ mod imp {
                     },
                 ) => func == f2 && grid == g2 && block == b2 && shared == s2 && params == p2 && offsets == o2,
                 (
-                    GpuOp::Sgemm { a, b, c, m, n, k },
-                    GpuOp::Sgemm { a: a2, b: b2, c: c2, m: m2, n: n2, k: k2 },
-                ) => a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2,
+                    GpuOp::Sgemm {
+                        kind, transa, transb,
+                        a, b, c, m, n, k, alpha_bits, beta_bits,
+                        batch, stride_a, stride_b, stride_c,
+                    },
+                    GpuOp::Sgemm {
+                        kind: kd2, transa: ta2, transb: tb2,
+                        a: a2, b: b2, c: c2, m: m2, n: n2, k: k2,
+                        alpha_bits: al2, beta_bits: be2,
+                        batch: bt2, stride_a: sa2, stride_b: sb2, stride_c: sc2,
+                    },
+                ) => kind == kd2 && transa == ta2 && transb == tb2
+                    && a == a2 && b == b2 && c == c2 && m == m2 && n == n2 && k == k2
+                    && alpha_bits == al2 && beta_bits == be2
+                    && batch == bt2 && stride_a == sa2 && stride_b == sb2 && stride_c == sc2,
                 (GpuOp::Memset { dst, bytes }, GpuOp::Memset { dst: d2, bytes: n2 }) => {
                     dst == d2 && bytes == n2
                 }
@@ -321,9 +395,26 @@ mod imp {
                     eat(&(offsets.len() as u64).to_le_bytes());
                     eat(params);
                 }
-                GpuOp::Sgemm { a, b, c, m, n, k } => {
+                GpuOp::Sgemm {
+                    kind, transa, transb,
+                    a, b, c, m, n, k, batch, stride_a, stride_b, stride_c, ..
+                } => {
                     eat(&[2]);
-                    for v in [*a as u64, *b as u64, *c as u64, *m, *n, *k] {
+                    // Wrapper identity and transposition are digested for the
+                    // same reason batch geometry is: two calls that produce
+                    // different products must not hash alike.
+                    eat(&[
+                        match kind {
+                            SgemmKind::RowMajor => 0u8,
+                            SgemmKind::WgradAccum => 1u8,
+                        },
+                        u8::from(*transa),
+                        u8::from(*transb),
+                    ]);
+                    for v in [
+                        *a as u64, *b as u64, *c as u64, *m, *n, *k,
+                        *batch, *stride_a, *stride_b, *stride_c,
+                    ] {
                         eat(&v.to_le_bytes());
                     }
                 }
@@ -352,7 +443,7 @@ mod imp {
     /// Eagerly re-issue recorded ops (bit-identical by construction: same
     /// function handles, same argument bytes, same stream). Must be called
     /// with the ACTIVE borrow RELEASED and the mode already advanced to
-    /// EagerRest/none — `sgemm_row_major` re-enters the on_sgemm hook.
+    /// EagerRest/none — the gemm wrappers re-enter the `on_sgemm_*` hooks.
     fn repair(ops: &[GpuOp]) {
         if ops.is_empty() {
             return;
@@ -383,14 +474,43 @@ mod imp {
                         "[cuda-graph] eager-repair kernel relaunch failed: {r:?}"
                     );
                 }
-                GpuOp::Sgemm { a, b, c, m, n, k } => {
-                    let r = unsafe {
-                        crate::cuda::cublas_inner::sgemm_row_major(
-                            *a as *const f32,
-                            *b as *const f32,
-                            *c as *mut f32,
-                            *m, *n, *k,
-                        )
+                GpuOp::Sgemm {
+                    kind, transa, transb,
+                    a, b, c, m, n, k, alpha_bits, beta_bits,
+                    batch, stride_a, stride_b, stride_c,
+                } => {
+                    let (alpha, beta) = (f32::from_bits(*alpha_bits), f32::from_bits(*beta_bits));
+                    // Dispatch on `kind`, not on shape. Replaying a
+                    // weight-gradient contraction through `sgemm_row_major`
+                    // would recompute a DIFFERENT product from the same three
+                    // buffers — no error, no crash, just a wrong gradient.
+                    let r = match (kind, *batch) {
+                        (SgemmKind::RowMajor, 1) => unsafe {
+                            crate::cuda::cublas_inner::sgemm_row_major_t(
+                                *a as *const f32,
+                                *b as *const f32,
+                                *c as *mut f32,
+                                *m, *n, *k, *transa, *transb, alpha, beta,
+                            )
+                        },
+                        (SgemmKind::RowMajor, _) => unsafe {
+                            crate::cuda::cublas_inner::sgemm_batched_row_major(
+                                *a as *const f32,
+                                *b as *const f32,
+                                *c as *mut f32,
+                                *m, *n, *k,
+                                *batch, *stride_a, *stride_b, *stride_c,
+                                alpha, beta,
+                            )
+                        },
+                        (SgemmKind::WgradAccum, _) => unsafe {
+                            crate::cuda::cublas_inner::sgemm_wgrad_accum(
+                                *a as *const f32,
+                                *b as *const f32,
+                                *c as *mut f32,
+                                *m, *n, *k, alpha, beta,
+                            )
+                        },
                     };
                     assert!(r.is_ok(), "[cuda-graph] eager-repair sgemm failed: {r:?}");
                 }
@@ -464,9 +584,14 @@ mod imp {
                         u64::from_le_bytes(pb[firstb & !7..][..8].try_into().unwrap_or([0; 8])),
                     );
                 }
-                (GpuOp::Sgemm { a: aa, b: ab, c: ac, .. }, GpuOp::Sgemm { a: ba, b: bb, c: bc, .. }) => {
+                (
+                    GpuOp::Sgemm { a: aa, b: ab, c: ac, batch: abt, kind: akd, .. },
+                    GpuOp::Sgemm { a: ba, b: bb, c: bc, batch: bbt, kind: bkd, .. },
+                ) => {
                     eprintln!(
-                        "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs ({aa:#x},{ab:#x},{ac:#x}) vs ({ba:#x},{bb:#x},{bc:#x})"
+                        "[cuda-graph] region {id}: first divergence at op {i}: sgemm ptrs \
+                         ({aa:#x},{ab:#x},{ac:#x}) batch={abt} {akd:?} vs \
+                         ({ba:#x},{bb:#x},{bc:#x}) batch={bbt} {bkd:?}"
                     );
                 }
                 _ => {
@@ -476,8 +601,11 @@ mod imp {
                             params.len(),
                             &params[..params.len().min(48)]
                         ),
-                        GpuOp::Sgemm { a, b, c, m, n, k } => {
-                            format!("sgemm a={a:#x} b={b:#x} c={c:#x} {m}x{n}x{k}")
+                        GpuOp::Sgemm { a, b, c, m, n, k, batch, kind, transa, transb, .. } => {
+                            format!(
+                                "sgemm[{kind:?} ta={transa} tb={transb}] a={a:#x} b={b:#x} \
+                                 c={c:#x} {m}x{n}x{k} batch={batch}"
+                            )
                         }
                         GpuOp::Memset { dst, bytes } => format!("memset dst={dst:#x} n={bytes}"),
                         GpuOp::HtoD { dst, len, .. } => format!("htod dst={dst:#x} n={len}"),
@@ -990,13 +1118,42 @@ mod imp {
         Some(GpuOp::Kernel { func, grid, block, shared, params, offsets, name })
     }
 
-    /// Hook for `sgemm_row_major`. Returns `false` when the gemm must be
-    /// skipped (verified against the captured sequence).
-    pub fn on_sgemm(a: usize, b: usize, c: usize, m: u64, n: u64, k: u64) -> bool {
+    /// Hook for `sgemm_batched_row_major` (item 9). Returns `false` when the
+    /// gemm must be skipped (verified against the captured sequence);
+    /// `stride_*` are element offsets, 0 meaning broadcast.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_sgemm_batched(
+        a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
+        batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
+    ) -> bool {
+        on_sgemm_full(
+            SgemmKind::RowMajor, false, false,
+            a, b, c, m, n, k, alpha, beta, batch, stride_a, stride_b, stride_c,
+        )
+    }
+
+    /// The full hook. Every cuBLAS gemm wrapper routes here so that ops which
+    /// differ in wrapper or transposition cannot compare equal.
+    ///
+    /// The `strides` for a `batch == 1` op are the natural per-slice extents
+    /// rather than 0, so a single-slice call recorded through the batched hook
+    /// and one recorded through the 2-D hook describe the same geometry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_sgemm_full(
+        kind: SgemmKind, transa: bool, transb: bool,
+        a: usize, b: usize, c: usize, m: u64, n: u64, k: u64, alpha: f32, beta: f32,
+        batch: u64, stride_a: u64, stride_b: u64, stride_c: u64,
+    ) -> bool {
         if !enabled() {
             return true;
         }
-        let op = GpuOp::Sgemm { a, b, c, m, n, k };
+        let op = GpuOp::Sgemm {
+            kind, transa, transb,
+            a, b, c, m, n, k,
+            alpha_bits: alpha.to_bits(),
+            beta_bits: beta.to_bits(),
+            batch, stride_a, stride_b, stride_c,
+        };
         let to_repair = ACTIVE.with(|act| {
             let mut guard = act.borrow_mut();
             let Some(active) = guard.as_mut() else { return None };
@@ -1322,6 +1479,118 @@ mod imp {
             EAGER_REGIONS.load(Ordering::Relaxed),
         );
     }
+
+    // ------------------------------------------------------------------
+    // Op-identity gates (item 9 phase 2, added after independent review)
+    // ------------------------------------------------------------------
+    //
+    // These live inside `imp` because `GpuOp` is private to it. They need no
+    // GPU: equality and `digest` are pure functions over recorded values.
+    //
+    // Why they exist: the bug this commit fixed was "three places that must
+    // agree about op identity, and one of them didn't". The fix added
+    // `kind`/`transa`/`transb` to `GpuOp::Sgemm` and threaded them through
+    // equality, the digest and the replay dispatch — but nothing pinned that
+    // agreement, so dropping `kind` from the digest while keeping it in `eq`
+    // (or the reverse) left the whole workspace green. An independent review
+    // pointed that out. These are the gates it asked for.
+    #[cfg(test)]
+    mod op_identity_tests {
+        use super::*;
+
+        /// A row-major gemm and a weight-gradient gemm over the SAME three
+        /// buffers with the SAME dims — the exact collision that used to make
+        /// eager repair replay a wgrad contraction as a plain matmul.
+        fn colliding_pair() -> (GpuOp, GpuOp) {
+            let common = |kind: SgemmKind| GpuOp::Sgemm {
+                kind,
+                transa: false,
+                transb: false,
+                a: 0x1000,
+                b: 0x2000,
+                c: 0x3000,
+                m: 64,
+                n: 128,
+                k: 32,
+                alpha_bits: 1.0f32.to_bits(),
+                beta_bits: 0.0f32.to_bits(),
+                batch: 1,
+                stride_a: 64 * 32,
+                stride_b: 32 * 128,
+                stride_c: 64 * 128,
+            };
+            (common(SgemmKind::RowMajor), common(SgemmKind::WgradAccum))
+        }
+
+        #[test]
+        fn wgrad_and_row_major_are_not_equal() {
+            let (row, wgrad) = colliding_pair();
+            // `assert!(a != b)`, not `assert_ne!`: `GpuOp` has no `Debug`
+            // (its `Kernel` variant carries a raw params blob).
+            assert!(
+                row != wgrad,
+                "a weight-gradient gemm and a row-major gemm over the same \
+                 buffers and dims compare EQUAL — replay would reproduce one \
+                 as the other, silently computing the wrong contraction"
+            );
+        }
+
+        #[test]
+        fn wgrad_and_row_major_digest_differently() {
+            let (row, wgrad) = colliding_pair();
+            assert_ne!(
+                digest(std::slice::from_ref(&row)),
+                digest(std::slice::from_ref(&wgrad)),
+                "the digest ignores SgemmKind, so a captured graph built for \
+                 one contraction would be reused for the other. Equality and \
+                 the digest must agree — disagreement between them is the \
+                 exact failure class this field was added to close"
+            );
+        }
+
+        /// Transposition is part of identity for the same reason: the ops
+        /// select different lda/ldb, so a replay under the wrong flags reads a
+        /// real, in-bounds, WRONG sub-matrix.
+        #[test]
+        fn transposition_flags_are_part_of_op_identity() {
+            let (base, _) = colliding_pair();
+            for mutate in [
+                |o: &mut GpuOp| {
+                    if let GpuOp::Sgemm { transa, .. } = o {
+                        *transa = true;
+                    }
+                },
+                |o: &mut GpuOp| {
+                    if let GpuOp::Sgemm { transb, .. } = o {
+                        *transb = true;
+                    }
+                },
+            ] {
+                let mut other = base.clone();
+                mutate(&mut other);
+                assert!(base != other, "transposition dropped from equality");
+                assert_ne!(
+                    digest(std::slice::from_ref(&base)),
+                    digest(std::slice::from_ref(&other)),
+                    "transposition dropped from the digest"
+                );
+            }
+        }
+
+        /// Sanity: two identical ops MUST still compare equal and hash alike.
+        /// Without this the tests above would pass against an implementation
+        /// that simply declared everything unequal.
+        #[test]
+        fn identical_ops_still_match() {
+            let (row, _) = colliding_pair();
+            let same = row.clone();
+            assert!(row == same, "two identical ops compare unequal");
+            assert_eq!(
+                digest(std::slice::from_ref(&row)),
+                digest(std::slice::from_ref(&same))
+            );
+        }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1382,6 +1651,7 @@ pub extern "C" fn nsl_cuda_graphs_report() {
 
 #[cfg(feature = "cuda")]
 pub(crate) use imp::{
-    in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm, queue_deferred_free, taint,
-    MemsetAction,
+    in_region, on_dtod, on_htod, on_kernel, on_memset, on_sgemm_batched,
+    on_sgemm_full, queue_deferred_free, taint,
+    MemsetAction, SgemmKind,
 };

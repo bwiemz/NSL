@@ -1884,6 +1884,78 @@ mod backward_live_tests {
 // Saved tensor analysis
 // ---------------------------------------------------------------------------
 
+/// Item 6: which of the four required `@fused_lm_ce` shape hints are absent.
+///
+/// Shared by the auto-substitution arm and the explicit `fused_linear_ce(...)`
+/// arm so the two cannot drift into disagreeing about what "fully hinted"
+/// means.
+fn missing_shape_hints(
+    cfg: &crate::FusedCeDecoratorConfig,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if cfg.vocab_size.is_none() {
+        missing.push("vocab_size");
+    }
+    if cfg.hidden_size.is_none() {
+        missing.push("hidden_size");
+    }
+    if cfg.batch_size.is_none() {
+        missing.push("batch_size");
+    }
+    if cfg.seq_len.is_none() {
+        missing.push("seq_len");
+    }
+    missing
+}
+
+/// Item 6: a short human name for a `PrimalOp`, for decline diagnostics.
+///
+/// `PrimalOp`'s `Debug` includes every field (tile sizes, eps, dims), which
+/// makes a diagnostic unreadable. The consumer only needs to know *which* op
+/// it was, so take the discriminant name and drop any payload — except for
+/// the three variants whose payload IS the identity.
+fn describe_primal_op(op: &PrimalOp) -> String {
+    // A bare "Passthrough" tells the reader nothing, while
+    // `Passthrough("reshape")` points straight at the offending line. That is
+    // the single most common decline (every model that flattens [B,S,V]
+    // logits before the loss); `Input("logits")` / `Param("w")` likewise name
+    // the exact binding.
+    match op {
+        PrimalOp::Passthrough(name) => return format!("Passthrough(\"{name}\")"),
+        PrimalOp::Input(name) => return format!("Input(\"{name}\")"),
+        PrimalOp::Param(name) => return format!("Param(\"{name}\")"),
+        _ => {}
+    }
+    let full = format!("{op:?}");
+    let name = full
+        .split(['{', '(', ' '])
+        .next()
+        .unwrap_or(&full)
+        .trim()
+        .to_string();
+    if name.is_empty() { full } else { name }
+}
+
+/// Item 6: render a transpose's dim pair, decoding the negative-dim sentinels
+/// `encode_transpose_dim` uses (`usize::MAX` is `-1`, not
+/// 18446744073709551615 — printing the raw value would be actively misleading
+/// in a diagnostic).
+fn format_transpose_dims(dim0: usize, dim1: usize) -> String {
+    // Match `encode_transpose_dim` EXACTLY: it emits precisely two sentinels,
+    // `usize::MAX` for -1 and `usize::MAX - 1` for -2, and passes any
+    // non-negative dim through as-is. An open-ended `d >= usize::MAX - k`
+    // guard would claim a range the encoder never produces, so decode only
+    // the two values that exist.
+    let decode = |d: usize| -> String {
+        match d {
+            usize::MAX => "-1".to_string(),
+            d if d == usize::MAX - 1 => "-2".to_string(),
+            d => d.to_string(),
+        }
+    };
+    format!("({}, {})", decode(dim0), decode(dim1))
+}
+
 /// Information about a tensor that must be saved from forward for backward.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedTensorInfo {
@@ -2025,6 +2097,51 @@ pub struct WengertExtractor<'a> {
     /// anything else?" check is exact (no false negatives from
     /// substitution-time scans that haven't yet seen later uses).
     pending_fused_lce_prunes: Vec<FusedLceMatch>,
+    /// Item 6: every `cross_entropy` call this extractor saw while an
+    /// `@fused_lm_ce(enabled = true)` decorator was active, paired with the
+    /// reason the fused substitution did NOT happen.
+    ///
+    /// The substitution declines for twelve distinct reasons (thirteen
+    /// `return Err` sites — `WeightNotTransposed` fires from two) and, before
+    /// item 6, every one of them fell silently through to
+    /// `PrimalOp::CrossEntropyLoss`.  A user who added the decorator to a
+    /// biasless or post-reshape LM head — which is what every production
+    /// coder model in this repo has — got no error, no warning, and full
+    /// `[N, V]` logits-gradient materialization while believing the fused
+    /// kernel was running.  That is the failure shape
+    /// `feedback_deferral_must_refuse` exists to prevent, so the reasons are
+    /// recorded here and the train block lowering refuses when NONE of the
+    /// block's `cross_entropy` calls fused.
+    fused_lce_declines: Vec<FusedLceDecline>,
+    /// Item 9 phase 2: model methods carrying `@fp8_compute`, keyed
+    /// `"ModelName::method_name"` — mirrors `Compiler::features
+    /// .fp8_compute_methods`, threaded here by `set_fp8_compute_methods`.
+    fp8_compute_methods: HashSet<String>,
+    /// Item 9 phase 2: the subset of `fp8_compute_methods` this extractor
+    /// actually INLINED into the Wengert list.
+    ///
+    /// `wengert_lower.rs` has no FP8 lowering — `PrimalOp::Matmul` emits an
+    /// unconditional `nsl_tensor_matmul`, and neither this file nor
+    /// `wengert_lower.rs` contains a single occurrence of "fp8".  So every
+    /// matmul inside an inlined `@fp8_compute` method computes in plain f32
+    /// while the user believes FP8 is active.  That is the same silent-
+    /// degradation shape as item 6's fused-CE declines, and
+    /// `feedback_deferral_must_refuse` says it must refuse.
+    ///
+    /// Recorded rather than refused on the spot so the diagnostic can name
+    /// every offending method at once, and so a non-training extraction
+    /// (e.g. the WGGO pre-pass, which builds a throwaway extractor purely
+    /// for importance scoring) does not abort the compile.
+    ///
+    /// `BTreeSet` for a deterministic message order.
+    inlined_fp8_methods: std::collections::BTreeSet<String>,
+    /// Item 6: how many calls this extractor DID substitute — both
+    /// auto-substituted `cross_entropy` and explicit `fused_linear_ce(...)`.
+    ///
+    /// Kept separately from `pending_fused_lce_prunes` because that vector is
+    /// drained by `apply_pending_fused_lce_prunes`, and the refusal above
+    /// must stay answerable after the drain.
+    fused_lce_substitutions: usize,
     /// CPKD (I-11): variable roots whose model fields are FROZEN — the
     /// distill block's teacher instance.  A model-field access whose
     /// compound name is rooted at one of these (e.g. `teacher.wq`,
@@ -2048,6 +2165,150 @@ pub struct WengertExtractor<'a> {
     /// `profiling::captures::size_hints_from_var_nodes` to resolve
     /// concrete typed shapes into byte sizes; never read by lowering.
     var_nodes: HashMap<VarId, nsl_ast::NodeId>,
+}
+
+/// Item 6: why a `cross_entropy` call under an active `@fused_lm_ce`
+/// decorator did not become a `PrimalOp::FusedLinearCe`.
+///
+/// One variant per decline REASON in the substitution arm and in
+/// [`WengertExtractor::try_match_fused_linear_ce_pattern`].  The point of
+/// the taxonomy is that a decline must be *actionable*: "the fused kernel
+/// did not engage" tells a user nothing they can fix, whereas "your LM head
+/// has no bias term, and the matcher requires `Add(Matmul(x, W^T), bias)`"
+/// names the edit.
+///
+/// These are diagnostics, not a semantic contract — falling back to the
+/// composite `PrimalOp::CrossEntropyLoss` is always numerically correct,
+/// just slower and `[N, V]`-sized.  What is NOT acceptable is doing it
+/// silently, which is what [`FusedLceDecline::describe`] plus the train
+/// block refusal in `stmt.rs` exist to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FusedLceDecline {
+    /// `cross_entropy` was called with an arity the substitution does not
+    /// recognise (it expects exactly `(logits, targets)`).
+    Arity { args: usize },
+    /// One or more of the four shape hints on the decorator is absent.
+    /// Carries the missing hint names so the message can list them.
+    MissingShapeHints { missing: Vec<&'static str> },
+    /// `logits` is a leaf — no producing op on the tape at all.
+    LogitsHasNoProducer,
+    /// The op producing `logits` is not an `Add`.  This is the biasless LM
+    /// head case (`x @ W.transpose(0, 1)` produces a bare `Matmul`) and the
+    /// reshape-before-loss case (the producer is the reshape).
+    LogitsProducerNotAdd { producer: String },
+    /// `Add` with an operand count other than two.
+    AddArity { inputs: usize },
+    /// Neither `Add` operand is produced by a `Matmul`.
+    NoMatmulOperand,
+    /// Both `Add` operands are high-rank producers, so whichever one landed
+    /// in the bias slot would be dereferenced as a dense `[V]` vector.
+    /// Deliberate guard, not a limitation.
+    BiasSlotIsHighRank { producer: String },
+    /// The `Matmul` does not have exactly two operands.
+    MatmulArity { inputs: usize },
+    /// The `Matmul`'s right operand is not a transpose: the head was written
+    /// `x @ W_t` with a pre-transposed `[H, V]` weight.
+    WeightNotTransposed,
+    /// The right operand is a transpose, but not one of the four
+    /// last-two-dims forms the `[V, H]` indexing can honour.
+    TransposeNotLastTwoDims { dims: String },
+    /// The transpose op carries no input operand (malformed tape).
+    TransposeHasNoOperand,
+    /// `W`'s rank is known from a type annotation and is not 2.  Deliberate
+    /// guard (CFTP v10 item 5) against striding a rank-3 expert stack as if
+    /// it were `[V, H]`.
+    WeightRankNot2 { rank: usize },
+}
+
+impl FusedLceDecline {
+    /// Variant name without its payload, for coverage bookkeeping.
+    ///
+    /// The match is deliberately exhaustive (no `_` arm): adding a variant is
+    /// a compile error here, which is what forces the new bail point to be
+    /// classified by `fused_lce_decline_reasons::classify_coverage` rather
+    /// than silently joining the taxonomy unexercised.
+    pub fn discriminant_name(&self) -> &'static str {
+        match self {
+            Self::Arity { .. } => "Arity",
+            Self::MissingShapeHints { .. } => "MissingShapeHints",
+            Self::LogitsHasNoProducer => "LogitsHasNoProducer",
+            Self::LogitsProducerNotAdd { .. } => "LogitsProducerNotAdd",
+            Self::AddArity { .. } => "AddArity",
+            Self::NoMatmulOperand => "NoMatmulOperand",
+            Self::BiasSlotIsHighRank { .. } => "BiasSlotIsHighRank",
+            Self::MatmulArity { .. } => "MatmulArity",
+            Self::WeightNotTransposed => "WeightNotTransposed",
+            Self::TransposeNotLastTwoDims { .. } => "TransposeNotLastTwoDims",
+            Self::TransposeHasNoOperand => "TransposeHasNoOperand",
+            Self::WeightRankNot2 { .. } => "WeightRankNot2",
+        }
+    }
+
+    /// A one-line, actionable explanation.  Phrased as "<what the matcher
+    /// found> — <what it needs>" so the reader can tell whether their code is
+    /// wrong or the feature simply does not cover their shape yet.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Arity { args } => format!(
+                "cross_entropy was called with {args} argument(s); the fused \
+                 substitution recognises exactly cross_entropy(logits, targets)"
+            ),
+            Self::MissingShapeHints { missing } => format!(
+                "@fused_lm_ce is missing required shape hint(s): {}. All four of \
+                 vocab_size, hidden_size, batch_size and seq_len must be given \
+                 when enabled = true",
+                missing.join(", ")
+            ),
+            Self::LogitsHasNoProducer => "the logits operand is not computed in \
+                 this step body (no producing op on the tape), so the LM head \
+                 chain the fused kernel needs to absorb is not visible here"
+                .to_string(),
+            Self::LogitsProducerNotAdd { producer } => format!(
+                "the logits operand is produced by {producer}, but the fused \
+                 substitution requires the canonical head chain \
+                 Add(Matmul(x, Transpose(W)), bias) feeding cross_entropy \
+                 directly. Two shapes hit this: a BIASLESS head \
+                 (`x @ W.transpose(0, 1)` with no `+ bias`), and a RESHAPE \
+                 between the head and cross_entropy (flatten x to [B*S, H] \
+                 BEFORE the head matmul instead)"
+            ),
+            Self::AddArity { inputs } => format!(
+                "the logits Add has {inputs} operand(s); the fused substitution \
+                 requires exactly two (the matmul result and the bias)"
+            ),
+            Self::NoMatmulOperand => "neither operand of the logits Add is a \
+                 matmul, so there is no LM-head GEMM for the fused kernel to \
+                 absorb"
+                .to_string(),
+            Self::BiasSlotIsHighRank { producer } => format!(
+                "the bias operand of the logits Add is produced by {producer}, \
+                 a high-rank op. The fused kernel dereferences that slot as a \
+                 dense [V] vector, so substituting here would read garbage; \
+                 refused deliberately"
+            ),
+            Self::MatmulArity { inputs } => format!(
+                "the LM-head matmul has {inputs} operand(s); the fused \
+                 substitution requires exactly two"
+            ),
+            Self::WeightNotTransposed => "the LM-head matmul's weight operand \
+                 is not produced by a transpose. The fused kernel indexes W as \
+                 [V, H], which is what `W.transpose(0, 1)` in the head \
+                 expresses; a pre-transposed [H, V] weight is not recognised"
+                .to_string(),
+            Self::TransposeNotLastTwoDims { dims } => format!(
+                "the LM-head weight is transposed over {dims}; the fused kernel \
+                 needs a last-two-dims transpose (0,1 / 1,0 / -2,-1 / -1,-2)"
+            ),
+            Self::TransposeHasNoOperand => "the LM-head weight transpose has no \
+                 input operand (malformed tape)"
+                .to_string(),
+            Self::WeightRankNot2 { rank } => format!(
+                "the LM-head weight W is rank {rank}; the fused kernel strides \
+                 it as a 2-D [V, H] matrix, so a rank-{rank} weight would be \
+                 read incorrectly. Refused deliberately (CFTP v10 item 5)"
+            ),
+        }
+    }
 }
 
 /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1):
@@ -2101,6 +2362,10 @@ impl<'a> WengertExtractor<'a> {
             fused_ce_config: None,
             known_ranks: HashMap::new(),
             pending_fused_lce_prunes: Vec::new(),
+            fused_lce_declines: Vec::new(),
+            fp8_compute_methods: HashSet::new(),
+            inlined_fp8_methods: std::collections::BTreeSet::new(),
+            fused_lce_substitutions: 0,
             fused_kl_ce_config: None,
             distill_loss_alpha_temp: (None, None),
             frozen_model_roots: HashSet::new(),
@@ -2209,6 +2474,44 @@ impl<'a> WengertExtractor<'a> {
     /// `compiler.active_fused_ce_config` (CFTP v10 item 3; pre-v10:
     /// `compiler.fused_ce_configs[0]`) here when the active train block
     /// carries the decorator and v1's opt-in gate is satisfied.
+    /// Item 6: reasons the fused linear-CE substitution declined, in the
+    /// order the `cross_entropy` calls were seen.
+    ///
+    /// Only populated while an `@fused_lm_ce(enabled = true)` decorator is
+    /// active — with the decorator absent or disabled the composite path is
+    /// what the program asked for, so there is nothing to report.
+    pub fn fused_lce_declines(&self) -> &[FusedLceDecline] {
+        &self.fused_lce_declines
+    }
+
+    /// Item 9 phase 2: mirror `Compiler::features.fp8_compute_methods` into
+    /// this extractor so inline sites can recognise a decorated method.
+    ///
+    /// Leaving this unset (the default) disables the refusal entirely, which
+    /// is what every extractor built outside the train/grad lowering wants.
+    pub fn set_fp8_compute_methods(&mut self, methods: HashSet<String>) {
+        self.fp8_compute_methods = methods;
+    }
+
+    /// Item 9 phase 2: the `@fp8_compute` model methods whose bodies were
+    /// inlined into this Wengert list, `"ModelName::method_name"`, sorted.
+    ///
+    /// Non-empty means the decorator was silently dropped — source-AD
+    /// lowering has no FP8 path — so the caller must refuse rather than emit
+    /// f32 matmuls under an FP8 banner.
+    pub fn inlined_fp8_methods(&self) -> Vec<String> {
+        self.inlined_fp8_methods.iter().cloned().collect()
+    }
+
+    /// Item 6: how many `cross_entropy` / `fused_linear_ce` calls actually
+    /// became a `PrimalOp::FusedLinearCe`.
+    ///
+    /// Survives `apply_pending_fused_lce_prunes` (which drains the prune
+    /// queue), so it stays answerable after lowering has begun.
+    pub fn fused_lce_substitution_count(&self) -> usize {
+        self.fused_lce_substitutions
+    }
+
     pub fn with_fused_ce_config(
         mut self,
         cfg: Option<crate::FusedCeDecoratorConfig>,
@@ -2332,13 +2635,19 @@ impl<'a> WengertExtractor<'a> {
     fn try_match_fused_linear_ce_pattern(
         &self,
         logits_var: VarId,
-    ) -> Option<FusedLceMatch> {
-        let add_op = self.list.find_producer(logits_var)?;
+    ) -> Result<FusedLceMatch, FusedLceDecline> {
+        let Some(add_op) = self.list.find_producer(logits_var) else {
+            return Err(FusedLceDecline::LogitsHasNoProducer);
+        };
         if !matches!(add_op.op, PrimalOp::Add) {
-            return None;
+            return Err(FusedLceDecline::LogitsProducerNotAdd {
+                producer: describe_primal_op(&add_op.op),
+            });
         }
         if add_op.inputs.len() != 2 {
-            return None;
+            return Err(FusedLceDecline::AddArity {
+                inputs: add_op.inputs.len(),
+            });
         }
         // Inspect both Add operands — Matmul may be on either side.
         let lhs = add_op.inputs[0];
@@ -2349,9 +2658,17 @@ impl<'a> WengertExtractor<'a> {
             lhs_op.map(|o| &o.op),
             rhs_op.map(|o| &o.op),
         ) {
-            (Some(PrimalOp::Matmul), _) => (lhs_op?, rhs),
-            (_, Some(PrimalOp::Matmul)) => (rhs_op?, lhs),
-            _ => return None,
+            // `lhs_op`/`rhs_op` are already `Some` in the arms that read them
+            // — the pattern matched on their contents — so the `expect` is
+            // unreachable rather than a silent `?` bail that would report the
+            // wrong decline reason.
+            (Some(PrimalOp::Matmul), _) => {
+                (lhs_op.expect("matched Some above"), rhs)
+            }
+            (_, Some(PrimalOp::Matmul)) => {
+                (rhs_op.expect("matched Some above"), lhs)
+            }
+            _ => return Err(FusedLceDecline::NoMatmulOperand),
         };
         // Review Finding 3: reject `Add(Matmul, Matmul)` and other
         // patterns where the "bias" slot would receive a high-rank
@@ -2370,16 +2687,22 @@ impl<'a> WengertExtractor<'a> {
                 bias_producer.op,
                 PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
             ) {
-                return None;
+                return Err(FusedLceDecline::BiasSlotIsHighRank {
+                    producer: describe_primal_op(&bias_producer.op),
+                });
             }
         }
         if matmul_op.inputs.len() != 2 {
-            return None;
+            return Err(FusedLceDecline::MatmulArity {
+                inputs: matmul_op.inputs.len(),
+            });
         }
         let matmul_result_var = matmul_op.result;
         let x_var = matmul_op.inputs[0];
         let w_transposed_var = matmul_op.inputs[1];
-        let transpose_op = self.list.find_producer(w_transposed_var)?;
+        let Some(transpose_op) = self.list.find_producer(w_transposed_var) else {
+            return Err(FusedLceDecline::WeightNotTransposed);
+        };
         // Sprint v4-3: accept any of the four semantically-equivalent
         // last-two-dim transposes of a 2D weight tensor:
         //   * `transpose(W, 0, 1)` → `{0, 1}` (stdlib form)
@@ -2410,14 +2733,23 @@ impl<'a> WengertExtractor<'a> {
                 dim0: NEG_MINUS_1,
                 dim1: NEG_MINUS_2,
             } => {}
-            _ => return None,
+            // A transpose over other dims is a DIFFERENT decline from "the
+            // weight was not transposed at all" — the first is a shape the
+            // fused kernel cannot honour, the second is usually a
+            // pre-transposed `[H, V]` weight. Keep them distinguishable.
+            PrimalOp::Transpose { dim0, dim1 } => {
+                return Err(FusedLceDecline::TransposeNotLastTwoDims {
+                    dims: format_transpose_dims(dim0, dim1),
+                });
+            }
+            _ => return Err(FusedLceDecline::WeightNotTransposed),
         }
         // `transpose(W, 0, 1)` is recognised in `extract_expr` with inputs
         // `[W, dim0_const, dim1_const]` (the two dim args get folded to
         // `PrimalOp::Constant` VarIds even though they aren't used by AD).
         // Pull W from the first input slot; reject if missing.
         if transpose_op.inputs.is_empty() {
-            return None;
+            return Err(FusedLceDecline::TransposeHasNoOperand);
         }
         let w_var = transpose_op.inputs[0];
         // CFTP v10 (item 5): structural rank-2 enforcement.
@@ -2438,10 +2770,10 @@ impl<'a> WengertExtractor<'a> {
         // `Tensor` params.
         if let Some(&r) = self.known_ranks.get(&w_var) {
             if r != 2 {
-                return None;
+                return Err(FusedLceDecline::WeightRankNot2 { rank: r });
             }
         }
-        Some(FusedLceMatch {
+        Ok(FusedLceMatch {
             x_var,
             w_var,
             bias_var,
@@ -3248,7 +3580,12 @@ impl<'a> WengertExtractor<'a> {
                                 .and_then(|methods| methods.get(&method_name))
                                 .cloned();
                             if let Some(fn_def) = fn_def {
-                                return self.inline_method_call(*obj_sym, &fn_def, args);
+                                return self.inline_method_call(
+                                    *obj_sym,
+                                    &fn_def,
+                                    args,
+                                    Some(model_type.as_str()),
+                                );
                             } else {
                                 eprintln!("[source-ad] method '{}' not found in model type '{}' (available: {:?})",
                                     method_name, model_type,
@@ -3307,7 +3644,12 @@ impl<'a> WengertExtractor<'a> {
                                         let extracted = self.pre_extract_args(&fn_def, args)?;
                                         let saved_self = self.self_context.clone();
                                         self.self_context = Some(compound_prefix);
-                                        let result = self.inline_method_body(&fn_def, extracted);
+                                        let sub_type_owned = sub_type.clone();
+                                        let result = self.inline_method_body(
+                                            &fn_def,
+                                            extracted,
+                                            Some(sub_type_owned.as_str()),
+                                        );
                                         self.self_context = saved_self;
                                         return result;
                                     }
@@ -3331,7 +3673,11 @@ impl<'a> WengertExtractor<'a> {
                                     let extracted = self.pre_extract_args(&fn_def, args)?;
                                     let saved_self = self.self_context.clone();
                                     self.self_context = Some(ctx);
-                                    let result = self.inline_method_body(&fn_def, extracted);
+                                    let result = self.inline_method_body(
+                                        &fn_def,
+                                        extracted,
+                                        Some(model_type.as_str()),
+                                    );
                                     self.self_context = saved_self;
                                     return result;
                                 }
@@ -3658,6 +4004,47 @@ impl<'a> WengertExtractor<'a> {
                             );
                             return None;
                         }
+                        // Item 6: an EXPLICIT `fused_linear_ce(...)` call that
+                        // silently expands to the stdlib composite is the same
+                        // broken promise as the auto-substitution case — more
+                        // so, because the user named the fused function
+                        // directly, so there is no reading under which the
+                        // composite was the request.
+                        //
+                        // Diagnose HERE rather than recording a decline for the
+                        // train-block refusal to report: every path out of this
+                        // arm without a substitution `return None`s, which fails
+                        // source-AD extraction outright, and the refusal in
+                        // `stmt.rs` is gated on `extraction_ok`. A decline
+                        // pushed here would be recorded and then never read —
+                        // silence with extra steps. This mirrors the
+                        // `fused_kl_ce` arm above, which diagnoses in place for
+                        // the same reason.
+                        match self.fused_ce_config.as_ref() {
+                            None => eprintln!(
+                                "[fused-lm-ce] fused_linear_ce(...) called without an \
+                                 active @fused_lm_ce decorator; the stdlib composite \
+                                 (matmul + cross_entropy) will run instead, \
+                                 materializing the full [batch*seq, vocab] logits. \
+                                 Add @fused_lm_ce(enabled=true, vocab_size=, \
+                                 hidden_size=, batch_size=, seq_len=) to the train block"
+                            ),
+                            Some(cfg) if !cfg.enabled => eprintln!(
+                                "[fused-lm-ce] fused_linear_ce(...): @fused_lm_ce is \
+                                 present but enabled=false; the stdlib composite will \
+                                 run instead"
+                            ),
+                            Some(cfg) => {
+                                let missing = missing_shape_hints(cfg);
+                                if !missing.is_empty() {
+                                    eprintln!(
+                                        "[fused-lm-ce] fused_linear_ce(...): {}",
+                                        FusedLceDecline::MissingShapeHints { missing }
+                                            .describe()
+                                    );
+                                }
+                            }
+                        }
                         if let Some(cfg) = self.fused_ce_config.as_ref() {
                             if cfg.enabled {
                                 if let (Some(v), Some(h), Some(b), Some(s)) = (
@@ -3691,6 +4078,7 @@ impl<'a> WengertExtractor<'a> {
                                         saved_for_backward: false,
                                         checkpointed: false,
                                     });
+                                    self.fused_lce_substitutions += 1;
                                     return Some(result);
                                 }
                             }
@@ -3727,59 +4115,92 @@ impl<'a> WengertExtractor<'a> {
                     //     stdlib decomposition (see
                     //     `try_match_fused_linear_ce_pattern`)
                     //
+                    // Item 6: the first bullet is a legitimate opt-out, but the
+                    // other two are a BROKEN PROMISE — the user asked for the
+                    // fused kernel and did not get it. Before item 6 all three
+                    // fell through identically and silently, so
+                    // `@fused_lm_ce(enabled = true)` on any production coder
+                    // head (biasless, or reshaped between head and CE) compiled
+                    // clean and materialized the full `[N, V]` logits gradient
+                    // every step. Every decline is now recorded with its
+                    // reason; `fused_lce_declines()` +
+                    // `fused_lce_substitution_count()` let the train-block
+                    // lowering refuse when NOTHING fused.
+                    //
                     // This is the substitution site that the wengert_lower.rs
                     // Sprint 2.5 comment near `PrimalOp::CrossEntropyLoss`
                     // forward-referenced.
                     "cross_entropy" | "cross_entropy_loss" => {
-                        if args.len() == 2 && input_vars.len() == 2 {
-                            if let Some(cfg) = self.fused_ce_config.as_ref() {
-                                if cfg.enabled {
-                                    if let (Some(v), Some(h), Some(b), Some(s)) = (
-                                        cfg.vocab_size,
-                                        cfg.hidden_size,
-                                        cfg.batch_size,
-                                        cfg.seq_len,
-                                    ) {
-                                        let logits_var = input_vars[0];
-                                        let targets_var = input_vars[1];
-                                        if let Some(m) =
-                                            self.try_match_fused_linear_ce_pattern(logits_var)
-                                        {
-                                            let vt = cfg.vocab_tile.unwrap_or(
-                                                crate::fused_linear_ce::FusedLinearCEConfig::default(
-                                                ).vocab_tile,
-                                            );
-                                            let is_large = v
-                                                > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
-                                            let four = vec![
-                                                m.x_var, m.w_var, m.bias_var, targets_var,
-                                            ];
-                                            self.push_op(WengertOp {
-                                                id: self.list.ops.len() as u32,
-                                                result,
-                                                op: PrimalOp::FusedLinearCe {
-                                                    vocab_size: v,
-                                                    hidden_size: h,
-                                                    batch_size: b,
-                                                    seq_len: s,
-                                                    vocab_tile: vt,
-                                                    ignore_index: -100,
-                                                    is_large,
-                                                },
-                                                inputs: four,
-                                                saved_for_backward: false,
-                                                checkpointed: false,
-                                            });
-                                            // Review Finding 1: defer the prune of the
-                                            // now-dead upstream composite chain
-                                            // (Transpose → Matmul → Add) until finalize().
-                                            // By then the whole tape is built, so the
-                                            // "is this VarId consumed elsewhere?" check is
-                                            // exact — no false-positive prunes from later
-                                            // ops that haven't been pushed yet.
-                                            self.pending_fused_lce_prunes.push(m);
-                                            return Some(result);
-                                        }
+                        // Only an ENABLED decorator makes a decline
+                        // interesting. With no decorator, or `enabled = false`,
+                        // the composite path is what was asked for.
+                        let active = matches!(
+                            self.fused_ce_config.as_ref(),
+                            Some(cfg) if cfg.enabled
+                        );
+                        if active && !(args.len() == 2 && input_vars.len() == 2) {
+                            self.fused_lce_declines
+                                .push(FusedLceDecline::Arity { args: args.len() });
+                        } else if active {
+                            // `active` proves `fused_ce_config` is `Some`.
+                            let cfg = self
+                                .fused_ce_config
+                                .clone()
+                                .expect("active implies Some");
+                            let missing = missing_shape_hints(&cfg);
+                            if !missing.is_empty() {
+                                self.fused_lce_declines.push(
+                                    FusedLceDecline::MissingShapeHints { missing },
+                                );
+                            } else {
+                                // All four hints present — the `expect`s cannot
+                                // fire, `missing_shape_hints` just checked each.
+                                let v = cfg.vocab_size.expect("checked above");
+                                let h = cfg.hidden_size.expect("checked above");
+                                let b = cfg.batch_size.expect("checked above");
+                                let s = cfg.seq_len.expect("checked above");
+                                let logits_var = input_vars[0];
+                                let targets_var = input_vars[1];
+                                match self.try_match_fused_linear_ce_pattern(logits_var) {
+                                    Ok(m) => {
+                                        let vt = cfg.vocab_tile.unwrap_or(
+                                            crate::fused_linear_ce::FusedLinearCEConfig::default(
+                                            ).vocab_tile,
+                                        );
+                                        let is_large = v
+                                            > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                                        let four = vec![
+                                            m.x_var, m.w_var, m.bias_var, targets_var,
+                                        ];
+                                        self.push_op(WengertOp {
+                                            id: self.list.ops.len() as u32,
+                                            result,
+                                            op: PrimalOp::FusedLinearCe {
+                                                vocab_size: v,
+                                                hidden_size: h,
+                                                batch_size: b,
+                                                seq_len: s,
+                                                vocab_tile: vt,
+                                                ignore_index: -100,
+                                                is_large,
+                                            },
+                                            inputs: four,
+                                            saved_for_backward: false,
+                                            checkpointed: false,
+                                        });
+                                        // Review Finding 1: defer the prune of the
+                                        // now-dead upstream composite chain
+                                        // (Transpose → Matmul → Add) until finalize().
+                                        // By then the whole tape is built, so the
+                                        // "is this VarId consumed elsewhere?" check is
+                                        // exact — no false-positive prunes from later
+                                        // ops that haven't been pushed yet.
+                                        self.pending_fused_lce_prunes.push(m);
+                                        self.fused_lce_substitutions += 1;
+                                        return Some(result);
+                                    }
+                                    Err(reason) => {
+                                        self.fused_lce_declines.push(reason);
                                     }
                                 }
                             }
@@ -4609,6 +5030,7 @@ impl<'a> WengertExtractor<'a> {
         model_sym: nsl_ast::Symbol,
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
+        model_type: Option<&str>,
     ) -> Option<VarId> {
         // Pre-extract args in caller's context before switching to callee's
         let extracted = self.pre_extract_args(fn_def, call_args)?;
@@ -4624,7 +5046,7 @@ impl<'a> WengertExtractor<'a> {
             });
         let saved_self = self.self_context.clone();
         self.self_context = Some(name);
-        let result = self.inline_method_body(fn_def, extracted);
+        let result = self.inline_method_body(fn_def, extracted, model_type);
         self.self_context = saved_self;
         result
     }
@@ -4670,6 +5092,7 @@ impl<'a> WengertExtractor<'a> {
         &mut self,
         fn_def: &nsl_ast::decl::FnDef,
         extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,
+        model_type: Option<&str>,
     ) -> Option<VarId> {
         // Inline callee locals in an isolated symbol scope so names like
         // `batch` inside a model method do not overwrite caller bindings such
@@ -4703,6 +5126,22 @@ impl<'a> WengertExtractor<'a> {
             .unwrap_or("?")
             .to_string();
         self.apply_checkpoint_policy(&fn_name);
+
+        // Item 9 phase 2: this method's body is now part of the Wengert list,
+        // where `PrimalOp::Matmul` lowers to an unconditional
+        // `nsl_tensor_matmul`.  If it carried `@fp8_compute`, that decorator
+        // has just been dropped on the floor — record it so the train/grad
+        // lowering can refuse instead of emitting f32 under an FP8 banner.
+        //
+        // Recorded AFTER the body extracted successfully: a method whose
+        // extraction bailed contributed no ops, so it neither degraded
+        // silently nor deserves to fail the compile.
+        if let Some(mt) = model_type {
+            let key = format!("{mt}::{fn_name}");
+            if self.fp8_compute_methods.contains(&key) {
+                self.inlined_fp8_methods.insert(key);
+            }
+        }
 
         // The method's return value is the list output (set by Return stmt extraction)
         let result = self.list.output;

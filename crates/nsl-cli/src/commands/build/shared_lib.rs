@@ -489,9 +489,8 @@ fn run_build_shared_multi(
 
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
-            for obj in &obj_files {
-                let _ = std::fs::remove_file(obj);
-            }
+            // Whole scratch directory — see normal.rs.
+            super::cleanup_temp_dir(&temp_dir);
             println!("Built shared library {}", lib_path.display());
         }
         Err(e) => {

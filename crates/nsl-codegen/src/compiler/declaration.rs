@@ -485,8 +485,21 @@ impl Compiler<'_> {
             let model_name = self.resolve_sym(md.name).to_string();
             let mut body_map = HashMap::new();
             for member in &md.members {
-                if let ModelMember::Method(fn_def, _decos) = member {
+                if let ModelMember::Method(fn_def, decos) = member {
                     let method_name = self.resolve_sym(fn_def.name).to_string();
+                    // Item 9 phase 2: record `@fp8_compute` on model methods.
+                    // `compiler/functions.rs` reads this decorator straight off
+                    // `decos` when it compiles the standalone method, so the
+                    // source-AD extractor — which inlines the method body into a
+                    // Wengert list instead of calling that function — otherwise
+                    // has no way to know the decorator was ever there.
+                    for d in decos {
+                        if d.name.len() == 1 && self.resolve_sym(d.name[0]) == "fp8_compute" {
+                            self.features
+                                .fp8_compute_methods
+                                .insert(format!("{model_name}::{method_name}"));
+                        }
+                    }
                     body_map.insert(method_name, fn_def.clone());
                 }
             }

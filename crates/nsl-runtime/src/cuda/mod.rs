@@ -1596,8 +1596,18 @@ pub(crate) mod inner {
         cuEventRecord(event as CUevent, current_stream())
     }
 
-    pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) {
-        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent);
+    /// Elapsed time between two recorded events, in milliseconds.
+    ///
+    /// Returns the driver status rather than discarding it.  It used to be
+    /// discarded, and `cuEventElapsedTime_v2` leaves its out-param UNTOUCHED
+    /// on failure — so every failed query silently became a 0.0 ms
+    /// measurement.  That is how `--profile-kernels` came to write a
+    /// `kernel_profile.json` reporting 412 launches and
+    /// `total_kernel_time_ms: 0.0`: not a fast program, a dead API call
+    /// nobody was checking.
+    #[must_use]
+    pub unsafe fn cu_event_elapsed_time(ms: *mut f32, start: u64, stop: u64) -> CUresult {
+        cuEventElapsedTime_v2(ms, start as CUevent, stop as CUevent)
     }
 
     pub unsafe fn cu_event_destroy(event: u64) {
@@ -1959,6 +1969,11 @@ pub(crate) use inner::{cu_event_create, cu_event_elapsed_time, cu_event_destroy,
 #[cfg(feature = "cuda")]
 pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
 
+/// Re-exported so callers that now CHECK a driver status (rather than
+/// discarding it) can name the success case without importing cudarc.
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::sys::CUresult;
+
 // === cuBLAS handle + sgemm wrapper (spec 2026-04-21-matmul-cublas-swap-design) ===
 
 /// cuBLAS handle lifecycle + sgemm dispatch for `gpu_matmul_f32`.
@@ -1995,29 +2010,87 @@ pub(crate) mod cublas_inner {
     /// the handle; a restart is required to switch modes.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum CublasMathMode {
-        /// `CUBLAS_DEFAULT_MATH` — TF32 tensor cores on sm_80+.
-        Default,
-        /// `CUBLAS_PEDANTIC_MATH` — strict f32 throughout, no TF32.
+        /// `CUBLAS_DEFAULT_MATH` — f32 throughout, on FP32 CUDA cores.
+        ///
+        /// This variant used to be called `Default` and was documented as
+        /// "TF32 tensor cores on sm_80+". That was **false**, and NSL's
+        /// startup banner repeated it. `CUBLAS_DEFAULT_MATH` does not enable
+        /// TF32 for `cublasSgemm`; that needs `CUBLAS_TF32_TENSOR_OP_MATH` or
+        /// a `..._FAST_TF32` compute type. Measured at 4096^3 on an RTX
+        /// 5070 Ti: this mode 32.9 TFLOP/s, `Pedantic` 33.2 — against a banner
+        /// promising pedantic would be "~5-10x slower". A comment on
+        /// `sgemm_strided_batched_raw` in this same file had said so all
+        /// along; only the muon path ever requested TF32.
+        Fp32Cores,
+        /// `CUBLAS_PEDANTIC_MATH` — strict f32, no algorithmic shortcuts.
+        ///
+        /// Distinct from `Fp32Cores` in what cuBLAS is permitted to do
+        /// internally (split-k reassociation, alternate kernels), not in the
+        /// arithmetic unit used. On this hardware the two measure the same.
         Pedantic,
+        /// `CUBLAS_TF32_TENSOR_OP_MATH` — f32 in and out, 10-bit-mantissa
+        /// multiplies on tensor cores.
+        ///
+        /// **Opt-in only.** Every product loses roughly 13 bits of mantissa
+        /// precision, so this is a numerics change for the entire stack, not
+        /// a free speedup — see `tests/matmul_tf32_mode.rs`, which asserts it
+        /// is both measurably faster AND measurably less accurate.
+        Tf32,
     }
 
     /// Resolve the math mode via env-var > Cargo-feature precedence (spec §9).
     ///
     /// - `NSL_MATMUL_PEDANTIC=1` forces pedantic (beats everything).
-    /// - `NSL_MATMUL_TF32=1` forces TF32 default.
-    /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic
-    ///   if the feature is on, else TF32 default.
+    /// - `NSL_MATMUL_TF32=1` forces TF32; `NSL_MATMUL_TF32=0` forces it off.
+    /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic if
+    ///   the feature is on, else **TF32**.
+    ///
+    /// # The default is TF32, and that is a numerics decision
+    ///
+    /// Measured on a Coder-50M forward (RTX 5070 Ti, sm_120), steady-state
+    /// over the second half of a 20-forward loop so the SM clock is up —
+    /// a single cold forward swings this by 10x and is worthless:
+    ///
+    /// | | FP32 cores | TF32 | |
+    /// |---|---|---|---|
+    /// | sgemm | 33.3 ms | 21.4 ms | **1.55x** |
+    /// | all kernels | 76.5 ms | 64.8 ms | **1.18x** |
+    ///
+    /// The GEMM speedup is real and reproducible (three paired runs, spread
+    /// under 5%), but GEMM is only ~44% of kernel time at this model size, so
+    /// the end-to-end win is ~15%, not 55%. Quoting the GEMM number as if it
+    /// were the model number would be the same overstatement this file's
+    /// history is already littered with.
+    ///
+    /// The cost is ~13 bits of mantissa on every product (f32's 24-bit
+    /// significand down to TF32's 11). Anything needing full f32 sets
+    /// `NSL_MATMUL_TF32=0`, or builds with `strict-matmul` for pedantic.
+    ///
+    /// **Known consequence, not a bug:** the naive PTX matmul kernels
+    /// (`nsl_bmm_f32` and friends) run on FP32 CUDA cores regardless. A
+    /// product that falls off the cuBLAS path — a strided operand, an
+    /// inexpressible batch shape — is therefore computed at a DIFFERENT
+    /// precision than the same product on the cuBLAS path. That divergence
+    /// existed before this change (as `NSL_MATMUL_TF32=1`) but was opt-in;
+    /// it is now the default, so `matmul_batch_collapse`'s two-arm parity
+    /// gate carries the wider tolerance explicitly rather than by accident.
     pub(crate) fn resolve_math_mode() -> CublasMathMode {
         if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
             return CublasMathMode::Pedantic;
         }
-        if std::env::var("NSL_MATMUL_TF32").ok().as_deref() == Some("1") {
-            return CublasMathMode::Default;
+        match std::env::var("NSL_MATMUL_TF32").ok().as_deref() {
+            Some("1") => return CublasMathMode::Tf32,
+            // Explicit opt-out. Anything else (unset, or a value we do not
+            // recognise) falls through to the default rather than silently
+            // meaning "off" — a typo'd `NSL_MATMUL_TF32=true` must not
+            // quietly change the arithmetic.
+            Some("0") => return CublasMathMode::Fp32Cores,
+            _ => {}
         }
         if cfg!(feature = "strict-matmul") {
             CublasMathMode::Pedantic
         } else {
-            CublasMathMode::Default
+            CublasMathMode::Tf32
         }
     }
 
@@ -2044,8 +2117,9 @@ pub(crate) mod cublas_inner {
                 // safe API surface — raw call is the canonical path.
                 let mode = resolve_math_mode();
                 let raw_mode = match mode {
-                    CublasMathMode::Default => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
+                    CublasMathMode::Fp32Cores => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
                     CublasMathMode::Pedantic => cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
+                    CublasMathMode::Tf32 => cublas_sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
                 };
                 // SAFETY: `handle` was just returned by `create_handle` and is a
                 // valid `cublasHandle_t`; `raw_mode` is a valid enum variant.
@@ -2058,13 +2132,18 @@ pub(crate) mod cublas_inner {
                 }
 
                 match mode {
-                    CublasMathMode::Default => eprintln!(
-                        "[nsl-matmul] cuBLAS math mode: TF32 (default — set NSL_MATMUL_PEDANTIC=1 \
-                         or build with --features strict-matmul for strict f32)"
+                    CublasMathMode::Fp32Cores => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores \
+                         (NSL_MATMUL_TF32=0)"
                     ),
                     CublasMathMode::Pedantic => eprintln!(
-                        "[nsl-matmul] cuBLAS math mode: pedantic (strict f32, ~5-10x slower than \
-                         TF32 default)"
+                        "[nsl-matmul] cuBLAS math mode: pedantic (strict f32; same arithmetic \
+                         units as FP32 cores, fewer internal shortcuts)"
+                    ),
+                    CublasMathMode::Tf32 => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: TF32 tensor cores (default) — 1.55x on \
+                         gemms, 1.18x on total kernel time at Coder-50M, at ~13 bits less \
+                         mantissa per product. Set NSL_MATMUL_TF32=0 for full f32."
                     ),
                 }
 
@@ -2073,52 +2152,64 @@ pub(crate) mod cublas_inner {
             .0
     }
 
-    /// Single-matmul dispatch: C[M,N] = A[M,K] @ B[K,N], f32, row-major.
+    /// `sgemm_row_major`, but either operand may be supplied as a TRANSPOSED
+    /// 2-D view instead of being materialised first (item 9 phase 2).
     ///
-    /// Per §2.1's rectangular worked example:
-    ///   cublasSgemm_v2(handle, N, N, m=N, n=M, k=K,
-    ///                  alpha, B_ptr, lda=N,
-    ///                         A_ptr, ldb=K,
-    ///                  beta,  C_ptr, ldc=N)
+    /// `transa` means: the buffer at `a_dev` is stored as a contiguous
+    /// row-major `[k, m]`, and the caller wants its transpose `[m, k]`. Same
+    /// for `transb` with `[n, k]` -> `[k, n]`. This is exactly what NSL's
+    /// `.transpose(0, 1)` on a 2-D tensor produces — a view with swapped
+    /// shape and swapped strides over an untouched buffer.
     ///
-    /// Returns `Ok(())` on success; translates cuBLAS status to a `CublasError`.
+    /// ## Deriving the ops and leading dimensions
     ///
-    /// # Safety
-    /// `a_dev`, `b_dev`, `c_dev` must be valid device f32 pointers of sizes
-    /// m*k, k*n, m*n respectively, with m, n, k > 0 and fitting in i32.
-    pub(crate) unsafe fn sgemm_row_major(
+    /// The wrapper computes `C_row = A_row @ B_row` by asking cuBLAS (which is
+    /// column-major) for `C^T = B^T A^T`, exploiting that a row-major `[p, q]`
+    /// buffer IS a column-major `[q, p]`. So cuBLAS's first operand is B and
+    /// its second is A. Under that swap:
+    ///
+    /// * `transb` toggles the op of cuBLAS's FIRST operand, `transa` the
+    ///   SECOND. Getting this backwards is the whole risk of this function.
+    /// * The leading dimension is always the row length of the operand AS
+    ///   STORED, which is what changes: a non-transposed `B_row` is stored
+    ///   `[k, n]` so `lda = n`; a transposed one is stored `[n, k]` so
+    ///   `lda = k`. Likewise `ldb` is `k` normally and `m` when `transa`.
+    ///
+    /// Cross those and cuBLAS reads a real, in-bounds, WRONG sub-matrix —
+    /// silent garbage, which is precisely the tied-embedding miscompile of
+    /// PR #335. `sgemm_wgrad_accum` below is the in-tree precedent for the
+    /// crossed form and was used to check this derivation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_row_major_t(
         a_dev: *const f32,
         b_dev: *const f32,
         c_dev: *mut f32,
         m: u64,
         n: u64,
         k: u64,
+        transa: bool,
+        transb: bool,
+        alpha: f32,
+        beta: f32,
     ) -> Result<(), cublas_result::CublasError> {
         debug_assert!(m > 0 && n > 0 && k > 0, "sgemm requires m,n,k > 0");
         debug_assert!(
             m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
             "sgemm dims must fit in i32"
         );
-        // cuda-graphs (P5 item 19): the gemm is a pseudo-op — recorded during
-        // record/capture passes, verified-and-skipped during replay (the
-        // region-end graph launch carries the captured cuBLAS kernels).
-        if !super::graph_capture::on_sgemm(
+        if !super::graph_capture::on_sgemm_full(
+            super::graph_capture::SgemmKind::RowMajor,
+            transa,
+            transb,
             a_dev as usize,
             b_dev as usize,
             c_dev as usize,
-            m,
-            n,
-            k,
+            m, n, k, alpha, beta,
+            1, m * k, k * n, m * n,
         ) {
             return Ok(());
         }
         let handle = cublas_handle();
-        // p8 PR-A: bind the gemm to the per-thread compute stream so cuBLAS
-        // kernels ride the same stream as every other kernel (ordering-neutral
-        // vs the old NULL-stream default thanks to blocking-stream semantics;
-        // required for future graph capture). Set per call — the handle is
-        // process-global while the stream is per-thread, and cublasSetStream_v2
-        // is a cheap handle-field write.
         {
             let r = unsafe {
                 cublas_sys::cublasSetStream_v2(
@@ -2127,31 +2218,229 @@ pub(crate) mod cublas_inner {
                 )
             };
             if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                // Ordering stays correct on failure (the handle falls back to
-                // its previous stream, still barrier-ordered) but graph
-                // capture (PR-B) would silently miss the gemm — log loudly.
-                eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — gemm stays on its previous stream", r);
+                eprintln!("[nsl] cublasSetStream_v2 failed: {r:?} — gemm stays on its previous stream");
             }
         }
-        // Safe API takes alpha/beta by value via *const pointers. Under
-        // CUBLAS_POINTER_MODE_HOST (default) cuBLAS reads these synchronously
-        // before the FFI returns, but we pin them as locals here since
-        // cublas_result::sgemm reads them before returning — no async footgun
-        // with host-pointer mode.
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
+        let op = |t: bool| {
+            if t {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
         cublas_result::sgemm(
             handle,
-            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-            n as i32, // cublas m = N (cols of row-major C)
-            m as i32, // cublas n = M (rows of row-major C)
-            k as i32, // contraction dim
+            op(transb), // cuBLAS's FIRST operand is B_row
+            op(transa), // ...and its SECOND is A_row
+            n as i32,
+            m as i32,
+            k as i32,
             &alpha,
-            b_dev, n as i32, // A^cublas := B_row, lda = N
-            a_dev, k as i32, // B^cublas := A_row, ldb = K
+            b_dev,
+            if transb { k as i32 } else { n as i32 }, // lda: B_row's stored row length
+            a_dev,
+            if transa { m as i32 } else { k as i32 }, // ldb: A_row's stored row length
             &beta,
-            c_dev, n as i32, // C^cublas := C_row, ldc = N
+            c_dev, n as i32,
+        )
+    }
+
+    /// Strided-batched row-major SGEMM: `C[i] = alpha * A[i] @ B[i] + beta * C[i]`
+    /// for `batch` slices (item 9).
+    ///
+    /// All three operands are ROW-MAJOR, using the same operand-swap idiom as
+    /// `sgemm_row_major`: cuBLAS is asked for `C^T = B^T A^T` in its
+    /// column-major view, which is the same bytes. `stride_*` are ELEMENT
+    /// offsets between consecutive slices; **0 broadcasts** that operand
+    /// across the batch, which is how `gpu_matmul_f32` expresses
+    /// `[b,m,k] @ [k,n]`-style shape broadcasting.
+    ///
+    /// Distinct from `sgemm_strided_batched_raw` above, which takes RAW
+    /// column-major arguments, is muon-only, and deliberately taints
+    /// cuda-graph regions. This one is on the general matmul path, so it
+    /// records a proper pseudo-op instead — tainting here would disable graph
+    /// capture for every model containing a batched product.
+    ///
+    /// Compute type is `CUBLAS_COMPUTE_32F`, matching `sgemm_row_major`, so
+    /// this arm does not itself request tensor cores.
+    ///
+    /// That is NOT the same as "this arm is always full f32". On CUDA 13.3 the
+    /// handle's math mode wins over the per-call compute type: under
+    /// `NSL_MATMUL_TF32=1` this call was measured at 8.104e-4 error against
+    /// the 2-D path's 8.101e-4 on the same product, i.e. both went to tensor
+    /// cores. That consistency is what you want — QK^T and the projections
+    /// should not disagree about precision — but it means the compute type
+    /// here is a floor, not a guarantee.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_batched_row_major(
+        a_dev: *const f32,
+        b_dev: *const f32,
+        c_dev: *mut f32,
+        m: u64,
+        n: u64,
+        k: u64,
+        batch: u64,
+        stride_a: u64,
+        stride_b: u64,
+        stride_c: u64,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(m > 0 && n > 0 && k > 0 && batch > 0);
+        debug_assert!(
+            m <= i32::MAX as u64
+                && n <= i32::MAX as u64
+                && k <= i32::MAX as u64
+                && batch <= i32::MAX as u64,
+            "batched gemm dims must fit in i32"
+        );
+        if !super::graph_capture::on_sgemm_batched(
+            a_dev as usize, b_dev as usize, c_dev as usize,
+            m, n, k, alpha, beta, batch, stride_a, stride_b, stride_c,
+        ) {
+            return Ok(());
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!(
+                    "[nsl] cublasSetStream_v2 failed: {r:?} — batched matmul stays on its previous stream"
+                );
+            }
+        }
+        let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
+        let status = unsafe {
+            cublas_sys::cublasGemmStridedBatchedEx(
+                handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                n as i32, // cublas m = N (cols of row-major C)
+                m as i32, // cublas n = M (rows of row-major C)
+                k as i32, // contraction dim
+                &alpha as *const f32 as *const std::ffi::c_void,
+                b_dev as *const std::ffi::c_void, // A^cublas := B_row
+                f32t,
+                n as i32,        // lda = N
+                stride_b as i64, // ...and B_row's stride goes with it
+                a_dev as *const std::ffi::c_void, // B^cublas := A_row
+                f32t,
+                k as i32, // ldb = K
+                stride_a as i64,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c_dev as *mut std::ffi::c_void,
+                f32t,
+                n as i32, // ldc = N
+                stride_c as i64,
+                batch as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
+            )
+        };
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublas_result::CublasError(status));
+        }
+        Ok(())
+    }
+
+    /// Weight-gradient contraction: `C[d, o] = alpha * (X[N, d]^T @ G[N, o]) + beta * C`.
+    ///
+    /// All three operands are ROW-MAJOR. This is the shape the weight gradient
+    /// actually has once the batch dimension is flattened: for a forward
+    /// `y = x @ W` with `x: [B, T, d]`, the gradient is
+    /// `dW[d, o] = sum_{b,t} x[b,t,d] * dy[b,t,o]`, which is exactly this
+    /// contraction with `N = B*T` — the batch sum falls out of the reduction
+    /// dimension instead of needing a separate `[B, d, o]` temporary and a
+    /// batch-reduce pass.
+    ///
+    /// With `beta = 1.0` and `C = m_partial`, the whole
+    /// "matmul -> reduce_to_shape -> scaled accumulate" chain collapses into
+    /// this single call.
+    ///
+    /// # Column-major derivation (get this wrong and it is silently transposed)
+    ///
+    /// Row-major `M[r, c]` is column-major `M_cm[c, r]` with `ld = c`. So:
+    ///   * `C[d, o]` -> `C_cm[o, d]`, ldc = o
+    ///   * `G[N, o]` -> `G_cm[o, N]`, lda = o
+    ///   * `X[N, d]` -> `X_cm[d, N]`, ldb = d
+    /// and `C[d,o] = sum_n X[n,d] G[n,o]` becomes
+    /// `C_cm[o,d] = sum_n G_cm[o,n] X_cm[d,n] = G_cm @ X_cm^T`.
+    /// Hence `transa = N` on G, `transb = T` on X, `m = o`, `n = d`, `k = N`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgemm_wgrad_accum(
+        x_dev: *const f32,
+        g_dev: *const f32,
+        c_dev: *mut f32,
+        n_rows: u64, // N = flattened batch*time (the contraction dim)
+        d_in: u64,   // d = C rows      (x's trailing dim)
+        d_out: u64,  // o = C cols      (g's trailing dim)
+        alpha: f32,
+        beta: f32,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(
+            n_rows > 0 && d_in > 0 && d_out > 0,
+            "wgrad gemm requires N,d,o > 0"
+        );
+        debug_assert!(
+            n_rows <= i32::MAX as u64 && d_in <= i32::MAX as u64 && d_out <= i32::MAX as u64,
+            "wgrad gemm dims must fit in i32"
+        );
+        // cuda-graphs: recorded as a distinct pseudo-op shape. The alpha/beta
+        // bits are part of GpuOp::Sgemm's identity, so an accumulating gemm
+        // can never be replayed as an overwriting one.
+        // Recorded with its OWN kind. `sgemm_row_major` calls the same hook
+        // with the same eight values, but performs a different contraction —
+        // without the discriminator the two compare equal under capture and
+        // eager repair reconstructs whichever it happens to hold as a plain
+        // row-major gemm. Silently wrong gradients, no error.
+        if !super::graph_capture::on_sgemm_full(
+            super::graph_capture::SgemmKind::WgradAccum,
+            false,
+            false,
+            x_dev as usize,
+            g_dev as usize,
+            c_dev as usize,
+            n_rows,
+            d_in,
+            d_out,
+            alpha,
+            beta,
+            1,
+            n_rows * d_in,
+            n_rows * d_out,
+            d_in * d_out,
+        ) {
+            return Ok(());
+        }
+        let handle = cublas_handle();
+        {
+            let r = unsafe {
+                cublas_sys::cublasSetStream_v2(
+                    handle,
+                    super::inner::current_stream() as cublas_sys::cudaStream_t,
+                )
+            };
+            if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — wgrad gemm stays on its previous stream", r);
+            }
+        }
+        cublas_result::sgemm(
+            handle,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N, // G_cm, no transpose
+            cublas_sys::cublasOperation_t::CUBLAS_OP_T, // X_cm, transposed
+            d_out as i32,  // cublas m = rows of C_cm = o
+            d_in as i32,   // cublas n = cols of C_cm = d
+            n_rows as i32, // contraction dim = N
+            &alpha,
+            g_dev, d_out as i32,  // A := G_cm, lda = o
+            x_dev, d_in as i32,   // B := X_cm, ldb = d
+            &beta,
+            c_dev, d_out as i32,  // C := C_cm, ldc = o
         )
     }
 
@@ -2213,12 +2502,18 @@ pub(crate) mod cublas_inner {
         };
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
-        // GemmStridedBatchedEx with an explicit compute type: the process
-        // handle sits in CUBLAS_DEFAULT_MATH (which, despite NSL's "TF32
-        // default" banner, runs f32 gemms on FP32 CUDA cores), so tensor-core
-        // TF32 must be requested per call. The muon batch engine opts in —
-        // Newton-Schulz is a coarse polynomial approximation and its own
-        // gates are tolerance-based; nothing else in the runtime is affected.
+        // GemmStridedBatchedEx with an explicit compute type. By DEFAULT the
+        // process handle sits in CUBLAS_DEFAULT_MATH, which runs f32 gemms on
+        // FP32 CUDA cores, so tensor-core TF32 must be requested per call —
+        // the muon batch engine opts in, Newton-Schulz being a coarse
+        // polynomial approximation whose own gates are tolerance-based.
+        //
+        // The converse no longer holds. Item 9 made `NSL_MATMUL_TF32=1` put
+        // the handle in CUBLAS_TF32_TENSOR_OP_MATH, and on CUDA 13.3 the
+        // handle's math mode overrides this per-call compute type: under that
+        // flag `tf32 = false` here still runs on tensor cores. Callers passing
+        // false are asking for no TF32 *from this call site*, not asserting
+        // the process is in full-f32 mode.
         let compute = if tf32 {
             cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
         } else {
@@ -2760,6 +3055,83 @@ pub(crate) fn gpu_scale_raw_f32(dev: *mut std::ffi::c_void, n: usize, scalar: f3
     inner::sync_after_kernel();
 }
 
+/// Fused weight-gradient accumulate: `m_partial += scale * (x^T @ g)`,
+/// contracted over the flattened leading dimensions.
+///
+/// One cuBLAS call with `alpha = scale, beta = 1.0` writing straight into
+/// `m_partial` — no `[B, d, o]` temporary, no batch-reduce pass, no separate
+/// elementwise accumulate launch. See `sgemm_wgrad_accum` for the column-major
+/// derivation and `nsl_tensor_wgrad_accum` for the (deliberate)
+/// non-bit-exactness.
+///
+/// The caller has already validated device/dtype/contiguity/shape.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_wgrad_accum_f32(
+    m_ptr: i64,
+    x_ptr: i64,
+    g_ptr: i64,
+    n_rows: u64,
+    d_in: u64,
+    d_out: u64,
+    scale: f32,
+) {
+    use crate::tensor::NslTensor;
+    let m = unsafe { &*(m_ptr as *const NslTensor) };
+    let x = unsafe { &*(x_ptr as *const NslTensor) };
+    let g = unsafe { &*(g_ptr as *const NslTensor) };
+    debug_assert_eq!(
+        m.len as u64,
+        d_in * d_out,
+        "wgrad accum: m_partial length must be d_in * d_out"
+    );
+    debug_assert_eq!(
+        x.len as u64,
+        n_rows * d_in,
+        "wgrad accum: x length must be N * d_in"
+    );
+    debug_assert_eq!(
+        g.len as u64,
+        n_rows * d_out,
+        "wgrad accum: g length must be N * d_out"
+    );
+
+    inner::ensure_context();
+
+    // SAFETY: all three are device f32 buffers of the sizes asserted above,
+    // validated by `nsl_tensor_wgrad_accum` before dispatch.
+    let res = unsafe {
+        cublas_inner::sgemm_wgrad_accum(
+            x.data as *const f32,
+            g.data as *const f32,
+            m.data as *mut f32,
+            n_rows,
+            d_in,
+            d_out,
+            scale,
+            // beta = 1.0: ACCUMULATE into m_partial rather than overwrite it.
+            // This is the whole point of the fusion; a 0.0 here would silently
+            // discard every earlier micro-batch's contribution.
+            1.0,
+        )
+    };
+    if let Err(e) = res {
+        panic!(
+            "[nsl-wgrad] cuBLAS wgrad accum failed (N={n_rows} d={d_in} o={d_out}): {e:?}. \
+             This writes gradients in place, so there is no safe partial result to \
+             continue from."
+        );
+    }
+
+    if inner::sync_mode_enabled() {
+        let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+        assert_eq!(
+            sync_result,
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "[nsl-wgrad] async CUDA error after wgrad accum gemm"
+        );
+    }
+}
+
 /// FASE fused scaled-add (Milestone C · p4): `m[i] = m[i] + g[i] * scale`,
 /// in place into `m`. `m` and `g` must be contiguous device f32 buffers of the
 /// same length `n`. Bit-exact with `gpu_scalar_op_inplace(g, scale, MUL_SCALAR)`
@@ -2876,13 +3248,23 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         k == m_ptrs.len() && k == v_ptrs.len() && k == mp_ptrs.len() && k == lens.len(),
         "multi adamw: table length mismatch"
     );
-    assert!(k <= 65535, "multi adamw: grid.y cap exceeded ({k})");
+    // No grid.y cap any more: the grid is flat (item 8). The old
+    // `assert!(k <= 65535)` guarded `grid.y`, which no longer exists.
 
     struct MultiWs {
         cap: usize,
         stage: u64,   // pinned host: 4*cap u64 + cap u32
         tabs: [u64; 4], // device u64 tables
         ntab: u64,    // device u32 table
+        /// Item 8: block -> (param index, element base) tables, and the shape
+        /// list they were built from. These depend ONLY on the shapes, which
+        /// are static across training steps, so rebuilding them every step
+        /// would be a pure per-step H2D cost (1.2 MB at Coder-50M). Cached and
+        /// rebuilt only when `lens` changes.
+        blk_lens: Vec<u32>,
+        blk_param: u64,  // device u32[nblocks]
+        blk_base: u64,   // device u32[nblocks]
+        blk_count: usize,
     }
     thread_local! {
         static WS: std::cell::Cell<*mut MultiWs> = const { std::cell::Cell::new(std::ptr::null_mut()) };
@@ -2905,6 +3287,10 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                         inner::free_managed(t as *mut c_void);
                     }
                     inner::free_managed(old.ntab as *mut c_void);
+                    if old.blk_param != 0 {
+                        inner::free_managed(old.blk_param as *mut c_void);
+                        inner::free_managed(old.blk_base as *mut c_void);
+                    }
                     cudarc::driver::sys::cuMemFreeHost(old.stage as *mut c_void);
                 }
                 let mut stage: *mut c_void = std::ptr::null_mut();
@@ -2922,7 +3308,16 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
                     inner::alloc_managed(k * 8) as u64,
                 ];
                 let ntab = inner::alloc_managed(k * 4) as u64;
-                let fresh = Box::into_raw(Box::new(MultiWs { cap: k, stage: stage as u64, tabs, ntab }));
+                let fresh = Box::into_raw(Box::new(MultiWs {
+                    cap: k,
+                    stage: stage as u64,
+                    tabs,
+                    ntab,
+                    blk_lens: Vec::new(),
+                    blk_param: 0,
+                    blk_base: 0,
+                    blk_count: 0,
+                }));
                 c.set(fresh);
             }
         } else {
@@ -2964,7 +3359,43 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         up(ws.ntab, 4 * ws.cap * 8, k * 4);
     }
 
-    let max_n = *lens.iter().max().unwrap() as i64;
+    // Item 8: (re)build the block -> param / element-base tables when the
+    // shape list changes. `build_block_tables` is a pure function of `lens`
+    // and is unit-tested on the CPU (`fase_step::item8_tests`).
+    let block = 256i64;
+    if ws.blk_lens != lens {
+        let (bparam, bbase) = crate::fase_step::build_block_tables(lens, block as u32);
+        let nblocks = bparam.len();
+        unsafe {
+            inner::ensure_context();
+            // The previous step's launch may still be reading these.
+            let r = cudarc::driver::sys::cuStreamSynchronize(inner::current_stream());
+            assert_eq!(r, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+            if ws.blk_param != 0 {
+                inner::free_managed(ws.blk_param as *mut c_void);
+                inner::free_managed(ws.blk_base as *mut c_void);
+            }
+            ws.blk_param = inner::alloc_managed(nblocks * 4) as u64;
+            ws.blk_base = inner::alloc_managed(nblocks * 4) as u64;
+            let cp = |dst: u64, src: &[u32]| {
+                let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    dst,
+                    src.as_ptr() as *const c_void,
+                    src.len() * 4,
+                );
+                assert_eq!(
+                    r,
+                    cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "multi adamw: block table upload failed"
+                );
+            };
+            cp(ws.blk_param, &bparam);
+            cp(ws.blk_base, &bbase);
+        }
+        ws.blk_count = nblocks;
+        ws.blk_lens = lens.to_vec();
+    }
+
     let mut a0 = ws.tabs[0];
     let mut a1 = ws.tabs[1];
     let mut a2 = ws.tabs[2];
@@ -2974,6 +3405,8 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     let (mut eps, mut neg_lr, mut neg_lr_wd, mut bc1, mut bc2) =
         (eps, neg_lr, neg_lr_wd, bc1, bc2);
     let mut has_wd_val: u32 = u32::from(has_wd);
+    let mut a5 = ws.blk_param;
+    let mut a6 = ws.blk_base;
     let args = [
         &mut a0 as *mut _ as *mut c_void,
         &mut a1 as *mut _ as *mut c_void,
@@ -2990,13 +3423,14 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut bc1 as *mut _ as *mut c_void,
         &mut bc2 as *mut _ as *mut c_void,
         &mut has_wd_val as *mut _ as *mut c_void,
+        &mut a5 as *mut _ as *mut c_void,
+        &mut a6 as *mut _ as *mut c_void,
     ];
-    let block = 256i64;
-    let grid_x = (max_n + block - 1) / block;
+    let grid_x = ws.blk_count as i64;
     let result = inner::kernel_launch(
         kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
         b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
-        [grid_x, k as i64, 1], [block, 1, 1], &args, 0,
+        [grid_x, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
         result as u32, 0,
@@ -3144,6 +3578,228 @@ fn gpu_cast_raw(ptx: *const u8, kname: *const u8, src: u64, dst: u64, n: usize) 
     inner::sync_after_kernel();
 }
 
+/// `NSL_MATMUL_NO_BATCH_COLLAPSE=1` — restore the pre-item-9 dispatch, keeping
+/// every batched product on the naive `nsl_bmm_f32` kernel.
+///
+/// One switch covers BOTH item-9 paths — the collapse of `[..,m,k] @ [k,n]`
+/// into a single sgemm and the routing of genuinely batched products to
+/// `cublasGemmStridedBatchedEx`. They are separate dispatch decisions but a
+/// single escape hatch is what an operator actually wants: "put the matmul
+/// back the way it was" while a suspected numerical regression is bisected.
+///
+/// This exists so the parity gate has a reference arm that is the OLD
+/// numerics, and so a suspected cuBLAS-tiling difference in a training run can
+/// be bisected without a rebuild. The env var is read once — `gpu_matmul_f32`
+/// is on the hot path and a per-call `std::env::var` would show up in the
+/// profile — but the resolved answer lives in an atomic rather than a
+/// `OnceLock<bool>` so `test_set_batch_collapse_disabled` can flip it. Without
+/// that, comparing the two arms would need two test BINARIES (the isolation
+/// dance `matmul_cublas_tf32_default_sanity.rs` documents), and a parity gate
+/// split across two processes cannot diff the two results against each other.
+///
+/// 0 = unresolved, 1 = collapse enabled, 2 = collapse disabled.
+#[cfg(feature = "cuda")]
+static BATCH_COLLAPSE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+fn batch_collapse_disabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match BATCH_COLLAPSE_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let disabled = std::env::var("NSL_MATMUL_NO_BATCH_COLLAPSE").as_deref() == Ok("1");
+            BATCH_COLLAPSE_STATE.store(u8::from(disabled) + 1, Ordering::Relaxed);
+            disabled
+        }
+    }
+}
+
+/// Test hook: force the batch-collapse decision for the rest of the process.
+///
+/// Gated on `test-hooks` so production builds cannot reach it. Used by
+/// `tests/matmul_batch_collapse.rs` to drive both dispatch arms from one
+/// process and compare their outputs element-wise.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_set_batch_collapse_disabled(disabled: bool) {
+    BATCH_COLLAPSE_STATE.store(u8::from(disabled) + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is `t` a 2-D view whose buffer is a contiguous row-major `[cols, rows]`,
+/// i.e. exactly what `.transpose(0, 1)` on a 2-D tensor produces?
+///
+/// Such an operand needs no materialisation: cuBLAS reads it directly with
+/// `CUBLAS_OP_T`. `x @ self.embed.transpose(0, 1)` — the weight-tied LM head
+/// every model in `models/` uses — otherwise copies a whole `[vocab, d_model]`
+/// matrix on every forward (96 MiB for Coder-50M's 49152 x 512).
+///
+/// Deliberately conservative:
+/// * `is_contiguous()` is checked FIRST. A `[k, 1]` contiguous tensor has
+///   strides `[1, 1]` and would satisfy the pattern below when `k == 1`;
+///   treating a contiguous operand as transposed is a silent transpose of the
+///   result.
+/// * Zero strides are rejected. `expand` produces them (shape_ops.rs), and a
+///   broadcast operand is not a transpose — `OP_T` would read one row as if
+///   it were the whole matrix.
+/// * `ndim == 2` only. A permuted 4-D attention tensor is not expressible as
+///   `OP_T`, and pretending otherwise reads the wrong elements in bounds.
+#[cfg(feature = "cuda")]
+fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
+    if t.ndim != 2 || t.is_contiguous() {
+        return false;
+    }
+    let shape = unsafe { std::slice::from_raw_parts(t.shape, 2) };
+    let strides = unsafe { std::slice::from_raw_parts(t.strides, 2) };
+    shape[0] > 0
+        && shape[1] > 0
+        && strides[0] == 1
+        && strides[1] == shape[0]
+}
+
+/// `NSL_MATMUL_TRANSPOSE_VIEWS=1` — hand a 2-D transposed operand to cuBLAS as
+/// `OP_T` instead of materialising it. **Default OFF — but which arm is
+/// faster now depends on the math mode; see the update at the end.**
+///
+/// The argument for defaulting this ON is seductive and false. Materialising
+/// `embed.transpose(0,1)` for the weight-tied LM head costs a 25,165,824-element
+/// strided copy on every forward — 96 MiB, in a kernel doing a software 64-bit
+/// div/rem per element — and cuBLAS reads a transposed operand natively, so the
+/// copy looks like pure waste. It is not waste: it buys a much faster GEMM.
+///
+/// Measured on an RTX 5070 Ti / CUDA 13.3, f32, per call:
+///
+/// | shape | `OP_T` | copy + `OP_N` | verdict |
+/// |---|---|---|---|
+/// | `[2048,512] @ [512,49152]` (Coder-50M LM head) | 5.92 ms | 1.04 + 2.89 = **3.93 ms** | OP_T **1.51x SLOWER** |
+/// | `[2048,512] @ [512,4096]` | 0.344 ms | 0.084 + 0.267 = 0.351 ms | a wash |
+/// | `[512,512] @ [512,512]` | **0.023 ms** | 0.024 + 0.019 = 0.043 ms | OP_T 1.9x faster |
+///
+/// End to end on a Coder-50M forward: 29 ms/forward with the copy, 33 ms
+/// without it, peak GPU 2.10 GB vs 2.01 GB. So this trades ~90 MB of peak
+/// memory for ~4 ms per forward — worth having when memory is the binding
+/// constraint, and a regression otherwise.
+///
+/// It is NOT defaulted on with a shape heuristic because three data points is
+/// not a cost model. This repo already learned that lesson: item 10's autotune
+/// database was ranking variants by a roofline ESTIMATE with no measurement
+/// behind it, and no consumer at all. A heuristic here would be the same
+/// mistake with fewer points.
+///
+/// UPDATE (2026-07-28, after TF32 became the matmul default): the committed
+/// reproducer (`matmul_transposed_operand::the_op_t_tradeoff_is_remeasurable`)
+/// shows the table above is a property of FP32-core math, not of the shapes.
+/// Under TF32, cuBLAS's tensor-core kernels read a transposed operand well
+/// and OP_T measured FASTER across the whole grid — 2.16 vs 3.30 ms on the
+/// LM head (0.65x), 0.72x and 0.46x on the other shapes — so under the
+/// current default this opt-out is the conservative arm, not the fast one.
+/// Flipping the default is an open decision, not an oversight: the OP_T
+/// value gates currently pin full f32, so OP_T-under-TF32 needs its own
+/// correctness gates first, and a dispatch default should not move on one
+/// measurement grid.
+/// 0 = unresolved, 1 = off, 2 = on.
+#[cfg(feature = "cuda")]
+static TRANSPOSE_VIEWS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+fn transpose_views_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match TRANSPOSE_VIEWS_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var("NSL_MATMUL_TRANSPOSE_VIEWS").as_deref() == Ok("1");
+            TRANSPOSE_VIEWS_STATE.store(u8::from(on) + 1, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test hook: force the transposed-view decision for the rest of the process.
+/// The gates need BOTH arms in one binary — the default-off path must keep
+/// materialising, and the opt-in path must stay numerically correct.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_set_transpose_views(enabled: bool) {
+    TRANSPOSE_VIEWS_STATE.store(u8::from(enabled) + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Can `gpu_matmul_f32` consume this operand WITHOUT materialising it?
+///
+/// `is_a` selects which operand is being asked about. THE SAME function
+/// answers for the caller (`nsl_tensor_matmul`, deciding whether to skip
+/// `nsl_tensor_contiguous`) and for the dispatcher (deciding whether to pass
+/// `CUBLAS_OP_T`). Two copies of this predicate that disagreed by one
+/// condition would either materialise pointlessly — harmless — or hand a
+/// strided buffer to a stride-blind kernel, which is PR #335 again. There is
+/// one copy, and `matmul_operand_exemption_agrees_with_dispatch` pins that.
+///
+/// Returns true ONLY for an operand that is already contiguous (nothing to do)
+/// or is a 2-D transposed view that the 2-D/collapse arm will express as
+/// `OP_T`. Every other arm requires contiguous operands, so this returns false
+/// for them and the caller copies exactly as it always did.
+#[cfg(feature = "cuda")]
+pub(crate) fn matmul_operand_needs_no_copy(a_ptr: i64, b_ptr: i64, is_a: bool) -> bool {
+    use crate::tensor::NslTensor;
+    let a = unsafe { &*(a_ptr as *const NslTensor) };
+    let b = unsafe { &*(b_ptr as *const NslTensor) };
+    let me = if is_a { a } else { b };
+
+    if me.is_contiguous() {
+        return true; // `nsl_tensor_contiguous` would only bump a refcount.
+    }
+    // OFF BY DEFAULT — the obvious argument for this is wrong, and measurement
+    // is the only reason we know. See `transpose_views_enabled`.
+    if !transpose_views_enabled() {
+        return false;
+    }
+    // Beyond here the operand IS strided, so it may only be skipped if the
+    // dispatch will genuinely express it.
+    if a.ndim < 2 || b.ndim < 2 || a.dtype != 1 || b.dtype != 1 {
+        return false;
+    }
+    if !is_transposed_2d_view(me) {
+        return false;
+    }
+
+    // Re-derive the output batch extent exactly as `gpu_matmul_f32` does; a
+    // transposed A is only expressible when there is no batch to flatten.
+    let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
+    let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
+    let a_batch = &a_shape[..a.ndim as usize - 2];
+    let b_batch = &b_shape[..b.ndim as usize - 2];
+    let nd = a_batch.len().max(b_batch.len());
+    let mut total_batch: i64 = 1;
+    for i in 0..nd {
+        let ad = if i < nd - a_batch.len() { 1 } else { a_batch[i - (nd - a_batch.len())] };
+        let bd = if i < nd - b_batch.len() { 1 } else { b_batch[i - (nd - b_batch.len())] };
+        if ad != bd && ad != 1 && bd != 1 {
+            return false; // shape error; let the dispatcher report it
+        }
+        total_batch = total_batch.saturating_mul(ad.max(bd));
+    }
+    let total_batch = total_batch.max(1) as u64;
+
+    if is_a {
+        // The collapse flattens A's leading dims into the row count, which
+        // needs A's slices contiguous and adjacent. A transposed A is neither,
+        // so it is only expressible in the plain 2-D case.
+        total_batch == 1
+    } else {
+        // B is 2-D in both the plain and collapse cases. In the collapse case
+        // it must still carry no batch extent of its own, and the collapse
+        // must actually be enabled.
+        let b_total_batch: u64 = b_batch.iter().product::<i64>().max(1) as u64;
+        if total_batch == 1 {
+            true
+        } else {
+            b_total_batch == 1
+                && a.is_contiguous()
+                && total_batch.saturating_mul(a_shape[a.ndim as usize - 2] as u64)
+                    <= i32::MAX as u64
+                && !batch_collapse_disabled()
+        }
+    }
+}
+
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
@@ -3153,6 +3809,27 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let b = unsafe { &*(b_ptr as *const NslTensor) };
 
     assert!(a.ndim >= 2 && b.ndim >= 2, "matmul requires 2D+ tensors");
+
+    // This whole function is f32-only and says so nowhere else: it sizes the
+    // output `alloc_managed(out_total * 4)`, hardcodes the output dtype to 1,
+    // and casts `a.data as *const f32`. A bf16 or f16 tensor carries the same
+    // element COUNT in half the bytes, so it would be read two-for-one past
+    // the end of its allocation — a live out-of-bounds read that returns
+    // plausible numbers rather than crashing.
+    //
+    // Refuse instead of silently mis-reading. Item 9's "mixed precision"
+    // bullet is exactly the work that would make this dispatch real; until
+    // then, saying so is the only honest option.
+    assert!(
+        a.dtype == 1 && b.dtype == 1,
+        "GPU matmul is f32-only (dtype 1); got dtype {} @ dtype {}. A non-f32 \
+         tensor here would be read as f32 — for a 2-byte dtype that is a \
+         read of twice the allocation, returning plausible wrong numbers. \
+         Cast the operands with `.to(f32)` first. (Mixed-precision GEMM \
+         dispatch is roadmap item 9 and is not implemented.)",
+        a.dtype,
+        b.dtype
+    );
 
     let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
     let b_shape = unsafe { std::slice::from_raw_parts(b.shape, b.ndim as usize) };
@@ -3222,7 +3899,116 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let stride_b = if b_total_batch == 1 { 0u64 } else { b_mat_stride };
     let stride_c = c_mat_stride;
 
-    if total_batch == 1 {
+    // PARTIAL batch broadcast is not representable by the single stride above,
+    // and the GPU path has always got it wrong. `[2,3,m,k] @ [2,1,k,n]` gives
+    // b_total_batch = 2, so stride_b = k*n — but the product has 6 slices and
+    // B holds 2, so slices 2..6 read past the end of B's allocation. Measured
+    // error against a CPU reference: 2.61 relative to the result's own RMS,
+    // BIT-IDENTICAL through the naive kernel and through cuBLAS. The CPU path
+    // (`tensor/arithmetic.rs`) walks per-dimension broadcast strides and is
+    // correct, so this is a live CPU/GPU divergence.
+    //
+    // Fixing it means per-dimension strides here, which is a real change with
+    // its own gates. Until then this refuses rather than returning plausible
+    // garbage from an out-of-bounds read — a wrong number that propagates into
+    // a training run is worse than a stopped process.
+    let partial_broadcast = |total: u64| total != 1 && total != total_batch;
+    assert!(
+        !partial_broadcast(a_total_batch) && !partial_broadcast(b_total_batch),
+        "GPU matmul does not support PARTIAL batch broadcasting: A batch \
+         extent {a_total_batch}, B batch extent {b_total_batch}, output batch \
+         {total_batch} (shapes {a_shape:?} @ {b_shape:?}). Each operand must \
+         be either fully broadcast (extent 1) or fully present (extent \
+         {total_batch}). The CPU path handles this correctly; the GPU path \
+         would read past the end of the smaller operand. Expand the operand \
+         explicitly, or run this product on CPU."
+    );
+
+    // Item 9 phase 1: collapse `[.., m, k] @ [k, n]` to ONE 2-D sgemm.
+    //
+    // This is the shape of every transformer projection (`x @ w` with
+    // `x: [batch, seq, d_model]`), and until this existed it took the
+    // `total_batch > 1` arm below — the naive 16x16 scalar `nsl_bmm_f32`.
+    // Measured on an RTX 5070 Ti at `[8,1024,512] @ [512,512]`:
+    // **0.67 TFLOP/s through the batched kernel vs 29.54 through cuBLAS for
+    // the identical math** written as `[8192,512] @ [512,512]`. A
+    // `GroupedQueryAttention` forward profiled six `nsl_bmm_f32` and zero
+    // cuBLAS calls.
+    //
+    // The collapse is a pure REINTERPRETATION, not a reassociation: when B is
+    // shared across the batch and A's slices are contiguous and adjacent, A's
+    // buffer already IS a row-major `(total_batch*m) x k` matrix and C's
+    // already IS `(total_batch*m) x n`. Every output element sums the same k
+    // products in the same index order, so this changes nothing about which
+    // reduction happens — only which kernel performs it. (cuBLAS's tiling
+    // still orders that reduction differently from the naive kernel, so
+    // results DO move; see the parity gate in
+    // `crates/nsl-runtime/tests/matmul_batch_collapse.rs`.)
+    //
+    // Preconditions, each checked rather than assumed:
+    //   * B carries no batch extent (`b_total_batch == 1`), so one B serves
+    //     every slice. Combined with `total_batch > 1` this forces
+    //     `a_total_batch == total_batch`, hence `stride_a == a_mat_stride`.
+    //   * A is contiguous. The sole caller (`nsl_tensor_matmul`) materialises
+    //     both operands first, but a strided A would make the flattening a
+    //     silently-wrong read — the same class of bug as the tied-embedding
+    //     miscompile in PR #335.
+    //   * The collapsed row count fits the i32 cuBLAS dimension.
+    //
+    // `NSL_MATMUL_NO_BATCH_COLLAPSE=1` forces the old kernel; the parity gate
+    // uses it as its reference arm.
+    // Item 9 phase 2: a 2-D TRANSPOSED operand goes to cuBLAS as `OP_T`
+    // instead of being materialised.
+    //
+    // `nsl_tensor_matmul` used to copy both operands contiguous before every
+    // GPU dispatch — correct and necessary when the target was a stride-blind
+    // PTX kernel (PR #335, where a stride-blind read of
+    // `emb @ embed.transpose(0,1)` silently produced the wrong product and the
+    // GPU loss climbed to the uniform plateau while CPU descended). Once the
+    // target is cuBLAS that copy buys nothing: `CUBLAS_OP_T` reads the
+    // original buffer.
+    //
+    // What it costs today, measured on Coder-50M: the weight-tied LM head at
+    // models/coder50m/model.nsl:80 is `x @ self.embed.transpose(0, 1)` with
+    // `embed: [49152, 512]`, so every forward runs one 25,165,824-element
+    // strided copy — 96 MiB in and 96 MiB out, through a kernel that does a
+    // software 64-bit div/rem per element.
+    //
+    // Eligibility is per-arm, because only the 2-D/collapse arm reaches
+    // `sgemm_row_major_t`:
+    //   * A may be transposed only when `total_batch == 1`. The collapse
+    //     flattens A's leading dims into the row count, which requires A's
+    //     slices to be contiguous and adjacent — a transposed A is neither.
+    //   * B may be transposed in both cases: it is 2-D either way.
+    // The batched and naive arms below stay strictly contiguous-only.
+    // Same predicate the caller used to decide not to copy — one function, so
+    // the exemption and the dispatch cannot drift apart.
+    let a_2d_transposed = !a.is_contiguous() && matmul_operand_needs_no_copy(a_ptr, b_ptr, true);
+    let b_2d_transposed = !b.is_contiguous() && matmul_operand_needs_no_copy(a_ptr, b_ptr, false);
+
+    let collapse_rows = total_batch.saturating_mul(m);
+    let collapse_to_2d = total_batch > 1
+        && b_total_batch == 1
+        && a.is_contiguous()
+        // B: contiguous, or a 2-D transpose we can express as OP_T. The doc
+        // above says every precondition is checked rather than assumed, and
+        // for one commit this one was assumed — the strided-batched arm below
+        // checked both operands while this arm checked only A.
+        && (b.is_contiguous() || b_2d_transposed)
+        && collapse_rows <= i32::MAX as u64
+        && !batch_collapse_disabled();
+
+    // The 2-D arm is only reachable with a strided operand when that operand
+    // is one we can express; anything else must still have been materialised
+    // by the caller.
+    let two_d_arm = total_batch == 1
+        && (a.is_contiguous() || a_2d_transposed)
+        && (b.is_contiguous() || b_2d_transposed);
+
+    if two_d_arm || collapse_to_2d {
+        // The only thing the collapse changes is the row count handed to
+        // cuBLAS: `k`, `n` and all three data pointers are already correct.
+        let m = if collapse_to_2d { collapse_rows } else { m };
         // Non-batched f32 matmul: dispatch to cuBLAS sgemm via the row-major
         // operand-swap idiom (spec 2026-04-21 §2.1). Replaces the naive
         // nsl_matmul_f32 PTX kernel (~1-2 TFLOPs/s on a 5070 Ti) with
@@ -3252,13 +4038,19 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 
         // SAFETY: a.data, b.data, out_data are valid device f32 pointers of
         // sizes m*k, k*n, m*n respectively (verified by the shape derivation
-        // above + the caller contract of gpu_matmul_f32).
+        // above + the caller contract of gpu_matmul_f32). A transposed operand
+        // spans the same element count in the same buffer — only the read
+        // order differs, which is what OP_T expresses.
         let res = unsafe {
-            cublas_inner::sgemm_row_major(
+            cublas_inner::sgemm_row_major_t(
                 a.data as *const f32,
                 b.data as *const f32,
                 out_data as *mut f32,
                 m, n, k,
+                a_2d_transposed,
+                b_2d_transposed,
+                // Plain matmul: overwrite a freshly-allocated output.
+                1.0, 0.0,
             )
         };
         if let Err(e) = res {
@@ -3294,6 +4086,99 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             // can still match.
             crate::kernel_profiler::kernel_profiler_push_trace(
                 "sgemm_cublas",
+                [1, 1, 1],
+                [1, 1, 1],
+            );
+        }
+    } else if !batch_collapse_disabled()
+        && total_batch <= i32::MAX as u64
+        && m <= i32::MAX as u64
+        && n <= i32::MAX as u64
+        && k <= i32::MAX as u64
+        && a.is_contiguous()
+        && b.is_contiguous()
+    {
+        // Item 9: a genuinely batched product — both operands carry a batch
+        // extent, or A is broadcast — goes to `cublasGemmStridedBatchedEx`.
+        // This is what remains after the collapse above: in a transformer it
+        // is QK^T and PV, which the collapse cannot touch because B differs
+        // per slice.
+        //
+        // Unlike the collapse this is NOT a reinterpretation — it is a
+        // different kernel computing the same contraction, so summation order
+        // changes exactly as it did for the 2-D cuBLAS swap.
+        //
+        // Contiguity is required because the strides handed to cuBLAS are the
+        // natural per-slice extents; a strided view would need its real
+        // strides, and passing the natural ones would read the wrong memory
+        // rather than fail. The caller materialises both operands, so this is
+        // defence in depth.
+        inner::ensure_context();
+
+        // Profiler-event wrapping mirrors the 2-D arm above, and must: a bare
+        // `kernel_profiler_push_trace` indexes the event pool at
+        // `pool_cursor - 1`, so without a popped pair it points one before the
+        // start of the pool and the trace is dropped at flush.
+        let profiler_events = if crate::kernel_profiler::kernel_profiler_enabled() {
+            crate::kernel_profiler::kernel_profiler_pop_events()
+        } else {
+            None
+        };
+        if let Some((start, _, _)) = &profiler_events {
+            unsafe {
+                cudarc::driver::sys::cuEventRecord(
+                    *start as cudarc::driver::sys::CUevent,
+                    inner::current_stream(),
+                );
+            }
+        }
+
+        let res = unsafe {
+            cublas_inner::sgemm_batched_row_major(
+                a.data as *const f32,
+                b.data as *const f32,
+                out_data as *mut f32,
+                m, n, k,
+                total_batch, stride_a, stride_b, stride_c,
+                1.0, 0.0,
+            )
+        };
+        if let Err(e) = res {
+            eprintln!(
+                "[nsl-matmul] cuBLAS batched gemm failed ({total_batch}x{m}x{n}x{k}): {e:?}"
+            );
+            // Release the output we allocated above before signalling failure.
+            // The 2-D arm's `return 0` does NOT do this and leaks the buffer,
+            // its shape and its strides on every cuBLAS error; that is
+            // pre-existing and left alone here rather than folded into an
+            // unrelated change, but a new `return 0` should not add a second
+            // instance of it.
+            crate::tensor::nsl_tensor_free(out_ptr as i64);
+            return 0;
+        }
+        if inner::sync_mode_enabled() {
+            let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+            if sync_result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                panic!(
+                    "[nsl] CUDA async error after cuBLAS batched gemm \
+                     ({total_batch}x{m}x{n}x{k}): {sync_result:?}"
+                );
+            }
+        }
+        if let Some((_, stop, _)) = &profiler_events {
+            unsafe {
+                cudarc::driver::sys::cuEventRecord(
+                    *stop as cudarc::driver::sys::CUevent,
+                    inner::current_stream(),
+                );
+            }
+            // Same synthetic-marker convention as the 2-D arm: the real
+            // arch-dispatched cuBLAS kernel name is not visible from the
+            // public API. Named distinctly so a profile can tell the two
+            // cuBLAS paths apart — and so the "did this collapse?" assertion
+            // in the gates can be specific rather than matching any gemm.
+            crate::kernel_profiler::kernel_profiler_push_trace(
+                "sgemm_cublas_batched",
                 [1, 1, 1],
                 [1, 1, 1],
             );
@@ -3771,22 +4656,34 @@ pub fn cuda_device_name() -> Option<String> {
         if cuDeviceGet(&mut device, ordinal) != CUresult::CUDA_SUCCESS {
             return None;
         }
-        let mut buf = [0i8; 128];
-        if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
-            return None;
+        device_marketing_name(device)
+    }
+}
+
+/// `cuDeviceGetName` for an already-resolved device, with the vendor/brand
+/// prefixes stripped. Shared by `cuda_device_name` and `cuda_device_identity`
+/// so the two can never disagree about what the card is called.
+///
+/// # Safety
+/// `device` must be a valid `CUdevice` obtained from `cuDeviceGet`.
+#[cfg(feature = "cuda")]
+unsafe fn device_marketing_name(device: cudarc::driver::sys::CUdevice) -> Option<String> {
+    use cudarc::driver::sys::*;
+    let mut buf = [0i8; 128];
+    if cuDeviceGetName(buf.as_mut_ptr(), buf.len() as i32, device) != CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
+    let mut name = cstr.to_str().ok()?.trim().to_string();
+    for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            name = rest.to_string();
         }
-        let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
-        let mut name = cstr.to_str().ok()?.trim().to_string();
-        for prefix in ["NVIDIA ", "GeForce ", "Tesla "] {
-            if let Some(rest) = name.strip_prefix(prefix) {
-                name = rest.to_string();
-            }
-        }
-        if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -3795,6 +4692,90 @@ pub fn cuda_device_name() -> Option<String> {
 pub fn cuda_device_name() -> Option<String> {
     None
 }
+
+/// Identity of the local CUDA device, as reported by the DRIVER.
+///
+/// This is the cache-key identity for `@autotune` (roadmap item 10). It is
+/// deliberately independent of `nsl-codegen`'s `GpuSpec` database: a tuning
+/// result is only transferable to hardware that reports the same values here,
+/// and that has to be true even for a card the database has never heard of.
+/// Reading identity out of the database instead would collapse every unknown
+/// GPU onto whatever the database default happens to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaDeviceIdentity {
+    /// Marketing name with vendor prefixes stripped, e.g. "RTX 5070 Ti".
+    pub name: String,
+    /// Compute capability major * 10 + minor, e.g. 120 for sm_120.
+    pub sm_version: u32,
+    /// Multiprocessor count.
+    pub sm_count: u32,
+    /// `cuDriverGetVersion`, e.g. 13030 for CUDA 13.3.
+    pub driver_version: u32,
+}
+
+/// Probe the local CUDA device for its cache-key identity.
+///
+/// Non-panicking for the same reason `cuda_device_name` is: this runs at
+/// COMPILE time, where an abort would kill the compiler. Every driver call is
+/// rc-checked and no context is created or retained.
+#[cfg(feature = "cuda")]
+pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
+    use cudarc::driver::sys::*;
+    unsafe {
+        if cuInit(0) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        // Resolve the ordinal ONCE and derive both the name and the attributes
+        // from it. Calling `cuda_device_name()` here instead would run
+        // `select_device_ordinal` a second time, which under the SPMD spawner
+        // prints its "binding CUDA device N" line twice per probe and, worse,
+        // lets the name and the attributes resolve to different ordinals if the
+        // environment changes in between.
+        let ordinal = inner::select_device_ordinal();
+        let mut device: CUdevice = 0;
+        if cuDeviceGet(&mut device, ordinal) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let name = device_marketing_name(device)?;
+        let attr = |a| -> Option<u32> {
+            let mut v: i32 = 0;
+            if cuDeviceGetAttribute(&mut v, a, device) != CUresult::CUDA_SUCCESS || v < 0 {
+                return None;
+            }
+            Some(v as u32)
+        };
+        let major = attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let minor = attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let sm_count = attr(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
+        let mut driver: i32 = 0;
+        if cuDriverGetVersion(&mut driver) != CUresult::CUDA_SUCCESS || driver < 0 {
+            return None;
+        }
+        Some(CudaDeviceIdentity {
+            name,
+            sm_version: major * 10 + minor,
+            sm_count,
+            driver_version: driver as u32,
+        })
+    }
+}
+
+/// Non-cuda build: no device to identify.
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_device_identity() -> Option<CudaDeviceIdentity> {
+    None
+}
+
+/// Whether this binary was compiled with CUDA support at all.
+///
+/// `cuda` is NOT a default feature (`nsl-cli` and `nsl-codegen` both default to
+/// `[]`, and the release workflow builds with no features), so the stock `nsl`
+/// binary cannot probe a device even on a machine that has one. Callers that
+/// record or key on device identity must be able to say *why* they have none —
+/// "this machine has no GPU" and "this compiler cannot see GPUs" are different
+/// claims, and conflating them would put `no-cuda-device` in a cache record
+/// written on a box with a 5070 Ti sitting in it.
+pub const CUDA_SUPPORT_COMPILED: bool = cfg!(feature = "cuda");
 
 /// Launch a PTX kernel. All params are i64 for Cranelift ABI compatibility.
 ///
@@ -6834,6 +7815,29 @@ pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
     }
     #[cfg(not(feature = "cuda"))]
     { let _ = (dst, src, bytes); }
+}
+
+/// Test hook: block until every kernel queued on this context has finished.
+///
+/// Any integration test that TIMES GPU work needs this. `sync_after_kernel` is
+/// a no-op unless `NSL_CUDA_SYNC=1`, so a bare `Instant::now()` loop around
+/// `nsl_tensor_matmul` measures kernel *enqueue* — which is how the first
+/// throughput probe for item 9 reported a 4096^3 gemm at 22,000 TFLOP/s, and
+/// how the first version of `matmul_batch_collapse.rs`'s ratchet passed with
+/// the fast path deleted (0.0037 vs 0.0034 ms, ratio 0.92).
+///
+/// Preferred over setting `NSL_CUDA_SYNC=1` from a test: that variable is read
+/// once during context init, so whether it takes effect depends on which test
+/// in the binary touched CUDA first.
+#[cfg(all(feature = "test-hooks", feature = "cuda"))]
+pub fn test_cuda_device_synchronize() {
+    inner::ensure_context();
+    let rc = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    assert_eq!(
+        rc,
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuCtxSynchronize failed: {rc:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -165,11 +165,22 @@ fn g16_3_t1_zero_d_model_smem_aliasing() {
     );
 }
 
-/// G16-3-T2: With d_model=0 and fused_projections=false, the A3 backward PTX
-/// must synthesize without error. Kernel synthesis is not the failure point --
-/// the crash fires at runtime during scratch-buffer free (deferred to cycle 17).
+/// G16-3-T2: SUPERSEDED BY R13 (2026-07-26). This asserted that A3's backward
+/// PTX synthesizes, which was the cycle-16 way of localising A3's crash as
+/// "runtime, not PTX" and deferring the crash itself to cycle 17.
+///
+/// That localisation was correct and is now moot. A3's config is `n1_p0`
+/// (fused_rmsnorm=true + fused_projections=false), and the cycle-17 crash it
+/// deferred was measured on 2026-07-25: with rope_q the FORWARD kernel faults
+/// on an invalid __shared__ read at the window base, and without rope_q the
+/// backward silently returns all-zero gradients. R13 now refuses the pair at
+/// synthesis, so the runtime crash can no longer be reached — which is the
+/// resolution of "deferred to cycle 17", not a regression against it.
+///
+/// Inverted rather than deleted: the config is still worth naming, and a
+/// future edit that weakens R13 should fail here too.
 #[test]
-fn g16_3_t2_a3_backward_ptx_synthesizes_ok() {
+fn g16_3_t2_a3_backward_ptx_now_refused_by_r13() {
     let mut cfg = build_cycle14_config();
     cfg.checkpoint = None;
     if let Some(ref mut csha) = cfg.csha {
@@ -177,17 +188,16 @@ fn g16_3_t2_a3_backward_ptx_synthesizes_ok() {
         csha.d_model = 0;
     }
 
-    let result = synthesize_backward_with_tier_b(&cfg, None);
+    let err = synthesize_backward_with_tier_b(&cfg, None)
+        .expect_err("R13 must refuse n1_p0 at synthesis (was: synthesis OK, crash at runtime)");
     assert!(
-        result.is_ok(),
-        "G16-3: A3 backward PTX synthesis must succeed (crash is runtime, not PTX): {:?}",
-        result.err()
+        err.contains("n1_p0"),
+        "G16-3: refusal must name the n1_p0 pair; got: {err}"
     );
-    let ptx = result.unwrap();
-    assert!(!ptx.is_empty(), "G16-3: synthesized PTX must be non-empty");
     eprintln!(
-        "[g16_3_t2] A3 backward PTX: {} bytes -- synthesis OK, crash deferred to cycle 17",
-        ptx.len()
+        "[g16_3_t2] A3 refused at synthesis by R13 -- the cycle-17 runtime crash \
+         is now unreachable: {}",
+        err.lines().next().unwrap_or("")
     );
 }
 
