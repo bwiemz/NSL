@@ -2,8 +2,11 @@
 //! Roadmap item 9 phase 2: a 2-D transposed operand reaches cuBLAS as `OP_T`
 //! instead of being copied.
 //!
-//! **This dispatch is OPT-IN (`NSL_MATMUL_TRANSPOSE_VIEWS=1`) and the default
-//! is the fast one.** Read the next two sections before changing that.
+//! **The default is coupled to the math mode (2026-07-28): OP_T under TF32,
+//! the materialising copy under FP32 cores and Pedantic;
+//! `NSL_MATMUL_TRANSPOSE_VIEWS=1`/`=0` always wins.** Read the next two
+//! sections — the history matters, because each arm of the coupling is
+//! backed by a measurement in exactly that cell.
 //!
 //! ## The obvious argument, and why it is wrong
 //!
@@ -30,18 +33,21 @@
 //! | `[512,512] @ [512,512]` | **0.023 ms** | 0.043 ms | OP_T 1.9x faster |
 //!
 //! End to end: 29 ms/forward with the copy, 33 ms without; peak GPU 2.10 GB
-//! versus 2.01 GB. So this trades ~90 MB of peak memory for ~4 ms per forward.
-//! Worth having when memory binds, a regression otherwise — hence opt-in, and
-//! hence `the_default_still_materialises_transposed_operands` below.
+//! versus 2.01 GB. So under FP32-core math the copy trades ~90 MB of peak
+//! memory for ~4 ms per forward — which is why `NSL_MATMUL_TF32=0` keeps it
+//! (`the_default_under_f32_cores_still_materialises` below).
 //!
 //! **UPDATE (2026-07-28): that table is a property of FP32-core math.** After
 //! TF32 became the matmul default, `the_op_t_tradeoff_is_remeasurable` (the
 //! committed reproducer at the bottom of this file) measured OP_T FASTER on
 //! every shape in the grid under TF32 — 0.65x on the LM head — while
-//! reproducing the table above under `NSL_MATMUL_TF32=0`. The default stays
-//! OFF until OP_T has correctness gates UNDER TF32 (every value gate in this
-//! file pins full f32) and the flip is decided on more than one grid; the
-//! reproducer exists so that decision starts from a command.
+//! reproducing the table above under `NSL_MATMUL_TF32=0`. A Coder-50M
+//! 20-forward loop then confirmed it end-to-end (63.4 -> 56.6 ms, three
+//! paired runs, sgemm at parity, the win exactly the vanished LM-head copy),
+//! and `matmul_dispatch_under_tf32.rs` gates OP_T's VALUES under TF32. On
+//! those two measurement levels plus gates, the default flipped to a
+//! per-math-mode coupling: OP_T under TF32, copy under FP32 cores (measured
+//! slower there) and Pedantic (unmeasured, keeps the conservative arm).
 //!
 //! ## Why this is the dangerous direction
 //!
@@ -516,39 +522,48 @@ fn zz_default_probe_child() {
     );
 }
 
-/// The DEFAULT must still materialise. `OP_T` is opt-in because it is slower
-/// on wide GEMMs — 5.92 ms versus 1.04 + 2.89 for the Coder-50M LM head — so a
-/// build that silently enabled it would be a 1.51x regression on the exact
-/// shape this file is named after.
+/// Spawn the default-probe child with an exact environment and return
+/// whether the dispatch materialised (copied) the transposed operand.
 ///
-/// **Why this spawns a child.** The first version of this gate called
+/// **Why children.** The first version of the default gate called
 /// `test_set_transpose_views(false)`, which sets the resolved-state atomic
 /// directly. `transpose_views_enabled()` returns early on states 1 and 2 and
-/// only consults `NSL_MATMUL_TRANSPOSE_VIEWS` in the unresolved arm — so that
-/// version never ran the resolution logic, and flipping the default (say
-/// `== Ok("1")` to `!= Ok("0")`, or seeding the atomic to "enabled") left the
-/// gate green while every real run took the slower path. An independent
-/// review caught it. A fresh process with the variable REMOVED is the only
-/// way to observe the actual default.
-#[test]
-#[ignore = "requires CUDA GPU"]
-fn the_default_still_materialises_transposed_operands() {
+/// only consults the environment in the unresolved arm — so that version
+/// never ran the resolution logic, and flipping the default left the gate
+/// green while every real run took the other path. An independent review
+/// caught it. A fresh process with the variables set EXACTLY is the only way
+/// to observe the real resolution, and since 2026-07-28 that resolution is
+/// COUPLED to the math mode, so every gate below controls all three
+/// variables explicitly.
+fn probe_dispatch(
+    views: Option<&str>,
+    tf32: Option<&str>,
+    pedantic: Option<&str>,
+) -> bool {
     let exe = std::env::current_exe().expect("test binary path");
-    let out = std::process::Command::new(exe)
-        .args([
-            "zz_default_probe_child",
-            "--exact",
-            // Not cosmetic: libtest swallows a passing test's stdout, so
-            // without this the child runs and the line never arrives.
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(DEFAULT_PROBE, "1")
-        // The whole point of the gate: observe what happens with the opt-in
-        // absent, whatever this shell happens to export.
-        .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
-        .output()
-        .expect("spawn default probe child");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([
+        "zz_default_probe_child",
+        "--exact",
+        // Not cosmetic: libtest swallows a passing test's stdout, so
+        // without this the child runs and the line never arrives.
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(DEFAULT_PROBE, "1")
+    .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
+    .env_remove("NSL_MATMUL_TF32")
+    .env_remove("NSL_MATMUL_PEDANTIC");
+    if let Some(v) = views {
+        cmd.env("NSL_MATMUL_TRANSPOSE_VIEWS", v);
+    }
+    if let Some(v) = tf32 {
+        cmd.env("NSL_MATMUL_TF32", v);
+    }
+    if let Some(v) = pedantic {
+        cmd.env("NSL_MATMUL_PEDANTIC", v);
+    }
+    let out = cmd.output().expect("spawn default probe child");
     let text = String::from_utf8_lossy(&out.stdout);
     // Substring, not prefix: libtest prefixes captured output with the test's
     // own name.
@@ -561,47 +576,63 @@ fn the_default_still_materialises_transposed_operands() {
                 String::from_utf8_lossy(&out.stderr)
             )
         });
+    line.contains("copied=true")
+}
+
+/// Under the shipped default (TF32), the transposed operand goes to cuBLAS
+/// as `OP_T` — no materialising copy. Flipped 2026-07-28 on two levels of
+/// measurement: the per-call grid (OP_T 0.65x on the LM head under TF32)
+/// and a Coder-50M 20-forward loop (63.4 -> 56.6 ms end-to-end, three
+/// paired runs), plus the ~90 MB peak the copy always cost. Correctness
+/// under TF32 is gated in `matmul_dispatch_under_tf32.rs`.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_default_under_tf32_takes_op_t() {
     assert!(
-        line.contains("copied=true"),
-        "with NSL_MATMUL_TRANSPOSE_VIEWS absent the operand must still be \
-         materialised — OP_T is 1.51x SLOWER on the LM-head shape and must \
-         not become the default by accident. Child said: {line}"
+        !probe_dispatch(None, None, None),
+        "under the TF32 default the transposed operand must go to cuBLAS as \
+         OP_T — the materialising copy is a measured 1.12x end-to-end \
+         regression on Coder-50M"
     );
 }
 
-/// The opt-in must also actually be reachable THROUGH THE ENV VAR, not just
-/// through the test hook. Without this, `the_default_still_materialises_*`
-/// could pass simply because the feature was unreachable by any means.
+/// Under FP32 cores (`NSL_MATMUL_TF32=0`) the coupling keeps the COPY: OP_T
+/// measured 1.40x SLOWER on the LM-head shape in that cell. An f32 opt-out
+/// must not silently inherit the TF32 cell's dispatch choice.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn the_env_var_really_enables_the_exemption() {
-    let exe = std::env::current_exe().expect("test binary path");
-    let out = std::process::Command::new(exe)
-        .args([
-            "zz_default_probe_child",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(DEFAULT_PROBE, "1")
-        .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
-        .output()
-        .expect("spawn default probe child");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text
-        .lines()
-        .find_map(|l| l.find("DEFAULTPROBE ").map(|i| &l[i..]))
-        .unwrap_or_else(|| {
-            panic!(
-                "default-probe child produced no line\nstdout:\n{text}\nstderr:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        });
+fn the_default_under_f32_cores_still_materialises() {
     assert!(
-        line.contains("copied=false"),
-        "NSL_MATMUL_TRANSPOSE_VIEWS=1 must skip the materialising copy — \
-         if it does not, the opt-in is unreachable and the default gate \
-         proves nothing. Child said: {line}"
+        probe_dispatch(None, Some("0"), None),
+        "under NSL_MATMUL_TF32=0 the default must materialise — OP_T is \
+         1.40x slower on the LM head under FP32-core math"
+    );
+}
+
+/// Pedantic keeps the copy too: that cell is UNMEASURED, and an unmeasured
+/// cell keeps the conservative arm.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_default_under_pedantic_still_materialises() {
+    assert!(
+        probe_dispatch(None, None, Some("1")),
+        "under NSL_MATMUL_PEDANTIC=1 the default must materialise — the \
+         pedantic cell has no OP_T measurement behind it"
+    );
+}
+
+/// The explicit env var beats the coupling in BOTH directions; without
+/// these, the coupling gates above could pass with the variable dead.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_env_var_wins_over_the_coupling() {
+    assert!(
+        probe_dispatch(Some("0"), None, None),
+        "NSL_MATMUL_TRANSPOSE_VIEWS=0 must force the copy even under TF32"
+    );
+    assert!(
+        !probe_dispatch(Some("1"), Some("0"), None),
+        "NSL_MATMUL_TRANSPOSE_VIEWS=1 must force OP_T even under FP32 cores"
     );
 }
 
@@ -675,7 +706,9 @@ fn zz_op_t_measure_child() {
 fn the_op_t_tradeoff_is_remeasurable() {
     let exe = std::env::current_exe().expect("test binary path");
     let mut rows: Vec<(String, String, Vec<(String, f64)>)> = Vec::new();
-    for (views_label, views_env) in [("copy+OP_N", None), ("OP_T", Some("1"))] {
+    // Explicit "0"/"1", never env_remove: since the default became coupled
+    // to the math mode, an absent variable no longer means the copy arm.
+    for (views_label, views_env) in [("copy+OP_N", Some("0")), ("OP_T", Some("1"))] {
         for (math_label, tf32) in [("f32", "0"), ("tf32", "1")] {
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["zz_op_t_measure_child", "--exact", "--nocapture", "--test-threads=1"])

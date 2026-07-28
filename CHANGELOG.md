@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed — transposed views now reach cuBLAS as `OP_T` under TF32 (math-mode-coupled default)
+
+- `NSL_MATMUL_TRANSPOSE_VIEWS` grew a per-math-mode default: **OP_T under
+  TF32** (the shipped default), the materialising copy under FP32 cores and
+  Pedantic. The literal `"1"`/`"0"` always win; any other value falls
+  through to the coupling (same tri-state discipline as `NSL_MATMUL_TF32`).
+- Flipped on two levels of measurement plus gates, per the process the
+  reproducer commit demanded: the per-call grid (OP_T 0.65x/0.72x/0.46x
+  under TF32) and a Coder-50M 20-forward loop — **63.4 → 56.6 ms
+  end-to-end (1.12x)**, three paired runs, sgemm at parity, the whole win
+  the vanished 96 MiB LM-head copy; plus the ~90 MB of peak memory that
+  copy always cost. OP_T values under TF32 are gated by
+  `matmul_dispatch_under_tf32` (path-witnessed).
+- The coupling is a decision per **measured cell**, not a shape heuristic:
+  FP32 cores keep the copy because OP_T measured 1.40x slower on the LM
+  head in that cell; Pedantic keeps the copy because that cell is
+  unmeasured and unmeasured cells keep the conservative arm.
+- New behavior gates spawn children with all three matmul variables
+  controlled: default-under-TF32 takes OP_T, default-under-f32/Pedantic
+  materialises, and the env var beats the coupling in both directions.
+  The under-TF32 suite gained an explicit copy-arm configuration, and its
+  path witness now takes its expectation from the parent instead of
+  re-deriving the resolution it is testing.
+
 ### Fixed — gpu-cert lane: `cpu-stub` class ends the permanent 2-NOTFOUND noise
 
 - The gate-inventory scanner classified `#[cfg(not(feature = "cuda"))]`

@@ -8,10 +8,12 @@
 //! dispatch paths are correct *under* TF32 — the shipped default — was not
 //! gated anywhere. TF32 selects DIFFERENT cuBLAS kernels, so "the mode applies
 //! identically to both arms" arguments say nothing about a transa/lda mistake
-//! that only that kernel family makes. This matters twice over now:
+//! that only that kernel family makes. This mattered twice over:
 //! `the_op_t_tradeoff_is_remeasurable` showed OP_T is FASTER under TF32, and
-//! the named precondition for flipping `NSL_MATMUL_TRANSPOSE_VIEWS` is
-//! exactly "OP_T has correctness gates under TF32".
+//! the named precondition for flipping `NSL_MATMUL_TRANSPOSE_VIEWS` was
+//! exactly "OP_T has correctness gates under TF32" — these gates are that
+//! precondition, and the flip has since happened (the default now couples
+//! to the math mode: OP_T under TF32, copy under FP32 cores/Pedantic).
 //!
 //! The math mode resolves once per process (`cublas_handle()`'s `OnceLock`),
 //! so each configuration runs in a fresh child process — the pattern
@@ -210,15 +212,23 @@ fn zz_tf32_dispatch_child() {
         check("transposed_right", &read_gpu(ct, m * n), &want);
         // Path witness: prove which dispatch arm actually ran. At K=16 both
         // arms can produce bit-identical values, so without this the OP_T
-        // configuration would be indistinguishable from the default and the
-        // exemption gate below would be vacuous.
+        // configuration would be indistinguishable from the copy arm and
+        // the gates would be vacuous. The EXPECTATION comes from the parent
+        // (NSL_TF32_DISPATCH_EXPECT_COPIED), not from re-deriving the
+        // resolution here — the transpose-views default is coupled to the
+        // math mode, and a child-side re-derivation would just mirror the
+        // code under test.
         let copied = names.iter().any(|kn| kn == "nsl_strided_copy_f32");
-        let views_on = std::env::var("NSL_MATMUL_TRANSPOSE_VIEWS").as_deref() == Ok("1");
+        let expect_copied = match std::env::var("NSL_TF32_DISPATCH_EXPECT_COPIED").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            other => panic!("parent must declare the expected arm, got {other:?}"),
+        };
         assert_eq!(
-            copied, !views_on,
-            "dispatch arm does not match the configuration: \
-             NSL_MATMUL_TRANSPOSE_VIEWS on={views_on} but strided-copy \
-             launched={copied} (kernels: {})",
+            copied, expect_copied,
+            "dispatch arm does not match the parent's declared expectation \
+             (strided-copy launched={copied}, expected {expect_copied}; \
+             kernels: {})",
             names.join(",")
         );
         println!("TF32CHECK path_witness copied={copied}");
@@ -400,30 +410,52 @@ fn spawn_child(configure: impl FnOnce(&mut std::process::Command)) -> String {
     text
 }
 
-/// Every dispatch path, under the SHIPPED default math mode.
+/// Every dispatch path, under the SHIPPED defaults — which now means TF32
+/// math AND (through the math-mode coupling) OP_T for transposed views.
 ///
-/// The child gets `NSL_MATMUL_TF32` REMOVED (same reasoning as
-/// `the_default_still_materialises_transposed_operands`: only a virgin
-/// process resolves the real default), and the vacuity probe requires the
-/// TF32 signature — so if the shipped default ever stops being TF32, this
-/// fails loudly and gets updated consciously rather than rotting.
+/// The child gets all three variables REMOVED (same reasoning as
+/// `matmul_transposed_operand::probe_dispatch`: only a virgin process
+/// resolves the real defaults), the vacuity probe requires the TF32
+/// signature, and the path witness must see NO copy — so if either shipped
+/// default moves, this fails loudly and gets updated consciously rather
+/// than rotting.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn dispatch_paths_are_correct_under_the_tf32_default() {
+fn dispatch_paths_are_correct_under_the_shipped_defaults() {
     if !cuda_available() {
         return;
     }
     spawn_child(|cmd| {
         cmd.env_remove("NSL_MATMUL_TF32")
             .env_remove("NSL_MATMUL_PEDANTIC")
-            .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS");
+            .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0");
     });
 }
 
-/// Every dispatch path under TF32 WITH the OP_T exemption enabled — the
-/// named precondition for flipping the `NSL_MATMUL_TRANSPOSE_VIEWS` default
+/// Every dispatch path under TF32 with the materialising COPY forced — the
+/// arm `NSL_MATMUL_TRANSPOSE_VIEWS=0` selects, which f32-pinned suites used
+/// to be the only coverage for.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn copy_arm_is_correct_under_tf32() {
+    if !cuda_available() {
+        return;
+    }
+    spawn_child(|cmd| {
+        cmd.env("NSL_MATMUL_TF32", "1")
+            .env("NSL_MATMUL_TRANSPOSE_VIEWS", "0")
+            .env_remove("NSL_MATMUL_PEDANTIC")
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "1");
+    });
+}
+
+/// Every dispatch path under TF32 with the OP_T exemption forced — the gate
+/// whose existence was the named precondition for the default flip
 /// (`the_op_t_tradeoff_is_remeasurable` measured OP_T faster under TF32,
 /// but nothing had ever checked its VALUES under the TF32 kernel family).
+/// Kept as an explicit=1 configuration so it stays meaningful even if the
+/// coupling changes.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn op_t_exemption_is_correct_under_tf32() {
@@ -433,6 +465,7 @@ fn op_t_exemption_is_correct_under_tf32() {
     spawn_child(|cmd| {
         cmd.env("NSL_MATMUL_TF32", "1")
             .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
-            .env_remove("NSL_MATMUL_PEDANTIC");
+            .env_remove("NSL_MATMUL_PEDANTIC")
+            .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0");
     });
 }

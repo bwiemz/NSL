@@ -3656,9 +3656,10 @@ fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
         && strides[1] == shape[0]
 }
 
-/// `NSL_MATMUL_TRANSPOSE_VIEWS=1` — hand a 2-D transposed operand to cuBLAS as
-/// `OP_T` instead of materialising it. **Default OFF — but which arm is
-/// faster now depends on the math mode; see the update at the end.**
+/// `NSL_MATMUL_TRANSPOSE_VIEWS` — hand a 2-D transposed operand to cuBLAS as
+/// `OP_T` instead of materialising it. **The default is coupled to the math
+/// mode: ON under TF32 (the shipped default), OFF under FP32 cores and
+/// Pedantic.** `=1`/`=0` always win; see the update at the end for why.
 ///
 /// The argument for defaulting this ON is seductive and false. Materialising
 /// `embed.transpose(0,1)` for the weight-tied LM head costs a 25,165,824-element
@@ -3690,12 +3691,22 @@ fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
 /// shows the table above is a property of FP32-core math, not of the shapes.
 /// Under TF32, cuBLAS's tensor-core kernels read a transposed operand well
 /// and OP_T measured FASTER across the whole grid — 2.16 vs 3.30 ms on the
-/// LM head (0.65x), 0.72x and 0.46x on the other shapes — so under the
-/// current default this opt-out is the conservative arm, not the fast one.
-/// Flipping the default is an open decision, not an oversight: the OP_T
-/// value gates currently pin full f32, so OP_T-under-TF32 needs its own
-/// correctness gates first, and a dispatch default should not move on one
-/// measurement grid.
+/// LM head (0.65x), 0.72x and 0.46x on the other shapes.
+///
+/// The flip was then made on TWO levels of measurement plus gates, not the
+/// grid alone: a Coder-50M 20-forward loop (second-half kernel sums, three
+/// paired runs) went 63.4 -> 56.6 ms end-to-end (1.12x) with sgemm at
+/// parity and the win exactly the vanished 96 MiB LM-head copy, on top of
+/// the ~90 MB peak-memory saving the copy always cost. Correctness under
+/// TF32 is gated by `matmul_dispatch_under_tf32::op_t_exemption_is_correct_
+/// under_tf32` (with a kernel-launch path witness, because at small K both
+/// arms can produce bit-identical values).
+///
+/// The default is per-math-mode because each arm won only in its own
+/// measured cell: FP32 cores keep the copy (OP_T 1.40x SLOWER on the LM
+/// head there), Pedantic keeps the copy (unmeasured). That is a decision
+/// per measured cell — NOT the shape heuristic the paragraph above warns
+/// about, which would interpolate into cells nobody measured.
 /// 0 = unresolved, 1 = off, 2 = on.
 #[cfg(feature = "cuda")]
 static TRANSPOSE_VIEWS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -3707,7 +3718,25 @@ fn transpose_views_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var("NSL_MATMUL_TRANSPOSE_VIEWS").as_deref() == Ok("1");
+            // Tri-state like NSL_MATMUL_TF32: only the literal "1"/"0" are
+            // honoured, so a typo'd value cannot silently change dispatch.
+            // The DEFAULT is coupled to the math mode, because each arm is
+            // measured only in its own cell (2026-07-28 grid + Coder-50M
+            // end-to-end): under TF32, OP_T won every shape per-call
+            // (0.65x on the LM head) and the 20-forward model loop
+            // (63.4 -> 56.6 ms, three paired runs); under FP32 cores the
+            // materialising copy won the wide shapes (OP_T 1.40x slower on
+            // the LM head), and Pedantic is unmeasured — both keep the
+            // copy. This is a decision per measured cell, not a shape
+            // heuristic; the env var always wins over the coupling.
+            let on = match std::env::var("NSL_MATMUL_TRANSPOSE_VIEWS").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => matches!(
+                    cublas_inner::resolve_math_mode(),
+                    cublas_inner::CublasMathMode::Tf32
+                ),
+            };
             TRANSPOSE_VIEWS_STATE.store(u8::from(on) + 1, Ordering::Relaxed);
             on
         }
