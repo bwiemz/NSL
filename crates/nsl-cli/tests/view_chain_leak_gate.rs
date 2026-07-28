@@ -204,13 +204,28 @@ fn the_gqa_residual_is_closed_exactly() {
 }
 
 /// The FREE-FUNCTION spellings of the same family (`contiguous(t)`,
-/// `unsqueeze(t, d)`, `slice(t, ...)`, `stack(l, d)`, `tensor_cat(l, d)`,
-/// `cumsum(t, d)`) take dedicated early-return lowerings in expr/calls.rs and
-/// are classified by the IDENT allowlist in `expr_result_is_owned_temporary`,
-/// not the method table. Before 2026-07-28 that allowlist omitted all of
-/// them: `x.transpose(0,1).contiguous().sum()` retained 1 block/call while
-/// the semantically identical `contiguous(x.transpose(0,1)).sum()` retained
-/// 2 — same runtime call, different books.
+/// `unsqueeze(t, d)`, `tensor_slice(t, ...)`, `stack(l, d)`,
+/// `tensor_cat(l, d)`, `cumsum(t, d)`) take dedicated early-return lowerings
+/// in expr/calls.rs and are classified by the IDENT allowlist in
+/// `expr_result_is_owned_temporary`, not the method table. Before 2026-07-28
+/// that allowlist omitted all of them: `x.transpose(0,1).contiguous().sum()`
+/// retained 1 block/call while the semantically identical
+/// `contiguous(x.transpose(0,1)).sum()` retained 2 — same runtime call,
+/// different books.
+///
+/// The fixture exercises every allowlist entry whose result is a FRESH GPU
+/// block: `contiguous` (of a transposed view), `tensor_slice`, `stack`,
+/// `tensor_cat`. The other four entries cannot be observed by a GPU
+/// block-count gate and are deliberately absent:
+/// - `unsqueeze` returns a VIEW — a stranded view handle pins its root,
+///   which here is the always-live `x`, so block counts never move;
+/// - `cumsum` and `argmax` (sampling.rs) are device-blind CPU
+///   implementations — handing them a GPU tensor would read device pointers
+///   on host, so they can only run on CPU tensors, whose strands are host
+///   allocations invisible to `[gpu-mem]`;
+/// - `causal_mask` allocates its output on host for the same reason.
+/// Their entries rest on the per-function runtime verification recorded in
+/// the allowlist comment plus `tensor_method_result_typing.rs`.
 ///
 /// The fixture ends in `.item()` so nothing tensor-typed is bound per
 /// iteration: with every link tracked, per-call growth must be ZERO.
@@ -218,10 +233,15 @@ fn the_gqa_residual_is_closed_exactly() {
 #[ignore = "requires CUDA GPU"]
 fn free_function_chain_links_do_not_strand_per_call() {
     let src = |calls: usize| {
-        let mut s = String::from("let x = full([256, 1024], 1.0).to(cuda)\n");
+        let mut s = String::from(
+            "let x = full([256, 1024], 1.0).to(cuda)\nlet pair = [x, x]\n",
+        );
         for i in 0..calls {
             s.push_str(&format!(
-                "let v{i} = contiguous(x.transpose(0, 1)).sum().item()\n"
+                "let a{i} = contiguous(x.transpose(0, 1)).sum().item()\n\
+                 let b{i} = tensor_slice(x, 0, 0, 128).sum().item()\n\
+                 let c{i} = stack(pair, 0).sum().item()\n\
+                 let d{i} = tensor_cat(pair, 0).sum().item()\n"
             ));
         }
         s.push_str("print(\"DONE\")\n");
@@ -236,11 +256,80 @@ fn free_function_chain_links_do_not_strand_per_call() {
     );
     assert_eq!(
         lb3, lb1,
-        "free-function chain strands {} blocks over 2 extra calls; the \
-         free-function names (contiguous/unsqueeze/slice/stack/tensor_cat/\
-         cumsum/argmax/causal_mask) must stay in the Ident allowlist of \
-         `expr_result_is_owned_temporary` (nsl-codegen/src/expr/mod.rs)",
+        "free-function chains strand {} blocks over 2 extra calls; the \
+         free-function names (contiguous/tensor_slice/stack/tensor_cat, plus \
+         the host-side unsqueeze/cumsum/argmax/causal_mask) must stay in the \
+         Ident allowlist of `expr_result_is_owned_temporary` \
+         (nsl-codegen/src/expr/mod.rs)",
         lb3 - lb1
+    );
+}
+
+/// Regression gate for the review finding on 734c548e: the indeterminate-
+/// receiver ownership arms must mirror the DISPATCHER's precedence. An
+/// indeterminate-typed Ident that is a registered model-array loop variable
+/// or agent variable dispatches to a compiled model/agent method
+/// (`models.model_var_types` / `agent_var_types` lookups in expr/calls.rs),
+/// NOT to tensor dispatch — so a method that happens to share a tensor-table
+/// name (`fn mean(self) -> int`) returns a plain I64, and classifying it by
+/// the tensor table would make statement cleanup call `nsl_tensor_free(5)`:
+/// `from_ptr` dereferences the value as an `NslTensor` box — segfault or
+/// silent heap corruption, not a leak.
+///
+/// REACHABILITY (verified by mutation, 2026-07-28): with the guard removed,
+/// this fixture does NOT currently crash, because today's checker types
+/// model-array loop vars concretely (the ownership arms additionally require
+/// an indeterminate SEMANTIC type, and `for blk in ...` receivers here are
+/// Model-typed). The live exposure of the unguarded arm is the M56
+/// @pipeline_agent path, whose synthesised agent vars are Error-typed BY
+/// DESIGN (see the `Type::Error` handling in expr/calls.rs), plus any future
+/// inference change that de-types model vars. This gate therefore pins two
+/// things that must BOTH hold for the hazard to stay closed: the value-level
+/// behaviour of model-array method calls with table-colliding names, and —
+/// should inference ever regress those receivers to Unknown — it becomes the
+/// live crash reproducer for the unguarded classifier. CPU-only.
+#[test]
+fn model_array_methods_with_tensor_table_names_are_not_freed_as_tensors() {
+    let src = r#"
+model Blk(tag: int):
+    _d: Tensor = full([1], float(tag))
+    fn mean(self) -> int:
+        return 5
+
+model Holder(dummy: int):
+    blocks: [Blk; 2] = Blk(0)
+
+let h = Holder(0)
+for blk in h.blocks:
+    print(blk.mean())
+print("DONE")
+"#;
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_modelvar_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(["run", "--deterministic"])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .output()
+        .expect("spawn nsl run");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    std::fs::remove_dir_all(&tmp).ok();
+    assert!(
+        out.status.success(),
+        "model-array method call crashed — the indeterminate-receiver \
+         ownership arms are classifying a model method by the tensor table \
+         again (check `indeterminate_receiver_takes_tensor_dispatch` in \
+         nsl-codegen/src/expr/mod.rs):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fives = stdout.lines().filter(|l| l.trim() == "5").count();
+    assert!(
+        stdout.contains("DONE") && fives == 2,
+        "expected two '5' lines and DONE, got:\n{stdout}"
     );
 }
 

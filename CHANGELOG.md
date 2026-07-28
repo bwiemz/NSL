@@ -37,12 +37,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   up). With layer 1 deliberately reverted, this layer alone still holds GQA
   at the 1-block floor — mutation-verified both ways.
 - **Fix layer 3:** the free-function spellings (`contiguous(t)`,
-  `unsqueeze(t,d)`, `slice(t,..)`, `stack(l,d)`, `tensor_cat(l,d)`,
+  `unsqueeze(t,d)`, `tensor_slice(t,..)`, `stack(l,d)`, `tensor_cat(l,d)`,
   `cumsum(t,d)`, `argmax(t)`, `causal_mask(n)`) joined the Ident allowlist in
   `expr_result_is_owned_temporary`, each entry verified against its runtime
-  implementation. Measured before: `contiguous(x.transpose(0,1)).sum()`
-  retained 2 blocks/call while the method spelling retained 1 — same runtime
-  call, different books.
+  implementation. (The entry first shipped as `"slice"`, which is dead — no
+  free function of that name exists; review caught it and it is now the real
+  spelling `tensor_slice`.) Measured before:
+  `contiguous(x.transpose(0,1)).sum()` retained 2 blocks/call while the
+  method spelling retained 1 — same runtime call, different books.
+- **Review hardening (independent review of 734c548e):** the
+  indeterminate-receiver arms now mirror the dispatcher's precedence — an
+  indeterminate-typed Ident registered as a model-array or agent variable
+  routes to compiled model/agent methods, so it is never classified by the
+  tensor ownership table (`indeterminate_receiver_takes_tensor_dispatch`).
+  Unguarded, a method sharing a table name (`fn mean(self) -> int`) would
+  have its plain-I64 return freed as a tensor — memory corruption, not a
+  leak. Mutation-tested reachability: today's checker types model-array loop
+  vars concretely, so the model-array shape does not currently reach the
+  unguarded arm; the live exposure is the M56 @pipeline_agent path (agent
+  vars are Error-typed by design) and any future inference regression. CPU
+  regression gate:
+  `model_array_methods_with_tensor_table_names_are_not_freed_as_tensors`
+  (doubles as the crash reproducer if inference ever de-types those
+  receivers).
+  The free-function gate now exercises every allowlist entry that yields a
+  fresh GPU block (contiguous/tensor_slice/stack/tensor_cat) and documents
+  why the other four cannot be observed by a GPU block gate (views pin
+  already-live roots; cumsum/argmax/causal_mask are host-side — and
+  device-blind, a pre-existing hazard noted for follow-up).
 - **Measured (RTX 5070 Ti, CUDA 13.3):** GQA `[2,1024,512]` forward
   5 → **1 block/call** (the caller-bound result — the floor), 16 → 4 MB/call.
   Coder-50M `[2,1024]` pure-inference forward +65 → **+33 blocks/call**,

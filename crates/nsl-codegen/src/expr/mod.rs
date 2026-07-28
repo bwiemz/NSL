@@ -69,7 +69,7 @@ use nsl_semantic::types::Type;
 /// # The free-function forms
 ///
 /// This table governs METHOD calls only. The free-function spellings
-/// (`contiguous(t)`, `unsqueeze(t,d)`, `slice(t,..)`, `stack(l,d)`,
+/// (`contiguous(t)`, `unsqueeze(t,d)`, `tensor_slice(t,..)`, `stack(l,d)`,
 /// `tensor_cat(l,d)`, `cumsum(t,d)`, ...) take dedicated early-return paths
 /// in `expr/calls.rs` and are classified by the `ExprKind::Ident` allowlist
 /// in `expr_result_is_owned_temporary` below — kept in sync per-function,
@@ -508,10 +508,15 @@ impl Compiler<'_> {
                             // - unsqueeze → nsl_tensor_unsqueeze: view via
                             //   new_view_i64 (fresh handle + root refcount
                             //   bump).
-                            // - slice → nsl_tensor_slice: fresh output on
-                            //   both the CPU (publish) and GPU
+                            // - tensor_slice → nsl_tensor_slice: fresh output
+                            //   on both the CPU (publish) and GPU
                             //   (gpu_slice_f32_with_shape / device-roundtrip)
-                            //   paths.
+                            //   paths. NOTE the spelling: the free-function
+                            //   form is `tensor_slice(t, d, s, e)`
+                            //   (expr/calls.rs early return; builtins.rs) —
+                            //   there is no free function named `slice`, and
+                            //   a `"slice"` entry here is dead (review
+                            //   finding on 734c548e).
                             // - stack/tensor_cat → nsl_tensor_{stack,cat}:
                             //   fresh output, CPU and GPU paths.
                             // - cumsum → nsl_tensor_cumsum, argmax →
@@ -526,7 +531,7 @@ impl Compiler<'_> {
                             // — same runtime call, different books.
                             | "contiguous"
                             | "unsqueeze"
-                            | "slice"
+                            | "tensor_slice"
                             | "stack"
                             | "tensor_cat"
                             | "cumsum"
@@ -541,18 +546,24 @@ impl Compiler<'_> {
                 // `print(y.sum())` leak).
                 //
                 // Indeterminate (Unknown/Error) receivers are classified by
-                // the SAME table: the dispatcher in `compile_call` defaults an
-                // Unknown-typed receiver to tensor dispatch (see the
-                // "defaulting to tensor dispatch" warning path in
-                // expr/calls.rs), so the identical runtime functions run and
-                // the identical ownership semantics apply. Requiring a proven
-                // Tensor type here while the dispatcher does not was the
-                // second half of the item-1 chain leak: one semantic-table
-                // gap (`expand` typed Unknown) silently switched every later
-                // chain link from tracked to stranded.
+                // the SAME table — but only when tensor dispatch is what will
+                // actually run. The dispatcher in `compile_call` defaults an
+                // Unknown-typed receiver to tensor dispatch (the "defaulting
+                // to tensor dispatch" warning path in expr/calls.rs) EXCEPT
+                // for Idents registered as model-array or agent variables,
+                // which it routes to compiled model/agent methods FIRST —
+                // `indeterminate_receiver_takes_tensor_dispatch` mirrors that
+                // precedence. Requiring a proven Tensor type here while the
+                // dispatcher does not was the second half of the item-1 chain
+                // leak: one semantic-table gap (`expand` typed Unknown)
+                // silently switched every later chain link from tracked to
+                // stranded.
                 if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let obj_ty = self.node_type(object.id);
-                    if obj_ty.is_tensor() || obj_ty.is_indeterminate() {
+                    if obj_ty.is_tensor()
+                        || (obj_ty.is_indeterminate()
+                            && self.indeterminate_receiver_takes_tensor_dispatch(object))
+                    {
                         return tensor_method_returns_owned_ref(self.resolve_sym(*member))
                             .unwrap_or(false);
                     }
@@ -594,21 +605,50 @@ impl Compiler<'_> {
         false
     }
 
+    /// Mirror of the dispatcher's precedence for an indeterminate-typed
+    /// method receiver (`compile_call`, expr/calls.rs): an Unknown/Error-typed
+    /// IDENT that is a registered model-array loop variable
+    /// (`models.model_var_types`, populated at the `for blk in self.blocks`
+    /// lowering) or an agent variable (`models.agent_var_types`) dispatches to
+    /// `compile_model_method_call` / the mangled agent call — a compiled NSL
+    /// function, NOT an `nsl_tensor_*` FFI — so the tensor ownership table
+    /// must not classify it. A model method that happens to share a table
+    /// name (`fn mean(self) -> int`) returns an I64 that is not a tensor
+    /// handle; tracking it would make statement cleanup call
+    /// `nsl_tensor_free` on it — memory corruption, not a leak (review
+    /// finding on 734c548e). Everything else genuinely falls through to
+    /// tensor dispatch.
+    fn indeterminate_receiver_takes_tensor_dispatch(&self, object: &Expr) -> bool {
+        if let ExprKind::Ident(sym) = &object.kind {
+            if self.models.model_var_types.contains_key(sym)
+                || self.models.agent_var_types.contains_key(sym)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// True when `expr` is a tensor-METHOD call whose method the ownership
     /// table (`tensor_method_returns_owned_ref`) marks owning, on a receiver
-    /// that is tensor-typed or indeterminate. This is the ONLY shape for
-    /// which an indeterminate RESULT type may still be tracked: whatever the
-    /// checker failed to infer, the dispatcher lowers these to `nsl_tensor_*`
-    /// calls that return real tensor handles. Ident-callee builtins and
-    /// compiled NSL functions do NOT qualify — an Unknown-typed `neg(i)` is
-    /// an integer at runtime, and an unannotated user fn can return a list;
-    /// freeing either as a tensor is memory corruption, so those keep the
-    /// strict tensor-type requirement (leak-not-crash).
+    /// that is tensor-typed — or indeterminate AND actually bound for tensor
+    /// dispatch (`indeterminate_receiver_takes_tensor_dispatch`). This is the
+    /// ONLY shape for which an indeterminate RESULT type may still be
+    /// tracked: whatever the checker failed to infer, the dispatcher lowers
+    /// these to `nsl_tensor_*` calls that return real tensor handles.
+    /// Ident-callee builtins and compiled NSL functions do NOT qualify — an
+    /// Unknown-typed `neg(i)` is an integer at runtime, and an unannotated
+    /// user fn can return a list; freeing either as a tensor is memory
+    /// corruption, so those keep the strict tensor-type requirement
+    /// (leak-not-crash).
     fn expr_is_owning_tensor_method_call(&self, expr: &Expr) -> bool {
         if let ExprKind::Call { callee, .. } = &expr.kind {
             if let ExprKind::MemberAccess { object, member } = &callee.kind {
                 let obj_ty = self.node_type(object.id);
-                if obj_ty.is_tensor() || obj_ty.is_indeterminate() {
+                if obj_ty.is_tensor()
+                    || (obj_ty.is_indeterminate()
+                        && self.indeterminate_receiver_takes_tensor_dispatch(object))
+                {
                     return tensor_method_returns_owned_ref(self.resolve_sym(*member))
                         == Some(true);
                 }
