@@ -1,0 +1,9 @@
+#[cfg( not( feature = "cuda" ) )]
+#[test]
+#[ignore]
+fn spaced_stub() {}
+
+# [cfg(not(feature = "cuda"))]
+#[test]
+#[ignore]
+fn hash_spaced_stub() {}

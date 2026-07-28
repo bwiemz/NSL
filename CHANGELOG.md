@@ -21,6 +21,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   renamed two `matmul_tf32_mode` gates after its manifest regeneration, and
   the fp8 device-guard commit added five gates without one.
 
+### Fixed — inventory-scanner review findings, pinned by committed probes
+
+- The batch review probed `gpu-gate-inventory.awk` with synthetic files and
+  found holes the in-tree stubs don't exercise: a one-line
+  `#[ignore] #[cfg(not(feature = "cuda"))]` classified `gpu` (a permanent
+  NOTFOUND back from the dead), the mirror order vanished from the
+  inventory entirely, a block-comment line inside the attribute stack
+  cleared the cfg flag, and spacing variants of the cfg escaped the
+  anchored regex. All fixed; a block-comment state machine also stops the
+  scanner from parsing `#[ignore]` prose inside `/* ... */` as gates.
+- The probes are committed as `.rs-probe` fixtures with a 7-gate test
+  (`gpu_gate_inventory_scanner`) — not inline strings, which the
+  line-oriented scanner itself inventoried as phantom gates; not `.rs`
+  files, which the inventory's `find` would walk.
+- Known limit, documented in the scanner: `#[cfg(not(feature = "cuda"))]`
+  on a `mod` of stubs is still defeated by the boundary rule (surfaces as a
+  visible NOTFOUND, never silent coverage loss). No in-tree stub is
+  mod-scoped; brace tracking waits until one is.
+- The OP_T measurement children now strip `NSL_MATMUL_PEDANTIC`, which
+  outranks `NSL_MATMUL_TF32` and would have silently measured pedantic math
+  in all four grid cells under a pedantic-pinned shell.
+
 ### Added — dispatch-path correctness gates UNDER TF32
 
 - Every pinned matmul suite documents the same gap: dispatch paths were

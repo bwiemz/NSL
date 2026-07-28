@@ -1,0 +1,8 @@
+#[cfg(not(feature = "cuda"))]
+#[test]
+#[ignore]
+fn stub() {}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn real_gate() {}

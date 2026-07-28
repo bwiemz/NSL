@@ -680,7 +680,12 @@ fn the_op_t_tradeoff_is_remeasurable() {
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["zz_op_t_measure_child", "--exact", "--nocapture", "--test-threads=1"])
                 .env(MEASURE_PROBE, "1")
-                .env("NSL_MATMUL_TF32", tf32);
+                .env("NSL_MATMUL_TF32", tf32)
+                // Precedence trap (review finding): NSL_MATMUL_PEDANTIC beats
+                // NSL_MATMUL_TF32 in resolve_math_mode, so a pedantic-pinned
+                // shell would silently measure pedantic math in all four
+                // cells while the labels claim f32/tf32.
+                .env_remove("NSL_MATMUL_PEDANTIC");
             match views_env {
                 Some(v) => {
                     cmd.env("NSL_MATMUL_TRANSPOSE_VIEWS", v);

@@ -113,9 +113,31 @@ function classify(r, fname, path,    lower) {
 # comment, or blank — so a cfg-gated item elsewhere in the file cannot leak
 # onto a later, genuinely runnable gate (that would silently DELETE coverage,
 # the F1 defect pointing the other way).
-/^[ \t]*#\[cfg\(not\(feature[ \t]*=[ \t]*"cuda"\)\)\]/ {
-    in_not_cuda_stack = 1
+# Block-comment tracker: lines inside a multi-line /* ... */ are neither
+# item boundaries (they must not clear the cfg-not flag, whatever character
+# they start with) nor gate text (a code sample mentioning `#[ignore]`
+# inside a block comment is prose, not a gate — the `//`-comment guard in
+# the ignore rule never covered this).
+in_block_comment {
+    if ($0 ~ /\*\//) in_block_comment = 0
     next
+}
+/^[ \t]*\/\*/ && !/\*\// {
+    in_block_comment = 1
+    next
+}
+
+# Liberal spacing on purpose: `#[cfg( not( feature = "cuda" ) )]` is legal
+# and gpu-cert.sh's whole-file grep would still set cuda_gated=1 for the
+# file, so a spacing variant this regex missed would classify a bare-ignore
+# stub `gpu-inferred` — a NOTFOUND. No `next`: the same line may also carry
+# the `#[ignore]` (one-line attribute stacks are inside the scanner's
+# support envelope since review finding F4), and swallowing it here made
+# the stub VANISH from the inventory — the exact silent drop the header
+# forbids. A pure cfg line falls through harmlessly: it matches no other
+# rule, and the boundary rule exempts attribute lines.
+/^[ \t]*#[ \t]*\[[ \t]*cfg\([ \t]*not\([ \t]*feature[ \t]*=[ \t]*"cuda"[ \t]*\)[ \t]*\)[ \t]*\]/ {
+    in_not_cuda_stack = 1
 }
 
 # Accumulate a (possibly line-continued) #[ignore ...] attribute.
@@ -142,6 +164,15 @@ function classify(r, fname, path,    lower) {
         sub(/^[ \t]+/, " ", nextline)
         attr = attr nextline
     }
+
+    # `#[ignore = "..."] #[cfg(not(feature = "cuda"))]` on ONE line: the
+    # start-anchored cfg rule above cannot see a cfg attribute that follows
+    # the ignore on the same line (or on a swallowed continuation line), so
+    # the accumulated attribute text is checked here too. Without this the
+    # one-line form of the fp8_dispatcher stub classified `gpu` — the
+    # permanent NOTFOUND this class exists to kill (review finding).
+    if (attr ~ /#[ \t]*\[[ \t]*cfg\([ \t]*not\([ \t]*feature[ \t]*=[ \t]*"cuda"[ \t]*\)[ \t]*\)[ \t]*\]/)
+        in_not_cuda_stack = 1
 
     # The reason runs from the first `"` to the LAST `"]` — the attribute's
     # own terminator. Keying on the last bare quote instead would swallow a
@@ -175,9 +206,18 @@ pending && /^[ \t]*(pub[ \t]+)?(async[ \t]+)?fn[ \t]+[A-Za-z0-9_]+/ {
     reason = ""
 }
 
-# Attribute-stack boundary: any line that is not an attribute, comment, or
-# blank ends the stack (the fn-emission rule above has already consumed the
-# flag by the time this runs on the same line).
-!/^[ \t]*#\[/ && !/^[ \t]*\/\// && !/^[ \t]*$/ {
+# Attribute-stack boundary: any line that is not an attribute, comment
+# (line or block), or blank ends the stack (the fn-emission rule above has
+# already consumed the flag by the time this runs on the same line).
+#
+# KNOWN LIMIT — item-level cfg only. A `#[cfg(not(feature = "cuda"))]` on a
+# `mod stubs { ... }` of ignored tests is defeated here: the `mod` opener
+# clears the flag and every test inside classifies by its reason —
+# a visible NOTFOUND, not silent coverage loss, which is the direction this
+# rule deliberately errs in. No in-tree stub is mod-scoped today (all 7
+# cfg-not sites are item-level, checked 2026-07-28); supporting the mod
+# form needs brace tracking, which this scanner should grow only when such
+# a stub actually appears rather than carrying half-a-parser on spec.
+!/^[ \t]*#[ \t]*\[/ && !/^[ \t]*\/\// && !/^[ \t]*\/\*/ && !/^[ \t]*\*/ && !/^[ \t]*$/ {
     in_not_cuda_stack = 0
 }
