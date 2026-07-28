@@ -3657,8 +3657,8 @@ fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
 }
 
 /// `NSL_MATMUL_TRANSPOSE_VIEWS=1` — hand a 2-D transposed operand to cuBLAS as
-/// `OP_T` instead of materialising it. **Default OFF, and the default is the
-/// fast one.**
+/// `OP_T` instead of materialising it. **Default OFF — but which arm is
+/// faster now depends on the math mode; see the update at the end.**
 ///
 /// The argument for defaulting this ON is seductive and false. Materialising
 /// `embed.transpose(0,1)` for the weight-tied LM head costs a 25,165,824-element
@@ -3684,6 +3684,18 @@ fn is_transposed_2d_view(t: &crate::tensor::NslTensor) -> bool {
 /// database was ranking variants by a roofline ESTIMATE with no measurement
 /// behind it, and no consumer at all. A heuristic here would be the same
 /// mistake with fewer points.
+///
+/// UPDATE (2026-07-28, after TF32 became the matmul default): the committed
+/// reproducer (`matmul_transposed_operand::the_op_t_tradeoff_is_remeasurable`)
+/// shows the table above is a property of FP32-core math, not of the shapes.
+/// Under TF32, cuBLAS's tensor-core kernels read a transposed operand well
+/// and OP_T measured FASTER across the whole grid — 2.16 vs 3.30 ms on the
+/// LM head (0.65x), 0.72x and 0.46x on the other shapes — so under the
+/// current default this opt-out is the conservative arm, not the fast one.
+/// Flipping the default is an open decision, not an oversight: the OP_T
+/// value gates currently pin full f32, so OP_T-under-TF32 needs its own
+/// correctness gates first, and a dispatch default should not move on one
+/// measurement grid.
 /// 0 = unresolved, 1 = off, 2 = on.
 #[cfg(feature = "cuda")]
 static TRANSPOSE_VIEWS_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);

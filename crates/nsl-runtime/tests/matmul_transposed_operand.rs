@@ -34,6 +34,15 @@
 //! Worth having when memory binds, a regression otherwise — hence opt-in, and
 //! hence `the_default_still_materialises_transposed_operands` below.
 //!
+//! **UPDATE (2026-07-28): that table is a property of FP32-core math.** After
+//! TF32 became the matmul default, `the_op_t_tradeoff_is_remeasurable` (the
+//! committed reproducer at the bottom of this file) measured OP_T FASTER on
+//! every shape in the grid under TF32 — 0.65x on the LM head — while
+//! reproducing the table above under `NSL_MATMUL_TF32=0`. The default stays
+//! OFF until OP_T has correctness gates UNDER TF32 (every value gate in this
+//! file pins full f32) and the flip is decided on more than one grid; the
+//! reproducer exists so that decision starts from a command.
+//!
 //! ## Why this is the dangerous direction
 //!
 //! Under the row-major `C^T = B^T A^T` swap, `transb` toggles the op of
@@ -47,10 +56,11 @@
 use nsl_runtime::kernel_profiler::{
     nsl_kernel_profiler_flush, nsl_kernel_profiler_start, nsl_kernel_profiler_stop,
 };
+use nsl_runtime::nsl_test_cuda_d2h;
 use nsl_runtime::test_set_transpose_views;
 use nsl_runtime::tensor::{
-    nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, test_build_tensor_2d_f32,
-    test_read_tensor_f64, NslTensor,
+    nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device,
+    test_build_tensor_2d_f32, test_read_tensor_f64, NslTensor,
 };
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -593,4 +603,133 @@ fn the_env_var_really_enables_the_exemption() {
          if it does not, the opt-in is unreachable and the default gate \
          proves nothing. Child said: {line}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The measurement behind the default, as a committed reproducer.
+// ---------------------------------------------------------------------------
+
+/// Env var the measurement child reads to know it is the child.
+const MEASURE_PROBE: &str = "NSL_TRANSPOSE_MEASURE_PROBE";
+
+/// Child entry point for `the_op_t_tradeoff_is_remeasurable`. Times
+/// `A @ transposed_view(B)` per call for the three shapes in the
+/// module-header table, under whatever `NSL_MATMUL_TRANSPOSE_VIEWS` /
+/// `NSL_MATMUL_TF32` the parent exported — both are resolved once per
+/// process, which is why this must be a child and why the parent spawns
+/// four of them. Prints one `MEASURE` line per shape.
+///
+/// Timing discipline (the 10x-swing lesson): the SM clock idles at ~1515
+/// MHz against a ~2900 boost, so each shape busy-loops for a full second
+/// of wall time before its timed window. Every iteration drains with a
+/// 4-byte D2H so the timer sees completed work, not launch queues.
+#[test]
+fn zz_op_t_measure_child() {
+    if std::env::var(MEASURE_PROBE).as_deref() != Ok("1") {
+        return;
+    }
+    for (m, k, n) in [(2048usize, 512usize, 49152usize), (2048, 512, 4096), (512, 512, 512)] {
+        let a = gpu_2d(m, k, &deterministic(m * k, 71));
+        let (bt, base) = transposed_view(n, k, &deterministic(n * k, 72));
+        let mut probe = [0.0f32; 1];
+        let mut one_call = || {
+            let c = nsl_tensor_matmul(a, bt, 0);
+            nsl_test_cuda_d2h(probe.as_mut_ptr() as i64, nsl_tensor_data_ptr(c), 4);
+            nsl_tensor_free(c);
+        };
+        let warm = std::time::Instant::now();
+        while warm.elapsed() < std::time::Duration::from_secs(1) {
+            one_call();
+        }
+        let iters = 20u32;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            one_call();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+        println!("MEASURE {m}x{k}x{n} ms_per_call={ms:.4}");
+        nsl_tensor_free(bt);
+        nsl_tensor_free(base);
+        nsl_tensor_free(a);
+    }
+}
+
+/// The committed reproducer for the measurement that decided the default.
+///
+/// The module header's table (OP_T 1.51x SLOWER on the LM-head shape, ~2x
+/// faster at 512^3) was measured once, by hand, on an RTX 5070 Ti under
+/// CUDA 13.3 with FP32-core math — and the default rides on it. Different
+/// hardware, a different CUDA release, or the TF32 default changing the
+/// GEMM/copy balance could all flip the verdict, and until now re-checking
+/// meant reconstructing the harness from the prose.
+///
+/// This prints the full grid — {copy+OP_N, OP_T} x {full f32, TF32} for the
+/// three shapes — and asserts only that the probes ran and produced finite
+/// timings. It deliberately makes NO performance assertion: three data
+/// points is not a cost model (item 10's lesson), and a threshold here
+/// would rot into flakes. The behavioral default is gated by
+/// `the_default_still_materialises_transposed_operands`; this exists so the
+/// next re-evaluation starts from a command, not an archaeology dig.
+#[test]
+#[ignore = "diagnostic: reruns the OP_T-vs-copy measurement grid behind the transpose-views default and prints the table; asserts only that the probes ran"]
+fn the_op_t_tradeoff_is_remeasurable() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut rows: Vec<(String, String, Vec<(String, f64)>)> = Vec::new();
+    for (views_label, views_env) in [("copy+OP_N", None), ("OP_T", Some("1"))] {
+        for (math_label, tf32) in [("f32", "0"), ("tf32", "1")] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["zz_op_t_measure_child", "--exact", "--nocapture", "--test-threads=1"])
+                .env(MEASURE_PROBE, "1")
+                .env("NSL_MATMUL_TF32", tf32);
+            match views_env {
+                Some(v) => {
+                    cmd.env("NSL_MATMUL_TRANSPOSE_VIEWS", v);
+                }
+                None => {
+                    cmd.env_remove("NSL_MATMUL_TRANSPOSE_VIEWS");
+                }
+            }
+            let out = cmd.output().expect("spawn measurement child");
+            assert!(
+                out.status.success(),
+                "measurement child ({views_label}/{math_label}) failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut shapes = Vec::new();
+            for l in text.lines() {
+                let Some(i) = l.find("MEASURE ") else { continue };
+                let mut it = l[i + 8..].split_whitespace();
+                let shape = it.next().unwrap_or("?").to_string();
+                let ms: f64 = it
+                    .next()
+                    .and_then(|s| s.strip_prefix("ms_per_call="))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(f64::NAN);
+                assert!(ms.is_finite() && ms > 0.0, "bad timing line: {l}");
+                shapes.push((shape, ms));
+            }
+            assert_eq!(
+                shapes.len(),
+                3,
+                "child ({views_label}/{math_label}) produced {} MEASURE lines, expected 3:\n{text}",
+                shapes.len()
+            );
+            rows.push((views_label.to_string(), math_label.to_string(), shapes));
+        }
+    }
+    println!("\nOP_T-vs-copy grid (ms/call, {} iters after 1s warmup each):", 20);
+    for (views, math, shapes) in &rows {
+        for (shape, ms) in shapes {
+            println!("  {views:>9} {math:>4} {shape:>15} {ms:>9.4}");
+        }
+    }
+    // Ratios per (shape, math mode): OP_T / copy — > 1.0 means the copy wins.
+    for math in ["f32", "tf32"] {
+        for idx in 0..3 {
+            let copy = rows.iter().find(|(v, m, _)| v == "copy+OP_N" && m == math).unwrap().2[idx].clone();
+            let opt = rows.iter().find(|(v, m, _)| v == "OP_T" && m == math).unwrap().2[idx].clone();
+            println!("  ratio OP_T/copy {math:>4} {:>15} {:.2}x", copy.0, opt.1 / copy.1);
+        }
+    }
 }

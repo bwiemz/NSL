@@ -323,6 +323,7 @@ crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_broadcast_view_is_still_
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_degenerate_unit_shape_is_not_mistaken_for_a_transpose	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_default_still_materialises_transposed_operands	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_env_var_really_enables_the_exemption	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_op_t_tradeoff_is_remeasurable	diagnostic	diagnostic: reruns the OP_T-vs-copy measurement grid behind the transpose-views default and prints the table; asserts only that the probes ran
 crates/nsl-runtime/tests/mul_scalar_gpu.rs	mul_scalar_inplace_gpu_matches_cpu_reference	gpu-inferred	
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_bf16_round_trip_within_epsilon	gpu-inferred	
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_fp16_round_trip_within_epsilon	gpu-inferred	

@@ -21,6 +21,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   renamed two `matmul_tf32_mode` gates after its manifest regeneration, and
   the fp8 device-guard commit added five gates without one.
 
+### Added — committed reproducer for the OP_T-vs-copy measurement, which now flips under TF32
+
+- `matmul_transposed_operand::the_op_t_tradeoff_is_remeasurable` (class
+  `diagnostic`, manual-run) re-measures the grid behind the
+  `NSL_MATMUL_TRANSPOSE_VIEWS` default from four fresh child processes —
+  {copy+OP_N, OP_T} × {full f32, TF32} over the three documented shapes —
+  with the clock-ramp discipline (1 s busy warmup per shape, drained
+  per-call timing). Until now the default rode on a one-off hand
+  measurement reconstructible only from prose.
+- First run reproduced the documented f32 table (OP_T 1.40x slower on the
+  LM head vs the recorded 1.51x) **and showed the premise inverts under
+  the new TF32 default**: OP_T measured faster on every shape (0.65x /
+  0.72x / 0.46x). The default stays OFF — OP_T has no correctness gates
+  under TF32 yet, and a dispatch default should not move on one grid — but
+  both doc sites now record that the "copy wins" table is a property of
+  FP32-core math, and the flip is an open decision rather than an
+  oversight.
+
 ### Changed — `@fp8_compute × --source-ad` joins the feature-composition registry
 
 - The item-9 refusal is now a registered item-20 rule
