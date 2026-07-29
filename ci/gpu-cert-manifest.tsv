@@ -60,6 +60,8 @@ crates/nsl-cli/tests/muon_optimizer_gate.rs	muon_mixed_gpu_trains_and_differs	gp
 crates/nsl-cli/tests/muon_p1_gate.rs	fast_primitive_matches_reference_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/muon_p1_gate.rs	csla_muon_bit_exact_vs_baseline_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/muon_state_gate.rs	muon_state_bf16_e2e_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/nested_arg_temporaries_gate.rs	loop_condition_nested_args_compile_and_run	gpu	requires CUDA GPU
+crates/nsl-cli/tests/nested_arg_temporaries_gate.rs	nested_builtin_args_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	pretrain_loss_decreases_on_gpu	gpu	requires CUDA GPU (runs a real training loop)
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	fase_deferred_matches_plain_adamw_checkpoint	gpu	requires CUDA GPU (runs two real training loops)
 crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference	gpu	requires CUDA GPU

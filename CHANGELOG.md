@@ -6,6 +6,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — the three ownership authorities are now drift-gated against each other
+
+- The ownership campaign's recurring bug class was silent divergence
+  between the owning-ref Ident ALLOWLIST, the FFI ownership TABLE
+  (`ffi_ownership.rs`), and the runtime's actual extern inventory: three
+  leak cycles came from allowlist omissions, the allowlist carried a dead
+  `"slice"` entry, and the table carried a documented-wrong
+  `nsl_tensor_slice` borrow plus TWELVE entries naming FFIs that do not
+  exist (`nsl_tensor_concat` vs the real `nsl_tensor_cat`,
+  `nsl_tensor_tanh` vs `nsl_tensor_tanh_act`, `nsl_tensor_log_softmax`
+  vs `nsl_tensor_logsoftmax`, `nsl_tensor_max` vs
+  `nsl_tensor_reduce_max`, and eight keys with no counterpart at all —
+  min/argmin/permute/scatter/view/broadcast_to/sum_to_scalar/
+  mean_to_scalar).
+- New `ffi_ownership_drift.rs` (3 CPU gates, each mutation-proven red):
+  the allowlist parsed from source must equal the gate's classified map
+  exactly; every mapped FFI must be in the table as OwnedNewResult; and
+  every table key must name a real `pub extern "C"` fn.
+- Table corrections: dead keys renamed to the real externs or removed
+  (removal is behavior-neutral — absence takes the instrumented
+  fallback); `nsl_tensor_slice` flipped to OwnedNewResult (the runtime
+  allocates fresh on both paths — triple-re-verified across the
+  #423/#426/#427 cycles, and the owning classification has been live on
+  the method/free-fn paths with leak gates green throughout; the borrow
+  misfile governed only the two `register_ffi_result_ownership` sites,
+  where it under-freed); the Ident-allowlist family added with the
+  verifications those PRs recorded; `nsl_tensor_topk` classified
+  NotATensor (dict handle — `dict_lifetime.rs` owns its lifecycle).
+- The generic-dispatch `tensor_unary_runtime_alias` fallback mapped
+  `tanh` to the nonexistent bare spelling — an "undefined function"
+  error instead of a fallback; corrected to `nsl_tensor_tanh_act`.
+- Full emission-site registration (threading `state` through
+  `compile_call_by_name` so the table becomes the single runtime
+  authority) is the queued v2; these bindings close the drift class
+  first.
+
+### Fixed — nested builtin arguments no longer strand their results
+
+- **A builtin call nested as another builtin's argument stranded its
+  fresh output** — `sum(cumsum(g, -1))` leaked the inner cumsum result 1
+  block per call (device-independent) while the bound spelling was
+  clean. 184 argument-compilation sites across `compile_call`'s dispatch
+  arms used `compile_expr`, which never registers a nested call's result
+  as a statement temporary; all now use `compile_nested_expr`, whose
+  tracking predicate registers exactly fresh-owning tensor results
+  (idents, literals, and non-tensor arguments are untouched — the
+  tracking fires only for `expr_call_returns_owning_ref` + tensor-typed
+  results, so string/path/int arms are no-ops by construction).
+- Gate `nested_arg_temporaries_gate.rs` pins the sampling + norm +
+  reduction families incl. a double-nested shape at zero per-round
+  strand (red-proven at exactly 6/round pre-fix) with bound-vs-nested
+  VALUE parity folded in. Method-form receiver chains were already
+  tracked (PR #423); method-form ARGUMENTS stay as-is (lists/ints
+  today).
+- **A pre-existing loop-scope ICE became trivially reachable and is
+  fixed** (review HIGH): temps registered while compiling a WHILE
+  condition / FOR iterable predate the loop-scope mark, and
+  `free_tensor_temporaries`' whole-list drain stole them — leaving the
+  exit cleanup's `[scope_start..]` slice out of bounds, a COMPILE-TIME
+  panic (`while sum(cumsum(g,-1)).item() ...` — also reproducible on
+  main via method-form conditions). The drain now takes only entries
+  above the innermost scope mark, and both loop-exit slices clamp
+  defensively. Residuals pinned by the new loop-condition gate: a
+  for-iterable evaluates once and sweeps clean; a while condition's
+  per-evaluation temps still strand until condition temps get a
+  header/exit free placement (queued).
+- Sites deliberately NOT converted (differently-spelled or unsound to
+  convert): module-alias/agent/`@fuse`/kv-cache/kernel-launch argument
+  paths, DataLoader data/labels, the escape-gated generic-call path
+  (converting it unconditionally would be unsound), and indirect/lambda
+  calls (no escape info — a lambda can store the pointer). These keep
+  their status-quo strands.
+
 ### Fixed — dict-lifetime follow-ups: loop-local dicts, load_safetensors, builtin shadowing
 
 - **Loop-local dict bindings no longer strand per iteration** (the eltls
