@@ -641,6 +641,7 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("context_parallel", "M34 @context_parallel - a parallelism feature, not an IR pass"),
     ("context", "compilation context types"),
     ("cost_model", "shared cost estimation used by several passes"),
+    ("dict_lifetime", "dict-local usage scan for the return sweep - operates on the AST, not the WengertList (same class as escape)"),
     ("dynamic_shapes", "dynamic shape support"),
     ("error", "error types"),
     ("escape", "ownership escape analysis - operates on the AST, not the WengertList"),

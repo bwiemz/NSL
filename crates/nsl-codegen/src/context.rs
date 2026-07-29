@@ -249,6 +249,14 @@ pub struct FuncState {
     /// predeclare pass, and nsl_tensor_free_if_valid tolerates the null
     /// pointer on the first iteration.
     pub eltls_loop_predeclared: HashSet<Symbol>,
+    /// Dict-local tensor lifetime: `Dict<_, Tensor>` locals that
+    /// `dict_lifetime::collect_sweepable_dict_locals` proved safe to free
+    /// with `nsl_dict_free_tensor_values` in the return-local sweep
+    /// (single top-level call binding, subscript reads only, never
+    /// returned/passed/stored-into). Empty when the body was never
+    /// scanned — the sweep then adds nothing, which is the pre-existing
+    /// leak-not-crash behavior.
+    pub sweepable_dict_locals: HashSet<Symbol>,
     /// M62 Task 4: controls how `self` and `self.<field>` are lowered
     /// inside model methods. Default is `StructPointer` (existing behavior).
     /// Set to `WeightPtrsArray` by the @export method compiler (Task 6).
@@ -283,6 +291,7 @@ impl FuncState {
             current_function_name: None,
             variable_types: HashMap::new(),
             eltls_loop_predeclared: HashSet::new(),
+            sweepable_dict_locals: HashSet::new(),
             self_resolution: SelfResolution::StructPointer,
         }
     }
