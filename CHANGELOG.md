@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Fixed — RoPE configuration was dead config; attention output projection was not depth-scaled
 
 - **`ROPE_THETA` never reached the model.** `models/coder1b` and
@@ -70,6 +71,231 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `coder7b` READMEs also now state the pretrain token budget against a
   compute-optimal reference (~15% and ~1.7% respectively) so their cert
   curves are not read as quality claims.
+=======
+### Fixed — dict locals no longer strand their stored tensors (aggregate-lifetime gap)
+
+- **A `Dict<Str, Tensor>` local was never freed outside DataLoader
+  lowerings** — `let r = topk(scaled, k)` stranded the dict plus both
+  stored tensors on every call: 2 VRAM blocks per call once the sampling
+  FFIs gained GPU support, and CPU heap before that (CPU sweep proven by
+  trace: exactly +2 tensor destroys per call on the minimal fixture; the
+  large `topk(x, 1M)`-loop fixture's remaining RSS growth is
+  allocator-level retention of transients — identical with the fix
+  reverted, no handle strand: destroys ≥ creations per iteration). The dict OWNS its
+  stored tensors outright (`nsl_dict_set_str` stores the raw handle;
+  every subscript read CLONES), so nothing but the dict itself ever
+  releases them.
+- The return-local sweep now carries a `nsl_dict_free_tensor_values` pass
+  armed by a conservative usage scan (`dict_lifetime.rs`): a dict local
+  qualifies only when its single binding is a top-level `let` from a
+  fresh-dict BUILTIN call (whitelist; today `topk`) and every other
+  appearance is a subscript READ. Aliases (`let r2 = r`), subscript
+  writes, ANY pattern re-binding of the name (loop patterns,
+  comprehension generators, match arms), a locally-bound callee name, and
+  opaque blocks all veto — the failure direction of a wrong admit is a
+  double-free, so the scan only allows shapes it fully understands.
+  Review proved that direction twice with runtime crashes on the first
+  cut (a `[0 for r in ...]` generator shadowing the candidate's slot; a
+  lambda returning its captured dict minting two "owning" candidates) —
+  both are vetoed and pinned as gates now
+  (`comprehension_generator_shadowing_vetoes_the_sweep`,
+  `lambda_returned_dict_aliases_do_not_double_free`).
+  `load_safetensors` also returns a fresh solely-owned tensor dict
+  (reviewer-verified) but stays OFF the whitelist until it has its own
+  gate. Probed: returning a dict
+  from a user fn is structurally impossible today (checker "wrong type"),
+  and passing one to a user fn dies in codegen — the two big escape shapes
+  cannot occur.
+- The whole stdlib sampling chain is now leak-free on GPU logits:
+  `sample_top_k` + `sample_top_p` went from 4 stranded blocks per round to
+  ZERO (`topk_dicts_no_longer_strand` ratchets the old 2-per-topk pin).
+  New gate file `dict_local_lifetime_gate.rs` (5 gates) pins the allowed
+  shape, the veto shapes (run-success asserts catch the double-free
+  direction), and the loop-local status quo. Scan-disable and veto-removal
+  mutations proven red.
+- Loop-local dict bindings (`for ...: let r = topk(...)`) keep the
+  pre-existing per-iteration strand — the eltls predeclare/clear twin for
+  dicts is queued follow-up work; the real generation pattern (sampling
+  helpers called per token) is function-wrapped and fully covered.
+
+### Fixed — sampling builtins no longer segfault on GPU tensors
+
+- **`topk` / `multinomial` / `argmax` / `cumsum` / `lt_scalar` accepted GPU
+  tensors and dereferenced their device pointers on the host** — an
+  immediate SIGSEGV. This is the entire tensor-input surface of
+  `sampling.rs`, and it is exactly what `stdlib/nsl/inference/sampling.nsl`
+  (`sample_greedy` / `sample_top_k` / `sample_top_p`) feeds with
+  GPU-resident logits, so *every* sampling strategy crashed on a model
+  living on the GPU. Reproduced on all five ops (RTX 5070 Ti, CUDA 13.3).
+- Fixed with the established CPU-redirect idiom (`nsl_tensor_gather`'s
+  non-dim-0 arm): GPU inputs are staged through the host and results are
+  handed back on the input's device, tape paused across the redirect. The
+  f32→f64→f32 round trip is value-exact; sampling tensors are vocab-sized,
+  so the transfer cost is noise next to a forward pass.
+- **`return multinomial(...)` / `return lt_scalar(...)` double-owned** —
+  both were missing from the owning-ref allowlist (the `return rmsnorm`
+  class), stranding one block per call from a user fn. Added with
+  per-runtime verification; `topk` deliberately stays out (it returns a
+  dict handle, not a tensor).
+- New gate `sampling_device_gate.rs` (5 tests): per-primitive CPU/GPU exact
+  parity, the stdlib chain end-to-end on GPU logits, redirect
+  leak-cleanliness, the return-position double-own, and a pin on the
+  PRE-EXISTING `topk` dict strand (below). Crash + double-own gates
+  mutation-proven red against their reverted fixes.
+- **Surfaced, pre-existing, now measured and pinned (not fixed here):**
+  (a) `topk`'s result dict owns its `values`/`indices` tensors and no
+  codegen path ever frees non-DataLoader dict locals — ~79 MB/call resident
+  growth in a CPU `topk(x, 1M)` loop, 2 VRAM blocks/call on GPU (the
+  aggregate-lifetime gap); (b) most builtin dispatch arms compile arguments
+  with `compile_expr`, so a NESTED call's fresh result (`sum(cumsum(g,-1))`)
+  never registers as a statement temporary and strands 1 block/call,
+  device-independent (76 arms affected). Both are queued as their own
+  items.
+
+### Fixed — CPU tape-mode dropout no longer strands its mask; ref-trace completed
+
+- The CPU tape-recording arm of `nsl_tensor_dropout` published its mask and
+  then bumped it again before recording. The mask is TAPE-ONLY — no caller
+  ever receives it — so the tape takes the publish reference itself and
+  `release_tape_op_refs` frees it exactly once, the accounting the GPU arm
+  has always used. The extra bump stranded one mask tensor per
+  training-mode CPU dropout call (independent-review finding on 1def2b9f).
+  Pinned by `cpu_tape_mode_dropout_mask_refcount_is_exactly_the_tapes`,
+  which asserts the recorded mask's refcount is exactly the tape's one —
+  red before the fix (rc=2), and rc=0 would flag the opposite
+  (use-after-free) direction.
+- `nsl_tensor_release` (decrement-without-free) now emits a
+  `[tensor-trace] release` event under `NSL_DEBUG_MEM_TRACE=1`, closing the
+  last unlogged refcount path (retain/release pairs were half-visible).
+- Investigated, deliberately NOT changed: the review's declared-vs-inferred
+  return-type divergence (a `-> Tensor` method whose return expression is
+  indeterminate skips the callee-side retain). Two candidate reproducers
+  produced correct values and balanced refcounts — the skip is symmetric
+  (the same static type gates both the retain and the sweep), so no
+  demonstrable defect exists to gate a change against, and adding
+  retains/frees without a reproducer is how UAFs get shipped. Recorded as a
+  watch item alongside the ffi_ownership dual-authority refactor.
+
+### Fixed — Coder-50M pure-inference forward no longer leaks AT ALL (roadmap item 1 complete)
+
+- **The remaining +33 blocks / +132 MB per forward is closed: per-call growth
+  is now ZERO** (154 blocks / 216 MB at N=1 and N=3, RTX 5070 Ti). At the
+  campaign's start a Coder-50M forward stranded +292 MB per call.
+- **Root cause A — the Return-arm double-own, recurring:** a compiled
+  function's Return arm conservatively retains any result it cannot prove
+  owning. `return rmsnorm(...)` (RMSNorm) and `return dropout(...)` (GQA,
+  SwiGLUFFN) hit that arm because the free-function builtins were missing
+  from the owning-ref allowlist — the same bug previously fixed for
+  `return scaled_dot_product_attention(...)`, one allowlist gap later. Each
+  nested call stranded its fresh output: 4 blocks per TransformerBlock call
+  (two RMSNorm outputs + two eval-`dropout` clones — eval dropout returns
+  `nsl_tensor_clone`, which ALWAYS allocates), ×8 layers = 32 of the 33.
+  Fixed by adding `rmsnorm`/`dropout`/`layernorm`/`bias_add`/`gather`/
+  `embedding_lookup` to the allowlist, each verified against its runtime
+  implementation on every path (the stdlib's complete set of
+  return-position tensor builtins).
+- **Root cause B — the Assign-arm double-own:** the Return handler had an
+  Unknown→Owned upgrade via `expr_call_returns_owning_ref`; the ASSIGN
+  handler did not, so `x = self.norm.forward(x)` (model-method results carry
+  no ELTLS registration) conservatively retained and stranded one block per
+  reassignment — the final-norm strand on every Coder-50M forward
+  (`forward_core`'s post-loop `x = self.norm.forward(x)`). The Assign
+  handler now carries the identical upgrade.
+- **The GQA gate's former "1 block/call floor" was a misdiagnosis** — that
+  block was GQA's double-owned `dropout` clone, not the caller-bound live
+  result (top-level `let`s are swept at main's return). The ceiling is now
+  0.0 and `the_gqa_residual_is_closed_exactly` pins exactly zero.
+- **New composition gate**
+  (`nested_model_composition_and_reassignment_do_not_strand_per_call`):
+  the exact Coder-50M TransformerBlock/forward_core shape — nested
+  model-method args and operands, builtin-returning callees, assign-in-loop
+  and post-loop reassignment — asserts zero per-call growth. Mutation-proven
+  red against both root causes independently (M6: Assign upgrade reverted;
+  M7: rmsnorm/dropout entries removed — which also reddens the GQA gate).
+- Diagnostics: `NSL_DEBUG_MEM_TRACE=1` now also prints `retain` and
+  `deref-owner` events, completing the per-handle ref-history needed to find
+  double-owns (this is how both root causes were isolated).
+
+### Fixed — the GQA view-chain residual: Unknown-typed chain links no longer strand (roadmap item 1)
+
+- **Root cause, two layers.** The semantic member table
+  (`check_member_access`, nsl-semantic/src/checker/ops.rs) typed the results
+  of `expand`, `contiguous`, `unsqueeze`, `select`, `slice` and `cumsum` as
+  `Unknown` — only `reshape`/`transpose` were covered — so every LATER link
+  of a method chain was Unknown-typed. Codegen ownership tracking
+  (`track_owned_tensor_expr_result`) filters on the result type and the
+  owned-temporary classifier required a proven-Tensor receiver, so each such
+  anonymous link silently stranded its handle: per
+  `expand(..).contiguous().reshape(..)` chain, the expand view pinned the
+  source block (the RoPE output) and the contiguous materialisation stranded
+  outright. `GroupedQueryAttention::forward` leaked 4 blocks (12 MB) per
+  pure-inference call.
+- **Fix layer 1 (root):** the six methods are now typed in the member table —
+  `contiguous`/`cumsum` return the receiver's type (shape-preserving),
+  `expand`/`unsqueeze`/`select`/`slice` return tensor-typed unknown-shape
+  results, and `expand` gets its exact target shape at the call site the same
+  way `reshape` does. Drift gate:
+  `nsl-semantic/tests/tensor_method_result_typing.rs` (fails naming the
+  method if any of them regresses to Unknown).
+- **Fix layer 2 (backstop):** the codegen ownership filters accept
+  indeterminate types exactly where the dispatcher already defaults to tensor
+  dispatch — an Unknown-receiver method call classified by the same ownership
+  table the dispatch uses, and an indeterminate RESULT type accepted only for
+  table-owning tensor-method calls (never Ident-callee builtins or user fns,
+  where an Unknown-typed value can be a scalar or list and freeing it as a
+  tensor is memory corruption; a Cranelift I64 pointer-type guard backs this
+  up). With layer 1 deliberately reverted, this layer alone still holds GQA
+  at the 1-block floor — mutation-verified both ways.
+- **Fix layer 3:** the free-function spellings (`contiguous(t)`,
+  `unsqueeze(t,d)`, `tensor_slice(t,..)`, `stack(l,d)`, `tensor_cat(l,d)`,
+  `cumsum(t,d)`, `argmax(t)`, `causal_mask(n)`) joined the Ident allowlist in
+  `expr_result_is_owned_temporary`, each entry verified against its runtime
+  implementation. (The entry first shipped as `"slice"`, which is dead — no
+  free function of that name exists; review caught it and it is now the real
+  spelling `tensor_slice`.) Measured before:
+  `contiguous(x.transpose(0,1)).sum()` retained 2 blocks/call while the
+  method spelling retained 1 — same runtime call, different books.
+- **Review hardening (independent review of 734c548e):** the
+  indeterminate-receiver arms now mirror the dispatcher's precedence — an
+  indeterminate-typed Ident registered as a model-array or agent variable
+  routes to compiled model/agent methods, so it is never classified by the
+  tensor ownership table (`indeterminate_receiver_takes_tensor_dispatch`).
+  Unguarded, a method sharing a table name (`fn mean(self) -> int`) would
+  have its plain-I64 return freed as a tensor — memory corruption, not a
+  leak. Mutation-tested reachability: today's checker types model-array loop
+  vars concretely, so the model-array shape does not currently reach the
+  unguarded arm; the live exposure is the M56 @pipeline_agent path (agent
+  vars are Error-typed by design) and any future inference regression. CPU
+  regression gate:
+  `model_array_methods_with_tensor_table_names_are_not_freed_as_tensors`
+  (doubles as the crash reproducer if inference ever de-types those
+  receivers).
+  The free-function gate now exercises every allowlist entry that yields a
+  fresh GPU block (contiguous/tensor_slice/stack/tensor_cat) and documents
+  why the other four cannot be observed by a GPU block gate (views pin
+  already-live roots; cumsum/argmax/causal_mask are host-side — and
+  device-blind, a pre-existing hazard noted for follow-up).
+- **Measured (RTX 5070 Ti, CUDA 13.3):** GQA `[2,1024,512]` forward
+  5 → **1 block/call** (the caller-bound result — the floor), 16 → 4 MB/call.
+  Coder-50M `[2,1024]` pure-inference forward +65 → **+33 blocks/call**,
+  +228 → **+132 MB/call**; N=3 reserved 2.10 → 1.99 GB. The remaining +33 is
+  the separate nested-model-method-argument class (escape.rs's sound refusal
+  for un-analysed callees), unchanged by this fix.
+- **Gates:** `view_chain_leak_gate.rs` ceiling lowered 5.0 → 1.0;
+  `the_residual_is_still_present_and_bounded` (which deliberately failed on
+  improvement) replaced by `the_gqa_residual_is_closed_exactly`, pinning
+  exactly one retained block per call in both directions — fewer than one
+  means the bound result itself was freed, the use-after-free direction. New:
+  `free_function_chain_links_do_not_strand_per_call` and
+  `unknown_typed_receiver_chains_do_not_strand_per_call` (anti-vacuity via
+  the compiler's "defaulting to tensor dispatch" warning and driver
+  allocation counters). Every gate proven RED against its own layer's
+  reverted fix before shipping.
+- **Diagnostics:** `NSL_DEBUG_MEM_TRACE=1` now prints a `[tensor-trace] new`
+  line at every tensor-handle publish (pointer, data, len, ndim, device,
+  data-owner), pairing with the existing free trace so leaked handles can be
+  diffed generation-accurately instead of by data-pointer heuristics.
+>>>>>>> origin/main
 
 ### Fixed — flip hardening: one shared math-mode resolution, and the two gates the flip broke
 

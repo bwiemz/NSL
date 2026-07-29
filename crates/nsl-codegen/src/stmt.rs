@@ -1964,7 +1964,24 @@ impl Compiler<'_> {
                     let val_is_ptr = builder.func.dfg.value_type(final_val) == cl_types::I64;
                     if val_is_ptr && rhs_ty.is_tensor() && !state.flags.in_dtype_method {
                         use crate::ownership_expr::Ownership;
-                        match self.get_ownership(state, final_val) {
+                        // Upgrade Unknown to Owned when the RHS is a call
+                        // contractually returning an owning ref — the exact
+                        // twin of the Return handler's upgrade above (ELTLS
+                        // §6.5). Without it, `x = self.norm.forward(x)`
+                        // (model-method results carry no ELTLS registration)
+                        // took the conservative retain below and double-owned
+                        // the result: the variable's single release left one
+                        // reference behind — one stranded block per
+                        // assignment, measured as the final-norm strand on
+                        // every Coder-50M forward (the `x = ...` twin of the
+                        // `return rmsnorm(...)` leak).
+                        let mut own = self.get_ownership(state, final_val);
+                        if matches!(own, Ownership::Unknown)
+                            && self.expr_call_returns_owning_ref(value)
+                        {
+                            own = Ownership::Owned;
+                        }
+                        match own {
                             Ownership::Owned => {
                                 self.consume_ownership(state, final_val);
                             }
@@ -2699,6 +2716,36 @@ impl Compiler<'_> {
         for var in locals {
             let val = builder.use_var(var);
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[val]);
+        }
+
+        // Dict-local pass (the aggregate-lifetime gap, 2026-07-28). A
+        // tensor-valued dict local owns its stored tensors outright — every
+        // read CLONES (compile_subscript's Dict arm), so no borrow of a
+        // stored tensor exists anywhere and freeing the dict with its
+        // values cannot free anything reachable. Only symbols the
+        // conservative usage scan admitted are freed here (single top-level
+        // call binding — so the slot dominates every return that can see it
+        // in `state.variables` — subscript reads only, never
+        // returned/passed/stored-into); see dict_lifetime.rs for the veto
+        // rules. An unscanned body has an empty set: status quo, the dict
+        // strands (leak, not crash).
+        let dict_locals: Vec<_> = state
+            .variables
+            .iter()
+            .filter(|(sym, _)| state.sweepable_dict_locals.contains(sym))
+            .filter(|(sym, _)| !state.param_symbols.contains(sym))
+            .filter_map(|(_, (var, cl_type))| {
+                if *cl_type == cl_types::I64 {
+                    Some(*var)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in dict_locals {
+            let val = builder.use_var(var);
+            let _ =
+                self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[val]);
         }
     }
 

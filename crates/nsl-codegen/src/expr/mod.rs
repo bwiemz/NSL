@@ -55,25 +55,27 @@ use nsl_semantic::types::Type;
 /// there are seven anonymous intermediates. Registering them recovered 3 of
 /// the 8 blocks retained per call (24 MB -> 16 MB), ×8 layers on every
 /// Coder-50M forward. NOT one block per intermediate: a view shares the root's
-/// data pointer, so leaked *handles* and leaked *blocks* do not correspond, and
-/// four blocks per call still strand for a separate reason (see
-/// `the_residual_is_still_present_and_bounded`).
+/// data pointer, so leaked *handles* and leaked *blocks* do not correspond.
+/// The remaining 4 blocks per call were closed on 2026-07-28: the semantic
+/// member table typed `expand`/`contiguous` (and the rest of this family)
+/// results as Unknown, which made `track_owned_tensor_expr_result`'s
+/// result-type filter drop links this table had already classified owning —
+/// see `the_gqa_residual_is_closed_exactly` in view_chain_leak_gate.rs and
+/// the member table in nsl-semantic/src/checker/ops.rs.
 ///
 /// The classification is a property of the RUNTIME function, so each entry
 /// records why. Do not add an entry without reading the implementation.
 ///
-/// # Not covered: the free-function forms
+/// # The free-function forms
 ///
-/// This table governs METHOD calls only. The sibling `ExprKind::Ident` arm in
-/// `expr_result_is_owned_temporary` still carries the original hand-maintained
-/// allowlist and still has the same omission, with no gate. Measured: the
-/// method form `x.transpose(0,1).contiguous().sum()` improves to 1 retained
-/// block per call, while the free-function form
-/// `contiguous(x.transpose(0,1)).sum()` is unchanged at 2 — `contiguous(t)`,
-/// `unsqueeze(t,d)`, `stack(l,d)` and `tensor_cat` all take dedicated
-/// early-return paths in `expr/calls.rs` and are absent from that allowlist.
-/// Extending it needs a per-function read of the runtime, since a wrong entry
-/// there is a use-after-free rather than a leak.
+/// This table governs METHOD calls only. The free-function spellings
+/// (`contiguous(t)`, `unsqueeze(t,d)`, `tensor_slice(t,..)`, `stack(l,d)`,
+/// `tensor_cat(l,d)`, `cumsum(t,d)`, ...) take dedicated early-return paths
+/// in `expr/calls.rs` and are classified by the `ExprKind::Ident` allowlist
+/// in `expr_result_is_owned_temporary` below — kept in sync per-function,
+/// gated by `free_function_chain_links_do_not_strand_per_call`. A wrong entry
+/// THERE is a use-after-free rather than a leak, so entries are only added
+/// with a per-function read of the runtime.
 pub(crate) fn tensor_method_returns_owned_ref(method: &str) -> Option<bool> {
     let owned = match method {
         // ── Reductions and elementwise maths: freshly allocated results. ──
@@ -494,6 +496,96 @@ impl Compiler<'_> {
                             | "scaled_dot_product_attention"
                             | "scaled_dot_product_attention_masked"
                             | "scaled_dot_product_attention_packed"
+                            // The free-function forms of the shape/view and
+                            // materialise family (roadmap item 1 residual,
+                            // 2026-07-28). Each entry verified against its
+                            // runtime implementation, because a wrong entry
+                            // here is a use-after-free rather than a leak:
+                            // - contiguous → nsl_tensor_contiguous: fresh
+                            //   tensor, or the receiver AFTER
+                            //   refcount.fetch_add(1) when already contiguous
+                            //   — a counted reference either way.
+                            // - unsqueeze → nsl_tensor_unsqueeze: view via
+                            //   new_view_i64 (fresh handle + root refcount
+                            //   bump).
+                            // - tensor_slice → nsl_tensor_slice: fresh output
+                            //   on both the CPU (publish) and GPU
+                            //   (gpu_slice_f32_with_shape / device-roundtrip)
+                            //   paths. NOTE the spelling: the free-function
+                            //   form is `tensor_slice(t, d, s, e)`
+                            //   (expr/calls.rs early return; builtins.rs) —
+                            //   there is no free function named `slice`, and
+                            //   a `"slice"` entry here is dead (review
+                            //   finding on 734c548e).
+                            // - stack/tensor_cat → nsl_tensor_{stack,cat}:
+                            //   fresh output, CPU and GPU paths.
+                            // - cumsum → nsl_tensor_cumsum, argmax →
+                            //   nsl_tensor_argmax: fresh via
+                            //   create_tensor_with_shape_rs*.
+                            // - causal_mask → nsl_tensor_causal_mask: fresh
+                            //   via publish.
+                            // Measured before this entry: the method chain
+                            // `x.transpose(0,1).contiguous().sum()` retained
+                            // 1 block/call while the free-function spelling
+                            // `contiguous(x.transpose(0,1)).sum()` retained 2
+                            // — same runtime call, different books.
+                            | "contiguous"
+                            | "unsqueeze"
+                            | "tensor_slice"
+                            | "stack"
+                            | "tensor_cat"
+                            | "cumsum"
+                            | "argmax"
+                            | "causal_mask"
+                            // The stdlib RETURN-position builtins (Coder-50M
+                            // TransformerBlock residual, 2026-07-28). A
+                            // compiled fn's Return arm retains any result it
+                            // cannot prove owning, so `return rmsnorm(...)` /
+                            // `return dropout(...)` double-owned their fresh
+                            // outputs: the caller's single free left rc=1 and
+                            // the block stranded — 4 blocks per TB call (two
+                            // RMSNorm outputs + two eval-dropout clones), 32
+                            // of Coder-50M's +33 blocks/forward. Same class
+                            // as the scaled_dot_product_attention entry
+                            // above. Per-runtime verification:
+                            // - rmsnorm → nsl_tensor_rmsnorm: fresh via
+                            //   gpu_rmsnorm_f32 / publish on CPU; frees its
+                            //   own contiguous/device temps.
+                            // - dropout → nsl_tensor_dropout: eval/p==0
+                            //   returns nsl_tensor_clone, which ALWAYS
+                            //   allocates ("clone always allocates to
+                            //   maintain memory accounting invariants");
+                            //   training paths are fresh kernel outputs. The
+                            //   codegen-level `.clone()` FBIP elision does
+                            //   not apply — this free-function form always
+                            //   reaches the runtime FFI.
+                            // - layernorm/bias_add/embedding_lookup →
+                            //   publish-fresh on every path; gather → fresh
+                            //   on GPU and CPU (create_tensor_with_shape).
+                            | "rmsnorm"
+                            | "dropout"
+                            | "layernorm"
+                            | "bias_add"
+                            | "gather"
+                            | "embedding_lookup"
+                            // The remaining sampling family (device-blind
+                            // sampling fix, 2026-07-28). `return
+                            // multinomial(x, 1)` / `return lt_scalar(x, p)`
+                            // took the Unknown arm and double-owned — 1
+                            // strand per call each (sampling_device_gate).
+                            // Per-runtime verification:
+                            // - lt_scalar → nsl_tensor_lt_scalar: fresh via
+                            //   create_tensor_with_shape_rs_dtype; the GPU
+                            //   arm returns the fresh upload from
+                            //   redirect_gpu_input_to_host.
+                            // - multinomial → nsl_tensor_multinomial: fresh
+                            //   via create_tensor_with_shape_rs; GPU arm as
+                            //   above.
+                            // `topk` is deliberately ABSENT: it returns a
+                            // DICT handle, not a tensor — listing it would
+                            // hand the dict to nsl_tensor_free.
+                            | "lt_scalar"
+                            | "multinomial"
                     );
                 }
                 // Method-form calls. `y.sum()` parses as Call with a
@@ -501,9 +593,26 @@ impl Compiler<'_> {
                 // so statement-position method temps were never registered
                 // and stranded one block per call (the inference-loop
                 // `print(y.sum())` leak).
+                //
+                // Indeterminate (Unknown/Error) receivers are classified by
+                // the SAME table — but only when tensor dispatch is what will
+                // actually run. The dispatcher in `compile_call` defaults an
+                // Unknown-typed receiver to tensor dispatch (the "defaulting
+                // to tensor dispatch" warning path in expr/calls.rs) EXCEPT
+                // for Idents registered as model-array or agent variables,
+                // which it routes to compiled model/agent methods FIRST —
+                // `indeterminate_receiver_takes_tensor_dispatch` mirrors that
+                // precedence. Requiring a proven Tensor type here while the
+                // dispatcher does not was the second half of the item-1 chain
+                // leak: one semantic-table gap (`expand` typed Unknown)
+                // silently switched every later chain link from tracked to
+                // stranded.
                 if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let obj_ty = self.node_type(object.id);
-                    if obj_ty.is_tensor() {
+                    if obj_ty.is_tensor()
+                        || (obj_ty.is_indeterminate()
+                            && self.indeterminate_receiver_takes_tensor_dispatch(object))
+                    {
                         return tensor_method_returns_owned_ref(self.resolve_sym(*member))
                             .unwrap_or(false);
                     }
@@ -545,6 +654,58 @@ impl Compiler<'_> {
         false
     }
 
+    /// Mirror of the dispatcher's precedence for an indeterminate-typed
+    /// method receiver (`compile_call`, expr/calls.rs): an Unknown/Error-typed
+    /// IDENT that is a registered model-array loop variable
+    /// (`models.model_var_types`, populated at the `for blk in self.blocks`
+    /// lowering) or an agent variable (`models.agent_var_types`) dispatches to
+    /// `compile_model_method_call` / the mangled agent call — a compiled NSL
+    /// function, NOT an `nsl_tensor_*` FFI — so the tensor ownership table
+    /// must not classify it. A model method that happens to share a table
+    /// name (`fn mean(self) -> int`) returns an I64 that is not a tensor
+    /// handle; tracking it would make statement cleanup call
+    /// `nsl_tensor_free` on it — memory corruption, not a leak (review
+    /// finding on 734c548e). Everything else genuinely falls through to
+    /// tensor dispatch.
+    fn indeterminate_receiver_takes_tensor_dispatch(&self, object: &Expr) -> bool {
+        if let ExprKind::Ident(sym) = &object.kind {
+            if self.models.model_var_types.contains_key(sym)
+                || self.models.agent_var_types.contains_key(sym)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when `expr` is a tensor-METHOD call whose method the ownership
+    /// table (`tensor_method_returns_owned_ref`) marks owning, on a receiver
+    /// that is tensor-typed — or indeterminate AND actually bound for tensor
+    /// dispatch (`indeterminate_receiver_takes_tensor_dispatch`). This is the
+    /// ONLY shape for which an indeterminate RESULT type may still be
+    /// tracked: whatever the checker failed to infer, the dispatcher lowers
+    /// these to `nsl_tensor_*` calls that return real tensor handles.
+    /// Ident-callee builtins and compiled NSL functions do NOT qualify — an
+    /// Unknown-typed `neg(i)` is an integer at runtime, and an unannotated
+    /// user fn can return a list; freeing either as a tensor is memory
+    /// corruption, so those keep the strict tensor-type requirement
+    /// (leak-not-crash).
+    fn expr_is_owning_tensor_method_call(&self, expr: &Expr) -> bool {
+        if let ExprKind::Call { callee, .. } = &expr.kind {
+            if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                let obj_ty = self.node_type(object.id);
+                if obj_ty.is_tensor()
+                    || (obj_ty.is_indeterminate()
+                        && self.indeterminate_receiver_takes_tensor_dispatch(object))
+                {
+                    return tensor_method_returns_owned_ref(self.resolve_sym(*member))
+                        == Some(true);
+                }
+            }
+        }
+        false
+    }
+
     /// Call-like expression lowering bypasses the per-op temporary registration
     /// used by binary tensor ops. Track those owned tensor results here so
     /// anonymous subexpressions participate in statement cleanup.
@@ -553,13 +714,28 @@ impl Compiler<'_> {
     /// forms, AND compiled NSL functions — a user fn's result in nested or
     /// statement position (`print(user_fn(x))`, bare `user_fn(x)`) has no
     /// other owner and stranded before this. The tensor-type filter below
-    /// keeps non-tensor results out of the free list either way.
-    fn track_owned_tensor_expr_result(&self, state: &mut FuncState, expr: &Expr, value: Value) {
+    /// keeps non-tensor results out of the free list either way; an
+    /// indeterminate result type is accepted only for the tensor-method form
+    /// (see `expr_is_owning_tensor_method_call`), and never for a non-pointer
+    /// Cranelift value.
+    fn track_owned_tensor_expr_result(
+        &self,
+        builder: &FunctionBuilder,
+        state: &mut FuncState,
+        expr: &Expr,
+        value: Value,
+    ) {
         if !self.expr_call_returns_owning_ref(expr) {
             return;
         }
+        if builder.func.dfg.value_type(value) != cl_types::I64 {
+            return;
+        }
         let ty = self.node_type(expr.id);
-        if ty.is_tensor() || matches!(ty, Type::Sparse { .. }) {
+        let trackable = ty.is_tensor()
+            || matches!(ty, Type::Sparse { .. })
+            || (ty.is_indeterminate() && self.expr_is_owning_tensor_method_call(expr));
+        if trackable {
             Self::track_tensor_temporary(state, value);
         }
     }
@@ -571,7 +747,7 @@ impl Compiler<'_> {
         expr: &Expr,
     ) -> Result<Value, CodegenError> {
         let value = self.compile_expr(builder, state, expr)?;
-        self.track_owned_tensor_expr_result(state, expr, value);
+        self.track_owned_tensor_expr_result(builder, state, expr, value);
         Ok(value)
     }
 

@@ -79,6 +79,7 @@ pub mod c_header;
 pub mod c_wrapper;
 pub mod compiler;
 pub mod context;
+pub(crate) mod dict_lifetime;
 pub mod dynamic_shapes;
 pub mod error;
 pub mod escape;

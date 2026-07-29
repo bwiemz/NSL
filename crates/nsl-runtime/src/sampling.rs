@@ -6,10 +6,39 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 
+use crate::autodiff;
 use crate::cpu::{create_tensor_with_shape_rs, create_tensor_with_shape_rs_dtype, get_shape_vec, get_strides_vec};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::NslTensor;
+use crate::tensor::{nsl_tensor_free, nsl_tensor_to_device, NslTensor};
+
+// ---------------------------------------------------------------------------
+// GPU-input redirect
+// ---------------------------------------------------------------------------
+
+/// CPU redirect shared by the sampling FFIs below. Every one of them is a
+/// host-side implementation, and a GPU tensor's `data` is a device pointer
+/// (`cuda::inner::alloc_managed`) that must never be dereferenced on the
+/// host. Stages the input on the CPU, re-enters the op there, and hands the
+/// result back on the input's device — mirroring the non-dim-0 arm of
+/// `nsl_tensor_gather`.
+///
+/// Index precision: CPU-side index outputs (argmax, multinomial, topk
+/// indices) are f64, but the upload converts to the GPU's f32 — exact only
+/// below 2^24 (16.7M). Vocab-scale dims are far under that; a >=2^24-wide
+/// dim would silently round indices, matching the runtime-wide
+/// "CPU=f64, GPU=f32" convention rather than guarding here.
+fn redirect_gpu_input_to_host(tensor_ptr: i64, op: impl FnOnce(i64) -> i64) -> i64 {
+    let device = NslTensor::from_ptr(tensor_ptr).device;
+    // Pause the tape across the CPU redirect (see nsl_tensor_stack).
+    let _pause = autodiff::TapePause::new();
+    let cpu_in = nsl_tensor_to_device(tensor_ptr, 0);
+    let cpu_out = op(cpu_in);
+    let dev_out = nsl_tensor_to_device(cpu_out, device as i64);
+    nsl_tensor_free(cpu_in);
+    nsl_tensor_free(cpu_out);
+    dev_out
+}
 
 // ---------------------------------------------------------------------------
 // Thread-local RNG
@@ -40,7 +69,19 @@ pub fn rng_f64() -> f64 {
 /// replaced by `k`.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    // Host-side implementation: stage GPU inputs on the CPU and upload both
+    // result tensors before the dict is built. The dict wraps two tensors,
+    // so this keeps the staging inline instead of re-entering through
+    // redirect_gpu_input_to_host and unpacking the CPU dict.
+    let in_device = NslTensor::from_ptr(tensor_ptr).device;
+    // Pause the tape across the CPU redirect (see nsl_tensor_stack).
+    let _pause = (in_device != 0).then(autodiff::TapePause::new);
+    let staged_ptr = if in_device != 0 {
+        nsl_tensor_to_device(tensor_ptr, 0)
+    } else {
+        tensor_ptr
+    };
+    let tensor = NslTensor::from_ptr(staged_ptr);
     let shape = get_shape_vec(tensor);
     let strides = get_strides_vec(tensor);
     let ndim = shape.len();
@@ -135,6 +176,19 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
         }
     }
 
+    // Hand the results back on the input's device and drop the CPU staging
+    // copies — the dict must hold the device-resident tensors.
+    let (values_ptr, indices_ptr) = if in_device != 0 {
+        let values_dev = nsl_tensor_to_device(values_ptr, in_device as i64);
+        let indices_dev = nsl_tensor_to_device(indices_ptr, in_device as i64);
+        nsl_tensor_free(values_ptr);
+        nsl_tensor_free(indices_ptr);
+        nsl_tensor_free(staged_ptr);
+        (values_dev, indices_dev)
+    } else {
+        (values_ptr, indices_ptr)
+    };
+
     // Return dict with "values" and "indices"
     let dict = nsl_dict_new();
     let key_values = nsl_str_from_rust("values");
@@ -155,6 +209,11 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    if tensor.device != 0 {
+        return redirect_gpu_input_to_host(tensor_ptr, |cpu| {
+            nsl_tensor_multinomial(cpu, num_samples)
+        });
+    }
     let shape = get_shape_vec(tensor);
     let in_dtype = tensor.dtype;
     let ndim = shape.len();
@@ -236,6 +295,9 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
 #[no_mangle]
 pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    if tensor.device != 0 {
+        return redirect_gpu_input_to_host(tensor_ptr, |cpu| nsl_tensor_argmax(cpu, dim));
+    }
     let shape = get_shape_vec(tensor);
     let strides = get_strides_vec(tensor);
     let ndim = shape.len();
@@ -318,6 +380,9 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_cumsum(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    if tensor.device != 0 {
+        return redirect_gpu_input_to_host(tensor_ptr, |cpu| nsl_tensor_cumsum(cpu, dim));
+    }
     let shape = get_shape_vec(tensor);
     let strides = get_strides_vec(tensor);
     let ndim = shape.len();
@@ -391,6 +456,22 @@ pub extern "C" fn nsl_tensor_cumsum(tensor_ptr: i64, dim: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_lt_scalar(tensor_ptr: i64, scalar: f64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    if tensor.device != 0 {
+        // The CPU f32 arm below compares in f32 against the ROUNDED
+        // threshold (`scalar as f32`), but the staging download promotes the
+        // data f32→f64 and would take the f64 arm against the UNROUNDED
+        // threshold — at an f32-representability boundary the masks differ
+        // (measured: `lt_scalar(x, 0.9)` on x == 0.9f32 flips per device,
+        // review M1 on 1070c53b). Pre-rounding the threshold through f32
+        // makes the f64 comparison of exact f32 promotions bit-identical to
+        // the f32 comparison the CPU input would take.
+        let s = if tensor.dtype == 1 {
+            (scalar as f32) as f64
+        } else {
+            scalar
+        };
+        return redirect_gpu_input_to_host(tensor_ptr, |cpu| nsl_tensor_lt_scalar(cpu, s));
+    }
     let shape = get_shape_vec(tensor);
     let in_dtype = tensor.dtype;
     let len = tensor.len as usize;
