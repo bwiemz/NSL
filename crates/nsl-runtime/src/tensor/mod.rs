@@ -1239,7 +1239,13 @@ pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
 pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
     if tensor_ptr == 0 { return; }
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    tensor.refcount.fetch_sub(1, Ordering::SeqCst);
+    let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
+    if tensor_trace_on() {
+        eprintln!(
+            "[tensor-trace] release t={:#x} data={:p} rc_pre={}",
+            tensor_ptr, tensor.data, prev
+        );
+    }
 }
 
 /// Free a HOST (device==0) tensor's data buffer, routing PINNED buffers
@@ -3219,8 +3225,13 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
     let mask_ptr = NslTensor::publish(mask_tensor);
 
     if autodiff::is_recording() {
-        // No refcount bump on a — identity-only. Mask still bumped (saved data).
-        NslTensor::from_ptr(mask_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        // No refcount bump on `a` — identity-only. No bump on the mask
+        // either: the mask is TAPE-ONLY (no caller ever receives it), so the
+        // tape takes the publish reference itself and `release_tape_op_refs`
+        // frees it exactly once — the same accounting the GPU arm above has
+        // always used. The former extra bump here stranded one mask per
+        // training-mode CPU dropout call (review finding on 1def2b9f; pinned
+        // by `cpu_tape_mode_dropout_mask_refcount_is_exactly_the_tapes`).
         autodiff::maybe_record(autodiff::TapeOp::Dropout {
             a: tensor_ptr, out: result_ptr, saved_mask: mask_ptr, scale,
         });
@@ -4424,6 +4435,56 @@ pub fn test_tensor_tape_id(ptr: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review finding on 1def2b9f (pre-existing defect): the CPU
+    /// tape-recording arm of `nsl_tensor_dropout` published its mask (rc=1)
+    /// and then bumped it AGAIN before recording — but the mask is
+    /// TAPE-ONLY: no caller ever owns it, so the tape takes the publish
+    /// reference itself, exactly as the GPU arm already records it (no
+    /// bump). `release_tape_op_refs` frees `saved_mask` exactly once, so
+    /// the extra bump stranded one mask tensor per training-mode CPU
+    /// dropout call.
+    ///
+    /// The invariant pinned here: while recorded, the mask's refcount is
+    /// exactly ONE — the tape's. Two is the strand; zero would mean the
+    /// tape's reference was stolen (the use-after-free direction, since
+    /// backward reads the mask).
+    #[test]
+    fn cpu_tape_mode_dropout_mask_refcount_is_exactly_the_tapes() {
+        let a = create_tensor_with_shape_rs(&[64]);
+        // Begin a fresh recording session on this thread directly — the
+        // FFI `nsl_tape_start` needs an NslList of params, which this
+        // in-crate test does not need to fabricate.
+        crate::autodiff::TAPE.with(|t| {
+            let mut tape = t.borrow_mut();
+            crate::autodiff::release_tape_op_refs(&tape.ops);
+            tape.ops.clear();
+            tape.recording = true;
+            tape.pause_depth = 0;
+        });
+        let out = nsl_tensor_dropout(a, 0.5, 1);
+        let mask = crate::autodiff::TAPE.with(|t| {
+            let tape = t.borrow();
+            tape.ops.iter().rev().find_map(|op| match op {
+                crate::autodiff::TapeOp::Dropout { saved_mask, .. } => Some(*saved_mask),
+                _ => None,
+            })
+        });
+        let mask = mask.expect("training-mode dropout under recording must record a Dropout op");
+        let rc = NslTensor::from_ptr(mask).refcount.load(Ordering::SeqCst);
+        // Tear the session down BEFORE asserting so a failure cannot poison
+        // the thread-local tape for other tests in this binary.
+        crate::autodiff::nsl_tape_stop();
+        nsl_tensor_free(out);
+        nsl_tensor_free(a);
+        assert_eq!(
+            rc, 1,
+            "the recorded dropout mask must be owned by the tape ALONE \
+             (rc=1). rc=2 restores the CPU-arm strand (one leaked mask per \
+             training-mode dropout call); rc=0 means the tape's reference \
+             was released early and backward would read a freed mask."
+        );
+    }
 
     /// P0.4 dtype/ABI cleanup: GOLDEN LOCK on the canonical dtype tag table.
     /// A future fused kernel that renumbers or reuses a tag fails HERE instead
