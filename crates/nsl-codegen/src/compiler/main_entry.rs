@@ -77,13 +77,16 @@ impl Compiler<'_> {
                 state.use_counts = Some(crate::use_count::analyze_use_counts(&main_block));
             }
             // Dict-local tensor lifetime: arm the return sweep's
-            // nsl_dict_free_tensor_values pass for script-scope dict locals
-            // the usage scan proves safe (see dict_lifetime.rs).
-            state.sweepable_dict_locals = crate::dict_lifetime::collect_sweepable_dict_locals(
+            // nsl_dict_free_tensor_values pass (and the loop-rebind clear)
+            // for script-scope dict locals the usage scan proves safe
+            // (see dict_lifetime.rs).
+            let dict_plan = crate::dict_lifetime::collect_sweepable_dict_locals(
                 &main_block,
                 |id| self.node_type(id).clone(),
                 |s| self.resolve_sym(s).to_string(),
             );
+            state.sweepable_dict_locals = dict_plan.at_exit;
+            state.dict_loop_rebind = dict_plan.loop_rebind;
 
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);

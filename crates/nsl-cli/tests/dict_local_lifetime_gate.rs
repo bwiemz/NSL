@@ -86,6 +86,78 @@ fn expect_value(stdout: &str, expected: &str, tag: &str) {
     assert_eq!(val, expected, "[{tag}] wrong computed value:\n{stdout}");
 }
 
+/// `load_safetensors` — the second fresh-dict builtin (whitelisted
+/// 2026-07-29 with this gate; the #427 review verified its dict stores
+/// fresh solely-owned tensors and reads clone, but the entry waited for
+/// coverage). A weights dict loaded to GPU and only subscript-read must
+/// be swept at exit; before the whitelist entry its dict + both tensors
+/// stranded (red-proven at lb=2).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn load_safetensors_dict_is_swept_at_exit() {
+    use safetensors::tensor::{serialize, TensorView};
+    use safetensors::Dtype;
+    use std::collections::HashMap;
+
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_dictlife_{}_sft", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let a_bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let b_bytes: Vec<u8> = [10.0f32, 20.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut views: HashMap<String, TensorView<'_>> = HashMap::new();
+    views.insert(
+        "a".to_string(),
+        TensorView::new(Dtype::F32, vec![4], a_bytes.as_slice()).unwrap(),
+    );
+    views.insert(
+        "b".to_string(),
+        TensorView::new(Dtype::F32, vec![2], b_bytes.as_slice()).unwrap(),
+    );
+    std::fs::write(tmp.join("w.safetensors"), serialize(&views, &None).unwrap()).unwrap();
+
+    let src = r#"
+let w = load_safetensors("w.safetensors", 1)
+let a = w["a"]
+let b = w["b"]
+print(sum(a).item() + sum(b).item())
+print("DONE")
+"#;
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(["run", "--deterministic"])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_GPU_MEM_REPORT", "1")
+        .output()
+        .expect("spawn nsl run");
+    assert!(
+        out.status.success(),
+        "[sft] run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stdout.contains("DONE"), "[sft] incomplete:\n{stdout}");
+    expect_value(&stdout, "40", "sft");
+    let lb = stderr
+        .lines()
+        .filter_map(|l| {
+            l.split("live_blocks=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .next_back()
+        .unwrap_or_else(|| panic!("[sft] no live_blocks report:\n{stderr}"));
+    std::fs::remove_dir_all(&tmp).ok();
+    assert_eq!(lb, 0, "load_safetensors dict stranded:\n{stdout}");
+}
+
 /// Script-scope dict locals are swept at main's exit — the shape the
 /// original 2-blocks-per-call measurement used.
 #[test]
@@ -176,6 +248,40 @@ print("DONE")
     assert_eq!(lb, 2, "subscript-write strand changed:\n{stdout}");
 }
 
+/// Review HIGH-1 on d114b5d7 (was reproduced memory corruption): a
+/// loop-body dict decl SHADOWING a function parameter is checker-legal
+/// (the body is a child scope) and invisible to the scan, which only
+/// walks the body. The predeclare skips the sym (the param's slot already
+/// exists) — so a rebind clear keyed on the plan set alone freed the
+/// CALLER'S TENSOR as a dict (`free_dict_impl` walked the tensor magic
+/// bytes as a bucket pointer). The clear now keys off
+/// `dict_loop_predeclared` — only slots the predeclare actually created —
+/// and this shape reverts to the status-quo leak: correct value, run
+/// success, dicts stranded.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn param_shadowing_loop_dict_does_not_free_the_callers_tensor() {
+    let src = r#"
+fn f(w: Tensor, x: Tensor) -> float:
+    let acc = 0.0
+    for i in range(3):
+        let w = topk(x, 3)
+        let v = w["values"]
+        acc = acc + sum(v).item()
+    return acc
+
+let a = arange(0.0, 4.0).to(cuda)
+let x = arange(0.0, 8.0).to(cuda)
+print(f(a, x))
+print("DONE")
+"#;
+    let (lb, stdout) = run_fixture(src, "paramshadow");
+    expect_value(&stdout, "54", "paramshadow");
+    // 3 stranded per-iteration dicts x 2 tensors = the status-quo leak
+    // this shape keeps (fail-closed direction).
+    assert_eq!(lb, 6, "param-shadow strand changed:\n{stdout}");
+}
+
 /// Review HIGH-1 on 7a0f83d9 (was a confirmed abort): a list-comprehension
 /// generator re-using a candidate's NAME re-points the symbol's variable
 /// slot at the loop element — the sweep then handed an integer to
@@ -227,18 +333,24 @@ print("DONE")
     assert_eq!(lb, 2, "lambda-alias strand changed:\n{stdout}");
 }
 
-/// Loop-local dict bindings are NOT top-level, so the scan never admits
-/// them — they keep the pre-fix per-iteration strand (2 blocks each).
-/// Pinned so the v2 work (the eltls predeclare/clear twin for dicts) must
-/// ratchet this, and so a scan bug that starts admitting nested bindings
-/// (conditionally-initialized slot → garbage to the free) shows up as a
-/// number change or a crash here. The REAL generation pattern — sampling
-/// helpers called per token — wraps the dict in a function and is already
-/// clean (`topk_dicts_no_longer_strand` in sampling_device_gate.rs).
+/// Loop-local dict bindings, RATCHETED TO ZERO (the eltls clear twin for
+/// dicts, 2026-07-29). A dict `let` in the DIRECT body of a top-level
+/// `for`/`while` is scan-admitted into the loop-rebind pool: the loop
+/// lowering zero-predeclares its slot, `compile_var_decl` frees the
+/// previous iteration's dict before each rebind, and the return sweep
+/// frees the last one. Was pinned at 2 blocks/iteration
+/// (`loop_local_dicts_keep_status_quo`).
+///
+/// Covers the for-loop, while-loop, break (early exit leaves the last
+/// dict to the return sweep), zero-iteration (the predeclared slot is 0 —
+/// `free_dict_impl` must no-op), and script-scope (main) shapes. A
+/// subscript read AFTER the loop is a checker error ("not found in
+/// scope"), so the scan's outside-the-loop mention veto is unreachable
+/// belt-and-braces today.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn loop_local_dicts_keep_status_quo() {
-    let src = r#"
+fn loop_local_dicts_are_cleared_per_rebind() {
+    let for_src = r#"
 fn f(x: Tensor) -> float:
     let acc = 0.0
     for i in range(3):
@@ -251,10 +363,68 @@ let x = arange(0.0, 8.0).to(cuda)
 print(f(x))
 print("DONE")
 "#;
-    let (lb, stdout) = run_fixture(src, "looplocal");
-    expect_value(&stdout, "54", "looplocal");
-    assert_eq!(
-        lb, 6,
-        "loop-local dict strand changed (3 iterations x dict values+indices):\n{stdout}"
-    );
+    let while_src = r#"
+fn f(x: Tensor) -> float:
+    let acc = 0.0
+    let i = 0
+    while i < 3:
+        let r = topk(x, 3)
+        let v = r["values"]
+        acc = acc + sum(v).item()
+        i = i + 1
+    return acc
+
+let x = arange(0.0, 8.0).to(cuda)
+print(f(x))
+print("DONE")
+"#;
+    let break_src = r#"
+fn f(x: Tensor) -> float:
+    let acc = 0.0
+    for i in range(5):
+        let r = topk(x, 3)
+        let v = r["values"]
+        acc = acc + sum(v).item()
+        if i == 1:
+            break
+    return acc
+
+let x = arange(0.0, 8.0).to(cuda)
+print(f(x))
+print("DONE")
+"#;
+    let zero_src = r#"
+fn f(x: Tensor) -> float:
+    let acc = 0.0
+    for i in range(0):
+        let r = topk(x, 3)
+        let v = r["values"]
+        acc = acc + sum(v).item()
+    return acc
+
+let x = arange(0.0, 8.0).to(cuda)
+print(f(x))
+print("DONE")
+"#;
+    let main_src = r#"
+let x = arange(0.0, 8.0).to(cuda)
+let acc = 0.0
+for i in range(3):
+    let r = topk(x, 3)
+    let v = r["values"]
+    acc = acc + sum(v).item()
+print(acc)
+print("DONE")
+"#;
+    for (src, expected, tag) in [
+        (for_src, "54", "loopfor"),
+        (while_src, "54", "loopwhile"),
+        (break_src, "36", "loopbreak"),
+        (zero_src, "0", "loopzero"),
+        (main_src, "54", "loopmain"),
+    ] {
+        let (lb, stdout) = run_fixture(src, tag);
+        expect_value(&stdout, expected, tag);
+        assert_eq!(lb, 0, "[{tag}] loop-local dict strand is back:\n{stdout}");
+    }
 }

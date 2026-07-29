@@ -55,9 +55,14 @@ use nsl_semantic::types::Type;
 /// "owning" candidates for one dict — a double free (review HIGH-2 on
 /// 7a0f83d9, confirmed crash). User fns and model methods cannot return
 /// dicts at all (checker error, probed), so the builtin list is the whole
-/// fresh-dict surface. `load_safetensors` is also verified fresh-and-
-/// solely-owned but stays OUT until it has its own gate.
-const FRESH_DICT_BUILTINS: &[&str] = &["topk"];
+/// fresh-dict surface. Per-runtime verification:
+/// - topk → nsl_tensor_topk: fresh dict, values/indices created rc=1 and
+///   stored raw (sampling.rs).
+/// - load_safetensors → nsl_safetensors_load: fresh dict; every stored
+///   tensor is a fresh `allocate_f32_tensor` the dict solely owns
+///   (safetensors_io.rs; #427-review-verified, gated by
+///   `load_safetensors_dict_is_swept_at_exit`).
+const FRESH_DICT_BUILTINS: &[&str] = &["topk", "load_safetensors"];
 
 /// Usage-veto walker. `candidates` holds the top-level dict-local bindings
 /// (symbol → its VarDecl stmt id so the binding itself is not treated as a
@@ -246,8 +251,42 @@ fn collect_pattern_syms(pattern: &nsl_ast::pattern::Pattern, out: &mut HashSet<S
     }
 }
 
-/// Entry point: scan `body` and return the dict-local symbols the
-/// return-local sweep may free with `nsl_dict_free_tensor_values`.
+/// The scan's output: which dict locals the return sweep frees at exit,
+/// and which of those additionally get a per-rebind clear because they
+/// are bound inside a top-level loop body (the loop lowering predeclares
+/// their slot to zero; `compile_var_decl` frees the previous iteration's
+/// dict before the rebind).
+#[derive(Default)]
+pub(crate) struct DictSweepPlan {
+    pub(crate) at_exit: HashSet<Symbol>,
+    pub(crate) loop_rebind: HashSet<Symbol>,
+}
+
+/// Records every identifier occurrence — including subscript objects and
+/// pattern bindings, which `DictLocalScan` deliberately exempts. Used for
+/// the outside-the-loop mention veto on loop-body candidates: a
+/// subscript READ after the loop would touch a slot that is zero when
+/// the loop ran no iterations, and `nsl_dict_get_str(0)` is a null
+/// dereference.
+#[derive(Default)]
+struct MentionScan {
+    mentioned: HashSet<Symbol>,
+}
+
+impl Visitor for MentionScan {
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let ExprKind::Ident(sym) = &expr.kind {
+            self.mentioned.insert(*sym);
+        }
+        walk_expr(self, expr);
+    }
+    fn visit_pattern(&mut self, pat: &Pattern) {
+        collect_pattern_syms(pat, &mut self.mentioned);
+        walk_pattern(self, pat);
+    }
+}
+
+/// Entry point: scan `body` and return the dict-local sweep plan.
 /// `node_type` resolves an expression id to its checked semantic type
 /// (the compiler's `node_type`, passed as a closure to keep this module
 /// independent of `Compiler`).
@@ -255,48 +294,101 @@ pub(crate) fn collect_sweepable_dict_locals(
     body: &Block,
     node_type: impl Fn(NodeId) -> Type,
     resolve_sym: impl Fn(Symbol) -> String,
-) -> HashSet<Symbol> {
-    // Pass 1: top-level `let <ident> = <fresh-dict builtin call>` bindings
-    // whose checked type is Dict<_, Tensor-valued>. The callee must be an
-    // Ident naming a FRESH_DICT_BUILTINS entry — see the const above for
-    // why arbitrary Dict-typed calls (lambdas) are unsafe to admit.
-    let mut candidates: HashMap<Symbol, NodeId> = HashMap::new();
-    let mut candidate_callees: HashMap<Symbol, Symbol> = HashMap::new();
-    for stmt in &body.stmts {
+) -> DictSweepPlan {
+    // Pass 1: `let <ident> = <fresh-dict builtin call>` bindings whose
+    // checked type is Dict<_, Tensor-valued>. The callee must be an Ident
+    // naming a FRESH_DICT_BUILTINS entry — see the const above for why
+    // arbitrary Dict-typed calls (lambdas) are unsafe to admit. Admitted
+    // from two positions only, both chosen so the (pre)declared slot
+    // dominates every return that can observe it:
+    //   - the body's top level;
+    //   - the DIRECT body of a TOP-LEVEL `for`/`while` (the loop-rebind
+    //     pool; the loop lowering zero-predeclares these slots).
+    let admit = |stmt: &Stmt| -> Option<(Symbol, NodeId, Symbol)> {
         let StmtKind::VarDecl { pattern, value, .. } = &stmt.kind else {
-            continue;
+            return None;
         };
         let PatternKind::Ident(sym) = &pattern.kind else {
-            continue;
+            return None;
         };
-        let Some(value) = value else { continue };
+        let value = value.as_ref()?;
         let ExprKind::Call { callee, .. } = &value.kind else {
-            continue;
+            return None;
         };
         let ExprKind::Ident(callee_sym) = &callee.kind else {
-            continue;
+            return None;
         };
         if !FRESH_DICT_BUILTINS.contains(&resolve_sym(*callee_sym).as_str()) {
-            continue;
+            return None;
         }
         let is_tensor_dict = matches!(
             node_type(value.id),
             Type::Dict(_, ref v) if v.is_tensor()
         );
         if !is_tensor_dict {
+            return None;
+        }
+        Some((*sym, stmt.id, *callee_sym))
+    };
+
+    let mut candidates: HashMap<Symbol, NodeId> = HashMap::new();
+    let mut candidate_callees: HashMap<Symbol, Symbol> = HashMap::new();
+    // sym → index of its owning top-level loop stmt (loop-rebind pool).
+    let mut loop_owner: HashMap<Symbol, usize> = HashMap::new();
+    let insert = |sym: Symbol,
+                      id: NodeId,
+                      callee: Symbol,
+                      owner: Option<usize>,
+                      candidates: &mut HashMap<Symbol, NodeId>,
+                      candidate_callees: &mut HashMap<Symbol, Symbol>,
+                      loop_owner: &mut HashMap<Symbol, usize>| {
+        // A candidate declared twice (any mix of positions) is a rebind —
+        // drop it outright rather than keeping either binding.
+        if candidates.insert(sym, id).is_some() {
+            candidates.remove(&sym);
+            candidate_callees.remove(&sym);
+            loop_owner.remove(&sym);
+        } else {
+            candidate_callees.insert(sym, callee);
+            if let Some(ix) = owner {
+                loop_owner.insert(sym, ix);
+            }
+        }
+    };
+    for (ix, stmt) in body.stmts.iter().enumerate() {
+        if let Some((sym, id, callee)) = admit(stmt) {
+            insert(
+                sym,
+                id,
+                callee,
+                None,
+                &mut candidates,
+                &mut candidate_callees,
+                &mut loop_owner,
+            );
             continue;
         }
-        // A candidate declared twice at top level is a rebind — drop it
-        // outright rather than keeping either binding.
-        if candidates.insert(*sym, stmt.id).is_some() {
-            candidates.remove(sym);
-            candidate_callees.remove(sym);
-        } else {
-            candidate_callees.insert(*sym, *callee_sym);
+        let (StmtKind::For { body: loop_body, .. } | StmtKind::While { body: loop_body, .. }) =
+            &stmt.kind
+        else {
+            continue;
+        };
+        for inner in &loop_body.stmts {
+            if let Some((sym, id, callee)) = admit(inner) {
+                insert(
+                    sym,
+                    id,
+                    callee,
+                    Some(ix),
+                    &mut candidates,
+                    &mut candidate_callees,
+                    &mut loop_owner,
+                );
+            }
         }
     }
     if candidates.is_empty() {
-        return HashSet::new();
+        return DictSweepPlan::default();
     }
 
     // Pass 2: the usage veto walk over the whole body.
@@ -310,11 +402,31 @@ pub(crate) fn collect_sweepable_dict_locals(
         scan.visit_stmt(stmt);
     }
     if scan.opaque_block_seen {
-        return HashSet::new();
+        return DictSweepPlan::default();
     }
-    let vetoed = scan.vetoed;
+    let mut vetoed = scan.vetoed;
     let bound_anywhere = scan.bound_anywhere;
-    candidates
+
+    // Loop-rebind pool only: veto on ANY mention outside the owning loop
+    // statement. Even the otherwise-allowed subscript read is unsafe
+    // there — with zero iterations the predeclared slot is still 0 and
+    // `nsl_dict_get_str(0)` is a null dereference.
+    for (sym, owner_ix) in &loop_owner {
+        if vetoed.contains(sym) {
+            continue;
+        }
+        let mut outside = MentionScan::default();
+        for (ix, stmt) in body.stmts.iter().enumerate() {
+            if ix != *owner_ix {
+                outside.visit_stmt(stmt);
+            }
+        }
+        if outside.mentioned.contains(sym) {
+            vetoed.insert(*sym);
+        }
+    }
+
+    let admitted: HashSet<Symbol> = candidates
         .into_keys()
         .filter(|sym| !vetoed.contains(sym))
         // Lambda-shadow guard: if the CALLEE name is bound anywhere in
@@ -324,5 +436,14 @@ pub(crate) fn collect_sweepable_dict_locals(
                 .get(sym)
                 .is_none_or(|callee| !bound_anywhere.contains(callee))
         })
-        .collect()
+        .collect();
+    let loop_rebind: HashSet<Symbol> = admitted
+        .iter()
+        .copied()
+        .filter(|sym| loop_owner.contains_key(sym))
+        .collect();
+    DictSweepPlan {
+        at_exit: admitted,
+        loop_rebind,
+    }
 }
