@@ -2717,6 +2717,36 @@ impl Compiler<'_> {
             let val = builder.use_var(var);
             let _ = self.compile_call_by_name(builder, "nsl_tensor_free_if_valid", &[val]);
         }
+
+        // Dict-local pass (the aggregate-lifetime gap, 2026-07-28). A
+        // tensor-valued dict local owns its stored tensors outright — every
+        // read CLONES (compile_subscript's Dict arm), so no borrow of a
+        // stored tensor exists anywhere and freeing the dict with its
+        // values cannot free anything reachable. Only symbols the
+        // conservative usage scan admitted are freed here (single top-level
+        // call binding — so the slot dominates every return that can see it
+        // in `state.variables` — subscript reads only, never
+        // returned/passed/stored-into); see dict_lifetime.rs for the veto
+        // rules. An unscanned body has an empty set: status quo, the dict
+        // strands (leak, not crash).
+        let dict_locals: Vec<_> = state
+            .variables
+            .iter()
+            .filter(|(sym, _)| state.sweepable_dict_locals.contains(sym))
+            .filter(|(sym, _)| !state.param_symbols.contains(sym))
+            .filter_map(|(_, (var, cl_type))| {
+                if *cl_type == cl_types::I64 {
+                    Some(*var)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for var in dict_locals {
+            let val = builder.use_var(var);
+            let _ =
+                self.compile_call_by_name(builder, "nsl_dict_free_tensor_values", &[val]);
+        }
     }
 
     pub(crate) fn free_tensor_temporaries(
