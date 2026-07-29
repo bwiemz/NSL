@@ -1964,7 +1964,24 @@ impl Compiler<'_> {
                     let val_is_ptr = builder.func.dfg.value_type(final_val) == cl_types::I64;
                     if val_is_ptr && rhs_ty.is_tensor() && !state.flags.in_dtype_method {
                         use crate::ownership_expr::Ownership;
-                        match self.get_ownership(state, final_val) {
+                        // Upgrade Unknown to Owned when the RHS is a call
+                        // contractually returning an owning ref — the exact
+                        // twin of the Return handler's upgrade above (ELTLS
+                        // §6.5). Without it, `x = self.norm.forward(x)`
+                        // (model-method results carry no ELTLS registration)
+                        // took the conservative retain below and double-owned
+                        // the result: the variable's single release left one
+                        // reference behind — one stranded block per
+                        // assignment, measured as the final-norm strand on
+                        // every Coder-50M forward (the `x = ...` twin of the
+                        // `return rmsnorm(...)` leak).
+                        let mut own = self.get_ownership(state, final_val);
+                        if matches!(own, Ownership::Unknown)
+                            && self.expr_call_returns_owning_ref(value)
+                        {
+                            own = Ownership::Owned;
+                        }
+                        match own {
                             Ownership::Owned => {
                                 self.consume_ownership(state, final_val);
                             }

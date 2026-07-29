@@ -1225,7 +1225,13 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
     if tensor_ptr == 0 { return; }
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    tensor.refcount.fetch_add(1, Ordering::SeqCst);
+    let prev = tensor.refcount.fetch_add(1, Ordering::SeqCst);
+    if tensor_trace_on() {
+        eprintln!(
+            "[tensor-trace] retain t={:#x} data={:p} rc_pre={}",
+            tensor_ptr, tensor.data, prev
+        );
+    }
 }
 
 /// Decrement refcount without freeing (paired with nsl_tensor_retain).
@@ -1302,6 +1308,12 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
             if data_owner != 0 {
                 let owner = NslTensor::from_ptr(data_owner);
                 let owner_prev = owner.refcount.fetch_sub(1, Ordering::SeqCst);
+                if tensor_trace_on() {
+                    eprintln!(
+                        "[tensor-trace] deref-owner t={data_owner:#x} data={:p} rc_pre={owner_prev}",
+                        owner.data
+                    );
+                }
                 if owner_prev == 1 {
                     // Owner's last reference gone — free the owner's data
                     if owner.owns_data != 0 {

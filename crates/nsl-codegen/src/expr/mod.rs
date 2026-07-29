@@ -537,6 +537,37 @@ impl Compiler<'_> {
                             | "cumsum"
                             | "argmax"
                             | "causal_mask"
+                            // The stdlib RETURN-position builtins (Coder-50M
+                            // TransformerBlock residual, 2026-07-28). A
+                            // compiled fn's Return arm retains any result it
+                            // cannot prove owning, so `return rmsnorm(...)` /
+                            // `return dropout(...)` double-owned their fresh
+                            // outputs: the caller's single free left rc=1 and
+                            // the block stranded — 4 blocks per TB call (two
+                            // RMSNorm outputs + two eval-dropout clones), 32
+                            // of Coder-50M's +33 blocks/forward. Same class
+                            // as the scaled_dot_product_attention entry
+                            // above. Per-runtime verification:
+                            // - rmsnorm → nsl_tensor_rmsnorm: fresh via
+                            //   gpu_rmsnorm_f32 / publish on CPU; frees its
+                            //   own contiguous/device temps.
+                            // - dropout → nsl_tensor_dropout: eval/p==0
+                            //   returns nsl_tensor_clone, which ALWAYS
+                            //   allocates ("clone always allocates to
+                            //   maintain memory accounting invariants");
+                            //   training paths are fresh kernel outputs. The
+                            //   codegen-level `.clone()` FBIP elision does
+                            //   not apply — this free-function form always
+                            //   reaches the runtime FFI.
+                            // - layernorm/bias_add/embedding_lookup →
+                            //   publish-fresh on every path; gather → fresh
+                            //   on GPU and CPU (create_tensor_with_shape).
+                            | "rmsnorm"
+                            | "dropout"
+                            | "layernorm"
+                            | "bias_add"
+                            | "gather"
+                            | "embedding_lookup"
                     );
                 }
                 // Method-form calls. `y.sum()` parses as Call with a
