@@ -111,3 +111,46 @@ are identical across scales. To go bigger, edit `config.nsl`:
 Every such variant inherits the validated FASE pipeline from
 `coder500m` — the numerics, the hook, the two-phase clip, the
 bias-correction scalars, the leak-free accumulate.
+
+## Reading the cert curves: this is a compute-limited budget
+
+`config.nsl`'s pretrain schedule sizes the *memory* demo, not a
+compute-optimal recipe.
+
+| | value |
+|---|---|
+| tokens / optimizer step | `batch 1 × accum 8 × seq 2048` = **16,384** |
+| total steps | 150,000 |
+| **total token budget** | **~2.46B** |
+| Chinchilla-ish compute-optimal for 7.2B params (~20 tok/param) | ~144B |
+| **fraction of compute-optimal** | **~1.7%** (about 59x short) |
+
+At this budget a 7B model is far into the under-trained regime — a 1B
+model on the same token count would be strictly better. The schedule
+exists so the FASE plan can be inspected and (on ≥80 GB hardware)
+executed at 7B tensor widths; it is not a recipe for a usable 7B model.
+Uniform-baseline loss over the 49,152-token vocab is
+`ln(49152) = 10.80` nats; treat monotone descent and stable VRAM as the
+signal, not the absolute value.
+
+`PRETRAIN_LR = 3e-4` at a 16,384-token effective batch is aggressive for
+the same reason as `coder1b` — see that README's section for the
+reference points and the two levers.
+
+## Weight decay applies to every parameter
+
+As in `coder1b`: `AdamW(weight_decay=0.1)` is a single scalar over all
+trainable parameters, RMSNorm gains and the tied embedding included. NSL's
+train-block optimizer DSL has no parameter groups, so the usual
+decay-2-D-weights-only convention cannot be expressed. See
+`models/coder1b/README.md` for the details and for the existing
+`muon_roles.rs` classification that a fix would build on.
+
+## Packed corpora
+
+`model.nsl` exposes `forward_train_packed(input_ids, segment_ids,
+position_ids, training)` for `DataLoader(..., packing=true)` streams —
+document-masked attention plus per-document RoPE position reset. The
+unpacked `forward_train` on a packed stream attends across document
+boundaries. `pretrain_fase.nsl` stays unpacked on purpose: its corpus is a
+single repeated token with no document structure.

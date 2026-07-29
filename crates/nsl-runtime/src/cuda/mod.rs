@@ -4984,7 +4984,12 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let vocab_size = unsafe { *weight.shape.add(0) } as u64;
     let embed_dim = unsafe { *weight.shape.add(1) } as u64;
     let seq_len = unsafe { *indices.shape.add(0) } as u64;
-    let _ = vocab_size; // bounds checked by CPU fallback before we get here
+    // Host-resident indices are bounds-checked by `nsl_tensor_embedding_lookup`
+    // before it dispatches here (it does NOT fall through to the CPU loop on
+    // this arm — an earlier comment here claimed otherwise and was wrong).
+    // Indices that are ALREADY device-resident remain unchecked: validating
+    // them needs a D2H copy plus a sync per lookup.
+    let _ = vocab_size;
 
     let out_elems = (seq_len * embed_dim) as usize;
     let out_data = inner::alloc_managed(out_elems * 4); // f32 = 4 bytes

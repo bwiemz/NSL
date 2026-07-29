@@ -486,8 +486,8 @@ fn csla_parity_packed_mha_gpu_fused() {
         true,
         "packed_mha_gpu",
         &[(
-            "GroupedQueryAttention(64, 2, 1, 32, 0.0)",
-            "GroupedQueryAttention(64, 2, 2, 32, 0.0)",
+            "GroupedQueryAttention(64, 2, 1, 32, 0.0, 1024, 10000.0, 2)",
+            "GroupedQueryAttention(64, 2, 2, 32, 0.0, 1024, 10000.0, 2)",
         )],
         &[],
         8,
@@ -525,8 +525,8 @@ fn csla_parity_packed_mha_gpu_selective_carry() {
         true,
         "packed_mha_sel_gpu",
         &[(
-            "GroupedQueryAttention(64, 2, 1, 32, 0.0)",
-            "GroupedQueryAttention(64, 2, 2, 32, 0.0)",
+            "GroupedQueryAttention(64, 2, 1, 32, 0.0, 1024, 10000.0, 2)",
+            "GroupedQueryAttention(64, 2, 2, 32, 0.0, 1024, 10000.0, 2)",
         )],
         &["--checkpoint-selective"],
         8,

@@ -7,7 +7,19 @@ from nsl.nn.rope import RotaryEmbedding
 # projection widths (wq/wk/wv/wo). When the original model has `n_heads * head_dim ==
 # d_model`, callers pass `d_model // n_heads` and the layout is unchanged; after CEP
 # head pruning, `n_heads * head_dim < d_model` and the projections become rectangular.
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
+#
+# `max_seq_len` and `rope_theta` are EXPLICIT too: they used to be hardcoded
+# here as (1024, 10000.0), which silently overrode every caller's RoPE
+# configuration — models declaring `ROPE_THETA = 500000.0` trained at 10000.0,
+# and a model with `MAX_SEQ_LEN = 2048` got a 1024-row rotary table.
+#
+# `n_layers` is the model's total block count, used ONLY to scale the output
+# projection `wo` by 1/sqrt(2 * n_layers) — the GPT-2 residual-stream
+# initialization. Both sublayers that write into the residual stream get it
+# (attention `wo` here, FFN `w_down` in the model files); scaling only one
+# leaves half the residual contributions un-damped, which shows up as
+# early-training instability at depth.
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float, max_seq_len: int, rope_theta: float, n_layers: int):
     # Store dims as tensor fields for method access
     _d_model: Tensor = full([1], float(d_model))
     _n_heads: Tensor = full([1], float(n_heads))
@@ -22,10 +34,12 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
     wq: Tensor = randn([d_model, n_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_heads * head_dim)))
     wk: Tensor = randn([d_model, n_kv_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * head_dim)))
     wv: Tensor = randn([d_model, n_kv_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * head_dim)))
-    wo: Tensor = randn([n_heads * head_dim, d_model]) * sqrt(full([1], 2.0 / float(n_heads * head_dim + d_model)))
+    # wo writes into the residual stream, so it carries the same
+    # 1/sqrt(2 * n_layers) depth scale as the FFN's down projection.
+    wo: Tensor = randn([n_heads * head_dim, d_model]) * sqrt(full([1], 2.0 / float(n_heads * head_dim + d_model))) * full([1], 1.0 / sqrt(full([1], float(2 * n_layers))).item())
 
-    # RoPE
-    rope: RotaryEmbedding = RotaryEmbedding(head_dim, 1024, 10000.0)
+    # RoPE — configured by the caller, not hardcoded.
+    rope: RotaryEmbedding = RotaryEmbedding(head_dim, max_seq_len, rope_theta)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
         let s = x.shape

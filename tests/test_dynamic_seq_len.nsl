@@ -15,9 +15,9 @@ model SwiGLUFFN(d_model: int, d_ff: int):
         let up = x @ self.w_up
         return (gate * up) @ self.w_down
 
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, max_seq_len: int, rope_theta: float, n_layers: int):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, 0.0)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, 0.0, max_seq_len, rope_theta, n_layers)
     ffn_norm: RMSNorm = RMSNorm(d_model)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff)
 
@@ -27,7 +27,7 @@ model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: in
 
 model TinyCoder:
     embed: Tensor = randn([256, 64])
-    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 16, 176)
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 16, 176, 1024, 10000.0, 2)
     norm: RMSNorm = RMSNorm(64)
 
     fn forward(self, input_ids: Tensor) -> Tensor:

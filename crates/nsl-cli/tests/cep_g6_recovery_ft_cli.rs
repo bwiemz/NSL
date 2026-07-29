@@ -137,11 +137,29 @@ fn cep_pruned_artifacts_compile_recovery_ft() {
          recovery FT has nothing to compile otherwise.\nSource head:\n{}",
         &pruned_src_text[..pruned_src_text.len().min(400)]
     );
-    // The fixture's baseline ctor is `TransformerBlock(64, 4, 2, 16, 128, 0.1)`.
-    // SP2 must have rewritten at least one of (n_heads=4, n_kv_heads=2, d_ff=128)
-    // — otherwise the round-trip is a no-op and the recovery-FT claim is
-    // structurally meaningless.
+    // SP2 must have rewritten at least one of (n_heads=4, n_kv_heads=2,
+    // d_ff=128) — otherwise the round-trip is a no-op and the recovery-FT
+    // claim is structurally meaningless.
+    //
+    // This literal is a copy of the fixture's ctor, so it goes stale the
+    // moment that ctor's argument list changes. A stale literal does not fail
+    // — `!contains` succeeds trivially against a ctor it can no longer match,
+    // and the no-op detector silently stops detecting. So assert the BASELINE
+    // source still contains it first: that turns a stale literal into a loud
+    // failure instead of a vacuous pass.
+    //
+    // (`cep_canonical_with_train.nsl` declares its own local TransformerBlock
+    // rather than importing the stdlib one, so the max_seq_len / rope_theta /
+    // n_layers threading did not touch it — but nothing said so, and nothing
+    // would have complained if it had.)
+    let baseline_src_text = fs::read_to_string(canonical_with_train_fixture()).unwrap();
     let baseline_ctor = "TransformerBlock(64, 4, 2, 16, 128, 0.1)";
+    assert!(
+        baseline_src_text.contains(baseline_ctor),
+        "the baseline ctor `{baseline_ctor}` is not in the fixture any more — \
+         update it together with the TransformerBlock signature, or the no-op \
+         check below passes vacuously"
+    );
     assert!(
         !pruned_src_text.contains(baseline_ctor),
         "SP2-emitted source still has the baseline ctor `{baseline_ctor}` — \

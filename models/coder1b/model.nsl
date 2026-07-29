@@ -15,6 +15,14 @@ from nsl.nn.norms import RMSNorm
 from nsl.nn.gqa import GroupedQueryAttention
 
 # ─── Architecture constants (inlined from config.nsl) ───
+#
+# These MUST agree with config.nsl. They are duplicated rather than imported
+# because NSL `const`s are not in scope inside model field initializers or
+# array-size positions (`[TransformerBlock; N_LAYERS]` does not parse), so the
+# literals below are the only form the compiler accepts. The duplication is
+# held honest by the drift gate in
+# `crates/nsl-cli/tests/model_config_drift.rs`, which parses config.nsl and
+# model.nsl and fails if any of these disagree.
 const VOCAB_SIZE = 49152
 const D_MODEL = 2048
 const N_LAYERS = 16
@@ -23,15 +31,16 @@ const N_KV_HEADS = 8
 const HEAD_DIM = 64
 const D_FF = 8192
 const MAX_SEQ_LEN = 2048
+const ROPE_THETA = 500000.0
 const DROPOUT = 0.0
 
 # ─── SwiGLU Feedforward ───
-# d_down scaled by 1/sqrt(2*N_LAYERS) = 1/sqrt(32) for residual stability
-model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+# w_down scaled by 1/sqrt(2*n_layers) for residual stream stability.
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float, n_layers: int):
     w_gate: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
     w_up: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
-    # Down projection scaled by 1/sqrt(2*N_LAYERS) for residual stream stability
-    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], 32.0)).item())
+    # Down projection scaled by 1/sqrt(2*n_layers) for residual stream stability
+    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], float(2 * n_layers))).item())
     _dropout_p: Tensor = full([1], dropout_p)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
@@ -43,14 +52,21 @@ model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
 # ─── Pre-norm Transformer Block ───
 # x -> RMSNorm -> GQA -> residual -> RMSNorm -> SwiGLU -> residual
 
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float, max_seq_len: int, rope_theta: float, n_layers: int):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p, max_seq_len, rope_theta, n_layers)
     ffn_norm: RMSNorm = RMSNorm(d_model)
-    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p, n_layers)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
         let h = x + self.attn.forward(self.attn_norm.forward(x), training)
+        return h + self.ffn.forward(self.ffn_norm.forward(h), training)
+
+    # Packed variant: attention masking + RoPE positions come from the
+    # DataLoader's segment/position metadata, so documents packed into one
+    # row never attend across their boundaries.
+    fn forward_packed(self, x: Tensor, segment_ids: Tensor, position_ids: Tensor, training: bool) -> Tensor:
+        let h = x + self.attn.forward_packed(self.attn_norm.forward(x), segment_ids, position_ids, training)
         return h + self.ffn.forward(self.ffn_norm.forward(h), training)
 
 # ─── NSL-Coder-1B ───
@@ -58,7 +74,10 @@ model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: in
 
 model NSLCoder:
     embed: Tensor = randn([49152, 2048]) * full([1], 0.02)
-    blocks: [TransformerBlock; 16] = TransformerBlock(2048, 32, 8, 64, 8192, 0.0)
+    # Positional args mirror the const block above:
+    #   D_MODEL, N_HEADS, N_KV_HEADS, HEAD_DIM, D_FF, DROPOUT,
+    #   MAX_SEQ_LEN, ROPE_THETA, N_LAYERS
+    blocks: [TransformerBlock; 16] = TransformerBlock(2048, 32, 8, 64, 8192, 0.0, 2048, 500000.0, 16)
     norm: RMSNorm = RMSNorm(2048)
 
     fn forward(self, input_ids: Tensor) -> Tensor:
@@ -86,3 +105,27 @@ model NSLCoder:
         let emb = embedding_lookup(self.embed, flat_ids)
         let emb_3d = emb.reshape([batch_size, seq_len, 2048])
         return self.forward_core(emb_3d, training)
+
+    # ─── Packed (document-aware) entry points ───
+    #
+    # Same math as forward_core/forward_train except that attention is masked
+    # to each document and RoPE positions RESET at every document boundary.
+    # Drive these from a `DataLoader(..., packing=true, pack_separator=<id>)`
+    # and pass `batch.segment_ids` / `batch.position_ids` straight through:
+    # without them a packed token stream trains with cross-document causal
+    # attention, which is not what a packed corpus means.
+    fn forward_core_packed(self, emb_3d: Tensor, segment_ids: Tensor, position_ids: Tensor, training: bool) -> Tensor:
+        let x = emb_3d
+        for block in self.blocks:
+            x = block.forward_packed(x, segment_ids, position_ids, training)
+        x = self.norm.forward(x)
+        return x @ self.embed.transpose(0, 1)
+
+    fn forward_train_packed(self, input_ids: Tensor, segment_ids: Tensor, position_ids: Tensor, training: bool) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let emb_3d = emb.reshape([batch_size, seq_len, 2048])
+        return self.forward_core_packed(emb_3d, segment_ids, position_ids, training)

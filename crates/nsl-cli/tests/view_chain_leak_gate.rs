@@ -116,7 +116,7 @@ fn gqa_src(calls: usize) -> String {
     let mut s = String::from(
         r#"
 from nsl.nn.gqa import GroupedQueryAttention
-let g = GroupedQueryAttention(512, 8, 4, 64, 0.1)
+let g = GroupedQueryAttention(512, 8, 4, 64, 0.1, 1024, 10000.0, 1)
 g.to(cuda)
 let x = full([2, 1024, 512], 1.0).to(cuda)
 "#,

@@ -17,7 +17,7 @@ from nsl.nn.losses import cross_entropy
 model Blk:
     norm_a: Tensor = ones([128])
     norm_f: Tensor = ones([128])
-    attn: GroupedQueryAttention = GroupedQueryAttention(128, 2, 1, 64, 0.0)
+    attn: GroupedQueryAttention = GroupedQueryAttention(128, 2, 1, 64, 0.0, 1024, 10000.0, 4)
     w_up: Tensor = randn([128, 256]) * 0.08
     w_down: Tensor = randn([256, 128]) * 0.08
 

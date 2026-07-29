@@ -1,30 +1,64 @@
+# Rotary frequency table: `emb[p, :] = concat(p * inv_freq, p * inv_freq)`
+# for p in [0, max_seq_len), i.e. the [max_seq_len, dim] argument that cos/sin
+# are taken over.
+#
+# This is a FREE function, not a method, because model field initializers
+# cannot reference sibling fields (`self.inv_freq` is not in scope while the
+# struct is still being built) — so the cached tables below and `inv_freq`
+# must each derive the frequencies from the constructor arguments. Keeping
+# that derivation in one place is the point of the function.
+fn rope_freq_table(dim: int, max_seq_len: int, theta: float) -> Tensor:
+    let inv_freq = exp(arange(0.0, float(dim), 2.0) * (-1.0 * log(theta) / float(dim)))
+    let half_d = dim // 2
+    let t2 = arange(0.0, float(max_seq_len)).reshape([max_seq_len, 1])
+    let inv2 = inv_freq.reshape([1, half_d])
+    let freqs = t2 @ inv2
+    let tensors = [freqs, freqs]
+    return tensor_cat(tensors, 1)
+
 model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
     # Precompute inverse frequencies: theta^(-2i/d) for i in [0, dim/2)
-    # Using exp(-log(theta) * indices / dim) since ** is scalar-only
+    # Using exp(-log(theta) * indices / dim) since ** is scalar-only.
+    # Still needed by forward_with_positions(), whose positions are per-token
+    # and therefore not a prefix of the cached table.
     inv_freq: Tensor = exp(arange(0.0, float(dim), 2.0) * (-1.0 * log(theta) / float(dim)))
     _dim: Tensor = full([1], float(dim))
     _half_dim: Tensor = full([1], float(dim) / 2.0)
 
+    # Cached cos/sin over the full [max_seq_len, dim] position grid, built
+    # ONCE at construction. `forward` gathers the first `seq_len` rows instead
+    # of rebuilding arange -> outer product -> cat -> cos/sin on every call —
+    # that chain used to run twice per attention layer (Q and K), i.e. 2 *
+    # n_layers times per model forward.
+    #
+    # The `_` prefix keeps these out of the trainable parameter set
+    # (`is_trainable_param_leaf_name` in nsl-codegen), so they get no
+    # gradient, no AdamW moments, and no weight decay — they are derived
+    # constants, not weights.
+    _cos_table: Tensor = tensor_cos(rope_freq_table(dim, max_seq_len, theta))
+    _sin_table: Tensor = tensor_sin(rope_freq_table(dim, max_seq_len, theta))
+
     fn forward(self, x: Tensor, seq_len: int) -> Tensor:
         # x shape: [batch, heads, seq, head_dim]
-        let half_d = int(self._half_dim.item())
         let d = int(self._dim.item())
 
-        # Build position indices: [seq_len]
-        let t = arange(0.0, float(seq_len))
-
-        # Outer product: freqs[seq, dim/2] = t[:, None] * inv_freq[None, :]
-        let t2 = t.reshape([seq_len, 1])
-        let inv2 = self.inv_freq.reshape([1, half_d])
-        let freqs = t2 @ inv2
-
-        # Duplicate for full head_dim: [seq, dim]
-        let tensors = [freqs, freqs]
-        let emb = tensor_cat(tensors, 1)
-
-        # Compute cos and sin: [seq, dim]
-        let cos_emb = tensor_cos(emb)
-        let sin_emb = tensor_sin(emb)
+        # Rows 0..seq_len of the cached tables. This is a row GATHER, not a
+        # slice: `PrimalOp::Slice` bakes its bounds in as compile-time
+        # constants, so a runtime `seq_len` cannot be expressed through it,
+        # while `embedding_lookup` takes its indices as a runtime tensor and
+        # is already a first-class source-AD op. Bit-exact with the former
+        # recompute (verified: sum of squared differences == 0).
+        #
+        # `seq_len > max_seq_len` is now a real constraint — the old per-call
+        # rebuild worked at any length. It is enforced by the host-resident
+        # bounds check in `nsl_tensor_embedding_lookup`, which aborts naming
+        # the offending index rather than reading past the table; there is no
+        # separate `_max_seq_len` field because the table's own row count is
+        # the authority. Gated by `rope_cache_gate::
+        # sequence_longer_than_max_seq_len_refuses`.
+        let pos = arange(0.0, float(seq_len))
+        let cos_emb = embedding_lookup(self._cos_table, pos)
+        let sin_emb = embedding_lookup(self._sin_table, pos)
 
         # Reshape for broadcasting: [1, 1, seq, dim]
         let cos_4d = cos_emb.reshape([1, 1, seq_len, d])
@@ -38,9 +72,17 @@ model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
     # rotary position to 0 at each document start (the DataLoader emits
     # `position_ids` = index-within-document alongside `segment_ids`).
     #
-    # Grad structure is IDENTICAL to forward(): position_ids is a
-    # non-differentiable leaf exactly as arange's output is, and the
-    # cos/sin chain reuses the same cat/cos/sin/mul ops — no new AD rules.
+    # position_ids is a non-differentiable leaf exactly as arange's output
+    # is, and the cos/sin chain uses only cat/cos/sin/mul ops — no new AD
+    # rules.
+    #
+    # This path deliberately still BUILDS the table per call rather than
+    # gathering from `_cos_table`/`_sin_table` like `forward` does. A gather
+    # would be valid arithmetic (position_ids are integer positions, so they
+    # index the same table rows), but the packed path's op sequence is what
+    # `pca_rope` / the segment-masked flash kernel selection match on, and
+    # that selection is gated on GPU hardware this change was not measured
+    # against. Left as-is on purpose; see the campaign notes.
     fn forward_with_positions(self, x: Tensor, position_ids: Tensor) -> Tensor:
         # x: [batch, heads, seq, head_dim]; position_ids: [batch, seq]
         let s = x.shape
