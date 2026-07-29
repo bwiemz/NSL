@@ -568,6 +568,24 @@ impl Compiler<'_> {
                             | "bias_add"
                             | "gather"
                             | "embedding_lookup"
+                            // The remaining sampling family (device-blind
+                            // sampling fix, 2026-07-28). `return
+                            // multinomial(x, 1)` / `return lt_scalar(x, p)`
+                            // took the Unknown arm and double-owned — 1
+                            // strand per call each (sampling_device_gate).
+                            // Per-runtime verification:
+                            // - lt_scalar → nsl_tensor_lt_scalar: fresh via
+                            //   create_tensor_with_shape_rs_dtype; the GPU
+                            //   arm returns the fresh upload from
+                            //   redirect_gpu_input_to_host.
+                            // - multinomial → nsl_tensor_multinomial: fresh
+                            //   via create_tensor_with_shape_rs; GPU arm as
+                            //   above.
+                            // `topk` is deliberately ABSENT: it returns a
+                            // DICT handle, not a tensor — listing it would
+                            // hand the dict to nsl_tensor_free.
+                            | "lt_scalar"
+                            | "multinomial"
                     );
                 }
                 // Method-form calls. `y.sum()` parses as Call with a

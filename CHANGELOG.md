@@ -6,7 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Fixed — Coder-50M pure-inference forward no longer leaks AT ALL (roadmap item 1 complete)
+### Fixed — sampling builtins no longer segfault on GPU tensors
+
+- **`topk` / `multinomial` / `argmax` / `cumsum` / `lt_scalar` accepted GPU
+  tensors and dereferenced their device pointers on the host** — an
+  immediate SIGSEGV. This is the entire tensor-input surface of
+  `sampling.rs`, and it is exactly what `stdlib/nsl/inference/sampling.nsl`
+  (`sample_greedy` / `sample_top_k` / `sample_top_p`) feeds with
+  GPU-resident logits, so *every* sampling strategy crashed on a model
+  living on the GPU. Reproduced on all five ops (RTX 5070 Ti, CUDA 13.3).
+- Fixed with the established CPU-redirect idiom (`nsl_tensor_gather`'s
+  non-dim-0 arm): GPU inputs are staged through the host and results are
+  handed back on the input's device, tape paused across the redirect. The
+  f32→f64→f32 round trip is value-exact; sampling tensors are vocab-sized,
+  so the transfer cost is noise next to a forward pass.
+- **`return multinomial(...)` / `return lt_scalar(...)` double-owned** —
+  both were missing from the owning-ref allowlist (the `return rmsnorm`
+  class), stranding one block per call from a user fn. Added with
+  per-runtime verification; `topk` deliberately stays out (it returns a
+  dict handle, not a tensor).
+- New gate `sampling_device_gate.rs` (5 tests): per-primitive CPU/GPU exact
+  parity, the stdlib chain end-to-end on GPU logits, redirect
+  leak-cleanliness, the return-position double-own, and a pin on the
+  PRE-EXISTING `topk` dict strand (below). Crash + double-own gates
+  mutation-proven red against their reverted fixes.
+- **Surfaced, pre-existing, now measured and pinned (not fixed here):**
+  (a) `topk`'s result dict owns its `values`/`indices` tensors and no
+  codegen path ever frees non-DataLoader dict locals — ~79 MB/call resident
+  growth in a CPU `topk(x, 1M)` loop, 2 VRAM blocks/call on GPU (the
+  aggregate-lifetime gap); (b) most builtin dispatch arms compile arguments
+  with `compile_expr`, so a NESTED call's fresh result (`sum(cumsum(g,-1))`)
+  never registers as a statement temporary and strands 1 block/call,
+  device-independent (76 arms affected). Both are queued as their own
+  items.
 
 - **The remaining +33 blocks / +132 MB per forward is closed: per-call growth
   is now ZERO** (154 blocks / 216 MB at N=1 and N=3, RTX 5070 Ti). At the
