@@ -257,6 +257,20 @@ impl<'a> TypeChecker<'a> {
                                 device: device.clone(),
                             };
                         }
+                        // `expand` takes a target-shape list exactly like
+                        // `reshape`, but legitimately CHANGES the element
+                        // count (broadcasting size-1 dims), so no product
+                        // proof — the shape is taken as declared.
+                        // `extract_shape_from_args` degrades to an unknown
+                        // shape for non-literal lists.
+                        "expand" => {
+                            let target_shape = self.extract_shape_from_args(args);
+                            return Type::Tensor {
+                                shape: target_shape,
+                                dtype: *dtype,
+                                device: device.clone(),
+                            };
+                        }
                         "transpose" => {
                             if let Type::Tensor { shape, dtype, device } = &obj_ty {
                                 if shape.rank() >= 2 && args.len() >= 2 {
@@ -446,6 +460,24 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Result type of a shape-CHANGING tensor view method (`expand`,
+    /// `unsqueeze`, `select`, `slice`): tensor-like, receiver's dtype and
+    /// device, unknown shape. Param/Buffer receivers keep their wrapper type
+    /// whole (with the receiver's — now stale — shape), which is the existing
+    /// `reshape` convention; shape fidelity is not load-bearing there, but
+    /// NOT being `Type::Unknown` is (codegen ownership tracking filters on
+    /// the result type).
+    fn view_result_type(obj_ty: &Type) -> Type {
+        match obj_ty {
+            Type::Tensor { dtype, device, .. } => Type::Tensor {
+                shape: crate::types::Shape::unknown(),
+                dtype: *dtype,
+                device: device.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     pub(crate) fn check_member_access(&mut self, object: &Expr, member: Symbol, span: Span) -> Type {
         let obj_ty = self.check_expr(object);
 
@@ -517,6 +549,64 @@ impl<'a> TypeChecker<'a> {
                     "transpose" => Type::Function {
                         params: vec![Type::Int, Type::Int],
                         ret: Box::new(obj_ty.clone()),
+                        effect: Effect::Inferred,
+                    },
+                    // ── Rest of the shape/view method family (roadmap item 1
+                    // residual, 2026-07-28). ──
+                    //
+                    // These were absent, so a call on any of them fell to the
+                    // `_ => Type::Unknown` arm below and every LATER link of a
+                    // method chain was typed Unknown. An Unknown-typed chain
+                    // link is invisible to codegen ownership tracking
+                    // (`track_owned_tensor_expr_result` filters on the result
+                    // type), so the link's handle stranded — measured 4 GPU
+                    // blocks per `GroupedQueryAttention::forward` call, 2 per
+                    // `expand(..).contiguous().reshape(..)` chain: the expand
+                    // view pinning the RoPE output block, plus the contiguous
+                    // materialisation itself.
+                    //
+                    // Arity mirrors the codegen dispatch arms in
+                    // `compile_tensor_method_call` (nsl-codegen/src/expr/
+                    // advanced.rs), which reject other counts at compile time.
+                    //
+                    // `contiguous` and `cumsum` preserve shape, dtype and
+                    // device exactly, so they return the receiver's own type —
+                    // same convention as `reshape`/`transpose` above.
+                    "contiguous" => Type::Function {
+                        params: vec![],
+                        ret: Box::new(obj_ty.clone()),
+                        effect: Effect::Inferred,
+                    },
+                    "cumsum" => Type::Function {
+                        params: vec![Type::Int],
+                        ret: Box::new(obj_ty.clone()),
+                        effect: Effect::Inferred,
+                    },
+                    // Shape-changing: the result is tensor-like with the
+                    // receiver's dtype/device but an unknown shape. (`expand`
+                    // gets its exact target shape at the call site — the
+                    // "Tensor method shape inference" block in `check_call` —
+                    // exactly as `reshape` does.) For Param/Buffer receivers,
+                    // fall back to the receiver type whole, preserving the
+                    // wrapper as `reshape` has always done.
+                    "expand" => Type::Function {
+                        params: vec![Type::List(Box::new(Type::Int))],
+                        ret: Box::new(Self::view_result_type(&obj_ty)),
+                        effect: Effect::Inferred,
+                    },
+                    "unsqueeze" => Type::Function {
+                        params: vec![Type::Int],
+                        ret: Box::new(Self::view_result_type(&obj_ty)),
+                        effect: Effect::Inferred,
+                    },
+                    "select" => Type::Function {
+                        params: vec![Type::Int, Type::Int],
+                        ret: Box::new(Self::view_result_type(&obj_ty)),
+                        effect: Effect::Inferred,
+                    },
+                    "slice" => Type::Function {
+                        params: vec![Type::Int, Type::Int, Type::Int],
+                        ret: Box::new(Self::view_result_type(&obj_ty)),
                         effect: Effect::Inferred,
                     },
                     "clone" => Type::Function {
