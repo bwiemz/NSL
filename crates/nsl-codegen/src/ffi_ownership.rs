@@ -132,15 +132,40 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     // was one of the documented absences the old KNOWN-WRONG comment
     // carried.
     m.insert("nsl_tensor_select", OwnedNewResult);
-    // STILL-UNCLASSIFIED raw-callable externs (leak-direction gap, do
-    // not lose this note again): `nsl_tensor_reduce_to_shape`
-    // (ad_ops.rs) and `nsl_tensor_gelu_backward` (activation.rs) are
-    // registered runtime fns reachable by raw-name calls but have no
-    // entry — absence takes the instrumented Unknown fallback (retain →
-    // one stranded block per raw call in return position). Classify them
-    // here WITH a per-runtime freshness read, not by pattern.
+    // The two formerly-unclassified raw-callable externs, each classified
+    // from a per-runtime freshness read (2026-07-29), closing the gap the
+    // old STILL-UNCLASSIFIED note tracked:
+    // - nsl_tensor_reduce_to_shape (ad_ops.rs): every non-degenerate path
+    //   hands back a COUNTED reference the caller must free — the
+    //   same-shape identity path retains grad before returning it (the
+    //   contiguous convention), the reduce paths return fresh
+    //   clone/sum_dim outputs, and the migrate path frees its own
+    //   to_device temp. The null-ARG guard returns grad_ptr unretained,
+    //   but grad_ptr is 0 on the only reachable arm of that guard unless
+    //   target is null, which is a broken upstream invariant already
+    //   reported loudly.
+    // - nsl_tensor_gelu_backward (activation.rs): fresh output on all
+    //   three paths (broadcast-fallback mul result, GPU
+    //   gpu_backward_binary output, CPU elementwise fresh); frees its own
+    //   ones/contiguous/deriv temps.
+    m.insert("nsl_tensor_reduce_to_shape", OwnedNewResult);
+    m.insert("nsl_tensor_gelu_backward", OwnedNewResult);
+    // Dispatch-arm terminals with no allowlist entry (their free-function
+    // results stranded in nested/receiver/statement position until the
+    // v2a dispatch-boundary registration; each read per-runtime
+    // 2026-07-29):
+    // - nsl_tensor_clamp (activation.rs): counted reference on every
+    //   path — the FBIP in-place arms bump the receiver's refcount
+    //   BEFORE returning it (the contiguous convention; both
+    //   can_mutate_inplace predicates are permanently false since
+    //   ad59b929 anyway), the GPU and CPU fallbacks are fresh.
+    // - nsl_tensor_conv2d / nsl_tensor_maxpool2d (tensor/mod.rs): fresh
+    //   on the GPU arm (gpu_conv2d_f32 / gpu_maxpool2d_f32; each frees
+    //   its own contiguous temp) and NslTensor::publish-fresh on CPU.
+    m.insert("nsl_tensor_clamp", OwnedNewResult);
+    m.insert("nsl_tensor_conv2d", OwnedNewResult);
+    m.insert("nsl_tensor_maxpool2d", OwnedNewResult);
     // Scalar-returning
-    
     m.insert("nsl_tensor_item", NotATensor);
     m
 }

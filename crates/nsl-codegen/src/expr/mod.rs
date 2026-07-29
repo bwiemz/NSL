@@ -107,10 +107,20 @@ pub(crate) fn tensor_method_returns_owned_ref(method: &str) -> Option<bool> {
 
         // ── NOT owning. ──
         //
-        // `.clone()` can elide to the receiver under FBIP, and `.to()` hands
-        // back the receiver when the tensor is already on the target device —
-        // neither bumps a refcount, so freeing the result would release a
-        // buffer the named variable still owns.
+        // `.clone()` can elide to the receiver AT COMPILE TIME under FBIP
+        // (the advanced.rs arm may return obj_val without emitting any
+        // FFI), so its result value can be a live binding — never
+        // classify it owning here. `.to()` is subtler: the runtime's
+        // nsl_tensor_to_device RETAINS before returning the receiver on
+        // the same-device path (a counted reference — the previous
+        // "neither bumps a refcount" claim here was stale, re-read
+        // 2026-07-29), but the dtype-argument forms route to
+        // nsl_tensor_{to,from}_custom_dtype whose freshness is
+        // unverified, and model `.to()` returns the model itself. This
+        // static entry stays false; the v2a dispatch-boundary
+        // registration classifies the device-transfer form dynamically
+        // from the FFI actually emitted — the only layer that can tell
+        // the forms apart.
         "clone" | "to" => false,
         // Not tensors: `.item()` yields a scalar, `.shape` an NslList. The
         // caller's tensor-type filter would reject them anyway; they are named
@@ -199,7 +209,16 @@ impl Compiler<'_> {
                 self.compile_binary_op(builder, state, left, *op, right, expr)
             }
             ExprKind::UnaryOp { op, operand } => self.compile_unary_op(builder, state, *op, operand),
-            ExprKind::Call { callee, args } => self.compile_call(builder, state, callee, args, expr),
+            ExprKind::Call { callee, args } => {
+                // ELTLS v2a: after the dispatch returns, classify its result
+                // from the ffi_ownership table when it is provably the fresh
+                // output of the FFI the dispatch emitted — see
+                // register_dispatch_result_ownership for the proof shape.
+                let ffi_counter_before = self.ffi_emission_counter;
+                let result = self.compile_call(builder, state, callee, args, expr)?;
+                self.register_dispatch_result_ownership(builder, state, result, ffi_counter_before);
+                Ok(result)
+            }
             ExprKind::MemberAccess { object, member } => {
                 self.compile_member_access(builder, state, object, *member, expr)
             }
@@ -725,16 +744,32 @@ impl Compiler<'_> {
         expr: &Expr,
         value: Value,
     ) {
-        if !self.expr_call_returns_owning_ref(expr) {
+        // ELTLS v2a: a value the dispatch boundary registered as the fresh
+        // output of a table-classified FFI DURING THIS STATEMENT is an
+        // owning anonymous temporary even when its NSL-level name has no
+        // allowlist entry (the recurring drift class: reduce_max, and every
+        // future arm composing table-listed FFIs). The Call-shape
+        // requirement matters: dispatch_fresh is keyed by Cranelift Value,
+        // and a variable READ can be the same SSA value as its defining
+        // statement's RHS — but an Ident expr never enters here as owning.
+        let dispatch_fresh_call = matches!(expr.kind, ExprKind::Call { .. })
+            && state.cleanup.dispatch_fresh.contains(&value);
+        if !self.expr_call_returns_owning_ref(expr) && !dispatch_fresh_call {
             return;
         }
         if builder.func.dfg.value_type(value) != cl_types::I64 {
             return;
         }
         let ty = self.node_type(expr.id);
+        // For dispatch-fresh values the emission is ground truth — the
+        // table only classifies tensor-returning externs — so an
+        // indeterminate checker type is acceptable (the `expand`-typed-
+        // Unknown lesson). A CONCRETE non-tensor type still refuses:
+        // when the checker and the emission disagree, leak-not-crash.
         let trackable = ty.is_tensor()
             || matches!(ty, Type::Sparse { .. })
-            || (ty.is_indeterminate() && self.expr_is_owning_tensor_method_call(expr));
+            || (ty.is_indeterminate()
+                && (dispatch_fresh_call || self.expr_is_owning_tensor_method_call(expr)));
         if trackable {
             Self::track_tensor_temporary(state, value);
         }

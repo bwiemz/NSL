@@ -608,6 +608,27 @@ pub struct Compiler<'a> {
     /// blocks exist in a single compile unit.
     pub fase_table_counter: u32,
 
+    // ── ELTLS dispatch-boundary ownership registration (spec §6.2 v2a) ─
+    /// The most recent tensor-FFI emission from `compile_call_by_name`:
+    /// the EFFECTIVE extern name actually called (alias-resolved, so
+    /// `tanh` records `nsl_tensor_tanh_act`) and its Cranelift result
+    /// Value. Only non-void calls record. Consulted by
+    /// `register_dispatch_result_ownership` at the `compile_expr` Call
+    /// arm: when a dispatch arm's returned value IS this recorded result
+    /// and the emission happened DURING that dispatch (see the counter
+    /// below), the arm's result is provably the fresh output of that
+    /// extern and can be classified from the ffi_ownership table without
+    /// a per-arm allowlist entry.
+    pub last_ffi_emission: Option<(String, Value)>,
+    /// Monotonic count of `compile_call_by_name` emissions that recorded
+    /// into `last_ffi_emission`. A dispatch wrapper snapshots it before
+    /// delegating and trusts `last_ffi_emission` only if it advanced —
+    /// which forces the record to have been written during THAT dispatch.
+    /// This makes stale matches impossible across statements AND across
+    /// function bodies (Cranelift Value indices restart per function, so
+    /// a stale record could otherwise collide with an unrelated value).
+    pub ffi_emission_counter: u64,
+
     // ── FlashAttention backward side-channel ────────────────────────
     /// Maps the Cranelift Value of a forward SDPA output to (out_val, lse_val)
     /// so the backward lowering can retrieve the logsumexp buffer.
@@ -1074,6 +1095,8 @@ impl<'a> Compiler<'a> {
             vmap: VmapState::new(),
             features: FeatureConfigs::new(options),
             fase_table_counter: 0,
+            last_ffi_emission: None,
+            ffi_emission_counter: 0,
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             sdpa_extra_owned: Vec::new(),
