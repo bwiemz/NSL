@@ -41,6 +41,16 @@ impl Compiler<'_> {
             }
         }
 
+        // ELTLS v2a hardening (review LOW on 838c889d): the trailing
+        // expression is not reached through compile_stmt, so the
+        // per-statement dispatch_fresh clear never runs for it — entries
+        // inserted by the LAST inner statement would still be visible
+        // here, and an identity-shaped tensor-typed dispatch in the
+        // trailing expression could match a live binding's Value.
+        // Unexploitable today (all identity-shaped arms type Void), but
+        // the per-statement invariant should hold structurally, not by
+        // accident of the current arm population.
+        state.cleanup.dispatch_fresh.clear();
         match &block.stmts[block.stmts.len() - 1].kind {
             StmtKind::Expr(expr) => self.compile_expr(builder, state, expr),
             _ => Err(CodegenError::new("block expression must end with a value")),
