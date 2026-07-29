@@ -86,6 +86,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   device-independent (76 arms affected). Both are queued as their own
   items.
 
+### Fixed — CPU tape-mode dropout no longer strands its mask; ref-trace completed
+
+- The CPU tape-recording arm of `nsl_tensor_dropout` published its mask and
+  then bumped it again before recording. The mask is TAPE-ONLY — no caller
+  ever receives it — so the tape takes the publish reference itself and
+  `release_tape_op_refs` frees it exactly once, the accounting the GPU arm
+  has always used. The extra bump stranded one mask tensor per
+  training-mode CPU dropout call (independent-review finding on 1def2b9f).
+  Pinned by `cpu_tape_mode_dropout_mask_refcount_is_exactly_the_tapes`,
+  which asserts the recorded mask's refcount is exactly the tape's one —
+  red before the fix (rc=2), and rc=0 would flag the opposite
+  (use-after-free) direction.
+- `nsl_tensor_release` (decrement-without-free) now emits a
+  `[tensor-trace] release` event under `NSL_DEBUG_MEM_TRACE=1`, closing the
+  last unlogged refcount path (retain/release pairs were half-visible).
+- Investigated, deliberately NOT changed: the review's declared-vs-inferred
+  return-type divergence (a `-> Tensor` method whose return expression is
+  indeterminate skips the callee-side retain). Two candidate reproducers
+  produced correct values and balanced refcounts — the skip is symmetric
+  (the same static type gates both the retain and the sweep), so no
+  demonstrable defect exists to gate a change against, and adding
+  retains/frees without a reproducer is how UAFs get shipped. Recorded as a
+  watch item alongside the ffi_ownership dual-authority refactor.
+
 ### Fixed — Coder-50M pure-inference forward no longer leaks AT ALL (roadmap item 1 complete)
 
 - **The remaining +33 blocks / +132 MB per forward is closed: per-call growth
