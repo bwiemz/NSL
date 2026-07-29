@@ -2592,13 +2592,13 @@ impl Compiler<'_> {
         // M19: Sampling intrinsics
 
         // manual_seed(seed)
-        if func_name == "manual_seed" {
+        if func_name == "manual_seed" && !self.registry.functions.contains_key(&func_name) {
             let seed_val = self.compile_expr(builder, state, &args[0].value)?;
             return self.compile_call_by_name(builder, "nsl_manual_seed", &[seed_val]);
         }
 
         // topk(tensor, k, dim=-1)
-        if func_name == "topk" {
+        if func_name == "topk" && !self.registry.functions.contains_key(&func_name) {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let k_val = self.compile_expr(builder, state, &args[1].value)?;
             let dim_val = if args.len() > 2 {
@@ -2614,7 +2614,7 @@ impl Compiler<'_> {
         }
 
         // multinomial(tensor, num_samples)
-        if func_name == "multinomial" {
+        if func_name == "multinomial" && !self.registry.functions.contains_key(&func_name) {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let n_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(
@@ -2803,7 +2803,7 @@ impl Compiler<'_> {
         }
 
         // argmax(tensor, dim=-1)
-        if func_name == "argmax" {
+        if func_name == "argmax" && !self.registry.functions.contains_key(&func_name) {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = if args.len() > 1 {
                 self.compile_expr(builder, state, &args[1].value)?
@@ -2814,14 +2814,14 @@ impl Compiler<'_> {
         }
 
         // cumsum(tensor, dim)
-        if func_name == "cumsum" {
+        if func_name == "cumsum" && !self.registry.functions.contains_key(&func_name) {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_cumsum", &[tensor_val, dim_val]);
         }
 
         // lt_scalar(tensor, scalar)
-        if func_name == "lt_scalar" {
+        if func_name == "lt_scalar" && !self.registry.functions.contains_key(&func_name) {
             let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
             let scalar_val = self.compile_expr(builder, state, &args[1].value)?;
             // Ensure scalar is f64

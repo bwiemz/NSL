@@ -257,6 +257,22 @@ pub struct FuncState {
     /// scanned — the sweep then adds nothing, which is the pre-existing
     /// leak-not-crash behavior.
     pub sweepable_dict_locals: HashSet<Symbol>,
+    /// The loop-rebind subset of the dict sweep plan: dict locals bound in
+    /// the DIRECT body of a top-level loop, used only inside it. The loop
+    /// lowering zero-predeclares their slot; `compile_var_decl` frees the
+    /// previous iteration's dict before each rebind; the return sweep
+    /// (they are also in `sweepable_dict_locals`) frees the last one.
+    pub dict_loop_rebind: HashSet<Symbol>,
+    /// The syms from `dict_loop_rebind` whose slot the loop lowering
+    /// ACTUALLY zero-predeclared. The rebind clear keys off THIS set, not
+    /// `dict_loop_rebind`: a loop-body decl can shadow a function
+    /// PARAMETER (checker-legal — the body is a child scope), which the
+    /// scan cannot see; the predeclare skips such syms because the slot
+    /// already exists, and a clear keyed on the plan alone would hand the
+    /// caller's tensor to `nsl_dict_free_tensor_values` — memory
+    /// corruption, review HIGH-1 on d114b5d7, reproduced. Keying on the
+    /// inserted set inherits the predeclare's exact skip conditions.
+    pub dict_loop_predeclared: HashSet<Symbol>,
     /// M62 Task 4: controls how `self` and `self.<field>` are lowered
     /// inside model methods. Default is `StructPointer` (existing behavior).
     /// Set to `WeightPtrsArray` by the @export method compiler (Task 6).
@@ -292,6 +308,8 @@ impl FuncState {
             variable_types: HashMap::new(),
             eltls_loop_predeclared: HashSet::new(),
             sweepable_dict_locals: HashSet::new(),
+            dict_loop_rebind: HashSet::new(),
+            dict_loop_predeclared: HashSet::new(),
             self_resolution: SelfResolution::StructPointer,
         }
     }

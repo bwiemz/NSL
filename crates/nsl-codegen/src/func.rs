@@ -143,13 +143,15 @@ impl Compiler<'_> {
             };
 
             // Dict-local tensor lifetime: arm the return sweep's
-            // nsl_dict_free_tensor_values pass for dict locals the usage
-            // scan proves safe (see dict_lifetime.rs).
-            state.sweepable_dict_locals = crate::dict_lifetime::collect_sweepable_dict_locals(
+            // nsl_dict_free_tensor_values pass (and the loop-rebind clear)
+            // for dict locals the usage scan proves safe (dict_lifetime.rs).
+            let dict_plan = crate::dict_lifetime::collect_sweepable_dict_locals(
                 &fn_def.body,
                 |id| self.node_type(id).clone(),
                 |s| self.resolve_sym(s).to_string(),
             );
+            state.sweepable_dict_locals = dict_plan.at_exit;
+            state.dict_loop_rebind = dict_plan.loop_rebind;
 
             // M38b: Set up ownership lowering for this function.
             // When --linear-types is active and the semantic pass produced ownership

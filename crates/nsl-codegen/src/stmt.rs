@@ -1255,6 +1255,26 @@ impl Compiler<'_> {
                             }
                             // ELTLS §6.5: unified slot clear before rebind.
                             self.eltls_clear_old_slot(builder, state, sym);
+                            // Dict twin of the slot clear: scan-admitted
+                            // loop-body dict locals free the previous
+                            // iteration's dict (values + structure) here.
+                            // The tensor clear above no-ops on them (their
+                            // Dict type fails its filter and they are not
+                            // in eltls_loop_predeclared); iteration one
+                            // frees the predeclared 0, a no-op. Keyed off
+                            // dict_loop_predeclared — slots the predeclare
+                            // actually created — NOT the plan set: a decl
+                            // shadowing a function parameter is in the
+                            // plan but keeps the caller's slot (review
+                            // HIGH-1 on d114b5d7, reproduced corruption).
+                            if state.dict_loop_predeclared.contains(&sym) {
+                                let old_val = builder.use_var(var);
+                                let _ = self.compile_call_by_name(
+                                    builder,
+                                    "nsl_dict_free_tensor_values",
+                                    &[old_val],
+                                );
+                            }
                             builder.def_var(var, init_val);
                         } else {
                             let var = state.new_variable();
@@ -2461,7 +2481,52 @@ impl Compiler<'_> {
             .into_iter()
             .filter(|s| self.sym_bindings_all_owning_in_block(body, *s))
             .collect();
-        self.eltls_predeclare_loop_lets(builder, state, &syms)
+        let inserted = self.eltls_predeclare_loop_lets(builder, state, &syms);
+
+        // Dict twin (dict_lifetime.rs): zero-predeclare scan-admitted
+        // loop-body dict locals whose decl sits at THIS body's direct
+        // level, so the rebind clear and the return sweep always see a
+        // defined slot (0 on iteration one / when the loop never runs —
+        // free_dict_impl no-ops on 0). Deliberately NOT recorded in
+        // eltls_loop_predeclared: that set arms the TENSOR clear, whose
+        // free_if_valid must keep no-oping on dict handles; the dict
+        // rebind clear keys off state.dict_loop_predeclared, written
+        // below only when this pass creates the slot. The scan only
+        // admits decls in top-level loops, so this emission point
+        // dominates every later return.
+        let dict_syms: Vec<_> = body
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                let nsl_ast::stmt::StmtKind::VarDecl { pattern, .. } = &s.kind else {
+                    return None;
+                };
+                let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind else {
+                    return None;
+                };
+                (state.dict_loop_rebind.contains(sym)
+                    && !state.variables.contains_key(sym)
+                    && !state.param_symbols.contains(sym))
+                .then_some(*sym)
+            })
+            .collect();
+        if !dict_syms.is_empty() {
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            for sym in dict_syms {
+                let var = state.new_variable();
+                builder.declare_var(var, cl_types::I64);
+                builder.def_var(var, zero);
+                state.variables.insert(sym, (var, cl_types::I64));
+                // The rebind clear keys off this set — ONLY slots this
+                // predeclare created may be dict-freed at rebind. A
+                // plan sym skipped here (e.g. it shadows a function
+                // parameter, whose slot already exists and holds the
+                // caller's value) must never reach the clear (review
+                // HIGH-1 on d114b5d7).
+                state.dict_loop_predeclared.insert(sym);
+            }
+        }
+        inserted
     }
 
     /// True when every VarDecl/Assign binding of `sym` in the block —

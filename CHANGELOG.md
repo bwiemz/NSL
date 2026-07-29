@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — dict-lifetime follow-ups: loop-local dicts, load_safetensors, builtin shadowing
+
+- **Loop-local dict bindings no longer strand per iteration** (the eltls
+  clear twin for dicts). A dict `let` in the direct body of a top-level
+  `for`/`while` joins the sweep plan's loop-rebind pool: the loop
+  lowering zero-predeclares its slot, `compile_var_decl` frees the
+  previous iteration's dict before each rebind, and the return sweep
+  frees the last one. Measured 2 blocks/iteration → 0 across for/while/
+  break/zero-iteration/script-scope shapes
+  (`loop_local_dicts_are_cleared_per_rebind`); admission-off and
+  clear-off mutations proven red (the latter at exactly the predicted
+  4 = stranded-iterations count). A subscript read after the loop is a
+  checker error, so the scan's outside-the-loop mention veto is
+  unreachable belt-and-braces.
+- **`load_safetensors` joins `FRESH_DICT_BUILTINS`** — a weights dict
+  that is only subscript-read is now swept at exit (was 2 stranded GPU
+  blocks in the new gate's shape, red-proven). The #427 review had
+  verified the runtime side (fresh, solely-owned stores; reads clone);
+  the entry waited for its gate per the fail-closed rule.
+- **A user `fn` shadowing a sampling builtin no longer miscompiles.**
+  The `topk`/`multinomial`/`manual_seed`/`argmax`/`cumsum`/`lt_scalar`
+  dispatch arms claimed calls by name while the checker had resolved the
+  user fn — a runtime magic-probe abort or a cranelift-frontend panic
+  depending on signature shape (found by the #427 review). The arms now
+  carry the `!registry.functions.contains_key` guard ~30 sibling arms
+  already had, so the user definition wins, matching the checker
+  (`builtin_shadow_dispatch.rs`, CPU-runnable).
+
 ### Fixed — dict locals no longer strand their stored tensors (aggregate-lifetime gap)
 
 - **A `Dict<Str, Tensor>` local was never freed outside DataLoader
