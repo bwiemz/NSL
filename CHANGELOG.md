@@ -6,72 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-<<<<<<< HEAD
-### Fixed — RoPE configuration was dead config; attention output projection was not depth-scaled
-
-- **`ROPE_THETA` never reached the model.** `models/coder1b` and
-  `models/coder7b` both declared `ROPE_THETA = 500000.0` (and
-  `MAX_SEQ_LEN = 2048`), but `stdlib/nsl/nn/gqa.nsl` hardcoded
-  `RotaryEmbedding(head_dim, 1024, 10000.0)`. Every model in `models/`
-  therefore trained at theta=10000 with a 1024-row rotary table regardless
-  of what its config said — the "Llama-3 long-context readiness" the model
-  comments claimed was not what ran. `GroupedQueryAttention` now takes
-  `max_seq_len` and `rope_theta` explicitly and threads them through; the
-  models pass their own constants. `coder500m` / `coder50m` / `coder-rl` /
-  the muon benchmarks pass `(1024, 10000.0)`, which is what they were
-  effectively using, so their numerics are unchanged.
-- **Asymmetric residual depth-scaling.** `SwiGLUFFN.w_down` carried the
-  GPT-2 `1/sqrt(2 * n_layers)` residual-stream scale but the attention
-  output projection `wo` did not, so only half the contributions into the
-  residual stream were damped. `GroupedQueryAttention` now takes `n_layers`
-  and applies the same factor to `wo`. The models' FFN scale is now derived
-  from `n_layers` too instead of a hand-written `sqrt(32.0)` / `sqrt(64.0)`
-  literal per model.
-- **RoPE cos/sin are cached instead of rebuilt per call.**
-  `RotaryEmbedding` now precomputes cos/sin over the full
-  `[max_seq_len, dim]` position grid at construction (`max_seq_len` was
-  previously accepted and ignored) and `forward` gathers the first
-  `seq_len` rows. The old path rebuilt `arange -> outer product -> cat ->
-  cos/sin` on every call, twice per attention layer (Q and K) — 32 rebuilds
-  per forward for a 16-layer model. Bit-exact with the old path (sum of
-  squared differences == 0 over the shared prefix). The tables use `_`
-  prefixes so they are excluded from the trainable parameter set — no
-  gradients, no AdamW moments, no weight decay.
-  - The gather is deliberate, not a slice: `PrimalOp::Slice` bakes its
-    bounds in as compile-time constants, so a runtime `seq_len` cannot go
-    through it, and neither `.slice()` nor `tensor_slice()` is reachable
-    from the source-AD extractor at all (both fall back to tape AD).
-    `embedding_lookup` takes runtime indices and is already a first-class
-    source-AD op.
-  - `forward_with_positions` (the packed path) still builds its table per
-    call: its positions are per-token, and its op sequence is what
-    `pca_rope` / the segment-masked flash kernel selection match on.
-- **Packed entry points wired into the coder models.**
-  `NSLCoder.forward_train_packed(input_ids, segment_ids, position_ids,
-  training)` and `TransformerBlock.forward_packed(...)` route through the
-  stdlib GQA's `forward_packed`, so a `DataLoader(..., packing=true)`
-  stream gets document-masked attention and per-document RoPE position
-  reset. The `pretrain_fase.nsl` demos stay on the unpacked path on
-  purpose — their corpus is a single repeated token with no document
-  boundaries — and the READMEs now say so.
-- **New drift gate** `crates/nsl-cli/tests/model_config_drift.rs`: NSL
-  `const`s are not in scope inside model field initializers and
-  `[TransformerBlock; N_LAYERS]` does not parse, so every model restates
-  its architecture as literals. The gate parses `config.nsl`, the
-  `model.nsl` const block, and the literals actually passed to
-  `TransformerBlock(...)` / `randn([V, D])`, and fails on any disagreement.
-  It is anti-vacuous: a stdlib-GQA model missing from its coverage list
-  fails the gate.
-- **Documented, not fixed:** `AdamW(weight_decay=...)` in a `train` block
-  is one scalar over all trainable parameters, RMSNorm gains and the tied
-  embedding included — NSL's train-block optimizer DSL has no parameter
-  groups, so the conventional decay-2-D-weights-only split cannot be
-  expressed. The per-parameter classification a fix would need already
-  exists in `crates/nsl-codegen/src/muon_roles.rs`. The `coder1b` /
-  `coder7b` READMEs also now state the pretrain token budget against a
-  compute-optimal reference (~15% and ~1.7% respectively) so their cert
-  curves are not read as quality claims.
-=======
 ### Fixed — dict locals no longer strand their stored tensors (aggregate-lifetime gap)
 
 - **A `Dict<Str, Tensor>` local was never freed outside DataLoader
@@ -295,7 +229,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   line at every tensor-handle publish (pointer, data, len, ndim, device,
   data-owner), pairing with the existing free trace so leaked handles can be
   diffed generation-accurately instead of by data-pointer heuristics.
->>>>>>> origin/main
+
+### Fixed — RoPE configuration was dead config; attention output projection was not depth-scaled
+
+- **`ROPE_THETA` never reached the model.** `models/coder1b` and
+  `models/coder7b` both declared `ROPE_THETA = 500000.0` (and
+  `MAX_SEQ_LEN = 2048`), but `stdlib/nsl/nn/gqa.nsl` hardcoded
+  `RotaryEmbedding(head_dim, 1024, 10000.0)`. Every model in `models/`
+  therefore trained at theta=10000 with a 1024-row rotary table regardless
+  of what its config said — the "Llama-3 long-context readiness" the model
+  comments claimed was not what ran. `GroupedQueryAttention` now takes
+  `max_seq_len` and `rope_theta` explicitly and threads them through; the
+  models pass their own constants. `coder500m` / `coder50m` / `coder-rl` /
+  the muon benchmarks pass `(1024, 10000.0)`, which is what they were
+  effectively using, so their numerics are unchanged.
+- **Asymmetric residual depth-scaling.** `SwiGLUFFN.w_down` carried the
+  GPT-2 `1/sqrt(2 * n_layers)` residual-stream scale but the attention
+  output projection `wo` did not, so only half the contributions into the
+  residual stream were damped. `GroupedQueryAttention` now takes `n_layers`
+  and applies the same factor to `wo`. The models' FFN scale is now derived
+  from `n_layers` too instead of a hand-written `sqrt(32.0)` / `sqrt(64.0)`
+  literal per model.
+- **RoPE cos/sin are cached instead of rebuilt per call.**
+  `RotaryEmbedding` now precomputes cos/sin over the full
+  `[max_seq_len, dim]` position grid at construction (`max_seq_len` was
+  previously accepted and ignored) and `forward` gathers the first
+  `seq_len` rows. The old path rebuilt `arange -> outer product -> cat ->
+  cos/sin` on every call, twice per attention layer (Q and K) — 32 rebuilds
+  per forward for a 16-layer model. Bit-exact with the old path (sum of
+  squared differences == 0 over the shared prefix). The tables use `_`
+  prefixes so they are excluded from the trainable parameter set — no
+  gradients, no AdamW moments, no weight decay.
+  - The gather is deliberate, not a slice: `PrimalOp::Slice` bakes its
+    bounds in as compile-time constants, so a runtime `seq_len` cannot go
+    through it, and neither `.slice()` nor `tensor_slice()` is reachable
+    from the source-AD extractor at all (both fall back to tape AD).
+    `embedding_lookup` takes runtime indices and is already a first-class
+    source-AD op.
+  - `forward_with_positions` (the packed path) still builds its table per
+    call: its positions are per-token, and its op sequence is what
+    `pca_rope` / the segment-masked flash kernel selection match on.
+- **Packed entry points wired into the coder models.**
+  `NSLCoder.forward_train_packed(input_ids, segment_ids, position_ids,
+  training)` and `TransformerBlock.forward_packed(...)` route through the
+  stdlib GQA's `forward_packed`, so a `DataLoader(..., packing=true)`
+  stream gets document-masked attention and per-document RoPE position
+  reset. The `pretrain_fase.nsl` demos stay on the unpacked path on
+  purpose — their corpus is a single repeated token with no document
+  boundaries — and the READMEs now say so.
+- **New drift gate** `crates/nsl-cli/tests/model_config_drift.rs`: NSL
+  `const`s are not in scope inside model field initializers and
+  `[TransformerBlock; N_LAYERS]` does not parse, so every model restates
+  its architecture as literals. The gate parses `config.nsl`, the
+  `model.nsl` const block, and the literals actually passed to
+  `TransformerBlock(...)` / `randn([V, D])`, and fails on any disagreement.
+  It is anti-vacuous: a stdlib-GQA model missing from its coverage list
+  fails the gate.
+- **Documented, not fixed:** `AdamW(weight_decay=...)` in a `train` block
+  is one scalar over all trainable parameters, RMSNorm gains and the tied
+  embedding included — NSL's train-block optimizer DSL has no parameter
+  groups, so the conventional decay-2-D-weights-only split cannot be
+  expressed. The per-parameter classification a fix would need already
+  exists in `crates/nsl-codegen/src/muon_roles.rs`. The `coder1b` /
+  `coder7b` READMEs also now state the pretrain token budget against a
+  compute-optimal reference (~15% and ~1.7% respectively) so their cert
+  curves are not read as quality claims.
 
 ### Fixed — flip hardening: one shared math-mode resolution, and the two gates the flip broke
 
