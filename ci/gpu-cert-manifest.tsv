@@ -26,6 +26,13 @@ crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_mpartial_surface_shrinks_gpu	gp
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_capture_replay_bitexact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/cuda_graph_gate.rs	cuda_graph_self_heals_on_host_readbacks_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/deferred_free_gpu_gate.rs	deferred_free_matches_eager_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	top_level_dict_local_is_swept_at_main_exit	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	returned_subscript_read_survives_the_dict_sweep	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	alias_vetoed_dict_strands_but_never_double_frees	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	subscript_write_vetoes_the_sweep	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	comprehension_generator_shadowing_vetoes_the_sweep	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	lambda_returned_dict_aliases_do_not_double_free	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_keep_status_quo	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/feature_composition_gate.rs	registered_refusals_actually_fire_on_gpu_only_configurations	gpu	requires a CUDA GPU (--weight-stream needs device-resident params)
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	loop_carried_borrow_seed_does_not_strand_per_iteration	gpu	requires CUDA GPU
@@ -59,7 +66,7 @@ crates/nsl-cli/tests/sampling_device_gate.rs	gpu_inputs_match_cpu_for_each_primi
 crates/nsl-cli/tests/sampling_device_gate.rs	stdlib_sampling_chain_runs_on_gpu_logits	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	gpu_redirect_does_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sampling_device_gate.rs	returned_sampling_results_do_not_double_own	gpu	requires CUDA GPU
-crates/nsl-cli/tests/sampling_device_gate.rs	topk_dict_strand_is_exactly_the_known_aggregate_gap	gpu	requires CUDA GPU
+crates/nsl-cli/tests/sampling_device_gate.rs	topk_dicts_no_longer_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sdpa_decorator_free_gpu_backward.rs	decorator_free_sdpa_backward_dispatches_on_gpu	gpu	requires a CUDA-capable GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires CUDA GPU

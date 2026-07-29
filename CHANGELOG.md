@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — dict locals no longer strand their stored tensors (aggregate-lifetime gap)
+
+- **A `Dict<Str, Tensor>` local was never freed outside DataLoader
+  lowerings** — `let r = topk(scaled, k)` stranded the dict plus both
+  stored tensors on every call: 2 VRAM blocks per call once the sampling
+  FFIs gained GPU support, and CPU heap before that (CPU sweep proven by
+  trace: exactly +2 tensor destroys per call on the minimal fixture; the
+  large `topk(x, 1M)`-loop fixture's remaining RSS growth is
+  allocator-level retention of transients — identical with the fix
+  reverted, no handle strand: destroys ≥ creations per iteration). The dict OWNS its
+  stored tensors outright (`nsl_dict_set_str` stores the raw handle;
+  every subscript read CLONES), so nothing but the dict itself ever
+  releases them.
+- The return-local sweep now carries a `nsl_dict_free_tensor_values` pass
+  armed by a conservative usage scan (`dict_lifetime.rs`): a dict local
+  qualifies only when its single binding is a top-level `let` from a
+  fresh-dict BUILTIN call (whitelist; today `topk`) and every other
+  appearance is a subscript READ. Aliases (`let r2 = r`), subscript
+  writes, ANY pattern re-binding of the name (loop patterns,
+  comprehension generators, match arms), a locally-bound callee name, and
+  opaque blocks all veto — the failure direction of a wrong admit is a
+  double-free, so the scan only allows shapes it fully understands.
+  Review proved that direction twice with runtime crashes on the first
+  cut (a `[0 for r in ...]` generator shadowing the candidate's slot; a
+  lambda returning its captured dict minting two "owning" candidates) —
+  both are vetoed and pinned as gates now
+  (`comprehension_generator_shadowing_vetoes_the_sweep`,
+  `lambda_returned_dict_aliases_do_not_double_free`).
+  `load_safetensors` also returns a fresh solely-owned tensor dict
+  (reviewer-verified) but stays OFF the whitelist until it has its own
+  gate. Probed: returning a dict
+  from a user fn is structurally impossible today (checker "wrong type"),
+  and passing one to a user fn dies in codegen — the two big escape shapes
+  cannot occur.
+- The whole stdlib sampling chain is now leak-free on GPU logits:
+  `sample_top_k` + `sample_top_p` went from 4 stranded blocks per round to
+  ZERO (`topk_dicts_no_longer_strand` ratchets the old 2-per-topk pin).
+  New gate file `dict_local_lifetime_gate.rs` (5 gates) pins the allowed
+  shape, the veto shapes (run-success asserts catch the double-free
+  direction), and the loop-local status quo. Scan-disable and veto-removal
+  mutations proven red.
+- Loop-local dict bindings (`for ...: let r = topk(...)`) keep the
+  pre-existing per-iteration strand — the eltls predeclare/clear twin for
+  dicts is queued follow-up work; the real generation pattern (sampling
+  helpers called per token) is function-wrapped and fully covered.
+
 ### Fixed — sampling builtins no longer segfault on GPU tensors
 
 - **`topk` / `multinomial` / `argmax` / `cumsum` / `lt_scalar` accepted GPU

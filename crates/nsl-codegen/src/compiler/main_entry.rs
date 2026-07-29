@@ -76,6 +76,14 @@ impl Compiler<'_> {
             if !self.compile_options.debug_training {
                 state.use_counts = Some(crate::use_count::analyze_use_counts(&main_block));
             }
+            // Dict-local tensor lifetime: arm the return sweep's
+            // nsl_dict_free_tensor_values pass for script-scope dict locals
+            // the usage scan proves safe (see dict_lifetime.rs).
+            state.sweepable_dict_locals = crate::dict_lifetime::collect_sweepable_dict_locals(
+                &main_block,
+                |id| self.node_type(id).clone(),
+                |s| self.resolve_sym(s).to_string(),
+            );
 
             let entry = builder.create_block();
             builder.append_block_params_for_function_params(entry);

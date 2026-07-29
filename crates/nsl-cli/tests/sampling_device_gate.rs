@@ -279,29 +279,27 @@ fn returned_sampling_results_do_not_double_own() {
     );
 }
 
-/// PRE-EXISTING dict-content strand, pinned — not caused by the redirect.
+/// The topk dict-content strand, RATCHETED TO ZERO (dict-local tensor
+/// lifetime fix, 2026-07-28).
 ///
-/// `nsl_tensor_topk` returns a dict owning its `values`/`indices` tensors
-/// (rc=1 each, `nsl_dict_get_str` hands out borrows). Codegen emits
-/// `nsl_dict_free_tensor_values` only for DataLoader batch dicts, so an
-/// ordinary dict local is never freed — the aggregate-lifetime gap. On CPU
-/// inputs that has always stranded heap (measured 2026-07-28: a
-/// `topk(x, 1M)` loop grows ~79 MB/call of resident heap, fix present or
-/// not); on GPU inputs the same two stranded tensors now live in VRAM,
-/// where `live_blocks` can finally see them. This gate pins the strand at
-/// EXACTLY 2 blocks per topk call so a regression fails loudly and the
-/// aggregate-lifetime fix must ratchet it down to zero when it lands.
+/// History: `nsl_tensor_topk` returns a dict owning its `values`/`indices`
+/// tensors, and codegen emitted `nsl_dict_free_tensor_values` only for
+/// DataLoader batch dicts — an ordinary dict local was never freed (the
+/// aggregate-lifetime gap). When the sampling FFIs gained GPU support the
+/// strand became visible here: exactly 2 VRAM blocks per topk call, and
+/// this gate first pinned `lb3 - lb1 == 2 * 4` on the chain. The
+/// return-local sweep now frees scan-approved dict locals
+/// (`dict_lifetime.rs`), so both `sample_top_k`'s and `sample_top_p`'s
+/// dicts die at their function's return and the whole chain must hold
+/// live_blocks at ZERO for any call count.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn topk_dict_strand_is_exactly_the_known_aggregate_gap() {
+fn topk_dicts_no_longer_strand() {
     let (lb1, ..) = run_fixture(&chain_src(1), "dictpin", 1);
     let (lb3, ..) = run_fixture(&chain_src(3), "dictpin", 3);
-    // chain_src runs sample_top_k + sample_top_p per round = 2 topk dicts,
-    // 2 tensors each.
     assert_eq!(
-        lb3 - lb1,
-        2 * 4,
-        "per-round GPU strand changed (was exactly the 2 topk dicts' \
-         values+indices): lb1={lb1} lb3={lb3}"
+        (lb1, lb3),
+        (0, 0),
+        "sampling-chain dict locals stranded again (was the aggregate-lifetime gap)"
     );
 }
