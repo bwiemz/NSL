@@ -80,6 +80,14 @@ fn run_fixture(src: &str, tag: &str, n: usize) -> (i64, String, String) {
 /// The one-hot probability rows make `multinomial` deterministic without
 /// touching RNG state: all the mass sits on one category, so the sampled
 /// index is forced regardless of the draw.
+///
+/// The `xb`/`0.9` case pins the f32-representability boundary: the CPU f32
+/// arm of `lt_scalar` compares against the ROUNDED threshold, so the GPU
+/// redirect must pre-round through f32 too or the masks differ exactly at
+/// elements equal to the threshold's f32 rounding (review M1 on 1070c53b —
+/// measured sum 0 vs 4 before the pre-round). The other four ops promote
+/// element-wise to f64 on their CPU f32 arms already, so they are bit-exact
+/// by construction.
 const PRIMITIVES_SRC: &str = r#"
 let x = arange(0.0, 16.0).reshape([2, 8])
 let g = x.to(cuda)
@@ -113,7 +121,13 @@ let s_gpu = multinomial(onehot2.to(cuda), 4)
 let d6 = s_cpu - s_gpu
 let e6 = sum(d6 * d6).item()
 
-let err = e1 + e2 + e3 + e4 + e5 + e6
+let xb = ramp * 0.0 + 0.8999999761581421
+let b_cpu = lt_scalar(xb, 0.9)
+let b_gpu = lt_scalar(xb.to(cuda), 0.9)
+let d7 = b_cpu - b_gpu
+let e7 = sum(d7 * d7).item()
+
+let err = e1 + e2 + e3 + e4 + e5 + e6 + e7
 print(err)
 if err == 0.0:
     print("PARITY_OK")

@@ -40,6 +40,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   device-independent (76 arms affected). Both are queued as their own
   items.
 
+### Fixed — Coder-50M pure-inference forward no longer leaks AT ALL (roadmap item 1 complete)
+
 - **The remaining +33 blocks / +132 MB per forward is closed: per-call growth
   is now ZERO** (154 blocks / 216 MB at N=1 and N=3, RTX 5070 Ti). At the
   campaign's start a Coder-50M forward stranded +292 MB per call.

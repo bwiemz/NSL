@@ -22,6 +22,12 @@ use crate::tensor::{nsl_tensor_free, nsl_tensor_to_device, NslTensor};
 /// host. Stages the input on the CPU, re-enters the op there, and hands the
 /// result back on the input's device — mirroring the non-dim-0 arm of
 /// `nsl_tensor_gather`.
+///
+/// Index precision: CPU-side index outputs (argmax, multinomial, topk
+/// indices) are f64, but the upload converts to the GPU's f32 — exact only
+/// below 2^24 (16.7M). Vocab-scale dims are far under that; a >=2^24-wide
+/// dim would silently round indices, matching the runtime-wide
+/// "CPU=f64, GPU=f32" convention rather than guarding here.
 fn redirect_gpu_input_to_host(tensor_ptr: i64, op: impl FnOnce(i64) -> i64) -> i64 {
     let device = NslTensor::from_ptr(tensor_ptr).device;
     // Pause the tape across the CPU redirect (see nsl_tensor_stack).
@@ -451,7 +457,20 @@ pub extern "C" fn nsl_tensor_cumsum(tensor_ptr: i64, dim: i64) -> i64 {
 pub extern "C" fn nsl_tensor_lt_scalar(tensor_ptr: i64, scalar: f64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device != 0 {
-        return redirect_gpu_input_to_host(tensor_ptr, |cpu| nsl_tensor_lt_scalar(cpu, scalar));
+        // The CPU f32 arm below compares in f32 against the ROUNDED
+        // threshold (`scalar as f32`), but the staging download promotes the
+        // data f32→f64 and would take the f64 arm against the UNROUNDED
+        // threshold — at an f32-representability boundary the masks differ
+        // (measured: `lt_scalar(x, 0.9)` on x == 0.9f32 flips per device,
+        // review M1 on 1070c53b). Pre-rounding the threshold through f32
+        // makes the f64 comparison of exact f32 promotions bit-identical to
+        // the f32 comparison the CPU input would take.
+        let s = if tensor.dtype == 1 {
+            (scalar as f32) as f64
+        } else {
+            scalar
+        };
+        return redirect_gpu_input_to_host(tensor_ptr, |cpu| nsl_tensor_lt_scalar(cpu, s));
     }
     let shape = get_shape_vec(tensor);
     let in_dtype = tensor.dtype;
