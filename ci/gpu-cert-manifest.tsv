@@ -35,6 +35,8 @@ crates/nsl-cli/tests/dict_local_lifetime_gate.rs	param_shadowing_loop_dict_does_
 crates/nsl-cli/tests/dict_local_lifetime_gate.rs	comprehension_generator_shadowing_vetoes_the_sweep	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dict_local_lifetime_gate.rs	lambda_returned_dict_aliases_do_not_double_free	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_are_cleared_per_rebind	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dispatch_ownership_gate.rs	unallowlisted_dispatch_results_do_not_strand	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dispatch_ownership_gate.rs	identity_shaped_dispatch_does_not_steal_bindings	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/feature_composition_gate.rs	registered_refusals_actually_fire_on_gpu_only_configurations	gpu	requires a CUDA GPU (--weight-stream needs device-resident params)
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	loop_carried_borrow_seed_does_not_strand_per_iteration	gpu	requires CUDA GPU

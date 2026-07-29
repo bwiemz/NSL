@@ -20,18 +20,28 @@
 //!   - every table key must name a real runtime extern (dead entries →
 //!     red).
 //!
-//! Full emission-site registration through `register_ffi_result_
-//! ownership` (making the table the single runtime authority) requires
-//! threading `state` through `compile_call_by_name` — queued as the v2
-//! refactor; these bindings close the drift class first.
+//! v2a (2026-07-29) closed the "new dispatch arm without an allowlist
+//! entry" blind spot at the dispatch boundary instead: the
+//! `compile_expr` Call arm registers a dispatch result as Owned when it
+//! is provably the fresh output of the table-classified FFI the dispatch
+//! just emitted (`register_dispatch_result_ownership`), and the nested
+//! tracker accepts that as an owning signal — so an arm whose terminal
+//! FFI is in the table no longer needs a hand-added allowlist entry
+//! (gates: crates/nsl-cli/tests/dispatch_ownership_gate.rs). The
+//! "thread `state` through all ~867 `compile_call_by_name` sites"
+//! sketch was REJECTED as unsound, not deferred: stmt.rs/func.rs
+//! machinery emits table-listed FFIs (clone, to_device) whose lifetimes
+//! it manages manually, and blanket Owned registration there flips the
+//! promote_to_tape_held retain balance into double frees.
 //!
 //! Known limits, stated plainly: the name→FFI edge in EXPECTED is
 //! hand-asserted, not derived from dispatch — a wrong claim naming a
 //! real owned-classified extern would pass (the tanh miswiring was
-//! caught only because its extern did not exist at all). And a new
-//! dispatch arm added WITHOUT an allowlist entry — the original leak
-//! class — is invisible to all three bindings. Both are the v2
-//! refactor's job.
+//! caught only because its extern did not exist at all). The allowlist
+//! itself is now a fast-path redundancy for names the dispatch boundary
+//! also proves dynamically; it still matters for Return-position
+//! upgrades inside tape regions, where v2a deliberately does not
+//! register.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

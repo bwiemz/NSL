@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — dispatch results classify from the ffi_ownership table without allowlist entries (ELTLS v2a)
+
+- **A dispatch arm whose NSL-level name was missing from the
+  hand-maintained owning-ref allowlist stranded its fresh result** in
+  nested, receiver, and bare-statement position — the recurring leak
+  class behind three separate hand-patch cycles (#423 sdpa, #424
+  rmsnorm/dropout, #426 lt_scalar/multinomial). `reduce_max` and `clamp`
+  were live instances: `reduce_max(x, 0, 0).item()` stranded one block
+  per call.
+- Root closure at the dispatch boundary: `compile_call_by_name` records
+  its last non-void emission (the EFFECTIVE extern name — alias-resolved,
+  so alias-path calls are covered — plus the result Value), and the
+  `compile_expr` Call arm registers the dispatch result as Owned when it
+  is provably that emission's fresh output: the emission counter must
+  have advanced DURING the dispatch (stale records from earlier
+  statements or function bodies cannot match) and the recorded Value
+  must be identical to the value the arm returned. The nested tracker
+  accepts the per-statement `dispatch_fresh` set as an owning signal, so
+  any arm composing table-listed FFIs is tracked automatically — the
+  allowlist is no longer the single point of drift.
+- Deliberate refusals, documented in
+  `register_dispatch_result_ownership`: nothing registers inside tape
+  regions (the promote_to_tape_held retain balance stays byte-identical
+  to pre-v2a); an arm's own ownership claim always wins; and the
+  "thread `state` through all ~867 `compile_call_by_name` sites" v2
+  sketch was REJECTED as unsound — machinery-managed emissions (clone,
+  to_device in stmt.rs choreography) registered Owned would double-free
+  inside train regions.
+- Five new table classifications, each from a per-runtime freshness
+  read: `nsl_tensor_reduce_to_shape` and `nsl_tensor_gelu_backward`
+  (closing the drift-gate's STILL-UNCLASSIFIED note; the raw-call strand
+  that note predicted turned out to be unreachable — the semantic
+  checker refuses raw extern names, so these matter for machinery and
+  future arms), plus `nsl_tensor_clamp`, `nsl_tensor_conv2d`,
+  `nsl_tensor_maxpool2d` (live dispatch-arm terminals that stranded).
+- The method table's `.to()` comment claimed "no refcount bump" — stale:
+  `nsl_tensor_to_device` retains before returning the receiver on the
+  same-device path (a counted reference). The static entry stays false
+  (dtype-arg `.to()` forms route to unverified custom-dtype FFIs and
+  model `.to()` returns the model); the dynamic path classifies the
+  device-transfer form from the FFI actually emitted, fixing the
+  pre-existing `.to()` receiver-position strand as a side effect.
+- Gates (`dispatch_ownership_gate.rs`, both GPU): unallowlisted
+  dispatch results leave live_blocks == 0 at two round counts with
+  exact bound-vs-nested value parity (mutation-proven red at exactly
+  (6, 18) — 3 strands/round — with the wrapper disabled, and again with
+  only the tracking half disabled); an identity-shaped dispatch fixture
+  pins that `copy_data` never steals a live binding (defensive — no
+  current arm has the full dangerous shape, stated plainly in the gate
+  header).
+
 ### Fixed — the three ownership authorities are now drift-gated against each other
 
 - The ownership campaign's recurring bug class was silent divergence

@@ -3149,28 +3149,47 @@ impl Compiler<'_> {
                 func_name
             };
 
-        let (func_id, sig) = if let Some(e) = self.registry.functions.get(effective_name) {
-            e.clone()
-        } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
-            e.clone()
-        } else if let Some(alias) = tensor_unary_runtime_alias(effective_name, arg_vals.len()) {
-            self.registry
-                .runtime_fns
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| CodegenError::new(format!("undefined function '{effective_name}'")))?
-        } else {
-            return Err(CodegenError::new(format!(
-                "undefined function '{effective_name}'"
-            )));
-        };
+        // `emitted_name` is the symbol actually called — for the unary alias
+        // fallback that is the runtime EXTERN (`tanh` emits
+        // `nsl_tensor_tanh_act`), which is also the name the ffi_ownership
+        // table classifies, so the dispatch-boundary registration below
+        // covers alias-path calls for free.
+        let (func_id, sig, emitted_name) =
+            if let Some(e) = self.registry.functions.get(effective_name) {
+                let (id, sig) = e.clone();
+                (id, sig, effective_name)
+            } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
+                let (id, sig) = e.clone();
+                (id, sig, effective_name)
+            } else if let Some(alias) = tensor_unary_runtime_alias(effective_name, arg_vals.len()) {
+                let (id, sig) = self
+                    .registry
+                    .runtime_fns
+                    .get(alias)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodegenError::new(format!("undefined function '{effective_name}'"))
+                    })?;
+                (id, sig, alias)
+            } else {
+                return Err(CodegenError::new(format!(
+                    "undefined function '{effective_name}'"
+                )));
+            };
 
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         let call = builder.ins().call(func_ref, arg_vals);
         if sig.returns.is_empty() {
             Ok(builder.ins().iconst(cl_types::I64, 0))
         } else {
-            Ok(builder.inst_results(call)[0])
+            let result = builder.inst_results(call)[0];
+            // ELTLS v2a: note the emission so the dispatch boundary can
+            // classify the arm's result from the ffi_ownership table.
+            // Non-void calls only — a void call's synthesized iconst 0
+            // must never be classifiable.
+            self.last_ffi_emission = Some((emitted_name.to_string(), result));
+            self.ffi_emission_counter += 1;
+            Ok(result)
         }
     }
 
@@ -3218,6 +3237,83 @@ impl Compiler<'_> {
                 // instrumentation counter surfaces migration gaps.
                 self.note_unknown_fallback(state, result);
             }
+        }
+    }
+
+    /// ELTLS v2a (spec §6.2): dispatch-boundary ownership registration.
+    /// Called once, at the `compile_expr` Call arm, after `compile_call`
+    /// returns. Classifies the dispatch result from the ffi_ownership
+    /// table when — and only when — the returned value is PROVABLY the
+    /// fresh output of the FFI the dispatch just emitted:
+    ///
+    ///   - the emission counter advanced during this dispatch (so
+    ///     `last_ffi_emission` was written during it — stale records
+    ///     from earlier statements or earlier function bodies cannot
+    ///     match), AND
+    ///   - the recorded result Value is identical to the value the arm
+    ///     returned (an arm that post-processes, frees temps last, or
+    ///     returns an input unchanged simply misses — status quo, in the
+    ///     leak-not-crash direction).
+    ///
+    /// This closes the recurring allowlist-drift leak class at its root
+    /// for every arm whose terminal call is a table-classified FFI: the
+    /// arm no longer needs a hand-added entry in
+    /// `expr_result_is_owned_temporary` for its result to be tracked
+    /// (see `dispatch_fresh` in TensorCleanupState).
+    ///
+    /// Deliberate refusals:
+    ///   - inside tape regions nothing registers: promote_to_tape_held
+    ///     retains None-entry values and free_tensor_temporaries frees
+    ///     tracked ones unconditionally — an Owned entry here would skip
+    ///     that retain while the statement-end free still runs, a double
+    ///     free. Tape choreography stays byte-identical to pre-v2a.
+    ///   - an existing expr_ownership entry wins (arms that classify
+    ///     their own results — set_ownership_from_op, Borrowed
+    ///     propagation — are never second-guessed; this also keeps the
+    ///     TapeHeld→Owned debug_assert unreachable).
+    ///   - blanket registration inside `compile_call_by_name` itself
+    ///     (the "thread state through all 867 sites" v2 sketch) is
+    ///     UNSOUND and was rejected: stmt.rs/func.rs machinery emits
+    ///     table-listed FFIs (clone, to_device) whose lifetimes it
+    ///     manages manually, and registering those Owned flips the
+    ///     promote-retain balance inside train regions into double
+    ///     frees. The dispatch boundary is exactly the layer whose
+    ///     results are handed to expression consumers, so ownership
+    ///     claims here are safe by construction.
+    pub(crate) fn register_dispatch_result_ownership(
+        &self,
+        builder: &FunctionBuilder,
+        state: &mut FuncState,
+        result: Value,
+        counter_before: u64,
+    ) {
+        use crate::ffi_ownership::{ffi_ownership_kind, FfiOwnershipKind};
+        use crate::ownership_expr::Ownership;
+
+        if builder.func.dfg.value_type(result) != cl_types::I64 {
+            return;
+        }
+        if state.flags.in_tape_region {
+            return;
+        }
+        if state.cleanup.expr_ownership.contains_key(&result) {
+            return;
+        }
+        if self.ffi_emission_counter == counter_before {
+            return;
+        }
+        let Some((emitted_name, emitted_val)) = &self.last_ffi_emission else {
+            return;
+        };
+        if *emitted_val != result {
+            return;
+        }
+        if matches!(
+            ffi_ownership_kind(emitted_name),
+            Some(FfiOwnershipKind::OwnedNewResult)
+        ) {
+            self.set_ownership(builder, state, result, Ownership::Owned);
+            state.cleanup.dispatch_fresh.insert(result);
         }
     }
 

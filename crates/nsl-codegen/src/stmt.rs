@@ -1201,6 +1201,13 @@ impl Compiler<'_> {
         // (only VarDecl should consume this; if it leaks past a statement boundary it's a bug)
         self.registry.last_lambda_capture_count = None;
 
+        // ELTLS v2a: dispatch-fresh membership is a PER-STATEMENT fact
+        // (see TensorCleanupState::dispatch_fresh) — a value that survives
+        // into the next statement is variable-bound, and SSA use_var can
+        // hand a later dispatch that very Value; tracking it there would
+        // free the live binding.
+        state.cleanup.dispatch_fresh.clear();
+
         match &stmt.kind {
             StmtKind::VarDecl { pattern, value, .. } => {
                 match &pattern.kind {

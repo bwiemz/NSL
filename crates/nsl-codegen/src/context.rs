@@ -79,6 +79,19 @@ pub struct TensorCleanupState {
     /// ELTLS: per-function counter of consumer sites that hit Unknown.
     /// Goal: zero for hot-path functions after full rollout.
     pub unknown_ownership_count: usize,
+
+    /// ELTLS v2a (spec §6.2): Values born from a table-classified
+    /// OwnedNewResult FFI during the CURRENT statement, registered at the
+    /// dispatch boundary (`register_dispatch_result_ownership`). The
+    /// nested-expression tracker accepts membership here as proof the
+    /// value is an anonymous fresh temporary of this statement — WITHOUT
+    /// a per-name allowlist entry. Cleared at every `compile_stmt` entry:
+    /// the per-statement lifetime is what makes the check sound. A value
+    /// bound to a variable in an earlier statement can be the SAME
+    /// Cranelift Value a later identity-shaped dispatch returns (SSA
+    /// use_var in one block), and tracking it there would free the live
+    /// binding — clearing per statement makes that shape unmatchable.
+    pub dispatch_fresh: std::collections::HashSet<ir::Value>,
 }
 
 impl TensorCleanupState {
@@ -93,6 +106,7 @@ impl TensorCleanupState {
             owned_temporaries: Vec::new(),
             tape_held: Vec::new(),
             unknown_ownership_count: 0,
+            dispatch_fresh: std::collections::HashSet::new(),
         }
     }
 }
