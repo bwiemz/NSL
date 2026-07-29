@@ -19,7 +19,11 @@ fn tensor_unary_runtime_alias(func_name: &str, arity: usize) -> Option<&'static 
     match func_name {
         "relu" => Some("nsl_tensor_relu"),
         "sigmoid" => Some("nsl_tensor_sigmoid"),
-        "tanh" => Some("nsl_tensor_tanh"),
+        // The extern's spelling carries an `_act` suffix — the bare name
+        // resolved to NOTHING here (runtime_fns lookup miss -> "undefined
+        // function" instead of the fallback), found by the
+        // ffi_ownership_drift extern binding, 2026-07-29.
+        "tanh" => Some("nsl_tensor_tanh_act"),
         "exp" => Some("nsl_tensor_exp"),
         "log" => Some("nsl_tensor_log"),
         "sqrt" => Some("nsl_tensor_sqrt"),

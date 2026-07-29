@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — the three ownership authorities are now drift-gated against each other
+
+- The ownership campaign's recurring bug class was silent divergence
+  between the owning-ref Ident ALLOWLIST, the FFI ownership TABLE
+  (`ffi_ownership.rs`), and the runtime's actual extern inventory: three
+  leak cycles came from allowlist omissions, the allowlist carried a dead
+  `"slice"` entry, and the table carried a documented-wrong
+  `nsl_tensor_slice` borrow plus TWELVE entries naming FFIs that do not
+  exist (`nsl_tensor_concat` vs the real `nsl_tensor_cat`,
+  `nsl_tensor_tanh` vs `nsl_tensor_tanh_act`, `nsl_tensor_log_softmax`
+  vs `nsl_tensor_logsoftmax`, `nsl_tensor_max` vs
+  `nsl_tensor_reduce_max`, and eight keys with no counterpart at all —
+  min/argmin/permute/scatter/view/broadcast_to/sum_to_scalar/
+  mean_to_scalar).
+- New `ffi_ownership_drift.rs` (3 CPU gates, each mutation-proven red):
+  the allowlist parsed from source must equal the gate's classified map
+  exactly; every mapped FFI must be in the table as OwnedNewResult; and
+  every table key must name a real `pub extern "C"` fn.
+- Table corrections: dead keys renamed to the real externs or removed
+  (removal is behavior-neutral — absence takes the instrumented
+  fallback); `nsl_tensor_slice` flipped to OwnedNewResult (the runtime
+  allocates fresh on both paths — triple-re-verified across the
+  #423/#426/#427 cycles, and the owning classification has been live on
+  the method/free-fn paths with leak gates green throughout; the borrow
+  misfile governed only the two `register_ffi_result_ownership` sites,
+  where it under-freed); the Ident-allowlist family added with the
+  verifications those PRs recorded; `nsl_tensor_topk` classified
+  NotATensor (dict handle — `dict_lifetime.rs` owns its lifecycle).
+- The generic-dispatch `tensor_unary_runtime_alias` fallback mapped
+  `tanh` to the nonexistent bare spelling — an "undefined function"
+  error instead of a fallback; corrected to `nsl_tensor_tanh_act`.
+- Full emission-site registration (threading `state` through
+  `compile_call_by_name` so the table becomes the single runtime
+  authority) is the queued v2; these bindings close the drift class
+  first.
+
 ### Fixed — nested builtin arguments no longer strand their results
 
 - **A builtin call nested as another builtin's argument stranded its
