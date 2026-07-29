@@ -22,6 +22,16 @@ pub fn ffi_ownership_kind(name: &str) -> Option<FfiOwnershipKind> {
     TABLE.get_or_init(build_table).get(name).copied()
 }
 
+/// Every FFI name the table classifies. Exists for the
+/// `ffi_ownership_drift` gate, which binds the table's keys to the
+/// runtime's actual `pub extern "C"` inventory (a key naming a
+/// nonexistent FFI is a dead entry — `nsl_tensor_concat` sat here for
+/// months while the real extern is `nsl_tensor_cat`) and to the
+/// owning-ref allowlist in `expr::expr_result_is_owned_temporary`.
+pub fn ffi_ownership_table_keys() -> Vec<&'static str> {
+    build_table().into_keys().collect()
+}
+
 fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     use FfiOwnershipKind::*;
     let mut m = HashMap::new();
@@ -45,9 +55,9 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_gelu", OwnedNewResult);
     m.insert("nsl_tensor_silu", OwnedNewResult);
     m.insert("nsl_tensor_sigmoid", OwnedNewResult);
-    m.insert("nsl_tensor_tanh", OwnedNewResult);
+    m.insert("nsl_tensor_tanh_act", OwnedNewResult); // extern spelling: _act suffix
     m.insert("nsl_tensor_softmax", OwnedNewResult);
-    m.insert("nsl_tensor_log_softmax", OwnedNewResult);
+    m.insert("nsl_tensor_logsoftmax", OwnedNewResult); // extern spelling: no underscore
     m.insert("nsl_tensor_sin", OwnedNewResult);
     m.insert("nsl_tensor_cos", OwnedNewResult);
     // Creation / conversion
@@ -64,41 +74,73 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     // Shape ops that produce new storage
     m.insert("nsl_tensor_reshape", OwnedNewResult);
     m.insert("nsl_tensor_transpose", OwnedNewResult);
-    m.insert("nsl_tensor_permute", OwnedNewResult);
-    m.insert("nsl_tensor_concat", OwnedNewResult);
+    // NOTE the spelling: the runtime extern is `nsl_tensor_cat` — a
+    // `nsl_tensor_concat` entry sat here dead for months (no such FFI;
+    // found by the ffi_ownership_drift runtime-extern binding,
+    // 2026-07-29). Same disease as the dead `"slice"` allowlist entry
+    // PR #423's review caught.
+    m.insert("nsl_tensor_cat", OwnedNewResult);
     m.insert("nsl_tensor_stack", OwnedNewResult);
     m.insert("nsl_tensor_gather", OwnedNewResult);
-    m.insert("nsl_tensor_scatter", OwnedNewResult);
     m.insert("nsl_tensor_expand", OwnedNewResult);
-    m.insert("nsl_tensor_broadcast_to", OwnedNewResult);
-    // Views (alias input storage)
-    m.insert("nsl_tensor_view", BorrowedFromInput(0));
-    // KNOWN-WRONG, left as-is deliberately (item 1, 2026-07-27). The runtime
-    // allocates FRESH storage on both paths — `shape_ops.rs` slice CPU, and
-    // `cuda::gpu_slice_f32_with_shape` on GPU — so this is an owning result
-    // misfiled as a borrow, i.e. an under-free. `expr::tensor_method_returns_
-    // owned_ref` classifies the `.slice()` METHOD correctly as owning; this
-    // table governs a different path and the two now disagree.
-    //
-    // Not flipped here because changing it ADDS frees on a path with no
-    // measurement behind it, and the failure mode of being wrong in that
-    // direction is a use-after-free rather than a leak. Fix it with a leak
-    // measurement in hand. `nsl_tensor_select`, `nsl_tensor_unsqueeze` and
-    // `nsl_tensor_cumsum` are absent from this table entirely, despite the
-    // header above saying every tensor-returning FFI should have an entry.
-    m.insert("nsl_tensor_slice", BorrowedFromInput(0));
+    // Corrected 2026-07-29 (was BorrowedFromInput(0), documented
+    // KNOWN-WRONG since 2026-07-27): the runtime allocates FRESH storage
+    // on both paths — `shape_ops.rs` slice CPU and
+    // `cuda::gpu_slice_f32_with_shape` GPU — re-verified three times
+    // since (the PR #423 allowlist audit, the #426 sampling review's
+    // per-runtime walk, and the #427 cycle). The `.slice()` method and
+    // the `tensor_slice` free fn have been classified owning (and
+    // statement-cleanup freed) through all of those cycles with the leak
+    // gates green — the borrow misfile governed only the two
+    // `register_ffi_result_ownership` call sites, where it under-freed.
+    m.insert("nsl_tensor_slice", OwnedNewResult);
+    // Creation intrinsics (all publish fresh storage).
+    m.insert("nsl_tensor_zeros", OwnedNewResult);
+    m.insert("nsl_tensor_ones", OwnedNewResult);
+    m.insert("nsl_tensor_full", OwnedNewResult);
+    m.insert("nsl_tensor_rand", OwnedNewResult);
+    m.insert("nsl_tensor_randn", OwnedNewResult);
+    m.insert("nsl_tensor_arange", OwnedNewResult);
+    // The remaining Ident-allowlist family (`expr_result_is_owned_
+    // temporary`), each per-runtime verified in that allowlist's own
+    // comment blocks across PRs #423/#424/#426: fresh output on every
+    // path (contiguous/unsqueeze return counted references either way;
+    // eval dropout clones; the sampling ops' GPU arms return fresh
+    // uploads).
+    m.insert("nsl_tensor_rotate_half", OwnedNewResult);
+    m.insert("nsl_tensor_cumsum", OwnedNewResult);
+    m.insert("nsl_tensor_unsqueeze", OwnedNewResult);
+    m.insert("nsl_tensor_causal_mask", OwnedNewResult);
+    m.insert("nsl_tensor_rmsnorm", OwnedNewResult);
+    m.insert("nsl_tensor_dropout", OwnedNewResult);
+    m.insert("nsl_tensor_layernorm", OwnedNewResult);
+    m.insert("nsl_tensor_bias_add", OwnedNewResult);
+    m.insert("nsl_tensor_embedding_lookup", OwnedNewResult);
+    m.insert("nsl_tensor_lt_scalar", OwnedNewResult);
+    m.insert("nsl_tensor_multinomial", OwnedNewResult);
+    // topk returns a DICT handle, not a tensor — "no tensor tracking" is
+    // exactly right here; dict_lifetime.rs owns the dict's lifecycle.
+    m.insert("nsl_tensor_topk", NotATensor);
     // Reductions
     m.insert("nsl_tensor_sum", OwnedNewResult);
     m.insert("nsl_tensor_mean", OwnedNewResult);
-    m.insert("nsl_tensor_max", OwnedNewResult);
-    m.insert("nsl_tensor_min", OwnedNewResult);
+    m.insert("nsl_tensor_reduce_max", OwnedNewResult); // extern spelling: reduce_ prefix
     m.insert("nsl_tensor_sum_dim", OwnedNewResult);
     m.insert("nsl_tensor_mean_dim", OwnedNewResult);
     m.insert("nsl_tensor_argmax", OwnedNewResult);
-    m.insert("nsl_tensor_argmin", OwnedNewResult);
+    // Fresh on both paths (shape_ops.rs:355; #7b8483f2-review-verified) —
+    // was one of the documented absences the old KNOWN-WRONG comment
+    // carried.
+    m.insert("nsl_tensor_select", OwnedNewResult);
+    // STILL-UNCLASSIFIED raw-callable externs (leak-direction gap, do
+    // not lose this note again): `nsl_tensor_reduce_to_shape`
+    // (ad_ops.rs) and `nsl_tensor_gelu_backward` (activation.rs) are
+    // registered runtime fns reachable by raw-name calls but have no
+    // entry — absence takes the instrumented Unknown fallback (retain →
+    // one stranded block per raw call in return position). Classify them
+    // here WITH a per-runtime freshness read, not by pattern.
     // Scalar-returning
-    m.insert("nsl_tensor_sum_to_scalar", NotATensor);
-    m.insert("nsl_tensor_mean_to_scalar", NotATensor);
+    
     m.insert("nsl_tensor_item", NotATensor);
     m
 }
@@ -122,10 +164,16 @@ mod tests {
     }
 
     #[test]
-    fn view_is_borrowed_from_input_zero() {
-        assert!(matches!(
-            ffi_ownership_kind("nsl_tensor_view"),
-            Some(FfiOwnershipKind::BorrowedFromInput(0))
-        ));
+    fn removed_dead_keys_are_gone() {
+        // 2026-07-29: `nsl_tensor_view` (with a BorrowedFromInput entry)
+        // named no runtime extern at all — real views are minted inside
+        // method dispatch via `new_view_i64`, never through an FFI of
+        // that name. The `ffi_ownership_drift` gate now binds every key
+        // to the extern inventory; the dead keys were removed rather
+        // than guessed at. BorrowedFromInput currently has no live
+        // entries — it stays for the day a true aliasing FFI appears.
+        assert!(ffi_ownership_kind("nsl_tensor_view").is_none());
+        assert!(ffi_ownership_kind("nsl_tensor_concat").is_none());
+        assert!(ffi_ownership_kind("nsl_tensor_tanh").is_none());
     }
 }
