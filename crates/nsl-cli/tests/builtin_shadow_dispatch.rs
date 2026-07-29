@@ -15,10 +15,17 @@
 //! CPU-only on purpose: dispatch is device-independent and this way the
 //! gate runs in the plain workspace suite too.
 //!
-//! Scope: MODULE-LEVEL `fn`s only. A nested `fn` or a let-bound lambda
-//! sharing a builtin name still loses to the builtin (registry.functions
-//! never holds those names) — parity with the ~30 pre-guarded sibling
-//! arms, not a regression; queued with the broader dispatch-arm audit.
+//! 2026-07-29: the nested-fn/lambda half is closed too. Nested `fn`s
+//! are REMOVED from `registry.functions` right after their body
+//! compiles (StmtKind::FnDef restores the previous entry) and lambdas
+//! never enter it, so the registry guards could not see them — a nested
+//! `fn topk` still hit the builtin arm. `compile_call` now routes any
+//! LOCAL binding whose checker type is `Type::Function` straight to
+//! `compile_indirect_call` before every builtin arm; non-Function
+//! locals (a tensor named `sum`) keep builtin dispatch exactly as
+//! before. Module-level arms WITHOUT a registry guard (e.g.
+//! `reduce_max`) remain a documented gap for the broader dispatch-arm
+//! audit — the new route only covers variable-bound function values.
 
 use std::process::Command;
 
@@ -96,6 +103,201 @@ print("DONE")
 "#;
     let stdout = run_src(src, "argmax");
     assert_eq!(printed_value(&stdout), "6", "user argmax did not win:\n{stdout}");
+}
+
+/// The bugs.md 2026-07-28 ICE shape: a NESTED `fn topk` — invisible to
+/// the registry guards because FnDef removes it after compiling. The
+/// Function-typed-binding route dispatches it like any local fn value.
+#[test]
+fn nested_fn_shadowing_topk_dispatches_to_the_nested_fn() {
+    let src = r#"
+fn outer(x: Tensor) -> float:
+    fn topk(t: Tensor, k: int) -> Tensor:
+        return t
+    let r = topk(x, 3)
+    return sum(r).item()
+
+let x = arange(0.0, 8.0)
+print(outer(x))
+print("DONE")
+"#;
+    let stdout = run_src(src, "nestedtopk");
+    assert_eq!(
+        printed_value(&stdout),
+        "28",
+        "nested topk did not win:\n{stdout}"
+    );
+}
+
+/// A let-bound lambda sharing a builtin arm's name. Pre-route the
+/// `cumsum` arm claimed the call and rejected it at compile time
+/// (wrong arity for the builtin the user never meant to call).
+///
+/// Int-typed on purpose: indirect calls MISCOMPILE float arguments
+/// today (`(|v: float| v * 2.0)(3.0)` returns 4 — pre-existing on the
+/// parent tree, probed 2026-07-29, filed in bugs.md) — an int lambda
+/// exercises the same dispatch routing without inheriting that bug.
+#[test]
+fn lambda_shadowing_cumsum_dispatches_to_the_lambda() {
+    let src = r#"
+let cumsum = |v: int| v * 2
+print(cumsum(3))
+print("DONE")
+"#;
+    let stdout = run_src(src, "lambdacumsum");
+    assert_eq!(
+        printed_value(&stdout),
+        "6",
+        "lambda cumsum did not win:\n{stdout}"
+    );
+}
+
+/// A fn-typed PARAMETER sharing a builtin arm's name — same class, via
+/// the parameter binding instead of a let. Int-typed for the same
+/// reason as the lambda test above.
+#[test]
+fn fn_typed_param_shadowing_lt_scalar_dispatches_indirect() {
+    let src = r#"
+fn apply(lt_scalar: (int) -> int, v: int) -> int:
+    return lt_scalar(v)
+
+let f = |z: int| z + 1
+print(apply(f, 4))
+print("DONE")
+"#;
+    let stdout = run_src(src, "paramshadow");
+    assert_eq!(
+        printed_value(&stdout),
+        "5",
+        "fn-typed param did not win:\n{stdout}"
+    );
+}
+
+/// Review HIGH on 371ee02f: `state.variables` is function-flat while
+/// the checker is block-scoped — a nested fn declared in an if-arm is
+/// out of scope after the arm, and a later call to the SAME name
+/// resolves to the builtin. The first cut of the guard trusted the flat
+/// map and rerouted that call into a dead (undefined-on-path) function
+/// pointer — a crash. `live_fn_bindings` now mirrors the checker's
+/// scoping; these four fixtures are the reviewer's runtime-confirmed
+/// repros, value-pinned.
+#[test]
+fn builtin_call_after_dead_arm_shadow_uses_the_builtin() {
+    let src = r#"
+let flag = 0
+if flag > 0:
+    fn sum(a: int) -> int:
+        return a + 1
+    print(sum(1))
+let t = ones([4])
+let s = sum(t)
+print(s.item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "deadarm");
+    assert_eq!(
+        printed_value(&stdout),
+        "4",
+        "post-arm builtin sum broke:\n{stdout}"
+    );
+}
+
+#[test]
+fn builtin_call_after_live_arm_shadow_uses_the_builtin() {
+    let src = r#"
+let flag = 1
+if flag > 0:
+    fn sum(a: int) -> int:
+        return a + 1
+    print(sum(1))
+let t = ones([4])
+let s = sum(t)
+print(s.item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "livearm");
+    assert!(
+        stdout.contains("2\n"),
+        "in-arm nested sum did not win:\n{stdout}"
+    );
+    assert_eq!(
+        printed_value(&stdout),
+        "4",
+        "post-arm builtin sum broke after a LIVE arm:\n{stdout}"
+    );
+}
+
+#[test]
+fn builtin_call_after_dead_arm_lambda_uses_the_builtin() {
+    let src = r#"
+let flag = 0
+if flag > 0:
+    let cumsum = |v: int| v * 2
+    print(cumsum(3))
+let x = arange(0.0, 4.0)
+let c = cumsum(x, -1)
+print(sum(c).item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "deadlambda");
+    // cumsum of 0..3 = [0,1,3,6]; sum = 10.
+    assert_eq!(
+        printed_value(&stdout),
+        "10",
+        "post-arm builtin cumsum broke:\n{stdout}"
+    );
+}
+
+#[test]
+fn module_fn_call_after_dead_arm_shadow_uses_the_module_fn() {
+    let src = r#"
+fn helper(x: int) -> int:
+    return x * 10
+
+let flag = 0
+if flag > 0:
+    fn helper(x: int) -> int:
+        return x + 1
+    print(helper(1))
+print(helper(5))
+print("DONE")
+"#;
+    let stdout = run_src(src, "deadmodfn");
+    assert_eq!(
+        printed_value(&stdout),
+        "50",
+        "post-arm module fn broke:\n{stdout}"
+    );
+}
+
+/// Grad-block bodies are checker-scoped but compile in the same
+/// FuncState with no variables restore — the review's residual-gap
+/// repro (MEDIUM on 682641ca): without a fn-binding scope around the
+/// grad body, the post-block builtin `sum(w)` rerouted into the grad
+/// body's dead nested fn (misaligned-deref abort).
+#[test]
+fn builtin_call_after_grad_block_shadow_uses_the_builtin() {
+    let src = r#"
+let w = ones([4])
+let (loss, grads) = grad(w):
+    fn sum(a: int) -> int:
+        return a + 1
+    mean(w * w)
+print(loss.item())
+let s = sum(w)
+print(s.item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "gradshadow");
+    assert!(
+        stdout.contains("1\n"),
+        "grad loss wrong (mean of ones = 1):\n{stdout}"
+    );
+    assert_eq!(
+        printed_value(&stdout),
+        "4",
+        "post-grad-block builtin sum broke:\n{stdout}"
+    );
 }
 
 /// The guard must not disturb the unshadowed builtins.

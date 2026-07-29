@@ -253,6 +253,40 @@ impl Compiler<'_> {
             }
         };
 
+        // A LOCAL binding holding a function value (nested `fn`, lambda
+        // `let f = |x| ...`, or a fn-typed parameter) shadows any builtin
+        // dispatch arm sharing its name. The registry guards added for
+        // the sampling arms (PR #429) cover MODULE-LEVEL user fns via
+        // `registry.functions`, but nested fns are REMOVED from the
+        // registry right after their body compiles (StmtKind::FnDef
+        // restores the previous entry) and lambdas never enter it — so a
+        // nested `fn topk` fell through to the BUILTIN arm while the
+        // checker had typed the user fn: a runtime magic-abort or a
+        // cranelift ICE ("declared type of variable doesn't match",
+        // bugs.md 2026-07-28), depending on arity.
+        //
+        // The binding lookup MUST be `live_fn_bindings`, not
+        // `state.variables`: the flat variables map never unbinds, but
+        // the CHECKER is block-scoped — after an if-arm that declared a
+        // nested `fn sum` exits, a later `sum(t)` resolves to the
+        // BUILTIN, and trusting the stale flat entry rerouted it into a
+        // dead function pointer (review HIGH on 371ee02f, four
+        // runtime-confirmed crashes). `live_fn_bindings` mirrors the
+        // checker's scoping via push/pop at every arm/body lowering.
+        //
+        // Route to the indirect call ONLY for Function-typed callees: a
+        // tensor local named `sum` keeps builtin dispatch exactly as
+        // before (rerouting it through an integer-as-pointer jump would
+        // be worse than the status quo in every way).
+        if let ExprKind::Ident(sym) = &callee.kind {
+            if state.live_fn_bindings.contains_key(sym)
+                && state.variables.contains_key(sym)
+                && matches!(self.node_type(callee.id), Type::Function { .. })
+            {
+                return self.compile_indirect_call(builder, state, callee, args);
+            }
+        }
+
         // M39b: matmul rewrite dispatch — VmapTransformer records (NodeId → target_name)
         // for matmul call sites that need batched semantics.  "batched_matmul" and
         // "batched_matmul_right" are logical names; both currently lower to

@@ -55,6 +55,13 @@ impl Compiler<'_> {
                 builder.def_var(var, param_val);
                 state.variables.insert(param.name, (var, cl_type));
                 state.param_symbols.insert(param.name);
+                // Params are function-root bindings for the
+                // shadow-dispatch guard (no open scope here, so they
+                // stay live for the whole body — the checker's scoping
+                // too). The guard's Function-type check filters non-fn
+                // params; registering unconditionally keeps this site
+                // free of type plumbing.
+                state.register_fn_binding(param.name);
             }
 
             // M28: emit runtime assertions for symbolic/bounded dimensions
