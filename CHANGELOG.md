@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — nested builtin arguments no longer strand their results
+
+- **A builtin call nested as another builtin's argument stranded its
+  fresh output** — `sum(cumsum(g, -1))` leaked the inner cumsum result 1
+  block per call (device-independent) while the bound spelling was
+  clean. 184 argument-compilation sites across `compile_call`'s dispatch
+  arms used `compile_expr`, which never registers a nested call's result
+  as a statement temporary; all now use `compile_nested_expr`, whose
+  tracking predicate registers exactly fresh-owning tensor results
+  (idents, literals, and non-tensor arguments are untouched — the
+  tracking fires only for `expr_call_returns_owning_ref` + tensor-typed
+  results, so string/path/int arms are no-ops by construction).
+- Gate `nested_arg_temporaries_gate.rs` pins the sampling + norm +
+  reduction families incl. a double-nested shape at zero per-round
+  strand (red-proven at exactly 6/round pre-fix) with bound-vs-nested
+  VALUE parity folded in. Method-form receiver chains were already
+  tracked (PR #423); method-form ARGUMENTS stay as-is (lists/ints
+  today).
+- **A pre-existing loop-scope ICE became trivially reachable and is
+  fixed** (review HIGH): temps registered while compiling a WHILE
+  condition / FOR iterable predate the loop-scope mark, and
+  `free_tensor_temporaries`' whole-list drain stole them — leaving the
+  exit cleanup's `[scope_start..]` slice out of bounds, a COMPILE-TIME
+  panic (`while sum(cumsum(g,-1)).item() ...` — also reproducible on
+  main via method-form conditions). The drain now takes only entries
+  above the innermost scope mark, and both loop-exit slices clamp
+  defensively. Residuals pinned by the new loop-condition gate: a
+  for-iterable evaluates once and sweeps clean; a while condition's
+  per-evaluation temps still strand until condition temps get a
+  header/exit free placement (queued).
+- Sites deliberately NOT converted (differently-spelled or unsound to
+  convert): module-alias/agent/`@fuse`/kv-cache/kernel-launch argument
+  paths, DataLoader data/labels, the escape-gated generic-call path
+  (converting it unconditionally would be unsound), and indirect/lambda
+  calls (no escape info — a lambda can store the pointer). These keep
+  their status-quo strands.
+
 ### Fixed — dict-lifetime follow-ups: loop-local dicts, load_safetensors, builtin shadowing
 
 - **Loop-local dict bindings no longer strand per iteration** (the eltls

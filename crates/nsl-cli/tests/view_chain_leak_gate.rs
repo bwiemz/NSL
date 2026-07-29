@@ -320,12 +320,29 @@ fn free_function_chain_links_do_not_strand_per_call() {
         s.push_str("print(\"DONE\")\n");
         s
     };
-    let (lb1, _, _) = run_fixture(&src(1), "freefn", 1);
+    let (lb1, _, stderr1) = run_fixture(&src(1), "freefn", 1);
     let (lb3, _, _) = run_fixture(&src(3), "freefn", 3);
+    // Anti-vacuity: prove the fixture exercised the device via the driver
+    // allocation counter, NOT via retained blocks. This gate originally
+    // required lb1 > 0 — valid while the chains stranded a documented
+    // handful of unobservable entries, but the nested-arg conversion
+    // (2026-07-29) freed those too, taking lb to a legitimate ZERO. The
+    // same probe swap was already made for the unknown-receiver gate
+    // below when its fixture reached zero.
+    let drv_allocs: i64 = stderr1
+        .lines()
+        .filter_map(|l| {
+            l.split("drv_allocs=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .next_back()
+        .unwrap_or(0);
     assert!(
-        lb1 > 0,
-        "[freefn] fixture retained no GPU blocks at all — not exercising the \
-         device, the growth assertion below would pass vacuously"
+        drv_allocs > 0,
+        "[freefn] no driver allocations reported — not exercising the \
+         device, the growth assertion below would pass vacuously:\n{stderr1}"
     );
     assert_eq!(
         lb3, lb1,
@@ -335,6 +352,12 @@ fn free_function_chain_links_do_not_strand_per_call() {
          Ident allowlist of `expr_result_is_owned_temporary` \
          (nsl-codegen/src/expr/mod.rs)",
         lb3 - lb1
+    );
+    assert_eq!(
+        (lb1, lb3),
+        (0, 0),
+        "the chains now free every link (nested-arg conversion) — a nonzero \
+         count here is a strand returning"
     );
 }
 

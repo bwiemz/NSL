@@ -2820,7 +2820,27 @@ impl Compiler<'_> {
         state: &mut FuncState,
         keep: Option<Value>,
     ) {
-        let temps = std::mem::take(&mut state.cleanup.tensor_temporaries);
+        // Drain only the temporaries registered ABOVE the innermost loop-scope
+        // mark. A `mem::take` of the whole list here stole entries that a loop
+        // CONDITION / for-ITERABLE registered before `temp_scope_stack` pushed
+        // its mark: the first body statement drained them (emitting their
+        // frees INSIDE the body = once per iteration), left `scope_start`
+        // pointing past the now-empty list, and the loop-exit cleanups'
+        // `[scope_start..]` slices panicked at compile time — a pre-existing
+        // ICE (method-form condition temps hit it on main) made trivially
+        // reachable once nested-arg tracking covered every dispatch arm
+        // (review HIGH on 3b7f085f, red-proven with a 6-line while loop).
+        // Below-mark entries stay listed; the loop statement's own
+        // statement-end cleanup frees the final condition evaluation's temp
+        // after the loop exits.
+        let start = state
+            .cleanup
+            .temp_scope_stack
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .min(state.cleanup.tensor_temporaries.len());
+        let temps = state.cleanup.tensor_temporaries.split_off(start);
         // Tape ID identity: intermediates can now be safely freed during tape recording
         // because TapeOps use monotonic tape_ids as identity keys (not raw pointers).
         for temp in &temps {
@@ -2898,6 +2918,10 @@ impl Compiler<'_> {
     /// CRITICAL: Does NOT truncate tensor_temporaries — that only happens at natural scope exit.
     fn emit_loop_scope_cleanup(&mut self, builder: &mut FunctionBuilder, state: &mut FuncState) {
         if let Some(&scope_start) = state.cleanup.temp_scope_stack.last() {
+            // Clamp defensively: the statement-end drain above now preserves
+            // below-mark entries, but a stale mark must degrade to a no-op,
+            // never a slice panic.
+            let scope_start = scope_start.min(state.cleanup.tensor_temporaries.len());
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
                     if is_block_filled(builder, block) {
@@ -2912,6 +2936,8 @@ impl Compiler<'_> {
     /// Emit cleanup AND truncate temporaries at natural loop exit.
     fn cleanup_loop_scope(&mut self, builder: &mut FunctionBuilder, state: &mut FuncState) {
         if let Some(scope_start) = state.cleanup.temp_scope_stack.pop() {
+            // Clamp defensively — see emit_loop_scope_cleanup.
+            let scope_start = scope_start.min(state.cleanup.tensor_temporaries.len());
             for &temp in &state.cleanup.tensor_temporaries[scope_start..] {
                 if let Some(block) = state.current_block {
                     if is_block_filled(builder, block) {
