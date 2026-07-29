@@ -23,15 +23,16 @@ const N_KV_HEADS = 10
 const HEAD_DIM = 64
 const D_FF = 3520
 const MAX_SEQ_LEN = 1024
+const ROPE_THETA = 10000.0
 const DROPOUT = 0.1
 
 # ─── SwiGLU Feedforward ───
 # d_down scaled by 1/sqrt(2*N_LAYERS) = 1/sqrt(48) for residual stability
-model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float, n_layers: int):
     w_gate: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
     w_up: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
     # Down projection scaled by 1/sqrt(2*N_LAYERS) for residual stream stability
-    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], 48.0)).item())
+    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], float(2 * n_layers))).item())
     _dropout_p: Tensor = full([1], dropout_p)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
@@ -43,11 +44,11 @@ model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
 # ─── Pre-norm Transformer Block ───
 # x -> RMSNorm -> GQA -> residual -> RMSNorm -> SwiGLU -> residual
 
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float, max_seq_len: int, rope_theta: float, n_layers: int):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p, max_seq_len, rope_theta, n_layers)
     ffn_norm: RMSNorm = RMSNorm(d_model)
-    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p, n_layers)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
         let h = x + self.attn.forward(self.attn_norm.forward(x), training)
@@ -59,7 +60,7 @@ model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: in
 
 model NSLCoder:
     embed: Tensor = randn([256, 1280]) * full([1], 0.02)
-    blocks: [TransformerBlock; 24] = TransformerBlock(1280, 20, 10, 64, 3520, 0.1)
+    blocks: [TransformerBlock; 24] = TransformerBlock(1280, 20, 10, 64, 3520, 0.1, 1024, 10000.0, 24)
     norm: RMSNorm = RMSNorm(1280)
 
     fn forward(self, input_ids: Tensor) -> Tensor:

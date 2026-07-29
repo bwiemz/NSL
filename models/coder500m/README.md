@@ -123,6 +123,20 @@ measurement, not absolute values.
 - Item #5's `test-hooks`-gated CPU peak-tracking validated this
   mechanism on a 4-parameter fixture (794 KB delta). This 500M demo
   scales it to a real model on GPU.
+- `MAX_SEQ_LEN` / `ROPE_THETA` are threaded from `config.nsl` into
+  `GroupedQueryAttention` -> `RotaryEmbedding` (they were hardcoded in the
+  stdlib attention layer before). This model's values, 1024 / 10000, match
+  what it effectively used, so its numerics are unchanged by that fix —
+  unlike `coder1b` / `coder7b`, whose declared `ROPE_THETA = 500000` was
+  dead. `crates/nsl-cli/tests/model_config_drift.rs` gates the agreement.
+- `AdamW(weight_decay=...)` in a `train` block applies to **every**
+  trainable parameter, RMSNorm gains and the tied embedding included —
+  NSL has no optimizer parameter groups. See
+  `models/coder1b/README.md` for details.
+- `model.nsl` also exposes `forward_train_packed(input_ids, segment_ids,
+  position_ids, training)` for `DataLoader(..., packing=true)` streams;
+  `pretrain_fase.nsl` uses the unpacked path because its synthetic corpus
+  has no document boundaries.
 
 ## Building bigger variants
 

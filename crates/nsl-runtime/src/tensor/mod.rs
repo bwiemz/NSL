@@ -2438,6 +2438,38 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         std::process::abort();
     }
 
+    // Bounds-check host-resident indices BEFORE dispatching, so the GPU arm
+    // is covered too.
+    //
+    // `gpu_embedding_lookup` used to carry the comment "bounds checked by CPU
+    // fallback before we get here" — that was false: the GPU arm returns
+    // above the CPU loop that does the checking, so an out-of-range id read
+    // out of bounds on the device with no fault and no NaN, just wrong rows.
+    // The common shapes both land here host-resident: `batch.input_ids` comes
+    // off the CPU DataLoader, and RotaryEmbedding's cached-table gather uses
+    // `arange(0, seq_len)`. For the latter this check is what turns
+    // `seq_len > max_seq_len` into a loud abort instead of a silent read past
+    // the rotary table.
+    //
+    // Device-resident indices stay unchecked — validating them would mean a
+    // D2H copy plus a sync on every lookup. That gap is real; it is not new,
+    // and it is not closed here.
+    if indices.device == 0 && weight.ndim == 2 {
+        let rows = unsafe { *weight.shape.add(0) };
+        let n = unsafe { *indices.shape.add(0) } as usize;
+        for i in 0..n {
+            let raw_idx = indices.read_index(i);
+            if raw_idx < 0 || raw_idx >= rows {
+                eprintln!(
+                    "nsl: embedding_lookup index {} at position {} is out of bounds \
+                     for a table with {} rows",
+                    raw_idx, i, rows
+                );
+                std::process::abort();
+            }
+        }
+    }
+
     // GPU path: launch fused embedding kernel when weight is on GPU.
     if weight.device > 0 {
         #[cfg(feature = "cuda")]
@@ -2479,6 +2511,9 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
 
     for i in 0..seq_len {
+        // Already validated above for host-resident indices, which is every
+        // index reaching this CPU path. Kept as a defensive re-check because
+        // the copy below is an unchecked raw pointer add.
         let raw_idx = indices.read_index(i);
         if raw_idx < 0 || raw_idx >= vocab_size as i64 {
             eprintln!(

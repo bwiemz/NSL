@@ -22,15 +22,17 @@ const D_MODEL = 384
 const N_LAYERS = 6
 const N_HEADS = 6
 const N_KV_HEADS = 3
+const HEAD_DIM = 64
 const D_FF = 1024
 const MAX_SEQ_LEN = 2048
+const ROPE_THETA = 10000.0
 const DROPOUT = 0.1
 
 # ─── SwiGLU Feedforward ───
-model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float, n_layers: int):
     w_gate: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
     w_up: Tensor = randn([d_model, d_ff]) * sqrt(full([1], 2.0 / float(d_model + d_ff)))
-    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], 12.0)).item())
+    w_down: Tensor = randn([d_ff, d_model]) * sqrt(full([1], 2.0 / float(d_ff + d_model))) * full([1], 1.0 / sqrt(full([1], float(2 * n_layers))).item())
     _dropout_p: Tensor = full([1], dropout_p)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
@@ -40,11 +42,11 @@ model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
         return dropout(out, self._dropout_p.item(), training)
 
 # ─── Pre-norm Transformer Block ───
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float, max_seq_len: int, rope_theta: float, n_layers: int):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p, max_seq_len, rope_theta, n_layers)
     ffn_norm: RMSNorm = RMSNorm(d_model)
-    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p, n_layers)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
         let h = x + self.attn.forward(self.attn_norm.forward(x), training)
@@ -53,7 +55,7 @@ model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: in
 # ─── NSL-Coder-RL Model ───
 model NSLCoderRL:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1, 2048, 10000.0, 6)
     norm: RMSNorm = RMSNorm(384)
 
     fn forward(self, input_ids: Tensor) -> Tensor:
