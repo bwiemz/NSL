@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — while-condition temporaries no longer strand per evaluation
+
+- **A while loop's condition stranded its tensor temporaries once per
+  evaluation** (all but the final one): condition temps register below
+  the loop-scope mark, and the only free site was the While statement's
+  end-of-statement cleanup in the exit block — which frees exactly one
+  evaluation's values (the final one, whose SSA results dominate the
+  exit). `while sum(cumsum(g, -1)).item() * n > 0.0:` leaked 2 blocks
+  per iteration. This was the deliberately-pinned exact-6 residual in
+  `nested_arg_temporaries_gate` (documented as "needs a header/exit free
+  placement", PR #430).
+- Fix: `free_condition_temporaries` — the loop HEADER frees each
+  evaluation's temps right after the branch scalar is computed and
+  before the `brif`, and drains them from `tensor_temporaries` so the
+  exit-block cleanup cannot double-free. The header re-executes before
+  every body entry AND before the exit branch, so the final evaluation
+  is freed exactly once too; entries below the snapshot (an outer
+  statement's temps) stay listed and untouched. `while-let` routes
+  through the same helper with the bound expression value excluded (it
+  is read throughout the body — the exclusion is defensive today since
+  top-level expression results are not tracked, and stated as such).
+- Gate updated: the exact-6 pin is retired — zero strands at 4 AND 7
+  evaluations (two counts so per-evaluation frees can't be faked by a
+  constant offset), plus a new while-let shape (int-typed binding whose
+  expression carries nested tensor temps; 4 stranded pre-fix) with loop
+  value correctness pinned throughout.
+
 ### Fixed — dispatch results classify from the ffi_ownership table without allowlist entries (ELTLS v2a)
 
 - **A dispatch arm whose NSL-level name was missing from the

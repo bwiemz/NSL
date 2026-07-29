@@ -2864,6 +2864,44 @@ impl Compiler<'_> {
         }
     }
 
+    /// Free the tensor temporaries a loop CONDITION registered during one
+    /// evaluation, inside the block that evaluates it (the loop header),
+    /// and drain them from `tensor_temporaries` so the loop statement's
+    /// end-of-statement cleanup does not free them a second time.
+    ///
+    /// `base` is the list length snapshotted immediately before the
+    /// condition compiled — everything at or above it was registered by
+    /// this evaluation. `keep` is the condition's own result value
+    /// (while-let binds it into the body; excluded defensively — a
+    /// tracked keep would otherwise become freed-then-read).
+    ///
+    /// Emitting the frees in the HEADER is what makes this per-iteration:
+    /// the header re-executes before every body entry AND before the
+    /// exit branch, so the final evaluation's temps are freed exactly
+    /// once too. Entries BELOW `base` (an outer statement's temps) stay
+    /// listed and untouched.
+    pub(crate) fn free_condition_temporaries(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        base: usize,
+        keep: Value,
+    ) {
+        let base = base.min(state.cleanup.tensor_temporaries.len());
+        let temps = state.cleanup.tensor_temporaries.split_off(base);
+        for temp in &temps {
+            if *temp == keep {
+                continue;
+            }
+            if let Some(block) = state.current_block {
+                if is_block_filled(builder, block) {
+                    break;
+                }
+            }
+            let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[*temp]);
+        }
+    }
+
     /// ELTLS: free all TapeHeld tensors accumulated during the current tape
     /// region. Called after nsl_tape_backward runs and before the block's
     /// normal scope cleanup. See spec §7.3.
@@ -3179,7 +3217,23 @@ impl Compiler<'_> {
 
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
+        let cond_base = state.cleanup.tensor_temporaries.len();
         let cond_val = self.compile_expr(builder, state, condition)?;
+        // Free per-evaluation condition temporaries INSIDE the header
+        // block, after the branch scalar is computed and before the brif.
+        // The condition re-evaluates every iteration, but until now its
+        // temps sat in tensor_temporaries below the loop-scope mark and
+        // only the While STATEMENT's end-of-statement cleanup (in the
+        // exit block) ever freed them — which frees exactly ONE
+        // evaluation's values (the final one, whose SSA results dominate
+        // the exit); every earlier iteration's condition temps stranded,
+        // one block per tracked temp per evaluation (the deliberate
+        // exact-6 pin in nested_arg_temporaries_gate, now retired).
+        // Draining here means the header frees each evaluation's temps —
+        // including the final one — and the exit-block cleanup no longer
+        // sees them, so nothing double-frees. The brif consumes only the
+        // extracted scalar, never the freed handles.
+        self.free_condition_temporaries(builder, state, cond_base, cond_val);
         builder
             .ins()
             .brif(cond_val, body_block, &[], exit_block, &[]);
@@ -3265,7 +3319,16 @@ impl Compiler<'_> {
         // Header: evaluate expression, check truthiness (non-zero = continue)
         builder.switch_to_block(header_block);
         state.current_block = Some(header_block);
+        let expr_base = state.cleanup.tensor_temporaries.len();
         let val = self.compile_expr(builder, state, expr)?;
+        // Per-evaluation sub-temporaries of the while-let expression free
+        // in the header, same as compile_while. `val` itself is excluded
+        // by free_condition_temporaries' keep parameter — it is bound to
+        // the pattern variable and read throughout the body (top-level
+        // compile_expr results are not tracked today, so the exclusion is
+        // defensive, but a tracked `val` would otherwise be a
+        // freed-then-read bug, not a leak).
+        self.free_condition_temporaries(builder, state, expr_base, val);
         let cond = builder.ins().icmp_imm(IntCC::NotEqual, val, 0);
         builder.ins().brif(cond, body_block, &[], exit_block, &[]);
 

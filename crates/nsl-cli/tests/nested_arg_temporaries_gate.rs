@@ -121,31 +121,64 @@ print("DONE")
 /// reachable by the arg conversion. `free_tensor_temporaries` now drains
 /// only above the innermost mark.
 ///
-/// Residuals pinned honestly: the for-iterable evaluates once and its
-/// temps free at the statement's end (0 strand); the while condition
-/// re-evaluates per iteration and all but the final evaluation's temps
-/// strand (6 here = 4 evaluations x 2 temps - 2 freed at statement end)
-/// — condition temps need a header/exit free placement to reach zero,
-/// queued as follow-up.
+/// The while-condition residual is now ZERO: `free_condition_temporaries`
+/// frees each evaluation's temps inside the loop HEADER (after the
+/// branch scalar is computed, before the brif) and drains them from the
+/// list so the statement-end cleanup cannot double-free. The old
+/// exact-6 pin (4 evaluations x 2 temps - 2 freed at statement end)
+/// documented the strand this fix retires; the two iteration counts
+/// below (4 and 7 evaluations) prove the frees are genuinely
+/// per-evaluation rather than a constant offset. The for-iterable
+/// evaluates once and was already clean.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn loop_condition_nested_args_compile_and_run() {
-    let while_src = r#"
+    for (start, evals) in [("3.0", "4"), ("6.0", "7")] {
+        let while_src = format!(
+            r#"
 let g = arange(0.0, 8.0).to(cuda)
-let n = 3.0
+let n = {start}
 while sum(cumsum(g, -1)).item() * n > 0.0:
     n = n - 1.0
 print(n)
 print("DONE")
+"#
+        );
+        let (lb, stdout) = run_fixture(&while_src, &format!("whilecond{evals}"));
+        let val = stdout
+            .lines()
+            .take_while(|l| *l != "DONE")
+            .last()
+            .unwrap_or("");
+        assert_eq!(val, "0", "while-condition loop computed wrong value:\n{stdout}");
+        assert_eq!(
+            lb, 0,
+            "while-condition temps stranded at {evals} evaluations:\n{stdout}"
+        );
+    }
+
+    // while-let goes through the same helper; an int-typed binding whose
+    // expression carries nested tensor temps terminates naturally when
+    // the sum reaches zero (3 evaluations here, 2 temps each — 4
+    // stranded pre-fix).
+    let while_let_src = r#"
+let g = arange(0.0, 8.0).to(cuda)
+let n = 2.0
+let hits = 0.0
+while let k = int(sum(lt_scalar(g, n)).item()):
+    n = n - 1.0
+    hits = hits + k
+print(hits)
+print("DONE")
 "#;
-    let (lb, stdout) = run_fixture(while_src, "whilecond");
+    let (lb, stdout) = run_fixture(while_let_src, "whilelet");
     let val = stdout
         .lines()
         .take_while(|l| *l != "DONE")
         .last()
         .unwrap_or("");
-    assert_eq!(val, "0", "while-condition loop computed wrong value:\n{stdout}");
-    assert_eq!(lb, 6, "while-condition temp residual changed:\n{stdout}");
+    assert_eq!(val, "3", "while-let loop computed wrong value:\n{stdout}");
+    assert_eq!(lb, 0, "while-let expression temps stranded:\n{stdout}");
 
     let for_src = r#"
 let g = arange(0.0, 4.0).to(cuda)
