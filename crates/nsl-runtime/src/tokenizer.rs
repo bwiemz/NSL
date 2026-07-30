@@ -182,15 +182,33 @@ pub extern "C" fn nsl_bpe_train(
         .vocab_size(vocab_size as usize)
         .min_frequency(min_freq as u64)
         .special_tokens(special_tokens)
+        // Seed the full 256-surrogate byte-level alphabet. Without it the
+        // vocabulary only contains characters the corpus happened to exhibit, so
+        // any byte absent from training has no token at all and encoding silently
+        // DROPS it — the tokenizer is not total over its own input domain.
+        // `ByteLevel::alphabet()` returns an `AHashSet`; the builder wants std's.
+        .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
         .build();
     let mut trainer = TrainerWrapper::BpeTrainer(bpe_trainer);
 
     let mut tokenizer = Tokenizer::new(
         tokenizers::ModelWrapper::BPE(BPE::default()),
     );
+    // `add_prefix_space = false`, unlike `ByteLevel::default()`. With it on, the
+    // pre-tokenizer PREPENDS a space to every input, so `decode(encode(x))`
+    // returns " " + x — the tokenizer is not a faithful round trip even with a
+    // decoder attached. `tokenizer_bpe::assemble` uses false for the same reason.
     tokenizer.with_pre_tokenizer(Some(
-        tokenizers::PreTokenizerWrapper::ByteLevel(ByteLevel::default()),
+        tokenizers::PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, true)),
     ));
+    // A ByteLevel pre-tokenizer REQUIRES the matching decoder. Without one,
+    // `Tokenizer::decode` joins the raw surrogate surfaces with spaces, so
+    // `decode(encode(x))` never returns `x` for any input — every space comes
+    // back as "Ġ" and a space is inserted between tokens. This shipped broken:
+    // 0 of 158 round-trip samples matched.
+    tokenizer.with_decoder(Some(tokenizers::DecoderWrapper::ByteLevel(
+        ByteLevel::default(),
+    )));
 
     if let Err(e) = tokenizer.train_from_files(&mut trainer, vec![path.to_string()]) {
         eprintln!("nsl: BPE training failed: {e}");
@@ -386,7 +404,30 @@ pub extern "C" fn nsl_tokenizer_encode_batch(
         .map(|ids| &ids[..ids.len().min(cap)])
         .collect();
     let widest = truncated.iter().map(|row| row.len()).max().unwrap_or(0);
+    // `padding` and `truncation` are independent, as they are in the HF
+    // tokenizers this mirrors: padding fills rows UP TO `max_len`, and only
+    // truncation may cut one down. So a row longer than `max_len` widens the
+    // batch rather than losing tokens the caller explicitly asked to keep.
+    //
+    // That is the right default — silently discarding tokens when
+    // `truncation == 0` would be worse than a wide tensor — but it does mean the
+    // returned width is not the requested one and can vary per batch, which
+    // shows up downstream as a positional-table bounds abort or as a shape that
+    // a cuda-graph capture cannot reuse. Those are confusing symptoms for a
+    // cause that lives here, so say it once.
     let seq_len = if padding != 0 {
+        if max_len > 0 && widest > effective_max {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nsl] warning: encode_batch padded to {widest}, not the requested \
+                     max_len={max_len}: a row is longer and truncation is off, so no tokens \
+                     were dropped. The batch width will vary with the longest document. \
+                     Pass truncation=1 for a fixed [batch, {max_len}] shape."
+                );
+            }
+        }
         effective_max.max(widest)
     } else {
         widest
@@ -489,6 +530,12 @@ mod tests {
 
     /// Padding to max_len must not shrink a row that is longer than max_len
     /// when truncation is off — that would silently discard tokens.
+    ///
+    /// The width is therefore NOT guaranteed to be `max_len` in this
+    /// combination; it is `max(max_len, longest)`, matching HF's independent
+    /// padding/truncation knobs, and the call warns once so the wider shape is
+    /// not a mystery downstream. Callers needing a fixed width pass
+    /// `truncation=1` (see `truncation_bounds_the_width`).
     #[test]
     fn padding_without_truncation_keeps_long_rows() {
         let handle = nsl_byte_tokenizer_new();
@@ -498,6 +545,43 @@ mod tests {
         let (rows, cols) = dims(ids);
         assert_eq!((rows, cols), (2, 6));
         assert_eq!(NslTensor::from_ptr(ids).len, 12);
+    }
+
+    /// `nsl_bpe_train` is the tokenizer NSL programs get from `bpe_train(...)`.
+    /// It attached a ByteLevel pre-tokenizer with no matching decoder, so
+    /// `Tokenizer::decode` joined the raw surrogate surfaces with spaces and
+    /// `decode(encode(x))` never returned `x` for ANY input — every space came
+    /// back as "Ġ" plus an inserted separator. It also never seeded the
+    /// byte-level alphabet, so a byte absent from the corpus had no token and
+    /// encoding silently dropped it.
+    #[test]
+    fn bpe_train_roundtrips_and_covers_every_byte() {
+        let dir = std::env::temp_dir().join(format!("nsl_bpe_train_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let corpus = dir.join("corpus.txt");
+        // Deliberately narrow: no digits, no braces, no non-ASCII. An unseeded
+        // alphabet would leave all of those unrepresentable.
+        let body = "fn forward self x return x\n".repeat(200);
+        std::fs::write(&corpus, &body).expect("write corpus");
+
+        let path = CString::new(corpus.to_string_lossy().as_ref()).unwrap();
+        let handle = nsl_bpe_train(path.as_ptr() as i64, 400, 2, 0);
+        assert_ne!(handle, 0, "bpe_train returned no handle");
+
+        for text in [
+            "fn forward self x return x\n",
+            "let y = 42",
+            "  indented\twith\ttabs  ",
+            "h\u{e9}llo \u{1F600}",
+        ] {
+            let c = CString::new(text).unwrap();
+            let ids = nsl_tokenizer_encode(handle, c.as_ptr() as i64);
+            let back = nsl_tokenizer_decode(handle, ids);
+            let got = unsafe { cstr_to_str(back) };
+            assert_eq!(got, text, "bpe_train tokenizer failed to round-trip {text:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

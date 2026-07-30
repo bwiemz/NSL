@@ -383,3 +383,159 @@ The transition point was re-swept with the shipped trainer:
 40960 is the out-of-domain optimum. 32768 trades 0.25% of OOD compression for
 3.9% better in-domain, which is the better choice if a run's data is known to
 match the tokenizer's training mix; the default stays at the OOD optimum.
+
+---
+
+## 5. Code-review fixes (same day, post-campaign)
+
+Two independent review passes over the campaign diff. Fifteen findings were
+confirmed against the code and fixed; the notes below cover the ones that
+changed behaviour rather than wording.
+
+### The one that mattered most: a certification gate had been switched off
+
+`every_ptx_constant_is_registered_for_certification` was inserted *between* the
+existing `#[test]` attribute and `all_handwritten_ptx_is_pure_ascii`. Rust
+accepts that with two warnings (`duplicated attribute`, `function is never
+used`) and no error, so the ASCII gate silently stopped running — including over
+the two PTX kernels this campaign added.
+
+That gate is load-bearing: a single non-ASCII byte in a PTX comment makes
+`cuModuleLoadData` fail with `CUDA_ERROR_INVALID_PTX`, and two em-dashes have
+already shipped broken kernels for exactly this reason. Verified by injecting an
+em-dash into a kernel comment after the fix — the gate fails with the precise
+diagnostic, and passes again once reverted.
+
+This is the **fourth** time in this campaign that inserting an item immediately
+after an existing attribute or doc block attached it to the wrong symbol. The
+same mistake also moved a load-bearing warning about the `std`-vs-`Σx²` confusion
+off `gpu_tensor_sum_sq_f32` and onto its new neighbour.
+
+### Correctness
+
+- **Use-after-free in the cross-entropy decline diagnostic.** `tg` was rebound to
+  the uploaded targets copy, which the decline path frees before the warning
+  block reads `tg.device`/`dtype`/`len`. Reachable on the ordinary 3-D-logits
+  path. Diagnostics now capture plain values from the *original* header before
+  any upload — which also fixes a second defect: because `tg` had been rebound to
+  a device tensor, the "targets are on the host" reason could never print, and
+  that was the only reason the upload existed to explain.
+- **Determinism leak in the coalesced `sum_dim` route.** The new route admitted on
+  `inner >= 32` with no determinism check, on a comment claiming `--deterministic`
+  runs never reach the function. The comment 40 lines above says why that is
+  false: the flag substitutes `gpu_det_sum_dim_f32` in *codegen* only, and four
+  runtime-internal callers reach `gpu_sum_dim_f32` directly. Any broadcast
+  reduce-to-shape over `[B, S, D]` has `inner = S*D`, so every such gradient had
+  silently lost run-to-run reproducibility. Now gated on `is_deterministic()`.
+  `NSL_SUM_DIM_SHORT_MAX=0` also now disables *both* routes, as documented.
+- **Stride-blind device grad clip.** Admission checked device and dtype but not
+  layout, then read and wrote `data[0..len]` raw. A non-contiguous gradient would
+  have its norm taken from the wrong elements and would scale a sibling tensor's
+  data. Predicate extracted as `device_clip_admissible` and directly unit-tested.
+- **Tied gradients were scaled twice.** The device path scales in place once per
+  list *slot*, so a gradient appearing twice — which `@tie_weights` produces, and
+  the benchmark model sets `tied_embeddings=True` — got `scale²`. At a typical
+  scale of 0.1 that is a silent 10x under-scale. The host path is unaffected
+  because it scales an independent copy per slot and writes each back. Scaling
+  now dedupes by data pointer; the norm still counts duplicates, matching the host.
+- **Stride-blind gather indices.** `nsl_tensor_to_device(p, 0)` is a refcount bump
+  for an already-host tensor, so a strided index view was read as if dense by
+  `read_index`. Now normalised with `nsl_tensor_contiguous`, as the CPU arm does.
+  Also bounded on `gather_dim_size <= 2^24`, since the kernel stages indices as
+  f32 and every valid index is below that axis length.
+- **Metadata cache vs cuda-graph capture.** Inside a capture region
+  `memcpy_htod` defers the payload to graph *launch*, so the cache published a
+  pointer to memory that was never written, and skipping the upload on later
+  steps changed the recorded op sequence between capture and replay. These
+  uploads are immutable and content-addressed, so they now use a new
+  `memcpy_htod_immediate` that bypasses capture entirely. The cache is also keyed
+  by device ordinal, and allocates from the **persistent** pool: the allocator
+  releases *segments*, not blocks, so a never-freed 24-byte block in a transient
+  segment would have pinned that segment forever and quietly broken the per-step
+  drain.
+
+### Reverted rather than patched
+
+The `len == 1` heuristic that kept model scalars host-resident is **gone**. It
+used shape as a proxy for a config-vs-parameter distinction only the compiler
+can make, so it also stranded genuine scalar parameters (a learnable
+temperature, a `logit_scale`) on the host as f64 — producing a mixed-device
+parameter list and a host-resident gradient that makes the grad-clip fast path
+decline for the *whole* model, undoing this campaign's own win. It had already
+measured no speedup, so there was nothing to weigh against that.
+
+### Where I disagreed with the review
+
+The review wanted `encode_batch` to cap the padded width at `max_len`. That
+would silently discard tokens when the caller explicitly passed `truncation=0`,
+and independent padding/truncation knobs is what the HF tokenizers this mirrors
+do. The non-lossy behaviour is kept; the call now warns once, naming the flag
+that gives a fixed shape, so the wider tensor is not a mystery downstream.
+
+### A measured mistake, and its fix
+
+Making the Σx² accumulation exact was straightforward — and the first version was
+a **single 256-thread block**, which for the 25M-element embedding gradient is
+~98,000 serial f64 FMAs per thread on one SM, at 1/64 rate. It cost **80 → 112
+ms** per micro-batch, a 39% step-level regression for a precision concern worth
+~1e-5 relative.
+
+The kernel is now grid-strided with one f64 partial per block, summed on the host
+in block order (so still reproducible). Measured with the new `NSL_SUM_SQ_BLOCKS`
+switch: **1 block = 178.5 ms, 256 blocks = 84.2 ms.** Note this is *not* the
+atomic variant tried earlier and reverted for measuring slower — partials go to
+per-block slots, so there is no contention and no ordering nondeterminism.
+
+The exactness is worth keeping because the norm feeds a `norm <= max_norm`
+comparison: a systematically low sum does not round the answer, it declines a
+clip that should have happened.
+
+### The tokenizer work was unreachable from the toolchain
+
+`nsl_bpe_train` — the FFI behind NSL's `bpe_train(...)` — and the `nsl tokenize`
+CLI both built their own `BpeTrainer` inline, so none of the trainer work was
+reachable from the shipped toolchain. Both are fixed:
+
+- `nsl_bpe_train` now seeds the byte-level alphabet (without it, a byte absent
+  from the corpus has no token and encoding silently drops it), attaches the
+  ByteLevel decoder, and uses `add_prefix_space=false`. The last one was found by
+  the new round-trip test: with a decoder but `ByteLevel::default()`, the
+  pre-tokenizer *prepends a space*, so `decode(encode(x))` returned `" " + x`.
+- `nsl tokenize` now calls `tokenizer_bpe::train_from_file`, with `--transition`
+  and `--max-token-bytes` flags. End to end on `stdlib/`:
+  `fn forward(self, x: Tensor) -> Tensor:` is **6 tokens two-stage vs 11
+  word-bounded**, and the emitted JSON carries the `Line` split regex plus a
+  ByteLevel decoder.
+
+### `assemble` and training could disagree about the boundary
+
+`assemble` re-derived the encode-time boundary from `spec.transition >=
+spec.vocab_size` while training compared an *effective* transition against
+`vocab_size - special_tokens.len()`. With special tokens reserved and a
+transition in that gap, stage two never ran — every merge word-bounded — yet a
+`Line` pre-tokenizer shipped, letting word-learned merges fire across boundaries
+the vocabulary was never trained on. Training now reports `TrainedBpe.two_stage`
+and `assemble` follows it. The gate depends on how full the vocabulary was when
+stage one stopped, so it cannot be re-derived from the spec at all.
+
+### Verification
+
+- 883 lib tests with `--features cuda` (up from 879: four new regression tests),
+  816 without; all integration suites for `nsl-runtime` and `nsl-cli` green.
+- All three PTX certification gates run and pass, verified by negative test.
+- Zero clippy warnings on the changed lines (checked by intersecting
+  `--message-format=short` output against the diff hunks).
+- Parity, all new device paths off vs on, 20 steps: step 1 **bit-identical**
+  (10.893657684326172), max relative divergence **3.6e-05**, matching trends.
+- Every fast path still admits, proven by flag sweep: `NSL_GPU_GRAD_CLIP=0` →
+  293 ms, `NSL_GATHER_DIM_GPU=0` → 250 ms, `NSL_SUM_DIM_COALESCED=0` → 130 ms,
+  all against ~89 ms default.
+
+### Throughput after the fixes
+
+~84–95 ms per micro-batch (median ~89), **8.3% MFU**, against 80.5–81.7 ms
+(9.1–9.2%) before. Part of that is the deliberate f64 norm; the rest is not
+cleanly attributable, because the working tree acquired a concurrent session's
+BF16 matmul and multi-tensor-AdamW work partway through this pass and the machine
+was under concurrent build load. The flag sweep above is the load-bearing
+evidence that no fast path regressed.

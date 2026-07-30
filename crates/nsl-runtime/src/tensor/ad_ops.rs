@@ -480,12 +480,21 @@ pub extern "C" fn nsl_embedding_backward(
         let force_cpu = *FORCE_CPU.get_or_init(|| {
             std::env::var("NSL_EMBEDDING_BWD_CPU").ok().as_deref() == Some("1")
         });
+        // Every condition that does not depend on where the ids live, checked
+        // BEFORE the upload so a call that declines anyway never touches the bus.
+        // In particular `NSL_EMBEDDING_BWD_CPU=1` exists to take the host path
+        // for M46 bisections; uploading and immediately freeing the ids on every
+        // backward of that run is pure waste.
+        let host_side_ok = !force_cpu
+            && grad_t.device > 0
+            && grad_t.dtype == 1
+            && weight_t.ndim >= 2;
         // Token ids arrive from the DataLoader on the host while the incoming
         // gradient is already on the device. Requiring both on the same device
         // sent the whole [vocab, embed_dim] scatter to the host instead — 96 MB
         // down and 192 MB back up (host tensors are f64) per step at
         // 49152x512. Uploading the ids costs `seq_len` elements.
-        let idx_dev = if grad_t.device > 0 && idx_t.device != grad_t.device {
+        let idx_dev = if host_side_ok && idx_t.device != grad_t.device {
             let up = nsl_tensor_to_device(idx_c, grad_t.device as i64);
             if up == 0 { None } else { Some(up) }
         } else {
@@ -494,12 +503,7 @@ pub extern "C" fn nsl_embedding_backward(
         let idx_eff = idx_dev.unwrap_or(idx_c);
         let idx_t = NslTensor::from_ptr(idx_eff);
 
-        if !force_cpu
-            && grad_t.device > 0
-            && idx_t.device == grad_t.device
-            && grad_t.dtype == 1
-            && weight_t.ndim >= 2
-        {
+        if host_side_ok && idx_t.device == grad_t.device {
             let vocab_size = unsafe { *weight_t.shape } as u64;
             let embed_dim = unsafe { *weight_t.shape.add(1) } as u64;
             let seq_len = idx_t.len as u64;
@@ -646,31 +650,47 @@ pub extern "C" fn nsl_cross_entropy_backward(
         let go_hdr = NslTensor::from_ptr(grad_out_c);
         let go_ok = go_hdr.len != 1 || go_hdr.device == 0 || go_hdr.dtype == 1;
         let rows = if lg.ndim == 2 { unsafe { *lg.shape } } else { 0 };
+        // Every condition that does NOT depend on where the targets live, so the
+        // upload below is only paid for by calls that can actually use it. When
+        // these fail the call declines regardless, and uploading first would put
+        // an allocation, a blocking H2D copy and a free on the hottest path in
+        // the step — including under `NSL_GPU_CE_BACKWARD=0`, whose whole point
+        // is to take the old path.
+        let targets_dtype_ok = tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32;
+        let shape_ok = enabled
+            && lg.device > 0
+            && lg.dtype == 1
+            && lg.ndim == 2
+            && lg.len <= u32::MAX as i64
+            && targets_dtype_ok
+            && tg.len >= rows
+            && go_ok;
+        // Diagnostics are captured from the ORIGINAL targets header, before any
+        // upload, because that is what the caller can act on ("your targets are
+        // on the host") and because the uploaded copy is freed below — reading
+        // its header in the warning was a use-after-free, and it could never
+        // report the device mismatch it existed to explain since the rebound
+        // header was device-resident by construction.
+        let tg_device = tg.device;
+        let tg_dtype = tg.dtype;
+        let tg_len = tg.len;
         // Targets arrive from the DataLoader on the host while logits are already
         // on the device, which used to fail the same-device admission check and
         // send the ENTIRE [N, C] logits tensor to the host and back — 384 MB per
         // call at 1024x49152. Uploading the targets instead costs `rows`
         // elements, four kilobytes at the same shape.
-        let targets_dev = if tg.device != lg.device
-            && (tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32)
-        {
+        let targets_dev = if shape_ok && tg_device != lg.device {
             let up = nsl_tensor_to_device(targets_c, lg.device as i64);
             if up == 0 { None } else { Some(up) }
         } else {
             None
         };
         let targets_eff = targets_dev.unwrap_or(targets_c);
-        let tg = NslTensor::from_ptr(targets_eff);
+        let tg_eff = NslTensor::from_ptr(targets_eff);
 
-        if enabled
-            && lg.device > 0
-            && lg.dtype == 1
-            && lg.ndim == 2
-            && lg.len <= u32::MAX as i64
-            && tg.device == lg.device
-            && (tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32)
-            && tg.len >= rows
-            && go_ok
+        if shape_ok
+            && tg_eff.device == lg.device
+            && (tg_eff.dtype == 1 || tg_eff.dtype == crate::tensor::DTYPE_I32)
         {
             let out = crate::cuda::gpu_cross_entropy_backward_f32(
                 logits_c, targets_eff, grad_out_c,
@@ -704,17 +724,21 @@ pub extern "C" fn nsl_cross_entropy_backward(
                 if lg.len > u32::MAX as i64 {
                     why.push(format!("logits len {} exceeds u32", lg.len));
                 }
-                if tg.device != lg.device {
+                if tg_device != lg.device {
+                    // Reached only when the upload was attempted and failed, or
+                    // was skipped because another condition already declined.
                     why.push(format!(
-                        "targets on device {} but logits on device {}",
-                        tg.device, lg.device
+                        "targets on device {} but logits on device {} (upload {})",
+                        tg_device,
+                        lg.device,
+                        if targets_dev.is_some() { "succeeded" } else { "not made" }
                     ));
                 }
-                if tg.dtype != 1 && tg.dtype != crate::tensor::DTYPE_I32 {
-                    why.push(format!("targets dtype {} is neither f32 nor i32", tg.dtype));
+                if tg_dtype != 1 && tg_dtype != crate::tensor::DTYPE_I32 {
+                    why.push(format!("targets dtype {} is neither f32 nor i32", tg_dtype));
                 }
-                if tg.len < rows {
-                    why.push(format!("targets len {} < rows {}", tg.len, rows));
+                if tg_len < rows {
+                    why.push(format!("targets len {} < rows {}", tg_len, rows));
                 }
                 if !go_ok {
                     why.push(format!(

@@ -373,6 +373,17 @@ pub struct TrainedBpe {
     pub merges: Vec<(String, String)>,
     /// How many merges were learned before the boundary widened.
     pub stage1_merges: usize,
+    /// Whether the relaxed (whole-chunk) stage actually ran AND learned merges.
+    ///
+    /// [`assemble`] needs this to pick the encode-time boundary, and it cannot
+    /// re-derive it from the spec: the gate depends on how full the vocabulary
+    /// was when stage one stopped, which only training knows. Recomputing a
+    /// "close enough" predicate from `spec` is what produced the mismatch this
+    /// field replaces — `assemble` compared the raw `spec.transition` against
+    /// `spec.vocab_size` while training compared an effective transition against
+    /// `vocab_size - special_tokens.len()`, so with special tokens reserved a
+    /// purely word-bounded vocabulary could ship a `Line` pre-tokenizer.
+    pub two_stage: bool,
 }
 
 /// Train over an iterator of relaxed chunks — in practice, corpus lines with
@@ -455,6 +466,7 @@ where
     // stage one can stop early on the frequency floor, and widening the
     // boundary to use up the remainder would silently turn a request for
     // ordinary BPE into two-stage training.
+    let mut two_stage = false;
     if transition < learned_target && learner.vocab.len() < learned_target {
         let mut relaxed: Vec<(Vec<u32>, u64)> = chunk_counts
             .into_iter()
@@ -467,6 +479,11 @@ where
             })
             .collect();
         learner.run(&mut relaxed, learned_target);
+        // Only report two-stage if the relaxed pass actually learned something.
+        // If it added no merges the vocabulary is word-bounded after all, and
+        // `assemble` should ship the narrower pre-tokenizer, which can only
+        // segment more conservatively than the merges support.
+        two_stage = learner.merges.len() > stage1_merges;
     }
 
     let merges = learner
@@ -484,6 +501,7 @@ where
         vocab: learner.vocab,
         merges,
         stage1_merges,
+        two_stage,
     }
 }
 
@@ -494,34 +512,42 @@ where
 /// single chunk. Splitting at every break instead would hand stage two chunks
 /// the encoder never produces, and it would optimise for a segmentation that
 /// cannot occur.
-fn split_relaxed(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let is_break = |c: char| c == '\n' || c == '\r';
+///
+/// Borrows from `text` and scans bytes rather than collecting a `Vec<char>`:
+/// `train_from_file` passes an entire corpus as one string, where the `Vec<char>`
+/// alone was 4 bytes per character on top of the corpus and the chunks. `\n` and
+/// `\r` are single-byte and cannot occur inside a multi-byte UTF-8 sequence, so
+/// every index below is a character boundary and the slicing cannot panic.
+fn split_relaxed(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let is_break = |b: u8| b == b'\n' || b == b'\r';
     let mut out = Vec::new();
     let mut i = 0;
-    while i < chars.len() {
+    while i < bytes.len() {
         let start = i;
-        while i < chars.len() && !is_break(chars[i]) {
+        while i < bytes.len() && !is_break(bytes[i]) {
             i += 1;
         }
-        while i < chars.len() && is_break(chars[i]) {
+        while i < bytes.len() && is_break(bytes[i]) {
             i += 1;
         }
-        out.push(chars[start..i].iter().collect());
+        out.push(&text[start..i]);
     }
     out
 }
 
 /// Wrap a trained vocabulary in a `Tokenizer` that round-trips.
 pub fn assemble(trained: &TrainedBpe, spec: &TrainSpec) -> Result<Tokenizer, String> {
-    // Ship whichever boundary training actually optimised for. Hardcoding `Line`
-    // here would mean a spec that never relaxed still encoded without the word
-    // pattern, so word-learned merges could fire across word boundaries at
-    // inference and `transition >= vocab_size` would not be ordinary BPE.
-    let encode_boundary = if spec.transition >= spec.vocab_size {
-        spec.stage1
-    } else {
+    // Ship whichever boundary training actually optimised for, as REPORTED BY
+    // training. Hardcoding `Line` here would mean a spec that never relaxed
+    // still encoded without the word pattern, so word-learned merges could fire
+    // across word boundaries at inference. Re-deriving the answer from `spec`
+    // is not safe either: the stage-two gate also depends on how full the
+    // vocabulary was when stage one stopped. Hence `trained.two_stage`.
+    let encode_boundary = if trained.two_stage {
         PreTokenizerKind::Line
+    } else {
+        spec.stage1
     };
     let vocab: ahash::AHashMap<String, u32> = trained
         .vocab
@@ -694,6 +720,58 @@ fn backward(self, g: Tensor) -> Tensor:
         );
     }
 
+    /// The encode-time boundary must agree with what training actually did, even
+    /// when reserving special-token slots pulls the effective transition below
+    /// the requested one.
+    ///
+    /// `assemble` used to re-derive the boundary from `spec.transition >=
+    /// spec.vocab_size`, while training compared an effective transition against
+    /// `vocab_size - special_tokens.len()`. With special tokens reserved and a
+    /// transition inside that gap, the two disagreed: stage two never ran, so
+    /// every merge was word-bounded, yet a `Line` pre-tokenizer shipped —
+    /// letting word-learned merges fire across word boundaries at inference over
+    /// a segmentation training never saw.
+    #[test]
+    fn encode_boundary_follows_training_when_special_tokens_are_reserved() {
+        let specials: Vec<String> =
+            ["<|a|>", "<|b|>", "<|c|>", "<|d|>", "<|e|>"].iter().map(|s| s.to_string()).collect();
+        // transition sits between `vocab_size - specials.len()` and `vocab_size`,
+        // so training clamps it to the learned target and stage two cannot run.
+        let spec = TrainSpec {
+            vocab_size: 800,
+            transition: 798,
+            special_tokens: specials,
+            ..TrainSpec::default()
+        };
+        let lines: Vec<String> = SAMPLE.lines().map(|l| format!("{l}\n")).collect();
+        let corpus: Vec<String> = std::iter::repeat(lines).take(40).flatten().collect();
+        let trained = train_two_stage(corpus, &spec);
+        assert!(
+            !trained.two_stage,
+            "stage two must not run when the transition is clamped to the learned target"
+        );
+
+        let tok = assemble(&trained, &spec).expect("assemble");
+        assert_eq!(
+            count_crossing(&tok, PreTokenizerKind::Cl100k),
+            0,
+            "no cross-boundary token can exist, so the shipped boundary must be word-bounded"
+        );
+        // The real check: the shipped pre-tokenizer segments as stage one did.
+        let probe = "let x = 1\nlet y = 2\n";
+        let shipped: Vec<String> = tok
+            .encode(probe, false)
+            .expect("encode")
+            .get_tokens()
+            .to_vec();
+        for t in &shipped {
+            assert!(
+                !crosses_stage1_boundary(t, PreTokenizerKind::Cl100k),
+                "token {t:?} crosses the stage-one pattern the vocabulary was learned under"
+            );
+        }
+    }
+
     /// Relaxing the boundary is the whole point: it must actually produce
     /// cross-boundary tokens, and they must compress better.
     #[test]
@@ -782,13 +860,37 @@ fn backward(self, g: Tensor) -> Tensor:
         // If they disagree, stage two optimises for chunks the encoder never
         // produces.
         let pre = PreTokenizerKind::Line.pre_tokenizer();
-        for text in ["a\nb\n", "a\nb", "\n\n\n", "a\r\nb\r\n", "no newline", ""] {
+        for text in [
+            "a\nb\n",
+            "a\nb",
+            "\n\n\n",
+            "a\r\nb\r\n",
+            "no newline",
+            "",
+            "a\r\rb",
+            "\r\n\r\nx",
+            "unicode \u{2014} em dash\nnext\n",
+            "trailing\r",
+        ] {
             let ours = split_relaxed(text);
+            // The pre-tokenizer applies the byte-level mapping to its surfaces,
+            // so compare against the mapped form of ours. Counts alone would
+            // pass for an implementation that puts the boundaries in the wrong
+            // places — attaching a `\r\n` to the following chunk rather than the
+            // preceding one keeps the count identical — and the invariant being
+            // guarded is that the segmentation matches, not that it has the
+            // right length.
+            // Mapping only, no splitting (use_regex=false), so each of our raw
+            // chunks maps to exactly one surface.
+            let mapper = PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false));
+            let ours_mapped: Vec<String> = ours
+                .iter()
+                .flat_map(|c| chunk_to_surfaces(&mapper, c))
+                .collect();
             let theirs = chunk_to_surfaces(&pre, text);
             assert_eq!(
-                ours.len(),
-                theirs.len(),
-                "chunk count differs for {text:?}: {ours:?} vs {theirs:?}"
+                ours_mapped, theirs,
+                "segmentation differs for {text:?}: {ours:?}"
             );
         }
     }

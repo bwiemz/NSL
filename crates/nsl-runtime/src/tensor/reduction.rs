@@ -517,16 +517,32 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                     let gather_dim_size = shape[d] as usize;
                     let idx_t = NslTensor::from_ptr(indices_ptr);
 
-                    if idx_t.len as usize == outer {
+                    // `gpu_gather_dim_f32` stages the indices as f32, which is
+                    // exact only up to 2^24. Every valid index is below
+                    // `gather_dim_size`, so bounding that bounds the indices —
+                    // a larger axis falls through to the CPU path, which reads
+                    // them as i64.
+                    const F32_EXACT_INT_MAX: usize = 1 << 24;
+                    if idx_t.len as usize == outer && gather_dim_size <= F32_EXACT_INT_MAX {
                         // Read the index vector to the host to validate it. It is
                         // `outer` elements, so this is kilobytes; keeping the
                         // check preserves the CPU path's abort-on-out-of-range.
+                        //
+                        // `read_index` addresses `data` linearly and ignores
+                        // strides, so the indices have to be made contiguous
+                        // first — `nsl_tensor_to_device(p, 0)` is a refcount bump
+                        // that materializes nothing when they are already on the
+                        // host, which left a strided index view being read as if
+                        // it were dense. The CPU arm below calls
+                        // `nsl_tensor_contiguous` for exactly this reason.
                         let idx_cpu = super::nsl_tensor_to_device(indices_ptr, 0);
-                        let idx_view = NslTensor::from_ptr(idx_cpu);
+                        let idx_dense = nsl_tensor_contiguous(idx_cpu);
+                        let idx_view = NslTensor::from_ptr(idx_dense);
                         let mut host_idx: Vec<i64> = Vec::with_capacity(outer);
                         for o in 0..outer {
                             host_idx.push(idx_view.read_index(o));
                         }
+                        super::nsl_tensor_free(idx_dense);
                         super::nsl_tensor_free(idx_cpu);
 
                         if let Some(bad) = host_idx

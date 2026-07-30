@@ -5,7 +5,16 @@
 use std::path::PathBuf;
 use std::process;
 
-pub(crate) fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, min_freq: u64, ext: &str) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_tokenize(
+    dirs: &[String],
+    output: &std::path::Path,
+    vocab_size: usize,
+    min_freq: u64,
+    ext: &str,
+    transition: usize,
+    max_token_bytes: usize,
+) {
     use std::io::Write;
 
     // Default directories if none specified
@@ -57,39 +66,47 @@ pub(crate) fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size
         eprintln!("[tokenize] Corpus: {} bytes from {} files", total_bytes, source_files.len());
     }
 
-    // Train BPE tokenizer using the runtime's nsl_bpe_train
-    eprintln!("[tokenize] Training BPE tokenizer (vocab_size={}, min_freq={})...", vocab_size, min_freq);
+    // Train through the runtime's two-stage trainer, which is the tokenizer the
+    // project actually ships. This command previously built its own
+    // `BpeTrainer` inline with a ByteLevel pre-tokenizer and no decoder, so the
+    // trainer's design work — the relaxed second stage, the seeded byte
+    // alphabet, the attached decoder — was unreachable from the CLI.
+    let spec = nsl_runtime::tokenizer_bpe::TrainSpec {
+        vocab_size,
+        min_frequency: min_freq,
+        transition,
+        max_token_bytes,
+        stage1: nsl_runtime::tokenizer_bpe::PreTokenizerKind::Cl100k,
+        special_tokens: vec![
+            "<|endoftext|>".to_string(),
+            "<|padding|>".to_string(),
+            "<|fim_prefix|>".to_string(),
+            "<|fim_middle|>".to_string(),
+            "<|fim_suffix|>".to_string(),
+        ],
+    };
+    if transition >= vocab_size {
+        eprintln!(
+            "[tokenize] Training BPE tokenizer (vocab_size={vocab_size}, min_freq={min_freq}, \
+             word-bounded)..."
+        );
+    } else {
+        eprintln!(
+            "[tokenize] Training two-stage BPE tokenizer (vocab_size={vocab_size}, \
+             min_freq={min_freq}, transition={transition})..."
+        );
+    }
 
-    // We call the runtime's BPE trainer directly via Rust (not through FFI)
-    use tokenizers::models::bpe::{BPE, BpeTrainer};
-    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-    use tokenizers::Tokenizer;
-
-    let trainer = BpeTrainer::builder()
-        .vocab_size(vocab_size)
-        .min_frequency(min_freq)
-        .special_tokens(vec![
-            tokenizers::AddedToken::from("<|endoftext|>".to_string(), true),
-            tokenizers::AddedToken::from("<|padding|>".to_string(), true),
-            tokenizers::AddedToken::from("<|fim_prefix|>".to_string(), true),
-            tokenizers::AddedToken::from("<|fim_middle|>".to_string(), true),
-            tokenizers::AddedToken::from("<|fim_suffix|>".to_string(), true),
-        ])
-        .build();
-
-    let mut tokenizer = Tokenizer::new(BPE::default());
-    tokenizer.with_pre_tokenizer(Some(
-        tokenizers::PreTokenizerWrapper::ByteLevel(ByteLevel::default()),
-    ));
-
-    let mut trainer_wrapper = tokenizers::models::TrainerWrapper::BpeTrainer(trainer);
-    match tokenizer.train_from_files(&mut trainer_wrapper, vec![corpus_path.to_string_lossy().to_string()]) {
-        Ok(_) => {}
+    let tokenizer = match nsl_runtime::tokenizer_bpe::train_from_file(
+        corpus_path.to_string_lossy().as_ref(),
+        &spec,
+    ) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("error: BPE training failed: {e}");
             process::exit(1);
         }
-    }
+    };
 
     // Ensure output directory exists
     if let Some(parent) = output.parent() {
