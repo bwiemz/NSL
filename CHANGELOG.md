@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — container/field assignments no longer strand or dangle tensor temporaries
+
+- **`d["k"] = t * 2.0` left the stored tensor in the statement-
+  temporaries list** (PR #433 review LOW-2): the next statement's sweep
+  freed it while the container still held the raw handle — dict reads
+  cloned a freed tensor (bad-magic abort), list reads handed out the
+  dangling pointer itself, struct/model field loads read freed memory,
+  and the WRGA adapter side-table's free-on-overwrite became a double
+  free. `compile_assign`'s Ident arm has always ended with the
+  ownership-transfer + drain pair; the Subscript arms (dict/list set,
+  tensor multi-dim set) and every MemberAccess store path had neither.
+- All five store paths now share one exit
+  (`assign_container_store_tail`): `free_tensor_temporaries` with the
+  just-stored value as `keep` — the drain removes the handle from the
+  sweep's reach without freeing it, which IS the ownership transfer
+  into the container (per the dict_lifetime.rs borrow-store convention
+  nothing retains: no machinery ever releases a container-stored
+  borrow). Sub-expression temporaries (`d["k"] = t * 2.0 + 1.0` leaves
+  the inner product) are freed at the statement — previously they
+  straddled into any region that frees the list without draining it,
+  and the train-block step loop freed such a straddler once per step:
+  double free at step 2, the review's original scenario.
+- The review's residual pass found the SAME class in two adjacent
+  arms, both fixed here: **dict/list LITERALS stored owned-temp
+  elements raw** while the VarDecl statement-end sweep freed them —
+  `let d = {"a": t * 2.0}` then reading `d["a"]` SILENTLY returned the
+  reused header of the next allocation (printed 2 instead of 8; list
+  reads aborted on bad magic). Owned elements now transfer into the
+  container (consume-only — no retain for borrows, since nothing ever
+  frees container-held values, unlike the tuple literal's convention).
+  And **destructuring `let (a, b) = ...` arms had no statement-end
+  drain** — a sub-expression temp straddled into the train step loop
+  exactly like the assign case (double free at step 2, runtime-
+  confirmed); both destructure arms now drain with the destructured
+  value kept.
+- 10 CPU gates in `assign_temp_drain_gate.rs`: dict, list, and
+  struct-field stores of owned temps surviving later sweeps; the
+  sub-expression straddler crossing a real 2-epoch train block; a
+  borrow-store + source-variable-liveness pin; an int-list pin.
+  Mutation-proven in both directions: drain removed → exactly the 4
+  defect gates red (delayed-sweep use-after-free); keep dropped →
+  exactly the 4 defect gates red (immediate-free direction), pins
+  green both times.
+
 ### Fixed — indirect calls no longer miscompile float arguments, returns, or captures
 
 - **`(|v: float| v * 2.0)(3.0)` returned 4** — silent wrong values,
@@ -1096,7 +1140,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   zeros output (now a real abort, `NSL_FLASH_ALLOW_FAILED=1` escape).
   The "v2 kernel produces ~zero output" residual noted here at the time
   was the missing f16→f32 output widen — fixed above.
-
 
 ### Added — `--grad-integrity` now covers the CSLA (`--layerwise-accum`) windowed backward
 

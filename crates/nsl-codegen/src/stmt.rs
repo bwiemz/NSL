@@ -1363,6 +1363,17 @@ impl Compiler<'_> {
                             tuple_val,
                             tuple_ty.as_ref(),
                         )?;
+                        // Review F2 on 67b9ba13: destructuring arms had no
+                        // statement-end drain — a sub-expression temp (the
+                        // inner `t * 2.0` of a tuple element `t * 2.0 + 1.0`;
+                        // the element itself transfers into the tuple)
+                        // straddled into the train step loop and was freed
+                        // once per step. The destructured value is kept
+                        // defensively: if an indeterminate-typed RHS ever
+                        // lands it in the list, freeing a list pointer via
+                        // nsl_tensor_free would abort on the magic probe.
+                        self.free_tensor_temporaries(builder, state, Some(tuple_val));
+                        self.free_linear_consumes(builder, state, Some(tuple_val));
                     }
                     PatternKind::Struct { fields, .. } => {
                         // Top-level struct destructuring: let { x, y } = expr
@@ -1430,6 +1441,12 @@ impl Compiler<'_> {
                                 }
                             }
                         }
+                        // Review F2 on 67b9ba13 — same statement-end drain as
+                        // the tuple/list destructure arm above; the bound
+                        // field values are clones (never listed) and the
+                        // struct value itself is kept defensively.
+                        self.free_tensor_temporaries(builder, state, Some(struct_val));
+                        self.free_linear_consumes(builder, state, Some(struct_val));
                     }
                     _ => {
                         return Err(CodegenError::new(
@@ -1918,6 +1935,41 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Shared exit for every non-Ident assignment target (dict/list set,
+    /// tensor multi-dim set, struct/model field stores, adapter
+    /// side-table stores): drain the statement's temporaries with the
+    /// just-stored value excluded, mirroring the Ident arm's tail.
+    /// These arms previously had NO drain at all (PR #433 review LOW-2),
+    /// which broke in two ways:
+    ///
+    /// - The stored value: an OWNED temp (`d["k"] = t * 2.0`) stayed in
+    ///   `tensor_temporaries`, so the NEXT statement's sweep freed it
+    ///   while the container still held the raw handle — dict reads
+    ///   cloned a freed tensor, list reads handed out the dangling
+    ///   pointer itself, and the adapter side-table's free-on-overwrite
+    ///   became a double free. `free_tensor_temporaries` DRAINS the
+    ///   list (`split_off`) and skips freeing `keep`, so passing the
+    ///   stored value as `keep` IS the ownership transfer into the
+    ///   container: the handle leaves the sweep's reach unfree'd.
+    ///   Nothing is retained for borrowed stores — per the borrow-store
+    ///   convention (dict_lifetime.rs) no machinery ever releases a
+    ///   container-stored borrow, so a retain would strand one
+    ///   reference per store.
+    /// - Sub-expression temporaries (`d["k"] = t * 2.0 + 1.0` leaves
+    ///   the inner `t * 2.0`) otherwise straddle past the statement;
+    ///   a region that frees the temporaries list without draining it —
+    ///   the train-block step loop — then freed the straddler once per
+    ///   step: double free at step 2.
+    fn assign_container_store_tail(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        stored_val: Value,
+    ) {
+        self.free_tensor_temporaries(builder, state, Some(stored_val));
+        self.free_linear_consumes(builder, state, Some(stored_val));
+    }
+
     fn compile_assign(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2111,6 +2163,7 @@ impl Compiler<'_> {
                         let set_id = self.registry.runtime_fns[set_fn].0;
                         let set_ref = self.module.declare_func_in_func(set_id, builder.func);
                         builder.ins().call(set_ref, &[obj_val, idx_val, final_val]);
+                        self.assign_container_store_tail(builder, state, final_val);
                     }
                     SubscriptKind::MultiDim(dims) => {
                         // Tensor element write: t[i, j, ...] = v (and compound
@@ -2177,6 +2230,9 @@ impl Compiler<'_> {
                             &[obj_val, indices_list, final_val],
                         )?;
                         self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
+                        // Stored value is a scalar; the drain covers
+                        // index-expression and RHS temporaries.
+                        self.assign_container_store_tail(builder, state, final_val);
                     }
                     _ => return Err(CodegenError::new("only simple index assignment supported")),
                 }
@@ -2249,6 +2305,7 @@ impl Compiler<'_> {
                                     obj_val,
                                     field.offset as i32,
                                 );
+                                self.assign_container_store_tail(builder, state, final_val);
                                 return Ok(());
                             }
                         }
@@ -2305,6 +2362,11 @@ impl Compiler<'_> {
                                         table_ptr,
                                         byte_off,
                                     );
+                                    // The side-table owns its tensors and
+                                    // frees the old slot on overwrite — a
+                                    // swept owned temp here became a later
+                                    // double free.
+                                    self.assign_container_store_tail(builder, state, new_val);
                                     return Ok(());
                                 }
                             }
@@ -2376,6 +2438,7 @@ impl Compiler<'_> {
                                     obj_val,
                                     field.offset as i32,
                                 );
+                                self.assign_container_store_tail(builder, state, final_val);
                                 return Ok(());
                             }
                         }
