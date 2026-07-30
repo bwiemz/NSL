@@ -229,6 +229,17 @@ fn the_plan_names_the_sharded_backend_under_zero3_gpu() {
         false,
     );
     assert!(r.ok, "zero3 run failed:\n{}", r.stderr);
+    // Check the backend ARMED before reading counts. If the 2-rank sim-gpu
+    // rendezvous fails to come up (it shares one device, and has been seen to
+    // lose a race under heavy concurrent GPU load), every count is legitimately
+    // zero — reporting that as "no parameter reached the sharded backend"
+    // sends the reader hunting a plan bug that isn't there.
+    assert!(
+        r.stderr.contains("[zero3] tensor-granular parameter sharding enabled"),
+        "zero3 backend never armed — the plan would be describing nothing, and \
+         the counts below are meaningless:\n{}",
+        r.stderr
+    );
     let (total, resident, host, bf16, sharded) = verified_line(&r.stderr)
         .unwrap_or_else(|| panic!("no [param-plan] verified line:\n{}", r.stderr));
     assert!(total > 0, "plan verified zero parameters — vacuous");
@@ -241,13 +252,6 @@ fn the_plan_names_the_sharded_backend_under_zero3_gpu() {
         r.stderr
     );
     assert_eq!(resident + sharded, total, "counts do not partition");
-    // Anti-vacuity against the sharding actually happening, not just being
-    // declared: the zero3 backend's own banner must be present.
-    assert!(
-        r.stderr.contains("[zero3] tensor-granular parameter sharding enabled"),
-        "zero3 backend never armed — the plan would be describing nothing:\n{}",
-        r.stderr
-    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
