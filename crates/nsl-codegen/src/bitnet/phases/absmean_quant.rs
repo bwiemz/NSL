@@ -34,7 +34,12 @@
 //! -from-zero**. PTX `cvt.rni` is round-half-to-**even**, so this emitter
 //! instead computes `trunc(x + copysign(0.5, x))` via `copysign.f32` +
 //! `cvt.rzi.s32.f32`. Without that the two disagree by one int8 step on exact
-//! `.5` values, which is visible in the bit-exact fixture comparison.
+//! `.5` values.
+//!
+//! That difference is NOT incidentally covered by the fixture and random
+//! suites — every `.5` tie arising there happens to have an odd floor, where
+//! the two modes agree. The dedicated regression test is
+//! `bitnet_gpu_correctness::rounding_is_half_away_from_zero_not_half_even`.
 
 use crate::bitnet::config::BitNetKernelConfig;
 
@@ -68,11 +73,7 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str("ABSMAX_LOOP:\n");
     ptx.push_str("setp.ge.u32 %p_amdone, %r_k, %r_hidden_dim;\n");
     ptx.push_str("@%p_amdone bra ABSMAX_END;\n");
-    ptx.push_str("mul.lo.u32 %r_off, %r_row_id, %r_hidden_dim;\n");
-    ptx.push_str("add.u32 %r_off, %r_off, %r_k;\n");
-    ptx.push_str("shl.b32 %r_off, %r_off, 1;\n");
-    ptx.push_str("cvt.u64.u32 %rd_off, %r_off;\n");
-    ptx.push_str("add.s64 %rd_addr, %rd_act_in, %rd_off;\n");
+    emit_act_address(ptx);
     ptx.push_str("ld.global.b16 %h_x, [%rd_addr];\n");
     ptx.push_str(&format!("{} %f_x, %h_x;\n", cvt_to_f32(config)));
     ptx.push_str("abs.f32 %f_absx, %f_x;\n");
@@ -145,16 +146,17 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str("QUANT_LOOP:\n");
     ptx.push_str("setp.ge.u32 %p_qdone, %r_k, %r_hidden_dim;\n");
     ptx.push_str("@%p_qdone bra QUANT_END;\n");
-    ptx.push_str("mul.lo.u32 %r_qoff, %r_row_id, %r_hidden_dim;\n");
-    ptx.push_str("add.u32 %r_qoff, %r_qoff, %r_k;\n");
-    ptx.push_str("shl.b32 %r_qoff, %r_qoff, 1;\n");
-    ptx.push_str("cvt.u64.u32 %rd_off, %r_qoff;\n");
-    ptx.push_str("add.s64 %rd_addr, %rd_act_in, %rd_off;\n");
+    emit_act_address(ptx);
     ptx.push_str("ld.global.b16 %h_xq, [%rd_addr];\n");
     ptx.push_str(&format!("{} %f_x, %h_xq;\n", cvt_to_f32(config)));
     ptx.push_str("mul.f32 %f_scaled, %f_x, %f_inv_scale;\n");
-    ptx.push_str("max.f32 %f_clip, %f_scaled, 0fC2FE0000;\n");
-    ptx.push_str("min.f32 %f_clip, %f_clip, 0f42FE0000;\n");
+    // `.NaN` variants (sm_80+): plain max/min return the NON-NaN operand, so a
+    // NaN activation would clip to exactly -127 and contribute a full -scale
+    // term to every output of that token while never surfacing as NaN. The
+    // CPU reference propagates (Rust `clamp` keeps NaN, then `NaN as i8` == 0).
+    // Propagating here makes the subsequent cvt.rzi yield 0 and match.
+    ptx.push_str("max.NaN.f32 %f_clip, %f_scaled, 0fC2FE0000;\n");
+    ptx.push_str("min.NaN.f32 %f_clip, %f_clip, 0f42FE0000;\n");
     ptx.push_str(
         "// Round half AWAY FROM ZERO to match the CPU reference's f32::round\n\
          // (cvt.rni would round half to even and disagree by one int8 step).\n",
@@ -172,6 +174,22 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str("bar.sync 0;\n");
 
     ptx.push_str("// === end BitNet absmax_quant ===\n");
+}
+
+/// Emit the address of `act_in[row_id * hidden_dim + k]` into `%rd_addr`.
+///
+/// The element index is built in **64 bits** (`mul.wide.u32`), not 32. A 32-bit
+/// index overflows once `rows * hidden_dim` exceeds 2^32 elements, and because
+/// the byte shift was also 32-bit the overflow silently wrapped to a valid
+/// address inside the same buffer — a later row would read/write on top of an
+/// earlier one with no fault. That is reachable during long-prefill inference,
+/// so the whole chain stays 64-bit.
+fn emit_act_address(ptx: &mut String) {
+    ptx.push_str("mul.wide.u32 %rd_off, %r_row_id, %r_hidden_dim;\n");
+    ptx.push_str("cvt.u64.u32 %rd_tmp, %r_k;\n");
+    ptx.push_str("add.s64 %rd_off, %rd_off, %rd_tmp;\n");
+    ptx.push_str("shl.b64 %rd_off, %rd_off, 1;\n");
+    ptx.push_str("add.s64 %rd_addr, %rd_act_in, %rd_off;\n");
 }
 
 /// FP16/BF16 -> FP32 conversion opcode for the configured activation dtype.

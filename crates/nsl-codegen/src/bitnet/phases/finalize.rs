@@ -45,7 +45,12 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     // BEFORE bias/residual (which operate in output space and are not scaled).
     ptx.push_str("// weight_scale: %f_y_out *= ld.param.f32 weight_scale.\n");
     ptx.push_str("ld.param.f32 %f_w_scale, [weight_scale];\n");
-    ptx.push_str("mul.f32 %f_y_out, %f_y_out, %f_w_scale;\n");
+    // `mul.rn.f32` (not bare `mul.f32`): with an optional bias/residual `add.f32`
+    // following, ptxas contracts the pair into a single FFMA, which rounds once
+    // instead of twice and so does not compute the arithmetic documented above.
+    // The explicit rounding modifier blocks the contraction. Verified at SASS
+    // level: bare mul.f32 emits FFMA, mul.rn.f32 emits FMUL + FADD.
+    ptx.push_str("mul.rn.f32 %f_y_out, %f_y_out, %f_w_scale;\n");
 
     if config.fused_bias_add {
         ptx.push_str("// Bias add: load bias[col_id] from global and add to accumulator.\n");
@@ -61,11 +66,14 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     }
 
     if config.fused_residual_add {
+        // NOTE: residual is FP32 here while `y_out` is F16/BF16 — see the
+        // module docstring's buffer-layout contract. 64-bit offset for the same
+        // reason as the output store below.
         ptx.push_str("// Residual add: load residual[row, col] (FP32) and add.\n");
-        ptx.push_str("mul.lo.u32 %r_res_off, %r_row_id, %r_out_dim;\n");
-        ptx.push_str("add.u32 %r_res_off, %r_res_off, %r_col_id;\n");
-        ptx.push_str("shl.b32 %r_res_off, %r_res_off, 2;\n"); // FP32
-        ptx.push_str("cvt.u64.u32 %rd_res_off, %r_res_off;\n");
+        ptx.push_str("mul.wide.u32 %rd_res_off, %r_row_id, %r_out_dim;\n");
+        ptx.push_str("cvt.u64.u32 %rd_tmp, %r_col_id;\n");
+        ptx.push_str("add.s64 %rd_res_off, %rd_res_off, %rd_tmp;\n");
+        ptx.push_str("shl.b64 %rd_res_off, %rd_res_off, 2;\n"); // FP32
         ptx.push_str("add.s64 %rd_res_addr, %rd_residual, %rd_res_off;\n");
         ptx.push_str("ld.global.f32 %f_res, [%rd_res_addr];\n");
         ptx.push_str("add.f32 %f_y_out, %f_y_out, %f_res;\n");
@@ -91,13 +99,18 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
         if elem_bytes == 2 { "F16/BF16" } else { "FP32" }
     ));
     ptx.push_str(&format!("{cvt_op} %h_y, %f_y_out;\n"));
-    ptx.push_str("mul.lo.u32 %r_yoff, %r_row_id, %r_out_dim;\n");
-    ptx.push_str("add.u32 %r_yoff, %r_yoff, %r_col_id;\n");
+    // 64-bit element index. A 32-bit `row_id * out_dim + col_id` (and a 32-bit
+    // byte shift) wraps once the output exceeds 2^32 elements / 4 GiB, and the
+    // wrapped address lands back inside the same buffer, so a later row silently
+    // overwrites an earlier one with no fault. Reproduced at out_dim=2048,
+    // rows=1048577. An lm_head with out_dim=128256 wraps at only ~16.7k rows.
+    ptx.push_str("mul.wide.u32 %rd_yoff, %r_row_id, %r_out_dim;\n");
+    ptx.push_str("cvt.u64.u32 %rd_tmp, %r_col_id;\n");
+    ptx.push_str("add.s64 %rd_yoff, %rd_yoff, %rd_tmp;\n");
     ptx.push_str(&format!(
-        "shl.b32 %r_yoff, %r_yoff, {};\n",
+        "shl.b64 %rd_yoff, %rd_yoff, {};\n",
         elem_bytes.trailing_zeros()
     ));
-    ptx.push_str("cvt.u64.u32 %rd_yoff, %r_yoff;\n");
     // %rd_y_out is already a .global address (cvta'd in mod.rs::emit_prologue);
     // re-applying cvta.to.global here would be a second translation of an
     // already-translated pointer.

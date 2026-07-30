@@ -41,6 +41,13 @@ use crate::kernel_ir::KirType;
 /// Sized for the maximum CTA width CUDA permits (1024 threads = 32 warps).
 const RED_SLOTS: u32 = 32;
 
+/// Per-CTA shared-memory budget assumed by `synthesize_kernel`.
+///
+/// 48 KiB is the portable static limit across sm_80 through sm_120; the larger
+/// opt-in limits require `cuFuncSetAttribute` at launch, which the current
+/// host contract does not do.
+const SMEM_BUDGET_BYTES: u64 = 48 * 1024;
+
 /// Launch geometry required by the kernel emitted by [`synthesize_kernel`].
 ///
 /// The host MUST launch with exactly this shape; the emitted PTX derives every
@@ -96,6 +103,13 @@ impl BitNetKernelConfig {
 ///   `forward_reference`; the reference is a math oracle, not a layout spec.
 /// - `y_out`: `[rows, out_dim]` row-major, `output_dtype`.
 /// - `weight_scale`: per-tensor BitLinear absmean scale (`loader.rs`).
+/// - `bias` (only when `fused_bias_add`): `[out_dim]`, **FP32** — note this is
+///   NOT `output_dtype`. BitNet b1.58's Llama-style projections carry no bias,
+///   so this path is unused in the pinned model; it exists for the optional
+///   spec-§4.4 capability.
+/// - `residual` (only when `fused_residual_add`): `[rows, out_dim]` row-major,
+///   **FP32**, again NOT `output_dtype`. Passing an F16 residual (the natural
+///   transformer layout) would be silently misread.
 ///
 /// Requires `hidden_dim % 4 == 0` so that each thread's 4-trit unpack lands on
 /// a byte boundary (`loader.rs` enforces the same constraint at pack time).
@@ -128,6 +142,29 @@ pub fn synthesize_kernel(config: &BitNetKernelConfig) -> Vec<u8> {
         "BitNet synthesize_kernel: block_n is the CTA width and must be a positive \
          multiple of 32 no greater than 1024, got {}",
         config.block_n
+    );
+    // The quantized activation row lives in SMEM (1 byte per hidden element),
+    // alongside the reduction scratch and the broadcast scale. Without this
+    // check an oversized hidden_dim surfaces as a ptxas "uses too much shared
+    // data" error at a distance rather than a named refusal here.
+    let smem_bytes = config.hidden_dim as u64 + (RED_SLOTS as u64 * 4) + 4;
+    assert!(
+        smem_bytes <= SMEM_BUDGET_BYTES,
+        "BitNet synthesize_kernel: hidden_dim={} needs {smem_bytes} B of SMEM \
+         (quantized row + {RED_SLOTS} reduction slots + scale), over the \
+         {SMEM_BUDGET_BYTES} B per-CTA budget. Tiling over hidden_dim is the \
+         follow-up that lifts this.",
+        config.hidden_dim
+    );
+    // The flat trit index `col_id * hidden_dim + k` is computed in 32 bits and
+    // consumed by packed_load's `shr.b32`. Refuse rather than silently wrap.
+    let trit_count = config.out_dim as u64 * config.hidden_dim as u64;
+    assert!(
+        trit_count <= u32::MAX as u64,
+        "BitNet synthesize_kernel: out_dim({}) * hidden_dim({}) = {trit_count} trits \
+         exceeds the 32-bit flat weight index",
+        config.out_dim,
+        config.hidden_dim
     );
 
     let mut ptx = String::new();
@@ -217,14 +254,13 @@ fn emit_register_decls(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str(".reg .f32 %f_scaled, %f_clip, %f_half, %f_rndbias, %f_rnd;\n");
     ptx.push_str(".reg .f32 %f_acc, %f_127, %f_inv127_scale, %f_y_out, %f_w_scale;\n");
     ptx.push_str(".reg .b64 %rd_act_in, %rd_w_packed, %rd_y_out;\n");
-    ptx.push_str(".reg .b64 %rd_off, %rd_addr, %rd_weight_addr, %rd_byte_off_64;\n");
+    ptx.push_str(".reg .b64 %rd_off, %rd_addr, %rd_weight_addr, %rd_byte_off_64, %rd_tmp;\n");
     ptx.push_str(".reg .b64 %rd_yoff, %rd_y_addr;\n");
     if config.fused_bias_add {
         ptx.push_str(".reg .b64 %rd_bias, %rd_bias_off, %rd_bias_addr;\n");
         ptx.push_str(".reg .f32 %f_bias;\n");
     }
     if config.fused_residual_add {
-        ptx.push_str(".reg .b32 %r_res_off;\n");
         ptx.push_str(".reg .b64 %rd_residual, %rd_res_off, %rd_res_addr;\n");
         ptx.push_str(".reg .f32 %f_res;\n");
     }

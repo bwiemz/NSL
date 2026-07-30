@@ -310,6 +310,16 @@ mod gpu {
         sys::cuCtxSetCurrent(ctx) == sys::CUresult::CUDA_SUCCESS
     }
 
+    /// True when the device reports at least `bytes` of free VRAM.
+    pub unsafe fn has_free_vram(bytes: u64) -> bool {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        if sys::cuMemGetInfo_v2(&mut free, &mut total) != sys::CUresult::CUDA_SUCCESS {
+            return false;
+        }
+        free as u64 >= bytes
+    }
+
     unsafe fn load_module(ptx: &str) -> Result<sys::CUmodule, String> {
         let ptx_c = CString::new(ptx).map_err(|_| "PTX contains embedded NUL".to_string())?;
         let mut module: sys::CUmodule = std::ptr::null_mut();
@@ -361,7 +371,17 @@ mod gpu {
             return Err(format!("cuModuleGetFunction({kernel_name}) failed"));
         }
 
-        let act_bytes = (acts_f16_bits.len() * 2) as usize;
+        // The shape is baked into the PTX at emission time, so a caller passing
+        // a mismatched buffer would read out of bounds rather than fail loudly.
+        assert_eq!(
+            acts_f16_bits.len(),
+            (rows * hidden_dim) as usize,
+            "activation buffer is {} elements but the kernel was emitted for \
+             rows={rows} x hidden_dim={hidden_dim}",
+            acts_f16_bits.len()
+        );
+
+        let act_bytes = acts_f16_bits.len() * 2;
         let w_bytes = packed.len();
         let y_elems = (rows * out_dim) as usize;
         let y_bytes = y_elems * 2;
@@ -478,7 +498,76 @@ fn gpu_matches_reference_on_committed_fixtures() {
             fx.name
         );
     }
+    assert!(
+        checked > 0,
+        "no output elements were compared; the fixture file is degenerate"
+    );
     eprintln!("All 10 fixtures bit-exact across {checked} output elements.");
+}
+
+/// Pin the round-half-AWAY-from-zero behaviour the emitter goes out of its way
+/// to produce (`copysign` + `cvt.rzi` rather than `cvt.rni`).
+///
+/// This is a targeted test because the general suites do NOT cover it: every
+/// exact-`.5` tie that happens to arise in the fixtures and random cases has an
+/// odd floor, where half-even and half-away agree. Mutating the emitter to
+/// `cvt.rni.s32.f32` passes all 14 of those cases and fails only this one.
+///
+/// Construction: the row's absmax is 127.0, so `127/scale == 1.0` exactly and
+/// each activation IS its own quantized value. The weight matrix is the
+/// identity, so `acc[r][c] == q[r][c]` and `y == (127/127) * q == q`. Every
+/// value is exactly representable in F16, so nothing is lost on the way in.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn rounding_is_half_away_from_zero_not_half_even() {
+    use reference::forward_reference;
+
+    if !unsafe { gpu::ensure_context() } {
+        eprintln!("SKIP: no usable CUDA device");
+        return;
+    }
+
+    let hidden_dim = 8usize;
+    let out_dim = 8usize;
+    let row: Vec<f32> = vec![0.5, 2.5, 4.5, 6.5, -0.5, -2.5, 127.0, 1.0];
+    // Half-away-from-zero. Half-even would give [0, 2, 4, 6, 0, -2, 127, 1].
+    let expect_q: [f32; 8] = [1.0, 3.0, 5.0, 7.0, -1.0, -3.0, 127.0, 1.0];
+
+    let activations = vec![row];
+    let weights: Vec<Vec<i8>> = (0..hidden_dim)
+        .map(|k| (0..out_dim).map(|c| i8::from(k == c)).collect())
+        .collect();
+
+    let (acts_bits, acts_rounded) = round_trip_f16(&activations);
+    let (scales, _q, expected) = forward_reference(&acts_rounded, &weights);
+    assert_eq!(scales[0], 127.0, "test construction requires an absmax of 127");
+
+    let config = config_for(hidden_dim as u32, out_dim as u32, 32);
+    let ptx = String::from_utf8(synthesize_kernel(&config)).expect("utf8");
+    let packed = pack_transposed(&weights, hidden_dim, out_dim);
+
+    let got = unsafe {
+        gpu::launch(
+            &ptx, &config.kernel_name(), &acts_bits, &packed,
+            1, hidden_dim as u32, out_dim as u32, 32, 1.0,
+        )
+    }
+    .expect("launch");
+
+    for c in 0..out_dim {
+        assert_eq!(
+            got[c], expect_q[c],
+            "column {c}: GPU={} but round-half-away-from-zero requires {} \
+             (round-half-to-even would give {}). The emitter must not regress \
+             to cvt.rni.",
+            got[c], expect_q[c],
+            if expect_q[c] > 0.0 { expect_q[c] - 1.0 } else { expect_q[c] + 1.0 }
+        );
+        // The reference must agree, or the oracle itself has drifted.
+        assert_eq!(expected[0][c], expect_q[c], "CPU reference disagrees at {c}");
+    }
+    eprintln!("rounding verified half-away-from-zero on {out_dim} exact .5 ties");
 }
 
 #[cfg(feature = "cuda")]
@@ -513,10 +602,17 @@ fn gpu_matches_reference_random() {
             state
         };
 
+        // Uniform in [-1, 1). `next() >> 40` is 24 bits, so divide by 2^23 to
+        // centre the range. An earlier version divided by 8192, giving
+        // [-1, 2047): the row absmax was then ~2047, which crushed every
+        // negative input to q == 0. That left ZERO negative quantized
+        // activations in the whole suite, and a mutation replacing
+        // `cvt.s32.s16` with `cvt.u32.u16` (destroying activation sign
+        // extension in the GEMM) passed all four random cases.
         let activations: Vec<Vec<f32>> = (0..rows)
             .map(|_| {
                 (0..hidden_dim)
-                    .map(|_| ((next() >> 40) as f32 / 8192.0) - 1.0)
+                    .map(|_| ((next() >> 40) as f32 / 8_388_608.0) - 1.0)
                     .collect()
             })
             .collect();
@@ -529,7 +625,16 @@ fn gpu_matches_reference_random() {
             .collect();
 
         let (acts_bits, acts_rounded) = round_trip_f16(&activations);
-        let (_s, _q, expected) = forward_reference(&acts_rounded, &weights);
+        let (_s, q_acts, expected) = forward_reference(&acts_rounded, &weights);
+
+        // Anti-vacuity: the GEMM sign-extends activations out of SMEM, so the
+        // suite is only meaningful if negative quantized values actually occur.
+        let negatives = q_acts.iter().flatten().filter(|&&q| q < 0).count();
+        assert!(
+            negatives > 0,
+            "random case rows={rows} hidden={hidden_dim} produced no negative \
+             quantized activations; the activation-sign path would be untested"
+        );
 
         let config = config_for(hidden_dim as u32, out_dim as u32, block_n);
         let ptx = String::from_utf8(synthesize_kernel(&config)).expect("utf8");
@@ -563,6 +668,77 @@ fn gpu_matches_reference_random() {
         );
         eprintln!("random case OK: rows={rows} hidden={hidden_dim} out_dim={out_dim} block_n={block_n}");
     }
+}
+
+/// Regression: output addressing must not wrap at 2^32 elements.
+///
+/// The offsets were originally computed as `mul.lo.u32` + `shl.b32`, so once
+/// `rows * out_dim * sizeof(elem)` passed 4 GiB the byte offset wrapped back
+/// into the same buffer — a later row silently overwrote an earlier one with
+/// no fault and no error. Reproduced at `out_dim=2048, rows=1048577`: row
+/// `2^31/out_dim` landed on top of row 0. An lm_head with `out_dim=128256`
+/// wraps at only ~16.7k rows of prefill, so this is reachable in real use.
+///
+/// Needs ~4.3 GiB of VRAM; skips when the device cannot spare it.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn output_addressing_does_not_wrap_at_4gib() {
+    if !unsafe { gpu::ensure_context() } {
+        eprintln!("SKIP: no usable CUDA device");
+        return;
+    }
+
+    let hidden_dim = 4u32;
+    let out_dim = 2048u32;
+    // First row whose flat element index crosses 2^31 (the shl.b32 wrap point).
+    let wrap_row = (1u64 << 31) / out_dim as u64;
+    let rows = (wrap_row + 1) as u32;
+
+    let y_bytes = rows as u64 * out_dim as u64 * 2;
+    let act_bytes = rows as u64 * hidden_dim as u64 * 2;
+    let needed = y_bytes + act_bytes + (1 << 26);
+    if !unsafe { gpu::has_free_vram(needed) } {
+        eprintln!("SKIP: needs {:.2} GiB free VRAM", needed as f64 / (1u64 << 30) as f64);
+        return;
+    }
+
+    // Row 0 gets activation magnitude 4, the wrap row gets magnitude 8; a
+    // single +1 weight in column 0 makes each row's output equal its own
+    // magnitude. If the wrap row aliases row 0, y[0][0] reads 8 instead of 4.
+    let mut acts = vec![0u16; (rows as usize) * (hidden_dim as usize)];
+    for k in 0..hidden_dim as usize {
+        acts[k] = half::f16::from_f32(4.0).to_bits();
+        acts[(wrap_row as usize) * hidden_dim as usize + k] = half::f16::from_f32(8.0).to_bits();
+    }
+
+    // weights[out_dim][hidden_dim]: column 0 selects k=0 only.
+    let mut trits = vec![0i8; (out_dim as usize) * (hidden_dim as usize)];
+    trits[0] = 1;
+    let packed = pack_trit_slice(&trits);
+
+    let config = config_for(hidden_dim, out_dim, 32);
+    let ptx = String::from_utf8(synthesize_kernel(&config)).expect("utf8");
+
+    let got = unsafe {
+        gpu::launch(
+            &ptx, &config.kernel_name(), &acts, &packed,
+            rows, hidden_dim, out_dim, 32, 1.0,
+        )
+    }
+    .expect("launch");
+
+    let y_row0 = got[0];
+    let y_wrap = got[(wrap_row as usize) * out_dim as usize];
+    eprintln!("rows={rows} wrap_row={wrap_row}: y[0][0]={y_row0} y[wrap][0]={y_wrap}");
+    assert_eq!(
+        y_row0, 4.0,
+        "row 0 was overwritten by row {wrap_row} -- the output offset wrapped at 2^32"
+    );
+    assert_eq!(
+        y_wrap, 8.0,
+        "row {wrap_row} did not land in its own slot -- the output offset wrapped at 2^32"
+    );
 }
 
 /// `weight_scale` must scale the output linearly. This is the M35.1 PR #172

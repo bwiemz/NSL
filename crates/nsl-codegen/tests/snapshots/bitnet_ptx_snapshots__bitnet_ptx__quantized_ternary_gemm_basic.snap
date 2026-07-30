@@ -11,10 +11,10 @@ mov.u32 %r_k, %r_tid;
 ABSMAX_LOOP:
 setp.ge.u32 %p_amdone, %r_k, %r_hidden_dim;
 @%p_amdone bra ABSMAX_END;
-mul.lo.u32 %r_off, %r_row_id, %r_hidden_dim;
-add.u32 %r_off, %r_off, %r_k;
-shl.b32 %r_off, %r_off, 1;
-cvt.u64.u32 %rd_off, %r_off;
+mul.wide.u32 %rd_off, %r_row_id, %r_hidden_dim;
+cvt.u64.u32 %rd_tmp, %r_k;
+add.s64 %rd_off, %rd_off, %rd_tmp;
+shl.b64 %rd_off, %rd_off, 1;
 add.s64 %rd_addr, %rd_act_in, %rd_off;
 ld.global.b16 %h_x, [%rd_addr];
 cvt.f32.f16 %f_x, %h_x;
@@ -86,16 +86,16 @@ mov.u32 %r_k, %r_tid;
 QUANT_LOOP:
 setp.ge.u32 %p_qdone, %r_k, %r_hidden_dim;
 @%p_qdone bra QUANT_END;
-mul.lo.u32 %r_qoff, %r_row_id, %r_hidden_dim;
-add.u32 %r_qoff, %r_qoff, %r_k;
-shl.b32 %r_qoff, %r_qoff, 1;
-cvt.u64.u32 %rd_off, %r_qoff;
+mul.wide.u32 %rd_off, %r_row_id, %r_hidden_dim;
+cvt.u64.u32 %rd_tmp, %r_k;
+add.s64 %rd_off, %rd_off, %rd_tmp;
+shl.b64 %rd_off, %rd_off, 1;
 add.s64 %rd_addr, %rd_act_in, %rd_off;
 ld.global.b16 %h_xq, [%rd_addr];
 cvt.f32.f16 %f_x, %h_xq;
 mul.f32 %f_scaled, %f_x, %f_inv_scale;
-max.f32 %f_clip, %f_scaled, 0fC2FE0000;
-min.f32 %f_clip, %f_clip, 0f42FE0000;
+max.NaN.f32 %f_clip, %f_scaled, 0fC2FE0000;
+min.NaN.f32 %f_clip, %f_clip, 0f42FE0000;
 // Round half AWAY FROM ZERO to match the CPU reference's f32::round
 // (cvt.rni would round half to even and disagree by one int8 step).
 copysign.f32 %f_rndbias, %f_clip, %f_half;

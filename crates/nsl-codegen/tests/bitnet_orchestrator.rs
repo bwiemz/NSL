@@ -72,14 +72,18 @@ fn synthesize_kernel_includes_all_phases() {
         ptx.contains("ld.param.f32 %f_w_scale, [weight_scale];"),
         "finalize must load weight_scale via ld.param.f32"
     );
+    // `mul.rn.f32`, not bare `mul.f32`: the explicit rounding modifier stops
+    // ptxas contracting this multiply with a following bias/residual add into
+    // a single FFMA, which would round once instead of twice.
     assert!(
-        ptx.contains("mul.f32 %f_y_out, %f_y_out, %f_w_scale;"),
-        "finalize must multiply %f_y_out by %f_w_scale"
+        ptx.contains("mul.rn.f32 %f_y_out, %f_y_out, %f_w_scale;"),
+        "finalize must multiply %f_y_out by %f_w_scale with an explicit \
+         rounding mode (mul.rn.f32) to block FMA contraction"
     );
     // The weight_scale multiply must come BEFORE the FP32->output cast,
     // and (when present) before bias/residual which operate in output space.
     let i_wscale = ptx
-        .find("mul.f32 %f_y_out, %f_y_out, %f_w_scale;")
+        .find("mul.rn.f32 %f_y_out, %f_y_out, %f_w_scale;")
         .expect("weight_scale mul present (asserted above)");
     let i_cast = ptx
         .find("cvt.rn.f16.f32")
