@@ -38,6 +38,7 @@ fn setup_env_default() {
     // SAFETY: single-threaded init (see matmul_cublas_equivalence.rs doc).
     std::env::remove_var("NSL_MATMUL_PEDANTIC");
     std::env::remove_var("NSL_MATMUL_TF32");
+    std::env::remove_var("NSL_MATMUL_BF16");
 }
 
 fn setup_env_force_tf32() {
@@ -45,6 +46,7 @@ fn setup_env_force_tf32() {
     // exercise the TF32 dispatch path in a CI matrix that may flip
     // `strict-matmul` on and off.
     std::env::remove_var("NSL_MATMUL_PEDANTIC");
+    std::env::remove_var("NSL_MATMUL_BF16");
     std::env::set_var("NSL_MATMUL_TF32", "1");
 }
 

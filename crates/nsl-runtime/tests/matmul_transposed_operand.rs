@@ -101,6 +101,7 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// via `test_set_transpose_views` rather than trusting the coupling.
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     std::env::set_var("NSL_MATMUL_TF32", "0");
+    std::env::set_var("NSL_MATMUL_BF16", "0");
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -556,7 +557,8 @@ fn probe_dispatch(
     .env(DEFAULT_PROBE, "1")
     .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
     .env_remove("NSL_MATMUL_TF32")
-    .env_remove("NSL_MATMUL_PEDANTIC");
+    .env_remove("NSL_MATMUL_PEDANTIC")
+    .env_remove("NSL_MATMUL_BF16");
     if let Some(v) = views {
         cmd.env("NSL_MATMUL_TRANSPOSE_VIEWS", v);
     }
@@ -720,8 +722,10 @@ fn the_op_t_tradeoff_is_remeasurable() {
                 // Precedence trap (review finding): NSL_MATMUL_PEDANTIC beats
                 // NSL_MATMUL_TF32 in resolve_math_mode, so a pedantic-pinned
                 // shell would silently measure pedantic math in all four
-                // cells while the labels claim f32/tf32.
-                .env_remove("NSL_MATMUL_PEDANTIC");
+                // cells while the labels claim f32/tf32. NSL_MATMUL_BF16
+                // beats NSL_MATMUL_TF32 the same way.
+                .env_remove("NSL_MATMUL_PEDANTIC")
+                .env_remove("NSL_MATMUL_BF16");
             match views_env {
                 Some(v) => {
                     cmd.env("NSL_MATMUL_TRANSPOSE_VIEWS", v);

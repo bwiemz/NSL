@@ -155,6 +155,7 @@ fn probe_with(extra: &[(&str, &str)]) -> Probe {
         .env(PROBE, "1")
         .env_remove("NSL_MATMUL_TF32")
         .env_remove("NSL_MATMUL_PEDANTIC")
+        .env_remove("NSL_MATMUL_BF16")
         // REQUIRED. `inner::sync_after_kernel` is a no-op unless this is set,
         // so without it the timing loop measures kernel *enqueue* — which is
         // how the first run of this probe reported a 2048^3 gemm in 4.9us.

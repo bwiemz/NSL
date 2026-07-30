@@ -44,6 +44,7 @@ use nsl_runtime::{nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d};
 /// to both arms of every comparison in this file — but it is a real gap.
 fn pin_full_f32() {
     std::env::set_var("NSL_MATMUL_TF32", "0");
+    std::env::set_var("NSL_MATMUL_BF16", "0");
 }
 
 fn cuda_available() -> bool {

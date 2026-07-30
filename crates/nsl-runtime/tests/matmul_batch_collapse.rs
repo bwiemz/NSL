@@ -71,6 +71,7 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// message rather than passing quietly, so this is self-checking.
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     std::env::set_var("NSL_MATMUL_TF32", "0");
+    std::env::set_var("NSL_MATMUL_BF16", "0");
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
