@@ -38,6 +38,10 @@ struct Run {
 
 /// Compile+run the CSLA FFN fixture on the GPU with `extra` flags.
 fn run(tag: &str, extra: &[&str], plan_report: bool) -> (Run, PathBuf) {
+    run_env(tag, extra, plan_report, &[])
+}
+
+fn run_env(tag: &str, extra: &[&str], plan_report: bool, env: &[(&str, &str)]) -> (Run, PathBuf) {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_paramplan_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -61,6 +65,9 @@ fn run(tag: &str, extra: &[&str], plan_report: bool) -> (Run, PathBuf) {
         .env("NSL_STDLIB_PATH", root.join("stdlib"));
     if plan_report {
         cmd.env("NSL_PARAM_PLAN_REPORT", "1");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn nsl run");
     (
@@ -133,28 +140,45 @@ fn the_plan_names_the_backend_that_actually_took_each_parameter_gpu() {
     let (total_p, resident_p, host_p, bf16_p, shard_p) = verified_line(&plain.stderr)
         .unwrap_or_else(|| panic!("no [param-plan] verified line:\n{}", plain.stderr));
     assert!(total_p > 0, "plan verified zero parameters — vacuous");
+    assert!(host_p > 0, "no parameter reached the host-mirror table");
     assert_eq!(
-        (host_p, bf16_p, shard_p),
-        (total_p, 0, 0),
-        "plain --weight-stream must put every declared param in the host-mirror \
-         table:\n{}",
+        (bf16_p, shard_p),
+        (0, 0),
+        "plain --weight-stream must not put anything in the bf16-sr or sharded \
+         backends:\n{}",
         plain.stderr
     );
-    assert_eq!(resident_p, 0, "only streamed params are declared");
+    // The fixture's tied embedding roots a buffered `transpose` view, so the
+    // schedule deliberately excludes it (the #397 hazard) — residents are a
+    // real, checked population here, not an empty set that makes the
+    // "registered nowhere" expectation vacuous.
+    assert!(
+        resident_p > 0,
+        "expected some view-rooted/unclaimed params to stay resident and be \
+         checked as such:\n{}",
+        plain.stderr
+    );
+    assert_eq!(resident_p + host_p, total_p, "counts do not partition");
 
     let (sr, t2) = run("sr", WS_SR, false);
     assert!(sr.ok, "bf16-sr run failed:\n{}", sr.stderr);
-    let (total_s, _, host_s, bf16_s, shard_s) = verified_line(&sr.stderr)
+    let (total_s, resident_s, host_s, bf16_s, shard_s) = verified_line(&sr.stderr)
         .unwrap_or_else(|| panic!("no [param-plan] verified line:\n{}", sr.stderr));
     assert_eq!(
-        (host_s, bf16_s, shard_s),
-        (0, total_s, 0),
-        "--param-dtype bf16-sr must put every declared param in the SR table, \
-         NOT the host-mirror table:\n{}",
+        (host_s, shard_s),
+        (0, 0),
+        "--param-dtype bf16-sr must put its params in the SR table, NOT the \
+         host-mirror table:\n{}",
         sr.stderr
     );
-    // Same fixture, same parameter count — only the backend moved.
-    assert_eq!(total_p, total_s, "parameter count changed between modes");
+    assert!(bf16_s > 0, "no parameter reached the SR backend");
+    // Same fixture: the same parameters move, only the backend changes.
+    assert_eq!(
+        (total_p, resident_p, host_p),
+        (total_s, resident_s, bf16_s),
+        "the streamed/resident split moved between storage modes; only the \
+         BACKEND should have"
+    );
 
     // Cross-check against an INDEPENDENT counter: the sr-bf16 teardown line
     // reports how many params the SR backend actually holds. If the plan and
@@ -208,12 +232,15 @@ fn the_plan_names_the_sharded_backend_under_zero3_gpu() {
     let (total, resident, host, bf16, sharded) = verified_line(&r.stderr)
         .unwrap_or_else(|| panic!("no [param-plan] verified line:\n{}", r.stderr));
     assert!(total > 0, "plan verified zero parameters — vacuous");
+    assert!(sharded > 0, "no parameter reached the sharded backend");
     assert_eq!(
-        (resident, host, bf16, sharded),
-        (0, 0, 0, total),
-        "--zero-stage 3 must put every declared param in the sharded backend:\n{}",
+        (host, bf16),
+        (0, 0),
+        "--zero-stage 3 must not leave anything in the host-mirror or bf16-sr \
+         backends:\n{}",
         r.stderr
     );
+    assert_eq!(resident + sharded, total, "counts do not partition");
     // Anti-vacuity against the sharding actually happening, not just being
     // declared: the zero3 backend's own banner must be present.
     assert!(
@@ -304,11 +331,22 @@ fn a_run_with_no_residency_backend_emits_no_check_gpu() {
         "a run with no streaming emitted a plan check:\n{}",
         r.stderr
     );
-    // The report still describes the (all-resident) plan when asked.
+    // The report still describes the plan when asked — and it must say the
+    // plan is ALL-resident. Asserting `contains("resident")` alone would pass
+    // on an all-streamed plan too: "resident" appears in the per-parameter
+    // mode column and in unrelated [weight-stream] chatter.
+    let header = r
+        .stderr
+        .lines()
+        .find(|l| l.contains("[param-plan]") && l.contains("parameter(s):"))
+        .unwrap_or_else(|| panic!("no [param-plan] header:\n{}", r.stderr));
     assert!(
-        r.stderr.contains("[param-plan]") && r.stderr.contains("resident"),
-        "NSL_PARAM_PLAN_REPORT should still describe an all-resident plan:\n{}",
-        r.stderr
+        header.contains("0 streamed"),
+        "with no residency backend every parameter must be resident:\n{header}"
+    );
+    assert!(
+        num_before(header, "parameter(s)").is_some_and(|n| n > 0),
+        "report covers no parameters — vacuous:\n{header}"
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -358,6 +396,158 @@ fn an_impossible_plan_is_refused_before_codegen() {
     assert!(
         err.contains("requires --weight-stream"),
         "refusal did not name the missing flag:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// **The gate that makes every other gate here mean something.**
+///
+/// `nsl_param_plan_verify`'s abort arm cannot be reached by a correct
+/// compiler — producing a real mismatch requires the bug the check exists to
+/// catch. So without fault injection, replacing `observe()` with `expected()`
+/// (i.e. deleting the entire cross-check and keeping only the bookkeeping)
+/// leaves all the assertions above passing: they read counts derived from the
+/// plan, not from the tables. This drives `NSL_PARAM_PLAN_FAULT`, which
+/// corrupts exactly one declared entry, and requires the process to die
+/// naming the parameter.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn a_corrupted_plan_entry_aborts_the_run_gpu() {
+    let (r, tmp) = run_env("fault", WS_SR, false, &[("NSL_PARAM_PLAN_FAULT", "0")]);
+    assert!(
+        !r.ok,
+        "a parameter whose declared plan disagrees with its actual backend did \
+         NOT abort the run — the cross-check is decorative:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("[param-plan] FATAL"),
+        "aborted without the plan diagnostic (something else failed?):\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("param 0"),
+        "the diagnostic must name the offending parameter:\n{}",
+        r.stderr
+    );
+    // Exactly one parameter was corrupted, so exactly one must be reported —
+    // proving the check is per-parameter and not an all-or-nothing flag.
+    assert!(
+        r.stderr.contains("FATAL: 1 of "),
+        "expected exactly one mismatched parameter:\n{}",
+        r.stderr
+    );
+    // And the injection announces itself, so a stray env var in CI cannot
+    // quietly turn a real run into a corrupted one.
+    assert!(
+        r.stderr.contains("FAULT INJECTION ACTIVE"),
+        "fault injection ran without announcing itself:\n{}",
+        r.stderr
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Same fixture, no fault: proves the gate above fails for the reason it
+/// claims (the corruption) rather than because this configuration is broken.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_same_run_without_fault_injection_succeeds_gpu() {
+    let (r, tmp) = run("nofault", WS_SR, false);
+    assert!(r.ok, "control run failed:\n{}", r.stderr);
+    assert!(
+        !r.stderr.contains("[param-plan] FATAL"),
+        "control run reported a mismatch:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("FAULT INJECTION"),
+        "fault injection leaked into the control run:\n{}",
+        r.stderr
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// `nsl_param_plan_teardown` is load-bearing and nothing else covers it:
+/// delete its emission and a single-train-block program still passes, while
+/// a two-block program aborts because block 2 verifies block 1's pointers
+/// after `teardown_mirrors` already dropped them from `MIRRORS`.
+#[test]
+#[ignore = "requires CUDA GPU (2 train blocks over 2 models, one process)"]
+fn two_train_blocks_in_one_process_each_verify_their_own_plan_gpu() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_paramplan_two_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // ONE program, TWO models, TWO train blocks. Block 1's teardown drops its
+    // parameters from MIRRORS; if the declared plan outlived the block, block
+    // 2's verify would find block 1's six pointers registered nowhere while
+    // their entries still say host-mirrored, and abort on staleness.
+    let base = std::fs::read_to_string(
+        root.join("crates/nsl-cli/tests/fixtures/csla_layerwise_ffn.nsl"),
+    )
+    .expect("ffn fixture missing");
+    let second = r#"
+let m2 = TinyLM()
+m2.to(cuda)
+
+print("SECOND_BLOCK_BEGIN")
+train(model=m2, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.002, weight_decay=0.01, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits2 = m2.forward_train(batch.input_ids)
+        let ls2 = logits2.shape
+        let flat_logits2 = logits2.reshape([ls2[0] * ls2[1], ls2[2]])
+        let flat_labels2 = batch.labels.reshape([ls2[0] * ls2[1]])
+        let loss = cross_entropy(flat_logits2, flat_labels2)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+print("SECOND_BLOCK_END")
+
+"#;
+    let src = base
+        .replace(
+            "CSLA_SAVE_PATH",
+            &tmp.join("a.nslm").display().to_string().replace('\\', "/"),
+        )
+        .replace("# GPU_PLACEMENT", "m.to(cuda)")
+        .replace("model_save(m, \"", &format!("{second}model_save(m, \""));
+    assert!(
+        src.contains("SECOND_BLOCK_BEGIN"),
+        "fixture lost its model_save anchor — the second train block was never \
+         spliced in, which would make this gate vacuous"
+    );
+    let prog = tmp.join("two.nsl");
+    std::fs::write(&prog, &src).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args([
+            "run",
+            "--source-ad",
+            "--deterministic",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--weight-stream",
+        ])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .output()
+        .expect("spawn nsl run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let sout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "two-block program failed:\n{err}");
+    assert!(
+        sout.contains("SECOND_BLOCK_BEGIN") && sout.contains("SECOND_BLOCK_END"),
+        "the second train block never ran — the gate would be vacuous:\n{sout}"
+    );
+    assert!(
+        !err.contains("[param-plan] FATAL"),
+        "stale-plan mismatch: the first block's plan outlived its teardown:\n{err}"
+    );
+    assert_eq!(
+        count_lines(&err, "[param-plan] verified"),
+        2,
+        "expected one verified line per train block:\n{err}"
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }

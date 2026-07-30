@@ -73,6 +73,9 @@ crates/nsl-cli/tests/param_plan_gate.rs	the_plan_names_the_sharded_backend_under
 crates/nsl-cli/tests/param_plan_gate.rs	the_check_reports_once_per_train_block_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/param_plan_gate.rs	the_per_parameter_report_is_opt_in_and_loss_neutral_gpu	gpu	requires CUDA GPU (2 runs)
 crates/nsl-cli/tests/param_plan_gate.rs	a_run_with_no_residency_backend_emits_no_check_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_plan_gate.rs	a_corrupted_plan_entry_aborts_the_run_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_plan_gate.rs	the_same_run_without_fault_injection_succeeds_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_plan_gate.rs	two_train_blocks_in_one_process_each_verify_their_own_plan_gpu	gpu	requires CUDA GPU (2 train blocks over 2 models, one process)
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	pretrain_loss_decreases_on_gpu	gpu	requires CUDA GPU (runs a real training loop)
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	fase_deferred_matches_plain_adamw_checkpoint	gpu	requires CUDA GPU (runs two real training loops)
 crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference	gpu	requires CUDA GPU

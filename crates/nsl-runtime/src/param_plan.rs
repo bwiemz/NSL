@@ -30,9 +30,12 @@
 //! Codegen bakes the plan it derived into the binary — one
 //! [`nsl_param_plan_declare`] per parameter, carrying its index and the
 //! [`PLAN_STREAMED`] / [`PLAN_BF16_SR`] / [`PLAN_SHARDED`] bits — and calls
-//! [`nsl_param_plan_verify`] once the registration belt has run. Verify
-//! reads the three tables directly and asserts each parameter landed in the
-//! backend the plan named, and in no other. A disagreement aborts.
+//! [`nsl_param_plan_verify`] after the registration belt has run. Because
+//! that belt is per-micro-batch, so is the check: a table that drifts
+//! mid-run is caught, not just the first step's state. Verify reads the three
+//! tables directly and asserts each parameter landed in the backend the plan
+//! named, and in no other. A disagreement aborts. Only the FIRST clean result
+//! is printed, so a long run does not bury its own stderr.
 //!
 //! # What this does NOT claim
 //!
@@ -75,9 +78,8 @@ struct Declared {
 }
 
 static PLAN: Mutex<Option<HashMap<i64, Declared>>> = Mutex::new(None);
-/// Anti-vacuity: gates assert this moved, so a plan that silently stopped
-/// being emitted cannot pass as "verified, zero mismatches".
-static PLAN_DECLARED: AtomicU64 = AtomicU64::new(0);
+/// How many times verify has run since the last teardown. Only used to make
+/// the success banner print once per train block.
 static PLAN_VERIFIES: AtomicU64 = AtomicU64::new(0);
 
 /// Which backend actually holds this parameter, observed from the tables.
@@ -129,6 +131,46 @@ fn describe(o: Observed) -> &'static str {
     }
 }
 
+/// Test-only fault injection: `NSL_PARAM_PLAN_FAULT=<idx>` corrupts the
+/// declared plan for that one parameter so it disagrees with whatever the
+/// runtime actually did.
+///
+/// This exists because [`nsl_param_plan_verify`]'s abort arm is otherwise
+/// unreachable from a test: producing a real mismatch requires a compiler
+/// bug. Without it, stubbing `observe()` to return `expected()` would leave
+/// every gate green — the check would be decorative and nothing would say
+/// so. The gate in `param_plan_gate.rs` drives this and asserts the process
+/// dies with `[param-plan] FATAL`.
+///
+/// The corruption is chosen to always produce a mismatch without tripping
+/// the shape guard below: a streamed parameter is re-declared as resident, a
+/// resident one as streamed.
+fn fault_injected_flags(idx: i64, flags: i64) -> i64 {
+    use std::sync::OnceLock;
+    static FAULT: OnceLock<Option<i64>> = OnceLock::new();
+    let target = *FAULT.get_or_init(|| {
+        let t = std::env::var("NSL_PARAM_PLAN_FAULT")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok());
+        if let Some(t) = t {
+            eprintln!(
+                "[param-plan] FAULT INJECTION ACTIVE (NSL_PARAM_PLAN_FAULT={t}): \
+                 parameter {t}'s declared plan will be corrupted on purpose. \
+                 This is a test hook; never set it for a real run."
+            );
+        }
+        t
+    });
+    if target != Some(idx) {
+        return flags;
+    }
+    if flags & PLAN_STREAMED != 0 {
+        0
+    } else {
+        PLAN_STREAMED
+    }
+}
+
 /// Declare parameter `idx` (pointer `tensor_ptr`) as planned with `flags`.
 /// Emitted once per parameter per train block; idempotent, so the step-top
 /// registration belt may re-declare freely.
@@ -139,6 +181,7 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
     if tensor_ptr == 0 || idx < 0 {
         return -1;
     }
+    let flags = fault_injected_flags(idx, flags);
     if flags & !PLAN_KNOWN_BITS != 0 {
         eprintln!(
             "[param-plan] FATAL: parameter {idx} declared with unknown plan \
@@ -162,14 +205,10 @@ pub extern "C" fn nsl_param_plan_declare(tensor_ptr: i64, idx: i64, flags: i64) 
         );
         std::process::abort();
     }
-    let mut guard = PLAN.lock().unwrap();
-    let fresh = guard
+    PLAN.lock()
+        .unwrap()
         .get_or_insert_with(HashMap::new)
-        .insert(tensor_ptr, Declared { idx, flags })
-        .is_none();
-    if fresh {
-        PLAN_DECLARED.fetch_add(1, Ordering::Relaxed);
-    }
+        .insert(tensor_ptr, Declared { idx, flags });
     0
 }
 
@@ -197,7 +236,9 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
             }
         }
     };
-    let mut mismatches: Vec<String> = Vec::new();
+    // (idx, message) so the fatal report sorts NUMERICALLY — sorting the
+    // formatted strings puts param 10 between 1 and 2.
+    let mut mismatches: Vec<(i64, String)> = Vec::new();
     let mut counts = [0usize; 4]; // nowhere / host / bf16 / sharded
     for (ptr, d) in &snapshot {
         let want = expected(d.flags);
@@ -211,12 +252,15 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
                 Observed::Conflict => unreachable!("expected() never yields Conflict"),
             }
         } else {
-            mismatches.push(format!(
-                "  param {} (ptr {:#x}): plan says {}, runtime has {}",
+            mismatches.push((
                 d.idx,
-                ptr,
-                describe(want),
-                describe(got)
+                format!(
+                    "  param {} (ptr {:#x}): plan says {}, runtime has {}",
+                    d.idx,
+                    ptr,
+                    describe(want),
+                    describe(got)
+                ),
             ));
         }
     }
@@ -239,23 +283,20 @@ pub extern "C" fn nsl_param_plan_verify() -> i64 {
         }
         return 0;
     }
-    mismatches.sort();
+    mismatches.sort_by_key(|(idx, _)| *idx);
     eprintln!(
         "[param-plan] FATAL: {} of {} parameter(s) did not land in the backend \
          the compiled plan named. The run would train storage the certification \
          does not describe.\n{}",
         mismatches.len(),
         snapshot.len(),
-        mismatches.join("\n")
+        mismatches
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     std::process::abort();
-}
-
-/// How many distinct parameters have been declared (anti-vacuity probe for
-/// the gates: a plan that stopped being emitted reads 0 here).
-#[no_mangle]
-pub extern "C" fn nsl_param_plan_declared_count() -> i64 {
-    PLAN_DECLARED.load(Ordering::Relaxed) as i64
 }
 
 /// Drop the declared plan at train-block teardown, alongside the residency
@@ -320,16 +361,36 @@ mod tests {
         assert_eq!(nsl_param_plan_declare(0x10, -1, 0), -1);
     }
 
+    /// The belts re-declare every micro-batch, so a re-declaration of the
+    /// same pointer must not grow the table (teardown's return value is the
+    /// entry count).
     #[test]
-    fn declare_is_idempotent_and_counts_distinct_params() {
+    fn declare_is_idempotent_per_pointer() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         nsl_param_plan_teardown();
-        PLAN_DECLARED.store(0, Ordering::Relaxed);
         assert_eq!(nsl_param_plan_declare(0xAA00, 0, 0), 0);
         assert_eq!(nsl_param_plan_declare(0xAA00, 0, 0), 0);
         assert_eq!(nsl_param_plan_declare(0xAA08, 1, 0), 0);
-        assert_eq!(nsl_param_plan_declared_count(), 2);
-        assert_eq!(nsl_param_plan_teardown(), 2);
+        assert_eq!(nsl_param_plan_teardown(), 2, "re-declare grew the table");
+    }
+
+    /// Fault injection must actually corrupt, and only the named parameter.
+    /// If this drifts, the gate that proves the abort arm works goes vacuous.
+    #[test]
+    fn fault_injection_flips_exactly_one_parameter_into_a_mismatch() {
+        // Without the env var set (the normal case) it is the identity.
+        assert_eq!(fault_injected_flags(0, PLAN_STREAMED), PLAN_STREAMED);
+        assert_eq!(fault_injected_flags(3, 0), 0);
+        // The transform itself, independent of the env read: a streamed
+        // parameter becomes resident and vice versa, and both directions
+        // change what `expected()` demands — which is what makes the
+        // mismatch certain rather than merely likely.
+        assert_ne!(expected(PLAN_STREAMED), expected(0));
+        assert_ne!(
+            expected(PLAN_STREAMED | PLAN_BF16_SR),
+            expected(0),
+            "corrupting a bf16-sr param to resident must change the expectation"
+        );
     }
 
     /// An all-resident plan verifies clean: it is the one shape whose

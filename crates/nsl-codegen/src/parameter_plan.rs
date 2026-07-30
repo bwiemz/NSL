@@ -263,6 +263,17 @@ impl ParameterPlan {
             .any(|e| e.residency == ParamResidency::Streamed)
     }
 
+    /// Must `nsl_sr_bf16_enable` be emitted? True iff some parameter's entry
+    /// asks for an SR counter block.
+    ///
+    /// The SR backend aborts on a `register` of a parameter that never got a
+    /// `note_param`, so arming the backend and noting a parameter have to be
+    /// decided from one source. Reading both off this plan is what makes that
+    /// structural rather than a coincidence of two matching `if` conditions.
+    pub fn needs_sr_backend(&self) -> bool {
+        self.entries.iter().any(|e| e.needs_sr_note())
+    }
+
     /// Human-readable plan, printed under `NSL_PARAM_PLAN_REPORT=1`.
     pub fn report(&self) -> String {
         let total = self.entries.len();
@@ -446,7 +457,44 @@ mod tests {
         let p =
             ParameterPlan::derive(&names(3), &[], &PlanFeatures::default()).unwrap();
         assert!(!p.has_streamed());
+        assert!(!p.needs_sr_backend());
         assert!(p.entries().iter().all(|e| e.runtime_flags() == 0));
+    }
+
+    /// `needs_sr_backend` gates the `nsl_sr_bf16_enable` emission and
+    /// `needs_sr_note` gates the per-parameter note. The SR backend aborts
+    /// when a parameter is registered without a note, so "armed" must imply
+    /// "some parameter will be noted" and vice versa — asserted here rather
+    /// than trusted, because the two are emitted at different call sites.
+    #[test]
+    fn arming_the_sr_backend_agrees_with_noting_parameters() {
+        let ws = PlanFeatures {
+            weight_stream: true,
+            ..Default::default()
+        };
+        let sr = PlanFeatures {
+            weight_stream: true,
+            param_dtype_bf16sr: true,
+            ..Default::default()
+        };
+        for (f, streamed) in [
+            (ws, &[0i64, 1][..]),
+            (ws, &[][..]),
+            (sr, &[0i64][..]),
+            (sr, &[][..]),
+        ] {
+            let p = ParameterPlan::derive(&names(3), streamed, &f).unwrap();
+            assert_eq!(
+                p.needs_sr_backend(),
+                p.entries().iter().any(|e| e.needs_sr_note()),
+                "arm/note disagreement for {f:?} streamed={streamed:?}"
+            );
+        }
+        // And bf16-sr with an EMPTY schedule must not arm the backend: there
+        // is no parameter to note, so arming it would guarantee the abort.
+        assert!(!ParameterPlan::derive(&names(3), &[], &sr)
+            .unwrap()
+            .needs_sr_backend());
     }
 
     #[test]

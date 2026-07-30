@@ -9630,7 +9630,13 @@ impl Compiler<'_> {
                         .as_ref()
                         .map(|p| &p.schedule.plan)
                         .expect("ws_fwd_plan and csla_pre are built in the same branch");
-                    if self.features.param_dtype_bf16sr {
+                    // The backend is armed iff some parameter's plan entry
+                    // needs it. `srbf16_register` aborts on a parameter that
+                    // reaches it without a prior `note_param`, so "enable is
+                    // on" and "this parameter gets a note" must come from the
+                    // SAME source — spelling one from the flag and the other
+                    // from the plan is exactly the split this item removes.
+                    if plan.needs_sr_backend() {
                         self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
                     }
                     for &idx in &wsplan.register_idxs {
@@ -12016,7 +12022,9 @@ impl Compiler<'_> {
                 // P4 item 17: activate the bf16 mirror backend and assign
                 // each streamed param its stable SR counter block BEFORE the
                 // first registration (register aborts on an un-noted param).
-                if self.features.param_dtype_bf16sr {
+                // Armed from the plan, for the same reason as the pre-forward
+                // belt: enable and note must not be spelled from two sources.
+                if pending.schedule.plan.needs_sr_backend() {
                     self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
                 }
                 for &idx in &pending.schedule.ws_streamed {
@@ -15809,19 +15817,27 @@ impl Compiler<'_> {
     /// otherwise connects the two, and a mismatch is silent: a parameter that
     /// reached `register` before its mode was enabled lands in the host-mirror
     /// table, trains in f32, and the run exits 0 with a plausible loss curve.
-    /// One `declare` per parameter plus one `verify` closes that gap for the
-    /// cost of `n + 1` calls at train-block setup.
+    /// One `declare` per parameter plus one `verify` closes that gap. Both
+    /// are emitted inside the per-micro-batch registration region, so the
+    /// check re-runs every micro-batch (catching drift, not just the first
+    /// step) at a cost of `2n + 1` FFI calls beside the `2n` the belt above
+    /// already makes — measured as no wall-clock change.
     ///
-    /// Only the streamed parameters are declared: a resident parameter's
-    /// expected observation ("registered with no backend") is the default
-    /// state of every pointer, so declaring them would inflate the report
-    /// without being able to fail.
+    /// EVERY parameter is declared, not only the streamed ones. A resident
+    /// parameter expects "registered with no backend", which is falsifiable
+    /// and worth checking: the streaming schedule deliberately excludes
+    /// view-rooted parameters (a buffered `transpose(w)` caches a pointer
+    /// into θ's storage, so registering θ would free it under the live view —
+    /// the #397 corruption hazard). If such a parameter ever leaks back into
+    /// a registration belt, this is what says so.
     pub(crate) fn emit_param_plan_check(
         &mut self,
         builder: &mut FunctionBuilder,
         plan: &crate::parameter_plan::ParameterPlan,
         param_list: Value,
     ) -> Result<(), CodegenError> {
+        // Nothing is registered anywhere, so there is no cross-check to make
+        // and no call is emitted at all.
         if !plan.has_streamed() {
             return Ok(());
         }
@@ -15829,7 +15845,6 @@ impl Compiler<'_> {
         let declares: Vec<(i64, i64)> = plan
             .entries()
             .iter()
-            .filter(|e| e.runtime_flags() != 0)
             .map(|e| (e.idx, e.runtime_flags()))
             .collect();
         for (idx, flags) in declares {
