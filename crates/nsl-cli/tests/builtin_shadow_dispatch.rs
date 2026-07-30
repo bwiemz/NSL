@@ -504,6 +504,33 @@ print("DONE")
     );
 }
 
+/// Review HIGH on cb1bd16f: the closure clear was block-scope-blind —
+/// a DEAD if-arm's non-capturing `let f = ...` deleted the outer
+/// capturing `f`'s entry at compile time, and the post-arm `f(1)`
+/// (whose runtime value is still the untouched closure) compiled as a
+/// bare-pointer call: the closure struct executed as code.
+/// closure_info now lives on FuncState with a per-scope undo log
+/// rolled back by pop_fn_binding_scope.
+#[test]
+fn dead_arm_lambda_rebind_does_not_corrupt_outer_closure_info() {
+    let src = r#"
+let k = 5
+let f = |v: int| v + k
+let flag = 0
+if flag > 0:
+    let f = |v: int| v * 2
+    print(f(3))
+print(f(1))
+print("DONE")
+"#;
+    let stdout = run_src(src, "deadarmclos");
+    assert_eq!(
+        printed_value(&stdout),
+        "6",
+        "outer closure corrupted by dead-arm rebind:\n{stdout}"
+    );
+}
+
 /// The guard must not disturb the unshadowed builtins.
 #[test]
 fn unshadowed_sampling_builtins_still_dispatch_to_the_runtime() {

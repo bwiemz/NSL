@@ -56,7 +56,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   NON-Function value (`let sum = 5`) now makes calls of that name a
   compile error ("not callable") — Python semantics — instead of the
   silent fallback to the builtin. Pinned by a gate.
-- 9 new CPU gates in `builtin_shadow_dispatch.rs` (20 total).
+- Second review pass found the clear was still BLOCK-scope-blind: a
+  dead if-arm's non-capturing rebind deleted the outer closure's entry
+  (the post-arm call executed the closure struct as code — a
+  regression over pre-audit behavior). `closure_info` now lives on
+  FuncState (per-function by construction — the nested-fn snapshot is
+  retired) with a per-scope undo log rolled back by
+  `pop_fn_binding_scope`, mirroring the checker's block scoping the
+  same way `live_fn_bindings` does.
+- 10 new CPU gates in `builtin_shadow_dispatch.rs` (21 total).
   Mutation-proven in three directions: hoist off → exactly the 3
   module-fn shadow gates red; checker gating off → exactly the 2
   tensor-arg shadow gates red (verifier disagreement); closure clear

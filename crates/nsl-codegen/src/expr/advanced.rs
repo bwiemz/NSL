@@ -794,7 +794,7 @@ impl Compiler<'_> {
         }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
         if let ExprKind::Ident(sym) = &args[0].value.kind {
-            if self.registry.closure_info.contains_key(sym) {
+            if state.closure_info.contains_key(sym) {
                 let name = self.resolve_sym(*sym).to_string();
                 return Err(CodegenError::new(format!(
                     "cannot pass closure '{name}' to {func_name}() -- closures with captured variables \

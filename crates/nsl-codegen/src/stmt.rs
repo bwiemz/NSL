@@ -1343,16 +1343,17 @@ impl Compiler<'_> {
 
                         // If the value was a closure lambda, record capture count for indirect call dispatch
                         if let Some(count) = self.registry.last_lambda_capture_count.take() {
-                            self.registry.closure_info.insert(sym, count);
+                            state.set_closure_info(sym, Some(count));
                         } else {
-                            // closure_info is compiler-global and symbol-keyed
-                            // (#435 review LOW): a rebind to anything that is
-                            // NOT a capturing lambda must clear the stale
-                            // entry, or the call site reads the new bare
-                            // function pointer as a closure struct (probed:
-                            // silent death after a capturing `f` was rebound
-                            // to a non-capturing lambda).
-                            self.registry.closure_info.remove(&sym);
+                            // A rebind to anything that is NOT a capturing
+                            // lambda must clear the stale entry, or the call
+                            // site reads the new bare function pointer as a
+                            // closure struct (probed: silent death). The
+                            // scoped setter records an undo entry so a
+                            // block-local rebind cannot outlive its scope
+                            // (review HIGH on cb1bd16f: a dead if-arm's
+                            // rebind deleted the outer closure's entry).
+                            state.set_closure_info(sym, None);
                         }
                     }
                     PatternKind::Tuple(sub_patterns) | PatternKind::List(sub_patterns) => {
@@ -1698,21 +1699,12 @@ impl Compiler<'_> {
                     .functions
                     .insert(base_name.clone(), (func_id, sig.clone()));
 
-                // closure_info is compiler-global and symbol-keyed, and this
-                // nested body compiles MID-way through the outer body — any
-                // closure_info mutation inside it (a `let f = <lambda>` insert
-                // or the non-capturing-rebind clear) would corrupt entries the
-                // OUTER function's remaining call sites still need (review
-                // HIGH on 44c011c1: a nested `let f = 7` deleted the outer
-                // capturing `f`'s entry — the outer call then executed the
-                // closure struct as code). Snapshot/restore, mirroring the
-                // registry.functions temp-entry pattern above.
-                let closure_info_snapshot = self.registry.closure_info.clone();
-
-                // Compile the nested function body
+                // Compile the nested function body. closure_info now lives
+                // on FuncState (per-function), so the nested body's own
+                // closure metadata cannot touch this function's — the
+                // earlier compiler-global map needed a snapshot here
+                // (review HIGH on 44c011c1).
                 self.compile_fn_def(fn_def)?;
-
-                self.registry.closure_info = closure_info_snapshot;
 
                 // Remove temp entry and restore any previous function with the same name
                 self.registry.functions.remove(&base_name);
@@ -2140,9 +2132,9 @@ impl Compiler<'_> {
                     // closure struct (silent death), and a capturing rebind
                     // was never recorded at all.
                     if let Some(count) = self.registry.last_lambda_capture_count.take() {
-                        self.registry.closure_info.insert(*sym, count);
+                        state.set_closure_info(*sym, Some(count));
                     } else {
-                        self.registry.closure_info.remove(sym);
+                        state.set_closure_info(*sym, None);
                     }
                 }
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)

@@ -3540,7 +3540,7 @@ impl Compiler<'_> {
 
         // Check if callee is a closure variable (has captures)
         let closure_captures = if let ExprKind::Ident(sym) = &callee.kind {
-            self.registry.closure_info.get(sym).copied()
+            state.closure_info.get(sym).copied()
         } else {
             None
         };
