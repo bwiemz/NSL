@@ -196,6 +196,21 @@ pub struct ModelMetadata {
     /// Distinct from `model_tensor_field_shapes`, which stores 2-D
     /// shapes as strings for the WRGA adapter injector only.
     pub model_field_ranks: HashMap<String, HashMap<String, usize>>,
+    /// Stage-2A (transient arena): FULL literal dims of shape-bearing model
+    /// field initializers at every rank, `model_name -> field_name -> dims`.
+    /// Superset of what the two maps above keep (rank-2 strings / bare
+    /// ranks), populated from the same `extract_shape_from_tensor_init`
+    /// site, including scalar-scaled idioms (`randn([64, 128]) * 0.15`).
+    /// Consumed by the arena hint bridge in `stmt.rs`, which sizes each
+    /// trainable param — and, mirrored through the adjoint map, its
+    /// gradient transients — from these dims.
+    pub model_field_dims: HashMap<String, HashMap<String, Vec<i64>>>,
+    /// Stage-2A veto set: bare names of Tensor-typed model fields whose dims
+    /// could NOT be derived (non-literal init, constructor-arg shapes,
+    /// annotation-only fields). `unique_field_elems` subtracts these so a
+    /// derivable same-named field in another model can never win the
+    /// name-keyed bridge uncontested and mis-size this one's params.
+    pub tensor_fields_without_dims: std::collections::HashSet<String>,
     /// P1 Muon item 6: explicit `@param_role("embedding"|"head"|"hidden")`
     /// decorators on model tensor fields, keyed `model_name -> field_name
     /// -> role`. The authoritative override for mixed Muon/AdamW routing
@@ -243,11 +258,53 @@ impl ModelMetadata {
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
             model_field_ranks: HashMap::new(),
+            model_field_dims: HashMap::new(),
+            tensor_fields_without_dims: std::collections::HashSet::new(),
             model_field_roles: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
             agent_var_types: HashMap::new(),
             agent_auto_device_params: HashMap::new(),
         }
+    }
+
+    /// Stage-2A hint bridge: element counts for tensor fields whose bare
+    /// NAME maps to exactly one distinct dims vector across every collected
+    /// model — ambiguous names (same field name, different shapes in two
+    /// models) are dropped, soundness over coverage. Keyed by field name
+    /// because trainable-param paths (`blocks.0.w_up`) end in the field
+    /// name while `model_field_dims` is keyed by model TYPE; threading the
+    /// root model type through the arena call site is Stage-2B work.
+    pub fn unique_field_elems(&self) -> HashMap<String, u64> {
+        let mut seen: HashMap<&str, Option<&Vec<i64>>> = HashMap::new();
+        for fields in self.model_field_dims.values() {
+            for (fname, dims) in fields {
+                seen.entry(fname.as_str())
+                    .and_modify(|prev| {
+                        if prev.is_some_and(|p| p != dims) {
+                            *prev = None; // ambiguous across models -> drop
+                        }
+                    })
+                    .or_insert(Some(dims));
+            }
+        }
+        seen.into_iter()
+            .filter_map(|(name, dims)| {
+                // A same-named field with UNDERIVABLE dims anywhere vetoes
+                // the name outright — it could be any size, so a derivable
+                // twin must not win by default.
+                if self.tensor_fields_without_dims.contains(name) {
+                    return None;
+                }
+                let dims = dims?;
+                if dims.iter().any(|&d| d <= 0) {
+                    return None;
+                }
+                let elems = dims
+                    .iter()
+                    .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))?;
+                Some((name.to_string(), elems))
+            })
+            .collect()
     }
 }
 

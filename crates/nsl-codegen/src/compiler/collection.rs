@@ -436,6 +436,13 @@ impl Compiler<'_> {
                         if let nsl_ast::types::TypeExprKind::Named(type_sym) = &type_ann.kind {
                             let tname = self.resolve_sym(*type_sym).to_string();
                             if tname == "Tensor" {
+                                // Stage-2A veto support: a Tensor field whose
+                                // dims can NOT be derived must still be able
+                                // to VETO the unique-field-name bridge — a
+                                // same-named derivable field in another model
+                                // would otherwise win uncontested and size
+                                // this one's params wrong.
+                                let mut derived_dims = false;
                                 if let Some(init_expr) = init {
                                     if let Some(shape) =
                                         extract_shape_from_tensor_init(init_expr, &|s| {
@@ -469,8 +476,24 @@ impl Compiler<'_> {
                                                 .entry(name.clone())
                                                 .or_default()
                                                 .insert(field_name.clone(), shape.len());
+                                            // Stage-2A: keep the FULL dims at
+                                            // every rank (the string map above
+                                            // is rank-2-only and formatted) —
+                                            // the transient-arena hint bridge
+                                            // sizes param gradients from these.
+                                            self.models
+                                                .model_field_dims
+                                                .entry(name.clone())
+                                                .or_default()
+                                                .insert(field_name.clone(), shape.clone());
+                                            derived_dims = true;
                                         }
                                     }
+                                }
+                                if !derived_dims {
+                                    self.models
+                                        .tensor_fields_without_dims
+                                        .insert(field_name.clone());
                                 }
                             }
                         }
@@ -856,6 +879,29 @@ fn extract_shape_from_tensor_init<F>(expr: &Expr, resolve: &F) -> Option<Vec<i64
 where
     F: Fn(nsl_ast::Symbol) -> String,
 {
+    // Stage-2A: peel a top-level scalar scale — `randn([64, 128]) * 0.15` is
+    // the dominant field-init idiom and previously derived NO shape. Sound
+    // only for elementwise ARITHMETIC with a scalar-literal operand (shape =
+    // the tensor side); the op whitelist keeps the argument local instead of
+    // leaning on the type checker to reject scalar MatMul/Is/In.
+    if let ExprKind::BinaryOp { op, left, right } = &expr.kind {
+        use nsl_ast::operator::BinOp;
+        if !matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow
+        ) {
+            return None;
+        }
+        let is_scalar_lit =
+            |e: &Expr| matches!(e.kind, ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_));
+        if is_scalar_lit(right) {
+            return extract_shape_from_tensor_init(left, resolve);
+        }
+        if is_scalar_lit(left) {
+            return extract_shape_from_tensor_init(right, resolve);
+        }
+        return None;
+    }
     let ExprKind::Call { callee, args } = &expr.kind else {
         return None;
     };
