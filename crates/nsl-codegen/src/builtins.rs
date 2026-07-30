@@ -2679,6 +2679,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_cuda_graph_region_begin", &[types::I64], None), // (region_id)
     ("nsl_cuda_graph_region_end", &[types::I64], None), // (region_id)
     ("nsl_cuda_graphs_report", &[], None),
+    // Item 3: the compiled ParameterPlan, cross-checked against the three
+    // residency tables at run time. LOCKSTEP: the flag bits are
+    // `nsl_runtime::param_plan::PLAN_*`, re-exported by
+    // `crate::parameter_plan` — there is no second copy to keep in sync.
+    ("nsl_param_plan_declare", &[types::I64, types::I64, types::I64], Some(types::I64)), // (tensor, idx, flags)
+    ("nsl_param_plan_verify", &[], Some(types::I64)),
+    ("nsl_param_plan_teardown", &[], Some(types::I64)),
     // P4 item 17: SR-BF16 authoritative weights
     ("nsl_sr_bf16_enable", &[], None),
     ("nsl_sr_bf16_note_param", &[types::I64, types::I64], None), // (tensor, idx)

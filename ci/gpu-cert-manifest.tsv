@@ -68,6 +68,11 @@ crates/nsl-cli/tests/muon_p1_gate.rs	csla_muon_bit_exact_vs_baseline_gpu	gpu	req
 crates/nsl-cli/tests/muon_state_gate.rs	muon_state_bf16_e2e_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/nested_arg_temporaries_gate.rs	loop_condition_nested_args_compile_and_run	gpu	requires CUDA GPU
 crates/nsl-cli/tests/nested_arg_temporaries_gate.rs	nested_builtin_args_do_not_strand_per_call	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_plan_gate.rs	the_plan_names_the_backend_that_actually_took_each_parameter_gpu	gpu	requires CUDA GPU (2 runs of the CSLA FFN fixture)
+crates/nsl-cli/tests/param_plan_gate.rs	the_plan_names_the_sharded_backend_under_zero3_gpu	gpu	requires CUDA GPU (sim-gpu collectives, 2 ranks on 1 device)
+crates/nsl-cli/tests/param_plan_gate.rs	the_check_reports_once_per_train_block_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_plan_gate.rs	the_per_parameter_report_is_opt_in_and_loss_neutral_gpu	gpu	requires CUDA GPU (2 runs)
+crates/nsl-cli/tests/param_plan_gate.rs	a_run_with_no_residency_backend_emits_no_check_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	pretrain_loss_decreases_on_gpu	gpu	requires CUDA GPU (runs a real training loop)
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	fase_deferred_matches_plain_adamw_checkpoint	gpu	requires CUDA GPU (runs two real training loops)
 crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference	gpu	requires CUDA GPU
