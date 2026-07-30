@@ -237,7 +237,6 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
 /// NSL_FASE_MULTI_STEP=0 at compile time keeps the legacy loop.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     params_list: i64,
     m_list: i64,
