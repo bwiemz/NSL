@@ -230,7 +230,9 @@ impl Compiler<'_> {
                 element,
                 generators,
             } => self.compile_list_comp(builder, state, element, generators),
-            ExprKind::Lambda { params, body } => self.compile_lambda(builder, state, params, body),
+            ExprKind::Lambda { params, body } => {
+                self.compile_lambda(builder, state, expr.id, params, body)
+            }
             ExprKind::BlockExpr(block) => self.compile_block_expr(builder, state, block),
             ExprKind::TupleLiteral(elements) => {
                 self.compile_tuple_literal(builder, state, elements)

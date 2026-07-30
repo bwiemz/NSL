@@ -133,10 +133,9 @@ print("DONE")
 /// `cumsum` arm claimed the call and rejected it at compile time
 /// (wrong arity for the builtin the user never meant to call).
 ///
-/// Int-typed on purpose: indirect calls MISCOMPILE float arguments
-/// today (`(|v: float| v * 2.0)(3.0)` returns 4 — pre-existing on the
-/// parent tree, probed 2026-07-29, filed in bugs.md) — an int lambda
-/// exercises the same dispatch routing without inheriting that bug.
+/// Int-typed on purpose so this gate pins DISPATCH alone. The float
+/// half (the lambda-signature ABI mismatch this fixture originally
+/// dodged) is fixed and pinned separately in lambda_float_abi.rs.
 #[test]
 fn lambda_shadowing_cumsum_dispatches_to_the_lambda() {
     let src = r#"
@@ -154,7 +153,8 @@ print("DONE")
 
 /// A fn-typed PARAMETER sharing a builtin arm's name — same class, via
 /// the parameter binding instead of a let. Int-typed for the same
-/// reason as the lambda test above.
+/// reason as the lambda test above (float ABI pinned in
+/// lambda_float_abi.rs).
 #[test]
 fn fn_typed_param_shadowing_lt_scalar_dispatches_indirect() {
     let src = r#"

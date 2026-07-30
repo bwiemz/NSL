@@ -162,9 +162,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Command-line args
     ("nsl_args_init", &[types::I32, types::I64], None),
     ("nsl_args", &[], Some(types::I64)),
-    // Higher-order functions
-    ("nsl_map", &[types::I64, types::I64], Some(types::I64)),
-    ("nsl_filter", &[types::I64, types::I64], Some(types::I64)),
+    // Higher-order functions. Third arg = ret_is_bool: the function
+    // pointer is invoked as fn(i64)->i64, but a bool-returning NSL fn
+    // compiles to an I8 return whose upper register bits are undefined —
+    // the runtime masks to the low byte when this flag is set (hof.rs).
+    ("nsl_map", &[types::I64, types::I64, types::I64], Some(types::I64)),
+    (
+        "nsl_filter",
+        &[types::I64, types::I64, types::I64],
+        Some(types::I64),
+    ),
     ("nsl_enumerate", &[types::I64], Some(types::I64)),
     ("nsl_zip", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_sorted", &[types::I64], Some(types::I64)),

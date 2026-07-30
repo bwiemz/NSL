@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — indirect calls no longer miscompile float arguments, returns, or captures
+
+- **`(|v: float| v * 2.0)(3.0)` returned 4** — silent wrong values,
+  exit 0 (bugs.md 2026-07-29). `compile_lambda` hardcoded every
+  parameter to I64 in the lambda's compiled signature while
+  `compile_indirect_call` builds the call-site signature from the
+  checker's `Type::Function` (F64 for float): the caller passed the
+  argument in an XMM register, the callee read an integer register, and
+  the value-type-keyed int→float promotion in `compile_binary_op`
+  laundered the garbage into a plausible float. Lambda signatures are
+  now derived from the checker's Function type — the same source every
+  call site lowers from. Int lambdas agreed by accident and are
+  unchanged.
+- **Float and bool captures had the mirror bug**: the lambda's
+  signature declared capture params with the captured variable's real
+  cl_type while the closure call site declares and loads every capture
+  slot as I64. Capture slots are now raw I64 bit-patterns on BOTH
+  sides — normalized at closure construction (floats bitcast, narrow
+  ints widened) and restored at lambda entry.
+- **`map()`/`filter()` refuse float-typed functions at compile time.**
+  The runtime invokes the passed pointer as `extern "C" fn(i64) -> i64`
+  (hof.rs) — a float parameter or return cannot survive that ABI and
+  produced silent garbage (the lambda wrote XMM0; the runtime read
+  RAX). Narrow-int returns (int8/16/32) are refused too (undefined
+  upper register bits). Int-typed functions work unchanged.
+- **`filter()` with a bool predicate kept garbage-dependent elements**
+  (pre-existing): a bool return lowers to I8 — only the low byte of the
+  return register is defined — but `nsl_filter` compared the full i64
+  against 0, seeing stale upper bits. `nsl_map`/`nsl_filter` now take a
+  codegen-supplied `ret_is_bool` flag and mask to the defined byte.
+- 13 CPU gates in `lambda_float_abi.rs`: the two bugs.md repros, float
+  through a fn-typed parameter, mixed float/int params, float + bool +
+  int captures, the nested-fn float route, int map/filter regression
+  pins, and three compile-time refusals. Mutation-proven in four
+  independent directions: param typing reverted → exactly the 5
+  float-param gates red; capture convention reverted → exactly the 2
+  non-I64 capture gates red; refusal guard off → exactly the 3 refusal
+  gates red; ret_is_bool flag off → exactly the filter gate red.
+
 ### Fixed — nested fns, lambdas, and fn-typed params now win builtin-name dispatch
 
 - **A local binding holding a function value lost dispatch to any
