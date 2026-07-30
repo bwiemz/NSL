@@ -11,6 +11,7 @@ pub(crate) mod fused_ce_kernels;
 pub(crate) mod fused_kl_ce_kernels;
 pub(crate) mod kernels_hopper;
 pub(crate) mod precision_cast_kernels;
+pub(crate) mod strided_copy;
 pub(crate) mod tier_b1_prepass;
 
 #[cfg(feature = "cuda")]
@@ -8377,6 +8378,57 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     let out_data = inner::alloc_managed(total as usize * 4); // f32
     let out_shape = NslTensor::copy_shape(t.shape, t.ndim);
     let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
+
+    // Fast path: views whose innermost axis is already a contiguous run (every
+    // broadcast, and every reordering that keeps the last axis innermost) can
+    // skip the generic kernel's per-element coordinate decomposition entirely.
+    // See `strided_copy` for the analysis; the generic kernel below stays as the
+    // fallback for true transposes.
+    {
+        let shape: Vec<i64> = (0..ndim).map(|i| unsafe { *t.shape.add(i) }).collect();
+        let src_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *t.strides.add(i) }).collect();
+        let dst_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *out_strides.add(i) }).collect();
+        if let Some(resident) = strided_copy::resident_plan(&shape, &src_strides, &dst_strides) {
+            // Vector moves assume 16-byte-aligned bases. The destination is a
+            // fresh allocation, but the source is a view that may point into the
+            // middle of a parent buffer.
+            let aligned = (t.data as usize) % 16 == 0 && (out_data as usize) % 16 == 0;
+            if !resident.plan.vec4 || aligned {
+                let (grid, block) = resident.plan.geometry();
+                let mut src_data = t.data as u64;
+                let mut dst_data = out_data as u64;
+                let mut offsets = resident.offsets_dev;
+                let mut run_len = resident.plan.run_len as u64;
+                let mut outer = resident.plan.outer as u64;
+                let args: [*mut std::ffi::c_void; 5] = [
+                    &mut src_data as *mut _ as *mut std::ffi::c_void,
+                    &mut dst_data as *mut _ as *mut std::ffi::c_void,
+                    &mut offsets as *mut _ as *mut std::ffi::c_void,
+                    &mut run_len as *mut _ as *mut std::ffi::c_void,
+                    &mut outer as *mut _ as *mut std::ffi::c_void,
+                ];
+                let result = inner::kernel_launch(
+                    strided_copy::STRIDED_COPY_RUN_PTX.as_ptr(),
+                    resident.plan.kernel_name().as_ptr(),
+                    grid,
+                    block,
+                    &args,
+                    0,
+                );
+                assert_eq!(
+                    result as u32, 0,
+                    "GPU strided run copy kernel failed: {result:?}"
+                );
+                inner::sync_after_kernel();
+
+                let out = Box::new(NslTensor::new(
+                    out_data, out_shape, out_strides,
+                    t.ndim, total as i64, t.device, 1, 1, 0,
+                ));
+                return NslTensor::publish(out);
+            }
+        }
+    }
 
     // Upload shape, src_strides, and dst_strides to device memory
     let gpu_shape = upload_meta_i64_cached(t.shape, ndim);
