@@ -715,6 +715,89 @@ DONE: ret;\n\
 }\0";
 
 // ---------------------------------------------------------------------------
+// GPU Per-dimension Sum Reduction — SHORT-AXIS variant.
+//
+// The general kernel below assigns one 256-thread block per output element,
+// which is the right shape when the reduced axis is long. When it is short
+// that shape is pathological: a tied [49152, 512] embedding gradient sums two
+// contributions per output, so it launched 25,165,824 blocks — 6.4 billion
+// threads to perform 25 million additions. Every thread past `reduce_size`
+// exits immediately and the survivors still run a full eight-level shared
+// memory tree reduction over a single live value. Profiling a Coder-50M step
+// attributed 82.5% of ALL GPU kernel time to `nsl_sum_dim_f32`, and 47.8% of
+// that to just three launches of this shape.
+//
+// Here each output element gets one THREAD, which walks the reduced axis
+// serially. Consecutive threads take consecutive `inner_idx`, so for the
+// contiguous case (inner large) the loads stay coalesced.
+//
+// Grid:  (ceil(outer * inner / 256), 1, 1)
+// Block: (256, 1, 1)
+// Params: in ptr, out ptr, outer (u64), reduce_size (u64), inner (u64)
+// ---------------------------------------------------------------------------
+pub(crate) const SUM_DIM_SHORT_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sum_dim_short_f32(\n\
+    .param .u64 inp, .param .u64 out,\n\
+    .param .u64 outer, .param .u64 reduce_size, .param .u64 inner\n\
+) {\n\
+    .reg .u64 %rd<20>;\n\
+    .reg .u32 %r<8>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .pred %p<4>;\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [outer];\n\
+    ld.param.u64 %rd4, [reduce_size];\n\
+    ld.param.u64 %rd5, [inner];\n\
+    // gid = blockIdx.x * blockDim.x + threadIdx.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd6, %r4;\n\
+    // total_out = outer * inner\n\
+    mul.lo.u64 %rd7, %rd3, %rd5;\n\
+    setp.ge.u64 %p1, %rd6, %rd7;\n\
+    @%p1 bra SHORT_DONE;\n\
+    // A reduce_size == 1 special case that skips the two emulated u64 divides
+    // (the address math is the identity there) was tried and MEASURED SLOWER:
+    // 689 -> 727 ms per micro-batch, against +-1.7% run-to-run noise. The kernel
+    // is only ~1.1% of GPU time inside a step that is ~90% host-bound, so the
+    // extra basic block costs more than the divides save. Left out deliberately.
+    // outer_idx = gid / inner ; inner_idx = gid % inner\n\
+    div.u64 %rd8, %rd6, %rd5;\n\
+    rem.u64 %rd9, %rd6, %rd5;\n\
+    // base = outer_idx * reduce_size * inner + inner_idx\n\
+    mul.lo.u64 %rd10, %rd8, %rd4;\n\
+    mul.lo.u64 %rd10, %rd10, %rd5;\n\
+    add.u64 %rd10, %rd10, %rd9;\n\
+    mov.f32 %f1, 0f00000000;\n\
+    mov.u64 %rd12, 0;\n\
+SHORT_LOOP:\n\
+    setp.ge.u64 %p2, %rd12, %rd4;\n\
+    @%p2 bra SHORT_STORE;\n\
+    mul.lo.u64 %rd13, %rd12, %rd5;\n\
+    add.u64 %rd13, %rd10, %rd13;\n\
+    shl.b64 %rd13, %rd13, 2;\n\
+    add.u64 %rd13, %rd1, %rd13;\n\
+    ld.global.f32 %f2, [%rd13];\n\
+    add.f32 %f1, %f1, %f2;\n\
+    add.u64 %rd12, %rd12, 1;\n\
+    bra SHORT_LOOP;\n\
+SHORT_STORE:\n\
+    shl.b64 %rd14, %rd6, 2;\n\
+    add.u64 %rd14, %rd2, %rd14;\n\
+    st.global.f32 [%rd14], %f1;\n\
+SHORT_DONE:\n\
+    ret;\n\
+}\0";
+
+// ---------------------------------------------------------------------------
 // GPU Per-dimension Sum Reduction
 // One thread block per output element.
 // Decomposes the reduction as: outer * reduce_size * inner
@@ -1734,6 +1817,87 @@ SA_DONE: ret;\n\
 // Identical to embedding lookup but with explicit bounds checking on input_rows.
 // Target: sm_80 (compatible sm_89, sm_90, sm_100 Blackwell)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GPU gather along an ARBITRARY dimension (NSL semantics).
+//
+// `nsl_tensor_gather` only had a device kernel for dim 0 and fell back to a full
+// CPU round trip otherwise — copy the whole tensor to the host, gather, copy the
+// result back. `cross_entropy` gathers along dim 1, so every training step moved
+// the entire [B*S, vocab] log-probability tensor across PCIe twice: 192 MB each
+// way at B*S=1024, vocab=49152. Host profiling showed memcpy at 94% of
+// attributed host time, ~1 GB per step.
+//
+// NSL's gather REMOVES the gathered dimension: for input shape S and dim d,
+// `indices` has length outer = prod(S[..d]) and the output is S with d dropped.
+//   out[o*inner + k] = input[o*gather_dim_size*inner + idx[o]*inner + k]
+//
+// Indices are read as f32, matching `nsl_gather_f32` above. The caller validates
+// them on the host first (they are only `outer` elements, so the check costs a
+// few KB), which keeps the abort-on-out-of-bounds contract the CPU path has.
+//
+// Grid:  (ceil(outer * inner / 256), 1, 1)
+// Block: (256, 1, 1)
+// ---------------------------------------------------------------------------
+pub(crate) const GATHER_DIM_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_gather_dim_f32(\n\
+    .param .u64 input, .param .u64 indices, .param .u64 out,\n\
+    .param .u64 outer, .param .u64 gather_dim_size, .param .u64 inner\n\
+) {\n\
+    .reg .u64 %rd<16>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .pred %p<4>;\n\
+    ld.param.u64 %rd1, [input];\n\
+    ld.param.u64 %rd2, [indices];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [outer];\n\
+    ld.param.u64 %rd5, [gather_dim_size];\n\
+    ld.param.u64 %rd6, [inner];\n\
+    // gid = blockIdx.x * blockDim.x + threadIdx.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd7, %r4;\n\
+    // total = outer * inner\n\
+    mul.lo.u64 %rd8, %rd4, %rd6;\n\
+    setp.ge.u64 %p1, %rd7, %rd8;\n\
+    @%p1 bra GD_DONE;\n\
+    // o = gid / inner ; k = gid % inner\n\
+    div.u64 %rd9, %rd7, %rd6;\n\
+    rem.u64 %rd10, %rd7, %rd6;\n\
+    // idx = (u64)indices[o]\n\
+    shl.b64 %rd11, %rd9, 2;\n\
+    add.u64 %rd11, %rd2, %rd11;\n\
+    ld.global.f32 %f1, [%rd11];\n\
+    cvt.rzi.u64.f32 %rd12, %f1;\n\
+    // Out-of-range writes zero rather than reading out of bounds. The host has\n\
+    // already rejected such indices; this only bounds the damage.\n\
+    mov.f32 %f2, 0f00000000;\n\
+    setp.ge.u64 %p2, %rd12, %rd5;\n\
+    @%p2 bra GD_STORE;\n\
+    // in_off = o * gather_dim_size * inner + idx * inner + k\n\
+    mul.lo.u64 %rd13, %rd9, %rd5;\n\
+    mul.lo.u64 %rd13, %rd13, %rd6;\n\
+    mul.lo.u64 %rd14, %rd12, %rd6;\n\
+    add.u64 %rd13, %rd13, %rd14;\n\
+    add.u64 %rd13, %rd13, %rd10;\n\
+    shl.b64 %rd13, %rd13, 2;\n\
+    add.u64 %rd13, %rd1, %rd13;\n\
+    ld.global.f32 %f2, [%rd13];\n\
+GD_STORE:\n\
+    shl.b64 %rd15, %rd7, 2;\n\
+    add.u64 %rd15, %rd3, %rd15;\n\
+    st.global.f32 [%rd15], %f2;\n\
+GD_DONE:\n\
+    ret;\n\
+}\0";
+
 pub(crate) const GATHER_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_80\n\
@@ -4332,6 +4496,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("SOFTMAX_F32_PTX", SOFTMAX_F32_PTX),
     ("LOG_SOFTMAX_F32_PTX", LOG_SOFTMAX_F32_PTX),
     ("SUM_DIM_F32_PTX", SUM_DIM_F32_PTX),
+    ("SUM_DIM_SHORT_F32_PTX", SUM_DIM_SHORT_F32_PTX),
     ("MAX_DIM_F32_PTX", MAX_DIM_F32_PTX),
     ("GLOBAL_SUM_F32_PTX", GLOBAL_SUM_F32_PTX),
     ("LAYERNORM_F32_PTX", LAYERNORM_F32_PTX),
@@ -4342,6 +4507,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("RMSNORM_DX_BWD_F32_PTX", RMSNORM_DX_BWD_F32_PTX),
     ("SCATTER_ADD_F32_PTX", SCATTER_ADD_F32_PTX),
     ("GATHER_F32_PTX", GATHER_F32_PTX),
+    ("GATHER_DIM_F32_PTX", GATHER_DIM_F32_PTX),
     ("GATHER_I32IDX_PTX", GATHER_I32IDX_PTX),
     ("CONV2D_F32_PTX", CONV2D_F32_PTX),
     ("MAXPOOL2D_F32_PTX", MAXPOOL2D_F32_PTX),

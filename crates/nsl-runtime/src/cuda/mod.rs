@@ -469,6 +469,7 @@ pub(crate) mod inner {
     /// IMPORTANT: The returned pointer is a device pointer. CPU code must NOT
     /// dereference it. Use `memcpy_htod` / `memcpy_dtoh` for data transfer.
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::DeviceAlloc);
         if size_bytes == 0 { return std::ptr::null_mut(); }
 
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -715,6 +716,7 @@ pub(crate) mod inner {
 
     /// Free device-only memory allocated with `alloc_device`.
     pub(crate) fn free_device(ptr: *mut c_void) {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::DeviceFree);
         // A1: decrement the unified accounting for this direct allocation.
         super::caching_allocator::CACHING_ALLOCATOR
             .lock()
@@ -1041,6 +1043,10 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        if size_bytes >= 262144 && crate::host_profile::enabled() {
+            eprintln!("[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
+        }
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         ensure_context();
         // cuda-graphs: uploads inside a region are pseudo-ops — the payload
         // flows through a graph-owned pinned staging buffer (see `on_htod`).
@@ -1049,25 +1055,29 @@ pub(crate) mod inner {
         }
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
-            let ctx = current_oom_context();
-            let ctx_suffix = if ctx.is_empty() {
-                String::new()
-            } else {
-                format!(" [context: {}]", ctx)
-            };
-            assert_eq!(
-                result,
-                CUresult::CUDA_SUCCESS,
-                "cuMemcpyHtoD_v2({} bytes) failed: {:?}{}",
-                size_bytes,
-                result,
-                ctx_suffix
-            );
+            // Build the context string only on failure: this ran on every
+            // successful copy, and there are ~1300 copies per training step.
+            if result != CUresult::CUDA_SUCCESS {
+                let ctx = current_oom_context();
+                let ctx_suffix = if ctx.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [context: {}]", ctx)
+                };
+                panic!(
+                    "cuMemcpyHtoD_v2({} bytes) failed: {:?}{}",
+                    size_bytes, result, ctx_suffix
+                );
+            }
         }
     }
 
     /// Copy `size_bytes` bytes from device memory to host memory.
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        if size_bytes >= 262144 && crate::host_profile::enabled() {
+            eprintln!("[copy] D2H {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
+        }
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         super::graph_capture::taint("sync DtoH readback");
         ensure_context();
         unsafe {
@@ -1629,6 +1639,7 @@ pub(crate) mod inner {
         args: &[*mut c_void],
         shared_mem_bytes: u32,
     ) -> CUresult {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::KernelLaunch);
         let state = state();
         let func = {
             let mut guard = state.lock().unwrap();
@@ -5363,12 +5374,104 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     ];
 
     let block = 256i64;
-    let grid = out_total as i64;
 
-    let result = inner::kernel_launch(
-        SUM_DIM_F32_PTX.as_ptr(), b"nsl_sum_dim_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
-    );
+    // A block per output element only pays off when the reduced axis is long
+    // enough to keep 256 threads busy. Below that the block is almost entirely
+    // idle: a tied [49152, 512] embedding gradient reduces 2 elements per
+    // output and launched 25,165,824 blocks, which profiling showed to be the
+    // single largest consumer of GPU time in a training step. Give each output
+    // element one thread instead.
+    // Default 1: a reduction over a single element is a copy, so the fast path
+    // returns the identical value for that length.
+    //
+    // This is not a corner case. Instrumenting a Coder-50M step showed that
+    // almost all `sum_dim` work IS reduce_size == 1 — including 64 launches of
+    // `reduce=1 inner=25165824`, i.e. copying the 49152x512 tied embedding
+    // gradient by launching 25,165,824 blocks of 256 threads: 6.4 billion
+    // threads to move 25 million floats. Kernel profiling attributed 82.5% of
+    // ALL GPU time in the step to `nsl_sum_dim_f32`, and the reduce_size == 1
+    // shapes are ~89% of that.
+    //
+    // Above 1 the two kernels genuinely disagree, because this one accumulates
+    // sequentially while the general one tree-reduces pairwise in shared
+    // memory; keep the default at 1 unless that reassociation is acceptable.
+    //
+    // Note that even at 1 a run's loss trajectory can differ from the general
+    // kernel in the last couple of significant digits. That is NOT this kernel
+    // reassociating — it is `nsl_embedding_bwd_f32` accumulating the embedding
+    // gradient with `red.global.add.f32`, whose ordering depends on execution
+    // timing. Changing the grid from 25M blocks to 98K blocks changes that
+    // timing.
+    //
+    // Do NOT assume `--deterministic` protects a raised threshold. That flag
+    // substitutes `gpu_det_sum_dim_f32` in CODEGEN, for `sum` written in NSL
+    // source only; four runtime-internal callers reach this function directly
+    // and check nothing — `autodiff/grad_utils.rs` and `autodiff/backward.rs`
+    // (broadcast reduce-to-shape), `tensor/ad_ops.rs`, and
+    // `flash_attention.rs` (GQA dK/dV, where reduce_size is 1 at group size 1).
+    // At the default of 1 those paths are bit-exact, so they are safe; above 1
+    // the reassociation would leak into determinism-gated runs through them.
+    //
+    // NSL_SUM_DIM_SHORT_MAX overrides the threshold; 0 disables the fast path.
+    static SHORT_AXIS_MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let short_axis_max = *SHORT_AXIS_MAX.get_or_init(|| {
+        std::env::var("NSL_SUM_DIM_SHORT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    });
+    static LOG_SHAPES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG_SHAPES.get_or_init(|| {
+        std::env::var("NSL_SUM_DIM_LOG").ok().as_deref() == Some("1")
+    }) {
+        eprintln!(
+            "[sum_dim] reduce={reduce_size} outer={outer} inner={inner} out_total={out_total} fast={}",
+            reduce_size <= short_axis_max
+        );
+    }
+    // Second admission route: a COALESCED-layout reduction.
+    //
+    // The general kernel walks the reduced axis with thread t reading
+    // `base + t*inner`, so when `inner > 1` consecutive threads land `inner`
+    // elements apart and every load pulls its own cache line. The short kernel
+    // assigns one thread per OUTPUT element, so consecutive threads take
+    // consecutive `inner_idx` and the loads coalesce. Kernel profiling put
+    // `nsl_sum_dim_f32` at 18.3% of GPU time on shapes like
+    // `reduce=1024 outer=1 inner=512`; routing those to the coalesced kernel
+    // measured 100 -> 83 ms per micro-batch, a 20% step-level win.
+    //
+    // This reassociates: the general kernel tree-reduces 256 partials pairwise
+    // while this accumulates sequentially. That is the same class of
+    // non-determinism the default path already has from
+    // `nsl_embedding_bwd_f32`'s `red.global.add.f32`; `--deterministic` runs are
+    // routed to `gpu_det_sum_dim_f32` and never reach here.
+    // NSL_SUM_DIM_COALESCED=0 opts out.
+    const COALESCE_MIN_INNER: u64 = 32;
+    static COALESCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let coalesced_ok = *COALESCED.get_or_init(|| {
+        std::env::var("NSL_SUM_DIM_COALESCED").ok().as_deref() != Some("0")
+    }) && inner >= COALESCE_MIN_INNER;
+
+    let result = if (short_axis_max > 0 && reduce_size <= short_axis_max) || coalesced_ok {
+        let grid = (out_total as i64 + block - 1) / block;
+        inner::kernel_launch(
+            fused_kernels::SUM_DIM_SHORT_F32_PTX.as_ptr(),
+            b"nsl_sum_dim_short_f32\0".as_ptr(),
+            [grid, 1, 1],
+            [block, 1, 1],
+            &args,
+            0,
+        )
+    } else {
+        inner::kernel_launch(
+            SUM_DIM_F32_PTX.as_ptr(),
+            b"nsl_sum_dim_f32\0".as_ptr(),
+            [out_total as i64, 1, 1],
+            [block, 1, 1],
+            &args,
+            256 * 4,
+        )
+    };
     assert_eq!(result as u32, 0, "GPU sum_dim kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
@@ -5502,6 +5605,75 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
 /// `nsl_tensor_sum_sq`'s GPU fast path — reading `gpu_tensor_stats_f32()[3]`
 /// there returned the population std instead of Σx² and silently disabled
 /// FASE gradient clipping on GPU (the global norm collapsed by ~n).
+/// Sum of squares for many tensors with a SINGLE synchronization.
+///
+/// `gpu_tensor_sum_sq_f32` synchronizes and reads back per call. Gradient
+/// clipping needs the norm over every gradient, so calling it per tensor forced
+/// one full pipeline drain per parameter — 57 for Coder-50M, every step. Here
+/// each tensor's stats land in its own slot of one device buffer, and the host
+/// synchronizes and reads once.
+///
+/// Returns the total Sum-of-squares across `tensors`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::TENSOR_STATS_F32_PTX;
+
+    let live: Vec<i64> = tensors
+        .iter()
+        .copied()
+        .filter(|&p| p != 0 && NslTensor::from_ptr(p).len > 0)
+        .collect();
+    if live.is_empty() {
+        return 0.0;
+    }
+
+    // The stats kernel writes [min, max, sum, sum_sq] per invocation, and each
+    // tensor gets its own slot so the whole set costs one drain.
+    //
+    // A grid-strided variant with atomic accumulation was tried, on the theory
+    // that a single 256-thread block cannot saturate the device for a 25M-element
+    // gradient. It measured SLOWER end to end (80 -> 83..85 ms per micro-batch at
+    // grid caps of both 96 and 1024 blocks), because the reduction is not on the
+    // critical path here and the atomics add contention. Kept simple.
+    const SLOT_F32: usize = 4;
+    let out_data = inner::alloc_managed(live.len() * SLOT_F32 * 4);
+
+    for (i, &ptr) in live.iter().enumerate() {
+        let t = NslTensor::from_ptr(ptr);
+        let mut in_data = t.data as u64;
+        let mut out_slot = (out_data as u64) + (i * SLOT_F32 * 4) as u64;
+        let mut n_val = t.len as u64;
+        let args: [*mut std::ffi::c_void; 3] = [
+            &mut in_data as *mut _ as *mut std::ffi::c_void,
+            &mut out_slot as *mut _ as *mut std::ffi::c_void,
+            &mut n_val as *mut _ as *mut std::ffi::c_void,
+        ];
+        let rc = inner::kernel_launch(
+            TENSOR_STATS_F32_PTX.as_ptr(),
+            b"nsl_tensor_stats_f32\0".as_ptr(),
+            [1, 1, 1],
+            [256, 1, 1],
+            &args,
+            256 * 4 * 4,
+        );
+        assert_eq!(rc as u32, 0, "GPU tensor_stats kernel failed: {:?}", rc);
+    }
+
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
+    let mut raw = vec![0f32; live.len() * SLOT_F32];
+    inner::memcpy_dtoh(
+        raw.as_mut_ptr() as *mut std::ffi::c_void,
+        out_data as *const std::ffi::c_void,
+        raw.len() * 4,
+    );
+    inner::free_managed(out_data);
+
+    raw.chunks(SLOT_F32).map(|c| c[3] as f64).sum()
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     use crate::tensor::NslTensor;
@@ -6687,6 +6859,115 @@ pub(crate) fn gpu_scatter_add_f32(
 // GPU Gather (general dim-0 gather)
 // ---------------------------------------------------------------------------
 
+/// Upload a small i64 metadata array (a shape or a stride vector) to the device,
+/// reusing a previous upload of the same contents.
+///
+/// `cuMemcpyHtoD_v2` is the blocking API, so each of these tiny uploads waits on
+/// the stream. The strided-copy path issues three per call and runs hundreds of
+/// times per training step, which made these the largest remaining host cost
+/// once the bulk transfers were gone. The distinct (shape, strides) tuples in a
+/// model are few and fixed, so caching them keyed on contents removes almost
+/// every upload after the first step.
+///
+/// Entries are never freed: they are bounded by the number of distinct metadata
+/// vectors in the program, tens of tuples at 8 bytes per dimension.
+#[cfg(feature = "cuda")]
+pub(crate) fn upload_meta_i64_cached(host: *const i64, ndim: usize) -> *mut std::ffi::c_void {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<Vec<i64>, u64>>> = std::sync::OnceLock::new();
+    let key: Vec<i64> = (0..ndim).map(|i| unsafe { *host.add(i) }).collect();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    // Take the lock only to look up / publish; the upload itself happens outside
+    // so a slow copy never serializes other threads' lookups.
+    if let Some(&dev) = cache.lock().unwrap().get(&key) {
+        return dev as *mut std::ffi::c_void;
+    }
+    let bytes = ndim * std::mem::size_of::<i64>();
+    let dev = inner::alloc_managed(bytes);
+    inner::memcpy_htod(dev, host as *const std::ffi::c_void, bytes);
+    let mut guard = cache.lock().unwrap();
+    match guard.entry(key) {
+        std::collections::hash_map::Entry::Occupied(slot) => {
+            // Another thread published an identical vector first; drop ours.
+            let winner = *slot.get() as *mut std::ffi::c_void;
+            inner::free_managed(dev);
+            winner
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(dev as u64);
+            dev
+        }
+    }
+}
+
+/// Gather along an arbitrary dimension, on the device.
+///
+/// `indices_host` must already be validated against `gather_dim_size` by the
+/// caller — the CPU path aborts on an out-of-range index and this keeps that
+/// contract without a device-side error channel.
+///
+/// `inner_size`, not `inner`: the latter would shadow this module's `inner`
+/// submodule, which every allocation and copy below goes through.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_gather_dim_f32(
+    input_ptr: i64,
+    indices_host: &[i64],
+    outer: u64,
+    gather_dim_size: u64,
+    inner_size: u64,
+) -> *mut std::ffi::c_void {
+    inner::set_oom_context("gather_dim_f32");
+    use crate::tensor::NslTensor;
+
+    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let out_elems = (outer * inner_size) as usize;
+    if out_elems == 0 {
+        return std::ptr::null_mut();
+    }
+
+    // The index vector is `outer` elements — kilobytes next to the tensor itself —
+    // so staging it as f32 to match the kernel's read is not worth avoiding.
+    let staged: Vec<f32> = indices_host.iter().map(|&i| i as f32).collect();
+    let idx_bytes = staged.len() * 4;
+    let idx_device = inner::alloc_managed(idx_bytes);
+    inner::memcpy_htod(idx_device, staged.as_ptr() as *const std::ffi::c_void, idx_bytes);
+
+    let out_data = inner::alloc_managed(out_elems * 4);
+
+    let mut i_data = input.data as u64;
+    let mut idx_data = idx_device as u64;
+    let mut o_data = out_data as u64;
+    let mut outer_v = outer;
+    let mut dim_v = gather_dim_size;
+    let mut inner_v = inner_size;
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut idx_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut outer_v as *mut _ as *mut std::ffi::c_void,
+        &mut dim_v as *mut _ as *mut std::ffi::c_void,
+        &mut inner_v as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = (out_elems as i64 + block - 1) / block;
+    let rc = inner::kernel_launch(
+        fused_kernels::GATHER_DIM_F32_PTX.as_ptr(),
+        b"nsl_gather_dim_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    inner::free_managed(idx_device);
+    assert_eq!(rc as u32, 0, "GPU gather_dim kernel failed: {:?}", rc);
+    inner::sync_after_kernel();
+    out_data
+}
+
 /// GPU gather along dim 0: out[i, :] = input[indices[i], :].
 /// Works on any 2D+ tensor — flattens trailing dims into `inner_dim`.
 /// Both input and indices must be on GPU (f32).
@@ -7689,14 +7970,10 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     // Upload shape, src_strides, and dst_strides to device memory
     let arr_bytes = ndim * std::mem::size_of::<i64>();
 
-    let gpu_shape = inner::alloc_managed(arr_bytes);
-    let gpu_src_strides = inner::alloc_managed(arr_bytes);
-    let gpu_dst_strides = inner::alloc_managed(arr_bytes);
-
-    // Copy metadata from host to device via explicit memcpy
-    inner::memcpy_htod(gpu_shape, t.shape as *const c_void, arr_bytes);
-    inner::memcpy_htod(gpu_src_strides, t.strides as *const c_void, arr_bytes);
-    inner::memcpy_htod(gpu_dst_strides, out_strides as *const c_void, arr_bytes);
+    let _ = arr_bytes;
+    let gpu_shape = upload_meta_i64_cached(t.shape, ndim);
+    let gpu_src_strides = upload_meta_i64_cached(t.strides, ndim);
+    let gpu_dst_strides = upload_meta_i64_cached(out_strides, ndim);
 
     let mut src_data = t.data as u64;
     let mut dst_data = out_data as u64;
@@ -7728,10 +8005,10 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
-    // Free GPU metadata arrays
-    inner::free_managed(gpu_shape);
-    inner::free_managed(gpu_src_strides);
-    inner::free_managed(gpu_dst_strides);
+    // The metadata arrays are cached and shared across calls, so they must
+    // NOT be freed here — a later call with the same shape reuses this exact
+    // device pointer.
+
 
     let out = Box::new(NslTensor::new(
         out_data, out_shape, out_strides,
@@ -8034,6 +8311,61 @@ mod tests {
     /// (`multitile_postpass_ptx_is_ascii_and_nul_terminated` and
     /// `csha_cast_ptx_is_ascii_and_nul_terminated`).
     #[test]
+    /// Every `*_PTX` constant in `fused_kernels` must appear in `ALL_PTX`.
+    ///
+    /// `ALL_PTX` is the sole input to the ptxas-assembles and pure-ASCII gates,
+    /// so a constant missing from it is a kernel those gates never see — its
+    /// syntax errors stay invisible until a launch fails on a real GPU. This
+    /// happened: `SUM_DIM_SHORT_F32_PTX` was added and became the default path
+    /// for the majority of `sum_dim` calls while absent from the table, and
+    /// nothing noticed because no gate compared the two.
+    #[test]
+    fn every_ptx_constant_is_registered_for_certification() {
+        let source = include_str!("fused_kernels.rs");
+
+        let mut declared: Vec<&str> = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub(crate) const ") else {
+                continue;
+            };
+            let mut parts = rest.splitn(2, ':');
+            let Some(name) = parts.next().map(str::trim) else {
+                continue;
+            };
+            // Only `&str` constants are kernels. This also excludes the
+            // `ALL_PTX` table itself, whose name ends in _PTX but whose type is
+            // a slice of pairs.
+            let is_str = parts.next().is_some_and(|ty| ty.trim_start().starts_with("&str"));
+            if name.ends_with("_PTX") && is_str {
+                declared.push(name);
+            }
+        }
+        assert!(
+            declared.len() > 40,
+            "parser found only {} PTX constants; the declaration form must have changed",
+            declared.len()
+        );
+
+        let registered: std::collections::HashSet<&str> =
+            fused_kernels::ALL_PTX.iter().map(|(name, _)| *name).collect();
+
+        // Fragments that are concatenated into other kernels rather than loaded
+        // on their own; the ASCII gate covers them via its own `extra` list.
+        const NOT_STANDALONE: &[&str] = &["HOPPER_PTX_HEADER_PTX"];
+
+        let missing: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|name| !registered.contains(name) && !NOT_STANDALONE.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "PTX constants absent from ALL_PTX, so neither the ptxas gate nor the \
+             ASCII gate covers them: {missing:?}"
+        );
+    }
+
     fn all_handwritten_ptx_is_pure_ascii() {
         // Runtime-loaded PTX that lives outside the two ALL_PTX tables. Header
         // fragments (HOPPER_PTX_HEADER) are checked here too: they are not

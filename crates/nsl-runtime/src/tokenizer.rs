@@ -107,9 +107,22 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
 
     let strides = NslTensor::compute_strides(shape, ndim);
 
+    // Loud in tests, safe in release: a length mismatch means the caller built
+    // ragged rows, which is a bug to fix rather than to silently truncate.
+    debug_assert_eq!(
+        flat.len(),
+        len as usize,
+        "make_2d_tensor got {} values for a {rows}x{cols} tensor",
+        flat.len()
+    );
     let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
-    for (i, &v) in flat.iter().enumerate() {
+    // `flat` is clamped rather than trusted: callers that build ragged rows
+    // would otherwise write past an allocation sized rows*cols.
+    for (i, &v) in flat.iter().take(len as usize).enumerate() {
         unsafe { *data.add(i) = v };
+    }
+    for i in flat.len()..(len as usize) {
+        unsafe { *data.add(i) = 0.0 };
     }
 
     let tensor = Box::new(NslTensor::new(
@@ -311,9 +324,13 @@ pub extern "C" fn nsl_tokenizer_vocab_size(handle: i64) -> i64 {
 /// Arguments:
 ///   - `handle`: tokenizer handle
 ///   - `texts_list`: pointer to an `NslList` of C string pointers
-///   - `padding`: 1 to pad all sequences to `max_len`, 0 to skip
-///   - `truncation`: 1 to truncate sequences longer than `max_len`, 0 to skip
-///   - `max_len`: maximum sequence length (0 = use longest in batch)
+///   - `padding`: 1 to pad every row to at least `max_len`, 0 to pad only to the
+///     longest row in the batch. A 2-D tensor cannot be ragged, so short rows
+///     are always zero-filled and the attention mask marks the padding; this
+///     argument controls the width, not whether padding happens.
+///   - `truncation`: 1 to cap rows at `max_len`, 0 to widen the tensor instead so
+///     no token is dropped
+///   - `max_len`: target sequence length (0 = use the longest row in the batch)
 ///
 /// Returns a pointer to an `NslList` containing two tensors:
 ///   [0] = input_ids  (2-D tensor [batch, seq_len])
@@ -359,38 +376,34 @@ pub extern "C" fn nsl_tokenizer_encode_batch(
         longest
     };
 
-    // Apply truncation and padding, build flat arrays
-    let seq_len = if padding != 0 { effective_max } else { longest };
+    // Every row is materialised at exactly `seq_len`. The previous version
+    // emitted rows at their natural lengths and then inferred the width by
+    // integer-dividing the total, so any ragged batch produced a flat buffer
+    // longer than the rows*cols tensor it was written into.
+    let cap = if truncation != 0 { effective_max } else { usize::MAX };
+    let truncated: Vec<&[f64]> = all_ids
+        .iter()
+        .map(|ids| &ids[..ids.len().min(cap)])
+        .collect();
+    let widest = truncated.iter().map(|row| row.len()).max().unwrap_or(0);
+    let seq_len = if padding != 0 {
+        effective_max.max(widest)
+    } else {
+        widest
+    };
+
     let mut flat_ids = Vec::with_capacity(batch_size * seq_len);
     let mut flat_mask = Vec::with_capacity(batch_size * seq_len);
-
-    for ids in &all_ids {
-        let mut row = ids.clone();
-
-        // Truncation
-        if truncation != 0 && row.len() > effective_max {
-            row.truncate(effective_max);
-        }
-
-        let real_len = row.len();
-
-        // Padding
-        if padding != 0 && row.len() < seq_len {
-            row.resize(seq_len, 0.0);
-        }
-
-        let row_len = row.len();
-        flat_ids.extend_from_slice(&row);
-        for j in 0..row_len {
+    for row in &truncated {
+        let real_len = row.len().min(seq_len);
+        flat_ids.extend_from_slice(&row[..real_len]);
+        flat_ids.resize(flat_ids.len() + (seq_len - real_len), 0.0);
+        for j in 0..seq_len {
             flat_mask.push(if j < real_len { 1.0 } else { 0.0 });
         }
     }
 
-    let actual_seq_len = if batch_size > 0 {
-        flat_ids.len() / batch_size
-    } else {
-        0
-    };
+    let actual_seq_len = seq_len;
 
     let ids_tensor = make_2d_tensor(batch_size, actual_seq_len, &flat_ids);
     let mask_tensor = make_2d_tensor(batch_size, actual_seq_len, &flat_mask);
@@ -400,4 +413,99 @@ pub extern "C" fn nsl_tokenizer_encode_batch(
     crate::list::nsl_list_push(result_list, ids_tensor);
     crate::list::nsl_list_push(result_list, mask_tensor);
     result_list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::list::{nsl_list_new, nsl_list_push};
+    use crate::tensor::NslTensor;
+
+    /// Build an `NslList` of C string pointers, as the codegen'd caller does.
+    fn texts_list(texts: &[&str]) -> (i64, Vec<CString>) {
+        let owned: Vec<CString> = texts.iter().map(|t| CString::new(*t).unwrap()).collect();
+        let list = nsl_list_new();
+        for s in &owned {
+            nsl_list_push(list, s.as_ptr() as i64);
+        }
+        // Keep the CStrings alive for the duration of the call.
+        (list, owned)
+    }
+
+    fn dims(tensor_ptr: i64) -> (i64, i64) {
+        let t = NslTensor::from_ptr(tensor_ptr);
+        assert_eq!(t.ndim, 2, "encode_batch must return 2-D tensors");
+        unsafe { (*t.shape, *t.shape.add(1)) }
+    }
+
+    /// The batch encoder used to emit each row at its natural length and then
+    /// infer the tensor width by integer-dividing the total token count by the
+    /// batch size. For a ragged batch that width is too small, and every token
+    /// past rows*cols was written past the end of the allocation.
+    ///
+    /// "aaaa", "b" and "cc" are 4, 1 and 2 bytes: 7 tokens over 3 rows floors to
+    /// a width of 2, so the old code allocated 3*2 slots and wrote 7 values.
+    #[test]
+    fn ragged_unpadded_batch_stays_within_its_allocation() {
+        let handle = nsl_byte_tokenizer_new();
+        let (list, _owned) = texts_list(&["aaaa", "b", "cc"]);
+
+        let result = nsl_tokenizer_encode_batch(handle, list, /*padding*/ 0, /*truncation*/ 0, 0);
+        let ids = crate::list::nsl_list_get(result, 0);
+        let mask = crate::list::nsl_list_get(result, 1);
+
+        let (rows, cols) = dims(ids);
+        assert_eq!(rows, 3);
+        // Width must be the longest row, so no token is dropped and none is
+        // written out of bounds.
+        assert_eq!(cols, 4, "width must cover the longest row");
+        assert_eq!(dims(mask), (3, 4));
+
+        let t = NslTensor::from_ptr(ids);
+        assert_eq!(t.len, rows * cols);
+        let read = |r: i64, c: i64| unsafe { *t.data_f64().add((r * cols + c) as usize) };
+        assert_eq!(
+            [read(0, 0), read(0, 1), read(0, 2), read(0, 3)],
+            [b'a' as f64; 4]
+        );
+        assert_eq!(read(1, 0), b'b' as f64);
+        // Short rows are zero-filled, and the mask marks the padding.
+        assert_eq!([read(1, 1), read(1, 2), read(1, 3)], [0.0; 3]);
+        let m = NslTensor::from_ptr(mask);
+        let mread = |r: i64, c: i64| unsafe { *m.data_f64().add((r * cols + c) as usize) };
+        assert_eq!([mread(1, 0), mread(1, 1)], [1.0, 0.0]);
+    }
+
+    /// With truncation on, no row may exceed max_len even when padding is off.
+    #[test]
+    fn truncation_bounds_the_width() {
+        let handle = nsl_byte_tokenizer_new();
+        let (list, _owned) = texts_list(&["aaaaaaaa", "bb"]);
+        let result = nsl_tokenizer_encode_batch(handle, list, 0, /*truncation*/ 1, /*max_len*/ 3);
+        let ids = crate::list::nsl_list_get(result, 0);
+        assert_eq!(dims(ids), (2, 3));
+        assert_eq!(NslTensor::from_ptr(ids).len, 6);
+    }
+
+    /// Padding to max_len must not shrink a row that is longer than max_len
+    /// when truncation is off — that would silently discard tokens.
+    #[test]
+    fn padding_without_truncation_keeps_long_rows() {
+        let handle = nsl_byte_tokenizer_new();
+        let (list, _owned) = texts_list(&["aaaaaa", "b"]);
+        let result = nsl_tokenizer_encode_batch(handle, list, /*padding*/ 1, 0, /*max_len*/ 2);
+        let ids = crate::list::nsl_list_get(result, 0);
+        let (rows, cols) = dims(ids);
+        assert_eq!((rows, cols), (2, 6));
+        assert_eq!(NslTensor::from_ptr(ids).len, 12);
+    }
+
+    #[test]
+    fn empty_batch_does_not_panic() {
+        let handle = nsl_byte_tokenizer_new();
+        let (list, _owned) = texts_list(&[]);
+        let result = nsl_tokenizer_encode_batch(handle, list, 1, 1, 8);
+        let ids = crate::list::nsl_list_get(result, 0);
+        assert_eq!(NslTensor::from_ptr(ids).len, 0);
+    }
 }

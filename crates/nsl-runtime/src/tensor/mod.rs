@@ -1040,6 +1040,11 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     if tensor.device > 0 {
         #[cfg(feature = "cuda")]
         {
+            // NSL_ITEM_PROFILE=1 accounts for the pipeline drain this forces.
+            // Reading a device scalar mid-stream cannot avoid waiting for every
+            // kernel queued ahead of it, so a hot-path `.item()` on a value that
+            // is a compile-time constant costs a full serialization.
+            let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::ScalarRead);
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
             match tensor.dtype {
                 DTYPE_I32 => {
@@ -2359,6 +2364,65 @@ pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
 pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     let list = NslList::from_ptr(grad_list_ptr);
     let num_grads = list.len as usize;
+
+    // Device-resident fast path.
+    //
+    // The host path below copies EVERY gradient to the host to compute the
+    // global norm, scales there, and copies every one back — and because host
+    // tensors are f64 while device tensors are f32, the upload is twice the
+    // size of the download. For Coder-50M that is about 560 MB of PCIe traffic
+    // per step across ~57 gradients, which host profiling showed to be the
+    // largest remaining cost in the step once cross-entropy was moved onto the
+    // device. Reducing on the device instead moves 4 bytes per gradient.
+    //
+    // NSL_GPU_GRAD_CLIP=0 restores the host path. The device reduction
+    // accumulates in f32 where the host accumulates f64, so the norm — and
+    // therefore the clip scale — can differ in the last few digits.
+    #[cfg(feature = "cuda")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| {
+            std::env::var("NSL_GPU_GRAD_CLIP").ok().as_deref() != Some("0")
+        });
+
+        let mut all_device_f32 = num_grads > 0;
+        let mut any = false;
+        for g in 0..num_grads {
+            let ptr = unsafe { *list.data.add(g) };
+            if ptr == 0 {
+                continue;
+            }
+            let t = NslTensor::from_ptr(ptr);
+            if t.device == 0 || t.dtype != 1 {
+                all_device_f32 = false;
+                break;
+            }
+            any = true;
+        }
+
+        if enabled && all_device_f32 && any {
+            // Batched so the whole set costs one pipeline drain rather than one
+            // per parameter.
+            let ptrs: Vec<i64> = (0..num_grads)
+                .map(|g| unsafe { *list.data.add(g) })
+                .collect();
+            let sum_sq = crate::cuda::gpu_sum_sq_many_f32(&ptrs);
+            let norm = sum_sq.sqrt();
+            if norm <= max_norm {
+                return;
+            }
+            let scale = (max_norm / (norm + 1e-8)) as f32;
+            for g in 0..num_grads {
+                let ptr = unsafe { *list.data.add(g) };
+                if ptr == 0 {
+                    continue;
+                }
+                let t = NslTensor::from_ptr(ptr);
+                crate::cuda::gpu_scale_raw_f32(t.data, t.len as usize, scale);
+            }
+            return;
+        }
+    }
 
     // Collect grad pointers, transferring GPU tensors to CPU for computation
     let mut cpu_grads: Vec<(i64, bool)> = Vec::with_capacity(num_grads); // (ptr, was_gpu)
@@ -3972,6 +4036,13 @@ pub extern "C" fn nsl_tensor_from_slab(
 /// Walks i64 fields: if a field is a live NslTensor (magic == TENSOR_MAGIC),
 /// transfers it to the requested device.
 /// Non-tensor fields (sub-models, scalars) are skipped.
+fn scalar_fields_to_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NSL_MODEL_SCALARS_TO_DEVICE").ok().as_deref() == Some("1")
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i64) {
     if model_ptr == 0 || num_fields <= 0 { return; }
@@ -3995,6 +4066,20 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
 
         if is_tensor {
             if t.device as i64 == device { continue; }
+            // Scalar model fields are configuration (`_d_model`, `_n_heads`,
+            // `_dropout_p`, ...), stored as tensors only because methods can
+            // reach fields but not constructor arguments. They are read back
+            // with `.item()` on every forward, and reading a device scalar
+            // drains the pipeline: 72 such reads per forward for Coder-50M,
+            // which host profiling measured at 30% of the step once the bulk
+            // transfers were gone. Leaving them on the host makes `.item()` a
+            // plain load.
+            //
+            // NSL_MODEL_SCALARS_TO_DEVICE=1 transfers them as before, for a
+            // model that feeds a scalar field straight into a device op.
+            if device > 0 && t.len == 1 && !scalar_fields_to_device() {
+                continue;
+            }
             let new_ptr = nsl_tensor_to_device(field_val, device);
             if new_ptr == 0 {
                 eprintln!("[nsl] WARNING: failed to transfer tensor field {} to device {}", i, device);
@@ -5657,6 +5742,8 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_drain_cache() {
+    // Called once per training step, so this is the natural reporting interval.
+    crate::host_profile::report_and_reset("step");
     // P5 item 19: while cuda-graph capture is armed, the per-step transient
     // drain would churn every transient address (no region could ever
     // digest-stabilize) AND physically unmap memory that already-captured

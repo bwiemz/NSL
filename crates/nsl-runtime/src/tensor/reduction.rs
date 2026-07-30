@@ -462,6 +462,14 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
     result_ptr
 }
 
+/// `NSL_GATHER_DIM_GPU=0` forces the historical CPU redirect, so the device
+/// kernel can be A/B'd against it on a real workload.
+#[cfg(feature = "cuda")]
+fn gather_dim_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_GATHER_DIM_GPU").ok().as_deref() != Some("0"))
+}
+
 /// Gather along a dimension: output[b] = tensor[b, indices[b]] (for dim=1, 2D input).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64) -> i64 {
@@ -493,6 +501,107 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
                 }
                 return result;
             }
+            // Non-zero dims: gather on the device when the layout allows it.
+            // The CPU redirect below copies the WHOLE tensor both ways, which for
+            // cross_entropy's `gather(log_probs, 1, targets)` is the entire
+            // [B*S, vocab] tensor — 192 MB each way at 1024x49152.
+            #[cfg(feature = "cuda")]
+            if tensor.dtype == 1 && gather_dim_gpu_enabled() {
+                let d = d as usize;
+                let shape = get_shape_vec(tensor);
+                if d < shape.len() {
+                    let outer: usize =
+                        shape[..d].iter().map(|&s| s as usize).product::<usize>().max(1);
+                    let inner: usize =
+                        shape[d + 1..].iter().map(|&s| s as usize).product::<usize>().max(1);
+                    let gather_dim_size = shape[d] as usize;
+                    let idx_t = NslTensor::from_ptr(indices_ptr);
+
+                    if idx_t.len as usize == outer {
+                        // Read the index vector to the host to validate it. It is
+                        // `outer` elements, so this is kilobytes; keeping the
+                        // check preserves the CPU path's abort-on-out-of-range.
+                        let idx_cpu = super::nsl_tensor_to_device(indices_ptr, 0);
+                        let idx_view = NslTensor::from_ptr(idx_cpu);
+                        let mut host_idx: Vec<i64> = Vec::with_capacity(outer);
+                        for o in 0..outer {
+                            host_idx.push(idx_view.read_index(o));
+                        }
+                        super::nsl_tensor_free(idx_cpu);
+
+                        if let Some(bad) = host_idx
+                            .iter()
+                            .find(|&&i| i < 0 || i as usize >= gather_dim_size)
+                        {
+                            eprintln!(
+                                "nsl: gather index {} out of bounds for dim {} with size {}",
+                                bad, d, gather_dim_size
+                            );
+                            std::process::abort();
+                        }
+
+                        let t_c = nsl_tensor_contiguous(tensor_ptr);
+                        let out_data = crate::cuda::gpu_gather_dim_f32(
+                            t_c,
+                            &host_idx,
+                            outer as u64,
+                            gather_dim_size as u64,
+                            inner as u64,
+                        );
+                        super::nsl_tensor_free(t_c);
+
+                        if !out_data.is_null() {
+                            // Output shape is the input shape with dim d removed.
+                            let out_shape_vec: Vec<i64> = shape
+                                .iter()
+                                .enumerate()
+                                .filter(|&(i, _)| i != d)
+                                .map(|(_, &v)| v)
+                                .collect();
+                            let out_ndim = out_shape_vec.len().max(1) as i64;
+                            let shape_ptr = crate::memory::checked_alloc(
+                                out_ndim as usize * std::mem::size_of::<i64>(),
+                            ) as *mut i64;
+                            if out_shape_vec.is_empty() {
+                                unsafe { *shape_ptr = 1 };
+                            } else {
+                                for (i, &v) in out_shape_vec.iter().enumerate() {
+                                    unsafe { *shape_ptr.add(i) = v };
+                                }
+                            }
+                            let strides_ptr =
+                                NslTensor::compute_strides(shape_ptr, out_ndim);
+                            let result = Box::new(NslTensor::new(
+                                out_data,
+                                shape_ptr,
+                                strides_ptr,
+                                out_ndim,
+                                (outer * inner) as i64,
+                                tensor.device,
+                                1,
+                                1,
+                                0,
+                            ));
+                            let result_ptr = NslTensor::publish(result);
+                            if autodiff::is_recording() {
+                                let input_shape = get_shape_vec(NslTensor::from_ptr(tensor_ptr));
+                                NslTensor::from_ptr(indices_ptr)
+                                    .refcount
+                                    .fetch_add(1, Ordering::SeqCst);
+                                autodiff::maybe_record(autodiff::TapeOp::Gather {
+                                    a: tensor_ptr,
+                                    out: result_ptr,
+                                    dim,
+                                    indices_ptr,
+                                    input_shape,
+                                });
+                            }
+                            return result_ptr;
+                        }
+                    }
+                }
+            }
+
             // Fallback for non-zero dims: CPU redirect
             let was_recording = autodiff::is_recording();
             let gpu_result = {
