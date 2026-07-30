@@ -15820,8 +15820,14 @@ impl Compiler<'_> {
     /// One `declare` per parameter plus one `verify` closes that gap. Both
     /// are emitted inside the per-micro-batch registration region, so the
     /// check re-runs every micro-batch (catching drift, not just the first
-    /// step) at a cost of `2n + 1` FFI calls beside the `2n` the belt above
-    /// already makes — measured as no wall-clock change.
+    /// step).
+    ///
+    /// Cost, stated precisely because the two populations differ: the belt
+    /// above emits `2s` calls per micro-batch (a `nsl_list_get` + a
+    /// `register` for each of the `s` STREAMED parameters); this adds
+    /// `2p + 1`, where `p` is ALL parameters — `p >= s`, since residents are
+    /// declared too (see below). Measured as no wall-clock change on the
+    /// CSLA FFN fixture.
     ///
     /// EVERY parameter is declared, not only the streamed ones. A resident
     /// parameter expects "registered with no backend", which is falsifiable
