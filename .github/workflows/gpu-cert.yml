@@ -1,0 +1,101 @@
+# GPU certification lane — the hardware half of roadmap item 19.
+#
+# ci.yml's `gpu-gate-inventory` job keeps the 380-gate manifest from rotting
+# and `cuda-feature` proves PTX assembles, but neither executes a kernel.
+# This workflow runs `scripts/gpu-cert.sh --run` on a real device: the
+# self-hosted runner registered on the RTX PRO 4500 Blackwell box (sm_120).
+#
+# ── SECURITY (load-bearing, do not relax) ────────────────────────────────
+# This repository is PUBLIC and the runner is a personal machine. The only
+# permitted triggers are `schedule` (executes default-branch code, already
+# trusted) and `workflow_dispatch` (write-access users only). Adding
+# `pull_request` or `push` here would hand fork code arbitrary execution on
+# the runner host — never do it. If broader triggering is ever needed, move
+# the lane to an ephemeral cloud GPU runner first.
+#
+# Missed nightly runs (box powered off) are acceptable: the lane certifies
+# trends, not every commit. `workflow_dispatch` covers pre-merge checks for
+# kernel-heavy PRs (run it from the PR branch AFTER review, or from main
+# after merge).
+
+name: gpu-cert
+
+on:
+  schedule:
+    # 09:00 UTC — early morning local, after any overnight training runs.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "NSL_CERT_TIER: gpu | toolchain | multiproc | isolate | all"
+        required: false
+        default: "gpu"
+
+# One hardware job at a time — the gates assume exclusive device access
+# (parallel GPU binaries fake-fail; the lane itself runs serially inside).
+concurrency:
+  group: gpu-cert-hardware
+  cancel-in-progress: false
+
+jobs:
+  run-lane:
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight — device, disk, stale-scratch sweep
+        run: |
+          set -euo pipefail
+          nvidia-smi -L
+          df -h /tmp
+          # /tmp is a 31G tmpfs and `nsl run` leaves ~130MB scratch dirs
+          # nothing cleans; a full tmpfs surfaces as linker "No space left"
+          # failures that read like compiler regressions. Sweep PID-AWARE:
+          # only dirs >30min old whose owning process is gone. Never a
+          # blanket rm — concurrent sessions may have live runs.
+          for d in /tmp/nsl_run_* /tmp/nsl_build_* /tmp/nsl_unkn_*; do
+            [ -d "${d}" ] || continue
+            pid="${d##*_}"
+            case "${pid}" in (*[!0-9]*) continue ;; esac
+            if [ -n "$(find "${d}" -maxdepth 0 -mmin +30)" ] \
+               && ! kill -0 "${pid}" 2>/dev/null; then
+              rm -rf -- "${d}"
+            fi
+          done
+          df -h /tmp
+
+      - name: Run the certification lane
+        env:
+          NSL_CERT_TIER: ${{ github.event.inputs.tier || 'gpu' }}
+          NSL_CERT_OUT: ${{ github.workspace }}/cert-artifacts/gpu-cert-report.tsv
+          CUDA_PATH: /opt/cuda
+          # Persistent warm target dir on the runner host — a cold release
+          # build costs ~10 min the nightly does not need to re-pay.
+          CARGO_TARGET_DIR: /home/brandon/.cache/nsl-target-gpucert
+          # gpu-cert.sh's own header: point TMPDIR at DISK, not the tmpfs.
+          TMPDIR: /home/brandon/.cache/nsl-gpucert-tmp
+        run: |
+          set -euo pipefail
+          mkdir -p cert-artifacts "${TMPDIR}"
+          ./scripts/gpu-cert.sh --run
+
+      - name: Bank hardware + toolchain metadata
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p cert-artifacts
+          nvidia-smi -q > cert-artifacts/nvidia-smi.txt || true
+          nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total \
+            --format=csv > cert-artifacts/device.csv || true
+          /opt/cuda/bin/ptxas --version > cert-artifacts/ptxas-version.txt || true
+          rustc --version > cert-artifacts/rustc-version.txt || true
+          git rev-parse HEAD > cert-artifacts/commit.txt
+
+      - name: Upload certification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-cert-${{ github.run_number }}
+          path: cert-artifacts/
+          retention-days: 90
