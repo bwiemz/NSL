@@ -8419,6 +8419,8 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
                     result as u32, 0,
                     "GPU strided run copy kernel failed: {result:?}"
                 );
+                strided_copy::ARM_LAUNCHES[resident.plan.arm_index()]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 inner::sync_after_kernel();
 
                 let out = Box::new(NslTensor::new(
@@ -8687,6 +8689,60 @@ mod tests {
     /// in one stays invisible until a kernel launch fails on a real GPU. `ptxas`
     /// needs no GPU, only the CUDA toolkit, so this gate runs anywhere the
     /// toolkit is installed.
+    /// Runtime-loaded PTX that lives outside the two `ALL_PTX` tables, with a
+    /// flag for whether it is standalone-assemblable.
+    ///
+    /// Both PTX gates read this one list, so a module registered here is covered
+    /// by BOTH. Registering in only one was the hole that let a whole kernel
+    /// module ship unassembled: an entry in the ASCII gate's local `extra` array
+    /// was invisible to the ptxas gate, which iterated the tables alone.
+    ///
+    /// `false` = a header fragment concatenated into other kernels rather than
+    /// loaded on its own; the ptxas gate skips those, the ASCII gate does not
+    /// (a non-ASCII byte in a header breaks every kernel that embeds it).
+    const EXTRA_RUNTIME_PTX: &[(&str, &str, bool)] = &[
+        (
+            "CSHA_TIER_B1_PREPASS_X_PTX",
+            super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_X_PTX,
+            true,
+        ),
+        (
+            "CSHA_TIER_B1_PREPASS_W_PTX",
+            super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_W_PTX,
+            true,
+        ),
+        (
+            "PTX_F32_TO_BF16",
+            super::precision_cast_kernels::PTX_F32_TO_BF16,
+            true,
+        ),
+        (
+            "PTX_BF16_TO_F32",
+            super::precision_cast_kernels::PTX_BF16_TO_F32,
+            true,
+        ),
+        (
+            "PTX_F32_TO_FP16",
+            super::precision_cast_kernels::PTX_F32_TO_FP16,
+            true,
+        ),
+        (
+            "PTX_FP16_TO_F32",
+            super::precision_cast_kernels::PTX_FP16_TO_F32,
+            true,
+        ),
+        (
+            "STRIDED_COPY_RUN_PTX",
+            super::strided_copy::STRIDED_COPY_RUN_PTX,
+            true,
+        ),
+        (
+            "HOPPER_PTX_HEADER",
+            super::kernels_hopper::HOPPER_PTX_HEADER,
+            false,
+        ),
+    ];
+
     #[test]
     fn all_handwritten_ptx_assembles_with_ptxas() {
         let Some(ptxas) = find_ptxas() else {
@@ -8699,7 +8755,14 @@ mod tests {
         let mut failures = Vec::new();
         let modules = super::kernels::ALL_PTX
             .iter()
-            .chain(super::fused_kernels::ALL_PTX.iter());
+            .chain(super::fused_kernels::ALL_PTX.iter())
+            .map(|(name, ptx)| (*name, *ptx))
+            .chain(
+                EXTRA_RUNTIME_PTX
+                    .iter()
+                    .filter(|(_, _, standalone)| *standalone)
+                    .map(|(name, ptx, _)| (*name, *ptx)),
+            );
 
         for (name, ptx) in modules {
             // These constants carry a trailing NUL for `cuModuleLoadData`. ptxas
@@ -8772,41 +8835,13 @@ mod tests {
     /// `csha_cast_ptx_is_ascii_and_nul_terminated`).
     #[test]
     fn all_handwritten_ptx_is_pure_ascii() {
-        // Runtime-loaded PTX that lives outside the two ALL_PTX tables. Header
-        // fragments (HOPPER_PTX_HEADER) are checked here too: they are not
-        // standalone-loadable so the ptxas gate skips them, but a non-ASCII
-        // byte in a header would break every kernel that concatenates it.
-        let extra: [(&str, &str); 7] = [
-            (
-                "CSHA_TIER_B1_PREPASS_X_PTX",
-                super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_X_PTX,
-            ),
-            (
-                "CSHA_TIER_B1_PREPASS_W_PTX",
-                super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_W_PTX,
-            ),
-            (
-                "PTX_F32_TO_BF16",
-                super::precision_cast_kernels::PTX_F32_TO_BF16,
-            ),
-            (
-                "PTX_BF16_TO_F32",
-                super::precision_cast_kernels::PTX_BF16_TO_F32,
-            ),
-            (
-                "PTX_F32_TO_FP16",
-                super::precision_cast_kernels::PTX_F32_TO_FP16,
-            ),
-            (
-                "PTX_FP16_TO_F32",
-                super::precision_cast_kernels::PTX_FP16_TO_F32,
-            ),
-            ("HOPPER_PTX_HEADER", super::kernels_hopper::HOPPER_PTX_HEADER),
-        ];
+        // Runtime-loaded PTX outside the two ALL_PTX tables comes from the
+        // shared `EXTRA_RUNTIME_PTX` registry, which the ptxas gate reads too.
         let modules = super::kernels::ALL_PTX
             .iter()
             .chain(super::fused_kernels::ALL_PTX.iter())
-            .chain(extra.iter());
+            .map(|(name, ptx)| (*name, *ptx))
+            .chain(EXTRA_RUNTIME_PTX.iter().map(|(name, ptx, _)| (*name, *ptx)));
         let mut failures = Vec::new();
         for (name, ptx) in modules {
             for (i, line) in ptx.lines().enumerate() {
@@ -8864,11 +8899,14 @@ mod tests {
             declared.len()
         );
 
-        let registered: std::collections::HashSet<&str> =
-            fused_kernels::ALL_PTX.iter().map(|(name, _)| *name).collect();
+        let registered: std::collections::HashSet<&str> = fused_kernels::ALL_PTX
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(EXTRA_RUNTIME_PTX.iter().map(|(name, _, _)| *name))
+            .collect();
 
         // Fragments that are concatenated into other kernels rather than loaded
-        // on their own; the ASCII gate covers them via its own `extra` list.
+        // on their own; `EXTRA_RUNTIME_PTX` covers them for the ASCII gate.
         const NOT_STANDALONE: &[&str] = &["HOPPER_PTX_HEADER_PTX"];
 
         let missing: Vec<&str> = declared
@@ -8880,6 +8918,60 @@ mod tests {
             missing.is_empty(),
             "PTX constants absent from ALL_PTX, so neither the ptxas gate nor the \
              ASCII gate covers them: {missing:?}"
+        );
+    }
+
+    /// The same drift check, for `cuda::` submodules that define runtime-loaded
+    /// PTX outside `fused_kernels`.
+    ///
+    /// `every_ptx_constant_is_registered_for_certification` only parses
+    /// `fused_kernels.rs`, so a `_PTX` constant added to any sibling module was
+    /// invisible to it AND to both PTX gates — a kernel could ship never having
+    /// been assembled or ASCII-checked. That is exactly the
+    /// `SUM_DIM_SHORT_F32_PTX` failure the original gate was written to prevent,
+    /// reappearing one module over.
+    #[test]
+    fn sibling_module_ptx_constants_are_registered() {
+        let sources: &[(&str, &str)] = &[
+            ("strided_copy.rs", include_str!("strided_copy.rs")),
+            ("tier_b1_prepass.rs", include_str!("tier_b1_prepass.rs")),
+            (
+                "precision_cast_kernels.rs",
+                include_str!("precision_cast_kernels.rs"),
+            ),
+        ];
+        let registered: std::collections::HashSet<&str> =
+            EXTRA_RUNTIME_PTX.iter().map(|(name, _, _)| *name).collect();
+
+        let mut missing = Vec::new();
+        for (file, source) in sources {
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                let Some(rest) = trimmed
+                    .strip_prefix("pub(crate) const ")
+                    .or_else(|| trimmed.strip_prefix("pub const "))
+                else {
+                    continue;
+                };
+                let mut parts = rest.splitn(2, ':');
+                let Some(name) = parts.next().map(str::trim) else {
+                    continue;
+                };
+                let is_str = parts
+                    .next()
+                    .is_some_and(|ty| ty.trim_start().starts_with("&str"));
+                if is_str
+                    && (name.ends_with("_PTX") || name.starts_with("PTX_"))
+                    && !registered.contains(name)
+                {
+                    missing.push(format!("{file}::{name}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "PTX constants in cuda:: submodules that are not in EXTRA_RUNTIME_PTX, so no \
+             gate assembles or ASCII-checks them: {missing:?}"
         );
     }
 

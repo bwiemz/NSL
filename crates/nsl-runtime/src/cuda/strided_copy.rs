@@ -27,6 +27,12 @@
 //! (true transposes, where the innermost axis is strided) fall back to the
 //! generic kernel unchanged.
 
+// The PTX is loaded at runtime by name through the CUDA driver API, and the
+// planner's only consumers are `#[cfg(feature = "cuda")]`, so on a default
+// (cuda-less) build dead-code analysis sees this whole module as unused. Same
+// reason, same allow, as every sibling kernel module.
+#![allow(dead_code)]
+
 /// Smallest run length worth the per-run offset table. Below this the table
 /// approaches the size of the data itself and the generic kernel is fine.
 const MIN_RUN: i64 = 32;
@@ -93,6 +99,13 @@ impl RunPlan {
             (true, true) => "nsl_scopy_bcast4_f32\0",
         }
     }
+
+    /// Index of this arm in `ARM_LAUNCHES`, in the same order as
+    /// [`Self::kernel_name`]: 0 = copy, 1 = copy/vec4, 2 = broadcast,
+    /// 3 = broadcast/vec4.
+    pub fn arm_index(&self) -> usize {
+        (self.broadcast as usize) * 2 + (self.vec4 as usize)
+    }
 }
 
 /// One axis of a collapsed view: `(size, src_stride, dst_stride)`.
@@ -154,6 +167,13 @@ pub(crate) fn plan_run(shape: &[i64], src: &[i64], dst: &[i64]) -> Option<RunPla
 
     let outer: i64 = outer_axes.iter().try_fold(1i64, |acc, a| acc.checked_mul(a.0))?;
     if outer > MAX_OUTER {
+        return None;
+    }
+    // The kernels carry `run_len` in a u32 (`cvt.u32.u64` feeding the x bound
+    // check, the vec4 shift, and `mul.wide.u32`). Past 2^32 that truncation
+    // would corrupt silently rather than fault, so refuse instead. Reachable in
+    // principle: a scalar broadcast into a >=16 GiB f32 destination.
+    if run_len > u32::MAX as i64 {
         return None;
     }
 
@@ -412,8 +432,14 @@ SC_BC4_DONE: ret;\n\
 type PlanKey = (i32, Vec<i64>, Vec<i64>);
 
 /// A resolved plan plus its device-resident offset table.
+///
+/// Handed out behind an `Arc` (see [`resident_plan`]): `RunPlan` owns the host
+/// copy of the offset table, which for the `[b,s,h,hd] -> [b,h,s,hd]` head
+/// transpose is 32768 entries. Returning it by value would malloc-and-memcpy
+/// 256 KiB on every cache hit -- on the hot path, while holding the memo lock --
+/// which is the very cost keying the memo on the view metadata exists to avoid.
+/// The launch site reads only `run_len`, `outer` and `offsets_dev`.
 #[cfg(feature = "cuda")]
-#[derive(Clone)]
 pub(crate) struct ResidentPlan {
     pub plan: RunPlan,
     /// Device pointer to `plan.src_offsets` as i64[outer].
@@ -455,11 +481,11 @@ pub(crate) fn resident_plan(
     shape: &[i64],
     src_strides: &[i64],
     dst_strides: &[i64],
-) -> Option<ResidentPlan> {
+) -> Option<std::sync::Arc<ResidentPlan>> {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PlanKey, Option<ResidentPlan>>>> =
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PlanKey, Option<Arc<ResidentPlan>>>>> =
         std::sync::OnceLock::new();
     static SPENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -470,6 +496,8 @@ pub(crate) fn resident_plan(
     let device = super::inner::current_device_ordinal();
     let key = (device, shape.to_vec(), src_strides.to_vec());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Clone the Arc, not the plan, and drop the guard before returning: the
+    // steady state is one refcount bump per copy.
     if let Some(hit) = cache.lock().unwrap().get(&key) {
         return hit.clone();
     }
@@ -503,14 +531,20 @@ pub(crate) fn resident_plan(
             plan.src_offsets.as_ptr() as *const std::ffi::c_void,
             bytes,
         );
-        ResidentPlan { plan, offsets_dev: dev as u64 }
+        Arc::new(ResidentPlan { plan, offsets_dev: dev as u64 })
     });
 
     let mut guard = cache.lock().unwrap();
     match guard.entry(key) {
-        std::collections::hash_map::Entry::Occupied(slot) => {
-            // Another thread published first; drop our duplicate table and give
-            // its bytes back to the budget.
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            // Another thread published first. If it lost the budget race and
+            // published `None` while we succeeded, take ours -- otherwise the
+            // key stays permanently poisoned even though the budget is free.
+            if slot.get().is_none() && built.is_some() {
+                slot.insert(built.clone());
+                return built;
+            }
+            // Otherwise ours is the duplicate: free it and refund the budget.
             if let Some(ours) = &built {
                 super::inner::free_managed(ours.offsets_dev as *mut std::ffi::c_void);
                 SPENT.fetch_sub(
@@ -524,6 +558,45 @@ pub(crate) fn resident_plan(
             slot.insert(built.clone());
             built
         }
+    }
+}
+
+/// Per-arm successful-launch counters, for tests that must prove the fast path
+/// actually ran.
+///
+/// Without these every GPU gate in `gpu_strided_copy_run_parity` would still
+/// pass with the fast path dead: they all compare against the generic kernel or
+/// a host reference, and both produce identical bytes. A regression that made
+/// `resident_plan` always return `None` would be invisible.
+///
+/// Indexed by [`RunPlan::arm_index`].
+#[cfg(feature = "cuda")]
+pub(crate) static ARM_LAUNCHES: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Launch count for one arm: 0 = copy, 1 = copy/vec4, 2 = broadcast,
+/// 3 = broadcast/vec4. Out-of-range returns 0.
+///
+/// Test-only observability; the counters are plain relaxed adds on a path that
+/// already issues a kernel launch.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn nsl_test_strided_copy_arm_launches(arm: i64) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        match ARM_LAUNCHES.get(arm as usize) {
+            Some(c) => c.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            None => 0,
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = arm;
+        0
     }
 }
 

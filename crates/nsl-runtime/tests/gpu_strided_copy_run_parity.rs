@@ -23,7 +23,31 @@ use nsl_runtime::tensor::{
     nsl_tensor_contiguous, nsl_tensor_data_ptr, nsl_tensor_expand, nsl_tensor_free,
     nsl_tensor_reshape, nsl_tensor_transpose, nsl_tensor_zeros_on,
 };
-use nsl_runtime::{nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d};
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d, nsl_test_strided_copy_arm_launches,
+};
+
+/// Arm indices of `ARM_LAUNCHES`, mirroring `RunPlan::arm_index`.
+const ARM_COPY: i64 = 0;
+const ARM_COPY_VEC4: i64 = 1;
+const ARM_BCAST: i64 = 2;
+const ARM_BCAST_VEC4: i64 = 3;
+
+/// Assert that materializing something actually took the intended fast-path arm.
+///
+/// Without this every gate in this file would still pass with the fast path
+/// dead: they all compare against the generic kernel or a host reference, and
+/// both produce identical bytes. A regression that made `resident_plan` always
+/// return `None` — an exhausted budget, an inverted alignment test, a planner
+/// that stopped recognizing runs — would be completely invisible.
+fn assert_arm_advanced(arm: i64, before: i64, what: &str) {
+    let after = nsl_test_strided_copy_arm_launches(arm);
+    assert!(
+        after > before,
+        "{what}: expected arm {arm} to launch (count {before} -> {after}); \
+         the fast path did not run, so this gate proved nothing"
+    );
+}
 
 fn cuda_available() -> bool {
     if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
@@ -127,6 +151,7 @@ fn gqa_kv_expand_matches_reference() {
     if !cuda_available() {
         return;
     }
+    let before = nsl_test_strided_copy_arm_launches(ARM_COPY_VEC4);
     let (b, nkv, n_rep, s, hd) = (2i64, 4i64, 2i64, 64i64, 32i64);
     let vals = ramp((b * nkv * s * hd) as usize);
     let base = gpu_tensor(&vals, &[b, nkv, s, hd]);
@@ -144,6 +169,7 @@ fn gqa_kv_expand_matches_reference() {
     let expect = reference(&vals, &shape, &src_strides);
 
     assert_materializes_to(expanded, &expect, "gqa kv expand");
+    assert_arm_advanced(ARM_COPY_VEC4, before, "gqa kv expand");
     nsl_tensor_free(reshaped);
     nsl_tensor_free(base);
 }
@@ -156,6 +182,7 @@ fn head_transpose_matches_reference() {
     if !cuda_available() {
         return;
     }
+    let before = nsl_test_strided_copy_arm_launches(ARM_COPY_VEC4);
     let (b, s, h, hd) = (2i64, 64i64, 8i64, 32i64);
     let vals = ramp((b * s * h * hd) as usize);
     let base = gpu_tensor(&vals, &[b, s, h, hd]);
@@ -166,6 +193,7 @@ fn head_transpose_matches_reference() {
     let expect = reference(&vals, &shape, &src_strides);
 
     assert_materializes_to(view, &expect, "head transpose");
+    assert_arm_advanced(ARM_COPY_VEC4, before, "head transpose");
     nsl_tensor_free(base);
 }
 
@@ -177,6 +205,7 @@ fn scalar_broadcast_matches_reference() {
     if !cuda_available() {
         return;
     }
+    let before = nsl_test_strided_copy_arm_launches(ARM_BCAST_VEC4);
     let vals = vec![std::f32::consts::PI];
     let base = gpu_tensor(&vals, &[1, 1, 1]);
     let target = list_of(&[4, 128, 64]);
@@ -185,6 +214,7 @@ fn scalar_broadcast_matches_reference() {
 
     let expect = vec![std::f32::consts::PI; 4 * 128 * 64];
     assert_materializes_to(view, &expect, "scalar broadcast");
+    assert_arm_advanced(ARM_BCAST_VEC4, before, "scalar broadcast");
     nsl_tensor_free(base);
 }
 
@@ -198,6 +228,7 @@ fn per_token_broadcast_matches_reference() {
     if !cuda_available() {
         return;
     }
+    let before = nsl_test_strided_copy_arm_launches(ARM_BCAST_VEC4);
     let (b, s, d) = (4i64, 32i64, 64i64);
     let vals = ramp((b * s) as usize);
     let base = gpu_tensor(&vals, &[b, s, 1]);
@@ -207,6 +238,7 @@ fn per_token_broadcast_matches_reference() {
 
     let expect = reference(&vals, &[b, s, d], &[s, 1, 0]);
     assert_materializes_to(view, &expect, "per-token broadcast");
+    assert_arm_advanced(ARM_BCAST_VEC4, before, "per-token broadcast");
     nsl_tensor_free(base);
 }
 
@@ -219,6 +251,9 @@ fn two_dimensional_transpose_matches_reference() {
     if !cuda_available() {
         return;
     }
+    let before: Vec<i64> = (0..4i64)
+        .map(|a| nsl_test_strided_copy_arm_launches(a))
+        .collect();
     let (rows, cols) = (96i64, 64i64);
     let vals = ramp((rows * cols) as usize);
     let base = gpu_tensor(&vals, &[rows, cols]);
@@ -226,6 +261,13 @@ fn two_dimensional_transpose_matches_reference() {
 
     let expect = reference(&vals, &[cols, rows], &[1, cols]);
     assert_materializes_to(view, &expect, "2d transpose");
+    for arm in [ARM_COPY, ARM_COPY_VEC4, ARM_BCAST, ARM_BCAST_VEC4] {
+        assert_eq!(
+            nsl_test_strided_copy_arm_launches(arm),
+            before[arm as usize],
+            "a true transpose must fall back to the generic kernel, but arm {arm} launched"
+        );
+    }
     nsl_tensor_free(base);
 }
 
@@ -238,6 +280,7 @@ fn unaligned_odd_run_matches_reference() {
     if !cuda_available() {
         return;
     }
+    let before = nsl_test_strided_copy_arm_launches(ARM_BCAST);
     // [8, 67] broadcast over a 33-wide innermost axis: 536 runs of 33. Both the
     // run length (33) and the run starts (stepping by 1 element) are odd, so the
     // planner must pick the scalar broadcast arm.
@@ -254,7 +297,59 @@ fn unaligned_odd_run_matches_reference() {
 
     let expect = reference(&vals, &[rows, wide, narrow], &[wide, 1, 0]);
     assert_materializes_to(view, &expect, "odd-length broadcast run");
+    assert_arm_advanced(ARM_BCAST, before, "odd-length broadcast run");
     nsl_tensor_free(reshaped);
+    nsl_tensor_free(base);
+}
+
+/// The scalar COPY arm (`nsl_scopy_run_f32`), which no other gate reaches: every
+/// other copy case here is vec4, and the odd-length case is a broadcast.
+///
+/// Same head-transpose geometry as above but with an ODD head_dim, so the run is
+/// contiguous (stride 1) yet not a whole number of float4s — vec4 must be
+/// refused and the scalar arm used. If the planner ever offered vec4 here the
+/// kernel would issue `ld.global.v4.f32` against a 4-byte-aligned address.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn odd_head_dim_copy_uses_scalar_arm() {
+    if !cuda_available() {
+        return;
+    }
+    let before = nsl_test_strided_copy_arm_launches(ARM_COPY);
+    let (b, s, h, hd) = (2i64, 8i64, 4i64, 33i64);
+    let vals = ramp((b * s * h * hd) as usize);
+    let base = gpu_tensor(&vals, &[b, s, h, hd]);
+    let view = nsl_tensor_transpose(base, 1, 2);
+
+    let shape = [b, h, s, hd];
+    let src_strides = [s * h * hd, hd, h * hd, 1];
+    let expect = reference(&vals, &shape, &src_strides);
+
+    assert_materializes_to(view, &expect, "odd head_dim copy");
+    assert_arm_advanced(ARM_COPY, before, "odd head_dim copy");
+    nsl_tensor_free(base);
+}
+
+/// `outer` beyond `gridDim.y`'s 65535 limit, so the kernels' grid-stride loop
+/// over y must take more than one trip. Nothing else in the suite exceeds 32768.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn more_runs_than_grid_y_limit_matches_reference() {
+    if !cuda_available() {
+        return;
+    }
+    let before = nsl_test_strided_copy_arm_launches(ARM_BCAST_VEC4);
+    // 70000 runs of 32: grid.y clamps to 65535, so the loop wraps once.
+    let (outer, run) = (70000i64, 32i64);
+    let vals = ramp(outer as usize);
+    let base = gpu_tensor(&vals, &[outer, 1]);
+    let target = list_of(&[outer, run]);
+    let view = nsl_tensor_expand(base, target);
+    nsl_list_free(target);
+
+    let expect = reference(&vals, &[outer, run], &[1, 0]);
+    assert_materializes_to(view, &expect, "outer beyond grid.y limit");
+    assert_arm_advanced(ARM_BCAST_VEC4, before, "outer beyond grid.y limit");
     nsl_tensor_free(base);
 }
 
@@ -281,6 +376,12 @@ fn generic_kernel_agrees_with_fast_path() {
         .env("NSL_STRIDED_COPY_RUN", "0")
         .output()
         .expect("re-exec test binary with the fast path disabled");
+    assert!(
+        out.status.success(),
+        "child exited {}; stderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let marker = "CHECKSUM=";
     let generic: f64 = stdout

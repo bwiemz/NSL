@@ -99,6 +99,8 @@ pub use cuda::{
     nsl_test_cuda_h2d, nsl_test_cuda_d2h,
     nsl_test_cuda_jit_log,
 };
+#[doc(hidden)]
+pub use cuda::strided_copy::nsl_test_strided_copy_arm_launches;
 
 // CFTP v7 follow-on (findings 3/11/13): expose the runtime-embedded PTX
 // cast constants and kernel-name C strings to the byte-for-byte parity
