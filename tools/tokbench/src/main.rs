@@ -308,7 +308,7 @@ fn print_report(report: &EvalReport, baseline: Option<f64>) {
         );
     }
     let mut exts: Vec<_> = report.by_ext.iter().collect();
-    exts.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+    exts.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
     for (ext, stat) in exts {
         println!(
             "    .{:<5} {:>4} docs  {:>9} B  {:>8} tok  {:.3} B/tok",
@@ -613,7 +613,7 @@ fn main() {
                 }
                 longest.push((n, surface.clone()));
             }
-            longest.sort_by(|a, b| b.0.cmp(&a.0));
+            longest.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
 
             let total = vocab.len();
             println!("vocab {total}, tokens containing a newline: {with_newline} ({:.1}%)",
