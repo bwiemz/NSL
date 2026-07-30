@@ -216,6 +216,25 @@ pub enum SelfResolution {
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {
     pub variables: HashMap<Symbol, (Variable, cl_types::Type)>,
+    /// Scope-aware liveness for FUNCTION-VALUED local bindings (nested
+    /// `fn`s, lambda / fn-typed `let`s, params). `variables` is
+    /// function-flat by Cranelift-frontend design and NEVER unbinds, but
+    /// the CHECKER is block-scoped — a nested `fn sum` declared inside
+    /// an if-arm is out of scope after the arm, and a later `sum(t)`
+    /// resolves to the BUILTIN. The shadow-dispatch guard in
+    /// `compile_call` must therefore consult THIS map, not `variables`:
+    /// trusting the flat map rerouted post-scope builtin/module-fn
+    /// calls into a dead (undefined-on-path or stale) function pointer
+    /// — a runtime crash, review HIGH on 371ee02f. Keyed by symbol with
+    /// a liveness count so shadowing across nested scopes balances.
+    pub live_fn_bindings: HashMap<Symbol, u32>,
+    /// One entry per OPEN binding scope (if/elif/else arms, loop bodies,
+    /// match arms, block expressions), listing the symbols registered in
+    /// that scope. `pop_fn_binding_scope` decrements their liveness.
+    /// Registration with NO open scope is a function-root binding
+    /// (params, top-level nested fns) and stays live for the whole
+    /// function — which is exactly the checker's scoping for those.
+    pub fn_binding_scopes: Vec<Vec<Symbol>>,
     pub param_symbols: HashSet<Symbol>,
     pub non_owning_symbols: HashSet<Symbol>,
     pub dataloader_symbols: HashSet<Symbol>,
@@ -303,6 +322,8 @@ impl FuncState {
     pub fn new() -> Self {
         FuncState {
             variables: HashMap::new(),
+            live_fn_bindings: HashMap::new(),
+            fn_binding_scopes: Vec::new(),
             param_symbols: HashSet::new(),
             non_owning_symbols: HashSet::new(),
             dataloader_symbols: HashSet::new(),
@@ -333,5 +354,47 @@ impl FuncState {
         let var = Variable::from_u32(self.var_counter as u32);
         self.var_counter += 1;
         var
+    }
+
+    /// Open a binding scope for `live_fn_bindings`. Call at the start of
+    /// every lowering that compiles a checker-scoped statement list
+    /// (if/elif/else arms, loop bodies, match arms, block expressions);
+    /// pair with `pop_fn_binding_scope` at its end.
+    pub fn push_fn_binding_scope(&mut self) {
+        self.fn_binding_scopes.push(Vec::new());
+    }
+
+    /// Close the innermost binding scope, retiring the fn-value bindings
+    /// it registered. Direction of failure, stated carefully (the first
+    /// draft of this comment had it BACKWARDS — review LOW on 682641ca):
+    /// a missed POP *widens* liveness, and because the flat `variables`
+    /// entry also persists, widened liveness is exactly the STALE-REROUTE
+    /// direction — the dangerous one. An EXTRA pop is the safe direction
+    /// (under-liveness falls back to builtin precedence, the pre-guard
+    /// behavior). Today every skipped-pop path is an `Err` propagation
+    /// that aborts the whole function compile, so no live window exists;
+    /// any future error-recovery path must keep the pairs balanced.
+    pub fn pop_fn_binding_scope(&mut self) {
+        if let Some(scope) = self.fn_binding_scopes.pop() {
+            for sym in scope {
+                if let Some(n) = self.live_fn_bindings.get_mut(&sym) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.live_fn_bindings.remove(&sym);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a function-valued binding (nested `fn`, lambda / fn-typed
+    /// `let`, fn-typed param) as live in the innermost open scope — or
+    /// for the whole function when no scope is open (params, top-level
+    /// nested fns), matching the checker's scoping.
+    pub fn register_fn_binding(&mut self, sym: Symbol) {
+        *self.live_fn_bindings.entry(sym).or_insert(0) += 1;
+        if let Some(top) = self.fn_binding_scopes.last_mut() {
+            top.push(sym);
+        }
     }
 }

@@ -1295,6 +1295,15 @@ impl Compiler<'_> {
                             state
                                 .variable_types
                                 .insert(sym, self.node_type(expr.id).clone());
+                            // Function-valued binding (lambda, fn alias,
+                            // call returning a fn): register scoped
+                            // liveness for the shadow-dispatch guard.
+                            if matches!(
+                                self.node_type(expr.id),
+                                nsl_semantic::types::Type::Function { .. }
+                            ) {
+                                state.register_fn_binding(sym);
+                            }
                             if self.expr_is_dataloader_handle(state, expr) {
                                 state.dataloader_symbols.insert(sym);
                             } else {
@@ -1681,6 +1690,10 @@ impl Compiler<'_> {
                 builder.declare_var(var, cl_types::I64);
                 builder.def_var(var, addr);
                 state.variables.insert(fn_def.name, (var, cl_types::I64));
+                // Scoped liveness for the shadow-dispatch guard — the
+                // flat `variables` entry above never unbinds, but the
+                // checker scopes this fn to the enclosing block.
+                state.register_fn_binding(fn_def.name);
             }
 
             StmtKind::GradBlock(grad) => {
@@ -3083,9 +3096,11 @@ impl Compiler<'_> {
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.flags.conditional_depth += 1;
+        state.push_fn_binding_scope();
         for s in &then_block.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.flags.conditional_depth -= 1;
         let current = state.current_block.unwrap_or(then_bb);
         if !is_block_filled(builder, current) {
@@ -3117,9 +3132,11 @@ impl Compiler<'_> {
             state.dataloader_symbols = incoming_loader_symbols.clone();
             state.cleanup.dataloader_vars = incoming_loader_vars.clone();
             state.flags.conditional_depth += 1;
+            state.push_fn_binding_scope();
             for s in &elif_body.stmts {
                 self.compile_stmt(builder, state, s)?;
             }
+            state.pop_fn_binding_scope();
             state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(elif_then);
             if !is_block_filled(builder, current) {
@@ -3138,9 +3155,11 @@ impl Compiler<'_> {
             state.dataloader_symbols = incoming_loader_symbols.clone();
             state.cleanup.dataloader_vars = incoming_loader_vars.clone();
             state.flags.conditional_depth += 1;
+            state.push_fn_binding_scope();
             for s in &else_body.stmts {
                 self.compile_stmt(builder, state, s)?;
             }
+            state.pop_fn_binding_scope();
             state.flags.conditional_depth -= 1;
             let current = state.current_block.unwrap_or(current_else);
             if !is_block_filled(builder, current) {
@@ -3251,9 +3270,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3351,9 +3372,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3589,9 +3612,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3709,9 +3734,11 @@ impl Compiler<'_> {
             exit_block,
             batch_var: None,
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         for sym in &predecl_syms {
             state.eltls_loop_predeclared.remove(sym);
@@ -3880,9 +3907,11 @@ impl Compiler<'_> {
             exit_block: break_exit_block,
             batch_var: Some(batch_var),
         });
+        state.push_fn_binding_scope();
         for s in &body.stmts {
             self.compile_stmt(builder, state, s)?;
         }
+        state.pop_fn_binding_scope();
         state.loop_stack.pop();
         state.borrowed_batch_symbols.remove(&loop_var_sym);
         for sym in &predecl_syms {
@@ -3971,9 +4000,11 @@ impl Compiler<'_> {
                 PatternKind::Wildcard => {
                     // Default arm — always taken
                     state.flags.conditional_depth += 1;
+                    state.push_fn_binding_scope();
                     for s in &arm.body.stmts {
                         self.compile_stmt(builder, state, s)?;
                     }
+                    state.pop_fn_binding_scope();
                     state.flags.conditional_depth -= 1;
                     if let Some(block) = state.current_block {
                         if !is_block_filled(builder, block) {
@@ -4001,9 +4032,11 @@ impl Compiler<'_> {
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         state.flags.conditional_depth += 1;
+                        state.push_fn_binding_scope();
                         for s in &arm.body.stmts {
                             self.compile_stmt(builder, state, s)?;
                         }
+                        state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
@@ -4022,9 +4055,11 @@ impl Compiler<'_> {
                         builder.def_var(var, subject_val);
                         state.variables.insert(*sym, (var, cl_types::I64));
                         state.flags.conditional_depth += 1;
+                        state.push_fn_binding_scope();
                         for s in &arm.body.stmts {
                             self.compile_stmt(builder, state, s)?;
                         }
+                        state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
                         if let Some(block) = state.current_block {
                             if !is_block_filled(builder, block) {
@@ -4058,9 +4093,11 @@ impl Compiler<'_> {
                     builder.seal_block(arm_block);
                     state.current_block = Some(arm_block);
                     state.flags.conditional_depth += 1;
+                    state.push_fn_binding_scope();
                     for s in &arm.body.stmts {
                         self.compile_stmt(builder, state, s)?;
                     }
+                    state.pop_fn_binding_scope();
                     state.flags.conditional_depth -= 1;
                     let current = state.current_block.unwrap_or(arm_block);
                     if !is_block_filled(builder, current) {
@@ -4095,9 +4132,11 @@ impl Compiler<'_> {
                         builder.seal_block(arm_block);
                         state.current_block = Some(arm_block);
                         state.flags.conditional_depth += 1;
+                        state.push_fn_binding_scope();
                         for s in &arm.body.stmts {
                             self.compile_stmt(builder, state, s)?;
                         }
+                        state.pop_fn_binding_scope();
                         state.flags.conditional_depth -= 1;
                         let current = state.current_block.unwrap_or(arm_block);
                         if !is_block_filled(builder, current) {
@@ -15212,6 +15251,13 @@ impl Compiler<'_> {
         //    The last expression is the loss (a scalar tensor).
         state.flags.in_tape_region = true;
         let mut loss_val = None;
+        // The grad body is checker-scoped (check_block ScopeKind::Block)
+        // but compiles in the SAME FuncState with no variables restore —
+        // a nested fn declared here must not stay a live fn-binding
+        // after the block (review MEDIUM on 682641ca: a post-block call
+        // the checker resolved to the builtin rerouted into the grad
+        // body's dead nested fn — misaligned-deref abort).
+        state.push_fn_binding_scope();
         for (i, stmt) in grad.body.stmts.iter().enumerate() {
             if i == grad.body.stmts.len() - 1 {
                 if let StmtKind::Expr(ref expr) = stmt.kind {
@@ -15223,6 +15269,7 @@ impl Compiler<'_> {
                 self.compile_stmt(builder, state, stmt)?;
             }
         }
+        state.pop_fn_binding_scope();
         // ELTLS: free tape-held tensors before clearing the tape flag.
         self.free_tape_held_tensors(builder, state);
         state.flags.in_tape_region = false;

@@ -28,6 +28,10 @@ impl Compiler<'_> {
             return Err(CodegenError::new("block expression must end with a value"));
         }
 
+        // Checker scope for the whole block expression: nested fns among
+        // the leading statements are visible to the trailing expression
+        // and die at block end.
+        state.push_fn_binding_scope();
         for stmt in &block.stmts[..block.stmts.len() - 1] {
             self.compile_stmt(builder, state, stmt)?;
             if state
@@ -51,10 +55,12 @@ impl Compiler<'_> {
         // the per-statement invariant should hold structurally, not by
         // accident of the current arm population.
         state.cleanup.dispatch_fresh.clear();
-        match &block.stmts[block.stmts.len() - 1].kind {
+        let result = match &block.stmts[block.stmts.len() - 1].kind {
             StmtKind::Expr(expr) => self.compile_expr(builder, state, expr),
             _ => Err(CodegenError::new("block expression must end with a value")),
-        }
+        };
+        state.pop_fn_binding_scope();
+        result
     }
 
     pub(crate) fn compile_if_expr(

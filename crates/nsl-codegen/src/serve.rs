@@ -476,9 +476,14 @@ impl Compiler<'_> {
                     state.variables.insert(param.name, (var, cl_types::I64));
                     state.param_symbols.insert(param.name);
                 }
+                // Endpoint bodies are checker-scoped; scope their
+                // fn-value bindings (review MEDIUM on 682641ca, same
+                // class as the grad-body gap).
+                state.push_fn_binding_scope();
                 for stmt in &endpoint.body.stmts {
                     self.compile_stmt(builder, state, stmt)?;
                 }
+                state.pop_fn_binding_scope();
             }
 
             // CFIE Cycle 11: the serve body is done — the `generate()`
@@ -1630,9 +1635,12 @@ impl Compiler<'_> {
         )?;
         // Router runs endpoint bodies (sets up the event loop)
         for endpoint in &serve.endpoints {
+            // Same scoping as the monolithic serve path above.
+            state.push_fn_binding_scope();
             for stmt in &endpoint.body.stmts {
                 self.compile_stmt(builder, state, stmt)?;
             }
+            state.pop_fn_binding_scope();
         }
         self.compile_call_by_name(builder, "nsl_disagg_destroy", &[])?;
         builder.ins().jump(merge_block, &[]);

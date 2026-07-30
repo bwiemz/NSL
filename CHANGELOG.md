@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed — nested fns, lambdas, and fn-typed params now win builtin-name dispatch
+
+- **A local binding holding a function value lost dispatch to any
+  builtin arm sharing its name.** The registry guards from #429 cover
+  module-level user fns, but nested `fn`s are removed from
+  `registry.functions` right after their body compiles and lambdas
+  never enter it — so a nested `fn topk` hit the BUILTIN arm while the
+  checker had typed the user fn: a runtime magic-abort or a cranelift
+  ICE depending on arity (the bugs.md 2026-07-28 `fn topk` shadow ICE).
+  `compile_call` now routes any local binding whose checker type is
+  `Type::Function` straight to `compile_indirect_call` before every
+  builtin arm; non-Function locals (a tensor named `sum`) keep builtin
+  dispatch unchanged.
+- The guard's binding lookup is the new scope-aware `live_fn_bindings`
+  map, NOT the flat `state.variables`: the flat map never unbinds, but
+  the checker is block-scoped — the first cut trusted the flat map and
+  the independent review runtime-confirmed four crash shapes where a
+  call AFTER the shadowing arm exited (which the checker resolves to
+  the builtin or module fn) rerouted into a dead function pointer.
+  Every arm/body/match/block-expression lowering now pushes and pops a
+  binding scope mirroring the checker.
+- The review's residual-gap pass added grad-block bodies (runtime-
+  confirmed crash: a post-grad-block builtin call rerouted into the
+  grad body's dead nested fn) and both serve endpoint-body sites to the
+  scoped lowerings; the pop-direction safety comment was also inverted
+  and is now stated correctly (a MISSED pop is the dangerous direction —
+  balance is load-bearing).
+- Eight new CPU gates: nested fn, let-bound lambda, fn-typed parameter
+  (each value-pinned; mutation-proven red with the route disabled) plus
+  the reviewer's four post-scope repros — dead-arm nested fn, LIVE-arm
+  nested fn, dead-arm lambda, dead-arm module-fn shadow (mutation-proven
+  red with the scope pop disabled) — and the post-grad-block shape
+  (mutation-proven red with the grad scope removed). Module-level arms
+  WITHOUT a registry guard (e.g. `reduce_max`) remain a documented gap
+  for the dispatch-arm audit.
+- Discovered en route, filed in bugs.md, NOT fixed here: indirect calls
+  MISCOMPILE float arguments (`(|v: float| v * 2.0)(3.0)` returns 4,
+  silently) — pre-existing on the parent tree, int-typed indirect calls
+  are correct; the new gates use int lambdas deliberately and say why.
+
 ### Fixed — while-condition temporaries no longer strand per evaluation
 
 - **A while loop's condition stranded its tensor temporaries once per
