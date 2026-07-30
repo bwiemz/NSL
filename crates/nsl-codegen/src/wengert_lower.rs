@@ -4144,8 +4144,13 @@ fn lower_fused_linear_ce_forward(
     // overread the buffer 2× — deterministic-garbage classes on small
     // shapes, CUDA_ERROR_ILLEGAL_ADDRESS at v49152 (first real e2e
     // engagement of the fused path).
-    let tgt_ptr =
-        call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
+    let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+    let tgt_ptr = call(
+        compiler,
+        builder,
+        "nsl_fused_lce_targets_i64_alloc",
+        &[targets_t, expected_rows_v],
+    )?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
 
@@ -4542,8 +4547,13 @@ fn lower_fused_linear_ce_backward_extract(
         let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t_for_ffi])?;
         // Targets dtype bridge — same s64-vs-f32 contract fix as the
         // forward (see the forward-side comment); freed after the FFI.
-        let tgt_ptr =
-            call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
+        let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+        let tgt_ptr = call(
+            compiler,
+            builder,
+            "nsl_fused_lce_targets_i64_alloc",
+            &[targets_t, expected_rows_v],
+        )?;
         let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
         let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
         let dw_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dw_out])?;
@@ -4777,8 +4787,13 @@ fn lower_fused_kl_ce_forward(
     // linear-CE s64 targets convention; NSL labels are f32/i32 4-byte —
     // same 2× overread class fixed on the linear-CE sites. Freed after
     // the FFI below.
-    let tgt_ptr =
-        call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
+    let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+    let tgt_ptr = call(
+        compiler,
+        builder,
+        "nsl_fused_lce_targets_i64_alloc",
+        &[targets_t, expected_rows_v],
+    )?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1_out])?;
     let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st_out])?;
@@ -4945,8 +4960,13 @@ fn lower_fused_kl_ce_backward_extract(
         let wt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[wt_t])?;
         let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
         // Targets dtype bridge (review D2c-2) — see the forward site.
-        let tgt_ptr =
-            call(compiler, builder, "nsl_fused_lce_targets_i64_alloc", &[targets_t])?;
+        let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+        let tgt_ptr = call(
+            compiler,
+            builder,
+            "nsl_fused_lce_targets_i64_alloc",
+            &[targets_t, expected_rows_v],
+        )?;
         let lse_s1_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_s1])?;
         let lse_st_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_st])?;
         let lse_tt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_tt])?;

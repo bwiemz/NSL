@@ -220,8 +220,19 @@ pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
 /// Returns the raw device pointer (NOT an NslTensor — the 8-byte stride
 /// would corrupt f32 byte-size accounting); release it with
 /// [`nsl_fused_lce_targets_i64_free`] after the kernel FFI returns.
+/// `expected_rows` pins the label count to the decorator-derived
+/// `batch_size * seq_len` (review Sprint 2.5 finding): the fused kernels
+/// index `rows` entries with no length validation of their own, so a
+/// program whose loss flatten produced a DIFFERENT row count (e.g. a
+/// `[B,S,V] -> [B, S*V]` reshape the see-through cannot distinguish from
+/// the row-preserving flatten) would otherwise read past this staging
+/// buffer on device — garbage class indices or ILLEGAL_ADDRESS. Pass 0 to
+/// skip the check (no caller does today).
 #[no_mangle]
-pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
+pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
+    tensor_ptr: i64,
+    expected_rows: i64,
+) -> i64 {
     if tensor_ptr == 0 {
         eprintln!("nsl_fused_lce_targets_i64_alloc: null tensor");
         std::process::abort();
@@ -230,6 +241,18 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
     {
         let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
         let n = t.len as usize;
+        if expected_rows > 0 && t.len != expected_rows {
+            eprintln!(
+                "nsl_fused_lce_targets_i64_alloc: label tensor has {} entries \
+                 but the @fused_lm_ce decorator pins batch_size * seq_len = \
+                 {expected_rows}. The loss flatten and the decorator hints \
+                 disagree — the fused kernel would read out of bounds. Fix \
+                 the reshape (it must be the row-preserving \
+                 [B,S,V] -> [B*S,V] flatten) or the decorator hints.",
+                t.len
+            );
+            std::process::abort();
+        }
         // Density guard (review D2c-3): the reads below walk t.data
         // linearly — a broadcast/expand view (stride 0) or a strided
         // slice would be silently misread. Every real label path is a

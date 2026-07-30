@@ -2920,7 +2920,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Fused-CE targets dtype bridge: the kernels read targets as s64 but
     // NSL GPU labels are f32 — materialize/free a device i64 copy around
     // each fused forward/backward FFI.
-    ("nsl_fused_lce_targets_i64_alloc", &[types::I64], Some(types::I64)),
+    // Second arg: expected row count (decorator batch*seq) — the runtime
+    // aborts loudly on mismatch instead of overreading the staging buffer.
+    ("nsl_fused_lce_targets_i64_alloc", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_fused_lce_targets_i64_free", &[types::I64], None),
     // D2b weight streaming: pointer-identity host offload of model params
     // (side-table mirrors; tensor pointers never change).

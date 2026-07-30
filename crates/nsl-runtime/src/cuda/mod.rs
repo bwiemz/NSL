@@ -2369,6 +2369,18 @@ pub(crate) mod cublas_inner {
         let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
         let use_bf16 = bf16_storage_worthwhile(m as i64, n as i64, k as i64, a_elems, b_elems);
         let (a_ptr, b_ptr, ab_type, a_scratch, b_scratch, compute) = if use_bf16 {
+            // cuda-graphs: taint the region (review finding, 2026-07-30).
+            // The caller's Sgemm pseudo-op was recorded BEFORE this branch,
+            // but the two cast launches below are hooked kernels that would
+            // ALSO be recorded — and on replay the wrapper early-returns at
+            // the Sgemm hook, so the casts are never re-issued: the next
+            // hooked op mismatches the recorded cast, the region cycles
+            // through repair, and after MAX_CAPTURE_ATTEMPTS goes
+            // permanently eager anyway — silently. Tainting makes the same
+            // outcome explicit and cheap (the muon strided path sets the
+            // precedent). BF16-mode GEMMs inside captured regions run
+            // eager; correctness is unaffected either way.
+            super::graph_capture::taint("bf16-storage gemm casts");
             let a16 = super::inner::alloc_managed(a_elems * 2);
             let b16 = super::inner::alloc_managed(b_elems * 2);
             super::gpu_cast_raw_f32_to_bf16(a_dev as u64, a16 as u64, a_elems);
@@ -2414,9 +2426,18 @@ pub(crate) mod cublas_inner {
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
             )
         };
-        // Stream-ordered: the GEMM is enqueued after the casts on the same
-        // stream, and free_managed defers physical reuse behind the queue,
-        // so freeing immediately after enqueue is safe.
+        // Freeing immediately after enqueue is safe, but NOT because the
+        // free is deferred — `free_managed` returns the block to the
+        // caching allocator's free list synchronously, and the very next
+        // `alloc_managed` can hand it out while the GemmEx is still
+        // pending (review finding, 2026-07-30). Safety rests on two
+        // process invariants documented at the launch path: all GPU work
+        // is single-threaded on per-thread BLOCKING streams, so any
+        // subsequent WRITE into a reused block — kernel or NULL-stream
+        // copy — is enqueued after the GemmEx on the same stream. A future
+        // multi-threaded dispatcher or cross-stream writer must either
+        // event-defer these frees (`defer_free_device`) or keep the
+        // scratch alive until a sync.
         if !a_scratch.is_null() {
             super::inner::free_managed(a_scratch);
             super::inner::free_managed(b_scratch);
