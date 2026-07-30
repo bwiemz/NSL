@@ -1363,6 +1363,17 @@ impl Compiler<'_> {
                             tuple_val,
                             tuple_ty.as_ref(),
                         )?;
+                        // Review F2 on 67b9ba13: destructuring arms had no
+                        // statement-end drain — a sub-expression temp (the
+                        // inner `t * 2.0` of a tuple element `t * 2.0 + 1.0`;
+                        // the element itself transfers into the tuple)
+                        // straddled into the train step loop and was freed
+                        // once per step. The destructured value is kept
+                        // defensively: if an indeterminate-typed RHS ever
+                        // lands it in the list, freeing a list pointer via
+                        // nsl_tensor_free would abort on the magic probe.
+                        self.free_tensor_temporaries(builder, state, Some(tuple_val));
+                        self.free_linear_consumes(builder, state, Some(tuple_val));
                     }
                     PatternKind::Struct { fields, .. } => {
                         // Top-level struct destructuring: let { x, y } = expr
@@ -1430,6 +1441,12 @@ impl Compiler<'_> {
                                 }
                             }
                         }
+                        // Review F2 on 67b9ba13 — same statement-end drain as
+                        // the tuple/list destructure arm above; the bound
+                        // field values are clones (never listed) and the
+                        // struct value itself is kept defensively.
+                        self.free_tensor_temporaries(builder, state, Some(struct_val));
+                        self.free_linear_consumes(builder, state, Some(struct_val));
                     }
                     _ => {
                         return Err(CodegenError::new(

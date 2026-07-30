@@ -187,6 +187,109 @@ print("DONE")
     assert_eq!(printed_value(&stdout), "8", "borrowed store broke:\n{stdout}");
 }
 
+/// Review F1 (HIGH) on 67b9ba13: dict LITERALS stored owned-temp
+/// elements raw while the VarDecl statement-end drain freed them —
+/// the read then cloned reused memory: this fixture SILENTLY printed
+/// 2 (the reused header of `q`) instead of 8 pre-fix. The fix ports
+/// compile_tuple_literal's ownership discrimination (consume owned /
+/// retain borrowed) to dict and list literals.
+#[test]
+fn dict_literal_owned_temp_element_survives_later_sweeps() {
+    let src = r#"
+let t = ones([4])
+let d = {"a": t * 2.0}
+let q = ones([2])
+print(sum(d["a"]).item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "dictlit");
+    assert_eq!(
+        printed_value(&stdout),
+        "8",
+        "dict-literal element died (silent pre-fix!):\n{stdout}"
+    );
+}
+
+/// Same class through a list literal — list reads are raw, so the
+/// pre-fix failure was a bad-magic abort or silent garbage.
+#[test]
+fn list_literal_owned_temp_element_survives_later_sweeps() {
+    let src = r#"
+let t = ones([4])
+let l = [t, t * 2.0]
+let q = ones([2])
+let y = l[1]
+print(sum(y).item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "listlit");
+    assert_eq!(
+        printed_value(&stdout),
+        "8",
+        "list-literal element died:\n{stdout}"
+    );
+}
+
+/// Review F2 (MEDIUM) on 67b9ba13: destructuring VarDecl arms had no
+/// drain either — a sub-expression temp (`t * 2.0` inside the tuple
+/// element `t * 2.0 + 1.0`; the tuple literal itself consumes the ADD
+/// result correctly) straddled into the train step loop: freed at
+/// step 1, double-freed at step 2 (abort).
+#[test]
+fn destructure_subexpr_temp_before_train_does_not_double_free() {
+    let src = r#"
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+let t = ones([4])
+let (a, b) = (t * 2.0 + 1.0, t)
+
+train(model = m, epochs = 2):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+print(sum(a).item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "destrtrain");
+    assert_eq!(
+        printed_value(&stdout),
+        "12",
+        "destructure straddler reached the train loop:\n{stdout}"
+    );
+}
+
+/// Destructure regression pin: bindings keep working and both values
+/// read back correctly (tuple literals already discriminate ownership
+/// — this pins that the new drain does not disturb the bound values).
+#[test]
+fn tuple_destructure_bindings_still_work() {
+    let src = r#"
+let t = ones([4])
+let (a, b) = (t * 2.0, t)
+let q = ones([2])
+print(sum(a).item() + sum(b).item())
+print("DONE")
+"#;
+    let stdout = run_src(src, "destrpin");
+    assert_eq!(
+        printed_value(&stdout),
+        "12",
+        "tuple destructure broke:\n{stdout}"
+    );
+}
+
 /// Plain int container writes are untouched by the tensor machinery.
 #[test]
 fn int_list_set_unchanged() {

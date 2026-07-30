@@ -28,7 +28,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   straddled into any region that frees the list without draining it,
   and the train-block step loop freed such a straddler once per step:
   double free at step 2, the review's original scenario.
-- 6 CPU gates in `assign_temp_drain_gate.rs`: dict, list, and
+- The review's residual pass found the SAME class in two adjacent
+  arms, both fixed here: **dict/list LITERALS stored owned-temp
+  elements raw** while the VarDecl statement-end sweep freed them —
+  `let d = {"a": t * 2.0}` then reading `d["a"]` SILENTLY returned the
+  reused header of the next allocation (printed 2 instead of 8; list
+  reads aborted on bad magic). Owned elements now transfer into the
+  container (consume-only — no retain for borrows, since nothing ever
+  frees container-held values, unlike the tuple literal's convention).
+  And **destructuring `let (a, b) = ...` arms had no statement-end
+  drain** — a sub-expression temp straddled into the train step loop
+  exactly like the assign case (double free at step 2, runtime-
+  confirmed); both destructure arms now drain with the destructured
+  value kept.
+- 10 CPU gates in `assign_temp_drain_gate.rs`: dict, list, and
   struct-field stores of owned temps surviving later sweeps; the
   sub-expression straddler crossing a real 2-epoch train block; a
   borrow-store + source-variable-liveness pin; an int-list pin.
