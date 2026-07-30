@@ -147,3 +147,79 @@ fn arena_report_is_consistent_and_loss_neutral() {
         transients as f64 / peak as f64
     );
 }
+
+/// Stage-2A: the hint plumbing (semantic types + initializer-derived model
+/// field dims + adjoint mirroring) must produce a PARTIALLY QUANTIFIED
+/// report on a plain CSLA fixture — real bytes for the sized subset, the
+/// lower-bound caveat for the rest, and NOT the old "shapes runtime-valued"
+/// fallback (which is exactly what reappears if any layer of the plumbing
+/// silently breaks). CPU-only: the report is emitted at compile time.
+#[test]
+fn stage2a_report_quantifies_param_gradients_cpu() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_arena2a_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = std::fs::read_to_string(
+        root.join("crates/nsl-cli/tests/fixtures/csla_layerwise_ffn.nsl"),
+    )
+    .unwrap()
+    .replace(
+        "CSLA_SAVE_PATH",
+        &tmp.join("out.nslm").display().to_string().replace('\\', "/"),
+    );
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args([
+            "run",
+            "--source-ad",
+            "--deterministic",
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+        ])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_ARENA_REPORT", "1")
+        .output()
+        .expect("spawn nsl run");
+    assert!(
+        out.status.success(),
+        "run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let arena = stderr
+        .split("[arena]")
+        .nth(1)
+        .expect("no [arena] report in stderr");
+    assert!(
+        arena.contains("arena bytes:"),
+        "no quantified byte line — the Stage-2A hint plumbing went dark:\n{arena}"
+    );
+    assert!(
+        arena.contains("LOWER BOUND"),
+        "partial quantification must be labeled a lower bound:\n{arena}"
+    );
+    assert!(
+        !arena.contains("shapes runtime-valued"),
+        "report fell back to the pre-2A unquantified branch:\n{arena}"
+    );
+    assert!(
+        arena.contains("tape-escaping"),
+        "gradient accumulators must be pinned live-to-tape-end (the escape \
+         fix) and reported as resident:\n{arena}"
+    );
+    // "bytes cover N of M transients" — N must be positive and below M
+    // (this fixture's params are sized via initializer dims + the adjoint
+    // mirror; its activation transients remain runtime-shaped).
+    let covered = first_int_after(arena, "bytes cover ")
+        .expect("no coverage count in the partial-quantification line");
+    let total = first_int_after(arena, " of ")
+        .expect("no total count in the partial-quantification line");
+    assert!(
+        covered > 0 && covered < total,
+        "expected 0 < covered < total, got {covered} of {total}:\n{arena}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}

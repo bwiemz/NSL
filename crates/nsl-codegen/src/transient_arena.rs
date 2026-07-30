@@ -91,15 +91,29 @@ pub struct ArenaPlan {
     pub max_concurrency: usize,
     /// Program point at which `max_concurrency` is reached (first such point).
     pub peak_at: u32,
-    /// Byte-level BFD packing, present only when *every* transient's element
-    /// count was known (the quantified path). `elem_bytes` was assumed for the
-    /// dtype. `None` when any transient is runtime-shaped.
+    /// Byte-level BFD packing over the SIZED subset of transients (Stage-2A
+    /// partial quantification; `slab_transients` maps its dense ids back to
+    /// `transients` positions). `elem_bytes` was assumed for the dtype.
+    /// `None` only when nothing at all could be sized.
     pub slab: Option<SlabPlan>,
     /// Σ of live-interval lengths — a proxy for the alloc/free churn the
     /// caching allocator performs that a static arena removes.
     pub total_alloc_events: usize,
     /// Bytes assumed per element for the quantified path (GPU training = f32).
     pub elem_bytes: u64,
+    /// Transients with NO static element count (Stage-2A partial
+    /// quantification): they are outside `slab` and make every byte figure a
+    /// lower bound. Zero means the slab covers the whole tape.
+    pub unsized_count: usize,
+    /// Dense alloc id -> position in `transients`, for the sized subset the
+    /// slab was planned over (`slab.assignments` is keyed by the dense id).
+    /// Identity permutation when `unsized_count == 0`.
+    pub slab_transients: Vec<usize>,
+    /// Transients pinned live-to-tape-end because something AFTER the tape
+    /// reads them (gradient accumulators, the loss). They can never share a
+    /// slot with each other, so their arena contribution is exactly their
+    /// sum — the honest floor, not a packing win.
+    pub escaping_count: usize,
 }
 
 /// True when `op` materializes a fresh device tensor that a transient arena
@@ -150,15 +164,23 @@ fn result_type(list: &WengertList, op: &crate::wengert::WengertOp) -> WengertTyp
 /// known (`|_| None` yields the size-agnostic concurrency result — the common
 /// case, since most transients are runtime-shaped). `elem_bytes` is the assumed
 /// dtype width for the quantified path (4 for GPU f32 training).
+/// `tape_escaping` names values consumed AFTER the tape — param-gradient
+/// accumulators read by the optimizer emission, the loss read by callbacks.
+/// The tape itself never reads them, so pure last-use liveness would give
+/// them `death == birth` and BFD would happily time-share every gradient in
+/// one slot — an illegal aliasing that inflated the byte savings until the
+/// review caught it. Escaping values are pinned live to tape end instead.
 pub fn analyze(
     forward: &WengertList,
     adjoint: &WengertList,
     elems_of: &dyn Fn(VarId) -> Option<u64>,
+    tape_escaping: &std::collections::HashSet<VarId>,
     elem_bytes: u64,
 ) -> ArenaPlan {
     // Concatenated timeline: forward ops first, then adjoint. A saved forward
     // value read in the backward therefore has death >= forward.len().
     let fwd_n = forward.ops.len();
+    let tape_end = (fwd_n + adjoint.ops.len()) as u32;
 
     // last_use[var] = highest concatenated index whose op reads `var`.
     let mut last_use: HashMap<VarId, u32> = HashMap::new();
@@ -185,8 +207,14 @@ pub fn analyze(
                 continue;
             }
             let birth = (base + i) as u32;
-            // Never-used values die where they were born (allocated then freed).
-            let death = last_use.get(&op.result).copied().unwrap_or(birth).max(birth);
+            // Never-used values die where they were born (allocated then
+            // freed) — unless they ESCAPE the tape, in which case they live
+            // to its end (nothing on the tape reads a value the optimizer
+            // or a callback consumes afterwards).
+            let mut death = last_use.get(&op.result).copied().unwrap_or(birth).max(birth);
+            if tape_escaping.contains(&op.result) {
+                death = death.max(tape_end.saturating_sub(1));
+            }
             transients.push(Transient {
                 var: op.result,
                 birth,
@@ -208,16 +236,34 @@ pub fn analyze(
 
     let total_alloc_events = transients.len();
 
-    // Quantified path: only when *every* transient has a known element count.
-    let all_known = !transients.is_empty() && transients.iter().all(|t| t.elems.is_some());
-    let slab = if all_known {
-        let allocs: Vec<TensorAlloc> = transients
+    // Quantified path (Stage-2A): PARTIAL quantification. The old gate was
+    // all-or-nothing (`all(|t| t.elems.is_some())`), which on real programs
+    // meant the byte path never fired at all — one runtime-shaped transient
+    // starved the whole plan. The slab is now planned over the SIZED subset;
+    // unsized transients are counted and reported, never silently absorbed.
+    // The resulting byte total is therefore a LOWER BOUND on the full arena
+    // (Stage-2 placement can only place what it can size), and the report
+    // says so whenever the unsized count is nonzero.
+    // The M36 engine indexes its interference/offset arrays by alloc id, so
+    // ids must be DENSE 0..n over the sized subset; `slab_transients` maps
+    // each dense id back to its position in `transients` (identity when
+    // everything is sized, i.e. the pre-2A behavior).
+    let slab_transients: Vec<usize> = transients
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.elems.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let unsized_count = transients.len() - slab_transients.len();
+    let slab = if !slab_transients.is_empty() {
+        let allocs: Vec<TensorAlloc> = slab_transients
             .iter()
             .enumerate()
-            .map(|(id, t)| {
+            .map(|(dense, &ti)| {
+                let t = &transients[ti];
                 let bytes = t.elems.unwrap().saturating_mul(elem_bytes);
                 TensorAlloc {
-                    id: id as u32,
+                    id: dense as u32,
                     name: format!("t{}", t.var),
                     size_bytes: bytes,
                     birth: t.birth,
@@ -237,13 +283,21 @@ pub fn analyze(
         None
     };
 
+    let escaping_count = transients
+        .iter()
+        .filter(|t| tape_escaping.contains(&t.var))
+        .count();
+
     ArenaPlan {
         transients,
         max_concurrency,
         peak_at,
         slab,
+        slab_transients,
         total_alloc_events,
         elem_bytes,
+        unsized_count,
+        escaping_count,
     }
 }
 
@@ -321,6 +375,7 @@ impl ArenaPlan {
             self.total_alloc_events, self.max_concurrency, self.max_concurrency,
         ));
         if let Some(slab) = &self.slab {
+            let sized = self.total_alloc_events - self.unsized_count;
             out.push_str(&format!(
                 "{indent}  arena bytes: {} vs naive {} ({:.2}x smaller, {:.1}% saved), \
                  {} slot(s), frag {:.1}%\n",
@@ -331,6 +386,22 @@ impl ArenaPlan {
                 slab.slots.len(),
                 slab.fragmentation_ratio() * 100.0,
             ));
+            if self.unsized_count > 0 {
+                out.push_str(&format!(
+                    "{indent}  partial quantification: bytes cover {sized} of {} \
+                     transients ({} unsized stay on the caching allocator) — \
+                     the byte figures are a LOWER BOUND on the full arena\n",
+                    self.total_alloc_events, self.unsized_count,
+                ));
+            }
+            if self.escaping_count > 0 {
+                out.push_str(&format!(
+                    "{indent}  {} tape-escaping value(s) (gradient accumulators \
+                     / loss) pinned live to tape end — resident, never \
+                     slot-shared\n",
+                    self.escaping_count,
+                ));
+            }
         } else {
             // Unquantified: report the concurrency win in alloc-count terms.
             let churn_reduction = if self.max_concurrency > 0 {
@@ -391,7 +462,7 @@ mod tests {
 
     #[test]
     fn empty_is_safe() {
-        let plan = analyze(&list(vec![]), &list(vec![]), &none_elems(), 4);
+        let plan = analyze(&list(vec![]), &list(vec![]), &none_elems(), &Default::default(), 4);
         assert_eq!(plan.max_concurrency, 0);
         assert!(plan.transients.is_empty());
         assert!(plan.slab.is_none());
@@ -414,7 +485,7 @@ mod tests {
             op(5, 5, PrimalOp::Select, vec![0]),
             op(6, 6, PrimalOp::Relu, vec![0]),
         ]);
-        let plan = analyze(&fwd, &list(vec![]), &none_elems(), 4);
+        let plan = analyze(&fwd, &list(vec![]), &none_elems(), &Default::default(), 4);
         let mut vars: Vec<VarId> = plan.transients.iter().map(|t| t.var).collect();
         vars.sort();
         // Reshape (4), Select (5), Relu (6) all materialize; transpose (3) and
@@ -435,7 +506,7 @@ mod tests {
             op(10, 100, PrimalOp::Constant(1.0), vec![]), // seed
             op(11, 101, PrimalOp::Mul, vec![1, 100]),     // reads h (var 1) in backward
         ]);
-        let plan = analyze(&fwd, &bwd, &none_elems(), 4);
+        let plan = analyze(&fwd, &bwd, &none_elems(), &Default::default(), 4);
         let h = plan.transients.iter().find(|t| t.var == 1).unwrap();
         assert!(h.saved_for_backward);
         // Born at index 1, last used at concatenated index 4 (fwd_n=3 + 1).
@@ -453,7 +524,7 @@ mod tests {
             op(2, 2, PrimalOp::Relu, vec![1]), // reads h at 2
             op(3, 3, PrimalOp::FreeTensor, vec![1]), // frees h at 3
         ]);
-        let plan = analyze(&fwd, &list(vec![]), &none_elems(), 4);
+        let plan = analyze(&fwd, &list(vec![]), &none_elems(), &Default::default(), 4);
         let h = plan.transients.iter().find(|t| t.var == 1).unwrap();
         // FreeTensor counts as the last use -> death 3, not extended past it.
         assert_eq!(h.death, 3);
@@ -474,7 +545,7 @@ mod tests {
             op(5, 5, PrimalOp::Add, vec![2, 3]), // uses b,c at 5
             op(6, 6, PrimalOp::Add, vec![3, 4]), // uses c at 6
         ]);
-        let plan = analyze(&fwd, &list(vec![]), &none_elems(), 4);
+        let plan = analyze(&fwd, &list(vec![]), &none_elems(), &Default::default(), 4);
         // a:[1..4) b:[2..5) c:[3..6) plus the Add results 4,5,6.
         // Peak overlap of the relu chain is 3 (a,b,c) around point 3-4.
         assert!(plan.max_concurrency >= 3, "got {}", plan.max_concurrency);
@@ -493,7 +564,7 @@ mod tests {
         ]);
         // All same element count -> quantified path fires.
         let elems = |_v: VarId| Some(256u64);
-        let plan = analyze(&fwd, &list(vec![]), &elems, 4);
+        let plan = analyze(&fwd, &list(vec![]), &elems, &Default::default(), 4);
         let slab = plan.slab.as_ref().expect("all shapes known -> quantified");
         // The chain a->b->c->d is a path graph under the occupancy model (each
         // value coexists with its immediate consumer during the consuming op),
@@ -512,6 +583,86 @@ mod tests {
     }
 
     #[test]
+    fn partial_hints_quantify_the_sized_subset_only() {
+        // Stage-2A: one unsized transient must no longer starve the byte
+        // plan. Sizes known for vars 1 and 3 only; var 2 stays unsized.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Relu, vec![0]), // sized
+            op(2, 2, PrimalOp::Relu, vec![1]), // UNSIZED
+            op(3, 3, PrimalOp::Relu, vec![2]), // sized
+            op(4, 4, PrimalOp::Neg, vec![3]),
+        ]);
+        let elems = |v: VarId| (v != 2).then_some(64u64);
+        let plan = analyze(&fwd, &list(vec![]), &elems, &Default::default(), 4);
+        assert_eq!(plan.unsized_count, 1);
+        let slab = plan.slab.as_ref().expect("sized subset must be planned");
+        // The sized transients are vars 1, 3 and 4 (Neg allocates too), so
+        // the slab's naive total is 3 * 64 * 4 and the dense ids map back
+        // to transient positions through `slab_transients`.
+        assert_eq!(slab.naive_total, 3 * 64 * 4);
+        assert_eq!(plan.slab_transients.len(), 3);
+        // Var 1 is dead before var 3; vars 3 and 4 coexist -> two slots.
+        assert_eq!(slab.slots.len(), 2);
+        let report = plan.render_report("");
+        assert!(
+            report.contains("LOWER BOUND") && report.contains("1 unsized"),
+            "partial quantification must be called out:\n{report}"
+        );
+        // Concurrency stays computed over ALL transients, sized or not.
+        assert_eq!(plan.max_concurrency, 2);
+    }
+
+    #[test]
+    fn escaping_values_live_to_tape_end_and_never_share() {
+        // Two gradient-accumulator-shaped values: born on the tape, never
+        // READ by any tape op (the optimizer consumes them afterwards).
+        // Pure last-use liveness gives them point intervals — BFD would
+        // time-share every gradient in one slot, which is exactly the
+        // illegal aliasing the escape pin exists to prevent.
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Relu, vec![0]), // g1: escapes, no tape reader
+            op(2, 2, PrimalOp::Relu, vec![0]), // t: ordinary transient
+            op(3, 3, PrimalOp::Relu, vec![2]), // g2: escapes, no tape reader
+        ]);
+        let escaping: std::collections::HashSet<VarId> = [1, 3].into_iter().collect();
+        let plan = analyze(&fwd, &list(vec![]), &|_| Some(50u64), &escaping, 4);
+        assert_eq!(plan.escaping_count, 2);
+        let g1 = plan.transients.iter().find(|t| t.var == 1).unwrap();
+        let g2 = plan.transients.iter().find(|t| t.var == 3).unwrap();
+        assert_eq!(g1.death, 3, "escaping value must be pinned to tape end");
+        assert_eq!(g2.death, 3);
+        let slab = plan.slab.as_ref().unwrap();
+        // g1/g2/t all overlap at the tape tail -> three slots, ZERO packing
+        // win (slot alignment padding can push the arena total slightly
+        // above raw naive; what matters is that nothing was shared).
+        assert_eq!(slab.slots.len(), 3);
+        assert!(slab.total_bytes >= slab.naive_total);
+        let report = plan.render_report("");
+        assert!(
+            report.contains("tape-escaping"),
+            "escaping pin must be visible in the report:\n{report}"
+        );
+    }
+
+    #[test]
+    fn full_hints_report_carries_no_partial_caveat() {
+        let fwd = list(vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Relu, vec![0]),
+            op(2, 2, PrimalOp::Relu, vec![1]),
+        ]);
+        let plan = analyze(&fwd, &list(vec![]), &|_| Some(8u64), &Default::default(), 4);
+        assert_eq!(plan.unsized_count, 0);
+        let report = plan.render_report("");
+        assert!(
+            !report.contains("LOWER BOUND"),
+            "fully-sized plan must not claim partiality:\n{report}"
+        );
+    }
+
+    #[test]
     fn saved_tensors_never_share_a_slot() {
         // Two saved-for-backward tensors with disjoint intervals must NOT be
         // coalesced (gradient-key uniqueness), so the arena keeps 2 slots even
@@ -524,7 +675,7 @@ mod tests {
             op(4, 4, PrimalOp::Neg, vec![3]),         // last use of s2
         ]);
         let elems = |_v: VarId| Some(100u64);
-        let plan = analyze(&fwd, &list(vec![]), &elems, 4);
+        let plan = analyze(&fwd, &list(vec![]), &elems, &Default::default(), 4);
         let slab = plan.slab.as_ref().unwrap();
         // s1 (var 1) and s2 (var 3) are disjoint in time but both saved ->
         // forced to distinct slots. `assignments` is keyed by TensorAllocId

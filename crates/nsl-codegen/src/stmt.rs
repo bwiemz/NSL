@@ -9054,16 +9054,93 @@ impl Compiler<'_> {
                 // surface the M36 slab planner (AST, forward-only) never sees.
                 // Pure analysis; no codegen change. Gated by --memory-report or
                 // NSL_ARENA_REPORT=1.
-                if self.compile_options.memory_report
-                    || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1")
-                {
-                    // Transients are runtime-shaped here, so element counts are
-                    // unquantified (|_| None) and the headline is peak
-                    // concurrency (the arena slot count). Stage-2 wires shapes.
+                // Stage-2A shape hints, shared by the arena report and the
+                // CSLA layerwise calibration below. Three SOUND layers, in
+                // priority order:
+                //   1. semantic-typed shapes (annotated Tensor<[..]> values
+                //      — near-empty on today's corpus since model fields are
+                //      typed from annotations only);
+                //   2. initializer-derived model-field dims for trainable
+                //      params (the unique-field-name bridge; covers the
+                //      dominant `randn([64, 128]) * 0.15` idiom);
+                //   3. each sized primal mirrored onto its adjoint
+                //      accumulator (an adjoint has its primal's shape by
+                //      construction) — this is what sizes the backward's
+                //      gradient transients, the surface the arena exists
+                //      to place.
+                // Symbolic/computed dims stay unsized; nothing is guessed.
+                let arena_report_on = self.compile_options.memory_report
+                    || std::env::var("NSL_ARENA_REPORT").ok().as_deref() == Some("1");
+                let elem_hints: std::collections::HashMap<crate::wengert::VarId, u64> =
+                    if arena_report_on || csla_active {
+                        let mut hints = crate::profiling::captures::elem_hints_from_var_nodes(
+                            extractor.var_nodes(),
+                            self.type_map,
+                        );
+                        let field_elems = self.models.unique_field_elems();
+                        for (name, vid) in extractor.named_param_var_ids() {
+                            if hints.contains_key(vid) {
+                                continue;
+                            }
+                            let leaf = name.rsplit('.').next().unwrap_or(name);
+                            if let Some(&e) = field_elems.get(leaf) {
+                                hints.insert(*vid, e);
+                            }
+                        }
+                        // Mirror ONLY adjoint accumulators with a UNIQUE
+                        // primal preimage. Add/Sub rules alias the OUTPUT's
+                        // adjoint onto both operands (Identity — no reduce
+                        // op), so a shared accumulator carries the OUTPUT's
+                        // shape and mirroring it would mis-size a broadcast
+                        // operand's grad. Reducing rules emit a dedicated
+                        // reduce_to_shape var per operand, which is exactly
+                        // what a unique preimage certifies.
+                        let mut preimage: std::collections::HashMap<crate::wengert::VarId, u32> =
+                            Default::default();
+                        for a in gen.adjoint_vars_map().values() {
+                            *preimage.entry(*a).or_default() += 1;
+                        }
+                        let mirrored: Vec<(crate::wengert::VarId, u64)> = gen
+                            .adjoint_vars_map()
+                            .iter()
+                            .filter(|(_, a)| preimage.get(a) == Some(&1))
+                            .filter_map(|(p, a)| hints.get(p).map(|&e| (*a, e)))
+                            .collect();
+                        for (a, e) in mirrored {
+                            hints.entry(a).or_insert(e);
+                        }
+                        hints
+                    } else {
+                        Default::default()
+                    };
+
+                if arena_report_on {
+                    // Stage-2A: partially quantified — sized transients get
+                    // real bytes (a lower bound on the full arena), the rest
+                    // still report as concurrency-only. Param-gradient
+                    // accumulators and the loss ESCAPE the tape (read by the
+                    // optimizer emission / callbacks, never by a tape op) —
+                    // without the escape pin, last-use liveness gives them
+                    // point intervals and BFD time-shares every gradient in
+                    // one slot, an illegal aliasing that fakes the savings.
+                    // Stage-2B assigns offsets.
+                    let param_vids: std::collections::HashSet<crate::wengert::VarId> = extractor
+                        .named_param_var_ids()
+                        .iter()
+                        .map(|(_, v)| *v)
+                        .collect();
+                    let mut tape_escaping: std::collections::HashSet<crate::wengert::VarId> = gen
+                        .adjoint_vars_map()
+                        .iter()
+                        .filter(|(p, _)| param_vids.contains(p))
+                        .map(|(_, a)| *a)
+                        .collect();
+                    tape_escaping.insert(effective_primal.output);
                     let arena = crate::transient_arena::analyze(
                         &effective_primal,
                         &adjoint,
-                        &|_| None,
+                        &|v| elem_hints.get(&v).copied(),
+                        &tape_escaping,
                         4, // GPU f32 training dtype width
                     );
                     eprintln!("[arena]\n{}", arena.render_report("  "));
@@ -9111,16 +9188,15 @@ impl Compiler<'_> {
                             .filter(|(name, _)| self.is_trainable_param_name(name))
                             .map(|(n, v)| (n.clone(), *v))
                             .collect();
-                        // Item 11 calibration (review M3 follow-through): wire
-                        // REAL element counts into the layerwise plan — this
-                        // call site passed `|_| None` since D1, leaving every
-                        // ParamInfo::elems empty and the prefetch gate's pack
-                        // pricing blind. Static param shapes resolve here;
-                        // symbolic ones stay None and decline their edges.
-                        let elem_hints = crate::profiling::captures::elem_hints_from_var_nodes(
-                            extractor.var_nodes(),
-                            self.type_map,
-                        );
+                        // Item 11 calibration (review M3 follow-through):
+                        // REAL element counts for the layerwise plan, now
+                        // from the SHARED Stage-2A hint map above — which
+                        // adds the initializer-derived field dims the pure
+                        // semantic map lacked (model fields are typed from
+                        // annotations only, so the old binding here was
+                        // empty for every unannotated real model and the
+                        // prefetch pack pricing stayed blind). Symbolic
+                        // shapes remain None and decline their edges.
                         let vid_by_pname: std::collections::HashMap<&str, crate::wengert::VarId> =
                             csla_trainable
                                 .iter()
