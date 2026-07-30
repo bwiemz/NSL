@@ -7171,6 +7171,14 @@ impl Compiler<'_> {
             /// (GPU f32) drive the prefetch overlap gate's transfer-time
             /// estimate against the target GpuSpec.
             range_pack_elems: Vec<u64>,
+            /// Item 3: the single ParameterPlan — per-param residency,
+            /// storage dtype and sharding — derived once from `ws_streamed`
+            /// plus the storage flags. Both registration sites (the
+            /// pre-forward belt and this window's belt) read their
+            /// `nsl_sr_bf16_note_param` / `nsl_weight_stream_register`
+            /// decisions from it instead of re-spelling the flag conditions,
+            /// and it is baked into the binary for the runtime cross-check.
+            plan: crate::parameter_plan::ParameterPlan,
         }
         let mut csla_pending: Option<CslaPending> = None;
         let mut csla_loss_buffered = false;
@@ -9538,6 +9546,31 @@ impl Compiler<'_> {
                                 }
                             })
                             .collect();
+                        // Item 3: derive the ParameterPlan ONCE, here, where
+                        // the streaming schedule is final. Everything
+                        // downstream (both registration belts, the runtime
+                        // cross-check) reads it rather than re-deriving
+                        // "streamed && bf16sr" / "zero3 ? streamed : {}" from
+                        // the flags — the duplication that let the three
+                        // residency tables be populated from three separate
+                        // spellings of the same intent.
+                        let plan = crate::parameter_plan::ParameterPlan::derive(
+                            &param_paths,
+                            &ws_streamed_sorted,
+                            &crate::parameter_plan::PlanFeatures {
+                                weight_stream: self.compile_options.weight_stream,
+                                param_dtype_bf16sr: self.features.param_dtype_bf16sr,
+                                zero_stage: self.features.zero_stage,
+                            },
+                        )
+                        .map_err(|e| {
+                            CodegenError::new(format!("parameter plan: {e}"))
+                        })?;
+                        if std::env::var("NSL_PARAM_PLAN_REPORT").ok().as_deref()
+                            == Some("1")
+                        {
+                            eprint!("{}", plan.report());
+                        }
                         (
                             Some(CslaPre {
                                 params: csla_params,
@@ -9549,6 +9582,7 @@ impl Compiler<'_> {
                                     global_group,
                                     ws_streamed: ws_streamed_sorted,
                                     range_pack_elems,
+                                    plan,
                                 },
                             }),
                             ws_plan,
@@ -9587,14 +9621,39 @@ impl Compiler<'_> {
                 // without it the first window's forward peak would still be
                 // the full-residency wall the flag exists to remove.
                 if let Some(wsplan) = &ws_fwd_plan {
-                    if self.features.param_dtype_bf16sr {
+                    // Item 3: the plan, not the raw flag, decides who gets an
+                    // SR counter block. Its entries are indexed by param_list
+                    // position, so a schedule index the plan did not mark
+                    // streamed cannot silently pick up (or lose) a storage
+                    // mode here.
+                    let plan = csla_pre
+                        .as_ref()
+                        .map(|p| &p.schedule.plan)
+                        .expect("ws_fwd_plan and csla_pre are built in the same branch");
+                    // The backend is armed iff some parameter's plan entry
+                    // needs it. `srbf16_register` aborts on a parameter that
+                    // reaches it without a prior `note_param`, so "enable is
+                    // on" and "this parameter gets a note" must come from the
+                    // SAME source — spelling one from the flag and the other
+                    // from the plan is exactly the split this item removes.
+                    if plan.needs_sr_backend() {
                         self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
                     }
                     for &idx in &wsplan.register_idxs {
+                        let entry = usize::try_from(idx)
+                            .ok()
+                            .and_then(|u| plan.entries().get(u))
+                            .ok_or_else(|| {
+                                CodegenError::new(format!(
+                                    "parameter plan: forward streaming schedule \
+                                     registers parameter {idx}, which the plan \
+                                     does not cover"
+                                ))
+                            })?;
                         let iv = builder.ins().iconst(cl_types::I64, idx);
                         let pw = self
                             .compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                        if self.features.param_dtype_bf16sr {
+                        if entry.needs_sr_note() {
                             self.compile_call_by_name(
                                 builder,
                                 "nsl_sr_bf16_note_param",
@@ -9607,6 +9666,14 @@ impl Compiler<'_> {
                             &[pw],
                         )?;
                     }
+                    // Bake the plan in and confirm the runtime realized it:
+                    // every declared param must be in the ONE residency table
+                    // its plan entry names. `register` dispatches on global
+                    // flags, so a mode that failed to activate would otherwise
+                    // train the wrong storage silently. Emitted here, after
+                    // the first belt, so the check covers the earliest moment
+                    // the tables are populated.
+                    self.emit_param_plan_check(builder, plan, param_list)?;
                 }
                 self.emit_inplace_suppress(builder, true)?;
                 let full_lowered = if let Some(wsplan) = &ws_fwd_plan {
@@ -11929,23 +11996,56 @@ impl Compiler<'_> {
             let ws_active = self.compile_options.weight_stream;
             let ws_streamed: std::collections::HashSet<i64> =
                 pending.schedule.ws_streamed.iter().copied().collect();
-            // P3 ZeRO-3: the sharded set == the streamed set (view-rooted /
-            // resident params stay Replicated). Passed into every group
-            // update for the per-layer reduce + owner gating.
-            let zero3_streamed: Option<std::collections::HashSet<i64>> =
-                (self.features.zero_stage == Some(3)).then(|| ws_streamed.clone());
+            // P3 ZeRO-3: the sharded set is READ FROM THE PLAN rather than
+            // re-derived as `(zero_stage == 3).then(|| ws_streamed.clone())`.
+            // The two are equal by construction — `derive` marks exactly the
+            // streamed set Sharded under stage 3 — but sourcing it here is
+            // what makes the plan the single definition of "sharded" instead
+            // of one of two independent spellings that merely agree.
+            let zero3_streamed: Option<std::collections::HashSet<i64>> = self
+                .features
+                .zero_stage
+                .filter(|&s| s == 3)
+                .map(|_| {
+                    pending
+                        .schedule
+                        .plan
+                        .entries()
+                        .iter()
+                        .filter(|e| {
+                            e.sharding == crate::parameter_plan::ParamSharding::Sharded
+                        })
+                        .map(|e| e.idx)
+                        .collect()
+                });
             if ws_active {
                 // P4 item 17: activate the bf16 mirror backend and assign
                 // each streamed param its stable SR counter block BEFORE the
                 // first registration (register aborts on an un-noted param).
-                if self.features.param_dtype_bf16sr {
+                // Armed from the plan, for the same reason as the pre-forward
+                // belt: enable and note must not be spelled from two sources.
+                if pending.schedule.plan.needs_sr_backend() {
                     self.compile_call_by_name(builder, "nsl_sr_bf16_enable", &[])?;
                 }
                 for &idx in &pending.schedule.ws_streamed {
+                    // Item 3: same plan, same decision as the pre-forward
+                    // belt — the two sites can no longer disagree about who
+                    // gets an SR counter block.
+                    let entry = usize::try_from(idx)
+                        .ok()
+                        .and_then(|u| pending.schedule.plan.entries().get(u))
+                        .ok_or_else(|| {
+                            CodegenError::new(format!(
+                                "parameter plan: window streaming schedule \
+                                 registers parameter {idx}, which the plan does \
+                                 not cover"
+                            ))
+                        })?;
+                    let needs_sr_note = entry.needs_sr_note();
                     let iv = builder.ins().iconst(cl_types::I64, idx);
                     let pw =
                         self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
-                    if self.features.param_dtype_bf16sr {
+                    if needs_sr_note {
                         self.compile_call_by_name(
                             builder,
                             "nsl_sr_bf16_note_param",
@@ -14453,6 +14553,12 @@ impl Compiler<'_> {
         // null data pointers.
         if csla_active && self.compile_options.weight_stream {
             self.compile_call_by_name(builder, "nsl_weight_stream_teardown", &[])?;
+            // Item 3: drop this block's declared plan in the same breath.
+            // The residency tables are cleared above, so leaving the plan
+            // behind would make a SECOND train block in the same program
+            // verify its predecessor's (now unregistered, possibly freed)
+            // pointers and abort on a mismatch that is really just staleness.
+            self.compile_call_by_name(builder, "nsl_param_plan_teardown", &[])?;
         }
 
         // P5 item 19: capture/replay counter banner (anti-vacuity evidence
@@ -15699,6 +15805,61 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let v = builder.ins().iconst(cl_types::I64, i64::from(on));
         self.compile_call_by_name(builder, "nsl_set_inplace_suppressed", &[v])?;
+        Ok(())
+    }
+
+    /// Item 3: bake the derived [`crate::parameter_plan::ParameterPlan`] into
+    /// the binary and assert the runtime realized it.
+    ///
+    /// `nsl_weight_stream_register` chooses a parameter's residency backend
+    /// from *global* flags (`zero3_active()` > `srbf16_active()` > host
+    /// mirrors) while the plan is per-parameter and compile-time. Nothing
+    /// otherwise connects the two, and a mismatch is silent: a parameter that
+    /// reached `register` before its mode was enabled lands in the host-mirror
+    /// table, trains in f32, and the run exits 0 with a plausible loss curve.
+    /// One `declare` per parameter plus one `verify` closes that gap. Both
+    /// are emitted inside the per-micro-batch registration region, so the
+    /// check re-runs every micro-batch (catching drift, not just the first
+    /// step).
+    ///
+    /// Cost, stated precisely because the two populations differ: the belt
+    /// above emits `2s` calls per micro-batch (a `nsl_list_get` + a
+    /// `register` for each of the `s` STREAMED parameters); this adds
+    /// `2p + 1`, where `p` is ALL parameters — `p >= s`, since residents are
+    /// declared too (see below). Measured as no wall-clock change on the
+    /// CSLA FFN fixture.
+    ///
+    /// EVERY parameter is declared, not only the streamed ones. A resident
+    /// parameter expects "registered with no backend", which is falsifiable
+    /// and worth checking: the streaming schedule deliberately excludes
+    /// view-rooted parameters (a buffered `transpose(w)` caches a pointer
+    /// into θ's storage, so registering θ would free it under the live view —
+    /// the #397 corruption hazard). If such a parameter ever leaks back into
+    /// a registration belt, this is what says so.
+    pub(crate) fn emit_param_plan_check(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        plan: &crate::parameter_plan::ParameterPlan,
+        param_list: Value,
+    ) -> Result<(), CodegenError> {
+        // Nothing is registered anywhere, so there is no cross-check to make
+        // and no call is emitted at all.
+        if !plan.has_streamed() {
+            return Ok(());
+        }
+        // Collected first so `plan` is not borrowed across the &mut self calls.
+        let declares: Vec<(i64, i64)> = plan
+            .entries()
+            .iter()
+            .map(|e| (e.idx, e.runtime_flags()))
+            .collect();
+        for (idx, flags) in declares {
+            let iv = builder.ins().iconst(cl_types::I64, idx);
+            let fv = builder.ins().iconst(cl_types::I64, flags);
+            let pw = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, iv])?;
+            self.compile_call_by_name(builder, "nsl_param_plan_declare", &[pw, iv, fv])?;
+        }
+        self.compile_call_by_name(builder, "nsl_param_plan_verify", &[])?;
         Ok(())
     }
 

@@ -667,6 +667,11 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("multimodal", "multimodal input support"),
     ("param_roles", "Parameter role classification (Muon routing + weight-decay groups)"),
     ("ownership", "ownership infrastructure"),
+    (
+        "parameter_plan",
+        "per-parameter storage plan (roadmap item 3) — a derived description \
+         consumed by the registration sites, not a tree-transforming pass",
+    ),
     ("pass_registry", "this registry"),
     ("pipeline", "pipeline-parallel scheduling"),
     ("precision_cast_ptx", "precision-cast PTX emitter"),
