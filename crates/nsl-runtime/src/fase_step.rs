@@ -315,6 +315,79 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     // silently disables a shipped feature.
     mp_scale: f64,
 ) {
+    fase_multi_impl(
+        params_list, m_list, v_list, mp_list, None, lr, beta1, one_minus_beta1,
+        beta2, one_minus_beta2, eps, wd, bc1_inv, bc2_inv, wd_exempt_list,
+        wd_exempt_non_rank2, mp_scale,
+    );
+}
+
+/// Item 8, CSLA half: the subset variant of the multi-tensor step. Identical
+/// contract to `nsl_fase_fused_adamw_step_multi` except only the parameters
+/// named in `idx_list` (an NslList of i64 indices into the four PARALLEL
+/// full-length lists) are stepped. The CSLA layerwise window updates one
+/// layer GROUP at a time, so codegen's group update is one of these calls
+/// over the group's compile-time index set; each index's arithmetic is
+/// bit-identical to the per-param loop it replaces (same kernel body, table
+/// addressing). The in-kernel m_partial zero is redundant under CSLA — the
+/// caller frees the group's accumulators right after — but harmless.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fase_fused_adamw_step_multi_idx(
+    params_list: i64,
+    m_list: i64,
+    v_list: i64,
+    mp_list: i64,
+    idx_list: i64,
+    lr: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1_inv: f64,
+    bc2_inv: f64,
+    wd_exempt_list: i64,
+    wd_exempt_non_rank2: i64,
+    mp_scale: f64,
+) {
+    assert!(idx_list != 0, "fase_fused_step_multi_idx: null idx_list");
+    let idxs_l = crate::list::NslList::from_ptr(idx_list);
+    let idxs: Vec<i64> = (0..idxs_l.len as usize)
+        .map(|k| unsafe { *idxs_l.data.add(k) })
+        .collect();
+    fase_multi_impl(
+        params_list, m_list, v_list, mp_list, Some(&idxs), lr, beta1,
+        one_minus_beta1, beta2, one_minus_beta2, eps, wd, bc1_inv, bc2_inv,
+        wd_exempt_list, wd_exempt_non_rank2, mp_scale,
+    );
+}
+
+/// Shared body of the two multi-step externs. `indices == None` walks every
+/// parameter (the FullBuffer boundary step); `Some(subset)` walks only those
+/// indices (a CSLA layer group), with `wd_exempt_list` still indexed by the
+/// ORIGINAL parameter position so parameter-group λ resolution is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn fase_multi_impl(
+    params_list: i64,
+    m_list: i64,
+    v_list: i64,
+    mp_list: i64,
+    indices: Option<&[i64]>,
+    lr: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1_inv: f64,
+    bc2_inv: f64,
+    wd_exempt_list: i64,
+    wd_exempt_non_rank2: i64,
+    mp_scale: f64,
+) {
     let params = crate::list::NslList::from_ptr(params_list);
     let ms = crate::list::NslList::from_ptr(m_list);
     let vs = crate::list::NslList::from_ptr(v_list);
@@ -348,6 +421,23 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
         crate::optim_groups::nsl_optim_param_wd(tp, flag, wd_exempt_non_rank2, wd)
     };
 
+    // Subset selection: original parameter positions, so wd exemption and the
+    // null/alias diagnostics all speak the caller's numbering.
+    let sel: Vec<usize> = match indices {
+        Some(ix) => ix
+            .iter()
+            .map(|&i| {
+                assert!(
+                    i >= 0 && (i as usize) < count,
+                    "fase_fused_step_multi_idx: param index {i} out of range \
+                     0..{count}"
+                );
+                i as usize
+            })
+            .collect(),
+        None => (0..count).collect(),
+    };
+
     // Item 8: collect eligible parameters as `UpdateDesc`s and bucket by
     // `UpdateKey` before launching, instead of accumulating one flat pointer
     // table. See `UpdateKey` for why `device` has to be part of the key.
@@ -356,7 +446,7 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     #[cfg(feature = "cuda")]
     let mut batched_thetas: Vec<u64> = Vec::new();
 
-    for i in 0..count {
+    for i in sel {
         let (tp, mp_, vp, ap) = unsafe {
             (
                 *params.data.add(i),
@@ -683,6 +773,99 @@ mod tests {
                 nsl_tensor_free(p);
             }
         }
+    }
+
+    /// Item 8, CSLA half: the `_idx` subset variant steps ONLY the named
+    /// indices — selected members match the single-step FFI bit-for-bit
+    /// (CPU tensors take the fallback arm), unselected members and all
+    /// their state stay untouched byte-for-byte, and selected m_partials
+    /// are zeroed (the FullBuffer caller's contract; the CSLA caller frees
+    /// them right after).
+    #[test]
+    fn multi_idx_steps_only_the_subset() {
+        use crate::list::{nsl_list_new, nsl_list_push};
+        let n = 33;
+        let (th, m, v, mp) = inputs_f64(n);
+        let (lr, b1, omb1, b2, omb2, eps, wd, bc1, bc2) = SCALARS;
+        let mk = || (make_f64(&th), make_f64(&m), make_f64(&v), make_f64(&mp));
+        let sets: Vec<(i64, i64, i64, i64)> = (0..3).map(|_| mk()).collect();
+        let (pl, ml, vl, al) =
+            (nsl_list_new(), nsl_list_new(), nsl_list_new(), nsl_list_new());
+        for &(t, mm, vv, aa) in &sets {
+            nsl_list_push(pl, t);
+            nsl_list_push(ml, mm);
+            nsl_list_push(vl, vv);
+            nsl_list_push(al, aa);
+        }
+        let il = nsl_list_new();
+        nsl_list_push(il, 0);
+        nsl_list_push(il, 2);
+        nsl_fase_fused_adamw_step_multi_idx(
+            pl, ml, vl, al, il, lr, b1, omb1, b2, omb2, eps, wd, bc1, bc2, 0, 0,
+            1.0,
+        );
+        // Reference: the single-step FFI on a fresh copy (members 0 and 2
+        // start identical, so one reference serves both).
+        let (rt, rm, rv, rmp) = mk();
+        nsl_fase_fused_adamw_step(
+            rt, rm, rv, rmp, lr, b1, omb1, b2, omb2, eps, wd, bc1, bc2,
+        );
+        let bits = |p: i64| -> Vec<u64> {
+            let t = NslTensor::from_ptr(p);
+            (0..n)
+                .map(|i| unsafe { (*t.data_f64().add(i)).to_bits() })
+                .collect()
+        };
+        for &sel in &[0usize, 2] {
+            let (t, mm, vv, aa) = sets[sel];
+            assert_eq!(bits(t), bits(rt), "theta[{sel}] != single-step reference");
+            assert_eq!(bits(mm), bits(rm), "m[{sel}] != single-step reference");
+            assert_eq!(bits(vv), bits(rv), "v[{sel}] != single-step reference");
+            let a = NslTensor::from_ptr(aa);
+            for i in 0..n {
+                assert_eq!(
+                    unsafe { *a.data_f64().add(i) },
+                    0.0,
+                    "m_partial[{sel}] not zeroed at element {i}"
+                );
+            }
+        }
+        // The unselected member: all four tensors byte-identical to fresh.
+        let (t1, m1, v1, a1) = sets[1];
+        let (ot, om, ov, oa) = mk();
+        assert_eq!(bits(t1), bits(ot), "unselected theta was touched");
+        assert_eq!(bits(m1), bits(om), "unselected m was touched");
+        assert_eq!(bits(v1), bits(ov), "unselected v was touched");
+        assert_eq!(bits(a1), bits(oa), "unselected m_partial was touched");
+        for (t, mm, vv, aa) in sets {
+            for p in [t, mm, vv, aa] {
+                nsl_tensor_free(p);
+            }
+        }
+        for p in [rt, rm, rv, rmp, ot, om, ov, oa] {
+            nsl_tensor_free(p);
+        }
+    }
+
+    /// Out-of-range indices must die loudly, not read past the lists. Tested
+    /// through the internal impl (a plain Rust fn) — a panic crossing the
+    /// `extern "C"` wrapper would abort the process instead of unwinding.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn multi_idx_rejects_out_of_range() {
+        use crate::list::{nsl_list_new, nsl_list_push};
+        let (th, m, v, mp) = inputs_f64(4);
+        let (lr, b1, omb1, b2, omb2, eps, wd, bc1, bc2) = SCALARS;
+        let (pl, ml, vl, al) =
+            (nsl_list_new(), nsl_list_new(), nsl_list_new(), nsl_list_new());
+        nsl_list_push(pl, make_f64(&th));
+        nsl_list_push(ml, make_f64(&m));
+        nsl_list_push(vl, make_f64(&v));
+        nsl_list_push(al, make_f64(&mp));
+        fase_multi_impl(
+            pl, ml, vl, al, Some(&[1]), lr, b1, omb1, b2, omb2, eps, wd, bc1,
+            bc2, 0, 0, 1.0,
+        );
     }
 }
 

@@ -11556,8 +11556,101 @@ impl Compiler<'_> {
                 zero3: Option<&std::collections::HashSet<i64>>,
                 // P4 item 17: Some(opt_step) under --param-dtype bf16-sr.
                 sr_step: Option<Value>,
+                // Item 8: Some(recipe scalars) admits collapsing this group
+                // into one nsl_fase_fused_adamw_step_multi_idx launch. The
+                // arm below re-checks the envelope booleans as a belt — a
+                // future call site passing scalars alongside an envelope
+                // falls through to the per-param loop instead of
+                // mis-batching.
+                multi: Option<&crate::stmt_fase::FusedAdamwScalars>,
                 idxs: &[i64],
             ) -> Result<(), CodegenError> {
+                if let Some(sc) = multi {
+                    // bf16-sr must be re-checked here too: the closure cannot
+                    // infer it from sr_step (both call sites thread Some
+                    // unconditionally), and batching under bf16-sr would
+                    // bypass the authoritative-mirror SR step silently — the
+                    // exact divergence class fase_emit_final_step refuses
+                    // loudly.
+                    if muon.is_none()
+                        && zero3.is_none()
+                        && !wrap_precision
+                        && !wrap_offload
+                        && !c.features.param_dtype_bf16sr
+                    {
+                        if idxs.is_empty() {
+                            return Ok(());
+                        }
+                        let il = c.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        for &i in idxs {
+                            let iv = builder.ins().iconst(cl_types::I64, i);
+                            c.compile_call_by_name(builder, "nsl_list_push", &[il, iv])?;
+                        }
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        // CSLA has no AdamW parameter-group plumbing (the
+                        // group update has always applied the recipe's flat
+                        // λ) — 0/0 makes the runtime resolve every member to
+                        // `wd`, exactly the per-param loop's behavior.
+                        // mp_scale = 1.0: the layerwise schedule refuses
+                        // grad_clip, so a clip factor can never exist here.
+                        let zero_i = builder.ins().iconst(cl_types::I64, 0);
+                        let one_scale = builder.ins().f64const(1.0);
+                        c.compile_call_by_name(
+                            builder,
+                            "nsl_fase_fused_adamw_step_multi_idx",
+                            &[
+                                param_list,
+                                state_list_1,
+                                state_list_2,
+                                accum_val,
+                                il,
+                                lr_v,
+                                b1_v,
+                                omb1_v,
+                                b2_v,
+                                omb2_v,
+                                eps_v,
+                                wd_v,
+                                bc.0,
+                                bc.1,
+                                zero_i,
+                                zero_i,
+                                one_scale,
+                            ],
+                        )?;
+                        c.compile_call_by_name(builder, "nsl_list_free", &[il])?;
+                        // The CSLA tail, unchanged: free the group's
+                        // accumulators (fresh zeros next window). The
+                        // in-kernel m_partial zero is redundant before a
+                        // free, and harmless.
+                        for &i in idxs {
+                            let iv = builder.ins().iconst(cl_types::I64, i);
+                            let m_partial = c.compile_call_by_name(
+                                builder,
+                                "nsl_list_get",
+                                &[accum_val, iv],
+                            )?;
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_free",
+                                &[m_partial],
+                            )?;
+                            let z = builder.ins().iconst(cl_types::I64, 0);
+                            c.compile_call_by_name(
+                                builder,
+                                "nsl_list_set",
+                                &[accum_val, iv, z],
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
                 if zero3.is_some() {
                     for &i in idxs {
                         let iv = builder.ins().iconst(cl_types::I64, i);
@@ -11865,6 +11958,36 @@ impl Compiler<'_> {
             } else {
                 None
             };
+
+            // Item 8, CSLA half: when every group member takes the PLAIN
+            // fused AdamW step — no muon routing, no ZeRO-3 owner gates, no
+            // CPDT precision or offload envelope, no bf16-sr mirror step —
+            // each layer-group update collapses into ONE pointer-table
+            // launch over the group's indices
+            // (nsl_fase_fused_adamw_step_multi_idx), bit-identical per
+            // element to the per-param loop (same kernel body, table
+            // addressing). Admission mirrors the FullBuffer multi arm and
+            // shares its kill-switches; the runtime still falls back
+            // per-param for non-uniform members (CPU tensors, tied-θ
+            // aliases), so this admits TRYING to batch, never a numeric
+            // fork.
+            let csla_multi_scalars: Option<crate::stmt_fase::FusedAdamwScalars> =
+                if muon_csla_ctx.is_none()
+                    && !wrap_precision
+                    && !self.compile_options.optim_state_offload
+                    && !self.features.param_dtype_bf16sr
+                    && zero3_streamed.is_none()
+                    && two_state
+                    && !self.compile_options.training_reference
+                    && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
+                    && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
+                {
+                    Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                        &fase_plan.recipe,
+                    ))
+                } else {
+                    None
+                };
 
             // Global/epilogue accumulators live for the whole window (their
             // grads may come from any range).
@@ -12531,6 +12654,7 @@ impl Compiler<'_> {
                     muon_csla_ctx.as_ref(),
                     zero3_streamed.as_ref(),
                     Some(opt_step),
+                    csla_multi_scalars.as_ref(),
                     &layer_group[ri],
                 )?;
                 // D2b: this layer's θ is final for the window — write back
@@ -12605,6 +12729,7 @@ impl Compiler<'_> {
                 muon_csla_ctx.as_ref(),
                 zero3_streamed.as_ref(),
                 Some(opt_step),
+                csla_multi_scalars.as_ref(),
                 global_group,
             )?;
             // P0.3: close the window-scoped grad-integrity step — every
