@@ -7244,7 +7244,13 @@ impl Compiler<'_> {
                 // `FusedLinearCeBackwardExtract` results — the lowerer then
                 // skips those Adds (unresolved ghost input) and every
                 // parameter gradient downstream of the fused loss vanishes.
-                extractor.apply_pending_fused_lce_prunes();
+                // Sprint 2.5: an Err here means a chain op SURVIVED the
+                // prune (a live outside consumer such as `logits.shape`) —
+                // unrecoverable after substitution, so it is a hard,
+                // actionable refusal rather than a ghost-adjoint ICE later.
+                extractor
+                    .apply_pending_fused_lce_prunes()
+                    .map_err(CodegenError::new)?;
 
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner call itself is pure data-in/data-out — it produces a

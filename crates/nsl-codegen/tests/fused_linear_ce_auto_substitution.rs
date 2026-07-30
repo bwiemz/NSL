@@ -166,6 +166,8 @@ fn auto_substitution_fires_when_decorator_enabled_and_pattern_matches() {
                 vocab_tile,
                 ignore_index,
                 is_large,
+                has_bias: _,
+                x_rank3: _,
             } => Some((
                 *vocab_size,
                 *hidden_size,
@@ -279,9 +281,10 @@ fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
         "composite PrimalOp::CrossEntropyLoss must be emitted as fallback"
     );
 
-    // Sub-case: pattern has Matmul + Transpose but NO bias add.
-    // The matcher requires the BiasAdd because v1's FFI signature is
-    // 4-input (x, W, bias, targets) with no bias-elision.
+    // Sub-case (FLIPPED, Sprint 2.5): Matmul + Transpose with NO bias add
+    // now SUBSTITUTES with has_bias=false — the GEMM-chunked runtime path
+    // handles biasless heads natively (`bias_free_pattern_substitutes`
+    // below pins the payload).
     let list_no_bias = extract_first_fn(
         NO_BIAS_SRC,
         Some(FusedCeDecoratorConfig {
@@ -298,13 +301,8 @@ fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
     .expect("extraction must succeed");
     assert_eq!(
         count_fused(&list_no_bias),
-        0,
-        "Matmul-without-bias-Add pattern must NOT trigger auto-substitution"
-    );
-    assert_eq!(
-        count_composite_ce(&list_no_bias),
         1,
-        "no-bias case must lower composite CE"
+        "Sprint 2.5: the biasless Matmul(x, W^T) -> CE chain substitutes"
     );
 }
 
@@ -558,7 +556,13 @@ fn negative_dim_transpose_substitutes() {
 // document the v4-3 → v5+ behaviour transition.
 
 #[test]
-fn bias_free_pattern_deferred_to_v5() {
+fn bias_free_pattern_substitutes() {
+    // BEHAVIOUR FLIP (Sprint 2.5, was `bias_free_pattern_deferred_to_v5`):
+    // biasless heads now substitute. The v4-3 deferral existed because the
+    // v1 PTX emitters read bias unconditionally; the substitution no
+    // longer depends on them — biasless heads route through the
+    // GEMM-chunked runtime path (`nsl_fused_linear_ce_{forward,backward}_gemm`,
+    // which guards every bias access behind has_bias), at ANY vocab size.
     let cfg = FusedCeDecoratorConfig {
         enabled: true,
         vocab_tile: Some(1024),
@@ -571,20 +575,29 @@ fn bias_free_pattern_deferred_to_v5() {
     };
     let list = extract_first_fn(NO_BIAS_SRC, Some(cfg))
         .expect("extraction must succeed");
+    let fused: Vec<_> = list
+        .ops
+        .iter()
+        .filter_map(|op| match &op.op {
+            PrimalOp::FusedLinearCe { has_bias, x_rank3, .. } => {
+                Some((op.inputs.clone(), *has_bias, *x_rank3))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fused.len(), 1, "biasless chain must substitute");
+    let (inputs, has_bias, x_rank3) = &fused[0];
+    assert!(!has_bias, "biasless head must carry has_bias=false");
+    assert!(!x_rank3, "flat 2-D x (no reshape seen) must carry x_rank3=false");
+    assert_eq!(inputs.len(), 4, "input convention stays 4-wide");
     assert_eq!(
-        count_fused(&list),
-        0,
-        "Sprint v4-3 deferral: bias-free Matmul(x, W^T) → CE chain does \
-         NOT substitute (needs a no-bias PTX emitter variant; tracked v5+). \
-         If a future sprint lands the variant, update this assertion to \
-         `count_fused == 1` and document the behaviour flip in the test \
-         body."
+        inputs[1], inputs[2],
+        "the bias slot must carry w_var as the never-read placeholder"
     );
     assert_eq!(
         count_composite_ce(&list),
-        1,
-        "bias-free case falls through to composite CE (correct + safe — \
-         slower but bit-equivalent)"
+        0,
+        "no composite CE remains after the biasless substitution"
     );
 }
 

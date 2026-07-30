@@ -774,7 +774,12 @@ fn plan_train_block(
         // @fused_lm_ce-substituted model (the 3 dead Transpose/Matmul/Add
         // ops change the hash) — rejecting every pre-solved plan AND
         // cost-modeling a dead V×H matmul into the plan itself.
-        extractor.apply_pending_fused_lce_prunes();
+        // Sprint 2.5: Err = live consumer blocks the prune; the in-place
+        // path raises the hard refusal with the full diagnosis, so the
+        // prepass just skips WGGO planning for this block.
+        if extractor.apply_pending_fused_lce_prunes().is_err() {
+            return None;
+        }
 
         let mut analysis_config = crate::wggo_weight_analysis::AnalysisConfig::default();
         if let Some(f) = compiler.compile_options.wggo.prune_fraction {

@@ -1570,6 +1570,33 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // Sprint 2.5: GEMM-chunked fused linear-CE (production path for large
+    // vocab and every biasless head). No PTX/kname/smem args — chunk
+    // kernels are runtime constants, heavy math is cuBLAS. bias/dbias
+    // pointers are the literal 0 when has_bias == 0.
+    (
+        "nsl_fused_linear_ce_forward_gemm",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias_or_0, targets
+            types::I64, types::I64, // loss_out, lse_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // has_bias
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_fused_linear_ce_backward_gemm",
+        &[
+            types::I64, // grad_output_bits (f32 bits packed into i64)
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias_or_0, targets
+            types::I64, // lse_ptr
+            types::I64, types::I64, types::I64, // dx_out, dW_out, dbias_or_0
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // num_valid
+            types::I64, // has_bias
+        ],
+        Some(types::I64),
+    ),
     // CPKD: fused KL-CE distillation loss (forward + backward).
     //
     // ABI LOCK-STEP: these declarations, the call sites in

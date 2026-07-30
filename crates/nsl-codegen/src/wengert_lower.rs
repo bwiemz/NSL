@@ -2093,6 +2093,8 @@ fn lower_single_op(
             vocab_tile,
             ignore_index,
             is_large,
+            has_bias,
+            x_rank3: _,
         } => lower_fused_linear_ce_forward(
             compiler,
             builder,
@@ -2104,6 +2106,7 @@ fn lower_single_op(
             *vocab_tile,
             *ignore_index,
             *is_large,
+            *has_bias,
         ),
         // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.
         // Mirrors `FlashAttentionBackwardExtract` — first component fires
@@ -2117,6 +2120,8 @@ fn lower_single_op(
             seq_len,
             vocab_tile,
             ignore_index,
+            has_bias,
+            x_rank3,
         } => lower_fused_linear_ce_backward_extract(
             compiler,
             builder,
@@ -2128,6 +2133,8 @@ fn lower_single_op(
             *seq_len,
             *vocab_tile,
             *ignore_index,
+            *has_bias,
+            *x_rank3,
         ),
         // CPKD: fused KL-CE distillation loss (forward).
         PrimalOp::FusedKlCe {
@@ -4033,6 +4040,7 @@ fn lower_fused_linear_ce_forward(
     vocab_tile: u32,
     ignore_index: i64,
     is_large: bool,
+    has_bias: bool,
 ) -> Result<Value, CodegenError> {
     // CFTP v5: read dtype hint from the active `@fused_lm_ce` decorator.
     // Both the emitter cfg AND the FFI dtype_tag must agree; a single
@@ -4059,6 +4067,22 @@ fn lower_fused_linear_ce_forward(
     // (`fused_linear_ce_{fp16,bf16}_v49152_numerical.rs`) continue to
     // allocate compliant bf16/fp16 buffers manually.
     let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
+    // Sprint 2.5 routing: large vocabularies (and every biasless head) go
+    // through the GEMM-chunked runtime path — the v1 scalar kernels are
+    // 335x/504x slower at production shape (measured: 486/2222 ms vs
+    // 1.45/4.41 ms at rows=1024, V=49152, H=512; see
+    // fused_linear_ce_perf_probe.rs) and require a bias. The v1 kernels
+    // keep their byte-identity domain: small-vocab WITH-bias f32 (every
+    // existing fixture) and all 16-bit storage configs. Kill-switch
+    // NSL_FUSED_LCE_GEMM=0 (compile-time) restores v1 for large vocab.
+    let use_gemm = dtype_tag == 0
+        && (is_large || !has_bias)
+        && std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() != Some("0");
+    if !use_gemm && !has_bias {
+        return Err(CodegenError::new(
+            "fused_linear_ce: a biasless head requires the GEMM path (dtype              f32 and NSL_FUSED_LCE_GEMM enabled) — the v1 PTX kernels read              bias unconditionally",
+        ));
+    }
     let cfg = build_fused_ce_cfg(
         vocab_size,
         hidden_size,
@@ -4125,16 +4149,45 @@ fn lower_fused_linear_ce_forward(
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
 
-    // Forward PTX synthesis + embedding.
-    let fwd_ptx_bytes = crate::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
-    let smem_bytes = cfg.shared_mem_bytes() as i64;
     let b_val = builder.ins().iconst(cl_types::I64, batch_size as i64);
     let s_val = builder.ins().iconst(cl_types::I64, seq_len as i64);
     let v_val = builder.ins().iconst(cl_types::I64, vocab_size as i64);
     let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
-    let smem_val = builder.ins().iconst(cl_types::I64, smem_bytes);
 
-    if is_large {
+    if use_gemm {
+        // GEMM-chunked runtime path: no PTX synthesis or embedding — the
+        // chunk kernels are runtime constants, the heavy math is cuBLAS.
+        // For a biasless head, `bias_t` is a placeholder (w_var) that is
+        // NEVER dereferenced: bias_ptr is the literal 0 and the runtime
+        // guards every bias read behind has_bias.
+        let bias_ptr_val = if has_bias {
+            bias_ptr
+        } else {
+            builder.ins().iconst(cl_types::I64, 0)
+        };
+        let has_bias_val = builder.ins().iconst(cl_types::I64, i64::from(has_bias));
+        let _rc = call(
+            compiler,
+            builder,
+            "nsl_fused_linear_ce_forward_gemm",
+            &[
+                x_ptr,
+                w_ptr,
+                bias_ptr_val,
+                tgt_ptr,
+                loss_ptr,
+                lse_ptr,
+                b_val,
+                s_val,
+                v_val,
+                h_val,
+                has_bias_val,
+            ],
+        )?;
+    } else if is_large {
+        // Forward PTX synthesis + embedding (v1 kernels).
+        let fwd_ptx_bytes = crate::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
+        let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
         // Large-vocab two-kernel path. Allocate partials buffer and
         // pass both kernel-name pointers.
         let num_tiles = cfg.num_vocab_tiles() as i64;
@@ -4198,6 +4251,8 @@ fn lower_fused_linear_ce_forward(
         // Partials scratch is no longer needed after the launch.
         free_tensor_value(compiler, builder, partials_buf)?;
     } else {
+        let fwd_ptx_bytes = crate::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
+        let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
         let tag = format!("v{}_h{}_small", vocab_size, hidden_size);
         let kname = cfg.kernel_name();
         let (ptx_ptr, name_ptr) =
@@ -4331,6 +4386,8 @@ fn lower_fused_linear_ce_backward_extract(
     seq_len: u32,
     vocab_tile: u32,
     ignore_index: i64,
+    has_bias: bool,
+    x_rank3: bool,
 ) -> Result<Value, CodegenError> {
     if component > 2 {
         return Err(CodegenError::new(format!(
@@ -4381,20 +4438,50 @@ fn lower_fused_linear_ce_backward_extract(
             emitter_dtype,
         )?;
 
-        // Allocate output tensors (dx[B*S, H], dW[V, H], dbias[V]).
+        // Sprint 2.5: mirror the forward's routing decision (same inputs:
+        // dtype, vocab size vs threshold, biaslessness, env kill-switch).
+        let is_large = vocab_size > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+        let use_gemm = dtype_tag == 0
+            && (is_large || !has_bias)
+            && std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() != Some("0");
+        if !use_gemm && !has_bias {
+            return Err(CodegenError::new(
+                "fused_linear_ce backward: a biasless head requires the GEMM                  path — the v1 PTX kernels write dbias unconditionally",
+            ));
+        }
+
+        // Allocate output tensors. dx is `[B, S, H]` when the matcher saw
+        // through a logits reshape (x on the tape is 3-D there — same
+        // bytes, but downstream shape-sensitive backward ops abort on a
+        // rank mismatch), `[B*S, H]` otherwise (the pre-2.5 shape every
+        // flat fixture expects).
         let rows = (batch_size as i64) * (seq_len as i64);
-        let dx_out = alloc_gpu_f32_tensor(
-            compiler,
-            builder,
-            &[rows, hidden_size as i64],
-        )?;
+        let dx_out = if x_rank3 {
+            alloc_gpu_f32_tensor(
+                compiler,
+                builder,
+                &[batch_size as i64, seq_len as i64, hidden_size as i64],
+            )?
+        } else {
+            alloc_gpu_f32_tensor(
+                compiler,
+                builder,
+                &[rows, hidden_size as i64],
+            )?
+        };
         let dw_out = alloc_gpu_f32_tensor(
             compiler,
             builder,
             &[vocab_size as i64, hidden_size as i64],
         )?;
-        let dbias_out =
-            alloc_gpu_f32_tensor(compiler, builder, &[vocab_size as i64])?;
+        // Biasless (GEMM-only): component 2 is never emitted by the AD
+        // rule, so no dbias buffer exists — the slot carries dx_out as a
+        // never-read placeholder.
+        let dbias_out = if has_bias {
+            alloc_gpu_f32_tensor(compiler, builder, &[vocab_size as i64])?
+        } else {
+            dx_out
+        };
 
         // Look up saved lse buffer; consume + evict from the map.
         let lse_out = compiler
@@ -4460,15 +4547,11 @@ fn lower_fused_linear_ce_backward_extract(
         let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
         let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
         let dw_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dw_out])?;
-        let dbias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dbias_out])?;
-
-        // Backward PTX synthesis + embed.
-        let bwd_ptx_bytes =
-            crate::fused_linear_ce::synthesize_fused_linear_ce_backward_ptx(&cfg);
-        let bwd_kname = cfg.bwd_kernel_name();
-        let tag = format!("bwd_v{}_h{}", vocab_size, hidden_size);
-        let (bwd_ptx_ptr, bwd_name_ptr) =
-            embed_fused_ce_data(compiler, builder, &tag, &bwd_ptx_bytes, &bwd_kname)?;
+        let dbias_ptr = if has_bias {
+            call(compiler, builder, "nsl_tensor_data_ptr", &[dbias_out])?
+        } else {
+            builder.ins().iconst(cl_types::I64, 0)
+        };
 
         // grad_output: the upstream scalar grad (a 0-dim or 1-elem tensor).
         // Extract its f32 value via nsl_tensor_item (returns f64), demote to
@@ -4509,36 +4592,79 @@ fn lower_fused_linear_ce_backward_extract(
         let s_val = builder.ins().iconst(cl_types::I64, seq_len as i64);
         let v_val = builder.ins().iconst(cl_types::I64, vocab_size as i64);
         let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
-        let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
 
-        // CFTP v4-2: dtype_tag from `@fused_lm_ce(dtype="...")` decorator
-        // (resolved above; same value the forward path used).
-        let dtype_tag_val = builder.ins().iconst(cl_types::I64, dtype_tag);
-        let _rc = call(
-            compiler,
-            builder,
-            "nsl_fused_linear_ce_backward",
-            &[
-                bwd_ptx_ptr,
-                bwd_name_ptr,
-                grad_bits,
-                x_ptr,
-                w_ptr,
-                bias_ptr,
-                tgt_ptr,
-                lse_ptr,
-                dx_ptr,
-                dw_ptr,
-                dbias_ptr,
-                b_val,
-                s_val,
-                v_val,
-                h_val,
-                num_valid,
-                smem_val,
-                dtype_tag_val,
-            ],
-        )?;
+        if use_gemm {
+            // GEMM-chunked backward: no PTX synthesis/embedding. For a
+            // biasless head, bias/dbias are the literal 0 and the runtime
+            // guards every access behind has_bias.
+            let bias_ptr_val = if has_bias {
+                bias_ptr
+            } else {
+                builder.ins().iconst(cl_types::I64, 0)
+            };
+            let has_bias_val =
+                builder.ins().iconst(cl_types::I64, i64::from(has_bias));
+            let _rc = call(
+                compiler,
+                builder,
+                "nsl_fused_linear_ce_backward_gemm",
+                &[
+                    grad_bits,
+                    x_ptr,
+                    w_ptr,
+                    bias_ptr_val,
+                    tgt_ptr,
+                    lse_ptr,
+                    dx_ptr,
+                    dw_ptr,
+                    dbias_ptr,
+                    b_val,
+                    s_val,
+                    v_val,
+                    h_val,
+                    num_valid,
+                    has_bias_val,
+                ],
+            )?;
+        } else {
+            // Backward PTX synthesis + embed (v1 kernels).
+            let bwd_ptx_bytes =
+                crate::fused_linear_ce::synthesize_fused_linear_ce_backward_ptx(&cfg);
+            let bwd_kname = cfg.bwd_kernel_name();
+            let tag = format!("bwd_v{}_h{}", vocab_size, hidden_size);
+            let (bwd_ptx_ptr, bwd_name_ptr) =
+                embed_fused_ce_data(compiler, builder, &tag, &bwd_ptx_bytes, &bwd_kname)?;
+            let smem_val =
+                builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
+            // CFTP v4-2: dtype_tag from `@fused_lm_ce(dtype="...")` decorator
+            // (resolved above; same value the forward path used).
+            let dtype_tag_val = builder.ins().iconst(cl_types::I64, dtype_tag);
+            let _rc = call(
+                compiler,
+                builder,
+                "nsl_fused_linear_ce_backward",
+                &[
+                    bwd_ptx_ptr,
+                    bwd_name_ptr,
+                    grad_bits,
+                    x_ptr,
+                    w_ptr,
+                    bias_ptr,
+                    tgt_ptr,
+                    lse_ptr,
+                    dx_ptr,
+                    dw_ptr,
+                    dbias_ptr,
+                    b_val,
+                    s_val,
+                    v_val,
+                    h_val,
+                    num_valid,
+                    smem_val,
+                    dtype_tag_val,
+                ],
+            )?;
+        }
 
         // Release the i64 targets copy (stream-ordered free).
         call(compiler, builder, "nsl_fused_lce_targets_i64_free", &[tgt_ptr])?;
@@ -4555,7 +4681,11 @@ fn lower_fused_linear_ce_backward_extract(
     };
 
     let result = slot[component as usize];
-    if component == 2 {
+    // Sprint 2.5: a biasless head never emits component 2 (the AD rule
+    // skips the bias adjoint), so eviction moves to the last EMITTED
+    // component — keying it to 2 would leak both caches per step.
+    let last_component = if has_bias { 2 } else { 1 };
+    if component == last_component {
         compiler.fused_ce_bwd_cache.remove(&fwd_result_key);
         // CFTP v6 Finding 10/14: evict the cast cache on the same
         // last-component boundary so the cache stays bounded across
@@ -5120,6 +5250,8 @@ mod tests {
                 vocab_tile: 1024,
                 ignore_index: -100,
                 is_large: false,
+                has_bias: true,
+                x_rank3: false,
             },
             PrimalOp::FusedLinearCeBackwardExtract {
                 component: 0,
@@ -5129,6 +5261,8 @@ mod tests {
                 seq_len: 1,
                 vocab_tile: 1024,
                 ignore_index: -100,
+                has_bias: true,
+                x_rank3: false,
             },
             PrimalOp::Input("x".into()),
             PrimalOp::Param("w".into()),

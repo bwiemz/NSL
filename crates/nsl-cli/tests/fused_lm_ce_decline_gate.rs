@@ -3,12 +3,15 @@
 //! # The defect this gates
 //!
 //! The decorator's purpose is to delete the `[batch*seq, vocab]`
-//! logits-gradient surface. Its substitution declines on a biasless LM head
-//! and on a reshape between the head and the loss — which is exactly what
-//! `models/coder50m/model.nsl:79-80` and `models/coder50m/pretrain.nsl:30-32`
-//! have. Before item 6 those declines were silent: `nsl build` exited 0, said
-//! nothing, and emitted the full composite path while the user believed the
-//! fused kernel was live.
+//! logits-gradient surface. Historically its substitution declined on a
+//! biasless LM head and on a reshape between the head and the loss — which
+//! is exactly what `models/coder50m/model.nsl:79-80` and
+//! `models/coder50m/pretrain.nsl:30-32` have. Before item 6 those declines
+//! were silent: `nsl build` exited 0, said nothing, and emitted the full
+//! composite path while the user believed the fused kernel was live.
+//! Sprint 2.5 flipped BOTH of those shapes into substitutions (GEMM-chunked
+//! path); the refusal machinery itself is still gated here via the
+//! pre-transposed-weight shape, which remains a genuine decline.
 //!
 //! Measured on the pre-fix binary with the `declines_when_nothing_fuses`
 //! fixture below: exit 0, and no line of stderr mentioning the decorator.
@@ -74,6 +77,7 @@ fn fixture(head: &str, loss: &str, enabled: &str) -> String {
 
 model TinyLM:
     embed: Tensor = randn([128, 64]) * 0.1
+    embed_hv: Tensor = randn([64, 128]) * 0.1
     norm_out: Tensor = ones([64])
     lm_bias: Tensor = zeros([128])
 
@@ -85,7 +89,6 @@ model TinyLM:
         let emb = embedding_lookup(self.embed, flat_ids)
         let h = emb.reshape([batch_size, seq_len, 64])
         let hn = rmsnorm(h, self.norm_out, 0.00001)
-        let flat_hn = hn.reshape([batch_size * seq_len, 64])
 {head}
 
 let m = TinyLM()
@@ -107,44 +110,52 @@ train(model=m, epochs=1):
 }
 
 /// `models/coder50m/model.nsl:79-80` — biasless weight-tied head.
-const BIASLESS_HEAD: &str = "        return flat_hn @ self.embed.transpose(0, 1)";
+/// BEHAVIOUR FLIP (Sprint 2.5): substitutes (has_bias=false, GEMM path).
+const BIASLESS_HEAD: &str = "        let flat_hn = hn.reshape([batch_size * seq_len, 64])\n\
+    \x20       return flat_hn @ self.embed.transpose(0, 1)";
+/// A head the matcher still cannot honour: the weight reaches the matmul
+/// WITHOUT a transpose (a pre-transposed `[H, V]` layout would need a new
+/// emitter family) — keeps the item-6 nothing-fused refusal genuinely
+/// exercised now that biasless and reshaped heads fuse.
+const NO_TRANSPOSE_HEAD: &str = "        let flat_hn = hn.reshape([batch_size * seq_len, 64])\n\
+    \x20       return (flat_hn @ self.embed_hv) + self.lm_bias";
 /// The canonical head the matcher accepts.
 const MATCHING_HEAD: &str =
-    "        return (flat_hn @ self.embed.transpose(0, 1)) + self.lm_bias";
+    "        let flat_hn = hn.reshape([batch_size * seq_len, 64])\n\
+    \x20       return (flat_hn @ self.embed.transpose(0, 1)) + self.lm_bias";
 const PLAIN_LOSS: &str = "        let loss = cross_entropy(logits, flat_labels)";
 
 // ─── The gate ──────────────────────────────────────────────────────────────
 
-/// A biasless head under an enabled, fully-hinted decorator must be a hard
-/// error naming the reason — not a clean compile.
+/// A head the matcher cannot honour (no transpose on the weight) under an
+/// enabled, fully-hinted decorator must be a hard error naming the reason —
+/// not a clean compile. (Sprint 2.5 flipped the original biasless fixture
+/// into a substitution — see `biasless_head_compiles_and_fuses` — so this
+/// gate now uses the pre-transposed-weight shape, which remains a genuine
+/// decline.)
 #[test]
 fn declines_when_nothing_fuses() {
     let (ok, stderr) = build(
-        &fixture(BIASLESS_HEAD, PLAIN_LOSS, "true"),
-        "biasless_refuses",
+        &fixture(NO_TRANSPOSE_HEAD, PLAIN_LOSS, "true"),
+        "no_transpose_refuses",
     );
     assert!(
         !ok,
-        "a biasless LM head under @fused_lm_ce(enabled=true) must REFUSE, but \
-         the build succeeded. stderr:\n{stderr}"
+        "a pre-transposed-weight LM head under @fused_lm_ce(enabled=true) \
+         must REFUSE, but the build succeeded. stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("@fused_lm_ce(enabled = true) is active on this train block"),
         "the refusal must be the fused-CE one, not an unrelated failure. \
          stderr:\n{stderr}"
     );
-    // Assert on the PRODUCER PAYLOAD, not on the explanatory boilerplate.
-    //
-    // The generic explanation names both failing shapes ("a BIASLESS head …
-    // and a RESHAPE between the head and cross_entropy"), so asserting on
-    // that text passes for EITHER cause and would not notice the diagnostic
-    // pointing at the wrong op. Only `produced by Matmul` is specific to this
-    // fixture. This was found by breaking the message and watching the test
-    // stay green.
+    // Assert on the DECLINE PAYLOAD, not the explanatory boilerplate (the
+    // original form of this test pinned `produced by Matmul` for the same
+    // reason — a generic message would pass for any cause).
     assert!(
-        stderr.contains("produced by Matmul"),
-        "the refusal must name the ACTUAL producer (a bare Matmul for a \
-         biasless head), not just the generic explanation. stderr:\n{stderr}"
+        stderr.contains("not produced by a transpose"),
+        "the refusal must name the actual reason (weight not transposed). \
+         stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("set enabled = false"),
@@ -152,35 +163,78 @@ fn declines_when_nothing_fuses() {
     );
 }
 
-/// A reshape between the head and the loss (`coder50m/pretrain.nsl:30-32`)
-/// also refuses, and names the reshape.
+/// BEHAVIOUR FLIP (Sprint 2.5): the biasless weight-tied head — the exact
+/// `models/coder50m/model.nsl` shape — now compiles AND fuses.
 #[test]
-fn reshape_between_head_and_loss_refuses_naming_the_reshape() {
-    // 3-D logits out of the head, flattened at the loss — the shape the
-    // repo's own pretrain scripts use.
+fn biasless_head_compiles_and_fuses() {
+    let (ok, stderr) = build(
+        &fixture(BIASLESS_HEAD, PLAIN_LOSS, "true"),
+        "biasless_fuses",
+    );
+    assert!(
+        ok,
+        "the biasless head must compile under @fused_lm_ce(enabled=true) \
+         since Sprint 2.5. stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("[fused-lm-ce]"),
+        "no fused-CE fallback diagnostic may fire for the biasless head. \
+         stderr:\n{stderr}"
+    );
+}
+
+/// BEHAVIOUR FLIP (Sprint 2.5): a reshape between the head and the loss
+/// (`coder50m/pretrain.nsl:30-32` — the shape the repo's own pretrain
+/// scripts use) is now seen through and fuses.
+#[test]
+fn reshape_between_head_and_loss_compiles_and_fuses() {
+    // 3-D logits out of the head, flattened at the loss with COMPILE-TIME
+    // dims (batch 2 x seq 64 = 128 rows, vocab 128). Runtime `.shape` reads
+    // of the logits are a separate, refused case — see the next test.
+    let head = "        let logits3d = (hn @ self.embed.transpose(0, 1)) + self.lm_bias\n\
+                \x20       return logits3d";
+    let loss = "        let flat_logits = logits.reshape([128, 128])\n\
+                \x20       let loss = cross_entropy(flat_logits, flat_labels)";
+    let (ok, stderr) = build(&fixture(head, loss, "true"), "reshape_fuses");
+    assert!(
+        ok,
+        "the reshape-between-head-and-loss shape must compile under \
+         @fused_lm_ce(enabled=true) since Sprint 2.5 (see-through). \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("[fused-lm-ce]"),
+        "no fused-CE fallback diagnostic may fire for the seen-through \
+         reshape. stderr:\n{stderr}"
+    );
+}
+
+/// A RUNTIME consumer of the logits (`let ls = logits.shape`) between the
+/// head and the loss keeps the composite chain alive after substitution —
+/// the logits must materialize every step anyway (fusion defeated) and the
+/// surviving chain's ghost adjoints would corrupt gradient accumulation.
+/// Must be a hard refusal that names the fix, not an unresolved-adjoint ICE.
+#[test]
+fn live_logits_consumer_refuses_with_actionable_message() {
     let head = "        let logits3d = (hn @ self.embed.transpose(0, 1)) + self.lm_bias\n\
                 \x20       return logits3d";
     let loss = "        let ls = logits.shape\n\
                 \x20       let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])\n\
                 \x20       let loss = cross_entropy(flat_logits, flat_labels)";
-    let (ok, stderr) = build(&fixture(head, loss, "true"), "reshape_refuses");
+    let (ok, stderr) = build(&fixture(head, loss, "true"), "live_consumer_refuses");
     assert!(
         !ok,
-        "a reshape between the head and cross_entropy must REFUSE. stderr:\n{stderr}"
+        "a live logits consumer under @fused_lm_ce(enabled=true) must \
+         REFUSE. stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("@fused_lm_ce(enabled = true) is active on this train block"),
-        "expected the fused-CE refusal. stderr:\n{stderr}"
+        stderr.contains("logits chain is still LIVE"),
+        "the refusal must be the live-consumer diagnosis, not an \
+         unresolved-adjoint ICE. stderr:\n{stderr}"
     );
-    // Same discipline as above: pin the producer payload. `contains("reshape")`
-    // alone is NOT sufficient — the generic explanation already says "a
-    // RESHAPE between the head and cross_entropy", so that assertion is
-    // satisfied by boilerplate present in every LogitsProducerNotAdd decline,
-    // including the biasless one. Only the payload distinguishes them.
     assert!(
-        stderr.contains(r#"produced by Passthrough("reshape")"#),
-        "the refusal must name the reshape as the actual producer. \
-         stderr:\n{stderr}"
+        stderr.contains("compile-time dims"),
+        "the refusal must name the fix. stderr:\n{stderr}"
     );
 }
 
@@ -288,7 +342,8 @@ fn disabled_decorator_on_the_same_head_compiles() {
 fn enabled_decorator_with_unextractable_body_warns() {
     // `bias_add` has no source-AD handler, so extraction fails and the run
     // falls back to tape AD, where the fused kernel does not exist.
-    let head = "        return bias_add(flat_hn @ self.embed.transpose(0, 1), self.lm_bias)";
+    let head = "        let flat_hn = hn.reshape([batch_size * seq_len, 64])\n\
+    \x20       return bias_add(flat_hn @ self.embed.transpose(0, 1), self.lm_bias)";
     let (_ok, stderr) = build(&fixture(head, PLAIN_LOSS, "true"), "unextractable");
     assert!(
         stderr.contains("source-AD extraction of the step body failed"),
