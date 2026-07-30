@@ -36,14 +36,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   return register is defined — but `nsl_filter` compared the full i64
   against 0, seeing stale upper bits. `nsl_map`/`nsl_filter` now take a
   codegen-supplied `ret_is_bool` flag and mask to the defined byte.
-- 13 CPU gates in `lambda_float_abi.rs`: the two bugs.md repros, float
+- Two review follow-ups folded in: indirect call sites now COERCE
+  checker-legal numeric widenings to the declared param type (`f(3)` on
+  `(float) -> float` previously reached the Cranelift verifier as an
+  i64-vs-f64 arg mismatch — an ICE with a raw dump), and map()/filter()
+  refuse UNANNOTATED lambda params (Unknown-typed bodies lowered through
+  tensor ops and aborted at runtime; refusing is strictly an upgrade).
+- 16 CPU gates in `lambda_float_abi.rs`: the two bugs.md repros, float
   through a fn-typed parameter, mixed float/int params, float + bool +
   int captures, the nested-fn float route, int map/filter regression
-  pins, and three compile-time refusals. Mutation-proven in four
-  independent directions: param typing reverted → exactly the 5
-  float-param gates red; capture convention reverted → exactly the 2
-  non-I64 capture gates red; refusal guard off → exactly the 3 refusal
-  gates red; ret_is_bool flag off → exactly the filter gate red.
+  pins, int→float widening (direct + via fn-typed param), and four
+  compile-time refusals. Mutation-proven in six independent directions:
+  param typing reverted → exactly the 5 float-param gates red; capture
+  convention reverted → exactly the 2 non-I64 capture gates red;
+  refusal guard off → exactly the 3 float-refusal gates red;
+  ret_is_bool flag off → exactly the filter gate red; arg coercion
+  off → exactly the 2 widening gates red; Unknown-param refusal off →
+  exactly the unannotated-map gate red.
 
 ### Fixed — nested fns, lambdas, and fn-typed params now win builtin-name dispatch
 

@@ -776,6 +776,21 @@ impl Compiler<'_> {
                      are undefined. Return int (or bool) instead."
                 )));
             }
+            // An unannotated lambda param is Unknown — the body then lowers
+            // through tensor ops and aborts at runtime on the int list
+            // slots (review LOW on 01bb85aa, misaligned-deref probe).
+            // Nothing Unknown-typed ever worked here, so refusing is
+            // strictly an upgrade.
+            if pts
+                .iter()
+                .any(|t| matches!(t, Type::Unknown | Type::Error))
+            {
+                return Err(CodegenError::new(format!(
+                    "{func_name}() requires annotated function parameter types \
+                     (e.g. `|x: int| ...`) — an unannotated parameter compiles \
+                     as Unknown and cannot dispatch correctly."
+                )));
+            }
         }
         // Error if first arg is a closure (captures variables) -- HOFs in C runtime expect bare fn ptrs
         if let ExprKind::Ident(sym) = &args[0].value.kind {

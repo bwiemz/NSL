@@ -270,6 +270,62 @@ print("DONE")
     );
 }
 
+/// Checker-legal int→float widening at an indirect call site: `f(3)`
+/// on a float lambda previously reached the Cranelift verifier as an
+/// i64-vs-f64 arg mismatch — an ICE with a raw dump (review MEDIUM on
+/// 01bb85aa). The call site now coerces to the declared param type.
+#[test]
+fn int_argument_widens_into_float_lambda() {
+    let src = r#"
+let f = |v: float| v * 2.0
+print(f(3))
+print("DONE")
+"#;
+    let stdout = run_src(src, "widen");
+    assert_eq!(printed_value(&stdout), "6", "int→float widening broke:\n{stdout}");
+}
+
+/// Same widening through a fn-typed parameter's annotation.
+#[test]
+fn int_argument_widens_via_fn_typed_param() {
+    let src = r#"
+fn apply(g: (float) -> float, v: int) -> float:
+    return g(v)
+
+let f = |z: float| z * 3.0
+print(apply(f, 2))
+print("DONE")
+"#;
+    let stdout = run_src(src, "widenparam");
+    assert_eq!(
+        printed_value(&stdout),
+        "6",
+        "int→float widening via param broke:\n{stdout}"
+    );
+}
+
+/// An UNANNOTATED lambda param compiles as Unknown and its body lowers
+/// through tensor ops — a runtime misaligned-deref abort pre-guard
+/// (review LOW on 01bb85aa). Refused at compile time now.
+#[test]
+fn map_unannotated_lambda_is_refused_at_compile_time() {
+    let src = r#"
+let r = map(|x| x * 2, [1, 2])
+print("DONE")
+"#;
+    let out = run_nsl(src, "mapunann");
+    assert!(
+        !out.status.success(),
+        "unannotated map lambda must be refused:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("annotated"),
+        "refusal should ask for annotations:\n{stderr}"
+    );
+}
+
 /// filter() with a float-typed predicate parameter — same refusal.
 #[test]
 fn filter_float_param_is_refused_at_compile_time() {
