@@ -194,7 +194,7 @@ pub struct ModelMetadata {
     /// decorators on model tensor fields, keyed `model_name -> field_name
     /// -> role`. The authoritative override for mixed Muon/AdamW routing
     /// (embedding/head route to AdamW, hidden to Muon); undecorated fields
-    /// fall back to structural inference (`muon_roles.rs`). Populated by
+    /// fall back to structural inference (`param_roles.rs`). Populated by
     /// `collection.rs`; an unknown role string is a hard compile error.
     pub model_field_roles: HashMap<String, HashMap<String, String>>,
     /// M62 Task 5: impl FuncId + signature for @export model methods.

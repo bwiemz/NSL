@@ -137,14 +137,16 @@ signal, not the absolute value.
 the same reason as `coder1b` — see that README's section for the
 reference points and the two levers.
 
-## Weight decay applies to every parameter
+## Weight decay: parameter groups
 
-As in `coder1b`: `AdamW(weight_decay=0.1)` is a single scalar over all
-trainable parameters, RMSNorm gains and the tied embedding included. NSL's
-train-block optimizer DSL has no parameter groups, so the usual
-decay-2-D-weights-only convention cannot be expressed. See
-`models/coder1b/README.md` for the details and for the existing
-`muon_roles.rs` classification that a fix would build on.
+As in `coder1b`: `AdamW(weight_decay=...)` decays every trainable parameter by
+default, RMSNorm gains and the tied embedding included. Exempt them with
+`no_decay=[...]` over parameter roles — `no_decay=["vector"]` for the usual
+norms-and-biases convention, plus `"embedding"` to spare the tied embedding.
+`"vector"` is resolved from the tensor's real rank at step time, because real
+model fields have no statically-derivable rank. See
+`models/coder1b/README.md` for the role table, the measured evidence, and the
+compositions that refuse.
 
 ## Packed corpora
 

@@ -5035,6 +5035,9 @@ impl Compiler<'_> {
         let mut momentum_value: f64 = 0.0;
         let mut dampening_value: f64 = 0.0;
         let mut weight_decay_value: f64 = 0.0;
+        // AdamW parameter groups (`no_decay=[...]`). Empty = every param
+        // decays, bit-identical to before this existed.
+        let mut no_decay_scope = crate::param_roles::NoDecayScope::default();
         let mut nesterov_value: bool = false;
         let mut beta1_value: f64 = 0.9;
         let mut beta2_value: f64 = 0.999;
@@ -5132,6 +5135,64 @@ impl Compiler<'_> {
                                     "weight_decay" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             weight_decay_value = *f;
+                                        }
+                                    }
+                                    // AdamW parameter groups: role names whose
+                                    // params are EXEMPT from weight decay. An
+                                    // unknown name is a compile error, not a
+                                    // silently-dropped entry — a typo'd
+                                    // "vectors" would otherwise read as
+                                    // "exclusion configured" while decaying
+                                    // every norm in the model.
+                                    "no_decay" => {
+                                        let ExprKind::ListLiteral(items) = &arg.value.kind else {
+                                            return Err(CodegenError::new(
+                                                "no_decay must be a list of role-name strings, \
+                                                 e.g. no_decay=[\"vector\"] (norms/biases) or \
+                                                 no_decay=[\"vector\", \"embedding\"]",
+                                            ));
+                                        };
+                                        for item in items {
+                                            let ExprKind::StringLiteral(s) = &item.kind else {
+                                                return Err(CodegenError::new(
+                                                    "no_decay entries must be string literals \
+                                                     naming a parameter role",
+                                                ));
+                                            };
+                                            if !crate::param_roles::VALID_ROLES.contains(&s.as_str()) {
+                                                return Err(CodegenError::new(format!(
+                                                    "no_decay: unknown parameter role {s:?}. \
+                                                     Valid roles are {:?}. \"vector\" covers \
+                                                     anything not rank-2 at runtime (norms, \
+                                                     biases); \"embedding\"/\"head\" come from \
+                                                     @param_role or embedding_lookup usage",
+                                                    crate::param_roles::VALID_ROLES,
+                                                )));
+                                            }
+                                            if s == "vector" {
+                                                no_decay_scope.exempt_non_rank2 = true;
+                                            } else if !no_decay_scope.exempts_role(s) {
+                                                no_decay_scope.static_roles.push(s.clone());
+                                            }
+                                        }
+                                        // Every param's role is exactly one of
+                                        // embedding/head/hidden/vector, so exempting
+                                        // the three non-vector roles exempts
+                                        // everything (a "vector"-role param needs a
+                                        // statically-derivable rank, which real
+                                        // models do not have). That is
+                                        // weight_decay=0.0 spelled obscurely.
+                                        if ["embedding", "head", "hidden"]
+                                            .iter()
+                                            .all(|r| no_decay_scope.exempts_role(r))
+                                        {
+                                            return Err(CodegenError::new(
+                                                "no_decay exempts every role that a parameter \
+                                                 can have (embedding, head, hidden), which \
+                                                 disables weight decay entirely — set \
+                                                 weight_decay=0.0 instead so the intent is \
+                                                 visible at the call site",
+                                            ));
                                         }
                                     }
                                     "nesterov" => {
@@ -6176,7 +6237,7 @@ impl Compiler<'_> {
         // ── 4a. P1 Muon item 6: parameter-ROLE routing flags ────────────
         // Mixed Muon/AdamW routes by parameter ROLE — explicit @param_role
         // decorator > embedding_lookup-usage inference > declared rank >
-        // default hidden (see muon_roles.rs). The name-substring exclusion
+        // default hidden (see param_roles.rs). The name-substring exclusion
         // list is gone. Flags ride in an i64 NslList parallel to param_list
         // (1 = force-AdamW); the rank-2 structural check remains the runtime
         // backstop inside muon_step. Built BEFORE the optimizer state
@@ -6184,7 +6245,7 @@ impl Compiler<'_> {
         // params (item 9). The routing table prints loudly so a misrouted
         // param is never silent.
         let muon_route_list = if optimizer_name == "muon" {
-            let table = self.classify_muon_param_roles(&model_type_name, &param_paths);
+            let table = self.classify_param_roles(&model_type_name, &param_paths);
             let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
             for e in &table.entries {
                 let flag = builder.ins().iconst(cl_types::I64, e.adamw as i64);
@@ -6225,6 +6286,116 @@ impl Compiler<'_> {
             Some(list)
         } else {
             None
+        };
+
+        // AdamW parameter groups: refuse the compositions that hoist ONE
+        // weight-decay scalar out of the per-parameter loop. Each of these
+        // would compile and train — decaying the parameters the user asked to
+        // exempt — so they must refuse rather than silently ignore no_decay.
+        if !no_decay_scope.is_empty() {
+            if self.compile_options.muon_batch_ns {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --muon-batch-ns: the \
+                     batched Newton-Schulz pre-loop takes one weight_decay \
+                     scalar for the whole batch, so per-parameter exemption \
+                     cannot be expressed there. Drop one",
+                ));
+            }
+            if csla_active {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --layerwise-accum: the \
+                     window-buffered group update hoists weight_decay out of \
+                     the per-parameter loop. Drop one",
+                ));
+            }
+            if self.compile_options.optim_state_offload {
+                return Err(CodegenError::new(
+                    "no_decay=[...] is not supported with --optim-state-offload \
+                     yet (the staged host/device envelope is untested against \
+                     per-parameter decay). Drop one",
+                ));
+            }
+        }
+
+        // ── 4a-bis. AdamW parameter groups: per-param decay-exempt flags ──
+        // `no_decay=[...]` names ROLES to exempt from weight decay. The
+        // static half of the decision (embedding / head / hidden) is decided
+        // here from the same role table Muon routes on; the `"vector"` half
+        // is NOT, because a model field only has a statically-derivable rank
+        // when its initializer is a direct zeros/ones/randn/... call over
+        // integer literals — which real models are not. Both halves meet in
+        // `nsl_optim_param_wd`, the single runtime rule.
+        //
+        // Flags ride in an i64 NslList parallel to param_list (1 = exempt),
+        // exactly like the Muon route flags. The table prints loudly: a
+        // parameter group that silently exempted nothing (or everything) is
+        // the failure this feature is supposed to remove, not add.
+        let decay_exempt_list = if no_decay_scope.is_empty() {
+            None
+        } else {
+            if weight_decay_value == 0.0 {
+                eprintln!(
+                    "[wd-groups] warning: no_decay=[...] was given but \
+                     weight_decay is 0.0 — nothing is being decayed, so the \
+                     exemption has no effect."
+                );
+            }
+            let table = self.classify_param_roles(&model_type_name, &param_paths);
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let mut static_exempt = 0usize;
+            for e in &table.entries {
+                let exempt = no_decay_scope.exempts_role(e.role);
+                static_exempt += usize::from(exempt);
+                let flag = builder.ins().iconst(cl_types::I64, i64::from(exempt));
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, flag])?;
+            }
+            let mut scope_desc = no_decay_scope.static_roles.clone();
+            if no_decay_scope.exempt_non_rank2 {
+                scope_desc.push("vector (runtime rank != 2)".to_string());
+            }
+            eprintln!(
+                "[wd-groups] weight_decay={} exempting roles [{}] over {} params: \
+                 {} exempt by role at compile time{}",
+                weight_decay_value,
+                scope_desc.join(", "),
+                table.entries.len(),
+                static_exempt,
+                if no_decay_scope.exempt_non_rank2 {
+                    ", plus every param that is not rank-2 at step time"
+                } else {
+                    ""
+                },
+            );
+            for e in &table.entries {
+                if no_decay_scope.exempts_role(e.role) {
+                    eprintln!(
+                        "[wd-groups]   {} role={} ({}) -> NO decay",
+                        e.path, e.role, e.source
+                    );
+                }
+            }
+            // Anti-vacuity: a scope that exempts nothing statically AND does
+            // not ask for the runtime rank check cannot ever fire. That is a
+            // configuration error, not a no-op to shrug at.
+            if static_exempt == 0 && !no_decay_scope.exempt_non_rank2 {
+                return Err(CodegenError::new(format!(
+                    "no_decay=[{}] matches no parameter in this model — every \
+                     param classified as one of the roles it does NOT name. \
+                     Roles present: {}. Note that norms and biases usually \
+                     classify as role `hidden` (their rank is not derivable \
+                     from the field initializer), so use no_decay=[\"vector\"] \
+                     to exempt them by runtime rank",
+                    no_decay_scope.static_roles.join(", "),
+                    {
+                        let mut roles: Vec<&str> =
+                            table.entries.iter().map(|e| e.role).collect();
+                        roles.sort_unstable();
+                        roles.dedup();
+                        roles.join(", ")
+                    },
+                )));
+            }
+            Some(list)
         };
 
         // ── 4. Create optimizer state buffers ─────────────────────────
@@ -12552,6 +12723,7 @@ impl Compiler<'_> {
                 grad_accumulation_steps,
                 grad_clip,
                 cpdt_precision_dtypes,
+                decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
             )?;
 
             // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
@@ -12838,6 +13010,12 @@ impl Compiler<'_> {
                         let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
                         let eps_v = builder.ins().f64const(sc.eps);
                         let wd_v = builder.ins().f64const(sc.wd);
+                        let exempt_list_v = decay_exempt_list
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        let exempt_nr2_v = builder.ins().iconst(
+                            cl_types::I64,
+                            i64::from(no_decay_scope.exempt_non_rank2),
+                        );
                         self.compile_call_by_name(
                             builder,
                             "nsl_fase_fused_adamw_step_multi",
@@ -12855,6 +13033,11 @@ impl Compiler<'_> {
                                 wd_v,
                                 bc1_inv,
                                 bc2_inv,
+                                // AdamW parameter groups. 0 = no no_decay,
+                                // in which case the runtime takes wd_v for
+                                // every param exactly as before.
+                                exempt_list_v,
+                                exempt_nr2_v,
                             ],
                         )?;
                     } else {
@@ -12915,18 +13098,34 @@ impl Compiler<'_> {
                         m
                     };
                     let wrap_precision = cpdt_precision_dtypes.is_some();
-                    self.fase_emit_final_step(
+                    // AdamW parameter groups. `fase_emit_final_step` bakes λ
+                    // into the emitted update program at COMPILE time (it
+                    // elides the `wd·θ` term entirely when λ == 0), so a
+                    // runtime λ cannot be handed to it. Branch between two
+                    // compile-time recipes instead: each arm is then
+                    // byte-identical to what this site emitted before the
+                    // feature, at its own λ. Multiplying θ by a runtime 0
+                    // would have been the smaller diff and is NOT used —
+                    // this file already documents why mul-by-0.0 is not a
+                    // zeroing idiom here (it keeps NaN/Inf alive).
+                    let fs_wd_join = self.emit_deferred_step_with_groups(
                         builder,
+                        decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
+                        fs_i,
                         theta,
                         m,
                         m_partial,
                         v,
                         &fase_plan.recipe,
-                        Some((bc1_inv, bc2_inv)),
+                        (bc1_inv, bc2_inv),
                         wrap_precision,
-                        self.compile_options.optim_state_offload,
                         Some(opt_step),
                     )?;
+                    if let Some(join) = fs_wd_join {
+                        builder.ins().jump(join, &[]);
+                        builder.switch_to_block(join);
+                        builder.seal_block(join);
+                    }
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     if let Some(fs_join) = fs_zero_blocks {
                         builder.ins().jump(fs_join, &[]);
@@ -13078,7 +13277,7 @@ impl Compiler<'_> {
                 s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
             };
             // P5 Muon: per-param routing flag (parameter-role classification,
-            // see 4a / muon_roles.rs) + Newton-Schulz depth + the AdamW-arm
+            // see 4a / param_roles.rs) + Newton-Schulz depth + the AdamW-arm
             // lr as a fixed ratio of the (possibly scheduled) lr.
             let muon_extra = if let Some(route_list) = muon_route_list {
                 let flag_i =
@@ -13123,6 +13322,16 @@ impl Compiler<'_> {
             // construction here, so wrap_precision is always structurally
             // false at this call site. Threaded through for signature
             // uniformity with the unified-dispatch site.
+            // AdamW parameter groups: per-param decay. Identity (no emitted
+            // IR) when no_decay was not configured.
+            let param_wd = self.emit_param_wd(
+                builder,
+                decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
+                idx,
+                param_val,
+                weight_decay_const,
+            )?;
+
             self.emit_stdlib_optim_call(
                 builder,
                 optimizer_name.as_str(),
@@ -13134,7 +13343,7 @@ impl Compiler<'_> {
                 lr,
                 momentum_const,
                 dampening_const,
-                weight_decay_const,
+                param_wd,
                 nesterov_const,
                 beta1_const,
                 beta2_const,
@@ -14348,6 +14557,9 @@ impl Compiler<'_> {
         let mut momentum_value: f64 = 0.0;
         let mut dampening_value: f64 = 0.0;
         let mut weight_decay_value: f64 = 0.0;
+        // AdamW parameter groups (`no_decay=[...]`). Empty = every param
+        // decays, bit-identical to before this existed.
+        let mut no_decay_scope = crate::param_roles::NoDecayScope::default();
         let mut nesterov_value: bool = false;
         let mut beta1_value: f64 = 0.9;
         let mut beta2_value: f64 = 0.999;
@@ -14396,6 +14608,64 @@ impl Compiler<'_> {
                                     "weight_decay" => {
                                         if let ExprKind::FloatLiteral(f) = &arg.value.kind {
                                             weight_decay_value = *f;
+                                        }
+                                    }
+                                    // AdamW parameter groups: role names whose
+                                    // params are EXEMPT from weight decay. An
+                                    // unknown name is a compile error, not a
+                                    // silently-dropped entry — a typo'd
+                                    // "vectors" would otherwise read as
+                                    // "exclusion configured" while decaying
+                                    // every norm in the model.
+                                    "no_decay" => {
+                                        let ExprKind::ListLiteral(items) = &arg.value.kind else {
+                                            return Err(CodegenError::new(
+                                                "no_decay must be a list of role-name strings, \
+                                                 e.g. no_decay=[\"vector\"] (norms/biases) or \
+                                                 no_decay=[\"vector\", \"embedding\"]",
+                                            ));
+                                        };
+                                        for item in items {
+                                            let ExprKind::StringLiteral(s) = &item.kind else {
+                                                return Err(CodegenError::new(
+                                                    "no_decay entries must be string literals \
+                                                     naming a parameter role",
+                                                ));
+                                            };
+                                            if !crate::param_roles::VALID_ROLES.contains(&s.as_str()) {
+                                                return Err(CodegenError::new(format!(
+                                                    "no_decay: unknown parameter role {s:?}. \
+                                                     Valid roles are {:?}. \"vector\" covers \
+                                                     anything not rank-2 at runtime (norms, \
+                                                     biases); \"embedding\"/\"head\" come from \
+                                                     @param_role or embedding_lookup usage",
+                                                    crate::param_roles::VALID_ROLES,
+                                                )));
+                                            }
+                                            if s == "vector" {
+                                                no_decay_scope.exempt_non_rank2 = true;
+                                            } else if !no_decay_scope.exempts_role(s) {
+                                                no_decay_scope.static_roles.push(s.clone());
+                                            }
+                                        }
+                                        // Every param's role is exactly one of
+                                        // embedding/head/hidden/vector, so exempting
+                                        // the three non-vector roles exempts
+                                        // everything (a "vector"-role param needs a
+                                        // statically-derivable rank, which real
+                                        // models do not have). That is
+                                        // weight_decay=0.0 spelled obscurely.
+                                        if ["embedding", "head", "hidden"]
+                                            .iter()
+                                            .all(|r| no_decay_scope.exempts_role(r))
+                                        {
+                                            return Err(CodegenError::new(
+                                                "no_decay exempts every role that a parameter \
+                                                 can have (embedding, head, hidden), which \
+                                                 disables weight decay entirely — set \
+                                                 weight_decay=0.0 instead so the intent is \
+                                                 visible at the call site",
+                                            ));
                                         }
                                     }
                                     "nesterov" => {
@@ -14740,6 +15010,19 @@ impl Compiler<'_> {
                 optimizer_fn_name.to_string()
             }
         };
+
+        // AdamW parameter groups are not wired through the @pipeline path:
+        // its optimizer step is emitted per pipeline stage rather than over
+        // the model's flat param list, so the role table's positional flags
+        // have no list to be parallel to here. Refuse rather than decay the
+        // parameters the user asked to exempt.
+        if !no_decay_scope.is_empty() {
+            return Err(CodegenError::new(
+                "no_decay=[...] is not supported on the @pipeline train path \
+                 yet: its optimizer step is emitted per stage rather than over \
+                 the flat parameter list the role flags index. Drop one",
+            ));
+        }
 
         let lr = builder.use_var(lr_var);
         let momentum_const = builder.ins().f64const(momentum_value);

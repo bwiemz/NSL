@@ -665,7 +665,7 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("matmul_mma", "tensor-core matmul emitter"),
     ("moe", "mixture-of-experts kernels and HF packing"),
     ("multimodal", "multimodal input support"),
-    ("muon_roles", "Muon optimizer role classification"),
+    ("param_roles", "Parameter role classification (Muon routing + weight-decay groups)"),
     ("ownership", "ownership infrastructure"),
     ("pass_registry", "this registry"),
     ("pipeline", "pipeline-parallel scheduling"),
