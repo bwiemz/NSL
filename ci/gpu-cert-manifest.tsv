@@ -344,6 +344,16 @@ crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_e5m2_backward_with_gpu_view
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	tape_fp8_training_backward_on_gpu_matches_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	block_quantizers_on_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_maxpool2d_argmax_readback.rs	gpu_maxpool2d_argmax_readback_does_not_segfault	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	gqa_kv_expand_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	head_transpose_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	scalar_broadcast_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	per_token_broadcast_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	two_dimensional_transpose_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	unaligned_odd_run_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	odd_head_dim_copy_uses_scalar_arm	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	more_runs_than_grid_y_limit_matches_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	generic_kernel_agrees_with_fast_path	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/gpu_strided_copy_run_parity.rs	print_checksum_child	unclassified	child process of generic_kernel_agrees_with_fast_path
 crates/nsl-runtime/tests/gpu_strided_view_ops.rs	gpu_matmul_with_transposed_view_matches_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_strided_view_ops.rs	gpu_matmul_with_transposed_view_left_matches_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_strided_view_ops.rs	gpu_unary_on_transposed_view_matches_reference	gpu	requires CUDA GPU
