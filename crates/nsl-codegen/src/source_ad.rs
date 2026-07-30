@@ -1407,6 +1407,8 @@ impl AdjointGenerator {
                 seq_len,
                 vocab_tile,
                 ignore_index,
+                has_bias,
+                x_rank3,
             } => self.emit_op(
                 PrimalOp::FusedLinearCeBackwardExtract {
                     component,
@@ -1416,6 +1418,8 @@ impl AdjointGenerator {
                     seq_len,
                     vocab_tile,
                     ignore_index,
+                    has_bias,
+                    x_rank3,
                 },
                 vec![grad, x, w, bias, targets, fwd_result],
             ),
@@ -2327,10 +2331,29 @@ impl FusedLceDecline {
 struct FusedLceMatch {
     x_var: VarId,
     w_var: VarId,
-    bias_var: VarId,
+    /// `None` for a biasless head (bare `Matmul(x, Transpose(W))` with no
+    /// `+ bias`) — Sprint 2.5. The substitution then places `w_var` in the
+    /// bias input slot as a never-read placeholder and sets
+    /// `has_bias: false` on the op.
+    bias_var: Option<VarId>,
     transpose_result_var: VarId,
     matmul_result_var: VarId,
-    add_result_var: VarId,
+    /// `None` when there is no Add (biasless head).
+    add_result_var: Option<VarId>,
+    /// Sprint 2.5 reshape see-through: result VarIds of up to two chained
+    /// `Passthrough("reshape")` ops between the head and the loss
+    /// (`[B,S,V] -> [B*S,V]` flattening). Members of the dead chain for
+    /// pruning purposes; `None` slots are unused.
+    reshape_result_vars: [Option<VarId>; 2],
+}
+
+impl FusedLceMatch {
+    /// True when the matcher descended through at least one reshape —
+    /// the tape-level x is then 3-D `[B, S, H]` (the flatten the user
+    /// wrote applied to the logits, not to x).
+    fn saw_reshape(&self) -> bool {
+        self.reshape_result_vars.iter().any(Option::is_some)
+    }
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -2636,39 +2659,77 @@ impl<'a> WengertExtractor<'a> {
         &self,
         logits_var: VarId,
     ) -> Result<FusedLceMatch, FusedLceDecline> {
-        let Some(add_op) = self.list.find_producer(logits_var) else {
+        // Sprint 2.5 — reshape see-through. Every model that produces
+        // 3-D `[B, S, V]` logits flattens them before the loss
+        // (`logits.reshape([B*S, V])`), which used to be the single most
+        // common decline. A row-major flatten is a layout no-op for the
+        // fused kernel (it operates on `rows = B*S` regardless), and the
+        // decorator's four mandatory shape hints pin the intended
+        // interpretation, so the matcher descends through up to two
+        // chained single-tensor `Passthrough("reshape")` producers and
+        // records their result VarIds as members of the dead chain.
+        // A reshape the kernel could NOT honour (e.g. `[B,S,V] -> [B, S*V]`)
+        // is unverifiable from the tape (shape args are runtime lists) but
+        // also changes the composite CE's semantics itself — the decorator
+        // opt-in with explicit vocab/hidden/batch/seq hints is the user's
+        // assertion of the head shape.
+        let mut reshape_result_vars: [Option<VarId>; 2] = [None, None];
+        let mut head_var = logits_var;
+        for slot in reshape_result_vars.iter_mut() {
+            match self.list.find_producer(head_var) {
+                Some(op)
+                    if matches!(&op.op, PrimalOp::Passthrough(name) if name == "reshape")
+                        && !op.inputs.is_empty() =>
+                {
+                    *slot = Some(op.result);
+                    head_var = op.inputs[0];
+                }
+                _ => break,
+            }
+        }
+        let Some(head_op) = self.list.find_producer(head_var) else {
             return Err(FusedLceDecline::LogitsHasNoProducer);
         };
-        if !matches!(add_op.op, PrimalOp::Add) {
-            return Err(FusedLceDecline::LogitsProducerNotAdd {
-                producer: describe_primal_op(&add_op.op),
-            });
-        }
-        if add_op.inputs.len() != 2 {
-            return Err(FusedLceDecline::AddArity {
-                inputs: add_op.inputs.len(),
-            });
-        }
-        // Inspect both Add operands — Matmul may be on either side.
-        let lhs = add_op.inputs[0];
-        let rhs = add_op.inputs[1];
-        let lhs_op = self.list.find_producer(lhs);
-        let rhs_op = self.list.find_producer(rhs);
-        let (matmul_op, bias_var) = match (
-            lhs_op.map(|o| &o.op),
-            rhs_op.map(|o| &o.op),
-        ) {
-            // `lhs_op`/`rhs_op` are already `Some` in the arms that read them
-            // — the pattern matched on their contents — so the `expect` is
-            // unreachable rather than a silent `?` bail that would report the
-            // wrong decline reason.
-            (Some(PrimalOp::Matmul), _) => {
-                (lhs_op.expect("matched Some above"), rhs)
+        // Sprint 2.5 — biasless heads. `Add(Matmul(x, W^T), bias)` and a
+        // bare `Matmul(x, W^T)` (the weight-tied coder50m head) both match;
+        // the latter sets `has_bias: false` downstream.
+        let (matmul_op, bias_var, add_result_var) = match &head_op.op {
+            PrimalOp::Matmul => (head_op, None, None),
+            PrimalOp::Add => {
+                let add_op = head_op;
+                if add_op.inputs.len() != 2 {
+                    return Err(FusedLceDecline::AddArity {
+                        inputs: add_op.inputs.len(),
+                    });
+                }
+                // Inspect both Add operands — Matmul may be on either side.
+                let lhs = add_op.inputs[0];
+                let rhs = add_op.inputs[1];
+                let lhs_op = self.list.find_producer(lhs);
+                let rhs_op = self.list.find_producer(rhs);
+                let (matmul_op, bias_var) = match (
+                    lhs_op.map(|o| &o.op),
+                    rhs_op.map(|o| &o.op),
+                ) {
+                    // `lhs_op`/`rhs_op` are already `Some` in the arms that
+                    // read them — the pattern matched on their contents — so
+                    // the `expect` is unreachable rather than a silent `?`
+                    // bail that would report the wrong decline reason.
+                    (Some(PrimalOp::Matmul), _) => {
+                        (lhs_op.expect("matched Some above"), rhs)
+                    }
+                    (_, Some(PrimalOp::Matmul)) => {
+                        (rhs_op.expect("matched Some above"), lhs)
+                    }
+                    _ => return Err(FusedLceDecline::NoMatmulOperand),
+                };
+                (matmul_op, Some(bias_var), Some(add_op.result))
             }
-            (_, Some(PrimalOp::Matmul)) => {
-                (rhs_op.expect("matched Some above"), lhs)
+            other => {
+                return Err(FusedLceDecline::LogitsProducerNotAdd {
+                    producer: describe_primal_op(other),
+                })
             }
-            _ => return Err(FusedLceDecline::NoMatmulOperand),
         };
         // Review Finding 3: reject `Add(Matmul, Matmul)` and other
         // patterns where the "bias" slot would receive a high-rank
@@ -2682,14 +2743,16 @@ impl<'a> WengertExtractor<'a> {
         // `ScaledDotProductAttention` (high-rank output) and `Conv2d`
         // (if/when it appears).  Refuse the substitution and fall
         // through to the composite path.
-        if let Some(bias_producer) = self.list.find_producer(bias_var) {
-            if matches!(
-                bias_producer.op,
-                PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
-            ) {
-                return Err(FusedLceDecline::BiasSlotIsHighRank {
-                    producer: describe_primal_op(&bias_producer.op),
-                });
+        if let Some(bv) = bias_var {
+            if let Some(bias_producer) = self.list.find_producer(bv) {
+                if matches!(
+                    bias_producer.op,
+                    PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
+                ) {
+                    return Err(FusedLceDecline::BiasSlotIsHighRank {
+                        producer: describe_primal_op(&bias_producer.op),
+                    });
+                }
             }
         }
         if matmul_op.inputs.len() != 2 {
@@ -2779,7 +2842,8 @@ impl<'a> WengertExtractor<'a> {
             bias_var,
             transpose_result_var: w_transposed_var,
             matmul_result_var,
-            add_result_var: logits_var,
+            add_result_var,
+            reshape_result_vars,
         })
     }
 
@@ -2799,15 +2863,23 @@ impl<'a> WengertExtractor<'a> {
     ///
     /// Returns the number of ops actually removed.  Conservative on
     /// ambiguity (leaves the op in place) — correctness over pruning.
-    fn prune_fused_lce_dead_chain(list: &mut WengertList, m: &FusedLceMatch) -> usize {
+    fn prune_fused_lce_dead_chain(
+        list: &mut WengertList,
+        m: &FusedLceMatch,
+    ) -> Result<usize, String> {
         // The three op-result VarIds we'd like to remove.  In-chain
         // consumers don't block removal (Matmul reads transpose, Add
         // reads matmul) since they themselves are about to be removed.
-        let chain_results = [
-            m.transpose_result_var,
-            m.matmul_result_var,
+        let chain_results: Vec<VarId> = [
+            Some(m.transpose_result_var),
+            Some(m.matmul_result_var),
             m.add_result_var,
-        ];
+            m.reshape_result_vars[0],
+            m.reshape_result_vars[1],
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
         let is_dead = |var: VarId, list: &WengertList| -> bool {
             // Never remove the function output.
@@ -2828,7 +2900,7 @@ impl<'a> WengertExtractor<'a> {
         };
 
         let mut removed = 0usize;
-        for target in chain_results {
+        for &target in &chain_results {
             if !is_dead(target, list) {
                 continue;
             }
@@ -2846,7 +2918,36 @@ impl<'a> WengertExtractor<'a> {
                 // happen to share an entry.
             }
         }
-        removed
+        // Sprint 2.5: a chain op that SURVIVED the prune means a live
+        // consumer outside the chain (e.g. `let ls = logits.shape`). With
+        // the substitution already emitted this is unrecoverable, not
+        // conservative: the surviving ops get ghost adjoints during the
+        // backward sweep, which either poison the shared gradient
+        // accumulation Adds (hard unresolved-adjoint error downstream,
+        // with a diagnostic that points HERE) or would silently drop
+        // parameter gradients pre-#396. And semantically, a live consumer
+        // forces the [batch*seq, vocab] logits to materialize every step
+        // anyway — the fusion's entire point is defeated. Refuse with the
+        // consumer named so the fix is one line away.
+        for &target in &chain_results {
+            if let Some(op) = list.ops.iter().find(|op| op.result == target) {
+                let consumer = list
+                    .ops
+                    .iter()
+                    .find(|c| {
+                        !chain_results.contains(&c.result) && c.inputs.contains(&target)
+                    })
+                    .map(|c| describe_primal_op(&c.op))
+                    .unwrap_or_else(|| "the function output".to_string());
+                return Err(format!(
+                    "@fused_lm_ce substituted the loss, but the composite                      logits chain is still LIVE: {} (VarId {}) is consumed by                      {} outside the chain. A live consumer forces the                      [batch*seq, vocab] logits to materialize every step,                      defeating the fusion, and its backward would corrupt                      gradient accumulation. Replace runtime reads of the                      logits (e.g. `let ls = logits.shape` before the                      flatten) with the decorator's compile-time dims, or                      set enabled = false on @fused_lm_ce.",
+                    describe_primal_op(&op.op),
+                    target,
+                    consumer
+                ));
+            }
+        }
+        Ok(removed)
     }
 
     fn extract_int_literal(expr: &nsl_ast::expr::Expr) -> Option<i64> {
@@ -4073,6 +4174,12 @@ impl<'a> WengertExtractor<'a> {
                                             vocab_tile: vt,
                                             ignore_index: -100,
                                             is_large,
+                                            // The explicit 4-arg call always
+                                            // has a real bias and a flat
+                                            // [rows, H] x by its stdlib
+                                            // signature contract.
+                                            has_bias: true,
+                                            x_rank3: false,
                                         },
                                         inputs: four,
                                         saved_for_backward: false,
@@ -4169,8 +4276,17 @@ impl<'a> WengertExtractor<'a> {
                                         );
                                         let is_large = v
                                             > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                                        // Sprint 2.5: a biasless head has
+                                        // no bias VarId — carry w_var as a
+                                        // never-read placeholder so the
+                                        // 4-wide input convention (and
+                                        // targets at inputs[3]) survives.
+                                        let has_bias = m.bias_var.is_some();
                                         let four = vec![
-                                            m.x_var, m.w_var, m.bias_var, targets_var,
+                                            m.x_var,
+                                            m.w_var,
+                                            m.bias_var.unwrap_or(m.w_var),
+                                            targets_var,
                                         ];
                                         self.push_op(WengertOp {
                                             id: self.list.ops.len() as u32,
@@ -4183,6 +4299,8 @@ impl<'a> WengertExtractor<'a> {
                                                 vocab_tile: vt,
                                                 ignore_index: -100,
                                                 is_large,
+                                                has_bias,
+                                                x_rank3: m.saw_reshape(),
                                             },
                                             inputs: four,
                                             saved_for_backward: false,
@@ -5343,7 +5461,13 @@ impl<'a> WengertExtractor<'a> {
         }
         // Review Finding 1: run all pending fused-LCE prunes against
         // the COMPLETED tape so the consumer-scan sees every op.
-        self.apply_pending_fused_lce_prunes();
+        if let Err(msg) = self.apply_pending_fused_lce_prunes() {
+            // finalize() has no error channel — surface the diagnosis and
+            // fail extraction (callers fall back to the tape/composite
+            // path, which is correct, just slower).
+            eprintln!("[fused-lm-ce] {msg}");
+            return None;
+        }
         Some(self.list)
     }
 
@@ -5366,13 +5490,13 @@ impl<'a> WengertExtractor<'a> {
     ///
     /// Returns the number of ops removed (0 when no fused substitution
     /// fired — the common non-decorated path).
-    pub fn apply_pending_fused_lce_prunes(&mut self) -> usize {
+    pub fn apply_pending_fused_lce_prunes(&mut self) -> Result<usize, String> {
         let prunes = std::mem::take(&mut self.pending_fused_lce_prunes);
         let mut removed = 0usize;
         for m in &prunes {
-            removed += Self::prune_fused_lce_dead_chain(&mut self.list, m);
+            removed += Self::prune_fused_lce_dead_chain(&mut self.list, m)?;
         }
-        removed
+        Ok(removed)
     }
 
     /// Check if the computation graph is static (no dynamic control flow).

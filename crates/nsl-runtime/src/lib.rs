@@ -119,6 +119,8 @@ pub use fused_linear_ce::{
     nsl_fused_linear_ce_forward,
     nsl_fused_linear_ce_forward_large,
     nsl_fused_linear_ce_backward,
+    nsl_fused_linear_ce_forward_gemm,
+    nsl_fused_linear_ce_backward_gemm,
 };
 
 // CPKD fused KL-CE FFIs exposed for the GPU numerical validation test
@@ -162,7 +164,9 @@ pub use cuda::{cuda_device_identity, CudaDeviceIdentity, CUDA_SUPPORT_COMPILED};
 pub mod autodiff;
 pub mod checkpoint;
 pub mod inspect;
+pub mod host_profile;
 pub mod tokenizer;
+pub mod tokenizer_bpe;
 pub mod quantize;
 pub mod fp8;
 pub mod awq;

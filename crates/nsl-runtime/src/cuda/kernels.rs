@@ -1290,6 +1290,14 @@ DONE: ret;\n\
 /// they ever did, a smaller `blockDim` silently skips elements (weights stop
 /// updating) and a larger one applies AdamW twice to the overlap. Neither is
 /// caught by any test, because no test can vary the two independently.
+///
+/// `mp_scale` folds the two-phase-clip Phase B pre-scale
+/// (`nsl_tensor_mul_scalar_inplace(m_partial, clip_factor)`) into the read:
+/// `g = rn(mp[i] * mp_scale)` — the same single f32 rounding the in-place
+/// scale-then-read performs, so the clip path stays bit-identical to the
+/// per-param loop it replaces. `mp_scale == 1.0` branches AROUND the
+/// multiply so the non-clip path keeps exact bit-identity (a `mul.rn` by
+/// 1.0 would canonicalize NaN payloads, which "bit-identical" must not).
 pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_70\n\
@@ -1301,12 +1309,12 @@ pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
     .param .f32 b1, .param .f32 omb1, .param .f32 b2, .param .f32 omb2,\n\
     .param .f32 eps, .param .f32 neg_lr, .param .f32 neg_lr_wd,\n\
     .param .f32 bc1, .param .f32 bc2, .param .u32 has_wd,\n\
-    .param .u64 bptab, .param .u64 bbtab\n\
+    .param .u64 bptab, .param .u64 bbtab, .param .f32 mp_scale\n\
 ) {\n\
     .reg .u32 %r<10>;\n\
     .reg .u64 %rd<12>;\n\
-    .reg .f32 %fs<16>;\n\
-    .reg .pred %p<3>;\n\
+    .reg .f32 %fs<17>;\n\
+    .reg .pred %p<4>;\n\
     ld.param.u64 %rd1, [ttab];\n\
     ld.param.u64 %rd2, [mtab];\n\
     ld.param.u64 %rd3, [vtab];\n\
@@ -1324,6 +1332,7 @@ pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
     ld.param.u32 %r4, [has_wd];\n\
     ld.param.u64 %rd10, [bptab];\n\
     ld.param.u64 %rd11, [bbtab];\n\
+    ld.param.f32 %fs16, [mp_scale];\n\
     mov.u32 %r1, %ctaid.x;\n\
     cvt.u64.u32 %rd6, %r1;\n\
     shl.b64 %rd7, %rd6, 2;\n\
@@ -1358,6 +1367,10 @@ pub(crate) const FASE_FUSED_ADAMW_MULTI_F32_PTX: &str = "\
     ld.global.f32 %fs12, [%rd8];\n\
     add.u64 %rd8, %rd4, %rd7;\n\
     ld.global.f32 %fs13, [%rd8];\n\
+    setp.eq.f32 %p3, %fs16, 0f3F800000;\n\
+    @%p3 bra MNOSC;\n\
+    mul.rn.f32 %fs13, %fs13, %fs16;\n\
+MNOSC:\n\
     mul.rn.f32 %fs14, %fs11, %fs1;\n\
     mul.rn.f32 %fs15, %fs13, %fs2;\n\
     add.rn.f32 %fs11, %fs14, %fs15;\n\

@@ -42,6 +42,49 @@ pub extern "C" fn nsl_fase_fused_step_count() -> i64 {
     FASE_FUSED_STEP_COUNT.load(Ordering::Relaxed) as i64
 }
 
+/// Global sum-of-squares over every tensor in an `NslList` — the FASE
+/// two-phase-clip Phase A norm, batched.
+///
+/// The per-tensor emission called `nsl_tensor_sum_sq` once per parameter,
+/// and each call is a full pipeline drain (the f64 result crosses back to
+/// the host synchronously): 74 drains per optimizer step at Coder-50M.
+/// This routes uniform device-f32 dense lists through
+/// `gpu_sum_sq_many_f32` — per-tensor kernels, ONE drain — and everything
+/// else through the same per-tensor `nsl_tensor_sum_sq` it replaces.
+///
+/// NUMERICS: the batched device kernel accumulates each tensor in f64
+/// (`nsl_sum_sq_f64_acc_f32`), where `nsl_tensor_sum_sq`'s GPU fast path
+/// accumulates in f32. This matches the main `nsl_clip_grad_norm` device
+/// path's choice — a clip decision is a comparison, so accumulation drift
+/// can flip it, and f64 is the accumulation every other GPU reduction here
+/// uses — but it is NOT bit-identical to the per-tensor emission. Codegen
+/// gates the substitution on `NSL_FASE_BATCH_SUMSQ != "0"` (compile-time)
+/// so bisections can restore the old path.
+#[no_mangle]
+pub extern "C" fn nsl_fase_sum_sq_list(mp_list: i64) -> f64 {
+    let mps = crate::list::NslList::from_ptr(mp_list);
+    let count = mps.len as usize;
+    if count == 0 {
+        return 0.0;
+    }
+    let ptrs: Vec<i64> = (0..count).map(|i| unsafe { *mps.data.add(i) }).collect();
+    #[cfg(feature = "cuda")]
+    {
+        let uniform_gpu_f32 = ptrs.iter().all(|&p| {
+            p != 0 && {
+                let t = unsafe { &*(p as *const NslTensor) };
+                t.device > 0 && t.dtype == 1 && t.is_contiguous()
+            }
+        });
+        if uniform_gpu_f32 {
+            return crate::cuda::gpu_sum_sq_many_f32(&ptrs);
+        }
+    }
+    ptrs.iter()
+        .map(|&p| crate::tensor::nsl_tensor_sum_sq(p))
+        .sum()
+}
+
 /// Fused FASE-Deferred AdamW/Adam final step for one parameter.
 ///
 /// `theta/m/v/mp` must be four same-length contiguous tensors on the same
@@ -235,6 +278,10 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
 /// per-param loop would have taken the fused path for EVERY param
 /// (admission mirrored in codegen; see stmt.rs). Kill-switch:
 /// NSL_FASE_MULTI_STEP=0 at compile time keeps the legacy loop.
+/// `mp_scale` scales every m_partial read (`g = rn(mp[i] * mp_scale)`),
+/// folding the two-phase-clip Phase B pre-scale into the same launch;
+/// pass 1.0 for the unclipped path (branched around in-kernel, so 1.0 is
+/// exactly the pre-mp_scale behaviour, bit for bit).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fase_fused_adamw_step_multi(
@@ -262,6 +309,11 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     //                          `nsl_optim_param_wd`, the single rule.
     wd_exempt_list: i64,
     wd_exempt_non_rank2: i64,
+    // Clip pre-scale, folded into the m_partial read. Independent of the two
+    // above: parameter groups decide each param's λ, this scales the gradient
+    // every param sees. Both must survive — dropping either compiles fine and
+    // silently disables a shipped feature.
+    mp_scale: f64,
 ) {
     let params = crate::list::NslList::from_ptr(params_list);
     let ms = crate::list::NslList::from_ptr(m_list);
@@ -358,7 +410,13 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
             }
         }
         // Fallback arm: single fused step (its own preconditions assert
-        // loudly) + the shared tail's m_partial zero.
+        // loudly) + the shared tail's m_partial zero. The clip pre-scale is
+        // applied the way the legacy per-param loop did it — an in-place
+        // scale of m_partial before the step (same rounding as the kernel
+        // fold: one rn multiply).
+        if mp_scale != 1.0 {
+            crate::tensor::nsl_tensor_mul_scalar_inplace(ap, mp_scale);
+        }
         nsl_fase_fused_adamw_step(
             tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps,
             param_wd(i, tp), bc1_inv, bc2_inv,
@@ -402,7 +460,11 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
                 ((-lr) * bucket_wd) as f32,
                 bc1_inv as f32,
                 bc2_inv as f32,
+                // `bucket_wd`, not the flat `wd`: each bucket carries its own λ
+                // from the parameter groups, so testing the scalar would tell a
+                // decay-exempt bucket it still has weight decay.
                 bucket_wd != 0.0,
+                mp_scale as f32,
             );
             // Keep the fused-step counter's per-param semantics (gates read it).
             FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
@@ -1176,7 +1238,7 @@ mod item8_gpu_bench {
             (1e-8f32, -1e-3f32, -1e-5f32, 1.0f32, 1.0f32);
         gpu_fase_fused_adamw_step_multi(
             &thetas, &ms, &vs, &mps, &lens, b1, omb1, b2, omb2, eps, neg_lr,
-            neg_lr_wd, bc1, bc2, true,
+            neg_lr_wd, bc1, bc2, true, 1.0,
         );
 
         // Same arithmetic as the kernel, in f32, on the host.
@@ -1251,7 +1313,7 @@ mod item8_gpu_bench {
         let step = || {
             gpu_fase_fused_adamw_step_multi(
                 &thetas, &ms, &vs, &mps, &lens, 0.9, 0.1, 0.95, 0.05, 1e-8, -1e-3, -1e-5,
-                1.0, 1.0, true,
+                1.0, 1.0, true, 1.0,
             );
         };
 

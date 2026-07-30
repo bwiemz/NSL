@@ -127,8 +127,10 @@ fn main_inner() {
                 }
             }
         }
-        Cli::Tokenize { dirs, output, vocab_size, min_freq, ext } => {
-            commands::tokenize::run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
+        Cli::Tokenize { dirs, output, vocab_size, min_freq, ext, transition, max_token_bytes } => {
+            commands::tokenize::run_tokenize(
+                &dirs, &output, vocab_size, min_freq, &ext, transition, max_token_bytes,
+            );
         }
 
         Cli::FpgaCompile { file, output_dir, fixture, test_taps, seq } => {

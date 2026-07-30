@@ -252,6 +252,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_muon_prof_report", &[], None),
     // Fusion item 1: multi-tensor fused AdamW final step over the whole
     // param/m/v/m_partial lists (one pointer-table launch, bit-identical).
+    //
+    // The two trailing I64s are the AdamW parameter groups (0 = no no_decay);
+    // the final F64 is mp_scale, the two-phase-clip factor folded into the
+    // m_partial read, 1.0 = unclipped (exact legacy behaviour, branched around
+    // in-kernel). The two features are independent and BOTH are load-bearing —
+    // this list, the emission order in `stmt.rs`, and the Rust signature in
+    // `fase_step.rs` must stay in lockstep or arguments silently shift.
     (
         "nsl_fase_fused_adamw_step_multi",
         &[
@@ -270,9 +277,13 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::F64, // bc2_inv
             types::I64, // wd_exempt_list (0 = no parameter groups)
             types::I64, // wd_exempt_non_rank2
+            types::F64, // mp_scale (1.0 = unclipped)
         ],
         None,
     ),
+    // FASE two-phase-clip Phase A: global sum-of-squares over an NslList of
+    // m_partial tensors with ONE pipeline drain (batched device reduction).
+    ("nsl_fase_sum_sq_list", &[types::I64], Some(types::F64)),
     // PCA Stage C: non-aborting shape probe (0 for out-of-range dims).
     ("nsl_tensor_dim_or_zero", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_len", &[types::I64], Some(types::I64)),
@@ -1577,6 +1588,33 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // num_valid
             types::I64, // smem_bytes
             types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
+        ],
+        Some(types::I64),
+    ),
+    // Sprint 2.5: GEMM-chunked fused linear-CE (production path for large
+    // vocab and every biasless head). No PTX/kname/smem args — chunk
+    // kernels are runtime constants, heavy math is cuBLAS. bias/dbias
+    // pointers are the literal 0 when has_bias == 0.
+    (
+        "nsl_fused_linear_ce_forward_gemm",
+        &[
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias_or_0, targets
+            types::I64, types::I64, // loss_out, lse_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // has_bias
+        ],
+        Some(types::I64),
+    ),
+    (
+        "nsl_fused_linear_ce_backward_gemm",
+        &[
+            types::I64, // grad_output_bits (f32 bits packed into i64)
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias_or_0, targets
+            types::I64, // lse_ptr
+            types::I64, types::I64, types::I64, // dx_out, dW_out, dbias_or_0
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // num_valid
+            types::I64, // has_bias
         ],
         Some(types::I64),
     ),
@@ -2903,7 +2941,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // Fused-CE targets dtype bridge: the kernels read targets as s64 but
     // NSL GPU labels are f32 — materialize/free a device i64 copy around
     // each fused forward/backward FFI.
-    ("nsl_fused_lce_targets_i64_alloc", &[types::I64], Some(types::I64)),
+    // Second arg: expected row count (decorator batch*seq) — the runtime
+    // aborts loudly on mismatch instead of overreading the staging buffer.
+    ("nsl_fused_lce_targets_i64_alloc", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_fused_lce_targets_i64_free", &[types::I64], None),
     // D2b weight streaming: pointer-identity host offload of model params
     // (side-table mirrors; tensor pointers never change).

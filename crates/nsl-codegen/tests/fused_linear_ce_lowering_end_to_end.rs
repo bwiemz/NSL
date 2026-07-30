@@ -117,6 +117,8 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
                 vocab_tile,
                 is_large,
                 ignore_index,
+                has_bias: _,
+                x_rank3: _,
             } => Some((
                 *vocab_size,
                 *hidden_size,
@@ -253,6 +255,8 @@ fn fused_linear_ce_ad_rule_emits_three_components() {
             vocab_tile: 256,
             ignore_index: -100,
             is_large: true,
+            has_bias: true,
+            x_rank3: false,
         },
         inputs: vec![10, 11, 12, 13], // x, W, bias, targets
         saved_for_backward: false,
@@ -277,6 +281,8 @@ fn fused_linear_ce_ad_rule_emits_three_components() {
                 seq_len,
                 vocab_tile,
                 ignore_index,
+                has_bias: _,
+                x_rank3: _,
             } => {
                 assert_eq!(*grad, 200);
                 assert_eq!(*x, 10);

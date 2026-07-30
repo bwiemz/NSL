@@ -1040,6 +1040,11 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     if tensor.device > 0 {
         #[cfg(feature = "cuda")]
         {
+            // NSL_ITEM_PROFILE=1 accounts for the pipeline drain this forces.
+            // Reading a device scalar mid-stream cannot avoid waiting for every
+            // kernel queued ahead of it, so a hot-path `.item()` on a value that
+            // is a compile-time constant costs a full serialization.
+            let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::ScalarRead);
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
             match tensor.dtype {
                 DTYPE_I32 => {
@@ -2355,10 +2360,107 @@ pub extern "C" fn nsl_tensor_sum_sq(tensor_ptr: i64) -> f64 {
 
 // === Gradient clipping ===
 
+/// May `nsl_clip_grad_norm`'s device fast path handle this gradient?
+///
+/// That path reads and writes `data[0 .. len]` as a dense f32 run, so it may
+/// only accept gradients for which that IS the tensor. A non-contiguous or
+/// aliased gradient would have its norm computed from the wrong elements and,
+/// worse, would have the first `len` floats of the OWNER's buffer scaled —
+/// silently corrupting sibling tensors that were never in the clip list. Two
+/// shipped bugs in this repo (the fp8 device guard and the PCA flash-backward
+/// FFI) were exactly this class.
+///
+/// `is_contiguous` returns true for `ndim <= 1` without consulting the stride,
+/// so the 1-D stride is checked explicitly.
+#[cfg(feature = "cuda")]
+fn device_clip_admissible(t: &NslTensor) -> bool {
+    t.device != 0
+        && t.dtype == 1
+        && t.data_owner == 0
+        && t.owns_data == 1
+        && t.slab_managed == 0
+        && t.is_contiguous()
+        && (t.ndim != 1 || unsafe { *t.strides } == 1)
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     let list = NslList::from_ptr(grad_list_ptr);
     let num_grads = list.len as usize;
+
+    // Device-resident fast path.
+    //
+    // The host path below copies EVERY gradient to the host to compute the
+    // global norm, scales there, and copies every one back — and because host
+    // tensors are f64 while device tensors are f32, the upload is twice the
+    // size of the download. For Coder-50M that is about 560 MB of PCIe traffic
+    // per step across ~57 gradients, which host profiling showed to be the
+    // largest remaining cost in the step once cross-entropy was moved onto the
+    // device. Reducing on the device instead moves 4 bytes per gradient.
+    //
+    // NSL_GPU_GRAD_CLIP=0 restores the host path. The device reduction
+    // accumulates in f64, matching the host, so the norm agrees to the
+    // reduction order rather than to f32 precision — this matters because the
+    // norm feeds a `<= max_norm` comparison, where a systematically low sum
+    // does not round the answer, it declines a clip that should have happened.
+    #[cfg(feature = "cuda")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| {
+            std::env::var("NSL_GPU_GRAD_CLIP").ok().as_deref() != Some("0")
+        });
+
+        let mut admissible = num_grads > 0;
+        let mut any = false;
+        for g in 0..num_grads {
+            let ptr = unsafe { *list.data.add(g) };
+            if ptr == 0 {
+                continue;
+            }
+            let t = NslTensor::from_ptr(ptr);
+            if !device_clip_admissible(t) {
+                admissible = false;
+                break;
+            }
+            any = true;
+        }
+
+        if enabled && admissible && any {
+            // Batched so the whole set costs one pipeline drain rather than one
+            // per parameter. Duplicates are kept here: the host path downloads
+            // an independent copy per list slot and sums over all of them, so a
+            // gradient listed twice contributes twice to the norm.
+            let ptrs: Vec<i64> = (0..num_grads)
+                .map(|g| unsafe { *list.data.add(g) })
+                .collect();
+            let sum_sq = crate::cuda::gpu_sum_sq_many_f32(&ptrs);
+            let norm = sum_sq.sqrt();
+            if norm <= max_norm {
+                return;
+            }
+            let scale = (max_norm / (norm + 1e-8)) as f32;
+            // Scaling, unlike the norm, must be applied ONCE per distinct
+            // buffer. The host path scales a separate copy per slot and writes
+            // each back, so a repeated gradient still ends up at scale*orig;
+            // scaling in place per slot would give it scale^k instead. Tied
+            // embeddings under `@tie_weights` put the same gradient in the list
+            // more than once, so this is reachable.
+            let mut scaled: Vec<*mut c_void> = Vec::with_capacity(num_grads);
+            for g in 0..num_grads {
+                let ptr = unsafe { *list.data.add(g) };
+                if ptr == 0 {
+                    continue;
+                }
+                let t = NslTensor::from_ptr(ptr);
+                if scaled.contains(&t.data) {
+                    continue;
+                }
+                scaled.push(t.data);
+                crate::cuda::gpu_scale_raw_f32(t.data, t.len as usize, scale);
+            }
+            return;
+        }
+    }
 
     // Collect grad pointers, transferring GPU tensors to CPU for computation
     let mut cpu_grads: Vec<(i64, bool)> = Vec::with_capacity(num_grads); // (ptr, was_gpu)
@@ -2411,6 +2513,36 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
         let tensor_ptr = unsafe { *list.data.add(g) };
         if tensor_ptr == 0 || cpu_ptr == 0 { continue; }
         let tensor = NslTensor::from_ptr(tensor_ptr);
+        // PRE-EXISTING LIMITATION, made loud rather than silent.
+        //
+        // The GPU write-back below materializes the gradient into a contiguous
+        // CPU copy, scales it, and pushes it back with `nsl_tensor_copy_data`,
+        // which is itself stride-blind. For a NON-CONTIGUOUS gradient that
+        // writes `len` dense floats over `data[0 .. len]` of the shared base
+        // buffer, so it scales the wrong elements and clobbers whatever else
+        // aliases that region — silent gradient corruption, not an error.
+        //
+        // Every gradient produced by source-AD and by the optimizers is a fresh
+        // dense allocation, so this is latent today; a strided in-place scale is
+        // the real fix and is deliberately not attempted here. Until then, say
+        // so instead of corrupting memory quietly.
+        if !tensor.is_contiguous() || (tensor.ndim == 1 && unsafe { *tensor.strides } != 1) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[nsl] warning: clip_grad_norm received a NON-CONTIGUOUS gradient \
+                     (slot {g}, ndim {}); the host write-back is stride-blind and would \
+                     scale the wrong elements of the shared buffer. Skipping this \
+                     gradient's rescale — the clipped norm is therefore not exact. \
+                     Gradients are expected to be dense allocations; please report the \
+                     model that produced this.",
+                    tensor.ndim
+                );
+            }
+            // The epilogue below frees every `was_gpu` copy, so do NOT free here.
+            continue;
+        }
         if was_gpu {
             // Scale the CPU copy, then copy back to GPU
             let cpu_t = NslTensor::from_ptr(cpu_ptr);
@@ -3972,6 +4104,27 @@ pub extern "C" fn nsl_tensor_from_slab(
 /// Walks i64 fields: if a field is a live NslTensor (magic == TENSOR_MAGIC),
 /// transfers it to the requested device.
 /// Non-tensor fields (sub-models, scalars) are skipped.
+///
+/// This function transfers EVERY tensor field, deliberately. A version that
+/// kept 1-element fields host-resident was tried, to make the `.item()` reads
+/// of configuration fields (`_d_model`, `_n_heads`, ...) a plain load instead
+/// of a pipeline drain. It was reverted for two reasons:
+///
+///   * It measured no speedup. Those 72 reads per forward cost 2.4 ms of a
+///     ~700 ms step; profiling had attributed a large share of host time to
+///     them, but that was time spent BLOCKED waiting for GPU work that had to
+///     happen anyway, not time caused by the reads.
+///   * `len == 1` is the wrong test. Config-field-versus-parameter is known to
+///     the compiler and invisible here, so the heuristic also stranded genuine
+///     scalar parameters (a learnable temperature, a `logit_scale`, a scalar
+///     gate) on the host as f64 while the rest of the model went to the device
+///     — producing a mixed-device parameter list, per-use reconcile uploads,
+///     and a host-resident gradient that makes `nsl_clip_grad_norm`'s device
+///     fast path decline for the whole model.
+///
+/// If those `.item()` reads ever do matter, the fix is a cheap device-scalar
+/// read or a compiler-side config marker, not a shape test in the shared
+/// transfer routine.
 #[no_mangle]
 pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i64) {
     if model_ptr == 0 || num_fields <= 0 { return; }
@@ -4519,6 +4672,170 @@ mod tests {
              training-mode dropout call); rc=0 means the tape's reference \
              was released early and backward would read a freed mask."
         );
+    }
+
+    /// A gradient listed twice — which `@tie_weights` produces — must end up
+    /// scaled ONCE, matching the host path.
+    ///
+    /// The host path downloads an independent copy per list slot, scales each
+    /// from the original values, and writes each back, so repeated slots
+    /// overwrite with the same `scale * orig` and the net effect is a single
+    /// application. The device path scales in place, so scaling per slot gave a
+    /// repeated gradient `scale^k` — a silent 10x under-scale of the tied
+    /// embedding gradient at a typical scale of 0.1, with no error anywhere.
+    ///
+    /// The norm, by contrast, DOES count duplicates twice on both paths (the
+    /// host sums over every slot), so this also pins that asymmetry.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_grad_clip_scales_a_repeated_gradient_exactly_once() {
+        use crate::list::{nsl_list_new, nsl_list_push};
+
+        // Two f32 device tensors, one of which is listed twice.
+        let shape = crate::list::nsl_list_new();
+        nsl_list_push(shape, 4);
+        let make = |v: f64| -> i64 {
+            let host = crate::tensor::creation::nsl_tensor_full(shape, v);
+            let dev = nsl_tensor_to_device(host, 1);
+            nsl_tensor_free(host);
+            dev
+        };
+
+        let run = |gpu: bool| -> (f64, f64) {
+            // SAFETY of the env poke: `nsl_clip_grad_norm` reads NSL_GPU_GRAD_CLIP
+            // through a OnceLock, so it cannot be flipped mid-process. Instead of
+            // fighting that, compare the device path against an analytically
+            // derived expectation, and use the host path only when it is what the
+            // admission gate selects anyway.
+            let _ = gpu;
+            let a = make(3.0);
+            let b = make(4.0);
+            let list = nsl_list_new();
+            nsl_list_push(list, a);
+            nsl_list_push(list, b);
+            nsl_list_push(list, a); // the tie: same pointer again
+            nsl_clip_grad_norm(list, 1.0);
+            let read = |p: i64| -> f64 {
+                let h = nsl_tensor_to_device(p, 0);
+                let t = NslTensor::from_ptr(h);
+                let v = unsafe { *t.data_f64() };
+                nsl_tensor_free(h);
+                v
+            };
+            let out = (read(a), read(b));
+            nsl_tensor_free(a);
+            nsl_tensor_free(b);
+            out
+        };
+
+        let (a_val, b_val) = run(true);
+
+        // Norm counts the duplicate: sum_sq = 4*(9) + 4*(16) + 4*(9) = 136.
+        let norm = 136f64.sqrt();
+        let scale = 1.0 / (norm + 1e-8);
+        let expect_a = 3.0 * scale;
+        let expect_b = 4.0 * scale;
+        assert!(
+            (a_val - expect_a).abs() < 1e-5,
+            "repeated gradient scaled to {a_val}, expected {expect_a} (scale applied once). \
+             {} would mean the scale was applied twice.",
+            3.0 * scale * scale
+        );
+        assert!(
+            (b_val - expect_b).abs() < 1e-5,
+            "single-slot gradient scaled to {b_val}, expected {expect_b}"
+        );
+    }
+
+    /// A gradient that is a strided view into a LARGER buffer must not reach the
+    /// raw device clip path, which addresses `data[0..len]` as the whole tensor.
+    ///
+    /// The discriminating case is a column slice: shape [4, 2] with strides
+    /// [4, 1] over a 4x4 base, so the view's 8 logical elements are columns 0-1
+    /// of every row, while `data[0..8]` is rows 0-1 entirely. Stride-blindness
+    /// therefore (a) computes the norm from the wrong elements and (b) scales
+    /// rows 0-1 — including columns 2-3, which are NOT in the clip list and may
+    /// belong to another live tensor.
+    ///
+    /// A whole-buffer transpose does NOT discriminate: `len` equals the buffer
+    /// size, so scaling `data[0..len]` happens to scale exactly the right
+    /// elements and only the norm's summation order differs. That version of
+    /// this test passed against the stride-blind code.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_grad_clip_declines_a_strided_view_into_a_larger_buffer() {
+        use crate::list::{nsl_list_new, nsl_list_push};
+
+        // Base 4x4 with distinct values so wrong-element reads are visible.
+        let shape = nsl_list_new();
+        nsl_list_push(shape, 4);
+        nsl_list_push(shape, 4);
+        let host = nsl_tensor_zeros_on(shape, 0);
+        // `zeros_on` produces f32 even on the host, so write through the tag.
+        let write = |p: i64, i: usize, v: f64| {
+            let t = NslTensor::from_ptr(p);
+            if t.dtype == 1 {
+                unsafe { *t.data_f32().add(i) = v as f32 };
+            } else {
+                unsafe { *t.data_f64().add(i) = v };
+            }
+        };
+        let read = |p: i64, i: usize| -> f64 {
+            let t = NslTensor::from_ptr(p);
+            if t.dtype == 1 {
+                unsafe { *t.data_f32().add(i) as f64 }
+            } else {
+                unsafe { *t.data_f64().add(i) }
+            }
+        };
+        for i in 0..16 {
+            write(host, i, (i + 1) as f64);
+        }
+        let dev = nsl_tensor_to_device(host, 1);
+        nsl_tensor_free(host);
+
+        // Columns 0..2 of every row: 8 logical elements, base stride preserved.
+        let view = NslTensor::new_view_i64(dev, &[4, 2], &[4, 1], 2, 8);
+        let vt = NslTensor::from_ptr(view);
+        assert!(!vt.is_contiguous(), "the view must be non-contiguous to be the case under test");
+        assert_ne!(vt.data_owner, 0, "the view must share the base buffer");
+
+        // The predicate is the change under test: this gradient must NOT reach
+        // the raw device path.
+        assert!(
+            !device_clip_admissible(vt),
+            "a strided view sharing a larger base buffer must be refused by the \
+             device clip path, which addresses data[0..len] as the whole tensor"
+        );
+
+        let list = nsl_list_new();
+        nsl_list_push(list, view);
+        // Logical elements are 1,2,5,6,9,10,13,14, so a clip to 1.0 is required.
+        // End to end, no element outside the view may change — neither the
+        // device path (refused above) nor the host fallback (which detects the
+        // layout and declines rather than writing a dense span over the base).
+        nsl_clip_grad_norm(list, 1.0);
+
+        // Read the WHOLE base back and check the elements outside the view.
+        let h = nsl_tensor_to_device(dev, 0);
+        let base: Vec<f64> = (0..16).map(|i| read(h, i)).collect();
+        nsl_tensor_free(h);
+
+        // Columns 2-3 of rows 0-1 are base indices 2, 3, 6, 7. They are not in
+        // the view, so they must be untouched. The stride-blind path scales
+        // base[0..8], which includes all four of them.
+        for &i in &[2usize, 3, 6, 7] {
+            assert!(
+                (base[i] - (i + 1) as f64).abs() < 1e-9,
+                "base[{i}] became {} but is outside the clipped view and must stay {}: \
+                 the clip scaled a raw span instead of the view's elements",
+                base[i],
+                i + 1
+            );
+        }
+
+        nsl_tensor_free(view);
+        nsl_tensor_free(dev);
     }
 
     /// P0.4 dtype/ABI cleanup: GOLDEN LOCK on the canonical dtype tag table.
@@ -5657,6 +5974,8 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_drain_cache() {
+    // Called once per training step, so this is the natural reporting interval.
+    crate::host_profile::report_and_reset("step");
     // P5 item 19: while cuda-graph capture is armed, the per-step transient
     // drain would churn every transient address (no region could ever
     // digest-stabilize) AND physically unmap memory that already-captured

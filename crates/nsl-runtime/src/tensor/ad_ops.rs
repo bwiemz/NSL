@@ -480,25 +480,49 @@ pub extern "C" fn nsl_embedding_backward(
         let force_cpu = *FORCE_CPU.get_or_init(|| {
             std::env::var("NSL_EMBEDDING_BWD_CPU").ok().as_deref() == Some("1")
         });
-        if !force_cpu
+        // Every condition that does not depend on where the ids live, checked
+        // BEFORE the upload so a call that declines anyway never touches the bus.
+        // In particular `NSL_EMBEDDING_BWD_CPU=1` exists to take the host path
+        // for M46 bisections; uploading and immediately freeing the ids on every
+        // backward of that run is pure waste.
+        let host_side_ok = !force_cpu
             && grad_t.device > 0
-            && idx_t.device == grad_t.device
             && grad_t.dtype == 1
-            && weight_t.ndim >= 2
-        {
+            && weight_t.ndim >= 2;
+        // Token ids arrive from the DataLoader on the host while the incoming
+        // gradient is already on the device. Requiring both on the same device
+        // sent the whole [vocab, embed_dim] scatter to the host instead — 96 MB
+        // down and 192 MB back up (host tensors are f64) per step at
+        // 49152x512. Uploading the ids costs `seq_len` elements.
+        let idx_dev = if host_side_ok && idx_t.device != grad_t.device {
+            let up = nsl_tensor_to_device(idx_c, grad_t.device as i64);
+            if up == 0 { None } else { Some(up) }
+        } else {
+            None
+        };
+        let idx_eff = idx_dev.unwrap_or(idx_c);
+        let idx_t = NslTensor::from_ptr(idx_eff);
+
+        if host_side_ok && idx_t.device == grad_t.device {
             let vocab_size = unsafe { *weight_t.shape } as u64;
             let embed_dim = unsafe { *weight_t.shape.add(1) } as u64;
             let seq_len = idx_t.len as u64;
             let gpu_out = crate::cuda::gpu_embedding_backward(
-                grad_c, idx_c, vocab_size, embed_dim, seq_len,
+                grad_c, idx_eff, vocab_size, embed_dim, seq_len,
             );
             if gpu_out != 0 {
+                if let Some(up) = idx_dev {
+                    nsl_tensor_free(up);
+                }
                 nsl_tensor_free(grad_c);
                 nsl_tensor_free(idx_c);
                 nsl_tensor_free(weight_c);
                 return gpu_out;
             }
             // Unsupported index dtype: fall through to the host scatter.
+        }
+        if let Some(up) = idx_dev {
+            nsl_tensor_free(up);
         }
     }
 
@@ -626,23 +650,109 @@ pub extern "C" fn nsl_cross_entropy_backward(
         let go_hdr = NslTensor::from_ptr(grad_out_c);
         let go_ok = go_hdr.len != 1 || go_hdr.device == 0 || go_hdr.dtype == 1;
         let rows = if lg.ndim == 2 { unsafe { *lg.shape } } else { 0 };
-        if enabled
+        // Every condition that does NOT depend on where the targets live, so the
+        // upload below is only paid for by calls that can actually use it. When
+        // these fail the call declines regardless, and uploading first would put
+        // an allocation, a blocking H2D copy and a free on the hottest path in
+        // the step — including under `NSL_GPU_CE_BACKWARD=0`, whose whole point
+        // is to take the old path.
+        let targets_dtype_ok = tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32;
+        let shape_ok = enabled
             && lg.device > 0
             && lg.dtype == 1
             && lg.ndim == 2
             && lg.len <= u32::MAX as i64
-            && tg.device == lg.device
-            && (tg.dtype == 1 || tg.dtype == crate::tensor::DTYPE_I32)
+            && targets_dtype_ok
             && tg.len >= rows
-            && go_ok
+            && go_ok;
+        // Diagnostics are captured from the ORIGINAL targets header, before any
+        // upload, because that is what the caller can act on ("your targets are
+        // on the host") and because the uploaded copy is freed below — reading
+        // its header in the warning was a use-after-free, and it could never
+        // report the device mismatch it existed to explain since the rebound
+        // header was device-resident by construction.
+        let tg_device = tg.device;
+        let tg_dtype = tg.dtype;
+        let tg_len = tg.len;
+        // Targets arrive from the DataLoader on the host while logits are already
+        // on the device, which used to fail the same-device admission check and
+        // send the ENTIRE [N, C] logits tensor to the host and back — 384 MB per
+        // call at 1024x49152. Uploading the targets instead costs `rows`
+        // elements, four kilobytes at the same shape.
+        let targets_dev = if shape_ok && tg_device != lg.device {
+            let up = nsl_tensor_to_device(targets_c, lg.device as i64);
+            if up == 0 { None } else { Some(up) }
+        } else {
+            None
+        };
+        let targets_eff = targets_dev.unwrap_or(targets_c);
+        let tg_eff = NslTensor::from_ptr(targets_eff);
+
+        if shape_ok
+            && tg_eff.device == lg.device
+            && (tg_eff.dtype == 1 || tg_eff.dtype == crate::tensor::DTYPE_I32)
         {
             let out = crate::cuda::gpu_cross_entropy_backward_f32(
-                logits_c, targets_c, grad_out_c,
+                logits_c, targets_eff, grad_out_c,
             );
+            if let Some(up) = targets_dev {
+                nsl_tensor_free(up);
+            }
             nsl_tensor_free(logits_c);
             nsl_tensor_free(targets_c);
             nsl_tensor_free(grad_out_c);
             return out;
+        }
+        if let Some(up) = targets_dev {
+            nsl_tensor_free(up);
+        }
+        // A silent decline here costs the whole [N, C] logits tensor across PCIe
+        // twice plus a host softmax over N*C elements — at 1024x49152 that is
+        // 192 MB each way and 50M host exp() calls, the single largest cost in a
+        // training step. Say why, once, rather than quietly bouncing.
+        if enabled && lg.device > 0 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut why: Vec<String> = Vec::new();
+                if lg.dtype != 1 {
+                    why.push(format!("logits dtype {} != f32", lg.dtype));
+                }
+                if lg.ndim != 2 {
+                    why.push(format!("logits ndim {} != 2", lg.ndim));
+                }
+                if lg.len > u32::MAX as i64 {
+                    why.push(format!("logits len {} exceeds u32", lg.len));
+                }
+                if tg_device != lg.device {
+                    // Reached only when the upload was attempted and failed, or
+                    // was skipped because another condition already declined.
+                    why.push(format!(
+                        "targets on device {} but logits on device {} (upload {})",
+                        tg_device,
+                        lg.device,
+                        if targets_dev.is_some() { "succeeded" } else { "not made" }
+                    ));
+                }
+                if tg_dtype != 1 && tg_dtype != crate::tensor::DTYPE_I32 {
+                    why.push(format!("targets dtype {} is neither f32 nor i32", tg_dtype));
+                }
+                if tg_len < rows {
+                    why.push(format!("targets len {} < rows {}", tg_len, rows));
+                }
+                if !go_ok {
+                    why.push(format!(
+                        "device grad_output scalar has dtype {} != f32",
+                        go_hdr.dtype
+                    ));
+                }
+                eprintln!(
+                    "[nsl] warning: GPU cross-entropy backward declined, falling back to the \
+                     host path ({} MB of PCIe traffic per call). Reason(s): {}",
+                    (lg.len * 4 * 2) / (1024 * 1024),
+                    if why.is_empty() { "unknown".to_string() } else { why.join("; ") }
+                );
+            }
         }
     }
     let out_device = NslTensor::from_ptr(logits_c).device;

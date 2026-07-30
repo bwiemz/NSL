@@ -193,6 +193,21 @@ pub(crate) enum Cli {
         /// File extensions to include (default: .nsl)
         #[arg(long, default_value = "nsl")]
         ext: String,
+
+        /// Vocabulary size at which the token boundary widens from words to
+        /// whole lines, letting merges cross word boundaries (SuperBPE-style).
+        /// Set to --vocab-size or above for ordinary word-bounded BPE.
+        ///
+        /// The default spends 5/6 of the vocabulary on ordinary subwords and the
+        /// last sixth on cross-boundary units, which measured 29.7% fewer tokens
+        /// for the same corpus while keeping the in-domain/out-of-domain
+        /// compression gap at 1.24x (full relaxation from the start gives 1.44x).
+        #[arg(long, default_value_t = 40960)]
+        transition: usize,
+
+        /// Longest token surface permitted, in bytes; 0 disables the cap.
+        #[arg(long, default_value_t = 0)]
+        max_token_bytes: usize,
     },
 
     /// M57: Compile an NSL file to synthesizable Verilog for FPGA targets.

@@ -136,13 +136,16 @@ fn step(x: Tensor, w: Tensor, targets: Tensor) -> Tensor:
 "#;
 
 #[test]
-fn biasless_head_declines_with_producer_not_add() {
-    assert_single_decline(
-        BIASLESS_HEAD_SRC,
-        &[],
-        &FusedLceDecline::LogitsProducerNotAdd {
-            producer: "Matmul".to_string(),
-        },
+fn biasless_head_substitutes_with_no_decline() {
+    // BEHAVIOUR FLIP (Sprint 2.5): the biasless head — previously the
+    // second most common decline — substitutes with has_bias=false via
+    // the GEMM-chunked runtime path.
+    let (declines, subs) = declines_for(BIASLESS_HEAD_SRC, Some(enabled_cfg()), &[]);
+    assert_eq!(subs, 1, "Sprint 2.5: the biasless head substitutes");
+    assert!(
+        declines.is_empty(),
+        "no decline may be recorded for a successful biasless match, got \
+         {declines:?}"
     );
 }
 
@@ -157,21 +160,38 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
 "#;
 
 #[test]
-fn reshape_between_head_and_ce_declines_naming_the_reshape() {
+fn reshape_between_head_and_ce_is_seen_through() {
+    // BEHAVIOUR FLIP (Sprint 2.5): the flatten between a 3-D head and the
+    // loss — previously THE single most common decline in real code — is
+    // now seen through (up to two chained reshapes) and substitutes with
+    // x_rank3=true.
     let (declines, subs) =
         declines_for(RESHAPE_BEFORE_CE_SRC, Some(enabled_cfg()), &[]);
-    assert_eq!(subs, 0, "reshape fixture must not substitute");
-    assert_eq!(declines.len(), 1, "expected one decline, got {declines:?}");
-    let FusedLceDecline::LogitsProducerNotAdd { producer } = &declines[0] else {
-        panic!("expected LogitsProducerNotAdd, got {:?}", declines[0]);
-    };
-    // The producer name must NAME the reshape. A bare "Passthrough" would be
-    // useless to the reader — this is the single most common decline in real
-    // code, so the message has to point at the offending line.
+    assert_eq!(subs, 1, "Sprint 2.5: the reshape is seen through");
     assert!(
-        producer.contains("reshape"),
-        "the decline must name the reshape so the diagnostic is actionable, \
-         got producer={producer:?}"
+        declines.is_empty(),
+        "no decline may be recorded for a successful see-through, got \
+         {declines:?}"
+    );
+}
+
+/// A reshape whose INPUT chain still cannot match (bare parameter under the
+/// reshape) — see-through must descend and then report the INNER producer,
+/// keeping the diagnostic actionable.
+const RESHAPE_OF_PARAM_SRC: &str = r#"
+fn step(logits3d: Tensor, targets: Tensor) -> Tensor:
+    let logits = logits3d.reshape([64, 4096])
+    return cross_entropy(logits, targets)
+"#;
+
+#[test]
+fn reshape_of_unmatchable_chain_declines_with_inner_producer() {
+    assert_single_decline(
+        RESHAPE_OF_PARAM_SRC,
+        &[],
+        &FusedLceDecline::LogitsProducerNotAdd {
+            producer: "Input(\"logits3d\")".to_string(),
+        },
     );
 }
 
@@ -531,8 +551,10 @@ fn every_exercised_variant_has_a_fixture() {
             produced.push(d.discriminant_name());
         }
     };
-    record(BIASLESS_HEAD_SRC, cfg(), &[]);
-    record(RESHAPE_BEFORE_CE_SRC, cfg(), &[]);
+    // BIASLESS_HEAD_SRC / RESHAPE_BEFORE_CE_SRC substitute since Sprint 2.5
+    // and record no declines; RESHAPE_OF_PARAM_SRC keeps the see-through
+    // decline path (inner producer) exercised.
+    record(RESHAPE_OF_PARAM_SRC, cfg(), &[]);
     record(PLAIN_LOGITS_SRC, cfg(), &[]);
     record(NO_TRANSPOSE_SRC, cfg(), &[]);
     record(AMBIGUOUS_ADD_SRC, cfg(), &[]);
@@ -575,11 +597,13 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
     // Pin the count so that collapse is a failure.
     assert_eq!(
         produced.len(),
-        9,
-        "expected exactly 9 declines across the fixtures, got {produced:?}. \
-         Three fixtures share LogitsProducerNotAdd, so a per-discriminant check \
+        8,
+        "expected exactly 8 declines across the fixtures, got {produced:?}. \
+         Two fixtures share LogitsProducerNotAdd, so a per-discriminant check \
          alone cannot notice one of them silently ceasing to decline — pin the \
-         count. Update this number deliberately when adding a fixture."
+         count. Update this number deliberately when adding a fixture. \
+         (Was 9 before Sprint 2.5 flipped the biasless + reshape fixtures \
+         into substitutions.)"
     );
 }
 

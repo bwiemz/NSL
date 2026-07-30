@@ -232,6 +232,10 @@ pub enum AdjointExpr {
         seq_len: u32,
         vocab_tile: u32,
         ignore_index: i64,
+        /// Sprint 2.5 (see `PrimalOp::FusedLinearCe::has_bias`).
+        has_bias: bool,
+        /// Sprint 2.5 (see `PrimalOp::FusedLinearCe::x_rank3`).
+        x_rank3: bool,
     },
     /// CPKD: fused KL-CE distillation backward — STUDENT components only
     /// (0 = dx_s, 1 = dW_s, 2 = dbias_s). The teacher inputs receive NO
@@ -672,68 +676,43 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             vocab_tile,
             ignore_index,
             is_large: _,
+            has_bias,
+            x_rank3,
         } => {
             let x = op.inputs[0];
             let w = op.inputs[1];
             let bias = op.inputs[2];
             let targets = op.inputs[3];
             let fwd_result = op.result;
-            vec![
-                InputAdjoint {
-                    input_var: x,
-                    expr: AdjointExpr::FusedLinearCeBackward {
-                        grad: output_bar,
-                        x,
-                        w,
-                        bias,
-                        targets,
-                        fwd_result,
-                        component: 0,
-                        vocab_size: *vocab_size,
-                        hidden_size: *hidden_size,
-                        batch_size: *batch_size,
-                        seq_len: *seq_len,
-                        vocab_tile: *vocab_tile,
-                        ignore_index: *ignore_index,
-                    },
-                },
-                InputAdjoint {
-                    input_var: w,
-                    expr: AdjointExpr::FusedLinearCeBackward {
-                        grad: output_bar,
-                        x,
-                        w,
-                        bias,
-                        targets,
-                        fwd_result,
-                        component: 1,
-                        vocab_size: *vocab_size,
-                        hidden_size: *hidden_size,
-                        batch_size: *batch_size,
-                        seq_len: *seq_len,
-                        vocab_tile: *vocab_tile,
-                        ignore_index: *ignore_index,
-                    },
-                },
-                InputAdjoint {
-                    input_var: bias,
-                    expr: AdjointExpr::FusedLinearCeBackward {
-                        grad: output_bar,
-                        x,
-                        w,
-                        bias,
-                        targets,
-                        fwd_result,
-                        component: 2,
-                        vocab_size: *vocab_size,
-                        hidden_size: *hidden_size,
-                        batch_size: *batch_size,
-                        seq_len: *seq_len,
-                        vocab_tile: *vocab_tile,
-                        ignore_index: *ignore_index,
-                    },
-                },
-            ]
+            let mk = |component: u8| AdjointExpr::FusedLinearCeBackward {
+                grad: output_bar,
+                x,
+                w,
+                bias,
+                targets,
+                fwd_result,
+                component,
+                vocab_size: *vocab_size,
+                hidden_size: *hidden_size,
+                batch_size: *batch_size,
+                seq_len: *seq_len,
+                vocab_tile: *vocab_tile,
+                ignore_index: *ignore_index,
+                has_bias: *has_bias,
+                x_rank3: *x_rank3,
+            };
+            let mut adjoints = vec![
+                InputAdjoint { input_var: x, expr: mk(0) },
+                InputAdjoint { input_var: w, expr: mk(1) },
+            ];
+            // Sprint 2.5: a biasless head has no bias adjoint — inputs[2]
+            // is a placeholder (w_var) that must NOT accumulate a dbias.
+            // The backward cache evicts on the last EMITTED component,
+            // which the lowering derives from has_bias.
+            if *has_bias {
+                adjoints.push(InputAdjoint { input_var: bias, expr: mk(2) });
+            }
+            adjoints
         }
         // CPKD: fused KL-CE distillation loss. Adjoints ONLY for the three
         // STUDENT inputs (x_s, W_s, bias_s = inputs[0..3]); the teacher

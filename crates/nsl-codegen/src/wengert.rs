@@ -448,6 +448,17 @@ pub enum PrimalOp {
         vocab_tile: u32,
         ignore_index: i64,
         is_large: bool,
+        /// Sprint 2.5: false for a biasless LM head (`x @ W^T` with no
+        /// `+ bias`). The bias input slot (inputs[2]) then carries `w_var`
+        /// as a placeholder — it is never read by the lowering and never
+        /// receives an adjoint (the AD rule skips component 2).
+        has_bias: bool,
+        /// Sprint 2.5: true when the matcher saw through a
+        /// `[B,S,V] -> [B*S,V]` reshape between the head and the loss —
+        /// x on the tape is then 3-D `[B,S,H]` and dx must be allocated
+        /// with that shape so downstream shape-sensitive backward ops
+        /// (rmsnorm dx, residual adds) see the rank they expect.
+        x_rank3: bool,
     },
     /// CFTP §4.4 G3 (Sprint 4): fused linear + cross-entropy backward extract.
     ///
@@ -479,6 +490,11 @@ pub enum PrimalOp {
         seq_len: u32,
         vocab_tile: u32,
         ignore_index: i64,
+        /// See `FusedLinearCe::has_bias`. When false, component 2 is never
+        /// emitted and the backward cache evicts on component 1.
+        has_bias: bool,
+        /// See `FusedLinearCe::x_rank3` — dx allocates `[B, S, H]`.
+        x_rank3: bool,
     },
     /// CPKD: fused KL-CE distillation loss.
     ///

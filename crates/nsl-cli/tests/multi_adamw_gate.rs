@@ -23,7 +23,12 @@ struct RunOut {
     stderr: String,
 }
 
-fn run_adamw_mlp(tag: &str, gpu: bool, multi_off: bool) -> RunOut {
+fn run_adamw_mlp_env(
+    tag: &str,
+    gpu: bool,
+    grad_clip: Option<f64>,
+    envs: &[(&str, &str)],
+) -> RunOut {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_multiadamw_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -39,6 +44,14 @@ fn run_adamw_mlp(tag: &str, gpu: bool, multi_off: bool) -> RunOut {
         src = src.replace("m.forward_train(x)", "m.forward_train(xg)");
         src = src.replace("l1_loss(pred, y)", "l1_loss(pred, yg)");
     }
+    if let Some(clip) = grad_clip {
+        // Route the optimizer through the two-phase-clip Deferred arm.
+        src = src.replace(
+            "train(model=m, epochs=8, grad_accumulation=2):",
+            &format!("train(model=m, epochs=8, grad_accumulation=2, grad_clip={clip}):"),
+        );
+        assert!(src.contains("grad_clip"), "grad_clip rewrite did not land");
+    }
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, src).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
@@ -46,8 +59,8 @@ fn run_adamw_mlp(tag: &str, gpu: bool, multi_off: bool) -> RunOut {
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"));
-    if multi_off {
-        cmd.env("NSL_FASE_MULTI_STEP", "0");
+    for (k, v) in envs {
+        cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn nsl run");
     assert!(
@@ -59,6 +72,15 @@ fn run_adamw_mlp(tag: &str, gpu: bool, multi_off: bool) -> RunOut {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+fn run_adamw_mlp(tag: &str, gpu: bool, multi_off: bool) -> RunOut {
+    let envs: &[(&str, &str)] = if multi_off {
+        &[("NSL_FASE_MULTI_STEP", "0")]
+    } else {
+        &[]
+    };
+    run_adamw_mlp_env(tag, gpu, None, envs)
 }
 
 fn loss_stream(stdout: &str) -> Vec<String> {
@@ -97,6 +119,84 @@ fn multi_adamw_gpu_bit_identical_and_fires() {
         !off.stderr.contains("[fase-multi]"),
         "kill-switch NSL_FASE_MULTI_STEP=0 did not disable the multi path"
     );
+}
+
+/// The two-phase-clip Phase B multi arm: ONE pointer-table launch with the
+/// clip factor folded into the m_partial read (`mp_scale`). Must be
+/// BIT-IDENTICAL to the legacy scale-then-step loop. Batched Phase A sum_sq
+/// is pinned OFF on both arms so this isolates the mp_scale fold — the
+/// batched norm changes accumulation dtype and is gated separately below.
+/// `grad_clip=0.01` is deliberately tiny so the factor is genuinely < 1 and
+/// the fold is exercised (a factor of exactly 1.0 takes the branch-around).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn multi_adamw_clip_gpu_bit_identical_and_fires() {
+    let on = run_adamw_mlp_env(
+        "clip_gpu_on",
+        true,
+        Some(0.01),
+        &[("NSL_FASE_BATCH_SUMSQ", "0")],
+    );
+    let off = run_adamw_mlp_env(
+        "clip_gpu_off",
+        true,
+        Some(0.01),
+        &[("NSL_FASE_BATCH_SUMSQ", "0"), ("NSL_FASE_MULTI_STEP", "0")],
+    );
+    let (ls_on, ls_off) = (loss_stream(&on.stdout), loss_stream(&off.stdout));
+    assert!(ls_on.len() >= 8, "expected >=8 losses, got {}", ls_on.len());
+    assert_eq!(
+        ls_on, ls_off,
+        "clip-arm multi AdamW (mp_scale fold) diverged from the legacy \
+         scale-then-step loop (must be bit-identical)"
+    );
+    assert!(
+        on.stderr.contains("[fase-multi] batched 6 params"),
+        "batch marker missing — the clip arm did not take the multi path:\n{}",
+        on.stderr
+    );
+    assert!(
+        !off.stderr.contains("[fase-multi]"),
+        "kill-switch NSL_FASE_MULTI_STEP=0 did not disable the clip-arm multi path"
+    );
+}
+
+/// Batched Phase A norm (`nsl_fase_sum_sq_list`, one drain) vs the per-param
+/// syncing loop. NOT bit-identical by design: the batched kernel accumulates
+/// each tensor in f64 where `nsl_tensor_sum_sq`'s GPU path accumulates in
+/// f32 (see the FFI's numerics note), so the clip factor — and every loss
+/// after the first clipped step — may differ in the low digits. Asserted
+/// CLOSE (1e-3 relative), which a broken norm (wrong tensor set, wrong
+/// slot, dropped param) fails by orders of magnitude.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn batched_phase_a_sumsq_gpu_close_to_per_param() {
+    let batched = run_adamw_mlp_env("sumsq_gpu_on", true, Some(0.01), &[]);
+    let legacy = run_adamw_mlp_env(
+        "sumsq_gpu_off",
+        true,
+        Some(0.01),
+        &[("NSL_FASE_BATCH_SUMSQ", "0")],
+    );
+    let (ls_b, ls_l) = (loss_stream(&batched.stdout), loss_stream(&legacy.stdout));
+    assert!(ls_b.len() >= 8, "expected >=8 losses, got {}", ls_b.len());
+    assert_eq!(ls_b.len(), ls_l.len(), "loss stream lengths diverged");
+    let parse = |s: &str| -> f64 {
+        s.trim_start_matches("tensor([")
+            .trim_end_matches("])")
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("unparseable loss line: {s}"))
+    };
+    for (b, l) in ls_b.iter().zip(&ls_l) {
+        let (vb, vl) = (parse(b), parse(l));
+        let rel = (vb - vl).abs() / vl.abs().max(1e-12);
+        assert!(
+            rel < 1e-3,
+            "batched Phase A norm diverged beyond accumulation-dtype noise: \
+             {vb} vs {vl} (rel {rel:.2e})"
+        );
+    }
 }
 
 #[test]

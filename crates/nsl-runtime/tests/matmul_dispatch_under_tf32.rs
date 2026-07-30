@@ -445,6 +445,7 @@ fn dispatch_paths_are_correct_under_the_shipped_defaults() {
     spawn_child(|cmd| {
         cmd.env_remove("NSL_MATMUL_TF32")
             .env_remove("NSL_MATMUL_PEDANTIC")
+            .env_remove("NSL_MATMUL_BF16")
             .env_remove("NSL_MATMUL_TRANSPOSE_VIEWS")
             .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0")
             .env("NSL_TF32_DISPATCH_EXPECT_TF32", "1");
@@ -464,6 +465,7 @@ fn copy_arm_is_correct_under_tf32() {
         cmd.env("NSL_MATMUL_TF32", "1")
             .env("NSL_MATMUL_TRANSPOSE_VIEWS", "0")
             .env_remove("NSL_MATMUL_PEDANTIC")
+            .env_remove("NSL_MATMUL_BF16")
             .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "1")
             .env("NSL_TF32_DISPATCH_EXPECT_TF32", "1");
     });
@@ -485,6 +487,7 @@ fn op_t_exemption_is_correct_under_tf32() {
         cmd.env("NSL_MATMUL_TF32", "1")
             .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
             .env_remove("NSL_MATMUL_PEDANTIC")
+            .env_remove("NSL_MATMUL_BF16")
             .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0")
             .env("NSL_TF32_DISPATCH_EXPECT_TF32", "1");
     });
@@ -506,6 +509,7 @@ fn op_t_override_is_correct_under_pedantic() {
         cmd.env("NSL_MATMUL_PEDANTIC", "1")
             .env("NSL_MATMUL_TRANSPOSE_VIEWS", "1")
             .env_remove("NSL_MATMUL_TF32")
+            .env_remove("NSL_MATMUL_BF16")
             .env("NSL_TF32_DISPATCH_EXPECT_COPIED", "0")
             .env("NSL_TF32_DISPATCH_EXPECT_TF32", "0");
     });

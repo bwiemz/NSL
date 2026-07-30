@@ -41,6 +41,7 @@ fn setup_env() {
     // resolves to Pedantic, which is fine for this test.
     // SAFETY: single-threaded init (see file doc-comment).
     std::env::remove_var("NSL_MATMUL_TF32");
+    std::env::remove_var("NSL_MATMUL_BF16");
     std::env::set_var("NSL_MATMUL_PEDANTIC", "1");
 }
 

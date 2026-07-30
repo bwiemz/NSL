@@ -715,6 +715,89 @@ DONE: ret;\n\
 }\0";
 
 // ---------------------------------------------------------------------------
+// GPU Per-dimension Sum Reduction — SHORT-AXIS variant.
+//
+// The general kernel below assigns one 256-thread block per output element,
+// which is the right shape when the reduced axis is long. When it is short
+// that shape is pathological: a tied [49152, 512] embedding gradient sums two
+// contributions per output, so it launched 25,165,824 blocks — 6.4 billion
+// threads to perform 25 million additions. Every thread past `reduce_size`
+// exits immediately and the survivors still run a full eight-level shared
+// memory tree reduction over a single live value. Profiling a Coder-50M step
+// attributed 82.5% of ALL GPU kernel time to `nsl_sum_dim_f32`, and 47.8% of
+// that to just three launches of this shape.
+//
+// Here each output element gets one THREAD, which walks the reduced axis
+// serially. Consecutive threads take consecutive `inner_idx`, so for the
+// contiguous case (inner large) the loads stay coalesced.
+//
+// Grid:  (ceil(outer * inner / 256), 1, 1)
+// Block: (256, 1, 1)
+// Params: in ptr, out ptr, outer (u64), reduce_size (u64), inner (u64)
+// ---------------------------------------------------------------------------
+pub(crate) const SUM_DIM_SHORT_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sum_dim_short_f32(\n\
+    .param .u64 inp, .param .u64 out,\n\
+    .param .u64 outer, .param .u64 reduce_size, .param .u64 inner\n\
+) {\n\
+    .reg .u64 %rd<20>;\n\
+    .reg .u32 %r<8>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .pred %p<4>;\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [outer];\n\
+    ld.param.u64 %rd4, [reduce_size];\n\
+    ld.param.u64 %rd5, [inner];\n\
+    // gid = blockIdx.x * blockDim.x + threadIdx.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd6, %r4;\n\
+    // total_out = outer * inner\n\
+    mul.lo.u64 %rd7, %rd3, %rd5;\n\
+    setp.ge.u64 %p1, %rd6, %rd7;\n\
+    @%p1 bra SHORT_DONE;\n\
+    // A reduce_size == 1 special case that skips the two emulated u64 divides
+    // (the address math is the identity there) was tried and MEASURED SLOWER:
+    // 689 -> 727 ms per micro-batch, against +-1.7% run-to-run noise. The kernel
+    // is only ~1.1% of GPU time inside a step that is ~90% host-bound, so the
+    // extra basic block costs more than the divides save. Left out deliberately.
+    // outer_idx = gid / inner ; inner_idx = gid % inner\n\
+    div.u64 %rd8, %rd6, %rd5;\n\
+    rem.u64 %rd9, %rd6, %rd5;\n\
+    // base = outer_idx * reduce_size * inner + inner_idx\n\
+    mul.lo.u64 %rd10, %rd8, %rd4;\n\
+    mul.lo.u64 %rd10, %rd10, %rd5;\n\
+    add.u64 %rd10, %rd10, %rd9;\n\
+    mov.f32 %f1, 0f00000000;\n\
+    mov.u64 %rd12, 0;\n\
+SHORT_LOOP:\n\
+    setp.ge.u64 %p2, %rd12, %rd4;\n\
+    @%p2 bra SHORT_STORE;\n\
+    mul.lo.u64 %rd13, %rd12, %rd5;\n\
+    add.u64 %rd13, %rd10, %rd13;\n\
+    shl.b64 %rd13, %rd13, 2;\n\
+    add.u64 %rd13, %rd1, %rd13;\n\
+    ld.global.f32 %f2, [%rd13];\n\
+    add.f32 %f1, %f1, %f2;\n\
+    add.u64 %rd12, %rd12, 1;\n\
+    bra SHORT_LOOP;\n\
+SHORT_STORE:\n\
+    shl.b64 %rd14, %rd6, 2;\n\
+    add.u64 %rd14, %rd2, %rd14;\n\
+    st.global.f32 [%rd14], %f1;\n\
+SHORT_DONE:\n\
+    ret;\n\
+}\0";
+
+// ---------------------------------------------------------------------------
 // GPU Per-dimension Sum Reduction
 // One thread block per output element.
 // Decomposes the reduction as: outer * reduce_size * inner
@@ -1734,6 +1817,87 @@ SA_DONE: ret;\n\
 // Identical to embedding lookup but with explicit bounds checking on input_rows.
 // Target: sm_80 (compatible sm_89, sm_90, sm_100 Blackwell)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GPU gather along an ARBITRARY dimension (NSL semantics).
+//
+// `nsl_tensor_gather` only had a device kernel for dim 0 and fell back to a full
+// CPU round trip otherwise — copy the whole tensor to the host, gather, copy the
+// result back. `cross_entropy` gathers along dim 1, so every training step moved
+// the entire [B*S, vocab] log-probability tensor across PCIe twice: 192 MB each
+// way at B*S=1024, vocab=49152. Host profiling showed memcpy at 94% of
+// attributed host time, ~1 GB per step.
+//
+// NSL's gather REMOVES the gathered dimension: for input shape S and dim d,
+// `indices` has length outer = prod(S[..d]) and the output is S with d dropped.
+//   out[o*inner + k] = input[o*gather_dim_size*inner + idx[o]*inner + k]
+//
+// Indices are read as f32, matching `nsl_gather_f32` above. The caller validates
+// them on the host first (they are only `outer` elements, so the check costs a
+// few KB), which keeps the abort-on-out-of-bounds contract the CPU path has.
+//
+// Grid:  (ceil(outer * inner / 256), 1, 1)
+// Block: (256, 1, 1)
+// ---------------------------------------------------------------------------
+pub(crate) const GATHER_DIM_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_gather_dim_f32(\n\
+    .param .u64 input, .param .u64 indices, .param .u64 out,\n\
+    .param .u64 outer, .param .u64 gather_dim_size, .param .u64 inner\n\
+) {\n\
+    .reg .u64 %rd<16>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .pred %p<4>;\n\
+    ld.param.u64 %rd1, [input];\n\
+    ld.param.u64 %rd2, [indices];\n\
+    ld.param.u64 %rd3, [out];\n\
+    ld.param.u64 %rd4, [outer];\n\
+    ld.param.u64 %rd5, [gather_dim_size];\n\
+    ld.param.u64 %rd6, [inner];\n\
+    // gid = blockIdx.x * blockDim.x + threadIdx.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd7, %r4;\n\
+    // total = outer * inner\n\
+    mul.lo.u64 %rd8, %rd4, %rd6;\n\
+    setp.ge.u64 %p1, %rd7, %rd8;\n\
+    @%p1 bra GD_DONE;\n\
+    // o = gid / inner ; k = gid % inner\n\
+    div.u64 %rd9, %rd7, %rd6;\n\
+    rem.u64 %rd10, %rd7, %rd6;\n\
+    // idx = (u64)indices[o]\n\
+    shl.b64 %rd11, %rd9, 2;\n\
+    add.u64 %rd11, %rd2, %rd11;\n\
+    ld.global.f32 %f1, [%rd11];\n\
+    cvt.rzi.u64.f32 %rd12, %f1;\n\
+    // Out-of-range writes zero rather than reading out of bounds. The host has\n\
+    // already rejected such indices; this only bounds the damage.\n\
+    mov.f32 %f2, 0f00000000;\n\
+    setp.ge.u64 %p2, %rd12, %rd5;\n\
+    @%p2 bra GD_STORE;\n\
+    // in_off = o * gather_dim_size * inner + idx * inner + k\n\
+    mul.lo.u64 %rd13, %rd9, %rd5;\n\
+    mul.lo.u64 %rd13, %rd13, %rd6;\n\
+    mul.lo.u64 %rd14, %rd12, %rd6;\n\
+    add.u64 %rd13, %rd13, %rd14;\n\
+    add.u64 %rd13, %rd13, %rd10;\n\
+    shl.b64 %rd13, %rd13, 2;\n\
+    add.u64 %rd13, %rd1, %rd13;\n\
+    ld.global.f32 %f2, [%rd13];\n\
+GD_STORE:\n\
+    shl.b64 %rd15, %rd7, 2;\n\
+    add.u64 %rd15, %rd3, %rd15;\n\
+    st.global.f32 [%rd15], %f2;\n\
+GD_DONE:\n\
+    ret;\n\
+}\0";
+
 pub(crate) const GATHER_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_80\n\
@@ -3563,6 +3727,108 @@ TS_DONE: ret;\n\
 }\0";
 
 // ---------------------------------------------------------------------------
+// Sum of squares over an f32 buffer, accumulated in DOUBLE, one partial per
+// block.
+//
+// Output: out[blockIdx.x] = that block's f64 partial. The host sums the
+// partials in f64, in block order, so the result is reproducible run to run.
+// Block: (256, 1, 1), SharedMem: 256 * 8 = 2048 bytes. Grid is chosen by the
+// caller (see `gpu_sum_sq_many_f32`) and MUST match the slot count.
+//
+// Why not slot 3 of `nsl_tensor_stats_f32`: that one accumulates in f32.
+// Gradient clipping feeds the result into a `norm <= max_norm` comparison, so a
+// systematically low sum does not merely round the answer, it can decline a clip
+// the host f64 path would have made.
+//
+// Why grid-strided rather than a single block: f64 runs at 1/64 rate on GeForce,
+// and a single 256-thread block accumulating a 25M-element gradient means about
+// 98,000 serial f64 FMAs per thread on ONE SM. That measured 80 -> 112 ms per
+// micro-batch, a 39% step-level regression -- an unacceptable price for the
+// precision. Spreading the same work over 256 blocks cuts it to ~384 FMAs per
+// thread. Note this is NOT the atomic variant that was tried and reverted
+// earlier: partials go to per-block slots, so there is no contention and no
+// ordering nondeterminism.
+//
+// `fma.rn.f64` squares and accumulates with a single rounding.
+// ---------------------------------------------------------------------------
+pub(crate) const SUM_SQ_F64_ACC_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_sum_sq_f64_acc_f32(\n\
+    .param .u64 inp, .param .u64 out, .param .u64 n\n\
+) {\n\
+    .reg .u64 %rd<12>;\n\
+    .reg .u32 %r<16>;\n\
+    .reg .f32 %f<4>;\n\
+    .reg .f64 %fd<6>;\n\
+    .reg .pred %p<4>;\n\
+    .shared .align 8 .f64 ssq[256];\n\
+    ld.param.u64 %rd1, [inp];\n\
+    ld.param.u64 %rd2, [out];\n\
+    ld.param.u64 %rd3, [n];\n\
+    mov.u32 %r2, %tid.x;\n\
+    mov.u32 %r10, %ctaid.x;\n\
+    mov.u32 %r11, %ntid.x;\n\
+    mov.u32 %r12, %nctaid.x;\n\
+    // start = ctaid*ntid + tid\n\
+    mul.lo.u32 %r13, %r10, %r11;\n\
+    add.u32 %r13, %r13, %r2;\n\
+    cvt.u64.u32 %rd5, %r13;\n\
+    // stride = ntid*nctaid\n\
+    mul.lo.u32 %r14, %r11, %r12;\n\
+    cvt.u64.u32 %rd7, %r14;\n\
+    mov.f64 %fd1, 0d0000000000000000;\n\
+SSQ_LOOP:\n\
+    setp.ge.u64 %p1, %rd5, %rd3;\n\
+    @%p1 bra SSQ_REDUCE;\n\
+    shl.b64 %rd6, %rd5, 2;\n\
+    add.u64 %rd6, %rd1, %rd6;\n\
+    ld.global.f32 %f1, [%rd6];\n\
+    cvt.f64.f32 %fd2, %f1;\n\
+    fma.rn.f64 %fd1, %fd2, %fd2, %fd1;\n\
+    add.u64 %rd5, %rd5, %rd7;\n\
+    bra SSQ_LOOP;\n\
+SSQ_REDUCE:\n\
+    mul.lo.u32 %r3, %r2, 8;\n\
+    mov.u32 %r7, ssq;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f64 [%r7], %fd1;\n\
+    bar.sync 0;\n\
+    mov.u32 %r4, 128;\n\
+SSQ_RED_LOOP:\n\
+    setp.lt.u32 %p1, %r4, 1;\n\
+    @%p1 bra SSQ_RED_DONE;\n\
+    setp.ge.u32 %p2, %r2, %r4;\n\
+    @%p2 bra SSQ_RED_SKIP;\n\
+    mul.lo.u32 %r5, %r2, 8;\n\
+    add.u32 %r6, %r2, %r4;\n\
+    mul.lo.u32 %r6, %r6, 8;\n\
+    mov.u32 %r7, ssq;\n\
+    add.u32 %r8, %r7, %r5;\n\
+    ld.shared.f64 %fd3, [%r8];\n\
+    add.u32 %r9, %r7, %r6;\n\
+    ld.shared.f64 %fd4, [%r9];\n\
+    add.f64 %fd3, %fd3, %fd4;\n\
+    st.shared.f64 [%r8], %fd3;\n\
+SSQ_RED_SKIP:\n\
+    bar.sync 0;\n\
+    shr.u32 %r4, %r4, 1;\n\
+    bra SSQ_RED_LOOP;\n\
+SSQ_RED_DONE:\n\
+    setp.ne.u32 %p3, %r2, 0;\n\
+    @%p3 bra SSQ_DONE;\n\
+    ld.shared.f64 %fd5, [ssq];\n\
+    // out[ctaid]\n\
+    cvt.u64.u32 %rd8, %r10;\n\
+    shl.b64 %rd8, %rd8, 3;\n\
+    add.u64 %rd9, %rd2, %rd8;\n\
+    st.global.f64 [%rd9], %fd5;\n\
+SSQ_DONE: ret;\n\
+}\0";
+
+// ---------------------------------------------------------------------------
 // M42b: KV-cache dequantization kernels (GPU)
 // ---------------------------------------------------------------------------
 
@@ -4308,6 +4574,370 @@ CEF_EXIT:\n\
     ret;\n\
 }\0";
 
+// ─── GEMM-chunked fused linear-CE companions (Sprint 2.5 wiring) ───────────
+//
+// The auto-substituted large-vocab fused linear-CE runs as a loop of cuBLAS
+// GEMMs over vocab CHUNKS (never materializing the full [rows, V] logits);
+// these three kernels are the per-chunk glue. Measured motivation: the v1
+// scalar kernels at Coder-50M shape (rows=1024, V=49152, H=512) run 486 ms
+// forward / 2222 ms backward against the composite's ~1.4 / ~2.9 ms GEMMs
+// (see fused_linear_ce_perf_probe.rs) — the atomics-based scatter cannot
+// compete at production vocab, so the GEMM path is the training path.
+//
+// exp/log go through ex2.approx / lg2.approx — the same approximation family
+// the v1 fused-CE kernels use (their softmax uses ex2.approx too), validated
+// against the CPU f64 reference at the same tolerances.
+
+/// Per-chunk online-softmax state update, one 256-thread block per row.
+///
+/// Folds a [rows, cols] logits chunk (vocab columns chunk_start..+cols of
+/// the full head) into three running [rows] state vectors:
+///   m (running max), s (running Σexp rescaled to m), tl (target logit).
+/// The caller initialises m = -inf (cuMemsetD32 0xFF800000), s = 0, tl = 0.
+/// `bias` is the FULL [V] bias vector, indexed at chunk_start+j; ignored
+/// when has_bias == 0 (the pointer may be null then).
+///
+/// Two smem passes per chunk: block-max, then block-Σexp relative to the
+/// UPDATED max (thread 0 publishes m_new through sdata[0] between passes,
+/// and rescales the running s by exp(m_old - m_new)).
+pub(crate) const LCE_CHUNK_STATS_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_lce_chunk_stats_f32(\n\
+    .param .u64 logits, .param .u64 bias, .param .u64 targets,\n\
+    .param .u64 mstate, .param .u64 sstate, .param .u64 tlstate,\n\
+    .param .u64 rows, .param .u64 cols, .param .u64 chunk_start,\n\
+    .param .u32 has_bias\n\
+) {\n\
+    .reg .u64 %rd<24>;\n\
+    .reg .u32 %r<10>;\n\
+    .reg .f32 %f<14>;\n\
+    .reg .s64 %tg<2>;\n\
+    .reg .pred %p<8>;\n\
+    .shared .f32 sdata[256];\n\
+    ld.param.u64 %rd1, [logits];\n\
+    ld.param.u64 %rd2, [bias];\n\
+    ld.param.u64 %rd3, [targets];\n\
+    ld.param.u64 %rd4, [mstate];\n\
+    ld.param.u64 %rd5, [sstate];\n\
+    ld.param.u64 %rd6, [tlstate];\n\
+    ld.param.u64 %rd7, [rows];\n\
+    ld.param.u64 %rd8, [cols];\n\
+    ld.param.u64 %rd9, [chunk_start];\n\
+    ld.param.u32 %r5, [has_bias];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    cvt.u64.u32 %rd10, %r1;\n\
+    setp.ge.u64 %p1, %rd10, %rd7;\n\
+    @%p1 bra LCS_DONE;\n\
+    mov.u32 %r2, %tid.x;\n\
+    cvt.u64.u32 %rd11, %r2;\n\
+    // row_base_bytes = row * cols * 4\n\
+    mul.lo.u64 %rd12, %rd10, %rd8;\n\
+    shl.b64 %rd12, %rd12, 2;\n\
+    add.u64 %rd12, %rd1, %rd12;\n\
+    // bias chunk base (bytes), used only when has_bias\n\
+    shl.b64 %rd13, %rd9, 2;\n\
+    add.u64 %rd13, %rd2, %rd13;\n\
+    // --- Pass 1: block max of val_j = logits[row,j] (+ bias[cs+j]) ---\n\
+    mov.f32 %f1, 0fFF800000;\n\
+    mov.u64 %rd14, %rd11;\n\
+LCS_MAX_LOOP:\n\
+    setp.ge.u64 %p2, %rd14, %rd8;\n\
+    @%p2 bra LCS_MAX_DONE;\n\
+    shl.b64 %rd15, %rd14, 2;\n\
+    add.u64 %rd16, %rd12, %rd15;\n\
+    ld.global.f32 %f2, [%rd16];\n\
+    setp.eq.u32 %p3, %r5, 0;\n\
+    @%p3 bra LCS_MAX_NOB;\n\
+    add.u64 %rd17, %rd13, %rd15;\n\
+    ld.global.f32 %f3, [%rd17];\n\
+    add.f32 %f2, %f2, %f3;\n\
+LCS_MAX_NOB:\n\
+    max.f32 %f1, %f1, %f2;\n\
+    add.u64 %rd14, %rd14, 256;\n\
+    bra LCS_MAX_LOOP;\n\
+LCS_MAX_DONE:\n\
+    mul.lo.u32 %r3, %r2, 4;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f1;\n\
+    bar.sync 0;\n\
+    setp.ne.u32 %p4, %r2, 0;\n\
+    @%p4 bra LCS_MAX_WAIT;\n\
+    // thread 0: reduce max, merge with m_old, publish m_new\n\
+    mov.u32 %r4, 1;\n\
+LCS_MAX_RED:\n\
+    setp.ge.u32 %p2, %r4, 256;\n\
+    @%p2 bra LCS_MAX_RED_DONE;\n\
+    mul.lo.u32 %r6, %r4, 4;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f4, [%r7];\n\
+    max.f32 %f1, %f1, %f4;\n\
+    add.u32 %r4, %r4, 1;\n\
+    bra LCS_MAX_RED;\n\
+LCS_MAX_RED_DONE:\n\
+    // m_old / s_old from global state (kept in thread-0 registers)\n\
+    shl.b64 %rd18, %rd10, 2;\n\
+    add.u64 %rd19, %rd4, %rd18;\n\
+    ld.global.f32 %f5, [%rd19];\n\
+    max.f32 %f6, %f5, %f1;\n\
+    st.shared.f32 [sdata], %f6;\n\
+LCS_MAX_WAIT:\n\
+    bar.sync 0;\n\
+    ld.shared.f32 %f6, [sdata];\n\
+    // --- Pass 2: block sum of exp(val_j - m_new) ---\n\
+    mov.f32 %f7, 0f00000000;\n\
+    mov.u64 %rd14, %rd11;\n\
+LCS_SUM_LOOP:\n\
+    setp.ge.u64 %p2, %rd14, %rd8;\n\
+    @%p2 bra LCS_SUM_DONE;\n\
+    shl.b64 %rd15, %rd14, 2;\n\
+    add.u64 %rd16, %rd12, %rd15;\n\
+    ld.global.f32 %f2, [%rd16];\n\
+    setp.eq.u32 %p3, %r5, 0;\n\
+    @%p3 bra LCS_SUM_NOB;\n\
+    add.u64 %rd17, %rd13, %rd15;\n\
+    ld.global.f32 %f3, [%rd17];\n\
+    add.f32 %f2, %f2, %f3;\n\
+LCS_SUM_NOB:\n\
+    sub.f32 %f2, %f2, %f6;\n\
+    mul.f32 %f2, %f2, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %f2, %f2;\n\
+    add.f32 %f7, %f7, %f2;\n\
+    add.u64 %rd14, %rd14, 256;\n\
+    bra LCS_SUM_LOOP;\n\
+LCS_SUM_DONE:\n\
+    bar.sync 0;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r3;\n\
+    st.shared.f32 [%r7], %f7;\n\
+    bar.sync 0;\n\
+    setp.ne.u32 %p4, %r2, 0;\n\
+    @%p4 bra LCS_DONE;\n\
+    // thread 0: reduce sum, rescale running s, store state\n\
+    mov.u32 %r4, 1;\n\
+LCS_SUM_RED:\n\
+    setp.ge.u32 %p2, %r4, 256;\n\
+    @%p2 bra LCS_SUM_RED_DONE;\n\
+    mul.lo.u32 %r6, %r4, 4;\n\
+    mov.u32 %r7, sdata;\n\
+    add.u32 %r7, %r7, %r6;\n\
+    ld.shared.f32 %f4, [%r7];\n\
+    add.f32 %f7, %f7, %f4;\n\
+    add.u32 %r4, %r4, 1;\n\
+    bra LCS_SUM_RED;\n\
+LCS_SUM_RED_DONE:\n\
+    // s_new = s_old * exp(m_old - m_new) + chunk_sum\n\
+    add.u64 %rd20, %rd5, %rd18;\n\
+    ld.global.f32 %f8, [%rd20];\n\
+    sub.f32 %f9, %f5, %f6;\n\
+    mul.f32 %f9, %f9, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %f9, %f9;\n\
+    fma.rn.f32 %f7, %f8, %f9, %f7;\n\
+    st.global.f32 [%rd20], %f7;\n\
+    add.u64 %rd19, %rd4, %rd18;\n\
+    st.global.f32 [%rd19], %f6;\n\
+    // target logit gather: t in [chunk_start, chunk_start+cols)\n\
+    shl.b64 %rd21, %rd10, 3;\n\
+    add.u64 %rd21, %rd3, %rd21;\n\
+    ld.global.s64 %tg0, [%rd21];\n\
+    cvt.s64.u64 %tg1, %rd9;\n\
+    setp.lt.s64 %p5, %tg0, %tg1;\n\
+    @%p5 bra LCS_DONE;\n\
+    sub.s64 %tg0, %tg0, %tg1;\n\
+    cvt.s64.u64 %tg1, %rd8;\n\
+    setp.ge.s64 %p6, %tg0, %tg1;\n\
+    @%p6 bra LCS_DONE;\n\
+    cvt.u64.s64 %rd22, %tg0;\n\
+    shl.b64 %rd15, %rd22, 2;\n\
+    add.u64 %rd16, %rd12, %rd15;\n\
+    ld.global.f32 %f10, [%rd16];\n\
+    setp.eq.u32 %p3, %r5, 0;\n\
+    @%p3 bra LCS_TL_NOB;\n\
+    add.u64 %rd17, %rd13, %rd15;\n\
+    ld.global.f32 %f11, [%rd17];\n\
+    add.f32 %f10, %f10, %f11;\n\
+LCS_TL_NOB:\n\
+    add.u64 %rd23, %rd6, %rd18;\n\
+    st.global.f32 [%rd23], %f10;\n\
+LCS_DONE: ret;\n\
+}\0";
+
+/// Per-chunk softmax-gradient, grid-strided over rows*cols elements,
+/// written IN PLACE over the logits chunk (which is dead after this).
+///
+///   dl[r,j] = valid(r) ? (exp(val - lse[r]) - [t_r == chunk_start+j]) * scale : 0
+///
+/// `scale` = grad_output / num_valid (host-folded). When has_bias != 0 the
+/// per-element dl is also reduced into dbias[chunk_start+j] via
+/// red.global.add.f32 (atomic-order nondeterministic, like every dbias in
+/// this family; ~rows collisions per column).
+pub(crate) const LCE_CHUNK_DLOGITS_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_lce_chunk_dlogits_f32(\n\
+    .param .u64 logits, .param .u64 bias, .param .u64 targets,\n\
+    .param .u64 lse, .param .u64 dbias,\n\
+    .param .u64 rows, .param .u64 cols, .param .u64 chunk_start,\n\
+    .param .f32 scale, .param .u32 has_bias\n\
+) {\n\
+    .reg .u64 %rd<22>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<10>;\n\
+    .reg .s64 %tg<3>;\n\
+    .reg .pred %p<8>;\n\
+    ld.param.u64 %rd1, [logits];\n\
+    ld.param.u64 %rd2, [bias];\n\
+    ld.param.u64 %rd3, [targets];\n\
+    ld.param.u64 %rd4, [lse];\n\
+    ld.param.u64 %rd5, [dbias];\n\
+    ld.param.u64 %rd6, [rows];\n\
+    ld.param.u64 %rd7, [cols];\n\
+    ld.param.u64 %rd8, [chunk_start];\n\
+    ld.param.f32 %f1, [scale];\n\
+    ld.param.u32 %r4, [has_bias];\n\
+    // idx = ctaid.x * ntid.x + tid.x; stride = ntid.x * nctaid.x\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r5, %r1, %r2;\n\
+    add.u32 %r5, %r5, %r3;\n\
+    cvt.u64.u32 %rd9, %r5;\n\
+    mov.u32 %r1, %nctaid.x;\n\
+    mul.lo.u32 %r5, %r1, %r2;\n\
+    cvt.u64.u32 %rd10, %r5;\n\
+    mul.lo.u64 %rd11, %rd6, %rd7;\n\
+LCD_LOOP:\n\
+    setp.ge.u64 %p1, %rd9, %rd11;\n\
+    @%p1 bra LCD_DONE;\n\
+    // r = idx / cols; j = idx % cols\n\
+    div.u64 %rd12, %rd9, %rd7;\n\
+    mul.lo.u64 %rd13, %rd12, %rd7;\n\
+    sub.u64 %rd13, %rd9, %rd13;\n\
+    // val = logits[idx] (+ bias[chunk_start + j])\n\
+    shl.b64 %rd14, %rd9, 2;\n\
+    add.u64 %rd14, %rd1, %rd14;\n\
+    ld.global.f32 %f2, [%rd14];\n\
+    setp.eq.u32 %p2, %r4, 0;\n\
+    @%p2 bra LCD_NOB;\n\
+    add.u64 %rd15, %rd8, %rd13;\n\
+    shl.b64 %rd15, %rd15, 2;\n\
+    add.u64 %rd15, %rd2, %rd15;\n\
+    ld.global.f32 %f3, [%rd15];\n\
+    add.f32 %f2, %f2, %f3;\n\
+LCD_NOB:\n\
+    // t = targets[r]; valid = t >= 0\n\
+    shl.b64 %rd16, %rd12, 3;\n\
+    add.u64 %rd16, %rd3, %rd16;\n\
+    ld.global.s64 %tg0, [%rd16];\n\
+    setp.lt.s64 %p3, %tg0, 0;\n\
+    @!%p3 bra LCD_VALID;\n\
+    mov.f32 %f6, 0f00000000;\n\
+    bra LCD_STORE;\n\
+LCD_VALID:\n\
+    // p = exp(val - lse[r])\n\
+    shl.b64 %rd17, %rd12, 2;\n\
+    add.u64 %rd17, %rd4, %rd17;\n\
+    ld.global.f32 %f4, [%rd17];\n\
+    sub.f32 %f2, %f2, %f4;\n\
+    mul.f32 %f2, %f2, 0f3FB8AA3B;\n\
+    ex2.approx.f32 %f5, %f2;\n\
+    // onehot subtract\n\
+    add.u64 %rd18, %rd8, %rd13;\n\
+    cvt.s64.u64 %tg1, %rd18;\n\
+    setp.ne.s64 %p4, %tg0, %tg1;\n\
+    @%p4 bra LCD_SCALE;\n\
+    mov.f32 %f7, 0f3F800000;\n\
+    sub.f32 %f5, %f5, %f7;\n\
+LCD_SCALE:\n\
+    mul.f32 %f6, %f5, %f1;\n\
+LCD_STORE:\n\
+    st.global.f32 [%rd14], %f6;\n\
+    // dbias[chunk_start + j] += dl (bias configs only)\n\
+    setp.eq.u32 %p2, %r4, 0;\n\
+    @%p2 bra LCD_NEXT;\n\
+    add.u64 %rd19, %rd8, %rd13;\n\
+    shl.b64 %rd19, %rd19, 2;\n\
+    add.u64 %rd19, %rd5, %rd19;\n\
+    red.global.add.f32 [%rd19], %f6;\n\
+LCD_NEXT:\n\
+    add.u64 %rd9, %rd9, %rd10;\n\
+    bra LCD_LOOP;\n\
+LCD_DONE: ret;\n\
+}\0";
+
+/// Finalize the online-softmax state into per-row loss and lse,
+/// grid-strided over rows.
+///
+///   lse[r]  = m[r] + log(s[r])
+///   loss[r] = valid(r) ? (lse[r] - tl[r]) : 0        [= -(tl - lse)]
+pub(crate) const LCE_FINALIZE_F32_PTX: &str = "\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry nsl_lce_finalize_f32(\n\
+    .param .u64 mstate, .param .u64 sstate, .param .u64 tlstate,\n\
+    .param .u64 targets, .param .u64 loss, .param .u64 lse,\n\
+    .param .u64 rows\n\
+) {\n\
+    .reg .u64 %rd<16>;\n\
+    .reg .u32 %r<6>;\n\
+    .reg .f32 %f<8>;\n\
+    .reg .s64 %tg<2>;\n\
+    .reg .pred %p<4>;\n\
+    ld.param.u64 %rd1, [mstate];\n\
+    ld.param.u64 %rd2, [sstate];\n\
+    ld.param.u64 %rd3, [tlstate];\n\
+    ld.param.u64 %rd4, [targets];\n\
+    ld.param.u64 %rd5, [loss];\n\
+    ld.param.u64 %rd6, [lse];\n\
+    ld.param.u64 %rd7, [rows];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ntid.x;\n\
+    mov.u32 %r3, %tid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    add.u32 %r4, %r4, %r3;\n\
+    cvt.u64.u32 %rd8, %r4;\n\
+    mov.u32 %r1, %nctaid.x;\n\
+    mul.lo.u32 %r4, %r1, %r2;\n\
+    cvt.u64.u32 %rd9, %r4;\n\
+LCF_LOOP:\n\
+    setp.ge.u64 %p1, %rd8, %rd7;\n\
+    @%p1 bra LCF_DONE;\n\
+    shl.b64 %rd10, %rd8, 2;\n\
+    add.u64 %rd11, %rd1, %rd10;\n\
+    ld.global.f32 %f1, [%rd11];\n\
+    add.u64 %rd12, %rd2, %rd10;\n\
+    ld.global.f32 %f2, [%rd12];\n\
+    // lse = m + log(s) = m + lg2(s) * ln(2)\n\
+    lg2.approx.f32 %f2, %f2;\n\
+    fma.rn.f32 %f3, %f2, 0f3F317218, %f1;\n\
+    add.u64 %rd13, %rd6, %rd10;\n\
+    st.global.f32 [%rd13], %f3;\n\
+    // loss = valid ? lse - tl : 0\n\
+    shl.b64 %rd14, %rd8, 3;\n\
+    add.u64 %rd14, %rd4, %rd14;\n\
+    ld.global.s64 %tg0, [%rd14];\n\
+    setp.lt.s64 %p2, %tg0, 0;\n\
+    mov.f32 %f5, 0f00000000;\n\
+    @%p2 bra LCF_STORE;\n\
+    add.u64 %rd15, %rd3, %rd10;\n\
+    ld.global.f32 %f4, [%rd15];\n\
+    sub.f32 %f5, %f3, %f4;\n\
+LCF_STORE:\n\
+    add.u64 %rd15, %rd5, %rd10;\n\
+    st.global.f32 [%rd15], %f5;\n\
+    add.u64 %rd8, %rd8, %rd9;\n\
+    bra LCF_LOOP;\n\
+LCF_DONE: ret;\n\
+}\0";
+
 /// Every hand-written PTX module in this file, paired with its constant name.
 ///
 /// Consumed by the `ptxas` gate in `super::tests`, which assembles each one.
@@ -4315,6 +4945,9 @@ CEF_EXIT:\n\
 /// in them is invisible until a kernel launch fails on a real GPU.
 #[cfg(test)]
 pub(crate) const ALL_PTX: &[(&str, &str)] = &[
+    ("LCE_CHUNK_STATS_F32_PTX", LCE_CHUNK_STATS_F32_PTX),
+    ("LCE_CHUNK_DLOGITS_F32_PTX", LCE_CHUNK_DLOGITS_F32_PTX),
+    ("LCE_FINALIZE_F32_PTX", LCE_FINALIZE_F32_PTX),
     ("MUON_BATCH_MOM_F32_PTX", MUON_BATCH_MOM_F32_PTX),
     ("MUON_BATCH_SUMSQ_F32_PTX", MUON_BATCH_SUMSQ_F32_PTX),
     ("MUON_BATCH_PACK_F32_PTX", MUON_BATCH_PACK_F32_PTX),
@@ -4332,6 +4965,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("SOFTMAX_F32_PTX", SOFTMAX_F32_PTX),
     ("LOG_SOFTMAX_F32_PTX", LOG_SOFTMAX_F32_PTX),
     ("SUM_DIM_F32_PTX", SUM_DIM_F32_PTX),
+    ("SUM_DIM_SHORT_F32_PTX", SUM_DIM_SHORT_F32_PTX),
     ("MAX_DIM_F32_PTX", MAX_DIM_F32_PTX),
     ("GLOBAL_SUM_F32_PTX", GLOBAL_SUM_F32_PTX),
     ("LAYERNORM_F32_PTX", LAYERNORM_F32_PTX),
@@ -4342,6 +4976,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("RMSNORM_DX_BWD_F32_PTX", RMSNORM_DX_BWD_F32_PTX),
     ("SCATTER_ADD_F32_PTX", SCATTER_ADD_F32_PTX),
     ("GATHER_F32_PTX", GATHER_F32_PTX),
+    ("GATHER_DIM_F32_PTX", GATHER_DIM_F32_PTX),
     ("GATHER_I32IDX_PTX", GATHER_I32IDX_PTX),
     ("CONV2D_F32_PTX", CONV2D_F32_PTX),
     ("MAXPOOL2D_F32_PTX", MAXPOOL2D_F32_PTX),
@@ -4360,6 +4995,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("DET_SUM_DIM_F32_PTX", DET_SUM_DIM_F32_PTX),
     ("DET_SCATTER_ADD_F32_PTX", DET_SCATTER_ADD_F32_PTX),
     ("TENSOR_STATS_F32_PTX", TENSOR_STATS_F32_PTX),
+    ("SUM_SQ_F64_ACC_F32_PTX", SUM_SQ_F64_ACC_F32_PTX),
     ("DEQUANT_INT8_PER_HEAD_F32_PTX", DEQUANT_INT8_PER_HEAD_F32_PTX),
     ("DEQUANT_INT8_PER_TOKEN_F32_PTX", DEQUANT_INT8_PER_TOKEN_F32_PTX),
     ("DEQUANT_INT4_PER_GROUP_F32_PTX", DEQUANT_INT4_PER_GROUP_F32_PTX),

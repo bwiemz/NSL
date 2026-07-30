@@ -7639,7 +7639,13 @@ impl Compiler<'_> {
                 // `FusedLinearCeBackwardExtract` results — the lowerer then
                 // skips those Adds (unresolved ghost input) and every
                 // parameter gradient downstream of the fused loss vanishes.
-                extractor.apply_pending_fused_lce_prunes();
+                // Sprint 2.5: an Err here means a chain op SURVIVED the
+                // prune (a live outside consumer such as `logits.shape`) —
+                // unrecoverable after substitution, so it is a hard,
+                // actionable refusal rather than a ghost-adjoint ICE later.
+                extractor
+                    .apply_pending_fused_lce_prunes()
+                    .map_err(CodegenError::new)?;
 
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner call itself is pure data-in/data-out — it produces a
@@ -12871,17 +12877,55 @@ impl Compiler<'_> {
                     &[beta2_const, opt_step],
                 )?;
 
+                // Fusion item 1 admission, shared by BOTH arms below: when
+                // every param would take the fused AdamW path (exact
+                // structural match, no envelopes, no ZeRO gating, no
+                // offload staging), the per-param final-step loop collapses
+                // into ONE multi-tensor pointer-table launch. The clip arm
+                // additionally folds its Phase B pre-scale into the same
+                // launch via the kernel's mp_scale argument (bit-identical
+                // to scale-then-step; see FASE_FUSED_ADAMW_MULTI_F32_PTX).
+                // Kill-switches NSL_FASE_FUSED_STEP=0 / NSL_FASE_MULTI_STEP=0
+                // (compile-time).
+                let multi_scalars = if cpdt_precision_dtypes.is_none()
+                    && !self.compile_options.training_reference
+                    && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
+                    && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
+                    && !zero_enabled
+                    && !self.compile_options.optim_state_offload
+                    && !self.features.param_dtype_bf16sr
+                    && num_state_buffers >= 2
+                {
+                    Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
+                        &fase_plan.recipe,
+                    ))
+                } else {
+                    None
+                };
+
                 if fase_plan.two_phase_clip {
+                    // Phase A batching: ONE `nsl_fase_sum_sq_list` call (a
+                    // single pipeline drain) instead of one synchronously
+                    // read-back `nsl_tensor_sum_sq` per parameter — 74
+                    // drains/step at Coder-50M. The f64-vs-f32 accumulation
+                    // note lives on the FFI. Kill-switch
+                    // NSL_FASE_BATCH_SUMSQ=0 (compile-time, like
+                    // NSL_FASE_FUSED_STEP).
+                    let batch_sumsq =
+                        std::env::var("NSL_FASE_BATCH_SUMSQ").ok().as_deref() != Some("0");
                     // ── Phase A: fused accumulation + sum_sq loop ──
                     // Accumulate the final micro-batch's gradients into m_partial
                     // (the standard accumulation loop was skipped for this batch),
                     // and simultaneously accumulate sum(||g_i||^2) for the global
-                    // L2 norm.
+                    // L2 norm. When the hook already accumulated during adjoint
+                    // lowering AND the norm is batched, there is nothing left
+                    // for the loop to do — skip emitting it entirely.
                     let pa_tot_var = state.new_variable();
                     builder.declare_var(pa_tot_var, cl_types::F64);
                     let pa_zero_f = builder.ins().f64const(0.0);
                     builder.def_var(pa_tot_var, pa_zero_f);
 
+                    if !(fase_hook_active && batch_sumsq) {
                     let pa_i_var = state.new_variable();
                     builder.declare_var(pa_i_var, cl_types::I64);
                     let pa_i_zero = builder.ins().iconst(cl_types::I64, 0);
@@ -12925,14 +12969,16 @@ impl Compiler<'_> {
                         )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
                     }
-                    let pa_sq = self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_sum_sq",
-                        &[pa_mpart],
-                    )?;
-                    let pa_tot_cur = builder.use_var(pa_tot_var);
-                    let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
-                    builder.def_var(pa_tot_var, pa_tot_new);
+                    if !batch_sumsq {
+                        let pa_sq = self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_sum_sq",
+                            &[pa_mpart],
+                        )?;
+                        let pa_tot_cur = builder.use_var(pa_tot_var);
+                        let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
+                        builder.def_var(pa_tot_var, pa_tot_new);
+                    }
                     let pa_i_next = builder.ins().iadd_imm(pa_i, 1);
                     builder.def_var(pa_i_var, pa_i_next);
                     builder.ins().jump(pa_hdr, &[]);
@@ -12940,6 +12986,7 @@ impl Compiler<'_> {
                     builder.switch_to_block(pa_exit);
                     builder.seal_block(pa_hdr);
                     builder.seal_block(pa_exit);
+                    }
 
                     // Free grads_list wrapper — skip when hook active (null sentinel).
                     if !fase_hook_active {
@@ -12950,7 +12997,11 @@ impl Compiler<'_> {
                     // `grad_clip` is the raw f64 from the train-block config
                     // (f64::MAX when not set, but two_phase_clip is only true when it IS set).
                     let grad_clip_threshold = grad_clip;
-                    let total_sq = builder.use_var(pa_tot_var);
+                    let total_sq = if batch_sumsq {
+                        self.compile_call_by_name(builder, "nsl_fase_sum_sq_list", &[accum])?
+                    } else {
+                        builder.use_var(pa_tot_var)
+                    };
                     let norm = builder.ins().sqrt(total_sq);
                     let eps_v = builder.ins().f64const(1e-6_f64);
                     let denom = builder.ins().fadd(norm, eps_v);
@@ -12959,6 +13010,55 @@ impl Compiler<'_> {
                     let one_f = builder.ins().f64const(1.0_f64);
                     let clip_factor = builder.ins().fmin(one_f, ratio);
 
+                    // ── Phase B, multi arm: ONE pointer-table launch with the
+                    // clip factor folded into the m_partial read. Replaces
+                    // 74 nsl_tensor_mul_scalar_inplace + 74 fused-step
+                    // launches (+ the per-param list traffic) at Coder-50M.
+                    if let Some(sc) = multi_scalars {
+                        let lr_v = builder.ins().f64const(sc.lr);
+                        let b1_v = builder.ins().f64const(sc.beta1);
+                        let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
+                        let b2_v = builder.ins().f64const(sc.beta2);
+                        let omb2_v = builder.ins().f64const(sc.one_minus_beta2);
+                        let eps_v = builder.ins().f64const(sc.eps);
+                        let wd_v = builder.ins().f64const(sc.wd);
+                        // The parameter-group arguments are as load-bearing here
+                        // as in the unclipped arm below. Omitting them does not
+                        // fail to compile — it shifts `clip_factor` into the
+                        // `wd_exempt_list` slot, so the runtime would read a
+                        // float bit-pattern as an NslList pointer while the clip
+                        // silently stopped being applied.
+                        let exempt_list_v = decay_exempt_list
+                            .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, 0));
+                        let exempt_nr2_v = builder.ins().iconst(
+                            cl_types::I64,
+                            i64::from(no_decay_scope.exempt_non_rank2),
+                        );
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_fase_fused_adamw_step_multi",
+                            &[
+                                param_list,
+                                state_list_1,
+                                state_list_2,
+                                accum,
+                                lr_v,
+                                b1_v,
+                                omb1_v,
+                                b2_v,
+                                omb2_v,
+                                eps_v,
+                                wd_v,
+                                bc1_inv,
+                                bc2_inv,
+                                exempt_list_v,
+                                exempt_nr2_v,
+                                // mp_scale: the clip factor, folded into the
+                                // m_partial read in-kernel.
+                                clip_factor,
+                            ],
+                        )?;
+                    } else {
                     // ── Phase B: scale m_partial in place, then fused optimizer step ──
                     let pb_i_var = state.new_variable();
                     builder.declare_var(pb_i_var, cl_types::I64);
@@ -13059,8 +13159,11 @@ impl Compiler<'_> {
                     builder.seal_block(pb_hdr);
                     builder.seal_block(pb_exit);
                     state.current_block = Some(pb_exit);
+                    }
                     // Offload P0.2: one drain per optimizer step (transfer-
                     // stream sync + deferred frees of the staged tensors).
+                    // (Unreachable from the multi arm: its admission requires
+                    // optim_state_offload == false.)
                     if self.compile_options.optim_state_offload {
                         self.compile_call_by_name(builder, "nsl_offload_drain", &[])?;
                     }
@@ -13069,28 +13172,12 @@ impl Compiler<'_> {
                     // accum_list is m_partial.  state_list_1 = m, state_list_2 = v.
                     //
                     // Fusion item 1: when EVERY param would take the fused
-                    // AdamW path (exact structural match, no envelopes, no
-                    // ZeRO gating), the whole loop collapses into ONE
+                    // AdamW path, the whole loop collapses into ONE
                     // multi-tensor pointer-table launch — bit-identical per
                     // element (the multi kernel is the single kernel's body
                     // with table addressing, and it folds the shared tail's
-                    // m_partial zero). Kill-switch NSL_FASE_MULTI_STEP=0
-                    // (compile-time, like NSL_FASE_FUSED_STEP).
-                    let multi_scalars = if cpdt_precision_dtypes.is_none()
-                        && !self.compile_options.training_reference
-                        && std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() != Some("0")
-                        && std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() != Some("0")
-                        && !zero_enabled
-                        && !self.compile_options.optim_state_offload
-                        && !self.features.param_dtype_bf16sr
-                        && num_state_buffers >= 2
-                    {
-                        Self::match_adamw_program(&crate::fase_optimizer::emit_final_step(
-                            &fase_plan.recipe,
-                        ))
-                    } else {
-                        None
-                    };
+                    // m_partial zero). Admission (`multi_scalars`) is hoisted
+                    // above the clip fork and shared with the clip arm.
                     if let Some(sc) = multi_scalars {
                         let lr_v = builder.ins().f64const(sc.lr);
                         let b1_v = builder.ins().f64const(sc.beta1);
@@ -13105,6 +13192,9 @@ impl Compiler<'_> {
                             cl_types::I64,
                             i64::from(no_decay_scope.exempt_non_rank2),
                         );
+                        // mp_scale = 1.0: unclipped path (the kernel branches
+                        // around the multiply, keeping exact bit-identity).
+                        let one_scale = builder.ins().f64const(1.0);
                         self.compile_call_by_name(
                             builder,
                             "nsl_fase_fused_adamw_step_multi",
@@ -13127,6 +13217,7 @@ impl Compiler<'_> {
                                 // every param exactly as before.
                                 exempt_list_v,
                                 exempt_nr2_v,
+                                one_scale,
                             ],
                         )?;
                     } else {

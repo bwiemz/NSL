@@ -118,6 +118,15 @@ function classify(r, fname, path,    lower) {
 # they start with) nor gate text (a code sample mentioning `#[ignore]`
 # inside a block comment is prose, not a gate — the `//`-comment guard in
 # the ignore rule never covered this).
+
+# CRLF proofing (review finding, 2026-07-30): on a checkout with CRLF
+# working-tree files, every `$0` ends in \r, so the multi-line-attribute
+# continuation regex (`\\[ \t]*$`) never matches — the reason string is
+# silently dropped and a `broken`-quarantined gate reclassifies to
+# `gpu-inferred`, un-quarantining a documented-segfaulting test in the
+# regenerated manifest. Strip the CR before any rule sees the line.
+{ sub(/\r$/, "") }
+
 in_block_comment {
     if ($0 ~ /\*\//) in_block_comment = 0
     next
@@ -160,6 +169,11 @@ in_block_comment {
     # `--write-manifest` would then bake that loss in and the drift gate would
     # defend the wrong inventory forever.
     while (attr ~ /\\[ \t]*$/ && (getline nextline) > 0) {
+        # getline bypasses the main-rule CR strip — without this, a CRLF
+        # checkout re-introduces \r here, the continuation regex stops
+        # matching after ONE joined line, and the reason silently truncates
+        # to empty (the same corruption the top-of-file strip fixes).
+        sub(/\r$/, "", nextline)
         sub(/[ \t]*\\[ \t]*$/, "", attr)
         sub(/^[ \t]+/, " ", nextline)
         attr = attr nextline

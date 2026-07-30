@@ -182,18 +182,21 @@ fn warn_on_legacy_env_once() {
 /// gate comparing csla-vs-baseline loss streams is vacuous if the fused
 /// kernel silently never engaged (composite fallback) — these counters
 /// prove which path ran and how many times.
-static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// Test/diagnostic probe: successful fused linear-CE launches for `kind`
-/// (0 = forward, 1 = forward_large, 2 = backward). Other kinds return -1.
+/// (0 = forward, 1 = forward_large, 2 = backward, 3 = forward_gemm,
+/// 4 = backward_gemm). Other kinds return -1.
 #[no_mangle]
 pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
     match kind {
-        0..=2 => FUSED_LCE_LAUNCH_COUNTS[kind as usize]
+        0..=4 => FUSED_LCE_LAUNCH_COUNTS[kind as usize]
             .load(std::sync::atomic::Ordering::Relaxed) as i64,
         _ => -1,
     }
@@ -217,8 +220,19 @@ pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
 /// Returns the raw device pointer (NOT an NslTensor — the 8-byte stride
 /// would corrupt f32 byte-size accounting); release it with
 /// [`nsl_fused_lce_targets_i64_free`] after the kernel FFI returns.
+/// `expected_rows` pins the label count to the decorator-derived
+/// `batch_size * seq_len` (review Sprint 2.5 finding): the fused kernels
+/// index `rows` entries with no length validation of their own, so a
+/// program whose loss flatten produced a DIFFERENT row count (e.g. a
+/// `[B,S,V] -> [B, S*V]` reshape the see-through cannot distinguish from
+/// the row-preserving flatten) would otherwise read past this staging
+/// buffer on device — garbage class indices or ILLEGAL_ADDRESS. Pass 0 to
+/// skip the check (no caller does today).
 #[no_mangle]
-pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
+pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
+    tensor_ptr: i64,
+    expected_rows: i64,
+) -> i64 {
     if tensor_ptr == 0 {
         eprintln!("nsl_fused_lce_targets_i64_alloc: null tensor");
         std::process::abort();
@@ -227,6 +241,18 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(tensor_ptr: i64) -> i64 {
     {
         let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
         let n = t.len as usize;
+        if expected_rows > 0 && t.len != expected_rows {
+            eprintln!(
+                "nsl_fused_lce_targets_i64_alloc: label tensor has {} entries \
+                 but the @fused_lm_ce decorator pins batch_size * seq_len = \
+                 {expected_rows}. The loss flatten and the decorator hints \
+                 disagree — the fused kernel would read out of bounds. Fix \
+                 the reshape (it must be the row-preserving \
+                 [B,S,V] -> [B*S,V] flatten) or the decorator hints.",
+                t.len
+            );
+            std::process::abort();
+        }
         // Density guard (review D2c-3): the reads below walk t.data
         // linearly — a broadcast/expand view (stride 0) or a strided
         // slice would be silently misread. Every real label path is a
@@ -600,6 +626,129 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
                  targets_ptr, lse_ptr, dx_out_ptr, dw_out_ptr, dbias_out_ptr,
                  b, s, v, h, num_valid, smem_bytes);
         eprintln!("nsl_fused_linear_ce_backward: compiled without cuda feature");
+        -1
+    }
+}
+
+/// GEMM-chunked forward (Sprint 2.5 production path for large vocab).
+///
+/// Same tensor contract as the PTX forwards — raw DEVICE pointers, f32
+/// storage, i64 targets, pre-allocated `loss_out`/`lse_out [B*S]` — but no
+/// PTX/kname/smem arguments: the chunk kernels are runtime constants and
+/// the heavy math is cuBLAS (so NSL_MATMUL_TF32/NSL_MATMUL_BF16 apply to
+/// the head like every other GEMM). `has_bias == 0` skips every bias read;
+/// `bias_ptr` may be 0 then. f32 only — 16-bit storage stays on the v1
+/// kernels. Rationale + measurements: cuda/fused_ce_kernels.rs.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fused_linear_ce_forward_gemm(
+    x_ptr: i64,
+    w_ptr: i64,
+    bias_ptr: i64,
+    targets_ptr: i64,
+    loss_out_ptr: i64,
+    lse_out_ptr: i64,
+    b: i64,
+    s: i64,
+    v: i64,
+    h: i64,
+    has_bias: i64,
+) -> i64 {
+    #[cfg(feature = "cuda")]
+    {
+        let rows = (b * s) as u64;
+        let rc = crate::cuda::fused_ce_kernels::gemm_forward(
+            x_ptr as u64,
+            w_ptr as u64,
+            bias_ptr as u64,
+            targets_ptr as u64,
+            loss_out_ptr as u64,
+            lse_out_ptr as u64,
+            rows,
+            v as u64,
+            h as u64,
+            has_bias != 0,
+        );
+        if rc != 0 {
+            eprintln!("nsl_fused_linear_ce_forward_gemm: failed rc={rc}");
+            return -(rc as i64);
+        }
+        crate::cuda::inner::sync_after_kernel();
+        FUSED_LCE_LAUNCH_COUNTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        0
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x_ptr, w_ptr, bias_ptr, targets_ptr, loss_out_ptr, lse_out_ptr, b, s, v, h,
+            has_bias,
+        );
+        eprintln!("nsl_fused_linear_ce_forward_gemm: compiled without cuda feature");
+        -1
+    }
+}
+
+/// GEMM-chunked backward. `dx [B*S, H]`, `dw [V, H]`, and (when `has_bias`)
+/// `dbias [V]` must be ZEROED by the caller — chunks accumulate. dW/dbias
+/// remain atomic/GEMM-order nondeterministic like the v1 kernels; the
+/// backward scale is `grad_output / num_valid`, folded here on the host.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
+    grad_output_bits: i64, // f32 bits packed into i64
+    x_ptr: i64,
+    w_ptr: i64,
+    bias_ptr: i64,
+    targets_ptr: i64,
+    lse_ptr: i64,
+    dx_out_ptr: i64,
+    dw_out_ptr: i64,
+    dbias_out_ptr: i64,
+    b: i64,
+    s: i64,
+    v: i64,
+    h: i64,
+    num_valid: i64,
+    has_bias: i64,
+) -> i64 {
+    let grad_output = f32::from_bits(grad_output_bits as u32);
+    #[cfg(feature = "cuda")]
+    {
+        let rows = (b * s) as u64;
+        // Same convention as the v1 backward kernel (emit_bwd_kernel):
+        // scale = grad_output / num_valid, num_valid >= 1 guaranteed by the
+        // caller (an all-ignore batch short-circuits upstream).
+        let scale = grad_output / (num_valid.max(1) as f32);
+        let rc = crate::cuda::fused_ce_kernels::gemm_backward(
+            x_ptr as u64,
+            w_ptr as u64,
+            bias_ptr as u64,
+            targets_ptr as u64,
+            lse_ptr as u64,
+            dx_out_ptr as u64,
+            dw_out_ptr as u64,
+            dbias_out_ptr as u64,
+            rows,
+            v as u64,
+            h as u64,
+            scale,
+            has_bias != 0,
+        );
+        if rc != 0 {
+            eprintln!("nsl_fused_linear_ce_backward_gemm: failed rc={rc}");
+            return -(rc as i64);
+        }
+        crate::cuda::inner::sync_after_kernel();
+        FUSED_LCE_LAUNCH_COUNTS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        0
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            grad_output, x_ptr, w_ptr, bias_ptr, targets_ptr, lse_ptr, dx_out_ptr,
+            dw_out_ptr, dbias_out_ptr, b, s, v, h, num_valid, has_bias,
+        );
+        eprintln!("nsl_fused_linear_ce_backward_gemm: compiled without cuda feature");
         -1
     }
 }

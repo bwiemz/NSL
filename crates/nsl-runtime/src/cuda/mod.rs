@@ -110,6 +110,17 @@ pub(crate) mod inner {
         }
     }
 
+    /// The device this process's CUDA state is bound to.
+    ///
+    /// For keying caches that hold device pointers: those are per-device, so a
+    /// contents-only key would hand a pointer allocated on one device to a
+    /// kernel launched on another.
+    pub(crate) fn current_device_ordinal() -> i32 {
+        let s = state();
+        let guard = s.lock().unwrap();
+        guard.device as i32
+    }
+
     /// Non-panicking probe: has the process-wide CUDA state already been
     /// initialized (by some prior tensor op)? Diagnostics-only callers
     /// (e.g. the NSL_PHASE_TIMING device sync) must NOT force-initialize
@@ -469,6 +480,7 @@ pub(crate) mod inner {
     /// IMPORTANT: The returned pointer is a device pointer. CPU code must NOT
     /// dereference it. Use `memcpy_htod` / `memcpy_dtoh` for data transfer.
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::DeviceAlloc);
         if size_bytes == 0 { return std::ptr::null_mut(); }
 
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -715,6 +727,7 @@ pub(crate) mod inner {
 
     /// Free device-only memory allocated with `alloc_device`.
     pub(crate) fn free_device(ptr: *mut c_void) {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::DeviceFree);
         // A1: decrement the unified accounting for this direct allocation.
         super::caching_allocator::CACHING_ALLOCATOR
             .lock()
@@ -1041,6 +1054,10 @@ pub(crate) mod inner {
 
     /// Copy `size_bytes` bytes from host memory to device memory.
     pub(crate) fn memcpy_htod(dst_device: *mut c_void, src_host: *const c_void, size_bytes: usize) {
+        if size_bytes >= 262144 && crate::host_profile::enabled() {
+            eprintln!("[copy] H2D {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
+        }
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         ensure_context();
         // cuda-graphs: uploads inside a region are pseudo-ops — the payload
         // flows through a graph-owned pinned staging buffer (see `on_htod`).
@@ -1049,25 +1066,62 @@ pub(crate) mod inner {
         }
         unsafe {
             let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
-            let ctx = current_oom_context();
-            let ctx_suffix = if ctx.is_empty() {
-                String::new()
-            } else {
-                format!(" [context: {}]", ctx)
-            };
-            assert_eq!(
-                result,
-                CUresult::CUDA_SUCCESS,
-                "cuMemcpyHtoD_v2({} bytes) failed: {:?}{}",
-                size_bytes,
-                result,
-                ctx_suffix
-            );
+            // Build the context string only on failure: this ran on every
+            // successful copy, and there are ~1300 copies per training step.
+            if result != CUresult::CUDA_SUCCESS {
+                let ctx = current_oom_context();
+                let ctx_suffix = if ctx.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [context: {}]", ctx)
+                };
+                panic!(
+                    "cuMemcpyHtoD_v2({} bytes) failed: {:?}{}",
+                    size_bytes, result, ctx_suffix
+                );
+            }
+        }
+    }
+
+    /// Copy `size_bytes` bytes from host to device NOW, bypassing cuda-graph
+    /// capture.
+    ///
+    /// `memcpy_htod` hands the payload to `graph_capture::on_htod`, which inside
+    /// a capture region stages it into a graph node — the bytes reach the device
+    /// at graph *launch*, not at the call. That is right for data the graph
+    /// replays, and wrong for a one-shot upload whose device pointer is then
+    /// cached and reused: the cache would publish a pointer to memory that was
+    /// never written, and skipping the upload on later steps would change the
+    /// recorded op sequence between the capture step and the replay steps,
+    /// diverging the capture instead of accelerating it.
+    ///
+    /// Only for immutable, content-addressed uploads (shape and stride vectors),
+    /// which are idempotent and must be visible before the kernel that reads
+    /// them is recorded.
+    pub(crate) fn memcpy_htod_immediate(
+        dst_device: *mut c_void,
+        src_host: *const c_void,
+        size_bytes: usize,
+    ) {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
+        ensure_context();
+        unsafe {
+            let result = cuMemcpyHtoD_v2(dst_device as CUdeviceptr, src_host, size_bytes);
+            if result != CUresult::CUDA_SUCCESS {
+                panic!(
+                    "cuMemcpyHtoD_v2({} bytes, immediate) failed: {:?}",
+                    size_bytes, result
+                );
+            }
         }
     }
 
     /// Copy `size_bytes` bytes from device memory to host memory.
     pub(crate) fn memcpy_dtoh(dst_host: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+        if size_bytes >= 262144 && crate::host_profile::enabled() {
+            eprintln!("[copy] D2H {:>9} KB  ctx={}", size_bytes / 1024, current_oom_context());
+        }
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::Memcpy);
         super::graph_capture::taint("sync DtoH readback");
         ensure_context();
         unsafe {
@@ -1629,6 +1683,7 @@ pub(crate) mod inner {
         args: &[*mut c_void],
         shared_mem_bytes: u32,
     ) -> CUresult {
+        let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::KernelLaunch);
         let state = state();
         let func = {
             let mut guard = state.lock().unwrap();
@@ -2036,11 +2091,46 @@ pub(crate) mod cublas_inner {
         /// a free speedup — see `tests/matmul_tf32_mode.rs`, which asserts it
         /// is both measurably faster AND measurably less accurate.
         Tf32,
+        /// BF16 tensor-core GEMMs: high-intensity products cast their
+        /// operands f32 -> bf16 into caching-allocator scratch and run
+        /// `cublasGemmEx(16BF, 16BF -> 32F, COMPUTE_32F)`; low-intensity
+        /// products stay f32-storage at explicit `FAST_TF32`.
+        ///
+        /// Two hard-won facts shape this design (both measured on CUDA
+        /// 13.3 / RTX 5070 Ti, 2026-07-29; see `gemm_bf16_mode`):
+        ///
+        /// 1. `cublasMath_t` has no BF16 fast variant, and the obvious
+        ///    substitute — per-call `CUBLAS_COMPUTE_32F_FAST_16BF` with f32
+        ///    storage — is a silent NO-OP: cuBLAS serves the identical TF32
+        ///    kernels, bit-for-bit, at TF32 speed. Only bf16 OPERAND
+        ///    STORAGE reaches the fast kernel family (71.3 vs 36.4 TFLOPS
+        ///    at N=4096).
+        /// 2. The handle must stay `CUBLAS_DEFAULT_MATH` under this mode:
+        ///    on CUDA 13.3 a TF32 handle overrides per-call compute types
+        ///    (see `sgemm_batched_row_major`), and the low-intensity arm
+        ///    relies on its per-call `FAST_TF32` being honoured.
+        ///
+        /// Why it exists: on GeForce Blackwell (GB203) the TF32 tensor rate
+        /// equals the FP32 vector rate (43.9 TFLOPS dense) — TF32's win is
+        /// the SIMT path underachieving, not extra FLOPs. BF16-with-f32-accum
+        /// is the first mode with real roofline headroom: 87.9 TFLOPS dense.
+        /// The cost: GEMM inputs are rounded to 8 mantissa bits (vs TF32's
+        /// 10-bit products over exact inputs) — measured ~7x TF32's drift at
+        /// N=4096. Accumulation and outputs stay f32; tensors, the tape, and
+        /// every non-cuBLAS kernel are untouched.
+        ///
+        /// **Opt-in only** (`NSL_MATMUL_BF16=1`); `tests/matmul_bf16_mode.rs`
+        /// asserts it is measurably faster than the FP32-cores opt-out AND
+        /// sits in a distinctly worse accuracy band than TF32.
+        Bf16,
     }
 
     /// Resolve the math mode via env-var > Cargo-feature precedence (spec §9).
     ///
     /// - `NSL_MATMUL_PEDANTIC=1` forces pedantic (beats everything).
+    /// - `NSL_MATMUL_BF16=1` forces BF16 tensor-core compute (beats TF32 —
+    ///   the more specific, later-added opt-in wins); `=0` is an explicit
+    ///   no-op so scripts can pin it off defensively.
     /// - `NSL_MATMUL_TF32=1` forces TF32; `NSL_MATMUL_TF32=0` forces it off.
     /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic if
     ///   the feature is on, else **TF32**.
@@ -2077,6 +2167,12 @@ pub(crate) mod cublas_inner {
     pub(crate) fn resolve_math_mode() -> CublasMathMode {
         if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
             return CublasMathMode::Pedantic;
+        }
+        // Same tri-state discipline as NSL_MATMUL_TF32: only the literal "1"
+        // engages, only the literal "0" is an (explicit, defensive) opt-out,
+        // and anything else falls through so a typo cannot change arithmetic.
+        if std::env::var("NSL_MATMUL_BF16").ok().as_deref() == Some("1") {
+            return CublasMathMode::Bf16;
         }
         match std::env::var("NSL_MATMUL_TF32").ok().as_deref() {
             Some("1") => return CublasMathMode::Tf32,
@@ -2137,6 +2233,12 @@ pub(crate) mod cublas_inner {
                     CublasMathMode::Fp32Cores => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
                     CublasMathMode::Pedantic => cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
                     CublasMathMode::Tf32 => cublas_sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+                    // BF16 deliberately leaves the handle in DEFAULT_MATH:
+                    // there is no BF16 cublasMath_t, and on CUDA 13.3 a TF32
+                    // handle would OVERRIDE the per-call FAST_16BF compute
+                    // type that actually carries this mode (see the
+                    // `sgemm_batched_row_major` floor-not-guarantee note).
+                    CublasMathMode::Bf16 => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
                 };
                 // SAFETY: `handle` was just returned by `create_handle` and is a
                 // valid `cublasHandle_t`; `raw_mode` is a valid enum variant.
@@ -2162,11 +2264,188 @@ pub(crate) mod cublas_inner {
                          gemms, 1.18x on total kernel time at Coder-50M, at ~13 bits less \
                          mantissa per product. Set NSL_MATMUL_TF32=0 for full f32."
                     ),
+                    CublasMathMode::Bf16 => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: BF16 tensor-core GEMMs \
+                         (NSL_MATMUL_BF16=1) — high-intensity products cast operands to \
+                         bf16 storage (measured 71.3 vs TF32's 36.4 TFLOPS at N=4096, \
+                         ~7x TF32's numeric drift), low-intensity ones stay f32 at \
+                         FAST_TF32. Accumulation and outputs remain f32. Handle stays \
+                         in DEFAULT_MATH so per-call compute types are authoritative."
+                    ),
                 }
 
                 CublasHandle(handle)
             })
             .0
+    }
+
+    /// The per-call compute type for `cublasGemmStridedBatchedEx` under the
+    /// resolved math mode.
+    ///
+    /// Under `Bf16` this is `FAST_TF32`, NOT `FAST_16BF`: measured on CUDA
+    /// 13.3 / RTX 5070 Ti (2026-07-29, N=4096 probe), `FAST_16BF` with f32
+    /// operand storage is a NO-OP — cuBLAS serves the same TF32 kernels,
+    /// bit-identical output, 36.7 vs 36.4 TFLOPS. Real BF16 rate (71.3
+    /// TFLOPS) requires bf16 OPERAND STORAGE (`gemm_bf16_storage` below),
+    /// which needs dense casts the strided-batched path cannot express in
+    /// general (arbitrary slice strides, stride-0 broadcast). So batched
+    /// products under Bf16 run explicit FAST_TF32 — same arithmetic the
+    /// TF32 default gives them, requested per call because the Bf16
+    /// handle is DEFAULT_MATH.
+    fn gemm_ex_compute_type() -> cublas_sys::cublasComputeType_t {
+        match resolved_math_mode() {
+            CublasMathMode::Bf16 => {
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+            }
+            _ => cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        }
+    }
+
+    /// Arithmetic-intensity gate for the bf16-storage path: the cast of both
+    /// operands is O(m·k + k·n) bytes of pure bandwidth, the GEMM saving is
+    /// O(m·n·k) FLOPs at (1/36.5 - 1/71.3) s/TFLOP. Equating the two on the
+    /// measured numbers (896 GB/s, 6 bytes moved per cast element) gives a
+    /// break-even near mnk/(a_elems + b_elems) ~ 250; the default of 512
+    /// stays a factor of 2 above break-even so marginal shapes do not
+    /// thrash. `NSL_MATMUL_BF16_MIN_RATIO` overrides (integer, elements).
+    fn bf16_storage_worthwhile(m: i64, n: i64, k: i64, a_elems: usize, b_elems: usize) -> bool {
+        static MIN_RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let min_ratio = *MIN_RATIO.get_or_init(|| {
+            std::env::var("NSL_MATMUL_BF16_MIN_RATIO")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(512.0)
+        });
+        let flops_cells = m as f64 * n as f64 * k as f64;
+        let cast_cells = (a_elems + b_elems) as f64;
+        cast_cells > 0.0 && flops_cells / cast_cells >= min_ratio
+    }
+
+    /// The BF16 math-mode GEMM: cast both operands f32 -> bf16 into scratch
+    /// and run `cublasGemmEx(16BF, 16BF -> 32F, COMPUTE_32F)`, or fall back
+    /// to f32-storage `FAST_TF32` for low-intensity shapes.
+    ///
+    /// Why storage and not a compute-type hint: measured on CUDA 13.3 /
+    /// RTX 5070 Ti (N=4096, 2026-07-29 probe),
+    ///
+    /// | call | TFLOPS | max_rel_err |
+    /// |---|---|---|
+    /// | Sgemm, TF32 handle            | 36.4 | 1.1e-3 |
+    /// | GemmEx f32 io, FAST_16BF      | 36.7 | 1.1e-3 (bit-identical to TF32) |
+    /// | GemmEx bf16 in / f32 out, 32F | 71.3 | 7.5e-3 |
+    ///
+    /// `FAST_16BF` with f32 storage is silently served by the TF32 kernels;
+    /// only bf16 operand storage reaches the 87.9-TFLOPS-peak kernel family.
+    /// The cast uses the SR-BF16 campaign's round-to-nearest-even
+    /// `precision_cast_kernels` (deterministic, not stochastic) and the
+    /// caching allocator, so steady-state scratch is a cache hit, not a
+    /// cuMemAlloc.
+    ///
+    /// Arguments are in cuBLAS column-major order, ALREADY operand-swapped
+    /// by the caller (first operand is the caller's B_row); `a_elems` /
+    /// `b_elems` are the dense element counts of the buffers, which are
+    /// independent of the transpose flags (a transposed 2-D view is the
+    /// same dense buffer read with swapped lda semantics, so casting the
+    /// flat buffer is exact).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm_bf16_mode(
+        handle: cublas_sys::cublasHandle_t,
+        transa: cublas_sys::cublasOperation_t,
+        transb: cublas_sys::cublasOperation_t,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: &f32,
+        a_dev: *const f32,
+        lda: i32,
+        a_elems: usize,
+        b_dev: *const f32,
+        ldb: i32,
+        b_elems: usize,
+        beta: &f32,
+        c_dev: *mut f32,
+        ldc: i32,
+    ) -> Result<(), cublas_result::CublasError> {
+        let f32t = cublas_sys::cudaDataType_t::CUDA_R_32F;
+        let use_bf16 = bf16_storage_worthwhile(m as i64, n as i64, k as i64, a_elems, b_elems);
+        let (a_ptr, b_ptr, ab_type, a_scratch, b_scratch, compute) = if use_bf16 {
+            // cuda-graphs: taint the region (review finding, 2026-07-30).
+            // The caller's Sgemm pseudo-op was recorded BEFORE this branch,
+            // but the two cast launches below are hooked kernels that would
+            // ALSO be recorded — and on replay the wrapper early-returns at
+            // the Sgemm hook, so the casts are never re-issued: the next
+            // hooked op mismatches the recorded cast, the region cycles
+            // through repair, and after MAX_CAPTURE_ATTEMPTS goes
+            // permanently eager anyway — silently. Tainting makes the same
+            // outcome explicit and cheap (the muon strided path sets the
+            // precedent). BF16-mode GEMMs inside captured regions run
+            // eager; correctness is unaffected either way.
+            super::graph_capture::taint("bf16-storage gemm casts");
+            let a16 = super::inner::alloc_managed(a_elems * 2);
+            let b16 = super::inner::alloc_managed(b_elems * 2);
+            super::gpu_cast_raw_f32_to_bf16(a_dev as u64, a16 as u64, a_elems);
+            super::gpu_cast_raw_f32_to_bf16(b_dev as u64, b16 as u64, b_elems);
+            (
+                a16 as *const std::ffi::c_void,
+                b16 as *const std::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                a16,
+                b16,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            )
+        } else {
+            (
+                a_dev as *const std::ffi::c_void,
+                b_dev as *const std::ffi::c_void,
+                f32t,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            )
+        };
+        let status = unsafe {
+            cublas_sys::cublasGemmEx(
+                handle,
+                transa,
+                transb,
+                m,
+                n,
+                k,
+                alpha as *const f32 as *const std::ffi::c_void,
+                a_ptr,
+                ab_type,
+                lda,
+                b_ptr,
+                ab_type,
+                ldb,
+                beta as *const f32 as *const std::ffi::c_void,
+                c_dev as *mut std::ffi::c_void,
+                f32t,
+                ldc,
+                compute,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
+            )
+        };
+        // Freeing immediately after enqueue is safe, but NOT because the
+        // free is deferred — `free_managed` returns the block to the
+        // caching allocator's free list synchronously, and the very next
+        // `alloc_managed` can hand it out while the GemmEx is still
+        // pending (review finding, 2026-07-30). Safety rests on two
+        // process invariants documented at the launch path: all GPU work
+        // is single-threaded on per-thread BLOCKING streams, so any
+        // subsequent WRITE into a reused block — kernel or NULL-stream
+        // copy — is enqueued after the GemmEx on the same stream. A future
+        // multi-threaded dispatcher or cross-stream writer must either
+        // event-defer these frees (`defer_free_device`) or keep the
+        // scratch alive until a sync.
+        if !a_scratch.is_null() {
+            super::inner::free_managed(a_scratch);
+            super::inner::free_managed(b_scratch);
+        }
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublas_result::CublasError(status));
+        }
+        Ok(())
     }
 
     /// `sgemm_row_major`, but either operand may be supplied as a TRANSPOSED
@@ -2245,6 +2524,34 @@ pub(crate) mod cublas_inner {
                 cublas_sys::cublasOperation_t::CUBLAS_OP_N
             }
         };
+        // BF16 cannot be expressed on the handle, so its branch goes through
+        // `gemm_bf16_mode` (bf16-storage casts for high-intensity shapes,
+        // explicit FAST_TF32 otherwise). Every other mode keeps the proven
+        // cublasSgemm_v2 call, where the handle's math mode governs —
+        // converting those too would re-open the measured speed/accuracy
+        // gates for no functional gain.
+        if resolved_math_mode() == CublasMathMode::Bf16 {
+            return unsafe {
+                gemm_bf16_mode(
+                    handle,
+                    op(transb), // cuBLAS's FIRST operand is B_row
+                    op(transa), // ...and its SECOND is A_row
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    &alpha,
+                    b_dev,
+                    if transb { k as i32 } else { n as i32 },
+                    (k * n) as usize, // B_row's dense element count
+                    a_dev,
+                    if transa { m as i32 } else { k as i32 },
+                    (m * k) as usize, // A_row's dense element count
+                    &beta,
+                    c_dev,
+                    n as i32,
+                )
+            };
+        }
         cublas_result::sgemm(
             handle,
             op(transb), // cuBLAS's FIRST operand is B_row
@@ -2355,7 +2662,12 @@ pub(crate) mod cublas_inner {
                 n as i32, // ldc = N
                 stride_c as i64,
                 batch as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                // Mode-derived: CUBLAS_COMPUTE_32F except under BF16, where
+                // the per-call type is the only carrier of the mode (the
+                // handle is DEFAULT_MATH there). Under TF32 the handle
+                // overrides this anyway — see the floor-not-guarantee note
+                // in the doc comment above.
+                gemm_ex_compute_type(),
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
             )
         };
@@ -2445,6 +2757,35 @@ pub(crate) mod cublas_inner {
             if r != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                 eprintln!("[nsl] cublasSetStream_v2 failed: {:?} — wgrad gemm stays on its previous stream", r);
             }
+        }
+        // BF16 goes per-call through `gemm_bf16_mode` (no handle-level BF16
+        // exists). The weight-gradient contraction joins the mode with the
+        // forward/dgrad GEMMs deliberately: a mixed cell where wgrad silently
+        // ran a different precision than the products it differentiates
+        // would be unobservable from dispatch alone. The bf16 cast rounds
+        // the INPUTS (x and the incoming grad); the beta=1 accumulation into
+        // the f32 master gradient stays f32 (Ctype CUDA_R_32F, COMPUTE_32F).
+        if resolved_math_mode() == CublasMathMode::Bf16 {
+            return unsafe {
+                gemm_bf16_mode(
+                    handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N, // G_cm
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T, // X_cm, transposed
+                    d_out as i32,
+                    d_in as i32,
+                    n_rows as i32,
+                    &alpha,
+                    g_dev,
+                    d_out as i32,
+                    (n_rows * d_out) as usize, // G's dense element count
+                    x_dev,
+                    d_in as i32,
+                    (n_rows * d_in) as usize, // X's dense element count
+                    &beta,
+                    c_dev,
+                    d_out as i32,
+                )
+            };
         }
         cublas_result::sgemm(
             handle,
@@ -3256,6 +3597,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     t_ptrs: &[u64], m_ptrs: &[u64], v_ptrs: &[u64], mp_ptrs: &[u64], lens: &[u32],
     b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
     neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+    mp_scale: f32,
 ) {
     let k = t_ptrs.len();
     if k == 0 {
@@ -3424,6 +3766,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     let mut has_wd_val: u32 = u32::from(has_wd);
     let mut a5 = ws.blk_param;
     let mut a6 = ws.blk_base;
+    let mut mp_scale_val = mp_scale;
     let args = [
         &mut a0 as *mut _ as *mut c_void,
         &mut a1 as *mut _ as *mut c_void,
@@ -3442,6 +3785,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut has_wd_val as *mut _ as *mut c_void,
         &mut a5 as *mut _ as *mut c_void,
         &mut a6 as *mut _ as *mut c_void,
+        &mut mp_scale_val as *mut _ as *mut c_void,
     ];
     let grid_x = ws.blk_count as i64;
     let result = inner::kernel_launch(
@@ -3751,9 +4095,17 @@ fn transpose_views_enabled() -> bool {
             let on = match std::env::var("NSL_MATMUL_TRANSPOSE_VIEWS").ok().as_deref() {
                 Some("1") => true,
                 Some("0") => false,
+                // Bf16 joins Tf32 in the OP_T cell: measured 2026-07-29 on
+                // the Coder-50M training step (mfu_bench, batch=1 accum=8)
+                // under NSL_MATMUL_BF16=1 — OP_T 61.96 ms/micro vs the
+                // materialising copy's 65.46 ms. The bf16-storage cast is
+                // layout-agnostic (it casts the dense buffer either way), so
+                // the copy arm buys nothing the cast did not already pay.
+                // FP32 cores / Pedantic keep the copy, as before, each per
+                // its own measured (or unmeasured) cell.
                 _ => matches!(
                     cublas_inner::resolved_math_mode(),
-                    cublas_inner::CublasMathMode::Tf32
+                    cublas_inner::CublasMathMode::Tf32 | cublas_inner::CublasMathMode::Bf16
                 ),
             };
             TRANSPOSE_VIEWS_STATE.store(u8::from(on) + 1, Ordering::Relaxed);
@@ -5363,12 +5715,118 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     ];
 
     let block = 256i64;
-    let grid = out_total as i64;
 
-    let result = inner::kernel_launch(
-        SUM_DIM_F32_PTX.as_ptr(), b"nsl_sum_dim_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
-    );
+    // A block per output element only pays off when the reduced axis is long
+    // enough to keep 256 threads busy. Below that the block is almost entirely
+    // idle: a tied [49152, 512] embedding gradient reduces 2 elements per
+    // output and launched 25,165,824 blocks, which profiling showed to be the
+    // single largest consumer of GPU time in a training step. Give each output
+    // element one thread instead.
+    // Default 1: a reduction over a single element is a copy, so the fast path
+    // returns the identical value for that length.
+    //
+    // This is not a corner case. Instrumenting a Coder-50M step showed that
+    // almost all `sum_dim` work IS reduce_size == 1 — including 64 launches of
+    // `reduce=1 inner=25165824`, i.e. copying the 49152x512 tied embedding
+    // gradient by launching 25,165,824 blocks of 256 threads: 6.4 billion
+    // threads to move 25 million floats. Kernel profiling attributed 82.5% of
+    // ALL GPU time in the step to `nsl_sum_dim_f32`, and the reduce_size == 1
+    // shapes are ~89% of that.
+    //
+    // Above 1 the two kernels genuinely disagree, because this one accumulates
+    // sequentially while the general one tree-reduces pairwise in shared
+    // memory; keep the default at 1 unless that reassociation is acceptable.
+    //
+    // Note that even at 1 a run's loss trajectory can differ from the general
+    // kernel in the last couple of significant digits. That is NOT this kernel
+    // reassociating — it is `nsl_embedding_bwd_f32` accumulating the embedding
+    // gradient with `red.global.add.f32`, whose ordering depends on execution
+    // timing. Changing the grid from 25M blocks to 98K blocks changes that
+    // timing.
+    //
+    // Do NOT assume `--deterministic` protects a raised threshold. That flag
+    // substitutes `gpu_det_sum_dim_f32` in CODEGEN, for `sum` written in NSL
+    // source only; four runtime-internal callers reach this function directly
+    // and check nothing — `autodiff/grad_utils.rs` and `autodiff/backward.rs`
+    // (broadcast reduce-to-shape), `tensor/ad_ops.rs`, and
+    // `flash_attention.rs` (GQA dK/dV, where reduce_size is 1 at group size 1).
+    // At the default of 1 those paths are bit-exact, so they are safe; above 1
+    // the reassociation would leak into determinism-gated runs through them.
+    //
+    // NSL_SUM_DIM_SHORT_MAX overrides the threshold; 0 disables the fast path.
+    static SHORT_AXIS_MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let short_axis_max = *SHORT_AXIS_MAX.get_or_init(|| {
+        std::env::var("NSL_SUM_DIM_SHORT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    });
+    static LOG_SHAPES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG_SHAPES.get_or_init(|| {
+        std::env::var("NSL_SUM_DIM_LOG").ok().as_deref() == Some("1")
+    }) {
+        eprintln!(
+            "[sum_dim] reduce={reduce_size} outer={outer} inner={inner} out_total={out_total} fast={}",
+            reduce_size <= short_axis_max
+        );
+    }
+    // Second admission route: a COALESCED-layout reduction.
+    //
+    // The general kernel walks the reduced axis with thread t reading
+    // `base + t*inner`, so when `inner > 1` consecutive threads land `inner`
+    // elements apart and every load pulls its own cache line. The short kernel
+    // assigns one thread per OUTPUT element, so consecutive threads take
+    // consecutive `inner_idx` and the loads coalesce. Kernel profiling put
+    // `nsl_sum_dim_f32` at 18.3% of GPU time on shapes like
+    // `reduce=1024 outer=1 inner=512`; routing those to the coalesced kernel
+    // measured 100 -> 83 ms per micro-batch, a 20% step-level win.
+    //
+    // This reassociates: the general kernel tree-reduces 256 partials pairwise
+    // while this accumulates sequentially, so unlike the reduce_size <= 1 route
+    // it is NOT bit-exact against the general kernel.
+    //
+    // It therefore has to check determinism itself. The claim that
+    // `--deterministic` runs "never reach here" is false, and the block above
+    // says why: that flag only substitutes `gpu_det_sum_dim_f32` in CODEGEN for
+    // `sum` written in NSL source, while `autodiff/grad_utils.rs`,
+    // `autodiff/backward.rs`, `tensor/ad_ops.rs` and `flash_attention.rs` call
+    // `nsl_tensor_sum_dim` -> `gpu_sum_dim_f32` directly. A broadcast
+    // reduce-to-shape over dim 0 of [B, S, D] has inner = S*D, far above the
+    // threshold, so without this check every such gradient silently lost
+    // run-to-run reproducibility under M46.
+    //
+    // NSL_SUM_DIM_COALESCED=0 opts out; NSL_SUM_DIM_SHORT_MAX=0 disables BOTH
+    // routes, since it is documented as the kill switch for this kernel and a
+    // bisection that only half-worked would exonerate the wrong code.
+    const COALESCE_MIN_INNER: u64 = 32;
+    static COALESCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let coalesced_ok = short_axis_max > 0
+        && *COALESCED.get_or_init(|| {
+            std::env::var("NSL_SUM_DIM_COALESCED").ok().as_deref() != Some("0")
+        })
+        && inner >= COALESCE_MIN_INNER
+        && !crate::deterministic_ops::is_deterministic();
+
+    let result = if (short_axis_max > 0 && reduce_size <= short_axis_max) || coalesced_ok {
+        let grid = (out_total as i64 + block - 1) / block;
+        inner::kernel_launch(
+            fused_kernels::SUM_DIM_SHORT_F32_PTX.as_ptr(),
+            b"nsl_sum_dim_short_f32\0".as_ptr(),
+            [grid, 1, 1],
+            [block, 1, 1],
+            &args,
+            0,
+        )
+    } else {
+        inner::kernel_launch(
+            SUM_DIM_F32_PTX.as_ptr(),
+            b"nsl_sum_dim_f32\0".as_ptr(),
+            [out_total as i64, 1, 1],
+            [block, 1, 1],
+            &args,
+            256 * 4,
+        )
+    };
     assert_eq!(result as u32, 0, "GPU sum_dim kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
@@ -5494,6 +5952,106 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     [min_val, max_val, mean_val, std_val]
 }
 
+/// Sum of squares for many tensors with a SINGLE synchronization.
+///
+/// `gpu_tensor_sum_sq_f32` synchronizes and reads back per call. Gradient
+/// clipping needs the norm over every gradient, so calling it per tensor forced
+/// one full pipeline drain per parameter — 57 for Coder-50M, every step. Here
+/// each tensor's stats land in its own slot of one device buffer, and the host
+/// synchronizes and reads once.
+///
+/// Every tensor must be device-resident f32 AND dense (`data[0..len]` is the
+/// whole tensor) — this reads raw, so the caller validates layout.
+///
+/// Returns the total Sum-of-squares across `tensors`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
+    use crate::tensor::NslTensor;
+    use fused_kernels::SUM_SQ_F64_ACC_F32_PTX;
+
+    let live: Vec<i64> = tensors
+        .iter()
+        .copied()
+        .filter(|&p| p != 0 && NslTensor::from_ptr(p).len > 0)
+        .collect();
+    if live.is_empty() {
+        return 0.0;
+    }
+
+    // `nsl_sum_sq_f64_acc_f32`, not slot 3 of `nsl_tensor_stats_f32`: the stats
+    // kernel accumulates in f32, and the clip decision is a comparison against
+    // `max_norm`, so its drift is not confined to the low digits of the result —
+    // it can flip whether clipping happens at all.
+    //
+    // Every tensor gets `MAX_BLOCKS` f64 slots and the whole set costs ONE drain.
+    // The kernel is grid-strided with one partial per block because f64 is 1/64
+    // rate on GeForce: a single 256-thread block over the 25M-element embedding
+    // gradient measured 80 -> 112 ms per micro-batch. Per-block slots rather than
+    // atomics — an atomic variant was tried earlier and measured slower (80 ->
+    // 83..85 ms) on top of making the summation order nondeterministic.
+    //
+    // The grid is derived from `len` alone, so a given shape always produces the
+    // same number of partials summed in the same order: reproducible run to run.
+    // NSL_SUM_SQ_BLOCKS overrides the block cap; 1 reproduces the single-block
+    // version, which is the bisection point if a norm ever looks wrong. It is
+    // also the measurement: 1 block costs 80 -> 112 ms per micro-batch, 256
+    // costs nothing detectable, and both accumulate in f64.
+    const BLOCK: i64 = 256;
+    static MAX_BLOCKS_ENV: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let max_blocks = *MAX_BLOCKS_ENV.get_or_init(|| {
+        std::env::var("NSL_SUM_SQ_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(256)
+    });
+    let grid_for = |len: i64| -> i64 { ((len + BLOCK - 1) / BLOCK).clamp(1, max_blocks) };
+
+    let out_data = inner::alloc_managed(live.len() * max_blocks as usize * 8);
+
+    for (i, &ptr) in live.iter().enumerate() {
+        let t = NslTensor::from_ptr(ptr);
+        let mut in_data = t.data as u64;
+        let mut out_slot = (out_data as u64) + (i * max_blocks as usize * 8) as u64;
+        let mut n_val = t.len as u64;
+        let args: [*mut std::ffi::c_void; 3] = [
+            &mut in_data as *mut _ as *mut std::ffi::c_void,
+            &mut out_slot as *mut _ as *mut std::ffi::c_void,
+            &mut n_val as *mut _ as *mut std::ffi::c_void,
+        ];
+        let rc = inner::kernel_launch(
+            SUM_SQ_F64_ACC_F32_PTX.as_ptr(),
+            b"nsl_sum_sq_f64_acc_f32\0".as_ptr(),
+            [grid_for(t.len), 1, 1],
+            [BLOCK, 1, 1],
+            &args,
+            (BLOCK * 8) as u32,
+        );
+        assert_eq!(rc as u32, 0, "GPU sum_sq kernel failed: {:?}", rc);
+    }
+
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
+    let mut raw = vec![0f64; live.len() * max_blocks as usize];
+    inner::memcpy_dtoh(
+        raw.as_mut_ptr() as *mut std::ffi::c_void,
+        out_data as *const std::ffi::c_void,
+        raw.len() * 8,
+    );
+    inner::free_managed(out_data);
+
+    // Sum only the slots the launch actually wrote; the rest are uninitialized.
+    live.iter()
+        .enumerate()
+        .map(|(i, &ptr)| {
+            let used = grid_for(NslTensor::from_ptr(ptr).len) as usize;
+            let base = i * max_blocks as usize;
+            raw[base..base + used].iter().sum::<f64>()
+        })
+        .sum()
+}
+
 /// GPU sum of squares (Σx²) for an f32 tensor — the RAW `sum_sq` accumulator
 /// from the stats kernel, WITHOUT the mean/std post-processing that
 /// `gpu_tensor_stats_f32` applies to its slot 3. Kept separate precisely
@@ -5502,6 +6060,10 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
 /// `nsl_tensor_sum_sq`'s GPU fast path — reading `gpu_tensor_stats_f32()[3]`
 /// there returned the population std instead of Σx² and silently disabled
 /// FASE gradient clipping on GPU (the global norm collapsed by ~n).
+///
+/// Do NOT collapse this into `gpu_sum_sq_many_f32`: that one exists for the
+/// batched-drain case and reads slot 3 of the same kernel, so the confusion
+/// above is one refactor away from returning.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     use crate::tensor::NslTensor;
@@ -6687,6 +7249,136 @@ pub(crate) fn gpu_scatter_add_f32(
 // GPU Gather (general dim-0 gather)
 // ---------------------------------------------------------------------------
 
+/// Upload a small i64 metadata array (a shape or a stride vector) to the device,
+/// reusing a previous upload of the same contents.
+///
+/// `cuMemcpyHtoD_v2` is the blocking API, so each of these tiny uploads waits on
+/// the stream. The strided-copy path issues three per call and runs hundreds of
+/// times per training step, which made these the largest remaining host cost
+/// once the bulk transfers were gone. The distinct (shape, strides) tuples in a
+/// model are few and fixed, so caching them keyed on contents removes almost
+/// every upload after the first step.
+///
+/// Entries are never freed, so they are allocated from the PERSISTENT pool.
+/// They are bounded by the number of distinct metadata vectors in the program —
+/// tens of tuples at 8 bytes per dimension — but the caching allocator releases
+/// segments, not blocks: `drain_all` only reclaims a transient segment whose
+/// `allocated_count` is zero, so a never-freed 24-byte block in a transient
+/// segment would pin that whole segment's VRAM for the life of the process and
+/// make the per-step drain silently stop working. Persistent segments are never
+/// drained anyway, so putting them there costs nothing and pins nothing extra.
+///
+/// The key includes the device ordinal: the contents alone would hand a pointer
+/// uploaded on device 0 to a kernel running on device 1.
+#[cfg(feature = "cuda")]
+pub(crate) fn upload_meta_i64_cached(host: *const i64, ndim: usize) -> *mut std::ffi::c_void {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<(i32, Vec<i64>), u64>>> =
+        std::sync::OnceLock::new();
+    let device = inner::current_device_ordinal();
+    let key = (device, (0..ndim).map(|i| unsafe { *host.add(i) }).collect::<Vec<i64>>());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    // Take the lock only to look up / publish; the upload itself happens outside
+    // so a slow copy never serializes other threads' lookups.
+    if let Some(&dev) = cache.lock().unwrap().get(&key) {
+        return dev as *mut std::ffi::c_void;
+    }
+    let bytes = ndim * std::mem::size_of::<i64>();
+    let dev = {
+        use crate::cuda::caching_allocator::{get_alloc_pool, set_alloc_pool, AllocPool};
+        let prev = get_alloc_pool();
+        set_alloc_pool(AllocPool::Persistent);
+        let p = inner::alloc_managed(bytes);
+        set_alloc_pool(prev);
+        p
+    };
+    // Immediate, NOT `memcpy_htod`: a capture region would defer this to graph
+    // launch and the cache would publish a pointer to unwritten memory. See
+    // `memcpy_htod_immediate`.
+    inner::memcpy_htod_immediate(dev, host as *const std::ffi::c_void, bytes);
+    let mut guard = cache.lock().unwrap();
+    match guard.entry(key) {
+        std::collections::hash_map::Entry::Occupied(slot) => {
+            // Another thread published an identical vector first; drop ours.
+            let winner = *slot.get() as *mut std::ffi::c_void;
+            inner::free_managed(dev);
+            winner
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(dev as u64);
+            dev
+        }
+    }
+}
+
+/// Gather along an arbitrary dimension, on the device.
+///
+/// `indices_host` must already be validated against `gather_dim_size` by the
+/// caller — the CPU path aborts on an out-of-range index and this keeps that
+/// contract without a device-side error channel.
+///
+/// `inner_size`, not `inner`: the latter would shadow this module's `inner`
+/// submodule, which every allocation and copy below goes through.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_gather_dim_f32(
+    input_ptr: i64,
+    indices_host: &[i64],
+    outer: u64,
+    gather_dim_size: u64,
+    inner_size: u64,
+) -> *mut std::ffi::c_void {
+    inner::set_oom_context("gather_dim_f32");
+    use crate::tensor::NslTensor;
+
+    let input = unsafe { &*(input_ptr as *const NslTensor) };
+    let out_elems = (outer * inner_size) as usize;
+    if out_elems == 0 {
+        return std::ptr::null_mut();
+    }
+
+    // The index vector is `outer` elements — kilobytes next to the tensor itself —
+    // so staging it as f32 to match the kernel's read is not worth avoiding.
+    let staged: Vec<f32> = indices_host.iter().map(|&i| i as f32).collect();
+    let idx_bytes = staged.len() * 4;
+    let idx_device = inner::alloc_managed(idx_bytes);
+    inner::memcpy_htod(idx_device, staged.as_ptr() as *const std::ffi::c_void, idx_bytes);
+
+    let out_data = inner::alloc_managed(out_elems * 4);
+
+    let mut i_data = input.data as u64;
+    let mut idx_data = idx_device as u64;
+    let mut o_data = out_data as u64;
+    let mut outer_v = outer;
+    let mut dim_v = gather_dim_size;
+    let mut inner_v = inner_size;
+    let args: [*mut std::ffi::c_void; 6] = [
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut idx_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut outer_v as *mut _ as *mut std::ffi::c_void,
+        &mut dim_v as *mut _ as *mut std::ffi::c_void,
+        &mut inner_v as *mut _ as *mut std::ffi::c_void,
+    ];
+
+    let block = 256i64;
+    let grid = (out_elems as i64 + block - 1) / block;
+    let rc = inner::kernel_launch(
+        fused_kernels::GATHER_DIM_F32_PTX.as_ptr(),
+        b"nsl_gather_dim_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    inner::free_managed(idx_device);
+    assert_eq!(rc as u32, 0, "GPU gather_dim kernel failed: {:?}", rc);
+    inner::sync_after_kernel();
+    out_data
+}
+
 /// GPU gather along dim 0: out[i, :] = input[indices[i], :].
 /// Works on any 2D+ tensor — flattens trailing dims into `inner_dim`.
 /// Both input and indices must be on GPU (f32).
@@ -7687,16 +8379,9 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     let out_strides = NslTensor::compute_strides(out_shape, t.ndim);
 
     // Upload shape, src_strides, and dst_strides to device memory
-    let arr_bytes = ndim * std::mem::size_of::<i64>();
-
-    let gpu_shape = inner::alloc_managed(arr_bytes);
-    let gpu_src_strides = inner::alloc_managed(arr_bytes);
-    let gpu_dst_strides = inner::alloc_managed(arr_bytes);
-
-    // Copy metadata from host to device via explicit memcpy
-    inner::memcpy_htod(gpu_shape, t.shape as *const c_void, arr_bytes);
-    inner::memcpy_htod(gpu_src_strides, t.strides as *const c_void, arr_bytes);
-    inner::memcpy_htod(gpu_dst_strides, out_strides as *const c_void, arr_bytes);
+    let gpu_shape = upload_meta_i64_cached(t.shape, ndim);
+    let gpu_src_strides = upload_meta_i64_cached(t.strides, ndim);
+    let gpu_dst_strides = upload_meta_i64_cached(out_strides, ndim);
 
     let mut src_data = t.data as u64;
     let mut dst_data = out_data as u64;
@@ -7728,10 +8413,10 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
-    // Free GPU metadata arrays
-    inner::free_managed(gpu_shape);
-    inner::free_managed(gpu_src_strides);
-    inner::free_managed(gpu_dst_strides);
+    // The metadata arrays are cached and shared across calls, so they must
+    // NOT be freed here — a later call with the same shape reuses this exact
+    // device pointer.
+
 
     let out = Box::new(NslTensor::new(
         out_data, out_shape, out_strides,
@@ -8088,6 +8773,61 @@ mod tests {
             "{} hand-written PTX module(s) contain non-ASCII bytes:\n\n{}",
             failures.len(),
             failures.join("\n")
+        );
+    }
+
+    /// Every `*_PTX` constant in `fused_kernels` must appear in `ALL_PTX`.
+    ///
+    /// `ALL_PTX` is the sole input to the ptxas-assembles and pure-ASCII gates,
+    /// so a constant missing from it is a kernel those gates never see — its
+    /// syntax errors stay invisible until a launch fails on a real GPU. This
+    /// happened: `SUM_DIM_SHORT_F32_PTX` was added and became the default path
+    /// for the majority of `sum_dim` calls while absent from the table, and
+    /// nothing noticed because no gate compared the two.
+    #[test]
+    fn every_ptx_constant_is_registered_for_certification() {
+        let source = include_str!("fused_kernels.rs");
+
+        let mut declared: Vec<&str> = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub(crate) const ") else {
+                continue;
+            };
+            let mut parts = rest.splitn(2, ':');
+            let Some(name) = parts.next().map(str::trim) else {
+                continue;
+            };
+            // Only `&str` constants are kernels. This also excludes the
+            // `ALL_PTX` table itself, whose name ends in _PTX but whose type is
+            // a slice of pairs.
+            let is_str = parts.next().is_some_and(|ty| ty.trim_start().starts_with("&str"));
+            if name.ends_with("_PTX") && is_str {
+                declared.push(name);
+            }
+        }
+        assert!(
+            declared.len() > 40,
+            "parser found only {} PTX constants; the declaration form must have changed",
+            declared.len()
+        );
+
+        let registered: std::collections::HashSet<&str> =
+            fused_kernels::ALL_PTX.iter().map(|(name, _)| *name).collect();
+
+        // Fragments that are concatenated into other kernels rather than loaded
+        // on their own; the ASCII gate covers them via its own `extra` list.
+        const NOT_STANDALONE: &[&str] = &["HOPPER_PTX_HEADER_PTX"];
+
+        let missing: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|name| !registered.contains(name) && !NOT_STANDALONE.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "PTX constants absent from ALL_PTX, so neither the ptxas gate nor the \
+             ASCII gate covers them: {missing:?}"
         );
     }
 
