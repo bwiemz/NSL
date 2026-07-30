@@ -168,6 +168,7 @@ pub mod fp8;
 pub mod awq;
 pub mod fase_bc;
 pub mod fase_step;
+pub mod optim_groups;
 pub mod muon;
 pub mod muon_batch;
 pub mod muon_prof;

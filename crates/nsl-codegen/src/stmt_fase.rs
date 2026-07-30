@@ -915,6 +915,126 @@ impl Compiler<'_> {
     /// since the P5 mixed Muon/AdamW upgrade). Caller must load `s2` from
     /// `state_list_2` for num_state_buffers >= 2, or pass `s1` as a
     /// placeholder otherwise.
+    /// AdamW parameter groups: resolve ONE parameter's weight decay.
+    ///
+    /// When no `no_decay=[...]` was configured, `groups` is None and this
+    /// returns `weight_decay_const` UNCHANGED — it emits no instructions at
+    /// all, so every existing optimizer arm keeps byte-identical IR and the
+    /// bit-exactness gates that pin it stay valid.
+    ///
+    /// Otherwise it calls `nsl_optim_param_wd`, which is the only place the
+    /// exemption rule lives (compile-time role flag OR runtime rank; see
+    /// nsl-runtime/src/optim_groups.rs for why the rank half cannot be static).
+    pub(crate) fn emit_param_wd(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        groups: Option<(Value, bool)>,
+        idx: Value,
+        param_val: Value,
+        weight_decay_const: Value,
+    ) -> Result<Value, crate::error::CodegenError> {
+        let Some((exempt_list, exempt_non_rank2)) = groups else {
+            return Ok(weight_decay_const);
+        };
+        let flag = self.compile_call_by_name(builder, "nsl_list_get", &[exempt_list, idx])?;
+        let nr2 = builder
+            .ins()
+            .iconst(cl_types::I64, i64::from(exempt_non_rank2));
+        self.compile_call_by_name(
+            builder,
+            "nsl_optim_param_wd",
+            &[param_val, flag, nr2, weight_decay_const],
+        )
+    }
+
+    /// Emit the Deferred fused final step for one parameter, honouring AdamW
+    /// parameter groups.
+    ///
+    /// `fase_emit_final_step` bakes λ into the update program at COMPILE time
+    /// — `UpdateOp::Update` elides its `wd·θ` term when `wd == 0.0` — so a
+    /// runtime λ cannot be threaded into it. This branches on the runtime
+    /// exemption and emits the step TWICE, once against the plan's recipe and
+    /// once against a λ = 0 clone. Each arm is therefore byte-identical to
+    /// what the call site emitted before parameter groups existed, at its own
+    /// λ, and the exempt arm contains no decay arithmetic at all rather than
+    /// a multiply by zero (which this file's L8 note rules out: mul-by-0.0
+    /// keeps NaN/Inf alive).
+    ///
+    /// Returns `Some(join_block)` the caller must jump to and switch into,
+    /// or `None` when no parameter groups are configured — in which case this
+    /// emits exactly one step and no branch, so the IR is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_deferred_step_with_groups(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        groups: Option<(Value, bool)>,
+        idx: Value,
+        theta: Value,
+        m: Value,
+        m_partial: Value,
+        v: Value,
+        recipe: &crate::fase::UpdateRecipe,
+        bc: (Value, Value),
+        wrap_precision: bool,
+        sr_step: Option<Value>,
+    ) -> Result<Option<cranelift_codegen::ir::Block>, crate::error::CodegenError> {
+        use cranelift_codegen::ir::condcodes::FloatCC;
+
+        let offload = self.compile_options.optim_state_offload;
+        let Some((exempt_list, exempt_non_rank2)) = groups else {
+            self.fase_emit_final_step(
+                builder, theta, m, m_partial, v, recipe, Some(bc), wrap_precision, offload,
+                sr_step,
+            )?;
+            return Ok(None);
+        };
+
+        let wd_const = builder.ins().f64const(recipe.weight_decay);
+        let param_wd = self.emit_param_wd(
+            builder,
+            Some((exempt_list, exempt_non_rank2)),
+            idx,
+            theta,
+            wd_const,
+        )?;
+        let zero_f = builder.ins().f64const(0.0);
+        let is_exempt = builder.ins().fcmp(FloatCC::Equal, param_wd, zero_f);
+
+        let exempt_blk = builder.create_block();
+        let decay_blk = builder.create_block();
+        let join_blk = builder.create_block();
+        builder.ins().brif(is_exempt, exempt_blk, &[], decay_blk, &[]);
+
+        // Exempt arm: the plan's recipe with λ forced to 0, so
+        // `UpdateOp::Update` drops the decay term at compile time.
+        builder.switch_to_block(exempt_blk);
+        builder.seal_block(exempt_blk);
+        let mut no_wd_recipe = recipe.clone();
+        no_wd_recipe.weight_decay = 0.0;
+        self.fase_emit_final_step(
+            builder,
+            theta,
+            m,
+            m_partial,
+            v,
+            &no_wd_recipe,
+            Some(bc),
+            wrap_precision,
+            offload,
+            sr_step,
+        )?;
+        builder.ins().jump(join_blk, &[]);
+
+        // Decayed arm: the plan's recipe verbatim.
+        builder.switch_to_block(decay_blk);
+        builder.seal_block(decay_blk);
+        self.fase_emit_final_step(
+            builder, theta, m, m_partial, v, recipe, Some(bc), wrap_precision, offload, sr_step,
+        )?;
+
+        Ok(Some(join_blk))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_stdlib_optim_call(
         &mut self,
@@ -1334,6 +1454,10 @@ impl Compiler<'_> {
         // None preserves the prior FP32-only behavior bit-identically.
         // Threaded from stmt.rs's `cpdt_precision_dtypes` binding.
         cpdt_precision_dtypes: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
+        // AdamW parameter groups: (per-param exempt-flag list, exempt
+        // anything not rank-2). None when `no_decay` was not configured, in
+        // which case both sub-arms emit exactly their pre-feature IR.
+        wd_groups: Option<(Value, bool)>,
     ) -> Result<(), crate::error::CodegenError> {
         use cranelift_codegen::ir::{condcodes::IntCC, InstBuilder};
 
@@ -1517,18 +1641,24 @@ impl Compiler<'_> {
             // gate at stmt.rs:3533 is what actually decides whether the caller
             // passes Some vs None — relaxing that gate is the S4 step that
             // activates the wrap end-to-end on the WGGO path.
-            self.fase_emit_final_step(
+            let wd_join = self.emit_deferred_step_with_groups(
                 builder,
+                wd_groups,
+                opt_i,
                 theta,
                 s1,
                 m_partial,
                 s2,
                 &fase_plan.recipe,
-                Some((bc1_inv, bc2_inv)),
+                (bc1_inv, bc2_inv),
                 cpdt_precision_dtypes.is_some(),
-                self.compile_options.optim_state_offload,
                 Some(opt_step),
             )?;
+            if let Some(join) = wd_join {
+                builder.ins().jump(join, &[]);
+                builder.switch_to_block(join);
+                builder.seal_block(join);
+            }
         }
         builder.ins().jump(iter_join, &[]);
 
@@ -1557,6 +1687,9 @@ impl Compiler<'_> {
         // the S4 review-fix) refused FP16 allocation whenever the table
         // contained ANY FullBuffer byte; with this arm now wrapping, that
         // guard can be lifted.
+        // AdamW parameter groups: identity (no emitted IR) when unconfigured.
+        let fullbuf_param_wd =
+            self.emit_param_wd(builder, wd_groups, opt_i, theta, weight_decay_const)?;
         self.emit_stdlib_optim_call(
             builder,
             optimizer_name,
@@ -1568,7 +1701,7 @@ impl Compiler<'_> {
             lr,
             momentum_const,
             dampening_const,
-            weight_decay_const,
+            fullbuf_param_wd,
             nesterov_const,
             beta1_const,
             beta2_const,

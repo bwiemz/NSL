@@ -1,4 +1,6 @@
-//! P1 Muon item 6: parameter-ROLE classification for mixed Muon/AdamW routing.
+//! Parameter-ROLE classification. Two consumers today: mixed Muon/AdamW
+//! routing (P1 Muon item 6, where this started) and AdamW weight-decay
+//! parameter groups (`no_decay=[...]`, see nsl-runtime/src/optim_groups.rs).
 //!
 //! Replaces the name-substring exclusion list (embed/lm_head/unembed/wte/wpe/
 //! vocab) that routed params to AdamW by accident of naming — a hidden weight
@@ -32,7 +34,7 @@ use nsl_ast::visitor::{walk_expr, Visitor};
 use crate::compiler::Compiler;
 
 /// One classified parameter, parallel to the `param_paths` order.
-pub(crate) struct MuonRouteEntry {
+pub(crate) struct ParamRoleEntry {
     pub path: String,
     /// "embedding" | "head" | "hidden" | "vector"
     pub role: &'static str,
@@ -42,9 +44,47 @@ pub(crate) struct MuonRouteEntry {
     pub adamw: bool,
 }
 
-pub(crate) struct MuonRouteTable {
-    pub entries: Vec<MuonRouteEntry>,
+pub(crate) struct ParamRoleTable {
+    pub entries: Vec<ParamRoleEntry>,
     pub warnings: Vec<String>,
+}
+
+/// Every role name `no_decay=[...]` accepts. Kept next to the classifier so
+/// the accepted set cannot drift from the set the classifier can produce —
+/// an unknown name is a compile error, never a silently-ignored entry.
+pub(crate) const VALID_ROLES: &[&str] = &["vector", "embedding", "head", "hidden"];
+
+/// Resolved `no_decay=[...]`: which roles are exempt from weight decay.
+///
+/// `vector` is deliberately NOT resolved here. A model field only has a
+/// statically-known rank when its initializer is a direct
+/// `zeros/ones/randn/rand/full/arange` call over integer literals, which
+/// real models almost never are (`ones([dim])` passes an identifier;
+/// `randn([..]) * sqrt(..)` is a multiply). Measured on `models/coder50m`:
+/// 74 params classify as 1 `embedding` + 73 `hidden`, ZERO `vector`, with
+/// both RMSNorm gains in `hidden`. Resolving `vector` statically would
+/// therefore compile, print a plausible table, and decay every norm anyway.
+/// It is resolved from the tensor's real rank at step time instead — see
+/// `nsl_optim_param_wd`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NoDecayScope {
+    /// Roles named in `no_decay`, minus `"vector"`.
+    pub static_roles: Vec<String>,
+    /// `no_decay` included `"vector"` → exempt anything not rank-2 at runtime.
+    pub exempt_non_rank2: bool,
+}
+
+impl NoDecayScope {
+    /// True when the train block said nothing — every parameter decays, which
+    /// is bit-identical to the behaviour before parameter groups existed.
+    pub fn is_empty(&self) -> bool {
+        self.static_roles.is_empty() && !self.exempt_non_rank2
+    }
+
+    /// Does the compile-time role table exempt this role outright?
+    pub fn exempts_role(&self, role: &str) -> bool {
+        self.static_roles.iter().any(|r| r == role)
+    }
 }
 
 /// AST scan for `embedding_lookup(self.<field>, ...)` inside one model
@@ -139,11 +179,11 @@ impl Compiler<'_> {
     /// Classify every trainable param for mixed Muon/AdamW routing. Order
     /// (and length) of `entries` matches `param_paths` exactly — the caller
     /// builds the runtime flag list positionally from it.
-    pub(crate) fn classify_muon_param_roles(
+    pub(crate) fn classify_param_roles(
         &self,
         root_type: &str,
         param_paths: &[String],
-    ) -> MuonRouteTable {
+    ) -> ParamRoleTable {
         // Pass 1: embedding-table usage over ALL model types' method bodies.
         // Scanning types not reachable from the root is harmless — their
         // (type, field) keys never match a resolved owner.
@@ -213,14 +253,14 @@ impl Compiler<'_> {
                 }
                 ("hidden", "default")
             };
-            entries.push(MuonRouteEntry {
+            entries.push(ParamRoleEntry {
                 path: path.clone(),
                 role,
                 source,
                 adamw: matches!(role, "embedding" | "head" | "vector"),
             });
         }
-        MuonRouteTable { entries, warnings }
+        ParamRoleTable { entries, warnings }
     }
 }
 

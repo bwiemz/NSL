@@ -125,24 +125,59 @@ Note the `pretrain_fase.nsl` demo itself runs at `seq_len=512`, not 2048,
 so its per-step token count is 8,192. It exists to exercise the FASE
 memory path for ~10 steps, not to train a model.
 
-## Weight decay applies to every parameter
+## Weight decay: parameter groups
 
-`AdamW(weight_decay=0.1)` in a `train` block is a single scalar applied to
-**all** trainable parameters — including RMSNorm gains and the tied
-embedding / LM head. NSL has no parameter-group mechanism in the train-block
-optimizer DSL today, so the usual convention (decay 2-D weights only,
-exempt norms/biases/embeddings) cannot be expressed.
+`AdamW(weight_decay=0.1)` applies to **every** trainable parameter by default,
+RMSNorm gains and the tied embedding / LM head included. The conventional
+recipe decays only the weight matrices. Express that with `no_decay=[...]`,
+which names parameter ROLES to exempt:
 
-This is nonstandard and worth knowing when comparing against a PyTorch
-baseline that does exempt them. The classification needed to fix it already
-exists — `crates/nsl-codegen/src/muon_roles.rs` labels every parameter
-`embedding` / `head` / `vector` (rank != 2) / `hidden`, via the
-`@param_role(...)` decorator and `embedding_lookup`-usage inference, and the
-mixed Muon/AdamW router already consumes it. Wiring a decay exemption to
-those same roles is a contained change; it is **not** implemented.
+```nsl
+train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0):
+    # decay the projections; exempt norms and biases (the usual convention)
+    optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95,
+                     eps=1e-8, no_decay=["vector"])
+```
 
-Until then, `weight_decay=0.0` is the option that avoids decaying norms,
-at the cost of not regularizing the projections either.
+| role | what it covers | resolved |
+|---|---|---|
+| `vector` | anything not rank-2 — RMSNorm gains, biases, scalars | at step time, from the tensor's real rank |
+| `embedding` | tables used by `embedding_lookup` (so the tied LM head too) | compile time |
+| `head` | an UNTIED lm_head, via `@param_role("head")` | compile time |
+| `hidden` | everything else — the projections | compile time |
+
+Add `"embedding"` to also exempt the tied embedding:
+`no_decay=["vector", "embedding"]`.
+
+**`vector` is decided at step time, not compile time, and that is
+load-bearing.** A model field only gets a statically-known rank when its
+initializer is a direct `zeros/ones/randn/...` call over integer literals.
+Real models fail that: `RMSNorm.weight = ones([dim])` passes an identifier,
+and `wq = randn([...]) * sqrt(...)` is a multiply. Measured on `coder50m` — 74
+parameters classify as 1 `embedding` + 73 `hidden`, **zero** `vector`, with
+both RMSNorm gains in the `hidden` bucket. A static-only "exempt rank < 2"
+would have compiled, printed a plausible table, and decayed every norm anyway.
+
+Every run prints what it exempted, and a scope that matches nothing is a
+compile error rather than a silent no-op:
+
+```
+[wd-groups] weight_decay=0.1 exempting roles [vector (runtime rank != 2)] over
+            74 params: 0 exempt by role at compile time, plus every param that
+            is not rank-2 at step time
+```
+
+Defaults and exactness: omitting `no_decay` decays everything, exactly as
+before — the emitted optimizer IR is unchanged. Exempt parameters are given
+λ = 0, which routes them down each optimizer arm's existing, already-gated
+no-decay branch, so a decayed parameter's arithmetic is bit-identical to a run
+without the feature. Both directions are pinned by
+`crates/nsl-cli/tests/weight_decay_groups_gate.rs`.
+
+Not supported with `--muon-batch-ns`, `--layerwise-accum`,
+`--optim-state-offload`, or the `@pipeline` train path — each hoists a single
+weight-decay scalar out of the per-parameter loop. Those combinations refuse
+loudly instead of silently decaying the parameters you asked to exempt.
 
 ## Packed corpora
 

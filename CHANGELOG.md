@@ -72,6 +72,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   constant offset), plus a new while-let shape (int-typed binding whose
   expression carries nested tensor temps; 4 stranded pre-fix) with loop
   value correctness pinned throughout.
+### Added — AdamW parameter groups: `no_decay=[...]`
+
+- `AdamW(weight_decay=λ)` in a `train` block applied λ to EVERY trainable
+  parameter — RMSNorm gains and the tied embedding included — because the
+  optimizer DSL had no parameter groups, so the conventional
+  decay-the-matrices-only recipe could not be expressed. `no_decay=[...]` now
+  names parameter ROLES to exempt, reusing the vocabulary `@param_role` and the
+  mixed Muon/AdamW router already share: `"vector"`, `"embedding"`, `"head"`,
+  `"hidden"`. `no_decay=["vector"]` is the usual norms-and-biases convention.
+- **`"vector"` is resolved at STEP time from the tensor's real rank, not at
+  compile time, and that is the load-bearing decision.** A model field only
+  gets a statically-known rank when its initializer is a direct
+  `zeros/ones/randn/rand/full/arange` call whose shape list is all integer
+  literals (`extract_shape_from_tensor_init`). Real models fail that on both
+  counts: `RMSNorm.weight = ones([dim])` passes an identifier, and
+  `wq = randn([...]) * sqrt(...)` is a multiply. Measured on `models/coder50m`
+  — 74 parameters classify as 1 `embedding` + 73 `hidden`, **zero** `vector`,
+  with both RMSNorm gains in that `hidden` bucket. A static-only "exempt
+  rank < 2" would have compiled, printed a plausible exemption table, and
+  decayed every norm in the model anyway.
+- Exemption is expressed as λ = 0, so it reuses each optimizer arm's EXISTING
+  no-decay branch rather than adding arithmetic: the stdlib `adamw_step` /
+  `muon_step` already guard `if weight_decay > 0.0`, the FASE update program
+  already elides its `wd·θ` term when `wd == 0.0`, and the fused kernels
+  already take `has_wd` as a launch parameter. A decayed parameter's numerics
+  are therefore bit-identical to a run without the feature.
+- The rule lives in ONE place, `nsl-runtime/src/optim_groups.rs`
+  (`nsl_optim_param_wd`). Codegen calls it per parameter inside the optimizer
+  loop and `nsl_fase_fused_adamw_step_multi` calls it while bucketing launches
+  — two copies of an eligibility predicate that had to agree exactly is the bug
+  pattern that module exists to avoid.
+- The flat-grid fused AdamW kernel takes `neg_lr_wd`/`has_wd` as LAUNCH
+  parameters, one value per grid, so λ is now part of `UpdateKey` alongside
+  device and dtype. λ takes at most two distinct values, so this costs at most
+  one extra launch and each parameter still gets bit-identical arithmetic to a
+  scalar-λ launch at its own λ.
+- Threaded through the FullBuffer per-param loop, both sub-arms of the unified
+  WGGO mode-table dispatch, and the two Deferred `fase_emit_final_step` sites.
+  The Deferred sites branch between two COMPILE-TIME recipes (the plan's, and a
+  λ = 0 clone) rather than handing the emitter a runtime λ: each arm is then
+  byte-identical to its pre-feature emission, and the exempt arm contains no
+  decay arithmetic at all. Multiplying θ by a runtime zero would have been the
+  smaller diff and is deliberately not used — the same file already documents
+  that mul-by-0.0 is not a zeroing idiom here because it keeps NaN/Inf alive.
+- Refused loudly, not silently ignored, where a single λ is hoisted out of the
+  per-parameter loop: `--muon-batch-ns`, `--layerwise-accum`,
+  `--optim-state-offload`, and the `@pipeline` train path.
+- Everything about this is loud. Every run prints a `[wd-groups]` table naming
+  the parameters it exempted; an unknown role name is a compile error; a scope
+  that matches no parameter is a compile error that points at
+  `no_decay=["vector"]`; and exempting every role a parameter can have refuses
+  in favour of writing `weight_decay=0.0`.
+- `crates/nsl-codegen/src/muon_roles.rs` is renamed `param_roles.rs`
+  (`classify_muon_param_roles` -> `classify_param_roles`) — it now has two
+  consumers, and the Muon-specific name would have implied weight-decay groups
+  only work under Muon.
+- Gates: `crates/nsl-cli/tests/weight_decay_groups_gate.rs` (12 tests). The two
+  load-bearing ones are exact equivalences rather than "the numbers moved" — an
+  all-rank-1 model under `no_decay=["vector"]` must be BIT-IDENTICAL to
+  `weight_decay=0.0`, and an all-rank-2 model must be BIT-IDENTICAL to plain
+  `weight_decay=λ` — each with an anti-vacuity assertion that λ affects the
+  fixture at all. Plus `optim_groups` unit tests and two `UpdateKey` bucketing
+  tests (λ splits launches; uniform λ stays one launch).
 
 ### Fixed — dispatch results classify from the ffi_ownership table without allowlist entries (ELTLS v2a)
 

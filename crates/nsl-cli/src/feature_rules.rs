@@ -281,6 +281,43 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         STMT_FASE,
         "--param-dtype bf16-sr does not compose with reduced-precision moment plans or --optim-state-offload",
     ),
+    // ── AdamW parameter groups (`no_decay=[...]`) ──────────────────────────
+    // Each of these arms hoists ONE weight_decay scalar out of the
+    // per-parameter optimizer loop, so a per-parameter exemption cannot be
+    // expressed there. They refuse rather than train with decay applied to the
+    // parameters the user asked to exempt.
+    //
+    // Direction: the FLAG is `flag` and `no_decay=[...]` is the partner, so the
+    // fragment names a real flag — the same shape as the `@fp8_compute` x
+    // `--source-ad` entry, and what
+    // `refusal_fragments_are_distinctive_enough_to_be_meaningful` requires.
+    //
+    // NOT registered: `no_decay=[...]` x `@pipeline`. That refusal exists (in
+    // `compile_train_block_pipelined_inner`) but it is source-feature x
+    // source-feature with no flag on either side, so its fragment cannot name
+    // one and this registry cannot express it. It is covered by
+    // weight_decay_groups_gate.rs instead.
+    src_rule(
+        "--muon-batch-ns",
+        RuleKind::Conflicts,
+        "no_decay=[...]",
+        STMT,
+        "no_decay=[...] is not supported with --muon-batch-ns",
+    ),
+    src_rule(
+        "--layerwise-accum",
+        RuleKind::Conflicts,
+        "no_decay=[...]",
+        STMT,
+        "no_decay=[...] is not supported with --layerwise-accum",
+    ),
+    src_rule(
+        "--optim-state-offload",
+        RuleKind::Conflicts,
+        "no_decay=[...]",
+        STMT,
+        "no_decay=[...] is not supported with --optim-state-offload",
+    ),
     // ── Muon envelope ──────────────────────────────────────────────────────
     src_rule(
         "--muon-batch-ns",

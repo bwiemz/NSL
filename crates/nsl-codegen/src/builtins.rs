@@ -248,19 +248,21 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_fase_fused_adamw_step_multi",
         &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
-            types::F64,
+            types::I64, // params_list
+            types::I64, // m_list
+            types::I64, // v_list
+            types::I64, // mp_list
+            types::F64, // lr
+            types::F64, // beta1
+            types::F64, // one_minus_beta1
+            types::F64, // beta2
+            types::F64, // one_minus_beta2
+            types::F64, // eps
+            types::F64, // wd
+            types::F64, // bc1_inv
+            types::F64, // bc2_inv
+            types::I64, // wd_exempt_list (0 = no parameter groups)
+            types::I64, // wd_exempt_non_rank2
         ],
         None,
     ),
@@ -329,6 +331,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_bias_correction_inv",
         &[types::F64, types::I64],
+        Some(types::F64),
+    ),
+    // AdamW parameter groups: resolve ONE param's weight decay from its
+    // compile-time role flag + its runtime rank.
+    // (param, static_exempt, exempt_non_rank2, wd) -> wd_for_this_param
+    (
+        "nsl_optim_param_wd",
+        &[types::I64, types::I64, types::I64, types::F64],
         Some(types::F64),
     ),
     // FASE Deferred two-phase grad clip: sum of squared elements, in-place scale.
