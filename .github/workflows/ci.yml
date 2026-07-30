@@ -333,6 +333,43 @@ jobs:
       - name: Check version strings agree with Cargo [workspace.package].version
         run: ./scripts/check-version-agreement.sh
 
+      # Every script a workflow invokes as `./path` must be committed
+      # executable, or the step dies with exit 126 ("found but not
+      # executable"). That failure reads like a broken check rather than a
+      # broken mode bit, and it is invisible locally because a fresh chmod in
+      # a dev tree is not what CI clones.
+      #
+      # This is not hypothetical: check-doc-agreement.sh and gpu-cert.sh both
+      # shipped 100644 and every PR went red on them. Worse, gpu-cert.sh never
+      # ran, so a REAL manifest drift (a gate added by the AdamW
+      # parameter-groups PR) sat undetected behind the 126 until the mode was
+      # fixed. A silently-not-running check is worse than no check.
+      - name: Workflow-invoked scripts are committed executable
+        run: |
+          set -euo pipefail
+          bad=0
+          # Collect dot-slash script invocations from every workflow, then ask
+          # git (not the filesystem) for the committed mode.
+          #
+          # YAML comment lines are dropped first: prose that names a script
+          # path is not an invocation, and without this the step's own
+          # explanatory comments match themselves.
+          for s in $(grep -rhv -E '^[[:space:]]*#' .github/workflows/ \
+                     | grep -oE '\./[A-Za-z0-9_./-]+\.(sh|py|pl)' | sort -u); do
+            f="${s#./}"
+            [ -f "${f}" ] || { echo "workflow invokes ${f}, which does not exist" >&2; bad=1; continue; }
+            mode="$(git ls-files -s -- "${f}" | awk '{print $1}')"
+            if [ "${mode}" != "100755" ]; then
+              echo "${f} is committed ${mode}, must be 100755 (invoked as ${s})" >&2
+              bad=1
+            fi
+          done
+          [ "${bad}" -eq 0 ] || {
+            echo "fix with: git update-index --chmod=+x <file>" >&2
+            exit 1
+          }
+          echo "all workflow-invoked scripts are executable"
+
   # Documentation agreement — the twin of version-agreement, for claims about
   # the CODE rather than about version strings. Build-free, so it costs
   # seconds. Every check exists because the corresponding drift was found in
