@@ -88,6 +88,7 @@ crates/nsl-cli/tests/view_chain_leak_gate.rs	nested_model_composition_and_reassi
 crates/nsl-cli/tests/view_chain_leak_gate.rs	free_function_chain_links_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	unknown_typed_receiver_chains_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	view_chain_results_are_numerically_unchanged	gpu	requires CUDA GPU
+crates/nsl-cli/tests/weight_decay_groups_gate.rs	fused_multi_launch_partitions_on_weight_decay_gpu	gpu	requires a CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_identity_reduce_chain_uses_the_fused_gemm	gpu	requires a CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_fused_wgrad_matches_the_unfused_chain_within_f32_tolerance	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	broken	Pre-existing inference-path segfault when adapter synth fields (m.gate_...) are overwritten at top-level after the train block — verified failing at HEAD by both Commit A and Commit B subagents without any option-3 changes to the segfaulting path. The anti-drift intent of this test still has value: if the shared rewrite_stmts_for_model helper were ever forked, Cranelift's and source-AD's AST copies would diverge in a runnable way. Unblock when the top-level synth-field-read / inference-path lowering bug lands as a separate milestone; see the synth-field-read follow-up in project_wrga_b32_measurement.md.
@@ -303,11 +304,11 @@ crates/nsl-runtime/src/data/gds.rs	mmap_fallback_h2d_copies_bytes_to_device	gpu-
 crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	flat_grid_multi_adamw_step_at_coder50m_shapes	gpu	requires CUDA GPU
 crates/nsl-runtime/src/flash_attention.rs	flash_lse_gpu_matches_cpu_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/muon.rs	profile_ns_500m_step	diagnostic	requires CUDA GPU (profiling driver, not a correctness gate)
 crates/nsl-runtime/src/muon_batch.rs	batch_matches_sequential_and_is_deterministic	gpu	requires CUDA GPU
 crates/nsl-runtime/src/muon_batch.rs	batch_nesterov_runs_and_is_deterministic	gpu	requires CUDA GPU
 crates/nsl-runtime/src/muon_batch.rs	workspace_grow_realloc_same_oriented_key	gpu	requires CUDA GPU
 crates/nsl-runtime/src/muon_batch.rs	profile_batch_ns_500m_step	diagnostic	requires CUDA GPU (timing driver, not a correctness gate)
-crates/nsl-runtime/src/muon.rs	profile_ns_500m_step	diagnostic	requires CUDA GPU (profiling driver, not a correctness gate)
 crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exact_vs_pair	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/ad_ops.rs	embedding_backward_deterministic_gpu_matches_cpu_and_is_stable	gpu	GPU: requires CUDA device
 crates/nsl-runtime/src/tensor/ad_ops.rs	test_gpu_ce_backward_matches_cpu_bounce	gpu	requires CUDA GPU
