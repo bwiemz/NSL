@@ -162,6 +162,8 @@ fn build_wengert_list() -> WengertList {
                     vocab_tile: VOCAB_TILE,
                     ignore_index: IGNORE_INDEX,
                     is_large: false,
+                    has_bias: true,
+                    x_rank3: false,
                 },
                 inputs: vec![1, 2, 3, 4],
                 saved_for_backward: false,
