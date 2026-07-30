@@ -168,14 +168,16 @@ impl<'a> TypeChecker<'a> {
             // — pre-hoist, `fn sum(x: Tensor) -> float` was typed by the
             // BUILTIN reduction case here while codegen ran the builtin
             // too (silent misdispatch); post-hoist, disagreeing typings
-            // became verifier errors. Builtins are declared with DUMMY
-            // spans (register_builtins); anything with a real def_span is
-            // user code, and the generic Function-type path below types
-            // the call from the resolved declaration.
+            // became verifier errors. The distinguisher is the explicit
+            // `is_builtin` flag (only register_builtins sets it, and a
+            // user redeclaration sheds it) — NOT a span heuristic:
+            // synthesized glob imports carry DUMMY spans and would be
+            // mislabeled as builtins. The generic Function-type path
+            // below types user calls from the resolved declaration.
             let user_declared = self
                 .scopes
                 .lookup(self.current_scope, *sym)
-                .map(|(_, info)| info.def_span != Span::DUMMY)
+                .map(|(_, info)| !info.is_builtin)
                 .unwrap_or(false);
             if !user_declared {
             let name = self.interner.resolve(sym.0).unwrap_or("").to_string();

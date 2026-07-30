@@ -37,7 +37,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   site then read the bare function pointer as a closure struct (probed:
   silent death mid-program). VarDecl now clears the entry on any
   non-capturing rebind.
-- 6 new CPU gates in `builtin_shadow_dispatch.rs` (17 total).
+- Review fixes on the first cut, all gated: the closure_info CLEAR was
+  itself a regression — the map is compiler-global and a nested fn body
+  compiles mid-way through the outer body, so a nested non-capturing
+  `let f = ...` deleted the OUTER function's live closure entry (the
+  outer call then executed the closure struct as code). The FnDef arm
+  now snapshots/restores closure_info around the nested compile, which
+  also stops nested capture-counts leaking outward (pre-existing).
+  Plain-Assign rebinds (`f = <lambda>`, no let) get the same
+  transfer/clear as VarDecl (previously stale in both directions,
+  pre-existing death). The checker's user-vs-builtin distinguisher is
+  now an explicit `is_builtin` flag on SymbolInfo (only
+  register_builtins sets it; user redeclaration sheds it) — the interim
+  DUMMY-span heuristic mislabeled synthesized glob imports (train-block
+  auto-imports carry DUMMY spans). The `cumsum` arm arity-checks
+  instead of indexing args[1] (compiler panic → diagnosed refusal).
+- **Deliberate behavior change**: shadowing a builtin name with a
+  NON-Function value (`let sum = 5`) now makes calls of that name a
+  compile error ("not callable") — Python semantics — instead of the
+  silent fallback to the builtin. Pinned by a gate.
+- 9 new CPU gates in `builtin_shadow_dispatch.rs` (20 total).
   Mutation-proven in three directions: hoist off → exactly the 3
   module-fn shadow gates red; checker gating off → exactly the 2
   tensor-arg shadow gates red (verifier disagreement); closure clear

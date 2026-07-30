@@ -2879,6 +2879,18 @@ impl Compiler<'_> {
 
         // cumsum(tensor, dim)
         if func_name == "cumsum" && !self.registry.functions.contains_key(&func_name) {
+            // Arity-check instead of indexing: a module-level `let cumsum =
+            // <lambda>` is checker-visible inside a fn body but not in this
+            // FuncState's bindings, so the call lands here — args[1] then
+            // panicked the compiler (review LOW on 44c011c1). Refusing is
+            // still a checker/codegen visibility gap, but a diagnosed one.
+            if args.len() < 2 {
+                return Err(CodegenError::new(
+                    "cumsum() takes 2 arguments (tensor, dim); if you meant a \
+                     module-level binding named `cumsum`, it is not reachable \
+                     from inside a function body",
+                ));
+            }
             let tensor_val = self.compile_nested_expr(builder, state, &args[0].value)?;
             let dim_val = self.compile_nested_expr(builder, state, &args[1].value)?;
             return self.compile_call_by_name(builder, "nsl_tensor_cumsum", &[tensor_val, dim_val]);

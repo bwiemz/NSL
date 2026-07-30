@@ -20,6 +20,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
                 is_const: true,
                 is_param: false,
                 is_used: true,
+                is_builtin: true,
             },
         );
     };

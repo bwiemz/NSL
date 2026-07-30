@@ -1698,8 +1698,21 @@ impl Compiler<'_> {
                     .functions
                     .insert(base_name.clone(), (func_id, sig.clone()));
 
+                // closure_info is compiler-global and symbol-keyed, and this
+                // nested body compiles MID-way through the outer body — any
+                // closure_info mutation inside it (a `let f = <lambda>` insert
+                // or the non-capturing-rebind clear) would corrupt entries the
+                // OUTER function's remaining call sites still need (review
+                // HIGH on 44c011c1: a nested `let f = 7` deleted the outer
+                // capturing `f`'s entry — the outer call then executed the
+                // closure struct as code). Snapshot/restore, mirroring the
+                // registry.functions temp-entry pattern above.
+                let closure_info_snapshot = self.registry.closure_info.clone();
+
                 // Compile the nested function body
                 self.compile_fn_def(fn_def)?;
+
+                self.registry.closure_info = closure_info_snapshot;
 
                 // Remove temp entry and restore any previous function with the same name
                 self.registry.functions.remove(&base_name);
@@ -2119,6 +2132,18 @@ impl Compiler<'_> {
                         state.dataloader_symbols.remove(sym);
                     }
                     self.update_non_owning_binding(state, *sym, Some(value));
+                    // Same capture-count transfer/clear as the VarDecl arm
+                    // (review MEDIUM-1 on 44c011c1): a plain `f = <lambda>`
+                    // rebind previously left closure_info stale in BOTH
+                    // directions — a non-capturing rebind after a capturing
+                    // one made the call site read the bare fn pointer as a
+                    // closure struct (silent death), and a capturing rebind
+                    // was never recorded at all.
+                    if let Some(count) = self.registry.last_lambda_capture_count.take() {
+                        self.registry.closure_info.insert(*sym, count);
+                    } else {
+                        self.registry.closure_info.remove(sym);
+                    }
                 }
                 // Free intermediate tensor temporaries (keep final_val which is now owned by the variable)
                 self.free_tensor_temporaries(builder, state, Some(final_val));

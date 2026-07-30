@@ -425,6 +425,85 @@ print("DONE")
     );
 }
 
+/// Review HIGH on 44c011c1: closure_info is compiler-global and a
+/// nested fn's body compiles MID-way through the outer body — a nested
+/// `let f = 7` (any non-capturing rebind) deleted the OUTER function's
+/// live closure entry, and the outer `f(1)` then executed the closure
+/// struct as code (exit 1, zero output). The FnDef arm now snapshots
+/// and restores closure_info around the nested compile.
+#[test]
+fn nested_fn_binding_does_not_corrupt_outer_closure_info() {
+    let src = r#"
+fn outer() -> int:
+    let k = 5
+    let f = |v: int| v + k
+    fn helper() -> int:
+        let f = 7
+        return f
+    let a = helper()
+    return f(1) + a
+
+print(outer())
+print("DONE")
+"#;
+    let stdout = run_src(src, "nestclos");
+    assert_eq!(
+        printed_value(&stdout),
+        "13",
+        "outer closure corrupted by nested binding:\n{stdout}"
+    );
+}
+
+/// Review MEDIUM-1 on 44c011c1: the plain-Assign rebind (`f = <lambda>`,
+/// no `let`) had NO capture-count transfer at all — a non-capturing
+/// assign-rebind after a capturing binding died exactly like the
+/// VarDecl shape (silent death at the second call), and a capturing
+/// assign-rebind was never recorded. compile_assign now mirrors the
+/// VarDecl transfer/clear.
+#[test]
+fn assign_rebind_clears_stale_closure_info() {
+    let src = r#"
+let k = 5
+let f = |v: int| v + k
+print(f(1))
+f = |v: int| v * 2
+print(f(3))
+print("DONE")
+"#;
+    let stdout = run_src(src, "assignrebind");
+    assert!(stdout.contains("6\n"), "capturing call broke:\n{stdout}");
+    assert_eq!(
+        printed_value(&stdout),
+        "6",
+        "post-assign-rebind call broke:\n{stdout}"
+    );
+}
+
+/// Deliberate semantics (review MEDIUM-2 on 44c011c1): shadowing a
+/// builtin name with a NON-Function value makes calls of that name a
+/// compile error — Python semantics — instead of the pre-hoist silent
+/// fallback to the builtin. Pinned so the behavior change is on record.
+#[test]
+fn calling_a_non_function_shadow_of_a_builtin_is_a_compile_error() {
+    let src = r#"
+let sum = 5
+let t = ones([4])
+let y = sum(t)
+print("DONE")
+"#;
+    let out = run_nsl(src, "nonfnshadow");
+    assert!(
+        !out.status.success(),
+        "calling a non-Function shadow must be a compile error:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not callable"),
+        "error should say the value is not callable:\n{stderr}"
+    );
+}
+
 /// The guard must not disturb the unshadowed builtins.
 #[test]
 fn unshadowed_sampling_builtins_still_dispatch_to_the_runtime() {
